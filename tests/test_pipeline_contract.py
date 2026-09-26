@@ -170,6 +170,16 @@ class VisualPromptContractTest(unittest.TestCase):
         self.candidates = {"grasped": np.asarray([[1, 2], [3, 4]]), "unattached": None}
         self.task = {"object_grasped": "tool", "task_instruction": "use the tool"}
 
+    def test_empty_grasped_object_preserves_the_nullable_motion_contract(self):
+        context, raw, image = vp_utils.request_motion(
+            {"object_grasped": "", "task_instruction": "observe the scene"},
+            self.test, self.test, {"grasped": None}, prompts={}, debug=True,
+            grasp=True, loaded_context={"grasp_keypoint": ""},
+        )
+        self.assertIsNone(context["keypoints_2d"]["function"])
+        self.assertEqual(raw, {"grasp_keypoint": ""})
+        self.assertIsInstance(image, Image.Image)
+
     def test_function_request_retains_demo_test_order_and_system_prompt(self):
         with patch.object(vp_utils, "Gemini") as client:
             client.return_value.chat_json.return_value = {"function_keypoint": "P2"}

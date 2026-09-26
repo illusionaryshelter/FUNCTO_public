@@ -324,8 +324,9 @@ def annotate_motion(image, context, log_dir=None, add_caption=True):
         function_keypoint = context['keypoints_2d']['function']
     else:
         function_keypoint = context['selected_keypoint']
-    plot_keypoints(ax, image_size, [function_keypoint], 'y', 'function', False,
-                   add_caption=add_caption)
+    if function_keypoint is not None:
+        plot_keypoints(ax, image_size, [function_keypoint], 'y', 'function', False,
+                       add_caption=add_caption)
     with io.BytesIO() as buf:
         fig.savefig(buf, transparent=True, bbox_inches='tight', pad_inches=0, format='jpg')
         buf.seek(0)
@@ -345,7 +346,14 @@ def request_motion(subtask, obs_image_reshaped, annotated_image, candidate_keypo
         context_json = _request_context(
             [f"Task: {subtask}"], annotated_image, prompts[selection],
             example_images, example_responses)
-    point = _selected_keypoint(context_json, candidate_keypoints, grasp)
+    # An empty grasped object legitimately has no selected point, as specified
+    # by the existing motion prompts. Do not turn that valid case into an index
+    # error; a nonempty object still requires a validated visible candidate.
+    field = 'grasp_keypoint' if grasp else 'function_keypoint'
+    if not subtask.get('object_grasped') and context_json.get(field) == '':
+        point = None
+    else:
+        point = _selected_keypoint(context_json, candidate_keypoints, grasp)
     context = {'keypoints_2d': {'function': point}}
     log_img = None
     if debug:
