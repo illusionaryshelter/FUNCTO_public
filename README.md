@@ -32,6 +32,11 @@ SAM, SD-DINO or LLaVA model servers to start.
   Network access is disabled inside perception workers; missing weights fail
   explicitly. The worker CUDA allocator is capped at 8 GiB, combined caller and
   worker RSS at 12 GiB, with at least 1.5 GiB host memory kept available.
+  <!-- BEGIN host allocator reclamation before resource rejection. -->
+  On host-memory pressure, the Linux worker first collects unreachable objects
+  and returns unused glibc allocator pages, then rechecks the same limits.
+  Live tensors, model calls and numerical settings are unchanged.
+  <!-- END host allocator reclamation. -->
 - `local_models/gemini.py`: reuses the sibling `s3e` source backend. It reads
   `SUB2API_API_KEY` only when called. `SUB2API_BASE_URL` defaults to the user's
   local gateway `http://127.0.0.1:18080/antigravity`; `GEMINI_MODEL` defaults to

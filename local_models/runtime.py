@@ -62,6 +62,21 @@ def run_worker(kind: str, images: list[Image.Image], options: dict) -> dict[str,
             return {key: arrays[key] for key in arrays.files}
 
 
+# BEGIN Linux host-memory reclamation: large checkpoint/model temporaries can
+# be dead while glibc retains their freed pages in allocator arenas. Returning
+# only unused pages changes no live tensor, dtype, RNG state or model call.
+def _reclaim_cpu_memory() -> None:
+    """Release unreachable objects and free allocator pages on this Linux host."""
+    import ctypes
+
+    gc.collect()
+    malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+    malloc_trim.argtypes = [ctypes.c_size_t]
+    malloc_trim.restype = ctypes.c_int
+    malloc_trim(0)
+# END Linux host-memory reclamation.
+
+
 def _guard_memory(parent_pid: int) -> None:
     """Stop this worker before the 16 GiB host is exhausted.
 
@@ -78,9 +93,21 @@ def _guard_memory(parent_pid: int) -> None:
             rss = worker.memory_info().rss + parent.memory_info().rss
             available = psutil.virtual_memory().available
             if rss > 12 * 2**30 or available < 1.5 * 2**30:
-                print(f"Local model stopped: combined RSS={rss / 2**30:.2f} GiB, "
-                      f"available={available / 2**30:.2f} GiB", file=sys.stderr, flush=True)
-                os._exit(75)
+                # BEGIN reclaim before enforcing the same resource limits.
+                # Re-sample both RSS and host availability after reclamation;
+                # a live working set above either bound must still stop.
+                previous_rss = rss
+                _reclaim_cpu_memory()
+                rss = worker.memory_info().rss + parent.memory_info().rss
+                available = psutil.virtual_memory().available
+                if rss > 12 * 2**30 or available < 1.5 * 2**30:
+                    print(f"Local model stopped: combined RSS={rss / 2**30:.2f} GiB, "
+                          f"available={available / 2**30:.2f} GiB", file=sys.stderr, flush=True)
+                    os._exit(75)
+                print(f"Local model reclaimed unused CPU memory: combined RSS "
+                      f"{previous_rss / 2**30:.2f} -> {rss / 2**30:.2f} GiB",
+                      file=sys.stderr, flush=True)
+                # END reclamation; resource thresholds are unchanged.
         except psutil.NoSuchProcess:
             os._exit(75)
         time.sleep(0.25)
