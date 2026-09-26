@@ -4,13 +4,14 @@ All translations and depths are metres. A pose maps column-vector points from
 the initial body frame into the initial camera reference frame. With a tracked
 reference, its motion is removed before returning the body poses; without one,
 the camera must be stationary. The body frame's axes initially match the camera
-and its origin is the centroid of the initial valid body correspondences.
+and its origin is the centroid of the initial observed body geometry.
 
-This module neither assigns object roles nor keeps GPU models resident. CoTracker
-propagates correspondence hypotheses in an isolated worker; calibrated depth
-and geometric consensus check their rigidity. These observations do not prove
-physical identity after occlusion or coherent drift.
-It cannot recover an unobserved object or silently fill lost tracks.
+This module neither assigns object roles nor keeps GPU models resident.
+FoundationPose estimates each rigid object's camera pose in an isolated worker.
+Its model frame is bound once to the initial observed body frame; tracking does
+not repeatedly sample depth at a projected point and assume material identity.
+The worker must validate model-to-observation geometry, not merely return SE(3).
+An object name alone does not establish that a mesh matches that instance.
 """
 
 # BEGIN task-adaptive observations: independent of tool/function/grasp fields.
@@ -243,29 +244,51 @@ def rigid_registration(source, target, max_error=0.01):
     }
 
 
-def _track_arrays(tracks, valid_mask, name):
-    points = np.asarray(tracks, dtype=float)
-    valid = np.asarray(valid_mask)
-    if (points.ndim != 3 or points.shape[2] != 3 or not len(points)
-            or valid.shape != points.shape[:2] or valid.dtype != np.bool_):
-        raise ValueError(f"{name} needs tracks[N,M,3] and boolean valid_mask[N,M]")
-    if not np.isfinite(points[valid]).all():
-        raise ValueError(f"{name} marks nonfinite 3D observations as valid")
-    return points, valid
+# BEGIN FoundationPose coordinates: bind fixed material points once, not tracks.
+def _model_poses(value, name):
+    """Check the transform convention without repairing invalid predictions.
 
-
-def poses_from_tracks(tracks, *, valid_mask, reference_tracks=None,
-                      reference_valid_mask=None, frame_indices=None, max_error=0.01):
-    """Convert identity-preserving 3D tracks to body poses and local geometry.
-
-    Column j must refer to the same physical feature at every frame. Missing
-    observations require a false entry in ``valid_mask``; no association is
-    inferred from unordered arrays. Registration uses only correspondences
-    shared with frame zero. With a reference, ``inv(T_reference) @ T_body``
-    removes camera/reference motion before applying the initial body offset.
+    These checks establish only numerical SE(3) validity. They do not measure
+    pose accuracy, object identity, symmetry ambiguity, or tracking success.
     """
-    points, valid = _track_arrays(tracks, valid_mask, "Body")
-    count = len(points)
+    poses = np.asarray(value, dtype=float)
+    if (poses.ndim != 3 or poses.shape[1:] != (4, 4) or not len(poses)
+            or not np.isfinite(poses).all()):
+        raise ValueError(f"{name} must be finite poses with shape [T,4,4]")
+    if not np.allclose(poses[:, 3], [0, 0, 0, 1], atol=1e-9, rtol=0):
+        raise ValueError(f"{name} has an invalid homogeneous last row")
+    rotations = poses[:, :3, :3]
+    if (not np.allclose(np.swapaxes(rotations, 1, 2) @ rotations, np.eye(3),
+                        atol=1e-6, rtol=0)
+            or not np.allclose(np.linalg.det(rotations), 1., atol=1e-6, rtol=0)):
+        raise ValueError(f"{name} rotations must be proper orthonormal matrices")
+    return poses
+
+
+def poses_from_models(camera_from_model, initial_points, *,
+                      reference_camera_from_model=None, frame_indices=None):
+    """Convert validated model poses to a fixed observed body frame.
+
+    ``camera_from_model[t]`` must be FoundationPose's returned transform of the
+    *original* mesh, not its internally centered ``pose_last``. ``initial_points``
+    are finite metric observations in the first camera frame. With their
+    centroid c, P0=[I,c] maps body to camera zero. The single binding
+    X=inv(B0)@P0 maps this body into the carrier mesh. For a tracked reference R,
+    returned poses are R0@inv(Rt)@Bt@X; without a reference they are Bt@X and
+    require a stationary camera. This removes reference motion, including any
+    actual reference-object motion, rather than asserting a fixed world frame.
+
+    Local points inv(P0)@p0 remain material-point hypotheses throughout the
+    sequence. No further depth lookup changes their identity. This function is
+    pure coordinate conversion, accepts a single frame, and makes no tracking
+    quality claim; the FoundationPose worker performs observation validation.
+    """
+    models = _model_poses(camera_from_model, "Carrier camera_from_model")
+    points = np.asarray(initial_points, dtype=float)
+    if (points.ndim != 2 or points.shape[1] != 3 or not len(points)
+            or not np.isfinite(points).all()):
+        raise ValueError("initial_points must be a nonempty finite N-by-3 array")
+    count = len(models)
     if frame_indices is None:
         indices = np.arange(count, dtype=int)
     else:
@@ -273,97 +296,84 @@ def poses_from_tracks(tracks, *, valid_mask, reference_tracks=None,
         if (indices.shape != (count,) or not np.issubdtype(indices.dtype, np.integer)
                 or (indices < 0).any() or (indices[1:] <= indices[:-1]).any()):
             raise ValueError("frame_indices must be nonnegative, strictly increasing integer frame IDs")
-    if not _noncollinear(points[0, valid[0]]):
-        raise ValueError("Initial body observations need noncollinear valid points")
-    if (reference_tracks is None) != (reference_valid_mask is None):
-        raise ValueError("Reference tracks and their valid mask must be supplied together")
-    reference = ref_valid = None
-    if reference_tracks is not None:
-        reference, ref_valid = _track_arrays(reference_tracks, reference_valid_mask, "Reference")
+    reference = None
+    if reference_camera_from_model is not None:
+        reference = _model_poses(reference_camera_from_model, "Reference camera_from_model")
         if len(reference) != count:
-            raise ValueError("Body and reference tracks must use the same frame sequence")
-        if not _noncollinear(reference[0, ref_valid[0]]):
-            raise ValueError("Initial reference observations need noncollinear valid points")
-    origin = points[0, valid[0]].mean(axis=0)
+            raise ValueError("Body and reference poses must use the same frame sequence")
+    origin = points.mean(axis=0)
     initial = np.eye(4)
     initial[:3, 3] = origin
-    poses = [initial]
-    diagnostics = [{"frame_index": int(indices[0]), "initial_valid_points": int(valid[0].sum())}]
-    for frame in range(1, count):
-        shared = valid[0] & valid[frame]
-        try:
-            body, body_info = rigid_registration(points[0, shared], points[frame, shared], max_error)
-            reference_motion = np.eye(4)
-            ref_info = None
-            if reference is not None:
-                shared_ref = ref_valid[0] & ref_valid[frame]
-                reference_motion, ref_info = rigid_registration(
-                    reference[0, shared_ref], reference[frame, shared_ref], max_error)
-        except ValueError as error:
-            raise ValueError(f"Rigid tracking failed at frame {int(indices[frame])}: {error}") from error
-        poses.append(np.linalg.solve(reference_motion, body @ initial))
-        diagnostics.append({"frame_index": int(indices[frame]), "body": body_info,
-                            "reference": ref_info})
+    model_from_body = np.linalg.solve(models[0], initial)
+    poses = models @ model_from_body
+    if reference is not None:
+        poses = reference[0] @ np.linalg.solve(reference, poses)
+    # This frame defines the coordinate gauge. Remove only floating-point
+    # round-off from the exact identity B0@inv(B0)@P0, not a pose estimation error.
+    poses[0] = initial
     return {
-        "poses": np.asarray(poses), "points": points[0, valid[0]] - origin,
-        "frame_indices": indices.copy(), "diagnostics": diagnostics,
+        "poses": poses, "points": points - origin,
+        "frame_indices": indices.copy(), "model_from_body": model_from_body,
         "body_origin_camera0_m": origin,
-        "body_frame": "initial correspondence centroid; axes aligned with initial camera",
+        "body_frame": "initial observed geometry centroid; axes aligned with initial camera",
         "reference_frame": "initial camera coordinates",
         "camera_assumption": ("reference motion compensated; reference defines relative motion"
                               if reference is not None else "stationary camera required"),
         "units": "metres", "pose_convention": "reference_from_body; column vectors",
     }
+# END FoundationPose coordinates.
 
 
-def _sample_tracks(depth, K, pixels, active):
-    """Sample only valid depth rows while retaining the original feature IDs."""
-    points = np.full((len(pixels), 3), np.nan)
-    valid = active & np.isfinite(pixels).all(axis=1)
-    valid &= ((pixels[:, 0] >= 0) & (pixels[:, 0] <= depth.shape[1] - 1)
-              & (pixels[:, 1] >= 0) & (pixels[:, 1] <= depth.shape[0] - 1))
-    candidates = np.flatnonzero(valid)
-    rounded = np.rint(pixels[candidates]).astype(int)
-    depths = depth[rounded[:, 1], rounded[:, 0]]
-    valid[candidates] &= np.isfinite(depths) & (depths > 0)
-    points[valid] = backproject(depth, K, pixels[valid])
-    return points, valid
+# BEGIN explicit instance geometry for FoundationPose; no category-mesh guess.
+def _pose_models(root, roles):
+    """Resolve metric instance meshes from the existing RGB-D config file.
 
-
-# BEGIN complete-video observation sampling: no local optical-flow fallback.
-def _initial_queries(depth, mask, count=256):
-    """Uniformly sample observed interior pixels without favouring boundaries.
-
-    Farthest-point sampling over a silhouette disproportionately selects its
-    outline, handles and holes, where depth can belong to another surface.
-    Uniform pixel sampling gives observed surface area its proper weight. The
-    one-pixel erosion excludes mixed boundary measurements; no object-specific
-    distance, material label or cached trajectory enters point selection.
+    Mesh paths are relative to config.json unless absolute. Scale must be
+    explicit, positive, and either scalar or three per-axis factors. A category
+    name is insufficient input; validation of the selected geometry against
+    RGB-D remains the worker's responsibility.
     """
-    import cv2
+    config_path = root / "config.json"
+    if not config_path.is_file():
+        raise ValueError("FoundationPose requires config.json pose_models for the selected entities")
+    config = json.loads(config_path.read_text())
+    models = config.get("pose_models") if isinstance(config, dict) else None
+    if not isinstance(models, dict):
+        raise ValueError("FoundationPose requires config.json pose_models for the selected entities")
+    selected = []
+    for role in roles:
+        model = models.get(role)
+        if (not isinstance(model, dict) or not isinstance(model.get("mesh"), str)
+                or not model["mesh"].strip()):
+            raise ValueError(f"FoundationPose pose_models.{role} must specify its instance mesh")
+        mesh = Path(model["mesh"]).expanduser()
+        mesh = (mesh if mesh.is_absolute() else config_path.parent / mesh).resolve()
+        if not mesh.is_file():
+            raise FileNotFoundError(f"FoundationPose {role} mesh does not exist: {mesh}")
+        scale = model.get("scale")
+        components = scale if isinstance(scale, list) else [scale]
+        numeric = all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                      for value in components)
+        values = np.asarray(components, dtype=float) if numeric else np.array([])
+        if (not numeric or (isinstance(scale, list) and len(scale) != 3)
+                or not np.isfinite(values).all() or (values <= 0).any()):
+            raise ValueError(f"FoundationPose {role} scale must be an explicit positive scalar or 3-vector")
+        selected.append({"mesh": str(mesh), "scale": values.tolist() if isinstance(scale, list) else float(values[0])})
+    return selected
+# END explicit instance geometry.
 
-    selected = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-    selected &= np.isfinite(depth) & (depth > 0)
-    rows, cols = np.nonzero(selected)
-    if len(rows) < 6:
-        raise ValueError("Tracking needs at least six valid-depth interior pixels per entity")
-    pixels = np.column_stack((cols, rows)).astype(np.float32)
-    indices = np.random.default_rng(0).choice(len(pixels), min(count, len(pixels)), replace=False)
-    return pixels[indices]
-# END complete-video observation sampling.
 
+def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None):
+    """Recover object/part motion with validated local FoundationPose poses.
 
-def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None, max_error=0.01):
-    """Recover demonstrated rigid motion with isolated, bounded CoTracker.
-
-    Masks select body/reference in the first frame. Each entity contributes at
-    most 256 uniformly sampled queries. The local tracker follows the entire
-    sequence, then refines it in one fixed crop inferred from its own tracks.
-    Valid visibility and metric depth precede the unchanged rigid RANSAC.
-    Every pose is registered to the initial observations, avoiding accumulation
-    of pairwise drift; insufficient consensus remains an explicit failure.
+    First-frame masks and config.json ``pose_models`` bind each selected rigid
+    entity to its own instance mesh. The isolated worker owns tracking state
+    and validates rendered geometry against RGB-D at every frame. This layer
+    validates the transport contract and converts original-mesh poses once to
+    the existing observed-body frame. No point tracker or fallback is used.
     """
-    from local_models.cotracker import track
+    # BEGIN FoundationPose observation path.
+    from local_models.foundationpose import track
 
     root = Path(directory)
     indices = sorted({int(path.stem) for path in (root / "rgb").iterdir()
@@ -374,47 +384,50 @@ def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None, max_err
         indices = indices[:max_frames]
     if len(indices) < 2:
         raise ValueError("RGB-D motion tracking requires at least two frames")
-    image, depth, camera = load_rgbd(root, indices[0])
+    _, depth, camera = load_rgbd(root, indices[0])
     body_mask = _mask(mask, depth.shape, "Body mask")
     ref_mask = None if reference_mask is None else _mask(reference_mask, depth.shape, "Reference mask")
     if ref_mask is not None and np.any(body_mask & ref_mask):
         raise ValueError("Body and reference masks must select distinct, nonoverlapping rigid parts")
+    masks = [body_mask] + ([] if ref_mask is None else [ref_mask])
+    roles = ["carrier"] + ([] if ref_mask is None else ["reference"])
+    models = _pose_models(root, roles)
+    for role, selected in zip(roles, masks):
+        if np.count_nonzero(selected & np.isfinite(depth) & (depth > 0)) < 6:
+            raise ValueError(f"FoundationPose {role} needs at least six valid initial depth observations")
     geometry = backproject(depth, camera.K, mask=body_mask)
     if len(geometry) > 3000:
         geometry = geometry[np.linspace(0, len(geometry) - 1, 3000, dtype=int)]
-    # BEGIN learned full-sequence tracking: all arrays return after GPU exit.
-    masks = [body_mask] + ([] if ref_mask is None else [ref_mask])
-    groups = [_initial_queries(depth, selected) for selected in masks]
-    queries = np.concatenate(groups)
-    paths = [_frame_file(root / "rgb", index, (".jpg", ".png", ".jpeg")) for index in indices]
-    tracked = track(paths, queries)
-    pixels, visible = tracked["pixels"], tracked["visible"]
-    histories, validity = [], []
-    for frame, index in enumerate(indices):
+    frame_paths, depth_paths = [], []
+    # Validate all files before launching a GPU worker. Decoding is sequential,
+    # so full videos are not accumulated in host memory by this preflight.
+    for index in indices:
         _, depth, current_camera = load_rgbd(root, index)
         if (not np.array_equal(camera.K, current_camera.K)
                 or camera.depth_scale != current_camera.depth_scale):
             raise ValueError("RGB-D calibration changed within the track")
-        observed, valid = _sample_tracks(depth, camera.K, pixels[frame], visible[frame])
-        split = len(groups[0])
-        for name, selected in [("body", valid[:split])]+([] if ref_mask is None else [("reference", valid[split:])]):
-            if selected.sum() < 6:
-                raise ValueError(f"RGB-D tracking lost {name} correspondences at frame {index}")
-        histories.append(observed)
-        validity.append(valid)
-    histories, validity = np.asarray(histories), np.asarray(validity)
-    result = poses_from_tracks(
-        histories[:, :split], valid_mask=validity[:, :split],
-        reference_tracks=None if ref_mask is None else histories[:, split:],
-        reference_valid_mask=None if ref_mask is None else validity[:, split:],
-        frame_indices=indices, max_error=max_error)
-    result["points"] = geometry - result["body_origin_camera0_m"]
-    result["tracking_method"] = "CoTracker3 fixed-crop refinement + calibrated depth + initial-frame rigid RANSAC"
-    result["tracking_crop_xyxy"] = tracked["crop_xyxy"]
-    result["tracking_query_group_sizes"] = [len(group) for group in groups]
-    result["tracking_pixels_uv"] = pixels
-    result["tracking_depth_valid"] = validity
-    result["tracking_visible"] = visible
+        if np.count_nonzero(np.isfinite(depth) & (depth > 0)) < 4:
+            raise ValueError(f"FoundationPose frame {index} has insufficient valid depth")
+        frame_paths.append(_frame_file(root / "rgb", index, (".jpg", ".png", ".jpeg")))
+        depth_paths.append(_frame_file(root / "depth", index, (".png", ".tiff", ".tif", ".npy")))
+    tracked = track(frame_paths, depth_paths, K=camera.K, depth_scale=camera.depth_scale,
+                    masks=np.stack(masks), models=models)
+    if not isinstance(tracked, dict) or "camera_from_model" not in tracked:
+        raise ValueError("FoundationPose worker must return camera_from_model")
+    poses = np.asarray(tracked["camera_from_model"])
+    if poses.shape != (len(indices), len(roles), 4, 4):
+        raise ValueError("FoundationPose camera_from_model must cover every frame and selected entity")
+    validated = np.asarray(tracked.get("validated"))
+    if (validated.shape != (len(indices), len(roles)) or validated.dtype != np.bool_
+            or not validated.all()):
+        raise ValueError("FoundationPose requires successful geometry validation for every frame and entity")
+    result = poses_from_models(
+        poses[:, 0], geometry, reference_camera_from_model=None if ref_mask is None else poses[:, 1],
+        frame_indices=indices)
+    result["tracking_method"] = "FoundationPose instance-mesh poses + fixed material-point binding"
+    result["tracking_models"] = dict(zip(roles, models))
+    result["tracking_camera_from_model"] = poses.copy()
+    result["tracking_diagnostics"] = {key: value for key, value in tracked.items() if key != "camera_from_model"}
     return result
-    # END learned full-sequence tracking.
+    # END FoundationPose observation path.
 # END task-adaptive observations.

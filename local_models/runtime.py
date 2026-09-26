@@ -55,7 +55,7 @@ def run_file_worker(kind: str, paths: list[Path], options: dict) -> dict[str, np
     independent of video pixel count, and reclaims the entire tracker before
     the next SAM/SD-DINO stage starts.
     """
-    if kind != "cotracker":
+    if kind != "foundationpose":
         raise ValueError(f"Unknown file-based local model: {kind}")
     paths = [Path(path).resolve() for path in paths]
     if not paths or any(not path.is_file() for path in paths):
@@ -72,6 +72,17 @@ def _run_file_worker(kind, paths, options, directory):
         torch.cuda.empty_cache()
     output = directory / "output.npz"
     request = directory / "request.json"
+    # BEGIN FoundationPose mask transport: keep initial instance masks as a
+    # small typed array instead of materializing millions of JSON booleans.
+    if kind == "foundationpose":
+        options = dict(options)
+        masks = np.asarray(options.pop("masks"))
+        if masks.ndim != 3 or masks.dtype != np.bool_:
+            raise ValueError("FoundationPose worker masks must be boolean [N,H,W]")
+        mask_path = directory / "masks.npy"
+        np.save(mask_path, masks, allow_pickle=False)
+        options["masks_path"] = str(mask_path)
+    # END FoundationPose mask transport.
     request.write_text(json.dumps({"kind": kind, "images": paths,
                                    "output": str(output), "options": options}))
     env = os.environ.copy()
@@ -182,11 +193,13 @@ def main() -> None:
             raise ValueError("SD-DINO expects a pair of images")
         from .sd_dino import worker_main
         worker_main(paths, output)
-    # BEGIN bounded CoTracker worker; the same offline and resource guards apply.
-    elif request["kind"] == "cotracker":
-        from .cotracker import worker_main
-        worker_main(paths, output, request["options"]["queries_uv"])
-    # END bounded CoTracker worker.
+    # BEGIN model-based pose worker; point-tracking dispatch is removed.
+    elif request["kind"] == "foundationpose":
+        from .foundationpose import worker_main
+        options = dict(request["options"])
+        masks = np.load(options.pop("masks_path"), allow_pickle=False)
+        worker_main(paths, output, masks=masks, **options)
+    # END model-based pose worker.
     else:
         raise ValueError(f"Unknown worker: {request['kind']}")
     print(json.dumps({"local_model": request["kind"],

@@ -17,7 +17,7 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 
 from manipulation.observations import (
-    backproject, load_calibration, load_rgbd, poses_from_tracks,
+    backproject, load_calibration, load_rgbd, poses_from_models,
     rigid_registration, track_rgbd,
 )
 
@@ -141,114 +141,247 @@ class CorrespondenceMotionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "consensus"):
             rigid_registration(source, source[rng.permutation(len(source))], max_error=0.001)
 
-    def test_camera_and_reference_compensation_with_missing_observations(self):
+# BEGIN original-mesh pose and fixed-material-point contracts.
+class ModelPoseTest(unittest.TestCase):
+    def test_arbitrary_camera_motion_is_removed_without_losing_object_rotation(self):
         rng = np.random.default_rng(17)
-        body = rng.uniform(-0.2, 0.2, (35, 3)) + [0.2, 0.1, 1.3]
-        reference = rng.uniform(-0.4, 0.4, (40, 3)) + [-0.4, 0., 1.6]
-        actual_body = [np.eye(4), pose((0.1, 0.2, 0.3), (0.1, 0.02, -0.04)),
-                       pose((-0.2, 0.1, 0.6), (0.12, 0.08, -0.02))]
-        cameras = [np.eye(4), pose((0.2, -0.2, 0.), (0.2, -0.1, 0.03)),
-                   pose((0.3, 0.2, -0.1), (-0.2, 0.3, 0.1))]
-        tracks = np.asarray([transform(body, camera @ motion) for camera, motion in zip(cameras, actual_body)])
-        refs = np.asarray([transform(reference, camera) for camera in cameras])
-        valid = np.ones(tracks.shape[:2], dtype=bool)
-        valid[1, :5] = False
-        tracks[~valid] = np.nan
-        result = poses_from_tracks(tracks, valid_mask=valid, reference_tracks=refs,
-                                   reference_valid_mask=np.ones(refs.shape[:2], dtype=bool),
-                                   frame_indices=[0, 2, 4])
-        initial = pose(translation=body.mean(axis=0))
-        np.testing.assert_allclose(result["poses"], [matrix @ initial for matrix in actual_body], atol=1e-12)
-        for frame, expected in enumerate(actual_body):
-            np.testing.assert_allclose(transform(result["points"], result["poses"][frame]),
-                                       transform(body, expected), atol=1e-12)
-        np.testing.assert_array_equal(result["frame_indices"], [0, 2, 4])
+        material_points = rng.uniform(-0.15, 0.15, (35, 3)) + [0.4, -0.2, 0.3]
+        bodies = np.asarray([pose((.1*f, -.06*f, .13*f), (.2+.01*f, .1, 1.2))
+                             for f in range(8)])
+        cameras = np.asarray([pose(rng.uniform(-.5, .5, 3), rng.uniform(-.2, .2, 3))
+                              for _ in bodies])
+        reference = pose((.6, -.4, .2), (-.4, .3, 1.8))
+        observations = cameras @ bodies
+        references = cameras @ reference
+        initial_points = transform(material_points, observations[0])
+        result = poses_from_models(observations, initial_points,
+                                   reference_camera_from_model=references,
+                                   frame_indices=np.arange(8)*2)
+        np.testing.assert_allclose(result["poses"][0], pose(translation=initial_points.mean(0)), atol=1e-12)
+        for frame, world_from_body in enumerate(bodies):
+            # Expected material coordinates are constructed in the physical
+            # world, then expressed in the first camera independently of the
+            # body-origin convention chosen by poses_from_models.
+            expected = transform(material_points, cameras[0] @ world_from_body)
+            actual = transform(result["points"], result["poses"][frame])
+            np.testing.assert_allclose(actual, expected, atol=1e-12)
+        np.testing.assert_array_equal(result["frame_indices"], np.arange(8)*2)
         self.assertIn("compensated", result["camera_assumption"])
 
-    def test_track_contract_and_loss_are_explicit(self):
-        rng = np.random.default_rng(12)
-        tracks = rng.uniform(-1, 1, (2, 10, 3))
-        valid = np.ones((2, 10), dtype=bool)
-        tracks[1] = tracks[0] + [0.1, 0., 0.]
-        result = poses_from_tracks(tracks, valid_mask=valid)
+    def test_moving_reference_defines_relative_motion_not_a_stationary_world(self):
+        material_points = np.array([[.1, .2, .3], [-.1, .3, .2], [.2, -.2, .1]])
+        bodies = np.array([pose((0, .1*f, 0), (.2, .1, 1.2)) for f in range(3)])
+        refs = np.array([pose((0, 0, .2*f), (-.3, .03*f, 1.4)) for f in range(3)])
+        cameras = np.array([pose((.1*f, -.1, .1), (.02*f, .2, -.1)) for f in range(3)])
+        initial_points = transform(material_points, cameras[0] @ bodies[0])
+        result = poses_from_models(cameras @ bodies, initial_points,
+                                   reference_camera_from_model=cameras @ refs)
+        for frame in range(3):
+            expected = transform(material_points, cameras[0] @ refs[0] @ np.linalg.inv(refs[frame]) @ bodies[frame])
+            np.testing.assert_allclose(transform(result["points"], result["poses"][frame]), expected, atol=1e-12)
+
+    def test_nonzero_mesh_center_and_arbitrary_mesh_frame_do_not_change_body_motion(self):
+        models = np.array([pose((.2, .3*f, -.1), (.4, .1*f, 1.6)) for f in range(4)])
+        refs = np.array([pose((0, -.2, .05*f), (-.4, .2, 1.4)) for f in range(4)])
+        points = np.array([[.2, .1, 1.4], [.3, .4, 1.2], [.5, -.2, 1.3]])
+        result = poses_from_models(models, points, reference_camera_from_model=refs)
+        mesh_change = pose((.6, -.4, .2), (1., -2., 3.))
+        reference_change = pose((-.4, .8, -.6), (-.5, .7, -.9))
+        reexpressed = poses_from_models(models @ np.linalg.inv(mesh_change), points,
+                                      reference_camera_from_model=refs @ np.linalg.inv(reference_change))
+        np.testing.assert_allclose(reexpressed["poses"], result["poses"], atol=1e-12)
+        np.testing.assert_allclose(reexpressed["model_from_body"], mesh_change @ result["model_from_body"], atol=1e-12)
+        np.testing.assert_array_equal(reexpressed["points"], result["points"])
+
+    def test_stationary_camera_and_single_frame_bind_points_once(self):
+        initial_model = pose((.4, -.5, .7), (.2, -.1, 1.5))
+        material_points = np.array([[.2, .1, 0], [-.1, .2, .1], [.1, -.2, .2]])
+        points = transform(material_points, initial_model)
+        original_points = points.copy()
+        single = poses_from_models(initial_model[None], points)
+        np.testing.assert_allclose(transform(single["points"], single["poses"][0]), points, atol=1e-12)
+        final_model = pose((-.2, .3, 1.), (.3, .2, 1.6))
+        result = poses_from_models([initial_model, final_model], points)
+        np.testing.assert_allclose(transform(result["points"], result["poses"][1]),
+                                   transform(material_points, final_model), atol=1e-12)
+        np.testing.assert_array_equal(points, original_points)
         self.assertEqual(result["camera_assumption"], "stationary camera required")
-        for indices in ([-1, 1], [0, 0], [0., np.nan], ["0", "1"]):
+
+    def test_invalid_poses_and_point_geometry_are_rejected(self):
+        points = np.array([[0., 0., 1.], [.1, 0., 1.], [0., .2, 1.]])
+        invalid = [np.eye(4), np.empty((0, 4, 4))]
+        for entry in ((0, 0, np.nan), (3, 0, .2), (0, 0, -1.), (1, 1, 2.)):
+            matrix = np.eye(4)
+            matrix[entry[:2]] = entry[2]
+            invalid.append(matrix[None])
+        for prediction in invalid:
+            with self.subTest(shape=prediction.shape), self.assertRaises(ValueError):
+                poses_from_models(prediction, points)
+        with self.assertRaisesRegex(ValueError, "same frame sequence"):
+            poses_from_models(np.array([np.eye(4)]*2), points, reference_camera_from_model=np.eye(4)[None])
+        for geometry in ([], [[0, 1]], [[0, np.nan, 1]]):
+            with self.subTest(geometry=geometry), self.assertRaisesRegex(ValueError, "initial_points"):
+                poses_from_models(np.eye(4)[None], geometry)
+
+    def test_frame_indices_preserve_unsigned_order_and_reject_invalid_values(self):
+        models = np.array([np.eye(4), pose(translation=(.1, 0, 0))])
+        points = np.array([[0., 0., 1.], [.1, 0., 1.], [0., .2, 1.]])
+        for indices in ([-1, 1], [0, 0], [0., np.nan], ["0", "1"], np.array([2, 1], np.uint64)):
             with self.subTest(indices=indices), self.assertRaisesRegex(ValueError, "integer frame IDs"):
-                poses_from_tracks(tracks, valid_mask=valid, frame_indices=indices)
-        # Unsigned subtraction wraps on descending values. Direct ordering must
-        # reject those IDs, while preserving very large, correctly ordered IDs.
-        with self.assertRaisesRegex(ValueError, "integer frame IDs"):
-            poses_from_tracks(tracks, valid_mask=valid, frame_indices=np.array([2, 1], np.uint64))
-        large = np.array([2**64 - 2, 2**64 - 1], dtype=np.uint64)
-        np.testing.assert_array_equal(poses_from_tracks(tracks, valid_mask=valid,
-                                                       frame_indices=large)["frame_indices"], large)
-        valid[1, 2:] = False
-        with self.assertRaisesRegex(ValueError, "failed at frame 1"):
-            poses_from_tracks(tracks, valid_mask=valid)
-        with self.assertRaisesRegex(ValueError, "boolean valid_mask"):
-            poses_from_tracks(tracks, valid_mask=valid.astype(int))
-        with self.assertRaisesRegex(ValueError, "supplied together"):
-            poses_from_tracks(tracks, valid_mask=valid, reference_tracks=tracks)
+                poses_from_models(models, points, frame_indices=indices)
+        # Comparing adjacent IDs, rather than subtracting them, avoids unsigned
+        # wraparound and preserves legitimately large ordered identifiers.
+        large = np.array([2**64-2, 2**64-1], dtype=np.uint64)
+        result = poses_from_models(models, points, frame_indices=large)
+        np.testing.assert_array_equal(result["frame_indices"], large)
+# END original-mesh pose and fixed-material-point contracts.
 
 
+# BEGIN isolated FoundationPose boundary; no model loading in these CPU tests.
 class SmallRGBDSequenceTest(unittest.TestCase):
-    def write_sequence(self, root, *, texture=True, invalidate_second=False):
-        import cv2
-
+    def write_sequence(self, root, *, invalidate_second=False):
         matrix = write_camera(root, width=128, height=96)
         (root / "rgb").mkdir()
         (root / "depth").mkdir()
+        (root / "meshes").mkdir()
+        (root / "meshes/carrier.obj").write_text("v 0 0 0\nv .1 0 0\nv 0 .1 0\nf 1 2 3\n")
+        config = json.loads((root / "config.json").read_text())
+        config["pose_models"] = {"carrier": {"mesh": "meshes/carrier.obj", "scale": 1.}}
+        (root / "config.json").write_text(json.dumps(config))
         mask = np.zeros((96, 128), dtype=bool)
         mask[14:82, 16:104] = True
-        rng = np.random.default_rng(42)
-        gray = rng.integers(0, 256, (96, 128), dtype=np.uint8) if texture else np.zeros((96, 128), np.uint8)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
         for frame in range(3):
-            shifted = cv2.warpAffine(gray, np.array([[1., 0., 2 * frame], [0., 1., frame]]), (128, 96))
-            Image.fromarray(shifted).convert("RGB").save(root / "rgb" / f"{frame:05d}.png")
+            Image.new("RGB", (128, 96), color=(80+frame, 90, 100)).save(root / "rgb" / f"{frame:05d}.png")
             depth = np.full((96, 128), 1500, dtype=np.uint16)
             if frame == 1 and invalidate_second:
                 depth[:] = 0
             Image.fromarray(depth).save(root / "depth" / f"{frame:05d}.png")
         return mask, matrix
 
-    # BEGIN learned-tracker boundary: CPU tests supply independent image tracks,
-    # while real calibrated backprojection and rigid registration remain active.
     @staticmethod
-    def known_tracks(paths, queries):
-        pixels = np.asarray([queries + [2 * frame, frame] for frame in range(len(paths))], np.float32)
-        return {"pixels": pixels, "visible": np.ones(pixels.shape[:2], bool),
-                "crop_xyxy": np.array([0, 0, 128, 96])}
+    def known_models(paths, depths, *, K, depth_scale, masks, models):
+        # This fake supplies known *model* poses only. It does not pretend to
+        # exercise the actual FoundationPose renderer or its quality checks.
+        count = len(paths)
+        first = pose((.4, -.3, .2), (.5, -.1, 1.3))
+        reference = pose((-.3, .4, -.2), (-.4, .2, 1.7))
+        output = []
+        for frame in range(count):
+            body_motion = pose((0, 0, .1*frame), (.03*frame, .01*frame, 0))
+            camera = np.eye(4) if len(masks) == 1 else pose((.05*frame, -.03*frame, 0), (.1*frame, 0, 0))
+            output.append([camera @ body_motion @ first] + ([] if len(masks) == 1 else [camera @ reference]))
+        return {"camera_from_model": np.asarray(output), "validated": np.ones((count, len(masks)), bool),
+                "support_fraction": np.full((count, len(masks)), .9)}
 
-    def test_tracked_pixels_and_depth_recover_known_metric_translation(self):
+    def test_model_pose_boundary_recovers_known_motion_and_preserves_raw_predictions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             mask, matrix = self.write_sequence(root)
-            with patch("local_models.cotracker.track", side_effect=self.known_tracks):
-                result = track_rgbd(root, mask, max_error=0.004)
+            with patch("local_models.foundationpose.track", side_effect=self.known_models) as worker:
+                result = track_rgbd(root, mask)
             relative = result["poses"] @ np.linalg.inv(result["poses"][0])
-            expected = [pose(translation=(2 * frame * 1.5 / matrix[0, 0], frame * 1.5 / matrix[1, 1], 0))
-                        for frame in range(3)]
-            np.testing.assert_allclose(relative, expected, atol=0.002)
+            expected = [pose((0, 0, .1*f), (.03*f, .01*f, 0)) for f in range(3)]
+            np.testing.assert_allclose(relative, expected, atol=1e-12)
             self.assertLessEqual(len(result["points"]), 3000)
-            self.assertEqual(result["poses"].shape, (3, 4, 4))
+            self.assertEqual(result["tracking_camera_from_model"].shape, (3, 1, 4, 4))
+            np.testing.assert_allclose(result["tracking_diagnostics"]["support_fraction"], .9)
+            np.testing.assert_array_equal(worker.call_args.kwargs["K"], matrix)
+            self.assertEqual(worker.call_args.kwargs["depth_scale"], .001)
+            self.assertEqual(worker.call_args.kwargs["models"], [{"mesh": str(root / "meshes/carrier.obj"), "scale": 1.}])
 
-    def test_visibility_or_depth_loss_does_not_create_a_stationary_success(self):
-        for invisible in (True, False):
-            with self.subTest(invisible=invisible), tempfile.TemporaryDirectory() as directory:
+    def test_two_entities_use_ordered_masks_and_independent_models_with_explicit_scales(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mask, _ = self.write_sequence(root)
+            reference_mask = np.zeros_like(mask)
+            reference_mask[10:80, 108:124] = True
+            config = json.loads((root / "config.json").read_text())
+            config["pose_models"]["carrier"]["scale"] = [.001, .002, .003]
+            config["pose_models"]["reference"] = {"mesh": str(root / "meshes/carrier.obj"), "scale": 2.}
+            (root / "config.json").write_text(json.dumps(config))
+            with patch("local_models.foundationpose.track", side_effect=self.known_models) as worker:
+                result = track_rgbd(root, mask, reference_mask=reference_mask)
+            np.testing.assert_array_equal(worker.call_args.kwargs["masks"], np.stack([mask, reference_mask]))
+            self.assertEqual(worker.call_args.kwargs["models"][0]["scale"], [.001, .002, .003])
+            self.assertEqual(worker.call_args.kwargs["models"][1]["scale"], 2.)
+            relative = result["poses"] @ np.linalg.inv(result["poses"][0])
+            np.testing.assert_allclose(relative, [pose((0, 0, .1*f), (.03*f, .01*f, 0)) for f in range(3)], atol=1e-12)
+
+    def test_missing_instance_models_or_files_fail_before_inference(self):
+        for specification in (None, {}, {"carrier": {"category": "cup"}},
+                              {"carrier": {"mesh": "missing.obj", "scale": 1.}}):
+            with self.subTest(specification=specification), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                mask, _ = self.write_sequence(root, invalidate_second=not invisible)
-
-                def observations(paths, queries):
-                    result = self.known_tracks(paths, queries)
-                    if invisible:
-                        result["visible"][1] = False
-                    return result
-
-                with patch("local_models.cotracker.track", side_effect=observations):
-                    with self.assertRaisesRegex(ValueError, "lost body correspondences"):
+                mask, _ = self.write_sequence(root)
+                (root / "config.json").write_text(json.dumps({"pose_models": specification}))
+                with patch("local_models.foundationpose.track") as worker:
+                    with self.assertRaises((ValueError, FileNotFoundError)):
                         track_rgbd(root, mask)
-    # END learned-tracker boundary.
+                    worker.assert_not_called()
+
+    def test_model_scale_must_be_explicit_finite_positive_and_correctly_shaped(self):
+        for scale in (None, 0, -1, True, "1", np.nan, np.inf, [], [1, 2], [1, 0, 1], [1, np.inf, 1], [True, 1, 1]):
+            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mask, _ = self.write_sequence(root)
+                config = json.loads((root / "config.json").read_text())
+                config["pose_models"]["carrier"]["scale"] = scale
+                (root / "config.json").write_text(json.dumps(config))
+                with patch("local_models.foundationpose.track") as worker:
+                    with self.assertRaisesRegex(ValueError, "scale"):
+                        track_rgbd(root, mask)
+                    worker.assert_not_called()
+
+    def test_truncated_or_wrong_entity_pose_outputs_are_rejected(self):
+        for shape in ((2, 1, 4, 4), (3, 2, 4, 4), (3, 4, 4)):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mask, _ = self.write_sequence(root)
+                output = {"camera_from_model": np.zeros(shape), "validated": np.ones((3, 1), bool)}
+                with patch("local_models.foundationpose.track", return_value=output):
+                    with self.assertRaisesRegex(ValueError, "every frame and selected entity"):
+                        track_rgbd(root, mask)
+
+    def test_valid_se3_without_successful_geometric_validation_is_not_accepted(self):
+        for validation in (None, np.ones((3, 1), int), np.ones((2, 1), bool), np.array([[True], [False], [True]])):
+            with self.subTest(validation=validation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mask, _ = self.write_sequence(root)
+                output = {"camera_from_model": np.tile(np.eye(4), (3, 1, 1, 1))}
+                if validation is not None:
+                    output["validated"] = validation
+                with patch("local_models.foundationpose.track", return_value=output):
+                    with self.assertRaisesRegex(ValueError, "geometry validation"):
+                        track_rgbd(root, mask)
+
+    def test_worker_failure_and_absent_depth_never_become_stationary_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mask, _ = self.write_sequence(root)
+            with patch("local_models.foundationpose.track", side_effect=ValueError("rendered depth mismatch")) as worker:
+                with self.assertRaisesRegex(ValueError, "rendered depth mismatch"):
+                    track_rgbd(root, mask)
+                worker.assert_called_once()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mask, _ = self.write_sequence(root, invalidate_second=True)
+            with patch("local_models.foundationpose.track") as worker:
+                with self.assertRaisesRegex(ValueError, "frame 1 has insufficient valid depth"):
+                    track_rgbd(root, mask)
+                worker.assert_not_called()
+
+    def test_max_frames_limits_both_rgb_and_depth_sequences(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mask, _ = self.write_sequence(root)
+            with patch("local_models.foundationpose.track", side_effect=self.known_models) as worker:
+                result = track_rgbd(root, mask, max_frames=2)
+            self.assertEqual([len(paths) for paths in worker.call_args.args], [2, 2])
+            np.testing.assert_array_equal(result["frame_indices"], [0, 1])
+            for value in (1, True, 2.5):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "max_frames"):
+                    track_rgbd(root, mask, max_frames=value)
+# END isolated FoundationPose boundary.
 
 
 if __name__ == "__main__":

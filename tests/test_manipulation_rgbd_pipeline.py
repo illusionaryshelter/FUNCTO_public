@@ -2,9 +2,10 @@
 
 SAM roles and Gemini semantics are supplied at their public boundaries. Image
 matching is replaced with independently known pixel correspondences; this does
-not measure SD-DINO quality. Learned tracking is supplied at its pixel boundary;
-calibrated backprojection, rigid RANSAC, motion transfer and support goals remain
-in the exercised data flow. Real-model accuracy is checked on the full video.
+not measure SD-DINO quality. FoundationPose is supplied at its model-pose
+boundary; relative-pose conversion, calibrated backprojection, cross-scene rigid
+registration, motion transfer and support goals remain real. These checks do
+not establish the pose model's accuracy on a real demonstration.
 """
 
 # BEGIN raw RGB-D manipulation integration tests.
@@ -16,6 +17,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image
+from scipy.spatial.transform import Rotation
 
 from manipulation.observations import track_rgbd
 from manipulation.perception import ground_rgbd, run_rgbd
@@ -70,7 +72,27 @@ class KnownRGBDScene:
                 "width": self.width, "height": self.height,
                 "intrinsic_matrix": self.K.ravel(order="F").tolist(),
             }))
-            (directory / "config.json").write_text(json.dumps({"depth_scale": 1000}))
+            # BEGIN explicit, local pose-model input for the synthetic fixture.
+            # The small closed cube only exercises model-file plumbing: no
+            # estimator is run against it and it is not a reconstruction of the
+            # textured patch. Model identity is never inferred from its label.
+            mesh = directory / "fixture_model.obj"
+            mesh.write_text(
+                "v -0.01 -0.01 -0.01\nv 0.01 -0.01 -0.01\n"
+                "v 0.01 0.01 -0.01\nv -0.01 0.01 -0.01\n"
+                "v -0.01 -0.01 0.01\nv 0.01 -0.01 0.01\n"
+                "v 0.01 0.01 0.01\nv -0.01 0.01 0.01\n"
+                "f 1 3 2\nf 1 4 3\nf 5 6 7\nf 5 7 8\n"
+                "f 1 2 6\nf 1 6 5\nf 2 3 7\nf 2 7 6\n"
+                "f 3 4 8\nf 3 8 7\nf 4 1 5\nf 4 5 8\n")
+            (directory / "config.json").write_text(json.dumps({
+                "depth_scale": 1000,
+                "pose_models": {
+                    "carrier": {"mesh": mesh.name, "scale": 1.0},
+                    "reference": {"mesh": mesh.name, "scale": [1., 1., 1.]},
+                },
+            }))
+            # END explicit local pose-model fixture.
             for index in range(frames):
                 if directory == self.demo:
                     gray, x, y = background.copy(), 18 + 2 * index, 36 + index
@@ -98,23 +120,34 @@ class KnownRGBDScene:
                         self.scene_image = rgb
         self.match_calls = []
 
-    # BEGIN analytic tracking observations, independent of the metric estimator.
-    def known_tracks(self, paths, queries):
-        """Project the fixture's independently prescribed motion into pixels."""
-        pixels = []
-        rounded = np.rint(queries).astype(int)
-        carrier = self.demo_carrier[rounded[:, 1], rounded[:, 0]]
+    # BEGIN analytic camera-from-model observations at the FoundationPose API.
+    def known_model_poses(self, paths, depth_paths, *, K, depth_scale, masks, models):
+        """Supply two independently prescribed rigid model poses per RGB frame.
+
+        Both model frames have arbitrary fixed axes and origins. A correct
+        adapter must remove common camera motion without treating a model's
+        origin as a pixel-centroid landmark or cancelling carrier motion.
+        """
+        if len(paths) != len(depth_paths) or len(masks) != 2 or len(models) != 2:
+            raise AssertionError("Both rigid models must share the same aligned RGB-D timeline")
+        np.testing.assert_allclose(K, self.K, atol=0)
+        np.testing.assert_allclose(depth_scale, .001, atol=0)
+        np.testing.assert_array_equal(masks[0], self.demo_carrier)
+        np.testing.assert_array_equal(masks[1], self.demo_reference & ~self.demo_carrier)
+        body = translation([-.25, -.12, self.carrier_depth])
+        reference = translation([.1, .08, self.reference_depth])
+        body[:3, :3] = Rotation.from_euler("xyz", [.2, -.1, .3]).as_matrix()
+        reference[:3, :3] = Rotation.from_euler("xyz", [-.15, .25, -.2]).as_matrix()
+        poses = []
         for index in range(len(paths)):
-            current = queries.astype(float).copy()
-            current[carrier] += [2*index, index]
-            if self.camera_motion:
-                current[carrier, 0] += 3*index
-                current[~carrier, 0] += 2*index
-            pixels.append(current)
-        pixels = np.asarray(pixels, np.float32)
-        return {"pixels": pixels, "visible": np.ones(pixels.shape[:2], bool),
-                "crop_xyxy": np.array([0, 0, self.width, self.height])}
-    # END analytic tracking observations.
+            camera = translation([.036 * index if self.camera_motion else 0., 0., 0.])
+            moving = translation([2 * index * self.carrier_depth / self.fx,
+                                  index * self.carrier_depth / self.fy, 0.])
+            poses.append([camera @ moving @ body, camera @ reference])
+        return {"camera_from_model": np.asarray(poses),
+                "validated": np.ones((len(paths), 2), dtype=bool),
+                "diagnostic_source": np.array("analytic API-boundary fixture; no model inference")}
+    # END analytic FoundationPose observations.
 
     def task(self, relation="transfer"):
         return {"relation": relation, "interaction": "none", "motion": "auto",
@@ -202,7 +235,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
                 return targets, diagnostics
 
             with patch("manipulation.perception.match_points", side_effect=near_tied), \
-                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks), \
+                    patch("local_models.foundationpose.track", side_effect=fixture.known_model_poses), \
                     patch("manipulation.perception.track_rgbd", wraps=track_rgbd) as real_tracker:
                 observed = ground_rgbd(fixture.demo, fixture.scene, "Move this patch", client=client,
                                        detector=fixture.detector, extractor=Mock())
@@ -221,8 +254,8 @@ class RawRGBDPipelineTest(unittest.TestCase):
             demo_relative = observed["demo_poses"] @ np.linalg.inv(observed["demo_poses"][0])
             expected = [translation([2 * frame * 1.2 / fixture.fx, frame * 1.2 / fixture.fy, 0.])
                         for frame in range(3)]
-            # The known pixel observations exercise actual metric registration,
-            # including camera/reference compensation and depth occlusions.
+            # The independent model frames exercise actual relative-pose
+            # conversion; camera motion must not become carrier motion.
             np.testing.assert_allclose(demo_relative[:, :3, 3], np.asarray(expected)[:, :3, 3], atol=0.005)
             np.testing.assert_allclose(demo_relative[:, :3, :3], np.asarray(expected)[:, :3, :3], atol=0.003)
             # Reconstructing scene points from the returned fixed body frame
@@ -245,7 +278,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
             client.chat_json.side_effect = [fixture.task("on"), {"candidate_id": 1}]
             destination = Path(directory) / "run"
             with patch("manipulation.perception.match_points", side_effect=fixture.known_matches), \
-                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks):
+                    patch("local_models.foundationpose.track", side_effect=fixture.known_model_poses):
                 result = run_rgbd(fixture.demo, fixture.scene, "Place the patch on the backing", destination,
                                   client=client, detector=fixture.detector, extractor=Mock())
             self.assertEqual(result["status"], "passed")
@@ -271,25 +304,44 @@ class RawRGBDPipelineTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 run_rgbd(fixture.demo, fixture.scene, "repeat", destination, client=client)
 
-    def test_raw_depth_tracking_failure_is_recorded_and_not_reported_as_a_trajectory(self):
+    # BEGIN pose-estimation failure is never replaced with an old tracker.
+    def test_pose_tracking_failure_is_recorded_and_not_reported_as_a_trajectory(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = KnownRGBDScene(directory)
-            Image.fromarray(np.zeros((fixture.height, fixture.width), np.uint16)).save(fixture.demo / "depth/00001.png")
             client = Mock()
             client.chat_json.return_value = fixture.task()
             destination = Path(directory) / "failed"
             with patch("manipulation.perception.match_points") as matcher, \
-                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks):
-                with self.assertRaisesRegex(ValueError, "lost body correspondences"):
+                    patch("local_models.foundationpose.track", side_effect=ValueError(
+                        "FoundationPose rejected the carrier at frame 1")) as estimator:
+                with self.assertRaisesRegex(ValueError, "FoundationPose rejected"):
                     run_rgbd(fixture.demo, fixture.scene, "Move the patch", destination,
                              client=client, detector=fixture.detector, extractor=Mock())
+                estimator.assert_called_once()
                 matcher.assert_not_called()
             report = json.loads((destination / "run.json").read_text())
             self.assertEqual(report["status"], "failed")
-            self.assertIn("lost body correspondences", report["error"])
+            self.assertIn("FoundationPose rejected", report["error"])
             self.assertFalse((destination / "trajectory.json").exists())
 
-    # BEGIN ordinary placement into a container requires no extra offline mesh.
+    def test_semantic_roles_cannot_replace_missing_pose_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = KnownRGBDScene(directory)
+            (fixture.demo / "config.json").write_text(json.dumps({"depth_scale": 1000}))
+            client = Mock(chat_json=Mock(return_value=fixture.task()))
+            destination = Path(directory) / "missing-models"
+            with patch("manipulation.perception.match_points") as matcher, \
+                    patch("local_models.foundationpose.track") as estimator:
+                with self.assertRaisesRegex(ValueError, "pose_models"):
+                    run_rgbd(fixture.demo, fixture.scene, "Move the patch", destination,
+                             client=client, detector=fixture.detector, extractor=Mock())
+                estimator.assert_not_called()
+                matcher.assert_not_called()
+            self.assertEqual(json.loads((destination / "run.json").read_text())["status"], "failed")
+            self.assertFalse((destination / "trajectory.json").exists())
+    # END explicit pose-estimation/model-input failure.
+
+    # BEGIN container placement needs no additional free-interior geometry.
     def test_inside_transfers_demonstrated_goal_without_inventing_cavity(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = KnownRGBDScene(directory)
@@ -297,7 +349,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
             client.chat_json.return_value = fixture.task("inside")
             destination = Path(directory) / "inside"
             with patch("manipulation.perception.match_points", side_effect=fixture.known_matches), \
-                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks):
+                    patch("local_models.foundationpose.track", side_effect=fixture.known_model_poses):
                 result = run_rgbd(fixture.demo, fixture.scene, "Put the object inside its container",
                                   destination, client=client, detector=fixture.detector, extractor=Mock())
             observed = json.loads((destination / "observations.json").read_text())
@@ -331,7 +383,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
 
             destination = Path(directory) / "ambiguous"
             with patch("manipulation.perception.match_points", side_effect=ambiguous), \
-                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks):
+                    patch("local_models.foundationpose.track", side_effect=fixture.known_model_poses):
                 with self.assertRaisesRegex(ValueError, "ambiguous"):
                     run_rgbd(fixture.demo, fixture.scene, "Move the patch", destination,
                              client=client, detector=fixture.detector, extractor=Mock())
@@ -341,6 +393,10 @@ class RawRGBDPipelineTest(unittest.TestCase):
     def test_tool_use_semantics_routes_to_preserved_bridge_without_object_tracking(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = KnownRGBDScene(directory)
+            # BEGIN the preserved annotated subset does not invoke FoundationPose.
+            for root in (fixture.demo, fixture.scene):
+                (root / "config.json").write_text(json.dumps({"depth_scale": 1000}))
+            # END preserved subset model independence.
             client = Mock()
             client.chat_json.return_value = fixture.task("tool_use")
             destination = Path(directory) / "tool"

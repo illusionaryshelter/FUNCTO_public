@@ -1,3 +1,4 @@
+# BEGIN model-based raw observation contract in CLI documentation.
 """Transfer an object/part demonstration, or replay grounded observations.
 
 Examples:
@@ -6,7 +7,13 @@ Examples:
 
 RGB-D inputs use aligned rgb/, depth/ and intrinsic.json. The output is an
 object/part trajectory, not a robot end-effector or force-control command.
+
+Raw motion estimation uses local FoundationPose. The demonstration's config.json
+must declare pose_models.carrier and pose_models.reference with the actual rigid
+mesh paths and scales into metres. Semantic labels do not establish model identity;
+missing models fail explicitly. The prepared numerical path needs no model inference.
 """
+# END model-based raw observation contract in CLI documentation.
 
 import argparse
 import json

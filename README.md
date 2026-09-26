@@ -27,6 +27,16 @@ SAM, SD-DINO or LLaVA model servers to start.
   normalization and equal-weight concatenation. SD960 and DINO840 produce two
   FP32 `[1,1536,60,60]` descriptors. The old remote feature service's implementation
   was not provided; this is an explicit local feature definition.
+
+<!-- BEGIN explicit model-pose adapter. -->
+
+- `local_models/foundationpose.py`: rigid-instance registration and tracking for
+  the raw object/part path, using calibrated RGB-D and explicitly identified
+  local meshes. It validates rendered geometry against the observations before
+  returning model poses; finite SE(3) matrices alone do not establish accuracy.
+
+<!-- END explicit model-pose adapter. -->
+
 - `local_models/runtime.py`: sequential, short-lived local worker processes
   release model RAM, GPU allocations and autocast state before dense matching.
   Network access is disabled inside perception workers; missing weights fail
@@ -44,11 +54,14 @@ SAM, SD-DINO or LLaVA model servers to start.
   Annotated images are sent to that authorized gateway. API failures and invalid
   candidate indices raise errors instead of using old predictions.
 
-Expected sibling repositories are `sam3`, `sd-dino` and `s3e`. SAM weights live at
+<!-- BEGIN explicit local rigid-pose dependency. -->
+Expected sibling repositories are `sam3`, `sd-dino`, `s3e`, and `FoundationPose`
+for raw object/part motion tracking. SAM weights live at
 `../models/sam3.1/sam3.1_multiplex.pt`; SD/ODISE/OpenCLIP and DINO use the existing
 local caches checked by the adapter. No entry point installs dependencies or
 downloads weights. The geometry stages require Open3D, SciPy, OpenCV and CasADi
 with IPOPT, in addition to the existing model dependencies.
+<!-- END explicit local rigid-pose dependency. -->
 
 The raw SD path retains the accepted unused-component GPU optimization. It does
 not share the two different CLIP models, change precision, cache pair features,
@@ -147,17 +160,45 @@ per stored value; Open3D `depth_scale` specifies its divisor. If neither is
 provided, the original millimetre convention applies. Geometry is no longer
 restricted to the original one-metre range or hard-coded camera intrinsics.
 
+<!-- BEGIN FoundationPose replaces point-tracker motion estimation. -->
 The new path uses Gemini for role/relationship selection, SAM3.1 for entity and
 part masks, SD-DINO for visible cross-instance correspondences, and local
-CoTracker3 with calibrated depth for demonstrated rigid motion. CoTracker uses
-the installed checkout's `checkpoints/scaled_online.pth`; no download occurs.
-It runs in the same isolated, memory-limited GPU worker as the other models,
-with 16-frame windows and at most 512 queries. A coarse pass determines one
-fixed context crop for a refined pass, preserving original pixel coordinates.
-Parent-object masks exclude the
-moving part when tracking a fixed reference. Registration diagnostics remain
-in the result; lost tracks, ambiguous correspondences and incompatible motion
-are errors, rather than a fallback to fabricated points or unconstrained motion.
+FoundationPose for rigid model poses from calibrated RGB-D. FoundationPose runs
+in an isolated, memory-limited GPU worker. It registers each model from its
+initial mask and tracks subsequent frames. Its original-mesh poses bind once
+to the initial observed body geometry; later poses retain that fixed binding.
+Reference motion is removed before motion transfer.
+Parent-object masks exclude the moving part when tracking a fixed reference.
+Pose-validation diagnostics remain in the result. Missing models, rejected
+poses, ambiguous correspondences and incompatible motion are explicit errors.
+There is no alternative point-tracking backend or fabricated substitute geometry.
+
+The demonstrated stage's `config.json` must identify the actual rigid models:
+
+```json
+{
+  "depth_scale": 1000,
+  "pose_models": {
+    "carrier": {"mesh": "models/moving_part.obj", "scale": 1.0},
+    "reference": {"mesh": "models/fixed_reference.obj", "scale": [1.0, 1.0, 1.0]}
+  }
+}
+```
+
+Mesh paths are relative to that RGB-D directory or absolute. A positive scalar
+or three positive scale values convert mesh coordinates into metres. Each mesh
+must describe its selected rigid instance or moving part; a complete articulated
+assembly cannot serve as one rigid moving-part model. The semantic labels and
+SAM masks identify roles, but they do not establish which 3D model is correct.
+An outer mask or partial visible point cloud is never silently converted into a
+replacement mesh. The destination still uses its calibrated observation and
+SD-DINO correspondences for cross-instance binding.
+
+The bundled `pour_demo` has no corresponding pose meshes, so it cannot run this
+raw model-based path without genuine matching models. Its prepared annotations
+and trajectory remain valid inputs to the original `main.py` tool-use example.
+No additional FoundationPose models are required by that annotated subset.
+<!-- END FoundationPose motion estimation and explicit model identity. -->
 Raw tool-use classification routes to the existing annotated tool subset, which
 still requires its original demonstration annotations and calibration.
 
