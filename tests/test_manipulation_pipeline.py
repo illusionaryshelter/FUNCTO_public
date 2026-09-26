@@ -96,16 +96,67 @@ class ManipulationPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(result["poses"][-1, 2, 3], .02)
         self.assertLess(result["goal_checks"]["support_gap_m"], 1e-8)
 
-    def test_inside_requires_real_interior_and_respects_exact_goal(self):
+    # BEGIN inside transfer and optional known-volume certification regressions.
+    def test_inside_transfers_bound_endpoint_without_unobserved_cavity_input(self):
         observed = stage("inside")
-        with self.assertRaisesRegex(ValueError, "free interior"):
-            run_stage(observed)
+        reference, carrier = pose([.6, -.2, .1]), pose([-.1, .3, .2])
+        reference[:3, :3] = Rotation.from_euler("z", .3).as_matrix()
+        carrier[:3, :3] = Rotation.from_euler("z", -.2).as_matrix()
+        expected = reference @ observed["demo_poses"][-1]
+        observed["scene"].pop("goal_pose")
+        observed["scene"].update(
+            initial_pose=carrier @ observed["demo_poses"][0],
+            reference_transform=reference, preferred_goal_pose=expected,
+            goal_source="demonstrated endpoint bound through visible reference correspondences")
+        result = run_stage(observed)
+        np.testing.assert_allclose(result["poses"][0], observed["scene"]["initial_pose"])
+        np.testing.assert_allclose(result["poses"][-1], expected)
+        self.assertEqual(result["task"]["relation"], "inside")
+        self.assertIsNone(result["goal_geometry"])
+        self.assertIsNone(result["interaction_geometry"])
+        checks = result["goal_checks"]
+        self.assertEqual(checks["containment_status"], "not_verified")
+        self.assertEqual(checks["goal_source"], observed["scene"]["goal_source"])
+        self.assertNotIn("interior_violation_m", checks)
+        self.assertNotIn("minimum_clearance_m", checks)
+        self.assertNotIn("checked_points", checks)
+
+    def test_inside_known_interior_respects_exact_goal_and_whole_object(self):
+        observed = stage("inside")
         observed["scene"]["interior"] = {"vertices": box([.1, .1, .1]), "source": "known free cavity"}
         with self.assertRaisesRegex(ValueError, "Exact goal"):
             run_stage(observed)
         observed["scene"]["preferred_goal_pose"] = observed["scene"].pop("goal_pose")
         result = run_stage(observed)
         self.assertLess(result["goal_checks"]["interior_violation_m"], 1e-8)
+        self.assertEqual(result["goal_checks"]["containment_status"], "verified_on_supplied_points")
+        observed["scene"]["body_points"] = box([.2, .2, .2])
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            run_stage(observed)
+
+    def test_inside_invalid_supplied_interior_is_not_ignored(self):
+        observed = stage("inside")
+        observed["scene"]["interior"] = {
+            "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]],
+            "source": "coplanar observations do not enclose free volume"}
+        with self.assertRaisesRegex(ValueError, "do not enclose"):
+            run_stage(observed)
+
+    def test_inside_unknown_cavity_cannot_silently_ignore_margin(self):
+        observed = stage("inside")
+        observed["scene"]["margin"] = .005
+        with self.assertRaisesRegex(ValueError, "margin needs known"):
+            run_stage(observed)
+        observed["scene"].update(
+            entry_region={"vertices": box([.3, .3, .5]), "source": "known entry corridor"},
+            entry_start_index=0)
+        result = run_stage(observed)
+        checks = result["goal_checks"]
+        self.assertEqual(checks["containment_status"], "not_verified")
+        self.assertNotIn("minimum_clearance_m", checks)
+        self.assertEqual(checks["entry_corridor_margin_m"], .005)
+        self.assertEqual(checks["entry_corridor_checked_nodes"], len(observed["demo_poses"]))
+    # END inside transfer and optional known-volume certification regressions.
 
     def test_exact_support_goal_obeys_margin_without_moving_it(self):
         observed = stage("on")
@@ -162,6 +213,17 @@ class ManipulationPipelineTest(unittest.TestCase):
         self.assertEqual(result["unobserved_entity_states"]["object"]["status"], "needs_observation")
         with self.assertRaisesRegex(ValueError, "fresh registered observation"):
             run_sequence([opening, placement, closing, stage()])
+
+        # BEGIN an unverified inside relation still cannot imply attachment.
+        placement["task"]["relation"] = "inside"
+        placement["scene"].pop("support")
+        result = run_sequence([opening, placement, closing])
+        inside_stage = result["stages"][1]
+        np.testing.assert_allclose(inside_stage["poses"][-1, :3, 3], [.3, 0, .02])
+        self.assertEqual(inside_stage["goal_checks"]["containment_status"], "not_verified")
+        self.assertNotIn("object", result["final_entity_poses"])
+        self.assertEqual(result["unobserved_entity_states"]["object"]["status"], "needs_observation")
+        # END an unverified inside relation still cannot imply attachment.
 
     def test_repeated_carrier_body_frames_must_match(self):
         first, second = stage(), stage()

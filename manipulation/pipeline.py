@@ -138,15 +138,30 @@ def run_stage(observation):
         else:
             goal, goal_report = place_on(preferred, body, geometry, margin=margin)
     elif relation == "inside":
-        if "interior" not in scene:
-            raise ValueError("Containment needs observed or provided free interior geometry")
-        geometry = _interior(scene["interior"])
-        if exact_goal:
-            goal, goal_report = preferred, check_inside(preferred, body, geometry)
-            if goal_report["minimum_clearance_m"] < margin-1e-7:
-                raise ValueError("Exact goal does not satisfy the interior relation")
+        # BEGIN separate demonstrated inside motion from volume certification.
+        # RGB-D often observes the destination relation without revealing the
+        # whole cavity. Transfer that bound endpoint without inventing walls or
+        # treating unknown clearance as zero. Supplied geometry is always used;
+        # an invalid/incompatible region is never bypassed by this branch.
+        if "interior" in scene:
+            geometry = _interior(scene["interior"])
+            if exact_goal:
+                goal, goal_report = preferred, check_inside(preferred, body, geometry)
+                if goal_report["minimum_clearance_m"] < margin-1e-7:
+                    raise ValueError("Exact goal does not satisfy the interior relation")
+            else:
+                goal, goal_report = place_inside(preferred, body, geometry, margin=margin)
         else:
-            goal, goal_report = place_inside(preferred, body, geometry, margin=margin)
+            if margin > 0 and "entry_region" not in scene:
+                raise ValueError("An inside margin needs known interior or entry-region geometry")
+            goal, goal_report = preferred, {
+                "containment_status": "not_verified",
+                "geometry_source": "not_observed_or_provided",
+                "goal_source": scene.get("goal_source", "explicit_goal_pose" if exact_goal
+                                         else "bound_demonstration_endpoint"),
+                "reason": "A transferred endpoint does not certify unobserved free container volume",
+            }
+        # END separate demonstrated inside motion from volume certification.
     else:
         goal, goal_report = preferred, {"geometry_source": scene.get("goal_source", "bound_demonstration")}
     transferred = transfer_motion(demo, start, goal_pose=goal, **options)
@@ -157,8 +172,11 @@ def run_stage(observation):
         raise ValueError("Transfer failed the bound goal pose")
     if relation == "on":
         goal_report = check_on(poses[-1], body, geometry)
-    elif relation == "inside":
+    # BEGIN verify known cavity geometry without claiming unknown containment.
+    elif relation == "inside" and geometry is not None:
         goal_report = check_inside(poses[-1], body, geometry)
+        goal_report["containment_status"] = "verified_on_supplied_points"
+    # END verify known cavity geometry without claiming unknown containment.
     # A supplied convex entry corridor is checked over actual object extent.
     # Its start index is an observed/demo event, not a hard-coded fraction.
     if "entry_region" in scene:

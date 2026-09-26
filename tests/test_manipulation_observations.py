@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -211,11 +212,20 @@ class SmallRGBDSequenceTest(unittest.TestCase):
             Image.fromarray(depth).save(root / "depth" / f"{frame:05d}.png")
         return mask, matrix
 
-    def test_image_flow_and_depth_recover_known_metric_translation(self):
+    # BEGIN learned-tracker boundary: CPU tests supply independent image tracks,
+    # while real calibrated backprojection and rigid registration remain active.
+    @staticmethod
+    def known_tracks(paths, queries):
+        pixels = np.asarray([queries + [2 * frame, frame] for frame in range(len(paths))], np.float32)
+        return {"pixels": pixels, "visible": np.ones(pixels.shape[:2], bool),
+                "crop_xyxy": np.array([0, 0, 128, 96])}
+
+    def test_tracked_pixels_and_depth_recover_known_metric_translation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             mask, matrix = self.write_sequence(root)
-            result = track_rgbd(root, mask, max_error=0.004)
+            with patch("local_models.cotracker.track", side_effect=self.known_tracks):
+                result = track_rgbd(root, mask, max_error=0.004)
             relative = result["poses"] @ np.linalg.inv(result["poses"][0])
             expected = [pose(translation=(2 * frame * 1.5 / matrix[0, 0], frame * 1.5 / matrix[1, 1], 0))
                         for frame in range(3)]
@@ -223,14 +233,22 @@ class SmallRGBDSequenceTest(unittest.TestCase):
             self.assertLessEqual(len(result["points"]), 3000)
             self.assertEqual(result["poses"].shape, (3, 4, 4))
 
-    def test_texture_or_depth_loss_does_not_create_a_stationary_success(self):
-        for texture, invalidate, message in ((False, False, "Insufficient textured"),
-                                              (True, True, "lost body correspondences")):
-            with self.subTest(texture=texture), tempfile.TemporaryDirectory() as directory:
+    def test_visibility_or_depth_loss_does_not_create_a_stationary_success(self):
+        for invisible in (True, False):
+            with self.subTest(invisible=invisible), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                mask, _ = self.write_sequence(root, texture=texture, invalidate_second=invalidate)
-                with self.assertRaisesRegex(ValueError, message):
-                    track_rgbd(root, mask)
+                mask, _ = self.write_sequence(root, invalidate_second=not invisible)
+
+                def observations(paths, queries):
+                    result = self.known_tracks(paths, queries)
+                    if invisible:
+                        result["visible"][1] = False
+                    return result
+
+                with patch("local_models.cotracker.track", side_effect=observations):
+                    with self.assertRaisesRegex(ValueError, "lost body correspondences"):
+                        track_rgbd(root, mask)
+    # END learned-tracker boundary.
 
 
 if __name__ == "__main__":

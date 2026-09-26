@@ -83,7 +83,17 @@ def infer_task(instruction, demo_image, scene_image, *, demo_final_image=None, c
         "A moving part and its parent body may overlap in the image. They are distinct "
         "roles, and the same physical instance cannot fill both roles. Do not require "
         "a tool, function point or grasp point. Infer interaction from the instruction "
-        "and visual demonstration, not solely from an object name. Relation meanings: "
+        # BEGIN requested-goal precedence: the same video can supply motion for
+        # a different requested relation. Visible side effects must not replace
+        # an explicit request to transfer only object position/orientation.
+        "and visual demonstration, not solely from an object name. The instruction "
+        "defines the requested success criterion; images identify entities and "
+        "demonstrated motion. Do not add a functional effect merely because one is "
+        "visible in the video. When the instruction explicitly asks only for object "
+        "motion or final position/orientation, choose the corresponding object "
+        "relation even if that demonstration also shows a functional side effect. "
+        # END requested-goal precedence.
+        "Relation meanings: "
         "transfer means relocating/reorienting the carrier itself is the goal; "
         "on means the carrier itself comes to rest on a support; inside means the "
         "carrier itself goes into a container's free interior; articulation means "
@@ -92,8 +102,9 @@ def infer_task(instruction, demo_image, scene_image, *, demo_final_image=None, c
         "a working region, including delivering its contained material into the "
         "reference or modifying/cleaning the reference. Its functional effect, "
         "not merely relocating the carrier, defines success. This functional "
-        "relation takes precedence over the transport/rotation needed to perform "
-        "it; a vessel used to deliver its contents is a functional carrier even "
+        "relation, when its functional effect is requested, takes precedence over "
+        "the transport/rotation needed to perform it; a vessel used to deliver "
+        "its contents is a functional carrier even "
         "if it is also grasped. For tool_use choose interaction=tool. Merely "
         "moving a potential tool into storage is still on/inside/transfer. "
         "For motion choose "

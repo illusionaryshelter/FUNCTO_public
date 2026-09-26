@@ -182,9 +182,12 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
             instruction=instruction + "\n" + task.get("goal_description", ""), client=client)
         scene["support"] = surface.to_dict()
         evidence["support"] = surface_evidence
-    if task["relation"] == "inside" and "interior" not in scene:
-        raise ValueError("A single outer-object mask does not establish free container interior; "
-                         "provide observed/known cavity geometry through scene geometry.json")
+    # BEGIN demonstrated containment target without invented hidden geometry.
+    # The reference-bound endpoint already specifies the demonstrated inside
+    # motion. Missing cavity geometry limits containment verification, rather
+    # than requiring another offline input before that motion can transfer.
+    # run_stage preserves this distinction and still validates supplied regions.
+    # END demonstrated containment target without invented hidden geometry.
     if task["relation"] == "articulation" and task["motion"] == "free":
         raise ValueError("Articulation cannot be silently represented by unconstrained free motion")
     # Noisy image bindings produce an estimated pose, not an exact six-DoF

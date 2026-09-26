@@ -35,10 +35,6 @@ def run_worker(kind: str, images: list[Image.Image], options: dict) -> dict[str,
         raise ValueError(f"Unknown local model: {kind}")
     if not images or any(not isinstance(im, Image.Image) for im in images):
         raise TypeError("images must be a nonempty list of PIL images")
-    torch = sys.modules.get("torch")
-    gc.collect()
-    if torch is not None and torch.cuda.is_initialized():
-        torch.cuda.empty_cache()
     with tempfile.TemporaryDirectory(prefix=f"functo-{kind}-") as directory:
         directory = Path(directory)
         paths = []
@@ -46,20 +42,47 @@ def run_worker(kind: str, images: list[Image.Image], options: dict) -> dict[str,
             path = directory / f"input-{index}.png"
             image.convert("RGB").save(path)
             paths.append(str(path))
-        output = directory / "output.npz"
-        request = directory / "request.json"
-        request.write_text(json.dumps({"kind": kind, "images": paths,
-                                       "output": str(output), "options": options}))
-        env = os.environ.copy()
-        env.update(PYTHONNOUSERSITE="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
-                   MPLBACKEND="Agg", MPLCONFIGDIR=str(directory / "matplotlib"),
-                   OMP_NUM_THREADS="2", OPENBLAS_NUM_THREADS="2", MKL_NUM_THREADS="2")
-        # A checked exit prevents missing/partial features becoming a successful
-        # inference result. Model logging stays visible, without request secrets.
-        subprocess.run([sys.executable, "-m", "local_models.runtime", str(request)],
-                       cwd=PROJECT_ROOT, env=env, check=True, timeout=1800)
-        with np.load(output, allow_pickle=False) as arrays:
-            return {key: arrays[key] for key in arrays.files}
+        # BEGIN shared bounded worker: video inputs can use existing files.
+        return _run_file_worker(kind, paths, options, directory)
+        # END shared bounded worker.
+
+
+# BEGIN local video tracking transport: reuse model isolation and memory guards.
+def run_file_worker(kind: str, paths: list[Path], options: dict) -> dict[str, np.ndarray]:
+    """Read existing video frames in the worker without duplicating the video.
+
+    Only the filenames cross the process boundary. This keeps parent memory
+    independent of video pixel count, and reclaims the entire tracker before
+    the next SAM/SD-DINO stage starts.
+    """
+    if kind != "cotracker":
+        raise ValueError(f"Unknown file-based local model: {kind}")
+    paths = [Path(path).resolve() for path in paths]
+    if not paths or any(not path.is_file() for path in paths):
+        raise ValueError("Tracking requires a nonempty sequence of existing frame files")
+    with tempfile.TemporaryDirectory(prefix=f"functo-{kind}-") as directory:
+        return _run_file_worker(kind, [str(path) for path in paths], options, Path(directory))
+
+
+def _run_file_worker(kind, paths, options, directory):
+    """Single checked subprocess boundary shared by image and video inference."""
+    torch = sys.modules.get("torch")
+    gc.collect()
+    if torch is not None and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+    output = directory / "output.npz"
+    request = directory / "request.json"
+    request.write_text(json.dumps({"kind": kind, "images": paths,
+                                   "output": str(output), "options": options}))
+    env = os.environ.copy()
+    env.update(PYTHONNOUSERSITE="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
+               MPLBACKEND="Agg", MPLCONFIGDIR=str(directory / "matplotlib"),
+               OMP_NUM_THREADS="2", OPENBLAS_NUM_THREADS="2", MKL_NUM_THREADS="2")
+    subprocess.run([sys.executable, "-m", "local_models.runtime", str(request)],
+                   cwd=PROJECT_ROOT, env=env, check=True, timeout=1800)
+    with np.load(output, allow_pickle=False) as arrays:
+        return {key: arrays[key] for key in arrays.files}
+# END local video tracking transport.
 
 
 # BEGIN Linux host-memory reclamation: large checkpoint/model temporaries can
@@ -143,7 +166,7 @@ def main() -> None:
     import torch
 
     if not torch.cuda.is_available():
-        raise RuntimeError("Local SAM3.1 and SD-DINO require the recovery CUDA environment")
+        raise RuntimeError("Local perception models require the recovery CUDA environment")
     total_memory = torch.cuda.get_device_properties(0).total_memory
     torch.cuda.set_per_process_memory_fraction(min(1.0, 8 * 2**30 / total_memory))
     started = time.monotonic()
@@ -159,6 +182,11 @@ def main() -> None:
             raise ValueError("SD-DINO expects a pair of images")
         from .sd_dino import worker_main
         worker_main(paths, output)
+    # BEGIN bounded CoTracker worker; the same offline and resource guards apply.
+    elif request["kind"] == "cotracker":
+        from .cotracker import worker_main
+        worker_main(paths, output, request["options"]["queries_uv"])
+    # END bounded CoTracker worker.
     else:
         raise ValueError(f"Unknown worker: {request['kind']}")
     print(json.dumps({"local_model": request["kind"],

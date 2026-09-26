@@ -148,10 +148,15 @@ provided, the original millimetre convention applies. Geometry is no longer
 restricted to the original one-metre range or hard-coded camera intrinsics.
 
 The new path uses Gemini for role/relationship selection, SAM3.1 for entity and
-part masks, SD-DINO for visible cross-instance correspondences, and bounded CPU
-RGB-D tracking for demonstrated rigid motion. Parent-object masks exclude the
+part masks, SD-DINO for visible cross-instance correspondences, and local
+CoTracker3 with calibrated depth for demonstrated rigid motion. CoTracker uses
+the installed checkout's `checkpoints/scaled_online.pth`; no download occurs.
+It runs in the same isolated, memory-limited GPU worker as the other models,
+with 16-frame windows and at most 512 queries. A coarse pass determines one
+fixed context crop for a refined pass, preserving original pixel coordinates.
+Parent-object masks exclude the
 moving part when tracking a fixed reference. Registration diagnostics remain
-in the result; texture loss, ambiguous correspondences and incompatible motion
+in the result; lost tracks, ambiguous correspondences and incompatible motion
 are errors, rather than a fallback to fabricated points or unconstrained motion.
 Raw tool-use classification routes to the existing annotated tool subset, which
 still requires its original demonstration annotations and calibration.
@@ -159,9 +164,16 @@ still requires its original demonstration annotations and calibration.
 An `on` goal selects a task-relevant observed plane with Gemini, then uses a
 bounded patch that remains inside its observed mask, including any holes. It
 does not treat the largest face of a reference object as its support surface.
-The supplied object extent must fit the patch. An `inside` goal requires known **free interior geometry**, never the
-outer box of a container. An optional `geometry.json` in the current-scene
-directory can carry geometry produced by another component:
+The supplied object extent must fit the patch. An `inside` goal means placing
+an object into a cabinet, drawer or another container. Its demonstrated endpoint
+is mapped through the observed container reference, without requiring extra
+offline geometry. The output marks containment as `not_verified` when no free
+interior is observed or supplied: it is a transferred object trajectory, not a
+claim that hidden walls or clearance have been checked. If known **free interior
+geometry** is supplied, the complete supplied object point set must fit it; an
+invalid region or infeasible placement remains an error. The container's outer
+box is never used as its free interior. An optional `geometry.json` can carry
+geometry produced by another component:
 
 ```json
 {

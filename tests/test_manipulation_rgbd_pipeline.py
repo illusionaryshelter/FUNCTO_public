@@ -2,8 +2,9 @@
 
 SAM roles and Gemini semantics are supplied at their public boundaries. Image
 matching is replaced with independently known pixel correspondences; this does
-not measure SD-DINO quality. Real LK tracking, calibrated backprojection, rigid
-RANSAC, motion transfer and support goals remain in the exercised data flow.
+not measure SD-DINO quality. Learned tracking is supplied at its pixel boundary;
+calibrated backprojection, rigid RANSAC, motion transfer and support goals remain
+in the exercised data flow. Real-model accuracy is checked on the full video.
 """
 
 # BEGIN raw RGB-D manipulation integration tests.
@@ -47,6 +48,7 @@ class KnownRGBDScene:
         import cv2
 
         self.demo, self.scene = Path(root) / "demo", Path(root) / "scene"
+        self.camera_motion = camera_motion
         self.K = np.array([[self.fx, 0., self.width / 2],
                            [0., self.fy, self.height / 2], [0., 0., 1.]])
         rng = np.random.default_rng(472)
@@ -95,6 +97,24 @@ class KnownRGBDScene:
                     else:
                         self.scene_image = rgb
         self.match_calls = []
+
+    # BEGIN analytic tracking observations, independent of the metric estimator.
+    def known_tracks(self, paths, queries):
+        """Project the fixture's independently prescribed motion into pixels."""
+        pixels = []
+        rounded = np.rint(queries).astype(int)
+        carrier = self.demo_carrier[rounded[:, 1], rounded[:, 0]]
+        for index in range(len(paths)):
+            current = queries.astype(float).copy()
+            current[carrier] += [2*index, index]
+            if self.camera_motion:
+                current[carrier, 0] += 3*index
+                current[~carrier, 0] += 2*index
+            pixels.append(current)
+        pixels = np.asarray(pixels, np.float32)
+        return {"pixels": pixels, "visible": np.ones(pixels.shape[:2], bool),
+                "crop_xyxy": np.array([0, 0, self.width, self.height])}
+    # END analytic tracking observations.
 
     def task(self, relation="transfer"):
         return {"relation": relation, "interaction": "none", "motion": "auto",
@@ -182,6 +202,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
                 return targets, diagnostics
 
             with patch("manipulation.perception.match_points", side_effect=near_tied), \
+                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks), \
                     patch("manipulation.perception.track_rgbd", wraps=track_rgbd) as real_tracker:
                 observed = ground_rgbd(fixture.demo, fixture.scene, "Move this patch", client=client,
                                        detector=fixture.detector, extractor=Mock())
@@ -200,9 +221,8 @@ class RawRGBDPipelineTest(unittest.TestCase):
             demo_relative = observed["demo_poses"] @ np.linalg.inv(observed["demo_poses"][0])
             expected = [translation([2 * frame * 1.2 / fixture.fx, frame * 1.2 / fixture.fy, 0.])
                         for frame in range(3)]
-            # Optical-flow observations are estimated, unlike the exact cross-
-            # instance correspondence stub. Check metric motion at 5 mm and
-            # rotation at 3 mrad, independently of internal RANSAC diagnostics.
+            # The known pixel observations exercise actual metric registration,
+            # including camera/reference compensation and depth occlusions.
             np.testing.assert_allclose(demo_relative[:, :3, 3], np.asarray(expected)[:, :3, 3], atol=0.005)
             np.testing.assert_allclose(demo_relative[:, :3, :3], np.asarray(expected)[:, :3, :3], atol=0.003)
             # Reconstructing scene points from the returned fixed body frame
@@ -224,7 +244,8 @@ class RawRGBDPipelineTest(unittest.TestCase):
             client = Mock()
             client.chat_json.side_effect = [fixture.task("on"), {"candidate_id": 1}]
             destination = Path(directory) / "run"
-            with patch("manipulation.perception.match_points", side_effect=fixture.known_matches):
+            with patch("manipulation.perception.match_points", side_effect=fixture.known_matches), \
+                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks):
                 result = run_rgbd(fixture.demo, fixture.scene, "Place the patch on the backing", destination,
                                   client=client, detector=fixture.detector, extractor=Mock())
             self.assertEqual(result["status"], "passed")
@@ -257,7 +278,8 @@ class RawRGBDPipelineTest(unittest.TestCase):
             client = Mock()
             client.chat_json.return_value = fixture.task()
             destination = Path(directory) / "failed"
-            with patch("manipulation.perception.match_points") as matcher:
+            with patch("manipulation.perception.match_points") as matcher, \
+                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks):
                 with self.assertRaisesRegex(ValueError, "lost body correspondences"):
                     run_rgbd(fixture.demo, fixture.scene, "Move the patch", destination,
                              client=client, detector=fixture.detector, extractor=Mock())
@@ -266,6 +288,34 @@ class RawRGBDPipelineTest(unittest.TestCase):
             self.assertEqual(report["status"], "failed")
             self.assertIn("lost body correspondences", report["error"])
             self.assertFalse((destination / "trajectory.json").exists())
+
+    # BEGIN ordinary placement into a container requires no extra offline mesh.
+    def test_inside_transfers_demonstrated_goal_without_inventing_cavity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = KnownRGBDScene(directory)
+            client = Mock()
+            client.chat_json.return_value = fixture.task("inside")
+            destination = Path(directory) / "inside"
+            with patch("manipulation.perception.match_points", side_effect=fixture.known_matches), \
+                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks):
+                result = run_rgbd(fixture.demo, fixture.scene, "Put the object inside its container",
+                                  destination, client=client, detector=fixture.detector, extractor=Mock())
+            observed = json.loads((destination / "observations.json").read_text())
+            initial = fixture.carrier_transform() @ np.asarray(observed["demo_poses"])[0]
+            goal = fixture.reference_transform() @ np.asarray(observed["demo_poses"])[-1]
+            np.testing.assert_allclose(result["poses"][0], initial, atol=1e-10)
+            np.testing.assert_allclose(result["poses"][-1], goal, atol=1e-10)
+            self.assertEqual(result["task"]["relation"], "inside")
+            self.assertIsNone(result["goal_geometry"])
+            self.assertEqual(result["goal_checks"]["containment_status"], "not_verified")
+            self.assertNotIn("interior_violation_m", result["goal_checks"])
+            self.assertNotIn("minimum_clearance_m", result["goal_checks"])
+            self.assertFalse((fixture.scene / "geometry.json").exists())
+            # Rendering must not fabricate a box when the cavity is unobserved.
+            from manipulation.visualization import _goal_geometry
+            geometry, _ = _goal_geometry(result)
+            self.assertIsNone(geometry)
+    # END ordinary container placement regression.
 
     def test_ambiguous_cross_scene_matching_cannot_generate_a_goal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -280,7 +330,8 @@ class RawRGBDPipelineTest(unittest.TestCase):
                 return targets, diagnostics
 
             destination = Path(directory) / "ambiguous"
-            with patch("manipulation.perception.match_points", side_effect=ambiguous):
+            with patch("manipulation.perception.match_points", side_effect=ambiguous), \
+                    patch("local_models.cotracker.track", side_effect=fixture.known_tracks):
                 with self.assertRaisesRegex(ValueError, "ambiguous"):
                     run_rgbd(fixture.demo, fixture.scene, "Move the patch", destination,
                              client=client, detector=fixture.detector, extractor=Mock())

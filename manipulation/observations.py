@@ -6,9 +6,10 @@ reference, its motion is removed before returning the body poses; without one,
 the camera must be stationary. The body frame's axes initially match the camera
 and its origin is the centroid of the initial valid body correspondences.
 
-This module neither assigns object roles nor loads perception models. Optical
-flow propagates correspondence hypotheses and geometric consensus checks their
-rigidity; neither proves physical identity after occlusion or coherent drift.
+This module neither assigns object roles nor keeps GPU models resident. CoTracker
+propagates correspondence hypotheses in an isolated worker; calibrated depth
+and geometric consensus check their rigidity. These observations do not prove
+physical identity after occlusion or coherent drift.
 It cannot recover an unobserved object or silently fill lost tracks.
 """
 
@@ -329,55 +330,40 @@ def _sample_tracks(depth, K, pixels, active):
     return points, valid
 
 
-def _initial_features(gray, depth, mask, name):
+# BEGIN complete-video observation sampling: no local optical-flow fallback.
+def _initial_queries(depth, mask, count=256):
+    """Uniformly sample observed interior pixels without favouring boundaries.
+
+    Farthest-point sampling over a silhouette disproportionately selects its
+    outline, handles and holes, where depth can belong to another surface.
+    Uniform pixel sampling gives observed surface area its proper weight. The
+    one-pixel erosion excludes mixed boundary measurements; no object-specific
+    distance, material label or cached trajectory enters point selection.
+    """
     import cv2
 
-    # Shrinking the ROI avoids mixing moving-part and background depth at its
-    # boundary. This is a tracking observation mask, not a changed SAM output.
-    selected = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8))
-    selected &= (np.isfinite(depth) & (depth > 0)).astype(np.uint8)
-    corners = cv2.goodFeaturesToTrack(gray, maxCorners=250, qualityLevel=0.01,
-                                    minDistance=5, mask=selected, blockSize=5)
-    if corners is None or len(corners) < 6:
-        raise ValueError(f"Insufficient textured, valid-depth features for {name}")
-    return corners.reshape(-1, 2)
-
-
-def _advance_flow(previous_gray, gray, pixels, active):
-    import cv2
-
-    indices = np.flatnonzero(active)
-    updated = pixels.copy()
-    surviving = np.zeros(len(pixels), dtype=bool)
-    if not len(indices):
-        return updated, surviving
-    original = pixels[indices].astype(np.float32).reshape(-1, 1, 2)
-    options = dict(winSize=(21, 21), maxLevel=3,
-                   criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-    forward, status, _ = cv2.calcOpticalFlowPyrLK(previous_gray, gray, original, None, **options)
-    if forward is None:
-        return updated, surviving
-    backward, back_status, _ = cv2.calcOpticalFlowPyrLK(gray, previous_gray, forward, None, **options)
-    if backward is None:
-        return updated, surviving
-    valid = status.ravel().astype(bool) & back_status.ravel().astype(bool)
-    valid &= np.isfinite(forward.reshape(-1, 2)).all(axis=1)
-    valid &= np.linalg.norm(backward.reshape(-1, 2) - original.reshape(-1, 2), axis=1) <= 1.0
-    surviving[indices[valid]] = True
-    updated[indices[valid]] = forward.reshape(-1, 2)[valid]
-    return updated, surviving
+    selected = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    selected &= np.isfinite(depth) & (depth > 0)
+    rows, cols = np.nonzero(selected)
+    if len(rows) < 6:
+        raise ValueError("Tracking needs at least six valid-depth interior pixels per entity")
+    pixels = np.column_stack((cols, rows)).astype(np.float32)
+    indices = np.random.default_rng(0).choice(len(pixels), min(count, len(pixels)), replace=False)
+    return pixels[indices]
+# END complete-video observation sampling.
 
 
 def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None, max_error=0.01):
-    """Track one rigid part through calibrated RGB-D, with bounded CPU memory.
+    """Recover demonstrated rigid motion with isolated, bounded CoTracker.
 
-    Masks select the body/reference in the first RGB frame. At most 250 optical
-    flow features per entity and 3000 initial geometry points are retained.
-    Forward/backward flow agreement and depth validity precede rigid RANSAC;
-    losing sufficient correspondences raises instead of extrapolating poses.
-    Files are read one frame at a time. No new feature IDs are silently inserted.
+    Masks select body/reference in the first frame. Each entity contributes at
+    most 256 uniformly sampled queries. The local tracker follows the entire
+    sequence, then refines it in one fixed crop inferred from its own tracks.
+    Valid visibility and metric depth precede the unchanged rigid RANSAC.
+    Every pose is registered to the initial observations, avoiding accumulation
+    of pairwise drift; insufficient consensus remains an explicit failure.
     """
-    import cv2
+    from local_models.cotracker import track
 
     root = Path(directory)
     indices = sorted({int(path.stem) for path in (root / "rgb").iterdir()
@@ -396,41 +382,39 @@ def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None, max_err
     geometry = backproject(depth, camera.K, mask=body_mask)
     if len(geometry) > 3000:
         geometry = geometry[np.linspace(0, len(geometry) - 1, 3000, dtype=int)]
-    old_threads = cv2.getNumThreads()
-    cv2.setNumThreads(1)
-    try:
-        gray = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2GRAY)
-        masks = [body_mask] + ([] if ref_mask is None else [ref_mask])
-        names = ["body", "reference"]
-        pixels = [_initial_features(gray, depth, selected, names[i]) for i, selected in enumerate(masks)]
-        active = [np.ones(len(group), dtype=bool) for group in pixels]
-        histories, validity = [], []
-        for group, visible in zip(pixels, active):
-            observed, valid = _sample_tracks(depth, camera.K, group, visible)
-            histories.append([observed])
-            validity.append([valid])
-        for index in indices[1:]:
-            image, depth, current_camera = load_rgbd(root, index)
-            if (not np.array_equal(camera.K, current_camera.K)
-                    or camera.depth_scale != current_camera.depth_scale):
-                raise ValueError("RGB-D calibration changed within the track")
-            next_gray = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2GRAY)
-            for entity in range(len(pixels)):
-                pixels[entity], active[entity] = _advance_flow(gray, next_gray, pixels[entity], active[entity])
-                observed, valid = _sample_tracks(depth, camera.K, pixels[entity], active[entity])
-                if valid.sum() < 6:
-                    raise ValueError(f"RGB-D tracking lost {names[entity]} correspondences at frame {index}")
-                histories[entity].append(observed)
-                validity[entity].append(valid)
-            gray = next_gray
-        result = poses_from_tracks(
-            np.asarray(histories[0]), valid_mask=np.asarray(validity[0]),
-            reference_tracks=None if ref_mask is None else np.asarray(histories[1]),
-            reference_valid_mask=None if ref_mask is None else np.asarray(validity[1]),
-            frame_indices=indices, max_error=max_error)
-    finally:
-        cv2.setNumThreads(old_threads)
+    # BEGIN learned full-sequence tracking: all arrays return after GPU exit.
+    masks = [body_mask] + ([] if ref_mask is None else [ref_mask])
+    groups = [_initial_queries(depth, selected) for selected in masks]
+    queries = np.concatenate(groups)
+    paths = [_frame_file(root / "rgb", index, (".jpg", ".png", ".jpeg")) for index in indices]
+    tracked = track(paths, queries)
+    pixels, visible = tracked["pixels"], tracked["visible"]
+    histories, validity = [], []
+    for frame, index in enumerate(indices):
+        _, depth, current_camera = load_rgbd(root, index)
+        if (not np.array_equal(camera.K, current_camera.K)
+                or camera.depth_scale != current_camera.depth_scale):
+            raise ValueError("RGB-D calibration changed within the track")
+        observed, valid = _sample_tracks(depth, camera.K, pixels[frame], visible[frame])
+        split = len(groups[0])
+        for name, selected in [("body", valid[:split])]+([] if ref_mask is None else [("reference", valid[split:])]):
+            if selected.sum() < 6:
+                raise ValueError(f"RGB-D tracking lost {name} correspondences at frame {index}")
+        histories.append(observed)
+        validity.append(valid)
+    histories, validity = np.asarray(histories), np.asarray(validity)
+    result = poses_from_tracks(
+        histories[:, :split], valid_mask=validity[:, :split],
+        reference_tracks=None if ref_mask is None else histories[:, split:],
+        reference_valid_mask=None if ref_mask is None else validity[:, split:],
+        frame_indices=indices, max_error=max_error)
     result["points"] = geometry - result["body_origin_camera0_m"]
-    result["tracking_method"] = "CPU pyramidal LK + forward/backward check + rigid correspondence RANSAC"
+    result["tracking_method"] = "CoTracker3 fixed-crop refinement + calibrated depth + initial-frame rigid RANSAC"
+    result["tracking_crop_xyxy"] = tracked["crop_xyxy"]
+    result["tracking_query_group_sizes"] = [len(group) for group in groups]
+    result["tracking_pixels_uv"] = pixels
+    result["tracking_depth_valid"] = validity
+    result["tracking_visible"] = visible
     return result
+    # END learned full-sequence tracking.
 # END task-adaptive observations.
