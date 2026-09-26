@@ -83,6 +83,32 @@ points and trajectory arrays. The final files are
 Historical results under `test_data/` remain example data, never substitutes for
 a completed new run.
 
+<!-- BEGIN offline visualization of saved local predictions. -->
+## Visual validation
+
+Render a completed run without model inference or Gemini calls:
+
+```bash
+PYTHONNOUSERSITE=1 MPLCONFIGDIR=/tmp/functo-mpl OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+  python visualize_run.py ./runs/pour-local
+```
+
+Open `visualization/index.html` inside the run. It links the mask/keypoint
+overlays, saved semantic selections, full trajectory MP4, an offline interactive
+3D replay with a frame slider, and numerical diagnostics. `--demo-dir` overrides
+the demonstration path recorded in `run.json` if the data has moved.
+
+The renderer reuses the original point-cloud reconstruction and compares its
+poses against every tool snapshot in the saved PLY. Only displayed point counts
+are reduced. The static original tool is removed from the background; hidden
+surfaces stay unknown. White crosses in the image show the actual 3D points
+reprojected through the saved calibration, exposing depth-neighbor adjustments
+to the 2D matches. Trajectory translations are **function-point** positions;
+video FPS is illustrative because the saved poses have no timestamps. These
+views support semantic and geometric inspection, not collision, dynamics or
+robot-execution certification.
+<!-- END offline visualization of saved local predictions. -->
+
 ## Contract checks
 
 The focused tests use synthetic CPU data and mock model/API boundaries. They
@@ -93,4 +119,3 @@ and result validation; they do not download weights or initialize GPU models.
 PYTHONNOUSERSITE=1 MPLBACKEND=Agg PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   python -m pytest -q tests cloud_services/test_scene_graph_contract.py
 ```
-
