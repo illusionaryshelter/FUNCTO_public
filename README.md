@@ -13,32 +13,84 @@ If you find this work useful, please cite:
 }
   ```
 
-## Installation
+## Local pipeline
 
-Please begin by installing the following dependency packages: Open3D, SciPy, PyTorch, and CasADi. 
+This workspace uses one `recovery` Python environment for local **SAM3.1 +
+SD-DINO** perception. Gemini performs semantic keypoint selection and optional
+pose selection through the existing s3e gateway backend. There are no OWLv2,
+SAM, SD-DINO or LLaVA model servers to start.
 
-**Our code also relies on OWL-ViT, Grounding-SAM, and SD-DINO (optional), which are currently deployed on our internal servers. To use these models locally, please follow the installation instructions provided below.**
+- `local_models/sam31.py`: SAM3.1 text detection and segmentation from the local
+  multiplex checkpoint. Boxes and masks always come from the same instance.
+- `local_models/sd_dino.py`: SD v1.3, timestep 0, DINOv2 ViT-B/14 token layer 11,
+  native shared two-image co-PCA (256 dimensions per SD scale), branch L2
+  normalization and equal-weight concatenation. SD960 and DINO840 produce two
+  FP32 `[1,1536,60,60]` descriptors. The old remote feature service's implementation
+  was not provided; this is an explicit local feature definition.
+- `local_models/runtime.py`: sequential, short-lived local worker processes
+  release model RAM, GPU allocations and autocast state before dense matching.
+  Network access is disabled inside perception workers; missing weights fail
+  explicitly. The worker CUDA allocator is capped at 8 GiB, combined caller and
+  worker RSS at 12 GiB, with at least 1.5 GiB host memory kept available.
+- `local_models/gemini.py`: reuses the sibling `s3e` source backend. It reads
+  `SUB2API_API_KEY` only when called. `SUB2API_BASE_URL` defaults to the user's
+  local gateway `http://127.0.0.1:18080/antigravity`; `GEMINI_MODEL` defaults to
+  `gemini-3.7-flash-tiered`. Override these environment variables if needed.
+  Annotated images are sent to that authorized gateway. API failures and invalid
+  candidate indices raise errors instead of using old predictions.
 
-1) Installing [[OWL-ViT]](https://huggingface.co/docs/transformers/en/model_doc/owlv2) or another object detector of your choice.
+Expected sibling repositories are `sam3`, `sd-dino` and `s3e`. SAM weights live at
+`../models/sam3.1/sam3.1_multiplex.pt`; SD/ODISE/OpenCLIP and DINO use the existing
+local caches checked by the adapter. No entry point installs dependencies or
+downloads weights. The geometry stages require Open3D, SciPy, OpenCV and CasADi
+with IPOPT, in addition to the existing model dependencies.
 
-2) Installing [[Grounding-SAM]](https://github.com/IDEA-Research/Grounded-Segment-Anything) or another segmentation model of your choice.
+The raw SD path retains the accepted unused-component GPU optimization. It does
+not share the two different CLIP models, change precision, cache pair features,
+or change FUNCTO's interpolation, cosine similarity, mask multiplication or
+global argmax.
 
-3) Installing [[SD+DINO]](https://github.com/Junyi42/sd-dino) (optional).
+## Demo
 
-4) After installing these models, please replace the code blocks in the original code that were used to call them from our internal servers.
+`main.py` implements released steps 8--12: it consumes the prepared demonstration
+annotations and trajectory, detects the test scene, transfers points and poses,
+then optimizes a trajectory. It does not implement raw human-video preparation
+or robot execution.
 
-## Demo 
-**We provide a demo showcasing the task of pouring:**
+The task configuration is `utils_IL/config/config_pour.yaml`. SD-DINO is enabled
+by default. `vp_flag: false` disables only optional pose selection; semantic
+function/grasp point selection still uses Gemini.
 
-1) Specify the parameters in the `config.yaml` file located under `utils_IL/config`. The `vp_flag` parameter controls whether to use a VLM for pose alignment refinement, while `sd_dino_flag` determines whether to use SD+DINO for functional keypoint transfer.
-Both parameters are set to False by default.
-
-2) To run the demo:
+```bash
+PYTHONNOUSERSITE=1 MPLCONFIGDIR=/tmp/functo-mpl OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+  python main.py --output-dir ./runs/pour-local
 ```
-python main.py
+
+The output directory must be empty. Only the initial test RGB-D observation and
+its metadata are copied there, and all predictions are generated anew. Without
+`--output-dir`, each invocation creates a timestamped directory under `runs/`.
+`--data-root` selects a root containing `demo_data/<task>_demo` and
+`test_data/<task>_test`; `--config` selects another YAML task configuration.
+Paths to prompts and default configuration are independent of the current
+working directory. The bundled RGB-D example uses the original Azure Kinect
+intrinsics and millimeter depth units in `utils_IL/params.py`; custom recordings
+need matching calibration before geometric processing.
+
+After success, `run.json` records stage completion and validates finite 2D/3D
+points and trajectory arrays. The final files are
+`tool_traj_transfer_output/test_tool_trajectory.json` and
+`tool_traj_transfer_output/test_tool_traj_pc.ply` inside that run directory.
+Historical results under `test_data/` remain example data, never substitutes for
+a completed new run.
+
+## Contract checks
+
+The focused tests use synthetic CPU data and mock model/API boundaries. They
+check instance association, semantic response parsing, fresh output isolation,
+and result validation; they do not download weights or initialize GPU models.
+
+```bash
+PYTHONNOUSERSITE=1 MPLBACKEND=Agg PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python -m pytest -q tests cloud_services/test_scene_graph_contract.py
 ```
-
-3) Check the generated trajectory at `test_data/pour_test/tool_traj_transfer_output/test_tool_traj_pc.ply`.
-
-
 

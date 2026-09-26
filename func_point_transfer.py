@@ -4,29 +4,20 @@ import torch
 from PIL import Image
 import torch.nn as nn
 import numpy as np
-import numpy as np
 import cv2
 import json
-import io
-import base64
-import requests
+# BEGIN local pair extraction replaces the remote feature serialization client.
+from pathlib import Path
+from local_models.sd_dino import extract_pair
+# END local pair extraction imports.
 
 from utils_IL.perception_utils import map_coordinates_to_original, map_coordinates_to_resized, resize_
 from utils_IL.perception_utils import convert_to_serializable
 from utils_IL.vp_utils import propose_candidate_keypoints, annotate_visual_prompts, annotate_candidate_keypoints, load_prompts, generate_vertices_and_update, keypoint_transfer
 
-def get_features(image):
-    # Convert the image to a PNG byte stream
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    img_encoded = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-    # Send the image as base64 to the server
-    response = requests.post("http://crane1.d2.comp.nus.edu.sg:4002/process_image", json={"image": img_encoded})
-
-    return response.json()
-        
-def func_point_transfer(data_path, test_data_path, test_tool_label='mug', test_target_label='bowl', task_label='pour', num_candidate_keypoints=8, sd_dino_flag=False):
+# BEGIN local default: standalone callers also use the approved SD-DINO path.
+def func_point_transfer(data_path, test_data_path, test_tool_label='mug', test_target_label='bowl', task_label='pour', num_candidate_keypoints=8, sd_dino_flag=True):
+    # END local default.
     """
     Function point transfer
     """
@@ -34,8 +25,9 @@ def func_point_transfer(data_path, test_data_path, test_tool_label='mug', test_t
     output_path = os.path.join(test_data_path, 'func_point_transfer_output')
     os.makedirs(output_path, exist_ok=True)
 
-    # load prompts
-    prompt_path = os.path.join(test_data_path, '..', '..', 'utils_IL', 'prompts')
+    # BEGIN repository-owned prompts do not depend on the output dataset path.
+    prompt_path = Path(__file__).resolve().parent / 'utils_IL' / 'prompts'
+    # END prompt path resolution.
     prompts = load_prompts(prompt_path)
 
     # load demo function point in the initial keyframe
@@ -190,13 +182,10 @@ def func_point_transfer(data_path, test_data_path, test_tool_label='mug', test_t
         # Create the region mask
         vp_mask_normalized = np.where((x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max), 1, 0)
 
-        # function point transfer with SD+DINO
-        response_1 = get_features(img1)
-        features_bytes_1 = base64.b64decode(response_1['features'])
-        feat1 = np.load(io.BytesIO(features_bytes_1))
-        response_2 = get_features(img2)
-        features_bytes_2 = base64.b64decode(response_2['features'])
-        feat2 = np.load(io.BytesIO(features_bytes_2))
+        # BEGIN local SD+DINO: the pair shares its PCA basis. The worker exits
+        # before returning CPU descriptors; the existing dense matching follows.
+        feat1, feat2 = extract_pair(img1, img2)
+        # END local pair extraction.
         feat1_cuda = torch.tensor(feat1).to('cuda')
         feat2_cuda = torch.tensor(feat2).to('cuda')
         ft = torch.cat([feat1_cuda, feat2_cuda], dim=0)

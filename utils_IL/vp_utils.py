@@ -1,26 +1,17 @@
 import numpy as np
 import os
 import io
-import requests
-import base64
 import json
 import cv2
-from io import BytesIO
 from PIL import Image
-import traceback
+import re
 from scipy.spatial import distance
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as path_effects
 
-DEFAULT_LLM_MODEL_NAME = 'gpt-4'
-DEFAULT_VLM_MODEL_NAME = 'gpt-4o'
-
-api_key = os.environ['OPENAI_API_KEY']
-
-headers = {
-    'Content-Type': 'application/json',
-    'Authorization': f'Bearer {api_key}'
-}
+# BEGIN Gemini migration: importing visual prompting no longer needs credentials.
+from local_models.gemini import Gemini
+# END Gemini migration.
 
 def load_prompts(prompt_dir):
     """
@@ -278,498 +269,119 @@ def annotate_visual_prompts(
 
     if log_dir is not None:
         annotated_image.save(os.path.join(log_dir, 'keypoints.png'))
-    else:
-        plt.imshow(annotated_image)
-        plt.show()
+    # BEGIN headless pipeline: the caller saves/inspects the returned image.
+    # Do not create an extra blocking GUI figure when log_dir is omitted.
+    # END headless pipeline.
 
     return annotated_image
 
-def encode_image_from_file(image_path):
-    # Function to encode the image
-    with open(image_path, 'rb') as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
-    
-def encode_image_from_pil(image):
-    buffered = BytesIO()
-    image.save(buffered, format='JPEG')
-    return base64.b64encode(buffered.getvalue()).decode('utf-8')
+# BEGIN Gemini semantic selection: preserve prompts/images, validate returned
+# candidate IDs, and surface errors instead of retrying malformed JSON forever.
+def _request_context(message, images, meta_prompt, example_images=None,
+                     example_responses=None):
+    """Send a semantic selection through the authorized Gemini gateway.
 
-def remove_trailing_comments(input_string):
-    # Split the input string into lines
-    lines = input_string.split('\n')
+    Images retain their supplied order. Optional demonstrations precede the
+    current observation; the text explicitly associates each example response
+    with its image so a multi-image request remains unambiguous.
+    """
+    images = images if isinstance(images, list) else [images]
+    if any(not isinstance(image, Image.Image) for image in images):
+        raise TypeError("Visual prompting requires PIL images")
+    text = "\n".join(message) if isinstance(message, list) else message
+    if example_images is not None or example_responses is not None:
+        if example_images is None or example_responses is None:
+            raise ValueError("Example images and responses must be supplied together")
+        if len(example_images) != len(example_responses):
+            raise ValueError("Each example image needs one response")
+        examples = "\n".join(
+            f"Example image {index + 1}: {response}"
+            for index, response in enumerate(example_responses)
+        )
+        text = f"{examples}\nThe remaining images are the current request.\n{text}"
+        images = list(example_images) + images
+    return Gemini().chat_json(text, images, system_prompt=meta_prompt)
 
-    # Process each line to remove comments
-    processed_lines = []
-    for line in lines:
-        comment_index = line.find('//')
-        if comment_index != -1:
-            # Remove the comment
-            line = line[:comment_index]
-        processed_lines.append(line.strip())
 
-    # Join the processed lines back into a single string
-    return """{}""".format('\n'.join(processed_lines))
+def _selected_keypoint(context, candidate_keypoints, grasp=False):
+    """Map a displayed, one-based Pi to the exact candidate that Gemini saw."""
+    field = 'grasp_keypoint' if grasp else 'function_keypoint'
+    label = context.get(field)
+    match = re.fullmatch(r'P([1-9][0-9]*)', label) if isinstance(label, str) else None
+    points = candidate_keypoints['grasped']
+    if match is None or not 1 <= int(match.group(1)) <= len(points):
+        raise ValueError(f"Invalid Gemini {field}: {label!r}; expected P1..P{len(points)}")
+    return points[int(match.group(1)) - 1]
 
-def parse_json_string(res, verbose=False):
-    if '```' in res:
-        try:
-            res_clean = res
-
-            if '```json' in res:
-                res_clean = res_clean.split('```')[1].split('json')[1]
-            elif '```JSON' in res:
-                res_clean = res_clean.split('```')[1].split('JSON')[1]
-            elif '```' in res:
-                res_clean = res_clean.split('```')[1]
-            else:
-                print('Invalid response: ')
-                print(res)
-
-        except Exception:
-            print(traceback.format_exc())
-            print('Invalid response: ')
-            print(res)
-            return None
-    else:
-        res_clean = res
-
-    try:
-        res_filtered = remove_trailing_comments(res_clean)
-        object_info = json.loads(res_filtered)
-
-        # if verbose:
-        #     print_object_info(object_info)
-
-        return object_info
-
-    except Exception:
-        print(traceback.format_exc())
-        print('The original response: ')
-        print(res)
-        print('Invalid cleaned response: ')
-        print(res_clean)
-        return None
-
-def prepare_inputs(messages,
-                   images,
-                   meta_prompt,
-                   model_name,
-                   local_image):
-
-    user_content = []
-
-    if not isinstance(messages, list):
-        messages = [messages]
-
-    for message in messages:
-        content = {
-            'type': 'text',
-            'text': message,
-        }
-        user_content.append(content)
-    
-    if not isinstance(images, list):
-        images = [images]
-    
-    for image in images:
-        if local_image:
-            base64_image = encode_image_from_file(image)
-        else:
-            base64_image = encode_image_from_pil(image)
-
-        content = {
-            'type': 'image_url',
-            'image_url': {
-                'url': f'data:image/jpeg;base64,{base64_image}'
-            }
-        }
-        user_content.append(content)
-
-    payload = {
-        'model': model_name,
-        'messages': [
-            {
-                'role': 'system',
-                'content': [
-                    meta_prompt
-                ]
-            },
-            {
-                'role': 'user',
-                'content': user_content,
-            }
-        ],
-        'max_tokens': 800,
-        # 'temperature': 0,
-        # 'top_p': 0.1
-    }
-
-    return payload
-
-def request_gpt(message,
-                images,
-                meta_prompt='',
-                model_name=None,
-                local_image=False):
-
-    if model_name is None:
-        if images is [] or images is None:
-            model_name = DEFAULT_LLM_MODEL_NAME
-        else:
-            model_name = DEFAULT_VLM_MODEL_NAME
-
-    payload = prepare_inputs(message,
-                             images,
-                             meta_prompt=meta_prompt,
-                             model_name=model_name,
-                             local_image=local_image)
-
-    response = requests.post(
-        'https://api.openai.com/v1/chat/completions',
-        headers=headers,
-        json=payload)
-
-    try:
-        res = response.json()['choices'][0]['message']['content']
-    except Exception:
-        print('\nInvalid response: ')
-        print(response)
-        print('\nInvalid response: ')
-        print(response.json())
-        exit()
-
-    return res
-
-def prepare_inputs_incontext(
-        messages,
-        images,
-        meta_prompt,
-        model_name,
-        local_image,
-        example_images,
-        example_responses,
-):
-
-    user_content = []
-
-    if not isinstance(messages, list):
-        messages = [messages]
-
-    for message in messages:
-        content = {
-            'type': 'text',
-            'text': message,
-        }
-        user_content.append(content)
-
-    if not isinstance(images, list):
-        images = [images]
-
-    for example_image, example_response in zip(
-            example_images, example_responses):
-        if local_image:
-            base64_image = encode_image_from_file(example_image)
-        else:
-            base64_image = encode_image_from_pil(example_image)
-
-        content = {
-            'type': 'image_url',
-            'image_url': {
-                'url': f'data:image/jpeg;base64,{base64_image}'
-            }
-        }
-        user_content.append(content)
-
-        content = {
-            'type': 'text',
-            'text': example_response,
-        }
-        user_content.append(content)
-    
-    for image in images:
-        if local_image:
-            base64_image = encode_image_from_file(image)
-        else:
-            base64_image = encode_image_from_pil(image)
-
-        content = {
-            'type': 'image_url',
-            'image_url': {
-                'url': f'data:image/jpeg;base64,{base64_image}'
-            }
-        }
-        user_content.append(content)
-
-    payload = {
-        'model': model_name,
-        'messages': [
-            {
-                'role': 'system',
-                'content': [
-                    meta_prompt
-                ]
-            },
-            {
-                'role': 'user',
-                'content': user_content,
-            }
-        ],
-        'max_tokens': 800
-    }
-
-    return payload
-
-def request_gpt_incontext(
-        message,
-        images,
-        meta_prompt='',
-        example_images=None,
-        example_responses=None,
-        model_name=None,
-        local_image=False):
-
-    if model_name is None:
-        if images is [] or images is None:
-            model_name = DEFAULT_LLM_MODEL_NAME
-        else:
-            model_name = DEFAULT_VLM_MODEL_NAME
-
-    payload = prepare_inputs_incontext(
-        message,
-        images,
-        meta_prompt=meta_prompt,
-        model_name=model_name,
-        local_image=local_image,
-        example_images=example_images,
-        example_responses=example_responses)
-
-    response = requests.post(
-        'https://api.openai.com/v1/chat/completions',
-        headers=headers,
-        json=payload)
-
-    try:
-        res = response.json()['choices'][0]['message']['content']
-    except Exception:
-        print('\nInvalid response: ')
-        print(response)
-        print('\nInvalid response: ')
-        print(response.json())
-        exit()
-
-    return res
 
 def annotate_motion(image, context, log_dir=None, add_caption=True):
+    """Return a saved visualization without opening a blocking GUI window."""
     fig, ax = plt.subplots(1, 1)
     ax.imshow(image)
     ax.axis('off')
-
     image_size = image.size[:2]
-
-    if 'keypoints_2d' in context.keys():
+    if 'keypoints_2d' in context:
         function_keypoint = context['keypoints_2d']['function']
     else:
         function_keypoint = context['selected_keypoint']
-
-    plot_keypoints(
-        ax, image_size, [function_keypoint], 'y', 'function', False,
-        add_caption=add_caption)
-
-    plt.show()
-    buf = io.BytesIO()
-    fig.savefig(buf, transparent=True, bbox_inches='tight',
-                pad_inches=0, format='jpg')
-    buf.seek(0)
-    # close the figure to prevent it from being displayed
+    plot_keypoints(ax, image_size, [function_keypoint], 'y', 'function', False,
+                   add_caption=add_caption)
+    with io.BytesIO() as buf:
+        fig.savefig(buf, transparent=True, bbox_inches='tight', pad_inches=0, format='jpg')
+        buf.seek(0)
+        result = Image.open(buf).copy()
     plt.close(fig)
+    return result
 
-    return Image.open(buf)
 
-def request_motion(  # NOQA
-        subtask,
-        obs_image_reshaped,
-        annotated_image,
-        candidate_keypoints,
-        prompts,
-        debug=False,
-        example_images=None,
-        example_responses=None,
-        loaded_context=None,
-        use_center=False,
-        log_dir=None,
-        suffix='',
-        add_caption=True,
-        grasp=False
-):
-    """
-    Generate the visual marks that specify the motion.
-    """
-    # annotation_size = obs_image_reshaped.size[:2]
-    # print('annotation_size (request_motion)', annotation_size)
-
-    # import pdb;pdb.set_trace()
-
-    if grasp:
-        selection = 'select_motion_grasp'
-    else:
-        selection = 'select_motion_func'
-
-    text_requests = [f"Task: {subtask}"]
-
-    if loaded_context is not None:
-        context = loaded_context
-    else:
-        context = None
-        while context is None:
-            if (example_images is not None and
-                    example_responses is not None):
-                print('example_respnses:')
-                print(example_responses)
-                assert len(example_images) == len(example_responses)
-                res = request_gpt_incontext(
-                    text_requests,
-                    [annotated_image],
-                    prompts[selection],
-                    example_images=example_images,
-                    example_responses=example_responses)
-            else:
-                res = request_gpt(
-                    text_requests,
-                    [annotated_image],
-                    prompts[selection])
-
-            if debug:
-                print('--------------------------------')
-                print('| Selected keypoint.')
-                print('--------------------------------')
-                print(res)
-            context = parse_json_string(res)
-
-    context_json = context
-   
-    detected_keypoint = None
-    # detect grasp point
-    if grasp:
-        # grasp_keypoint = None
-        val = context['grasp_keypoint']
-    # detect function point
-    else:
-        # function_keypoint = None
-        val = context['function_keypoint']
-    if val != '':
-        idx = int(val[1:]) - 1
-        detected_keypoint = candidate_keypoints['grasped'][idx]
-
-    context = dict(
-        keypoints_2d=dict(
-            function=detected_keypoint,
-        )
-    )
-
+def request_motion(subtask, obs_image_reshaped, annotated_image, candidate_keypoints,
+                   prompts, debug=False, example_images=None, example_responses=None,
+                   loaded_context=None, use_center=False, log_dir=None, suffix='',
+                   add_caption=True, grasp=False):
+    """Generate a motion point with the same task-specific visual prompts."""
+    selection = 'select_motion_grasp' if grasp else 'select_motion_func'
+    context_json = loaded_context
+    if context_json is None:
+        context_json = _request_context(
+            [f"Task: {subtask}"], annotated_image, prompts[selection],
+            example_images, example_responses)
+    point = _selected_keypoint(context_json, candidate_keypoints, grasp)
+    context = {'keypoints_2d': {'function': point}}
+    log_img = None
     if debug:
-        # if True:
-        log_img = annotate_motion(obs_image_reshaped, context,
-                                  add_caption=add_caption)
+        log_img = annotate_motion(obs_image_reshaped, context, add_caption=add_caption)
         if log_dir is not None:
             log_img.save(os.path.join(log_dir, f'motion{suffix}.png'))
-            out_file = open(os.path.join(log_dir, f'context{suffix}.json'), 'w')
-            json.dump(context_json, out_file)
+            with open(os.path.join(log_dir, f'context{suffix}.json'), 'w') as output:
+                json.dump(context_json, output)
+    return context, context_json, log_img
 
-        return context, context_json, log_img
-    else:
-        return context, context_json, None
 
-def keypoint_transfer(  # NOQA
-        subtask,
-        obs_image_reshaped,
-        annotated_image,
-        candidate_keypoints,
-        prompts,
-        waypoint_grid_size=None,
-        debug=False,
-        example_images=None,
-        example_responses=None,
-        loaded_context=None,
-        use_center=False,
-        log_dir=None,
-        suffix='',
-        add_caption=False,
-        grasp=False
-):
-    """Generate the visual marks that specify the motion.
-    """
-    text_requests = [f"Task: {subtask}"]
-
-    if loaded_context is not None:
-        context = loaded_context
-    else:
-        context = None
-        while context is None:
-            if (example_images is not None and
-                    example_responses is not None):
-                print('example_respnses:')
-                print(example_responses)
-                assert len(example_images) == len(example_responses)
-                res = request_gpt_incontext(
-                    text_requests,
-                    [annotated_image],
-                    prompts,
-                    example_images=example_images,
-                    example_responses=example_responses)
-            else:
-                # res = request_gpt(
-                #     text_requests,
-                #     [annotated_image],
-                #     prompts[selection])
-                res = request_gpt(
-                    text_requests,
-                    annotated_image,
-                    prompts)
-            if debug:
-                print('--------------------------------')
-                print('| Selected keypoint.')
-                print('--------------------------------')
-                print(res)
-            context = parse_json_string(res)
-
-    if grasp:
-        context_cor = {'selected_keypoint': candidate_keypoints['grasped'][int(context['grasp_keypoint'][1:])-1]}
-    else:
-        context_cor = {'selected_keypoint': candidate_keypoints['grasped'][int(context['function_keypoint'][1:])-1]}
-    
+def keypoint_transfer(subtask, obs_image_reshaped, annotated_image, candidate_keypoints,
+                      prompts, waypoint_grid_size=None, debug=False, example_images=None,
+                      example_responses=None, loaded_context=None, use_center=False,
+                      log_dir=None, suffix='', add_caption=False, grasp=False):
+    """Select a coarse semantic point; SD-DINO performs the existing refinement."""
+    context = loaded_context
+    if context is None:
+        context = _request_context([f"Task: {subtask}"], annotated_image, prompts,
+                                   example_images, example_responses)
+    context_cor = {'selected_keypoint': _selected_keypoint(context, candidate_keypoints, grasp)}
+    log_img = None
     if debug:
-        # if True:
-        log_img = annotate_motion(obs_image_reshaped, context_cor,
-                                  add_caption=add_caption)
-
+        print(json.dumps(context, ensure_ascii=False))
+        log_img = annotate_motion(obs_image_reshaped, context_cor, add_caption=add_caption)
     return context, context_cor, log_img
 
-def pose_selection(  # NOQA
-        subtask,
-        obs_image,
-        prompts,
-        debug=False,
-):
-    """Select the pose that supports the task
-    """
 
-    text_requests = [f"Task: {subtask}"]
-
-    context = None
-    while context is None:
-        res = request_gpt(
-            text_requests,
-            obs_image,
-            prompts)
-
-        if debug:
-            print('--------------------------------')
-            print('| Selected pose.')
-            print('--------------------------------')
-            print(res)
-        context = parse_json_string(res)
-    
+def pose_selection(subtask, obs_image, prompts, debug=False):
+    """Validate the zero-based pose index against the supplied rendered images."""
+    images = obs_image if isinstance(obs_image, list) else [obs_image]
+    context = _request_context([f"Task: {subtask}"], images, prompts)
+    index = context.get('selected_idx')
+    if type(index) is not int or not 0 <= index < len(images):
+        raise ValueError(f"Invalid Gemini selected_idx: {index!r}; expected 0..{len(images)-1}")
+    if debug:
+        print(json.dumps(context, ensure_ascii=False))
     return context
-    
-
-    
+# END Gemini semantic selection.

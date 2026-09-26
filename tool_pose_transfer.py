@@ -12,8 +12,9 @@ from utils_IL.geometry_utils import compute_3d_points, compute_point_cloud, comp
 from utils_IL.vp_utils import load_prompts, pose_selection
 from utils_IL.params import CAM_MATRIX
 
-from openai import OpenAI
-client = OpenAI()
+# BEGIN local pipeline: no unused API client is created at import time.
+from pathlib import Path
+# END local pipeline.
 
 def backproject_3d_2d(point_3d, cam_matrix):
 
@@ -35,7 +36,9 @@ def tool_pose_transfer(data_path, test_data_path, test_tool_label, test_target_l
     os.makedirs(output_path, exist_ok=True)
 
     # load prompts
-    prompt_path = os.path.join(test_data_path, '..', '..', 'utils_IL', 'prompts')
+    # BEGIN relocatable prompts: output data may live outside the repository.
+    prompt_path = Path(__file__).resolve().parent / 'utils_IL' / 'prompts'
+    # END relocatable prompts.
     prompts = load_prompts(prompt_path)
 
     ############ Demo 3D functional points ############

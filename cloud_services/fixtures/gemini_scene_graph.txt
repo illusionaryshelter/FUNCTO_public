@@ -1,0 +1,18 @@
+```python
+nodes = [
+    ("table1"),
+    ("bowl1", "wood"),
+    ("orange1", "Fruits"),
+    ("orange2", "Fruits"),
+    ("orange3", "Fruits"),
+    ("orange4", "Fruits", "with_mark"),
+]
+
+edges = [
+    ("ON", "bowl1", "table1"),
+    ("ON", "orange1", "table1"),
+    ("ON", "orange2", "table1"),
+    ("ON", "orange3", "table1"),
+    ("ON", "orange4", "table1"),
+]
+```

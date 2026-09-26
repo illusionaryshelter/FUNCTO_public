@@ -9,7 +9,11 @@ params:
   bbox_expansion: 0.05
   num_candidate_keypoints: 12
   vp_flag: false
-  sd_dino_flag: false
+  # BEGIN local pipeline: test both SD and DINO on the default demo.
+  sd_dino_flag: true
+  # END local pipeline.
 
 paths:
-  base_data_path: /data/home/chao/FUNCTO_public
+  # BEGIN relocatable data: relative to the FUNCTO repository root.
+  base_data_path: .
+  # END relocatable data.

@@ -1,16 +1,16 @@
 from PIL import Image
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
-import os
-import sys
-import re
-import time
-from PIL import Image
-from cloud_services.apis.owlv2 import OWLViT, visualize_image
-from cloud_services.apis.sam import SAM, visualize_image
-from cloud_services.apis.language_model import GPT4V
+from pathlib import Path
+from typing import List, Optional, Tuple, Any
+# BEGIN local perception and the shared Gemini API integration.
+from cloud_services.apis.language_model import Gemini
 from cloud_services.image_utils import annotate_masks
+from local_models.sam31 import detect
+# END local perception and the shared Gemini API integration.
+# BEGIN shared literal-only scene graph parser and prompt.
+from cloud_services.graph_format import GRAPH_INSTRUCTION, parse_graph_assignments, strip_literal_fence
+# END shared literal-only scene graph parser and prompt.
 from collections import Counter
 import ast
 
@@ -47,103 +47,105 @@ class SceneGraphData:
 
 class SceneGraph:
     def __init__(self):
-        self.detector = OWLViT()
-        self.sam = SAM()
-        self.gpt4v = GPT4V()
+        # BEGIN use the same Gemini client as the main FUNCTO pipeline.
+        self.gemini = Gemini()
+        # END shared Gemini client.
 
     @staticmethod
     def get_scene_graph_prompt(predicate: str) -> Tuple[str, str]:
         prompt = f"The additional predicate is [{predicate}]"
-        meta_prompt = '''Generate the Scene Graph with the following format, with the given predicate to check if the object satisfies this. Where the node defines the objects and edge defines spatial relationship ['ON', 'INSIDE']. If the predicate is None, don't generate predicate.
-
-nodes=
-[
-('apple1', 'predicate'),
-('flatmat1', 'predicate'),
-...
-]
-
-edges=
-[
-('ON', 'apple1', 'mat1'),
-...
-]
-        '''
+        # BEGIN require a complete literal graph with every matching predicate.
+        meta_prompt = GRAPH_INSTRUCTION
+        # END complete graph response contract.
         return prompt, meta_prompt
 
+    # BEGIN specify the literal format and one-based visual labels to Gemini.
     @staticmethod
     def get_alignments_prompt(nodes: str) -> str:
         prompt = f'''Align the number in the marked image with the following nodes: 
 {nodes}
 
-with the format:
-[
-(number, (nodes)),
-xxxx
-]
+Return only a Python literal list of (number, (node_name, predicate1, predicate2))
+tuples, without Markdown fences or explanation. Include all predicate fields for
+each node, or (node_name,) if it has none. Use the image's labels, which start at
+1, and preserve the requested node names exactly. Match every requested node
+exactly once, never reuse an image number, and include no unrequested nodes.
         '''
         return prompt
+    # END alignment response contract.
 
     @staticmethod
     def parse_scene_graph(scene_graph: str) -> Tuple[List[SceneNode], List[SceneEdge], List[str]]:
-        node_pattern = re.compile(r"\('([a-zA-Z_]+\d+)', (?:'([^']+)'|None)\)")
-        edge_pattern = re.compile(r"\('([a-zA-Z]+)', '([a-zA-Z_]+\d+)', '([a-zA-Z_]+\d+)'\)")
-
+        # BEGIN parse all legal literal quotes and predicate fields safely.
+        node_values, edge_values = parse_graph_assignments(scene_graph)
         nodes = [SceneNode(name=obj, object_type=re.sub(r'\d+', '', obj), predicates=ot.split(', ') if ot else []) 
-                 for obj, ot in node_pattern.findall(scene_graph)]
+                 for obj, ot in node_values]
         edges = [SceneEdge(relationship=rel, source=src, destination=dest) 
-                 for rel, src, dest in edge_pattern.findall(scene_graph)]
+                 for rel, src, dest in edge_values]
+        # END shared graph parsing.
 
         filtered_nodes = [node for node in nodes if not ('table' in node.name.lower() or 'chair' in node.name.lower())]
-        filtered_edges = [edge for edge in edges if not any('table' in element or 'chair' in element for element in [edge.source, edge.destination])]
+        # BEGIN apply the existing exclusion to either endpoint consistently.
+        filtered_edges = [edge for edge in edges if not any(
+            'table' in element.lower() or 'chair' in element.lower()
+            for element in [edge.source, edge.destination]
+        )]
+        # END endpoint exclusion.
 
         object_classes = list(set(re.sub(r'\d+', '', node.name) for node in filtered_nodes))
 
         return filtered_nodes, filtered_edges, object_classes
 
     def parse_alignments(self, alignments_string: str):
-    
-        # Convert the string to a Python list of tuples using ast.literal_eval for safety
-        data_list = ast.literal_eval(alignments_string)
-
-        # Extract the match relation as (number, name)
-        match_relation = [(number, name) for number, (name, _) in data_list]
+        # BEGIN accept only complete literal responses with unambiguous mapping.
+        data_list = ast.literal_eval(strip_literal_fence(alignments_string))
+        if not isinstance(data_list, list):
+            raise ValueError("Alignments must be a literal list")
+        match_relation, used_numbers, used_names = [], set(), set()
+        for pair in data_list:
+            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                raise ValueError(f"Invalid alignment pair: {pair!r}")
+            number, node = pair
+            if type(number) is not int or number < 1:
+                raise ValueError(f"Invalid annotated mask number: {number!r}")
+            fields = (node,) if isinstance(node, str) else node
+            if not (isinstance(fields, (tuple, list)) and fields
+                    and isinstance(fields[0], str) and fields[0].strip()
+                    and all(field is None or isinstance(field, str) for field in fields[1:])):
+                raise ValueError(f"Invalid alignment node: {node!r}")
+            name = fields[0]
+            if number in used_numbers or name in used_names:
+                raise ValueError("Alignments must use unique node names and mask numbers")
+            used_numbers.add(number)
+            used_names.add(name)
+            match_relation.append((number, name))
         return match_relation
+        # END validated literal alignment mapping.
 
     def get_scene_graph_string(self, image: Image.Image, predicate: str) -> str:
         prompt, meta_prompt = self.get_scene_graph_prompt(predicate)
-        scene_graph_string = self.gpt4v.chat(prompt, image, meta_prompt=meta_prompt)
-        return scene_graph_string
+        # BEGIN retain the graph prompt and image while changing the VLM provider.
+        return self.gemini.chat(prompt, images=[image], system_prompt=meta_prompt)
+        # END shared Gemini graph request.
 
     def get_alignments_string(self, image: Image.Image, nodes: str, scene_graph_string: str) -> str:
         prompt = self.get_alignments_prompt(nodes)
-        alignments_string = self.gpt4v.chat(prompt, image, scene_graph_string)
-        return alignments_string
+        # BEGIN include graph context and the numbered image in the Gemini request.
+        return self.gemini.chat(prompt, images=[image], system_prompt=scene_graph_string)
+        # END shared Gemini alignment request.
 
-    def detect_and_segment(self, image: Image.Image, object_classes: List[str]) -> Tuple[List[Any], List[str]]:
-        detected_objects = self.detector.detect_objects(
-            image=image,
-            text_queries=object_classes,
-            bbox_score_top_k=20,
-            bbox_conf_threshold=0.15
-        )
-        best_boxes = {}
-        multiple_box_names = []
-
-        for det in detected_objects:
-            box_name = det["box_name"]
-
-            if box_name not in best_boxes or det["score"] > best_boxes[box_name]["score"]:
-                best_boxes[box_name] = det
-
-
-        missing_objects = set(object_classes) - set(best_boxes.keys())
+    # BEGIN use all local SAM3.1 instances, preserving same-class disambiguation.
+    def detect_and_segment(self, image: Image.Image, object_classes: List[str]) -> Tuple[List[Any], List[str], List[str]]:
+        if not object_classes:
+            return [], [], []
+        detected_objects = detect(image, list(object_classes))
+        box_names = [obj["label"] for obj in detected_objects]
+        missing_objects = set(object_classes) - set(box_names)
         if missing_objects:
-            print(f"Missing objects that were not detected or had no best box: {', '.join(missing_objects)}")
-
-        masks = self.sam.segment_by_bboxes(image=image, bboxes=[obj['bbox'] for obj in detected_objects])
-
-        box_names = [obj["box_name"] for obj in detected_objects]
+            print(f"Missing objects that were not detected: {', '.join(sorted(missing_objects))}")
+        # Each mask comes from the same prediction as its label and pixel bbox;
+        # running a second segmentor would break that one-to-one association.
+        masks = [{"segmentation": obj["mask"]} for obj in detected_objects]
 
         # Count occurrences of each box_name
         box_count = Counter(box_names)
@@ -151,6 +153,7 @@ xxxx
         # Filter out box_names that appear more than once
         multiple_box_names = [name for name, count in box_count.items() if count > 1]
         return masks, box_names, multiple_box_names
+    # END local SAM3.1 instance mapping.
 
     def get_annotated_segmentation(self, image: Image.Image, masks: List[Any]) -> Image.Image:
         segment_img = annotate_masks(
@@ -166,8 +169,24 @@ xxxx
         return segment_img
 
     def assign_masks_to_nodes(self, image, scene_graph_data: SceneGraphData, masks: List[Any], box_names: List[str], multiple_box_names: List[str], scene_graph_string):
+        # BEGIN reject missing instances before assigning masks or requesting alignment.
+        if len(masks) != len(box_names):
+            raise ValueError("Masks and detected class names must have the same length")
+        requested_counts = Counter(node.object_type for node in scene_graph_data.nodes)
+        detected_counts = Counter(box_names)
+        for object_type, requested_count in requested_counts.items():
+            detected_count = detected_counts[object_type]
+            if detected_count < requested_count:
+                raise ValueError(
+                    f"Insufficient detected instances for {object_type!r}: "
+                    f"requested {requested_count}, detected {detected_count}"
+                )
+        # END instance coverage validation; extra detections remain available for alignment.
         # print("multiple names:", multiple_box_names)
         masks_muiltiple = []
+        # BEGIN retain class association for the numbered ambiguous subset.
+        ambiguous_labels = []
+        # END ambiguous subset class association.
         # Adding masks to the nodes
         for mask, box_name in zip(masks, box_names):
             if box_name not in multiple_box_names:
@@ -179,6 +198,9 @@ xxxx
                         print(f"Added mask to node: {node.name}")
             else:
                 masks_muiltiple.append(mask)
+                # BEGIN keep each subset mask paired with its detected class.
+                ambiguous_labels.append(box_name)
+                # END ambiguous subset class association.
         
 
         unmatched_nodes = [str(node) for node in scene_graph_data.nodes if node.object_type in multiple_box_names]  # Using the __str__ method of each node
@@ -194,40 +216,32 @@ xxxx
             # for 
             print("alignments:", parse_alignments)
             
-            for pair in parse_alignments:
-                number, name = pair
-                for node in scene_graph_data.nodes:
-                    if name == node.name:
-                        node.mask = masks[number]["segmentation"]
+            # BEGIN validate the complete mapping before assigning any ambiguous mask.
+            requested_nodes = {
+                node.name: node for node in scene_graph_data.nodes
+                if node.object_type in multiple_box_names
+            }
+            if {name for _, name in parse_alignments} != set(requested_nodes):
+                raise ValueError("Alignments must match exactly the requested node names")
+            for number, name in parse_alignments:
+                if not 1 <= number <= len(masks_muiltiple):
+                    raise ValueError(f"Invalid annotated mask number: {number}")
+                if ambiguous_labels[number - 1] != requested_nodes[name].object_type:
+                    raise ValueError(f"Annotated mask class does not match node {name}")
+            # annotate_masks numbers only the ambiguous subset, starting at one.
+            for number, name in parse_alignments:
+                requested_nodes[name].mask = masks_muiltiple[number - 1]["segmentation"]
+            # END validated visual-label to mask mapping.
         return scene_graph_data, annotated_img
 
 if __name__ == "__main__":
     scene_graph_processor = SceneGraph()
-    file_path = "cloud_services/images/1.png"
-    image = Image.open(file_path)
+    # BEGIN run the example with real Gemini semantics and local SAM3.1 masks.
+    file_path = Path(__file__).resolve().parent / "images" / "1.png"
+    image = Image.open(file_path).convert("RGB")
     predicate = ['Fruits', 'wood', 'with_mark']
-
-    # scene_graph_string = scene_graph_processor.get_scene_graph_string(image, predicate)
-    # Simulated scene graph string from GPT-4V output
-    scene_graph_string ='''
-    nodes=
-    [
-    ('orange1', 'fruits'),
-    ('orange2', 'fruits'),
-    ('orange3', 'fruits'),
-    ('orange4', 'fruits, with_sticker'),
-    ('bowl1', 'wood'),
-    ]
-
-    edges=
-    [
-    ('ON', 'orange1', 'table'),
-    ('ON', 'orange2', 'table'),
-    ('ON', 'orange3', 'table'),
-    ('ON', 'orange4', 'table'),
-    ('ON', 'bowl1', 'table'),
-    ]
-    '''
+    scene_graph_string = scene_graph_processor.get_scene_graph_string(image, predicate)
+    # END real model example.
 
     nodes, edges, object_classes = scene_graph_processor.parse_scene_graph(scene_graph_string)
     print("Nodes:", nodes)
@@ -246,36 +260,9 @@ if __name__ == "__main__":
     ## Adding masks to the nodes
 
     scene_graph_data, annotated_img = scene_graph_processor.assign_masks_to_nodes(image, scene_graph_data, masks, box_names, multiple_box_names, scene_graph_string)
-    # print("multiple names:", multiple_box_names)
-    # masks_muiltiple = []
-    # # Adding masks to the nodes
-    # for mask, box_name in zip(masks, box_names):
-    #     if box_name not in multiple_box_names:
-    #         print(f"Box name {box_name} not found in multiple_box_names")
-    #         for node in scene_graph_data.nodes:
-    #             # Check if the box_name matches the object_type of the node
-    #             if box_name == node.object_type:
-    #                 node.mask = mask["segmentation"]
-    #                 print(f"Added mask to node: {node.name}")
-    #     else:
-    #         masks_muiltiple.append(mask)
-    
-
-    # unmatched_nodes = [str(node) for node in scene_graph_data.nodes if node.object_type in multiple_box_names]  # Using the __str__ method of each node
-    # print("Unmatched nodes:", unmatched_nodes)
-    
-    # annotated_img = scene_graph_processor.get_annotated_segmentation(image, masks_muiltiple)
-
-    # get_alignments_string = scene_graph_processor.get_alignments_string(annotated_img, str(unmatched_nodes), scene_graph_string)    
-    # parse_alignments = scene_graph_processor.parse_alignments(get_alignments_string)
-    # # for 
-    # print("alignments:", parse_alignments)
-    
-    # for pair in parse_alignments:
-    #     number, name = pair
-    #     for node in scene_graph_data.nodes:
-    #         if name == node.name:
-    #             node.mask = masks[number]["segmentation"]
-
     print(scene_graph_data.nodes)
-    # annotated_img.show()
+    # BEGIN support a headless local run without opening an external image viewer.
+    output_path = Path.cwd() / "scene_graph_instances.png"
+    annotated_img.save(output_path)
+    print(f"Annotated masks saved to {output_path}")
+    # END headless example output.

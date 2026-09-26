@@ -5,159 +5,59 @@ import cv2
 from PIL import Image
 import json
 
-from cloud_services.apis.owlv2 import OWLViT
-from cloud_services.apis.sam import SAM
-
-from utils_IL.perception_utils import non_maximum_suppression
+# BEGIN local SAM 3.1 integration: one model supplies both boxes and masks.
+from local_models.sam31 import detect
+# END local SAM 3.1 integration.
 from utils_IL.geometry_utils import compute_point_cloud
 from utils_IL.params import CAM_MATRIX
 
+# BEGIN local SAM 3.1 integration: preserve the detection_output file contract.
 def demo_test_deteciton(data_path, tool_label, target_label):
-    """
-    detect tools and targets in demo and test scenes
-    """
+    """Detect both roles locally and save each role's highest-scoring instance.
 
+    The model layer returns all instances without assigning task-specific roles.
+    This pipeline selects one tool and one target, retaining the pixel xyxy JSON,
+    boolean NPY mask, binary PNG mask, and annotated image used downstream.
+    """
     output_path = os.path.join(data_path, 'detection_output')
     os.makedirs(output_path, exist_ok=True)
+    initial_frame_file_path = os.path.join(data_path, 'rgb', '00000.jpg')
+    with Image.open(initial_frame_file_path) as opened:
+        initial_frame_pil = opened.convert('RGB')
+    detected_objects = detect(initial_frame_pil, [tool_label, target_label])
 
-    initial_frame_index = 0
-    initial_frame_filenname = f'{initial_frame_index:05d}.jpg'
-    initial_frame_file_path = os.path.join(data_path, 'rgb', initial_frame_filenname)
-    initial_frame_pil = Image.open(initial_frame_file_path).convert('RGB')
-    initial_frame = np.array(initial_frame_pil)
+    # Resolve every required role before writing files, so missing detections
+    # fail explicitly instead of producing an apparently complete partial run.
+    selected_objects = {}
+    for role, label in [('tool', tool_label), ('target', target_label)]:
+        candidates = [obj for obj in detected_objects if obj['label'] == label]
+        if not candidates:
+            raise RuntimeError(f"SAM 3.1 detected no {role} for text label {label!r}")
+        selected_objects[role] = max(candidates, key=lambda obj: obj['score'])
 
-    owl = OWLViT()
-    sam_predictor = SAM()
-
-    ############ Demo/test tool detection ############
-    detected_objects = owl.detect_objects(
-        initial_frame_pil,
-        [tool_label],
-        bbox_score_top_k=20,
-        bbox_conf_threshold=0.1
-    )
-
-    if len(detected_objects):
-        x = initial_frame_pil.size[0]
-        y = initial_frame_pil.size[1]
-
-        # Non-Maximum Suppression
-        detected_objects = non_maximum_suppression(detected_objects, iou_threshold=0.2)
-        
-        # sort the detected object of each class according to the confidence
-        filtered_objects = {}
-        for detection in detected_objects:
-            box_name = detection['box_name']
-            if box_name not in filtered_objects or detection['score'] > filtered_objects[box_name]['score']:
-                filtered_objects[box_name] = detection
-        detected_objects = list(filtered_objects.values())
-
-        boxes_l = [[x * obj['bbox'][0], y * obj['bbox'][1], x * obj['bbox'][2], y * obj['bbox'][3]] for obj in detected_objects]
-        pred_phrases = [obj['box_name'] for obj in detected_objects]
-
-        # Draw bounding boxes and labels on the image
-        for i, box in enumerate(boxes_l):
-            top_left = (int(box[0]), int(box[1]))
-            bottom_right = (int(box[2]), int(box[3]))
-            cv2.rectangle(initial_frame, top_left, bottom_right, (255, 0, 0), 2)  # Blue color box
-            cv2.putText(initial_frame, pred_phrases[i], top_left, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
-
-            # Convert the image back to BGR for saving with OpenCV
-            initial_frame_bgr = cv2.cvtColor(initial_frame, cv2.COLOR_RGB2BGR)
-            output_image_path = os.path.join(output_path, 'tool_bbox.png')
-            cv2.imwrite(output_image_path, initial_frame_bgr)
-            print(f"image with bounding boxes saved at {output_image_path}")
-        
-        # save bbox info
-        tool_bbox_path = os.path.join(output_path, 'tool.json')
-        with open(tool_bbox_path, 'w') as json_file:
+    for role, detection in selected_objects.items():
+        box = detection['bbox']
+        mask = detection['mask']
+        annotated_frame = np.array(initial_frame_pil)
+        top_left = (int(box[0]), int(box[1]))
+        bottom_right = (int(box[2]), int(box[3]))
+        cv2.rectangle(annotated_frame, top_left, bottom_right, (255, 0, 0), 2)
+        cv2.putText(
+            annotated_frame, detection['label'], top_left,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA,
+        )
+        output_image_path = os.path.join(output_path, f'{role}_bbox.png')
+        if not cv2.imwrite(output_image_path, cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)):
+            raise OSError(f"Could not save detection image: {output_image_path}")
+        with open(os.path.join(output_path, f'{role}.json'), 'w') as json_file:
             json.dump(box, json_file, indent=4)
-
-        ############ Demo tool segmentation ############
-        masks = sam_predictor.segment_by_bboxes(image=initial_frame_pil, bboxes=[obj['bbox'] for obj in detected_objects])
-        masks = [anno["segmentation"] for anno in masks]
-
-        # Save masks according to the label of each bbox
-        for i, mask in enumerate(masks):
-            mask_image = Image.fromarray(mask.astype(np.uint8) * 255)  # Convert mask to binary image
-            mask_output_path_png = os.path.join(output_path, 'tool_mask.png')
-            mask_output_path_npy = os.path.join(output_path, 'tool_mask.npy')
-            
-            # Save mask as PNG
-            mask_image.save(mask_output_path_png)
-            print(f"mask for {pred_phrases[i]} saved at {mask_output_path_png}")
-            
-            # Save mask as NPY
-            np.save(mask_output_path_npy, mask)
-            print(f"mask for {pred_phrases[i]} saved as NPY at {mask_output_path_npy}")
-    else:
-        raise RuntimeError("no tool detected!")
-
-    ############ Demo/test target detection ############
-    detected_objects = owl.detect_objects(
-        initial_frame_pil,
-        [target_label],
-        bbox_score_top_k=20,
-        bbox_conf_threshold=0.1
-    )
-
-    if len(detected_objects):
-        x = initial_frame_pil.size[0]
-        y = initial_frame_pil.size[1]
-
-        # Non-Maximum Suppression
-        detected_objects = non_maximum_suppression(detected_objects, iou_threshold=0.2)
-        
-        # sort the detected object of each class according to the confidence
-        filtered_objects = {}
-        for detection in detected_objects:
-            box_name = detection['box_name']
-            if box_name not in filtered_objects or detection['score'] > filtered_objects[box_name]['score']:
-                filtered_objects[box_name] = detection
-        detected_objects = list(filtered_objects.values())
-
-        boxes_l = [[x * obj['bbox'][0], y * obj['bbox'][1], x * obj['bbox'][2], y * obj['bbox'][3]] for obj in detected_objects]
-        pred_phrases = [obj['box_name'] for obj in detected_objects]
-
-        # Draw bounding boxes and labels on the image
-        for i, box in enumerate(boxes_l):
-            top_left = (int(box[0]), int(box[1]))
-            bottom_right = (int(box[2]), int(box[3]))
-            cv2.rectangle(initial_frame, top_left, bottom_right, (255, 0, 0), 2)  # Blue color box
-            cv2.putText(initial_frame, pred_phrases[i], top_left, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
-
-            # Convert the image back to BGR for saving with OpenCV
-            initial_frame_bgr = cv2.cvtColor(initial_frame, cv2.COLOR_RGB2BGR)
-            output_image_path = os.path.join(output_path, 'target_bbox.png')
-            cv2.imwrite(output_image_path, initial_frame_bgr)
-            print(f"image with bounding boxes saved at {output_image_path}")
-        
-        # save bbox info
-        target_bbox_path = os.path.join(output_path, 'target.json')
-        with open(target_bbox_path, 'w') as json_file:
-            json.dump(box, json_file, indent=4)
-
-        ############ Demo target segmentation ############
-        masks = sam_predictor.segment_by_bboxes(image=initial_frame_pil, bboxes=[obj['bbox'] for obj in detected_objects])
-        masks = [anno["segmentation"] for anno in masks]
-
-        # Save masks according to the label of each bbox
-        for i, mask in enumerate(masks):
-            mask_image = Image.fromarray(mask.astype(np.uint8) * 255)  # Convert mask to binary image
-            mask_output_path_png = os.path.join(output_path, 'target_mask.png')
-            mask_output_path_npy = os.path.join(output_path, 'target_mask.npy')
-            
-            # Save mask as PNG
-            mask_image.save(mask_output_path_png)
-            print(f"mask for {pred_phrases[i]} saved at {mask_output_path_png}")
-            
-            # Save mask as NPY
-            np.save(mask_output_path_npy, mask)
-            print(f"mask for {pred_phrases[i]} saved as NPY at {mask_output_path_npy}")
-    else:
-        raise RuntimeError("no target detected!")
-    
+        Image.fromarray(mask.astype(np.uint8) * 255).save(
+            os.path.join(output_path, f'{role}_mask.png')
+        )
+        np.save(os.path.join(output_path, f'{role}_mask.npy'), mask)
+        print(f"SAM 3.1 {role} detection saved in {output_path}")
     return None
+# END local SAM 3.1 integration.
 
 def cam_to_target_trans(data_path):
 
@@ -266,4 +166,3 @@ def cam_to_target_trans(data_path):
     return None
 
  
-
