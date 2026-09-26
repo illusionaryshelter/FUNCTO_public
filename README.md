@@ -124,3 +124,103 @@ and result validation; they do not download weights or initialize GPU models.
 PYTHONNOUSERSITE=1 MPLBACKEND=Agg PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   python -m pytest -q tests cloud_services/test_scene_graph_contract.py
 ```
+
+<!-- BEGIN task-adaptive object/part manipulation. -->
+## Object and moving-part manipulation
+
+`manipulate.py` adds a separate path for object transport, placement, containment
+and articulated parts. Motion, goal relation and interaction are independent:
+an object does not need a tool function point, and a pushed part does not need a
+grasp point. The existing `main.py` tool-use example remains available unchanged.
+
+```bash
+PYTHONNOUSERSITE=1 MPLCONFIGDIR=/tmp/functo-mpl OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python manipulate.py --demo /path/to/demonstrated-stage --scene /path/to/current-scene \
+  --instruction "push the drawer closed" --output-dir runs/drawer-close
+```
+
+Each RGB-D directory contains `rgb/00000.jpg` (or PNG), registered
+`depth/00000.png` (or NPY), and `intrinsic.json`. The demonstration contains the
+whole stage's numbered frames. Open3D's column-major `intrinsic_matrix`, width
+and height are read from calibration. `depth_unit_m` explicitly specifies metres
+per stored value; Open3D `depth_scale` specifies its divisor. If neither is
+provided, the original millimetre convention applies. Geometry is no longer
+restricted to the original one-metre range or hard-coded camera intrinsics.
+
+The new path uses Gemini for role/relationship selection, SAM3.1 for entity and
+part masks, SD-DINO for visible cross-instance correspondences, and bounded CPU
+RGB-D tracking for demonstrated rigid motion. Parent-object masks exclude the
+moving part when tracking a fixed reference. Registration diagnostics remain
+in the result; texture loss, ambiguous correspondences and incompatible motion
+are errors, rather than a fallback to fabricated points or unconstrained motion.
+Raw tool-use classification routes to the existing annotated tool subset, which
+still requires its original demonstration annotations and calibration.
+
+An `on` goal selects a task-relevant observed plane with Gemini, then uses a
+bounded patch that remains inside its observed mask, including any holes. It
+does not treat the largest face of a reference object as its support surface.
+The supplied object extent must fit the patch. An `inside` goal requires known **free interior geometry**, never the
+outer box of a container. An optional `geometry.json` in the current-scene
+directory can carry geometry produced by another component:
+
+```json
+{
+  "reference_frame": "scene_camera",
+  "interior": {
+    "vertices": [[0,0,0.5], [0.2,0,0.5], [0,0.2,0.5], [0.2,0.2,0.5],
+                 [0,0,0.7], [0.2,0,0.7], [0,0.2,0.7], [0.2,0.2,0.7]],
+    "source": "known free cavity geometry"
+  }
+}
+```
+
+This example describes a convex free region in metres. Partial RGB-D does not
+reveal an occluded cavity, and neither a semantic label nor an outer mask is used
+to invent it. Optional `entry_region` and `entry_start_index` check the supplied
+object geometry against a known entry corridor at the generated trajectory
+nodes, using the supplied `margin` in metres. They do not certify interpolation
+between those nodes. These local checks are not complete-scene collision or force planning.
+
+The numerical API `manipulation.pipeline.run_stage` accepts already grounded
+observations. `run_sequence` accepts an ordered list and updates carrier and
+reference states. Repeated entities require registered, fixed `body_frame_id`
+values; moving references require `reference_body_frame_id` and their capture
+pose. A placed object is not assumed rigidly attached to its support/container:
+if that reference later moves, its world state becomes `needs_observation`.
+This sequence API consumes a provided order; it does not discover a new task
+plan from a long instruction.
+
+`scene.goal_pose` is an exact target and is never projected into a convenient
+answer. `scene.preferred_goal_pose` is an estimate that placement may adjust
+within the requested geometric relation. Goal geometry and motion must both
+pass. The core supports free SE(3), planar SE(2), fixed-orientation planar
+translation, fixed-axis rotation, and fixed-direction translation.
+
+To replay a saved grounding without loading models or calling an API:
+
+```bash
+PYTHONNOUSERSITE=1 python manipulate.py --prepared runs/drawer-close/observations.json \
+  --output-dir runs/drawer-close-replay
+```
+
+Every new run writes `run.json`, grounded `observations.json` for the object path,
+and `trajectory.json` containing fixed-body-to-reference 4×4 poses in metres,
+entity IDs, frame conventions, model/goal checks and available interaction
+evidence. These are object/part trajectories, not end-effector commands. The
+offline `trajectory.png` and `coordinate_checks.json` visualize bounded
+keyframes and verify the underlying point transformations without invented
+function or grasp markers. A successful geometry run does not certify contact
+forces, hidden surfaces, physical task completion or robot execution.
+
+Run the analytic examples without models to inspect all five spaces, placement
+and an open/place/close sequence:
+
+```bash
+PYTHONNOUSERSITE=1 MPLCONFIGDIR=/tmp/functo-mpl OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python examples/manipulation_geometry.py --output-dir runs/manipulation-geometry
+```
+
+These examples use known synthetic geometry. Actual new task coverage still
+requires its own demonstrated stage and scene; the bundled pouring example
+alone cannot verify real drawer, door or container operation.
+<!-- END task-adaptive object/part manipulation. -->
