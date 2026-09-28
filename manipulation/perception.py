@@ -265,11 +265,17 @@ def _bind_on_geometry(event, binding, paired_sources, paired_matches, current, o
     observed_reference = _interaction_samples(reference_match)
     reference_points = observed_reference @ output_reference[:3, :3].T + output_reference[:3, 3]
     offsets = reference_points-support.origin
-    uv = offsets @ support.basis
-    boundary = support._hull.equations
-    if (np.any(np.abs(offsets @ support.normal) > gap)
-            or np.any(uv @ boundary[:, :2].T + boundary[:, 2] > gap)):
-        raise ValueError("Selected support disagrees with matched interaction points or its finite visible boundary")
+    # BEGIN distinguish observed plane witnesses from the finite placement patch.
+    # Correspondences can identify corners of the observed support outside a
+    # conservative interior patch returned by infer_support. Their owner/depth
+    # membership was checked during matching; here they must agree with the
+    # selected plane and its signed normal. The placement patch still bounds
+    # the actual carrier face and complete supplied body in ground_on and the
+    # numerical program's independent checks; it need not contain these visual
+    # witnesses, and must never be expanded merely to include them.
+    if np.any(np.abs(offsets @ support.normal) > gap):
+        raise ValueError("Selected support disagrees with the matched interaction plane")
+    # END distinguish observed plane witnesses from the finite placement patch.
     if reference_match["geometry_kind"] == "plane" and not _normal_matches(
             output_reference[:3, :3] @ reference_match["target_normal"], support.normal, angle,
             signed=reference_source.get("normal_role") == "support"):

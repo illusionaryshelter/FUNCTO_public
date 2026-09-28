@@ -295,20 +295,41 @@ class CurrentProgramTest(unittest.TestCase):
                 bind_current_scene(program, scene, templates, owners, client=client(), extractor=descriptors)
             infer.assert_not_called()
 
+    # BEGIN separate functional plane evidence from placement feasibility.
+    def test_reference_witnesses_outside_safe_patch_preserve_carrier_fit_checks(self):
+        from manipulation.program import ground_object_program
+
+        program, scene, templates, owners, support = self.on_fixture()
+        # The three visible reference witnesses are (0.04,0.04), (0.14,0.04)
+        # and (0.04,0.14) on the same camera-Z=1 plane. This safe interior patch
+        # is fully observed but excludes those corner witnesses. Binding is
+        # still meaningful; whether the actual carrier fits is a separate test.
+        interior = SupportSurface(support.origin, support.basis, support.normal,
+                                  np.array([[.06, .06], [.12, .06], [.12, .12], [.06, .12]]),
+                                  source="conservative observed interior placement patch")
+        with patch("manipulation.perception.infer_support", return_value=(interior, {})):
+            bound = bind_current_scene(program, scene, templates, owners,
+                                       client=client(), extractor=descriptors)
+        # Retain the finite patch rather than enlarging it to fit the witnesses.
+        np.testing.assert_array_equal(bound["support"]["boundary"], interior.boundary)
+        self.assertEqual(len(bound["region_binding_evidence"]["effect"]["reference"]["target_points"]), 3)
+        # The observed carrier spans 0.19 m, so it cannot fit this 0.06 m patch.
+        # Use the real numerical consumer to ensure loosening the *reference
+        # witness* gate did not remove the carrier's finite-area requirement.
+        with self.assertRaisesRegex(ValueError, "Object geometry does not fit"):
+            ground_object_program(program, bound)
+
     def test_inferred_support_cannot_choose_a_different_plane_or_physical_side(self):
-        for wrong in ("height", "normal", "boundary"):
+        for wrong in ("height", "normal"):
             program, scene, templates, owners, support = self.on_fixture()
             if wrong == "height":
                 support.origin[2] += .02
-            elif wrong == "normal":
-                support.normal *= -1
             else:
-                support = SupportSurface(support.origin, support.basis, support.normal,
-                                         np.array([[.11, .11], [.19, .11], [.19, .19], [.11, .19]]),
-                                         source=support.source)
+                support.normal *= -1
             with self.subTest(wrong=wrong), patch("manipulation.perception.infer_support", return_value=(support, {})):
                 with self.assertRaisesRegex(ValueError, "support.*disagrees|support normal disagrees"):
                     bind_current_scene(program, scene, templates, owners, client=client(), extractor=descriptors)
+    # END separate functional plane evidence from placement feasibility.
 
     def test_missing_physical_normal_role_is_a_source_error_before_models(self):
         for role in ("carrier", "reference"):
