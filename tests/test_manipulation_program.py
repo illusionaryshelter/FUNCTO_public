@@ -278,8 +278,9 @@ class ProgramTest(unittest.TestCase):
             ground_program(program, scene)
 
     def test_cached_region_binding_checks_both_owners_and_preserves_owner_local_coordinates(self):
-        # The matcher is isolated here: correct coordinate consumption must be
-        # testable without SAM/descriptor inference or an actual camera.
+        # BEGIN current-owner binder contract; visual accuracy is tested outside
+        # this isolated coordinate/owner regression. No current part is supplied.
+        from PIL import Image
         from manipulation.perception import bind_current_scene
 
         program, scene = fixture()
@@ -288,25 +289,35 @@ class ProgramTest(unittest.TestCase):
         event["carrier_frame"] = pose(x=.02)
         event["reference_frame"] = pose(y=.01)
         carrier_map, reference_map = pose(y=.03), pose(z=.04)
-        pairs = {"effect": {
-            "carrier": [{"owner_id": "demo_carrier"}, {"owner_id": "new_carrier"}],
-            "reference": [{"owner_id": "demo_target"}, {"owner_id": "new_target"}],
+        templates = {"effect": {
+            "carrier": {"owner_id": "demo_carrier", "region_id": "source_contact"},
+            "reference": {"owner_id": "demo_target", "region_id": "source_target"},
         }}
-        with patch("manipulation.perception.match_regions", side_effect=[
-                {"transform": carrier_map}, {"transform": reference_map}]) as match:
-            bound = bind_current_scene(program, scene, pairs)
+        owners = {role: {"owner_id": scene[role + "_id"], "image": Image.new("RGB", (4, 4)),
+                         "owner_mask": np.ones((4, 4), bool), "depth": np.ones((4, 4)),
+                         "K": np.eye(3), "frame_convention": "binding_camera", "T_output_camera": pose()}
+                  for role in ("carrier", "reference")}
+        sources = [{"source_frame": event[role + "_frame"], "geometry_kind": "frame"}
+                   for role in ("carrier", "reference")]
+        matched = [{**source, "target_frame": transform @ source["source_frame"], "transform": transform}
+                   for source, transform in zip(sources, (carrier_map, reference_map))]
+        with patch("manipulation.perception.source_function_geometry", side_effect=sources), \
+                patch("manipulation.perception.match_functional_region", side_effect=matched) as match:
+            bound = bind_current_scene(program, scene, templates, owners)
         self.assertEqual(match.call_count, 2)
         numeric = bound["functional_bindings"]["effect"]
         np.testing.assert_allclose(numeric["carrier_frame"], carrier_map @ event["carrier_frame"])
         np.testing.assert_allclose(numeric["reference_frame"], reference_map @ event["reference_frame"])
         self.assertFalse(np.allclose(numeric["carrier_frame"], scene["functional_bindings"]["effect"]["carrier_frame"]))
-        for side, expected_message in ((0, "Demonstration region owner"), (1, "Current region owner")):
-            wrong = deepcopy(pairs)
-            wrong["effect"]["carrier"][side]["owner_id"] = "wrong_similar_instance"
-            with self.subTest(side=side), patch("manipulation.perception.match_regions") as match:
+        for side, expected_message in ((0, "Demonstration region owner"), (1, "Current owner")):
+            wrong_templates, wrong_owners = deepcopy(templates), deepcopy(owners)
+            wrong = wrong_templates["effect"]["carrier"] if side == 0 else wrong_owners["carrier"]
+            wrong["owner_id"] = "wrong_similar_instance"
+            with self.subTest(side=side), patch("manipulation.perception.match_functional_region") as match:
                 with self.assertRaisesRegex(ValueError, expected_message):
-                    bind_current_scene(program, scene, wrong)
+                    bind_current_scene(program, scene, wrong_templates, wrong_owners)
                 match.assert_not_called()
+        # END current-owner binder contract.
 
 
 if __name__ == "__main__":

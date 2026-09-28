@@ -8,6 +8,7 @@ contracts, not the quality of predicted SAM regions or dense descriptors.
 # BEGIN interaction-region and functional-frame regression tests.
 from copy import deepcopy
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image
@@ -16,8 +17,9 @@ from scipy.spatial.transform import Rotation
 from manipulation.goals import SupportSurface, check_on
 from manipulation.regions import (align_axis, bind_observations, bind_region,
                                   check_region_on, function_frame, ground_on,
-                                  ground_relation, match_regions,
-                                  relation_error, sample_region_pixels)
+                                  ground_relation, match_functional_region,
+                                  relation_error, sample_region_pixels,
+                                  source_function_geometry)
 
 
 def pose(angles=(0., 0., 0.), translation=(0., 0., 0.)):
@@ -152,78 +154,252 @@ class RegionObservationTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sample_region_pixels(invalid, self.depth)
 
-    def observations(self, target_shift=(2, 1)):
-        yy, xx = np.mgrid[:16, :16]
-        rgb = np.stack((xx+1, yy+1, np.ones_like(xx)*50), axis=-1).astype(np.uint8)
-        scene_rgb = rgb.copy()
-        source_mask = np.zeros((16, 16), bool); source_mask[5:9, 4:8] = True
-        target_mask = np.zeros((16, 16), bool)
-        dx, dy = target_shift
-        target_mask[5+dy:9+dy, 4+dx:8+dx] = True
-        scene_rgb[5+dy:9+dy, 4+dx:8+dx] = rgb[5:9, 4:8]
-        common = {"owner_mask": np.ones((16, 16), bool), "depth": self.depth,
-                  "K": self.K}
-        demo = dict(common, image=Image.fromarray(rgb), mask=source_mask,
+
+class FunctionalQueryGroundingTest(unittest.TestCase):
+    """Run the real coarse selector, matcher and frame recipe on CPU evidence.
+
+    Mocked VLM cell choices and synthetic descriptors stand in for inference.
+    No target part, target frame, target query or rigid registration is injected
+    into the production interface. The four source queries are grouped geometry
+    witnesses, deliberately differing from the former three semantic landmarks.
+    """
+
+    def observations(self):
+        source_pixels = np.array([[4, 5], [7, 5], [4, 8], [7, 8]])
+        target_pixels = np.array([[6, 4], [12, 4], [6, 13], [12, 13]])
+        images = []
+        for pixels in (source_pixels, target_pixels):
+            rgb = np.zeros((16, 16, 3), np.uint8)
+            for label, (x, y) in enumerate(pixels, 1):
+                rgb[y, x, 0] = label
+            images.append(Image.fromarray(rgb))
+        common = {"owner_mask": np.ones((16, 16), bool), "depth": np.ones((16, 16)),
+                  "K": np.diag([100., 100., 1.])}
+        interaction = np.zeros((16, 16), bool); interaction[4:7, 3:6] = True
+        demo = dict(deepcopy(common), image=images[0], mask=interaction,
                     T_camera_owner=pose((.3, -.1, .2), (.4, .1, -.2)),
-                    region_id="source_surface", owner_id="source_instance")
-        scene = dict(common, image=Image.fromarray(scene_rgb), mask=target_mask,
-                     T_camera_owner=pose((-.2, .5, -.3), (-.2, .3, .1)),
-                     region_id="corresponding_surface", owner_id="target_instance")
-        return demo, scene
+                    region_id="source_surface", owner_id="source_instance",
+                    description="Local interaction at the first visible edge",
+                    query_pixels=source_pixels,
+                    query_descriptions=["left near edge", "right near edge",
+                                        "left far edge", "right far edge"],
+                    frame_recipe={"kind": "frame", "origin_weights": [.25]*4,
+                                  "axis_weights": [-.5, .5, -.5, .5],
+                                  "plane_weights": [-.5, -.5, .5, .5],
+                                  "source": "Grouped left-to-right functional direction and ordered near/far plane evidence"})
+        current = dict(deepcopy(common), image=images[1], owner_id="current_instance",
+                       T_camera_owner=pose((-.2, .5, -.3), (-.2, .3, .1)))
+        return demo, current, target_pixels
 
     @staticmethod
     def descriptors(first, second):
-        # Images encode a unique feature direction at each corresponding pixel.
-        # Full-resolution synthetic features exercise the unchanged masked
-        # matcher, including original-pixel coordinate conventions.
-        output = []
+        # Exact one-hot directions encode query identity; the actual masked
+        # matcher still selects pixels, resolves cosine scores and lifts depth.
+        features = []
         for image in (first, second):
-            rgb = np.asarray(image, dtype=np.float32)
-            x, y = rgb[:, :, 0] / 16, rgb[:, :, 1] / 16
-            output.append(np.stack((np.ones_like(x), x, y, x*y))[None])
-        return output
+            labels = np.asarray(image)[:, :, 0]
+            features.append(np.eye(5, dtype=np.float32)[labels].transpose(2, 0, 1)[None])
+        return features
 
-    def test_matching_consumes_both_region_masks_and_retains_owner_image_context(self):
-        demo, scene = self.observations()
-        observed_sizes = []
-        def extractor(first, second):
-            observed_sizes.append((first.size, second.size))
-            return self.descriptors(first, second)
-        result = match_regions(demo, scene, extractor=extractor, max_error=1e-6)
-        camera_mapping = pose(translation=[.02, .01, 0])
-        expected = np.linalg.inv(scene["T_camera_owner"]) @ camera_mapping @ demo["T_camera_owner"]
-        np.testing.assert_allclose(result["transform"], expected, atol=1e-12)
-        self.assertEqual(observed_sizes, [((16, 16), (16, 16))])
-        data = result["diagnostics"]
-        self.assertEqual(data["matching"]["masked_pixel_count"], 16)
-        self.assertEqual(len(data["source_pixels"]), 16)
-        np.testing.assert_allclose(data["target_pixels"]-data["source_pixels"],
-                                   np.broadcast_to([2, 1], (16, 2)), atol=1e-14)
-        for key, mask in (("source_pixels", demo["mask"]), ("target_pixels", scene["mask"])):
-            x, y = data[key].astype(int).T
-            self.assertTrue(mask[y, x].all())
-        # Changing only the paired local regions genuinely changes the binding.
-        first2, second2 = self.observations(target_shift=(3, 2))
-        moved = match_regions(first2, second2, extractor=self.descriptors, max_error=1e-6)
-        expected2 = np.linalg.inv(scene["T_camera_owner"]) @ pose(translation=[.03, .02, 0]) @ demo["T_camera_owner"]
-        np.testing.assert_allclose(moved["transform"], expected2, atol=1e-12)
-        self.assertGreater(np.linalg.norm(moved["transform"]-result["transform"]), .01)
+    @staticmethod
+    def client_for(pixels, size=(16, 16)):
+        # Only the semantic API result is controlled. Production grid creation,
+        # validation and box expansion remain active in every ordinary test.
+        edges = [np.linspace(0, length, 6, dtype=int) for length in size]
+        cells = [int(5*(np.searchsorted(edges[1], y, side="right")-1)
+                     + np.searchsorted(edges[0], x, side="right")) for x, y in pixels]
+        return Mock(chat_json=Mock(return_value={"cells": cells}))
 
-    def test_wrong_owner_empty_regions_and_collapsed_matches_cannot_be_repaired(self):
-        demo, scene = self.observations()
-        wrong = deepcopy(scene); wrong["owner_mask"][:] = False; wrong["owner_mask"][:3] = True
-        with self.assertRaisesRegex(ValueError, "outside its declared owner"):
-            match_regions(demo, wrong, extractor=self.descriptors)
-        empty = deepcopy(scene); empty["mask"][:] = False
-        with self.assertRaisesRegex(ValueError, "no selected pixels"):
-            match_regions(demo, empty, extractor=self.descriptors)
-        no_depth = deepcopy(scene); no_depth["depth"][:] = 0
-        with self.assertRaisesRegex(ValueError, "valid depth"):
-            match_regions(demo, no_depth, extractor=self.descriptors)
+    def run_match(self, demo, current, target_pixels, *, extractor=None):
+        return match_functional_region(demo, current, client=self.client_for(target_pixels),
+                                       extractor=self.descriptors if extractor is None else extractor)
+
+    def test_current_owner_is_sufficient_and_noncongruent_geometry_is_reconstructed(self):
+        demo, current, target_pixels = self.observations()
+        before_source, before_current = deepcopy(demo), deepcopy(current)
+        extractor, client = Mock(side_effect=self.descriptors), self.client_for(target_pixels)
+        with patch("manipulation.regions.rigid_registration", side_effect=AssertionError("not a rigid fit")):
+            result = match_functional_region(demo, current, client=client, extractor=extractor)
+        self.assertNotIn("mask", current)
+        self.assertNotIn("region_id", current)
+        self.assertEqual(extractor.call_count, 1)
+        self.assertEqual(client.chat_json.call_count, 1)
+        self.assertEqual(tuple(image.size for image in extractor.call_args.args), ((16, 16), (16, 16)))
+        diagnostic = result["diagnostics"]
+        np.testing.assert_array_equal(diagnostic["target_pixels"], target_pixels)
+        np.testing.assert_array_equal(diagnostic["interaction_query_indices"], [0])
+        np.testing.assert_array_equal(diagnostic["queries_outside_interaction_mask"], [1, 2, 3])
+        self.assertEqual(diagnostic["descriptor_pair_extractions"], 1)
+        for description in demo["query_descriptions"]:
+            self.assertIn(description, client.chat_json.call_args.args[0])
+        np.testing.assert_allclose(result["transform"] @ result["source_frame"],
+                                   result["target_frame"], atol=1e-14)
+        # Different x/y stretches cannot be fitted by one rigid mapping. They
+        # can still define the same functional axes at a new meaningful origin.
+        self.assertGreater(np.linalg.norm(transform(result["transform"], result["source_points"])
+                                          - result["target_points"]), .05)
+        source_camera = np.column_stack((demo["query_pixels"]/100., np.ones(4)))
+        target_camera = np.column_stack((target_pixels/100., np.ones(4)))
+        np.testing.assert_allclose(transform(demo["T_camera_owner"], result["source_points"]), source_camera)
+        np.testing.assert_allclose(transform(current["T_camera_owner"], result["target_points"]), target_camera)
+        for actual, before in ((demo, before_source), (current, before_current)):
+            for name in ("image", "owner_mask", "depth", "K", "T_camera_owner"):
+                np.testing.assert_array_equal(np.asarray(actual[name]), np.asarray(before[name]))
+
+    def test_owner_coordinate_gauges_preserve_physical_geometry(self):
+        demo, current, pixels = self.observations()
+        base = self.run_match(demo, current, pixels)
+        hd, hn = pose((.5, -.4, .1), (.2, .5, -.2)), pose((-.3, .7, -.2), (-.2, .3, .4))
+        demo["T_camera_owner"] = demo["T_camera_owner"] @ np.linalg.inv(hd)
+        current["T_camera_owner"] = current["T_camera_owner"] @ np.linalg.inv(hn)
+        changed = self.run_match(demo, current, pixels)
+        np.testing.assert_allclose(changed["source_frame"], hd @ base["source_frame"], atol=1e-14)
+        np.testing.assert_allclose(changed["target_frame"], hn @ base["target_frame"], atol=1e-14)
+        np.testing.assert_allclose(changed["transform"], hn @ base["transform"] @ np.linalg.inv(hd), atol=1e-14)
+
+    def test_cropped_nonsquare_owner_context_restores_full_image_pixels(self):
+        demo, current, pixels = self.observations()
+        # Identical padded canvases have a 16x18 owner-context crop at (4,3).
+        # match_points independently square-pads that crop; its descriptor
+        # coordinates and regions' camera coordinates must both stay correct.
+        offsets = (np.array([4, 3]), np.array([7, 5]))
+        for record, offset in zip((demo, current), offsets):
+            rgb = np.zeros((28, 30, 3), np.uint8)
+            x, y = offset
+            rgb[y:y+16, x:x+16] = np.asarray(record["image"])
+            record["image"] = Image.fromarray(rgb)
+            record["owner_mask"] = np.zeros((28, 30), bool)
+            record["owner_mask"][y+2:y+14, x+2:x+14] = True
+            record["depth"] = np.ones((28, 30))
+        # Extend the target owner vertically to include its low two queries;
+        # this also exercises the unequal crop-square sizes used by the matcher.
+        current["owner_mask"][7:21, 9:21] = True
+        shifted_region = np.zeros((28, 30), bool)
+        shifted_region[7:10, 7:10] = demo["mask"][4:7, 3:6]
+        demo["mask"] = shifted_region
+        demo["query_pixels"] = demo["query_pixels"] + offsets[0]
+        boxes = np.tile([0, 0, 16, 18], (4, 1))
+        with patch("manipulation.regions.propose_query_regions", return_value={"boxes": boxes, "diagnostics": {}}) as proposal:
+            result = match_functional_region(demo, current, extractor=self.descriptors)
+        np.testing.assert_array_equal(result["diagnostics"]["target_pixels"], pixels+offsets[1])
+        np.testing.assert_array_equal(result["diagnostics"]["crop_offsets_xy"], offsets)
+        np.testing.assert_array_equal(proposal.call_args.args[5], demo["query_pixels"]-offsets[0])
+        self.assertEqual(proposal.call_args.args[0].size, (16, 16))
+        self.assertEqual(proposal.call_args.args[1].size, (16, 18))
+
+    def test_plane_basis_marks_free_tangent_and_retains_explicit_normal_role(self):
+        demo, current, pixels = self.observations()
+        demo["frame_recipe"]["kind"] = "plane"
+        demo["frame_recipe"]["source"] = "Ordered surface samples; offline evidence establishes outward negative camera z"
+        demo["normal_role"] = "outward"
+        result = self.run_match(demo, current, pixels)
+        self.assertEqual(result["geometry_kind"], "plane")
+        self.assertEqual(result["normal_role"], "outward")
+        self.assertIn("preference", result["diagnostics"]["x_axis_source"])
+        self.assertIn("not an observed", result["diagnostics"]["target_geometry"]["x_axis_source"])
+        self.assertIn("source evidence", result["diagnostics"]["normal_source"])
+        np.testing.assert_allclose(current["T_camera_owner"][:3, :3] @ result["target_normal"], [0, 0, -1], atol=1e-14)
+
+    def test_source_spill_is_recorded_without_expanding_or_clipping_interaction(self):
+        demo, current, pixels = self.observations()
+        demo["owner_mask"][4, 3] = False
+        before = demo["mask"].copy()
+        result = self.run_match(demo, current, pixels)
+        self.assertEqual(result["diagnostics"]["interaction_pixels_outside_owner"], 1)
+        np.testing.assert_array_equal(demo["mask"], before)
+        np.testing.assert_array_equal(result["diagnostics"]["interaction_query_indices"], [0])
+
+    def test_invalid_source_recipe_or_evidence_fails_before_any_inference(self):
+        demo, current, _ = self.observations()
+        invalid_recipes = [
+            ("origin_weights", [0., 0., 0., 0.]),
+            ("axis_weights", [1., 0., 0., 0.]),
+            ("plane_weights", [0., 0., 0.]),
+            ("axis_weights", [np.nan, 0., 0., 0.]),
+            ("axis_weights", [0., 0., 0., 0.]),
+            ("plane_weights", [-.5, .5, -.5, .5]),
+            ("kind", "axis"), ("source", ""),
+        ]
+        client, extractor = Mock(), Mock()
+        for key, value in invalid_recipes:
+            invalid = deepcopy(demo); invalid["frame_recipe"][key] = value
+            with self.subTest(field=key, value=value), self.assertRaises(ValueError):
+                match_functional_region(invalid, current, client=client, extractor=extractor)
+        for edit in ("missing recipe", "query outside owner", "query missing depth", "region disjoint", "normal role on full frame"):
+            invalid = deepcopy(demo)
+            if edit == "missing recipe":
+                del invalid["frame_recipe"]
+            elif edit == "query outside owner":
+                invalid["owner_mask"][5, 4] = False
+            elif edit == "query missing depth":
+                invalid["depth"][5, 4] = np.nan
+            elif edit == "region disjoint":
+                invalid["owner_mask"][invalid["mask"]] = False
+            else:
+                invalid["normal_role"] = "outward"
+            with self.subTest(edit=edit), self.assertRaises(ValueError):
+                match_functional_region(invalid, current, client=client, extractor=extractor)
+        client.chat_json.assert_not_called()
+        extractor.assert_not_called()
+
+    def test_unresolved_semantics_invalid_current_calibration_or_depth_do_not_guess(self):
+        demo, current, pixels = self.observations()
+        extractor = Mock()
+        with self.assertRaisesRegex(ValueError, "Unresolved functional correspondence"):
+            match_functional_region(demo, current,
+                                    client=Mock(chat_json=Mock(return_value={"cells": [None]*4})),
+                                    extractor=extractor)
+        for field, value in (("K", np.zeros((3, 3))), ("depth", np.zeros((16, 16))),
+                             ("owner_mask", np.zeros((16, 16), bool))):
+            invalid = deepcopy(current); invalid[field] = value
+            client = self.client_for(pixels)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                match_functional_region(demo, invalid, client=client, extractor=extractor)
+            client.chat_json.assert_not_called()
+        extractor.assert_not_called()
+
+    def test_candidate_boxes_intersect_owner_and_depth(self):
+        demo, current, target = self.observations()
+        # Better-looking copies outside the owner or at invalid depth would win
+        # row-major matching if either required observation constraint vanished.
+        rgb = np.array(current["image"], copy=True)
+        for label, (x, y) in enumerate(target, 1):
+            rgb[y-1, x, 0] = label
+            current["owner_mask"][y-1, x] = False
+            rgb[y, x-1, 0] = label
+            current["depth"][y, x-1] = 0
+        current["image"] = Image.fromarray(rgb)
+        result = self.run_match(demo, current, target)
+        np.testing.assert_array_equal(result["diagnostics"]["target_pixels"], target)
+        empty_scope = np.tile([0, 0, 2, 2], (4, 1))
+        current["depth"][:2, :2] = np.nan
+        extractor = Mock()
+        with patch("manipulation.regions.propose_query_regions", return_value={"boxes": empty_scope, "diagnostics": {}}):
+            with self.assertRaisesRegex(ValueError, "no valid current owner depth"):
+                match_functional_region(demo, current, extractor=extractor)
+        extractor.assert_not_called()
+
+    def test_repeated_or_nonpositive_matches_are_not_replaced_by_invented_geometry(self):
+        demo, current, _ = self.observations()
+        boxes = np.tile([0, 0, 16, 16], (4, 1))
         def constant(first, second):
             return [np.ones((1, 2, image.height, image.width), np.float32) for image in (first, second)]
-        with self.assertRaisesRegex(ValueError, "distinct"):
-            match_regions(demo, scene, extractor=constant)
+        with patch("manipulation.regions.propose_query_regions", return_value={"boxes": boxes, "diagnostics": {}}):
+            with self.assertRaisesRegex(ValueError, "nonzero|collinear"):
+                match_functional_region(demo, current, extractor=constant)
+            def opposite(first, second):
+                pair = constant(first, second)
+                pair[1] *= -1
+                return pair
+            with self.assertRaisesRegex(ValueError, "positive-score descriptor"):
+                match_functional_region(demo, current, extractor=opposite)
+
+    def test_source_geometry_is_independent_of_visual_inference(self):
+        demo, _, _ = self.observations()
+        with patch("manipulation.regions.propose_query_regions", side_effect=AssertionError("offline lifting only")):
+            result = source_function_geometry(demo)
+        self.assertEqual(result["geometry_kind"], "frame")
+        np.testing.assert_allclose(np.linalg.det(result["source_frame"][:3, :3]), 1., atol=1e-14)
 
 
 class SupportRegionTest(unittest.TestCase):

@@ -255,6 +255,192 @@ def select_roles(image, task, domain="demo", *, detector=None, client=None):
     return {"carrier": carrier, "reference": reference}
 
 
+# BEGIN source-evidence query proposals: current interaction masks are inferred, not inputs.
+def propose_query_regions(source_image, current_image, source_owner_mask,
+                          current_owner_mask, source_region_mask, query_pixels, *,
+                          description, query_descriptions, client=None):
+    """Ask once for coarse current-owner cells corresponding to source queries.
+
+    Images are owner-context crops; xy queries and returned integer xyxy boxes
+    use their respective crop coordinates. Right/bottom box edges are exclusive.
+    Source queries may lie outside the interaction region, because functional
+    directions can require evidence elsewhere on the same owner. Descriptions
+    explain that evidence; they are actually passed to the semantic selector.
+    Noisy source region pixels outside the owner remain visible and are counted;
+    nonempty overlap is required, while every query must belong to the owner.
+
+    The current owner is partitioned by a 5x5 image grid, discarding empty cells.
+    A selected cell gets a quarter-cell margin for the downstream dense search.
+    These boxes are program-defined search windows, NOT predicted part masks or
+    metric geometry. The caller must intersect each window with the current
+    owner and valid depth, then assess the resulting correspondences. Null or
+    invalid semantic selections fail explicitly rather than guessing a region.
+    """
+    source_image, current_image = _image(source_image), _image(current_image)
+    source_owner = _mask(source_owner_mask, source_image, "source_owner_mask")
+    current_owner = _mask(current_owner_mask, current_image, "current_owner_mask")
+    source_region = _mask(source_region_mask, source_image, "source_region_mask")
+    if not np.any(source_region & source_owner):
+        raise ValueError("Source interaction region does not overlap its owner")
+    source_spill = int(np.count_nonzero(source_region & ~source_owner))
+    pixels = np.asarray(query_pixels)
+    if (pixels.dtype.kind not in "iuf" or pixels.ndim != 2
+            or pixels.shape[1] != 2 or not len(pixels)):
+        raise ValueError("query_pixels must be a nonempty numeric Nx2 xy array")
+    pixels = pixels.astype(float)
+    if (not np.isfinite(pixels).all() or np.any(pixels < 0)
+            or np.any(pixels > [source_image.width-1, source_image.height-1])):
+        raise ValueError("Source queries must be finite and inside source_image")
+    # Match the existing descriptor sampler/backprojection nearest-pixel rule.
+    nearest = np.rint(pixels).astype(int)
+    if not source_owner[nearest[:, 1], nearest[:, 0]].all():
+        raise ValueError("Every source query must belong to the source owner")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError("description must explain the demonstrated interaction")
+    if (not isinstance(query_descriptions, (list, tuple))
+            or len(query_descriptions) != len(pixels)
+            or any(not isinstance(item, str) or not item.strip()
+                   for item in query_descriptions)):
+        raise ValueError("query_descriptions must give one nonempty description per query")
+
+    def owner_panel(image, owner):
+        """Retain owner appearance and context while marking the chosen instance."""
+        array = np.array(image, copy=True)
+        array[~owner] = np.rint(array[~owner].astype(float) * .45).astype(np.uint8)
+        padded = np.pad(owner, 1, constant_values=False)
+        interior = (padded[:-2, 1:-1] & padded[2:, 1:-1]
+                    & padded[1:-1, :-2] & padded[1:-1, 2:])
+        array[owner & ~interior] = (40, 255, 90)
+        return Image.fromarray(array)
+
+    source_panel = owner_panel(source_image, source_owner)
+    # A translucent source-only overlay records the supplied interaction part;
+    # it does not hide other owner locations needed to define an axis or plane.
+    source_panel = Image.composite(
+        Image.new("RGB", source_image.size, (255, 65, 45)), source_panel,
+        Image.fromarray(source_region.astype(np.uint8) * 70),
+    )
+
+    def display_panel(panel):
+        """Scale presentation only; small native crops otherwise lose their parts
+        under grid labels. Pixel and edge mappings below stay explicit, and the
+        unannotated images used by correspondence models are never resized here.
+        """
+        scale = 480 / max(panel.size)
+        size = tuple(max(1, int(round(length*scale))) for length in panel.size)
+        scales = np.asarray(size, dtype=float) / np.asarray(panel.size, dtype=float)
+        return panel.resize(size, Image.Resampling.BICUBIC), scales
+
+    source_panel, source_scale = display_panel(source_panel)
+    source_draw = ImageDraw.Draw(source_panel)
+    for number, (x, y) in enumerate(pixels, 1):
+        # Queries are pixel centers; cell rectangles below are pixel edges.
+        x, y = (np.array([x, y])+.5)*source_scale-.5
+        source_draw.ellipse((x-3, y-3, x+3, y+3), outline=(255, 255, 0), width=1)
+        source_draw.text((max(0, min(x+5, source_panel.width-14)),
+                          max(0, min(y-14, source_panel.height-14))), str(number),
+                         fill=(255, 255, 0), stroke_width=1, stroke_fill="black")
+
+    current_panel, current_scale = display_panel(owner_panel(current_image, current_owner))
+    current_draw = ImageDraw.Draw(current_panel)
+    x_edges = np.linspace(0, current_image.width, 6, dtype=int)
+    y_edges = np.linspace(0, current_image.height, 6, dtype=int)
+    cells = {}
+    for row in range(5):
+        for column in range(5):
+            x0, x1 = map(int, x_edges[column:column+2])
+            y0, y1 = map(int, y_edges[row:row+2])
+            yy, xx = np.nonzero(current_owner[y0:y1, x0:x1])
+            if not len(xx):
+                continue
+            # Grid IDs stay row-major even when empty cells are absent. This
+            # lets response validation reject cells without any owner pixels.
+            number = row * 5 + column + 1
+            cells[number] = [x0, y0, x1, y1]
+            display_box = [x0*current_scale[0], y0*current_scale[1],
+                           x1*current_scale[0]-1, y1*current_scale[1]-1]
+            current_draw.rectangle(display_box, outline=(255, 210, 0), width=1)
+            xx, yy = xx+x0, yy+y0
+            index = int(np.argmin((xx-(x0+x1-1)/2)**2 + (yy-(y0+y1-1)/2)**2))
+            tx, ty = (np.array([xx[index], yy[index]])+.5)*current_scale-.5
+            current_draw.text((max(0, min(tx, current_panel.width-14)),
+                               max(0, min(ty-5, current_panel.height-14))),
+                              str(number), fill="white", stroke_width=1, stroke_fill="black")
+
+    details = {
+        "description": description.strip(),
+        "source_interaction_pixels_outside_owner": source_spill,
+        "queries": [{"id": index+1, "source_xy": point.tolist(),
+                     "description": query_descriptions[index].strip()}
+                    for index, point in enumerate(pixels)],
+        "allowed_cells": [{"id": number, "box_xyxy": box} for number, box in cells.items()],
+    }
+    prompt = (
+        "Find functional visual correspondences from ONE demonstration owner to ONE "
+        "selected current owner. Image 1 keeps the demonstration owner context: its "
+        "green outline identifies the owner, translucent red highlights the known "
+        "interaction region, and yellow numbered points are the source queries. "
+        "Some queries deliberately lie outside the red region because they define "
+        "functional directions; use their descriptions and the demonstrated purpose. "
+        "The supplied red region may have noisy boundary pixels outside the green "
+        "owner. They are shown unchanged; the selected owner takes priority and "
+        "every source query belongs to it. Do not interpret spilled red pixels as "
+        "another interaction owner. "
+        "Image 2 shows the selected current owner in green and numbered coarse grid "
+        "cells. Only cells containing current-owner pixels are allowed. For every "
+        "source query, identify the current-owner location with the same functional "
+        "role and choose the cell containing that location. This is coarse semantic "
+        "search guidance; do not estimate a precise mask, coordinate, depth, axis, "
+        "pose or distance. Multiple queries may select the same cell. If a query's "
+        "functional counterpart is absent, occluded or cannot be identified from "
+        "these images, return null for that query instead of guessing or selecting "
+        "a merely similar-looking unrelated part. Return exactly {\"cells\": "
+        "[integer_cell_ID_or_null, ...]}, in source query ID order, one entry per "
+        "query. Do not return metric geometry or additional keys.\n"
+        + json.dumps(details, ensure_ascii=False)
+    )
+    response = _client(client).chat_json(prompt, images=[source_panel, current_panel])
+    if (not isinstance(response, dict) or set(response) != {"cells"}
+            or not isinstance(response["cells"], list)
+            or len(response["cells"]) != len(pixels)):
+        raise ValueError("Query proposal must contain exactly one cells list matching the query count")
+    selected = response["cells"]
+    boxes = []
+    for index, number in enumerate(selected):
+        if number is None:
+            raise ValueError(f"Unresolved functional correspondence for source query {index+1}")
+        if type(number) is not int or number not in cells:
+            raise ValueError(f"Invalid current-owner cell for source query {index+1}: {number!r}")
+        x0, y0, x1, y1 = cells[number]
+        # Small fixed margins absorb coarse grid-boundary uncertainty. Expansion
+        # never substitutes for the caller's owner/valid-depth intersection.
+        dx, dy = max(1, (x1-x0+3)//4), max(1, (y1-y0+3)//4)
+        boxes.append([max(0, x0-dx), max(0, y0-dy),
+                      min(current_image.width, x1+dx), min(current_image.height, y1+dy)])
+    return {"boxes": np.asarray(boxes, dtype=np.int64), "diagnostics": {
+        "description": details["description"],
+        "query_descriptions": [item["description"] for item in details["queries"]],
+        "source_interaction_pixels_outside_owner": source_spill,
+        "query_count": len(pixels), "grid_shape": [5, 5],
+        "allowed_cells": details["allowed_cells"], "selected_cell_ids": selected.copy(),
+        "cell_boxes": [cells[number].copy() for number in selected],
+        "search_boxes": boxes, "margin_fraction": .25,
+        "box_convention": "current-image xyxy; right and bottom exclusive",
+        "display": {
+            "source": {"native_size": list(source_image.size), "panel_size": list(source_panel.size),
+                       "scale_xy": source_scale.tolist()},
+            "current": {"native_size": list(current_image.size), "panel_size": list(current_panel.size),
+                        "scale_xy": current_scale.tolist()},
+            "pixel_center_mapping": "(native_xy + 0.5) * scale_xy - 0.5",
+            "edge_mapping": "native_xy * scale_xy",
+        },
+        "scope": ("VLM-selected program-defined coarse search windows; "
+                  "not a current interaction mask or metric correspondence"),
+        "client_calls": 1,
+    }}
+# END source-evidence query proposals.
+
+
 def _square(image):
     """Pad before extraction, avoiding different SD/DINO resize-rounding offsets."""
     size = max(image.size)

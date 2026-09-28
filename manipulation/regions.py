@@ -1,11 +1,12 @@
-"""Consume interaction regions without requiring three named semantic points.
+"""Consume source interaction regions and infer current functional geometry.
 
-Masks select visible metric evidence; owner masks only provide image context.
-All rigid transforms use column vectors and metres. A functional frame has an
-explicit origin, signed operational x axis and signed function-plane z normal.
-Its axes describe the supplied functional geometry, not an inferred whole-object
-shape registration. Partial relations must keep their unobserved freedoms outside
-the full-frame API instead of silently inventing an axis.
+The known source interaction mask records the demonstrated local interaction.
+Current owner masks bound visual search; current part masks are not inputs.
+All rigid transforms use column vectors and metres. A full functional frame has
+an explicit origin, signed operational x axis and function-plane z normal. A
+plane recipe instead marks its tangent as a coordinate preference, so consumers
+cannot mistake an unobserved functional angle for a hard geometric constraint.
+Neither recipe estimates whole-object shape registration.
 """
 
 # BEGIN local interaction-region geometry and functional-frame consumers.
@@ -15,9 +16,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .goals import SupportSurface, _points, place_on
-from .grounding import _image, match_points
+from .grounding import _image, match_points, propose_query_regions
 from .motion import _inverse, _pose_array
-from .observations import _mask, backproject, rigid_registration
+from .observations import _intrinsics, _mask, backproject, rigid_registration
 
 
 def _vector(value, name):
@@ -310,28 +311,6 @@ def sample_region_pixels(mask, depth, count=24):
     return candidates[selected], valid.copy()
 
 
-def _observation(record, name):
-    if not isinstance(record, Mapping):
-        raise ValueError(f"{name} must be a region observation mapping")
-    required = {"image", "mask", "owner_mask", "depth", "K", "T_camera_owner", "region_id", "owner_id"}
-    if not required.issubset(record):
-        raise ValueError(f"{name} is missing region observation fields: {sorted(required-set(record))}")
-    for key in ("region_id", "owner_id"):
-        if not isinstance(record[key], str) or not record[key].strip():
-            raise ValueError(f"{name}.{key} must be a nonempty string")
-    image = _image(record["image"])
-    shape = (image.height, image.width)
-    region = _mask(record["mask"], shape, f"{name}.mask")
-    owner = _mask(record["owner_mask"], shape, f"{name}.owner_mask")
-    if np.any(region & ~owner):
-        raise ValueError(f"{name} region mask extends outside its declared owner; resolve ownership before matching")
-    depth = np.asarray(record["depth"], dtype=float)
-    if depth.shape != shape:
-        raise ValueError(f"{name} RGB, mask and registered depth dimensions must agree")
-    pose = _pose_array(record["T_camera_owner"], f"{name}.T_camera_owner")
-    return image, region, owner, depth, pose
-
-
 def _context_crop(image, owner_mask, region_mask):
     """Keep owner context for descriptors while restricting their candidate ROI."""
     y, x = np.nonzero(owner_mask)
@@ -343,57 +322,235 @@ def _context_crop(image, owner_mask, region_mask):
             np.array([x0, y0]))
 
 
-def match_regions(demo, scene, *, extractor=None, max_error=0.01):
-    """Bind paired visible regions using owner context, masked matching and depth.
+# BEGIN asymmetric source-functional-query to current-owner grounding.
+def _owner_observation(record, name):
+    """Validate observable owner data without requiring its functional answer."""
+    if not isinstance(record, Mapping):
+        raise ValueError(f"{name} must be an owner observation mapping")
+    required = {"image", "owner_mask", "depth", "K", "T_camera_owner", "owner_id"}
+    if not required.issubset(record):
+        raise ValueError(f"{name} is missing owner observation fields: {sorted(required-set(record))}")
+    if not isinstance(record["owner_id"], str) or not record["owner_id"].strip():
+        raise ValueError(f"{name}.owner_id must be a nonempty string")
+    image = _image(record["image"])
+    shape = (image.height, image.width)
+    owner = _mask(record["owner_mask"], shape, f"{name}.owner_mask")
+    depth = np.asarray(record["depth"], dtype=float)
+    if depth.shape != shape:
+        raise ValueError(f"{name} RGB, owner mask and registered depth dimensions must agree")
+    _intrinsics(record["K"])
+    if not np.any(owner & np.isfinite(depth) & (depth > 0)):
+        raise ValueError(f"{name} owner has no valid depth")
+    pose = _pose_array(record["T_camera_owner"], f"{name}.T_camera_owner")
+    return image, owner, depth, pose
 
-    Each mapping supplies ``image, mask, owner_mask, depth, K, T_camera_owner,
-    region_id, owner_id``. Owner IDs identify the separately selected instances;
-    this numeric API does not prove their semantic identity. The caller supplies
-    a semantic pairing, and a region outside its declared owner is rejected.
 
-    Existing SD/DINO correspondence is used unchanged. Only source-region pixels
-    are sampled; only target-region pixels with valid depth are candidates. All
-    matched points are transformed to the associated owner-local coordinates
-    before rigid fitting. No GT mask, whole-owner fallback, mask intersection
-    repair, or fixed function/center/grasp keypoint is introduced.
+def _source_observation(demo):
+    """Require source function evidence, including its geometric query roles.
+
+    Function-direction witnesses may lie outside the true interaction patch,
+    but must remain on the same selected source owner. The interaction mask is
+    never expanded to make it encompass those witnesses. Small segmentation
+    disagreements are reported instead of treating pixel containment as proof
+    of owner identity; query ownership itself is checked by backprojection.
     """
-    first, mask1, owner1, depth1, pose1 = _observation(demo, "demo")
-    second, mask2, owner2, depth2, pose2 = _observation(scene, "scene")
-    pixels, valid1 = sample_region_pixels(mask1, depth1)
-    valid2 = mask2 & np.isfinite(depth2) & (depth2 > 0)
-    if valid2.sum() < 3:
-        raise ValueError("Scene region has fewer than three valid depth pixels")
-    first_crop, first_mask, first_offset = _context_crop(first, owner1, valid1)
-    second_crop, second_mask, second_offset = _context_crop(second, owner2, valid2)
-    targets, matching = match_points(first_crop, second_crop, first_mask, second_mask,
-                                     pixels-first_offset, extractor=extractor)
-    targets = targets + second_offset
-    scores = np.asarray(matching["scores"], dtype=float)
-    selected, seen = [], set()
-    for index in np.argsort(-scores, kind="stable"):
-        key = tuple(np.rint(targets[index]).astype(int))
-        # Preserve nearest-match diagnostics instead of assigning a convenient
-        # unused pixel. Rigid consensus judges metric compatibility; descriptor
-        # ties remain visible and are not a semantic-confidence certificate.
-        if scores[index] <= 0 or key in seen:
-            continue
-        selected.append(int(index))
-        seen.add(key)
-    if len(selected) < 3:
-        raise ValueError("Region correspondences have fewer than three distinct positive-score targets")
-    source_pixels, target_pixels = pixels[selected], targets[selected]
-    camera1 = backproject(depth1, demo["K"], source_pixels, mask=valid1)
-    camera2 = backproject(depth2, scene["K"], target_pixels, mask=valid2)
-    local1 = (camera1-pose1[:3, 3]) @ pose1[:3, :3]
-    local2 = (camera2-pose2[:3, 3]) @ pose2[:3, :3]
-    binding = bind_region(local1, local2, max_error=max_error)
-    return {"transform": binding["transform"],
-            "source_region_id": demo["region_id"], "target_region_id": scene["region_id"],
-            "source_owner_id": demo["owner_id"], "target_owner_id": scene["owner_id"],
-            "diagnostics": {"source_pixels": source_pixels, "target_pixels": target_pixels,
-                            "source_local_points": local1, "target_local_points": local2,
-                            "selected_query_indices": selected, "matching": matching,
-                            "rigid_fit": binding["diagnostics"],
-                            "crop_offsets_xy": [first_offset, second_offset],
-                            "source": "paired semantic-region correspondences and calibrated metric RGB-D"}}
+    image, owner, depth, pose = _owner_observation(demo, "demo")
+    required = {"mask", "region_id", "description", "query_pixels", "query_descriptions", "frame_recipe"}
+    if not required.issubset(demo):
+        raise ValueError(f"demo is missing source functional fields: {sorted(required-set(demo))}")
+    for name in ("region_id", "description"):
+        if not isinstance(demo[name], str) or not demo[name].strip():
+            raise ValueError(f"demo.{name} must be a nonempty string")
+    region = _mask(demo["mask"], (image.height, image.width), "demo interaction mask")
+    if not np.any(region & owner):
+        raise ValueError("Source interaction mask has no overlap with its selected owner")
+    pixels = np.asarray(demo["query_pixels"])
+    if (pixels.ndim != 2 or pixels.shape[1:] != (2,) or len(pixels) < 3
+            or pixels.dtype.kind not in "iuf" or not np.isfinite(pixels).all()):
+        raise ValueError("query_pixels must contain at least three finite numeric (u,v) queries")
+    descriptions = demo["query_descriptions"]
+    if (not isinstance(descriptions, (list, tuple)) or len(descriptions) != len(pixels)
+            or any(not isinstance(value, str) or not value.strip() for value in descriptions)):
+        raise ValueError("query_descriptions must explain every source query's geometric role")
+    pixels = pixels.astype(float, copy=True)
+    # Explicit queries retain their row identity; invalid depth and queries
+    # outside the selected owner fail instead of being dropped or replaced.
+    camera = backproject(depth, demo["K"], pixels, mask=owner)
+    local = (camera-pose[:3, 3]) @ pose[:3, :3]
+    return image, owner, region, depth, pose, pixels, local
+
+
+def _recipe_frame(points, recipe):
+    """Rebuild a function frame, independent of cross-instance point distances.
+
+    For Q (N,3), o=Q.T@w, a=Q.T@axis_weights and b=Q.T@plane_weights.
+    sum(w)=1 and both direction sums=0 make the construction SE(3)-equivariant.
+    x=unit(a), z=unit(b cross x), y=z cross x. Different point distances and
+    shapes are allowed. Zero or parallel directions cannot produce a frame.
+
+    In ``plane`` mode the same arithmetic supplies a reproducible plane basis,
+    but its x direction is merely a chosen tangent, never an observed functional
+    angle. Its ordered normal is not automatically a physical outward normal;
+    the source recipe must describe its sign evidence for the relevant caller.
+    """
+    if not isinstance(recipe, Mapping):
+        raise ValueError("frame_recipe must be an explicit geometric recipe mapping")
+    required = {"kind", "origin_weights", "axis_weights", "plane_weights", "source"}
+    if not required.issubset(recipe):
+        raise ValueError(f"frame_recipe is missing fields: {sorted(required-set(recipe))}")
+    if recipe["kind"] not in ("frame", "plane"):
+        raise ValueError("frame_recipe.kind must be 'frame' or 'plane'")
+    if not isinstance(recipe["source"], str) or not recipe["source"].strip():
+        raise ValueError("frame_recipe.source must explain functional geometry and normal-sign evidence")
+    geometry = _points(points, "functional query points", minimum=3)
+    weights = {}
+    for key, expected_sum in (("origin_weights", 1.), ("axis_weights", 0.), ("plane_weights", 0.)):
+        values = np.asarray(recipe[key])
+        if (values.shape != (len(geometry),) or values.dtype.kind not in "iuf"
+                or not np.isfinite(values).all()):
+            raise ValueError(f"frame_recipe.{key} must be a finite numeric weight for every query")
+        values = values.astype(float, copy=True)
+        if not np.isclose(values.sum(), expected_sum, atol=1e-9, rtol=0):
+            raise ValueError(f"frame_recipe.{key} must sum to {expected_sum:g}")
+        weights[key] = values
+    origin = geometry.T @ weights["origin_weights"]
+    a, b = geometry.T @ weights["axis_weights"], geometry.T @ weights["plane_weights"]
+    x, hint = _unit(a, "recipe axis"), _unit(b, "recipe plane hint")
+    cross = np.cross(hint, x)
+    independence = float(np.linalg.norm(cross))
+    if independence <= 1e-6:
+        raise ValueError("Functional recipe directions are collinear or insufficiently independent")
+    frame = function_frame(origin, x, cross / independence)
+    provenance = ("observed functional query direction" if recipe["kind"] == "frame"
+                  else "chosen ordered-sample tangent preference; not an observed functional angle")
+    normalized = {"kind": recipe["kind"], **weights, "source": recipe["source"]}
+    return frame, {"recipe": normalized,
+                   "axis_length_m": float(np.linalg.norm(a)),
+                   "plane_hint_length_m": float(np.linalg.norm(b)),
+                   "direction_independence_sine": independence,
+                   "x_axis_source": provenance,
+                   "normal_source": "ordered recipe directions; physical outward sign requires declared source evidence",
+                   "shape_assumption": "functional query correspondence; no local or whole-owner rigid congruence"}
+
+
+def source_function_geometry(demo):
+    """Validate and lift compiled source functional queries without inference.
+
+    Source includes the true interaction mask, owner context, explicit queries,
+    per-query descriptions and a geometry recipe. It need not contain fixed
+    function/center/grasp landmarks. This computes the recipe's source frame;
+    a program binder separately checks agreement with its compiled event frame.
+    No visual model, current scene, API request or point matching is involved.
+    """
+    _, owner, region, _, _, pixels, points = _source_observation(demo)
+    frame, diagnostics = _recipe_frame(points, demo["frame_recipe"])
+    rows = np.rint(pixels).astype(int)
+    in_interaction = (region & owner)[rows[:, 1], rows[:, 0]]
+    normal_role = demo.get("normal_role")
+    if normal_role is not None and (demo["frame_recipe"]["kind"] != "plane"
+                                    or normal_role not in ("outward", "support")):
+        raise ValueError("normal_role must be 'outward' or 'support' on a plane recipe")
+    diagnostics.update(source_pixels=pixels,
+                       query_descriptions=list(demo["query_descriptions"]),
+                       region_id=demo["region_id"], owner_id=demo["owner_id"],
+                       description=demo["description"],
+                       interaction_query_indices=np.flatnonzero(in_interaction),
+                       queries_outside_interaction_mask=np.flatnonzero(~in_interaction),
+                       normal_role=normal_role,
+                       interaction_evidence_scope="matched visible query samples; not a recovered complete contact face",
+                       interaction_pixels_outside_owner=int(np.count_nonzero(region & ~owner)))
+    return {"source_frame": frame, "geometry_kind": demo["frame_recipe"]["kind"],
+            "normal_role": normal_role,
+            "source_points": points, "source_origin": frame[:3, 3].copy(),
+            "source_normal": frame[:3, 2].copy(), "diagnostics": diagnostics}
+
+
+def match_functional_region(demo, current, *, client=None, extractor=None):
+    """Infer current functional geometry from source evidence and owner RGB-D.
+
+    Current input contains only image, owner_mask, depth, K, T_camera_owner and
+    owner_id. It never supplies a part mask, functional frame or target queries.
+    The VLM chooses coarse owner-local candidate cells from the source example;
+    the existing dense matcher searches each proposed box intersected with the
+    current owner and valid depth. Those query correspondences reconstruct the
+    current functional frame under the same source recipe. Unlike rigid fitting,
+    no cross-instance pairwise-distance equality is assumed.
+
+    Owner-context crops are fixed for all queries. One descriptor pair is
+    extracted and reused; each matcher invocation retains its bounded sampling.
+    Repeated target pixels are not arbitrarily reassigned: recipe degeneracy,
+    together with reported correspondence ambiguity, exposes missing geometry.
+    A geometric frame candidate is not proof of semantic or physical success.
+    """
+    source = source_function_geometry(demo)
+    first, owner1, region, depth1, _, pixels, _ = _source_observation(demo)
+    second, owner2, depth2, pose2 = _owner_observation(current, "current")
+    first_crop, first_owner, first_offset = _context_crop(first, owner1, owner1)
+    second_crop, second_owner, second_offset = _context_crop(second, owner2, owner2)
+    x, y = first_offset
+    first_region = region[y:y+first_crop.height, x:x+first_crop.width]
+    proposals = propose_query_regions(
+        first_crop, second_crop, first_owner, second_owner, first_region,
+        pixels-first_offset, description=demo["description"],
+        query_descriptions=demo["query_descriptions"], client=client)
+    boxes = np.asarray(proposals["boxes"])
+    if (boxes.shape != (len(pixels), 4) or boxes.dtype.kind not in "iu"
+            or np.any(boxes[:, :2] < 0) or np.any(boxes[:, 2:] <= boxes[:, :2])
+            or np.any(boxes[:, 2:] > [second_crop.width, second_crop.height])):
+        raise ValueError("Coarse query boxes must be valid integer xyxy boxes for every query")
+    x1, y1 = first_offset
+    x2, y2 = second_offset
+    first_valid = first_owner & np.isfinite(depth1[y1:y1+first_crop.height, x1:x1+first_crop.width])
+    first_valid &= depth1[y1:y1+first_crop.height, x1:x1+first_crop.width] > 0
+    second_depth = depth2[y2:y2+second_crop.height, x2:x2+second_crop.width]
+    second_valid = second_owner & np.isfinite(second_depth) & (second_depth > 0)
+    for index, (left, top, right, bottom) in enumerate(boxes):
+        if not second_valid[top:bottom, left:right].any():
+            raise ValueError(f"Coarse region for query {index} has no valid current owner depth")
+    pair_cache = None
+
+    def cached_pair(first_image, second_image):
+        nonlocal pair_cache
+        if pair_cache is None:
+            actual = extractor
+            if actual is None:
+                from local_models.sd_dino import extract_pair
+                actual = extract_pair
+            pair_cache = actual(first_image, second_image)
+        return pair_cache
+
+    targets, matching = [], []
+    for index, (left, top, right, bottom) in enumerate(boxes):
+        candidates = np.zeros_like(second_valid)
+        candidates[top:bottom, left:right] = second_valid[top:bottom, left:right]
+        found, diagnostic = match_points(first_crop, second_crop, first_valid, candidates,
+                                         (pixels[index:index+1]-first_offset), extractor=cached_pair)
+        if not np.isfinite(diagnostic["scores"][0]) or diagnostic["scores"][0] <= 0:
+            raise ValueError(f"Functional query {index} has no positive-score descriptor candidate")
+        targets.append(found[0]+second_offset)
+        matching.append(diagnostic)
+    target_pixels = np.asarray(targets)
+    camera_points = backproject(depth2, current["K"], target_pixels, mask=owner2)
+    target_points = (camera_points-pose2[:3, 3]) @ pose2[:3, :3]
+    target_frame, target_diagnostics = _recipe_frame(target_points, demo["frame_recipe"])
+    diagnostics = dict(source["diagnostics"])
+    # Per-query coarse windows require separate matcher calls. Retain duplicate
+    # identities across those calls as evidence instead of inventing uniqueness.
+    duplicate_groups = [np.flatnonzero(np.all(target_pixels == pixel, axis=1)).tolist()
+                        for pixel in np.unique(target_pixels, axis=0)
+                        if np.count_nonzero(np.all(target_pixels == pixel, axis=1)) > 1]
+    diagnostics.update(target_geometry=target_diagnostics,
+                       target_pixels=target_pixels, target_owner_id=current["owner_id"],
+                       matching=matching, coarse_regions=proposals["diagnostics"],
+                       coarse_boxes_xyxy=boxes,
+                       crop_offsets_xy=[first_offset, second_offset],
+                       descriptor_pair_extractions=1,
+                       duplicate_target_groups=duplicate_groups,
+                       matching_scope="source functional queries to coarse regions inside current owner",
+                       transform_scope="functional-frame correspondence, not whole-owner rigid registration")
+    return {**source, "target_frame": target_frame,
+            "transform": target_frame @ _inverse(source["source_frame"]),
+            "target_points": target_points, "target_origin": target_frame[:3, 3].copy(),
+            "target_normal": target_frame[:3, 2].copy(), "diagnostics": diagnostics}
+# END asymmetric source-functional-query grounding.
 # END local interaction-region geometry and functional-frame consumers.

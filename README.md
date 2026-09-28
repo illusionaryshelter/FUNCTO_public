@@ -168,15 +168,58 @@ one supported estimator, not a replacement for functional semantics.
 Owner-local functional frames and current output coordinates are distinct:
 `scene.reference_pose` maps the current reference owner into the named output
 `scene.reference_frame`; use an explicit identity only when they coincide.
-`perception.bind_current_scene` binds cached demonstration regions to current
-observations without rerunning source tracking. It checks both source and
-current owner IDs and confines correspondence sampling/search to the actual
-part masks. Missing/ambiguous parts do not fall back to whole-object masks.
+`perception.bind_current_scene(program, scene, source_templates, current_owners)`
+binds cached demonstration evidence without rerunning source tracking. Source
+templates contain the known interaction region, explanatory query pixels and
+their geometric construction. **Current input contains owner RGB-D only; no
+current part mask, part ID, target query or functional frame is supplied.**
+Gemini uses the source evidence to propose coarse search cells; the existing
+SD-DINO matcher searches those windows inside the current owner. One descriptor
+pair is reused for the queries. The source/current frames are reconstructed
+independently, so changed part dimensions do not have to pass a rigid-shape fit.
 
-For an `on` event, use the supplied local contact face and bounded support;
-`ground_on` aligns its normal and checks both the specified face and complete
-body extent. A free twist is selected from the demonstration preference, not
-declared observed. Constrained parts require a sourced current `motion_model`,
+The source template fields are `image`, `mask` (offline interaction region),
+`owner_mask`, registered metric `depth`, `K`, `T_camera_owner`, `owner_id`,
+`region_id`, `description`, `query_pixels`, `query_descriptions` and
+`frame_recipe`. Direction queries may be elsewhere on the same owner: a small
+contact patch does not necessarily contain every directional cue. The recipe
+stores `kind` (`frame` or `plane`), `origin_weights`, `axis_weights`,
+`plane_weights`, and an evidence `source`. Weights have one entry per query;
+their sums are respectively 1, 0, and 0. `plane_weights` defines the second
+in-plane hint, not a normal. The origin and two directed hints reconstruct a
+right-handed frame. These weights express evidenced functional geometry, not
+an automatic semantic interpretation of arbitrary sampled points. Source
+reconstruction is checked against compiled event frames before model inference.
+
+Each current owner supplies `image`, `owner_mask`, registered metric `depth`,
+`K`, `owner_id`, `T_output_camera` and a `frame_convention`: `tracked_owner`
+uses its existing `T_camera_owner`; `binding_camera` explicitly defines the
+binding-time camera as its fixed initial local coordinates. Identity in the
+latter case is a coordinate definition, not an inferred physical orientation.
+Subsequent tracking must preserve that definition. Camera calibration cannot
+be replaced by the coordinate choice. A grasp needs only the carrier owner;
+manipulation needs both carrier and reference.
+
+`perception.ground_current_program(..., output="eef")` calls this binder and
+the existing complete skill consumer. Choose `output="object"` explicitly
+for manipulation body geometry. Missing actual Holding never silently switches
+an EEF request to object-only output. Both return candidates with correspondence
+and coordinate evidence, not certificates of physical execution. The existing
+raw-video `--demo` path keeps its separate extraction/tracking responsibility.
+
+For an `on` event, a source plane recipe additionally declares `normal_role` as
+`outward` (carrier) or `support` (reference), backed by its offline evidence.
+Matched queries originally inside the source interaction mask can generate
+sparse current contact samples; auxiliary direction queries cannot stand in
+for contact samples. The existing support estimator recovers a finite visible
+surface from current owner RGB-D and checks it against the correspondence.
+Richer current model geometry may be supplied, but current part geometry is
+not a universal external prerequisite. Sparse samples and visible body points
+do not certify hidden geometry or a complete contact face. `ground_on` checks
+the contact samples, signed normal, supplied body extent and finite support.
+Plane-frame tangents are numerical preferences, not measured functional twist;
+plane evidence is rejected where a full functional orientation is required.
+Constrained parts require a sourced current `motion_model`,
 including available coordinate limits. Required function poses cannot be
 silently projected off that mechanism. Supplied entry corridors remain checked.
 
