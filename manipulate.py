@@ -1,19 +1,21 @@
 # BEGIN calibrated material-track contract in CLI documentation.
-"""Transfer an object/part demonstration, or replay grounded observations.
+"""Transfer an object/part demonstration, or consume a compiled skill.
 
 Examples:
   python manipulate.py --demo demo_dir --scene scene_dir --instruction 'push the drawer closed' --output-dir runs/close
   python manipulate.py --prepared observations.json --output-dir runs/replay
 
 RGB-D inputs use aligned rgb/, depth/ and intrinsic.json. The output is an
-object/part trajectory, not a robot end-effector or force-control command.
+object/part trajectory. A prepared grasp/manipulation InteractionProgram also
+produces explicit EEF geometry and gripper intentions. Neither output is a
+robot joint command or a certificate of successful physical execution.
 
 Local TAPIP3D tracks material points; rigid fits drive optional owned semantic
 anchors. For stationary recordings, config.json declares stationary_camera=true.
 Known camera-from-world poses are supported by the programmatic observation API.
 No instance mesh or mandatory function/grasp point is needed for object motion.
-The annotated tool subset retains its original initial semantics and function
-event, while obtaining its demonstration motion from the same tracker.
+Compiled tool semantics supply owner-local function frames and internal
+function events, while demonstration motion can come from the same tracker.
 """
 # END calibrated material-track contract in CLI documentation.
 
@@ -27,7 +29,9 @@ def main():
     parser.add_argument("--demo", type=Path, help="One demonstrated RGB-D stage")
     parser.add_argument("--scene", type=Path, help="Current calibrated initial RGB-D observation")
     parser.add_argument("--instruction", help="Task instruction for the demonstrated stage")
-    parser.add_argument("--prepared", type=Path, help="Replay already grounded observations or ordered stages")
+    # BEGIN shared prepared input for compiled and object geometry consumers.
+    parser.add_argument("--prepared", type=Path, help="Consume a compiled skill with current bindings, grounded observations, or ordered object stages")
+    # END prepared input description.
     parser.add_argument("--output-dir", type=Path, required=True, help="Empty directory for this run")
     parser.add_argument("--no-render", action="store_true", help="Skip the bounded offline trajectory plot")
     args = parser.parse_args()

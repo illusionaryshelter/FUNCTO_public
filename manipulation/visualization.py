@@ -251,6 +251,10 @@ def render_result(result, output_dir):
     The JSON records actual transformed probe coordinates, not image similarity.
     No global Matplotlib backend, model state, or working directory is changed.
     """
+    # BEGIN explicit EEF and internal functional-event rendering.
+    if isinstance(result, dict) and ("eef_poses" in result or "function_checks" in result):
+        return _render_program(result, output_dir)
+    # END skill program rendering.
     if not isinstance(result, dict):
         raise ValueError("result must be a result dictionary")
     stages = result.get("stages", [result])
@@ -332,3 +336,65 @@ def render_result(result, output_dir):
         figure.clear()
     return {"trajectory_png": str(png.resolve()), "coordinate_checks_json": str(checks.resolve())}
 # END independent object-trajectory rendering and coordinate verification.
+
+
+# BEGIN independent skill-geometry rendering, with no invented body shape.
+def _render_program(result, output_dir):
+    """Show actual saved EEF/body origins and internal event locations on CPU.
+
+    A line represents a frame origin, never a reconstructed physical surface.
+    Released object motion is not extrapolated. The numeric result remains the
+    authoritative artifact; this bounded plot makes phase boundaries visible.
+    """
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    figure = Figure(figsize=(9, 7))
+    FigureCanvasAgg(figure)
+    axis = figure.add_subplot(111, projection="3d")
+    all_points, records = [], {}
+    for key, label, color in (("eef_poses", "EEF origin", "tab:blue"),
+                              ("object_poses", "controlled body origin", "tab:orange"),
+                              ("poses", "body origin", "tab:orange")):
+        if key not in result:
+            continue
+        poses = _poses(result[key], key)
+        positions = poses[_indices(len(poses), 1000), :3, 3]
+        axis.plot(*positions.T, label=label, color=color)
+        axis.scatter(*positions[0], color=color, marker="o", s=22)
+        axis.scatter(*positions[-1], color=color, marker="s", s=22)
+        all_points.append(positions)
+        records[key] = {"count": len(poses), "start": poses[0].tolist(), "end": poses[-1].tolist()}
+    for check in result.get("function_checks", []):
+        point = _poses(np.asarray(check["goal_pose"])[None], "function goal")[0, :3, 3]
+        axis.scatter(*point, color="tab:red", marker="x", s=40)
+        # Full semantic IDs remain in the numeric report; compact frame labels
+        # prevent long event names from clipping a 3-D view's right boundary.
+        axis.text(*point, f" f{check['frame_index']}", fontsize=8)
+    if not all_points:
+        raise ValueError("The skill has no geometric references to display")
+    cloud = np.concatenate(all_points)
+    center = (cloud.min(0) + cloud.max(0)) / 2
+    radius = max(float(np.ptp(cloud, axis=0).max()) / 2, .01)
+    axis.set(xlim=(center[0] - radius, center[0] + radius),
+             ylim=(center[1] - radius, center[1] + radius),
+             zlim=(center[2] - radius, center[2] + radius),
+             xlabel="x (m)", ylabel="y (m)", zlabel="z (m)")
+    axis.set_box_aspect((1, 1, 1))
+    axis.legend(fontsize=8)
+    axis.set_title(f"Geometry reference in {result['reference_frame']}\n"
+                   "frame origins; physical feasibility is not established")
+    png, checks = destination / "trajectory.png", destination / "coordinate_checks.json"
+    try:
+        figure.subplots_adjust(left=.03, right=.84, bottom=.07, top=.88)
+        figure.savefig(png, dpi=130)
+        checks.write_text(json.dumps({"scope": "saved frame origins only", "references": records,
+                                     "function_events": [{"event_id": item["event_id"], "frame_index": item["frame_index"]}
+                                                         for item in result.get("function_checks", [])]},
+                                     indent=2, allow_nan=False) + "\n")
+    finally:
+        figure.clear()
+    return {"trajectory_png": str(png.resolve()), "coordinate_checks_json": str(checks.resolve())}
+# END skill-geometry rendering.

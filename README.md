@@ -144,7 +144,66 @@ PYTHONNOUSERSITE=1 MPLBACKEND=Agg PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 `manipulate.py` adds a separate path for object transport, placement, containment
 and articulated parts. Motion, goal relation and interaction are independent:
 an object does not need a tool function point, and a pushed part does not need a
-grasp point. The existing `main.py` tool-use example remains available unchanged.
+grasp point. The existing `main.py` tool-use reproduction remains available.
+
+<!-- BEGIN compiled region/grasp/function-event consumer. -->
+### Compiled skills and functional regions
+
+`manipulation.program.ground_program(program, scene)` consumes independent
+`skill_kind="grasp"` and `"manipulation"` skills. It returns EEF geometry,
+explicit gripper intentions and original frame IDs/timestamps. A grasp is a
+candidate until current observations verify stable holding; lifting belongs to
+the subsequent manipulation. Held-object motion uses the caller's measured
+`scene.holding.T_carrier_eef`, not the preceding grasp candidate. At release,
+the EEF continues independently and the released object requires observation.
+
+`regions.function_frame` constructs directions from evidenced functional
+geometry. `regions.ground_relation` preserves both sides of the relation:
+`D_new = F_reference_new @ inverse(F_reference_demo) @ D_demo @ F_carrier_demo
+@ inverse(F_carrier_new)`. Explicit internal function events prevent initial-pose
+normalization from cancelling the carrier's functional offset. Region clouds do
+not have to describe globally congruent objects. RGB-D local correspondence is
+one supported estimator, not a replacement for functional semantics.
+
+Owner-local functional frames and current output coordinates are distinct:
+`scene.reference_pose` maps the current reference owner into the named output
+`scene.reference_frame`; use an explicit identity only when they coincide.
+`perception.bind_current_scene` binds cached demonstration regions to current
+observations without rerunning source tracking. It checks both source and
+current owner IDs and confines correspondence sampling/search to the actual
+part masks. Missing/ambiguous parts do not fall back to whole-object masks.
+
+For an `on` event, use the supplied local contact face and bounded support;
+`ground_on` aligns its normal and checks both the specified face and complete
+body extent. A free twist is selected from the demonstration preference, not
+declared observed. Constrained parts require a sourced current `motion_model`,
+including available coordinate limits. Required function poses cannot be
+silently projected off that mechanism. Supplied entry corridors remain checked.
+
+`function_motion.transfer_function_motion` consumes function-frame SE(3) poses
+directly, keeps the original function-origin/Euler objective and internal hard
+events, and independently verifies all saved-node increments. Its fixed strict
+constraint mode does not retry by weakening angular limits. The compiled tool
+object path uses the same core; missing actual holding never produces a fake EEF.
+
+Existing `--prepared` accepts a JSON object containing `skill_kind`, `demo`,
+`task` when needed, and the current `scene`. Source numeric arrays may live in
+`demo.trajectory_file` (NPZ, relative to the input JSON); field duplication is
+rejected and saved run metadata retains an absolute reference for replay.
+
+```bash
+PYTHONNOUSERSITE=1 python manipulate.py --prepared /path/to/prepared.json \
+  --output-dir runs/compiled-skill
+```
+
+The read-only offline exporter is `../collect/export_functo.py`. Actual eight-clip
+numeric examples and full field conventions are documented in
+[the implementation and mathematical review](../sim-version-plans/2026-09-28-mimicfunc-region-math-and-implementation.md).
+Those are same-instance offline GT fixtures, not proof of SAM localization,
+cross-instance grounding or robot execution. The current semantic mask gaps
+remain explicit. No environment installation or model download is required for
+the numeric consumers.
+<!-- END compiled region/grasp/function-event consumer. -->
 
 ```bash
 PYTHONNOUSERSITE=1 MPLCONFIGDIR=/tmp/functo-mpl OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
@@ -182,11 +241,13 @@ Optional semantic points and directions bind once to an explicit owner using
 `manipulation.anchors.bind_anchors` and follow that owner's fixed body poses
 through `propagate_anchors`. Empty anchor lists are valid for object motion.
 A sliding contact is not automatically treated as a fixed material point.
-The tool subset binds its initial function/center/grasp annotations through
-this same interface. `manipulate.py` now tracks tool demonstrations too, writes
-a derived demo under its output directory and preserves the original function
-event and optimizer; later historical track rows cannot bypass TAPIP3D.
-The original annotations and calibration are still required by that subset.
+The tool path now consumes `demo/interaction_program.json` (compiled functional
+frames, original timeline and internal events) and `scene/interaction_scene.json`
+(current functional bindings and geometry). Source tracking converts once to
+`T_reference_carrier`; an already compiled source trajectory can also be consumed
+directly. This production interface has no mandatory function/center/grasp triple
+or fixed list of tool-action names. The original `main.py` reproduction still
+uses its released annotations; it is not a fallback for missing region evidence.
 
 Observed compatible motion families and applied task constraints are separate
 in `motion_checks`. A straight carry does not automatically become a slider;

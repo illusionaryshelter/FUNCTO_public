@@ -18,37 +18,16 @@ from .motion import transfer_motion
 from .observations import backproject, load_rgbd, rigid_registration, track_rgbd
 from .pipeline import motion_kind, run_stage, write_json
 from .support_grounding import infer_support
-
-
-def _anchors(mask, depth, count=24):
-    """Choose spatially distributed, valid-depth observations inside one ROI."""
-    import cv2
-    valid = np.asarray(mask, bool) & np.isfinite(depth) & (depth > 0)
-    # Depth at object boundaries often belongs to the background. Erosion is a
-    # measurement choice, not a synthetic keypoint or a guessed depth value.
-    interior = cv2.erode(valid.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-    if interior.sum() >= count:
-        valid = interior
-    y, x = np.nonzero(valid)
-    if len(x) < 6:
-        raise ValueError("Insufficient valid depth in the selected entity")
-    candidates = np.column_stack((x, y)).astype(float)
-    if len(candidates) > 6000:
-        candidates = candidates[np.linspace(0, len(candidates)-1, 6000).astype(int)]
-    selected = [int(np.argmin(np.sum((candidates-candidates.mean(0))**2, axis=1)))]
-    distances = np.full(len(candidates), np.inf)
-    while len(selected) < min(count, len(candidates)):
-        distances = np.minimum(distances, np.sum((candidates-candidates[selected[-1]])**2, axis=1))
-        index = int(np.argmax(distances))
-        if distances[index] <= 0:
-            break
-        selected.append(index)
-    return candidates[selected], valid
+# BEGIN shared local-region evidence consumers.
+from .regions import match_regions, sample_region_pixels
+# END local-region imports.
 
 
 def _binding(demo_image, scene_image, demo_depth, scene_depth, demo_camera, scene_camera,
              demo_mask, scene_mask, extractor):
-    pixels, valid_demo = _anchors(demo_mask, demo_depth)
+    # BEGIN share region sampling while retaining owner geometry for tracking.
+    pixels, valid_demo = sample_region_pixels(demo_mask, demo_depth)
+    # END shared calibrated sampling.
     valid_scene = np.asarray(scene_mask, bool) & np.isfinite(scene_depth) & (scene_depth > 0)
     def crop(image, mask):
         yy, xx = np.nonzero(mask)
@@ -95,6 +74,63 @@ def _body_points(depth, camera, mask, initial_pose):
     return (cloud-initial_pose[:3, 3]) @ initial_pose[:3, :3]
 
 
+# BEGIN cached-demo to current-region binding, independent of demo tracking.
+def bind_current_scene(program, scene, region_pairs, *, extractor=None, max_error=.01):
+    """Bind compiled functional evidence using current calibrated region masks.
+
+    ``region_pairs`` maps an event ID to ``carrier`` and ``reference`` pairs
+    ``(demo_observation, current_observation)``; grasp uses one ``grasp`` pair.
+    Each observation follows ``regions.match_regions`` (image, part mask,
+    owner mask, depth, intrinsics, same-time camera-from-owner pose and IDs).
+    The current masks/poses must come from current perception. This entry point
+    neither loads an offline simulator state nor reruns source motion tracking.
+
+    Rigid local matching is appropriate only where correspondence supports it.
+    Different shapes may instead supply evidenced semantic functional frames
+    directly to ``ground_program``; failure here never falls back to owner-wide
+    fitting or region centroids. Owner IDs are checked but their semantic
+    identity remains the upstream selector's responsibility.
+    """
+    from copy import deepcopy
+    result = deepcopy(scene)
+    evidence = {}
+
+    def bind(pair, role):
+        source, current = pair
+        expected = scene[role + "_id"]
+        source_expected = program["demo"].get(role + "_id")
+        if not isinstance(source_expected, str) or not source_expected:
+            raise ValueError("Cached region grounding requires explicit demonstration owner role IDs")
+        if source.get("owner_id") != source_expected:
+            raise ValueError("Demonstration region owner does not match the compiled source role")
+        if current.get("owner_id") != expected:
+            raise ValueError("Current region owner does not match the selected scene role")
+        return match_regions(source, current, extractor=extractor, max_error=max_error)
+
+    if program["skill_kind"] == "grasp":
+        matched = bind(region_pairs["grasp"], "carrier")
+        result["region_transform"] = matched["transform"]
+        evidence["grasp"] = matched
+    elif program["skill_kind"] == "manipulation":
+        bindings = deepcopy(result.get("functional_bindings", {}))
+        for event in program["demo"]["functional_events"]:
+            name = event["event_id"]
+            carrier = bind(region_pairs[name]["carrier"], "carrier")
+            reference = bind(region_pairs[name]["reference"], "reference")
+            binding = bindings.setdefault(name, {})
+            binding.update(carrier_frame=carrier["transform"] @ np.asarray(event["carrier_frame"], float),
+                           reference_frame=reference["transform"] @ np.asarray(event["reference_frame"], float),
+                           carrier_id=scene["carrier_id"], reference_id=scene["reference_id"],
+                           source="calibrated local region correspondences")
+            evidence[name] = {"carrier": carrier, "reference": reference}
+        result["functional_bindings"] = bindings
+    else:
+        raise ValueError("Only grasp/manipulation programs have region bindings")
+    result["region_binding_evidence"] = evidence
+    return result
+# END independent current scene binding.
+
+
 def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
                 extractor=None, tracker=None, output_dir=None):
     """Produce a numerical stage from RGB-D and task semantics, without new labels.
@@ -115,7 +151,7 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
     task = infer_task(instruction, demo_image, scene_image,
                       demo_final_image=final_image, client=client)
     # BEGIN one observation path for tools, transported objects and moving parts.
-    # A tool's semantic annotations specify material points, not its subsequent
+    # Compiled functional frames describe fixed local geometry, not subsequent
     # motion. Track its carrier/reference exactly as for the other task families.
     if task["relation"] == "tool_use" and task["motion"] not in {"auto", "free"}:
         raise ValueError("The tool-use optimizer cannot jointly enforce function events and "
@@ -144,8 +180,8 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
     if len(demo_poses) != len(indices) or not np.array_equal(track["frame_indices"], indices):
         raise ValueError("Tracked poses do not cover the selected demonstration frames")
     if task["relation"] == "tool_use":
-        # The released tool subset already grounds its destination semantics.
-        # Repeating descriptor matching here would add work with no consumer.
+        # The compiled tool scene supplies its functional region bindings.
+        # Whole-owner matching here cannot replace those local correspondences.
         return {"tool_use": True, "task": task, "instruction": instruction, "tracking": track}
     scene_roles = select_roles(scene_image, task, "scene", detector=detector, client=client)
     role_masks("scene", scene_roles)
@@ -237,7 +273,7 @@ def run_rgbd(demo_dir, scene_dir, instruction, output_dir, **dependencies):
         if observation.get("tool_use"):
             from .tool_use import run_tool_use
             result = run_tool_use(demo_dir, scene_dir, observation["task"], instruction,
-                                  destination, tracking=observation["tracking"], client=dependencies.get("client"))
+                                  destination, tracking=observation["tracking"])
         else:
             result = run_stage(observation)
             write_json(destination / "trajectory.json", result)
@@ -245,8 +281,7 @@ def run_rgbd(demo_dir, scene_dir, instruction, output_dir, **dependencies):
         report["status"] = "passed"
         report["output_type"] = result["output_type"]
     except BaseException as error:
-        # The preserved optimizer may signal failure through SystemExit.
-        # Record that failure (or interruption) before propagating it unchanged.
+        # Preserve failure (including interruption) before propagating it.
         report.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
     finally:

@@ -420,7 +420,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
             self.assertEqual(json.loads((destination / "run.json").read_text())["status"], "failed")
             self.assertFalse((destination / "trajectory.json").exists())
 
-    def test_tool_use_tracks_once_before_preserved_bridge_without_cross_scene_matching(self):
+    def test_tool_use_tracks_once_before_compiled_bridge_without_cross_scene_matching(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = KnownRGBDScene(directory)
             client = Mock()
@@ -440,7 +440,8 @@ class RawRGBDPipelineTest(unittest.TestCase):
             bridge.assert_called_once()
             self.assertEqual(bridge.call_args.args,
                              (fixture.demo, fixture.scene, fixture.task("tool_use"), "Use this tool", destination))
-            self.assertIs(bridge.call_args.kwargs["client"], client)
+            # The compiled function consumer has no semantic/API client.
+            self.assertNotIn("client", bridge.call_args.kwargs)
             tracked = bridge.call_args.kwargs["tracking"]
             self.assertEqual(np.asarray(tracked["poses"]).shape, (3, 4, 4))
             self.assertIn("TAPIP3D", tracked["tracking_method"])

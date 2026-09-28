@@ -1,239 +1,247 @@
-"""Bridge regression with independent tool targets and a simulated legacy chain.
+"""Compiled tool interface and its real functional-event geometry core.
 
-Perception, CUDA and optimization boundaries are mocked. The pure frame helper
-is loaded directly from its real source definition, without importing that
-legacy module's heavyweight dependencies or duplicating its implementation.
+Only the numerical optimizer is injected where noted. Functional frames,
+two-sided target grounding, timeline conversion and independent output checks
+remain real. No legacy annotations, vision weights or network calls are used.
 """
 
-# BEGIN independent-goal and body-frame bridge regression tests.
-import ast
+# BEGIN compiled tool-program bridge tests.
+from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
-import types
 import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from manipulation.pipeline import write_json
 from manipulation.tool_use import prepare_tracked_demo, run_tool_use
-from utils_IL.params import CAM_MATRIX
 
 
-def legacy_frame_function():
-    path = Path(__file__).resolve().parents[1] / "tool_traj_transfer.py"
-    tree = ast.parse(path.read_text(), filename=str(path))
-    node = next(node for node in tree.body
-                if isinstance(node, ast.FunctionDef) and node.name == "compute_function_plane_frame")
-    module = ast.Module(body=[node], type_ignores=[])
-    namespace = {"np": np, "R_scipy": Rotation}
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    return namespace["compute_function_plane_frame"]
-
-
-def module(name, **attributes):
-    result = types.ModuleType(name)
-    result.__dict__.update(attributes)
+def pose(angles=(0., 0., 0.), translation=(0., 0., 0.)):
+    result = np.eye(4)
+    result[:3, :3] = Rotation.from_euler("xyz", angles).as_matrix()
+    result[:3, 3] = translation
     return result
 
 
-class ToolUseBridgeTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.compute_frame = staticmethod(legacy_frame_function())
+def fixture():
+    frames = np.arange(11) * 3 + 7
+    source = np.array([pose((.2, -.1, .3), (.4 + .002*i, -.2 + .0005*i, .7))
+                       for i in range(len(frames))])
+    cd, cn = pose((.1, .2, -.3), (.03, -.02, .01)), pose((-.2, .1, .4), (-.02, .03, .04))
+    rd, rn = pose((.3, -.2, .1), (.1, .04, -.03)), pose((-.4, .1, -.2), (-.06, .02, .1))
+    reference_pose = pose((-.2, .3, -.1), (.6, -.4, .2))
+    event = {"event_id": "functional_effect", "frame_index": int(frames[7]),
+             "carrier_frame": cd, "reference_frame": rd,
+             "source": "compiled observed part frames and effect event",
+             "position_tolerance_m": 1e-6, "rotation_tolerance_rad": 1e-6}
+    program = {"skill_kind": "manipulation", "task": {"relation": "tool_use", "motion": "free"},
+               "demo": {"frame_indices": frames, "timestamps": 1. + np.arange(11) * .05,
+                        "T_reference_carrier": source, "functional_events": [event]}}
+    mapping = rn @ np.linalg.inv(rd)
+    initial = reference_pose @ mapping @ source[0] @ cd @ np.linalg.inv(cn)
+    scene = {"initial_pose": initial, "reference_frame": "observed_camera", "reference_pose": reference_pose,
+             "carrier_id": "new_functional_object", "reference_id": "current_target",
+             "body_points": [[x, y, z] for x in (-.03, .03) for y in (-.02, .02) for z in (0., .08)],
+             "functional_bindings": {"functional_effect": {
+                 "carrier_id": "new_functional_object", "reference_id": "current_target",
+                 "carrier_frame": cn, "reference_frame": rn, "source": "current observed functional regions"}}}
+    reference = np.array([pose((.4, -.2, .1+.01*i), (.1+.003*i, -.3, .2)) for i in range(11)])
+    carrier = reference @ source
+    tracking = {"frame_indices": frames.copy(), "body_poses": {"carrier": carrier, "reference": reference},
+                "poses": reference[0] @ source, "tracker": "analytic fixed-owner observation fixture"}
+    return program, scene, tracking
 
+
+class TrackedProgramTest(unittest.TestCase):
+    def test_relative_conversion_removes_reference_once_without_mutating_program(self):
+        program, _, tracking = fixture()
+        expected = program["demo"]["T_reference_carrier"].copy()
+        # Existing stale motion must not override explicitly supplied new
+        # observations. Functional frames and event identities remain intact.
+        program["demo"]["T_reference_carrier"][:, :3, 3] += 9.
+        before = deepcopy(program)
+        observed_before = deepcopy(tracking)
+        prepared = prepare_tracked_demo(program, tracking)
+        np.testing.assert_allclose(prepared["demo"]["T_reference_carrier"], expected, atol=1e-14)
+        np.testing.assert_array_equal(program["demo"]["T_reference_carrier"], before["demo"]["T_reference_carrier"])
+        np.testing.assert_array_equal(tracking["poses"], observed_before["poses"])
+        np.testing.assert_array_equal(prepared["demo"]["frame_indices"], before["demo"]["frame_indices"])
+        np.testing.assert_array_equal(prepared["demo"]["timestamps"], before["demo"]["timestamps"])
+        self.assertEqual(prepared["demo"]["functional_events"][0]["frame_index"], 28)
+        prepared["demo"]["functional_events"][0]["carrier_frame"][:] = 0
+        np.testing.assert_array_equal(program["demo"]["functional_events"][0]["carrier_frame"],
+                                      before["demo"]["functional_events"][0]["carrier_frame"])
+
+    def test_sparse_frames_are_supported_but_mismatched_ids_and_gauges_reject(self):
+        program, _, tracking = fixture()
+        wrong_ids = deepcopy(tracking); wrong_ids["frame_indices"] += 1
+        with self.assertRaisesRegex(ValueError, "exactly match.*frame_indices"):
+            prepare_tracked_demo(program, wrong_ids)
+        missing_ids = deepcopy(tracking); missing_ids["frame_indices"] = missing_ids["frame_indices"][:-1]
+        with self.assertRaisesRegex(ValueError, "exactly match.*frame_indices"):
+            prepare_tracked_demo(program, missing_ids)
+        wrong_gauge = deepcopy(tracking)
+        wrong_gauge["poses"] = program["demo"]["T_reference_carrier"].copy()
+        with self.assertRaisesRegex(ValueError, "initial-reference gauge"):
+            prepare_tracked_demo(program, wrong_gauge)
+        wrong_count = deepcopy(tracking)
+        wrong_count["body_poses"]["carrier"] = wrong_count["body_poses"]["carrier"][:-1]
+        with self.assertRaisesRegex(ValueError, "complete compiled frame_indices"):
+            prepare_tracked_demo(program, wrong_count)
+        wrong_time = deepcopy(tracking); wrong_time["timestamps"] = program["demo"]["timestamps"] + .1
+        with self.assertRaisesRegex(ValueError, "timestamps disagree"):
+            prepare_tracked_demo(program, wrong_time)
+
+    def test_missing_compiled_functional_fields_are_explicit_not_reinferred(self):
+        program, _, tracking = fixture()
+        del program["demo"]["T_reference_carrier"]
+        prepared = prepare_tracked_demo(program, tracking)
+        self.assertEqual(prepared["demo"]["T_reference_carrier"].shape, (11, 4, 4))
+        del program["demo"]["functional_events"][0]["carrier_frame"]
+        with self.assertRaisesRegex(ValueError, "functional_events\\[0\\].*carrier_frame"):
+            prepare_tracked_demo(program, tracking)
+
+
+class CompiledToolBridgeTest(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.demo, self.scene, self.output = (self.root / name for name in ("demo", "scene", "output"))
-        for directory in (self.demo, self.scene):
-            directory.mkdir()
-            calibration = {"width": 1280, "height": 720, "depth_unit_m": 0.001,
-                           "intrinsic_matrix": CAM_MATRIX.flatten(order="F").tolist()}
-            (directory / "intrinsic.json").write_text(json.dumps(calibration))
-        files = {
-            "key_point_track_output/keyframe_idx.json": {"func": 1},
-            "tool_pose_track_output/tool_track.json": {
-                "function": [[0., 0., .8]], "center": [[.1, 0., .8]], "grasp": [[0., .1, .8]]},
-            "func_point_track_output/func_point_2d_init.json": {},
-            "grasp_det_output/grasp_points.json": {},
-            "cam_to_target_trans_output/cam_to_target_trans.json": {
-                "rotation_matrix": np.eye(3).tolist(), "rotation_center": [0, 0, 0], "centroid": [0, 0, 0]},
-            "detection_output/tool.json": {},
-        }
-        for relative, value in files.items():
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.demo, self.scene, self.output = [self.root / name for name in ("demo", "scene", "output")]
+        self.demo.mkdir(); self.scene.mkdir()
+        self.program, self.current, self.tracking = fixture()
+        self.program_path = self.demo / "interaction_program.json"
+        self.scene_path = self.scene / "interaction_scene.json"
+        self.save_inputs()
+        self.corrupt_position = 0.
+        self.corrupt_rotation = 0.
+        self.optimizer = Mock(side_effect=self.solve)
+
+    def save_inputs(self):
+        write_json(self.program_path, self.program)
+        write_json(self.scene_path, self.current)
+
+    def solve(self, reference, initial, function_keyframes):
+        # The known reference already satisfies the fixture's target. This
+        # injected solver boundary preserves the real transfer wrapper's
+        # equality and increment validation without launching IPOPT here.
+        output = np.asarray(reference).copy()
+        output[0] = initial
+        self.assertEqual(len(reference), 11)
+        for goal in function_keyframes:
+            output[goal["index"]] = goal["pose"]
+            output[goal["index"], 0, 0] += self.corrupt_position
+            output[goal["index"], 1, 2] += self.corrupt_rotation
+        return output
+
+    def run_bridge(self, tracking=None):
+        with patch("manipulation.function_motion.optimize_trajectory", self.optimizer):
+            return run_tool_use(self.demo, self.scene, self.program["task"],
+                                "Apply the observed functional edge to the surface", self.output,
+                                tracking=tracking)
+
+    def expected_goal(self):
+        event = self.program["demo"]["functional_events"][0]
+        binding = self.current["functional_bindings"]["functional_effect"]
+        return (self.current["reference_pose"] @ binding["reference_frame"]
+                @ np.linalg.inv(event["reference_frame"])
+                @ self.program["demo"]["T_reference_carrier"][7] @ event["carrier_frame"]
+                @ np.linalg.inv(binding["carrier_frame"]))
+
+    def test_compiled_source_calls_shared_function_core_and_preserves_internal_event(self):
+        before = self.program_path.read_text()
+        result = self.run_bridge()
+        self.assertEqual(result["status"], "candidate")
+        self.assertEqual(result["output_type"], "object_trajectory")
+        self.assertNotIn("eef_poses", result)
+        self.assertNotIn("holding", result)
+        np.testing.assert_allclose(result["poses"][0], self.current["initial_pose"], atol=1e-13)
+        np.testing.assert_allclose(result["poses"][7], self.expected_goal(), atol=1e-13)
+        self.assertEqual(result["function_checks"][0]["frame_index"], 28)
+        self.assertEqual(result["function_checks"][0]["constraint_kind"], "functional_frame")
+        self.assertGreater(np.linalg.norm(result["poses"][-1]-self.expected_goal()), .001)
+        np.testing.assert_array_equal(result["frame_indices"], self.program["demo"]["frame_indices"])
+        self.optimizer.assert_called_once()
+        self.assertEqual(self.program_path.read_text(), before)
+        self.assertEqual(result["input_evidence"]["motion_source"], "compiled demonstration")
+        saved = json.loads((self.output / "trajectory.json").read_text())
+        np.testing.assert_allclose(saved["function_checks"][0]["goal_pose"], self.expected_goal(), atol=1e-13)
+
+    def test_only_compiled_json_is_read_without_legacy_landmarks_or_named_action_dispatch(self):
+        # Make obsolete files deliberately invalid. Opening them would fail,
+        # while their existence must have no influence on this production path.
+        for relative in ("tool_pose_track_output/tool_track.json", "key_point_track_output/keyframe_idx.json",
+                         "func_point_track_output/func_point_2d_init.json", "grasp_det_output/grasp_points.json"):
             path = self.demo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(value))
-        np.save(self.demo / "detection_output/tool_mask.npy", np.ones((2, 2), bool))
-        self.task = {"relation": "tool_use", "interaction": "tool", "motion": "free",
-                     "carrier": {"scene_label": "cup", "demo_label": "cup"},
-                     "reference": {"scene_label": "bowl", "demo_label": "bowl"},
-                     "goal_description": "The visible demonstration pours into the bowl."}
-        self.start_angles, self.goal_angles = np.array([.2, -.4, .3]), np.array([.4, -.3, 1.1])
-        self.start_position, self.goal_position = np.array([.4, -.2, .7]), np.array([.6, .3, .5])
-        self.start_rotation = Rotation.from_euler("xyz", self.start_angles).as_matrix()
-        self.goal_rotation = Rotation.from_euler("xyz", self.goal_angles).as_matrix()
-        self.local_points = np.array([[.02, .03, .04], [.04, .03, .04],
-                                      [.02, .06, .04], [.02, .03, .08]])
-        self.cloud = types.SimpleNamespace(points=self.local_points @ self.start_rotation.T + self.start_position)
-        self.target = {
-            "function_init": self.start_position.tolist(),
-            "center_init": (self.start_position + self.start_rotation[:, 0] * .12).tolist(),
-            "grasp_init": (self.start_position + self.start_rotation[:, 1] * .15).tolist(),
-            "function_func": self.goal_position.tolist(),
-            "center_func": (self.goal_position + self.goal_rotation[:, 0] * .12).tolist(),
-            "grasp_func": (self.goal_position + self.goal_rotation[:, 1] * .15).tolist(),
-        }
-        # A small accepted optimization residual must remain visible. A bridge
-        # that takes its goal from the output would erase it and fail this test.
-        self.contact_position = self.goal_position + [2e-7, 0, 0]
-        self.contact_angles = self.goal_angles.copy()
-        self.mutate_target_after_optimization = False
-        self.frame_helper = Mock(side_effect=self.compute_frame)
-        self.client = Mock(chat_json=Mock(return_value={"action": "pour"}))
-        self.tracking = {"frame_indices": [0, 1, 2], "tracker": "analytic_fixture",
-                         "poses": np.repeat(np.eye(4)[None], 3, axis=0),
-                         "body_poses": {name: np.repeat(np.eye(4)[None], 3, axis=0)
-                                        for name in ("carrier", "reference")}}
-        self.tracking["poses"][1:, :3, 3] = [[.1, 0, 0], [.2, .03, 0]]
-        self.tracking["body_poses"]["carrier"] = self.tracking["poses"].copy()
+            path.write_text("not valid JSON and must never be read")
+        allowed = {self.program_path, self.scene_path}
+        original_read = Path.read_text
+        read_paths = []
+        def read(path, *args, **kwargs):
+            self.assertIn(path, allowed)
+            read_paths.append(path)
+            return original_read(path, *args, **kwargs)
+        with patch.object(Path, "read_text", autospec=True, side_effect=read):
+            result = self.run_bridge()
+        self.assertEqual(set(read_paths), allowed)
+        self.assertEqual(result["status"], "candidate")
+        self.assertFalse((self.output / "tracked_demo").exists())
+        self.assertFalse((self.output / "tool_use").exists())
 
-        def prepare_run(source, destination):
-            destination.mkdir(parents=True)
+    def test_supplied_tracking_replaces_only_motion_in_memory(self):
+        expected = self.expected_goal()
+        self.program["demo"]["T_reference_carrier"][:, :3, 3] += 20.
+        self.save_inputs()
+        before = self.program_path.read_text()
+        result = self.run_bridge(self.tracking)
+        np.testing.assert_allclose(result["poses"][7], expected, atol=1e-13)
+        self.assertEqual(result["input_evidence"]["motion_source"], "current tracked demonstration")
+        self.assertEqual(self.program_path.read_text(), before)
 
-        def pose_transfer(demo, destination, *args):
-            path = destination / "tool_pose_transfer_output/test_tool_track.json"
-            path.parent.mkdir()
-            path.write_text(json.dumps(self.target))
+    def test_optimizer_cannot_report_pass_after_missing_function_position_or_direction(self):
+        for position, angle in ((.01, 0.), (0., .03)):
+            self.corrupt_position, self.corrupt_rotation = position, angle
+            with self.subTest(position=position, angle=angle), self.assertRaisesRegex(
+                    ValueError, "independent equality"):
+                self.run_bridge()
+            self.assertFalse((self.output / "trajectory.json").exists())
 
-        def trajectory_transfer(demo, destination):
-            old = np.array([[self.start_position, self.start_angles],
-                            [self.contact_position, self.contact_angles],
-                            [self.goal_position + [0, .2, .1], self.goal_angles + [0, 0, .2]]])
-            path = destination / "tool_traj_transfer_output/test_tool_trajectory.json"
-            path.parent.mkdir()
-            path.write_text(json.dumps(old.tolist()))
-            if self.mutate_target_after_optimization:
-                changed = {key: (np.asarray(value) + 10).tolist() for key, value in self.target.items()}
-                (destination / "tool_pose_transfer_output/test_tool_track.json").write_text(json.dumps(changed))
-
-        self.optimizer = Mock(side_effect=trajectory_transfer)
-        self.fake_torch = module("torch", manual_seed=Mock(), set_num_threads=Mock(),
-                                 cuda=types.SimpleNamespace(is_available=Mock(return_value=False)))
-        self.modules = {
-            "matplotlib": module("matplotlib", use=Mock()),
-            "torch": self.fake_torch,
-            "open3d": module("open3d", utility=types.SimpleNamespace(random=types.SimpleNamespace(seed=Mock()))),
-            "main": module("main", prepare_run=prepare_run,
-                           validate_outputs=Mock(return_value={"trajectory_shape": [3, 2, 3]})),
-            "cam_to_target_trans": module("cam_to_target_trans", cam_to_target_trans=Mock(),
-                                           demo_test_deteciton=Mock()),
-            "func_point_transfer": module("func_point_transfer", func_point_transfer=Mock()),
-            "grasp_point_transfer": module("grasp_point_transfer", grasp_point_transfer=Mock()),
-            "tool_pose_transfer": module("tool_pose_transfer", tool_pose_transfer=Mock(side_effect=pose_transfer)),
-            "tool_traj_transfer": module("tool_traj_transfer", compute_function_plane_frame=self.frame_helper,
-                                          pc_viz=Mock(return_value=(None, self.cloud)),
-                                          tool_trajectory_transfer=self.optimizer),
-        }
-
-    def run_bridge(self):
-        with patch.dict("sys.modules", self.modules):
-            return run_tool_use(self.demo, self.scene, self.task, "Repeat the demonstration",
-                                self.output, tracking=self.tracking, client=self.client)
-
-    def test_independent_goal_and_fixed_function_body_coordinates(self):
-        result = self.run_bridge()
-        expected = np.eye(4)
-        expected[:3, :3], expected[:3, 3] = self.goal_rotation, self.goal_position
-        np.testing.assert_allclose(result["goal_pose"], expected, atol=1e-12)
-        np.testing.assert_allclose(result["body_points"], self.local_points, atol=1e-12)
-        reconstructed = result["body_points"] @ result["poses"][0, :3, :3].T + result["poses"][0, :3, 3]
-        np.testing.assert_allclose(reconstructed, self.cloud.points, atol=1e-12)
-        self.assertEqual(result["goal_frame_index"], 1)
-        self.assertEqual(result["reference_frame"], "legacy_target")
-        self.assertAlmostEqual(result["goal_checks"]["goal_position_error_m"], 2e-7, places=12)
-        self.assertLess(result["goal_checks"]["goal_rotation_error_rad"], 1e-12)
-        self.assertEqual(result["goal_checks"]["trajectory_shape"], [3, 2, 3])
-        self.frame_helper.assert_called_once()
-        self.assertIn(self.task["goal_description"], self.client.chat_json.call_args.args[0])
-        saved = json.loads((self.output / "trajectory.json").read_text())
-        manifest = json.loads((self.output / "tool_use/run.json").read_text())
-        self.assertEqual(manifest["status"], "passed")
-        self.assertEqual(Path(manifest["demo"]), (self.output / "tracked_demo").resolve())
-        np.testing.assert_allclose(saved["goal_pose"], expected, atol=1e-12)
-        self.assertFalse(np.array_equal(result["goal_pose"], result["poses"][1]))
-
-    def test_target_is_captured_before_optimization(self):
-        self.mutate_target_after_optimization = True
-        result = self.run_bridge()
-        np.testing.assert_allclose(result["goal_pose"][:3, 3], self.goal_position, atol=1e-12)
-        self.assertAlmostEqual(result["goal_checks"]["goal_position_error_m"], 2e-7, places=12)
-
-    def test_position_miss_cannot_pass_by_redefining_goal_from_result(self):
-        self.contact_position = self.goal_position + [.01, 0, 0]
-        with self.assertRaisesRegex(ValueError, "independent goal.*position"):
-            self.run_bridge()
-        self.assertFalse((self.output / "trajectory.json").exists())
-
-    def test_rotation_miss_is_checked_as_rotation_not_euler_component_equality(self):
-        self.contact_angles = self.goal_angles + [0, 0, .03]
-        with self.assertRaisesRegex(ValueError, "independent goal.*rotation"):
-            self.run_bridge()
-        self.assertFalse((self.output / "trajectory.json").exists())
-
-    def test_equivalent_euler_branch_preserves_the_same_goal_rotation(self):
-        self.contact_angles = self.goal_angles + [0, 0, 2 * np.pi]
-        result = self.run_bridge()
-        self.assertLess(result["goal_checks"]["goal_rotation_error_rad"], 1e-12)
-
-    def test_degenerate_goal_rejected_before_optimization(self):
-        self.target["grasp_func"] = self.target["center_func"].copy()
-        with self.assertRaisesRegex(ValueError, "noncollinear"):
-            self.run_bridge()
+    def test_missing_compilation_metadata_and_event_timeline_fail_before_solver(self):
+        for mutate, message in (
+            (lambda: self.program["demo"].pop("functional_events"), "functional_events"),
+            (lambda: self.program["demo"].pop("T_reference_carrier"), "T_reference_carrier"),
+            (lambda: self.program["demo"]["functional_events"][0].update(frame_index=8), "original demonstration frame"),
+            (lambda: self.current.pop("reference_pose"), "reference_pose"),
+        ):
+            self.program, self.current, self.tracking = fixture()
+            mutate(); self.save_inputs()
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self.run_bridge()
         self.optimizer.assert_not_called()
-
-    def test_new_motion_replaces_later_annotations_and_preserves_source(self):
-        """Moving reference and nontrivial calibration expose frame mistakes."""
-        path = self.demo / "tool_pose_track_output/tool_track.json"
-        original = json.loads(path.read_text())
-        for values in original.values():
-            values.extend([[999, 999, 999], [-999, -999, -999]])
-        path.write_text(json.dumps(original))
-        rotation = Rotation.from_euler("xyz", [.25, -.3, .6]).as_matrix()
-        center, centroid = np.array([.03, -.07, .02]), np.array([.12, .11, -.2])
-        (self.demo / "cam_to_target_trans_output/cam_to_target_trans.json").write_text(json.dumps({
-            "rotation_matrix": rotation.tolist(), "rotation_center": center.tolist(), "centroid": centroid.tolist()}))
-        reference = self.tracking["body_poses"]["reference"]
-        reference[:, :3, 3] = [[.02, .03, 0], [.02, .06, 0], [.04, .09, 0]]
-        self.tracking["poses"] = reference[0] @ np.linalg.inv(reference) @ self.tracking["body_poses"]["carrier"]
-        source, evidence = prepare_tracked_demo(self.demo, self.tracking, self.output / "derived")
-        generated = json.loads((source / "tool_pose_track_output/tool_track.json").read_text())
-        # In this fixture the true relative displacement is supplied
-        # independently in camera coordinates; axes and target origin differ.
-        relative_delta = np.array([[0, 0, 0], [.1, -.03, 0], [.18, -.03, 0]])
-        for name, values in generated.items():
-            expected = np.asarray(original[name][0]) + relative_delta @ rotation.T
-            np.testing.assert_allclose(values, expected, atol=1e-12)
-        self.assertEqual(json.loads(path.read_text()), original)
-        self.assertEqual(evidence["goal_original_frame_id"], 1)
-
-    def test_known_constraint_cannot_be_ignored_by_tool_optimizer(self):
-        self.task["motion"] = "planar"
-        with self.assertRaisesRegex(ValueError, "cannot jointly enforce"):
+        self.program_path.unlink()
+        with self.assertRaisesRegex(ValueError, "Missing compiled interaction program"):
             self.run_bridge()
-        self.client.chat_json.assert_not_called()
-        self.optimizer.assert_not_called()
 
-    def test_missing_original_frames_cannot_relabel_legacy_function_event(self):
-        self.tracking["frame_indices"] = [0, 3, 9]
-        with self.assertRaisesRegex(ValueError, "consecutive original frames"):
+    def test_requested_or_compiled_constraints_are_not_erased_and_output_is_not_overwritten(self):
+        with self.assertRaisesRegex(ValueError, "requested constrained motion"):
+            run_tool_use(self.demo, self.scene, {"relation": "tool_use", "motion": "planar"},
+                         "Retain the plane", self.output)
+        self.program["task"]["motion"] = "prismatic"; self.save_inputs()
+        with self.assertRaisesRegex(ValueError, "constrained motion"):
             self.run_bridge()
-        self.optimizer.assert_not_called()
+        self.program, self.current, self.tracking = fixture(); self.save_inputs()
+        self.run_bridge()
+        saved = (self.output / "trajectory.json").read_text()
+        with self.assertRaises(FileExistsError):
+            self.run_bridge()
+        self.assertEqual((self.output / "trajectory.json").read_text(), saved)
 
 
 if __name__ == "__main__":
     unittest.main()
-# END independent-goal and body-frame bridge regression tests.
+# END compiled tool-program bridge tests.

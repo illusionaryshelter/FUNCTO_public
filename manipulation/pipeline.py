@@ -336,7 +336,25 @@ def run_prepared(input_path, output_dir):
     write_json(destination / "run.json", report)
     try:
         write_json(destination / "observations.json", inputs)
-        result = run_sequence(inputs["stages"]) if "stages" in inputs else run_stage(inputs)
+        # BEGIN consume compiled skills through the existing prepared entry.
+        if "skill_kind" in inputs:
+            from .program import ground_program
+            demo = inputs["demo"]
+            if "trajectory_file" in demo:
+                array_path = (path.parent / demo["trajectory_file"]).resolve(strict=True)
+                # The saved observations may be replayed from their new run
+                # directory; preserve the actual array location explicitly.
+                demo["trajectory_file"] = str(array_path)
+                write_json(destination / "observations.json", inputs)
+                with np.load(array_path, allow_pickle=False) as arrays:
+                    for name in arrays.files:
+                        if name in demo:
+                            raise ValueError(f"Duplicate inline/NPZ demonstration field: {name}")
+                        demo[name] = arrays[name].copy()
+            result = ground_program(inputs, inputs["scene"])
+        else:
+            result = run_sequence(inputs["stages"]) if "stages" in inputs else run_stage(inputs)
+        # END shared prepared entry; object-only stages retain their own scope.
         write_json(destination / "trajectory.json", result)
         report["status"] = "passed"
     except BaseException as error:

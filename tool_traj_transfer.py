@@ -4,67 +4,15 @@ from PIL import Image
 import cv2
 import json
 import open3d as o3d
-import casadi as ca
 from scipy.spatial.transform import Rotation as R_scipy
-import sys
 
 from utils_IL.perception_utils import convert_to_serializable
 from utils_IL.geometry_utils import compute_point_cloud, calculate_rotation_matrix_z
 from utils_IL.params import CAM_MATRIX
 
-def optimize_trajectory(reference_trajectory, static_pose, contact_pose=None, contact_idx=None, n_points=100, flag=2):
-       
-    opti = ca.Opti()
-
-    print(f"Solving with angular velocity constraint {flag}......\n")
-
-    static_pos, static_ori = static_pose
-    contact_pos, contact_ori = contact_pose
-    
-    positions = opti.variable(n_points, 3)
-    euler_angles = opti.variable(n_points, 3)
-
-    cost = 0
-    for t in range(n_points):
-        ref_pos, ref_euler = reference_trajectory[t]
-        
-        step_cost = ca.sumsqr(positions[t, :] - np.array(ref_pos).reshape((1, 3))) + \
-                ca.sumsqr(ca.fmod(euler_angles[t, :] - np.array(ref_euler).reshape((1, 3)) + np.pi, np.pi*2) - np.pi)
-            
-        if t/n_points > 0.4:
-            cost += step_cost
-            # velocity constraints
-            if t < n_points - 1:
-                opti.subject_to(ca.sumsqr(positions[t+1, :] - positions[t, :]) <= 0.01**2)  # translation velocity
-
-                if flag == 2:
-                    opti.subject_to(ca.sumsqr(ca.fmod(euler_angles[t+1, :] - euler_angles[t, :] + np.pi, np.pi*2) - np.pi) <= (np.pi/72)**2)
-                elif flag == 1:
-                    opti.subject_to(ca.sumsqr(ca.fmod(euler_angles[t+1, :] - euler_angles[t, :] + np.pi, np.pi*2) - np.pi) <= (np.pi/60)**2)
-                # far from contact, free to move
-                else:
-                    opti.subject_to(ca.sumsqr(ca.fmod(euler_angles[t+1, :] - euler_angles[t, :] + np.pi, np.pi*2) - np.pi) <= (np.pi/36)**2)
-        else:
-            opti.subject_to(ca.sumsqr(positions[t+1, :] - positions[t, :]) <= 0.01**2)  # translation velocity
-            opti.subject_to(ca.sumsqr(ca.fmod(euler_angles[t+1, :] - euler_angles[t, :] + np.pi, np.pi*2) - np.pi) <= (np.pi / 36000)**2)
-
-    # inital keyframe constraint
-    opti.subject_to(positions[0, :] == np.array(static_pos).reshape((1, 3)))
-    opti.subject_to(euler_angles[0, :] == np.array(static_ori).reshape((1, 3)))
-    
-    # function keyframe constraint
-    opti.subject_to(positions[contact_idx, :] == np.array(contact_pos).reshape((1, 3)))
-    opti.subject_to(euler_angles[contact_idx, :] == np.array(contact_ori).reshape((1, 3)))
-
-    opti.minimize(cost)
-    opti.solver('ipopt')
-    try: 
-        sol = opti.solve()
-        optimized_trajectory = [(sol.value(positions[t, :]),  sol.value(euler_angles[t, :])) for t in range(n_points)]
-        return optimized_trajectory, -2
-    except RuntimeError:
-        flag -= 1
-        return None, flag
+# BEGIN share the function-frame kernel without semantic-keypoint coupling.
+from manipulation.function_motion import transfer_function_motion
+# END shared function-frame kernel.
 
 def compute_function_plane_frame(func_list, center_list, grasp_list):
     """
@@ -210,19 +158,20 @@ def tool_trajectory_transfer(data_path, test_data_path):
                                                                             [test_tool_track_dict['center_init'], test_tool_track_dict['center_func']], 
                                                                             [test_tool_track_dict['grasp_init'], test_tool_track_dict['grasp_func']])
 
-    # test tool trajectory optimization
-    # TODO: change to SO(3) optimization
-    constraint_flag = 2
-    while constraint_flag != -2:
-        test_tool_trjectory, constraint_flag = optimize_trajectory(reference_trajectory=rotated_demo_tool_pose_list, 
-                                                static_pose=test_tool_pose_list[0], 
-                                                contact_pose=test_tool_pose_list[1],
-                                                contact_idx=contact_idx,
-                                                n_points=len(demo_tool_pose_list),
-                                                flag=constraint_flag)
-        if constraint_flag == -1:
-            print("Solver failed with all constraints. Shutting down...")
-            sys.exit("Solver failure: Could not optimize trajectory.")
+    # BEGIN use the same strict function-frame entry as compiled skills.
+    # The historical annotations above have already supplied function frames.
+    # Convert their numeric representation only; keep their functional origin,
+    # directions, target alignment and exact internal event. A failure remains
+    # a failure instead of initiating progressively weaker angular limits.
+    pose_pairs = np.asarray(rotated_demo_tool_pose_list + test_tool_pose_list, dtype=float)
+    function_poses = np.repeat(np.eye(4)[None], len(pose_pairs), axis=0)
+    function_poses[:, :3, 3] = pose_pairs[:, 0]
+    function_poses[:, :3, :3] = R_scipy.from_euler('xyz', pose_pairs[:, 1]).as_matrix()
+    solved = transfer_function_motion(function_poses[:-2], function_poses[-2],
+                                      [{"index": contact_idx, "pose": function_poses[-1]}])
+    test_tool_trjectory = [(value[:3, 3], R_scipy.from_matrix(value[:3, :3]).as_euler('xyz'))
+                          for value in solved["poses"]]
+    # END shared strict solve and independent node/event verification.
     print("Test tool trajecory optimization completed.")
 
     # save test tool trajectory
@@ -260,7 +209,6 @@ def tool_trajectory_transfer(data_path, test_data_path):
     o3d.io.write_point_cloud(os.path.join(output_path, 'test_tool_traj_pc.ply'), test_tool_trajectory_pc)
 
     return None
-
 
 
 
