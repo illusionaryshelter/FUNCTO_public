@@ -2,10 +2,10 @@
 
 SAM roles and Gemini semantics are supplied at their public boundaries. Image
 matching is replaced with independently known pixel correspondences; this does
-not measure SD-DINO quality. FoundationPose is supplied at its model-pose
-boundary; relative-pose conversion, calibrated backprojection, cross-scene rigid
-registration, motion transfer and support goals remain real. These checks do
-not establish the pose model's accuracy on a real demonstration.
+not measure SD-DINO quality. TAPIP3D is supplied at its fixed-query 3D-track
+boundary; correspondence fitting, relative-pose conversion, calibrated
+backprojection, cross-scene registration, motion transfer and support goals
+remain real. These checks do not establish real-video tracking accuracy.
 """
 
 # BEGIN raw RGB-D manipulation integration tests.
@@ -17,7 +17,6 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image
-from scipy.spatial.transform import Rotation
 
 from manipulation.observations import track_rgbd
 from manipulation.perception import ground_rgbd, run_rgbd
@@ -46,11 +45,14 @@ class KnownRGBDScene:
     reference_shift = np.array([4., 2.])
     carrier_shift = np.array([9., 3.])
 
-    def __init__(self, root, *, camera_motion=False, small_carrier=False):
+    def __init__(self, root, *, camera_motion=False, reference_motion=False, small_carrier=False):
         import cv2
 
         self.demo, self.scene = Path(root) / "demo", Path(root) / "scene"
         self.camera_motion = camera_motion
+        self.reference_motion = reference_motion
+        self.camera_from_world = np.array([
+            translation([.036 * index if camera_motion else 0., 0., 0.]) for index in range(3)])
         self.K = np.array([[self.fx, 0., self.width / 2],
                            [0., self.fy, self.height / 2], [0., 0., 1.]])
         rng = np.random.default_rng(472)
@@ -72,37 +74,25 @@ class KnownRGBDScene:
                 "width": self.width, "height": self.height,
                 "intrinsic_matrix": self.K.ravel(order="F").tolist(),
             }))
-            # BEGIN explicit, local pose-model input for the synthetic fixture.
-            # The small closed cube only exercises model-file plumbing: no
-            # estimator is run against it and it is not a reconstruction of the
-            # textured patch. Model identity is never inferred from its label.
-            mesh = directory / "fixture_model.obj"
-            mesh.write_text(
-                "v -0.01 -0.01 -0.01\nv 0.01 -0.01 -0.01\n"
-                "v 0.01 0.01 -0.01\nv -0.01 0.01 -0.01\n"
-                "v -0.01 -0.01 0.01\nv 0.01 -0.01 0.01\n"
-                "v 0.01 0.01 0.01\nv -0.01 0.01 0.01\n"
-                "f 1 3 2\nf 1 4 3\nf 5 6 7\nf 5 7 8\n"
-                "f 1 2 6\nf 1 6 5\nf 2 3 7\nf 2 7 6\n"
-                "f 3 4 8\nf 3 8 7\nf 4 1 5\nf 4 5 8\n")
-            (directory / "config.json").write_text(json.dumps({
-                "depth_scale": 1000,
-                "pose_models": {
-                    "carrier": {"mesh": mesh.name, "scale": 1.0},
-                    "reference": {"mesh": mesh.name, "scale": [1., 1., 1.]},
-                },
-            }))
-            # END explicit local pose-model fixture.
+            # BEGIN calibrated query tracking without artificial mesh inputs.
+            # A moving camera has independently known extrinsics. A stationary
+            # camera is declared explicitly, including when both tracked bodies
+            # move together; reference motion is not camera calibration.
+            calibration = {"depth_scale": 1000,
+                           "stationary_camera": not (directory == self.demo and camera_motion)}
+            (directory / "config.json").write_text(json.dumps(calibration))
+            # END calibrated mesh-free query fixture.
             for index in range(frames):
                 if directory == self.demo:
                     gray, x, y = background.copy(), 18 + 2 * index, 36 + index
-                    if camera_motion:
-                        # A common +0.036 m camera-coordinate translation gives
-                        # 2 px on the 1.8 m reference and 3 px on the 1.2 m part.
-                        # The reference tracker must remove that common motion.
-                        gray = cv2.warpAffine(gray, np.array([[1., 0., 2 * index], [0., 1., 0.]]),
+                    if camera_motion or reference_motion:
+                        # Known camera motion and physical reference motion can
+                        # produce the same common image displacement. Their
+                        # distinct world trajectories below must not be confused.
+                        common = int(camera_motion) + int(reference_motion)
+                        gray = cv2.warpAffine(gray, np.array([[1., 0., 2 * index * common], [0., 1., 0.]]),
                                               (self.width, self.height))
-                        x += 3 * index
+                        x += 3 * index * common
                 else:
                     gray = cv2.warpAffine(background, np.array([[1., 0., 4.], [0., 1., 2.]]),
                                           (self.width, self.height))
@@ -120,34 +110,55 @@ class KnownRGBDScene:
                         self.scene_image = rgb
         self.match_calls = []
 
-    # BEGIN analytic camera-from-model observations at the FoundationPose API.
-    def known_model_poses(self, paths, depth_paths, *, K, depth_scale, masks, models):
-        """Supply two independently prescribed rigid model poses per RGB frame.
+    # BEGIN independent known-ID world tracks at the TAPIP3D API boundary.
+    def known_tracks(self, paths, depth_paths, *, K, depth_scale, masks,
+                     extrinsics=None, stationary_camera=False):
+        """Prescribe material-point tracks; production still estimates SE(3).
 
-        Both model frames have arbitrary fixed axes and origins. A correct
-        adapter must remove common camera motion without treating a model's
-        origin as a pixel-centroid landmark or cancelling carrier motion.
+        The first query coordinates come from calibrated observed depth. Later
+        world positions follow known body translations, and only projection
+        applies camera extrinsics. No precomputed object poses bypass fitting.
         """
-        if len(paths) != len(depth_paths) or len(masks) != 2 or len(models) != 2:
-            raise AssertionError("Both rigid models must share the same aligned RGB-D timeline")
+        if len(paths) != len(depth_paths) or len(masks) != 2:
+            raise AssertionError("Both rigid bodies must share one aligned RGB-D timeline")
         np.testing.assert_allclose(K, self.K, atol=0)
         np.testing.assert_allclose(depth_scale, .001, atol=0)
         np.testing.assert_array_equal(masks[0], self.demo_carrier)
         np.testing.assert_array_equal(masks[1], self.demo_reference & ~self.demo_carrier)
-        body = translation([-.25, -.12, self.carrier_depth])
-        reference = translation([.1, .08, self.reference_depth])
-        body[:3, :3] = Rotation.from_euler("xyz", [.2, -.1, .3]).as_matrix()
-        reference[:3, :3] = Rotation.from_euler("xyz", [-.15, .25, -.2]).as_matrix()
-        poses = []
+        expected_camera = np.array([translation([.036 * index if self.camera_motion else 0., 0., 0.])
+                                    for index in range(len(paths))])
+        # The observation adapter resolves its fixed-camera declaration into
+        # explicit identity matrices before crossing this model API boundary.
+        np.testing.assert_allclose(extrinsics, expected_camera, atol=0)
+        if stationary_camera:
+            raise AssertionError("Resolved extrinsics must not also declare a stationary camera")
+        pixels, owners = [], []
+        for owner, mask in enumerate(masks):
+            y, x = np.nonzero(mask)
+            chosen = np.linspace(0, len(x) - 1, 64, dtype=int)
+            pixels.extend(np.column_stack((x[chosen], y[chosen])))
+            owners.extend([owner] * len(chosen))
+        pixels, owners = np.asarray(pixels, float), np.asarray(owners, dtype=np.int32)
+        depths = np.where(owners == 0, self.carrier_depth, self.reference_depth)
+        initial = np.column_stack((pixels, np.ones(len(pixels)))) @ np.linalg.inv(K).T * depths[:, None]
+        coords = []
         for index in range(len(paths)):
-            camera = translation([.036 * index if self.camera_motion else 0., 0., 0.])
-            moving = translation([2 * index * self.carrier_depth / self.fx,
-                                  index * self.carrier_depth / self.fy, 0.])
-            poses.append([camera @ moving @ body, camera @ reference])
-        return {"camera_from_model": np.asarray(poses),
-                "validated": np.ones((len(paths), 2), dtype=bool),
-                "diagnostic_source": np.array("analytic API-boundary fixture; no model inference")}
-    # END analytic FoundationPose observations.
+            world = initial.copy()
+            world += [.036 * index if self.reference_motion else 0., 0., 0.]
+            world[owners == 0] += [2 * index * self.carrier_depth / self.fx,
+                                  index * self.carrier_depth / self.fy, 0.]
+            coords.append(world)
+        coords = np.asarray(coords)
+        camera_points = coords + expected_camera[:, None, :3, 3]
+        image_points = camera_points @ K.T
+        projected = image_points[..., :2] / image_points[..., 2:]
+        return {"coords": coords, "visibs": np.ones(coords.shape[:2], dtype=bool),
+                "query_points": np.column_stack((np.zeros(len(initial)), initial)),
+                "query_owner": owners, "query_pixels": pixels,
+                "pixels": projected, "projection_valid": np.ones(coords.shape[:2], dtype=bool),
+                "camera_from_world": expected_camera,
+                "diagnostic_source": "analytic API-boundary fixture; no model inference"}
+    # END known TAPIP3D material-point observations.
 
     def task(self, relation="transfer"):
         return {"relation": relation, "interaction": "none", "motion": "auto",
@@ -223,7 +234,7 @@ class KnownRGBDScene:
 class RawRGBDPipelineTest(unittest.TestCase):
     def test_grounding_tracks_raw_images_and_preserves_body_reference_directions(self):
         with tempfile.TemporaryDirectory() as directory:
-            fixture = KnownRGBDScene(directory, camera_motion=True)
+            fixture = KnownRGBDScene(directory, reference_motion=True)
             client = Mock()
             client.chat_json.return_value = fixture.task()
 
@@ -235,7 +246,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
                 return targets, diagnostics
 
             with patch("manipulation.perception.match_points", side_effect=near_tied), \
-                    patch("local_models.foundationpose.track", side_effect=fixture.known_model_poses), \
+                    patch("local_models.tapip3d.track", side_effect=fixture.known_tracks), \
                     patch("manipulation.perception.track_rgbd", wraps=track_rgbd) as real_tracker:
                 observed = ground_rgbd(fixture.demo, fixture.scene, "Move this patch", client=client,
                                        detector=fixture.detector, extractor=Mock())
@@ -254,8 +265,8 @@ class RawRGBDPipelineTest(unittest.TestCase):
             demo_relative = observed["demo_poses"] @ np.linalg.inv(observed["demo_poses"][0])
             expected = [translation([2 * frame * 1.2 / fixture.fx, frame * 1.2 / fixture.fy, 0.])
                         for frame in range(3)]
-            # The independent model frames exercise actual relative-pose
-            # conversion; camera motion must not become carrier motion.
+            # Both owners move in this fixed-camera video. Reference-relative
+            # conversion must retain only the carrier's own physical motion.
             np.testing.assert_allclose(demo_relative[:, :3, 3], np.asarray(expected)[:, :3, 3], atol=0.005)
             np.testing.assert_allclose(demo_relative[:, :3, :3], np.asarray(expected)[:, :3, :3], atol=0.003)
             # Reconstructing scene points from the returned fixed body frame
@@ -271,6 +282,25 @@ class RawRGBDPipelineTest(unittest.TestCase):
             self.assertNotIn("grasp", observed)
             self.assertEqual(observed["reference_frame"], "scene_camera")
 
+    def test_known_camera_motion_is_compensated_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = KnownRGBDScene(directory, camera_motion=True)
+            client = Mock(chat_json=Mock(return_value=fixture.task()))
+
+            def calibrated_tracker(*args, **kwargs):
+                return track_rgbd(*args, extrinsics=fixture.camera_from_world,
+                                  stationary_camera=False, **kwargs)
+
+            with patch("manipulation.perception.match_points", side_effect=fixture.known_matches), \
+                    patch("local_models.tapip3d.track", side_effect=fixture.known_tracks) as model:
+                observed = ground_rgbd(fixture.demo, fixture.scene, "Move the patch", client=client,
+                                       detector=fixture.detector, extractor=Mock(), tracker=calibrated_tracker)
+            model.assert_called_once()
+            relative = observed["demo_poses"] @ np.linalg.inv(observed["demo_poses"][0])
+            expected = [translation([2 * index * 1.2 / fixture.fx, index * 1.2 / fixture.fy, 0.])
+                        for index in range(3)]
+            np.testing.assert_allclose(relative, expected, atol=1e-12)
+
     def test_run_rgbd_estimates_support_and_saves_complete_numeric_output(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = KnownRGBDScene(directory, small_carrier=True)
@@ -278,7 +308,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
             client.chat_json.side_effect = [fixture.task("on"), {"candidate_id": 1}]
             destination = Path(directory) / "run"
             with patch("manipulation.perception.match_points", side_effect=fixture.known_matches), \
-                    patch("local_models.foundationpose.track", side_effect=fixture.known_model_poses):
+                    patch("local_models.tapip3d.track", side_effect=fixture.known_tracks):
                 result = run_rgbd(fixture.demo, fixture.scene, "Place the patch on the backing", destination,
                                   client=client, detector=fixture.detector, extractor=Mock())
             self.assertEqual(result["status"], "passed")
@@ -304,7 +334,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 run_rgbd(fixture.demo, fixture.scene, "repeat", destination, client=client)
 
-    # BEGIN pose-estimation failure is never replaced with an old tracker.
+    # BEGIN failed or uncalibrated tracks never produce a trajectory.
     def test_pose_tracking_failure_is_recorded_and_not_reported_as_a_trajectory(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = KnownRGBDScene(directory)
@@ -312,34 +342,34 @@ class RawRGBDPipelineTest(unittest.TestCase):
             client.chat_json.return_value = fixture.task()
             destination = Path(directory) / "failed"
             with patch("manipulation.perception.match_points") as matcher, \
-                    patch("local_models.foundationpose.track", side_effect=ValueError(
-                        "FoundationPose rejected the carrier at frame 1")) as estimator:
-                with self.assertRaisesRegex(ValueError, "FoundationPose rejected"):
+                    patch("local_models.tapip3d.track", side_effect=ValueError(
+                        "TAPIP3D rejected the carrier at frame 1")) as estimator:
+                with self.assertRaisesRegex(ValueError, "TAPIP3D rejected"):
                     run_rgbd(fixture.demo, fixture.scene, "Move the patch", destination,
                              client=client, detector=fixture.detector, extractor=Mock())
                 estimator.assert_called_once()
                 matcher.assert_not_called()
             report = json.loads((destination / "run.json").read_text())
             self.assertEqual(report["status"], "failed")
-            self.assertIn("FoundationPose rejected", report["error"])
+            self.assertIn("TAPIP3D rejected", report["error"])
             self.assertFalse((destination / "trajectory.json").exists())
 
-    def test_semantic_roles_cannot_replace_missing_pose_models(self):
+    def test_semantic_roles_cannot_replace_unknown_camera_motion(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = KnownRGBDScene(directory)
             (fixture.demo / "config.json").write_text(json.dumps({"depth_scale": 1000}))
             client = Mock(chat_json=Mock(return_value=fixture.task()))
-            destination = Path(directory) / "missing-models"
+            destination = Path(directory) / "unknown-camera"
             with patch("manipulation.perception.match_points") as matcher, \
-                    patch("local_models.foundationpose.track") as estimator:
-                with self.assertRaisesRegex(ValueError, "pose_models"):
+                    patch("local_models.tapip3d.track") as estimator:
+                with self.assertRaisesRegex(ValueError, "extrinsics|stationary_camera"):
                     run_rgbd(fixture.demo, fixture.scene, "Move the patch", destination,
                              client=client, detector=fixture.detector, extractor=Mock())
                 estimator.assert_not_called()
                 matcher.assert_not_called()
             self.assertEqual(json.loads((destination / "run.json").read_text())["status"], "failed")
             self.assertFalse((destination / "trajectory.json").exists())
-    # END explicit pose-estimation/model-input failure.
+    # END failed or uncalibrated tracking.
 
     # BEGIN container placement needs no additional free-interior geometry.
     def test_inside_transfers_demonstrated_goal_without_inventing_cavity(self):
@@ -349,7 +379,7 @@ class RawRGBDPipelineTest(unittest.TestCase):
             client.chat_json.return_value = fixture.task("inside")
             destination = Path(directory) / "inside"
             with patch("manipulation.perception.match_points", side_effect=fixture.known_matches), \
-                    patch("local_models.foundationpose.track", side_effect=fixture.known_model_poses):
+                    patch("local_models.tapip3d.track", side_effect=fixture.known_tracks):
                 result = run_rgbd(fixture.demo, fixture.scene, "Put the object inside its container",
                                   destination, client=client, detector=fixture.detector, extractor=Mock())
             observed = json.loads((destination / "observations.json").read_text())
@@ -383,20 +413,16 @@ class RawRGBDPipelineTest(unittest.TestCase):
 
             destination = Path(directory) / "ambiguous"
             with patch("manipulation.perception.match_points", side_effect=ambiguous), \
-                    patch("local_models.foundationpose.track", side_effect=fixture.known_model_poses):
+                    patch("local_models.tapip3d.track", side_effect=fixture.known_tracks):
                 with self.assertRaisesRegex(ValueError, "ambiguous"):
                     run_rgbd(fixture.demo, fixture.scene, "Move the patch", destination,
                              client=client, detector=fixture.detector, extractor=Mock())
             self.assertEqual(json.loads((destination / "run.json").read_text())["status"], "failed")
             self.assertFalse((destination / "trajectory.json").exists())
 
-    def test_tool_use_semantics_routes_to_preserved_bridge_without_object_tracking(self):
+    def test_tool_use_tracks_once_before_preserved_bridge_without_cross_scene_matching(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = KnownRGBDScene(directory)
-            # BEGIN the preserved annotated subset does not invoke FoundationPose.
-            for root in (fixture.demo, fixture.scene):
-                (root / "config.json").write_text(json.dumps({"depth_scale": 1000}))
-            # END preserved subset model independence.
             client = Mock()
             client.chat_json.return_value = fixture.task("tool_use")
             destination = Path(directory) / "tool"
@@ -404,14 +430,27 @@ class RawRGBDPipelineTest(unittest.TestCase):
             # its own annotations/models and is covered by separate regressions.
             expected = {"status": "passed", "output_type": "object_trajectory"}
             with patch("manipulation.tool_use.run_tool_use", return_value=expected) as bridge, \
-                    patch("manipulation.perception.track_rgbd") as tracker, \
-                    patch("manipulation.perception.select_roles") as selection:
-                result = run_rgbd(fixture.demo, fixture.scene, "Use this tool", destination, client=client)
+                    patch("manipulation.perception.track_rgbd", wraps=track_rgbd) as tracker, \
+                    patch("local_models.tapip3d.track", side_effect=fixture.known_tracks) as model, \
+                    patch("manipulation.perception.match_points") as matcher:
+                detector = Mock(side_effect=fixture.detector)
+                result = run_rgbd(fixture.demo, fixture.scene, "Use this tool", destination, client=client,
+                                  detector=detector, extractor=Mock())
             self.assertEqual(result, expected)
-            bridge.assert_called_once_with(fixture.demo, fixture.scene, fixture.task("tool_use"),
-                                           "Use this tool", destination, client=client)
-            tracker.assert_not_called()
-            selection.assert_not_called()
+            bridge.assert_called_once()
+            self.assertEqual(bridge.call_args.args,
+                             (fixture.demo, fixture.scene, fixture.task("tool_use"), "Use this tool", destination))
+            self.assertIs(bridge.call_args.kwargs["client"], client)
+            tracked = bridge.call_args.kwargs["tracking"]
+            self.assertEqual(np.asarray(tracked["poses"]).shape, (3, 4, 4))
+            self.assertIn("TAPIP3D", tracked["tracking_method"])
+            tracker.assert_called_once()
+            model.assert_called_once()
+            matcher.assert_not_called()
+            # Demo roles precede tracking. Scene role selection and descriptor
+            # binding belong to the preserved tool bridge after this routing.
+            detector.assert_called_once()
+            np.testing.assert_array_equal(np.asarray(detector.call_args.args[0]), fixture.demo_image)
             self.assertEqual(json.loads((destination / "run.json").read_text())["status"], "passed")
 
     def test_legacy_solver_exit_is_recorded_as_failure(self):
@@ -419,9 +458,11 @@ class RawRGBDPipelineTest(unittest.TestCase):
             fixture = KnownRGBDScene(directory)
             client = Mock(chat_json=Mock(return_value=fixture.task("tool_use")))
             destination = Path(directory) / "solver-exit"
-            with patch("manipulation.tool_use.run_tool_use", side_effect=SystemExit(1)):
+            with patch("manipulation.tool_use.run_tool_use", side_effect=SystemExit(1)), \
+                    patch("local_models.tapip3d.track", side_effect=fixture.known_tracks):
                 with self.assertRaises(SystemExit):
-                    run_rgbd(fixture.demo, fixture.scene, "Repeat the tool action", destination, client=client)
+                    run_rgbd(fixture.demo, fixture.scene, "Repeat the tool action", destination, client=client,
+                             detector=fixture.detector, extractor=Mock())
             report = json.loads((destination / "run.json").read_text())
             self.assertEqual(report["status"], "failed")
             self.assertIn("SystemExit", report["error"])

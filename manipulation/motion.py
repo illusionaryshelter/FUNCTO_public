@@ -326,6 +326,56 @@ def _fit_one(poses: np.ndarray, kind: str, ptol: float, rtol: float) -> MotionMo
     return model
 
 
+# BEGIN observed structure: report compatible geometry independently of task constraints.
+def _candidate_models(observed: np.ndarray, ptol: float, rtol: float):
+    """Fit the existing families without interpreting them as physical joints."""
+    accepted, rejected = [], {}
+    for candidate in _CANDIDATES:
+        try:
+            accepted.append(_fit_one(observed, candidate, ptol, rtol))
+        except ValueError as error:
+            rejected[candidate] = str(error)
+    # Input SE(3) validity is checked before this helper. The free family must
+    # therefore succeed; it is a complete representation, not an error fallback.
+    free = next(model for model in accepted if model.kind == "free")
+    excited = (free.diagnostics["translation_excitation_m"] > ptol
+               or free.diagnostics["rotation_excitation_rad"] > rtol)
+    return accepted, rejected, excited
+
+
+def analyze_motion(
+    poses: Any,
+    position_tolerance: float = 0.005,
+    rotation_tolerance: float = 0.035,
+) -> dict[str, Any]:
+    """Describe observed motion without selecting an applied task constraint.
+
+    Every candidate is checked against the complete SE(3) sequence, including
+    orientation. A line may be compatible with a prismatic description while
+    remaining an unconstrained carry task. Similarly, a planar observation
+    alone cannot establish contact or a physical planar joint. Accepted models
+    retain all fitted coordinates and per-frame residuals; no terminal-only
+    compression replaces the observed motion. Near-static observations remain
+    valid poses but report that their motion structure is not identifiable.
+
+    Invalid poses raise before candidate fitting. In particular, ``free`` does
+    not repair invalid rotations, missing observations or a lost track.
+    """
+    observed = _poses_array(poses)
+    ptol, rtol = _tolerances(position_tolerance, rotation_tolerance)
+    accepted, rejected, excited = _candidate_models(observed, ptol, rtol)
+    return {
+        "status": "observed_compatible" if excited else "insufficient_excitation",
+        "preferred_description": accepted[0].kind if excited else None,
+        "compatible_candidates": [model.kind for model in accepted],
+        "candidates": {model.kind: model.to_dict() for model in accepted},
+        "rejected_candidates": rejected,
+        "position_tolerance_m": ptol, "rotation_tolerance_rad": rtol,
+        "interpretation": "observed geometry only; task and reference evidence determine applied constraints",
+    }
+# END observed structure.
+
+
 def fit_motion(
     poses: Any,
     kind: str = "auto",
@@ -347,17 +397,11 @@ def fit_motion(
     if kind != "auto":
         return _fit_one(observed, kind, ptol, rtol)
 
-    delta_p = np.linalg.norm(observed[:, :3, 3] - observed[0, :3, 3], axis=1)
-    delta_r = Rotation.from_matrix(observed[:, :3, :3] @ observed[0, :3, :3].T).magnitude()
-    if delta_p.max() <= ptol and delta_r.max() <= rtol:
+    # BEGIN share the same candidate fits with non-constraining observation analysis.
+    accepted, rejected, excited = _candidate_models(observed, ptol, rtol)
+    if not excited:
         raise ValueError("Static or insufficiently excited observations cannot identify a motion mode")
-    accepted: list[MotionModel] = []
-    rejected: dict[str, str] = {}
-    for candidate in _CANDIDATES:
-        try:
-            accepted.append(_fit_one(observed, candidate, ptol, rtol))
-        except ValueError as error:
-            rejected[candidate] = str(error)
+    # END shared candidate fits.
     selected = accepted[0]  # Valid input always admits the free family.
     selected.diagnostics["selection"] = {
         "requested": "auto",

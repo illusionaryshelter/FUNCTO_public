@@ -14,7 +14,9 @@ import numpy as np
 
 from .goals import (InteriorRegion, SupportSurface, check_inside, check_on,
                     place_inside, place_on)
-from .motion import transfer_motion
+# BEGIN separate observed structure from the applied task motion constraint.
+from .motion import analyze_motion, transfer_motion
+# END motion analysis import.
 
 
 RELATIONS = {"transfer", "on", "inside", "articulation"}
@@ -22,10 +24,21 @@ INTERACTIONS = {"none", "grasp", "push", "pull", "tool"}
 
 
 def motion_kind(task):
-    """Do not turn an incidental straight carry into a physical slide joint."""
+    # BEGIN semantic constraint selection, independent of candidate diagnostics.
+    """Select the applied family from semantic evidence, not trajectory rank.
+
+    The existing semantic ``motion`` proposal can specify planar motion for a
+    whole-stage support/contact requirement; complete poses must still fit it.
+    ``auto`` for a general object task does not authorize a new mechanical
+    restriction. ``run_stage`` separately reports every compatible observed
+    family, so keeping a carry free does not hide its planar/linear geometry.
+    An articulation task supplies mechanism evidence and permits automatic
+    selection only of a geometrically supported joint family downstream.
+    """
     if task["motion"] == "auto" and task["relation"] != "articulation":
         return "free"
     return task["motion"]
+    # END semantic constraint selection.
 
 
 def serializable(value):
@@ -106,6 +119,13 @@ def run_stage(observation):
             or not np.isfinite(body).all()):
         raise ValueError("Scene body_points must contain finite local object geometry")
     demo = np.asarray(observation["demo_poses"], float)
+    # BEGIN retain observed candidates even when the task permits free motion.
+    # These fits use demonstration-reference coordinates, before scene binding
+    # or endpoint correction. They are evidence, never a substitute for the
+    # selected task constraint or a reason to silently downgrade that constraint.
+    observed_structure = analyze_motion(demo)
+    observed_structure["pose_frame"] = "demonstration_reference_from_fixed_body"
+    # END observed candidate diagnostics.
     options = {"kind": motion_kind(task), "reference_transform": transform}
     preliminary = transfer_motion(demo, start, **options)
     if relation == "articulation" and preliminary["model"].kind not in {"prismatic", "revolute"}:
@@ -198,6 +218,17 @@ def run_stage(observation):
             or (frame_indices < 0).any() or (frame_indices[1:] <= frame_indices[:-1]).any()):
         raise ValueError("Frame indices must be nonnegative strictly increasing integers matching the demonstration")
     model = transferred["model"]
+    # BEGIN distinguish what was observed from what is actually enforced.
+    transferred["diagnostics"]["observed_structure"] = observed_structure
+    transferred["diagnostics"]["applied_constraint"] = {
+        "requested_motion": task["motion"], "kind": model.kind,
+        "source": ("articulation semantics and compatible observed motion"
+                   if task["motion"] == "auto" and relation == "articulation"
+                   else "no additional task motion constraint"
+                   if task["motion"] == "auto"
+                   else "task motion specification validated against complete poses"),
+    }
+    # END observed/applied distinction.
     return {
         "status": "passed", "output_type": "object_trajectory",
         "carrier_id": observation["carrier_id"], "reference_id": observation["reference_id"],

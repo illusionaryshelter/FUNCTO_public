@@ -160,47 +160,42 @@ per stored value; Open3D `depth_scale` specifies its divisor. If neither is
 provided, the original millimetre convention applies. Geometry is no longer
 restricted to the original one-metre range or hard-coded camera intrinsics.
 
-<!-- BEGIN FoundationPose replaces point-tracker motion estimation. -->
-The new path uses Gemini for role/relationship selection, SAM3.1 for entity and
-part masks, SD-DINO for visible cross-instance correspondences, and local
-FoundationPose for rigid model poses from calibrated RGB-D. FoundationPose runs
-in an isolated, memory-limited GPU worker. It registers each model from its
-initial mask and tracks subsequent frames. Its original-mesh poses bind once
-to the initial observed body geometry; later poses retain that fixed binding.
-Reference motion is removed before motion transfer.
-Parent-object masks exclude the moving part when tracking a fixed reference.
-Pose-validation diagnostics remain in the result. Missing models, rejected
-poses, ambiguous correspondences and incompatible motion are explicit errors.
-There is no alternative point-tracking backend or fabricated substitute geometry.
+<!-- BEGIN TAPIP3D object motion and fixed semantic ownership. -->
+The raw path uses Gemini for role/relationship selection, SAM3.1 for rigid-part
+masks, SD-DINO for cross-instance correspondence and local TAPIP3D for calibrated
+RGB-D material tracks. It samples up to 64 spread, valid-depth points per body,
+tracks carrier and reference together in one bounded GPU worker, and fits
+first-frame-to-current rigid motion with the existing correspondence RANSAC
+and least-squares refit. Visibility is a filter, not an independent accuracy
+score. Raw tracks, query identities, residuals and reference motion remain
+available in `observations.json`. No mesh or monocular depth model is required.
 
-The demonstrated stage's `config.json` must identify the actual rigid models:
+Camera coordinates must be calibrated. For a stationary recording, declare
+`"stationary_camera": true` in the existing demonstration `config.json`.
+Programmatic `track_rgbd(..., extrinsics=...)` instead accepts known
+camera-from-world SE(3) matrices for every selected frame. An object's reference
+motion is compensated separately and never substitutes for camera calibration.
+The bundled pour recording uses a stationary camera; older runs can be replayed
+through `main.py` with their original annotated trajectories.
 
-```json
-{
-  "depth_scale": 1000,
-  "pose_models": {
-    "carrier": {"mesh": "models/moving_part.obj", "scale": 1.0},
-    "reference": {"mesh": "models/fixed_reference.obj", "scale": [1.0, 1.0, 1.0]}
-  }
-}
-```
+Optional semantic points and directions bind once to an explicit owner using
+`manipulation.anchors.bind_anchors` and follow that owner's fixed body poses
+through `propagate_anchors`. Empty anchor lists are valid for object motion.
+A sliding contact is not automatically treated as a fixed material point.
+The tool subset binds its initial function/center/grasp annotations through
+this same interface. `manipulate.py` now tracks tool demonstrations too, writes
+a derived demo under its output directory and preserves the original function
+event and optimizer; later historical track rows cannot bypass TAPIP3D.
+The original annotations and calibration are still required by that subset.
 
-Mesh paths are relative to that RGB-D directory or absolute. A positive scalar
-or three positive scale values convert mesh coordinates into metres. Each mesh
-must describe its selected rigid instance or moving part; a complete articulated
-assembly cannot serve as one rigid moving-part model. The semantic labels and
-SAM masks identify roles, but they do not establish which 3D model is correct.
-An outer mask or partial visible point cloud is never silently converted into a
-replacement mesh. The destination still uses its calibrated observation and
-SD-DINO correspondences for cross-instance binding.
-
-The bundled `pour_demo` has no corresponding pose meshes, so it cannot run this
-raw model-based path without genuine matching models. Its prepared annotations
-and trajectory remain valid inputs to the original `main.py` tool-use example.
-No additional FoundationPose models are required by that annotated subset.
-<!-- END FoundationPose motion estimation and explicit model identity. -->
-Raw tool-use classification routes to the existing annotated tool subset, which
-still requires its original demonstration annotations and calibration.
+Observed compatible motion families and applied task constraints are separate
+in `motion_checks`. A straight carry does not automatically become a slider;
+a declared whole-stage planar task is validated and transferred in its tilted
+plane. Invalid observations or incompatible known constraints fail explicitly.
+The released tool optimizer cannot jointly enforce a mechanical/planar family
+and its function event; such combinations are explicitly rejected, never
+silently converted into free motion.
+<!-- END TAPIP3D object motion and fixed semantic ownership. -->
 
 An `on` goal selects a task-relevant observed plane with Gemini, then uses a
 bounded patch that remains inside its observed mask, including any holes. It

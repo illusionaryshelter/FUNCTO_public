@@ -2,6 +2,7 @@
     "path_dataset": "/home/yuhong/Desktop/kinect/tmp8",
     "path_intrinsic": "/home/yuhong/Desktop/kinect/tmp8/intrinsic.json",
     "depth_map_type": "redwood",
+    "stationary_camera": true,
     "n_frames_per_fragment": 100,
     "n_keyframes_per_n_frame": 5,
     "depth_min": 0.3,

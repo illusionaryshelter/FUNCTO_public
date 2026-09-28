@@ -22,6 +22,9 @@ import numpy as np
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# BEGIN serialize local stages in one caller: one GPU worker at a time.
+_WORKER_LOCK = threading.Lock()
+# END local stage serialization.
 
 
 def run_worker(kind: str, images: list[Image.Image], options: dict) -> dict[str, np.ndarray]:
@@ -55,8 +58,10 @@ def run_file_worker(kind: str, paths: list[Path], options: dict) -> dict[str, np
     independent of video pixel count, and reclaims the entire tracker before
     the next SAM/SD-DINO stage starts.
     """
-    if kind != "foundationpose":
+    # BEGIN TAPIP3D uses the same bounded, offline file transport.
+    if kind not in {"foundationpose", "tapip3d"}:
         raise ValueError(f"Unknown file-based local model: {kind}")
+    # END TAPIP3D file transport.
     paths = [Path(path).resolve() for path in paths]
     if not paths or any(not path.is_file() for path in paths):
         raise ValueError("Tracking requires a nonempty sequence of existing frame files")
@@ -66,6 +71,14 @@ def run_file_worker(kind: str, paths: list[Path], options: dict) -> dict[str, np
 
 def _run_file_worker(kind, paths, options, directory):
     """Single checked subprocess boundary shared by image and video inference."""
+    # BEGIN serial worker lifetime includes CPU result materialization.
+    with _WORKER_LOCK:
+        return _run_file_worker_locked(kind, paths, options, directory)
+
+
+def _run_file_worker_locked(kind, paths, options, directory):
+    """Execute after the previous model worker has released GPU ownership."""
+    # END serial worker lifetime.
     torch = sys.modules.get("torch")
     gc.collect()
     if torch is not None and torch.cuda.is_initialized():
@@ -193,13 +206,18 @@ def main() -> None:
             raise ValueError("SD-DINO expects a pair of images")
         from .sd_dino import worker_main
         worker_main(paths, output)
-    # BEGIN model-based pose worker; point-tracking dispatch is removed.
+    # BEGIN explicit model-based comparison component.
     elif request["kind"] == "foundationpose":
         from .foundationpose import worker_main
         options = dict(request["options"])
         masks = np.load(options.pop("masks_path"), allow_pickle=False)
         worker_main(paths, output, masks=masks, **options)
-    # END model-based pose worker.
+    # END explicit model-based comparison component.
+    # BEGIN TAPIP3D default point tracker; no model imported before dispatch.
+    elif request["kind"] == "tapip3d":
+        from .tapip3d import worker_main
+        worker_main(paths, output, **request["options"])
+    # END TAPIP3D point tracker.
     else:
         raise ValueError(f"Unknown worker: {request['kind']}")
     print(json.dumps({"local_model": request["kind"],

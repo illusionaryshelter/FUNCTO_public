@@ -60,6 +60,108 @@ class ManipulationPipelineTest(unittest.TestCase):
         result = run_stage(observed)
         self.assertEqual(result["model"]["kind"], "free")
         np.testing.assert_allclose(result["poses"][-1][:3, 3], [.1, .4, .25])
+        # BEGIN observed line is visible in diagnostics without becoming a rail.
+        structure = result["motion_checks"]["observed_structure"]
+        self.assertIn("prismatic", structure["compatible_candidates"])
+        self.assertEqual(result["motion_checks"]["applied_constraint"]["kind"], "free")
+        # END observed/applied line regression.
+
+    # BEGIN whole-stage planar semantics and structure evidence are independent.
+    def test_tilted_se2_candidate_is_retained_and_applied_only_when_requested(self):
+        phase = np.linspace(0., 1., 25)
+        local = np.repeat(np.eye(4)[None], len(phase), axis=0)
+        local[:, :3, :3] = Rotation.from_euler("z", .8*phase).as_matrix()
+        local[:, :3, 3] = np.column_stack((.2*phase, .1*np.sin(4*phase), .3*np.ones(len(phase))))
+        placement = pose([.3, -.2, .1])
+        placement[:3, :3] = Rotation.from_euler("xyz", [.4, -.6, .2]).as_matrix()
+        trajectory = placement @ local
+        observed = stage(motion="auto")
+        observed["demo_poses"] = trajectory
+        observed["frame_indices"] = np.arange(len(phase))*3
+        observed["scene"].update(initial_pose=trajectory[0], goal_pose=trajectory[-1])
+
+        unconstrained = run_stage(observed)
+        self.assertEqual(unconstrained["model"]["kind"], "free")
+        structure = unconstrained["motion_checks"]["observed_structure"]
+        self.assertIn("planar", structure["compatible_candidates"])
+        self.assertEqual(structure["preferred_description"], "planar")
+
+        observed["task"]["motion"] = "planar"
+        planar = run_stage(observed)
+        self.assertEqual(planar["model"]["kind"], "planar")
+        self.assertEqual(planar["motion_checks"]["applied_constraint"]["requested_motion"], "planar")
+        np.testing.assert_allclose(planar["poses"], trajectory, atol=1e-10)
+        np.testing.assert_array_equal(planar["frame_indices"], observed["frame_indices"])
+        self.assertEqual(np.asarray(planar["model"]["coordinates"]).shape, (len(phase), 3))
+        normal = placement[:3, 2]
+        displacement = planar["poses"][:, :3, 3] - trajectory[0, :3, 3]
+        np.testing.assert_allclose(displacement @ normal, 0., atol=1e-10)
+
+        # A known planar task cannot become free when an observed frame tilts.
+        observed["demo_poses"] = trajectory.copy()
+        observed["demo_poses"][12, :3, :3] = (
+            placement[:3, :3] @ Rotation.from_euler("x", .3).as_matrix()
+            @ local[12, :3, :3])
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            run_stage(observed)
+
+    def test_fixed_orientation_observations_can_support_a_planar_task(self):
+        # Zero observed yaw does not disprove an SE(2) task; a sufficiently
+        # spread 2-D path establishes a plane and the task requests allowed yaw.
+        phase = np.linspace(0., 1., 25)
+        trajectory = np.array([pose([.2*t, .1*np.sin(4*t), .3]) for t in phase])
+        observed = stage(motion="planar")
+        observed["demo_poses"] = trajectory
+        goal = trajectory[-1].copy()
+        goal[:3, :3] = Rotation.from_euler("z", .4).as_matrix()
+        observed["scene"].update(initial_pose=trajectory[0], goal_pose=goal)
+        result = run_stage(observed)
+        self.assertEqual(result["model"]["kind"], "planar")
+        structure = result["motion_checks"]["observed_structure"]
+        self.assertIn("translation_plane", structure["compatible_candidates"])
+        self.assertIn("planar", structure["compatible_candidates"])
+        np.testing.assert_allclose(result["poses"][-1], goal, atol=1e-10)
+        np.testing.assert_allclose(result["poses"][:, 2, 3], .3, atol=1e-10)
+
+    def test_static_auto_object_observations_are_valid_but_structure_is_undetermined(self):
+        observed = stage(motion="auto")
+        initial = observed["scene"]["initial_pose"].copy()
+        observed["demo_poses"] = np.repeat(initial[None], 8, axis=0)
+        observed["scene"]["goal_pose"] = initial
+        result = run_stage(observed)
+        structure = result["motion_checks"]["observed_structure"]
+        self.assertEqual(structure["status"], "insufficient_excitation")
+        self.assertIsNone(structure["preferred_description"])
+        np.testing.assert_allclose(result["poses"], observed["demo_poses"])
+
+        observed["task"]["relation"] = "articulation"
+        with self.assertRaisesRegex(ValueError, "excited"):
+            run_stage(observed)
+
+    def test_final_on_relation_does_not_constrain_the_airborne_carry_to_se2(self):
+        observed = stage("on", "auto", "grasp")
+        observed["scene"]["support"] = support()
+        observed["scene"]["goal_pose"] = pose([.2, .1, .02])
+        phase = np.linspace(0., 1., len(observed["demo_poses"]))
+        observed["demo_poses"][:, :3, 3] = np.column_stack((
+            .2*phase, .1*phase,
+            .4-.38*phase + .08*np.sin(np.pi*phase)*np.sin(4*np.pi*phase)))
+        result = run_stage(observed)
+        self.assertEqual(result["model"]["kind"], "free")
+        self.assertGreater(result["poses"][0, 2, 3], .3)
+        self.assertAlmostEqual(result["poses"][-1, 2, 3], .02)
+        self.assertLess(result["goal_checks"]["support_gap_m"], 1e-10)
+
+    def test_articulation_screw_motion_cannot_downgrade_to_free(self):
+        phase = np.linspace(0., 1.2, 25)
+        trajectory = np.array([pose([0., 0., .1*t]) for t in phase])
+        trajectory[:, :3, :3] = Rotation.from_euler("z", phase).as_matrix()
+        observed = stage("articulation", "auto", "pull")
+        observed["demo_poses"] = trajectory
+        observed["scene"].update(initial_pose=trajectory[0], goal_pose=trajectory[-1])
+        with self.assertRaisesRegex(ValueError, "Articulation"):
+            run_stage(observed)
+    # END planar semantics and structure evidence.
 
     def test_push_slide_without_grasp_and_incompatible_goal(self):
         observed = stage("articulation", "prismatic", "push")

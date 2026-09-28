@@ -114,14 +114,16 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
     final_image, _, _ = load_rgbd(demo_dir, indices[-1])
     task = infer_task(instruction, demo_image, scene_image,
                       demo_final_image=final_image, client=client)
-    if task["relation"] == "tool_use":
-        # Tool use remains a supported subset through its existing annotated
-        # demonstration pipeline, rather than being reduced to generic grasping.
-        return {"tool_use": True, "task": task, "instruction": instruction}
+    # BEGIN one observation path for tools, transported objects and moving parts.
+    # A tool's semantic annotations specify material points, not its subsequent
+    # motion. Track its carrier/reference exactly as for the other task families.
+    if task["relation"] == "tool_use" and task["motion"] not in {"auto", "free"}:
+        raise ValueError("The tool-use optimizer cannot jointly enforce function events and "
+                         "a constrained motion family; refusing to discard the motion constraint")
     demo_roles = select_roles(demo_image, task, "demo", detector=detector, client=client)
-    scene_roles = select_roles(scene_image, task, "scene", detector=detector, client=client)
     masks = {}
-    for domain, roles in (("demo", demo_roles), ("scene", scene_roles)):
+
+    def role_masks(domain, roles):
         carrier = roles["carrier"]["mask"]
         # A parent cabinet mask may contain the moving drawer/door. Only its
         # remaining visible fixed part is allowed to serve as motion reference.
@@ -136,10 +138,18 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
             for role, mask in masks[domain].items():
                 Image.fromarray(mask.astype(np.uint8)*255).save(destination / f"{role}_mask.png")
     tracker = track_rgbd if tracker is None else tracker
+    role_masks("demo", demo_roles)
     track = tracker(demo_dir, masks["demo"]["carrier"], reference_mask=masks["demo"]["reference"])
     demo_poses = np.asarray(track["poses"], float)
-    if len(demo_poses) != len(indices):
+    if len(demo_poses) != len(indices) or not np.array_equal(track["frame_indices"], indices):
         raise ValueError("Tracked poses do not cover the selected demonstration frames")
+    if task["relation"] == "tool_use":
+        # The released tool subset already grounds its destination semantics.
+        # Repeating descriptor matching here would add work with no consumer.
+        return {"tool_use": True, "task": task, "instruction": instruction, "tracking": track}
+    scene_roles = select_roles(scene_image, task, "scene", detector=detector, client=client)
+    role_masks("scene", scene_roles)
+    # END common observation path; destination grounding remains task-specific.
     actual_extractor = extractor
     if actual_extractor is None:
         from local_models.sd_dino import extract_pair
@@ -222,14 +232,16 @@ def run_rgbd(demo_dir, scene_dir, instruction, output_dir, **dependencies):
     write_json(destination / "run.json", report)
     try:
         observation = ground_rgbd(demo_dir, scene_dir, instruction, output_dir=destination, **dependencies)
+        # BEGIN save the actual motion source before either downstream consumer.
+        write_json(destination / "observations.json", observation)
         if observation.get("tool_use"):
             from .tool_use import run_tool_use
             result = run_tool_use(demo_dir, scene_dir, observation["task"], instruction,
-                                  destination, client=dependencies.get("client"))
+                                  destination, tracking=observation["tracking"], client=dependencies.get("client"))
         else:
-            write_json(destination / "observations.json", observation)
             result = run_stage(observation)
             write_json(destination / "trajectory.json", result)
+        # END common motion provenance and task-specific trajectory generation.
         report["status"] = "passed"
         report["output_type"] = result["output_type"]
     except BaseException as error:

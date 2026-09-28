@@ -1,4 +1,4 @@
-# BEGIN model-based raw observation contract in CLI documentation.
+# BEGIN calibrated material-track contract in CLI documentation.
 """Transfer an object/part demonstration, or replay grounded observations.
 
 Examples:
@@ -8,12 +8,14 @@ Examples:
 RGB-D inputs use aligned rgb/, depth/ and intrinsic.json. The output is an
 object/part trajectory, not a robot end-effector or force-control command.
 
-Raw motion estimation uses local FoundationPose. The demonstration's config.json
-must declare pose_models.carrier and pose_models.reference with the actual rigid
-mesh paths and scales into metres. Semantic labels do not establish model identity;
-missing models fail explicitly. The prepared numerical path needs no model inference.
+Local TAPIP3D tracks material points; rigid fits drive optional owned semantic
+anchors. For stationary recordings, config.json declares stationary_camera=true.
+Known camera-from-world poses are supported by the programmatic observation API.
+No instance mesh or mandatory function/grasp point is needed for object motion.
+The annotated tool subset retains its original initial semantics and function
+event, while obtaining its demonstration motion from the same tracker.
 """
-# END model-based raw observation contract in CLI documentation.
+# END calibrated material-track contract in CLI documentation.
 
 import argparse
 import json

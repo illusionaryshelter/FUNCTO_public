@@ -49,6 +49,19 @@ class TaskGroundingTest(unittest.TestCase):
         self.assertIn("demonstration final scene", client.chat_json.call_args.args[0])
         self.assertNotIn("grasp_point", result)
 
+    # BEGIN preserve simultaneous semantic and motion requirements for routing.
+    def test_planar_tool_semantics_are_retained_instead_of_silently_weakened(self):
+        response = task()
+        response.update(relation="tool_use", interaction="tool", motion="planar")
+        result = infer_task("Sweep along the tabletop while keeping contact", self.image,
+                            self.image, client=Mock(chat_json=Mock(return_value=response)))
+        self.assertEqual(result["relation"], "tool_use")
+        self.assertEqual(result["motion"], "planar")
+        # The execution entry must reject an unsupported combination explicitly;
+        # grounding must not erase a requirement to make that route succeed.
+        self.assertEqual(set(result), set(task()))
+    # END simultaneous requirements.
+
     def test_invalid_semantics_and_vlm_geometry_are_rejected(self):
         invalid = []
         for field, value in [("motion", "drawer"), ("relation", None), ("interaction", []),

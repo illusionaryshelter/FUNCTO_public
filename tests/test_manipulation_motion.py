@@ -11,7 +11,9 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from manipulation.motion import fit_motion, transfer_motion
+# BEGIN non-constraining motion analysis regressions.
+from manipulation.motion import analyze_motion, fit_motion, transfer_motion
+# END motion analysis import.
 
 
 def transform(rotation=None, translation=None):
@@ -51,6 +53,36 @@ def fixture(kind, seed=3, count=41):
 
 
 class MotionFittingTest(unittest.TestCase):
+    # BEGIN observation analysis must preserve ambiguity and reject invalid data.
+    def test_candidates_retain_full_planar_process_without_selecting_a_task(self):
+        observed = fixture("planar")
+        report = analyze_motion(observed)
+        self.assertEqual(report["status"], "observed_compatible")
+        self.assertEqual(report["preferred_description"], "planar")
+        self.assertEqual(report["compatible_candidates"], ["planar", "free"])
+        candidate = report["candidates"]["planar"]
+        self.assertEqual(np.asarray(candidate["coordinates"]).shape, (len(observed), 3))
+        self.assertEqual(len(candidate["diagnostics"]["position_residuals_m"]), len(observed))
+        self.assertLess(candidate["diagnostics"]["max_rotation_residual_rad"], 1e-12)
+        # The report is serializable without mutating the input sequence.
+        json.dumps(report, allow_nan=False)
+        np.testing.assert_array_equal(observed, fixture("planar"))
+
+    def test_static_candidate_report_does_not_assert_physical_free_motion(self):
+        observed = np.repeat(transform(translation=[.1, .2, .3])[None], 5, axis=0)
+        report = analyze_motion(observed)
+        self.assertEqual(report["status"], "insufficient_excitation")
+        self.assertIsNone(report["preferred_description"])
+        self.assertEqual(report["compatible_candidates"], ["free"])
+        self.assertEqual(len(report["candidates"]["free"]["coordinates"]), len(observed))
+
+    def test_candidate_analysis_cannot_fallback_from_invalid_poses(self):
+        observed = fixture("free")
+        observed[8, :3, 0] *= -1
+        with self.assertRaisesRegex(ValueError, "proper"):
+            analyze_motion(observed)
+    # END observation analysis regressions.
+
     def test_five_models_reconstruct_arbitrary_placements(self):
         dimensions = {"free": 6, "planar": 3, "translation_plane": 2, "revolute": 1, "prismatic": 1}
         for kind, dimension in dimensions.items():

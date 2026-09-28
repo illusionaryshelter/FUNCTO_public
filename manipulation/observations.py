@@ -2,16 +2,17 @@
 
 All translations and depths are metres. A pose maps column-vector points from
 the initial body frame into the initial camera reference frame. With a tracked
-reference, its motion is removed before returning the body poses; without one,
-the camera must be stationary. The body frame's axes initially match the camera
+reference, its motion is removed before returning the body poses. Camera motion
+requires supplied extrinsics; otherwise the camera must be explicitly stationary.
+The body frame's axes initially match the camera
 and its origin is the centroid of the initial observed body geometry.
 
 This module neither assigns object roles nor keeps GPU models resident.
-FoundationPose estimates each rigid object's camera pose in an isolated worker.
-Its model frame is bound once to the initial observed body frame; tracking does
-not repeatedly sample depth at a projected point and assume material identity.
-The worker must validate model-to-observation geometry, not merely return SE(3).
-An object name alone does not establish that a mesh matches that instance.
+TAPIP3D follows fixed-ID measured surface queries in an isolated worker. Rigid
+fitting transports all body-attached anchors; depth is not resampled to replace
+point identity. Finite SE(3), visibility and fit residuals are diagnostics, not
+accuracy certificates. Model-pose conversion remains an independent geometric
+utility for inspecting existing FoundationPose/BundleSDF experiments.
 """
 
 # BEGIN task-adaptive observations: independent of tool/function/grasp fields.
@@ -324,56 +325,112 @@ def poses_from_models(camera_from_model, initial_points, *,
 # END FoundationPose coordinates.
 
 
-# BEGIN explicit instance geometry for FoundationPose; no category-mesh guess.
-def _pose_models(root, roles):
-    """Resolve metric instance meshes from the existing RGB-D config file.
+# BEGIN fixed-ID TAPIP3D observations and common owner-body coordinates.
+def poses_from_tracks(tracked, initial_points, *, frame_indices=None, max_error=0.01):
+    """Fit independent bodies and preserve their common first-camera gauge.
 
-    Mesh paths are relative to config.json unless absolute. Scale must be
-    explicit, positive, and either scalar or three per-axis factors. A category
-    name is insufficient input; validation of the selected geometry against
-    RGB-D remains the worker's responsibility.
+    ``body_poses[owner]`` maps that owner's fixed initial geometry-centroid
+    body into camera-zero coordinates with actual object motion retained.
+    ``poses`` removes the reference body's motion, if present, using
+    Br[0] @ inv(Br[t]) @ Bc[t]. This is relative motion, not a claim that the
+    reference is stationary. Raw TAPIP3D predictions remain in their supplied
+    world coordinates; they are never overwritten with the rigid projection.
     """
-    config_path = root / "config.json"
-    if not config_path.is_file():
-        raise ValueError("FoundationPose requires config.json pose_models for the selected entities")
-    config = json.loads(config_path.read_text())
-    models = config.get("pose_models") if isinstance(config, dict) else None
-    if not isinstance(models, dict):
-        raise ValueError("FoundationPose requires config.json pose_models for the selected entities")
-    selected = []
-    for role in roles:
-        model = models.get(role)
-        if (not isinstance(model, dict) or not isinstance(model.get("mesh"), str)
-                or not model["mesh"].strip()):
-            raise ValueError(f"FoundationPose pose_models.{role} must specify its instance mesh")
-        mesh = Path(model["mesh"]).expanduser()
-        mesh = (mesh if mesh.is_absolute() else config_path.parent / mesh).resolve()
-        if not mesh.is_file():
-            raise FileNotFoundError(f"FoundationPose {role} mesh does not exist: {mesh}")
-        scale = model.get("scale")
-        components = scale if isinstance(scale, list) else [scale]
-        numeric = all(isinstance(value, (int, float)) and not isinstance(value, bool)
-                      for value in components)
-        values = np.asarray(components, dtype=float) if numeric else np.array([])
-        if (not numeric or (isinstance(scale, list) and len(scale) != 3)
-                or not np.isfinite(values).all() or (values <= 0).any()):
-            raise ValueError(f"FoundationPose {role} scale must be an explicit positive scalar or 3-vector")
-        selected.append({"mesh": str(mesh), "scale": values.tolist() if isinstance(scale, list) else float(values[0])})
-    return selected
-# END explicit instance geometry.
+    from local_models.tapip3d import camera_extrinsics
+
+    roles = list(initial_points)
+    if roles not in (["carrier"], ["carrier", "reference"]):
+        raise ValueError("initial_points must contain carrier and optional reference in that order")
+    coords = np.asarray(tracked.get("coords"))
+    queries = np.asarray(tracked.get("query_points"))
+    owners = np.asarray(tracked.get("query_owner"))
+    visibility = np.asarray(tracked.get("visibs"))
+    projected = np.asarray(tracked.get("projection_valid"))
+    if (coords.ndim != 3 or coords.shape[2] != 3 or not coords.shape[0]
+            or coords.dtype.kind != "f" or not np.isfinite(coords).all()):
+        raise ValueError("TAPIP3D requires finite coords [T,N,3]")
+    count, query_count = coords.shape[:2]
+    if (queries.shape != (query_count, 4) or not np.isfinite(queries).all()
+            or not np.all(queries[:, 0] == 0)
+            or owners.shape != (query_count,) or owners.dtype.kind not in "iu"
+            or set(owners.tolist()) != set(range(len(roles)))):
+        raise ValueError("TAPIP3D query identities and owners must cover the initial rigid parts")
+    if (visibility.shape != (count, query_count) or visibility.dtype != np.bool_
+            or projected.shape != visibility.shape or projected.dtype != np.bool_):
+        raise ValueError("TAPIP3D requires boolean visibility and projection validity for every query")
+    E = camera_extrinsics(tracked.get("camera_from_world"), count)
+    indices = np.arange(count) if frame_indices is None else np.asarray(frame_indices)
+    if (indices.shape != (count,) or indices.dtype.kind not in "iu"
+            or (indices < 0).any() or (indices[1:] <= indices[:-1]).any()):
+        raise ValueError("frame_indices must be nonnegative increasing integer frame IDs")
+    camera0_queries = queries[:, 1:] @ E[0, :3, :3].T + E[0, :3, 3]
+    camera0_coords = coords @ E[0, :3, :3].T + E[0, :3, 3]
+    body_poses, local_points, origins, diagnostics = {}, {}, {}, {}
+    for owner, role in enumerate(roles):
+        geometry = np.asarray(initial_points[role], dtype=float)
+        if (geometry.ndim != 2 or geometry.shape[1] != 3 or not len(geometry)
+                or not np.isfinite(geometry).all()):
+            raise ValueError(f"{role} initial_points must be finite N-by-3 observations")
+        ids = np.flatnonzero(owners == owner)
+        if len(ids) < 6 or not _noncollinear(camera0_queries[ids]):
+            raise ValueError(f"{role} requires six spread initial material queries")
+        estimates, records = [], []
+        for frame in range(count):
+            valid = visibility[frame, ids] & projected[frame, ids]
+            accepted_ids = ids[valid]
+            if len(accepted_ids) < 6:
+                raise ValueError(f"{role} frame {indices[frame]} has insufficient visible material correspondences")
+            try:
+                estimate, fit = rigid_registration(camera0_queries[accepted_ids],
+                    camera0_coords[frame, accepted_ids], max_error=max_error)
+            except ValueError as error:
+                raise ValueError(f"{role} frame {indices[frame]} rigid fit failed: {error}") from error
+            estimates.append(estimate)
+            records.append({"frame_index": int(indices[frame]), "query_ids": accepted_ids.copy(), **fit})
+        origin = geometry.mean(axis=0)
+        initial = np.eye(4)
+        initial[:3, 3] = origin
+        estimates = np.asarray(estimates)
+        bodies = estimates @ np.linalg.solve(estimates[0], initial)
+        # Exact first-frame gauge only; raw predictions and their residuals
+        # remain available, including the model's small query-frame offsets.
+        bodies[0] = initial
+        body_poses[role], local_points[role] = bodies, geometry - origin
+        origins[role], diagnostics[role] = origin, records
+    poses = body_poses["carrier"].copy()
+    if "reference" in body_poses:
+        reference = body_poses["reference"]
+        poses = reference[0] @ np.linalg.solve(reference, poses)
+        poses[0] = body_poses["carrier"][0]
+    return {
+        "poses": poses, "points": local_points["carrier"], "frame_indices": indices.copy(),
+        "body_poses": body_poses, "body_points": local_points,
+        "body_origin_camera0_m": origins["carrier"],
+        "camera_from_initial_camera": E @ np.linalg.inv(E[0]),
+        "body_frame": "initial observed geometry centroid; axes aligned with initial camera",
+        "reference_frame": "initial camera coordinates",
+        "camera_assumption": ("reference motion compensated; reference defines relative motion"
+            if "reference" in body_poses else "supplied camera extrinsics remove camera motion"),
+        "units": "metres", "pose_convention": "reference_from_body; column vectors",
+        "tracking_method": "TAPIP3D calibrated RGB-D material tracks + rigid correspondence fit",
+        "tracking_coords": coords.copy(), "tracking_query_points": queries.copy(),
+        "tracking_visibility": visibility.copy(), "tracking_query_owner": owners.copy(),
+        "tracking_owner_names": roles, "tracking_projection_valid": projected.copy(),
+        "tracking_diagnostics": {"fit_threshold_m": float(max_error), "per_owner": diagnostics,
+            "interpretation": "visibility and fit residuals do not certify pose accuracy"},
+    }
 
 
-def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None):
-    """Recover object/part motion with validated local FoundationPose poses.
+def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None,
+               stationary_camera=None, extrinsics=None):
+    """Recover body motion from local RGB-D without an instance mesh.
 
-    First-frame masks and config.json ``pose_models`` bind each selected rigid
-    entity to its own instance mesh. The isolated worker owns tracking state
-    and validates rendered geometry against RGB-D at every frame. This layer
-    validates the transport contract and converts original-mesh poses once to
-    the existing observed-body frame. No point tracker or fallback is used.
+    Camera stationarity must be declared explicitly, or by the existing
+    config.json ``stationary_camera`` boolean. Supplied ``extrinsics`` are
+    camera-from-world matrices for this selected frame sequence. The reference
+    part has its own tracks and motion; it never supplies camera calibration.
     """
-    # BEGIN FoundationPose observation path.
-    from local_models.foundationpose import track
+    from local_models.tapip3d import camera_extrinsics, track
 
     root = Path(directory)
     indices = sorted({int(path.stem) for path in (root / "rgb").iterdir()
@@ -391,13 +448,19 @@ def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None):
         raise ValueError("Body and reference masks must select distinct, nonoverlapping rigid parts")
     masks = [body_mask] + ([] if ref_mask is None else [ref_mask])
     roles = ["carrier"] + ([] if ref_mask is None else ["reference"])
-    models = _pose_models(root, roles)
+    if stationary_camera is None:
+        config_path = root / "config.json"
+        config = json.loads(config_path.read_text()) if config_path.is_file() else {}
+        stationary_camera = config.get("stationary_camera", False)
+    E = camera_extrinsics(extrinsics, len(indices), stationary_camera=stationary_camera)
+    geometries = {}
     for role, selected in zip(roles, masks):
         if np.count_nonzero(selected & np.isfinite(depth) & (depth > 0)) < 6:
-            raise ValueError(f"FoundationPose {role} needs at least six valid initial depth observations")
-    geometry = backproject(depth, camera.K, mask=body_mask)
-    if len(geometry) > 3000:
-        geometry = geometry[np.linspace(0, len(geometry) - 1, 3000, dtype=int)]
+            raise ValueError(f"TAPIP3D {role} needs at least six valid initial depth observations")
+        geometry = backproject(depth, camera.K, mask=selected)
+        if len(geometry) > 3000:
+            geometry = geometry[np.linspace(0, len(geometry) - 1, 3000, dtype=int)]
+        geometries[role] = geometry
     frame_paths, depth_paths = [], []
     # Validate all files before launching a GPU worker. Decoding is sequential,
     # so full videos are not accumulated in host memory by this preflight.
@@ -407,27 +470,17 @@ def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None):
                 or camera.depth_scale != current_camera.depth_scale):
             raise ValueError("RGB-D calibration changed within the track")
         if np.count_nonzero(np.isfinite(depth) & (depth > 0)) < 4:
-            raise ValueError(f"FoundationPose frame {index} has insufficient valid depth")
+            raise ValueError(f"TAPIP3D frame {index} has insufficient valid depth")
         frame_paths.append(_frame_file(root / "rgb", index, (".jpg", ".png", ".jpeg")))
         depth_paths.append(_frame_file(root / "depth", index, (".png", ".tiff", ".tif", ".npy")))
     tracked = track(frame_paths, depth_paths, K=camera.K, depth_scale=camera.depth_scale,
-                    masks=np.stack(masks), models=models)
-    if not isinstance(tracked, dict) or "camera_from_model" not in tracked:
-        raise ValueError("FoundationPose worker must return camera_from_model")
-    poses = np.asarray(tracked["camera_from_model"])
-    if poses.shape != (len(indices), len(roles), 4, 4):
-        raise ValueError("FoundationPose camera_from_model must cover every frame and selected entity")
-    validated = np.asarray(tracked.get("validated"))
-    if (validated.shape != (len(indices), len(roles)) or validated.dtype != np.bool_
-            or not validated.all()):
-        raise ValueError("FoundationPose requires successful geometry validation for every frame and entity")
-    result = poses_from_models(
-        poses[:, 0], geometry, reference_camera_from_model=None if ref_mask is None else poses[:, 1],
-        frame_indices=indices)
-    result["tracking_method"] = "FoundationPose instance-mesh poses + fixed material-point binding"
-    result["tracking_models"] = dict(zip(roles, models))
-    result["tracking_camera_from_model"] = poses.copy()
-    result["tracking_diagnostics"] = {key: value for key, value in tracked.items() if key != "camera_from_model"}
+                    masks=np.stack(masks), extrinsics=E)
+    if not isinstance(tracked, dict) or np.asarray(tracked.get("coords")).shape[:1] != (len(indices),):
+        raise ValueError("TAPIP3D trajectories must cover every requested frame")
+    result = poses_from_tracks(tracked, geometries, frame_indices=indices)
+    result["tracking_pixels"] = np.asarray(tracked["pixels"]).copy()
+    if stationary_camera and reference_mask is None:
+        result["camera_assumption"] = "explicitly stationary camera"
     return result
-    # END FoundationPose observation path.
+# END fixed-ID TAPIP3D observations.
 # END task-adaptive observations.

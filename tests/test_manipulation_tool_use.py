@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from manipulation.tool_use import run_tool_use
+from manipulation.tool_use import prepare_tracked_demo, run_tool_use
 from utils_IL.params import CAM_MATRIX
 
 
@@ -55,10 +55,12 @@ class ToolUseBridgeTest(unittest.TestCase):
             (directory / "intrinsic.json").write_text(json.dumps(calibration))
         files = {
             "key_point_track_output/keyframe_idx.json": {"func": 1},
-            "tool_pose_track_output/tool_track.json": {},
+            "tool_pose_track_output/tool_track.json": {
+                "function": [[0., 0., .8]], "center": [[.1, 0., .8]], "grasp": [[0., .1, .8]]},
             "func_point_track_output/func_point_2d_init.json": {},
             "grasp_det_output/grasp_points.json": {},
-            "cam_to_target_trans_output/cam_to_target_trans.json": {},
+            "cam_to_target_trans_output/cam_to_target_trans.json": {
+                "rotation_matrix": np.eye(3).tolist(), "rotation_center": [0, 0, 0], "centroid": [0, 0, 0]},
             "detection_output/tool.json": {},
         }
         for relative, value in files.items():
@@ -78,6 +80,9 @@ class ToolUseBridgeTest(unittest.TestCase):
                                       [.02, .06, .04], [.02, .03, .08]])
         self.cloud = types.SimpleNamespace(points=self.local_points @ self.start_rotation.T + self.start_position)
         self.target = {
+            "function_init": self.start_position.tolist(),
+            "center_init": (self.start_position + self.start_rotation[:, 0] * .12).tolist(),
+            "grasp_init": (self.start_position + self.start_rotation[:, 1] * .15).tolist(),
             "function_func": self.goal_position.tolist(),
             "center_func": (self.goal_position + self.goal_rotation[:, 0] * .12).tolist(),
             "grasp_func": (self.goal_position + self.goal_rotation[:, 1] * .15).tolist(),
@@ -89,6 +94,12 @@ class ToolUseBridgeTest(unittest.TestCase):
         self.mutate_target_after_optimization = False
         self.frame_helper = Mock(side_effect=self.compute_frame)
         self.client = Mock(chat_json=Mock(return_value={"action": "pour"}))
+        self.tracking = {"frame_indices": [0, 1, 2], "tracker": "analytic_fixture",
+                         "poses": np.repeat(np.eye(4)[None], 3, axis=0),
+                         "body_poses": {name: np.repeat(np.eye(4)[None], 3, axis=0)
+                                        for name in ("carrier", "reference")}}
+        self.tracking["poses"][1:, :3, 3] = [[.1, 0, 0], [.2, .03, 0]]
+        self.tracking["body_poses"]["carrier"] = self.tracking["poses"].copy()
 
         def prepare_run(source, destination):
             destination.mkdir(parents=True)
@@ -131,7 +142,7 @@ class ToolUseBridgeTest(unittest.TestCase):
     def run_bridge(self):
         with patch.dict("sys.modules", self.modules):
             return run_tool_use(self.demo, self.scene, self.task, "Repeat the demonstration",
-                                self.output, client=self.client)
+                                self.output, tracking=self.tracking, client=self.client)
 
     def test_independent_goal_and_fixed_function_body_coordinates(self):
         result = self.run_bridge()
@@ -149,6 +160,9 @@ class ToolUseBridgeTest(unittest.TestCase):
         self.frame_helper.assert_called_once()
         self.assertIn(self.task["goal_description"], self.client.chat_json.call_args.args[0])
         saved = json.loads((self.output / "trajectory.json").read_text())
+        manifest = json.loads((self.output / "tool_use/run.json").read_text())
+        self.assertEqual(manifest["status"], "passed")
+        self.assertEqual(Path(manifest["demo"]), (self.output / "tracked_demo").resolve())
         np.testing.assert_allclose(saved["goal_pose"], expected, atol=1e-12)
         self.assertFalse(np.array_equal(result["goal_pose"], result["poses"][1]))
 
@@ -178,6 +192,44 @@ class ToolUseBridgeTest(unittest.TestCase):
     def test_degenerate_goal_rejected_before_optimization(self):
         self.target["grasp_func"] = self.target["center_func"].copy()
         with self.assertRaisesRegex(ValueError, "noncollinear"):
+            self.run_bridge()
+        self.optimizer.assert_not_called()
+
+    def test_new_motion_replaces_later_annotations_and_preserves_source(self):
+        """Moving reference and nontrivial calibration expose frame mistakes."""
+        path = self.demo / "tool_pose_track_output/tool_track.json"
+        original = json.loads(path.read_text())
+        for values in original.values():
+            values.extend([[999, 999, 999], [-999, -999, -999]])
+        path.write_text(json.dumps(original))
+        rotation = Rotation.from_euler("xyz", [.25, -.3, .6]).as_matrix()
+        center, centroid = np.array([.03, -.07, .02]), np.array([.12, .11, -.2])
+        (self.demo / "cam_to_target_trans_output/cam_to_target_trans.json").write_text(json.dumps({
+            "rotation_matrix": rotation.tolist(), "rotation_center": center.tolist(), "centroid": centroid.tolist()}))
+        reference = self.tracking["body_poses"]["reference"]
+        reference[:, :3, 3] = [[.02, .03, 0], [.02, .06, 0], [.04, .09, 0]]
+        self.tracking["poses"] = reference[0] @ np.linalg.inv(reference) @ self.tracking["body_poses"]["carrier"]
+        source, evidence = prepare_tracked_demo(self.demo, self.tracking, self.output / "derived")
+        generated = json.loads((source / "tool_pose_track_output/tool_track.json").read_text())
+        # In this fixture the true relative displacement is supplied
+        # independently in camera coordinates; axes and target origin differ.
+        relative_delta = np.array([[0, 0, 0], [.1, -.03, 0], [.18, -.03, 0]])
+        for name, values in generated.items():
+            expected = np.asarray(original[name][0]) + relative_delta @ rotation.T
+            np.testing.assert_allclose(values, expected, atol=1e-12)
+        self.assertEqual(json.loads(path.read_text()), original)
+        self.assertEqual(evidence["goal_original_frame_id"], 1)
+
+    def test_known_constraint_cannot_be_ignored_by_tool_optimizer(self):
+        self.task["motion"] = "planar"
+        with self.assertRaisesRegex(ValueError, "cannot jointly enforce"):
+            self.run_bridge()
+        self.client.chat_json.assert_not_called()
+        self.optimizer.assert_not_called()
+
+    def test_missing_original_frames_cannot_relabel_legacy_function_event(self):
+        self.tracking["frame_indices"] = [0, 3, 9]
+        with self.assertRaisesRegex(ValueError, "consecutive original frames"):
             self.run_bridge()
         self.optimizer.assert_not_called()
 

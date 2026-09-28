@@ -17,7 +17,7 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 
 from manipulation.observations import (
-    backproject, load_calibration, load_rgbd, poses_from_models,
+    backproject, load_calibration, load_rgbd, poses_from_models, poses_from_tracks,
     rigid_registration, track_rgbd,
 )
 
@@ -237,151 +237,181 @@ class ModelPoseTest(unittest.TestCase):
 # END original-mesh pose and fixed-material-point contracts.
 
 
-# BEGIN isolated FoundationPose boundary; no model loading in these CPU tests.
+# BEGIN fixed-ID TAPIP3D boundary and independent frame-gauge tests.
+class TrackPoseTest(unittest.TestCase):
+    def observations(self, *, count=6, with_reference=True, initial_bias=True):
+        rng = np.random.default_rng(83)
+        roles = ["carrier", "reference"] if with_reference else ["carrier"]
+        geometries = {role:rng.uniform(-.1,.1,(64,3))+[.2*i, .1, 1.5]
+                      for i,role in enumerate(roles)}
+        E0 = pose((.3,-.2,.4), (.3,.1,-.15))
+        cameras = np.array([pose((.02*f,-.01*f,.03*f), (.02*f,0,0)) @ E0 for f in range(count)])
+        motions = {"carrier":np.array([pose((.04*f,-.02*f,.03*f), (.01*f,-.003*f,.002*f)) for f in range(count)]),
+                   "reference":np.array([pose((-.01*f,.01*f,-.02*f), (-.003*f,.007*f,0)) for f in range(count)])}
+        query_camera = np.concatenate(list(geometries.values()))
+        query_world = transform(query_camera, np.linalg.inv(E0))
+        owners = np.repeat(np.arange(len(roles)),64)
+        coords = []
+        for f in range(count):
+            groups = []
+            for i, role in enumerate(roles):
+                bias = pose((.001,-.002,.003), (.0003,.0002,-.0001)) if initial_bias else np.eye(4)
+                groups.append(transform(geometries[role], np.linalg.inv(E0) @ motions[role][f] @ bias))
+            coords.append(np.concatenate(groups))
+        tracked = {"coords":np.asarray(coords),"query_points":np.column_stack((np.zeros(len(query_world)),query_world)),
+                   "query_owner":owners,"visibs":np.ones((count,len(owners)),bool),
+                   "projection_valid":np.ones((count,len(owners)),bool),"camera_from_world":cameras}
+        return tracked,geometries,motions
+
+    def test_moving_camera_reference_and_query_frame_bias_keep_one_common_gauge(self):
+        tracked,geometry,motions = self.observations()
+        raw = tracked["coords"].copy()
+        result = poses_from_tracks(tracked,geometry,frame_indices=np.arange(6)*3)
+        for role in geometry:
+            P0 = pose(translation=geometry[role].mean(0))
+            np.testing.assert_allclose(result["body_poses"][role], motions[role] @ P0, atol=2e-12)
+            np.testing.assert_array_equal(result["body_poses"][role][0],P0)
+        P0 = pose(translation=geometry["carrier"].mean(0))
+        expected = np.linalg.inv(motions["reference"]) @ motions["carrier"] @ P0
+        np.testing.assert_allclose(result["poses"],expected,atol=2e-12)
+        E = tracked["camera_from_world"]
+        np.testing.assert_allclose(result["camera_from_initial_camera"],E @ np.linalg.inv(E[0]),atol=1e-12)
+        np.testing.assert_array_equal(result["tracking_coords"],raw)
+        np.testing.assert_array_equal(tracked["coords"],raw)
+        np.testing.assert_array_equal(result["frame_indices"],np.arange(6)*3)
+        # The first predicted coordinates are deliberately biased, while the
+        # normalized fixed-body gauge still binds original semantic geometry.
+        self.assertGreater(np.linalg.norm(raw[0]-tracked["query_points"][:,1:]),0.001)
+
+    def test_reference_is_not_required_with_known_camera_motion(self):
+        tracked,geometry,motions = self.observations(with_reference=False)
+        result = poses_from_tracks(tracked,geometry)
+        initial = pose(translation=geometry["carrier"].mean(0))
+        np.testing.assert_allclose(result["poses"],motions["carrier"] @ initial,atol=2e-12)
+        np.testing.assert_array_equal(result["points"],geometry["carrier"]-geometry["carrier"].mean(0))
+
+    def test_visibility_is_a_filter_and_failed_fits_do_not_become_free_motion(self):
+        tracked,geometry,_ = self.observations()
+        tracked["visibs"][3,:64] = False
+        tracked["visibs"][3,:5] = True
+        with self.assertRaisesRegex(ValueError,"carrier frame 3.*insufficient"):
+            poses_from_tracks(tracked,geometry)
+        tracked,geometry,_ = self.observations(initial_bias=False)
+        tracked["coords"][4,:64] *= 1.8
+        with self.assertRaisesRegex(ValueError,"carrier frame 4 rigid fit failed"):
+            poses_from_tracks(tracked,geometry)
+
+    def test_visibility_and_correspondence_identity_shapes_are_enforced(self):
+        tracked,geometry,_ = self.observations()
+        changes = [{"query_owner":np.zeros(128,dtype=int)},
+                   {"visibs":np.ones((6,128),float)},
+                   {"projection_valid":np.ones((6,64),bool)},
+                   {"query_points":np.ones((128,4))},
+                   {"coords":np.full((6,128,3),np.nan)}]
+        for change in changes:
+            with self.subTest(change=list(change)),self.assertRaises(ValueError):
+                poses_from_tracks(dict(tracked,**change),geometry)
+        with self.assertRaisesRegex(ValueError,"integer frame IDs"):
+            poses_from_tracks(tracked,geometry,frame_indices=[0,1,2,2,4,5])
+
+
 class SmallRGBDSequenceTest(unittest.TestCase):
-    def write_sequence(self, root, *, invalidate_second=False):
-        matrix = write_camera(root, width=128, height=96)
-        (root / "rgb").mkdir()
-        (root / "depth").mkdir()
-        (root / "meshes").mkdir()
-        (root / "meshes/carrier.obj").write_text("v 0 0 0\nv .1 0 0\nv 0 .1 0\nf 1 2 3\n")
-        config = json.loads((root / "config.json").read_text())
-        config["pose_models"] = {"carrier": {"mesh": "meshes/carrier.obj", "scale": 1.}}
-        (root / "config.json").write_text(json.dumps(config))
-        mask = np.zeros((96, 128), dtype=bool)
-        mask[14:82, 16:104] = True
+    def write_sequence(self,root,*,invalidate_second=False,stationary=True):
+        matrix = write_camera(root,width=128,height=96)
+        config = json.loads((root/"config.json").read_text())
+        if stationary is not None:
+            config["stationary_camera"] = stationary
+        (root/"config.json").write_text(json.dumps(config))
+        (root/"rgb").mkdir(); (root/"depth").mkdir()
+        mask = np.zeros((96,128),bool); mask[14:82,16:94] = True
         for frame in range(3):
-            Image.new("RGB", (128, 96), color=(80+frame, 90, 100)).save(root / "rgb" / f"{frame:05d}.png")
-            depth = np.full((96, 128), 1500, dtype=np.uint16)
-            if frame == 1 and invalidate_second:
+            Image.new("RGB",(128,96),(80+frame,90,100)).save(root/"rgb"/f"{frame:05d}.png")
+            depth = np.full((96,128),1500,dtype=np.uint16)
+            if frame==1 and invalidate_second:
                 depth[:] = 0
-            Image.fromarray(depth).save(root / "depth" / f"{frame:05d}.png")
-        return mask, matrix
+            Image.fromarray(depth).save(root/"depth"/f"{frame:05d}.png")
+        return mask,matrix
 
     @staticmethod
-    def known_models(paths, depths, *, K, depth_scale, masks, models):
-        # This fake supplies known *model* poses only. It does not pretend to
-        # exercise the actual FoundationPose renderer or its quality checks.
-        count = len(paths)
-        first = pose((.4, -.3, .2), (.5, -.1, 1.3))
-        reference = pose((-.3, .4, -.2), (-.4, .2, 1.7))
-        output = []
-        for frame in range(count):
-            body_motion = pose((0, 0, .1*frame), (.03*frame, .01*frame, 0))
-            camera = np.eye(4) if len(masks) == 1 else pose((.05*frame, -.03*frame, 0), (.1*frame, 0, 0))
-            output.append([camera @ body_motion @ first] + ([] if len(masks) == 1 else [camera @ reference]))
-        return {"camera_from_model": np.asarray(output), "validated": np.ones((count, len(masks)), bool),
-                "support_fraction": np.full((count, len(masks)), .9)}
+    def known_tracks(paths,depth_paths,*,K,depth_scale,masks,extrinsics,stationary_camera=False):
+        from local_models.tapip3d import sample_queries
+        with Image.open(depth_paths[0]) as image:
+            depth = np.asarray(image,dtype=float)*depth_scale
+        E = np.asarray(extrinsics)
+        q,owners,_ = sample_queries(depth,K,masks,E[0])
+        initial_camera = transform(q[:,1:],E[0])
+        coords = []
+        for frame in range(len(paths)):
+            current = initial_camera.copy()
+            for owner in range(len(masks)):
+                delta = pose((0,0,.05*frame),(.015*frame,.003*frame,0)) if owner==0 else pose((0,0,-.02*frame),(-.005*frame,0,0))
+                current[owners==owner] = transform(current[owners==owner],delta)
+            coords.append(transform(current,np.linalg.inv(E[0])))
+        coords = np.asarray(coords)
+        camera = np.einsum("tij,tnj->tni",E[:,:3,:3],coords)+E[:,None,:3,3]
+        uvz = camera @ np.asarray(K).T
+        return {"coords":coords,"visibs":np.ones(coords.shape[:2],bool),
+                "query_points":q,"query_owner":owners,"projection_valid":np.ones(coords.shape[:2],bool),
+                "pixels":uvz[...,:2]/uvz[...,2:],"camera_from_world":E}
 
-    def test_model_pose_boundary_recovers_known_motion_and_preserves_raw_predictions(self):
+    def test_default_path_needs_no_mesh_and_preserves_query_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            mask, matrix = self.write_sequence(root)
-            with patch("local_models.foundationpose.track", side_effect=self.known_models) as worker:
-                result = track_rgbd(root, mask)
+            root = Path(directory); mask,K = self.write_sequence(root)
+            with patch("local_models.tapip3d.track",side_effect=self.known_tracks) as worker:
+                result = track_rgbd(root,mask)
+            worker.assert_called_once()
+            self.assertNotIn("models",worker.call_args.kwargs)
+            self.assertLessEqual(len(result["points"]),3000)
+            self.assertEqual(result["tracking_coords"].shape,(3,64,3))
             relative = result["poses"] @ np.linalg.inv(result["poses"][0])
-            expected = [pose((0, 0, .1*f), (.03*f, .01*f, 0)) for f in range(3)]
-            np.testing.assert_allclose(relative, expected, atol=1e-12)
-            self.assertLessEqual(len(result["points"]), 3000)
-            self.assertEqual(result["tracking_camera_from_model"].shape, (3, 1, 4, 4))
-            np.testing.assert_allclose(result["tracking_diagnostics"]["support_fraction"], .9)
-            np.testing.assert_array_equal(worker.call_args.kwargs["K"], matrix)
-            self.assertEqual(worker.call_args.kwargs["depth_scale"], .001)
-            self.assertEqual(worker.call_args.kwargs["models"], [{"mesh": str(root / "meshes/carrier.obj"), "scale": 1.}])
+            expected = [pose((0,0,.05*f),(.015*f,.003*f,0)) for f in range(3)]
+            np.testing.assert_allclose(relative,expected,atol=2e-12)
+            self.assertEqual(result["camera_assumption"],"explicitly stationary camera")
 
-    def test_two_entities_use_ordered_masks_and_independent_models_with_explicit_scales(self):
+    def test_reference_tracks_compensate_actual_reference_motion(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            mask, _ = self.write_sequence(root)
-            reference_mask = np.zeros_like(mask)
-            reference_mask[10:80, 108:124] = True
-            config = json.loads((root / "config.json").read_text())
-            config["pose_models"]["carrier"]["scale"] = [.001, .002, .003]
-            config["pose_models"]["reference"] = {"mesh": str(root / "meshes/carrier.obj"), "scale": 2.}
-            (root / "config.json").write_text(json.dumps(config))
-            with patch("local_models.foundationpose.track", side_effect=self.known_models) as worker:
-                result = track_rgbd(root, mask, reference_mask=reference_mask)
-            np.testing.assert_array_equal(worker.call_args.kwargs["masks"], np.stack([mask, reference_mask]))
-            self.assertEqual(worker.call_args.kwargs["models"][0]["scale"], [.001, .002, .003])
-            self.assertEqual(worker.call_args.kwargs["models"][1]["scale"], 2.)
-            relative = result["poses"] @ np.linalg.inv(result["poses"][0])
-            np.testing.assert_allclose(relative, [pose((0, 0, .1*f), (.03*f, .01*f, 0)) for f in range(3)], atol=1e-12)
+            root = Path(directory); mask,_ = self.write_sequence(root)
+            reference = np.zeros_like(mask); reference[10:85,100:124] = True
+            with patch("local_models.tapip3d.track",side_effect=self.known_tracks) as worker:
+                result = track_rgbd(root,mask,reference_mask=reference)
+            np.testing.assert_array_equal(worker.call_args.kwargs["masks"],np.stack([mask,reference]))
+            for f in range(3):
+                ref_motion = pose((0,0,-.02*f),(-.005*f,0,0))
+                body_motion = pose((0,0,.05*f),(.015*f,.003*f,0))
+                expected = np.linalg.inv(ref_motion) @ body_motion @ result["poses"][0]
+                np.testing.assert_allclose(result["poses"][f],expected,atol=2e-12)
 
-    def test_missing_instance_models_or_files_fail_before_inference(self):
-        for specification in (None, {}, {"carrier": {"category": "cup"}},
-                              {"carrier": {"mesh": "missing.obj", "scale": 1.}}):
-            with self.subTest(specification=specification), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                mask, _ = self.write_sequence(root)
-                (root / "config.json").write_text(json.dumps({"pose_models": specification}))
-                with patch("local_models.foundationpose.track") as worker:
-                    with self.assertRaises((ValueError, FileNotFoundError)):
-                        track_rgbd(root, mask)
-                    worker.assert_not_called()
-
-    def test_model_scale_must_be_explicit_finite_positive_and_correctly_shaped(self):
-        for scale in (None, 0, -1, True, "1", np.nan, np.inf, [], [1, 2], [1, 0, 1], [1, np.inf, 1], [True, 1, 1]):
-            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                mask, _ = self.write_sequence(root)
-                config = json.loads((root / "config.json").read_text())
-                config["pose_models"]["carrier"]["scale"] = scale
-                (root / "config.json").write_text(json.dumps(config))
-                with patch("local_models.foundationpose.track") as worker:
-                    with self.assertRaisesRegex(ValueError, "scale"):
-                        track_rgbd(root, mask)
-                    worker.assert_not_called()
-
-    def test_truncated_or_wrong_entity_pose_outputs_are_rejected(self):
-        for shape in ((2, 1, 4, 4), (3, 2, 4, 4), (3, 4, 4)):
-            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                mask, _ = self.write_sequence(root)
-                output = {"camera_from_model": np.zeros(shape), "validated": np.ones((3, 1), bool)}
-                with patch("local_models.foundationpose.track", return_value=output):
-                    with self.assertRaisesRegex(ValueError, "every frame and selected entity"):
-                        track_rgbd(root, mask)
-
-    def test_valid_se3_without_successful_geometric_validation_is_not_accepted(self):
-        for validation in (None, np.ones((3, 1), int), np.ones((2, 1), bool), np.array([[True], [False], [True]])):
-            with self.subTest(validation=validation), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                mask, _ = self.write_sequence(root)
-                output = {"camera_from_model": np.tile(np.eye(4), (3, 1, 1, 1))}
-                if validation is not None:
-                    output["validated"] = validation
-                with patch("local_models.foundationpose.track", return_value=output):
-                    with self.assertRaisesRegex(ValueError, "geometry validation"):
-                        track_rgbd(root, mask)
-
-    def test_worker_failure_and_absent_depth_never_become_stationary_success(self):
+    def test_camera_declaration_missing_files_and_worker_failure_are_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            mask, _ = self.write_sequence(root)
-            with patch("local_models.foundationpose.track", side_effect=ValueError("rendered depth mismatch")) as worker:
-                with self.assertRaisesRegex(ValueError, "rendered depth mismatch"):
-                    track_rgbd(root, mask)
-                worker.assert_called_once()
+            root = Path(directory); mask,_ = self.write_sequence(root,stationary=None)
+            with patch("local_models.tapip3d.track") as worker:
+                with self.assertRaisesRegex(ValueError,"declare stationary_camera"):
+                    track_rgbd(root,mask)
+                worker.assert_not_called()
+            with patch("local_models.tapip3d.track",side_effect=ValueError("tracking failed")):
+                with self.assertRaisesRegex(ValueError,"tracking failed"):
+                    track_rgbd(root,mask,stationary_camera=True)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            mask, _ = self.write_sequence(root, invalidate_second=True)
-            with patch("local_models.foundationpose.track") as worker:
-                with self.assertRaisesRegex(ValueError, "frame 1 has insufficient valid depth"):
-                    track_rgbd(root, mask)
+            root = Path(directory); mask,_ = self.write_sequence(root,invalidate_second=True)
+            with patch("local_models.tapip3d.track") as worker:
+                with self.assertRaisesRegex(ValueError,"frame 1 has insufficient valid depth"):
+                    track_rgbd(root,mask)
                 worker.assert_not_called()
 
-    def test_max_frames_limits_both_rgb_and_depth_sequences(self):
+    def test_frame_subset_and_bad_output_length_are_checked(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            mask, _ = self.write_sequence(root)
-            with patch("local_models.foundationpose.track", side_effect=self.known_models) as worker:
-                result = track_rgbd(root, mask, max_frames=2)
-            self.assertEqual([len(paths) for paths in worker.call_args.args], [2, 2])
-            np.testing.assert_array_equal(result["frame_indices"], [0, 1])
-            for value in (1, True, 2.5):
-                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "max_frames"):
-                    track_rgbd(root, mask, max_frames=value)
-# END isolated FoundationPose boundary.
+            root = Path(directory); mask,_ = self.write_sequence(root)
+            with patch("local_models.tapip3d.track",side_effect=self.known_tracks) as worker:
+                result = track_rgbd(root,mask,max_frames=2)
+            self.assertEqual([len(x) for x in worker.call_args.args],[2,2])
+            np.testing.assert_array_equal(result["frame_indices"],[0,1])
+            for value in (1,True,2.5):
+                with self.subTest(value=value),self.assertRaisesRegex(ValueError,"max_frames"):
+                    track_rgbd(root,mask,max_frames=value)
+            with patch("local_models.tapip3d.track",return_value={"coords":np.zeros((2,64,3))}):
+                with self.assertRaisesRegex(ValueError,"every requested frame"):
+                    track_rgbd(root,mask)
+# END fixed-ID TAPIP3D boundary and independent frame-gauge tests.
 
 
 if __name__ == "__main__":
