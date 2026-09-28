@@ -304,6 +304,13 @@ class RawRGBDPipelineTest(unittest.TestCase):
     def test_run_rgbd_estimates_support_and_saves_complete_numeric_output(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = KnownRGBDScene(directory, small_carrier=True)
+            # BEGIN independently calibrated support side for this camera.
+            config_path = fixture.scene / "config.json"
+            config = json.loads(config_path.read_text())
+            config.update(support_direction=[0., 0., -1.],
+                          support_direction_source="known physical outward side in the fixture camera frame")
+            config_path.write_text(json.dumps(config))
+            # END explicit side; the mapped carrier goal does not define it.
             client = Mock()
             client.chat_json.side_effect = [fixture.task("on"), {"candidate_id": 1}]
             destination = Path(directory) / "run"
@@ -333,6 +340,19 @@ class RawRGBDPipelineTest(unittest.TestCase):
                 self.assertFalse(np.any(body & reference))
             with self.assertRaises(FileExistsError):
                 run_rgbd(fixture.demo, fixture.scene, "repeat", destination, client=client)
+
+    # BEGIN missing physical support calibration must fail before tracking.
+    def test_on_requires_support_side_without_guessing_from_a_goal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = KnownRGBDScene(directory, small_carrier=True)
+            client = Mock(chat_json=Mock(return_value=fixture.task("on")))
+            with patch("manipulation.perception.track_rgbd") as tracker, \
+                    patch("manipulation.perception.select_roles") as roles:
+                with self.assertRaisesRegex(ValueError, "support_direction"):
+                    ground_rgbd(fixture.demo, fixture.scene, "Place it on the support", client=client)
+            tracker.assert_not_called()
+            roles.assert_not_called()
+    # END physical side cannot be synthesized from source motion.
 
     # BEGIN failed or uncalibrated tracks never produce a trajectory.
     def test_pose_tracking_failure_is_recorded_and_not_reported_as_a_trajectory(self):

@@ -158,27 +158,33 @@ the subsequent manipulation. Held-object motion uses the caller's measured
 the EEF continues independently and the released object requires observation.
 
 `regions.function_frame` constructs directions from evidenced functional
-geometry. `regions.ground_relation` preserves both sides of the relation:
+geometry. For tasks that require a complete functional orientation,
+`regions.ground_relation` preserves both sides of the relation:
 `D_new = F_reference_new @ inverse(F_reference_demo) @ D_demo @ F_carrier_demo
 @ inverse(F_carrier_new)`. Explicit internal function events prevent initial-pose
 normalization from cancelling the carrier's functional offset. Region clouds do
 not have to describe globally congruent objects. RGB-D local correspondence is
 one supported estimator, not a replacement for functional semantics.
 
-Owner-local functional frames and current output coordinates are distinct:
-`scene.reference_pose` maps the current reference owner into the named output
-`scene.reference_frame`; use an explicit identity only when they coincide.
+Owner-local functional frames and current output coordinates are distinct.
+Every result names its common output coordinates in `scene.reference_frame`.
+For a complete-frame relation, `scene.reference_pose` maps the current reference
+owner into those coordinates; use an explicit identity only when they coincide.
+The `on` relation instead binds a finite support region directly and does not
+require the reference object's complete pose or a reference functional frame.
+
 `perception.bind_current_scene(program, scene, source_templates, current_owners)`
-binds cached demonstration evidence without rerunning source tracking. Source
-templates contain the known interaction region, explanatory query pixels and
-their geometric construction. **Current input contains owner RGB-D only; no
-current part mask, part ID, target query or functional frame is supplied.**
+binds cached demonstration evidence without rerunning source tracking. For a
+grasp or a complete-frame relation, source templates contain the known
+interaction region, explanatory query pixels and their geometric construction.
+**Current visual input contains owner RGB-D; it requires no current part mask,
+part ID, target query or functional frame.**
 Gemini uses the source evidence to propose coarse search cells; the existing
 SD-DINO matcher searches those windows inside the current owner. One descriptor
 pair is reused for the queries. The source/current frames are reconstructed
 independently, so changed part dimensions do not have to pass a rigid-shape fit.
 
-The source template fields are `image`, `mask` (offline interaction region),
+The query-based source template fields are `image`, `mask` (offline interaction region),
 `owner_mask`, registered metric `depth`, `K`, `T_camera_owner`, `owner_id`,
 `region_id`, `description`, `query_pixels`, `query_descriptions` and
 `frame_recipe`. Direction queries may be elsewhere on the same owner: a small
@@ -198,7 +204,9 @@ binding-time camera as its fixed initial local coordinates. Identity in the
 latter case is a coordinate definition, not an inferred physical orientation.
 Subsequent tracking must preserve that definition. Camera calibration cannot
 be replaced by the coordinate choice. A grasp needs only the carrier owner;
-manipulation needs both carrier and reference.
+complete-frame manipulation needs both carrier and reference. An `on` binding
+needs only the reference observation because the held carrier is already bound,
+as described below.
 
 `perception.ground_current_program(..., output="eef")` calls this binder and
 the existing complete skill consumer. Choose `output="object"` explicitly
@@ -207,18 +215,73 @@ an EEF request to object-only output. Both return candidates with correspondence
 and coordinate evidence, not certificates of physical execution. The existing
 raw-video `--demo` path keeps its separate extraction/tracking responsibility.
 
-For an `on` event, a source plane recipe additionally declares `normal_role` as
-`outward` (carrier) or `support` (reference), backed by its offline evidence.
-Matched queries originally inside the source interaction mask can generate
-sparse current contact samples; auxiliary direction queries cannot stand in
-for contact samples. The existing support estimator recovers a finite visible
-surface from current owner RGB-D and checks it against the correspondence.
-Richer current model geometry may be supplied, but current part geometry is
-not a universal external prerequisite. Sparse samples and visible body points
-do not certify hidden geometry or a complete contact face. `ground_on` checks
-the contact samples, signed normal, supplied body extent and finite support.
-Plane-frame tangents are numerical preferences, not measured functional twist;
-plane evidence is rejected where a full functional orientation is required.
+<!-- BEGIN unordered support binding and explicit held-carrier contract. -->
+For `task.relation="on"`, each `source_templates[event_id]` contains only a
+`reference` semantic record with `owner_id`, `region_id`, `description`,
+`normal_role="support"` and `source`. Its owner is the demonstrated reference
+owner. The record identifies the demonstrated supporting part; it contains no
+ordered corner queries or reference frame recipe. `current_owners` contains only
+the selected `reference` owner's calibrated RGB-D observation. Gemini selects
+among planes measured from that owner, or abstains; it does not generate metric
+geometry. All events in one `on` skill name the same source support region and
+use one consistent carrier mapping. The chosen finite patch stays within
+observed support pixels.
+
+The caller supplies the already bound carrier and actual holding:
+
+- `scene.carrier_id`, `initial_pose`, `body_points` and `body_points_source`
+  identify the current body, its pose in the common output coordinates, and
+  its geometry in the current carrier's fixed local coordinates.
+- `scene.functional_bindings[event_id]` contains `carrier_id`, `reference_id`,
+  `carrier_mapping`, `on_geometry` and `source`. `carrier_mapping` maps source
+  carrier coordinates into current carrier coordinates. `on_geometry` declares
+  `carrier_region_points`, `carrier_outward_normal`, an evidence `source`, and
+  `gap_tolerance`/`normal_tolerance`, all geometry in carrier-local coordinates.
+  Identity is permitted only for an
+  explicitly established common carrier coordinate system, never inferred
+  from the action name or matching object category.
+- `scene.support_direction` and `support_direction_source` provide the
+  physically justified support-side direction in `scene.reference_frame`.
+  For a top bearing surface this can be calibrated world up. A camera viewing
+  direction, arbitrary carrier starting point or fitted PCA axis cannot replace
+  that evidence. The visual binder rejects a pre-supplied `support`; an
+  independently established signed support observation instead goes directly
+  to `ground_program` or `ground_object_program`, the numerical consumers.
+- EEF output retains the synchronized `eef_pose`, actual
+  `holding.T_carrier_eef`, and the existing tool identity requirements. The
+  support binder neither estimates nor verifies that holding relationship.
+
+This does not require current simulator object GT. When the carrier's contact
+surface is visible, the upstream helper
+`perception.bind_carrier_contact(template, current_owner, *, position_tolerance_m,
+normal_tolerance_rad, client=None, extractor=None)` reuses the source-region
+visual matcher. It returns `carrier_mapping`, `on_geometry`, `initial_pose`,
+`body_points` and their coordinate/evidence records, which the caller combines
+with actual holding feedback. Its source plane template declares
+`normal_role="outward"`; only matched source interaction queries become
+contact samples. Sparse observations do not establish an occluded complete
+face or full body coverage. A previously known carrier model may supply richer
+geometry in the same bound coordinates. Neither route fabricates holding.
+
+`ground_on` checks the declared contact face, opposing signed normals, supplied
+body extent and finite support. Plane tangent axes are computational coordinates,
+not a measured cup-handle yaw or a required placement point. The motion preference
+comes from the current carrier and the demonstrated motion; changing only a
+support plane's coordinate basis cannot rotate the carrier or its trajectory.
+Internal function events, opening intentions, the release boundary and the
+independent post-release retreat remain distinct and retain the original
+timeline. Satisfying a function event does not certify subsequent contact,
+force stability, collision-free robot motion or execution.
+
+An isolated placement experiment may explicitly assume a fixed known carrier
+and exact Holding. This tests support grounding and conditional motion transfer;
+it does not establish online holding estimation or successful execution of a
+preceding grasp. Offline demonstration GT may label source geometry and events;
+current hidden reference-object pose, masks, contact or surface geometry must
+not enter a visual grounding experiment.
+<!-- END unordered support binding and explicit held-carrier contract. -->
+
+Plane-only evidence is rejected where a full functional orientation is required.
 Constrained parts require a sourced current `motion_model`,
 including available coordinate limits. Required function poses cannot be
 silently projected off that mechanism. Supplied entry corridors remain checked.
@@ -304,7 +367,26 @@ silently converted into free motion.
 An `on` goal selects a task-relevant observed plane with Gemini, then uses a
 bounded patch that remains inside its observed mask, including any holes. It
 does not treat the largest face of a reference object as its support surface.
-The supplied object extent must fit the patch. An `inside` goal means placing
+The supplied object extent must fit the patch. When the raw RGB-D path infers
+this support, the current scene's existing `config.json` must provide
+`support_direction` and `support_direction_source`; the direction is expressed
+in **scene camera coordinates**. For example, if independent calibration places
+the physical upward direction along camera negative Y:
+
+```json
+{
+  "depth_scale": 1000,
+  "support_direction": [0, -1, 0],
+  "support_direction_source": "calibrated upward direction in this camera frame"
+}
+```
+
+The vector in this example is not a default. Missing direction evidence is an
+error when inferring support; the demonstrated endpoint or object center is not
+used to guess the physical side. An independently supplied signed `support` in
+`geometry.json` remains usable without separately providing this direction.
+
+An `inside` goal means placing
 an object into a cabinet, drawer or another container. Its demonstrated endpoint
 is mapped through the observed container reference, without requiring extra
 offline geometry. The output marks containment as `not_verified` when no free

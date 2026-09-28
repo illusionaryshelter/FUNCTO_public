@@ -15,7 +15,7 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 
 from manipulation.goals import SupportSurface
-from manipulation.perception import bind_current_scene, ground_current_program
+from manipulation.perception import bind_carrier_contact, bind_current_scene, ground_current_program
 from manipulation.regions import source_function_geometry
 
 
@@ -227,118 +227,150 @@ class CurrentProgramTest(unittest.TestCase):
         self.assertGreater(len(bound["observed_body_points"]), len(supplied))
         self.assertEqual(bound["body_points_source"], "current known body model")
 
+    # BEGIN unordered support and explicitly bound current carrier tests.
     @staticmethod
     def on_fixture():
-        program, scene, templates, owners = fixture()
+        program, scene, _, owners = fixture()
         program["task"]["relation"] = "on"
-        for role, normal_role in (("carrier", "outward"), ("reference", "support")):
-            template = templates["effect"][role]
-            template["normal_role"] = normal_role
-            template["mask"][:] = True
-            template["frame_recipe"]["kind"] = "plane"
-            if role == "carrier":
-                template["frame_recipe"]["plane_weights"] = [-1., 0., 1.]
-            template["frame_recipe"]["source"] = f"offline source establishes the signed {normal_role} normal"
-            program["demo"]["functional_events"][0][role + "_frame"] = source_function_geometry(template)["source_frame"]
+        event = program["demo"]["functional_events"][0]
+        event["carrier_frame"] = np.eye(4)
+        del event["reference_frame"]
+        bottom = np.array([[-.01, -.01, 0.], [.01, -.01, 0.], [.01, .01, 0.], [-.01, .01, 0.]])
+        scene.update(carrier_id="new_carrier", reference_id="new_reference", initial_pose=np.eye(4),
+                     body_points=np.concatenate((bottom, bottom+[0., 0., .02])),
+                     body_points_source="independently bound finite current fixture body",
+                     support_direction=[0., 0., 1.], support_direction_source="calibrated fixture physical up",
+                     functional_bindings={"effect": {
+                         "carrier_id": "new_carrier", "reference_id": "new_reference",
+                         "carrier_mapping": np.eye(4),
+                         "source": "independently established common source/current carrier coordinates",
+                         "on_geometry": {"carrier_region_points": bottom, "carrier_outward_normal": [0., 0., -1.],
+                                         "gap_tolerance": 1e-6, "normal_tolerance": 1e-6,
+                                         "source": "independently observed fixture bottom face"}}})
+        templates = {"effect": {"reference": {
+            "owner_id": "old_reference", "region_id": "demo_support", "normal_role": "support",
+            "description": "Use the demonstrated top support surface.",
+            "source": "offline demonstrated support semantics"}}}
+        reference = owners["reference"]
+        reference["frame_convention"] = "binding_camera"
+        del reference["T_camera_owner"]
         support = SupportSurface(np.array([0., 0., 1.]), np.eye(3)[:, :2], np.array([0., 0., 1.]),
                                  np.array([[0., 0.], [.19, 0.], [.19, .19], [0., .19]]),
                                  source="independent observed reference plane fixture")
-        return program, scene, templates, owners, support
+        return program, scene, templates, {"reference": reference}, support
 
-    def test_on_infers_sparse_contact_and_support_without_preprovided_geometry(self):
+    def test_on_consumes_unordered_support_without_any_reference_queries_or_pose(self):
         program, scene, templates, owners, support = self.on_fixture()
-        with patch("manipulation.perception.infer_support", return_value=(support, {"source": support.source})) as infer:
-            bound = bind_current_scene(program, scene, templates, owners, client=client(), extractor=descriptors)
+        with patch("manipulation.perception.infer_support", return_value=(support, {"fixture": "visible plane"})) as infer, \
+                patch("manipulation.perception.match_functional_region") as match:
+            result = ground_current_program(program, scene, templates, owners, client=client())
         infer.assert_called_once()
-        # The support side comes from the signed reference template, not the
-        # carrier's starting location. Native camera geometry is passed here.
-        np.testing.assert_allclose(infer.call_args.args[4], [.04, .04, 1.05], atol=1e-10)
-        face = bound["functional_bindings"]["effect"]["on_geometry"]
-        self.assertEqual(len(face["carrier_region_points"]), 3)
-        self.assertIn("sparse visible", face["coverage"])
-        self.assertIn("tangent is a numerical preference",
-                      bound["functional_bindings"]["effect"]["orientation_source"]["carrier"])
+        match.assert_not_called()
+        np.testing.assert_allclose(infer.call_args.kwargs["support_direction"], [0., 0., 1.])
+        self.assertEqual(result["output_type"], "interaction_trajectory")
+        self.assertTrue(result["function_checks"][0]["valid"])
+        self.assertEqual(result["function_checks"][0]["constraint_kind"], "on_region")
+        self.assertNotIn("rotation_error_rad", result["function_checks"][0])
         self.assertNotIn("support", scene)
-        # Use the actual on consumer: its hard requirement is the face/support
-        # relation, and no fictitious full-frame rotation error is reported.
-        with patch("manipulation.perception.infer_support", return_value=(support, {"source": support.source})):
-            result = ground_current_program(program, scene, templates, owners, output="object",
-                                            client=client(), extractor=descriptors)
-        check = result["function_checks"][0]
-        self.assertEqual(check["constraint_kind"], "on_region")
-        self.assertTrue(check["valid"])
-        self.assertNotIn("rotation_error_rad", check)
-        self.assertIn("sparse visible", result["region_binding_evidence"]["effect"]["on_geometry"]["coverage"])
+        self.assertNotIn("reference_pose", scene)
+        self.assertNotIn("reference_frame", program["demo"]["functional_events"][0])
+        reference = result["region_binding_evidence"]["effect"]["reference"]
+        self.assertEqual(reference["binding_kind"], "unordered_observed_support")
+        self.assertNotIn("target_frame", reference)
+        np.testing.assert_array_equal(result["frame_indices"], program["demo"]["frame_indices"])
 
-    def test_provided_contact_model_is_preserved_and_checked_against_current_correspondences(self):
+    def test_on_preserves_bound_carrier_geometry_without_requiring_its_hidden_bottom_image(self):
+        program, scene, templates, owners, support = self.on_fixture()
+        before = scene["body_points"].copy()
+        with patch("manipulation.perception.infer_support", return_value=(support, {})):
+            bound = bind_current_scene(program, scene, templates, owners, client=client())
+        np.testing.assert_array_equal(bound["body_points"], before)
+        self.assertNotIn("carrier", owners)
+        self.assertEqual(bound["body_points_source"], scene["body_points_source"])
+        self.assertEqual(bound["holding"]["source"], scene["holding"]["source"])
+
+    def test_on_rejects_missing_binding_semantics_and_unsupported_corner_recipe_before_models(self):
+        for error in ("mapping", "direction", "source", "normal_role", "owner", "corners", "body_source"):
+            program, scene, templates, owners, support = self.on_fixture()
+            binding = scene["functional_bindings"]["effect"]
+            reference = templates["effect"]["reference"]
+            if error == "mapping":
+                binding["carrier_mapping"] = np.zeros((4, 4))
+            elif error == "direction":
+                scene["support_direction"] = [0., 0., 0.]
+            elif error == "source":
+                binding["source"] = ""
+            elif error == "normal_role":
+                del reference["normal_role"]
+            elif error == "owner":
+                owners["reference"]["owner_id"] = "wrong_instance"
+            elif error == "corners":
+                reference["query_pixels"] = [[1, 1], [2, 1], [2, 2]]
+            else:
+                del scene["body_points_source"]
+            with self.subTest(error=error), patch("manipulation.perception.infer_support") as infer:
+                with self.assertRaises(ValueError):
+                    bind_current_scene(program, scene, templates, owners, client=client())
+                infer.assert_not_called()
+
+    def test_on_support_coordinates_do_not_change_target_or_complete_eef_trajectory(self):
         program, scene, templates, owners, support = self.on_fixture()
         with patch("manipulation.perception.infer_support", return_value=(support, {})):
-            known = bind_current_scene(program, scene, templates, owners, client=client(), extractor=descriptors)
-        known["functional_bindings"]["effect"]["on_geometry"]["source"] = "independent complete current contact model"
-        with patch("manipulation.perception.infer_support") as infer:
-            rebound = bind_current_scene(program, known, templates, owners, client=client(), extractor=descriptors)
-            infer.assert_not_called()
-        self.assertEqual(rebound["functional_bindings"]["effect"]["on_geometry"]["source"],
-                         "independent complete current contact model")
-        known["functional_bindings"]["effect"]["on_geometry"]["carrier_outward_normal"] *= -1
-        with self.assertRaisesRegex(ValueError, "physical contact normal disagree"):
-            bind_current_scene(program, known, templates, owners, client=client(), extractor=descriptors)
+            first = ground_current_program(program, scene, templates, owners, client=client())
+        for theta, reflection in ((.8, False), (-1.3, True)):
+            uv = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+            if reflection:
+                uv[:, 0] *= -1
+            offset = np.array([.03, -.02])
+            changed = SupportSurface(support.origin + support.basis @ offset, support.basis @ uv,
+                                     support.normal, (support.boundary-offset) @ uv, source=support.source)
+            with self.subTest(theta=theta), patch("manipulation.perception.infer_support", return_value=(changed, {})):
+                second = ground_current_program(program, scene, templates, owners, client=client())
+            np.testing.assert_allclose(first["eef_poses"], second["eef_poses"], atol=1e-8)
 
-    def test_direction_queries_cannot_replace_unobserved_contact_samples(self):
+    def test_on_output_frame_change_rotates_side_once_and_preserves_physical_result(self):
         program, scene, templates, owners, support = self.on_fixture()
-        # Only the first query is actually in the contact region; the other
-        # two establish directions elsewhere on this same owner.
-        templates["effect"]["carrier"]["mask"][:] = False
-        templates["effect"]["carrier"]["mask"][3:6, 3:6] = True
-        with patch("manipulation.perception.infer_support") as infer:
-            with self.assertRaisesRegex(ValueError, "at least 3"):
-                bind_current_scene(program, scene, templates, owners, client=client(), extractor=descriptors)
-            infer.assert_not_called()
+        with patch("manipulation.perception.infer_support", return_value=(support, {})):
+            first = ground_current_program(program, scene, templates, owners, client=client())
+        transform = pose(.3, -.2, .1)
+        transform[:3, :3] = Rotation.from_rotvec([.2, .1, -.4]).as_matrix()
+        owners["reference"]["T_output_camera"] = transform @ owners["reference"]["T_output_camera"]
+        scene["initial_pose"] = transform @ scene["initial_pose"]
+        scene["eef_pose"] = transform @ scene["eef_pose"]
+        scene["support_direction"] = transform[:3, :3] @ scene["support_direction"]
+        with patch("manipulation.perception.infer_support", return_value=(support, {})) as infer:
+            second = ground_current_program(program, scene, templates, owners, client=client())
+        np.testing.assert_allclose(infer.call_args.kwargs["support_direction"], [0., 0., 1.], atol=1e-12)
+        np.testing.assert_allclose(second["eef_poses"], transform @ first["eef_poses"], atol=1e-8)
 
-    # BEGIN separate functional plane evidence from placement feasibility.
-    def test_reference_witnesses_outside_safe_patch_preserve_carrier_fit_checks(self):
-        from manipulation.program import ground_object_program
-
+    def test_on_cannot_enlarge_observed_patch_to_fit_the_carrier(self):
         program, scene, templates, owners, support = self.on_fixture()
-        # The three visible reference witnesses are (0.04,0.04), (0.14,0.04)
-        # and (0.04,0.14) on the same camera-Z=1 plane. This safe interior patch
-        # is fully observed but excludes those corner witnesses. Binding is
-        # still meaningful; whether the actual carrier fits is a separate test.
-        interior = SupportSurface(support.origin, support.basis, support.normal,
-                                  np.array([[.06, .06], [.12, .06], [.12, .12], [.06, .12]]),
-                                  source="conservative observed interior placement patch")
-        with patch("manipulation.perception.infer_support", return_value=(interior, {})):
-            bound = bind_current_scene(program, scene, templates, owners,
-                                       client=client(), extractor=descriptors)
-        # Retain the finite patch rather than enlarging it to fit the witnesses.
-        np.testing.assert_array_equal(bound["support"]["boundary"], interior.boundary)
-        self.assertEqual(len(bound["region_binding_evidence"]["effect"]["reference"]["target_points"]), 3)
-        # The observed carrier spans 0.19 m, so it cannot fit this 0.06 m patch.
-        # Use the real numerical consumer to ensure loosening the *reference
-        # witness* gate did not remove the carrier's finite-area requirement.
-        with self.assertRaisesRegex(ValueError, "Object geometry does not fit"):
-            ground_object_program(program, bound)
+        tiny = SupportSurface(support.origin, support.basis, support.normal,
+                              np.array([[.06, .06], [.061, .06], [.061, .061], [.06, .061]]), source=support.source)
+        with patch("manipulation.perception.infer_support", return_value=(tiny, {})):
+            bound = bind_current_scene(program, scene, templates, owners, client=client())
+        np.testing.assert_array_equal(bound["support"]["boundary"], tiny.boundary)
+        from manipulation.program import ground_program
+        with self.assertRaises(ValueError):
+            ground_program(program, bound)
 
-    def test_inferred_support_cannot_choose_a_different_plane_or_physical_side(self):
-        for wrong in ("height", "normal"):
-            program, scene, templates, owners, support = self.on_fixture()
-            if wrong == "height":
-                support.origin[2] += .02
-            else:
-                support.normal *= -1
-            with self.subTest(wrong=wrong), patch("manipulation.perception.infer_support", return_value=(support, {})):
-                with self.assertRaisesRegex(ValueError, "support.*disagrees|support normal disagrees"):
-                    bind_current_scene(program, scene, templates, owners, client=client(), extractor=descriptors)
-    # END separate functional plane evidence from placement feasibility.
-
-    def test_missing_physical_normal_role_is_a_source_error_before_models(self):
-        for role in ("carrier", "reference"):
-            program, scene, templates, owners, support = self.on_fixture()
-            del templates["effect"][role]["normal_role"]
-            model = client()
-            with self.subTest(role=role), self.assertRaisesRegex(ValueError, "evidenced.*plane normal"):
-                bind_current_scene(program, scene, templates, owners, client=model, extractor=descriptors)
-            model.chat_json.assert_not_called()
+    def test_upstream_visible_carrier_contact_remains_available_without_ground_truth(self):
+        source, current = evidence()
+        source["normal_role"] = "outward"
+        source["frame_recipe"]["kind"] = "plane"
+        source["mask"][:] = True
+        result = bind_carrier_contact(source, current, position_tolerance_m=1e-6,
+                                      normal_tolerance_rad=1e-6, client=client(), extractor=descriptors)
+        np.testing.assert_allclose(result["carrier_mapping"], np.eye(4), atol=1e-8)
+        self.assertEqual(len(result["on_geometry"]["carrier_region_points"]), 3)
+        self.assertIn("sparse visible", result["on_geometry"]["coverage"])
+        self.assertNotIn("holding", result)
+        source["mask"][:] = False
+        source["mask"][3:6, 3:6] = True
+        with self.assertRaisesRegex(ValueError, "at least 3"):
+            bind_carrier_contact(source, current, position_tolerance_m=1e-6,
+                                 normal_tolerance_rad=1e-6, client=client(), extractor=descriptors)
+    # END unordered support and explicitly bound current carrier tests.
 
 
 if __name__ == "__main__":

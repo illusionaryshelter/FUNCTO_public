@@ -19,6 +19,13 @@ from .observations import backproject
 _DISTANCE_THRESHOLD = 0.005
 _MAX_POINTS = 6000
 _MAX_PLANES = 4
+# BEGIN dimensionless support-side degeneracy threshold.
+# Unit directions within asin(0.1), about 5.7 degrees, of the fitted tangent
+# plane do not reliably select a physical side. This preserves the earlier
+# 5 mm check with a 5 cm side witness, without mixing metres and unit vectors.
+# It is neither a permissible support tilt nor a physical stability criterion.
+_MIN_SIDE_ALIGNMENT = 0.1
+# END dimensionless support-side degeneracy threshold.
 
 
 def _plane_candidates(depth, K, valid):
@@ -143,25 +150,42 @@ def _observed_patch(mask):
     }
 
 
-def infer_support(image, depth_m, K, reference_mask, facing_point, *, instruction, client=None):
+# BEGIN unordered observed support with an explicit physical side direction.
+def infer_support(image, depth_m, K, reference_mask, *, support_direction,
+                  instruction, client=None):
     """Select a task support from visible reference-instance plane candidates.
 
     RGB and depth must be aligned, depth must be metric, and ``K`` must describe
     that image. All returned geometry uses camera coordinates. Even a single
     candidate requires semantic confirmation: its largest plane may be a side
     panel. Selection accepts exactly ``{"candidate_id": ID_or_null}``.
-    ``facing_point`` is a point on the intended carrier side at the goal. The
-    caller must not substitute its arbitrary initial position: a lifted object
-    can start below a tabletop. This side observation does not infer gravity.
+    ``support_direction`` is a nonzero direction in these same camera
+    coordinates, supplied from known calibration and the intended physical
+    support side. For a top support it can be calibrated world-up. It is not a
+    point, the current carrier position, a matched query, or an inferred object
+    axis. Only its direction matters. Near-tangent directions are rejected;
+    accepting its sign does not establish a stable or sufficiently level face.
+
+    Unordered observed points establish the plane. Its sample mean and PCA
+    tangent axis define computational coordinates only: neither is a physical
+    object centre, placement target, or task-required yaw. The returned finite
+    patch remains certified against actual visible support pixels.
     """
     image = _image(image)
     mask = _mask(reference_mask, image, "reference_mask")
     depth = np.asarray(depth_m, float)
-    facing = np.asarray(facing_point, float)
+    direction = np.asarray(support_direction, float)
     if depth.shape != mask.shape:
         raise ValueError("Support depth and RGB dimensions must agree")
-    if facing.shape != (3,) or not np.isfinite(facing).all():
-        raise ValueError("Support-facing point must be finite XYZ")
+    if direction.shape != (3,) or not np.isfinite(direction).all():
+        raise ValueError("Physical support direction must be finite XYZ")
+    # Normalize through the largest component so finite nonzero vectors have
+    # the same meaning even at very large or very small numerical scales.
+    scale = float(np.max(np.abs(direction)))
+    if scale == 0:
+        raise ValueError("Physical support direction must be nonzero")
+    direction = direction / scale
+    direction /= np.linalg.norm(direction)
     if not isinstance(instruction, str) or not instruction.strip():
         raise ValueError("Support selection requires a nonempty instruction")
     valid = mask & np.isfinite(depth) & (depth > 0)
@@ -191,9 +215,9 @@ def infer_support(image, depth_m, K, reference_mask, facing_point, *, instructio
         raise ValueError("No unambiguous task support candidate was selected")
     chosen = candidates[number-1]
     origin, normal = chosen["origin"], chosen["normal"].copy()
-    side = float(normal @ (facing-origin))
-    if abs(side) < _DISTANCE_THRESHOLD:
-        raise ValueError("Cannot determine the selected support side from the facing point")
+    side = float(normal @ direction)
+    if abs(side) <= _MIN_SIDE_ALIGNMENT:
+        raise ValueError("Physical support direction is near-tangent to the selected plane; side is ambiguous")
     if side < 0:
         normal = -normal
     polygon, patch_diagnostics = _observed_patch(chosen["mask"])
@@ -217,6 +241,12 @@ def infer_support(image, depth_m, K, reference_mask, facing_point, *, instructio
         "sampled_point_count": sample_count, "plane_distance_threshold_m": _DISTANCE_THRESHOLD,
         "selected_roi_xyxy": chosen["bbox"], "selected_plane_observed_pixels": chosen["observed_pixel_count"],
         "plane_rms_m": chosen["plane_rms_m"], "geometry_source": surface.source,
+        "support_direction_camera": direction.tolist(),
+        "support_side_alignment": abs(side),
+        "minimum_support_side_alignment": _MIN_SIDE_ALIGNMENT,
+        "support_side_scope": "physical sign from supplied direction; not support tilt or stability certification",
+        "origin_scope": "observed inlier mean as a plane-coordinate origin; not object centre or placement target",
+        "basis_scope": "PCA tangent basis is a computational gauge; not a task-required yaw",
         "candidate_evidence": [{key: candidate[key] for key in (
             "candidate_id", "bbox", "sample_inlier_count", "observed_pixel_count", "plane_rms_m")}
             for candidate in candidates],
@@ -224,3 +254,4 @@ def infer_support(image, depth_m, K, reference_mask, facing_point, *, instructio
         **patch_diagnostics,
     }
     return surface, diagnostics
+# END unordered observed support with an explicit physical side direction.

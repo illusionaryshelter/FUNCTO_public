@@ -46,6 +46,33 @@ def fixture():
     return program, scene
 
 
+# BEGIN unordered support fixtures have no complete target functional frame.
+def on_fixture():
+    program, scene = fixture()
+    program["task"]["relation"] = "on"
+    program["demo"]["functional_events"][0].pop("reference_frame")
+    scene.pop("reference_pose")
+    body = np.asarray([[x, y, z] for x in (-.01, .01)
+                       for y in (-.01, .01) for z in (0., .02)])
+    scene["body_points"] = body
+    scene["support"] = {
+        "origin": [0., 0., 0.], "normal": [0., 0., 1.],
+        "basis": [[1., 0.], [0., 1.], [0., 0.]],
+        "boundary": [[-.3, -.3], [.3, -.3], [.3, .3], [-.3, .3]],
+        "source": "supplied finite support; its tangent axes are a coordinate gauge",
+    }
+    scene["functional_bindings"]["effect"] = {
+        "carrier_id": scene["carrier_id"], "reference_id": scene["reference_id"],
+        "carrier_mapping": pose(),
+        "source": "explicit same carrier-local frame; independently supplied support",
+        "on_geometry": {"carrier_region_points": body[body[:, 2] == 0].copy(),
+                        "carrier_outward_normal": [0., 0., -1.],
+                        "gap_tolerance": 1e-6, "normal_tolerance": 1e-6},
+    }
+    return program, scene
+# END unordered support fixture.
+
+
 class ProgramTest(unittest.TestCase):
     def test_supplied_entry_corridor_is_checked_between_function_events(self):
         from itertools import product
@@ -217,23 +244,9 @@ class ProgramTest(unittest.TestCase):
                                    np.linalg.inv(demo_hand[7]) @ demo_hand[7:], atol=1e-10)
 
     def test_on_consumes_the_declared_contact_face_in_addition_to_whole_body(self):
-        program, scene = fixture()
-        program["task"]["relation"] = "on"
-        body = np.asarray([[x, y, z] for x in (-.01, .01)
-                           for y in (-.01, .01) for z in (0., .02)])
-        face = body[body[:, 2] == 0].copy()
-        scene["body_points"] = body
-        scene["support"] = {
-            "origin": [0., 0., 0.], "normal": [0., 0., 1.],
-            "basis": [[1., 0.], [0., 1.], [0., 0.]],
-            "boundary": [[-.3, -.3], [.3, -.3], [.3, .3], [-.3, .3]],
-            "source": "supplied finite support",
-        }
-        scene["functional_bindings"]["effect"]["on_geometry"] = {
-            "carrier_region_points": face, "carrier_outward_normal": [0., 0., -1.],
-            "gap_tolerance": 1e-6, "normal_tolerance": 1e-6,
-        }
-        result = ground_program(program, scene)
+        program, scene = on_fixture()
+        with patch("manipulation.program.ground_relation", side_effect=AssertionError("on has no full target frame")):
+            result = ground_program(program, scene)
         self.assertTrue(result["function_checks"][0]["valid"])
         self.assertIn("body_checks", result["function_checks"][0])
         # The carrier can rest on its lower face while the requested (wrong)
@@ -318,6 +331,185 @@ class ProgramTest(unittest.TestCase):
                     bind_current_scene(program, scene, wrong_templates, wrong_owners)
                 match.assert_not_called()
         # END current-owner binder contract.
+
+
+# BEGIN partial on geometry, carrier mapping, and phase-preservation regressions.
+class UnorderedSupportProgramTest(unittest.TestCase):
+    def test_support_basis_origin_and_point_order_are_only_coordinate_choices(self):
+        program, scene = on_fixture()
+        original = ground_program(program, scene)
+        for angle, reflected in ((.7, False), (-1.1, True), (np.pi, False)):
+            changed = deepcopy(scene)
+            surface = changed["support"]
+            basis = np.asarray(surface["basis"])
+            boundary = np.asarray(surface["boundary"])
+            transform = Rotation.from_rotvec([0., 0., angle]).as_matrix()[:2, :2]
+            if reflected:
+                transform[:, 1] *= -1
+            shift = np.array([.08, -.04])
+            surface["origin"] = np.asarray(surface["origin"]) + basis @ shift
+            surface["basis"] = basis @ transform
+            surface["boundary"] = ((boundary - shift) @ transform)[[2, 0, 3, 1]]
+            changed["body_points"] = changed["body_points"][::-1]
+            face = changed["functional_bindings"]["effect"]["on_geometry"]
+            face["carrier_region_points"] = face["carrier_region_points"][[2, 0, 3, 1]]
+            with self.subTest(angle=angle, reflected=reflected):
+                result = ground_program(program, changed)
+                np.testing.assert_allclose(result["object_poses"], original["object_poses"], atol=1e-9)
+                np.testing.assert_allclose(result["eef_poses"], original["eef_poses"], atol=1e-9)
+
+    def test_output_frame_is_equivariant_but_source_reference_frame_cancels(self):
+        program, scene = on_fixture()
+        original = ground_program(program, scene)
+        world = pose(x=.4, y=-.3, z=.2)
+        world[:3, :3] = Rotation.from_euler("xyz", [.4, -.3, .7]).as_matrix()
+        changed = deepcopy(scene)
+        changed["initial_pose"] = world @ scene["initial_pose"]
+        changed["eef_pose"] = world @ scene["eef_pose"]
+        surface = changed["support"]
+        surface["origin"] = world[:3, :3] @ surface["origin"] + world[:3, 3]
+        surface["normal"] = world[:3, :3] @ surface["normal"]
+        surface["basis"] = world[:3, :3] @ surface["basis"]
+        transformed = ground_program(program, changed)
+        np.testing.assert_allclose(transformed["object_poses"], world @ original["object_poses"], atol=1e-9)
+        np.testing.assert_allclose(transformed["eef_poses"], world @ original["eef_poses"], atol=1e-9)
+        source_change = pose(x=-.2, y=.1, z=.4)
+        source_change[:3, :3] = Rotation.from_euler("xyz", [-.6, .1, -.4]).as_matrix()
+        source_program = deepcopy(program)
+        source_program["demo"]["T_reference_carrier"] = source_change @ program["demo"]["T_reference_carrier"]
+        changed_reference = ground_program(source_program, scene)
+        np.testing.assert_allclose(changed_reference["object_poses"], original["object_poses"], atol=1e-9)
+        np.testing.assert_allclose(changed_reference["eef_poses"], original["eef_poses"], atol=1e-9)
+
+    def test_nonidentity_carrier_mapping_preserves_noncommuting_motion_and_function_origin(self):
+        from manipulation.program import _event_transfer
+        program, scene = on_fixture()
+        source = program["demo"]["T_reference_carrier"]
+        source[:, :3, :3] = Rotation.from_euler("z", np.linspace(.2, .9, len(source))).as_matrix()
+        source[:, 2, 3] = .08
+        mapping = pose(x=.035, y=-.025)
+        mapping[:3, :3] = Rotation.from_euler("z", .6).as_matrix()
+        scene["functional_bindings"]["effect"]["carrier_mapping"] = mapping
+        material = pose(x=.023, y=.014)
+        program["demo"]["functional_events"][0]["carrier_frame"] = material
+        scene["initial_pose"] = pose(x=.04, y=.02, z=.12)
+        scene["eef_pose"] = scene["initial_pose"] @ scene["holding"]["T_carrier_eef"]
+        expected = scene["initial_pose"] @ mapping @ np.linalg.inv(source[0]) @ source @ np.linalg.inv(mapping)
+        wrong = scene["initial_pose"] @ np.linalg.inv(source[0]) @ source
+        self.assertGreater(np.max(np.abs(expected - wrong)), .005)
+        with patch("manipulation.program._event_transfer", wraps=_event_transfer) as transfer:
+            result = ground_program(program, scene)
+        np.testing.assert_allclose(transfer.call_args.args[0], expected[:8], atol=1e-10)
+        np.testing.assert_allclose(transfer.call_args.args[3], mapping @ material, atol=1e-10)
+        # The finite support changes height, while the unrequired yaw and XY
+        # stay at the mapped preference because this broad support admits it.
+        np.testing.assert_allclose(result["object_poses"][5, :3, :3], expected[5, :3, :3], atol=1e-9)
+        np.testing.assert_allclose(result["object_poses"][5, :2, 3], expected[5, :2, 3], atol=1e-9)
+        self.assertAlmostEqual(result["object_poses"][5, 2, 3], 0.)
+
+    def test_explicit_consistent_carrier_mapping_is_required(self):
+        program, scene = on_fixture()
+        del scene["functional_bindings"]["effect"]["carrier_mapping"]
+        with self.assertRaisesRegex(ValueError, "explicit evidenced carrier_mapping"):
+            ground_program(program, scene)
+        program, scene = on_fixture()
+        event = deepcopy(program["demo"]["functional_events"][0])
+        event.update(event_id="second", frame_index=106)
+        program["demo"]["functional_events"].append(event)
+        second = deepcopy(scene["functional_bindings"]["effect"])
+        second["carrier_mapping"] = pose(x=.01)
+        scene["functional_bindings"]["second"] = second
+        with self.assertRaisesRegex(ValueError, "same carrier_mapping"):
+            ground_program(program, scene)
+
+    def test_independent_source_and_current_carrier_gauges_preserve_physical_eef_and_retreat(self):
+        program, scene = on_fixture()
+        phase = np.linspace(0., 1., len(program["demo"]["frame_indices"]))
+        source = program["demo"]["T_reference_carrier"]
+        source[:, :3, :3] = Rotation.from_euler("xyz", phase[:, None] * [.12, -.2, .6]).as_matrix()
+        source[:, 2, 3] = .06 * np.sin(np.pi * phase)
+        mapping = pose(x=.015, y=-.02, z=.035)
+        mapping[:3, :3] = Rotation.from_euler("xyz", [.25, -.35, .5]).as_matrix()
+        scene["functional_bindings"]["effect"]["carrier_mapping"] = mapping
+        material = pose(x=.013, y=-.008, z=.003)
+        material[:3, :3] = Rotation.from_euler("xyz", [-.3, .1, .2]).as_matrix()
+        program["demo"]["functional_events"][0]["carrier_frame"] = material
+        actual = pose(x=.01, y=.004, z=.045)
+        actual[:3, :3] = Rotation.from_euler("xyz", [.1, .2, -.3]).as_matrix()
+        scene["holding"]["T_carrier_eef"] = actual
+        scene["eef_pose"] = scene["initial_pose"] @ actual
+        original = ground_program(program, scene)
+
+        # These are coordinate re-expressions of identical physical input,
+        # not expected trajectories produced with the implementation formula.
+        # Q maps coordinates in a newly chosen local frame into the old one.
+        source_gauge = pose(x=-.07, y=.04, z=.025)
+        source_gauge[:3, :3] = Rotation.from_euler("xyz", [-.5, .3, -.4]).as_matrix()
+        source_changed, same_scene = deepcopy(program), deepcopy(scene)
+        source_changed["demo"]["T_reference_carrier"] = source @ source_gauge
+        source_changed["demo"]["T_carrier_eef"] = np.linalg.inv(source_gauge) @ program["demo"]["T_carrier_eef"]
+        source_changed["demo"]["functional_events"][0]["carrier_frame"] = np.linalg.inv(source_gauge) @ material
+        same_scene["functional_bindings"]["effect"]["carrier_mapping"] = mapping @ source_gauge
+        source_result = ground_program(source_changed, same_scene)
+        np.testing.assert_allclose(source_result["object_poses"], original["object_poses"], atol=1e-9)
+        np.testing.assert_allclose(source_result["eef_poses"], original["eef_poses"], atol=1e-9)
+
+        current_gauge = pose(x=.09, y=-.06, z=.035)
+        current_gauge[:3, :3] = Rotation.from_euler("xyz", [.4, -.3, .7]).as_matrix()
+        changed = deepcopy(scene)
+        inverse = np.linalg.inv(current_gauge)
+        changed["initial_pose"] = scene["initial_pose"] @ current_gauge
+        changed["holding"]["T_carrier_eef"] = inverse @ actual
+        changed["body_points"] = scene["body_points"] @ inverse[:3, :3].T + inverse[:3, 3]
+        binding = changed["functional_bindings"]["effect"]
+        binding["carrier_mapping"] = inverse @ mapping
+        face = binding["on_geometry"]
+        face["carrier_region_points"] = face["carrier_region_points"] @ inverse[:3, :3].T + inverse[:3, 3]
+        face["carrier_outward_normal"] = inverse[:3, :3] @ face["carrier_outward_normal"]
+        # Physical robot feedback and world support are unchanged. Every EEF
+        # node, including the independent release suffix, must remain the same.
+        current_result = ground_program(program, changed)
+        np.testing.assert_allclose(current_result["object_poses"], original["object_poses"] @ current_gauge, atol=1e-9)
+        np.testing.assert_allclose(current_result["eef_poses"], original["eef_poses"], atol=1e-9)
+        self.assertGreater(np.linalg.norm(original["eef_poses"][-1, :3, 3] - original["eef_poses"][7, :3, 3]), .02)
+
+    def test_full_273_node_timeline_keeps_internal_effect_release_and_independent_retreat(self):
+        program, scene = on_fixture()
+        frames = np.arange(197, 470)
+        times = frames.astype(float) / 20.
+        count, effect, release = len(frames), 402 - 197, 405 - 197
+        source = np.repeat(pose()[None], count, axis=0)
+        source[:, 0, 3] = np.r_[np.linspace(0., .12, effect + 1), np.repeat(.12, count - effect - 1)]
+        source[:effect + 1, 2, 3] = .08 * np.sin(np.linspace(0., np.pi, effect + 1))
+        source_hand = np.repeat(pose(z=.025)[None], count, axis=0)
+        source_hand[release:, 1, 3] -= np.linspace(0., .045, count - release)
+        source_hand[release:, 2, 3] += np.linspace(0., .075, count - release)
+        source_hand[release:, :3, :3] = Rotation.from_euler("x", np.linspace(0., .25, count - release)).as_matrix()
+        demo = program["demo"]
+        demo.update(frame_indices=frames, timestamps=times,
+                    T_reference_carrier=source, T_carrier_eef=source_hand,
+                    release_frame=405,
+                    gripper_events=[{"event_id": "open", "frame_index": 403, "command": "open"}])
+        demo["functional_events"][0]["frame_index"] = 402
+        actual = pose(x=.005, y=-.008, z=.04)
+        actual[:3, :3] = Rotation.from_euler("xyz", [.2, -.1, .4]).as_matrix()
+        scene["holding"]["T_carrier_eef"] = actual
+        scene["eef_pose"] = scene["initial_pose"] @ actual
+        result = ground_program(program, scene)
+        np.testing.assert_array_equal(result["frame_indices"], frames)
+        np.testing.assert_array_equal(result["timestamps"], times)
+        self.assertEqual(result["object_poses"].shape, (209, 4, 4))
+        self.assertEqual(result["eef_poses"].shape, (273, 4, 4))
+        self.assertEqual(result["function_checks"][0]["frame_index"], 402)
+        self.assertEqual(result["release_frame"], 405)
+        self.assertEqual(result["gripper_events"][0]["frame_index"], 403)
+        np.testing.assert_allclose(result["eef_poses"][:release + 1], result["object_poses"] @ actual, atol=1e-9)
+        source_eef = source @ source_hand
+        np.testing.assert_allclose(np.linalg.inv(result["eef_poses"][release]) @ result["eef_poses"][release:],
+                                   np.linalg.inv(source_eef[release]) @ source_eef[release:], atol=1e-9)
+        self.assertGreater(np.linalg.norm(result["eef_poses"][-1, :3, 3] - result["eef_poses"][release, :3, 3]), .08)
+        self.assertEqual(result["released_object_state"], "requires_observation")
+# END partial on geometry and complete phase regressions.
 
 
 if __name__ == "__main__":

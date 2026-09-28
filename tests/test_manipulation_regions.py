@@ -463,6 +463,54 @@ class SupportRegionTest(unittest.TestCase):
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                 ground_on(pose(), self.body, self.bottom, [0, 0, -1], self.surface, **kwargs)
 
+    # BEGIN yaw remains a searched task freedom, independent of surface basis.
+    def test_preferred_feasible_yaw_is_preserved_without_searching_other_yaws(self):
+        preferred = pose((0., 0., .37), self.surface.origin)
+        result = ground_on(preferred, self.body, self.bottom, [0, 0, -1], self.surface, **self.tolerances)
+        np.testing.assert_allclose(result["goal_pose"], preferred, atol=1e-12)
+        self.assertEqual(result["freedom"]["yaw_search"]["checked_candidates"], 1)
+        self.assertEqual(result["freedom"]["yaw_search"]["chosen_offset_rad"], 0.)
+
+    def test_preferred_footprint_failure_can_succeed_at_another_free_yaw(self):
+        body = np.array([[x, y, z] for x in (-.14, .14) for y in (-.035, .035) for z in (0., .1)])
+        bottom = body[body[:, 2] == 0]
+        surface = SupportSurface(self.surface.origin, self.surface.basis, self.surface.normal,
+                                 np.array([[-.05, -.2], [-.05, .2], [.05, .2], [.05, -.2]]))
+        preferred = pose(translation=surface.origin)
+        result = ground_on(preferred, body, bottom, [0, 0, -1], surface, **self.tolerances)
+        self.assertTrue(result["checks"]["region"]["valid"])
+        self.assertLess(result["checks"]["body"]["boundary_violation_m"], 1e-7)
+        search = result["freedom"]["yaw_search"]
+        self.assertGreater(abs(search["chosen_offset_rad"]), np.deg2rad(75))
+        self.assertGreater(search["checked_candidates"], 1)
+        self.assertIn("no global", search["scope"])
+        # Re-express the same finite world patch by a reflected/rotated basis
+        # and shifted origin. Neither operation changes the selected free yaw.
+        rotation = Rotation.from_euler("z", .63).as_matrix()[:2, :2]
+        rotation[:, 1] *= -1
+        shift = np.array([.035, -.025])
+        reparameterized = SupportSurface(
+            surface.origin + surface.basis @ shift, surface.basis @ rotation, surface.normal,
+            ((surface.boundary - shift) @ rotation)[::-1])
+        equivalent = ground_on(preferred, body[::-1], bottom[::-1], [0, 0, -1],
+                               reparameterized, **self.tolerances)
+        np.testing.assert_allclose(equivalent["goal_pose"], result["goal_pose"], atol=1e-8)
+        # Common SE(3) transforms act on the normal and preference, not on a
+        # fixed world axis. The whole selected placement must transform too.
+        world = pose((.4, -.6, .2), (.2, -.5, .3))
+        moved = SupportSurface(transform(world, surface.origin[None])[0],
+                               world[:3, :3] @ surface.basis,
+                               world[:3, :3] @ surface.normal, surface.boundary)
+        changed = ground_on(world @ preferred, body, bottom, [0, 0, -1], moved, **self.tolerances)
+        np.testing.assert_allclose(changed["goal_pose"], world @ result["goal_pose"], atol=1e-8)
+
+    def test_exhausted_yaw_samples_do_not_claim_global_infeasibility(self):
+        body = np.array([[x, y, z] for x in (-.4, .4) for y in (-.4, .4) for z in (0., .1)])
+        with self.assertRaisesRegex(ValueError, "bounded.*not a proof of global infeasibility"):
+            ground_on(pose(translation=self.surface.origin), body, body[body[:, 2] == 0],
+                      [0, 0, -1], self.surface, **self.tolerances)
+    # END free-yaw and coordinate-gauge regressions.
+
 
 if __name__ == "__main__":
     unittest.main()

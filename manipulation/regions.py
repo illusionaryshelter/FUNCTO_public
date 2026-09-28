@@ -202,36 +202,94 @@ def ground_on(preferred_pose, body_points, carrier_region_points,
     First rotate the specified carrier outward normal opposite the support
     normal, selecting the closest twist from the explicit pose preference.
     Then ``place_on`` moves the *whole supplied body geometry* into the finite
-    support. Finally verify the declared functional contact face independently;
+    support. If that preferred twist cannot produce an accepted candidate, try
+    5-degree yaw increments about the physical support normal, in increasing
+    absolute angle. Both signs at the same angle are compared by translation
+    change. Finally verify the declared functional contact face independently;
     the body's lowest point alone cannot make this API report success.
 
     The chosen twist and tangential location are numerical preferences, not
     measured task requirements. Their feasible range is bounded by the supplied
     support and body geometry. The output certifies this sampled geometric
     relation only, not hidden-shape coverage, force stability or collision-free
-    robot execution. A missing antiparallel branch is rejected by ``align_axis``.
+    robot execution. The finite yaw search is not a global infeasibility proof.
+    A missing antiparallel branch is rejected by ``align_axis``.
     """
     _support_arguments(support, margin, gap_tolerance, normal_tolerance)
+    body = _points(body_points, "body_points", minimum=3)
+    region = _points(carrier_region_points, "carrier_region_points", minimum=1)
+    outward = _unit(carrier_outward_normal, "carrier_outward_normal")
     preferred = _pose_array(preferred_pose, "preferred_pose")
-    preferred[:3, :3] = align_axis(preferred[:3, :3], carrier_outward_normal,
+    preferred[:3, :3] = align_axis(preferred[:3, :3], outward,
                                   -support.normal, antiparallel_axis=antiparallel_axis)
-    goal, body_check = place_on(preferred, body_points, support, margin=margin)
-    region_check = check_region_on(goal, carrier_region_points, carrier_outward_normal,
-                                   support, gap_tolerance=gap_tolerance,
-                                   normal_tolerance=normal_tolerance, margin=margin)
-    if not region_check["valid"]:
+    # BEGIN search only genuine free yaw, without using a support tangent gauge.
+    # Plane height and signed normal do not change under yaw. Reject a wrong
+    # face once, before trying bounded footprint candidates; no yaw can move a
+    # cup rim onto the support while keeping its lower body above that plane.
+    height_pose = preferred.copy()
+    rotated_body = body @ preferred[:3, :3].T
+    plane_height = float((preferred[:3, 3] - support.origin) @ support.normal)
+    height_pose[:3, 3] += (-float(np.min(rotated_body @ support.normal)) - plane_height) * support.normal
+    vertical = check_region_on(height_pose, region, outward, support,
+                               gap_tolerance=gap_tolerance,
+                               normal_tolerance=normal_tolerance, margin=margin)
+    if (vertical["max_abs_gap_m"] > gap_tolerance + 1e-10
+            or vertical["normal_error_rad"] > normal_tolerance + 1e-10):
         raise ValueError("Specified functional contact face does not satisfy support: "
-                         f"gap={region_check['max_abs_gap_m']:.6g} m, "
-                         f"normal={region_check['normal_error_rad']:.6g} rad, "
-                         f"boundary={region_check['boundary_violation_m']:.6g} m")
-    # Preserve the existing placement kernel's independent full-body check;
-    # the small contact patch must not replace complete geometry coverage.
-    return {"goal_pose": goal, "checks": {"body": body_check, "region": region_check},
-            "freedom": {
-                "required": "specified face on finite support with opposing signed normals",
-                "twist": "closest preferred orientation; chosen free component, not observed",
-                "tangential_position": "nearest preferred position satisfying supplied full-body bounds",
-                "antiparallel_branch": "explicit geometric axis" if antiparallel_axis is not None else None}}
+                         f"gap={vertical['max_abs_gap_m']:.6g} m, "
+                         f"normal={vertical['normal_error_rad']:.6g} rad")
+
+    checked, last_region = 0, None
+    # 0, +/-5, ... +/-175, 180 degrees covers one full circle. The tangent
+    # basis of SupportSurface is used only inside the translation constraints;
+    # it cannot determine these world-space rotations or their ordering.
+    for step in range(37):
+        angle = np.deg2rad(5. * step)
+        angles = (angle,) if step in (0, 36) else (angle, -angle)
+        valid = []
+        for yaw in angles:
+            checked += 1
+            candidate = preferred.copy()
+            candidate[:3, :3] = Rotation.from_rotvec(yaw * support.normal).as_matrix() @ preferred[:3, :3]
+            try:
+                goal, body_check = place_on(candidate, body, support, margin=margin)
+            except ValueError as error:
+                # Only the existing solver's explicit finite-region failure
+                # means this candidate is unavailable. Invalid inputs and
+                # failed independent checks must not be hidden by yaw search.
+                if str(error) != "Object geometry does not fit the requested target region":
+                    raise
+                continue
+            region_check = check_region_on(goal, region, outward, support,
+                                           gap_tolerance=gap_tolerance,
+                                           normal_tolerance=normal_tolerance, margin=margin)
+            last_region = region_check
+            if region_check["valid"]:
+                distance = float(np.linalg.norm(goal[:3, 3] - preferred[:3, 3]))
+                valid.append((distance, yaw, goal, body_check, region_check))
+        if valid:
+            # Both signs have equal angular preference. Distance breaks the
+            # tie; stable order chooses the positive signed physical yaw when
+            # translations agree to floating-point precision.
+            best = valid[0]
+            for item in valid[1:]:
+                if item[0] < best[0] - 1e-10:
+                    best = item
+            _, yaw, goal, body_check, region_check = best
+            return {"goal_pose": goal, "checks": {"body": body_check, "region": region_check},
+                    "freedom": {
+                        "required": "specified face on finite support with opposing signed normals",
+                        "twist": "closest accepted sampled yaw to preferred orientation; chosen free component, not observed",
+                        "tangential_position": "nearest preferred position satisfying supplied full-body bounds at chosen yaw",
+                        "yaw_search": {"chosen_offset_rad": float(yaw), "step_degrees": 5.,
+                                       "checked_candidates": checked,
+                                       "scope": "bounded yaw samples; no global feasibility or optimality guarantee"},
+                        "antiparallel_branch": "explicit geometric axis" if antiparallel_axis is not None else None}}
+    detail = ("; specified functional contact face boundary violation="
+              f"{last_region['boundary_violation_m']:.6g} m" if last_region is not None else "")
+    raise ValueError("No accepted placement candidate in bounded 5-degree yaw search; "
+                     "this is not a proof of global infeasibility" + detail)
+    # END free-yaw search with independent full-body and contact-face checks.
 # END partial support-region consumption.
 
 

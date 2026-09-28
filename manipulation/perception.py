@@ -1,8 +1,9 @@
 # BEGIN current-owner grounding module documentation.
 """Ground source evidence using FUNCTO's existing local perception models.
 
-Cached skills reconstruct functional geometry from source query recipes and
-current owner RGB-D. The original raw-video path also retains its explicit
+Cached skills bind source semantic evidence to current owner RGB-D. Complete
+functional frames use query recipes; on placement uses unordered support and
+an explicitly bound carrier. The original raw-video path retains its explicit
 tracking and rigid observations. Neither path supplies knowledge of hidden
 joints, complete container interiors, actual Holding, or robot executability.
 """
@@ -186,109 +187,174 @@ def _normal_matches(observed, expected, tolerance, *, signed):
     return np.arccos(np.clip(cosine if signed else abs(cosine), -1., 1.)) <= tolerance
 
 
-def _bind_on_geometry(event, binding, paired_sources, paired_matches, current, owner_evidence, scene, client):
-    """Recover sparse contact/support evidence; never require a target part mask.
+# BEGIN unordered support binding and independently observed carrier contact.
+def _support_direction(direction, source):
+    """Validate physical side evidence, expressed in the declared output frame."""
+    value = np.asarray(direction, float)
+    if value.shape != (3,) or not np.isfinite(value).all() or not np.any(value):
+        raise ValueError("support_direction must be a finite nonzero physical direction")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("support_direction_source must explain calibration and physical side")
+    # Direction scale has no physical meaning. Scale first to avoid overflow
+    # or underflow before taking the norm, as in the support estimator itself.
+    scaled = value / np.max(np.abs(value))
+    return scaled / np.linalg.norm(scaled)
 
-    A recipe normal only gains a physical side through the offline declaration
-    ``normal_role``. Only matched queries originally inside the source contact
-    mask can become contact samples. These are sparse visible evidence, not a
-    reconstructed full face or a certificate about an occluded bottom surface.
-    A supplied richer current geometry remains usable and is checked for plane
-    and normal consistency with these independent correspondences. Discrete
-    carrier face samples do not establish a polygon boundary, so no such
-    boundary is invented. The observed support has its own finite boundary.
-    """
-    from .pipeline import _surface
-    gap, angle = _tolerances(event["position_tolerance_m"], event["rotation_tolerance_rad"])
-    carrier_match, reference_match = paired_matches["carrier"], paired_matches["reference"]
-    carrier_source, reference_source = paired_sources["carrier"], paired_sources["reference"]
-    if "on_geometry" not in binding:
-        if carrier_match["geometry_kind"] != "plane" or carrier_source.get("normal_role") != "outward":
-            raise ValueError("Source on template needs an evidenced outward plane normal to infer contact geometry")
-        face_points = _interaction_samples(carrier_match, minimum=3)
-        normal = np.asarray(carrier_match["target_normal"], float)
-        if np.any(np.abs((face_points-carrier_match["target_origin"]) @ normal) > gap):
-            raise ValueError("Observed carrier contact samples are not on the declared functional plane")
-        binding["on_geometry"] = {
-            "carrier_region_points": face_points.copy(), "carrier_outward_normal": normal.copy(),
-            "gap_tolerance": gap, "normal_tolerance": angle,
-            "source": "offline outward-normal semantics + current interaction-query correspondences",
-            "normal_evidence": carrier_source["frame_recipe"]["source"],
-            "coverage": "sparse visible contact correspondences; full face and hidden geometry are unknown",
-        }
-    face = binding["on_geometry"]
-    if not isinstance(face.get("source"), str) or not face["source"].strip():
-        raise ValueError("Current on_geometry requires an independent physical geometry source")
-    face_points = _points(face["carrier_region_points"], "Current carrier contact geometry")
-    face_normal = np.asarray(face["carrier_outward_normal"], float)
-    face_gap, face_angle = _tolerances(face["gap_tolerance"], face["normal_tolerance"])
-    if not _normal_matches(face_normal, face_normal, np.pi, signed=True):
+
+def _contact_geometry(face):
+    """Validate sourced owner-local contact samples without completing a face."""
+    if not isinstance(face, Mapping) or not isinstance(face.get("source"), str) or not face["source"].strip():
+        raise ValueError("Current on_geometry requires a physical geometry source")
+    points = _points(face["carrier_region_points"], "Current carrier contact geometry", minimum=3)
+    normal = np.asarray(face["carrier_outward_normal"], float)
+    if not _normal_matches(normal, normal, np.pi, signed=True):
         raise ValueError("Invalid physical carrier normal")
-    face_normal = face_normal / np.linalg.norm(face_normal)
-    observed_face = _interaction_samples(carrier_match)
-    if np.any(np.abs((observed_face-face_points[0]) @ face_normal) > face_gap):
-        raise ValueError("Current contact model disagrees with the matched interaction surface")
-    if carrier_match["geometry_kind"] == "plane" and not _normal_matches(
-            carrier_match["target_normal"], face_normal, face_angle,
-            signed=carrier_source.get("normal_role") == "outward"):
-        raise ValueError("Matched carrier plane and physical contact normal disagree")
+    gap, angle = _tolerances(face["gap_tolerance"], face["normal_tolerance"])
+    normal = normal / np.linalg.norm(normal)
+    if not _noncollinear(points) or np.max(np.abs((points-points[0]) @ normal)) > gap:
+        raise ValueError("Current carrier contact geometry must be a noncollinear planar face")
+    return {**deepcopy(face), "carrier_region_points": points.copy(),
+            "carrier_outward_normal": normal, "gap_tolerance": gap, "normal_tolerance": angle}
 
-    reference_observation = current["reference"]
-    if "support" not in scene:
-        if reference_match["geometry_kind"] != "plane" or reference_source.get("normal_role") != "support":
-            raise ValueError("Source on template needs an evidenced support plane normal to infer the current support")
-        # Three independent interaction queries support the plane hypothesis.
-        # Direction-only witnesses may lie elsewhere on the same owner and are
-        # never substituted when the actual interaction surface is unobserved.
-        observed_reference = _interaction_samples(reference_match, minimum=3)
-        if np.any(np.abs((observed_reference-reference_match["target_origin"])
-                         @ reference_match["target_normal"]) > gap):
-            raise ValueError("Observed reference samples are not on the declared support plane")
-        camera_owner = reference_observation["T_camera_owner"]
-        normal_camera = camera_owner[:3, :3] @ reference_match["target_normal"]
-        origin_camera = camera_owner[:3, :3] @ reference_match["target_origin"] + camera_owner[:3, 3]
-        support_camera, support_evidence = infer_support(
-            reference_observation["image"], reference_observation["depth"], reference_observation["K"],
-            reference_observation["owner_mask"], origin_camera + .05 * normal_camera,
-            instruction=reference_source["description"], client=client)
-        output_camera = owner_evidence["reference"]["T_output_camera"]
-        support = SupportSurface(
-            output_camera[:3, :3] @ support_camera.origin + output_camera[:3, 3],
-            output_camera[:3, :3] @ support_camera.basis,
-            output_camera[:3, :3] @ support_camera.normal,
-            support_camera.boundary.copy(), source=support_camera.source)
-        scene["support"] = support.to_dict()
-        owner_evidence["reference"]["support"] = support_evidence
-    else:
-        support = _surface(scene["support"])
-    output_reference = owner_evidence["reference"]["T_output_owner"]
-    observed_reference = _interaction_samples(reference_match)
-    reference_points = observed_reference @ output_reference[:3, :3].T + output_reference[:3, 3]
-    offsets = reference_points-support.origin
-    # BEGIN distinguish observed plane witnesses from the finite placement patch.
-    # Correspondences can identify corners of the observed support outside a
-    # conservative interior patch returned by infer_support. Their owner/depth
-    # membership was checked during matching; here they must agree with the
-    # selected plane and its signed normal. The placement patch still bounds
-    # the actual carrier face and complete supplied body in ground_on and the
-    # numerical program's independent checks; it need not contain these visual
-    # witnesses, and must never be expanded merely to include them.
-    if np.any(np.abs(offsets @ support.normal) > gap):
-        raise ValueError("Selected support disagrees with the matched interaction plane")
-    # END distinguish observed plane witnesses from the finite placement patch.
-    if reference_match["geometry_kind"] == "plane" and not _normal_matches(
-            output_reference[:3, :3] @ reference_match["target_normal"], support.normal, angle,
-            signed=reference_source.get("normal_role") == "support"):
-        raise ValueError("Selected support normal disagrees with the matched reference plane")
-    binding["on_observation_scope"] = "matched contact samples and observed finite support; physical stability is unverified"
+
+def bind_carrier_contact(template, current_owner, *, position_tolerance_m,
+                         normal_tolerance_rad, client=None, extractor=None):
+    """Observe a carrier's contact geometry for a subsequent placement binding.
+
+    This is an explicit upstream operation when the relevant carrier surface
+    is visible. It reuses functional correspondence and produces sparse current
+    evidence, not a full hidden bottom or verified Holding. A known, already
+    bound object model can instead supply these same numerical fields directly.
+    Neither route infers current geometry by copying demonstration samples.
+    """
+    gap, angle = _tolerances(position_tolerance_m, normal_tolerance_rad)
+    source = source_function_geometry(template)
+    if source["geometry_kind"] != "plane" or template.get("normal_role") != "outward":
+        raise ValueError("Carrier contact requires an evidenced outward plane normal")
+    current, owner_evidence = _current_owner(current_owner, "carrier")
+    matched = match_functional_region(template, current, client=client, extractor=extractor)
+    if (matched["geometry_kind"] != source["geometry_kind"]
+            or not np.allclose(matched["source_frame"], source["source_frame"], atol=1e-8, rtol=0)):
+        raise ValueError("Current matching changed the prevalidated carrier source geometry")
+    face = _contact_geometry({
+        "carrier_region_points": _interaction_samples(matched, minimum=3),
+        "carrier_outward_normal": matched["target_normal"],
+        "gap_tolerance": gap, "normal_tolerance": angle,
+        "source": "offline outward-normal semantics + current interaction-query correspondences",
+        "normal_evidence": template["frame_recipe"]["source"],
+        "coverage": "sparse visible contact correspondences; full face and hidden geometry are unknown",
+    })
+    camera = Camera(current["K"], current["image"].width, current["image"].height)
+    body = _body_points(current["depth"], camera, current["owner_mask"], current["T_camera_owner"])
+    return {"carrier_id": current["owner_id"], "source_owner_id": template["owner_id"],
+            "carrier_mapping": _pose_array(matched["transform"], "Current carrier mapping"),
+            "on_geometry": face, "initial_pose": owner_evidence["T_output_owner"],
+            "body_points": body, "body_points_source": "current visible owner RGB-D; hidden geometry unknown",
+            "source": "current carrier contact correspondence and calibrated owner coordinates",
+            "region_binding_evidence": matched, "owner_observation_evidence": owner_evidence}
+
+
+def _bind_support_scene(program, scene, source_templates, current_owners, *, client):
+    """Bind an on goal from reference RGB-D, without reference point identities.
+
+    Carrier pose, geometry, source-to-current mapping and (for EEF output)
+    actual Holding are upstream responsibilities. This function never assumes
+    the carrier is identical to the demonstration, nor guesses identity for its
+    mapping. Only the support role needs a current image here. Every event in
+    this skill must refer to the same evidenced source support region, because
+    its numerical consumer checks one finite current support surface.
+    """
+    if not isinstance(current_owners, Mapping) or set(current_owners) != {"reference"}:
+        raise ValueError("An on binding requires only reference owner RGB-D and an already bound carrier")
+    if "support" in scene:
+        raise ValueError("Visual on binding estimates support; use the numerical consumer for supplied support")
+    reference, owner_evidence = _current_owner(current_owners["reference"], "reference")
+    for role in ("carrier", "reference"):
+        if not isinstance(scene.get(role + "_id"), str) or not scene[role + "_id"]:
+            raise ValueError("On binding requires explicit current carrier_id and reference_id")
+    if scene["reference_id"] != reference["owner_id"] or scene["carrier_id"] == scene["reference_id"]:
+        raise ValueError("Current on owners disagree with the selected reference instance")
+    scene["initial_pose"] = _pose_array(scene["initial_pose"], "Current carrier pose")
+    scene["body_points"] = _points(scene["body_points"], "Current carrier body points", minimum=3).copy()
+    if not isinstance(scene.get("body_points_source"), str) or not scene["body_points_source"].strip():
+        raise ValueError("Current carrier body_points_source is required")
+    direction = _support_direction(scene.get("support_direction"), scene.get("support_direction_source"))
+    events = program["demo"].get("functional_events")
+    if not isinstance(events, list) or not events:
+        raise ValueError("On binding requires explicit functional_events")
+    names = [event.get("event_id") for event in events]
+    if (any(not isinstance(name, str) or not name for name in names)
+            or len(set(names)) != len(names) or not isinstance(source_templates, Mapping)
+            or set(source_templates) != set(names)):
+        raise ValueError("Source support semantics must cover every unique functional event")
+    bindings = scene.get("functional_bindings", {})
+    semantics, mapping = None, None
+    for event in events:
+        name = event["event_id"]
+        pair = source_templates[name]
+        if not isinstance(pair, Mapping) or set(pair) != {"reference"}:
+            raise ValueError("Each on source event requires reference support semantics only")
+        template = pair["reference"]
+        required = ("owner_id", "region_id", "description", "source")
+        if (not isinstance(template, Mapping) or any(
+                not isinstance(template.get(key), str) or not template[key].strip() for key in required)
+                or template.get("owner_id") != program["demo"].get("reference_id")
+                or template.get("normal_role") != "support"):
+            raise ValueError("Source on semantics require the selected owner, region and evidenced support side")
+        if any(key in template for key in ("query_pixels", "query_descriptions", "frame_recipe")):
+            raise ValueError("On reference semantics do not accept ordered queries or a frame recipe")
+        selection = tuple(template[key] for key in ("owner_id", "region_id", "description"))
+        if semantics is not None and selection != semantics:
+            raise ValueError("One on skill must refer to one source support region")
+        semantics = selection
+        binding = bindings.get(name)
+        if not isinstance(binding, Mapping) or not isinstance(binding.get("source"), str) or not binding["source"].strip():
+            raise ValueError("On binding requires an evidenced current carrier_mapping")
+        if any(binding.get(role + "_id") != scene[role + "_id"] for role in ("carrier", "reference")):
+            raise ValueError("Current functional binding owners disagree with the scene")
+        if "carrier_mapping" not in binding:
+            raise ValueError("On binding requires an explicit current carrier_mapping")
+        current_mapping = _pose_array(binding["carrier_mapping"], "Current carrier_mapping")
+        if mapping is not None and not np.allclose(mapping, current_mapping, atol=1e-8, rtol=0):
+            raise ValueError("One carrier requires a consistent source-to-current mapping")
+        mapping = current_mapping
+        binding["on_geometry"] = _contact_geometry(binding["on_geometry"])
+    output_camera = owner_evidence["T_output_camera"]
+    support_camera, support_evidence = infer_support(
+        reference["image"], reference["depth"], reference["K"], reference["owner_mask"],
+        support_direction=output_camera[:3, :3].T @ direction,
+        instruction=semantics[2], client=client)
+    support = SupportSurface(output_camera[:3, :3] @ support_camera.origin + output_camera[:3, 3],
+                             output_camera[:3, :3] @ support_camera.basis,
+                             output_camera[:3, :3] @ support_camera.normal,
+                             support_camera.boundary.copy(), source=support_camera.source)
+    scene["support"] = support.to_dict()
+    scene["region_binding_evidence"] = {
+        name: {"reference": {"source_owner_id": semantics[0], "source_region_id": semantics[1],
+                              "target_owner_id": scene["reference_id"],
+                              "source_semantics": source_templates[name]["reference"]["source"],
+                              "support_direction_output": direction.copy(),
+                              "support_direction_source": scene["support_direction_source"],
+                              "binding_kind": "unordered_observed_support", **support_evidence},
+               "on_geometry": deepcopy(bindings[name]["on_geometry"]), "support": support.to_dict(),
+               "carrier_mapping_source": bindings[name]["source"],
+               "orientation_source": "physical support normal; no observed reference tangent or target yaw"}
+        for name in names}
+    scene["owner_observation_evidence"] = {"reference": owner_evidence,
+                                          "carrier": {"source": scene["body_points_source"],
+                                                      "scope": "explicit upstream current carrier binding"}}
+    return scene
+# END unordered support binding and independently observed carrier contact.
 
 
 def bind_current_scene(program, scene, source_templates, current_owners, *, client=None, extractor=None):
     """Bind a cached skill from source functional evidence and current owners.
 
-    ``source_templates`` is ``{'grasp': template}`` for an independent grasp,
-    otherwise ``{event_id: {'carrier': template, 'reference': template}}``.
-    Templates use ``source_function_geometry``'s explicit query/recipe schema;
+    ``source_templates`` is ``{'grasp': template}`` for an independent grasp.
+    Full-frame manipulation uses paired carrier/reference templates per event.
+    On placement uses reference semantics only and an explicitly prebound
+    carrier; see ``_bind_support_scene``. Full-frame templates use
+    ``source_function_geometry``'s explicit query/recipe schema;
     auxiliary direction queries may extend beyond the source interaction mask
     within its owner. Current observations never require a part mask/region ID.
 
@@ -298,10 +364,10 @@ def bind_current_scene(program, scene, source_templates, current_owners, *, clie
     actual Holding, known geometry and mechanism evidence are retained; none
     are inferred from a source demonstration or from successful matching.
 
-    All inputs are copied. Every source recipe, owner ID, coordinate mapping
-    and existing pose is checked before a current model call. Plane recipes
-    provide only a normal and numerical tangent preference and are permitted
-    for ``on``; they cannot satisfy full-frame manipulation or independent grasp.
+    All inputs are copied. Source recipes, owner IDs and coordinate mappings
+    are checked before a current model call. Plane recipes cannot satisfy a
+    full-frame manipulation or independent grasp. On support selection has no
+    query recipe or reference object pose requirement.
     """
     program, result = deepcopy(program), deepcopy(scene)
     source_templates, current_owners = deepcopy(source_templates), deepcopy(current_owners)
@@ -310,6 +376,10 @@ def bind_current_scene(program, scene, source_templates, current_owners, *, clie
         raise ValueError("Only grasp/manipulation programs have functional bindings")
     if not isinstance(result.get("reference_frame"), str) or not result["reference_frame"].strip():
         raise ValueError("Current scene must name its common reference_frame")
+    # BEGIN bind only the physical relation needed by an on placement.
+    if kind == "manipulation" and program["task"]["relation"] == "on":
+        return _bind_support_scene(program, result, source_templates, current_owners, client=client)
+    # END relation-specific unordered support dispatch.
     roles = ("carrier",) if kind == "grasp" else ("carrier", "reference")
     if not isinstance(current_owners, Mapping) or set(current_owners) != set(roles):
         raise ValueError(f"Current owner roles must be exactly {list(roles)}")
@@ -377,14 +447,8 @@ def bind_current_scene(program, scene, source_templates, current_owners, *, clie
         geometry_kind = geometry["geometry_kind"]
         if geometry_kind not in {"frame", "plane"}:
             raise ValueError("Functional recipe kind must be frame or plane")
-        if geometry_kind == "plane" and (kind == "grasp" or program["task"]["relation"] != "on"):
+        if geometry_kind == "plane":
             raise ValueError("A plane supplies insufficient direction evidence for this full-frame skill")
-        if kind == "manipulation" and program["task"]["relation"] == "on":
-            existing = result.get("functional_bindings", {}).get(name, {})
-            needs_normal = "on_geometry" not in existing if role == "carrier" else "support" not in result
-            normal_role = "outward" if role == "carrier" else "support"
-            if needs_normal and (geometry_kind != "plane" or template.get("normal_role") != normal_role):
-                raise ValueError(f"Source on template needs an evidenced {normal_role} plane normal")
         source_geometry[(name, role)] = geometry
         if event is not None:
             source_checks[(name, role)] = _check_source_frame(geometry, event, role)
@@ -423,15 +487,6 @@ def bind_current_scene(program, scene, source_templates, current_owners, *, clie
                                                       else "observed plane normal; tangent is a numerical preference")
                                                for role in roles},
                            source="source query recipes reconstructed from current owner RGB-D correspondences")
-            if program["task"]["relation"] == "on":
-                _bind_on_geometry(event, binding, source_templates[name], evidence[name], current,
-                                  owner_evidence, result, client)
-                # Preserve the sparse physical samples and the actually checked
-                # support with their coverage; frame success alone does not
-                # explain which contact geometry the downstream check used.
-                evidence[name]["on_geometry"] = deepcopy(binding["on_geometry"])
-                evidence[name]["support"] = deepcopy(result["support"])
-                evidence[name]["orientation_source"] = deepcopy(binding["orientation_source"])
         result["functional_bindings"] = bindings
     result["region_binding_evidence"], result["owner_observation_evidence"] = evidence, owner_evidence
     return result
@@ -480,6 +535,18 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
     final_image, _, _ = load_rgbd(demo_dir, indices[-1])
     task = infer_task(instruction, demo_image, scene_image,
                       demo_final_image=final_image, client=client)
+    # BEGIN explicit physical support side, independent of mapped goal points.
+    geometry_path = scene_dir / "geometry.json"
+    geometry = json.loads(geometry_path.read_text()) if geometry_path.is_file() else {}
+    if geometry and geometry.get("reference_frame") != "scene_camera":
+        raise ValueError("Optional scene geometry must declare reference_frame=scene_camera")
+    support_direction_camera = None
+    if task["relation"] == "on" and "support" not in geometry:
+        config_path = scene_dir / "config.json"
+        config = json.loads(config_path.read_text()) if config_path.is_file() else {}
+        support_direction_camera = _support_direction(
+            config.get("support_direction"), config.get("support_direction_source"))
+    # END calibrated support-side validation before tracking or instance models.
     # BEGIN one observation path for tools, transported objects and moving parts.
     # Compiled functional frames describe fixed local geometry, not subsequent
     # motion. Track its carrier/reference exactly as for the other task families.
@@ -537,27 +604,21 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
              "body_points": body, "preferred_goal_pose": goal,
              "goal_source": "demonstrated endpoint bound through visible reference correspondences",
              "geometry_coverage": "visible RGB-D surface samples; hidden geometry is unknown"}
-    geometry_path = scene_dir / "geometry.json"
-    if geometry_path.is_file():
-        geometry = json.loads(geometry_path.read_text())
-        if geometry.get("reference_frame") != "scene_camera":
-            raise ValueError("Optional scene geometry must declare reference_frame=scene_camera")
-        for key in ("support", "interior", "entry_region", "entry_start_index", "margin"):
-            if key in geometry:
-                scene[key] = geometry[key]
+    for key in ("support", "interior", "entry_region", "entry_start_index", "margin"):
+        if key in geometry:
+            scene[key] = geometry[key]
     if task["relation"] == "on" and "support" not in scene:
+        # BEGIN support-side direction from actual calibration/physical evidence.
         # A reference object's largest plane may be a side panel. Select an
         # observed plane by the task and retain only its observed support area.
-        # Orient its side from the demonstrated goal, since a carried object
-        # may start below its destination support before being lifted onto it.
-        # Use a material point average, not the arbitrary body-frame origin,
-        # so a different valid body coordinate convention cannot flip the side.
-        goal_center = goal[:3, :3] @ body.mean(axis=0) + goal[:3, 3]
         surface, surface_evidence = infer_support(
-            scene_image, scene_depth, scene_camera.K, masks["scene"]["reference"], goal_center,
+            scene_image, scene_depth, scene_camera.K, masks["scene"]["reference"],
+            support_direction=support_direction_camera,
             instruction=instruction + "\n" + task.get("goal_description", ""), client=client)
         scene["support"] = surface.to_dict()
         evidence["support"] = surface_evidence
+        evidence["support"]["support_direction_source"] = config["support_direction_source"]
+        # END calibrated support side; no source goal or camera-facing default.
     # BEGIN demonstrated containment target without invented hidden geometry.
     # The reference-bound endpoint already specifies the demonstrated inside
     # motion. Missing cavity geometry limits containment verification, rather

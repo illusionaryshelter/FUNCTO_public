@@ -162,12 +162,19 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None):
     return output, diagnostics
 
 
-def _functional_events(demo, scene, frames, poses, last_held, task):
+def _functional_events(demo, scene, frames, poses, last_held, task, initial):
     events = demo.get("functional_events")
     if not isinstance(events, list) or not events:
         raise ValueError("Manipulation requires explicit functional_events; release/end frames are not substitutes")
     current = scene.get("functional_bindings", {})
-    reference_pose = _pose_array(scene["reference_pose"], "Current reference-owner pose")
+    # BEGIN unordered support: an on relation has no measured target tangent
+    # or material origin. Its finite support is already in the output frame.
+    # Other relations retain their complete two-sided functional coordinates.
+    on_relation = task["relation"] == "on"
+    reference_pose = (None if on_relation else
+                      _pose_array(scene["reference_pose"], "Current reference-owner pose"))
+    carrier_mapping = None
+    # END unordered support coordinate entrance.
     output, previous, names = [], -1, set()
     for event in events:
         name = event.get("event_id")
@@ -184,30 +191,59 @@ def _functional_events(demo, scene, frames, poses, last_held, task):
         # numeric transforms alone cannot identify a wrong, similar instance.
         if binding.get("carrier_id") != scene["carrier_id"] or binding.get("reference_id") != scene["reference_id"]:
             raise ValueError("Functional binding owners disagree with the selected current entities")
-        relation = ground_relation(poses[index], event["carrier_frame"], binding["carrier_frame"],
-                                   event["reference_frame"], binding["reference_frame"])
-        # The semantic frames are owner-local. Embed their relation in the
-        # declared output coordinates once, even when those are camera/world
-        # rather than the target owner's own frame.
-        relation["goal_pose"] = reference_pose @ relation["goal_pose"]
-        relation["reference_binding"] = reference_pose @ relation["reference_binding"]
-        if task["relation"] == "on":
-            # For a surface relation, frame correspondence supplies a pose
-            # preference. Only the supported face/normal/finite area are hard
-            # requirements; an unobserved twist is not made a semantic fact.
+        if on_relation:
+            # BEGIN direct partial on relation. A_C maps source-carrier local
+            # coordinates into the current carrier's fixed local coordinates.
+            # Identity is explicit, with provenance in binding.source; it is
+            # never inferred from similar labels or silently filled in here.
+            if "carrier_mapping" not in binding:
+                raise ValueError("On binding requires an explicit evidenced carrier_mapping")
+            mapping = _pose_array(binding["carrier_mapping"], "On carrier_mapping")
+            if carrier_mapping is None:
+                carrier_mapping = mapping
+            elif not np.allclose(mapping, carrier_mapping, atol=1e-8, rtol=0):
+                raise ValueError("On events for one carrier require the same carrier_mapping")
+            # P_t = X_0 A_C S_0^-1 S_t A_C^-1. Source-reference changes cancel,
+            # while nonidentity carrier mappings retain their lever-arm effect.
+            # This is a motion/pose preference; no shelf PCA axis participates.
+            source_binding = initial @ mapping @ _inverse(poses[0])
+            preferred = source_binding @ poses[index] @ _inverse(mapping)
+            function_frame = mapping @ _pose_array(event["carrier_frame"], "Source material function frame")
             from .pipeline import _surface
             from .regions import ground_on
             face = binding["on_geometry"]
             surface = _surface(scene["support"])
-            grounded = ground_on(relation["goal_pose"], scene["body_points"],
-                                face["carrier_region_points"], face["carrier_outward_normal"],
+            # The free tangential-position preference belongs to a material
+            # function point, not an arbitrary carrier coordinate origin.
+            # Normal alignment can rotate a translated body-local frame; if
+            # its origin were held fixed, merely changing that coordinate
+            # gauge would move the physical goal. Re-express all geometry in
+            # the already evidenced material frame before placement, then
+            # convert the candidate back. No target tangent is introduced.
+            function_body = _inverse(function_frame)
+            body_points = np.asarray(scene["body_points"], float)
+            contact_points = np.asarray(face["carrier_region_points"], float)
+            grounded = ground_on(preferred @ function_frame,
+                                body_points @ function_body[:3, :3].T + function_body[:3, 3],
+                                contact_points @ function_body[:3, :3].T + function_body[:3, 3],
+                                function_body[:3, :3] @ face["carrier_outward_normal"],
                                 surface, margin=scene.get("margin", 0.),
                                 gap_tolerance=face["gap_tolerance"],
                                 normal_tolerance=face["normal_tolerance"],
                                 antiparallel_axis=face.get("antiparallel_axis"))
-            relation["goal_pose"] = grounded["goal_pose"]
-            relation["constraint_kind"] = "on_region"
+            relation = {"goal_pose": grounded["goal_pose"] @ function_body,
+                        "carrier_binding": mapping, "reference_binding": source_binding,
+                        "function_frame": function_frame,
+                        "constraint_kind": "on_region", "freedom": grounded["freedom"]}
+            # END direct partial on relation.
         else:
+            relation = ground_relation(poses[index], event["carrier_frame"], binding["carrier_frame"],
+                                       event["reference_frame"], binding["reference_frame"])
+            # Full functional frames are owner-local; embed them once in the
+            # output frame, including when it differs from the reference owner.
+            relation["goal_pose"] = reference_pose @ relation["goal_pose"]
+            relation["reference_binding"] = reference_pose @ relation["reference_binding"]
+            relation["function_frame"] = _pose_array(binding["carrier_frame"], "Current functional frame")
             relation["constraint_kind"] = "functional_frame"
         output.append({**relation, "event_id": name, "index": index,
                        "frame_index": int(frames[index]), "binding": binding,
@@ -232,10 +268,10 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
     if task["relation"] == "inside" and margin > 0 and not any(
             name in scene for name in ("interior", "entry_region")):
         raise ValueError("An inside clearance margin requires observed free geometry")
-    events = _functional_events(demo, scene, frames, source, last_held, task)
-    # The soft reference uses the first active functional correspondence; all
-    # required events have their own two-sided goals, so A_C cannot disappear
-    # through initial-pose normalization, even with different local mappings.
+    events = _functional_events(demo, scene, frames, source, last_held, task, initial)
+    # Full-frame relations use the first functional correspondence. For on,
+    # reference_binding is instead the initial-state source-coordinate map;
+    # its goals are constrained by finite support, without a target frame.
     first = events[0]
     reference = first["reference_binding"] @ source @ _inverse(first["carrier_binding"])
     # Several regions can constrain one physical event. They must agree on
@@ -255,7 +291,7 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
     if task["relation"] == "articulation" and (model_spec is None
             or model_spec.get("kind") not in {"prismatic", "revolute"}):
         raise ValueError("Articulation requires the current instance's supported mechanism model")
-    function_frame = _pose_array(first["binding"]["carrier_frame"], "Current functional frame")
+    function_frame = first["function_frame"]
     if task["relation"] == "tool_use":
         if model_spec is not None or motion not in {"free", "auto"}:
             raise ValueError("The function optimizer cannot silently discard a current mechanism constraint")
@@ -285,6 +321,7 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
                                     gap_tolerance=face["gap_tolerance"],
                                     normal_tolerance=face["normal_tolerance"])
             error["body_checks"] = check_on(pose, scene["body_points"], surface)
+            error["freedom"] = deepcopy(event["freedom"])
             if (not error["valid"] or error["body_checks"]["support_gap_m"] > 1e-7
                     or error["body_checks"]["minimum_boundary_clearance_m"] < scene.get("margin", 0.) - 1e-7):
                 raise ValueError("Transferred function event violates the specified support face or full body bounds")
@@ -370,13 +407,21 @@ def ground_program(program, scene):
     """Generate one grasp/manipulation geometry reference from a compiled demo.
 
     ``program`` contains ``skill_kind``, ``demo`` and (for manipulation) task
-    ``relation``/``motion``. ``demo.functional_events`` explicitly name source
-    frame IDs, two owner-local functional frames, their source, and tolerances.
-    ``scene.functional_bindings[event_id]`` supplies the two current functional
-    frames, owner IDs and evidence source. This does not assume congruent shapes.
-    ``scene.reference_pose`` maps the current reference owner's local frame to
-    ``scene.reference_frame`` (the common output frame); identity is explicit
-    when those frames coincide. Initial poses and scene geometry use the latter.
+    ``relation``/``motion``. Every functional event names its source frame ID,
+    carrier-local material function frame and evidence source. Full-frame
+    relations additionally supply source/current reference functional frames,
+    a current carrier frame and metric event tolerances. Their explicit
+    ``scene.reference_pose`` embeds the current reference owner's local frame
+    in ``scene.reference_frame`` (the common output frame).
+
+    An ``on`` relation instead supplies finite ``scene.support`` in the output
+    frame and, per event, ``carrier_mapping`` (current-carrier-from-source-
+    carrier), owner IDs, evidence source and ``on_geometry`` contact samples,
+    signed normal and tolerances. It requires no current reference pose or
+    complete reference functional frame. Source motion is aligned with the
+    current initial carrier pose before the support constrains the event goal;
+    its tangential position and yaw remain preferences, not observations.
+    Every event for one carrier must use the same explicit carrier mapping.
 
     Manipulation additionally requires caller-verified ``scene.holding`` with
     measured ``T_carrier_eef`` and its evidence source, plus synchronized
