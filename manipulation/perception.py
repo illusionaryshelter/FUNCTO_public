@@ -516,6 +516,111 @@ def ground_current_program(program, scene, source_templates, current_owners, *, 
 # END cached skill grounding from current owner observations.
 
 
+# BEGIN screened rigid-owner candidate generation through the numerical core.
+def _registered_owner_transform(program, scene, role):
+    """Derive the tested mapping from the exact bindings consumed by the core.
+
+    Do not accept a second caller-supplied validation transform: checking a
+    good transform while generating motion from a different binding would
+    defeat the gate. Full functional frames yield one rigid owner mapping;
+    inconsistent event mappings or support/joint-only constraints do not.
+    Those representations continue using their own grounding entry points.
+    """
+    if program["skill_kind"] == "grasp":
+        if role != "carrier":
+            raise ValueError("Independent grasp registers its carrier")
+        return (_pose_array(scene["carrier_pose"], "carrier_pose")
+                @ _pose_array(scene["region_transform"], "region_transform"))
+    if program["skill_kind"] != "manipulation" or role not in {"carrier", "reference"}:
+        raise ValueError("A manipulation registers its carrier or reference owner")
+    events = program["demo"].get("functional_events")
+    if not events or program["task"]["relation"] == "on":
+        raise ValueError("Rigid registration screening requires full functional-frame bindings")
+    pose_key = "initial_pose" if role == "carrier" else "reference_pose"
+    owner_pose = _pose_array(scene[pose_key], pose_key)
+    transforms = []
+    for event in events:
+        if event.get("constraint_kind", "functional_frame") != "functional_frame":
+            raise ValueError("A joint-coordinate goal does not define a rigid owner registration")
+        binding = scene["functional_bindings"][event["event_id"]]
+        if binding.get(role + "_id") != scene[role + "_id"]:
+            raise ValueError("Functional binding and registered owner must agree")
+        source = _pose_array(event[role + "_frame"], "source functional frame")
+        current = _pose_array(binding[role + "_frame"], "current functional frame")
+        transforms.append(owner_pose @ current @ np.linalg.inv(source))
+    if any(not np.allclose(value, transforms[0], atol=1e-7, rtol=0) for value in transforms[1:]):
+        raise ValueError("Functional events do not share one rigid owner registration")
+    return transforms[0]
+
+
+def ground_registered_candidates(program, candidate_scenes, source, current_views, *,
+                                 role, same_rigid_geometry, geometry_source, max_error=.01):
+    """Screen bound rigid-owner candidates, then generate geometric references.
+
+    candidate_scenes maps arbitrary unique candidate IDs to complete scenes for
+    ground_program. source and current_views follow screen_registrations' owner
+    RGB-D contract. All scenes bind the same current owner and output frame;
+    all observations describe that same captured state. There is no dataset,
+    camera name, candidate count, skill name, asset or point-order convention.
+
+    Only supported/unresolved candidates reach the existing numerical consumer.
+    Rejected bindings have no trajectory here. Return selected_trajectory only
+    for a unique supported candidate with no unresolved competitors. A geometry
+    applicability failure returns not_applicable and no unvalidated trajectory.
+    Numeric consumer errors still propagate; there is no unchecked fallback.
+
+    Full-frame grasp/manipulation bindings support this entry. On-support and
+    joint-coordinate goals do not imply a complete rigid registration. The
+    existing dedicated entries remain responsible for those distinct inputs.
+    Screening establishes neither actual Holding nor robot executability.
+    """
+    from .program import ground_program
+    from .registration_validation import screen_registrations
+
+    if not isinstance(candidate_scenes, Mapping) or not candidate_scenes:
+        raise ValueError("A nonempty candidate-ID to scene mapping is required")
+    if role not in {"carrier", "reference"}:
+        raise ValueError("role must be carrier or reference")
+    if (not isinstance(source.get("owner_id"), str) or not source["owner_id"]
+            or source["owner_id"] != program["demo"].get(role + "_id")):
+        raise ValueError("Source owner must match the compiled demonstration role")
+    frames = {scene.get("reference_frame") for scene in candidate_scenes.values()}
+    owners = {scene.get(role + "_id") for scene in candidate_scenes.values()}
+    if len(frames) != 1 or len(owners) != 1 or None in frames or None in owners:
+        raise ValueError("Candidates must share one output frame and registered owner")
+    if (not isinstance(current_views, Mapping) or not current_views
+            or any(view.get("owner_id") not in owners for view in current_views.values())):
+        raise ValueError("Current views must belong to the candidates' registered owner")
+    transforms = {name: _registered_owner_transform(program, scene, role)
+                  for name, scene in candidate_scenes.items()}
+    validation = screen_registrations(
+        source, current_views, transforms, reference_frame=next(iter(frames)),
+        same_rigid_geometry=same_rigid_geometry, geometry_source=geometry_source,
+        max_error=max_error)
+    trajectories = {}
+    # Keep rejected/unresolved status in the returned evidence. Numerical
+    # trajectory construction never upgrades uncertain registration to truth.
+    for name in validation["supported_candidate_ids"] + validation["unresolved_candidate_ids"]:
+        trajectory = ground_program(program, deepcopy(candidate_scenes[name]))
+        evidence = validation["candidates"][name]
+        trajectory["registration_validation"] = {
+            "candidate_id": name, "status": evidence["status"], "role": role,
+            "source_owner_id": source["owner_id"], "target_owner_id": next(iter(owners)),
+            "reference_frame": validation["reference_frame"],
+            "T_output_source_owner": evidence["T_output_source_owner"].copy(),
+            "geometry_source": geometry_source, "same_rigid_geometry": bool(same_rigid_geometry),
+            "max_error_m": validation["max_error_m"], "scope": validation["scope"],
+            "views": {view: deepcopy(value["summary"]) for view, value in evidence["views"].items()},
+        }
+        trajectories[name] = trajectory
+    selected = validation["selected_candidate_id"]
+    return {"status": validation["status"], "selected_candidate_id": selected,
+            "selected_trajectory": trajectories[selected] if selected is not None else None,
+            "trajectories": trajectories, "registration_validation": validation,
+            "robot_execution_verified": False}
+# END screened rigid-owner candidate generation through the numerical core.
+
+
 def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
                 extractor=None, tracker=None, output_dir=None):
     """Produce a numerical stage from RGB-D and task semantics, without new labels.

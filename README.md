@@ -693,8 +693,84 @@ weak evidence because it has no additional supporting correspondence.
 If source points are in the demonstration owner frame and current points in
 the binding camera frame, each hypothesis maps source owner to current camera.
 Pass it as `region_transform`, with the calibrated camera pose as
-`carrier_pose`, to `ground_program`. Process competing candidates separately;
-the camera pose is a coordinate gauge, not current object GT. The original
-timeline, closure intent and protected suffix stay with the existing consumer.
-Geometric support does not establish actual holding or execution feasibility.
+`carrier_pose`, in a candidate scene for the grasp consumer. For full-frame
+manipulation, bind the reference functional frames in the same declared output
+coordinates. The camera pose is a coordinate gauge, not current object GT.
+Where the same rigid source surface remains applicable, submit all bound
+candidate scenes together through the screened entry below. The original
+timeline, closure intent and protected suffix stay with the numerical consumer;
+geometric support does not establish actual holding or execution feasibility.
 <!-- END unordered visible-vertex correspondence and stable consensus. -->
+
+<!-- BEGIN production projective registration screening and selected trajectory. -->
+### Select registered trajectories using current depth
+
+`manipulation.perception.ground_registered_candidates` is the shared entry for
+competing, fully bound rigid-owner registrations. It checks all candidates
+against the same current views, then calls the existing `ground_program` for
+supported or unresolved bindings. Clearly rejected bindings produce no
+trajectory. A unique supported candidate with no unresolved competitors yields
+`selected_trajectory`; ambiguous, insufficient or inapplicable evidence yields
+`None`. Candidate names, order and path length do not choose a winner.
+
+```python
+from manipulation.perception import ground_registered_candidates
+
+decision = ground_registered_candidates(
+    program,
+    candidate_scenes,  # {candidate_id: complete_scene_for_ground_program}
+    source_owner_rgbd,
+    current_views,
+    role="reference",  # "carrier" for an independently grounded grasp
+    same_rigid_geometry=geometry_is_established,
+    geometry_source=geometry_evidence,
+    max_error=0.01,
+)
+trajectory = decision["selected_trajectory"]  # None means no unique selection.
+```
+
+Inputs use existing owner/frame conventions:
+
+| Input | Required fields and meaning |
+|---|---|
+| `source_owner_rgbd` | `owner_id`, `depth`, `K`, `owner_mask`, `T_camera_owner`; metric camera-z depth and the observed source whole-owner surface, which may use offline annotations |
+| `current_views` | Arbitrary nonempty view-ID mapping; each value has `owner_id`, `reference_frame`, `depth`, `K`, `owner_mask`, `T_output_camera`; all views observe the same current rigid owner/state in one calibrated output frame |
+| `candidate_scenes` | Arbitrary nonempty candidate-ID mapping to numerical scenes; same bound owner and output frame, full grasp or manipulation functional-frame bindings |
+| Geometry applicability | An explicit boolean and nonempty evidence source; true means the observed source rigid geometry remains valid for this owner, e.g. an unchanged instance. A new shape must not silently inherit this assumption |
+
+The checked transform is derived from the **actual numerical binding**. For
+grasp it is `carrier_pose @ region_transform`; for a manipulation reference it
+is `reference_pose @ current_reference_frame @ inverse(source_reference_frame)`.
+All functional events must imply the same rigid mapping. A separately supplied
+"validation pose" cannot pass while a different pose generates the motion.
+Source owner IDs must match the compiled role; current view IDs bind to the
+same owner as every candidate scene. No skill/asset-name branches, fixed camera
+labels or fixed candidate/semantic-point counts are used.
+
+The lower-level `manipulation.registration_validation.screen_registrations`
+accepts arbitrary candidate-ID -> output-from-source-owner transforms with the
+same source/view contract. It returns per-candidate/per-view summaries and
+actual pixel-ray evidence. No models, simulation or motion planners are called.
+The source surface is projected using each hypothesis. A predicted surface
+clearly **before** the nearest measured surface contradicts observed free space;
+one **behind** it may be occluded and remains unknown. A z-buffer counts each
+image ray once. Owner-mask erosion and depth-continuous 3x3 neighborhoods avoid
+boundary/background comparisons without inventing a noise model or filling
+hidden geometry. Positive support must be noncollinear in every supplied view;
+insufficient coverage stays unresolved instead of passing on zero conflicts.
+
+The 10 mm default ray gate and fixed 10 mm depth-continuity gate are geometric
+consistency parameters, not sensor variance, permitted penetration or task
+accuracy. A known geometry mismatch returns `not_applicable` and no unchecked
+trajectory. An `on` support patch or a joint-coordinate goal does not by itself
+define a complete rigid registration; those distinct representations retain
+their existing grounding entries. This check must not impose whole-object
+congruence on functional transfer between different shapes.
+
+Selected/unresolved references carry `registration_validation` with the tested
+transform, owner IDs, evidence source and per-view summaries. Frame IDs,
+timestamps, grasp closure, functional events, actual-Holding requirements and
+release/retreat semantics are preserved. `robot_execution_verified` remains
+false: this module does not add cuRobo/OMPL, whole-robot collision, trajectory
+optimization or proof of complete `inside`/physical execution.
+<!-- END production projective registration screening and selected trajectory. -->
