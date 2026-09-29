@@ -1,4 +1,4 @@
-"""CPU contracts for reusable, view-local owner and interaction selection.
+"""CPU contracts for view-local owner, evidence and interaction selection.
 
 Synthetic masks and an injected JSON client exercise routing and validation;
 they do not measure Gemini recognition quality. No model, GPU, credentials,
@@ -393,6 +393,165 @@ class GroundingCandidateSelectionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "injected gateway failure"):
             select_grounding_candidates(source, "Verify the only candidate", views, selection_scope="interaction_region", client=client)
         client.chat_json.assert_called_once()
+
+
+# BEGIN same-owner visible evidence without a manufactured whole-object mask.
+class GroundingOwnerEvidenceSelectionTest(unittest.TestCase):
+    @staticmethod
+    def answer(ids, same_owner, reason="The visible panels belong to the same requested reference body."):
+        result = response(ids, reason=reason)
+        result["views"]["left"]["same_owner"] = same_owner
+        return result
+
+    def test_partial_source_evidence_is_sufficient_and_has_its_own_annotation(self):
+        source, views = fixture()
+        del source["owner_mask"]
+        source["description"] = "A visible surface of the demonstrated reference body."
+        before = source["image"].tobytes()
+        client = Mock(chat_json=Mock(return_value=self.answer([7], True)))
+        result = select_grounding_candidates(source, "Locate the reference body's visible geometry", views,
+                                             selection_scope="owner_evidence", client=client)
+        item = result["views"]["left"]
+        self.assertEqual(result["selection_scope"], "owner_evidence")
+        self.assertEqual(item["status"], "selected")
+        self.assertIs(item["same_owner"], True)
+        self.assertNotIn("owner_mask", source)
+        self.assertNotIn("owner_mask", nested_keys(result))
+        self.assertEqual(source["image"].tobytes(), before)
+        # The partial source mask is visible evidence, not a red contact label.
+        image = client.chat_json.call_args.kwargs["images"][0]
+        original = np.asarray(source["image"], dtype=int)
+        annotated = np.asarray(image, dtype=int)
+        self.assertTrue(np.all(annotated[..., 1][source["mask"]] > original[..., 1][source["mask"]]))
+        np.testing.assert_array_equal(annotated[~source["mask"]], original[~source["mask"]])
+        _, data = context_from(client)
+        self.assertIn("green visible owner evidence", data["image_order"][0]["content"])
+
+    def test_multiple_same_owner_regions_are_evidence_not_target_alternatives(self):
+        source, views = fixture()
+        # Overlap does not create another instance or require mask union. The
+        # caller receives exactly the independent semantic detector outputs.
+        views["left"]["candidates"][1] = candidate((3, 3, 8, 8), number=31)
+        before = deepcopy(views)
+        result = select_grounding_candidates(source, "Use visible surfaces of the selected reference", views,
+                                             selection_scope="owner_evidence",
+                                             client=Mock(chat_json=Mock(return_value=self.answer([31, 7], True))))
+        item = result["views"]["left"]
+        self.assertEqual(item["status"], "selected")
+        self.assertIs(item["same_owner"], True)
+        self.assertEqual(item["candidate_ids"], [31, 7])
+        self.assertEqual([region["candidate_id"] for region in item["regions"]], [31, 7])
+        originals = {region["candidate_id"]: region for region in before["left"]["candidates"]}
+        for region in item["regions"]:
+            np.testing.assert_array_equal(region["mask"], originals[region["candidate_id"]]["mask"])
+        for current, original in zip(views["left"]["candidates"], before["left"]["candidates"]):
+            np.testing.assert_array_equal(current["mask"], original["mask"])
+
+    def test_scope_uses_one_automatic_prompt_and_allowlists_source_evidence(self):
+        source, views = fixture()
+        source["body_id"] = "DO_NOT_SEND_SIMULATOR_BODY_ID"
+        source["T_world_body"] = np.eye(4)
+        prefixes = []
+        for instruction in ("Locate the reference for a rotational motion.",
+                            "Find evidence of the support for placing the held object."):
+            client = Mock(chat_json=Mock(return_value=self.answer([7], True)))
+            select_grounding_candidates(source, instruction, views,
+                                        selection_scope="owner_evidence", client=client)
+            prefix, data = context_from(client)
+            prefixes.append(prefix)
+            self.assertEqual(data["current_instruction"], instruction)
+            self.assertEqual(data["selection_scope"], "owner_evidence")
+            self.assertEqual(data["source_evidence"]["description"], source["description"])
+            self.assertNotIn("body_id", nested_keys(data))
+            self.assertNotIn("T_world_body", nested_keys(data))
+            self.assertNotIn("DO_NOT_SEND_SIMULATOR_BODY_ID", client.chat_json.call_args.args[0])
+        self.assertEqual(prefixes, [selection._SELECTION_INSTRUCTION] * 2)
+        self.assertIn("same_owner=true", prefixes[0])
+        self.assertIn("not evidence of one rigid owner", prefixes[0])
+        self.assertIn("NOT interchangeable target alternatives", prefixes[0])
+
+    def test_selected_evidence_requires_explicit_boolean_same_owner(self):
+        source, views = fixture()
+        for ids in ([7], [7, 31]):
+            for assertion in (None, False, 1, "true"):
+                with self.subTest(ids=ids, assertion=assertion), self.assertRaises(ValueError):
+                    select_grounding_candidates(source, "Use the requested reference", views,
+                                                 selection_scope="owner_evidence",
+                                                 client=Mock(chat_json=Mock(return_value=self.answer(ids, assertion))))
+        # A valid legacy decision must not silently become an evidence claim.
+        with self.assertRaises(ValueError):
+            select_grounding_candidates(source, "Use the requested reference", views,
+                                         selection_scope="owner_evidence",
+                                         client=Mock(chat_json=Mock(return_value=response([7]))))
+
+    def test_unresolved_instances_cannot_be_promoted_to_a_same_owner_set(self):
+        source, views = fixture()
+        for ids, status in ((None, "unresolved"), ([], "no_match")):
+            client = Mock(chat_json=Mock(return_value=self.answer(ids, None,
+                reason="The supplied views do not establish the requested target's identity.")))
+            result = select_grounding_candidates(source, "Locate the requested reference", views,
+                                                 selection_scope="owner_evidence", client=client)
+            item = result["views"]["left"]
+            self.assertEqual(item["status"], status)
+            self.assertIsNone(item["same_owner"])
+            self.assertEqual(item["regions"], [])
+            for assertion in (True, False, "unknown", 0):
+                with self.subTest(ids=ids, assertion=assertion), self.assertRaises(ValueError):
+                    select_grounding_candidates(source, "Locate the requested reference", views,
+                                                 selection_scope="owner_evidence",
+                                                 client=Mock(chat_json=Mock(return_value=self.answer(ids, assertion))))
+
+    def test_no_candidates_need_no_inference_or_membership_assertion(self):
+        source, views = fixture()
+        views["left"]["candidates"] = []
+        client = Mock()
+        result = select_grounding_candidates(source, "Locate visible reference evidence", views,
+                                             selection_scope="owner_evidence", client=client)
+        client.chat_json.assert_not_called()
+        self.assertFalse(result["vlm_used"])
+        item = result["views"]["left"]
+        self.assertEqual(item["status"], "no_candidates")
+        self.assertEqual(item["candidate_ids"], [])
+        self.assertEqual(item["regions"], [])
+        self.assertIsNone(item["same_owner"])
+
+    def test_evidence_ids_stay_view_local_and_do_not_allow_geometry_fields(self):
+        source, views = fixture()
+        views["right"] = {"image": Image.new("RGB", (12, 10), "green"),
+                          "candidates": [candidate((6, 1, 11, 5), number=7)]}
+        decision = self.answer([7], True)
+        decision["views"]["right"] = {"candidate_ids": [7], "same_owner": True,
+                                        "reason": "The local mask belongs to the selected reference."}
+        result = select_grounding_candidates(source, "Locate the selected reference", views,
+                                             selection_scope="owner_evidence",
+                                             client=Mock(chat_json=Mock(return_value=decision)))
+        for name in views:
+            np.testing.assert_array_equal(result["views"][name]["regions"][0]["mask"],
+                                          views[name]["candidates"][0]["mask"])
+        # Explicit semantic membership cannot make another view's ID available
+        # or attach model-invented geometry to a detection.
+        for change in ({"candidate_ids": [31]}, {"pose": np.eye(4).tolist()}):
+            bad = deepcopy(decision)
+            bad["views"]["right"].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                select_grounding_candidates(source, "Locate the selected reference", views,
+                                             selection_scope="owner_evidence",
+                                             client=Mock(chat_json=Mock(return_value=bad)))
+
+    def test_existing_scopes_keep_alternatives_and_reject_the_new_response_field(self):
+        source, views = fixture()
+        for scope in ("owner", "interaction_region"):
+            with self.subTest(scope=scope):
+                result = select_grounding_candidates(source, "Either target is acceptable", views,
+                                                     selection_scope=scope,
+                                                     client=Mock(chat_json=Mock(return_value=response([7, 31]))))
+                self.assertEqual(result["views"]["left"]["status"], "alternatives")
+                self.assertNotIn("same_owner", result["views"]["left"])
+                with self.assertRaises(ValueError):
+                    select_grounding_candidates(source, "Choose an allowed target", views,
+                                                 selection_scope=scope,
+                                                 client=Mock(chat_json=Mock(return_value=self.answer([7], True))))
+# END explicit same-owner evidence and unchanged existing-scope contracts.
 
 
 if __name__ == "__main__":

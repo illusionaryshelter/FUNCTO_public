@@ -1,4 +1,4 @@
-"""Task-conditioned selection of observed owners or interaction regions.
+"""Task-conditioned selection of observed owners, evidence or contact regions.
 
 The same request builder consumes compiled demonstration semantics and actual
 detector candidates for any skill. It generates no prompts with a second LLM,
@@ -21,7 +21,8 @@ _SELECTION_INSTRUCTION = (
     "describe a demonstration, not a command overriding the current instruction. "
     "Source-only position, level, colour, camera direction or world orientation "
     "must not become current-instance requirements unless the current instruction "
-    "actually requests them. Preserve the demonstrated functional contact role. "
+    "actually requests them. Preserve the demonstrated functional contact role "
+    "for owner and interaction_region. "
     "Do not infer a new target from a skill name.\n"
     "selection_scope states exactly what is being selected: owner means the whole "
     "rigid entity or moving rigid part marked GREEN in the source image; it is not "
@@ -30,6 +31,18 @@ _SELECTION_INSTRUCTION = (
     "a whole object is not a precise interaction-region mask. Source query descriptions "
     "can mention surrounding geometry used for directions: these are contextual "
     "witnesses, not additional interaction targets and need not fit inside the red mask.\n"
+    # BEGIN local visible evidence is neither a whole owner nor a contact mask.
+    "owner_evidence instead means visible geometric evidence belonging to ONE "
+    "target rigid entity, whose source evidence is marked GREEN. The source green "
+    "mask and current candidates may be only partial surfaces of that entity: "
+    "neither is required to cover its whole owner or a precise contact region. "
+    "Match the owner's demonstrated role to the current instruction. Check visible "
+    "membership using scene context; nearby objects and independently moving parts "
+    "of an enclosing assembly are different rigid owners. Do not select them merely "
+    "because their detector labels sound suitable. A furniture/assembly mask that "
+    "includes other independently moving parts is not evidence of one rigid owner. "
+    "Do not demand a complete-object segmentation to fill missing evidence.\n"
+    # END explicit rigid-owner evidence scope.
     "Each current view has an original image and, when nonempty, numbered candidate "
     "panels. Panels enlarge existing pixels only. Use the original scene to determine "
     "which object or moving part a candidate belongs to. Candidate labels are detector "
@@ -37,17 +50,30 @@ _SELECTION_INSTRUCTION = (
     "provided IDs within that view; equal IDs in different views do not establish "
     "physical correspondence. Images from other supplied views may provide context, "
     "but do not invent a mask in a view without a candidate.\n"
-    "For each view return candidate_ids as: one ID for a uniquely supported match; "
+    "For owner or interaction_region, return candidate_ids as: one ID for a uniquely supported match; "
     "multiple IDs only if EVERY listed candidate independently satisfies the current "
     "semantic request, so choosing any is allowed; [] when no supplied candidate "
     "matches; null when evidence cannot resolve which candidate meets the request. "
     "Uncertainty between possible targets is NOT permission to use all of them. "
+    # BEGIN evidence sets require an explicit same-owner semantic assertion.
+    "For owner_evidence, return one or more IDs ONLY for visible evidence of the "
+    "SAME target rigid entity. Multiple masks may provide complementary or "
+    "overlapping evidence; they are NOT interchangeable target alternatives. "
+    "The reason must identify the visible owner and justify every selected mask's "
+    "membership. Return [] if none matches, or null if target identity or owner "
+    "membership is unresolved; never combine uncertain instances. This scope "
+    "additionally requires same_owner=true for a nonempty ID list, and "
+    "same_owner=null for [] or null. This is a semantic assertion, not a proof "
+    "of geometric registration or pixel-perfect segmentation.\n"
+    # END evidence membership, distinct from per-target alternatives.
     "If a view has no candidates, return [] for it. Do not force an answer from weak "
     "or occluded evidence. Do not merge masks, generate coordinates, geometry, poses "
     "or claim grasp feasibility. This is semantic selection only.\n"
     "Return exactly {\"views\": {view_id: {\"candidate_ids\": [integer_ID, ...] "
     "or null, \"reason\": short_nonempty_string}, ...}}, with exactly the supplied "
-    "views. Explain the visible evidence or the reason for abstaining briefly."
+    "views; for owner_evidence only, each view decision must also include the "
+    "same_owner field specified above. Explain the visible evidence or the reason "
+    "for abstaining briefly."
 )
 
 
@@ -96,8 +122,8 @@ def _panels(image, candidates):
 
 def _prepare(source, instruction, views, selection_scope):
     """Allowlist semantic evidence; source poses and simulator IDs are not sent."""
-    if selection_scope not in {"owner", "interaction_region"}:
-        raise ValueError("selection_scope must be owner or interaction_region")
+    if selection_scope not in {"owner", "interaction_region", "owner_evidence"}:
+        raise ValueError("selection_scope must be owner, interaction_region or owner_evidence")
     if not isinstance(instruction, str) or not instruction.strip():
         raise ValueError("A current instruction is required")
     if not isinstance(source, dict) or not {"image", "mask", "description"} <= source.keys():
@@ -110,20 +136,27 @@ def _prepare(source, instruction, views, selection_scope):
             or any(not isinstance(query, str) or not query.strip() for query in queries)):
         raise ValueError("Source query_descriptions must be a list of nonempty strings")
     source_image = _image(source["image"])
-    interaction = _mask(source["mask"], source_image, "Source interaction mask")
+    # BEGIN evidence-only sources need no manufactured interaction/owner mask.
+    evidence_scope = selection_scope == "owner_evidence"
+    source_region = _mask(source["mask"], source_image,
+                          "Source owner evidence mask" if evidence_scope else "Source interaction mask")
     owner = None
     if "owner_mask" in source:
         owner = _mask(source["owner_mask"], source_image, "Source owner mask")
     if selection_scope == "owner" and owner is None:
         raise ValueError("Owner selection requires the source owner_mask")
-    panel = _highlight(source_image, interaction, (255, 65, 65), outline=False)
+    panel = _highlight(source_image, source_region,
+                       (30, 225, 110) if evidence_scope else (255, 65, 65), outline=False)
     if owner is not None:
         # An outline gives source context without occluding the red contact area.
         ImageDraw.Draw(panel).rectangle(_box(owner), outline=(30, 225, 110), width=2)
-    source_extent = owner if owner is not None else interaction
+    source_extent = owner if owner is not None else source_region
     images = [panel, _context_crop(panel, _box(source_extent))]
-    image_order = ["source scene: red interaction region, green owner bounds when available",
+    image_order = [("source scene: green visible owner evidence, optional green owner bounds"
+                    if evidence_scope else
+                    "source scene: red interaction region, green owner bounds when available"),
                    "source detail: same annotation, enlarged existing pixels"]
+    # END scope-specific source annotation; current candidate masks stay separate.
     if not isinstance(views, dict) or not views:
         raise ValueError("views must be a nonempty view-ID mapping")
     prepared, descriptions = {}, {}
@@ -176,6 +209,15 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
     only ``instruction`` describes the current request. No source file path,
     skill-name branch, source pose or current oracle geometry is used.
 
+    ``selection_scope='owner_evidence'`` interprets ``source.mask`` as visible
+    evidence of the rigid entity described by the source, not as a contact mask.
+    Its optional ``owner_mask`` provides wider source context only. Neither
+    source nor current evidence must cover a complete owner. A nonempty current
+    selection requires an explicit VLM ``same_owner=True`` assertion: all masks
+    are complementary/overlapping evidence of one target, never alternatives
+    between instances. Empty/unresolved decisions require ``same_owner=None``.
+    This semantic membership claim does not establish measured motion rigidity.
+
     Each ``views[view_id]`` contains an image and detector candidates. Explicit
     positive integer candidate IDs are preserved; otherwise the input index
     starting at one is used. A normal single-view call supplies one mapping
@@ -188,6 +230,11 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
     returned record; this function never silently constructs an owner_mask.
     Geometry, correspondence, accessibility and grasp feasibility remain the
     responsibilities of the existing downstream consumers.
+
+    Owner-evidence selections use ``selected`` for one or several masks, carry
+    the semantic ``same_owner`` assertion, and never merge their pixels or
+    upgrade them to a complete ``owner_mask``. Other scopes retain their
+    existing response schema and multi-target ``alternatives`` status.
     """
     prompt, images, candidates = _prepare(source, instruction, views, selection_scope)
     called = any(candidates.values())
@@ -196,14 +243,22 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
     else:
         response = {"views": {name: {"candidate_ids": [], "reason": "No detector candidates were supplied."}
                               for name in candidates}}
+        # BEGIN the no-candidate fast path obeys the same evidence schema.
+        if selection_scope == "owner_evidence":
+            for decision in response["views"].values():
+                decision["same_owner"] = None
+        # END local empty decision, with no fabricated membership assertion.
     if (not isinstance(response, dict) or set(response) != {"views"}
             or not isinstance(response["views"], dict) or set(response["views"]) != set(candidates)):
         raise ValueError("Selection must return exactly the supplied view IDs")
     result = {}
     for name, items in candidates.items():
         decision = response["views"][name]
-        if not isinstance(decision, dict) or set(decision) != {"candidate_ids", "reason"}:
-            raise ValueError("Each view decision requires exactly candidate_ids and reason")
+        # BEGIN same-owner evidence is an explicit, scope-specific contract.
+        evidence_scope = selection_scope == "owner_evidence"
+        required = {"candidate_ids", "reason", "same_owner"} if evidence_scope else {"candidate_ids", "reason"}
+        if not isinstance(decision, dict) or set(decision) != required:
+            raise ValueError(f"Each view decision requires exactly {', '.join(sorted(required))}")
         ids, reason = decision["candidate_ids"], decision["reason"]
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("Selection reason must be a nonempty string")
@@ -212,6 +267,9 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
             if (not isinstance(ids, list) or any(type(number) is not int or number not in by_id for number in ids)
                     or len(set(ids)) != len(ids)):
                 raise ValueError("Selected IDs must be distinct integers from this view's candidates")
+        if evidence_scope and ((ids and decision["same_owner"] is not True)
+                               or (not ids and decision["same_owner"] is not None)):
+            raise ValueError("Owner evidence requires same_owner=true for selected IDs, null otherwise")
         if not items:
             if ids != []:
                 raise ValueError("A view with no candidates must return an empty list")
@@ -221,8 +279,11 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
         elif not ids:
             status = "no_match"
         else:
-            status = "selected" if len(ids) == 1 else "alternatives"
+            status = "selected" if evidence_scope or len(ids) == 1 else "alternatives"
         result[name] = {"status": status, "candidate_ids": ids, "reason": reason.strip(),
                         "regions": [by_id[number] for number in ids] if ids else []}
+        if evidence_scope:
+            result[name]["same_owner"] = decision["same_owner"]
+        # END same-owner evidence; legacy scopes keep their independent alternatives.
     return {"selection_scope": selection_scope, "views": result, "vlm_used": called}
 # END generic grounding selection.

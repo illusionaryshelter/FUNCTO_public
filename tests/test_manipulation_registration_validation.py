@@ -78,6 +78,33 @@ class RegistrationValidationTest(unittest.TestCase):
         rejected = screen({"near": pose(z=-.5)})
         self.assertEqual(rejected["status"], "rejected")
 
+    # BEGIN partial visible-owner support must not invent complete mask coverage.
+    def test_partial_owner_evidence_supports_only_observed_membership(self):
+        source, views = observations()
+        for view in views.values():
+            view["owner_mask"][:] = False
+            view["owner_mask"][2:7, 2:7] = True
+        before = {name: view["owner_mask"].copy() for name, view in views.items()}
+        result = screen({"matching": pose(), "in_free_space": pose(z=-.5)}, source, views)
+        self.assertEqual(result["selected_candidate_id"], "matching")
+        for name, view in views.items():
+            matching = result["candidates"]["matching"]["views"][name]
+            self.assertTrue(matching["summary"]["positive_support_noncollinear"])
+            self.assertGreater(matching["summary"]["unknown_rays"], 0)
+            self.assertEqual(matching["summary"]["free_space_conflict_rays"], 0)
+            x, y = matching["rays"]["pixels"].T
+            outside = ~view["owner_mask"][y, x]
+            self.assertTrue(outside.any())
+            self.assertTrue(np.all(matching["rays"]["labels"][outside] == 0))
+            # Partial membership restricts positive support, not usable depth:
+            # a surface in measured free space remains contradictory even on
+            # rays outside the selected local evidence mask.
+            wrong = result["candidates"]["in_free_space"]["views"][name]
+            x, y = wrong["rays"]["pixels"].T
+            self.assertTrue(np.any((wrong["rays"]["labels"] == 2) & ~view["owner_mask"][y, x]))
+            np.testing.assert_array_equal(view["owner_mask"], before[name])
+    # END no whole-owner completion or mask-based free-space invention.
+
     def test_geometry_applicability_is_explicit_and_never_bypassed(self):
         result = screen({"apparently_matching": pose()}, same_rigid_geometry=False)
         self.assertEqual(result["status"], "not_applicable")

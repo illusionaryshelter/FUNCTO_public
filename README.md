@@ -263,12 +263,26 @@ candidates, and a caller must explicitly resolve multiple allowed candidates
 before using a consumer that requires one. IDs are local to each supplied view;
 multiple views do not establish a three-dimensional correspondence.
 
-Only a selection with `selection_scope == "owner"` can supply a current
-`owner_mask`. A selected interaction mask remains local evidence and cannot stand
-in for the object's visible geometry. This semantic selection does not certify
-mask completeness, accessibility, grasp orientation, Holding, or execution. The
-existing functional-correspondence and observed-support solvers retain their
-separate geometric responsibilities.
+<!-- BEGIN partial rigid-owner evidence without complete-object segmentation. -->
+`selection_scope="owner_evidence"` instead selects **visible geometric samples
+belonging to one target rigid entity**. Here `source_template["mask"]` is known
+source-owner evidence, not a contact mask; a source `owner_mask` is optional.
+Current candidates may be partial surfaces, without covering the complete owner.
+The automatically assembled request requires `same_owner=true` for a nonempty
+selection. Several masks then form a `selected` evidence set, never alternative
+target instances; empty or unresolved decisions carry `same_owner=null`.
+The caller may explicitly combine these separately returned masks as positive
+owner evidence for observed-point correspondence or `screen_registrations`.
+This semantic co-ownership statement does not establish measured motion rigidity.
+
+An `owner` selection supplies object-scoped geometry. Neither a selected
+interaction region nor an `owner_evidence` subset may be relabelled as a complete
+object segmentation. The registration validator accepts partial owner evidence:
+outside its mask ownership stays unknown, although measured free space may still
+contradict a projected surface. No scope certifies mask completeness,
+accessibility, grasp orientation, Holding, or execution. The existing geometric
+consumers retain their separate responsibilities.
+<!-- END explicit partial-owner evidence semantics. -->
 <!-- END generic semantic selection before geometric binding. -->
 
 `perception.bind_current_scene(program, scene, source_templates, current_owners)`

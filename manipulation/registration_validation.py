@@ -4,7 +4,8 @@ The source is an observed surface of a rigid owner, not a complete mesh. This
 check applies only when that geometry is known to remain valid for the current
 owner. A predicted surface in observed free space contradicts the hypothesis;
 a predicted surface behind measured depth may be occluded and stays unknown.
-No current part mask, simulator state, noise model or motion planner is used.
+Precise current contact masks are unnecessary. No simulator state, noise model
+or motion planner is used.
 """
 
 # BEGIN perception-only, same-geometry registration validation.
@@ -34,12 +35,18 @@ def _apply(points, transform):
 
 
 def _observation(record):
-    """Validate aligned metric depth and a whole-owner mask, including empties.
+    # BEGIN owner membership does not imply complete visible-object coverage.
+    """Validate metric depth and selected owner evidence, including empties.
 
     Empty masks or invalid depth express missing observation. They must not
     turn into positive evidence, nor be filled with invented surfaces. Input
-    arrays are never modified. Current images need no functional-part labels.
+    arrays are never modified. ``owner_mask`` may cover only observed surfaces
+    of the bound rigid entity; neither source nor current masks assert complete
+    owner coverage. Positive support is restricted to its eroded interior,
+    while measured depth outside it may still contradict a predicted surface
+    in observed free space. Current images need no functional-contact labels.
     """
+    # END partial evidence has the same conservative ray semantics.
     depth = np.asarray(record["depth"], float)
     mask = np.asarray(record["owner_mask"])
     K = _intrinsics(record["K"])
@@ -124,6 +131,12 @@ def screen_registrations(source, views, transforms, *, reference_frame,
     views: nonempty view-ID -> {owner_id, reference_frame, depth, K, owner_mask,
                                T_output_camera}; views observe the same state.
     transforms: unique candidate-ID -> output-from-source-owner SE(3).
+
+    ``owner_mask`` identifies visible evidence of the selected rigid entity;
+    it need not cover its whole image footprint. Missing mask coverage adds no
+    positive support and is never interpreted as evidence that the owner ends
+    there. The caller establishes mask membership; this geometric check does
+    not identify owners or merge independently moving parts into one body.
 
     Geometry applicability must be explicitly established by the caller, e.g.
     a known unchanged rigid instance. If false, return not_applicable with no
