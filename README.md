@@ -585,3 +585,55 @@ complete candidates when line sign is unresolved. The original timeline,
 closure events and protected suffix remain governed by the grasp consumer;
 actual holding, IK, collision and execution still require current verification.
 <!-- END observed local protrusion geometry for independent grasp grounding. -->
+
+<!-- BEGIN observed orthogonal surfaces for functional-frame grounding. -->
+### Functional directions from two observed surfaces
+
+When a demonstrated functional frame is defined by two approximately
+orthogonal exterior faces, observed RGB-D normals can supply its directions.
+Existing semantic correspondence still identifies the two faces and the anchor:
+
+```python
+from manipulation.surface_geometry import observe_orthogonal_surface_frame
+
+geometry = observe_orthogonal_surface_frame(
+    depth_m, K, owner_mask,
+    axis_pixel=matched_axis_surface_pixel,
+    anchor_pixel=matched_anchor_surface_pixel,
+    surface_side_source="Evidence that these are visible opaque exterior faces",
+)
+Fn = geometry["frame"]  # camera coordinates
+```
+
+This is an explicit geometric assumption, not a detector for every graspable
+object. The two semantic roles must follow the same convention offline and at
+runtime. The observer cannot recognize a role swap from depth alone. It does
+not require a complete current interaction mask, ideal object dimensions or
+material corner identities. It does require a perceived owner mask and two
+valid semantic queries on sufficiently observed, distinct planar surfaces.
+
+The existing 5 mm RANSAC candidates provide coarse mask membership. Each query
+must uniquely belong to a different candidate and remain inside its core after
+all candidate overlaps are removed and one 3×3 erosion is applied. SVD refits
+the actual core points, with at least 24 noncollinear samples per face. The
+caller’s visible opaque exterior-surface declaration signs normals toward the
+camera; near-grazing observations are rejected. The default maximum deviation
+from orthogonality is 5 degrees; this is an admissibility tolerance, not an
+accuracy guarantee. All residuals, selected masks and normal corrections are
+returned. Missing, ambiguous or inconsistent evidence raises an error.
+
+For signed normals `a` (axis face) and `b` (anchor face), the frame uses
+`x = a`, `z = normalize(b cross a)`, and `y = z cross x`. Its origin is the
+anchor pixel’s original measured-depth backprojection, never a fitted centroid,
+ideal centre or plane projection. Thus improving the direction measurement
+does not remove semantic anchor localization error. Both source and current
+frames must use this definition; replacing only the current frame would change
+the meaning of the transferred skill.
+
+Convert the offline camera frame into its demonstration owner coordinates to
+obtain `Fd`. Pass `region_transform = Fn @ inverse(Fd)` and
+`carrier_pose = T_output_camera` to the existing `ground_program`. The original
+EEF relative motion, gripper intentions and protected suffix retain their
+existing contract. A returned frame does not establish symmetric-face material
+identity, collision clearance or actual holding.
+<!-- END observed orthogonal surfaces for functional-frame grounding. -->
