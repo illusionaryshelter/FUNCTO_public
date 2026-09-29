@@ -100,7 +100,9 @@ def _exact_coordinates(model, pose):
     return coordinates
 
 
-def _event_transfer(reference, start, goals, function_frame, model_spec=None):
+# BEGIN native coordinate events share the existing constrained transfer kernel.
+def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
+                    coordinate_reference=None, coordinate_goals=None):
     """Transfer in a physical function frame, preserving every internal event.
 
     Free intervals reuse the existing SE(3) transfer kernel on a material
@@ -109,12 +111,19 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None):
     each event. A model projection is allowed only for the soft reference.
     Required event targets and the observed initial pose must be exactly on
     the model, and the final output is independently checked by the caller.
+
+    Native joint events additionally supply their complete coordinate reference
+    and indexed coordinate goals. These are not recovered from their FK poses:
+    doing so would discard explicitly recorded revolute winding numbers.
     """
     knots = [(0, start)] + [(index, goal) for index, goal in goals if index != 0]
     if goals and goals[0][0] == 0 and not np.allclose(goals[0][1], start, atol=1e-8, rtol=0):
         raise ValueError("The initial function event conflicts with the observed current pose")
     output = np.empty_like(reference)
     diagnostics = {"phase": "source sample index; physical timestamps retained separately"}
+    native = coordinate_reference is not None
+    if native != (coordinate_goals is not None) or (native and model_spec is None):
+        raise ValueError("Native coordinate reference/goals require one current mechanism model")
     if model_spec is None:
         # Right multiplication preserves the physical function origin and its
         # lever arm while the existing free kernel enforces each endpoint.
@@ -128,24 +137,34 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None):
         diagnostics["model"] = {"kind": "free", "origin": "material functional frame"}
     else:
         model, limits = _current_model(model_spec)
-        coordinates = model._coordinates_unchecked(reference)
+        coordinates = (np.asarray(coordinate_reference, float).copy() if native
+                       else model._coordinates_unchecked(reference))
+        if (coordinates.shape != (len(reference), model.dimension)
+                or not np.isfinite(coordinates).all()):
+            raise ValueError("Coordinate reference must align with all reference poses")
         # Projection of noisy reference geometry is reported, not re-labelled
         # as evidence that the reference already lies on the mechanism.
         p, r = _errors(reference, model.poses(coordinates))
+        if native and (p.max() > 1e-8 or r.max() > 1e-8):
+            raise ValueError("Native coordinate reference and its FK poses disagree")
+        if native and 0 in coordinate_goals and not np.allclose(
+                coordinate_goals[0], coordinates[0], atol=1e-8, rtol=0):
+            raise ValueError("The initial coordinate goal conflicts with the observed current pose")
         diagnostics["reference_projection"] = {"max_position_m": float(p.max()),
                                                 "max_rotation_rad": float(r.max())}
         angular = 0 if model.kind == "revolute" else 2 if model.kind == "planar" else None
         values = coordinates.copy()
         for position, (begin, initial) in enumerate(knots):
             end, goal = knots[position + 1] if position + 1 < len(knots) else (len(reference) - 1, None)
-            initial_q = _exact_coordinates(model, initial)
-            if angular is not None:
+            initial_q = ((coordinates[0].copy() if begin == 0 else coordinate_goals[begin].copy())
+                         if native else _exact_coordinates(model, initial))
+            if angular is not None and not native:
                 initial_q[angular] += 2 * np.pi * np.round(
                     (coordinates[begin, angular] - initial_q[angular]) / (2 * np.pi))
             part = coordinates[begin:end + 1] - coordinates[begin] + initial_q
             if goal is not None:
-                goal_q = _exact_coordinates(model, goal)
-                if angular is not None:
+                goal_q = coordinate_goals[end].copy() if native else _exact_coordinates(model, goal)
+                if angular is not None and not native:
                     goal_q[angular] += 2 * np.pi * np.round(
                         (part[-1, angular] - goal_q[angular]) / (2 * np.pi))
                 part += np.linspace(0, 1, len(part))[:, None] * (goal_q - part[-1])
@@ -160,6 +179,162 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None):
     if not np.allclose(output[0], start, atol=1e-7, rtol=0):
         raise ValueError("Function transfer changed the observed initial object pose")
     return output, diagnostics
+# END native coordinate events share the existing constrained transfer kernel.
+
+
+# BEGIN direct functional joint goals without manufactured region frames.
+def _coordinate_vector(value, name):
+    """One prismatic distance in metres or one unwrapped revolute angle."""
+    vector = np.asarray(value)
+    if (vector.shape != (1,) or vector.dtype.kind not in "iuf"
+            or not np.isfinite(vector).all()):
+        raise ValueError(f"{name} must be one finite numeric coordinate in a length-one vector")
+    return vector.astype(float, copy=True)
+
+
+def _joint_source(value, name):
+    """Evidence may be a description or an existing structured source record."""
+    if (not isinstance(value, (str, dict)) or not value
+            or (isinstance(value, str) and not value.strip())):
+        raise ValueError(f"{name} requires a nonempty evidence source")
+    return deepcopy(value)
+
+
+def _joint_reference(demo, scene, frames, last_held, task, initial):
+    """Bind measured source coordinates and explicit current coordinate goals.
+
+    Source ``motion_coordinates`` cover every original observation, including
+    release/retreat observations; their evidence is in
+    ``motion_coordinates_source``. Every event declares ``joint_coordinate``,
+    ``coordinate_value`` at its original source frame and a positive
+    ``coordinate_tolerance``. The current binding declares
+    ``current_coordinates`` in the caller's current model, matching owner IDs
+    and its own evidence source. Distance units are metres; angle units are
+    unwrapped radians. The caller must bind the same signed coordinate sense
+    on source and current mechanisms; fitting the source does not establish a
+    current joint axis or a new instance's limits.
+
+    The observed initial pose defines the current initial coordinate q0. Only
+    the source coordinate origin changes: q_ref=q_demo-q_demo[0]+q0.
+    For revolute motion, q0 is the principal relative angle about this model's
+    reference pose: a pose cannot reveal already accumulated revolutions.
+    Current goals/limits must use that starting convention. Setting the model
+    reference pose to the current start explicitly defines q0=0; recorded and
+    requested winding after that start is still retained in native coordinates.
+    Functional goals are evaluated directly by current FK, without a reference-owner
+    functional frame. ``scene.carrier_mapping`` explicitly maps source carrier
+    coordinates into current carrier coordinates for the existing released-hand
+    reference; it is never inferred from names or silently set to identity.
+    """
+    if task.get("relation") != "articulation":
+        raise ValueError("Joint-coordinate functional events require an articulation relation")
+    spec = scene.get("motion_model")
+    if not isinstance(spec, dict) or spec.get("kind") not in {"prismatic", "revolute"}:
+        raise ValueError("Joint-coordinate goals require an evidenced current articulation motion_model")
+    if task.get("motion", "free") not in {"free", "auto", spec["kind"]}:
+        raise ValueError("Constrained motion requires a compatible evidenced current motion_model")
+    model, _ = _current_model(spec)
+    source_evidence = _joint_source(demo.get("motion_coordinates_source"), "motion_coordinates_source")
+    raw = np.asarray(demo.get("motion_coordinates"))
+    if raw.ndim == 1:
+        raw = raw[:, None]
+    if (raw.shape != (len(frames), 1) or raw.dtype.kind not in "iuf"
+            or not np.isfinite(raw).all()):
+        raise ValueError("motion_coordinates must be finite N or N-by-1 values on the original timeline")
+    source_coordinates = raw.astype(float, copy=True)
+    if "carrier_mapping" not in scene:
+        raise ValueError("Joint-coordinate grounding requires an explicit carrier_mapping")
+    mapping = _pose_array(scene["carrier_mapping"], "Current carrier_mapping")
+    mapping_source = _joint_source(scene.get("carrier_mapping_source"), "carrier_mapping_source")
+    initial_coordinates = _exact_coordinates(model, initial)
+    coordinates = source_coordinates-source_coordinates[0]+initial_coordinates
+    reference = model.poses(coordinates)
+
+    events = demo.get("functional_events")
+    if not isinstance(events, list) or not events:
+        raise ValueError("Manipulation requires explicit functional_events")
+    bindings = scene.get("functional_bindings", {})
+    if not isinstance(bindings, dict):
+        raise ValueError("functional_bindings must map event IDs to current joint goals")
+    names, previous, unique_goals, recorded = set(), -1, {}, []
+    for event in events:
+        if not isinstance(event, dict) or event.get("constraint_kind") != "joint_coordinate":
+            raise ValueError("An articulation program cannot mix joint-coordinate and frame functional events")
+        name = event.get("event_id")
+        index = _index(event.get("frame_index"), frames, "functional event")
+        if (not isinstance(name, str) or not name or name in names
+                or index < previous or index > last_held):
+            raise ValueError("Functional events must be unique, ordered and occur within controlled object motion")
+        evidence = _joint_source(event.get("source"), "Functional joint event")
+        tolerance = _positive(event.get("coordinate_tolerance"), "coordinate_tolerance")
+        source_value = _coordinate_vector(event.get("coordinate_value"), "Source coordinate_value")
+        if np.max(np.abs(source_value-source_coordinates[index])) > tolerance:
+            raise ValueError("Source functional coordinate_value disagrees with its original observation")
+        binding = bindings.get(name)
+        if not isinstance(binding, dict):
+            raise ValueError(f"Functional event {name!r} requires an evidenced current joint binding")
+        binding_source = _joint_source(binding.get("source"), "Current joint binding")
+        if binding.get("carrier_id") != scene["carrier_id"] or binding.get("reference_id") != scene["reference_id"]:
+            raise ValueError("Functional binding owners disagree with the selected current entities")
+        target = _coordinate_vector(binding.get("current_coordinates"), "Current functional coordinates")
+        if index in unique_goals and not np.allclose(unique_goals[index], target, atol=1e-8, rtol=0):
+            raise ValueError("Same-frame functional events require consistent coordinate goals")
+        unique_goals[index] = target
+        recorded.append({"event_id": name, "index": index, "frame_index": int(frames[index]),
+                         "source_coordinate_value": source_value, "target_coordinates": target,
+                         "coordinate_tolerance": tolerance, "source": evidence,
+                         "binding_source": binding_source})
+        names.add(name)
+        previous = index
+    goals = [(index, model.poses(value)[0]) for index, value in unique_goals.items()]
+    objects, diagnostics = _event_transfer(
+        reference[:last_held+1], initial, goals, None, spec,
+        coordinate_reference=coordinates[:last_held+1], coordinate_goals=unique_goals)
+    actual = np.asarray(diagnostics["model"]["coordinates"], float)
+    checks = []
+    for event in recorded:
+        index, target = event["index"], event["target_coordinates"]
+        goal = model.poses(target)[0]
+        error = float(np.max(np.abs(actual[index]-target)))
+        p, r = _errors(objects[index:index+1], goal[None])
+        if error > event["coordinate_tolerance"] or max(p[0], r[0]) > 1e-8:
+            raise ValueError(f"Transferred trajectory misses joint functional event {event['event_id']!r}")
+        checks.append({key: value for key, value in event.items() if key != "index"})
+        checks[-1].update(constraint_kind="joint_coordinate", goal_pose=goal,
+                          actual_coordinates=actual[index].copy(), coordinate_error=error,
+                          coordinate_unit="m" if model.kind == "prismatic" else "rad",
+                          position_error_m=float(p[0]), rotation_error_rad=float(r[0]))
+    diagnostics.update(source_coordinates_source=source_evidence,
+                       carrier_mapping_source=mapping_source,
+                       source_initial_coordinates=source_coordinates[0].copy(),
+                       current_initial_coordinates=initial_coordinates.copy(),
+                       initial_coordinate_convention=(
+                           "principal relative angle from the current reference pose; pre-existing revolutions are not inferred"
+                           if model.kind == "revolute" else
+                           "metric displacement from the current reference pose"),
+                       coordinate_reference="source coordinates shifted to observed current start; original signed increments retained")
+    return objects, checks, diagnostics, reference, {"carrier_binding": mapping}
+
+
+def _check_entry_corridor(objects, scene, margin, motion_checks):
+    """Keep the existing optional observed-corridor check on both goal paths."""
+    if "entry_region" not in scene:
+        return
+    from .pipeline import _interior
+    from .goals import check_inside
+    begin = scene.get("entry_start_index")
+    if type(begin) is not int or not 0 <= begin < len(objects):
+        raise ValueError("entry_start_index must address a controlled object trajectory row")
+    corridor = _interior(scene["entry_region"])
+    clearance = min(check_inside(pose, scene["body_points"], corridor)["minimum_clearance_m"]
+                    for pose in objects[begin:])
+    if clearance < margin - 1e-7:
+        raise ValueError("Transferred object motion leaves the supplied entry corridor")
+    motion_checks["entry_corridor"] = {"minimum_clearance_m": float(clearance),
+                                       "margin_m": float(margin),
+                                       "checked_nodes": len(objects)-begin,
+                                       "scope": "saved controlled nodes; not continuous collision certification"}
+# END direct functional joint goals without manufactured region frames.
 
 
 def _functional_events(demo, scene, frames, poses, last_held, task, initial):
@@ -268,6 +443,15 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
     if task["relation"] == "inside" and margin > 0 and not any(
             name in scene for name in ("interior", "entry_region")):
         raise ValueError("An inside clearance margin requires observed free geometry")
+    # BEGIN joint-coordinate goals use FK directly, never surrogate region frames.
+    declared_events = demo.get("functional_events")
+    if isinstance(declared_events, list) and any(
+            isinstance(event, dict) and event.get("constraint_kind") == "joint_coordinate"
+            for event in declared_events):
+        result = _joint_reference(demo, scene, frames, last_held, task, initial)
+        _check_entry_corridor(result[0], scene, margin, result[2])
+        return result
+    # END joint-coordinate goals use FK directly, never surrogate region frames.
     events = _functional_events(demo, scene, frames, source, last_held, task, initial)
     # Full-frame relations use the first functional correspondence. For on,
     # reference_binding is instead the initial-state source-coordinate map;
@@ -344,24 +528,11 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
         checks.append({"event_id": event["event_id"], "frame_index": event["frame_index"],
                        "constraint_kind": event["constraint_kind"],
                        "goal_pose": event["goal_pose"], **error})
-    if "entry_region" in scene:
-        # Preserve the existing geometry contract: this index addresses source
-        # trajectory rows, unlike functional event frame IDs. Only controlled
-        # object nodes exist here; released body poses require new observation.
-        from .pipeline import _interior
-        from .goals import check_inside
-        begin = scene.get("entry_start_index")
-        if type(begin) is not int or not 0 <= begin < len(objects):
-            raise ValueError("entry_start_index must address a controlled object trajectory row")
-        corridor = _interior(scene["entry_region"])
-        clearance = min(check_inside(pose, scene["body_points"], corridor)["minimum_clearance_m"]
-                        for pose in objects[begin:])
-        if clearance < margin - 1e-7:
-            raise ValueError("Transferred object motion leaves the supplied entry corridor")
-        motion_checks["entry_corridor"] = {"minimum_clearance_m": float(clearance),
-                                           "margin_m": float(margin),
-                                           "checked_nodes": len(objects) - begin,
-                                           "scope": "saved controlled nodes; not continuous collision certification"}
+    # BEGIN share unchanged corridor semantics with direct joint-coordinate goals.
+    # The index addresses source rows, not frame IDs; released body poses still
+    # require new observations and are not included in this geometry check.
+    _check_entry_corridor(objects, scene, margin, motion_checks)
+    # END share unchanged corridor semantics with direct joint-coordinate goals.
     return objects, checks, motion_checks, reference, first
 
 
@@ -403,6 +574,7 @@ def ground_object_program(program, scene):
     return result
 
 
+# BEGIN public joint-coordinate input documentation; holding/release logic stays shared.
 def ground_program(program, scene):
     """Generate one grasp/manipulation geometry reference from a compiled demo.
 
@@ -413,6 +585,15 @@ def ground_program(program, scene):
     a current carrier frame and metric event tolerances. Their explicit
     ``scene.reference_pose`` embeds the current reference owner's local frame
     in ``scene.reference_frame`` (the common output frame).
+
+    Articulation events may instead declare ``constraint_kind=joint_coordinate``.
+    Source ``motion_coordinates`` / ``motion_coordinates_source`` preserve the
+    full observed signed scalar sequence; event ``coordinate_value`` and
+    ``coordinate_tolerance`` describe its source function state. Current
+    bindings provide ``current_coordinates`` with source/owner evidence in the
+    already bound ``scene.motion_model``. No reference pose or surrogate region
+    frame is needed. ``scene.carrier_mapping`` / ``carrier_mapping_source``
+    explicitly transport source body-local hand geometry through release.
 
     An ``on`` relation instead supplies finite ``scene.support`` in the output
     frame and, per event, ``carrier_mapping`` (current-carrier-from-source-
@@ -496,4 +677,5 @@ def ground_program(program, scene):
             "retreat_anchor": "predicted_release_eef; rebind from actual release feedback" if release is not None else None,
             "pose_convention": "column-vector reference_from_body/eef; metres; 4x4 SE(3)",
             "path_scope": "geometry reference; robot IK, collision, forces and timing remain external"}
+# END public joint-coordinate input documentation; holding/release logic stays shared.
 # END region-based skill program consumer.

@@ -173,6 +173,48 @@ owner into those coordinates; use an explicit identity only when they coincide.
 The `on` relation instead binds a finite support region directly and does not
 require the reference object's complete pose or a reference functional frame.
 
+<!-- BEGIN native articulation coordinate goals. -->
+An `articulation` relation can instead use explicit `joint_coordinate` events
+with a caller-bound `prismatic` or `revolute` `scene.motion_model`. This expresses
+a functional joint state directly, without constructing artificial two-sided
+region frames or supplying `scene.reference_pose`:
+
+- `demo.motion_coordinates`: the full original `N` or `N×1` signed scalar
+  sequence, with nonempty `motion_coordinates_source`. Distances are metres;
+  revolute angles are unwrapped radians. Keep release/retreat observations.
+- `demo.functional_events`: each event retains `event_id`, `frame_index`,
+  `source`, and declares `constraint_kind="joint_coordinate"`, a length-one
+  `coordinate_value` matching that source observation, and positive
+  `coordinate_tolerance` in the same unit.
+- `scene.functional_bindings[event_id]`: `current_coordinates` is a length-one
+  target in the **current model's** signed coordinate convention, accompanied
+  by `carrier_id`, `reference_id`, and its evidence `source`.
+- `scene.carrier_mapping` and `carrier_mapping_source`: an explicit SE(3) map
+  from source carrier coordinates to current carrier coordinates, used when
+  transporting the released-hand reference. Identity requires evidence of
+  the same coordinate convention; it is never assumed.
+
+The reference progress is `q_demo - q_demo[0] + q_current_start`; functional
+targets are enforced by current FK. A target that reproduces demonstration
+amplitude therefore adds the demonstrated increment to the current start,
+rather than reusing an absolute source joint reading. Source/current signed
+directions must already correspond. Recorded winding and explicit target
+winding are preserved. The initial revolute coordinate is the principal angle
+relative to the model's reference pose; supplied targets and limits must use
+that same gauge, since a static pose cannot establish past full revolutions.
+
+This numerical consumer does not identify a new object's hidden joint or
+its travel limits. A learned same-instance mechanism can be localized using
+robot FK and a separately established fixed Holding. Transferring that prior
+to a different instance needs evidence. `coordinate_limits`, when supplied,
+are checked at controlled trajectory nodes; otherwise the result explicitly
+reports `limit_status="not_supplied"`. Neither case certifies collisions or
+execution. The existing Holding, gripper events, release boundary, independent
+retreat and optional entry-corridor checks remain in force. Source action
+intervals are retained as demonstration evidence, not returned as transferable
+robot commands.
+<!-- END native articulation coordinate goals. -->
+
 <!-- BEGIN generic semantic selection before geometric binding. -->
 `manipulation.selection.select_grounding_candidates` automatically assembles one
 VLM request from an existing demonstration template, the **current instruction**,
