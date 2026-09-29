@@ -115,6 +115,11 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
     Native joint events additionally supply their complete coordinate reference
     and indexed coordinate goals. These are not recovered from their FK poses:
     doing so would discard explicitly recorded revolute winding numbers.
+
+    Native prismatic intervals between hard events retain the source's scalar
+    progress profile while adapting its displacement to the new endpoints.
+    The unanchored suffix after the final event retains source metric increments;
+    this does not rescale release motion or the separately consumed hand retreat.
     """
     knots = [(0, start)] + [(index, goal) for index, goal in goals if index != 0]
     if goals and goals[0][0] == 0 and not np.allclose(goals[0][1], start, atol=1e-8, rtol=0):
@@ -154,6 +159,14 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
                                                 "max_rotation_rad": float(r.max())}
         angular = 0 if model.kind == "revolute" else 2 if model.kind == "planar" else None
         values = coordinates.copy()
+        # BEGIN native prismatic endpoint changes preserve demonstrated progress.
+        if native and model.kind == "prismatic":
+            diagnostics["coordinate_transfer"] = {
+                "method": "piecewise_source_progress_affine",
+                "intervals": [],
+                "post_final_event": "unchanged source metric increments from the bound final event",
+            }
+        # END native prismatic progress diagnostics.
         for position, (begin, initial) in enumerate(knots):
             end, goal = knots[position + 1] if position + 1 < len(knots) else (len(reference) - 1, None)
             initial_q = ((coordinates[0].copy() if begin == 0 else coordinate_goals[begin].copy())
@@ -167,7 +180,51 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
                 if angular is not None and not native:
                     goal_q[angular] += 2 * np.pi * np.round(
                         (part[-1, angular] - goal_q[angular]) / (2 * np.pi))
-                part += np.linspace(0, 1, len(part))[:, None] * (goal_q - part[-1])
+                # BEGIN native prismatic progress instead of a time-linear drift.
+                if native and model.kind == "prismatic":
+                    source_delta = float(coordinates[end, 0] - coordinates[begin, 0])
+                    target_delta = float(goal_q[0] - initial_q[0])
+                    if not np.isfinite([source_delta, target_delta]).all():
+                        raise ValueError("Prismatic endpoint displacements must be finite")
+                    if source_delta == 0.:
+                        # A return-to-start motion contains no net-progress
+                        # denominator. Preserve its actual loop or pause when
+                        # both targets agree; never invent a time drift to a
+                        # different endpoint or erase the intervening motion.
+                        # Current q comes from FK dot products; the same
+                        # supplied coordinate can differ by a few arithmetic
+                        # ULPs. This bound addresses float64 roundoff only,
+                        # not camera noise or a permissible task displacement.
+                        roundoff = 8 * np.finfo(float).eps * max(
+                            1., abs(float(initial_q[0])), abs(float(goal_q[0])))
+                        if abs(target_delta) > roundoff:
+                            raise ValueError("Zero-net prismatic source interval cannot bind a nonzero displacement")
+                        scale, mode = 1., "zero_net_source_motion_preserved"
+                    elif np.array_equal(goal_q, part[-1]):
+                        # Identity retargeting must not needlessly round the
+                        # already translated source coordinates a second time.
+                        scale, mode = 1., "source_metric_increments_preserved"
+                    else:
+                        scale, mode = target_delta / source_delta, "source_progress_scaled"
+                        if not np.isfinite(scale):
+                            raise ValueError("Prismatic source progress scale must be finite")
+                        part = initial_q + scale * (coordinates[begin:end + 1] - coordinates[begin])
+                        # Pin only floating-point endpoint arithmetic, not any
+                        # interior sample or its order. A positive scale keeps
+                        # every source increment's sign, including real pauses
+                        # and reversals; a negative explicit goal reverses it.
+                        part[0], part[-1] = initial_q, goal_q
+                    diagnostics["coordinate_transfer"]["intervals"].append({
+                        "begin_index": begin, "end_index": end, "method": mode,
+                        "source_displacement": source_delta,
+                        "target_displacement": target_delta, "progress_scale": scale,
+                    })
+                else:
+                    # The revolute branch keeps its existing explicit unwrapped
+                    # coordinate and winding contract. This distance-progress
+                    # correction introduces no modulo-angle reinterpretation.
+                    part += np.linspace(0, 1, len(part))[:, None] * (goal_q - part[-1])
+                # END native prismatic source-progress endpoint retargeting.
             values[begin:end + 1] = part
         if limits is not None and (np.any(values < limits[:, 0] - 1e-9)
                                    or np.any(values > limits[:, 1] + 1e-9)):
@@ -214,8 +271,11 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
     on source and current mechanisms; fitting the source does not establish a
     current joint axis or a new instance's limits.
 
-    The observed initial pose defines the current initial coordinate q0. Only
-    the source coordinate origin changes: q_ref=q_demo-q_demo[0]+q0.
+    The observed initial pose defines the current initial coordinate q0. The
+    soft reference is q_ref=q_demo-q_demo[0]+q0. Native prismatic intervals
+    between hard events then scale their source progress to the explicit
+    current endpoint displacement; same-endpoint zero-net loops remain intact.
+    After the final event, metric source increments remain unchanged.
     For revolute motion, q0 is the principal relative angle about this model's
     reference pose: a pose cannot reveal already accumulated revolutions.
     Current goals/limits must use that starting convention. Setting the model
@@ -312,7 +372,15 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
                            "principal relative angle from the current reference pose; pre-existing revolutions are not inferred"
                            if model.kind == "revolute" else
                            "metric displacement from the current reference pose"),
-                       coordinate_reference="source coordinates shifted to observed current start; original signed increments retained")
+                       # BEGIN distinguish source reference from constrained retargeting.
+                       coordinate_reference=(
+                           "source coordinates shifted to observed current start; between hard events, "
+                           "prismatic source progress is scaled to current endpoint displacement; "
+                           "after the final event, source metric increments are retained"
+                           if model.kind == "prismatic" else
+                           "source unwrapped angular coordinates shifted to observed current start; "
+                           "explicit winding is retained, with current functional targets enforced"))
+                       # END explicit native coordinate-transfer semantics.
     return objects, checks, diagnostics, reference, {"carrier_binding": mapping}
 
 

@@ -194,14 +194,27 @@ region frames or supplying `scene.reference_pose`:
   transporting the released-hand reference. Identity requires evidence of
   the same coordinate convention; it is never assumed.
 
-The reference progress is `q_demo - q_demo[0] + q_current_start`; functional
-targets are enforced by current FK. A target that reproduces demonstration
-amplitude therefore adds the demonstrated increment to the current start,
-rather than reusing an absolute source joint reading. Source/current signed
-directions must already correspond. Recorded winding and explicit target
-winding are preserved. The initial revolute coordinate is the principal angle
-relative to the model's reference pose; supplied targets and limits must use
-that same gauge, since a static pose cannot establish past full revolutions.
+<!-- BEGIN native prismatic progress and post-event displacement contract. -->
+The soft coordinate reference is `q_demo - q_demo[0] + q_current_start`;
+functional targets are enforced by current FK. Between native prismatic hard
+events, source progress `(q_demo[i]-q_demo[a])/(q_demo[b]-q_demo[a])` maps to
+the bound current endpoints. This scales each source displacement by the
+interval's target/source displacement ratio, retaining its pauses and, for a
+positive ratio, the signs of its increments. Equal-amplitude targets retain
+the translated source sequence. A zero-net source interval retains its entire
+internal motion when the current endpoints also coincide; binding it to a
+nonzero displacement is rejected because source progress is undefined.
+After the last functional event, source metric increments remain unchanged.
+Timestamps, gripper events and the separately transferred released-hand retreat
+are not rescaled. `motion_checks.coordinate_transfer` records the interval
+scales; it does not claim that retargeted source increments retain their size.
+
+Source/current signed directions must already correspond. Revolute transfer
+keeps its existing unwrapped-coordinate and explicit winding contract. The
+initial revolute coordinate is the principal angle relative to the model's
+reference pose; supplied targets and limits must use that same gauge, since a
+static pose cannot establish past full revolutions.
+<!-- END native prismatic progress and post-event displacement contract. -->
 
 This numerical consumer does not identify a new object's hidden joint or
 its travel limits. A learned same-instance mechanism can be localized using
