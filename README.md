@@ -173,6 +173,49 @@ owner into those coordinates; use an explicit identity only when they coincide.
 The `on` relation instead binds a finite support region directly and does not
 require the reference object's complete pose or a reference functional frame.
 
+<!-- BEGIN generic semantic selection before geometric binding. -->
+`manipulation.selection.select_grounding_candidates` automatically assembles one
+VLM request from an existing demonstration template, the **current instruction**,
+and actual detector candidates. Its fixed instructions are shared across skills;
+it does not ask another model to write a prompt, branch on a skill name, or send
+source poses, asset IDs or detector scores to the semantic decision.
+
+```python
+from manipulation.selection import select_grounding_candidates
+
+selection = select_grounding_candidates(
+    source_template,             # image, interaction mask, description; optional query descriptions
+    current_instruction,         # current task intent, separate from demonstration evidence
+    {"camera": {"image": rgb, "candidates": detections}},
+    selection_scope="owner",     # requires source_template["owner_mask"]
+)
+decision = selection["views"]["camera"]
+```
+
+Choose the scope from the consumer's responsibility: `owner` selects the whole
+rigid entity or moving part represented by the demonstration owner (for example,
+the grasped object or the reference furniture); `interaction_region` selects a
+local functional part. The same source interaction mask and semantic description
+explain the function in either case. Source-only colour, level or world orientation
+does not override the current request. Placement can supply its existing support
+description with no ordered queries or frame recipe.
+
+Even a single candidate is checked by the VLM. Results distinguish `selected`,
+`alternatives` (every returned candidate is semantically permitted), `unresolved`,
+`no_match`, and `no_candidates`. Empty input does not trigger a model call. No mask
+is generated or merged: `decision["regions"]` contains the selected original
+candidates, and a caller must explicitly resolve multiple allowed candidates
+before using a consumer that requires one. IDs are local to each supplied view;
+multiple views do not establish a three-dimensional correspondence.
+
+Only a selection with `selection_scope == "owner"` can supply a current
+`owner_mask`. A selected interaction mask remains local evidence and cannot stand
+in for the object's visible geometry. This semantic selection does not certify
+mask completeness, accessibility, grasp orientation, Holding, or execution. The
+existing functional-correspondence and observed-support solvers retain their
+separate geometric responsibilities.
+<!-- END generic semantic selection before geometric binding. -->
+
 `perception.bind_current_scene(program, scene, source_templates, current_owners)`
 binds cached demonstration evidence without rerunning source tracking. For a
 grasp or a complete-frame relation, source templates contain the known
