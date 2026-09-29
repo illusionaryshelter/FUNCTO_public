@@ -637,3 +637,64 @@ EEF relative motion, gripper intentions and protected suffix retain their
 existing contract. A returned frame does not establish symmetric-face material
 identity, collision clearance or actual holding.
 <!-- END observed orthogonal surfaces for functional-frame grounding. -->
+
+<!-- BEGIN unordered visible-vertex correspondence and stable consensus. -->
+### Unordered vertex correspondences and joint rigid estimation
+
+Visible vertices can provide rigid correspondences without assigning fixed
+function/grasp/centre roles or requiring exactly three semantic points. The
+RGB-D observer and visual association are independent of the rigid estimator:
+
+```python
+from manipulation.vertices import (
+    observe_vertex_candidates, associate_vertex_candidates,
+)
+from manipulation.consensus import rigid_correspondence_hypotheses
+
+source_vertices = observe_vertex_candidates(source_rgb, source_depth, source_K, source_mask)
+current_vertices = observe_vertex_candidates(current_rgb, current_depth, current_K, current_mask)
+association = associate_vertex_candidates(
+    source_rgb, current_rgb, source_mask, current_mask,
+    source_vertices, current_vertices, client=client,
+)
+# source_points and current_points are the measured 3D coordinates from the
+# returned explicit pairs, expressed in the desired source/current frames.
+consensus = rigid_correspondence_hypotheses(
+    source_points, current_points, pair_ids=correspondence_ids,
+    max_error=0.01,
+)
+```
+
+The caller obtains the current owner mask from perception. The source can use
+offline demonstration annotations. The observer retains RGB corner locations
+and the actual nearby depth pixels separately; a sampled surface point is not
+certified to be the exact physical vertex. Duplicate corner/depth observations
+cannot add multiple votes. A shared geometry-only prompt proposes a variable
+number of source/current ID pairs, without skill-name branches, asset names,
+metric geometry from the VLM, fixed point roles, or image-order assumptions.
+Ambiguous or insufficient visual association must remain explicit.
+
+Three noncollinear corresponding measurements form a minimal rigid hypothesis.
+The sparse estimator enumerates these subsets, checks every original pair,
+and jointly refits each consensus until its fitted and accepted sets agree.
+It returns all stable candidates with maximum support; lower-support outcomes
+remain in diagnostics. Commonly reordering paired measurements does not assign
+new axes or change their roles. Explicit correspondence is still necessary:
+geometric consistency cannot disambiguate every symmetric object.
+
+The 10 mm default is a geometric consistency gate inherited from the existing
+rigid-registration interface. It is **not** a noise estimate, covariance,
+calibrated confidence interval, or terminal-pose accuracy guarantee. This path
+does not require a noise model or calibration dataset, and uses no uncertainty
+weights or local surface fitting. All observed pairs and final residuals remain
+available for review. A candidate supported by only three points is marked as
+weak evidence because it has no additional supporting correspondence.
+
+If source points are in the demonstration owner frame and current points in
+the binding camera frame, each hypothesis maps source owner to current camera.
+Pass it as `region_transform`, with the calibrated camera pose as
+`carrier_pose`, to `ground_program`. Process competing candidates separately;
+the camera pose is a coordinate gauge, not current object GT. The original
+timeline, closure intent and protected suffix stay with the existing consumer.
+Geometric support does not establish actual holding or execution feasibility.
+<!-- END unordered visible-vertex correspondence and stable consensus. -->
