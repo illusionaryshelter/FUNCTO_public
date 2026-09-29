@@ -501,3 +501,45 @@ These examples use known synthetic geometry. Actual new task coverage still
 requires its own demonstrated stage and scene; the bundled pouring example
 alone cannot verify real drawer, door or container operation.
 <!-- END task-adaptive object/part manipulation. -->
+
+<!-- BEGIN observed local protrusion geometry for independent grasp grounding. -->
+### Local protruding regions and independent grasp candidates
+
+An observed elongated region can supply grasp direction without three ordered
+material-point correspondences or a complete current owner mask:
+
+```python
+from manipulation.protruding_perception import observed_backing_planes
+from manipulation.protruding_geometry import observe_protruding_line, protruding_frames
+
+plane, evidence = observed_backing_planes(rgb, depth_m, K, selected_region_mask)
+geometry = observe_protruding_line(depth_m, K, selected_region_mask, plane)
+# Match an existing source contact anchor into geometry["front_mask"] with
+# manipulation.grounding.match_points. Keep the returned original-image pixel.
+frames, evidence = protruding_frames(depth_m, K, matched_pixel, geometry)
+```
+
+`selected_region_mask` is a perception result, such as a SAM candidate confirmed
+by the generic task-conditioned selector. A surrounding image window proposes
+backing-plane candidates; Gemini confirms the backing role. The window and local
+part do not become a complete owner mask. The same geometric definition must be
+used offline and at runtime. Missing or inconsistent evidence is an error.
+
+The plane-to-protrusion direction gives the signed outward normal. A reliable
+observed front band supplies an **unsigned** line; fitting pixels and valid
+anchor pixels remain distinct observed masks. The functional origin is the
+explicit matched surface pixel with its measured depth, never the region mean.
+Returned frames use `y = inward`, `z = +/-line`, and `x = y cross z`. The two
+orientations record unresolved line sign; they do not certify physically
+interchangeable or collision-free grasps. The estimator requires an elongated,
+approximately plane-parallel protrusion and sufficient metric separation at its
+5 mm surface tolerance; it is not the geometry model for every graspable object.
+
+For a source frame `Fd` in demonstration owner coordinates and each current
+camera-local frame `Fn`, pass `region_transform = Fn @ inverse(Fd)` and
+`carrier_pose = T_output_camera` to the existing independent `ground_program`.
+This camera pose is a coordinate gauge, not a recovered object pose. Keep both
+complete candidates when line sign is unresolved. The original timeline,
+closure events and protected suffix remain governed by the grasp consumer;
+actual holding, IK, collision and execution still require current verification.
+<!-- END observed local protrusion geometry for independent grasp grounding. -->
