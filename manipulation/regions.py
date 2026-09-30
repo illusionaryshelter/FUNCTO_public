@@ -1,13 +1,16 @@
+# BEGIN source queries with optional current part evidence, never a part oracle.
 """Consume source interaction regions and infer current functional geometry.
 
 The known source interaction mask records the demonstrated local interaction.
-Current owner masks bound visual search; current part masks are not inputs.
+Current owner masks bound visual search. Optional observed part evidence guides
+semantic correspondence without requiring all queries to lie in that part.
 All rigid transforms use column vectors and metres. A full functional frame has
 an explicit origin, signed operational x axis and function-plane z normal. A
 plane recipe instead marks its tangent as a coordinate preference, so consumers
 cannot mistake an unobserved functional angle for a hard geometric constraint.
 Neither recipe estimates whole-object shape registration.
 """
+# END functional evidence module documentation.
 
 # BEGIN local interaction-region geometry and functional-frame consumers.
 from collections.abc import Mapping
@@ -16,7 +19,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .goals import SupportSurface, _points, place_on
-from .grounding import _image, match_points, propose_query_regions
+from .grounding import (_image, _selected_interaction_evidence, match_points,
+                        propose_query_regions)
 from .motion import _inverse, _pose_array
 from .observations import _intrinsics, _mask, backproject, rigid_registration
 
@@ -526,8 +530,11 @@ def source_function_geometry(demo):
 def match_functional_region(demo, current, *, client=None, extractor=None):
     """Infer current functional geometry from source evidence and owner RGB-D.
 
-    Current input contains only image, owner_mask, depth, K, T_camera_owner and
-    owner_id. It never supplies a part mask, functional frame or target queries.
+    Current input requires image, owner_mask, depth, K, T_camera_owner and
+    owner_id. Optional interaction_evidence contains a selected visible part,
+    semantic description and provenance, never a functional frame or queries.
+    That part guides the coarse VLM request while preserving owner context;
+    attachment and direction witnesses can remain outside its observed mask.
     The VLM chooses coarse owner-local candidate cells from the source example;
     the existing dense matcher searches each proposed box intersected with the
     current owner and valid depth. Those query correspondences reconstruct the
@@ -543,14 +550,27 @@ def match_functional_region(demo, current, *, client=None, extractor=None):
     source = source_function_geometry(demo)
     first, owner1, region, depth1, _, pixels, _ = _source_observation(demo)
     second, owner2, depth2, pose2 = _owner_observation(current, "current")
+    # BEGIN validate current evidence against its actual selected owner.
+    interaction = _selected_interaction_evidence(
+        current.get("interaction_evidence"), second, owner2, owner_id=current["owner_id"])
+    # END evidence is optional and cannot substitute for the owner observation.
     first_crop, first_owner, first_offset = _context_crop(first, owner1, owner1)
     second_crop, second_owner, second_offset = _context_crop(second, owner2, owner2)
     x, y = first_offset
     first_region = region[y:y+first_crop.height, x:x+first_crop.width]
+    # BEGIN crop evidence using the same native offset as owner correspondence.
+    cropped_interaction = None
+    if interaction is not None:
+        x, y = second_offset
+        cropped_interaction = {
+            **interaction,
+            "mask": interaction["mask"][y:y+second_crop.height, x:x+second_crop.width].copy()}
+    # END original RGB, descriptor context and query identities remain unchanged.
     proposals = propose_query_regions(
         first_crop, second_crop, first_owner, second_owner, first_region,
         pixels-first_offset, description=demo["description"],
-        query_descriptions=demo["query_descriptions"], client=client)
+        query_descriptions=demo["query_descriptions"], client=client,
+        current_interaction_evidence=cropped_interaction)
     boxes = np.asarray(proposals["boxes"])
     if (boxes.shape != (len(pixels), 4) or boxes.dtype.kind not in "iu"
             or np.any(boxes[:, :2] < 0) or np.any(boxes[:, 2:] <= boxes[:, :2])
@@ -606,6 +626,22 @@ def match_functional_region(demo, current, *, client=None, extractor=None):
                        duplicate_target_groups=duplicate_groups,
                        matching_scope="source functional queries to coarse regions inside current owner",
                        transform_scope="functional-frame correspondence, not whole-owner rigid registration")
+    # BEGIN retain exact observed part support in original-image coordinates.
+    if interaction is not None:
+        mask = interaction["mask"]
+        yy, xx = np.nonzero(mask)
+        nearest = np.rint(target_pixels).astype(int)
+        diagnostics["current_interaction_evidence"] = {
+            **{key: interaction[key] for key in ("owner_id", "description", "source")},
+            "image_size": list(second.size),
+            "mask_pixels_xy": np.column_stack((xx, yy)),
+            "mask_pixel_count": int(mask.sum()),
+            "pixels_outside_owner": int(np.count_nonzero(mask & ~owner2)),
+            "query_inside_mask": mask[nearest[:, 1], nearest[:, 0]].tolist(),
+            "coordinate_convention": "original current-image integer pixel centres in xy order",
+            "use": "observed evidence in coarse VLM correspondence; not a hard query containment rule",
+        }
+    # END the sparse pixels preserve the input mask without duplicating a dense raster.
     return {**source, "target_frame": target_frame,
             "transform": target_frame @ _inverse(source["source_frame"]),
             "target_points": target_points, "target_origin": target_frame[:3, 3].copy(),

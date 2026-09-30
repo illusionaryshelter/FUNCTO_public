@@ -274,6 +274,14 @@ class FunctionalQueryGroundingTest(unittest.TestCase):
         # Extend the target owner vertically to include its low two queries;
         # this also exercises the unequal crop-square sizes used by the matcher.
         current["owner_mask"][7:21, 9:21] = True
+        # BEGIN crop optional part evidence in lockstep with its owner context.
+        current_part = np.zeros_like(current["owner_mask"])
+        current_part[9:11, 13:15] = True
+        current_part[0, 0] = True  # Off-crop spill remains in the final evidence.
+        current["interaction_evidence"] = {
+            "mask": current_part, "owner_id": current["owner_id"],
+            "description": "visible first working edge", "source": "observed semantic selection"}
+        # END no target queries or functional geometry are supplied.
         shifted_region = np.zeros((28, 30), bool)
         shifted_region[7:10, 7:10] = demo["mask"][4:7, 3:6]
         demo["mask"] = shifted_region
@@ -286,6 +294,18 @@ class FunctionalQueryGroundingTest(unittest.TestCase):
         np.testing.assert_array_equal(proposal.call_args.args[5], demo["query_pixels"]-offsets[0])
         self.assertEqual(proposal.call_args.args[0].size, (16, 16))
         self.assertEqual(proposal.call_args.args[1].size, (16, 18))
+        # BEGIN native sparse mask and crop coordinates preserve every raw pixel.
+        supplied = proposal.call_args.kwargs["current_interaction_evidence"]
+        np.testing.assert_array_equal(supplied["mask"], current_part[5:23, 7:23])
+        retained = result["diagnostics"]["current_interaction_evidence"]
+        self.assertEqual(retained["mask_pixel_count"], 5)
+        self.assertEqual(retained["pixels_outside_owner"], 1)
+        self.assertEqual(retained["query_inside_mask"], [True, False, False, False])
+        restored = np.zeros_like(current_part)
+        xy = retained["mask_pixels_xy"]
+        restored[xy[:, 1], xy[:, 0]] = True
+        np.testing.assert_array_equal(restored, current_part)
+        # END omitted spill in the display crop is not deleted from native evidence.
 
     def test_plane_basis_marks_free_tangent_and_retains_explicit_normal_role(self):
         demo, current, pixels = self.observations()

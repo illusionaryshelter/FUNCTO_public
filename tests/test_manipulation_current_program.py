@@ -100,6 +100,54 @@ def client():
 
 
 class CurrentProgramTest(unittest.TestCase):
+    # BEGIN optional observed-part evidence reaches the real grasp consumer.
+    def test_selected_part_survives_normalization_and_preserves_outside_witnesses(self):
+        program, scene, templates, owners = fixture("grasp")
+        original_queries = deepcopy(templates["grasp"]["query_pixels"])
+        baseline = ground_current_program(program, scene, templates, owners,
+                                          client=client(), extractor=descriptors)
+        part = np.zeros((20, 20), bool)
+        part[3:6, 3:6] = True
+        owners["carrier"]["interaction_evidence"] = {
+            "mask": part, "owner_id": owners["carrier"]["owner_id"],
+            "description": "the visible working surface",
+            "source": "detector candidate 3, selected interaction_region"}
+        before_owner = owners["carrier"]["owner_mask"].copy()
+        model, extractor = client(), Mock(side_effect=descriptors)
+        result = ground_current_program(program, scene, templates, owners,
+                                        client=model, extractor=extractor)
+        self.assertIn("the visible working surface", model.chat_json.call_args.args[0])
+        self.assertEqual(extractor.call_count, 1)
+        diagnostic = result["region_binding_evidence"]["grasp"]["diagnostics"]
+        observed = diagnostic["current_interaction_evidence"]
+        self.assertEqual(observed["owner_id"], "new_carrier")
+        self.assertEqual(observed["query_inside_mask"], [True, False, False])
+        restored = np.zeros_like(part)
+        xy = observed["mask_pixels_xy"]
+        restored[xy[:, 1], xy[:, 0]] = True
+        np.testing.assert_array_equal(restored, part)
+        np.testing.assert_array_equal(diagnostic["target_pixels"], original_queries)
+        np.testing.assert_allclose(result["eef_poses"], baseline["eef_poses"], atol=1e-12)
+        self.assertEqual(result["holding_status"], "requires_verification")
+        self.assertEqual(result["owner_observation_evidence"]["carrier"]["interaction_evidence"]["mask_pixel_count"], 9)
+        np.testing.assert_array_equal(owners["carrier"]["owner_mask"], before_owner)
+        np.testing.assert_array_equal(templates["grasp"]["query_pixels"], original_queries)
+        # The blue annotation belongs to the VLM panel only, not SD-DINO input.
+        np.testing.assert_array_equal(extractor.call_args.args[0], templates["grasp"]["image"])
+        np.testing.assert_array_equal(extractor.call_args.args[1], owners["carrier"]["image"])
+
+    def test_part_bound_to_another_owner_fails_before_any_model(self):
+        program, scene, templates, owners = fixture("grasp")
+        owners["carrier"]["interaction_evidence"] = {
+            "mask": owners["carrier"]["owner_mask"].copy(), "owner_id": "different_object",
+            "description": "a similar visible surface", "source": "semantic candidate"}
+        model, extractor = client(), Mock()
+        with self.assertRaisesRegex(ValueError, "different selected owner"):
+            bind_current_scene(program, scene, templates, owners, client=model, extractor=extractor)
+        model.chat_json.assert_not_called()
+        extractor.assert_not_called()
+    # END optional evidence does not modify source motion, queries or ownership.
+
     def test_owner_only_inputs_reach_real_grasp_and_manipulation_consumers(self):
         for kind, expected in (("grasp", "eef_trajectory"), ("manipulation", "interaction_trajectory")):
             program, scene, templates, owners = fixture(kind)

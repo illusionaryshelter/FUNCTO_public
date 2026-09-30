@@ -66,6 +66,81 @@ def nested_keys(value):
 
 
 class GroundingCandidateSelectionTest(unittest.TestCase):
+    # BEGIN selected-owner context must enter the real semantic request.
+    def test_selected_current_owner_is_visible_and_described_without_changing_candidates(self):
+        source, views = fixture()
+        owner = np.zeros((10, 12), dtype=bool)
+        owner[2:8, 6:11] = True
+        views["left"]["selected_owner"] = {
+            "owner_id": "observed_object", "mask": owner,
+            "description": "The currently selected rigid object.",
+            "source": "Independent visible owner selection on this image.",
+        }
+        original = deepcopy(views)
+        client = Mock(chat_json=Mock(return_value=response(
+            [31], reason="This part belongs to the green selected object.")))
+        result = select_grounding_candidates(source, "Use this object's demonstrated region", views,
+                                             selection_scope="interaction_region", client=client)
+        prefix, context = context_from(client)
+        self.assertIn("mask overlap", prefix)
+        self.assertEqual(context["views"]["left"]["allowed_ids"], [7, 31])
+        self.assertEqual(context["views"]["left"]["selected_owner"], {
+            key: views["left"]["selected_owner"][key]
+            for key in ("owner_id", "description", "source")})
+        images = client.chat_json.call_args.kwargs["images"]
+        current_owner_image = next(entry["image"] - 1 for entry in context["image_order"]
+                                   if entry["content"] == "view left: selected current owner highlighted GREEN")
+        panel = np.asarray(images[current_owner_image], dtype=int)
+        raw = np.asarray(views["left"]["image"], dtype=int)
+        self.assertTrue(np.all(panel[..., 1][owner] > raw[..., 1][owner]))
+        np.testing.assert_array_equal(panel[~owner], raw[~owner])
+        np.testing.assert_array_equal(result["views"]["left"]["regions"][0]["mask"],
+                                      original["left"]["candidates"][1]["mask"])
+        np.testing.assert_array_equal(views["left"]["selected_owner"]["mask"], owner)
+        for before, after in zip(original["left"]["candidates"], views["left"]["candidates"]):
+            np.testing.assert_array_equal(before["mask"], after["mask"])
+
+    def test_owner_overlap_does_not_resolve_semantic_membership(self):
+        source, views = fixture()
+        # Both candidates overlap this mask. Neither overlap nor a single
+        # detector label may turn the model's abstention into a selected part.
+        views["left"]["selected_owner"] = {
+            "owner_id": "current_owner", "mask": np.ones((10, 12), dtype=bool),
+            "description": "Visible evidence of the already selected owner.",
+            "source": "Current owner perception.",
+        }
+        for ids, status in ((None, "unresolved"), ([], "no_match")):
+            client = Mock(chat_json=Mock(return_value=response(ids)))
+            selected = select_grounding_candidates(source, "Use a part of the selected owner", views,
+                                                   selection_scope="interaction_region", client=client)
+            client.chat_json.assert_called_once()
+            self.assertEqual(selected["views"]["left"]["status"], status)
+            self.assertEqual(selected["views"]["left"]["regions"], [])
+
+    def test_malformed_selected_owner_or_wrong_scope_fails_before_model_call(self):
+        source, views = fixture()
+        valid = {"owner_id": "current_owner", "mask": np.ones((10, 12), bool),
+                 "description": "Selected visible owner.", "source": "Current image perception."}
+        invalid = [None, {key: value for key, value in valid.items() if key != "source"},
+                   {**valid, "body_pose": np.eye(4)}, {**valid, "description": " "},
+                   {**valid, "owner_id": 123}, {**valid, "mask": np.ones((3, 3), bool)},
+                   {**valid, "mask": np.zeros((10, 12), bool)}]
+        for record in invalid:
+            views["left"]["selected_owner"] = record
+            client = Mock()
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                select_grounding_candidates(source, "Choose this owner's part", views,
+                                             selection_scope="interaction_region", client=client)
+            client.chat_json.assert_not_called()
+        views["left"]["selected_owner"] = valid
+        for scope in ("owner", "owner_evidence"):
+            client = Mock()
+            with self.subTest(scope=scope), self.assertRaises(ValueError):
+                select_grounding_candidates(source, "Choose visible evidence", views,
+                                             selection_scope=scope, client=client)
+            client.chat_json.assert_not_called()
+    # END selected-owner visual association is independent of mask overlap.
+
     def test_fixed_prompt_separates_current_instruction_and_demonstration_evidence(self):
         source, views = fixture()
         # Rich source records must not leak unrelated identifiers or geometry

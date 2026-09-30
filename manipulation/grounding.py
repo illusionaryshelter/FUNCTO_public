@@ -8,6 +8,7 @@ Models and network clients are imported only when a caller requests their use.
 
 # BEGIN task-adaptive grounding: the existing tool-use entry points stay separate.
 import json
+from collections.abc import Mapping
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -256,9 +257,40 @@ def select_roles(image, task, domain="demo", *, detector=None, client=None):
 
 
 # BEGIN source-evidence query proposals: current interaction masks are inferred, not inputs.
+# BEGIN optional observed interaction evidence, separate from its owner.
+def _selected_interaction_evidence(record, image, owner_mask, *, owner_id=None):
+    """Validate an observed part without promoting it to a physical answer.
+
+    The semantic selection's provenance belongs to the record. A mask is
+    permitted to spill outside its independently selected owner; it is retained
+    unchanged, provided the two have some overlap. Queries need not lie in it.
+    """
+    if record is None:
+        return None
+    required = {"mask", "owner_id", "description", "source"}
+    if not isinstance(record, Mapping) or set(record) != required:
+        raise ValueError("interaction_evidence requires exactly mask, owner_id, description and source")
+    for name in required - {"mask"}:
+        if not isinstance(record[name], str) or not record[name].strip():
+            raise ValueError(f"interaction_evidence.{name} must be a nonempty string")
+    if owner_id is not None and record["owner_id"] != owner_id:
+        raise ValueError("interaction_evidence belongs to a different selected owner")
+    mask = np.asarray(record["mask"])
+    if mask.dtype != np.bool_:
+        raise ValueError("interaction_evidence.mask must be a boolean array")
+    mask = _mask(mask, image, "interaction_evidence.mask").copy()
+    if not np.any(mask & owner_mask):
+        raise ValueError("interaction_evidence must overlap its selected owner")
+    # Entity IDs are opaque; trim prose only, never silently rename the owner.
+    return {"mask": mask, "owner_id": record["owner_id"],
+            "description": record["description"].strip(), "source": record["source"].strip()}
+# END optional observed interaction evidence validation.
+
+
 def propose_query_regions(source_image, current_image, source_owner_mask,
                           current_owner_mask, source_region_mask, query_pixels, *,
-                          description, query_descriptions, client=None):
+                          description, query_descriptions, client=None,
+                          current_interaction_evidence=None):
     """Ask once for coarse current-owner cells corresponding to source queries.
 
     Images are owner-context crops; xy queries and returned integer xyxy boxes
@@ -275,10 +307,20 @@ def propose_query_regions(source_image, current_image, source_owner_mask,
     metric geometry. The caller must intersect each window with the current
     owner and valid depth, then assess the resulting correspondences. Null or
     invalid semantic selections fail explicitly rather than guessing a region.
+
+    Optional selected current interaction evidence supplies an observed mask,
+    owner identity, semantic description and provenance. Its blue overlay and
+    cell coverage guide the same VLM request; they neither change the owner nor
+    forbid attachment/direction queries outside the visible part. Without this
+    evidence, the request and images remain the owner-only form.
     """
     source_image, current_image = _image(source_image), _image(current_image)
     source_owner = _mask(source_owner_mask, source_image, "source_owner_mask")
     current_owner = _mask(current_owner_mask, current_image, "current_owner_mask")
+    # BEGIN selected current part is visual evidence, not a dense-search gate.
+    interaction = _selected_interaction_evidence(
+        current_interaction_evidence, current_image, current_owner)
+    # END optional current evidence validation before model invocation.
     source_region = _mask(source_region_mask, source_image, "source_region_mask")
     if not np.any(source_region & source_owner):
         raise ValueError("Source interaction region does not overlap its owner")
@@ -341,7 +383,14 @@ def propose_query_regions(source_image, current_image, source_owner_mask,
                           max(0, min(y-14, source_panel.height-14))), str(number),
                          fill=(255, 255, 0), stroke_width=1, stroke_fill="black")
 
-    current_panel, current_scale = display_panel(owner_panel(current_image, current_owner))
+    # BEGIN retain the complete owner context while displaying selected evidence.
+    current_native = owner_panel(current_image, current_owner)
+    if interaction is not None:
+        current_native = Image.composite(
+            Image.new("RGB", current_image.size, (65, 135, 255)), current_native,
+            Image.fromarray(interaction["mask"].astype(np.uint8) * 75))
+    current_panel, current_scale = display_panel(current_native)
+    # END no annotation is passed to the dense descriptor extractor.
     current_draw = ImageDraw.Draw(current_panel)
     x_edges = np.linspace(0, current_image.width, 6, dtype=int)
     y_edges = np.linspace(0, current_image.height, 6, dtype=int)
@@ -375,6 +424,32 @@ def propose_query_regions(source_image, current_image, source_owner_mask,
                     for index, point in enumerate(pixels)],
         "allowed_cells": [{"id": number, "box_xyxy": box} for number, box in cells.items()],
     }
+    # BEGIN part evidence changes the semantic request, not admissible owners.
+    interaction_instruction = ""
+    if interaction is not None:
+        mask = interaction["mask"]
+        details["current_interaction_evidence"] = {
+            **{key: interaction[key] for key in ("owner_id", "description", "source")},
+            "mask_pixel_count": int(mask.sum()),
+            "pixels_outside_owner": int(np.count_nonzero(mask & ~current_owner)),
+            "cell_coverage": [{"cell_id": number,
+                               "part_owner_pixels": int(np.count_nonzero(
+                                   mask[y0:y1, x0:x1] & current_owner[y0:y1, x0:x1]))}
+                              for number, (x0, y0, x1, y1) in cells.items()],
+            "scope": "selected visible part evidence; not complete contact geometry or an owner mask",
+        }
+        interaction_instruction = (
+            "The translucent BLUE region in Image 2 is additional current part "
+            "evidence selected for this owner; its meaning and provenance are in "
+            "current_interaction_evidence. Use it to locate the demonstrated "
+            "functional role, while retaining the whole owner context. The mask "
+            "can omit attachments, boundaries, occluded surfaces or auxiliary "
+            "direction witnesses: queries need not lie inside it. Every allowed "
+            "owner cell remains selectable. Blue pixels outside the owner are "
+            "reported segmentation spill, not another owner or permission to "
+            "match background. The mask does not establish a pose or grasp "
+            "feasibility; return null for a counterpart you cannot observe. ")
+    # END optional evidence; absent evidence leaves the original prompt intact.
     prompt = (
         "Find functional visual correspondences from ONE demonstration owner to ONE "
         "selected current owner. Image 1 keeps the demonstration owner context: its "
@@ -394,7 +469,8 @@ def propose_query_regions(source_image, current_image, source_owner_mask,
         "pose or distance. Multiple queries may select the same cell. If a query's "
         "functional counterpart is absent, occluded or cannot be identified from "
         "these images, return null for that query instead of guessing or selecting "
-        "a merely similar-looking unrelated part. Return exactly {\"cells\": "
+        "a merely similar-looking unrelated part. "
+        + interaction_instruction + "Return exactly {\"cells\": "
         "[integer_cell_ID_or_null, ...]}, in source query ID order, one entry per "
         "query. Do not return metric geometry or additional keys.\n"
         + json.dumps(details, ensure_ascii=False)
@@ -417,7 +493,7 @@ def propose_query_regions(source_image, current_image, source_owner_mask,
         dx, dy = max(1, (x1-x0+3)//4), max(1, (y1-y0+3)//4)
         boxes.append([max(0, x0-dx), max(0, y0-dy),
                       min(current_image.width, x1+dx), min(current_image.height, y1+dy)])
-    return {"boxes": np.asarray(boxes, dtype=np.int64), "diagnostics": {
+    diagnostics = {
         "description": details["description"],
         "query_descriptions": [item["description"] for item in details["queries"]],
         "source_interaction_pixels_outside_owner": source_spill,
@@ -437,7 +513,12 @@ def propose_query_regions(source_image, current_image, source_owner_mask,
         "scope": ("VLM-selected program-defined coarse search windows; "
                   "not a current interaction mask or metric correspondence"),
         "client_calls": 1,
-    }}
+    }
+    # BEGIN preserve the actual evidence supplied to semantic correspondence.
+    if interaction is not None:
+        diagnostics["current_interaction_evidence"] = details["current_interaction_evidence"]
+    # END no source queries, cell eligibility or descriptor pixels are changed.
+    return {"boxes": np.asarray(boxes, dtype=np.int64), "diagnostics": diagnostics}
 # END source-evidence query proposals.
 
 

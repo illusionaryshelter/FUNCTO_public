@@ -77,6 +77,42 @@ _SELECTION_INSTRUCTION = (
 )
 
 
+# BEGIN optional current-owner identity context for part selection.
+_SELECTED_OWNER_INSTRUCTION = (
+    "\nSome current views additionally supply selected_owner: this is an already "
+    "selected CURRENT instance, separately highlighted GREEN in that view's "
+    "owner-context images. Its ID is an opaque association label, not a visual "
+    "answer. For such a view, select only interaction regions belonging to this "
+    "particular owner and satisfying the current instruction. Use the original "
+    "scene, the green owner evidence and each numbered candidate together to "
+    "verify membership. A matching part name, mask overlap, adjacency or an "
+    "enclosing assembly does not establish that membership. Do not replace the "
+    "selected owner with a different instance or its independently moving part. "
+    "Return candidate_ids=null when occlusion or uncertain ownership prevents "
+    "association, and [] when the candidates visibly belong to other owners or "
+    "none matches. The reason must explain this owner-part association or why "
+    "it cannot be established. Keep all supplied masks separate; neither merge "
+    "them nor clip a part mask to the owner. Views without selected_owner retain "
+    "the ordinary instruction-conditioned selection rules.\n"
+)
+
+
+def _selected_owner(record, image, selection_scope):
+    """Validate identity evidence without treating pixel overlap as identity."""
+    if selection_scope != "interaction_region":
+        raise ValueError("selected_owner is only applicable to interaction_region selection")
+    required = {"owner_id", "mask", "description", "source"}
+    if not isinstance(record, dict) or set(record) != required:
+        raise ValueError("selected_owner requires exactly owner_id, mask, description and source")
+    for name in required - {"mask"}:
+        if not isinstance(record[name], str) or not record[name].strip():
+            raise ValueError(f"selected_owner.{name} must be a nonempty string")
+    mask = _mask(record["mask"], image, "Current selected_owner.mask")
+    return {"owner_id": record["owner_id"], "mask": mask,
+            "description": record["description"].strip(), "source": record["source"].strip()}
+# END current-owner context, separate from candidate selection or mask geometry.
+
+
 def _box(mask):
     """Compute display bounds from an existing mask, without changing its pixels."""
     yy, xx = np.nonzero(mask)
@@ -160,6 +196,7 @@ def _prepare(source, instruction, views, selection_scope):
     if not isinstance(views, dict) or not views:
         raise ValueError("views must be a nonempty view-ID mapping")
     prepared, descriptions = {}, {}
+    has_selected_owner = False
     for name, view in views.items():
         if not isinstance(name, str) or not name.strip():
             raise ValueError("View IDs must be nonempty strings")
@@ -188,6 +225,18 @@ def _prepare(source, instruction, views, selection_scope):
         }
         images.append(image)
         image_order.append(f"view {name}: original current scene")
+        # BEGIN show the actual already-selected owner, never an inferred mask union.
+        if "selected_owner" in view:
+            selected_owner = _selected_owner(view["selected_owner"], image, selection_scope)
+            descriptions[name]["selected_owner"] = {
+                key: selected_owner[key] for key in ("owner_id", "description", "source")}
+            owner_panel = _highlight(image, selected_owner["mask"],
+                                     (30, 225, 110), outline=False)
+            images.extend((owner_panel, _context_crop(owner_panel, _box(selected_owner["mask"]))))
+            image_order.extend((f"view {name}: selected current owner highlighted GREEN",
+                                f"view {name}: same selected owner, enlarged existing pixels"))
+            has_selected_owner = True
+        # END no candidate is removed, intersected or associated by mask overlap.
         if candidates:
             images.append(_panels(image, candidates))
             image_order.append(f"view {name}: numbered candidate details")
@@ -196,7 +245,11 @@ def _prepare(source, instruction, views, selection_scope):
                "views": descriptions,
                "image_order": [{"image": index + 1, "content": content}
                                for index, content in enumerate(image_order)]}
-    prompt = _SELECTION_INSTRUCTION + "\nInput data:\n" + json.dumps(context, ensure_ascii=False)
+    # BEGIN absent current-owner context leaves the original request unchanged.
+    prompt = (_SELECTION_INSTRUCTION
+              + (_SELECTED_OWNER_INSTRUCTION if has_selected_owner else "")
+              + "\nInput data:\n" + json.dumps(context, ensure_ascii=False))
+    # END optional contextual selection, without skill-name prompt branches.
     return prompt, images, prepared
 
 
@@ -223,6 +276,13 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
     starting at one is used. A normal single-view call supplies one mapping
     entry. Multiple supplied views share semantic context only: their IDs and
     masks are not fused into a physical or geometric association.
+
+    For ``interaction_region`` only, a view may supply ``selected_owner`` with
+    exactly owner_id, mask, description and source. That actual current mask is
+    shown independently in green, and the same request must verify that each
+    selected part belongs to that instance. Spatial overlap alone is not used
+    to associate, select, clip or merge masks. Unclear membership remains null.
+    Omitting this record preserves the original request and behavior.
 
     Each result has a status: selected, alternatives (all semantically allowed),
     unresolved, no_match, or no_candidates. ``regions`` retains the separate

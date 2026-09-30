@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 
 from .goals import SupportSurface, _points
-from .grounding import _image
+from .grounding import _image, _selected_interaction_evidence
 from .motion import _errors, _pose_array, _tolerances
 from .observations import Camera, _mask, _noncollinear
 from .regions import (match_functional_region, sample_region_pixels,
@@ -94,6 +94,10 @@ def _current_owner(record, role):
     a physical principal axis. Subsequent tracking must retain that fixed gauge.
     ``T_output_camera`` is mandatory even when explicitly identity: a gauge
     choice cannot replace camera-to-output calibration.
+
+    Optional ``interaction_evidence`` is a separately selected visible part
+    with mask, owner_id, description and source. It is retained for the coarse
+    semantic request, not used to crop body geometry or require query coverage.
     """
     if not isinstance(record, Mapping):
         raise ValueError(f"Current {role} observation must be a mapping")
@@ -108,6 +112,10 @@ def _current_owner(record, role):
     image = _image(record["image"])
     shape = (image.height, image.width)
     owner_mask = _mask(record["owner_mask"], shape, "Current owner_mask")
+    # BEGIN preserve selected observed parts separately from current owners.
+    interaction = _selected_interaction_evidence(
+        record.get("interaction_evidence"), image, owner_mask, owner_id=record["owner_id"])
+    # END malformed ownership/provenance fails before any model invocation.
     depth = np.asarray(record["depth"], dtype=float)
     if depth.shape != shape:
         raise ValueError("Current RGB, owner mask and registered metric depth must share dimensions")
@@ -135,6 +143,16 @@ def _current_owner(record, role):
                 "T_output_owner": output_camera @ camera_owner,
                 "visible_depth_samples": len(cloud),
                 "geometry_coverage": "current visible RGB-D surfaces; hidden geometry is unknown"}
+    # BEGIN carry optional evidence through normalization rather than dropping it.
+    if interaction is not None:
+        normalized["interaction_evidence"] = interaction
+        evidence["interaction_evidence"] = {
+            **{key: interaction[key] for key in ("owner_id", "description", "source")},
+            "mask_pixel_count": int(interaction["mask"].sum()),
+            "pixels_outside_owner": int(np.count_nonzero(interaction["mask"] & ~owner_mask)),
+            "scope": "selected visible part, separate from whole-owner geometry",
+        }
+    # END owner masks and their full visible point clouds remain unchanged.
     return normalized, evidence
 
 
@@ -516,6 +534,68 @@ def ground_current_program(program, scene, source_templates, current_owners, *, 
 # END cached skill grounding from current owner observations.
 
 
+# BEGIN grasp candidates screened against actual tool and observed owner geometry.
+def ground_grasp_candidates(program, candidate_scenes, current_views, tool, *,
+                            current_joint_positions_m, contact_tolerance_m,
+                            penetration_tolerance_m):
+    """Generate complete functional grasp references and assess their geometry.
+
+    ``candidate_scenes`` contains already perceived functional bindings for one
+    selected owner, synchronized robot EEF pose, and common output frame. This
+    entry deliberately preserves every generated reference, even when observed
+    target geometry contradicts its grasp. A functional frame is not promoted
+    to an exact whole-object rigid registration.
+
+    ``tool`` is the caller's known robot geometry; current finger coordinates
+    are explicit proprioception, never borrowed from source contact samples.
+    ``current_views`` supplies actual owner RGB-D and optional perceived part
+    masks. The checker evaluates visible owner/tool compatibility, not full-arm
+    planning, complete scene clearance, dynamic closure, or actual Holding.
+    These are alternative actions under one established owner/goal binding,
+    not mutually exclusive scene hypotheses. A unique supported action can be
+    selected while other actions remain unresolved; their uncertainty does not
+    invalidate its own geometry. Multiple supported actions remain available
+    without a path-cost ranking. Ambiguous identity/semantics belongs upstream.
+    """
+    from .program import ground_program
+    from .grasp_validation import screen_grasp_candidates
+
+    if program.get("skill_kind") != "grasp":
+        raise ValueError("Tool contact screening consumes independent grasp programs")
+    if not isinstance(candidate_scenes, Mapping) or not candidate_scenes:
+        raise ValueError("A nonempty mapping of bound grasp candidates is required")
+    scenes = list(candidate_scenes.values())
+    frames = {scene.get("reference_frame") for scene in scenes}
+    owners = {scene.get("carrier_id") for scene in scenes}
+    if len(frames) != 1 or len(owners) != 1 or None in frames or None in owners:
+        raise ValueError("Grasp candidates must share one output frame and selected owner")
+    first_eef = _pose_array(scenes[0]["eef_pose"], "Current robot EEF feedback")
+    for scene in scenes:
+        if not np.allclose(_pose_array(scene["eef_pose"], "Current EEF"), first_eef,
+                           atol=1e-9, rtol=0):
+            raise ValueError("Grasp candidates must use synchronized current robot feedback")
+        if scene.get("tool_id") != tool.tool_id or scene.get("tool_frame") != tool.tool_frame:
+            raise ValueError("Tool geometry and the bound candidate use different tool conventions")
+    if (not isinstance(current_views, Mapping) or not current_views
+            or any(view.get("owner_id") not in owners for view in current_views.values())):
+        raise ValueError("Current grasp observations must belong to the selected owner")
+    trajectories = {name: ground_program(program, deepcopy(scene))
+                    for name, scene in candidate_scenes.items()}
+    validation = screen_grasp_candidates(
+        trajectories, current_views, tool, reference_frame=next(iter(frames)),
+        current_eef_pose=first_eef, current_joint_positions_m=current_joint_positions_m,
+        contact_tolerance_m=contact_tolerance_m,
+        penetration_tolerance_m=penetration_tolerance_m)
+    for name, trajectory in trajectories.items():
+        trajectory["grasp_geometry_validation"] = deepcopy(validation["candidates"][name])
+    selected = validation["selected_candidate_id"]
+    return {"status": validation["status"], "selected_candidate_id": selected,
+            "selected_trajectory": trajectories[selected] if selected is not None else None,
+            "trajectories": trajectories, "grasp_geometry_validation": validation,
+            "robot_execution_verified": False}
+# END grasp screening keeps functional references separate from execution facts.
+
+
 # BEGIN screened rigid-owner candidate generation through the numerical core.
 def _registered_owner_transform(program, scene, role):
     """Derive the tested mapping from the exact bindings consumed by the core.
@@ -569,10 +649,14 @@ def ground_registered_candidates(program, candidate_scenes, source, current_view
     applicability failure returns not_applicable and no unvalidated trajectory.
     Numeric consumer errors still propagate; there is no unchecked fallback.
 
-    Full-frame grasp/manipulation bindings support this entry. On-support and
-    joint-coordinate goals do not imply a complete rigid registration. The
-    existing dedicated entries remain responsible for those distinct inputs.
+    # BEGIN an explicit physical registration is stronger than a function frame.
+    Use this entry only for bindings that actually claim physical rigid-owner
+    registration. A full functional frame or unchanged instance shape alone
+    does not establish that claim. Functional grasp candidates instead use
+    ground_grasp_candidates to inspect tool/owner geometry. On-support and
+    joint-coordinate goals likewise do not imply a complete rigid registration.
     Screening establishes neither actual Holding nor robot executability.
+    # END check applicability from geometric meaning, not the skill label.
     """
     from .program import ground_program
     from .registration_validation import screen_registrations

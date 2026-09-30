@@ -179,6 +179,58 @@ class QueryProposalTest(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["allowed_cells"], [{"id": 25, "box_xyxy": [2, 1, 3, 2]}])
         np.testing.assert_array_equal(result["boxes"], [[1, 0, 3, 2]])
 
+    # BEGIN observed current parts guide semantics without excluding owner cells.
+    def test_optional_part_enters_request_without_changing_query_domain(self):
+        baseline, baseline_client = self.call()
+        mask = np.zeros_like(self.current_owner)
+        mask[8:11, 8:11] = True
+        mask[4, 8] = True  # Deliberate segmentation spill; do not trim it away.
+        evidence = {"mask": mask, "owner_id": "selected_object",
+                    "description": "the observed working edge",
+                    "source": "detector candidate 2, semantic interaction-region selection"}
+        before = mask.copy()
+        result, client = self.call(current_interaction_evidence=evidence)
+        prompt = client.chat_json.call_args.args[0]
+        context = json.loads(prompt.split("\n", 1)[1])
+        actual = context["current_interaction_evidence"]
+        self.assertIn("BLUE", prompt)
+        self.assertIn("queries need not lie inside", prompt)
+        self.assertEqual(actual["description"], evidence["description"])
+        self.assertEqual(actual["source"], evidence["source"])
+        self.assertEqual(actual["mask_pixel_count"], 10)
+        self.assertEqual(actual["pixels_outside_owner"], 1)
+        self.assertEqual(actual["cell_coverage"],
+                         [{"cell_id": 1, "part_owner_pixels": 9},
+                          {"cell_id": 25, "part_owner_pixels": 0}])
+        # Cell 25 has no part pixels and is still a valid direction witness.
+        self.assertEqual(context["allowed_cells"], baseline["diagnostics"]["allowed_cells"])
+        np.testing.assert_array_equal(result["boxes"], baseline["boxes"])
+        self.assertEqual(result["diagnostics"]["current_interaction_evidence"], actual)
+        before_images = baseline_client.chat_json.call_args.kwargs["images"]
+        after_images = client.chat_json.call_args.kwargs["images"]
+        np.testing.assert_array_equal(after_images[0], before_images[0])
+        self.assertFalse(np.array_equal(after_images[1], before_images[1]))
+        np.testing.assert_array_equal(mask, before)
+
+    def test_invalid_part_observation_fails_before_semantic_request(self):
+        good = {"mask": self.current_owner.copy(), "owner_id": "object",
+                "description": "working region", "source": "observed selected candidate"}
+        variants = [None, {**good, "owner_id": " "}, {**good, "description": ""},
+                    {**good, "source": []}, {**good, "mask": np.ones((100, 99), bool)},
+                    {**good, "mask": good["mask"].astype(float)},
+                    {**good, "mask": ~self.current_owner}, {**good, "pose": np.eye(4)}]
+        # None is the declared absence case and retains the existing interface.
+        baseline, old_client = self.call()
+        absent, absent_client = self.call(current_interaction_evidence=variants.pop(0))
+        self.assertEqual(old_client.chat_json.call_args.args[0], absent_client.chat_json.call_args.args[0])
+        np.testing.assert_array_equal(baseline["boxes"], absent["boxes"])
+        for evidence in variants:
+            model = Mock()
+            with self.subTest(fields=list(evidence)), self.assertRaises(ValueError):
+                self.call(current_interaction_evidence=evidence, client=model)
+            model.chat_json.assert_not_called()
+    # END optional observed-part request contracts.
+
 
 if __name__ == "__main__":
     unittest.main()

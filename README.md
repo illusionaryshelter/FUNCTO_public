@@ -296,6 +296,24 @@ SD-DINO matcher searches those windows inside the current owner. One descriptor
 pair is reused for the queries. The source/current frames are reconstructed
 independently, so changed part dimensions do not have to pass a rigid-shape fit.
 
+<!-- BEGIN optional perceived part evidence with explicit current-owner context. -->
+When a detector does provide a useful current part, pass
+`views[view_id]["selected_owner"] = {"owner_id": ..., "mask": ..., "description":
+..., "source": ...}` to `select_grounding_candidates(...,
+selection_scope="interaction_region")`. The request shows the actual selected
+owner separately and asks the VLM to verify part membership; pixel overlap is
+not an identity test. Uncertain membership remains unresolved.
+
+The selected observation may then be supplied as
+`current_owners[role]["interaction_evidence"]`, with the same four field names.
+Here `mask` is the actual selected **part** mask and `owner_id` names the already
+selected owner. This optional evidence reaches the coarse VLM localization as a
+separate blue overlay and structured provenance. Owner-context RGB and dense
+descriptor inputs remain unchanged. Attachment points and direction witnesses
+may lie outside the part; no fixed query count or part-containment rule is added.
+The binding records the original mask pixels and actual model requests.
+<!-- END optional part evidence does not replace whole-owner observations. -->
+
 The query-based source template fields are `image`, `mask` (offline interaction region),
 `owner_mask`, registered metric `depth`, `K`, `T_camera_owner`, `owner_id`,
 `region_id`, `description`, `query_pixels`, `query_descriptions` and
@@ -729,6 +747,68 @@ timeline, closure intent and protected suffix stay with the numerical consumer;
 geometric support does not establish actual holding or execution feasibility.
 <!-- END unordered visible-vertex correspondence and stable consensus. -->
 
+<!-- BEGIN actual tool versus observed-owner grasp screening. -->
+### Check functional grasp candidates against the known gripper
+
+Use `manipulation.perception.ground_grasp_candidates` for complete, already
+bound functional grasp candidates. It first generates every EEF reference with
+the existing consumer, then checks the actual known tool against current owner
+RGB-D. Rejected and unresolved references remain in `trajectories` for inspection;
+they are not relabelled as executable motions. No whole-owner registration is
+inferred from the functional frame.
+
+```python
+from manipulation.perception import ground_grasp_candidates
+from manipulation.tool_geometry import load_robosuite_panda_tool
+
+tool = load_robosuite_panda_tool(tool_id=feedback["tool_id"], tool_frame=feedback["tool_frame"])
+decision = ground_grasp_candidates(
+    program, candidate_scenes, current_views, tool,
+    current_joint_positions_m=feedback["current_joint_positions_m"],
+    contact_tolerance_m=0.001,
+    penetration_tolerance_m=0.00025,
+)
+```
+
+The Panda factory reads the installed standalone robot asset; it never reads a
+live scene or object mesh. Its external tool frame must explicitly denote that
+asset's `grip_site`. Native finger coordinates are `[q1, q2]` with open values
+`[0.04, -0.04]` metres, not two positive distances. Actual pad faces, palm/finger
+convex collision geometry and their FK are used; the tool site is not assumed
+to be a pad centre. Another robot supplies its own tool adapter, not a skill-name
+branch in the checker.
+
+Current views use `owner_id`, `reference_frame`, `depth`, `K`, `owner_mask` and
+`T_output_camera`, with optional actual `interaction_mask`. Owner pixels remain
+available to detect palm/finger interference even outside the selected part.
+Current finger q is synchronized robot feedback, not demonstration contact q.
+The original open/close intent and protected EEF suffix remain unchanged.
+
+Finite owner depth samples are retained as position observations. Local surface
+normals use only continuous, same-owner neighborhoods, including one-sided
+neighborhoods at thin parts; failure to estimate a normal does not erase a depth
+sample. Uncertain edge membership cannot by itself establish a hard collision,
+and missing opposed surface evidence cannot establish bilateral contact.
+
+The two explicit tolerances have different meanings: the first is an observed
+near-contact band; the second permits only shallow geometric penetration before
+reporting a solid conflict. The values above are the Panda experiment's declared
+1 mm contact and 0.25 mm penetration settings, not camera noise estimates or
+universal tolerances for every gripper. They are fixed before outcome evaluation.
+
+The checker reports visible local grasp geometry and retains missing evidence
+as unresolved. It does not certify unseen surfaces, full-scene/full-arm collision,
+dynamic closing, forces or stable Holding. A freely replannable approach conflict
+does not prove that the terminal grasp itself is impossible; inspect phase
+diagnostics. `selected_trajectory` returns the unique supported action. Multiple
+supported actions remain ambiguous; this checker does not rank path costs.
+Other unresolved actions are
+retained and do not veto that candidate: these are alternative grasps of one
+already established owner/goal, not conflicting hypotheses about scene identity.
+Resolve ambiguous object/goal bindings upstream. The motion backend and
+synchronized execution feedback retain their separate responsibilities.
+<!-- END functional grasp generation and physical execution remain distinct. -->
+
 <!-- BEGIN production projective registration screening and selected trajectory. -->
 ### Select registered trajectories using current depth
 
@@ -748,7 +828,7 @@ decision = ground_registered_candidates(
     candidate_scenes,  # {candidate_id: complete_scene_for_ground_program}
     source_owner_rgbd,
     current_views,
-    role="reference",  # "carrier" for an independently grounded grasp
+    role="reference",  # "carrier" only for an explicit physical carrier registration
     same_rigid_geometry=geometry_is_established,
     geometry_source=geometry_evidence,
     max_error=0.01,
@@ -762,8 +842,8 @@ Inputs use existing owner/frame conventions:
 |---|---|
 | `source_owner_rgbd` | `owner_id`, `depth`, `K`, `owner_mask`, `T_camera_owner`; metric camera-z depth and the observed source whole-owner surface, which may use offline annotations |
 | `current_views` | Arbitrary nonempty view-ID mapping; each value has `owner_id`, `reference_frame`, `depth`, `K`, `owner_mask`, `T_output_camera`; all views observe the same current rigid owner/state in one calibrated output frame |
-| `candidate_scenes` | Arbitrary nonempty candidate-ID mapping to numerical scenes; same bound owner and output frame, full grasp or manipulation functional-frame bindings |
-| Geometry applicability | An explicit boolean and nonempty evidence source; true means the observed source rigid geometry remains valid for this owner, e.g. an unchanged instance. A new shape must not silently inherit this assumption |
+| `candidate_scenes` | Arbitrary nonempty candidate-ID mapping to numerical scenes; same bound owner and output frame, bindings that actually claim physical rigid registration |
+| Geometry applicability | Source geometry must remain valid and the correspondence must claim the same material rigid mapping. An unchanged instance alone does not turn a local functional frame into an exact body pose; a new shape must not inherit rigid congruence |
 
 The checked transform is derived from the **actual numerical binding**. For
 grasp it is `carrier_pose @ region_transform`; for a manipulation reference it
