@@ -1,0 +1,701 @@
+"""Small CPU geometry/gradient counterexamples for the planning-scene contract.
+
+Analytic queries below stand in for a library kernel only in these tests. They
+do not add a second production collision backend or certify any real scene.
+"""
+
+# BEGIN CPU scene ownership, contact, release and coverage regression tests.
+from dataclasses import replace
+from types import SimpleNamespace
+import unittest
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+import torch
+
+from manipulation.planning_problem import (
+    JointCoupling, MotionPhase, PlanningEvent, PlanningProblem, PosePath,
+)
+from manipulation.planning_scene import (
+    Attachment, CollisionOwner, ContactRule, CuroboSphereQuery, ObservedSpace,
+    PlanningScene, PrismaticGripper,
+)
+
+
+class SphereQuery:
+    def __init__(self, owner_ids=(), center=(8., 0., 0.), radius=.1):
+        self.owner_ids = frozenset(owner_ids)
+        self.center, self.radius = center, radius
+        self.calls = {}
+
+    def clone_for_rollout(self):
+        return SphereQuery(self.owner_ids, self.center, self.radius)
+
+    def __call__(self, spheres, *, key):
+        self.calls[key] = spheres
+        center = spheres.new_tensor(self.center)
+        distance = torch.linalg.vector_norm(spheres[..., :3] - center, dim=-1)
+        return torch.relu(spheres[..., 3] + self.radius - distance)
+
+
+class BoxQuery(SphereQuery):
+    def __init__(self, owner):
+        super().__init__((owner,))
+
+    def clone_for_rollout(self):
+        return BoxQuery(next(iter(self.owner_ids)))
+
+    def __call__(self, spheres, *, key):
+        self.calls[key] = spheres
+        relative = (spheres[..., :3] - spheres.new_tensor([0., 0., -.1])).abs() - spheres.new_tensor([.4, .4, .1])
+        sdf = torch.linalg.vector_norm(torch.relu(relative), dim=-1) + relative.amax(-1).clamp_max(0)
+        return torch.relu(spheres[..., 3] - sdf)
+
+
+def pose_path(position=(0., 0., 0.), end=None, turn=0.):
+    poses = np.repeat(np.eye(4)[None], 2, axis=0)
+    poses[:, :3, 3] = position
+    if end is not None:
+        poses[1, :3, 3] = end
+    poses[1, :3, :3] = Rotation.from_rotvec([0., 0., turn]).as_matrix()
+    return PosePath(np.array([0., 1.]), poses, source={"kind": "synthetic_test"})
+
+
+def coverage(mask=None, **kwargs):
+    return ObservedSpace(np.ones((41, 41, 41), bool) if mask is None else mask,
+                         origin=[-2., -2., -2.], voxel_size=.1,
+                         observation_ids=["synthetic_current_scene"], reference_frame="world", **kwargs)
+
+
+def scene(owners=(), materials=(None,), **kwargs):
+    options = dict(background=SphereQuery(("background",)), owners=owners,
+                   coverage=coverage(), reference_frame="world",
+                   robot_sphere_materials=materials, robot_geometry_source="synthetic_robot",
+                   has_gripper=False)
+    options.update(kwargs)
+    return PlanningScene(**options)
+
+
+def inputs(progress=(.5,), positions=None, sphere_rows=None, dtype=torch.float64):
+    s = torch.tensor([progress], dtype=dtype)
+    p = torch.zeros((*s.shape, 3), dtype=dtype) if positions is None else torch.tensor([positions], dtype=dtype)
+    q = torch.tensor([1., 0., 0., 0.], dtype=dtype).expand(*s.shape, 4).clone()
+    rows = [[[-1., 0., 0., .05]]] * s.shape[1] if sphere_rows is None else sphere_rows
+    balls = torch.tensor([rows], dtype=dtype)
+    return balls, p, q, s
+
+
+def contact_rule(**changes):
+    value = ContactRule(
+        rule_id="pad_to_surface", actor="robot", target_owner="surface",
+        interval=(0., 1.), sphere_indices=(0,), material_id="pad",
+        feature_points=[[-.003, -.003, -.01], [.003, -.003, -.01], [.003, .003, -.01], [-.003, .003, -.01]],
+        feature_normal=[0., 0., -1.], patch_origin=[0., 0., 0.], patch_axes=np.eye(3),
+        patch_half_size=[.03, .03], gap_bounds=(-.002, .002), normal_tolerance_rad=.01,
+        modeling_allowance_m=.002, geometry_error_m=.003, minimum_thickness_m=.02,
+        source="synthetic_material_and_patch")
+    return replace(value, **changes)
+
+
+class PlanningSceneTest(unittest.TestCase):
+    def test_partial_scene_cannot_be_declared_without_coverage_and_provenance(self):
+        with self.assertRaisesRegex(ValueError, "coverage"):
+            scene(coverage=None)
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            ObservedSpace(np.ones((4, 4, 4), bool), origin=[0, 0, 0], voxel_size=.1,
+                          observation_ids=[], reference_frame="world")
+        with self.assertRaisesRegex(ValueError, "gripper"):
+            scene(has_gripper=True)
+
+    def test_unknown_grid_checks_whole_sphere_and_outside_grid(self):
+        mask = np.ones((41, 41, 41), bool)
+        mask[20, 20, 20] = False
+        observed = coverage(mask)
+        balls = torch.tensor([[[[.16, 0, 0, .2], [2.2, 0, 0, .02], [-1., 0, 0, .03]]]], dtype=torch.float64)
+        violation = observed.violation(balls)
+        self.assertGreater(violation[0, 0, 0].item(), 0)
+        self.assertGreater(violation[0, 0, 1].item(), 0)
+        self.assertEqual(violation[0, 0, 2].item(), 0)
+
+    # BEGIN occupied-interior evidence must preserve collision and state contracts.
+    def test_static_partial_owner_used_for_occupied_coverage_remains_unknown(self):
+        evidence = {"solids": [{"body_kind": "owner", "body_id": "part", "occupancy_kind": "verified_inner_solid"}],
+                    "owners": {"part": {"T_output_owner": np.eye(4).tolist()}}, "robot": None}
+        owner = CollisionOwner("part", SphereQuery(("part",)), pose_path(), "synthetic_owner", False)
+        world = scene((owner,), coverage=coverage(occupancy_evidence=evidence))
+        values = world.components(*inputs())
+        self.assertEqual(values["unknown/owner/part"].item(), 1.)
+        self.assertEqual(values["collision/robot/part"].item(), 0.)
+        self.assertEqual(world.describe()["complete_geometry_required_by_coverage"], ("part",))
+        owner.geometry_complete = True
+        self.assertEqual(world.evaluate(*inputs()).item(), 0.)
+        # Completing geometry never exempts that same owner from collision.
+        owner.query = SphereQuery(("part",), center=(-1., 0., 0.), radius=.1)
+        self.assertGreater(world.components(*inputs())["collision/robot/part"].item(), 0.)
+
+    def test_occupied_owner_identity_and_current_pose_cannot_be_removed_or_edited(self):
+        evidence = {"solids": [{"body_kind": "owner", "body_id": "part", "occupancy_kind": "verified_inner_solid"}],
+                    "owners": {"part": {"T_output_owner": np.eye(4).tolist()}}, "robot": None}
+        observed = coverage(occupancy_evidence=evidence)
+        with self.assertRaisesRegex(ValueError, "explicit collision owner"):
+            scene(coverage=observed)
+        owner = CollisionOwner("part", SphereQuery(("part",)), pose_path(), "synthetic_owner", True)
+        world = scene((owner,), coverage=observed)
+        problem = PlanningProblem(("joint",), np.zeros(1), np.zeros(1), "tool", "world", np.eye(4), np.eye(4),
+                                  (MotionPhase("move", pose_path(), "free"),))
+        world.validate_problem(problem)
+        owner.pose_path = pose_path(position=(.1, 0., 0.))
+        with self.assertRaisesRegex(ValueError, "occupied-evidence current pose"):
+            world.validate_problem(problem)
+
+    def test_occupied_robot_evidence_requires_same_model_measured_feedback_and_base(self):
+        evidence = {"solids": [{"body_kind": "robot_link", "body_id": "tool", "occupancy_kind": "verified_inner_solid"}],
+                    "owners": {}, "robot": {"joint_names": ["joint"], "joint_position": [0.],
+                                                "locked_joint_positions": {},
+                                                "T_output_robot_base": np.eye(4).tolist(),
+                                                "robot_geometry_source": "synthetic_robot", "robot_spheres": 1,
+                                                "current_spheres_output": [[-1., 0., 0., .05]],
+                                                "link_poses_output": {"tool": np.eye(4).tolist()}}}
+        observed = coverage(occupancy_evidence=evidence)
+        with self.assertRaisesRegex(ValueError, "complete native collision model"):
+            scene(coverage=observed, robot_geometry_source="different_model")
+        world = scene(coverage=observed)
+        self.assertEqual(world.required_robot_links, ("tool",))
+        world.validate_robot_geometry([[-1., 0., 0., .05]], {"tool": np.eye(4)})
+        with self.assertRaisesRegex(ValueError, "collision sphere model disagree"):
+            world.validate_robot_geometry([[-1., 0., 0., .06]], {"tool": np.eye(4)})
+        moved = np.eye(4)
+        moved[0, 3] = .01
+        with self.assertRaisesRegex(ValueError, "link FK disagree"):
+            world.validate_robot_geometry([[-1., 0., 0., .05]], {"tool": moved})
+        problem = PlanningProblem(("joint",), np.zeros(1), np.zeros(1), "tool", "world", np.eye(4), np.eye(4),
+                                  (MotionPhase("move", pose_path(), "free"),))
+        world.validate_problem(problem)
+        problem.start_q[0] = .000001
+        with self.assertRaisesRegex(ValueError, "exact current joint feedback"):
+            world.validate_problem(problem)
+        problem.start_q[0] = 0.
+        problem.base_pose[0, 3] = .000001
+        with self.assertRaisesRegex(ValueError, "same current base calibration"):
+            world.validate_problem(problem)
+        # A binary drive still needs true current finger feedback for this
+        # optional solid evidence; a YAML lock at another width is not it.
+        problem.base_pose[0, 3] = 0.
+        problem.events = (PlanningEvent("cmd", "skill", 0., 0, "close", "synthetic command"),)
+        evidence["robot"]["locked_joint_positions"] = {"finger": .03}
+        binary = scene(coverage=coverage(occupancy_evidence=evidence), gripper=self.gripper(), has_gripper=True)
+        with self.assertRaisesRegex(ValueError, "actual current fingers"):
+            binary.validate_problem(problem)
+        evidence["robot"]["locked_joint_positions"] = {"finger": .04}
+        scene(coverage=coverage(occupancy_evidence=evidence), gripper=self.gripper(), has_gripper=True).validate_problem(problem)
+    # END occupied-interior evidence must preserve collision and state contracts.
+
+    def test_owned_geometry_cannot_remain_in_background_under_another_partition(self):
+        owner = CollisionOwner("part", SphereQuery(("part",)), pose_path(), "measured_part", True)
+        with self.assertRaisesRegex(ValueError, "partitioned"):
+            scene((owner,), background=SphereQuery(("part", "background")))
+
+    def test_moving_owner_inverse_transform_and_progress_gradients(self):
+        query = SphereQuery(("part",), center=(.3, 0., 0.), radius=.1)
+        owner = CollisionOwner("part", query, pose_path(turn=np.pi / 2), "measured_part", True,
+                               local_spheres=[[.3, 0, 0, .1]], moving=True)
+        world = scene((owner,))
+        balls, p, q, s = inputs((1.,), sphere_rows=[[[.02, .4, 0., .08]]])
+        balls.requires_grad_()
+        s.requires_grad_()
+        value = world.components(balls, p, q, s)["collision/robot/part"]
+        value.sum().backward()
+        torch.testing.assert_close(query.calls[("robot", "part")][0, 0, 0, :3],
+                                   torch.tensor([.4, -.02, 0.], dtype=torch.float64), atol=1e-8, rtol=0)
+        self.assertGreater(value.item(), 0)
+        self.assertTrue(torch.isfinite(balls.grad).all())
+        self.assertGreater(balls.grad[..., :3].abs().sum().item(), 0)
+        self.assertTrue(torch.isfinite(s.grad).all())
+        self.assertGreater(s.grad.abs().sum().item(), 0)
+
+    def test_owner_local_path_is_placed_in_declared_global_phase(self):
+        owner = CollisionOwner("part", SphereQuery(("part",)), pose_path(end=(1., 0, 0)),
+                               "measured_part", True, pose_interval=(2., 3.))
+        s = torch.tensor([[1., 2.5, 4.]], dtype=torch.float64)
+        p, _ = owner.predicted_pose(s)
+        torch.testing.assert_close(p[..., 0], torch.tensor([[0., .5, 1.]], dtype=torch.float64))
+
+    def test_local_contact_permission_does_not_remove_palm_or_other_owner(self):
+        target = CollisionOwner("surface", BoxQuery("surface"), pose_path(), "measured_surface", True)
+        allowed = scene((target,), materials=("pad",), contacts=(contact_rule(),))
+        args = inputs(positions=[[0., 0., .009]], sphere_rows=[[[0., 0., .009, .01]]])
+        self.assertLess(allowed.evaluate(*args).item(), 1e-12)
+        outside = list(args)
+        outside[-1] = torch.tensor([[1.2]], dtype=torch.float64)
+        self.assertGreater(allowed.evaluate(*outside).item(), .0009)
+        palm = scene((target,), materials=("pad", None), contacts=(contact_rule(),))
+        palm_args = inputs(positions=[[0., 0., .009]], sphere_rows=[[[0., 0., .009, .01], [.02, 0., .009, .01]]])
+        self.assertGreater(palm.evaluate(*palm_args).item(), .0009)
+        other = CollisionOwner("other", BoxQuery("other"), pose_path(), "other_measurement", True)
+        both = scene((target, other), materials=("pad",), contacts=(contact_rule(),))
+        self.assertGreater(both.evaluate(*args).item(), .0009)
+
+    def test_feature_footprint_and_normal_guard_contact_margin(self):
+        target = CollisionOwner("surface", BoxQuery("surface"), pose_path(), "measured_surface", True)
+        args = inputs(positions=[[0., 0., .009]], sphere_rows=[[[0., 0., .009, .01]]])
+        large = contact_rule(feature_points=[[-.05, -.003, -.01], [.05, -.003, -.01], [.05, .003, -.01], [-.05, .003, -.01]])
+        self.assertGreater(scene((target,), materials=("pad",), contacts=(large,)).evaluate(*args).item(), .0009)
+        backwards = contact_rule(feature_normal=[0, 0, 1])
+        self.assertGreater(scene((target,), materials=("pad",), contacts=(backwards,)).evaluate(*args).item(), .0009)
+        with self.assertRaisesRegex(ValueError, "whole links"):
+            scene((target,), materials=(None,), contacts=(contact_rule(),))
+        with self.assertRaisesRegex(ValueError, "thin-part"):
+            contact_rule(modeling_allowance_m=.006, geometry_error_m=.01, minimum_thickness_m=.01)
+
+    # BEGIN adjacent permissions preserve earlier contact without summing allowances.
+    def test_adjacent_material_permissions_are_order_independent_and_never_stack(self):
+        target = CollisionOwner("surface", BoxQuery("surface"), pose_path(), "measured_surface", True)
+        other = CollisionOwner("other", SphereQuery(("other",)), pose_path(), "other_measurement", True)
+        rules = (contact_rule(rule_id="first_contact", interval=(0., .5), gap_bounds=(-.004, .002)),
+                 contact_rule(rule_id="second_contact", interval=(.5, 1.), gap_bounds=(-.004, .002)))
+        args = inputs(progress=(.25, .5, .75, 1.2), positions=[[0., 0., .009]]*4,
+                      sphere_rows=[[[0., 0., .009, .01]]]*4)
+        for ordered in (rules, rules[::-1]):
+            world = scene((target, other), materials=("pad",), contacts=ordered)
+            values = world.evaluate(*args)
+            torch.testing.assert_close(values[0, :3], torch.zeros(3, dtype=torch.float64))
+            self.assertGreater(values[0, 3].item(), .0009)
+            adjusted = target.query.calls[("robot", "surface")][0, :, 0, 3]
+            torch.testing.assert_close(adjusted, torch.tensor([.008, .008, .008, .01], dtype=torch.float64))
+            # Material permission is scoped to its owner. The same physical
+            # robot retains its complete original radius for every other one.
+            torch.testing.assert_close(other.query.calls[("robot", "other")][..., 3], args[0][..., 3])
+            deep = inputs(progress=(.5,), positions=[[0., 0., .007]],
+                          sphere_rows=[[[0., 0., .007, .01]]])
+            deep[0].requires_grad_()
+            cost = world.evaluate(*deep).sum()
+            self.assertGreater(cost.item(), .0009)
+            cost.backward()
+            self.assertAlmostEqual(deep[0].grad[0, 0, 0, 2].item(), -1.)
+    # END permission-order and non-additive-allowance counterexample.
+
+    def payload_scene(self, *, complete=True, background=None):
+        relation = Attachment((0., 1.), [.3, 0, 0], [1., 0, 0, 0], "observed_grasp_needed", "release_feedback_needed")
+        owner = CollisionOwner("payload", SphereQuery(("payload",), center=(0, 0, 0), radius=.05),
+                               pose_path((.3, 0, 0)), "observed_payload", complete,
+                               local_spheres=[[0, 0, 0, .05]], attachments=(relation,))
+        return scene((owner,), **({} if background is None else {"background": background}))
+
+    def test_release_uses_actual_anchor_and_keeps_gradient_to_release_q(self):
+        background = SphereQuery(("background",), center=(.85, 0, 0), radius=.07)
+        world = self.payload_scene(background=background)
+        balls, p, q, s = inputs((.5, 1., 1.5), positions=[[0., 0, 0], [.5, 0, 0], [1.2, 0, 0]])
+        p.requires_grad_()
+        components = world.components(balls, p, q, s)
+        actual = background.calls[("payload", "background")][..., 0, 0]
+        torch.testing.assert_close(actual, torch.tensor([[.3, .8, .8]], dtype=torch.float64))
+        components["collision/payload/background"][0, -1].backward()
+        self.assertGreater(abs(p.grad[0, 1, 0].item()), .9)
+        self.assertEqual(p.grad[0, 2].abs().sum().item(), 0.)
+        self.assertFalse(any(key.startswith("attachment/boundary") for key in components))
+        self.assertIn("payload", world.describe()["release_requires_evidence"])
+
+    def test_missing_release_anchor_fails_and_search_can_freeze_whole_candidate(self):
+        world = self.payload_scene()
+        balls, p, q, s = inputs((.5, 1.5), positions=[[0., 0, 0], [1., 0, 0]])
+        missing = world.components(balls, p, q, s)["unknown/release_anchor/payload/0"]
+        torch.testing.assert_close(missing, torch.tensor([[0., 1.]], dtype=torch.float64))
+        with self.assertRaisesRegex(ValueError, "exact release"):
+            world.with_fixed_endpoints(p, q, s)
+        _, ep, eq, es = inputs((0., 1.), positions=[[0., 0, 0], [.5, 0, 0]])
+        fixed = world.with_fixed_endpoints(ep, eq, es)
+        args = inputs((1.5,), positions=[[1.2, 0, 0]])
+        fixed.evaluate(*args)
+        torch.testing.assert_close(fixed.background.calls[("payload", "background")][..., 0, 0],
+                                   torch.tensor([[.8]], dtype=torch.float64))
+        self.assertIsNot(fixed.background, world.background)
+        self.assertFalse(world._fixed_release_poses)
+
+    def test_payload_keeps_noncontact_robot_collision_and_partial_cover_unknown(self):
+        world = self.payload_scene()
+        args = inputs((.5, 1.), positions=[[0., 0, 0], [0., 0, 0]],
+                      sphere_rows=[[[.32, 0, 0, .04]], [[.32, 0, 0, .04]]])
+        self.assertGreater(world.components(*args)["collision/robot/payload"].min().item(), .06)
+        partial = self.payload_scene(complete=False)
+        self.assertEqual(partial.components(*args)["unknown/owner/payload"].min().item(), 1.)
+
+    def test_place_regrasp_carry_shares_each_previous_release_state(self):
+        first = Attachment((0., 1.), [.3, 0, 0], [1., 0, 0, 0], "grasp1", "release1")
+        second = Attachment((2., 3.), [.2, 0, 0], [1., 0, 0, 0], "grasp2", "release2")
+        owner = CollisionOwner("payload", SphereQuery(("payload",)), pose_path((.3, 0, 0)),
+                               "observed_payload", True, local_spheres=[[0, 0, 0, .05]],
+                               attachments=(first, second))
+        world = scene((owner,))
+        args = inputs((0., .5, 1., 1.5, 2., 2.5, 3., 3.5),
+                      positions=[[0., 0, 0], [.2, 0, 0], [.5, 0, 0], [-.1, 0, 0],
+                                 [.6, 0, 0], [1., 0, 0], [1.2, 0, 0], [1.8, 0, 0]])
+        terms = world.components(*args)
+        actual = world.background.calls[("payload", "background")][..., 0, 0]
+        torch.testing.assert_close(actual, torch.tensor([[.3, .5, .8, .8, .8, 1.2, 1.4, 1.4]], dtype=torch.float64))
+        self.assertEqual(terms["attachment/start/payload/1"].sum().item(), 0.)
+        # A second grasp cannot reset the same owner to its initial .3 m pose.
+        bad = list(args)
+        bad[1] = args[1].clone()
+        bad[1][0, 4, 0] = .1
+        self.assertGreater(world.components(*bad)["attachment/start/payload/1"][0, 4].item(), .49)
+        frozen = world.with_fixed_endpoints(args[1], args[2], args[3])
+        later = inputs((2.5,), positions=[[1., 0, 0]])
+        frozen.components(*later)
+        self.assertEqual(len(frozen._fixed_release_poses), 2)
+        self.assertEqual(world.required_progress_anchors, (0., 1., 2., 3.))
+
+    def test_attachment_start_has_separate_numerical_pose_tolerances(self):
+        world = self.payload_scene()
+        args = inputs((0., 1.), positions=[[.00001, 0, 0], [0, 0, 0]])
+        terms = world.components(*args)
+        self.assertEqual(terms["attachment/start/payload/0"].sum().item(), 0.)
+        bad = list(args)
+        bad[1] = args[1].clone()
+        bad[1][0, 0, 0] = .002
+        self.assertGreater(world.components(*bad)["attachment/start/payload/0"][0, 0].item(), .0018)
+
+    def test_fp32_release_anchor_is_matched_before_any_precision_conversion(self):
+        anchor = 17 + 1 / 3
+        relation = Attachment((17., anchor), [.3, 0, 0], [1., 0, 0, 0], "grasp", "release")
+        owner = CollisionOwner("payload", SphereQuery(("payload",)), pose_path((.3, 0, 0)),
+                               "observed_payload", True, local_spheres=[[0, 0, 0, .05]],
+                               attachments=(relation,))
+        world = scene((owner,))
+        args = inputs((17., anchor), positions=[[0., 0, 0], [.5, 0, 0]], dtype=torch.float32)
+        fixed = world.with_fixed_endpoints(args[1], args[2], args[3])
+        self.assertEqual(len(fixed._fixed_release_poses), 1)
+        result = fixed.components(*inputs((18.,), positions=[[1., 0, 0]], dtype=torch.float32))
+        self.assertFalse(any(key.startswith("unknown/release_anchor") for key in result))
+
+    def test_overlapping_attachment_cycles_are_rejected(self):
+        a = Attachment((0., 2.), [.3, 0, 0], [1., 0, 0, 0], "first", "release1")
+        b = Attachment((1., 3.), [.2, 0, 0], [1., 0, 0, 0], "second", "release2")
+        with self.assertRaisesRegex(ValueError, "cannot overlap"):
+            CollisionOwner("payload", SphereQuery(("payload",)), pose_path(), "observation", True,
+                           local_spheres=[[0, 0, 0, .05]], attachments=(a, b))
+
+    def gripper(self, controller="binary", tolerance=1e-5):
+        def bounds(progress):
+            value = progress.new_full((*progress.shape, 1), .04)
+            return value, value
+        return PrismaticGripper(
+            controller=controller, joint_names=("finger",), current_positions=[.04], joint_limits=[[0, .04]],
+            joint_bounds=bounds if controller == "position_tracking" else None,
+            coupling_matrix=np.zeros((0, 1)), coupling_offset=[], sphere_indices=(0,),
+            local_spheres=[[0, 0, 0, .005]], sphere_joint_translation=[[[1.], [0.], [0.]]],
+            self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "cmd", "command": "close", "progress": 0.}],
+            source="synthetic_drive_and_tool", numerical_joint_tolerance=tolerance)
+
+    def test_binary_continuous_envelope_catches_collision_between_open_and_closed(self):
+        background = SphereQuery(("background",), center=(.012, 0., 0.), radius=.001)
+        world = scene(gripper=self.gripper(), has_gripper=True, background=background)
+        args = inputs((0., .5), sphere_rows=[[[.04, 0, 0, .005]], [[.04, 0, 0, .005]]])
+        terms = world.components(*args)
+        self.assertEqual(terms["collision/robot/background"][0, 0].item(), 0.)
+        self.assertGreater(terms["collision/robot/background"][0, 1].item(), .01)
+        self.assertIn("time-independent", world.describe()["gripper_timing_contract"])
+        # Neither endpoint sphere intersects this obstacle; the swept interval does.
+        endpoints = torch.tensor([[[[0, 0, 0, .005], [.04, 0, 0, .005]]]], dtype=torch.float64)
+        self.assertEqual(background(endpoints, key="endpoint_only").sum().item(), 0.)
+
+    def test_tracking_commands_and_coupling_use_separate_numerical_tolerance(self):
+        hand = self.gripper("position_tracking")
+        s = torch.tensor([[.5]], dtype=torch.float32)
+        _, _, small = hand.state(s, torch.tensor([[[.0400001]]]), ("finger",))
+        self.assertEqual(small.item(), 0.)
+        _, _, changed = hand.state(s, torch.tensor([[[.02]]]), ("finger",))
+        self.assertGreater(changed.item(), .019)
+        with self.assertRaisesRegex(ValueError, "named solver joints"):
+            hand.state(s, None, None)
+
+    def test_tracking_preference_keeps_driving_to_command_without_changing_acceptance(self):
+        hand = self.gripper("position_tracking")
+        world = scene(gripper=hand, has_gripper=True)
+        s = torch.tensor([[.5]], dtype=torch.float64)
+        q = torch.tensor([[[.039998]]], dtype=torch.float64, requires_grad=True)
+        self.assertEqual(hand.state(s, q, ("finger",))[2].item(), 0.)
+        objective = world.optimizer_preferences(s, q, ("finger",))
+        self.assertGreater(objective.item(), 0.)
+        objective.sum().backward()
+        self.assertLess(q.grad.item(), 0.)
+        self.assertEqual(world.optimizer_preferences(s, q.detach().new_full(q.shape, .04), ("finger",)).item(), 0.)
+        self.assertEqual(scene().optimizer_preferences(s, q, ("finger",)).item(), 0.)
+        binary = scene(gripper=self.gripper("binary"), has_gripper=True)
+        self.assertEqual(binary.optimizer_preferences(s, q, ("finger",)).item(), 0.)
+
+    def test_tracking_projection_preserves_gradients_without_repeating_coupling(self):
+        hand = PrismaticGripper(
+            controller="position_tracking", joint_names=("left", "right"),
+            current_positions=[.02, -.02], joint_limits=[[0, .04], [-.04, 0]],
+            joint_bounds=lambda s: (s.new_tensor([.02, -.02]).expand(*s.shape, 2),
+                                    s.new_tensor([.02, -.02]).expand(*s.shape, 2)),
+            coupling_matrix=[[1., 1.]], coupling_offset=[0.], sphere_indices=(0,),
+            local_spheres=[[0, 0, 0, .005]], sphere_joint_translation=[[[1., 0], [0., 0], [0., 0]]],
+            self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "drive", "command": "hold", "progress": 0.}],
+            source="synthetic_coupled_native_drive")
+        world = scene(gripper=hand, has_gripper=True)
+        q = torch.tensor([[[.03, -.03]]], dtype=torch.float64, requires_grad=True)
+        residual = world.project_residual(torch.tensor([[.5]], dtype=torch.float64), q, ("left", "right"))
+        self.assertEqual(residual.shape, (1, 1, 1))
+        self.assertGreater(residual.abs().item(), .014)
+        residual.sum().backward()
+        self.assertAlmostEqual(q.grad.sum().item(), 0.)
+        self.assertEqual(world.describe()["gripper_projection_dimension"], 1)
+
+    def test_required_contact_with_uncertain_fingers_is_explicitly_unknown(self):
+        target = CollisionOwner("surface", BoxQuery("surface"), pose_path(), "measured_surface", True)
+        rule = contact_rule(required=True,
+                            feature_joint_translation=np.tile(np.array([[[1.], [0.], [0.]]]), (4, 1, 1)))
+        world = scene((target,), materials=("pad",), contacts=(rule,), gripper=self.gripper(), has_gripper=True)
+        args = inputs(positions=[[0., 0., .1]], sphere_rows=[[[.02, 0., .1, .005]]])
+        result = world.components(*args)
+        self.assertEqual(result["unknown/contact/pad_to_surface"].item(), 1.)
+
+    # BEGIN paired geometric successes for moving closure, carried support and new observations.
+    def test_tracking_closes_while_tool_moves_and_keeps_material_permission_local(self):
+        def command(progress):
+            width = (.04-.03*progress)[..., None]
+            return width, width
+        hand = PrismaticGripper(
+            controller="position_tracking", joint_names=("finger",), current_positions=[.04],
+            joint_limits=[[0., .04]], joint_bounds=command, coupling_matrix=np.zeros((0, 1)), coupling_offset=[],
+            sphere_indices=(0,), local_spheres=[[0., 0., 0., .005]],
+            sphere_joint_translation=[[[0.], [0.], [1.]]], self_collision_pairs=(),
+            commands=[{"skill_id": "moving_close", "event_id": "close", "command": "close", "progress": 0.}],
+            source="explicit affine finger model and position-tracking command")
+        target = CollisionOwner("surface", BoxQuery("surface"), pose_path(), "known test surface", True)
+        rule = contact_rule(feature_points=[[-.003, -.003, -.005], [.003, -.003, -.005],
+                                             [.003, .003, -.005], [-.003, .003, -.005]],
+                            feature_joint_translation=np.tile(np.array([[[0.], [0.], [1.]]]), (4, 1, 1)))
+        world = scene((target,), materials=("pad",), contacts=(rule,), gripper=hand, has_gripper=True)
+        args = inputs((0., .25, .5, .75, 1.), positions=[[-.02+.02*s, 0., -.006] for s in (0., .25, .5, .75, 1.)])
+        joints = command(args[-1])[0]
+        self.assertLess(world.evaluate(*args, joint_position=joints, joint_names=("finger",)).max().item(), 1e-12)
+        actual = world.background.calls[("robot", "background")][0, :, 0, :3]
+        self.assertGreater(float(torch.diff(actual[:, 0]).min()), 0.)
+        self.assertLess(float(torch.diff(actual[:, 2]).max()), 0.)
+        # The same moving closure fails without the finite material patch;
+        # a separate obstacle on the intermediate sweep also remains active.
+        unpermitted = scene((target,), materials=("pad",), gripper=hand, has_gripper=True)
+        self.assertGreater(unpermitted.evaluate(*args, joint_position=joints, joint_names=("finger",))[0, -1].item(), .0009)
+        blocked = scene((target,), materials=("pad",), contacts=(rule,), gripper=hand, has_gripper=True,
+                        background=SphereQuery(("background",), center=(-.01, 0., .019), radius=.002))
+        self.assertGreater(blocked.evaluate(*args, joint_position=joints, joint_names=("finger",))[0, 2].item(), .006)
+
+    def test_carried_payload_can_reach_its_support_patch_but_environment_is_still_checked(self):
+        relation = Attachment((0., 1.), [.3, 0., 0.], [1., 0., 0., 0.], "conditional_grasp", None)
+        payload = CollisionOwner("payload", SphereQuery(("payload",), center=(0., 0., 0.), radius=.01),
+                                 pose_path((.3, 0., .1)), "complete synthetic payload sphere", True,
+                                 local_spheres=[[0., 0., 0., .01]], sphere_materials=("bottom",),
+                                 attachments=(relation,))
+        support = CollisionOwner("surface", BoxQuery("surface"), pose_path(), "known finite support", True)
+        permission = contact_rule(actor="payload", material_id="bottom", patch_origin=[.3, 0., 0.])
+        world = scene((payload, support), contacts=(permission,))
+        args = inputs((0., .5, 1.), positions=[[0., 0., .1], [0., 0., .06], [0., 0., .009]])
+        self.assertLess(world.evaluate(*args).max().item(), 1e-12)
+        unpermitted = scene((payload, support))
+        self.assertGreater(unpermitted.evaluate(*args)[0, -1].item(), .0009)
+        blocked = scene((payload, support), contacts=(permission,),
+                        background=SphereQuery(("background",), center=(.3, 0., .06), radius=.006))
+        self.assertGreater(blocked.components(*args)["collision/payload/background"][0, 1].item(), .015)
+
+    def test_new_calibrated_view_makes_the_same_free_trajectory_observed_and_feasible(self):
+        from manipulation.planning_observation import observed_space_from_rgbd
+        first_depth, second_depth = np.full((96, 96), 2.), np.full((96, 96), 2.)
+        first_depth[35:61, 35:61] = 0.
+        matrix = np.array([[60., 0., 47.5], [0., 60., 47.5], [0., 0., 1.]])
+        first = {"depth": first_depth, "K": matrix, "T_output_camera": np.eye(4), "reference_frame": "world"}
+        second_pose = np.eye(4)
+        second_pose[0, 3] = .3
+        second = {"depth": second_depth, "K": matrix, "T_output_camera": second_pose, "reference_frame": "world"}
+        def observed(views):
+            return observed_space_from_rgbd(views, origin=[-.5, -.5, .2], shape=(45, 21, 21),
+                                              voxel_size=.05, depth_error_m=.01, reference_frame="world", depth_range_m=(.1, 3.))
+        args = inputs((0., .25, .5, .75, 1.),
+                      sphere_rows=[[[x, 0., 1., .02]] for x in (-.12, -.06, 0., .06, .12)])
+        missing = scene(coverage=observed({"first_current_camera": first}))
+        self.assertGreater(missing.components(*args)["unknown/space/robot"].max().item(), .019)
+        complete = scene(coverage=observed({"first_current_camera": first, "second_current_camera": second}))
+        self.assertLess(complete.evaluate(*args).max().item(), 1e-12)
+        self.assertEqual(complete.coverage.observation_ids, ("first_current_camera", "second_current_camera"))
+        np.testing.assert_array_equal(first_depth[35:61, 35:61], np.zeros((26, 26)))
+    # END paired geometric successes; these CPU proxies are not robot planning certificates.
+
+    def test_cache_work_estimate_grows_with_horizon_and_payload_partitions(self):
+        plain, payload = scene(), self.payload_scene()
+        self.assertGreater(plain.estimated_workspace_bytes(2, 32), plain.estimated_workspace_bytes(1, 8))
+        self.assertGreater(payload.estimated_workspace_bytes(2, 32), plain.estimated_workspace_bytes(2, 32))
+
+    # BEGIN scene/problem binding counterexamples, independent of GPU kernels.
+    def bound_payload(self):
+        initial, attachment = np.eye(4), np.eye(4)
+        initial[0, 3], attachment[0, 3] = .3, -.3
+        relation = Attachment((0., 1.), [.3, 0, 0], [1., 0, 0, 0], "observed_holding", None)
+        owner = CollisionOwner("payload", SphereQuery(("payload",)), pose_path((.3, 0, 0)),
+                               "current_observation", True, local_spheres=[[0, 0, 0, .05]], attachments=(relation,))
+        phase = MotionPhase("held", pose_path(), metadata={
+            "mode": "held", "carrier_id": "payload", "owner_initial_pose": initial,
+            "attachment": attachment, "attachment_interval": [0., 1.],
+            "attachment_condition_id": "observed_holding", "release_condition_id": None})
+        problem = PlanningProblem(("arm",), np.zeros(1), np.zeros(1), "tool", "world", np.eye(4), np.eye(4),
+                                  (phase,), conditions=({"kind": "observed_attachment", "carrier_id": "payload",
+                                                        "condition_id": "observed_holding", "progress": 0.},))
+        return scene((owner,)), problem
+
+    def test_bound_payload_cannot_be_omitted_or_changed_to_evade_collision(self):
+        world, problem = self.bound_payload()
+        world.validate_problem(problem)
+        self.assertNotIn("payload", world.describe()["release_requires_evidence"])
+        with self.assertRaisesRegex(ValueError, "explicit owner"):
+            scene().validate_problem(problem)
+        owner = world.owners[0]
+        owner.attachments = (replace(owner.attachments[0], position_tool_owner=[.2, 0, 0]),)
+        with self.assertRaisesRegex(ValueError, "attachment transform"):
+            world.validate_problem(problem)
+        world, problem = self.bound_payload()
+        world.owners[0].pose_path = pose_path((.4, 0, 0))
+        with self.assertRaisesRegex(ValueError, "initial observed pose"):
+            world.validate_problem(problem)
+
+    def test_window_end_holding_follows_each_fk_while_real_release_freezes_first(self):
+        world, _ = self.bound_payload()
+        args = inputs((1., 1.), positions=[[0., 0., 0.], [.2, 0., 0.]])
+        world.components(*args)
+        actual = world.background.calls[("payload", "background")][..., 0, 0]
+        torch.testing.assert_close(actual, actual.new_tensor([[.3, .5]]))
+        # No real release means search can evaluate a subpath without asking
+        # for the artificial window end as a frozen physical event.
+        subset = inputs((.5,), positions=[[.1, 0., 0.]])
+        fixed = world.with_fixed_endpoints(subset[1], subset[2], subset[3])
+        self.assertFalse(fixed._fixed_release_poses)
+        self.assertFalse(any(key.startswith("unknown/release_anchor") for key in fixed.components(*subset)))
+        owner = world.owners[0]
+        owner.attachments = (replace(owner.attachments[0], release_condition_id="actual_release"),)
+        world.components(*args)
+        actual = world.background.calls[("payload", "background")][..., 0, 0]
+        torch.testing.assert_close(actual, actual.new_tensor([[.3, .3]]))
+
+    def test_attachment_requires_exact_span_condition_and_real_release_boundary(self):
+        world, problem = self.bound_payload()
+        world.owners[0].attachments = (replace(world.owners[0].attachments[0], interval=(0., .8)),)
+        with self.assertRaisesRegex(ValueError, "attachment span"):
+            world.validate_problem(problem)
+        world, problem = self.bound_payload()
+        world.owners[0].attachments = (replace(world.owners[0].attachments[0], condition_id="invented"),)
+        with self.assertRaisesRegex(ValueError, "condition IDs"):
+            world.validate_problem(problem)
+        world, problem = self.bound_payload()
+        problem.phases += (MotionPhase("later", pose_path(), "free"),)
+        with self.assertRaisesRegex(ValueError, "window boundary"):
+            world.validate_problem(problem)
+        world, problem = self.bound_payload()
+        problem.conditions += ({"kind": "predicted_release", "carrier_id": "payload", "progress": 1.,
+                                "condition_id": "required_release"},)
+        with self.assertRaisesRegex(ValueError, "real release condition"):
+            world.validate_problem(problem)
+
+    def test_unattached_task_carrier_cannot_move_away_and_return(self):
+        world, problem = self.bound_payload()
+        owner = world.owners[0]
+        owner.attachments = ()
+        initial = problem.phases[0].metadata["owner_initial_pose"]
+        problem.phases = (MotionPhase("grasp", pose_path(), metadata={
+            "mode": "grasp", "carrier_id": "payload", "owner_initial_pose": initial}),)
+        poses = np.repeat(initial[None], 3, axis=0)
+        poses[1, 1, 3] = .4
+        owner.pose_path = PosePath(np.array([0., .5, 1.]), poses, "independent altered obstacle path")
+        with self.assertRaisesRegex(ValueError, "unattached task-carrier pose"):
+            world.validate_problem(problem)
+
+    def test_gripper_events_require_same_skill_and_native_joint_feedback(self):
+        event = PlanningEvent("cmd", "skill", 0., 0, "close", "original_command")
+        problem = PlanningProblem(("finger",), np.array([.04]), np.zeros(1), "tool", "world", np.eye(4), np.eye(4),
+                                  (MotionPhase("free", pose_path()),), events=(event,))
+        with self.assertRaisesRegex(ValueError, "skill/event/command/progress"):
+            scene().validate_problem(problem)
+        hand = self.gripper("position_tracking")
+        world = scene(gripper=hand, has_gripper=True)
+        world.validate_problem(problem)
+        hand.commands = ({**hand.commands[0], "skill_id": "another_instance"},)
+        with self.assertRaisesRegex(ValueError, "skill/event/command/progress"):
+            world.validate_problem(problem)
+        hand.commands = ({**hand.commands[0], "skill_id": "skill"},)
+        problem.start_q[0] = .02
+        with self.assertRaisesRegex(ValueError, "current native feedback"):
+            world.validate_problem(problem)
+
+    def test_tracking_drive_projection_cannot_omit_problem_coupling(self):
+        hand = PrismaticGripper(
+            controller="position_tracking", joint_names=("left", "right"),
+            current_positions=[.02, -.02], joint_limits=[[0, .04], [-.04, 0]],
+            joint_bounds=lambda s: (s.new_tensor([.02, -.02]).expand(*s.shape, 2),
+                                    s.new_tensor([.02, -.02]).expand(*s.shape, 2)),
+            coupling_matrix=[[1., 1.]], coupling_offset=[0.], sphere_indices=(0,),
+            local_spheres=[[0, 0, 0, .005]], sphere_joint_translation=[[[1., 0], [0., 0], [0., 0]]],
+            self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "drive", "command": "hold", "progress": 0.}],
+            source="actual_native_coupling")
+        event = PlanningEvent("drive", "skill", 0., 0, "hold", "original_command")
+        problem = PlanningProblem(("left", "right"), np.array([.02, -.02]), np.zeros(2), "tool", "world",
+                                  np.eye(4), np.eye(4), (MotionPhase("free", pose_path()),), events=(event,))
+        world = scene(gripper=hand, has_gripper=True)
+        with self.assertRaisesRegex(ValueError, "A q=b"):
+            world.validate_problem(problem)
+        problem.couplings = (JointCoupling(("right", "left"), np.array([[1., 1.]]), np.array([0.]), "actual_native_coupling"),)
+        world.validate_problem(problem)
+        problem.couplings[0].matrix[0, 1] = 2.
+        with self.assertRaisesRegex(ValueError, "A q=b"):
+            world.validate_problem(problem)
+    # END scene/problem binding counterexamples, independent of GPU kernels.
+
+
+class MutableKernel(torch.autograd.Function):
+    """Match V2's mutable precomputed-gradient buffer contract on CPU."""
+    @staticmethod
+    def forward(ctx, spheres, buffer):
+        buffer.distance.copy_(spheres[..., 0].square())
+        buffer.gradient.zero_()
+        buffer.gradient[..., 0] = 2 * spheres[..., 0]
+        ctx.save_for_backward(buffer.gradient)
+        return buffer.distance
+
+    @staticmethod
+    def backward(ctx, output_gradient):
+        (gradient,) = ctx.saved_tensors
+        return gradient * output_gradient[..., None], None
+
+
+class RawQuery:
+    device_cfg = SimpleNamespace(device=torch.device("cpu"), collision_distance_dtype=torch.float32,
+                                 collision_gradient_dtype=torch.float32,
+                                 is_same_torch_device=lambda device: device == torch.device("cpu"))
+
+    def get_sphere_distance_raw(self, spheres, buffer, weight, activation, return_loss):
+        assert return_loss
+        return MutableKernel.apply(spheres, buffer)
+
+
+class CuroboQueryWorkspaceTest(unittest.TestCase):
+    def test_reused_kernel_buffers_cannot_overwrite_unbackpropagated_queries(self):
+        query = CuroboSphereQuery(RawQuery(), owner_ids=("fixture",), source="test_kernel_contract")
+        first = torch.tensor([[[[.2, 0, 0, .1]]]], requires_grad=True)
+        second = torch.tensor([[[[-.6, 0, 0, .1]]]], requires_grad=True)
+        a, b = query(first, key="same"), query(second, key="same")
+        (3*a + 2*b).sum().backward()
+        self.assertAlmostEqual(a.item(), .04, places=6)
+        self.assertAlmostEqual(first.grad[0, 0, 0, 0].item(), 1.2, places=6)
+        self.assertAlmostEqual(second.grad[0, 0, 0, 0].item(), -2.4, places=6)
+        cloned = query.clone_for_rollout()
+        self.assertFalse(cloned._buffers)
+        self.assertIs(cloned.scene_collision, query.scene_collision)
+
+    def test_total_cache_byte_cap_prevents_accumulating_many_query_shapes(self):
+        query = CuroboSphereQuery(RawQuery(), owner_ids=("fixture",), source="test_kernel_contract", max_cache_bytes=28)
+        value = torch.tensor([[[[.2, 0, 0, .1]]]])
+        query(value, key="first")
+        with self.assertRaisesRegex(ValueError, "total query cache"):
+            query(value, key="second")
+
+
+if __name__ == "__main__":
+    unittest.main()
+# END CPU scene ownership, contact, release and coverage regression tests.

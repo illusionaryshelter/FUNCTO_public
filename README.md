@@ -928,3 +928,131 @@ release/retreat semantics are preserved. `robot_execution_verified` remains
 false: this module does not add cuRobo/OMPL, whole-robot collision, trajectory
 optimization or proof of complete `inside`/physical execution.
 <!-- END production projective registration screening and selected trajectory. -->
+
+<!-- BEGIN complete-window constrained robot planning. -->
+### Plan a robot trajectory for grounded skills
+
+Grounding produces the interaction requirements and geometric reference.
+`manipulation.planning.plan_trajectory` uses cuRobo V2 to solve one joint
+trajectory through the current skill and its known successors. Required local
+motion, functional events, joint limits, self collision and scene constraints
+participate in generation. When needed, OMPL searches ordinary or constrained
+`(q, progress)` connections and supplies an initializer for another complete
+cuRobo optimization.
+
+| Module | Responsibility |
+|---|---|
+| `planning_problem` | Compile grounded skill instances, required motion, functional freedom, original events and actual/conditional attachment evidence |
+| `planning_scene` | Share observed-space, owner, contact, payload and gripper constraints across optimization, search and final checks |
+| `planning_observation` | Convert calibrated current RGB-D and explicit pixel masks into owner-separated native Mapper fields and conservative coverage |
+| `planning` | Bound native work, solve the complete window, refine failing samples and export the verified cubic joint curve |
+
+```python
+from manipulation.planning_problem import build_planning_problem
+from manipulation.planning import PlanningBudget, plan_trajectory
+
+problem = build_planning_problem(
+    skill_instances,  # [{skill_id, program, scene, barrier_can_stop}, ...]
+    joint_names=joint_names,
+    start_q=measured_joint_positions,
+    start_dq=measured_joint_velocities,
+    tool_link=robot_tool_link,
+    reference_frame=planning_frame,
+    base_pose=T_reference_robot_base,
+    tool_transform=T_link_tool,
+    couplings=actual_joint_couplings,
+)
+result = plan_trajectory(
+    problem, collision_scene, robot_config,
+    budget=PlanningBudget(knots=12, interpolation_buffer_size=768),
+)
+if result.success:
+    curve = result.trajectory
+    q, dq, progress = curve.sample(controller_sample_times)
+    # Execution requires actual evidence before crossing this boundary.
+    permitted_end_time = curve.executable_until
+    next_evidence = curve.next_verification
+```
+
+Each skill instance supplies an existing compiled `program` and its current
+bound grounding `scene`. All entries share an explicit tool and planning frame.
+The builder binds successor initial states to preceding predicted boundaries;
+it never fills actual Holding evidence from a proposed grasp. A requested
+grasp/release evidence barrier requires `barrier_can_stop=True` and a zero
+velocity condition at that boundary. Rebind the remaining window after actual
+feedback establishes or changes the attachment.
+
+The robot YAML/configuration, active joint names, measured state, base transform
+and link-to-TCP calibration are mandatory. `collision_scene` must be a
+`PlanningScene` with the actual robot sphere identities, observed-space coverage,
+background and separately identified moving/contact owners. Owner attachment
+intervals, transforms, condition IDs and original gripper commands must agree
+with the problem. Dedicated material contact proxies can receive bounded local
+allowances; complete targets and whole finger links are not removed to permit
+contact. An actuated hand requires its measured coordinates, actual drive
+coupling, controller capability and calibrated geometry. Position tracking uses
+the supplied executable command path; binary control uses a conservative
+mechanical envelope and may therefore remain uncertified.
+
+For position tracking, optimization also aims at the supplied command inside
+its allowed tracking band. The final check still uses that original band.
+Declared verification stops similarly target zero velocity. Pose preferences
+only target finite, equal source bounds and retain their actual functional
+endpoint and release-frame dependence. Finite-width and unbounded pose axes
+receive no invented center; numerical tolerances and final residuals stay
+separate from these optimizer objectives.
+Every returned trajectory seed is checked independently using its own active
+joint layout, final time step, valid sample count and original events; one
+candidate cannot inherit another candidate's feasibility or timing.
+
+With two trajectory seeds, native IK evaluates the declared candidate budget
+and retains two distinct continuous chains when available. Temporary merging
+does not prevent later separation. If nominal IK fails or the complete chains
+coincide, the second initializer uses the measured state, allowing the full
+optimizer to find an admissible functional endpoint family. Diagnostics report
+the actual initializer strategies and distinct candidate counts.
+These counts describe numerical joint separation within the requested budget;
+equivalent full-turn representations do not establish different arm geometry
+or exhaustive physical branch coverage.
+
+Phase progress uses a bounded scalar clock in the native cubic basis, including
+the explicitly permitted verification stops. Original motion vertices, event
+identities and search-path pauses retain their progress values. The same clock
+maps search-path joints into control initializers; it never replaces measured
+initial velocity. A control horizon too small for the required stops is rejected
+before solver allocation.
+
+`build_scene_from_rgbd` takes identified current views containing aligned
+`image`, metric camera-z `depth`, rectified `K`, `T_output_camera`,
+`reference_frame`, disjoint `owner_masks` and an explicit `robot_mask`.
+`owner_frames` supplies each observed `T_output_owner` and its source; the
+native `MapperCfg` supplies bounded mapping volumes and resolution. Ray
+coverage is computed independently from the original depth. Hidden surfaces,
+occlusion and surface uncertainty remain unknown. This adapter supplies partial
+owner geometry; rigid payload coverage and contact precision require their own
+evidence.
+
+Observed space includes both observed free space and evidenced current solid
+interiors. Optional `known_solids` can add cells wholly inside a verified
+physical solid or verified inner solid after accounting for geometry and pose
+error. It requires explicit geometry provenance and a current observed owner
+pose or synchronized `current_robot` feedback. Robot evidence is checked
+against the planner's actual FK, locked joints and collision model. Outer
+collision proxies, partial reconstructions, watertightness alone and future
+predicted poses cannot establish solid occupancy. Added occupied coverage
+keeps every collision check active; unobserved exterior gaps remain unknown.
+
+Success requires both native acceptance and independent checks of the exported
+curve. Planning uses the request's `maximum_trajectory_dt` as both native time
+bounds: feasibility is solved at one declared time step, preserving measured
+boundary velocities and evidence stops. The result reports its actual exported
+duration; it does not claim minimum duration. The same `sample(t)` defines downstream positions, velocities and phase
+progress; do not add an unchecked interpolation. Original event identities,
+conditions, numerical residuals and the first evidence barrier accompany the
+curve. Diagnostics separate task measurements from numerical tolerances and
+report search/resource failures. A failed bounded solve returns no executable
+trajectory and does not establish physical impossibility. Discrete sphere and
+observed-space checks do not certify unseen geometry, arbitrary continuous
+contact dynamics or real robot execution. Importing these modules does not
+create a robot connection or run GPU solvers.
+<!-- END complete-window constrained robot planning. -->
