@@ -228,6 +228,53 @@ intervals are retained as demonstration evidence, not returned as transferable
 robot commands.
 <!-- END native articulation coordinate goals. -->
 
+<!-- BEGIN offline interaction references drive runtime semantic observation. -->
+Compiled grounding skills live under `../collect/skills/<episode>/<segment>/`.
+They contain the demonstrated program, calibrated source evidence, reviewed
+functional geometry and the actual offline VLM semantic record. The runtime
+entry reads its SAM query from that record; experiment scripts do not choose a
+different object/part phrase or rewrite the skill description.
+
+```python
+from manipulation.skill import load_grounding_skill, observe_interaction_reference
+
+skill = load_grounding_skill(skill_directory)
+observation = observe_interaction_reference(
+    skill, current_instruction,
+    {"camera": {"image": current_rgb}},
+)
+decision = observation["selection"]["views"]["camera"]
+# Preserve unresolved/alternative decisions. Pass selected masks to the
+# existing geometry consumer declared by skill["manifest"]["geometry_kind"].
+```
+
+`skill.json` uses schema `functo.grounding_skill.1`, `owner_role` (`carrier` or
+`reference`), and `geometry_kind` (`query_frame`, `vertices` or
+`protruding_line`). Its `files` mapping names bundle-relative `semantic`,
+`template`, `program`, `observations` and `image` files. `protruding_line` also
+requires a `geometry` JSON attachment; its observed source front-surface mask
+can be stored in the NPZ observations. All payloads stay inside the bundle.
+Provenance paths are retained as records and are never opened by this loader.
+
+`semantic.json` is the corresponding offline owner's unmodified record:
+`object_description`, `interaction_part_description`, `description`, `reason`
+and `interaction_reference={"text": noun_phrase, "scope": "object" | "part"}`.
+Object scope selects an owner mask. Part scope selects a functional component
+with the explicit runtime scope `interaction_reference`; its mask can exceed
+the demonstrated contact patch and does not become an owner mask. Current
+owner evidence remains a separate observation when a later consumer needs it.
+No missing part detection triggers an automatic object-query substitution.
+
+`load_grounding_skill` returns `manifest`, `semantic`, `program`,
+`source_template` and `geometry` (or `None`). It injects offline semantics into
+the in-memory source template and rejects duplicate handwritten semantics in
+the geometry file. Only query-frame geometry retains reviewed query pixels,
+their descriptions and the frame recipe. Vertex and protruding-line consumers
+must not inherit discarded three-point roles. The demonstrated grasp poses,
+timeline and numerical geometry consumers are unchanged. This integration does
+not claim that reviewed geometric annotations have become automatic extraction.
+<!-- END offline artifact to runtime observation contract. -->
+
 <!-- BEGIN generic semantic selection before geometric binding. -->
 `manipulation.selection.select_grounding_candidates` automatically assembles one
 VLM request from an existing demonstration template, the **current instruction**,

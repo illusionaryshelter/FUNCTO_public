@@ -31,6 +31,18 @@ _SELECTION_INSTRUCTION = (
     "a whole object is not a precise interaction-region mask. Source query descriptions "
     "can mention surrounding geometry used for directions: these are contextual "
     "witnesses, not additional interaction targets and need not fit inside the red mask.\n"
+    # BEGIN offline-selected detection references are distinct from contact masks.
+    "interaction_reference means the functional COMPONENT named in "
+    "source_evidence.interaction_reference.text. The red source contact evidence "
+    "helps identify this component but does not define its complete segmentation. "
+    "The selected component may extend beyond that contact patch; it must belong "
+    "to the rigid owner described by object_description and preserve the demonstrated "
+    "interaction_part_description under the current instruction. Do not substitute "
+    "an entire enclosing owner or a different independently moving part. Do not "
+    "require a complete current owner mask before selecting a visibly supported "
+    "component. A component selection does not certify the exact grasp point, "
+    "all contact pixels, a grasp pose or geometric feasibility.\n"
+    # END explicit component-level grounding reference.
     # BEGIN local visible evidence is neither a whole owner nor a contact mask.
     "owner_evidence instead means visible geometric evidence belonging to ONE "
     "target rigid entity, whose source evidence is marked GREEN. The source green "
@@ -50,7 +62,7 @@ _SELECTION_INSTRUCTION = (
     "provided IDs within that view; equal IDs in different views do not establish "
     "physical correspondence. Images from other supplied views may provide context, "
     "but do not invent a mask in a view without a candidate.\n"
-    "For owner or interaction_region, return candidate_ids as: one ID for a uniquely supported match; "
+    "For owner, interaction_region or interaction_reference, return candidate_ids as: one ID for a uniquely supported match; "
     "multiple IDs only if EVERY listed candidate independently satisfies the current "
     "semantic request, so choosing any is allowed; [] when no supplied candidate "
     "matches; null when evidence cannot resolve which candidate meets the request. "
@@ -82,8 +94,11 @@ _SELECTED_OWNER_INSTRUCTION = (
     "\nSome current views additionally supply selected_owner: this is an already "
     "selected CURRENT instance, separately highlighted GREEN in that view's "
     "owner-context images. Its ID is an opaque association label, not a visual "
-    "answer. For such a view, select only interaction regions belonging to this "
-    "particular owner and satisfying the current instruction. Use the original "
+    # BEGIN owner association applies to either declared local selection scope.
+    "answer. For such a view, select only the local contact region or functional "
+    "component requested by selection_scope, belonging to this particular owner "
+    "and satisfying the current instruction. Use the original "
+    # END explicit local target semantics, without changing owner association.
     "scene, the green owner evidence and each numbered candidate together to "
     "verify membership. A matching part name, mask overlap, adjacency or an "
     "enclosing assembly does not establish that membership. Do not replace the "
@@ -99,8 +114,10 @@ _SELECTED_OWNER_INSTRUCTION = (
 
 def _selected_owner(record, image, selection_scope):
     """Validate identity evidence without treating pixel overlap as identity."""
-    if selection_scope != "interaction_region":
-        raise ValueError("selected_owner is only applicable to interaction_region selection")
+    # BEGIN either local contact or component selection may use owner context.
+    if selection_scope not in {"interaction_region", "interaction_reference"}:
+        raise ValueError("selected_owner is only applicable to interaction_region or interaction_reference selection")
+    # END explicit local scope check.
     required = {"owner_id", "mask", "description", "source"}
     if not isinstance(record, dict) or set(record) != required:
         raise ValueError("selected_owner requires exactly owner_id, mask, description and source")
@@ -158,8 +175,10 @@ def _panels(image, candidates):
 
 def _prepare(source, instruction, views, selection_scope):
     """Allowlist semantic evidence; source poses and simulator IDs are not sent."""
-    if selection_scope not in {"owner", "interaction_region", "owner_evidence"}:
-        raise ValueError("selection_scope must be owner, interaction_region or owner_evidence")
+    # BEGIN component references retain a scope distinct from exact contacts.
+    if selection_scope not in {"owner", "interaction_region", "interaction_reference", "owner_evidence"}:
+        raise ValueError("selection_scope must be owner, interaction_region, interaction_reference or owner_evidence")
+    # END declared detection-reference selection scope.
     if not isinstance(instruction, str) or not instruction.strip():
         raise ValueError("A current instruction is required")
     if not isinstance(source, dict) or not {"image", "mask", "description"} <= source.keys():
@@ -171,6 +190,25 @@ def _prepare(source, instruction, views, selection_scope):
     if (not isinstance(queries, list)
             or any(not isinstance(query, str) or not query.strip() for query in queries)):
         raise ValueError("Source query_descriptions must be a list of nonempty strings")
+    # BEGIN copy only declared offline semantics into the fixed runtime request.
+    source_evidence = {"description": description.strip(), "query_descriptions": queries}
+    semantic_fields = {"object_description", "interaction_part_description", "interaction_reference"}
+    if source.keys() & semantic_fields:
+        if not semantic_fields <= source.keys():
+            raise ValueError("Offline interaction semantics require object, part and detection reference")
+        for key in semantic_fields - {"interaction_reference"}:
+            if not isinstance(source[key], str) or not source[key].strip():
+                raise ValueError(f"Source {key} must be a nonempty string")
+        reference = source["interaction_reference"]
+        if (not isinstance(reference, dict) or set(reference) != {"text", "scope"}
+                or reference["scope"] not in {"object", "part"}
+                or not isinstance(reference["text"], str) or not reference["text"].strip()):
+            raise ValueError("Source interaction_reference requires text and scope object or part")
+        source_evidence.update({key: source[key] for key in semantic_fields})
+    if (selection_scope == "interaction_reference"
+            and source_evidence.get("interaction_reference", {}).get("scope") != "part"):
+        raise ValueError("Component selection requires an offline part interaction_reference")
+    # END offline semantic input; poses and provenance are not model inputs.
     source_image = _image(source["image"])
     # BEGIN evidence-only sources need no manufactured interaction/owner mask.
     evidence_scope = selection_scope == "owner_evidence"
@@ -241,7 +279,7 @@ def _prepare(source, instruction, views, selection_scope):
             images.append(_panels(image, candidates))
             image_order.append(f"view {name}: numbered candidate details")
     context = {"selection_scope": selection_scope, "current_instruction": instruction.strip(),
-               "source_evidence": {"description": description.strip(), "query_descriptions": queries},
+               "source_evidence": source_evidence,
                "views": descriptions,
                "image_order": [{"image": index + 1, "content": content}
                                for index, content in enumerate(image_order)]}
@@ -262,6 +300,13 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
     only ``instruction`` describes the current request. No source file path,
     skill-name branch, source pose or current oracle geometry is used.
 
+    ``selection_scope='interaction_reference'`` selects the functional component
+    named in the offline ``source.interaction_reference`` (scope ``part``), with
+    its ``object_description`` and ``interaction_part_description``. The source
+    red contact mask locates the demonstrated interaction; it does not require
+    the selected component to have exactly the same contact-patch extent. This
+    scope needs no complete current owner mask and never manufactures one.
+
     ``selection_scope='owner_evidence'`` interprets ``source.mask`` as visible
     evidence of the rigid entity described by the source, not as a contact mask.
     Its optional ``owner_mask`` provides wider source context only. Neither
@@ -277,7 +322,7 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
     entry. Multiple supplied views share semantic context only: their IDs and
     masks are not fused into a physical or geometric association.
 
-    For ``interaction_region`` only, a view may supply ``selected_owner`` with
+    For ``interaction_region`` or ``interaction_reference``, a view may supply ``selected_owner`` with
     exactly owner_id, mask, description and source. That actual current mask is
     shown independently in green, and the same request must verify that each
     selected part belongs to that instance. Spatial overlap alone is not used
