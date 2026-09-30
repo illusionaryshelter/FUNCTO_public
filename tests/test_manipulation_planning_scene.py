@@ -386,17 +386,34 @@ class PlanningSceneTest(unittest.TestCase):
             self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "cmd", "command": "close", "progress": 0.}],
             source="synthetic_drive_and_tool", numerical_joint_tolerance=tolerance)
 
+    # BEGIN binary zero-progress queries must retain the physical sweep envelope.
     def test_binary_continuous_envelope_catches_collision_between_open_and_closed(self):
         background = SphereQuery(("background",), center=(.012, 0., 0.), radius=.001)
         world = scene(gripper=self.gripper(), has_gripper=True, background=background)
         args = inputs((0., .5), sphere_rows=[[[.04, 0, 0, .005]], [[.04, 0, 0, .005]]])
         terms = world.components(*args)
-        self.assertEqual(terms["collision/robot/background"][0, 0].item(), 0.)
-        self.assertGreater(terms["collision/robot/background"][0, 1].item(), .01)
+        self.assertGreater(terms["collision/robot/background"].min().item(), .01)
         self.assertIn("time-independent", world.describe()["gripper_timing_contract"])
         # Neither endpoint sphere intersects this obstacle; the swept interval does.
         endpoints = torch.tensor([[[[0, 0, 0, .005], [.04, 0, 0, .005]]]], dtype=torch.float64)
         self.assertEqual(background(endpoints, key="endpoint_only").sum().item(), 0.)
+
+    def test_binary_paused_and_isolated_zero_progress_do_not_receive_initial_exemption(self):
+        background = SphereQuery(("background",), center=(.012, 0., 0.), radius=.001)
+        world = scene(gripper=self.gripper(), has_gripper=True, background=background)
+        # The arm can move 1 mm while progress remains zero. A binary close
+        # command can put the finger at .012 m then, although the earlier
+        # feedback was .04 m. This physically reachable sphere intersects.
+        actual = torch.tensor([[[[.013, 0, 0, .005]]]], dtype=torch.float64)
+        self.assertGreater(background(actual, key="reachable_actual_finger").item(), .004)
+        for progress, positions in (
+                ((0., 0., .5), [[0., 0., 0.], [.001, 0., 0.], [.001, 0., 0.]]),
+                ((0.,), [[.001, 0., 0.]])):
+            with self.subTest(progress=progress):
+                rows = [[[position[0]+.04, 0., 0., .005]] for position in positions]
+                terms = world.components(*inputs(progress, positions=positions, sphere_rows=rows))
+                self.assertGreater(terms["collision/robot/background"].min().item(), .01)
+    # END paused and isolated zero-progress binary regression.
 
     def test_tracking_commands_and_coupling_use_separate_numerical_tolerance(self):
         hand = self.gripper("position_tracking")

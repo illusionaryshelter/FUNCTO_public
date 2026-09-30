@@ -20,6 +20,12 @@ from manipulation.planning import (
     PlanningBudget,
     _CuroboPlanner,
     _ProgressMap,
+    # BEGIN actual-anchor allocation and projection preflight regressions.
+    _anchor_capacity,
+    _planning_workspace_bytes,
+    _projection_tolerance,
+    _require_planning_memory,
+    # END actual-anchor allocation and projection preflight regressions.
     _bounded_robot_configuration,
     _hermite_at_parameters,
     _native_gradient_layout_type,
@@ -1009,6 +1015,214 @@ class NativeIkCoverageTests(unittest.TestCase):
 # END installed native IK seed-coverage control flow without CUDA imports.
 
 
+# BEGIN preserve complete source timelines under request-sized allocation bounds.
+class RequiredAnchorAllocationTests(unittest.TestCase):
+    @staticmethod
+    def timeline_problem(counts=(252, 9, 60)):
+        # These phase lengths match the existing 319-row placement input.
+        # Analytic poses isolate source retention from robot/scene feasibility.
+        phases = tuple(MotionPhase(f"phase_{index}", PosePath(
+            np.linspace(0., 1., count), np.broadcast_to(np.eye(4), (count, 4, 4)),
+            "complete supplied source timeline")) for index, count in enumerate(counts))
+        events = (PlanningEvent("release", "current", 2., 259, "verification",
+                                "original release boundary", "actual release feedback", True),)
+        return cartesian_problem(phases, events)
+
+    @staticmethod
+    def clock(problem):
+        return _progress_for_cubic_boundaries(
+            _ProgressMap(np.array([0., 1.]), np.array([0., float(problem.phase_count)])),
+            8, problem.start_dq, stop_progress=problem.stop_progress, anchors=problem.anchors)[0]
+
+    @staticmethod
+    def robot_metadata():
+        return {"active_joint_names": tuple(f"q{index}" for index in range(16)),
+                "links": 64, "spheres": 512}
+
+    def test_complete_319_node_timeline_and_all_322_clock_anchors_survive(self):
+        problem = self.timeline_problem()
+        mapping = self.clock(problem)
+        pairs = mapping.anchor_parameters(problem.anchors)
+        self.assertEqual(len(problem.anchors), 319)
+        self.assertEqual(len(pairs), 322)
+        np.testing.assert_array_equal(np.unique(pairs[:, 1]), problem.anchors)
+        self.assertEqual(_anchor_capacity(mapping, problem.anchors, PlanningBudget()), 386)
+        no_refinement = PlanningBudget(max_refinement_points=0)
+        self.assertEqual(_anchor_capacity(mapping, problem.anchors, no_refinement), 322)
+        with self.assertRaisesRegex(ValueError, "refinement-point budget"):
+            _anchor_capacity(mapping, problem.anchors, no_refinement, [.123])
+        tight = PlanningBudget(max_validation_points=330)
+        self.assertEqual(_anchor_capacity(mapping, problem.anchors, tight), 330)
+        with self.assertRaisesRegex(ValueError, "refinement-point budget"):
+            _anchor_capacity(mapping, problem.anchors, tight, np.linspace(.1, .9, 9))
+
+    def test_total_source_and_pause_overflow_fail_before_native_construction(self):
+        for counts, maximum in (((252, 9, 60), 128), ((12, 11, 10), 32)):
+            with self.subTest(counts=counts):
+                problem = self.timeline_problem(counts)
+                scene = SimpleNamespace(validate_problem=Mock(), required_progress_anchors=(),
+                                        reference_frame=problem.reference_frame)
+                with patch("manipulation.planning._bounded_robot_configuration") as robot, \
+                        patch("manipulation.planning._process_manager_type") as manager:
+                    with self.assertRaisesRegex(ValueError, "anchors|source knots"):
+                        _CuroboPlanner(problem, scene, object(), PlanningBudget(
+                            max_validation_points=maximum, max_refinement_points=0), "cuda:0")
+                robot.assert_not_called()
+                manager.assert_not_called()
+
+    def test_native_anchor_estimate_matches_installed_meta_buffer_layout(self):
+        # Execute only the installed pure buffer factory on Torch's meta
+        # device: no native library import, GPU context or physical allocation.
+        import ast
+        from importlib.util import find_spec
+        from pathlib import Path
+        source = Path(find_spec("curobo").origin).parent / "_src/curobolib/cuda_ops/kinematics.py"
+        tree = ast.parse(source.read_text())
+        definition = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                          and node.name == "KinematicsFusedFunction")
+        factory = next(node for node in definition.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "create_buffers")
+        factory.decorator_list = []
+        module = ast.Module(body=[ast.ImportFrom(module="__future__",
+                            names=[ast.alias(name="annotations")], level=0), factory], type_ignores=[])
+        scope = {"torch": torch, "DeviceCfg": lambda: SimpleNamespace(device="meta", dtype=torch.float32)}
+        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
+        metadata = self.robot_metadata()
+        native = SimpleNamespace(num_pose_links=1, num_spheres=512, num_dof=16, num_links=64)
+        scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon: 0)
+        budget = PlanningBudget(max_validation_points=8192)
+        before_cuda = torch.cuda.is_initialized()
+        for count in (322, 386, 8192):
+            buffers = scope["create_buffers"](44, count, native)
+            expected = sum(value.numel()*value.element_size() for value in buffers.values())
+            _, actual = _planning_workspace_bytes(scene, metadata, budget, count)
+            self.assertEqual(actual, expected)
+        self.assertGreater(actual, 6*1024**3)
+        self.assertEqual(torch.cuda.is_initialized(), before_cuda)
+
+    def test_torch_cache_covers_tensors_but_not_the_other_native_reserve(self):
+        native_reserve = 2*1024**3
+        cuda = SimpleNamespace(mem_get_info=Mock(return_value=(native_reserve+500, 12*1024**3)),
+                               memory_reserved=Mock(return_value=400), memory_allocated=Mock(return_value=101))
+        runtime = SimpleNamespace(cuda=cuda)
+        with self.assertRaisesRegex(ValueError, "anchor FK"):
+            _require_planning_memory(runtime, "cuda:0", 200, 600)
+        cuda.memory_allocated.return_value = 100
+        _require_planning_memory(runtime, "cuda:0", 200, 600)
+        cuda.mem_get_info.return_value = native_reserve-1, 12*1024**3
+        cuda.memory_reserved.return_value = 10*1024**3
+        with self.assertRaisesRegex(ValueError, "GPU memory"):
+            _require_planning_memory(runtime, "cuda:0", 200, 600)
+
+    def test_replacement_rechecks_changed_pause_count_before_recreating_solver(self):
+        import gc
+        import weakref
+        planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.budget = PlanningBudget(max_refinement_points=0)
+        planner.anchors = np.array([0., 1., 2.])
+        planner.problem = object()
+        planner.scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon: batch*horizon)
+        planner.robot_metadata = self.robot_metadata()
+        planner.progress_map = _ProgressMap(np.array([0., .5, 1.]), planner.anchors)
+        planner.seed_progress = object()
+        planner.refinement_parameters = np.empty(0)
+        planner.torch = SimpleNamespace(cuda=SimpleNamespace(
+            mem_get_info=Mock(return_value=(12*1024**3, 12*1024**3)),
+            memory_reserved=Mock(return_value=0), memory_allocated=Mock(return_value=0)))
+        planner.device_cfg = SimpleNamespace(device="cuda:0")
+        # Match the native optimizer/core bound-method cycle. destroy() only
+        # records graph teardown; it deliberately does not break the cycle.
+        destroyed = Mock()
+
+        class CyclicSolver:
+            def __init__(self):
+                self.core = SimpleNamespace(callback=self.step)
+
+            def step(self):
+                pass
+
+            def destroy(self):
+                destroyed()
+
+        planner.trajopt = CyclicSolver()
+        previous = weakref.ref(planner.trajopt)
+
+        def memory_after_release(device):
+            self.assertIsNone(previous())
+            return planner.torch.cuda.mem_get_info.return_value
+
+        planner.torch.cuda.mem_get_info.side_effect = memory_after_release
+        planner._trajectory_configuration = {}
+        planner._optimizer_config_class = SimpleNamespace(create=Mock(return_value="new configuration"))
+        planner._optimizer_class = Mock(return_value=SimpleNamespace(destroy=Mock()))
+        planner._initialize_verification_constraints = Mock()
+        mapping = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
+        with patch("manipulation.planning._process_manager_type", return_value="new manager") as manager, \
+                patch("manipulation.planning.gc.collect", wraps=gc.collect) as collect:
+            planner.replace_schedule(mapping)
+            self.assertEqual(planner.anchor_capacity, 4)
+            expected = _planning_workspace_bytes(planner.scene, planner.robot_metadata, planner.budget, 4)
+            self.assertEqual((planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes), expected)
+            destroyed.assert_called_once_with()
+            collect.assert_called_once_with()
+            manager.assert_called_once()
+            planner._optimizer_class.assert_called_once_with("new configuration")
+            # A second replacement must repeat the current device check. The
+            # old solver is released, but an inadmissible new one is not built.
+            planner.torch.cuda.mem_get_info.return_value = 2*1024**3, 12*1024**3
+            planner._optimizer_class.reset_mock()
+            with self.assertRaisesRegex(ValueError, "GPU memory"):
+                planner.replace_schedule(mapping)
+            planner._optimizer_class.assert_not_called()
+            self.assertIsNone(planner.trajopt)
+        self.assertEqual(planner.torch.cuda.mem_get_info.call_count, 2)
+
+    def test_close_releases_both_native_cycles_and_remains_idempotent(self):
+        import gc
+        import weakref
+        destroyed = []
+
+        class CyclicSolver:
+            def __init__(self, name):
+                self.name = name
+                self.core = SimpleNamespace(callback=self.destroy)
+
+            def destroy(self):
+                destroyed.append(self.name)
+
+        planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.ik, planner.trajopt = CyclicSolver("ik"), CyclicSolver("trajectory")
+        references = (weakref.ref(planner.ik), weakref.ref(planner.trajopt))
+        with patch("manipulation.planning.gc.collect", wraps=gc.collect) as collect:
+            planner.close()
+            self.assertEqual(destroyed, ["ik", "trajectory"])
+            self.assertTrue(all(reference() is None for reference in references))
+            self.assertIsNone(planner.ik)
+            self.assertIsNone(planner.trajopt)
+            collect.assert_called_once_with()
+            planner.close()
+        self.assertEqual(destroyed, ["ik", "trajectory"])
+
+    def test_scene_budget_and_removed_legacy_parameter_remain_strict(self):
+        scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon: 1024**3)
+        with self.assertRaisesRegex(ValueError, "scene query workspaces"):
+            _planning_workspace_bytes(scene, self.robot_metadata(), PlanningBudget(), 322)
+        with self.assertRaises(TypeError):
+            PlanningBudget(max_anchors=128)
+        with self.assertRaisesRegex(ValueError, "Refinement points"):
+            PlanningBudget(max_refinement_points=-1)
+
+    def test_projection_accuracy_respects_the_strictest_source_mechanism(self):
+        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        self.assertAlmostEqual(_projection_tolerance(problem), 1e-6)
+        model = SimpleNamespace(position_tolerance=1e-6, rotation_tolerance=2e-6)
+        problem.phases = (SimpleNamespace(reference=SimpleNamespace(motion_model=model)),)
+        self.assertAlmostEqual(_projection_tolerance(problem), 1e-7)
+        model.rotation_tolerance = 1e-8
+        self.assertAlmostEqual(_projection_tolerance(problem), 1e-9)
+# END preserve complete source timelines under request-sized allocation bounds.
+
+
 class RobotAllocationPreflightTests(unittest.TestCase):
     """Inspect installed metadata only; native model constructors remain unused."""
 
@@ -1345,7 +1559,10 @@ class PlannerRetryContractTests(unittest.TestCase):
                         for value in residuals]
         planner = SimpleNamespace(
             budget=PlanningBudget(),
-            scene_workspace_bytes=64, progress_map=_ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
+            # BEGIN explicit allocation diagnostics in the CPU retry fixture.
+            scene_workspace_bytes=64, anchor_fk_workspace_bytes=32, anchor_capacity=4,
+            # END explicit allocation diagnostics in the CPU retry fixture.
+            progress_map=_ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
             ik=SimpleNamespace(config=SimpleNamespace(exit_early=False)),
             reference_ik_distinct_counts=[2, 2, 2],
             initial_seed_strategies=["reference_ik", "reference_ik_alternative"],

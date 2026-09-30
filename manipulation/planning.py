@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from copy import copy, deepcopy
 from dataclasses import asdict, dataclass, field, fields
+import gc
 import time
 
 import numpy as np
@@ -25,10 +26,13 @@ from scipy.optimize import linear_sum_assignment
 class PlanningBudget:
     """Explicit local resource and numerical-work limits, for a single request.
 
-    These defaults bound the current 16 GB RAM / 12 GB GPU integration.  More
+    These defaults bound the current 16 GB RAM / 12 GB GPU integration. More
     seeds or a larger batch must not be silently allocated by native defaults.
     The interpolation buffer covers the largest allowed native knot interval.
     Native solvers use eager execution for the dynamic process/scene tensors.
+    Required source vertices use their actual count; ``max_refinement_points``
+    bounds only additional queries. Both share ``max_validation_points`` and
+    the checked scene/native allocation budgets.
     ``maximum_trajectory_dt`` fixes both native time bounds for this request:
     process feasibility and evidence stops take precedence over compression.
     """
@@ -43,7 +47,9 @@ class PlanningBudget:
     maximum_trajectory_dt: float = 0.2
     interpolation_buffer_size: int = 512
     constraint_weight: float = 100000.0
-    max_anchors: int = 64
+    # BEGIN reserve optional refinement work separately from required evidence.
+    max_refinement_points: int = 64
+    # END reserve optional refinement work separately from required evidence.
     max_robot_spheres: int = 256
     max_robot_dof: int = 16
     max_robot_links: int = 64
@@ -58,13 +64,17 @@ class PlanningBudget:
         if (not 1 <= self.trajectory_seeds <= 2 or not self.trajectory_seeds <= self.ik_seeds <= 8
                 or not 6 <= self.knots <= 24 or not 1 <= self.interpolation_steps <= 8
                 or not 1 <= self.ik_iterations <= 200 or not 1 <= self.trajectory_iterations <= 300
-                or not 1 <= self.max_anchors <= 128
                 or not 1 <= self.max_robot_spheres <= 512
                 or not 1 <= self.max_robot_dof <= 16
                 or not 1 <= self.max_robot_links <= 64
                 or not 32 <= self.max_validation_points <= 8192
                 or not 1 <= self.maximum_trajectory_solves <= 4):
             raise ValueError("Planning budget exceeds the bounded local single-batch configuration")
+        # BEGIN bound optional samples without capping a skill's source knots.
+        if (type(self.max_refinement_points) is not int
+                or not 0 <= self.max_refinement_points <= self.max_validation_points):
+            raise ValueError("Refinement points must fit the finite validation-point budget")
+        # END bound optional samples without capping a skill's source knots.
         if type(self.max_scene_workspace_bytes) is not int or not 0 <= self.max_scene_workspace_bytes <= 1024**3:
             raise ValueError("Scene workspaces must remain within the local one-GiB allocation budget")
         for name in ("interpolation_dt", "maximum_trajectory_dt", "constraint_weight", "validation_joint_step"):
@@ -138,6 +148,77 @@ class PlanningResult:
     success: bool
     trajectory: JointTrajectory | None
     diagnostics: dict
+
+
+# BEGIN size required evidence and native anchor buffers from the actual request.
+def _anchor_capacity(progress_map, anchors, budget, refinement_parameters=()):
+    """Keep every required clock anchor; bound only additional refinement.
+
+    A stopped source vertex can have two clock parameters. Count those actual
+    pairs before reserving optional samples, so no source point or pause is
+    removed to fit the refinement allowance.
+    """
+    required = len(progress_map.anchor_parameters(anchors))
+    if required > budget.max_validation_points:
+        raise ValueError("Required source anchors exceed the finite validation-point budget")
+    additional = np.unique(np.asarray(refinement_parameters, float))
+    refinement_limit = min(budget.max_refinement_points, budget.max_validation_points-required)
+    if (not np.isfinite(additional).all() or np.any(additional < 0) or np.any(additional > 1)
+            or len(additional) > refinement_limit):
+        raise ValueError("Refinement samples exceed the finite refinement-point budget")
+    return required+refinement_limit
+
+
+def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
+    """Estimate the independent scene queries and all native anchor FK buffers.
+
+    The main native rollout retains its original control horizon. Each custom
+    manager evaluates the required anchors with a separate native FK model,
+    then folds their penalties into that rollout's existing final cost column.
+    """
+    horizon = (budget.knots+4)*budget.interpolation_steps+1
+    # Native LBFGS has two rollout instances and four line-search particles.
+    # Include optimization/metrics, dense export and independent verification.
+    allocation_shapes = (
+        (4, budget.ik_seeds, 1), (8, budget.ik_seeds*4, 1),
+        (4, budget.trajectory_seeds, horizon+anchor_capacity),
+        (4, budget.trajectory_seeds*4, horizon+anchor_capacity),
+        (2, budget.trajectory_seeds, budget.interpolation_buffer_size+anchor_capacity),
+        (1, 1, budget.max_validation_points), (2, 1, anchor_capacity),
+    )
+    scene_bytes = sum(copies*scene.estimated_workspace_bytes(batch, length)
+                      for copies, batch, length in allocation_shapes)
+    if scene_bytes > budget.max_scene_workspace_bytes:
+        raise ValueError("Independent scene query workspaces exceed the declared local allocation budget")
+    dof, links, spheres = (len(robot_metadata["active_joint_names"]),
+                           robot_metadata["links"], robot_metadata["spheres"])
+    # Installed KinematicsFusedFunction.create_buffers uses float32 and this
+    # planner requests exactly one tool frame. Per [batch, anchor] it allocates
+    # pose/COM values and gradients (22 floats), sphere values/gradients (8*S),
+    # a 6*D Jacobian and two D joint gradients, and 12*L cumulative transforms.
+    # The same conservative rollout counts above give 22*K anchor batches.
+    # Main FK, verification, model storage and other native allocations retain
+    # the separate two-GiB allowance in the device-memory preflight below.
+    bytes_per_state = 4*(22+8*spheres+8*dof+12*links)
+    anchor_fk_bytes = 22*budget.trajectory_seeds*anchor_capacity*bytes_per_state
+    return int(scene_bytes), int(anchor_fk_bytes)
+
+
+def _require_planning_memory(torch, device, scene_bytes, anchor_fk_bytes):
+    """Admit Torch buffers without promising cached memory to native allocators.
+
+    CollisionBuffer and native FK buffers use torch.zeros. Unused capacity in
+    this process's Torch allocator can therefore serve those tensors after a
+    schedule replacement. Existing Mapper fields are already allocated. The
+    separate native allowance must still fit driver-reported free memory.
+    """
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    reusable_torch_bytes = max(0, torch.cuda.memory_reserved(device)-torch.cuda.memory_allocated(device))
+    other_native_bytes = 2*1024**3
+    if (free_bytes < other_native_bytes
+            or free_bytes+reusable_torch_bytes < other_native_bytes+scene_bytes+anchor_fk_bytes):
+        raise ValueError("Available GPU memory does not cover the bounded planner, anchor FK and scene workspaces")
+# END size required evidence and native anchor buffers from the actual request.
 
 
 def _bounded_robot_configuration(robot, problem, scene, budget):
@@ -450,6 +531,18 @@ def _hermite_at_parameters(position, velocity, dt, counts, parameters):
     dq = (((6*a**2-6*a)*q0 + (-6*a**2+6*a)*q1)/delta
           + (3*a**2-4*a+1)*v0 + (3*a**2-2*a)*v1)
     return q, dq
+
+
+# BEGIN project more tightly than every existing mechanism acceptance band.
+def _projection_tolerance(problem):
+    """Set native projection accuracy without changing equalities or acceptance."""
+    bounds = [problem.numerical.position_m, problem.numerical.rotation_rad, problem.numerical.joint]
+    for phase in problem.phases:
+        model = phase.reference.motion_model
+        if model is not None:
+            bounds.extend((model.position_tolerance, model.rotation_tolerance))
+    return min(bounds)*.1
+# END project more tightly than every existing mechanism acceptance band.
 
 
 def _ompl_stage(start, goal, lower, upper, valid, equality, *, tolerance,
@@ -1014,7 +1107,8 @@ class _CuroboPlanner:
         # before importing native GPU solvers or creating any of their buffers.
         scene.validate_problem(problem)
         anchors = np.unique(np.concatenate((problem.anchors, np.asarray(scene.required_progress_anchors, float))))
-        if (len(anchors) > budget.max_anchors or not np.isfinite(anchors).all()
+        # BEGIN preserve all required source points within the total query budget.
+        if (len(anchors) > budget.max_validation_points or not np.isfinite(anchors).all()
                 or np.any(anchors < 0) or np.any(anchors > problem.phase_count)):
             raise ValueError("All required source knots and scene anchors must fit the finite planning horizon and budget")
         if problem.reference_frame != scene.reference_frame:
@@ -1022,24 +1116,11 @@ class _CuroboPlanner:
         self.progress_map, _ = _progress_for_cubic_boundaries(
             _ProgressMap(np.array([0., 1.]), np.array([0., float(problem.phase_count)])),
             budget.knots, problem.start_dq, stop_progress=problem.stop_progress, anchors=anchors)
-        if len(self.progress_map.anchor_parameters(anchors)) > budget.max_anchors:
-            raise ValueError("Exact anchors including native boundary pauses exceed the declared anchor budget")
-        horizon = (budget.knots+4)*budget.interpolation_steps+1
-        # Native LBFGS has two rollout instances and four line-search particles.
-        # Count both optimization/metrics managers conservatively, including
-        # the seed initializer, dense export, and separate verification scene.
-        allocation_shapes = (
-            (4, budget.ik_seeds, 1), (8, budget.ik_seeds*4, 1),
-            (4, budget.trajectory_seeds, horizon+budget.max_anchors),
-            (4, budget.trajectory_seeds*4, horizon+budget.max_anchors),
-            (2, budget.trajectory_seeds, budget.interpolation_buffer_size+budget.max_anchors),
-            (1, 1, budget.max_validation_points), (2, 1, budget.max_anchors),
-        )
-        self.scene_workspace_bytes = sum(copies*scene.estimated_workspace_bytes(batch, length)
-                                         for copies, batch, length in allocation_shapes)
-        if self.scene_workspace_bytes > budget.max_scene_workspace_bytes:
-            raise ValueError("Independent scene query workspaces exceed the declared local allocation budget")
+        self.anchor_capacity = _anchor_capacity(self.progress_map, anchors, budget)
         robot_dict, self.robot_metadata = _bounded_robot_configuration(robot, problem, scene, budget)
+        self.scene_workspace_bytes, self.anchor_fk_workspace_bytes = _planning_workspace_bytes(
+            scene, self.robot_metadata, budget, self.anchor_capacity)
+        # END preserve all required source points within the total query budget.
         import torch
         from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
         from curobo.trajectory_optimizer import TrajectoryOptimizer, TrajectoryOptimizerCfg
@@ -1052,13 +1133,10 @@ class _CuroboPlanner:
         self.problem, self.scene, self.budget = problem, scene, budget
         self.torch, self.JointState, self.GoalToolPose = torch, JointState, GoalToolPose
         self.device_cfg = DeviceCfg(device)
-        free_device_bytes, _ = torch.cuda.mem_get_info(self.device_cfg.device)
-        # Reserve two GiB beyond geometry for the bounded native model,
-        # optimizer, FK/Jacobian and library workspaces measured by the small
-        # integration probe. Existing perception allocations remain visible
-        # through the actual device free-memory query.
-        if free_device_bytes < self.scene_workspace_bytes+2*1024**3:
-            raise ValueError("Available GPU memory does not cover the bounded planner and scene workspaces")
+        # BEGIN include request-sized anchor FK in native allocation admission.
+        _require_planning_memory(torch, self.device_cfg.device,
+                                 self.scene_workspace_bytes, self.anchor_fk_workspace_bytes)
+        # END include request-sized anchor FK in native allocation admission.
         self.ik = self.trajopt = None
         self.anchors = anchors
         self.robot_dict = robot_dict
@@ -1208,9 +1286,18 @@ class _CuroboPlanner:
             self.trajopt.transition_model)
 
     def close(self):
-        for solver in (self.ik, self.trajopt):
+        # BEGIN release native callback cycles at the request lifecycle boundary.
+        # Native destroy() resets CUDA graphs. LBFGS and GradientOptCore also
+        # retain each other through bound callbacks, so drop every solver
+        # reference before collecting their now-unreachable tensor workspaces.
+        for name in ("ik", "trajopt"):
+            solver = getattr(self, name)
             if solver is not None:
                 solver.destroy()
+            setattr(self, name, None)
+        del solver
+        gc.collect()
+        # END release native callback cycles at the request lifecycle boundary.
 
     def _goal(self, progress):
         s = self.device_cfg.to_device([[float(progress)]])
@@ -1278,19 +1365,28 @@ class _CuroboPlanner:
         immutable robot/scene configuration are retained; no second planner
         and no duplicate native roadmap is allocated.
         """
+        # BEGIN apply the same point and memory admission to every new clock.
         parameters = np.unique(np.asarray(refinement_parameters, float))
-        if (not np.isfinite(parameters).all() or np.any(parameters < 0) or np.any(parameters > 1)
-                or len(parameters)+len(progress_map.anchor_parameters(self.anchors)) > self.budget.max_anchors):
-            raise ValueError("Refinement samples exceed the finite exact-anchor budget")
+        capacity = _anchor_capacity(progress_map, self.anchors, self.budget, parameters)
+        scene_bytes, anchor_fk_bytes = _planning_workspace_bytes(
+            self.scene, self.robot_metadata, self.budget, capacity)
+        self.trajopt.destroy()
+        self.trajopt = None
+        # Native destroy() releases graphs, while optimizer callbacks can keep
+        # rollout tensors in a reference cycle. Collect only at this explicit
+        # replacement boundary before querying live allocator statistics.
+        gc.collect()
+        _require_planning_memory(self.torch, self.device_cfg.device, scene_bytes, anchor_fk_bytes)
         self.progress_map, self.refinement_parameters = progress_map, parameters
+        self.anchor_capacity = capacity
+        self.scene_workspace_bytes, self.anchor_fk_workspace_bytes = scene_bytes, anchor_fk_bytes
         manager_type = _process_manager_type(self.problem, self.scene, progress_map, self.anchors,
                                              self.budget, self.seed_progress, parameters)
         self._trajectory_configuration["cost_manager_config_instance_type"] = manager_type
-        self.trajopt.destroy()
-        self.trajopt = None
         self.trajopt = self._optimizer_class(
             self._optimizer_config_class.create(**deepcopy(self._trajectory_configuration)))
         self._initialize_verification_constraints()
+        # END apply the same point and memory admission to every new clock.
 
     def _boundary_candidates(self, seed, candidate_trajectory, *, deadline):
         """Create a complete candidate for every shared boundary before search."""
@@ -1341,8 +1437,9 @@ class _CuroboPlanner:
             return None, None, report
         lower = self.trajopt.transition_model.action_bound_lows.detach().cpu().numpy().reshape(-1)
         upper = self.trajopt.transition_model.action_bound_highs.detach().cpu().numpy().reshape(-1)
-        tolerance = min(self.problem.numerical.position_m, self.problem.numerical.rotation_rad,
-                        self.problem.numerical.joint)*.1
+        # BEGIN preserve source mechanism precision during native projection.
+        tolerance = _projection_tolerance(self.problem)
+        # END preserve source mechanism precision during native projection.
 
         for branch in range(candidates.shape[1]):
             if time.monotonic() >= deadline:
@@ -1507,9 +1604,11 @@ class _CuroboPlanner:
             except ValueError as error:
                 report["branches"][-1].append({"failure": "progress_schedule_rejected", "reason": str(error)})
                 continue
-            if exact_anchor_count > self.budget.max_anchors:
+            # BEGIN required OMPL anchors share the complete validation budget.
+            if exact_anchor_count > self.budget.max_validation_points:
                 report["branches"][-1].append({"failure": "progress_schedule_exceeds_anchor_budget"})
                 continue
+            # END required OMPL anchors share the complete validation budget.
             # These are control initializers only.  Native whole-window
             # optimization subsequently changes every internal boundary q.
             control_u = (np.arange(self.trajopt.action_horizon)+3.)/(self.trajopt.action_horizon+4.)
@@ -1640,14 +1739,17 @@ class _CuroboPlanner:
     # END all-candidate hard verification and continuation selection.
 
     def refinement_samples(self):
-        """Select uncovered failing curve samples within the exact-anchor cap."""
+        """Select uncovered failures within the separate refinement allowance."""
         violations = self.last_validation["violations"]
         if not np.isfinite(violations).all():
             return None
         fixed = self.progress_map.anchor_parameters(self.anchors)[:, 0]
         existing = np.r_[fixed, self.refinement_parameters,
                          np.linspace(0, 1, self.trajopt.horizon)]
-        remaining = self.budget.max_anchors-len(fixed)-len(self.refinement_parameters)
+        # BEGIN required evidence never consumes the optional refinement limit.
+        remaining = min(self.budget.max_refinement_points,
+                        self.budget.max_validation_points-len(fixed))-len(self.refinement_parameters)
+        # END required evidence never consumes the optional refinement limit.
         selected = []
         for index in np.argsort(-violations, kind="stable"):
             if violations[index] <= 0 or len(selected) >= remaining:
@@ -1770,6 +1872,10 @@ def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0"):
                    "progress_parameter_error_bound": _PROGRESS_PARAMETER_ERROR,
                    "progress_clock_max_keys": _MAX_PROGRESS_KEYS,
                    "scene": scene.describe(), "scene_workspace_bytes": planner.scene_workspace_bytes,
+                   # BEGIN expose the request-sized native anchor allocation.
+                   "anchor_fk_workspace_bytes": planner.anchor_fk_workspace_bytes,
+                   "exact_anchor_capacity": planner.anchor_capacity,
+                   # END expose the request-sized native anchor allocation.
                    "attempts": []}
     try:
         seeds, ik_success = planner.reference_seeds()
@@ -1826,6 +1932,11 @@ def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0"):
                                   else "complete_process_optimization_not_feasible")
         return PlanningResult(False, None, diagnostics)
     finally:
+        # BEGIN report the final admitted schedule's actual capacity estimates.
+        diagnostics["scene_workspace_bytes"] = planner.scene_workspace_bytes
+        diagnostics["anchor_fk_workspace_bytes"] = planner.anchor_fk_workspace_bytes
+        diagnostics["exact_anchor_capacity"] = planner.anchor_capacity
+        # END report the final admitted schedule's actual capacity estimates.
         diagnostics["elapsed_seconds"] = time.monotonic()-started
         planner.close()
 

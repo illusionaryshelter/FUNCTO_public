@@ -8,6 +8,7 @@ assumptions and do not obtain geometry from a simulator or another project.
 
 # BEGIN independent process-constraint and existing-grounding integration tests.
 from copy import deepcopy
+import json
 import unittest
 from unittest.mock import patch
 
@@ -300,6 +301,125 @@ class PlanningProcessTest(unittest.TestCase):
         np.testing.assert_array_equal(request.anchors, knots)
         measured = reference.sample_numpy(request.anchors)[:, 2, 3]
         np.testing.assert_allclose(measured, [.1, .13, .13, .08, .15], atol=1e-12)
+
+    # BEGIN compare physical mechanism acceptance with the existing NumPy oracle.
+    def test_mechanism_metrics_match_source_projection_with_attachment_and_frame_changes(self):
+        coordinates = {
+            "prismatic": np.array([[0.], [.05], [.09]]),
+            "revolute": np.array([[0.], [.3], [.6]]),
+            "planar": np.array([[0., 0., 0.], [.03, -.02, .3], [.06, -.01, .6]]),
+            "translation_plane": np.array([[0., 0.], [.03, -.02], [.06, -.01]]),
+        }
+        attachment = pose((.17, -.12, .09), (.4, .2, -.3))
+        basis = Rotation.from_euler("xyz", (.3, .4, -.2)).as_matrix()
+        world = pose((.6, -.4, .8), (.3, -.2, .5))
+        carrier = pose((.03, .02, -.04), (-.1, .15, .2))
+        progress = torch.tensor([[0., .5, 1.]], dtype=torch.float64)
+        for kind, values in coordinates.items():
+            source = MotionModel(kind, values, pose((.23, -.1, .08), (.2, -.15, .4)), basis,
+                                 np.array([.05, .04, -.03]) if kind == "revolute" else None,
+                                 1e-6, 1e-6, {"source": "independent physical mechanism"})
+            original = source.poses(values)
+            perturbed = original.copy()
+            transverse = basis[:, 2] if kind in {"planar", "translation_plane"} else basis[:, 0]
+            perturbed[1, :3, 3] += 5e-5*transverse
+            perturbed[2, :3, :3] = Rotation.from_rotvec(2e-5*basis[:, 0]).as_matrix() @ perturbed[2, :3, :3]
+            for world_frame, carrier_frame in ((pose(), pose()), (world, carrier)):
+                with self.subTest(kind=kind, changed_frames=not np.array_equal(world_frame, pose())):
+                    reference_body = world_frame @ original @ carrier_frame
+                    actual_body = world_frame @ perturbed @ carrier_frame
+                    reference_pose = world_frame @ source.reference_pose @ carrier_frame
+                    current_basis = world_frame[:3, :3] @ basis
+                    center = (None if source.axis_point is None else
+                              world_frame[:3, :3] @ source.axis_point+world_frame[:3, 3])
+                    model = MotionModel(kind, values.copy(), reference_pose, current_basis, center,
+                                        1e-6, 1e-6, source.diagnostics)
+                    # A translated planar body origin changes its x/y coordinate
+                    # gauge while representing the same physical set of poses.
+                    current_coordinates = model.coordinates_of(reference_body)
+                    model.coordinates = current_coordinates
+                    current_attachment = np.linalg.inv(carrier_frame) @ attachment
+                    reference = PosePath(np.array([0., .5, 1.]), reference_body, "complete source path",
+                                         motion_model=model, coordinates=current_coordinates,
+                                         attachment=current_attachment)
+                    request = problem([MotionPhase("mechanism", reference)])
+                    on_position, on_quaternion = components((reference_body @ current_attachment)[None])
+                    on_position.requires_grad_(), on_quaternion.requires_grad_()
+                    accepted = request.evaluate(on_position, on_quaternion, progress)
+                    np.testing.assert_allclose(accepted.detach().numpy(), 0., atol=1e-12)
+                    accepted.sum().backward()
+                    self.assertTrue(torch.isfinite(on_position.grad).all())
+                    self.assertTrue(torch.isfinite(on_quaternion.grad).all())
+                    position, quaternion = components((actual_body @ current_attachment)[None])
+                    position.requires_grad_(), quaternion.requires_grad_()
+                    measured = request.measurements(position, quaternion, progress)
+                    projected = model.poses(model._coordinates_unchecked(actual_body))
+                    oracle_position = np.linalg.norm(actual_body[:, :3, 3]-projected[:, :3, 3], axis=1)
+                    oracle_rotation = Rotation.from_matrix(
+                        actual_body[:, :3, :3] @ projected[:, :3, :3].transpose(0, 2, 1)).magnitude()
+                    np.testing.assert_allclose(measured["mechanism:0:position_error_m"].detach().numpy()[0],
+                                               oracle_position, atol=2e-15)
+                    np.testing.assert_allclose(measured["mechanism:0:rotation_error_rad"].detach().numpy()[0],
+                                               oracle_rotation, atol=2e-15)
+                    residuals = request.residuals(position, quaternion, progress)
+                    np.testing.assert_allclose(residuals["phase:0:mechanism"].detach().numpy(), 0., atol=1e-12)
+                    self.assertGreater(residuals["mechanism:0:mechanism"][0, 1].item(), 4e-5)
+                    self.assertGreater(residuals["mechanism:0:mechanism"][0, 2].item(), 1e-5)
+                    with self.assertRaisesRegex(ValueError, "incompatible"):
+                        model.coordinates_of(actual_body)
+                    sum(residuals.values()).sum().backward()
+                    self.assertTrue(torch.isfinite(position.grad).all())
+                    self.assertTrue(torch.isfinite(quaternion.grad).all())
+
+    def test_ambiguous_axis_projection_rejects_half_turn_with_finite_gradients(self):
+        for kind, values in (("revolute", np.zeros((2, 1))), ("planar", np.zeros((2, 3)))):
+            for dtype in (torch.float32, torch.float64):
+                with self.subTest(kind=kind, dtype=dtype):
+                    model = MotionModel(kind, values, pose(), np.eye(3),
+                                        np.array([.2, 0., 0.]) if kind == "revolute" else None,
+                                        1e-6, 1e-6, {"source": "independent axis model"})
+                    reference = PosePath(np.array([0., 1.]), model.poses(values), "fixed mechanism pose",
+                                         motion_model=model, coordinates=values)
+                    request = problem([MotionPhase("mechanism", reference)])
+                    progress = torch.tensor([[.5]], dtype=dtype)
+                    position = torch.zeros((1, 1, 3), dtype=dtype, requires_grad=True)
+                    # Exactly zero scalar and axial quaternion components make
+                    # the axis projection nonunique, without relying on sin(pi).
+                    quaternion = torch.tensor([[[0., 1., 0., 0.]]], dtype=dtype, requires_grad=True)
+                    measured = request.measurements(position, quaternion, progress)
+                    self.assertAlmostEqual(measured["mechanism:0:rotation_error_rad"].item(), np.pi, places=6)
+                    residual = request.residuals(position, quaternion, progress)["mechanism:0:mechanism"]
+                    self.assertGreater(residual.item(), 3.)
+                    residual.sum().backward()
+                    self.assertTrue(torch.isfinite(position.grad).all())
+                    self.assertTrue(torch.isfinite(quaternion.grad).all())
+
+    def test_physical_mechanism_tolerances_remain_strict_inside_generic_path_allowance(self):
+        skill = prismatic_input()
+        skill["scene"]["motion_model"].update(position_tolerance=1e-6, rotation_tolerance=1e-6)
+        request = compile_inputs(skill)
+        progress = torch.as_tensor(request.anchors[None], dtype=torch.float64)
+        position, quaternion = request.sample_reference(progress)
+        position = position.clone()
+        position[0, 1, 1] += 5e-5
+        residuals = request.residuals(position, quaternion, progress,
+                                      joint_velocity=torch.zeros((*progress.shape, 3), dtype=torch.float64))
+        for name, value in residuals.items():
+            if name.startswith("mechanism:"):
+                continue
+            np.testing.assert_allclose(value.numpy(), 0., atol=1e-12)
+        self.assertGreater(residuals["mechanism:0:slide:0-3"][0, 1].item(), 4.8e-5)
+        # At the independent retreat the hand is no longer constrained by the
+        # previously held mechanism, even though the generic path still applies.
+        position, quaternion = request.sample_reference(progress)
+        position = position.clone()
+        position[0, -1, 1] += 5e-5
+        residuals = request.residuals(position, quaternion, progress,
+                                      joint_velocity=torch.zeros((*progress.shape, 3), dtype=torch.float64))
+        for name, value in residuals.items():
+            if name.startswith("mechanism:"):
+                np.testing.assert_allclose(value.numpy(), 0., atol=1e-12)
+    # END compare physical mechanism acceptance with the existing NumPy oracle.
 
     def test_on_endpoint_moves_within_support_without_freeing_local_motion(self):
         body = np.array([[x, y, z] for x in (-.01, .01)
@@ -678,6 +798,68 @@ class PlanningProcessTest(unittest.TestCase):
 
 
 class PlanningBuilderTest(unittest.TestCase):
+    # BEGIN validate serialized public inputs and complete grounding evidence.
+    def test_json_and_array_inputs_compile_equivalently_without_mutation(self):
+        first, second = prismatic_input(), prismatic_input()
+        first["program"]["demo"]["release_frame"] = None
+        first["program"]["demo"]["gripper_events"] = []
+        second["skill_id"] = "next_slide"
+        second["scene"]["functional_bindings"]["function"]["current_coordinates"] = [.18]
+        second["scene"]["holding"]["verified"] = False
+        windows = [(grasp_input(),), (manipulation_input(),), (on_input(),),
+                   (prismatic_input(),), (revolute_input(),), (first, second)]
+        for window in windows:
+            with self.subTest(skills=[skill["skill_id"] for skill in window]):
+                encoded = json.dumps(window, default=lambda value: value.tolist(), sort_keys=True)
+                serialized = json.loads(encoded)
+                original_serialized = deepcopy(serialized)
+                arrays, lists = compile_inputs(*window), compile_inputs(*serialized)
+                np.testing.assert_array_equal(arrays.anchors, lists.anchors)
+                progress = torch.as_tensor(arrays.anchors[None], dtype=torch.float64)
+                np.testing.assert_allclose(matrices(*arrays.sample_reference(progress)),
+                                           matrices(*lists.sample_reference(progress)), atol=1e-12)
+                self.assertEqual([phase.metadata for phase in arrays.phases],
+                                 [phase.metadata for phase in lists.phases])
+                self.assertEqual(json.dumps(arrays.conditions, default=lambda value: value.tolist(), sort_keys=True),
+                                 json.dumps(lists.conditions, default=lambda value: value.tolist(), sort_keys=True))
+                self.assertEqual(serialized, original_serialized)
+                self.assertEqual(json.dumps(window, default=lambda value: value.tolist(), sort_keys=True), encoded)
+        boundary = next(item for item in lists.conditions
+                        if item["kind"] == "predicted_skill_boundary" and item["skill_id"] == "next_slide")
+        self.assertAlmostEqual(boundary["initial_pose"][0][3], .14)
+        self.assertAlmostEqual(lists.phases[2].metadata["owner_initial_pose"][0][3], .1)
+
+    def test_missing_grounding_model_evidence_is_not_silently_free(self):
+        for missing in ("model", "diagnostics"):
+            with self.subTest(missing=missing):
+                skill = prismatic_input()
+                grounded = ground_program(skill["program"], skill["scene"])
+                if missing == "model":
+                    del grounded["motion_checks"]["model"]
+                else:
+                    del grounded["motion_checks"]["model"]["diagnostics"]
+                with patch("manipulation.program.ground_program", return_value=grounded):
+                    with self.assertRaisesRegex(KeyError, missing):
+                        compile_inputs(skill)
+
+    def test_tool_use_keeps_its_existing_function_kernel_without_a_model_record(self):
+        skill = manipulation_input()
+        skill["program"]["task"]["relation"] = "tool_use"
+        body = np.array([pose((x, 0., 0.)) for x in (0., .005, .01, .015, .015, .015, .015)])
+        skill["program"]["demo"]["T_reference_carrier"] = body
+        # Isolate this adapter test from the already independently tested IPOPT
+        # solve; the real tool consumer still validates all six returned nodes.
+        solved_pairs = np.stack((body[:6, :3, 3], np.zeros((6, 3))), axis=1)
+        with patch("manipulation.function_motion.optimize_trajectory", return_value=solved_pairs):
+            grounded = ground_program(skill["program"], skill["scene"])
+            request = compile_inputs(skill)
+        self.assertNotIn("model", grounded["motion_checks"])
+        self.assertEqual(grounded["motion_checks"]["kernel"], "released_function_origin_xyz_euler_objective")
+        self.assertTrue(all(phase.reference.motion_model is None for phase in request.phases))
+        np.testing.assert_allclose(request.phases[0].reference.sample_numpy(np.linspace(0., 1., 4)),
+                                   grounded["eef_poses"][:4], atol=1e-12)
+    # END validate serialized public inputs and complete grounding evidence.
+
     def test_declared_support_tolerances_are_not_widened_by_solver_numerics(self):
         skill = on_input()
         request = compile_inputs(skill)

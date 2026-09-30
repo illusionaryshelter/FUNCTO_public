@@ -288,6 +288,52 @@ def _compose(p, q, transform):
     return p+quaternion_rotate(q, t), quaternion_multiply(q, _tensor(_quaternion(transform), q))
 
 
+# BEGIN preserve the current mechanism's original full-body compatibility metric.
+def _mechanism_errors(reference, position, quaternion):
+    """Differentiable counterpart of MotionModel.coordinates_of's pose check.
+
+    Project the actual path body onto the same physical model, then measure
+    position norm and SO(3) angle. The tool offset is removed before projecting:
+    a small tool error does not establish compatibility of an attached body.
+    This pointwise membership check does not recover or replace the separately
+    retained signed, unwrapped reference coordinates and progress constraints.
+    """
+    import torch
+    model = reference.motion_model
+    p, q = _compose(position, quaternion, _inverse(reference.attachment))
+    base_p = _tensor(model.reference_pose[:3, 3], p)
+    base_q = _tensor(_quaternion(model.reference_pose), q)
+    axis = _tensor(model.axis, p)
+    projected_q = base_q.expand_as(q)
+    if model.kind in {"revolute", "planar"}:
+        relative = quaternion_multiply(q, quaternion_conjugate(base_q))
+        w, along = relative[..., 0], (relative[..., 1:]*axis).sum(-1)
+        sine, cosine = 2*w*along, w.square()-along.square()
+        # These are exactly MotionModel._angles's skew/trace projection.
+        # A half-turn about a perpendicular axis has no unique projected turn.
+        # Choose zero only at machine precision, before atan2, to avoid an
+        # undefined derivative; its actual SO(3) residual remains pi and fails
+        # the original model tolerance, rather than becoming a zero quaternion.
+        singular = w.square()+along.square() <= torch.finfo(q.dtype).eps**2
+        angle = torch.atan2(torch.where(singular, torch.zeros_like(sine), sine),
+                            torch.where(singular, torch.ones_like(cosine), cosine))
+        half = angle[..., None]/2
+        turn = torch.cat((torch.cos(half), torch.sin(half)*axis), -1)
+        projected_q = quaternion_multiply(turn, base_q)
+    if model.kind == "revolute":
+        center = _tensor(model.axis_point, p)
+        projected_p = center+quaternion_rotate(turn, (base_p-center).expand_as(p))
+    elif model.kind == "prismatic":
+        projected_p = base_p+((p-base_p)*axis).sum(-1, keepdim=True)*axis
+    else:
+        basis = _tensor(model.basis[:, :2], p)
+        projected_p = base_p+((p-base_p) @ basis) @ basis.T
+    error = _pose_error(p, q, projected_p, projected_q)
+    return (torch.linalg.vector_norm(error[..., :3], dim=-1),
+            torch.linalg.vector_norm(error[..., 3:], dim=-1))
+# END preserve the current mechanism's original full-body compatibility metric.
+
+
 @dataclass
 class SupportRequirement:
     """A finite observed support and a specific material face at one event."""
@@ -672,6 +718,16 @@ class PlanningProblem:
             if phase.kind == "free" and not phase.require_end:
                 mask = torch.zeros_like(mask)
             result[f"phase:{index}:{phase.name}"] = torch.where(mask, violation, torch.zeros_like(violation))
+            # BEGIN retain mechanism compatibility independently of path numerics.
+            model = phase.reference.motion_model
+            if model is not None:
+                body_position, body_rotation = _mechanism_errors(phase.reference, position, quaternion)
+                # Preserve coordinates_of's existing floating-point guard;
+                # the planning solver's wider pose allowances do not enter.
+                violation = (torch.relu(body_position-model.position_tolerance-1e-10)
+                             + torch.relu(body_rotation-model.rotation_tolerance-1e-10))
+                result[f"mechanism:{index}:{phase.name}"] = torch.where(mask, violation, torch.zeros_like(violation))
+            # END retain mechanism compatibility independently of path numerics.
         for index, requirement in enumerate(self.supports):
             violation = requirement.evaluate(position, quaternion, self.numerical)
             result[f"support:{index}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
@@ -767,6 +823,12 @@ class PlanningProblem:
             values[f"phase:{index}:rotation_error_rad"] = torch.where(mask, torch.linalg.vector_norm(error[..., 3:], dim=-1), 0.)
             values[f"phase:{index}:position_component_error_m"] = torch.where(mask, error[..., :3].abs().amax(-1), 0.)
             values[f"phase:{index}:rotation_component_error_rad"] = torch.where(mask, error[..., 3:].abs().amax(-1), 0.)
+            # BEGIN report the independently checked physical-model residuals.
+            if phase.reference.motion_model is not None:
+                body_position, body_rotation = _mechanism_errors(phase.reference, position, quaternion)
+                values[f"mechanism:{index}:position_error_m"] = torch.where(mask, body_position, 0.)
+                values[f"mechanism:{index}:rotation_error_rad"] = torch.where(mask, body_rotation, 0.)
+            # END report the independently checked physical-model residuals.
             # BEGIN keep the original grounded reference independent of the candidate.
             # Calling _phase_reference here would move the comparison target
             # with the endpoint or release pose and conceal that displacement.
@@ -824,12 +886,14 @@ def _path_from_rows(poses, source, *, model=None, coordinates=None, attachment=N
 
 
 def _model_from_diagnostics(value):
-    if value.get("kind") == "free":
+    # BEGIN require the current grounding model's complete serialization.
+    if value["kind"] == "free":
         return None
     return MotionModel(value["kind"], np.asarray(value["coordinates"], float),
                        np.asarray(value["reference_pose"], float), np.asarray(value["basis"], float),
                        None if value["axis_point"] is None else np.asarray(value["axis_point"], float),
-                       value["position_tolerance"], value["rotation_tolerance"], value.get("diagnostics", {}))
+                       value["position_tolerance"], value["rotation_tolerance"], value["diagnostics"])
+    # END require the current grounding model's complete serialization.
 
 
 def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
@@ -878,9 +942,15 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
         carrier_id = scene.get("carrier_id")
         if not isinstance(carrier_id, str) or not carrier_id:
             raise ValueError("Every robot-planned skill needs its physical carrier identity")
+        # BEGIN normalize this copied skill's pose at the existing public boundary.
+        # JSON matrices and NumPy matrices follow the same validated contract.
+        # A repeated owner still has its own skill entrance; the first observed
+        # owner pose below remains separate collision-geometry provenance.
+        initial_key = "carrier_pose" if program["skill_kind"] == "grasp" else "initial_pose"
+        scene[initial_key] = _pose_array(scene[initial_key], "current skill carrier pose")
+        # END normalize this copied skill's pose at the existing public boundary.
         if carrier_id not in owner_initial_poses:
-            initial_key = "carrier_pose" if program["skill_kind"] == "grasp" else "initial_pose"
-            owner_initial_poses[carrier_id] = _pose_array(scene[initial_key], "first current owner pose")
+            owner_initial_poses[carrier_id] = scene[initial_key].copy()
         # END bind planning geometry to the first current owner observation.
         source = {"skill_id": skill_id, "frame_indices": frames.tolist(),
                   "timestamps": times.tolist(), "kind": "current_grounding_and_original_program"}
@@ -1000,8 +1070,13 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             function_rows = sorted({int(np.flatnonzero(frames == event["frame_index"])[0])
                                     for event in demo["functional_events"]})
             knots = sorted({0, last_held, *function_rows})
-            model_value = grounded["motion_checks"].get("model", {"kind": "free"})
-            model = _model_from_diagnostics(model_value)
+            # BEGIN distinguish the existing tool kernel from mechanism diagnostics.
+            # Tool-use motion has its own function optimizer and no FK model.
+            # Every other relation receives an explicit model from _event_transfer;
+            # missing evidence must not silently turn a mechanism into free motion.
+            model = (None if program["task"]["relation"] == "tool_use" else
+                     _model_from_diagnostics(grounded["motion_checks"]["model"]))
+            # END distinguish the existing tool kernel from mechanism diagnostics.
             on = program["task"]["relation"] == "on"
             if on and model is not None:
                 raise ValueError("A support endpoint family cannot override a physical mechanism")

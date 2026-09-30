@@ -978,6 +978,8 @@ if result.success:
 
 Each skill instance supplies the same compiled `program` and bound `scene`
 already consumed by `ground_program` in the existing prepared-input flow.
+Serialized JSON matrices and NumPy matrices use the same validated pose contract;
+the builder leaves the caller's inputs unchanged.
 The builder reuses that grounding implementation, including functional events,
 necessary motion and release semantics. Use those structured inputs rather
 than reconstructing requirements from the final pose arrays in `trajectory.json`.
@@ -1006,7 +1008,9 @@ allowances; complete targets and whole finger links are not removed to permit
 contact. An actuated hand requires its measured coordinates, actual drive
 coupling, controller capability and calibrated geometry. Position tracking uses
 the supplied executable command path; binary control uses a conservative
-mechanical envelope and may therefore remain uncertified.
+mechanical envelope at every query, including repeated zero progress, and may
+therefore remain uncertified. Progress can pause while the fingers move, so it
+cannot identify the instant of the initial feedback.
 
 For position tracking, optimization also aims at the supplied command inside
 its allowed tracking band. The final check still uses that original band.
@@ -1023,6 +1027,9 @@ They remain fixed when the candidate changes a permitted endpoint or release
 anchor. The existing phase error fields measure the constraint reference;
 neither set invents an additional acceptance threshold or changes source
 freedoms. Reported peaks are over the exported curve's validation samples.
+Physical mechanisms additionally retain their original position-norm and
+rotation-angle tolerances on the attached body. Generic path tolerances do not
+widen those limits; OMPL projection uses the strictest declared tolerances.
 Every returned trajectory seed is checked independently using its own active
 joint layout, final time step, valid sample count and original events; one
 candidate cannot inherit another candidate's feasibility or timing.
@@ -1043,6 +1050,14 @@ identities and search-path pauses retain their progress values. The same clock
 maps search-path joints into control initializers; it never replaces measured
 initial velocity. A control horizon too small for the required stops is rejected
 before solver allocation.
+
+Required source vertices and their clock pauses are retained in full.
+`PlanningBudget.max_refinement_points` limits only additional failure samples;
+the combined exact queries must fit `max_validation_points`. Scene queries and
+the extra native FK buffers are sized from that actual capacity and checked
+against available memory before initial allocation and each clock replacement.
+Those queries do not add native optimization variables or enlarge the control
+horizon.
 
 `build_scene_from_rgbd` takes identified current views containing aligned
 `image`, metric camera-z `depth`, rectified `K`, `T_output_camera`,

@@ -413,8 +413,10 @@ class PrismaticGripper:
     """Bind native finger coordinates to a supported controller and geometry.
 
     Position tracking binds solver joints to the declared command path. A
-    binary controller instead uses the whole native mechanical interval after
-    the measured initial state. Each proxy covers the *continuous* affine
+    binary controller instead uses the whole native mechanical interval for
+    every planning query, including zero progress. Progress is not elapsed
+    time: it may pause while the arm and binary drive continue moving. Each
+    proxy covers the *continuous* affine
     finger sweep, not a finite collection of guessed widths. This conservative
     envelope is independent of timing and remains valid after retiming. It
     may prevent a grasp from being certified; a narrower unverified closure
@@ -498,9 +500,14 @@ class PrismaticGripper:
         limits = _tensor(self.joint_limits, progress)
         measured = _tensor(self.current_positions, progress)
         if self.controller == "binary":
-            initial = progress[..., None] == 0
-            lower = torch.where(initial, measured, limits[:, 0]).expand(expected)
-            upper = torch.where(initial, measured, limits[:, 1]).expand(expected)
+            # BEGIN binary progress cannot identify the measured initial instant.
+            # Neither a repeated zero-progress sample nor an isolated IK/search
+            # query carries a time/velocity contract for the fingers. Preserve
+            # the full continuous mechanical interval at every queried state;
+            # current_positions remains the separately checked real feedback.
+            lower = limits[:, 0].expand(expected)
+            upper = limits[:, 1].expand(expected)
+            # END time-independent binary envelope.
         else:
             lower, upper = self.joint_bounds(progress)
         if lower.shape != expected or upper.shape != expected:
