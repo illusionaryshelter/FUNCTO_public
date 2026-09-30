@@ -1,0 +1,188 @@
+"""Bounded V2 process-manager integration on a synthetic obstacle-free robot.
+
+This is a numerical API test, not a current-scene planning or execution claim.
+It imports the production planner and limits all seed/horizon allocations.
+"""
+
+# BEGIN bounded explicit GPU integration experiment.
+import argparse
+from contextlib import ExitStack
+from dataclasses import asdict
+import json
+from pathlib import Path
+import resource
+import sys
+import time
+import traceback
+from unittest.mock import patch
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+# BEGIN resolve imports from this FUNCTO checkout, independent of its directory name.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+# END project-local imports.
+
+
+class NoObstacleExperiment:
+    """Only for this declared empty synthetic world; never a production default."""
+    reference_frame = "robot_base"
+    required_progress_anchors = ()
+    required_robot_links = ()
+
+    def __init__(self, sphere_count):
+        self.robot_sphere_materials = (None,)*sphere_count
+
+    def clone_for_rollout(self):
+        return type(self)(len(self.robot_sphere_materials))
+
+    def validate_problem(self, problem):
+        if problem.events or problem.conditions or any(phase.metadata for phase in problem.phases):
+            raise ValueError("This declared empty experiment cannot validate interaction evidence or gripper commands")
+
+    def estimated_workspace_bytes(self, batch, horizon):
+        return 0
+
+    def validate_robot_geometry(self, current_spheres_output, link_poses_output):
+        """This explicit empty fixture contains no occupied robot evidence."""
+
+    def optimizer_preferences(self, progress, joint_position, joint_names):
+        return progress*0.
+
+    def describe(self):
+        return {"scope": "explicit synthetic no-obstacle scene", "production_environment_validation": False}
+
+    def with_fixed_endpoints(self, position, quaternion, progress):
+        return self.clone_for_rollout()
+
+    def project_residual(self, progress, joint_position, joint_names):
+        return joint_position[..., :0]
+
+    def evaluate(self, spheres, position, quaternion, progress,
+                 joint_position=None, joint_names=None):
+        return progress*0.
+
+
+def run(output, debug_gradient, initial_joint_velocity=0.):
+    output.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    report = {"scope": "synthetic no-obstacle process-manager API integration",
+              "production_environment_validation": False, "status": "running"}
+    try:
+        import torch
+        from curobo.kinematics import Kinematics, KinematicsCfg
+        from curobo.types import JointState
+        from manipulation.planning_problem import PlanningProblem, MotionPhase, PosePath, NumericalTolerance
+        from manipulation.planning import PlanningBudget, plan_trajectory
+        from manipulation import planning as planner_module
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("Explicit GPU access is required for this bounded experiment")
+        torch.set_num_threads(2)
+        torch.cuda.set_per_process_memory_fraction(2*1024**3/torch.cuda.get_device_properties(0).total_memory)
+        torch.cuda.reset_peak_memory_stats()
+        kinematics = Kinematics(KinematicsCfg.from_robot_yaml_file("franka.yml"))
+        initial = kinematics.default_joint_position.reshape(-1).clone()
+        q1, q2 = initial.clone(), initial.clone()
+        q1[0] += .08
+        q1[1] -= .03
+        q2[0] += .12
+        q2[1] -= .04
+        state = kinematics.compute_kinematics(JointState.from_position(
+            torch.stack((initial, q1, q2))[None].contiguous(), joint_names=kinematics.joint_names))
+        p = state.tool_poses.position[0, :, 0].detach().cpu().numpy()
+        r = state.tool_poses.quaternion[0, :, 0].detach().cpu().numpy()
+        poses = np.repeat(np.eye(4)[None], 3, axis=0)
+        poses[:, :3, 3] = p
+        poses[:, :3, :3] = Rotation.from_quat(r[:, [1, 2, 3, 0]]).as_matrix()
+        # BEGIN measured nonzero boundary-velocity regression.
+        measured_velocity = np.zeros(len(initial))
+        measured_velocity[0] = initial_joint_velocity
+        report["measured_initial_velocity"] = measured_velocity.tolist()
+        problem = PlanningProblem(
+            tuple(kinematics.joint_names), initial.cpu().numpy(), measured_velocity,
+            "panda_hand", "robot_base", np.eye(4), np.eye(4),
+            (MotionPhase("free_approach", PosePath(np.array([0., 1.]), poses[:2], "synthetic FK targets"), "free"),
+             MotionPhase("required_local_motion", PosePath(np.array([0., 1.]), poses[1:], "synthetic FK targets"))),
+            numerical=NumericalTolerance(position_m=.001, rotation_rad=.005))
+        # END measured nonzero boundary-velocity regression.
+        budget = PlanningBudget(ik_seeds=4, trajectory_seeds=1,
+                                trajectory_iterations=125, search_seconds=0.)
+        report["budget"] = asdict(budget)
+        # BEGIN keep optional diagnostics within one planner invocation.
+        if debug_gradient:
+            original_optimize = planner_module._CuroboPlanner.optimize
+
+            def measured_optimize(planner, seed):
+                result = original_optimize(planner, seed)
+                traces = []
+                for rollout in planner.trajopt.optimizer_rollouts:
+                    # The live optimizer retains one goal index per line-search
+                    # particle, so diagnostic actions must preserve that axis.
+                    particles = planner.trajopt.optimizer.optimizers[0].config.num_particles
+                    x = seed.detach().reshape(-1, seed.shape[-2], seed.shape[-1]).repeat_interleave(
+                        particles, dim=0).clone().requires_grad_(True)
+                    evaluated = rollout.evaluate_action(x, use_cuda_graph=False)
+                    collection = evaluated.costs_and_constraints
+                    row = {"rollout": rollout.rollout_instance_name,
+                           "manager": type(rollout.constraint_manager).__name__,
+                           "process_mode": rollout.constraint_manager._process_mode,
+                           "terms": {}}
+                    for label, terms in (("cost", collection.costs), ("constraint", collection.constraints)):
+                        for name, value in zip(terms.names, terms.values):
+                            grad = torch.autograd.grad(value.sum(), x, retain_graph=True, allow_unused=True)[0] if value.requires_grad else None
+                            row["terms"][f"{label}:{name}"] = {
+                                "sum": float(value.detach().sum().cpu()),
+                                "requires_grad": value.requires_grad,
+                                "gradient_present": grad is not None,
+                                "gradient_nonfinite": None if grad is None else int((~torch.isfinite(grad)).sum().cpu()),
+                                "finite_gradient_max": None if grad is None else float(torch.nan_to_num(grad).abs().max().cpu())}
+                    traces.append(row)
+                report["gradient_trace"] = traces
+                report["max_control_change"] = float((result.solution.reshape_as(seed)-seed).abs().max().detach().cpu())
+                return result
+
+        # A native solve or diagnostic callback may raise. ExitStack restores
+        # the prior method before the outer error handler records the failure.
+        with ExitStack() as instrumentation:
+            if debug_gradient:
+                instrumentation.enter_context(patch.object(
+                    planner_module._CuroboPlanner, "optimize", new=measured_optimize))
+            result = plan_trajectory(problem, NoObstacleExperiment(kinematics.total_spheres), "franka.yml", budget=budget)
+        # END scoped optional diagnostics.
+        report.update(status="completed", success=result.success, diagnostics=result.diagnostics)
+        if result.trajectory is not None:
+            t = result.trajectory
+            np.savez(output / "trajectory.npz", times=t.times, position=t.position, velocity=t.velocity,
+                     progress_u=t.progress_u, progress_s=t.progress_s)
+            report["duration"] = t.duration
+            # BEGIN independent boundary-velocity check on the actual curve.
+            _, actual_velocity, _ = t.sample(0.)
+            report["exported_initial_velocity"] = actual_velocity.tolist()
+            report["initial_velocity_max_error"] = float(np.max(np.abs(actual_velocity-measured_velocity)))
+            if report["initial_velocity_max_error"] > problem.numerical.velocity:
+                raise AssertionError("The accepted curve changed the measured initial velocity")
+            # END independent boundary-velocity check on the actual curve.
+        report.update(torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                      torch_peak_reserved_bytes=torch.cuda.max_memory_reserved())
+    except Exception as error:
+        report.update(status="error", error=f"{type(error).__name__}: {error}")
+        (output / "exception.txt").write_text(traceback.format_exc())
+        traceback.print_exc()
+    finally:
+        report.update(elapsed_seconds=time.monotonic()-started,
+                      peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
+        print(json.dumps(report, allow_nan=False), flush=True)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--debug-gradient", action="store_true")
+    parser.add_argument("--initial-joint-velocity", type=float, default=0.,
+                        help="Synthetic measured velocity of the first Franka joint in rad/s")
+    args = parser.parse_args()
+    run(args.output, args.debug_gradient, args.initial_joint_velocity)
+# END bounded explicit GPU integration experiment.

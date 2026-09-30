@@ -934,7 +934,9 @@ optimization or proof of complete `inside`/physical execution.
 
 Grounding produces the interaction requirements and geometric reference.
 `manipulation.planning.plan_trajectory` uses cuRobo V2 to solve one joint
-trajectory through the current skill and its known successors. Required local
+trajectory through the current skill and at most one explicitly supplied next
+skill. Requests with more than two skills are rejected before grounding;
+each accepted skill retains all of its motion phases. Required local
 motion, functional events, joint limits, self collision and scene constraints
 participate in generation. When needed, OMPL searches ordinary or constrained
 `(q, progress)` connections and supplies an initializer for another complete
@@ -952,7 +954,7 @@ from manipulation.planning_problem import build_planning_problem
 from manipulation.planning import PlanningBudget, plan_trajectory
 
 problem = build_planning_problem(
-    skill_instances,  # [{skill_id, program, scene, barrier_can_stop}, ...]
+    skill_instances,  # One or two {skill_id, program, scene, barrier_can_stop} entries.
     joint_names=joint_names,
     start_q=measured_joint_positions,
     start_dq=measured_joint_velocities,
@@ -974,13 +976,25 @@ if result.success:
     next_evidence = curve.next_verification
 ```
 
-Each skill instance supplies an existing compiled `program` and its current
-bound grounding `scene`. All entries share an explicit tool and planning frame.
-The builder binds successor initial states to preceding predicted boundaries;
+Each skill instance supplies the same compiled `program` and bound `scene`
+already consumed by `ground_program` in the existing prepared-input flow.
+The builder reuses that grounding implementation, including functional events,
+necessary motion and release semantics. Use those structured inputs rather
+than reconstructing requirements from the final pose arrays in `trajectory.json`.
+All entries share an explicit tool and planning frame. The builder binds the
+next skill's initial state to the preceding predicted boundary;
 it never fills actual Holding evidence from a proposed grasp. A requested
 grasp/release evidence barrier requires `barrier_can_stop=True` and a zero
 velocity condition at that boundary. Rebind the remaining window after actual
 feedback establishes or changes the attachment.
+
+The production implementation lives in `manipulation/planning*.py`, with CPU
+regressions in `tests/test_manipulation_planning*.py`. Explicit native-backend
+checks and diagnostics live in [`tests/planning`](tests/planning/README.md).
+They are not imported by production or run by ordinary CPU test discovery;
+no source code is loaded from a dated planning directory. Their synthetic
+scenes establish local backend behavior, not acceptance of a particular
+grounded manipulation task.
 
 The robot YAML/configuration, active joint names, measured state, base transform
 and link-to-TCP calibration are mandatory. `collision_scene` must be a
@@ -1001,6 +1015,14 @@ only target finite, equal source bounds and retain their actual functional
 endpoint and release-frame dependence. Finite-width and unbounded pose axes
 receive no invented center; numerical tolerances and final residuals stay
 separate from these optimizer objectives.
+Export diagnostics also report `phase:N:original_reference_position_error_m`
+and `phase:N:original_reference_rotation_error_rad`, with corresponding
+component maxima. These compare the actual TCP against the original grounded
+reference at the same source progress, including free approaches and retreat.
+They remain fixed when the candidate changes a permitted endpoint or release
+anchor. The existing phase error fields measure the constraint reference;
+neither set invents an additional acceptance threshold or changes source
+freedoms. Reported peaks are over the exported curve's validation samples.
 Every returned trajectory seed is checked independently using its own active
 joint layout, final time step, valid sample count and original events; one
 candidate cannot inherit another candidate's feasibility or timing.

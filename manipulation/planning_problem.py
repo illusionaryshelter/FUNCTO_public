@@ -443,10 +443,12 @@ class InteriorRequirement:
 
 @dataclass
 class PlanningProblem:
-    """One shared joint trajectory through all currently known phases.
+    """One shared joint trajectory for the current skill and at most one next.
 
     ``base_pose`` and ``tool_transform`` are mandatory calibration inputs; the
     named robot link is never silently equated with a demonstrated TCP frame.
+    A skill may contain several phases. Low-level phase inputs need not name
+    skills, but all explicitly declared phase/event skill IDs share this limit.
     """
     joint_names: tuple[str, ...]
     start_q: np.ndarray
@@ -477,6 +479,17 @@ class PlanningProblem:
             raise ValueError("A planning problem needs current named joint state, calibrated frames, and phases")
         self.base_pose = _pose_array(self.base_pose, "T_reference_robot_base")
         self.tool_transform = _pose_array(self.tool_transform, "T_link_tool")
+        # BEGIN bound declared skill identities without limiting motion phases.
+        # Direct phase-level callers may omit skill identities. When supplied,
+        # phase and event IDs describe one shared window, not separate budgets.
+        skill_ids = [phase.metadata["skill_id"] for phase in self.phases
+                     if "skill_id" in phase.metadata]
+        skill_ids.extend(event.skill_id for event in self.events)
+        if any(not isinstance(skill_id, str) or not skill_id for skill_id in skill_ids):
+            raise ValueError("Declared planning skill IDs must be nonempty strings")
+        if len(set(skill_ids)) > 2:
+            raise ValueError("A planning window supports the current skill and at most one next skill")
+        # END bound declared skill identities without limiting motion phases.
         for index, phase in enumerate(self.phases):
             if phase.frame_anchor is not None and phase.frame_anchor["progress"] > index:
                 raise ValueError("A predicted owner frame must come from this phase's entrance or an earlier boundary")
@@ -732,7 +745,15 @@ class PlanningProblem:
     # END retain an optimizer gradient for source pose equalities.
 
     def measurements(self, position, quaternion, progress):
-        """Actual metric deviations before acceptance clipping, for reporting."""
+        """Report constraint-reference errors and original-reference deviations.
+
+        Existing ``*_error_*`` fields measure the reference used by the hard
+        constraints, including explicitly allowed endpoint/frame transfers.
+        ``original_reference_*`` instead compares to the grounded input path
+        at the same source progress, before any candidate-dependent transfer.
+        These deviations cover each entire phase, including free approaches;
+        they are measurements, not an invented task acceptance threshold.
+        """
         import torch
         values = {}
         for index, phase in enumerate(self.phases):
@@ -746,6 +767,22 @@ class PlanningProblem:
             values[f"phase:{index}:rotation_error_rad"] = torch.where(mask, torch.linalg.vector_norm(error[..., 3:], dim=-1), 0.)
             values[f"phase:{index}:position_component_error_m"] = torch.where(mask, error[..., :3].abs().amax(-1), 0.)
             values[f"phase:{index}:rotation_component_error_rad"] = torch.where(mask, error[..., 3:].abs().amax(-1), 0.)
+            # BEGIN keep the original grounded reference independent of the candidate.
+            # Calling _phase_reference here would move the comparison target
+            # with the endpoint or release pose and conceal that displacement.
+            original_p, original_q = phase.reference.sample((progress-index).clamp(0, 1))
+            original_error = _pose_error(position, quaternion, original_p, original_q)
+            original_mask = (progress >= index-1e-7) & (progress <= index+1+1e-7)
+            prefix = f"phase:{index}:original_reference"
+            values[f"{prefix}_position_error_m"] = torch.where(
+                original_mask, torch.linalg.vector_norm(original_error[..., :3], dim=-1), 0.)
+            values[f"{prefix}_rotation_error_rad"] = torch.where(
+                original_mask, torch.linalg.vector_norm(original_error[..., 3:], dim=-1), 0.)
+            values[f"{prefix}_position_component_error_m"] = torch.where(
+                original_mask, original_error[..., :3].abs().amax(-1), 0.)
+            values[f"{prefix}_rotation_component_error_rad"] = torch.where(
+                original_mask, original_error[..., 3:].abs().amax(-1), 0.)
+            # END independent original-reference measurements.
         for index, event in enumerate(self.pose_events):
             p, r = event.errors(position, quaternion)
             mask = (progress-event.progress).abs() <= 1e-7
@@ -798,12 +835,14 @@ def _model_from_diagnostics(value):
 def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
                            reference_frame, base_pose, tool_transform,
                            numerical=NumericalTolerance(), couplings=()):
-    """Compile grounded skill inputs into one conditional joint-planning window.
+    """Compile the current skill and optional next into one conditional window.
 
-    ``skills`` contains ``skill_id``, the compiled ``program``, its current
-    bound ``scene``, and explicit ``barrier_can_stop`` permission. Grounding
-    inputs are copied. Future manipulation uses object geometry plus the
-    proposed attachment, never the actual-Holding wrapper with invented facts.
+    ``skills`` is an ordered list/tuple of one or two entries containing
+    ``skill_id``, the compiled ``program``, its current bound ``scene``, and
+    explicit ``barrier_can_stop`` permission. Every skill keeps its complete
+    motion phases. Grounding inputs are copied. Next-skill manipulation uses
+    object geometry plus the proposed attachment, never the actual-Holding
+    wrapper with invented facts.
     A caller continues execution past a barrier only after actual feedback and
     rebinds remaining work if those conditions differ.
     """
@@ -811,8 +850,10 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
     from .program import ground_program, ground_object_program, _object_reference, _intentions
     from .pipeline import _surface, _interior
 
-    if not isinstance(skills, (list, tuple)) or not skills:
-        raise ValueError("Provide the current skill and any known local successors")
+    # BEGIN limit lookahead before grounding or predicting any skill state.
+    if not isinstance(skills, (list, tuple)) or not 1 <= len(skills) <= 2:
+        raise ValueError("Provide the current skill and at most one next skill")
+    # END limit lookahead before grounding or predicting any skill state.
     phases, events, conditions, supports, interiors, pose_events, coordinate_events = [], [], [], [], [], [], []
     previous, skill_ids, tool_identity = None, set(), None
     predicted_objects, owner_initial_poses = {}, {}

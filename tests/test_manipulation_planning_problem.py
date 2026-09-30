@@ -640,6 +640,29 @@ class PlanningProcessTest(unittest.TestCase):
             problem(phases, events=(PlanningEvent("holding", "first", 1., 43, "verification", "source",
                                                  requires_evidence="actual Holding"),))
 
+    # BEGIN bound named windows while preserving complete multi-phase skills.
+    def test_declared_skill_limit_combines_phase_and_event_identities(self):
+        phases = [MotionPhase(f"phase_{index}", path([pose(), pose()]),
+                              metadata={"skill_id": skill_id})
+                  for index, skill_id in enumerate(("current", "current", "current", "next", "next"))]
+        request = problem(phases)
+        self.assertEqual(request.phase_count, 5)
+        later = MotionPhase("later", path([pose(), pose()]), metadata={"skill_id": "later"})
+        with self.assertRaisesRegex(ValueError, "current skill and at most one next skill"):
+            problem([*phases, later])
+        with self.assertRaisesRegex(ValueError, "current skill and at most one next skill"):
+            problem(phases, events=(PlanningEvent("open", "later", 4.5, 42,
+                                                 "gripper", "independent original event"),))
+
+    def test_event_only_skill_ids_cannot_bypass_the_window_limit(self):
+        phase = MotionPhase("explicit_phase", path([pose(), pose()]))
+        events = tuple(PlanningEvent("open", skill_id, index / 3., index,
+                                     "gripper", "independent original event")
+                       for index, skill_id in enumerate(("current", "next", "later")))
+        with self.assertRaisesRegex(ValueError, "current skill and at most one next skill"):
+            problem([phase], events=events)
+    # END bound named windows while preserving complete multi-phase skills.
+
     def test_numerical_acceptance_does_not_mutate_declared_skill_bounds(self):
         declared = np.zeros((6, 2))
         declared[0] = [-.02, .02]
@@ -807,6 +830,61 @@ class PlanningBuilderTest(unittest.TestCase):
         self.assertGreater(request.evaluate(wrong_position, quaternion, progress,
                                             joint_velocity=velocity)[0, -1].item(), .02)
 
+    # BEGIN independent source-reference reporting across support transfer and release.
+    def test_original_reference_reports_allowed_transfer_and_retreat_displacement(self):
+        skill = on_input()
+        request = compile_inputs(skill)
+        original = ground_program(skill["program"], skill["scene"])["eef_poses"]
+        saved = [phase.reference.poses.copy() for phase in request.phases]
+        progress = torch.tensor([[0., 1./3, 2./3, 1., 1.5, 2., 3.]], dtype=torch.float64)
+        candidates = [original, alternative_placement(skill)[0],
+                      alternative_placement(skill, pose((.08, -.06, 0.), (0., 0., -.3)))[0]]
+        for actual in candidates:
+            position, quaternion = components(actual[None])
+            # The opposite quaternion representative describes the same pose.
+            quaternion = -quaternion
+            velocity = torch.zeros((1, len(actual), 3), dtype=torch.float64)
+            np.testing.assert_allclose(request.evaluate(
+                position, quaternion, progress, joint_velocity=velocity).numpy(), 0., atol=1e-12)
+            measured = request.measurements(position, quaternion, progress)
+            relative_rotation = np.swapaxes(original[:, :3, :3], 1, 2) @ actual[:, :3, :3]
+            translation = np.einsum("nji,nj->ni", original[:, :3, :3],
+                                    actual[:, :3, 3]-original[:, :3, 3])
+            rotation = Rotation.from_matrix(relative_rotation).as_rotvec()
+            for index in range(request.phase_count):
+                mask = ((progress.numpy()[0] >= index-1e-7)
+                        & (progress.numpy()[0] <= index+1+1e-7))
+                prefix = f"phase:{index}:original_reference"
+                for unit, error in (("position", translation), ("rotation", rotation)):
+                    suffix = "m" if unit == "position" else "rad"
+                    np.testing.assert_allclose(
+                        measured[f"{prefix}_{unit}_error_{suffix}"].numpy()[0],
+                        np.where(mask, np.linalg.norm(error, axis=-1), 0.), atol=1e-12)
+                    np.testing.assert_allclose(
+                        measured[f"{prefix}_{unit}_component_error_{suffix}"].numpy()[0],
+                        np.where(mask, np.abs(error).max(axis=-1), 0.), atol=1e-12)
+                self.assertLess(measured[f"phase:{index}:position_error_m"].max().item(), 1e-12)
+            if actual is not original:
+                self.assertGreater(measured["phase:2:original_reference_position_error_m"].max().item(), .01)
+                self.assertGreater(measured["phase:2:original_reference_rotation_error_rad"].max().item(), .1)
+        for phase, before in zip(request.phases, saved):
+            np.testing.assert_array_equal(phase.reference.poses, before)
+
+    def test_original_reference_also_reports_unconstrained_free_motion(self):
+        request = problem([MotionPhase("free approach", path([pose(), pose()]),
+                                       kind="free", require_end=False)])
+        progress = torch.tensor([[0., .5, 1.]], dtype=torch.float64)
+        actual = np.array([pose(), pose((.03, -.04, 0.), (0., 0., .2)), pose()])
+        position, quaternion = components(actual[None])
+        self.assertTrue(torch.all(request.evaluate(position, quaternion, progress) == 0))
+        measured = request.measurements(position, quaternion, progress)
+        np.testing.assert_allclose(measured["phase:0:original_reference_position_error_m"].numpy(),
+                                   [[0., .05, 0.]], atol=1e-12)
+        np.testing.assert_allclose(measured["phase:0:original_reference_rotation_error_rad"].numpy(),
+                                   [[0., .2, 0.]], atol=1e-12)
+        self.assertTrue(torch.all(measured["phase:0:position_error_m"] == 0))
+    # END independent source-reference reporting.
+
     def test_on_carrier_coordinate_gauge_does_not_move_physical_joint_requirements(self):
         skill = on_input()
         changed = deepcopy(skill)
@@ -835,6 +913,9 @@ class PlanningBuilderTest(unittest.TestCase):
     def test_regrasp_tracks_the_actual_variable_placement_instead_of_its_nominal_pose(self):
         place, grasp = on_input(), grasp_input()
         request = compile_inputs(place, grasp)
+        # BEGIN distinguish the two-skill limit from its complete five phases.
+        self.assertEqual(request.phase_count, 5)
+        # END distinguish the two-skill limit from its complete five phases.
         placement, release_delta = alternative_placement(place)
         grasp_phases = [phase for phase in request.phases if phase.metadata.get("skill_id") == "grasp"]
         nominal_grasp = np.concatenate((grasp_phases[0].reference.sample_numpy(np.linspace(0., 1., 3)),
@@ -890,6 +971,9 @@ class PlanningBuilderTest(unittest.TestCase):
 
     def test_function_open_release_and_retreat_keep_distinct_source_boundaries(self):
         request = compile_inputs(manipulation_input())
+        # BEGIN retain all phases of one skill within the bounded window.
+        self.assertEqual(request.phase_count, 3)
+        # END retain all phases of one skill within the bounded window.
         events = {event.event_id: event for event in request.events}
         self.assertEqual(events["function"].source_frame, 106)
         self.assertEqual(events["open"].source_frame, 108)
@@ -1000,40 +1084,16 @@ class PlanningBuilderTest(unittest.TestCase):
         barrier = next(event for event in terminal.events if event.requires_evidence is not None)
         self.assertEqual(barrier.progress, terminal.phase_count)
 
-    def test_release_then_regrasp_creates_distinct_conditional_spans_from_one_observation(self):
+    # BEGIN reject remote successors instead of compiling a four-skill task.
+    def test_window_rejects_more_than_current_and_next_skill(self):
         grasp, place, regrasp, carry = grasp_input(), manipulation_input(), grasp_input(), manipulation_input()
         regrasp["skill_id"], carry["skill_id"] = "regrasp", "carry"
-        carry["program"]["demo"]["release_frame"] = None
-        carry["program"]["demo"]["gripper_events"] = [
-            {"event_id": "hold", "frame_index": 100, "command": "hold"}]
-        for future in (place, carry):
-            future["scene"]["holding"]["verified"] = False
-            future["scene"]["holding"]["source"] = "no future Holding observation exists"
-        request = compile_inputs(grasp, place, regrasp, carry)
-        self.assertEqual(request.phase_count, 9)
-        first_held = [phase for phase in request.phases if phase.metadata.get("skill_id") == "transfer"
-                      and phase.metadata.get("mode") == "held"]
-        later_held = [phase for phase in request.phases if phase.metadata.get("skill_id") == "carry"]
-        self.assertEqual(len(first_held), 2)
-        self.assertEqual(len(later_held), 2)
-        for phase in first_held:
-            self.assertEqual(phase.metadata["attachment_interval"], [2., 4.])
-            self.assertEqual(phase.metadata["attachment_condition_id"], "grasp:stable_holding")
-            self.assertEqual(phase.metadata["release_condition_id"], "transfer:actual_release")
-        for phase in later_held:
-            self.assertEqual(phase.metadata["attachment_interval"], [7., 9.])
-            self.assertEqual(phase.metadata["attachment_condition_id"], "regrasp:stable_holding")
-            self.assertIsNone(phase.metadata["release_condition_id"])
-        for phase in request.phases:
-            np.testing.assert_array_equal(phase.metadata["owner_initial_pose"], grasp["scene"]["carrier_pose"])
-        self.assertFalse(any(item["kind"] == "observed_attachment" for item in request.conditions))
-        candidates = [item for item in request.conditions if item["kind"] == "candidate_attachment"]
-        self.assertEqual([item["condition_id"] for item in candidates],
-                         ["grasp:stable_holding", "regrasp:stable_holding"])
-        self.assertTrue(all(item["requires_evidence"] for item in candidates))
-        self.assertFalse(any("verified" in item for item in request.conditions))
-        self.assertFalse(place["scene"]["holding"]["verified"])
-        self.assertFalse(carry["scene"]["holding"]["verified"])
+        skills = (grasp, place, regrasp, carry)
+        for count in (3, 4):
+            with self.subTest(skill_count=count):
+                with self.assertRaisesRegex(ValueError, "current skill and at most one next skill"):
+                    compile_inputs(*skills[:count])
+    # END reject remote successors instead of compiling a four-skill task.
     # END attachment provenance and exact collision-span contract regressions.
 
 
