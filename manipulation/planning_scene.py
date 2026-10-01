@@ -25,6 +25,7 @@ from scipy.ndimage import distance_transform_edt
 from scipy.spatial.transform import Rotation
 import torch
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .planning_problem import (
     PosePath, quaternion_conjugate, quaternion_multiply, quaternion_rotate, quaternion_rotvec,
@@ -76,6 +77,49 @@ def _world_spheres(spheres, position, quaternion):
     points = _world_points(local[..., :3], position, quaternion)
     radii = local[..., 3:4].expand(*points.shape[:-1], 1)
     return torch.cat((points, radii), dim=-1)
+
+
+# BEGIN bounded batched hand-pair penalties with unchanged sum and derivatives.
+def _self_pair_chunk_size(states, pairs):
+    """Bound temporary pair expansion independently of a robot's sphere count."""
+    return min(pairs, 512, max(1, 1_048_576 // states)) if pairs else 0
+
+
+def _pair_penetration(spheres, pairs):
+    """Sum the original positive linear penetrations of these explicit pairs.
+
+    Native cuRobo self-collision differentiates a maximum over pairs; it cannot
+    replace this sum without changing the optimizer objective. Torch's norm
+    preserves its zero-distance derivative, without artificial clearance.
+    """
+    first = spheres.index_select(-2, pairs[:, 0])
+    second = spheres.index_select(-2, pairs[:, 1])
+    distance = torch.linalg.vector_norm(first[..., :3] - second[..., :3], dim=-1)
+    return torch.relu(first[..., 3] + second[..., 3] - distance).sum(-1)
+
+
+def _self_pair_sum(spheres, pair_indices):
+    """Evaluate every pair in bounded chunks, recomputing saved intermediates.
+
+    Non-reentrant checkpointing uses Torch's own derivatives while avoiding
+    one retained [B,H,P,3] graph for every chunk. Inputs are immutable during
+    native backward; pair indices are explicit arguments, not loop closures.
+    All costs are nonnegative, so a zero sum means every declared pair passed.
+    """
+    total = spheres.new_zeros(spheres.shape[:2])
+    if not len(pair_indices):
+        return total
+    pairs = torch.as_tensor(pair_indices, dtype=torch.long, device=spheres.device)
+    step = _self_pair_chunk_size(math.prod(spheres.shape[:2]), len(pairs))
+    gradients = torch.is_grad_enabled() and spheres.requires_grad
+    for begin in range(0, len(pairs), step):
+        selected = pairs[begin:begin+step]
+        value = (checkpoint(_pair_penetration, spheres, selected,
+                            use_reentrant=False, preserve_rng_state=False)
+                 if gradients else _pair_penetration(spheres, selected))
+        total = total + value
+    return total
+# END bounded batched hand-pair penalties with unchanged sum and derivatives.
 
 
 class CuroboSphereQuery:
@@ -482,6 +526,11 @@ class PrismaticGripper:
             if (len(pair) != 2 or pair[0] == pair[1] or any(type(i) is not int or i < 0 for i in pair)
                     or not set(pair) & set(self.sphere_indices)):
                 raise ValueError("Envelope self-collision pairs must involve the gripper")
+        # BEGIN reject duplicate declarations before batched summation.
+        if len(set(self.self_collision_pairs)) != len(self.self_collision_pairs):
+            raise ValueError("Self-collision pair declarations must be unique")
+        self._self_pair_indices = np.asarray(self.self_collision_pairs, dtype=np.int64).reshape(-1, 2)
+        # END reject duplicate declarations before batched summation.
         self.commands = tuple(commands)
         if not self.commands:
             raise ValueError("Gripper geometry must be bound to explicit controller events")
@@ -888,7 +937,18 @@ class PlanningScene:
         query_bytes = batch * horizon * count * 40
         coverage_bytes = (batch * horizon * sum(actors.values()) * 128
                           + (1 + len(actors)) * self.coverage._distance.numel() * 4)
-        return int(query_bytes + coverage_bytes)
+        # BEGIN include checkpointed hand-pair scratch and its retained input.
+        pair_bytes = 0
+        if self.gripper is not None and self.gripper.self_collision_pairs:
+            pairs = len(self.gripper.self_collision_pairs)
+            chunk = _self_pair_chunk_size(batch*horizon, pairs)
+            # 24 floats per expanded pair cover indexed balls, displacement,
+            # norm/ReLU and backward scratch. Reserve sphere values plus
+            # accumulated gradients and explicit int64 pair indices as well.
+            # Checkpointing frees chunk scratch rather than retaining all P.
+            pair_bytes = batch*horizon*(96*chunk+32*actors["robot"])+16*pairs
+        return int(query_bytes + coverage_bytes + pair_bytes)
+        # END include checkpointed hand-pair scratch and its retained input.
 
     def project_residual(self, progress, joint_position, joint_names):
         """Independent executable finger-drive equalities for OMPL projection.
@@ -1012,10 +1072,10 @@ class PlanningScene:
         if self.gripper is not None:
             coordinates, half, costs["gripper/controller"] = self.gripper.state(progress, joint_position, joint_names)
             spheres = self.gripper.spheres(spheres, position, quaternion, coordinates, half)
-            for first, second in self.gripper.self_collision_pairs:
-                pair = spheres[..., [first, second], :]
-                distance = torch.linalg.vector_norm(pair[..., 0, :3] - pair[..., 1, :3], dim=-1)
-                costs[f"gripper/self/{first}/{second}"] = torch.relu(pair[..., 0, 3] + pair[..., 1, 3] - distance)
+            # BEGIN retain every declared pair without a per-pair Python graph.
+            if self.gripper.self_collision_pairs:
+                costs["gripper/self"] = _self_pair_sum(spheres, self.gripper._self_pair_indices)
+            # END retain every declared pair without a per-pair Python graph.
         poses = {}
         release_states = {}
         for owner in self.owners:

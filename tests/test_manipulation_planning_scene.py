@@ -18,8 +18,43 @@ from manipulation.planning_problem import (
 )
 from manipulation.planning_scene import (
     Attachment, CollisionOwner, ContactRule, CuroboSphereQuery, ObservedSpace,
-    PlanningScene, PrismaticGripper,
+    PlanningScene, PrismaticGripper, _self_pair_sum,
 )
+
+
+# BEGIN multiple-collision and cross-chunk gradient regression.
+class BatchedHandCollisionTest(unittest.TestCase):
+    def test_all_pair_penetrations_and_gradients_survive_chunk_boundaries(self):
+        generator = torch.Generator().manual_seed(29)
+        values = torch.randn((2, 3, 34, 4), generator=generator, dtype=torch.float64)
+        values[..., 3] = .9
+        # Coincident centres test Torch's original zero-distance derivative;
+        # a reversed declared pair remains a separate term in the old sum.
+        values[..., 1, :3] = values[..., 0, :3]
+        pairs = np.asarray([(a, b) for a in range(34) for b in range(a+1, 34)] + [(1, 0)])
+        actual_input = values.clone().requires_grad_()
+        expected_input = values.clone().requires_grad_()
+        actual = _self_pair_sum(actual_input, pairs)
+        expected = torch.stack([
+            torch.relu(expected_input[..., a, 3]+expected_input[..., b, 3]
+                       - torch.linalg.vector_norm(expected_input[..., a, :3]
+                                                  - expected_input[..., b, :3], dim=-1))
+            for a, b in pairs]).sum(0)
+        weights = torch.randn((2, 3), generator=generator, dtype=torch.float64)
+        actual_grad = torch.autograd.grad((actual*weights).sum(), actual_input)[0]
+        expected_grad = torch.autograd.grad((expected*weights).sum(), expected_input)[0]
+        torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(actual_grad, expected_grad, atol=1e-12, rtol=1e-12)
+        with torch.no_grad():
+            torch.testing.assert_close(_self_pair_sum(values, pairs), expected)
+
+    def test_distinct_pair_sum_is_not_replaced_by_a_maximum(self):
+        spheres = torch.tensor([[[[0., 0., 0., .2], [.1, 0., 0., .2],
+                                   [.2, 0., 0., .2]]]], dtype=torch.float64)
+        value = _self_pair_sum(spheres, np.asarray([[0, 1], [1, 2]]))
+        self.assertAlmostEqual(value.item(), .6)
+        self.assertEqual(_self_pair_sum(spheres, np.empty((0, 2), dtype=int)).item(), 0.)
+# END multiple-collision and cross-chunk gradient regression.
 
 
 class SphereQuery:

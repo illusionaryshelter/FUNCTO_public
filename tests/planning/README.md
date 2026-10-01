@@ -29,6 +29,9 @@ not include every allocation made by native libraries.
 | `check_recorded_task_inputs.py` | CPU replay of manifest-declared task references and input completeness; preserves candidate ambiguity and independent snapshots |
 | `check_recorded_robot_binding.py` | CPU comparison of an explicitly mapped recorded robot and planning URDF, including collision-sphere coverage counterexamples |
 | `visualize_recorded_task.py` | Local HTML and PNG presentation of those input audits and task-space references; does not run joint planning or simulation |
+| `robot_fixture.py`, `prepare_recorded_task.py` | Explicit native robot geometry, named proprioception, FK checks and current planning-problem preparation |
+| `recorded_observation.py`, `recorded_owner_geometry.py`, `detect_recorded_owners.py` | Current robot/owner masks and explicitly bound offline carrier geometry; no current object truth enters planning |
+| `run_recorded_skill.py`, `recorded_task_planning.py` | Current bounded joint planning, unchanged skill constraints and classified diagnostic curve export |
 | `probe_ompl_constraints.py` | CPU OMPL projection and connection contracts |
 | `probe_scalar_progress_clock.py`, `diagnose_moving_gripper_capacity.py`, `probe_collision_suffix_capacity.py` | CPU representation and interpolation diagnostics |
 | `probe_fk_gradient.py`, `probe_process_gradient.py` | Native FK and full-process derivative checks |
