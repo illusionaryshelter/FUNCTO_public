@@ -220,6 +220,11 @@ class RobotCoverage:
             raise RuntimeError(f"Native solid operation failed: {status}")
         if shape.num_tri() > _MAX_RESULT_FACES:
             raise CoverageBudgetExceeded("Native solid result exceeds the face budget")
+        # A successful native empty set has no triangle tolerance (the
+        # installed library returns -1). Its empty topology plus NoError is
+        # the required Boolean result, not invalid geometry metadata.
+        if shape.is_empty():
+            return shape
         tolerance = float(shape.get_tolerance())
         if not np.isfinite(tolerance) or tolerance < 0:
             raise RuntimeError("Native solid operation returned invalid numerical metadata")
