@@ -29,6 +29,13 @@ def _native_pair_policies(model, geometry_names):
     partially enabled link pair. Sphere separation certificates are deliberately
     absent: their native solids still require an actual distance query.
     """
+    # BEGIN bind enabled pairs only when native physics processes contacts.
+    # Geometric distance queries remain valid with these flags disabled, but
+    # that is not the native physical collision policy claimed by this adapter.
+    disabled = int(mujoco.mjtDisableBit.mjDSBL_CONTACT) | int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+    if int(model.opt.disableflags) & disabled:
+        raise ValueError("Native contact and constraint processing must both be enabled for the execution policy")
+    # END reject disabled contact physics without changing geometry queries.
     bodies = {name: int(model.geom_bodyid[model.geom(name).id]) for name in geometry_names}
     links = {name: model.body(body).name for name, body in bodies.items()}
     ignored = _native_ignored_pairs(model, list(dict.fromkeys(links.values())))

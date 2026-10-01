@@ -185,4 +185,25 @@ def test_source_pair_policy_keeps_world_weld_pair_and_individual_geom_masks():
     assert policy["first_a", "sibling_geom"][0] == "excluded"
     assert "individual geom" in policy["first_a", "sibling_geom"][1]
     assert policy["first_b", "sibling_geom"][0] == "required"
+
+
+# BEGIN global native contact switches cannot masquerade as enabled pair policy.
+@pytest.mark.parametrize("flag_name", ["mjDSBL_CONTACT", "mjDSBL_CONSTRAINT"])
+def test_source_pair_policy_rejects_disabled_contact_physics(flag_name):
+    import mujoco
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
+    from robot_validation_fixture import _native_pair_policies
+
+    native = mujoco.MjModel.from_xml_string("""<mujoco><worldbody>
+      <geom name="first" type="box" size=".1 .1 .1"/>
+      <body name="moving" pos="0 0 1"><joint name="q" type="hinge"/>
+        <geom name="second" type="box" size=".1 .1 .1"/>
+      </body>
+    </worldbody></mujoco>""")
+    assert _native_pair_policies(native, ("first", "second"))[0][2] == "required"
+    native.opt.disableflags |= int(getattr(mujoco.mjtDisableBit, flag_name))
+    with pytest.raises(ValueError, match="contact and constraint processing"):
+        _native_pair_policies(native, ("first", "second"))
+# END reject each disabled native contact switch independently.
 # END actual-state and whole-cubic preflight regressions.
