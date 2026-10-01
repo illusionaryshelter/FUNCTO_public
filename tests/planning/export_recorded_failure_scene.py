@@ -74,6 +74,12 @@ def export(args):
     from curobo.types import DeviceCfg
 
     prepared = observed_scene(source_args)
+    # The producer imports this public module AFTER hand calibration. Its
+    # maintained native seed module enables TF32 globally at import time;
+    # the scene's einsum also sees that setting. Reproduce the same numerical
+    # context without constructing or calling any solver. Importing it before
+    # calibration would change a different part of the recorded computation.
+    import curobo.inverse_kinematics
     problem, scene = prepared['problem'], prepared['scene']
     if scene.contacts or any(owner.moving for owner in scene.owners):
         raise ValueError('This frozen grasp review requires static owners and no contact permissions')
@@ -95,8 +101,19 @@ def export(args):
     arrays = {key: [] for key in ('actual_spheres', 'scene_spheres', 'tool_poses',
                                   'unknown', 'background', 'gripper_overlap', 'native_overlap')}
     maximum_scene_error = maximum_fk_error = 0.
-    for start in range(0, len(rows), 8):
-        batch = rows[start:start+8]
+    # Preserve the producer's one-state entrance and per-target batches.
+    # Mixing q0 with an IK batch can select another GEMM implementation.
+    batches, start = [], 0
+    while start < len(rows):
+        first_row = rows[start]
+        end = start+1
+        identity = lambda row: (row['kind'], row['mode'], row['source_frame'])
+        while end < len(rows) and end-start < 8 and identity(rows[end]) == identity(first_row):
+            end += 1
+        batches.append((start, end))
+        start = end
+    for start, end in batches:
+        batch = rows[start:end]
         values = np.asarray([row['q'] for row in batch])
         with torch.no_grad():
             query, state, position, quaternion, poses = native_fk(native, problem, values, names, device)
@@ -179,6 +196,8 @@ def export(args):
               'maximum_original_scene_term_difference': maximum_scene_error,
               'ik_solver_called': False, 'trajectory_planning_called': False,
               'simulation_called': False, 'maximum_query_batch': 8,
+              'native_import_matmul_allow_tf32': torch.backends.cuda.matmul.allow_tf32,
+              'native_import_cudnn_allow_tf32': torch.backends.cudnn.allow_tf32,
               'elapsed_seconds': time.monotonic()-started,
               'peak_rss_mib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,
               'torch_peak_allocated_bytes': torch.cuda.max_memory_allocated()}
