@@ -34,6 +34,47 @@ def read_json(path):
     return json.loads(Path(path).read_text())
 
 
+# BEGIN report native finger force-limit samples independently of arm clipping.
+def summarize_finger_force_limits(times_s, forces, *, joint_names, actuator_names, forcelimited, forcerange):
+    """Count observed enabled force-limit boundaries with exact comparisons.
+
+    The native floating-point samples use <= lower or >= upper, without an
+    added tolerance. Disabled force limits never count, even when their stored
+    default range is [0, 0]. A boundary observation alone does not establish
+    excess unclipped demand, a tracking failure or a calibrated control bound.
+    Nonfinite force samples remain separately identified and cannot count as
+    successful observations at a finite force limit.
+    """
+    names, actuators = tuple(joint_names), tuple(actuator_names)
+    times = np.asarray(times_s, dtype=float)
+    forces = np.asarray(forces, dtype=float)
+    enabled = np.asarray(forcelimited, dtype=bool)
+    bounds = np.asarray(forcerange, dtype=float)
+    count = len(names)
+    if (not count or len(actuators) != count or len(set(names)) != count or len(set(actuators)) != count
+            or times.ndim != 1 or len(times) == 0 or not np.isfinite(times).all()
+            or np.any(np.diff(times) < 0) or forces.shape != (len(times), count)
+            or enabled.shape != (count,) or bounds.shape != (count, 2)
+            or not np.isfinite(bounds).all() or np.any(bounds[:, 0] > bounds[:, 1])):
+        raise ValueError("Finger force summaries require complete ordered samples and named native force limits")
+    finite = np.isfinite(forces)
+    at_limit = finite & enabled & ((forces <= bounds[:, 0]) | (forces >= bounds[:, 1]))
+    first, last = [], []
+    for column in range(count):
+        indexes = np.flatnonzero(at_limit[:, column])
+        first.append(float(times[indexes[0]]) if len(indexes) else None)
+        last.append(float(times[indexes[-1]]) if len(indexes) else None)
+    return {"joint_names": list(names), "actuator_names": list(actuators),
+            "native_forcelimited": enabled.tolist(), "native_forcerange": bounds.tolist(),
+            "sample_count": len(times), "at_limit_sample_count": at_limit.sum(axis=0).tolist(),
+            "first_at_limit_elapsed_s": first, "last_at_limit_elapsed_s": last,
+            "nonfinite_force_sample_count": (~finite).sum(axis=0).tolist(),
+            "comparison_rule": "finite(force) and native forcelimited and (force <= lower or force >= upper); exact native floating-point comparison, no added tolerance",
+            "sampling": "Initial restored state and every completed step after mj_forward; elapsed seconds are relative to the diagnostic entrance",
+            "scope": "Observed native actuator force-limit boundaries only; not a tracking predicate, excess-demand proof or control calibration"}
+# END native finger force observations never replace execution acceptance.
+
+
 def run(args):
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -42,7 +83,9 @@ def run(args):
               "mode": "supervised_control_reference" if args.execution_limits else "measurement",
               "planner_called": False, "planner_accepted": False, "holding_certified": False,
               "geometry_scope": "independent actual robot entities, not full scene/continuous collision",
-              "steps_completed": 0, "saturated_coordinates": 0, "physics_parameters_changed": False,
+              # BEGIN distinguish arm command clipping from finger force limits.
+              "steps_completed": 0, "arm_control_saturated_coordinates": 0, "physics_parameters_changed": False,
+              # END native finger limits receive a separate sampled summary.
               "fixture": str(args.fixture.resolve()), "frame_index": args.frame_index,
               "controller_manifest": str(args.controller_manifest.resolve()),
               "controller_part": args.controller_part, "gpu_used": False}
@@ -142,7 +185,10 @@ def run(args):
             "actuator_gainprm": model.actuator_gainprm[actuator_ids].tolist(),
             "actuator_biasprm": model.actuator_biasprm[actuator_ids].tolist(),
             "actuator_ctrlrange": model.actuator_ctrlrange[actuator_ids].tolist(),
+            # BEGIN preserve whether each native force range is actually enabled.
+            "actuator_forcelimited": model.actuator_forcelimited[actuator_ids].astype(bool).tolist(),
             "actuator_forcerange": model.actuator_forcerange[actuator_ids].tolist(),
+            # END a disabled [0, 0] range must not imply force saturation.
             "gravity": model.opt.gravity.tolist(), "integrator": int(model.opt.integrator),
             "solver": int(model.opt.solver), "solver_iterations": int(model.opt.iterations)}
 
@@ -215,7 +261,9 @@ def run(args):
                 controls.append({"time": index * backend.timestep,
                                  "requested_arm_torque": control["requested_arm_torque"],
                                  "arm_torque_saturated": control["arm_torque_saturated"]})
-                report["saturated_coordinates"] += control["saturated_coordinates"]
+                # BEGIN aggregate only arm command clipping, with no legacy alias.
+                report["arm_control_saturated_coordinates"] += control["arm_control_saturated_coordinates"]
+                # END finger force-limit observations are summarized from samples.
                 backend.step()
                 report["steps_completed"] = index + 1
                 capture(elapsed)
@@ -240,7 +288,9 @@ def run(args):
             child_report = output / "execution" / "execution-report.json"
             if child_report.is_file():
                 report["execution"] = read_json(child_report)
-                report["saturated_coordinates"] = report["execution"]["actuator_saturated_coordinates"]
+                # BEGIN read the production executor's exact arm-only counter.
+                report["arm_control_saturated_coordinates"] = report["execution"]["arm_control_saturated_coordinates"]
+                # END all execution modes use the same explicit report name.
                 report["control_evidence"] = str(output / "execution" / "physical-trajectory.npz")
             else:
                 report["control_evidence"] = str(output / "measurement.npz")
@@ -251,6 +301,14 @@ def run(args):
                           contact_offsets=np.asarray(contact_offsets, dtype=int))
             np.savez_compressed(output / "measurement.npz", **arrays)
             arm_count = arrays["reference_q"].shape[1]
+            # BEGIN report force-limit observations from actual native forces.
+            finger_actuators = np.asarray(actuator_ids[arm_count:], dtype=int)
+            report["finger_actuator_force_limits"] = summarize_finger_force_limits(
+                arrays["time"], arrays["actuator_force"][:, arm_count:],
+                joint_names=backend.finger_joint_names, actuator_names=backend.actuator_names[arm_count:],
+                forcelimited=backend.native_model.actuator_forcelimited[finger_actuators],
+                forcerange=backend.native_model.actuator_forcerange[finger_actuators])
+            # END this statistic does not change control or any acceptance gate.
             errors = arrays["q"][:, :arm_count] - arrays["reference_q"]
             speed_errors = arrays["dq"][:, :arm_count] - arrays["reference_dq"]
             finite_rotation = (np.isfinite(arrays["tcp"][:, :3, :3]).all(axis=(1, 2))

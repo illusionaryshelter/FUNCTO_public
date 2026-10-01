@@ -657,7 +657,9 @@ class RobosuiteBackendTests(unittest.TestCase):
         self.assertIsNone(backend._arm_controller.interpolator)
         self.assertIsNone(backend._grip_controller.interpolator)
         control = backend.apply_control(np.asarray([1.]), np.asarray([.004, -.009]))
-        self.assertEqual(control["saturated_coordinates"], 1)
+        # BEGIN the backend reports only arm torque command clipping here.
+        self.assertEqual(control["arm_control_saturated_coordinates"], 1)
+        # END native gripper force limiting is a separate observation.
         self.assertTrue(control["arm_torque_saturated"][0])
         self.assertGreater(control["requested_arm_torque"][0], 2.)
         np.testing.assert_array_equal(control["actuator_ctrl"], [2., .004, -.009])
@@ -726,6 +728,25 @@ class ReferenceFKTests(unittest.TestCase):
 
 
 class FingerConvergenceTests(unittest.TestCase):
+    # BEGIN force-limit observations use native enable flags and exact bounds.
+    def test_force_limit_samples_are_distinct_from_tracking_and_disabled_ranges(self):
+        from probe_mounted_execution import summarize_finger_force_limits
+
+        forces = np.array([[-20., 20., 0.],
+                           [np.nextafter(-20., 0.), np.nextafter(20., 0.), 0.],
+                           [-20.0001, 20.0001, 0.],
+                           [np.nan, 20., 0.]])
+        result = summarize_finger_force_limits(np.array([0., .002, .004, .006]), forces,
+            joint_names=("finger_a", "finger_b", "unlimited_finger"),
+            actuator_names=("servo_a", "servo_b", "unlimited_servo"),
+            forcelimited=[True, True, False], forcerange=[[-20., 20.], [-20., 20.], [0., 0.]])
+        self.assertEqual(result["at_limit_sample_count"], [2, 3, 0])
+        self.assertEqual(result["first_at_limit_elapsed_s"], [0., 0., None])
+        self.assertEqual(result["last_at_limit_elapsed_s"], [.004, .006, None])
+        self.assertEqual(result["nonfinite_force_sample_count"], [1, 0, 0])
+        self.assertEqual(result["sample_count"], 4)
+    # END one-ULP-inside samples and disabled zero ranges do not count.
+
     def test_contact_blocked_quiet_position_is_not_command_convergence(self):
         from probe_finger_control import convergence
         result = convergence(np.array([0., .1, .2, .3]), np.full((4, 2), .015), np.zeros((4, 2)),

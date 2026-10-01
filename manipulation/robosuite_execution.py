@@ -245,9 +245,11 @@ class RobosuiteExecutionBackend:
             raise RuntimeError("Unscaled GRIP changed an explicit native finger position target")
         self.native_data.ctrl[self._arm_actuators] = bounded
         self.native_data.ctrl[self._finger_actuators] = finger_ctrl
+        # BEGIN arm control clipping is separate from native finger force limits.
         return {"actuator_ctrl": self.actuator_control,
                 "requested_arm_torque": torque.copy(), "arm_torque_saturated": bounded != torque,
-                "saturated_coordinates": int(np.count_nonzero(bounded != torque))}
+                "arm_control_saturated_coordinates": int(np.count_nonzero(bounded != torque))}
+        # END count only the arm controller's clipped torque coordinates.
 
     def step(self):
         """Integrate exactly one native step and refresh derived feedback."""

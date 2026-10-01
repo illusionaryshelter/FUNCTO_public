@@ -527,7 +527,9 @@ class TrajectoryExecutor:
         # END physical guard provenance and actual-event evidence.
         controls, requested_torques, saturated_torques, samples, event_index = [], [], [], [], 0
         command = "restored_ctrl"
-        saturation_count = 0
+        # BEGIN this counter excludes native finger actuator force limiting.
+        arm_control_saturation_count = 0
+        # END explicit arm control clipping scope.
 
         def record(elapsed, desired_arm_q, arm_curve_dq, progress, feedback=None):
             feedback = backend.proprioception() if feedback is None else feedback
@@ -625,7 +627,9 @@ class TrajectoryExecutor:
                 next_time = (index + 1) * backend.timestep
                 q, dq, progress = trajectory.sample(min(next_time, stop))
                 control = backend.apply_control(q, next_finger_positions)
-                saturation_count += control["saturated_coordinates"]
+                # BEGIN aggregate only the backend's named arm clipping count.
+                arm_control_saturation_count += control["arm_control_saturated_coordinates"]
+                # END native finger force limits are measured separately.
                 target_positions, finger_state, command = next_finger_positions, next_finger_state, next_command
                 if due:
                     report["superseded_gripper_events"].extend(deepcopy(due[:-1]))
@@ -681,7 +685,9 @@ class TrajectoryExecutor:
                                           if (event["skill_id"], event["event_id"]) not in applied_ids],
                 maximum_arm_tracking_error_rad=float(np.max(np.abs(actual_q[:, :narm]-command_q[:, :narm]))),
                 maximum_finger_position_tracking_error=float(np.max(np.abs(actual_q[:, narm:]-command_q[:, narm:]))),
-                actuator_saturated_coordinates=saturation_count,
+                # BEGIN preserve the arm-only meaning in the report field.
+                arm_control_saturated_coordinates=arm_control_saturation_count,
+                # END never describe this as all-actuator saturation.
                 maximum_absolute_actual_arm_velocity=float(np.max(np.abs(np.asarray([row["dq"] for row in samples])[:, :narm]))),
                 peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,
                 unconsumed_events=[deepcopy(event) for event in trajectory.events
