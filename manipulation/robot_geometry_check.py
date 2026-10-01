@@ -143,6 +143,10 @@ class RobotGeometryChecker:
             raise ValueError("Every joint must have finite ordered position limits")
         self.joint_limits = {name: (float(lower[column]), float(upper[column]))
                              for name, column in self._q_columns.items()}
+        # BEGIN expose the same URDF velocity contract to independent preflight.
+        self.joint_velocity_limits = {name: float(self.model.velocityLimit[column])
+                                      for name, column in self._q_columns.items()}
+        # END expose the same URDF velocity contract to independent preflight.
         self._geometries = {}
         for record in geometries:
             name = _name(record.name, "geometry name")
@@ -182,6 +186,17 @@ class RobotGeometryChecker:
         if index >= self.model.nframes:
             raise ValueError(f"Unknown URDF frame: {name}")
         return index
+
+    # BEGIN expose immutable geometry identities for a complete acceptance policy.
+    @property
+    def geometry_names(self):
+        """Stable native-solid order; an acceptance layer must cover all pairs."""
+        return tuple(self._geometries)
+
+    @property
+    def geometry_sources(self):
+        return {name: value[2] for name, value in self._geometries.items()}
+    # END expose immutable geometry identities for a complete acceptance policy.
 
     def query(self, *, joint_names, joint_positions, T_reference_base, pairs, frames=()):
         """Return JSON-ready FK, raw signed distances, witnesses and limits.

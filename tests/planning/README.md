@@ -35,9 +35,10 @@ checked independently. It preserves all required source anchors.
 | `robot_fixture.py`, `prepare_recorded_task.py` | Explicit native robot geometry, named proprioception, FK checks and current planning-problem preparation |
 | `check_recorded_robot_geometry.py` | Independent Pinocchio FK and Coal convex/analytic-solid pair distances for complete named recorded states; CPU only |
 | `probe_finger_control.py` | Bounded native asset control diagnostic with actual q/dq, actuator/generalized forces, contact identities and explicit convergence thresholds |
+| `probe_mounted_execution.py` | Complete mounted-scene control measurement or explicitly supervised diagnostic reference through the production backend/executor; preserves measured entrance velocity |
 | `recorded_observation.py`, `recorded_owner_geometry.py`, `detect_recorded_owners.py` | Current robot/owner masks and explicitly bound offline carrier geometry; no current object truth enters planning |
 | `run_recorded_skill.py`, `recorded_task_planning.py` | Current bounded joint planning, unchanged skill constraints and classified diagnostic curve export |
-| `recorded_simulation.py`, `recorded_skill_evaluation.py`, `run_recorded_simulation.py` | Native joint-controlled physics up to the next evidence barrier, with separate task evaluation and calibrated videos |
+| `recorded_simulation.py`, `robot_validation_fixture.py`, `recorded_skill_evaluation.py`, `run_recorded_simulation.py` | Recording/model adapters to the production executor and mandatory independent validator, with separate task evaluation and calibrated videos |
 | `visualize_current_recorded_task.py` | Current references, classified joint curves, actual robot feedback and physical outcomes; retains historical incomplete attempts |
 | `visualize_recorded_failure.py` | Frozen reference, commanded FK and actual TCP, plus joint position/velocity/acceleration and native limits on their recorded clocks |
 | `probe_ompl_constraints.py` | CPU OMPL projection and connection contracts |
@@ -80,7 +81,7 @@ the grasp pose. Missing selections remain reported input failures.
 
 <!-- BEGIN shared actual-hand execution contract and independent geometry diagnostics. -->
 Recorded planning and execution require the same `--execution-limits` JSON,
-validated by `ExecutionLimits` in `recorded_simulation.py`. It supplies complete
+validated by `ExecutionLimits` in `manipulation/execution.py`. It supplies complete
 ordered joint names, a source, arm/TCP tracking limits, actual finger position
 and speed intervals for the initial state and every original command event,
 and the velocity threshold for original stops. It contains no duplicate event
@@ -130,6 +131,26 @@ The finger asset probe preserves its input model's contact topology. A hand
 welded directly to world can have different parent collision filtering from
 the same hand attached to a movable arm. Use its contact/force records to inspect
 that distinction; calibrate whole-robot control in its original mounted context.
+
+The production `TrajectoryExecutor` combines `RobosuiteExecutionBackend` with a
+mandatory named independent validator. The recording adapter only restores the
+source integration state and loads classified curves. Independent preflight
+checks actual full robot geometry/FK plus polynomial extrema of the original
+arm cubic; every actual step receives the same robot-state checks. This gate
+does not certify observed obstacles, unknown space, future finger geometry or
+continuous collision between steps. Source-native excluded pairs retain raw
+distances; sphere separation certificates do not exclude native entity pairs.
+
+`probe_mounted_execution.py` constructs a new, explicitly identified control
+reference from the measured q/dq, supplied arm displacement and move/hold times.
+Without `--execution-limits` it measures the backend without inventing a pass
+band. With that input it exercises the production executor in
+`diagnostic_control_reference` mode, with the same mandatory checks as other
+modes. Neither mode is a planned skill or Holding result. This mode cannot load
+historical curve archives through `load_saved_trajectory`. Reports retain
+native parameters, requested/applied torques, actual robot state, complete
+bounded contacts and independent robot geometry results. All paths, source
+controller identity, step/contact budgets and reference parameters are explicit.
 <!-- END shared actual-hand execution contract and independent geometry diagnostics. -->
 
 The native simulator accepts a classified saved curve and an explicit evaluation

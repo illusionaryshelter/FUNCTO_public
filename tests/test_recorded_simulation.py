@@ -22,7 +22,11 @@ import mujoco
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 
 from manipulation.planning import JointTrajectory
-from recorded_simulation import ExecutionGuardError, ExecutionLimits, FixedFingerTargets, RecordedSimulation, load_saved_trajectory
+# BEGIN exercise production execution through the thin recording adapter.
+from manipulation.execution import ExecutionGuardError, ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
+from manipulation.robosuite_execution import RobosuiteExecutionBackend
+from recorded_simulation import load_saved_trajectory
+# END exercise production execution through the thin recording adapter.
 
 
 def _event(event_id, kind, time, evidence=None):
@@ -34,7 +38,7 @@ def _fixture():
     """A mocked clock/state source with the installed, real GRIP controller."""
     from robosuite.controllers.parts.gripper.simple_grip import SimpleGripController
 
-    simulation = RecordedSimulation()
+    simulation = RobosuiteExecutionBackend.__new__(RobosuiteExecutionBackend)
     simulation.arm_joint_names = tuple(f"arm_{index}" for index in range(7))
     simulation.finger_joint_names = ("independent_finger_left", "independent_finger_right")
     simulation.joint_names = simulation.arm_joint_names + simulation.finger_joint_names
@@ -46,7 +50,7 @@ def _fixture():
     simulation._dt = .002
     simulation._trial_id = str(uuid4())
     simulation._feedback_source = "explicit mocked robot feedback; no physical integration"
-    simulation.restore_report = {"scope": "mocked integration clock only"}
+    simulation._description = {"scope": "mocked integration clock only"}
     simulation.native_data = SimpleNamespace(
         qpos=np.r_[np.linspace(.1, .7, 7), .012, -.017],
         qvel=np.r_[np.linspace(.01, .07, 7), .03, -.04],
@@ -54,6 +58,7 @@ def _fixture():
         xmat=np.eye(3).reshape(1, 9), xpos=np.zeros((1, 3)),
         site_xmat=np.eye(3).reshape(1, 9), site_xpos=np.zeros((1, 3)))
     simulation.native_model = SimpleNamespace(
+        site=lambda index: SimpleNamespace(name="declared_test_tcp"),
         actuator_ctrlrange=np.vstack((np.tile([-10., 10.], (7, 1)), [0., .04], [-.04, 0.])),
         jnt_limited=np.ones(9, dtype=bool),
         jnt_range=np.vstack((np.tile([-2., 2.], (7, 1)), [0., .04], [-.04, 0.])))
@@ -94,10 +99,48 @@ def _fixture():
     return simulation, curve, targets
 
 
+# BEGIN explicit fake geometry verdicts only for execution sequencing tests.
+class _GeometryChecker:
+    """Record exact inputs; supplied verdicts do not represent physical geometry."""
+
+    name = "scripted_test_geometry_verdict"
+
+    def __init__(self, joint_names, *, rejected_stage=None, rejected_time=None, preflight_passed=True):
+        self.joint_names = tuple(joint_names)
+        self.rejected_stage = rejected_stage
+        self.rejected_time = rejected_time
+        self.preflight_passed = preflight_passed
+        self.states = []
+        self.preflight_inputs = []
+
+    def describe(self):
+        return {"name": self.name, "joint_names": list(self.joint_names),
+                "scope": "Scripted control-contract test verdicts; no independent geometry calculation",
+                "pair_order": [["mock_link_a", "mock_link_b"]]}
+
+    def preflight(self, trajectory, initial_feedback, execution_limits):
+        self.preflight_inputs.append(deepcopy(initial_feedback))
+        return {"passed": self.preflight_passed,
+                "violations": [] if self.preflight_passed else [
+                    {"kind": "scripted_preflight_rejection", "name": "test_reference", "measured": "rejected"}]}
+
+    def check_state(self, feedback, *, stage, trajectory_time):
+        self.states.append({"feedback": deepcopy(feedback), "stage": stage, "trajectory_time": trajectory_time})
+        rejected = (stage == self.rejected_stage
+                    and (self.rejected_time is None or trajectory_time == self.rejected_time))
+        return {"passed": not rejected, "distances_m": [-.01 if rejected else .5],
+                "violations": [] if not rejected else [{"kind": "scripted_geometry_rejection",
+                    "name": "mock_link_a/mock_link_b", "measured": -.01}]}
+
+
+def _executor(backend):
+    return TrajectoryExecutor(backend, geometry_checker=_GeometryChecker(backend.joint_names))
+# END explicit fake geometry verdicts only for execution sequencing tests.
+
+
 def _initial_feedback(simulation):
     """Explicit calibration metadata accompanies the measured robot state."""
-    return {**simulation.proprioception(), "reference_frame": "declared_test_frame",
-            "tool_link": "declared_test_tcp", "tool_transform": np.eye(4).tolist()}
+    return {**simulation.proprioception(), "tool_transform": simulation.tool_transform.tolist()}
 
 
 # BEGIN explicit mock execution policy; these values are not robot calibration.
@@ -223,7 +266,7 @@ class RecordedControlTests(unittest.TestCase):
                 with self.subTest(field=field, column=column), TemporaryDirectory() as temporary:
                     output = Path(temporary)/"trial"
                     with self.assertRaisesRegex(ValueError, "full robot state"):
-                        simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                        _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                             initial_feedback=feedback, evaluation_mode="accepted_plan", output=output,
                             execution_limits=_limits(simulation, curve),
                             start_position_tolerance=1., start_velocity_tolerance=1.)
@@ -233,9 +276,9 @@ class RecordedControlTests(unittest.TestCase):
         simulation, curve, value = _fixture()
         initial = _initial_feedback(simulation)
         original_events = deepcopy(curve.events)
-        with TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
-            report = simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+            report = _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=initial, execution_limits=_limits(simulation, curve),
                 evaluation_mode="accepted_plan", output=output, max_physics_steps=4)
             self.assertEqual(report["executed_steps"], 4)
@@ -280,8 +323,8 @@ class RecordedControlTests(unittest.TestCase):
         simulation, curve, value = _fixture()
         curve.events[0]["time"], curve.events[1]["time"] = .0005, .0015
         curve.events[3]["time"] = curve.executable_until
-        with TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
-            report = simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=_initial_feedback(simulation), evaluation_mode="diagnostic_rejected_candidate",
                 execution_limits=_limits(simulation, curve),
                 output=Path(temporary)/"trial", max_physics_steps=4)
@@ -305,7 +348,7 @@ class ExecutionGuardTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             output = Path(temporary)/"trial"
             with self.assertRaisesRegex(ValueError, "fresh measured feedback at the original evidence barrier"):
-                simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                     initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(policy),
                     evaluation_mode="accepted_plan", output=output)
             self.assertFalse(output.exists())
@@ -327,7 +370,7 @@ class ExecutionGuardTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             output = Path(temporary)/"trial"
             with self.assertRaisesRegex(ValueError, "match every original"):
-                simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                     initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(policy),
                     evaluation_mode="accepted_plan", output=output)
             self.assertFalse(output.exists())
@@ -349,10 +392,10 @@ class ExecutionGuardTests(unittest.TestCase):
             steps.append(simulation.native_data.ctrl.copy())
 
         simulation._sim.step = step
-        with TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                     initial_feedback=initial, execution_limits=ExecutionLimits.from_mapping(limits),
                     evaluation_mode="accepted_plan", output=output)
             report = json.loads((output/"execution-report.json").read_text())
@@ -384,7 +427,7 @@ class ExecutionGuardTests(unittest.TestCase):
             ("nonfinite_feedback", lambda data: data.qvel.__setitem__(0, np.nan)),
         )
         for kind, change in changes:
-            with self.subTest(kind=kind), TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
+            with self.subTest(kind=kind), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
                 simulation, curve, value = _fixture()
                 initial = _initial_feedback(simulation)
                 original_step = simulation._sim.step
@@ -397,7 +440,7 @@ class ExecutionGuardTests(unittest.TestCase):
                 simulation._sim.step = step
                 output = Path(temporary)/"trial"
                 with self.assertRaises(ExecutionGuardError):
-                    simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                    _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                         initial_feedback=initial, execution_limits=_limits(simulation, curve),
                         evaluation_mode="accepted_plan", output=output,
                         step_callback=lambda model, data, sample: observed.append(sample["q"].copy()))
@@ -420,10 +463,10 @@ class ExecutionGuardTests(unittest.TestCase):
         simulation, curve, value = _fixture()
         limits = _limit_values(simulation, curve)
         limits["stop_arm_velocity"] = [.001]*7
-        with TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                     initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
                     evaluation_mode="accepted_plan", output=output)
             report = json.loads((output/"execution-report.json").read_text())
@@ -432,6 +475,212 @@ class ExecutionGuardTests(unittest.TestCase):
             self.assertIn("planned_stop_velocity", [row["kind"] for row in report["feedback_failure"]["violations"]])
             self.assertFalse(report["evidence_passed"])
             self.assertFalse(report["barrier_crossed"])
+
+
+# BEGIN mandatory production geometry gates and explicit diagnostic references.
+class GeometryExecutionTests(unittest.TestCase):
+    def test_geometry_checker_is_required_and_bound_to_all_actual_joint_names(self):
+        simulation, _, _ = _fixture()
+        with self.assertRaises(TypeError):
+            TrajectoryExecutor(simulation)
+        for checker in (None, lambda feedback: True, _GeometryChecker(simulation.arm_joint_names)):
+            with self.subTest(checker=checker), self.assertRaisesRegex(ValueError, "named independent geometry checker"):
+                TrajectoryExecutor(simulation, geometry_checker=checker)
+        self.assertEqual(simulation.native_data.time, 1.3)
+        np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.026, -.023])
+
+    def test_rejected_preflight_persists_its_verdict_without_any_native_control_or_step(self):
+        simulation, curve, targets = _fixture()
+        checker = _GeometryChecker(simulation.joint_names, preflight_passed=False)
+        with TemporaryDirectory() as temporary:
+            output = Path(temporary)/"trial"
+            with self.assertRaisesRegex(ExecutionGuardError, "geometry preflight"):
+                TrajectoryExecutor(simulation, geometry_checker=checker).execute(curve,
+                    finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
+                    execution_limits=_limits(simulation, curve), evaluation_mode="diagnostic_control_reference", output=output)
+            report = json.loads((output/"execution-report.json").read_text())
+            self.assertEqual(report["feedback_failure"]["point"], "geometry_preflight")
+            self.assertEqual(report["executed_steps"], 0)
+            self.assertFalse(report["geometry_preflight"]["passed"])
+            self.assertEqual(report["events"], [])
+            self.assertEqual(checker.states, [])
+            self.assertFalse(report["abort_hold"]["native_ctrl_written"])
+            self.assertEqual(simulation.native_data.time, 1.3)
+            np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.026, -.023])
+            with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
+                self.assertEqual(saved["actuator_ctrl"].shape, (0, 9))
+                self.assertEqual(saved["actual_q"].shape, (1, 9))
+                self.assertFalse(saved["geometry_checked"][0])
+                self.assertTrue(np.isnan(saved["geometry_distances_m"][0]).all())
+
+    def test_geometry_rejects_original_close_before_goal_change_and_receives_actual_fingers(self):
+        simulation, curve, targets = _fixture()
+        checker = _GeometryChecker(simulation.joint_names, rejected_stage="command_event", rejected_time=.003)
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                TrajectoryExecutor(simulation, geometry_checker=checker).execute(curve,
+                    finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
+                    execution_limits=_limits(simulation, curve), evaluation_mode="accepted_plan", output=output)
+            report = json.loads((output/"execution-report.json").read_text())
+            self.assertEqual(report["executed_steps"], 2)
+            self.assertEqual(report["feedback_failure"]["event_id"], "close-original")
+            self.assertEqual(report["feedback_failure"]["curve_time_s"], .003)
+            self.assertEqual([row["event_id"] for row in report["events"]], ["open-original"])
+            self.assertEqual(report["geometry_check_counts"]["command_event"], 2)
+            self.assertEqual(report["event_gate_checks"][-1]["geometry_check"]["distances_m"], [-.01])
+            final_check = checker.states[-1]
+            self.assertEqual(final_check["stage"], "command_event")
+            np.testing.assert_array_equal(final_check["feedback"]["q"][7:], [.012, -.017])
+            np.testing.assert_array_equal(final_check["feedback"]["actuator_ctrl"]["values"][7:], [.032, -.025])
+            np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.032, -.025])
+            self.assertFalse(report["abort_hold"]["physical_stop_confirmed"])
+
+    def test_post_step_geometry_rejection_retains_the_completed_sample_and_pair_distances(self):
+        simulation, curve, targets = _fixture()
+        checker = _GeometryChecker(simulation.joint_names, rejected_stage="after_step")
+        observed = []
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                TrajectoryExecutor(simulation, geometry_checker=checker).execute(curve,
+                    finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
+                    execution_limits=_limits(simulation, curve), evaluation_mode="diagnostic_rejected_candidate", output=output,
+                    step_callback=lambda model, data, sample: observed.append(sample["geometry_check"]))
+            report = json.loads((output/"execution-report.json").read_text())
+            self.assertEqual(report["executed_steps"], 1)
+            self.assertEqual(report["feedback_failure"]["point"], "after_step")
+            self.assertEqual(len(observed), 1)
+            self.assertFalse(observed[0]["passed"])
+            with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
+                np.testing.assert_array_equal(saved["geometry_checked"], [True, True])
+                np.testing.assert_array_equal(saved["geometry_passed"], [True, False])
+                np.testing.assert_array_equal(saved["geometry_distances_m"], [[.5], [-.01]])
+                self.assertEqual(saved["actual_q"].shape, (2, 9))
+                self.assertEqual(saved["requested_arm_torque"].shape, (1, 7))
+                self.assertEqual(saved["arm_torque_saturated"].shape, (1, 7))
+
+    def test_checker_exception_is_a_rejection_with_unavailable_distance_evidence(self):
+        simulation, curve, targets = _fixture()
+        checker = _GeometryChecker(simulation.joint_names)
+        checker.check_state = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("independent query unavailable"))
+        with TemporaryDirectory() as temporary:
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                TrajectoryExecutor(simulation, geometry_checker=checker).execute(curve,
+                    finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
+                    execution_limits=_limits(simulation, curve), evaluation_mode="accepted_plan", output=output)
+            report = json.loads((output/"execution-report.json").read_text())
+            self.assertEqual(report["executed_steps"], 0)
+            self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "geometry_checker_error")
+            with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
+                self.assertFalse(saved["geometry_checked"][0])
+                self.assertFalse(saved["geometry_passed"][0])
+                self.assertTrue(np.isnan(saved["geometry_distances_m"]).all())
+
+    def test_control_reference_has_its_own_classification_and_supports_exact_entrance(self):
+        simulation, curve, targets = _fixture()
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            report = _executor(simulation).execute(curve,
+                finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
+                execution_limits=_limits(simulation, curve), evaluation_mode="diagnostic_control_reference", output=output,
+                start_position_tolerance=0., start_velocity_tolerance=0.)
+            self.assertFalse(report["planner_accepted"])
+            self.assertEqual(report["reference_origin"], "explicit_control_diagnostic")
+            self.assertEqual(report["executed_steps"], 4)
+            self.assertTrue(report["geometry_preflight"]["passed"])
+            self.assertEqual(report["geometry_check_counts"],
+                             {"initial_state": 1, "before_step": 4, "command_event": 2, "after_step": 4})
+
+    def test_initial_frame_or_tcp_relabelling_fails_before_creating_output(self):
+        for field, wrong in (("reference_frame", "another_frame"), ("tool_link", "another_site"),
+                             ("tool_transform", np.diag([1., 1., 1., 2.]))):
+            simulation, curve, targets = _fixture()
+            initial = _initial_feedback(simulation)
+            initial[field] = wrong
+            with self.subTest(field=field), TemporaryDirectory() as temporary:
+                output = Path(temporary)/"trial"
+                with self.assertRaises(ValueError):
+                    _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(targets),
+                        initial_feedback=initial, execution_limits=_limits(simulation, curve),
+                        evaluation_mode="accepted_plan", output=output)
+                self.assertFalse(output.exists())
+                self.assertEqual(simulation.native_data.time, 1.3)
+# END mandatory production geometry gates and explicit diagnostic references.
+
+
+# BEGIN concrete native backend binding, independent of recorded datasets.
+class RobosuiteBackendTests(unittest.TestCase):
+    @staticmethod
+    def _simulator(*, arm_attributes='gaintype="fixed" dyntype="none" gear="1"'):
+        from robosuite.utils.binding_utils import MjSim
+
+        model = mujoco.MjModel.from_xml_string(f'''
+            <mujoco><compiler angle="radian"/><option timestep=".002"/>
+              <worldbody><body name="base"><body name="arm">
+                <joint name="arm_q" type="hinge" axis="0 0 1" range="-2 2"/>
+                <inertial pos="0 0 0" mass="1" diaginertia=".1 .1 .1"/>
+                <geom type="sphere" size=".02"/><site name="tcp" pos=".1 0 0"/>
+                <body name="left"><joint name="left_q" type="slide" axis="0 1 0" range="0 .04"/>
+                  <geom type="sphere" size=".01" mass=".1"/></body>
+                <body name="right"><joint name="right_q" type="slide" axis="0 1 0" range="-.04 0"/>
+                  <geom type="sphere" size=".01" mass=".1"/></body>
+              </body></body></worldbody>
+              <actuator><general name="arm_motor" joint="arm_q" {arm_attributes}
+                gainprm="1" biastype="none" ctrllimited="true" ctrlrange="-2 2"/>
+                <position name="left_servo" joint="left_q" kp="100" ctrllimited="true" ctrlrange="0 .04"/>
+                <position name="right_servo" joint="right_q" kp="100" ctrllimited="true" ctrlrange="-.04 0"/>
+              </actuator></mujoco>''')
+        sim = MjSim(model)
+        sim.data._data.qpos[:] = [.2, .012, -.017]
+        sim.data._data.ctrl[:] = [0., .026, -.023]
+        mujoco.mj_forward(model, sim.data._data)
+        return sim
+
+    @staticmethod
+    def _bind(sim):
+        return RobosuiteExecutionBackend(sim, base_link="base", tcp_site="tcp", arm_joint_names=("arm_q",),
+            finger_joint_names=("left_q", "right_q"), arm_kp=1000., arm_kd=200.,
+            velocity_limits={"arm_q": 1., "left_q": .2, "right_q": .2}, source="Explicit tiny native CPU binding test")
+
+    def test_existing_native_state_and_actuator_semantics_survive_binding_and_control(self):
+        sim = self._simulator()
+        q, dq, ctrl, initial_time = sim.data._data.qpos.copy(), sim.data._data.qvel.copy(), sim.data._data.ctrl.copy(), sim.data._data.time
+        backend = self._bind(sim)
+        np.testing.assert_array_equal(backend.native_data.qpos, q)
+        np.testing.assert_array_equal(backend.native_data.qvel, dq)
+        np.testing.assert_array_equal(backend.actuator_control, ctrl)
+        self.assertEqual(backend.sim_time, initial_time)
+        self.assertEqual(backend.timestep, .002)
+        self.assertEqual(backend._arm_controller.input_type, "absolute")
+        self.assertIsNone(backend._arm_controller.interpolator)
+        self.assertIsNone(backend._grip_controller.interpolator)
+        control = backend.apply_control(np.asarray([1.]), np.asarray([.004, -.009]))
+        self.assertEqual(control["saturated_coordinates"], 1)
+        self.assertTrue(control["arm_torque_saturated"][0])
+        self.assertGreater(control["requested_arm_torque"][0], 2.)
+        np.testing.assert_array_equal(control["actuator_ctrl"], [2., .004, -.009])
+        np.testing.assert_array_equal(backend.proprioception()["q"], q)
+        self.assertEqual(backend.sim_time, initial_time)
+        feedback = backend.proprioception()
+        self.assertEqual(feedback["reference_frame"], "world")
+        self.assertEqual(feedback["tool_link"], "tcp")
+        np.testing.assert_array_equal(feedback["tool_transform"], np.eye(4))
+
+    def test_non_torque_arm_transmissions_are_rejected_before_control(self):
+        variants = ('gaintype="affine" dyntype="none" gear="1"',
+                    'gaintype="fixed" dyntype="filter" dynprm=".02" gear="1"',
+                    'gaintype="fixed" dyntype="none" gear="1 1 0 0 0 0"')
+        for attributes in variants:
+            with self.subTest(attributes=attributes):
+                sim = self._simulator(arm_attributes=attributes)
+                initial_ctrl = sim.data._data.ctrl.copy()
+                with self.assertRaisesRegex(ValueError, "unit-gain torque motors"):
+                    self._bind(sim)
+                self.assertEqual(sim.data._data.time, 0.)
+                np.testing.assert_array_equal(sim.data._data.ctrl, initial_ctrl)
+# END concrete native backend binding, independent of recorded datasets.
 
 
 class ReferenceFKTests(unittest.TestCase):
@@ -446,7 +695,7 @@ class ReferenceFKTests(unittest.TestCase):
                 <geom type="sphere" size=".01" mass=".1"/><site name="finger_tcp" pos=".02 0 0"/>
               </body>
             </body></worldbody></mujoco>''')
-        simulation = RecordedSimulation()
+        simulation = RobosuiteExecutionBackend.__new__(RobosuiteExecutionBackend)
         simulation.native_model, simulation.native_data = model, mujoco.MjData(model)
         simulation.arm_joint_names, simulation.finger_joint_names = ("arm_q",), ("finger_q",)
         simulation.joint_names = simulation.arm_joint_names+simulation.finger_joint_names

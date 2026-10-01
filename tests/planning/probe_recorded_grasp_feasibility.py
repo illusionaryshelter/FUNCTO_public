@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Probe explicit recorded grasp targets without trajectory optimization.
 
-The ordinary recorded runner builds its unchanged RGB-D/binary-hand scene.
+The ordinary recorded runner builds its RGB-D scene and explicit actual-hand intervals.
 A scoped test interception stops at its plan_and_record boundary; no planner,
 TrajOpt, path search, simulator, or robot command is invoked. Two bounded native
 IK modes then share the same measured-q0/native-Halton seed pool: pose + joint

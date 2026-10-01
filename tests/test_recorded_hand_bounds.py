@@ -10,7 +10,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
 from manipulation.planning_scene import PrismaticGripper
-from recorded_simulation import ExecutionLimits
+# BEGIN exercise the production contract, independently of recording setup.
+from manipulation.execution import ExecutionLimits
+# END production execution contract.
 from run_recorded_skill import event_finger_bounds
 
 

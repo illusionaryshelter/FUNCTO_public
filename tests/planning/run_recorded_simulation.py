@@ -25,9 +25,11 @@ WORKSPACE_ROOT = PROJECT_ROOT.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(WORKSPACE_ROOT))
 
-# BEGIN explicit fixed finger goals alongside the exported arm cubic.
-from recorded_simulation import ExecutionLimits, FixedFingerTargets, RecordedSimulation, load_saved_trajectory
-# END explicit fixed finger goals alongside the exported arm cubic.
+# BEGIN production execution owns control; this adapter owns recording setup.
+from manipulation.execution import ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
+from recorded_simulation import restore_recorded_simulation, load_saved_trajectory
+from robot_validation_fixture import build_robot_validator
+# END production execution and explicit recording adapter.
 from recorded_skill_evaluation import NativeSkillPhysicsEvaluator
 
 
@@ -202,7 +204,8 @@ def run(args):
             raise ValueError("The evaluator's explicit source identity must match the compiled skill kind")
         actor = {key: deepcopy(evidence["actor"][key]) for key in
                  ("entity_name", "eef_site_name", "contact_geom_groups")}
-        simulation = RecordedSimulation.restore(scene_path=fixture["source_scene_xml"],
+        # BEGIN restore native context before constructing the production executor.
+        simulation, restore_report = restore_recorded_simulation(scene_path=fixture["source_scene_xml"],
             catalog_path=fixture["catalog_path"], episode_path=fixture["episode_path"],
             frame_index=feedback["entry_frame"], base_link=fixture["base_link"], tcp_site=fixture["tcp_site"],
             arm_joint_names=fixture["arm_joint_names"], finger_joint_names=fixture["finger_joint_names"],
@@ -215,7 +218,8 @@ def run(args):
             "time": abs(current["sim_time"]-feedback["sim_time_s"])}
         if max(differences.values()) > 1e-9:
             raise ValueError(f"Restored native feedback differs from the selected observed entrance: {differences}")
-        report.update(restored_feedback_errors=differences, restore=simulation.restore_report,
+        # END restoration is independent of trajectory execution.
+        report.update(restored_feedback_errors=differences, restore=restore_report,
             original_controller_configuration={"source": str(source_manifest_path),
                 "part": args.controller_part, "configuration": deepcopy(arm_config),
                 "policy_frequency_hz": environment["control_freq_hz"]},
@@ -250,14 +254,21 @@ def run(args):
             if videos is not None:
                 videos.capture(record["elapsed"])
 
+        # BEGIN mandatory independent robot verification before native commands.
+        validator = build_robot_validator(fixture,
+            reference_frame=feedback["reference_frame"],
+            T_reference_base=np.asarray(feedback["base_pose"], dtype=float),
+            tool_frame=feedback["tool_link"], T_frame_tcp=tool_transform)
+        executor = TrajectoryExecutor(simulation, geometry_checker=validator)
         report["status"] = "executing"
-        execution = simulation.execute(curve, evaluation_mode=args.evaluation_mode,
+        execution = executor.execute(curve, evaluation_mode=args.evaluation_mode,
             finger_targets=finger_targets, initial_feedback=initial_feedback,
             execution_limits=execution_limits,
             output=output/"execution", step_callback=observe,
             max_physics_steps=args.max_physics_steps,
             start_position_tolerance=args.start_position_tolerance,
             start_velocity_tolerance=args.start_velocity_tolerance)
+        # END independent verification and the sole production execution loop.
         report["execution_tested"] = execution["executed_steps"] > 0
         # BEGIN export robot-only feedback for a separately verified handoff.
         report.update(robot_feedback_path=execution["robot_feedback_path"],

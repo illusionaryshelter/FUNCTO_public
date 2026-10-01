@@ -8,6 +8,17 @@ FUNCTO 提供交互参考、事件和过程约束。机器人后端负责将这�
 
 生产链继续使用 cuRobo 的 FK、IK 和全过程轨迹优化；OMPL 提供必要的候选 seed，再经过同一完整过程优化和验收。OMPL 直接复用 cuRobo FK、同一 PlanningProblem 和 PlanningScene，不维护另一套机器人模型，也不直接输出可执行路径。
 
+正式执行边界为：`Skill / Interaction → cuRobo + OMPL → 独立机器人验收 → TrajectoryExecutor → robosuite controllers → MuJoCo dynamics/contact`。实际状态反馈回执行器和技能证据流程。robosuite 提供机器人装配与控制器，MuJoCo 是该仿真后端的物理引擎。
+
+| 模块 | 唯一职责 |
+| --- | --- |
+| `manipulation/execution.py` | 执行合同、原曲线时钟/事件、独立验收调用、逐步反馈守卫和证据屏障 |
+| `manipulation/robosuite_execution.py` | 绑定已构造的完整仿真、具名反馈、成熟绝对关节/独立指位控制器、原生单步积分和隔离参考 FK |
+| `manipulation/robot_validation.py` | Pinocchio/Coal 当前机器人几何与模型一致性、完整碰撞对政策、原 cubic 位置/速度极值验收 |
+| `tests/planning/recorded_simulation.py` | 录制 integration state 恢复与正式存档加载；不再实现第二条控制循环 |
+
+规划关节轨迹直接送入绝对关节控制器，不再经过采集用 WHOLE_BODY_IK，也不增加控制器插值。独立两指位置目标通过 unscaled GRIP 进入原生位置执行器。当前原生关节控制器没有接收期望速度前馈；曲线速度用于轨迹验收与实际反馈监督。
+
 状态、指令和优化自由度必须区分：
 
 - 完整机器人反馈与执行位置命令包含机械臂及独立两指。
@@ -65,7 +76,7 @@ FUNCTO 提供交互参考、事件和过程约束。机器人后端负责将这�
 
 ## 4. 独立机器人模型与几何检查
 
-独立检查器的职责是定位不同表示之间的分歧：同一具名完整 q 的 FK、原生碰撞实体与球代理、明确几何对的距离/最近点，以及固定状态的碰撞政策。它不是第二套规划器，也不根据局部数值结果放行生产轨迹。
+独立检查器负责同一具名完整 q 的 FK、原生实体距离/最近点、明确碰撞政策以及模型身份。`RobotStateValidator` 是执行器的必需输入；执行前检查实际入口、独立 TCP/base FK 一致性和原 cubic 的位置/速度极值，执行中检查每步完整实际机器人状态。失败或检查器异常均阻止后续控制。它不根据局部数值结果替代原场景与过程验收。
 
 采用 Pinocchio + Coal 作为独立 CPU 检查器。Pinocchio 从显式 fixed-base URDF 和完整具名 q 计算 link FK；Coal 对与原生模型对应的凸实体及 Box/Cylinder 做几何窄相检查。现有 yourdfpy 与 MuJoCo 用于交叉核对导出模型，不替换生产规划器。其必要性在于独立核对机器人变换与实体几何，定位球代理、碰撞政策和坐标链之间的分歧。
 
@@ -79,11 +90,15 @@ Pinocchio 的 Python distribution 是 `pin`，导入名是 `pinocchio`。当前�
 - 原生碰撞启用政策、机器人允许接触关系、由已有证据完成的查询和剩余查询分别保留。
 - 离散构型检查不宣称连续轨迹安全；局部观测几何不宣称完整环境已知。
 
+独立执行验收的范围仅为机器人及已知固定安装实体。required 对必须明确分离；边界数值与穿透均不获得隐式接触许可。excluded 对仍保存原始距离与来源；球代理分离证书不转换成原生实体对的永久排除。未来实际两指不被冻结为当前反馈或命令值，故该门槛不宣称完整未来碰撞路径已获独立证明。
+
 具体库能力、环境可用性与实现验收记录在[实施目录](../sim-version-plans/2026-10-01-functo-long-task/engineering-backend-implementation/implementation-result.md)。独立检查必须保留所有查询对及其启用/排除来源，不能将有限构型比较外推为全域证明。
 
 ## 5. 执行反馈和事件推进
 
 原 source frame 已通过 progress 映射到正式轨迹的实际事件时间。沿用这条时钟，不重新按全局采样序号触发。
+
+`TrajectoryExecutor` 组合既有后端与必需的具名独立 validator；通用模块不读取 HDF5、录制目录或任务身份。诊断控制参考使用明确的 `diagnostic_control_reference` 标签，仍接受同一实际限值与独立验收，不获得 planner accepted 身份；存档加载器不接受此标签来绕过旧曲线缺失的合同。
 
 事件到期仍须满足实际执行条件。当前执行守卫在每个原生步骤前后检查具名 q/dq、原生限位、速度、arm/TCP 跟踪和手指有效范围；在 close 生效前，检查对应原事件状态的允许误差。异常时保存已发生的最后样本、具体违反项及未应用事件，然后停止物理积分。故障保持输出只是已准备的命令，不表示已经完成物理制停。
 

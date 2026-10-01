@@ -180,7 +180,9 @@ def run(args):
     from prepare_recorded_task import prepare_candidate
     from recorded_observation import render_robot_mask
     from recorded_task_planning import plan_and_record
-    from recorded_simulation import ExecutionLimits
+    # BEGIN use the production execution contract shared with the executor.
+    from manipulation.execution import ExecutionLimits
+    # END production execution contract.
     from manipulation.planning import PlanningBudget
     from manipulation.planning_observation import build_scene_from_rgbd
     from curobo.perception import MapperCfg
