@@ -254,6 +254,8 @@ class RobotCoverage:
     def guidance_geometry(self):
         """Return copies for a caller's differentiable, non-certifying guidance."""
         return {"reference_frame": self.reference_frame,
+                "T_reference_base": self._base.copy(),
+                "urdf_path": self._checker.urdf_path,
                 "baseline_joint_names": list(self.baseline_joint_names),
                 "baseline_joint_positions": self._baseline_q.copy(),
                 "initialization_source": self.initialization_source,
