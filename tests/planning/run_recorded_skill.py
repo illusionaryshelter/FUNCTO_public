@@ -258,7 +258,10 @@ def run(args):
         # BEGIN read native command timing/ranges from the selected robot model.
         # No world/object state enters planning through this hardware binding.
         import mujoco
-        native_model = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
+        # The exported geometry-only fixture deliberately has no actuators.
+        # Read only the named robot actuator metadata from its source model;
+        # no MjData or current object state is constructed or queried here.
+        native_model = mujoco.MjModel.from_xml_path(fixture["source_scene_xml"])
         finger_actuators = []
         for name in feedback["finger_joint_names"]:
             joint_id = native_model.joint(name).id
