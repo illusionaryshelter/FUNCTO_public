@@ -1347,8 +1347,16 @@ class _CuroboPlanner:
                 components[f"scene:{name}"] = value
             residuals = {name: float(value.max().item()) for name, value in components.items()}
         failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
+        # BEGIN preserve nonfinite failures in strict JSON diagnostics.
+        # JSON null plus the explicit component list retains the rejection
+        # without emitting NaN/Infinity or losing the report during saving.
+        nonfinite = [name for name, value in residuals.items() if not np.isfinite(value)]
+        for name in nonfinite:
+            residuals[name] = None
+        # END preserve nonfinite failures in strict JSON diagnostics.
         return {
             "passed": not failed, "residuals": residuals, "failed_components": failed,
+            "nonfinite_components": nonfinite,
             "joint_names": list(self.joint_names), "joint_bounds": joint_bounds,
             "scope": {
                 "kind": "necessary_conditions_at_fixed_measured_entrance",

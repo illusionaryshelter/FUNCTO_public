@@ -7,6 +7,7 @@ IK, GPU execution, collision geometry or physical grasp certification.
 
 # BEGIN independent calculus, exact-anchor and execution-boundary regressions.
 from copy import deepcopy
+import json
 from types import MethodType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -1650,8 +1651,13 @@ class InitialStatePreflightTests(unittest.TestCase):
                 actual = entrance["residuals"][component]
                 if np.isfinite(expected):
                     self.assertAlmostEqual(actual, expected)
+                    self.assertEqual(entrance["nonfinite_components"], [])
                 else:
-                    self.assertFalse(np.isfinite(actual))
+                    # BEGIN strict JSON must retain the nonfinite rejection.
+                    self.assertIsNone(actual)
+                    self.assertEqual(entrance["nonfinite_components"], [component])
+                    # END strict JSON must retain the nonfinite rejection.
+                json.dumps(result.diagnostics, allow_nan=False)
                 self.assertEqual(result.diagnostics["attempts"], [])
                 self.assertFalse(result.diagnostics["used_ompl"])
                 planner.reference_seeds.assert_not_called()
