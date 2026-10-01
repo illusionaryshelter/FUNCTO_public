@@ -127,7 +127,15 @@ def export(args):
                     or abs(unknown_max-row['postcheck']['residuals']['scene:unknown/space/robot']) > 2e-6
                     or abs(float(hand_penetration[index].sum())-
                            row['postcheck']['residuals']['scene:gripper/self']) > 2e-5):
-                raise ValueError('Per-sphere reductions disagree with the original scene result')
+                difference = {'state_index': start+index, 'mode': row['mode'],
+                              'source_frame': row['source_frame'], 'rank': row['rank'],
+                              'background_sum': background_sum, 'unknown_max': unknown_max,
+                              'gripper_sum': float(hand_penetration[index].sum()),
+                              'saved': row['postcheck']['residuals'],
+                              'current_components': {k: float(cpu_array(v)[index].max())
+                                                     for k, v in components.items()}}
+                (args.output/'query-mismatch.json').write_text(json.dumps(difference, indent=2)+'\n')
+                raise ValueError(f'Per-sphere reductions disagree with the frozen scene: {difference}')
             overlaps = np.zeros(native.total_spheres, dtype=float)
             np.maximum.at(overlaps, hand_pairs[:, 0], hand_penetration[index])
             np.maximum.at(overlaps, hand_pairs[:, 1], hand_penetration[index])
