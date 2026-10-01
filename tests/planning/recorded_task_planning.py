@@ -287,6 +287,17 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
                 report["optimizer_inputs"].append(entry)
             # END copy the exact optimizer input before native buffer reuse.
             result = method(planner, *args, **kwargs)
+            # BEGIN persist the measured entrance before potentially long IK.
+            # This copies the production verdict once; interrupted later work
+            # must not erase its evidence or cause a second geometry query.
+            if name == "initial_state_diagnostics":
+                try:
+                    (output/"initial-state-diagnostics.json").write_text(json.dumps(
+                        result, default=_json_value, indent=2, allow_nan=False)+"\n")
+                except Exception as error:
+                    report.setdefault("observer_errors", []).append(
+                        f"Entrance record: {type(error).__name__}: {error}")
+            # END entrance recording does not alter its production verdict.
             # BEGIN save effective settings after construction and each solve.
             # Refinement can replace the optimizer. Capture the instance that
             # actually produced the next result, not only its input YAML.
@@ -400,10 +411,12 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
         with ExitStack() as stack:
             stack.enter_context(patch.object(planning._CuroboPlanner, "select_candidate", new=observed))
             stack.enter_context(patch.object(planning._CuroboPlanner, "export", new=observed_export))
-            for name in ("_initialize", "reference_seeds", "optimize"):
+            # BEGIN record the entrance at its original evaluation point.
+            for name in ("_initialize", "initial_state_diagnostics", "reference_seeds", "optimize"):
                 method = getattr(planning._CuroboPlanner, name)
                 stack.enter_context(patch.object(planning._CuroboPlanner, name,
                                                  new=stage_observer(method, name)))
+            # END the observer does not repeat or bypass any entrance check.
             result = planning.plan_trajectory(problem, scene, robot, budget=budget)
         report.update(status="completed", success=result.success,
                       diagnostics=result.diagnostics)
