@@ -11,6 +11,8 @@ gradient gets a fresh forward and is copied to CPU before another evaluation.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
+from copy import copy
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -71,6 +73,96 @@ def gradient_summary(value, names):
                                    "joint": names[index[2]], "gradient": float(value[index])},
             "joint_maximum_absolute": dict(zip(names, np.abs(value).max(axis=(0, 1)).tolist())),
             "joint_sum": dict(zip(names, value.sum(axis=(0, 1)).tolist()))}
+
+
+# BEGIN isolate the observed TF32 inverse-base transform without production edits.
+def quaternion_inverse_native_state(state, problem, scene, joint_names, trajectory_time):
+    """Diagnostic copy of the production timed-state path with one substitution.
+
+    Every forward operation and VJP binding before the final inverse-base
+    rotation is identical to ``planning._timed_native_state``. Only that
+    rotation uses the existing elementwise quaternion implementation instead
+    of GEMM, so this variant leaves cuRoBo's process-wide TF32 policy intact.
+    It preserves all arm spheres, timed fingers, native pairs, and radii.
+    """
+    import torch
+    from scipy.spatial.transform import Rotation
+    from manipulation import planning
+    from manipulation.planning_problem import quaternion_rotate
+
+    hand = scene.gripper
+    if hand is None or hand.controller != "timed_reference":
+        return state
+    q = state.joint_state.position
+    tool = state.tool_poses
+    index = tool.tool_frames.index(problem.tool_link)
+    layout = planning._native_gradient_layout_type()
+    r = planning._orientation_vjp_type().apply(q, tool.quaternion.detach(),
+                                     state.cuda_robot_model_state.tool_jacobians[..., 3:, :].detach())
+    p, r = problem.transform_tool_pose(layout.apply(tool.position)[:, :, index], r[:, :, index])
+    spheres = problem.transform_robot_spheres(layout.apply(state.robot_spheres))
+    progress = torch.zeros_like(trajectory_time)
+    fingers, half, _ = hand.state(progress, q, joint_names, trajectory_time=trajectory_time)
+    spheres = hand.spheres(spheres, p, r, fingers, half)
+    base = torch.as_tensor(problem.base_pose, dtype=q.dtype, device=q.device)
+    inverse_rotation = torch.as_tensor(
+        Rotation.from_matrix(problem.base_pose[:3, :3].T).as_quat()[[3, 0, 1, 2]],
+        dtype=q.dtype, device=q.device)
+    centers = quaternion_rotate(inverse_rotation, spheres[..., :3]-base[:3, 3])
+    spheres = torch.cat((centers, spheres[..., 3:4]), -1)
+    result = copy(state)
+    result.cuda_robot_model_state = copy(state.cuda_robot_model_state)
+    result.cuda_robot_model_state.robot_spheres = spheres.contiguous()
+    return result
+
+
+def precision_snapshot(torch):
+    """Record live backend settings rather than the requested policy label."""
+    return {"cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+            "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+            "float32_matmul_precision": torch.get_float32_matmul_precision()}
+
+
+@contextmanager
+def replay_precision(torch, variant, report):
+    """Change only replay arithmetic after all original initialization/checks.
+
+    Global IEEE arithmetic can affect every Torch matmul in an objective; the
+    local quaternion variant isolates the inverse-base rotation instead. Both
+    restore process state, including exceptional exits, before planner cleanup.
+    """
+    from manipulation import planning
+
+    prior = precision_snapshot(torch)
+    original = planning._timed_native_state
+    details = {"variant": variant, "before": prior,
+               "scope": "Objective replay only; scene, planner, goal and archive identity checks already completed",
+               "local_replacement": "Inverse-base rotation only: GEMM to existing quaternion_rotate"
+                   if variant == "local_inverse_quaternion" else None}
+    report["precision_variant"] = details
+    try:
+        if variant == "global_ieee":
+            torch.backends.cuda.matmul.allow_tf32 = False
+        scope = (patch.object(planning, "_timed_native_state", new=quaternion_inverse_native_state)
+                 if variant == "local_inverse_quaternion" else nullcontext())
+        with scope:
+            details["during"] = precision_snapshot(torch)
+            if variant == "global_ieee" and (details["during"]["cuda_matmul_allow_tf32"]
+                    or details["during"]["float32_matmul_precision"] != "highest"):
+                raise RuntimeError("Installed Torch did not enter requested IEEE float32 matmul mode")
+            yield
+    finally:
+        if variant == "global_ieee":
+            torch.backends.cuda.matmul.allow_tf32 = prior["cuda_matmul_allow_tf32"]
+            # Restoring the precision string also preserves a possible prior
+            # 'medium' setting, which the boolean flag alone cannot encode.
+            torch.set_float32_matmul_precision(prior["float32_matmul_precision"])
+        details["after"] = precision_snapshot(torch)
+        details["settings_restored"] = details["after"] == prior
+        details["native_state_function_restored"] = planning._timed_native_state is original
+        if not details["settings_restored"] or not details["native_state_function_restored"]:
+            raise RuntimeError("Diagnostic precision scope did not restore the original process state")
+# END numerical variants preserve production files and original input identities.
 
 
 def objective_probe(planner, rollout, actions, label, witness_joint, archive, arrays, report, save):
@@ -406,7 +498,14 @@ def self_forward_probe(planner, rollout, actions, witness_joint, arrays, report,
             arrays[f"self_audit.{label}.sphere_gradient"] = sphere_gradient
         errors = values-exact["values"]
         worst = np.argsort(-np.abs(errors), kind="stable")[:5]
+        # BEGIN expose TF32's characteristic 10-bit mantissa in saved centers.
+        # This is an observation, not a dtype conversion or an acceptance
+        # criterion. TF32 keeps float32's exponent range, unlike float16.
+        center_bits = np.ascontiguousarray(spheres[..., :3]).view(np.uint32)
+        tf32_grid_fraction = float(np.mean((center_bits & np.uint32(8191)) == 0))
+        # END retain the full unmodified float32 centers in the NPZ artifact.
         result = {"label": label, "gradient_enabled": gradient,
+            "center_zero_low_13_mantissa_bits_fraction": tf32_grid_fraction,
             "hook_vs_collection_identical": bool(np.array_equal(values, late_values)),
             "hook_vs_collection_maximum_difference": float(np.abs(values-late_values).max()),
             "gpu_sum_float32": float(values.sum(dtype=np.float32)),
@@ -585,18 +684,20 @@ def replay(problem, scene, robot, budget, args, report, save, arrays):
             "dt": float(seed_goal.dt.item()), "tool_pose_tracking_disabled_as_in_production": True}
         archive = {"native": native, "native_names": native_info["states"]["js_solution"]["joint_names"]}
         save("planner_initialized_without_solve")
-        # BEGIN optional focused audit preserves all original input/goal checks.
-        if args.self_forward_audit:
-            actions = planner.device_cfg.to_device(native["solution"]).reshape(
-                expected_shape[0], *expected_shape[2:])
-            self_forward_probe(planner, rollout, actions, witness["joint"], arrays, report, save)
-            return
-        # END focused audit performs no broad objective replay or solve.
-        for label, value in (("seed", seed.reshape(expected_shape[0], *expected_shape[2:])),
-                             ("native_solution", planner.device_cfg.to_device(native["solution"]).reshape(
-                                 expected_shape[0], *expected_shape[2:]))):
-            objective_probe(planner, rollout, value, label, witness["joint"], archive, arrays, report, save)
-        single_state_probe(planner, rollout, rollout._num_particles_goal, witness, arrays, report, save)
+        # BEGIN opt-in arithmetic variants start after unchanged input/goal checks.
+        with replay_precision(torch, args.precision_variant, report):
+            if args.self_forward_audit:
+                actions = planner.device_cfg.to_device(native["solution"]).reshape(
+                    expected_shape[0], *expected_shape[2:])
+                self_forward_probe(planner, rollout, actions, witness["joint"], arrays, report, save)
+                if not args.include_objective_replay:
+                    return
+            for label, value in (("seed", seed.reshape(expected_shape[0], *expected_shape[2:])),
+                                 ("native_solution", planner.device_cfg.to_device(native["solution"]).reshape(
+                                     expected_shape[0], *expected_shape[2:]))):
+                objective_probe(planner, rollout, value, label, witness["joint"], archive, arrays, report, save)
+            single_state_probe(planner, rollout, rollout._num_particles_goal, witness, arrays, report, save)
+        # END precision restoration also runs on focused-audit early return.
     finally:
         planner.close()
 
@@ -707,6 +808,10 @@ def parse_args():
     # BEGIN opt-in isolation of the observed native self finite-difference gap.
     parser.add_argument("--self-forward-audit", action="store_true",
                         help="Only replay saved native_solution: repeated actual self inputs and epsilon ladder")
+    parser.add_argument("--precision-variant", choices=("default", "local_inverse_quaternion", "global_ieee"),
+                        default="default", help="Replay-only arithmetic comparison after original initialization")
+    parser.add_argument("--include-objective-replay", action="store_true",
+                        help="After self audit, also run the original seed/native component gradients and FD")
     # END the default archived objective probe remains unchanged.
     return parser.parse_args()
 
