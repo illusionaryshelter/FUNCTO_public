@@ -113,6 +113,7 @@ def objective_probe(planner, rollout, actions, label, witness_joint, archive, ar
             return scalars, derivative, states
 
     baseline, _, state = evaluate(actions, capture=True)
+    arrays[f"{label}.controls"] = cpu(actions)
     entry["values"] = baseline
     entry["shape"] = list(actions.shape)
     for field, value in state.items():
@@ -256,7 +257,9 @@ def single_state_probe(planner, rollout, goal, witness, arrays, report, save):
                     "analytic_derivative": float(derivative[0, 0, index]),
                     "upper_value": upper, "lower_value": lower})
         finally:
-            if all(value is not None for value in saved_shape):
+            # A manager that has never evaluated a state uses native -1/-1
+            # sentinels. Negative sizes are not a restorable allocation.
+            if all(value is not None and value > 0 for value in saved_shape):
                 cost.setup_batch_tensors(*saved_shape)
         save(f"single_state:{label}")
     first, second = (result["costs"][name]["physical_limits"] for name, _, _ in sources)
@@ -290,6 +293,11 @@ def replay(problem, scene, robot, budget, args, report, save, arrays):
                              ("observation_ids", scene.coverage.observation_ids)):
             require_equal(f"observed_free.{name}", actual, saved[name], checks)
     with np.load(args.source_run/"entrance-scene.npz", allow_pickle=False) as saved:
+        # Include the independently controlled fingers and the actual sphere
+        # model, not only the active arm slice consumed by the optimizer.
+        with np.load(args.output/"scene-build"/"entrance-scene.npz", allow_pickle=False) as rebuilt:
+            for field in ("joint_names", "actual_q", "actual_dq", "measured_robot_spheres"):
+                require_equal(f"entrance.{field}", rebuilt[field], saved[field], checks)
         columns = [saved["joint_names"].tolist().index(name) for name in problem.joint_names]
         require_equal("measured_q0", problem.start_q, saved["actual_q"][columns], checks)
         require_equal("measured_dq0", problem.start_dq, saved["actual_dq"][columns], checks)
@@ -298,6 +306,7 @@ def replay(problem, scene, robot, budget, args, report, save, arrays):
     planner = _CuroboPlanner(problem, scene, robot, budget, "cuda:0")
     try:
         names = list(planner.joint_names)
+        arrays["joint_names"] = np.asarray(names)
         require_equal("joint_names", names, seed_data["joint_names"], checks)
         require_equal("native_active_joint_names", names, native["active_joint_names"], checks)
         require_equal("native_q0", cpu(planner.start.position), seed_data["start_q"], checks)
