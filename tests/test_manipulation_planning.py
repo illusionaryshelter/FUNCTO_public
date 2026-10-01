@@ -184,6 +184,39 @@ class PlannerCalculusTests(unittest.TestCase):
         self.assertEqual(calls[1][0].dtype, np.float64)
         self.assertEqual(planner.last_validation["robot_coverage"]["failed"][0]["time_s"], .5)
 
+    # BEGIN a rounded spline boundary is a reference state, not measured q0.
+    def test_export_nearby_first_sample_gets_ordinary_volume_residual(self):
+        from manipulation.planning_scene import PlanningScene
+        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+        baseline = np.array([.123456789, 0., 0.])
+        rounded = np.float32(baseline[0])
+        first = np.array([float(np.nextafter(rounded, np.float32(np.inf))), 0., 0.])
+        position = np.repeat(first[None], 2, axis=0)
+        planner, native = export_fixture(problem, mapping, position, np.zeros((2, 3)), 1.)
+        queries = []
+
+        def check_state(**kwargs):
+            queries.append(kwargs)
+            return {"passed": False, "failure": "new_unknown_volume", "witness": {"sample": "ordinary"}}
+
+        world = PlanningScene.__new__(PlanningScene)
+        world.gripper = None
+        world.robot_coverage = SimpleNamespace(baseline_joint_names=planner.joint_names,
+            baseline_joint_positions=baseline, check_state=check_state)
+        world.evaluate = planner._verification_scene.evaluate
+        planner._verification_scene = world
+        curve, count = planner.export(native)
+        self.assertEqual(count, 3)
+        self.assertFalse(queries[0]["entrance"])
+        np.testing.assert_array_equal(queries[0]["joint_positions"], first)
+        np.testing.assert_array_equal(curve.position, position)
+        self.assertEqual(curve.residuals["unknown/new_robot_volume"], 1.)
+        failure = planner.last_validation["robot_coverage"]["failed"][0]
+        self.assertEqual(failure["time_s"], 0.)
+        self.assertEqual(failure["result"]["failure"], "new_unknown_volume")
+    # END no tolerance, start replacement or alternate curve enters acceptance.
+
     def test_initializer_plateau_inverse_is_explicitly_earliest(self):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.progress_map = _ProgressMap(np.array([0., .2, .4, 1.]), np.array([0., 1., 1., 2.]))

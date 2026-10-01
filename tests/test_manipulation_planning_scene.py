@@ -304,22 +304,33 @@ class PlanningSceneTest(unittest.TestCase):
         self.assertEqual(ordinary-without_guidance, batch*horizon*17*128)
 
     def test_full_volume_entrance_accepts_only_exact_named_representations(self):
-        baseline = np.array([.123456789])
+        baseline = np.array([.123456789, -.234567891])
         received = []
         oracle = SimpleNamespace(reference_frame="world", required_link_names=("body",),
-            baseline_joint_names=("q",), baseline_joint_positions=baseline,
+            baseline_joint_names=("q", "finger"), baseline_joint_positions=baseline,
             guidance_geometry=lambda: {"solids": []},
-            check_state=lambda **kwargs: received.append(kwargs) or {"passed": True})
+            check_state=lambda **kwargs: received.append(kwargs) or {"passed": kwargs["entrance"]})
         world = scene(robot_coverage=oracle)
-        q = torch.tensor([[[float(np.float32(baseline[0]))]]], dtype=torch.float64)
-        world.check_robot_coverage(q, ("q",), torch.zeros((1, 1)), entrance=True)
+        # BEGIN each named coordinate, including the independent finger, must
+        # match one exact representation before the oracle gets entrance=True.
+        q = torch.tensor([[[float(np.float32(baseline[0])), baseline[1]]]], dtype=torch.float64)
+        world.check_robot_coverage(q, ("q", "finger"), torch.zeros((1, 1)), entrance=True)
         self.assertTrue(received[0]["entrance"])
-        changed = q+np.spacing(q.item())
-        with self.assertRaisesRegex(ValueError, "exactly preserve"):
-            world.check_robot_coverage(changed, ("q",), torch.zeros((1, 1)), entrance=True)
-        world.check_robot_coverage(changed, ("q",), torch.zeros((1, 1)), entrance=False)
-        self.assertEqual(received[-1]["joint_positions"][0], changed.item())
+        for column, step in ((0, np.spacing(q[0, 0, 0].item())),
+                             (0, float(np.spacing(np.float32(baseline[0])))),
+                             (1, np.spacing(baseline[1]))):
+            changed = q.clone()
+            changed[0, 0, column] += step
+            report = world.check_robot_coverage(changed, ("q", "finger"), torch.zeros((1, 1)), entrance=True)
+            self.assertFalse(report[0]["passed"])
+            self.assertFalse(received[-1]["entrance"])
+            np.testing.assert_array_equal(received[-1]["joint_positions"], changed.numpy()[0, 0])
+        # Even an exact float32 start representation at a future sample must
+        # pass the ordinary volume predicate without entrance canonicalization.
+        world.check_robot_coverage(q, ("q", "finger"), torch.ones((1, 1)), entrance=False)
+        np.testing.assert_array_equal(received[-1]["joint_positions"], q.numpy()[0, 0])
         self.assertFalse(received[-1]["entrance"])
+        # END nearby first samples produce a verdict without changing the curve.
     # END command references never substitute for physical finger feedback.
 
     def test_partial_scene_cannot_be_declared_without_coverage_and_provenance(self):

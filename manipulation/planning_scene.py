@@ -1148,6 +1148,12 @@ class PlanningScene:
         return names, values
 
     def check_robot_coverage(self, joint_position, joint_names, trajectory_time, *, entrance=False):
+        """Check actual coordinates; nominate only exact initial representations.
+
+        A native curve's first sample may differ from measured q0 even when
+        its boundary conditions use q0. Such a sample remains an ordinary
+        full-volume query; the entrance request never grants a tolerance band.
+        """
         if self.robot_coverage is None:
             return []
         names, positions = self.full_robot_positions(joint_position, joint_names, trajectory_time)
@@ -1156,6 +1162,8 @@ class PlanningScene:
         for row in values:
             query = row
             representation = None
+            # BEGIN preserve unmatched native first samples as ordinary states.
+            query_entrance = False
             if entrance:
                 columns = [self.robot_coverage.baseline_joint_names.index(name) for name in names]
                 baseline = self.robot_coverage.baseline_joint_positions[columns]
@@ -1163,11 +1171,12 @@ class PlanningScene:
                 # A mixed arm-native/CPU-finger entrance is accepted only if
                 # every original value is exactly one declared representation.
                 # Rounding an arbitrary nearby value first would hide motion.
-                if not np.all((row == baseline) | (row == rounded)):
-                    raise ValueError("Coverage entrance must exactly preserve measured or native float32 coordinates")
-                query = baseline if np.array_equal(row, baseline) else rounded
-                representation = "measured_float64" if np.array_equal(row, baseline) else "exact_named_native_float32_binding"
-            report = self.robot_coverage.check_state(joint_names=names, joint_positions=query, entrance=entrance)
+                if np.all((row == baseline) | (row == rounded)):
+                    query = baseline if np.array_equal(row, baseline) else rounded
+                    representation = "measured_float64" if np.array_equal(row, baseline) else "exact_named_native_float32_binding"
+                    query_entrance = True
+            report = self.robot_coverage.check_state(joint_names=names, joint_positions=query, entrance=query_entrance)
+            # END no coordinate is rounded before deciding entrance identity.
             if representation is not None:
                 report = {**report, "entrance_representation": representation}
             reports.append(report)
