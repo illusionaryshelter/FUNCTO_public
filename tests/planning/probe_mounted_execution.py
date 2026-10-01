@@ -224,6 +224,10 @@ def run(args):
             child_report = output / "execution" / "execution-report.json"
             if child_report.is_file():
                 report["execution"] = read_json(child_report)
+                report["saturated_coordinates"] = report["execution"]["actuator_saturated_coordinates"]
+                report["control_evidence"] = str(output / "execution" / "physical-trajectory.npz")
+            else:
+                report["control_evidence"] = str(output / "measurement.npz")
             arrays = {key: np.asarray([row[key] for row in samples]) for key in samples[0]}
             arrays.update({"control_" + key: np.asarray([row[key] for row in controls])
                            for key in ("time", "requested_arm_torque", "arm_torque_saturated")})
