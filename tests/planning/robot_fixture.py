@@ -633,6 +633,19 @@ def _validate_fixture_kinematics(fixture, kinematics, models):
             or len(joint_names) != len(set(joint_names))
             or not set(kinematics["lock_joints"]).issubset(joint_names)):
         raise ValueError("Fixture configuration-space joints no longer match the native binding")
+    # BEGIN bind physical position bounds before any planner dtype conversion.
+    # An outward physical endpoint such as 0.04 is not interchangeable with
+    # its float32 planner representation. Preserve the source's named doubles
+    # exactly; numerical FK tolerances must never widen hardware limits.
+    position_limits = fixture.get("position_limits")
+    if not isinstance(position_limits, dict) or set(position_limits) != set(joint_names):
+        raise ValueError("Fixture position_limits must name every native joint exactly once")
+    for name, bounds in position_limits.items():
+        values = np.asarray(bounds)
+        if (values.shape != (2,) or values.dtype.kind not in "iuf"
+                or not np.isfinite(values).all() or values[0] > values[1]):
+            raise ValueError(f"Fixture position_limits require finite ordered native bounds: {name}")
+    # END named physical bounds remain independent of planner precision.
     actual = URDF.load(path, load_meshes=False)
     actual_links = [link.name for link in actual.robot.links]
     actual_joints = [joint.name for joint in actual.robot.joints]
@@ -685,6 +698,10 @@ def _validate_fixture_kinematics(fixture, kinematics, models):
                 native_joints.add(joint_name)
                 kind = "revolute" if model.jnt_type[index] == mujoco.mjtJoint.mjJNT_HINGE else "prismatic"
                 axis, limits = model.jnt_axis[index], model.jnt_range[index]
+                # BEGIN independently recheck the original and robot-only doubles.
+                if not np.array_equal(position_limits[joint_name], limits):
+                    raise ValueError(f"Fixture position_limits differ from original native bounds: {joint_name}")
+                # END no physical epsilon or float32 round-trip enters this check.
             expected_joints.add(joint_name)
             require_joint(joint_name, model.body(model.body_parentid[body]).name, name, kind,
                           model.body_pos[body], model.body_quat[body], axis, limits)
@@ -1016,6 +1033,9 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, collisi
         "finger_link_names": finger_links,
         "planning_joint_names": list(arm_joint_names), "joint_binding": binding,
         "initial_frame": int(initial_frame), "initial_joint_positions": q0.tolist(),
+        # BEGIN preserve native double endpoints for the physical execution contract.
+        "position_limits": {name: model.jnt_range[model.joint(name).id].tolist() for name in names},
+        # END planner float32 limits are not hardware metadata.
         "velocity_limits": velocity_limits, "effort_limits": effort_limits,
         "collision_geometries": records, "fixed_collision_geometries": fixed_geometries,
         "sphere_count": sphere_count,

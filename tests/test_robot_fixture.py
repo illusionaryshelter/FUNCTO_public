@@ -275,6 +275,69 @@ class NativeSeparationTest(unittest.TestCase):
 
 
 class FixtureReloadTest(unittest.TestCase):
+    # BEGIN physical endpoint precision and original-source binding regression.
+    def test_named_position_limits_preserve_native_double_endpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/"scene.xml"
+            source.write_text(_scene(joint_type="slide").replace('range="-1 1"', 'range="0 .04"'))
+            catalog = root/"catalog.json"
+            catalog.write_text(json.dumps({"joints": [{"name": "spin", "qpos_count": 1,
+                "qvel_count": 1, "qpos_start": 0, "qvel_start": 0}]}))
+            episode = root/"episode.h5"
+            with h5py.File(episode, "w") as stream:
+                stream.create_dataset("states/qpos", data=np.array([[.04], [.02], [0.]]))
+            fixture = export_fixture(
+                scene_path=source, catalog_path=catalog, episode_path=episode,
+                root_body="anchor", collision_root="anchor", tcp_site="tool",
+                arm_joint_names=["spin"], finger_joint_names=[], velocity_limits={"spin": 1.},
+                effort_limits={"spin": 2.}, cover_specifications={
+                    name: {"subdivisions": [1, 1, 1]} for name in ("anchor_geom", "rotor_geom")},
+                initial_frame=0, output=root/"fixture", binding_audit_path=catalog,
+                max_acceleration=2., max_jerk=10.)
+            fixture = json.loads((root/"fixture/manifest.json").read_text())
+            config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
+            self.assertEqual(fixture["position_limits"], {"spin": [0., .04]})
+            self.assertNotEqual(fixture["position_limits"]["spin"][1], float(np.float32(.04)))
+            validate_fixture_collision_contract(fixture, config)
+            # Missing/foreign identities, unordered or malformed ranges, and
+            # even a single double ULP must fail; this is hardware metadata.
+            for bounds in ({}, {"other": [0., .04]}, {"spin": [.04, 0.]},
+                           {"spin": [0.]}, {"spin": [0., np.nan]},
+                           {"spin": [0., float(np.float32(.04))]},
+                           {"spin": [0., np.nextafter(.04, np.inf)]}):
+                wrong = deepcopy(fixture)
+                wrong["position_limits"] = bounds
+                with self.subTest(bounds=bounds), self.assertRaisesRegex(ValueError, "position_limits"):
+                    validate_fixture_collision_contract(wrong, config)
+            missing = deepcopy(fixture); del missing["position_limits"]
+            with self.assertRaisesRegex(ValueError, "position_limits"):
+                validate_fixture_collision_contract(missing, config)
+            robot_path = Path(fixture["robot_mjcf_path"])
+            urdf_path = Path(fixture["urdf_path"])
+            original_robot, original_urdf = robot_path.read_text(), urdf_path.read_text()
+            changed = float(np.nextafter(.04, np.inf))
+            for native_path in (robot_path, source):
+                original = native_path.read_text()
+                tree = ET.fromstring(original)
+                tree.find(".//joint[@name='spin']").set("range", f"0 {changed!r}")
+                native_path.write_text(ET.tostring(tree, encoding="unicode"))
+                with self.subTest(native_path=native_path.name), self.assertRaisesRegex(ValueError, "position_limits"):
+                    validate_fixture_collision_contract(fixture, config)
+                native_path.write_text(original)
+            # Updating the manifest, exported MJCF and consumed URDF together
+            # still cannot override the independent original native source.
+            wrong = deepcopy(fixture); wrong["position_limits"]["spin"][1] = changed
+            tree = ET.fromstring(original_robot)
+            tree.find(".//joint[@name='spin']").set("range", f"0 {changed!r}")
+            robot_path.write_text(ET.tostring(tree, encoding="unicode"))
+            tree = ET.fromstring(original_urdf)
+            tree.find("joint[@name='spin']/limit").set("upper", repr(changed))
+            urdf_path.write_text(ET.tostring(tree, encoding="unicode"))
+            with self.assertRaisesRegex(ValueError, "position_limits"):
+                validate_fixture_collision_contract(wrong, config)
+    # END native double endpoint and dual-model validation regression.
+
     def test_source_export_reload_and_tamper_checks_allow_new_joint_feedback(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

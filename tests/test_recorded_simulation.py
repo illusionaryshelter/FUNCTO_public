@@ -27,7 +27,7 @@ from recorded_simulation import ExecutionGuardError, ExecutionLimits, FixedFinge
 
 def _event(event_id, kind, time, evidence=None):
     return {"skill_id": "declared_skill", "event_id": event_id, "kind": kind,
-            "time": time, "requires_evidence": evidence, "stop": evidence is not None}
+            "time": time, "progress": time, "requires_evidence": evidence, "stop": evidence is not None}
 
 
 def _fixture():
@@ -265,6 +265,25 @@ class RecordedControlTests(unittest.TestCase):
 
 # BEGIN physical feedback rejection and isolated native FK regressions.
 class ExecutionGuardTests(unittest.TestCase):
+    def test_non_grid_close_cannot_narrow_actual_interval_before_new_feedback(self):
+        simulation, curve, value = _fixture()
+        self.assertEqual(curve.events[1]["time"], .003)
+        self.assertEqual(simulation._dt, .002)
+        policy = _limit_values(simulation, curve)
+        # This tighter interval contains the currently measured q, but there
+        # is no new feedback at the future close event. It must not replace
+        # the preceding allowed set during the delayed physical application.
+        policy["events"][1]["position_bounds"] = [[.011, .019], [-.019, -.015]]
+        with TemporaryDirectory() as temporary:
+            output = Path(temporary)/"trial"
+            with self.assertRaisesRegex(ValueError, "fresh measured feedback at the original evidence barrier"):
+                simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                    initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(policy),
+                    evaluation_mode="accepted_plan", output=output)
+            self.assertFalse(output.exists())
+            self.assertEqual(simulation.native_data.time, 1.3)
+            np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.026, -.023])
+
     def test_missing_limits_extra_clock_and_unbound_finger_event_fail_before_physics(self):
         simulation, curve, value = _fixture()
         policy = _limit_values(simulation, curve)

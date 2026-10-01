@@ -248,6 +248,9 @@ class ExecutionLimits:
         if np.any(speed <= 0):
             raise ValueError("Hardware velocity limits must be finite and positive")
         commands = [event for event in trajectory.events if event["kind"] in ("open", "close", "hold")]
+        if any(not isinstance(event.get("progress"), (int, float, np.floating))
+               or not np.isfinite(event["progress"]) or event["progress"] < 0 for event in commands):
+            raise ValueError("Actual hand intervals require each command's original finite progress anchor")
         identities = [(event["skill_id"], event["event_id"]) for event in commands]
         rows = {(row["skill_id"], row["event_id"]): deepcopy(row) for row in self.events}
         if len(set(identities)) != len(identities) or set(identities) != set(rows):
@@ -258,6 +261,20 @@ class ExecutionLimits:
             if (np.any(bounds[:, 0] < ranges[narm:, 0]) or np.any(bounds[:, 1] > ranges[narm:, 1])
                     or np.any(np.asarray(row["maximum_speed"]) > speed[narm:])):
                 raise ValueError("Actual finger intervals must remain within native position and hardware velocity limits")
+        # BEGIN commands cannot narrow actual geometry without new feedback.
+        # A command is applied on the next native step, while planning modes
+        # change at the original progress anchor. Containing the preceding
+        # interval covers this delay without moving an event or pretending a
+        # servo has already converged. A tighter interval belongs to a new
+        # measured binding after the original evidence barrier, not a command.
+        previous = np.asarray(self.initial_fingers["position_bounds"])
+        for event in sorted(commands, key=lambda item: item["progress"]):
+            current = np.asarray(rows[(event["skill_id"], event["event_id"])]["position_bounds"])
+            if np.any(current[:, 0] > previous[:, 0]) or np.any(current[:, 1] < previous[:, 1]):
+                raise ValueError("A command cannot narrow the previous actual finger interval; "
+                                 "use fresh measured feedback at the original evidence barrier before rebinding")
+            previous = current
+        # END commands cannot narrow actual geometry without new feedback.
         if np.any(np.asarray(self.stop_arm_velocity) > speed[:narm]):
             raise ValueError("Stop-speed limits cannot exceed the named hardware limits")
         return {"joint_ranges": ranges, "maximum_speed": speed,

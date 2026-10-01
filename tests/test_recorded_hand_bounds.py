@@ -21,9 +21,9 @@ def limits():
         arm_velocity_error=[.02], tcp_position_error_m=.003, tcp_rotation_error_rad=.01,
         stop_arm_velocity=[.01],
         initial_fingers={"position_bounds": [[.03, .04], [-.03, -.02]], "maximum_speed": [.1, .1]},
-        events=({"skill_id": "s", "event_id": "close", "position_bounds": [[.005, .03], [-.025, -.004]],
+        events=({"skill_id": "s", "event_id": "close", "position_bounds": [[.005, .04], [-.03, -.004]],
                  "maximum_speed": [.1, .1]},
-                {"skill_id": "s", "event_id": "hold", "position_bounds": [[.012, .016], [-.02, -.011]],
+                {"skill_id": "s", "event_id": "hold", "position_bounds": [[.004, .04], [-.03, -.003]],
                  "maximum_speed": [.01, .01]}))
 
 
@@ -36,9 +36,9 @@ def test_original_progress_boundaries_cover_both_actual_intervals():
     bounds = event_finger_bounds(limits(), events())
     lower, upper = bounds(torch.tensor([[0., .49, .5, .6, .8, .9]], dtype=torch.float64))
     np.testing.assert_allclose(lower[0], [[.03, -.03], [.03, -.03], [.005, -.03],
-                                        [.005, -.025], [.005, -.025], [.012, -.02]])
+                                        [.005, -.03], [.004, -.03], [.004, -.03]])
     np.testing.assert_allclose(upper[0], [[.04, -.02], [.04, -.02], [.04, -.004],
-                                        [.03, -.004], [.03, -.004], [.016, -.011]])
+                                        [.04, -.004], [.04, -.003], [.04, -.003]])
     # Repeating a boundary at a later clock time must not narrow its geometry.
     repeat = bounds(torch.tensor([[.5, .5]], dtype=torch.float64))
     torch.testing.assert_close(repeat[0][0, 0], repeat[0][0, 1])

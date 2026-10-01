@@ -64,7 +64,8 @@ def event_finger_bounds(execution_limits, events):
     return bounds
 
 
-def position_controlled_hand(robot, feedback, problem, *, device, execution_limits, velocity_limits):
+def position_controlled_hand(robot, feedback, problem, *, device, execution_limits,
+                             position_limits, velocity_limits):
     """Calibrate the affine hand from the supplied native robot, not a name.
 
     Native axes and sphere ordering are measured by FK. Independent position
@@ -91,16 +92,17 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
                     for i in parameters.get_sphere_index_from_link_name(link).cpu().tolist())
     if not indices or len(set(indices)) != len(indices):
         raise ValueError("The actual native finger links must have disjoint nonempty sphere sets")
-    limits = parameters.joint_limits.position[:, columns].T.cpu().numpy().copy()
+    # The fixture preserves native double-precision ranges. Float32 solver
+    # storage can round 0.04 down, and is not a different physical limit.
+    limits = np.asarray([position_limits[name] for name in finger_names], dtype=float)
     # Bind all ranges by identity before asking a planner to consume a narrower
     # actual hand interval. No numerical solver tolerance becomes a physical
     # tracking allowance, and no allowed interval is inferred from ctrl.
-    full_columns = [names.index(name) for name in feedback["joint_names"]]
     binding = execution_limits.bind(
         SimpleNamespace(joint_names=problem.joint_names, events=[asdict(event) for event in problem.events]),
         joint_names=feedback["joint_names"], arm_joint_names=feedback["arm_joint_names"],
         finger_joint_names=finger_names,
-        native_joint_ranges=parameters.joint_limits.position[:, full_columns].T.cpu().numpy(),
+        native_joint_ranges=[position_limits[name] for name in feedback["joint_names"]],
         named_velocity_limits=velocity_limits)
     actual_fingers = np.asarray([measured[name] for name in finger_names])
     actual_dq = dict(zip(feedback["joint_names"], feedback["start_dq"]))
@@ -171,7 +173,7 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
     return hand, report, {"robot_spheres": current, "tool_position": p, "tool_quaternion": q,
                          "sphere_indices_by_link": sphere_indices_by_link}
 # END one actual-finger interval contract shared by planning and execution.
-    # END the binary hand contract and its measured FK remain unchanged.
+    # END expose the exact native sphere ownership for fixed-installation policy.
 
 
 def run(args):
@@ -248,7 +250,7 @@ def run(args):
         device = DeviceCfg("cuda:0")
         hand, hand_report, entrance_fk = position_controlled_hand(
             robot, feedback, problem, device=device, execution_limits=execution_limits,
-            velocity_limits=fixture["velocity_limits"])
+            position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"])
         report["gripper"] = hand_report
         carrier_id = scene_input["carrier_id"]
         carrier_phases = [phase for phase in problem.phases
