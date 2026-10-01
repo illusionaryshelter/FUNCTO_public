@@ -831,10 +831,11 @@ class NativeCubicClockTests(unittest.TestCase):
         free_indices = np.arange(4, 4+count)
         greville = np.array([curve.t[index+1:index+curve.k+1].mean() for index in free_indices])
         clock = greville/curve.t[-curve.k-1]
-        requested = []
+        requested, requested_parameters = [], []
 
         def solve_pose(goal, **kwargs):
             requested.append(goal)
+            requested_parameters.append(float(planner.seed_parameter.item()))
             return SimpleNamespace(js_solution=SimpleNamespace(position=torch.tensor([[[goal], [goal+.2]]])),
                                    success=torch.tensor([[True, True]]))
 
@@ -844,12 +845,16 @@ class NativeCubicClockTests(unittest.TestCase):
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=1e-5))
         planner.start = SimpleNamespace(position=torch.tensor([[-10.]]))
         planner.seed_progress = torch.zeros((1, 1))
+        # BEGIN explicitly model the native initializer's independent time input.
+        planner.seed_parameter = torch.zeros_like(planner.seed_progress)
+        # END progress alone cannot identify a point on a pause interval.
         planner.progress_map = mapping
         planner.trajopt = SimpleNamespace(action_horizon=count)
         planner.ik = SimpleNamespace(solve_pose=solve_pose, get_active_js=lambda state: state)
         planner._goal = lambda progress: progress
         seeds, success_counts = planner.reference_seeds()
         np.testing.assert_allclose(requested, np.interp(clock, mapping.u, mapping.s), atol=1e-14)
+        np.testing.assert_array_equal(requested_parameters, clock.astype(np.float32).astype(float))
         self.assertEqual(seeds.shape, (1, 1, count, 1))
         self.assertEqual(success_counts, [2]*count)
         self.assertTrue(torch.all(seeds[:, :, 0] != planner.start.position).item())
@@ -866,10 +871,11 @@ class NativeCubicClockTests(unittest.TestCase):
         position_before, velocity_before = measured_q.clone(), measured_dq.clone()
         native_generator = TrajectorySeedGenerator(horizon, 3, DeviceCfg("cpu"))
         helper = Mock(wraps=native_generator.generate_constant_seeds)
-        goals, supplied_seed_shapes = [], []
+        goals, supplied_seed_shapes, requested_parameters = [], [], []
 
         def failed_pose_ik(goal, **kwargs):
             goals.append(goal)
+            requested_parameters.append(float(planner.seed_parameter.item()))
             supplied_seed_shapes.append(tuple(kwargs["seed_config"].shape))
             # Finite solutions of failed pose IK may initialize the optimizer,
             # but their zero success count must remain visible to its caller.
@@ -884,12 +890,17 @@ class NativeCubicClockTests(unittest.TestCase):
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=1e-5))
         planner.start = SimpleNamespace(position=measured_q, velocity=measured_dq)
         planner.seed_progress = torch.zeros((1, 1))
+        # BEGIN failed pose IK still receives the real control-point clock.
+        planner.seed_parameter = torch.zeros_like(planner.seed_progress)
+        # END diagnostic failure does not remove the independent time input.
         planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         planner.trajopt = SimpleNamespace(action_horizon=horizon,
                                          _trajectory_seed_generator=SimpleNamespace(generate_constant_seeds=helper))
         planner.ik = SimpleNamespace(solve_pose=failed_pose_ik, get_active_js=lambda state: state)
         planner._goal = lambda progress: progress
         seeds, success_counts = planner.reference_seeds()
+        np.testing.assert_array_equal(requested_parameters,
+            ((np.arange(horizon)+3.)/(horizon+4.)).astype(np.float32).astype(float))
         helper.assert_called_once()
         self.assertIs(helper.call_args.args[0], measured_q)
         self.assertEqual(helper.call_args.args[1], 1)
@@ -931,6 +942,9 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner.start = SimpleNamespace(position=torch.zeros((1, 3), dtype=torch.float64),
                                         velocity=torch.tensor([[.1, -.2, .3]], dtype=torch.float64))
         planner.seed_progress = torch.zeros((1, 1), dtype=torch.float64)
+        # BEGIN seed selection fixtures retain the production time parameter.
+        planner.seed_parameter = torch.zeros_like(planner.seed_progress)
+        # END no implicit default clock is added to the production planner.
         planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         generator = TrajectorySeedGenerator(horizon, 3, DeviceCfg("cpu"))
         constant = Mock(wraps=generator.generate_constant_seeds)
@@ -940,6 +954,8 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
 
         def solve(goal, **kwargs):
             index = len(warm_starts)
+            np.testing.assert_array_equal(planner.seed_parameter.numpy(),
+                                          [[(index+3.)/(horizon+4.)]])
             warm_starts.append(kwargs["seed_config"].clone())
             return SimpleNamespace(js_solution=SimpleNamespace(position=torch.tensor(pools[index][None], dtype=torch.float64)),
                                    success=torch.tensor(flags[index][None], dtype=torch.bool))
