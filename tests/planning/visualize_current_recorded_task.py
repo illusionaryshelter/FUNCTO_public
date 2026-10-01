@@ -17,11 +17,13 @@ An external trial directory can additionally be supplied with --trial-dir.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import html
 import json
 import os
 from pathlib import Path
 import resource
+import subprocess
 import time
 from urllib.parse import quote
 
@@ -35,6 +37,7 @@ from PIL import Image, ImageOps
 import plotly.graph_objects as go
 from plotly.colors import qualitative
 from plotly.offline import get_plotlyjs
+from plotly.subplots import make_subplots
 from scipy.interpolate import CubicHermiteSpline
 
 
@@ -123,11 +126,13 @@ def load_trial(path):
                 physical = {name: saved[name].copy() for name in saved.files}
             elapsed, poses = physical["elapsed"], physical["actual_tool_pose"]
             names, actual_q = physical["joint_names"].tolist(), physical["actual_q"]
+            actual_dq = physical["actual_dq"]
             if (elapsed.ndim != 1 or not 1 <= len(elapsed) <= 100001
                     or np.any(np.diff(elapsed) <= 0) or poses.shape != (len(elapsed), 4, 4)
                     or actual_q.shape != (len(elapsed), len(names))
+                    or actual_dq.shape != actual_q.shape
                     or len(set(names)) != len(names)
-                    or not all(np.isfinite(value).all() for value in (elapsed, poses, actual_q))
+                    or not all(np.isfinite(value).all() for value in (elapsed, poses, actual_q, actual_dq))
                     or not np.allclose(poses[:, 3], [0, 0, 0, 1], atol=1e-8, rtol=0)):
                 raise ValueError("Physical samples must retain aligned time, named q and world TCP")
             result["physical"] = physical
@@ -282,30 +287,41 @@ def eef_plot(curve, reference_frame, historical):
 def joint_plot(curve):
     """Sample the original Hermite cubic; physical traces retain their own time."""
     times = np.unique(np.r_[curve["times"], np.linspace(0, curve["times"][-1], 1200)])
-    positions = CubicHermiteSpline(curve["times"], curve["position"], curve["velocity"], axis=0)(times)
-    figure = go.Figure()
+    # BEGIN show both q and its exact cubic derivative against physical feedback.
+    spline = CubicHermiteSpline(curve["times"], curve["position"], curve["velocity"], axis=0)
+    samples = (spline(times), spline(times, 1))
+    figure = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=.10,
+                           subplot_titles=("关节位置 q", "关节速度 dq"))
     for column, name in enumerate(curve["names"]):
         color = qualitative.Plotly[column % len(qualitative.Plotly)]
-        figure.add_trace(go.Scatter(x=times, y=positions[:, column], mode="lines",
-            name=f"规划 q · {name}", legendgroup=name, line={"color": color},
-            hovertemplate="曲线时间 %{x:.4f} s<br>q=%{y:.6f}<extra>"+escape(name)+"</extra>"))
-        for index, trial in enumerate(curve["trials"]):
-            physical = trial["physical"]
-            if physical is None or name not in physical["joint_names"].tolist():
-                continue
-            actual_column = physical["joint_names"].tolist().index(name)
-            selection = np.unique(np.linspace(0, len(physical["elapsed"])-1,
-                                               min(len(physical["elapsed"]), 2500)).astype(int))
-            figure.add_trace(go.Scatter(x=physical["elapsed"][selection],
-                y=physical["actual_q"][selection, actual_column], mode="lines",
-                name=f"真实 q · {name} · 试验 {index+1}", legendgroup=name,
-                line={"dash": "dot", "color": color},
-                hovertemplate="物理 elapsed %{x:.4f} s<br>q=%{y:.6f}<extra>"+escape(name)+"</extra>"))
+        for derivative, label in enumerate(("q", "dq")):
+            figure.add_trace(go.Scatter(x=times, y=samples[derivative][:, column], mode="lines",
+                name=f"规划 · {name}", legendgroup=name, line={"color": color}, showlegend=derivative == 0,
+                hovertemplate="曲线时间 %{x:.4f} s<br>"+label+"=%{y:.6f}<extra>"+escape(name)+"</extra>"),
+                row=derivative+1, col=1)
+            for index, trial in enumerate(curve["trials"]):
+                physical = trial["physical"]
+                if physical is None or name not in physical["joint_names"].tolist():
+                    continue
+                actual_column = physical["joint_names"].tolist().index(name)
+                selection = np.unique(np.linspace(0, len(physical["elapsed"])-1,
+                                                   min(len(physical["elapsed"]), 2500)).astype(int))
+                figure.add_trace(go.Scatter(x=physical["elapsed"][selection],
+                    y=physical["actual_"+label][selection, actual_column], mode="lines",
+                    name=f"真实 · {name} · 试验 {index+1}", legendgroup=name, showlegend=derivative == 0,
+                    line={"dash": "dot", "color": color},
+                    hovertemplate="物理 elapsed %{x:.4f} s<br>"+label+"=%{y:.6f}<extra>"+escape(name)+"</extra>"),
+                    row=derivative+1, col=1)
     figure.add_vline(x=curve["metadata"]["executable_until_seconds"], line_dash="dash",
-                     line_color="#b33e36", annotation_text="原证据屏障 / 可执行终点")
-    figure.update_layout(title="原导出 q(t) 与真实反馈", height=420,
-        xaxis_title="相对试验入口的时间 (s)", yaxis_title="q（原生关节单位）",
-        legend={"orientation": "h", "y": -.25}, margin={"t": 40, "b": 100})
+                     line_color="#b33e36", annotation_text="原证据屏障 / 可执行终点", row=1, col=1)
+    figure.add_vline(x=curve["metadata"]["executable_until_seconds"], line_dash="dash",
+                     line_color="#b33e36", row=2, col=1)
+    figure.update_layout(title="原导出 q(t) / dq(t) 与真实反馈", height=740,
+        legend={"orientation": "h", "y": -.25}, margin={"t": 65, "b": 130})
+    figure.update_yaxes(title_text="q（原生关节单位）", row=1, col=1)
+    figure.update_yaxes(title_text="dq（原生关节单位 / s）", row=2, col=1)
+    figure.update_xaxes(title_text="相对试验入口的时间 (s)", row=2, col=1)
+    # END show both q and dq.
     return plot_html(figure)
 
 
@@ -341,6 +357,25 @@ def observation_panel(segment, workspace, output, run, run_index):
     return '<div class="views">'+"".join(cards)+"</div>"
 
 
+def prepare_video_previews(trial, output, trial_index):
+    """Create browser-playable copies with existing FFmpeg; preserve all source frames.
+
+    The source MP4, its fixed-rate clock and separate physical capture times
+    remain evidence. Re-encoding changes only the page's playback copy, uses
+    two CPU threads, and never invokes the simulator or a hardware encoder.
+    """
+    previews = []
+    for index, video in enumerate(trial["report"].get("videos", [])):
+        target = output / "assets" / f"trial_{trial_index:03d}_view_{index:02d}.mp4"
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-threads", "2",
+                        "-i", str(video["path"]), "-map", "0:v:0", "-an", "-c:v", "libx264",
+                        "-crf", "18", "-preset", "fast", "-pix_fmt", "yuv420p",
+                        "-vsync", "0", "-threads", "2", "-filter_threads", "2",
+                        "-movflags", "+faststart", str(target)], check=True, timeout=120)
+        previews.append(target)
+    trial["video_previews"] = previews
+
+
 def trial_panel(trial, output):
     """Expose evaluator outcome alongside the executor's still-pending barriers."""
     report, execution = trial["report"], trial["execution"]
@@ -361,38 +396,66 @@ def trial_panel(trial, output):
                     f'证据通过：{escape(execution["evidence_passed"])}；'
                     f'屏障命令已采样：{escape(execution["barrier_command_reached"])}</p>')
         body.append(details("执行时间、未执行命令与待验证事件", execution))
+        if "maximum_arm_tracking_error_rad" in execution:
+            body.append(f'<p>物理时长：{execution["elapsed_sim_s"]:.3f} s；'
+                        f'最大关节跟踪误差：{execution["maximum_arm_tracking_error_rad"]:.4f} rad。</p>')
     if trial["evaluation"] is not None:
+        if "stable_grasp_at_stop" in trial["evaluation"]:
+            body.append(f'<p>停止时稳定抓持：<b>{escape(trial["evaluation"]["stable_grasp_at_stop"])}</b>。</p>')
         body.append(details("独立物理判定", trial["evaluation"]))
-    for video in report.get("videos", []):
-        relative = quote(os.path.relpath(Path(video["path"]), output), safe="/")
+    for index, video in enumerate(report.get("videos", [])):
+        relative = quote(os.path.relpath(trial["video_previews"][index], output), safe="/")
         body.append(f'<figure><video controls preload="metadata" src="{relative}"></video>'
                     f'<figcaption>真实控制试验 · {escape(video["view_id"])} · '
                     f'{escape(video["frame_count"])} 帧 / {escape(video["fps"])} fps</figcaption></figure>')
+        body.append(link(video["path"], output, "原始试验视频"))
+        if video.get("capture_times_path"):
+            body.append(link(video["capture_times_path"], output, "原始仿真取帧时间")+
+                        "<p>视频按固定帧率播放；最后一帧保留停止状态。取帧数组两列依次为 elapsed、sim_time，"
+                        "精确物理时刻以上方数组为准。</p>")
     body.append(details("仿真源产物与模式", report)+"</div>")
     return "".join(body)
 
 
-def render(manifest, audit, runs, unmatched, output):
+def render(manifest, audit, runs, unmatched, output, *, defer_untested=False):
     """Render every manifest segment, keeping independent snapshots separate."""
     workspace = Path(manifest["workspace_root"])
     output.mkdir(parents=True, exist_ok=False)
     (output / "assets").mkdir()
+    trials = [trial for run in runs for curve in run["curves"] for trial in curve["trials"]]+unmatched
+    for index, trial in enumerate(trials):
+        prepare_video_previews(trial, output, index)
     by_segment = {segment["id"]: [] for segment in manifest["segments"]}
     for run in runs:
         by_segment[run["report"]["segment_id"]].append(run)
-    body = ["<h1>当前长程任务实测</h1><p>各段使用独立入口快照；此页记录分段测试，连续八段执行尚未验证。"
+    # BEGIN bring real curves forward while retaining every failed setup record.
+    for segment_runs in by_segment.values():
+        segment_runs.sort(key=lambda run: (
+            any(curve["metadata"]["validation_status"] == "completed" for curve in run["curves"]),
+            any(curve["trials"] for curve in run["curves"]), bool(run["curves"])), reverse=True)
+        for run in segment_runs:
+            run["curves"].sort(key=lambda curve: (bool(curve["trials"]),
+                                curve["metadata"]["validation_status"] == "completed"), reverse=True)
+    untested = "未测 · 暂缓" if defer_untested else "未测"
+    # END current-evidence ordering and explicit user-requested deferral.
+    body = ["<h1>当前长程任务实测</h1><p>各段使用独立入口快照；此页记录分段测试，连续任务执行尚未验证。"
             "规划结果与物理判定分别列示。折线中的 FK 仅来自导出 q 节点，真实 TCP 来自物理步反馈。"
             "旧输入参考默认隐藏，保留原始源帧与时间。</p>",
             '<table><thead><tr><th>段 / 独立入口</th><th>当前规划</th><th>真实物理试验</th></tr></thead><tbody>']
     overview = []
     for segment in manifest["segments"]:
         selected = by_segment[segment["id"]]
-        planned = "；".join(planning_label(run) for run in selected) if selected else "未测"
-        physical = "；".join(dict.fromkeys(physics_label(run) for run in selected)) if selected else "未测"
+        # BEGIN compact retry summaries; counts refer to runs, not physics trials.
+        planned = [f"{label}（{count} 次运行）" for label, count in
+                   Counter(planning_label(run) for run in selected).items()] if selected else [untested]
+        physical = [f"{label}（{count} 次运行）" for label, count in
+                    Counter(physics_label(run) for run in selected).items()] if selected else [untested]
         body.append(f'<tr><td><a href="#{escape(segment["id"])}">{escape(segment["id"])} · '
                     f'{escape(segment["name"])}</a><br>入口帧 {segment["snapshot"]["entry_frame"]}</td>'
-                    f'<td>{escape(planned)}</td><td>{escape(physical)}</td></tr>')
-        overview.append([segment["id"]+"\n"+segment["name"], planned, physical])
+                    f'<td>{"<br>".join(map(escape, planned))}</td>'
+                    f'<td>{"<br>".join(map(escape, physical))}</td></tr>')
+        overview.append([segment["id"]+"\n"+segment["name"], "\n".join(planned), "\n".join(physical)])
+        # END compact retry summaries.
     body.append("</tbody></table>")
     run_index, errors = 0, []
     for segment in manifest["segments"]:
@@ -400,13 +463,18 @@ def render(manifest, audit, runs, unmatched, output):
                     f'{escape(segment["name"])}</h2><p>独立入口帧：{segment["snapshot"]["entry_frame"]}；'
                     f'源程序帧范围：{escape(segment["source_frame_range"])}。</p>')
         if not by_segment[segment["id"]]:
-            body.append("<p>当前未测；无当前规划曲线或物理执行结果。</p></section>")
+            body.append(f"<p>{untested}；无当前规划曲线或物理执行结果。</p></section>")
             continue
         for run in by_segment[segment["id"]]:
             run_index += 1
             report = run["report"]
+            incomplete_history = (any(curve["metadata"]["validation_status"] == "completed"
+                for other in by_segment[segment["id"]] for curve in other["curves"])
+                and bool(run["curves"]) and all(curve["metadata"]["validation_status"] == "not_completed"
+                                               for curve in run["curves"]))
+            history_label = " · 历史诊断（验证未完成）" if incomplete_history else ""
             body.append(f'<article><h3>{escape(report["candidate_id"])} · '
-                        f'{escape(run["directory"].name)}</h3><div class="outcomes"><p>规划：'
+                        f'{escape(run["directory"].name)}{history_label}</h3><div class="outcomes"><p>规划：'
                         f'<b>{escape(planning_label(run))}</b></p><p>物理：'
                         f'<b>{escape(physics_label(run))}</b></p></div>')
             if report.get("error"):
@@ -463,13 +531,17 @@ overflow-wrap:anywhere;max-height:500px;overflow:auto;font-size:12px}details{mar
     (output / "index.html").write_text("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>当前长程任务实测</title>"
         f"<style>{style}</style><script>{get_plotlyjs()}</script></head><body>"+"".join(body)+"</body></html>", encoding="utf-8")
-    figure, axis = plt.subplots(figsize=(14, 1.6+len(overview)*.65))
+    # BEGIN fit every grouped retry status without clipping the static overview.
+    row_lines = [1]+[max(value.count("\n")+1 for value in row) for row in overview]
+    figure, axis = plt.subplots(figsize=(14, 1.6+sum(row_lines)*.35))
     axis.set_axis_off()
     table = axis.table(cellText=overview, colLabels=["段", "当前规划", "真实物理试验"],
                        colWidths=[.38, .32, .3], cellLoc="left", loc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(10)
-    table.scale(1, 3)
+    for (row, _), cell in table.get_celld().items():
+        cell.set_height(.9*row_lines[row]/sum(row_lines))
+    # END fit every grouped retry status.
     axis.set_title("当前长程任务实测 · 独立入口分段测试\n规划接受与物理判定分列；连续执行尚未验证", pad=24)
     figure.tight_layout()
     figure.savefig(output / "overview.png", dpi=140, bbox_inches="tight")
@@ -478,7 +550,9 @@ overflow-wrap:anywhere;max-height:500px;overflow:auto;font-size:12px}details{mar
             "segments_tested": sum(bool(value) for value in by_segment.values()),
             "curve_count": sum(len(run["curves"]) for run in runs),
             "physical_trial_count": sum(len(curve["trials"]) for run in runs for curve in run["curves"]),
+            "browser_video_count": sum(len(trial["video_previews"]) for trial in trials),
             "unmatched_trial_count": len(unmatched), "render_errors": errors,
+            "untested_segments_deferred": defer_untested,
             "continuous_execution_tested": False, "gpu_used": False,
             "browser_interaction_tested": False}
 
@@ -489,6 +563,8 @@ def main():
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, action="append", required=True)
     parser.add_argument("--trial-dir", type=Path, action="append", default=[])
+    parser.add_argument("--defer-untested", action="store_true",
+                        help="Mark untested segments as explicitly deferred by the user")
     args = parser.parse_args()
     started = time.monotonic()
     configure_font()
@@ -496,9 +572,11 @@ def main():
     if not manifest["snapshots_are_independent"]:
         raise ValueError("This report requires explicitly independent segment snapshots")
     runs, unmatched = load_runs(args.run_dir, args.trial_dir, manifest)
-    report = render(manifest, audit, runs, unmatched, args.output.resolve())
+    report = render(manifest, audit, runs, unmatched, args.output.resolve(),
+                    defer_untested=args.defer_untested)
     report.update(manifest_path=str(args.manifest.resolve()), audit_path=str(args.audit.resolve()),
                   run_directories=[str(path.resolve()) for path in args.run_dir],
+                  trial_directories=[str(path.resolve()) for path in args.trial_dir],
                   elapsed_seconds=time.monotonic()-started,
                   peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024)
     (args.output / "visualization-report.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")

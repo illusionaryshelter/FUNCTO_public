@@ -35,6 +35,8 @@ checked independently. It preserves all required source anchors.
 | `robot_fixture.py`, `prepare_recorded_task.py` | Explicit native robot geometry, named proprioception, FK checks and current planning-problem preparation |
 | `recorded_observation.py`, `recorded_owner_geometry.py`, `detect_recorded_owners.py` | Current robot/owner masks and explicitly bound offline carrier geometry; no current object truth enters planning |
 | `run_recorded_skill.py`, `recorded_task_planning.py` | Current bounded joint planning, unchanged skill constraints and classified diagnostic curve export |
+| `recorded_simulation.py`, `recorded_skill_evaluation.py`, `run_recorded_simulation.py` | Native joint-controlled physics up to the next evidence barrier, with separate task evaluation and calibrated videos |
+| `visualize_current_recorded_task.py` | Current references, classified joint curves, actual robot feedback and physical outcomes; retains historical incomplete attempts |
 | `probe_ompl_constraints.py` | CPU OMPL projection and connection contracts |
 | `probe_scalar_progress_clock.py`, `diagnose_moving_gripper_capacity.py`, `probe_collision_suffix_capacity.py` | CPU representation and interpolation diagnostics |
 | `probe_fk_gradient.py`, `probe_process_gradient.py` | Native FK and full-process derivative checks |
@@ -64,3 +66,19 @@ complete collision inputs, or robot execution. The robot audit reads only the
 declared robot subtree and proprioception columns; a rigid TCP calibration does
 not repair mismatched collision geometry. Use each script's `--help` for its
 required paths and mappings.
+
+The native simulator accepts a classified saved curve and an explicit evaluation
+mode. A rejected candidate may be run only as an isolated diagnostic; its physics
+outcome never changes planner acceptance. The restored full scene is used for
+simulator setup and independent evaluation. Planning consumes named robot
+feedback and RGB-D observations. After setup, execution applies the recorded
+controller configuration through actuator commands and native physics steps.
+It stops at the first evidence barrier, clamps the final command to that barrier,
+and reports any sub-step physical clock overrun separately. It never infers that
+issuing a close command establishes a grasp.
+
+Current visualization takes explicit run and trial directories. It keeps solver
+acceptance, validation completion and measured physics outcome separate; an
+input reference or an unexecuted candidate cannot become a successful trial.
+MP4 playback uses a constant frame rate, while saved capture times preserve
+the exact native simulation times, including the final barrier state.
