@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -78,7 +79,10 @@ def run(args):
         translations = np.array([[0, 0, 0], [.003, -.002, .001], [.02, .03, -.01],
             [-.02, .04, .01], [.1, -.06, .02], [-.1, .2, -.03], [.4, .3, .1], [1., -.3, .2]])
         base_p = np.array([baseline[name][:3, 3] for name in frames])
-        base_r = np.array([baseline[name][:3, :3] for name in frames])
+        # Match the production FK pose contract: rotations are WXYZ unit
+        # quaternions, not rotation matrices. Derivatives remain numerical
+        # input derivatives; this does not vary physical joint coordinates.
+        base_r = Rotation.from_matrix(np.array([baseline[name][:3, :3] for name in frames])).as_quat()[:, [3, 0, 1, 2]]
         positions = torch.tensor(base_p[None, None]+translations[:, None, None], device=device, dtype=torch.float32)
         rotations = torch.tensor(np.broadcast_to(base_r, (8, 1)+base_r.shape).copy(), device=device, dtype=torch.float32)
         progress = torch.zeros((8, 1), device=device)
@@ -121,7 +125,7 @@ def run(args):
                     for p in scene._coverage_samples for n in counts),
                 "values": results[method][0].tolist()}
         old, new = (results[name] for name in report["methods"])
-        report["maximum_absolute_differences"] = dict(zip(("value", "position_gradient", "rotation_gradient"),
+        report["maximum_absolute_differences"] = dict(zip(("value", "position_gradient", "quaternion_gradient"),
             (float(np.max(np.abs(a-b))) for a, b in zip(old, new))))
         # FP32 GEMM reduction order can vary with chunk dimensions. Compare
         # values tightly; ties may legitimately choose another subgradient.
