@@ -36,6 +36,8 @@ checked independently. It preserves all required source anchors.
 | `check_recorded_robot_geometry.py` | Independent Pinocchio FK and Coal convex/analytic-solid pair distances for complete named recorded states; CPU only |
 | `probe_finger_control.py` | Bounded native asset control diagnostic with actual q/dq, actuator/generalized forces, contact identities and explicit convergence thresholds |
 | `probe_mounted_execution.py` | Complete mounted-scene control measurement or explicitly supervised diagnostic reference through the production backend/executor; preserves measured entrance velocity |
+| `probe_mounted_planning.py` | Bounded native free-reach planning with complete fixed mounts and explicitly synthetic known space; retains accepted curve and effective solver configuration |
+| `probe_recorded_robot_mask.py` | One calibrated recorded RGB-D view with the complete known robot assembly, fixed-mount coverage checks and actual OpenGL device metadata |
 | `recorded_observation.py`, `recorded_owner_geometry.py`, `detect_recorded_owners.py` | Current robot/owner masks and explicitly bound offline carrier geometry; no current object truth enters planning |
 | `run_recorded_skill.py`, `recorded_task_planning.py` | Current bounded joint planning, unchanged skill constraints and classified diagnostic curve export |
 | `recorded_simulation.py`, `robot_validation_fixture.py`, `recorded_skill_evaluation.py`, `run_recorded_simulation.py` | Recording/model adapters to the production executor and mandatory independent validator, with separate task evaluation and calibrated videos |
@@ -151,6 +153,18 @@ historical curve archives through `load_saved_trajectory`. Reports retain
 native parameters, requested/applied torques, actual robot state, complete
 bounded contacts and independent robot geometry results. All paths, source
 controller identity, step/contact budgets and reference parameters are explicit.
+
+The same mounted execution probe also accepts `--trajectory` with the original
+`--execution-limits`. This mode loads an already accepted archive and executes
+its unchanged curve, event clock and evidence barriers; it cannot add arm
+displacements, move/hold timing or finger events. The separate mounted planning
+probe can produce a small free-reach archive with measured finger coordinates
+as rigid planner parameters. Its known box and empty background are explicitly
+synthetic. Physical fingers remain actuated and independently supervised;
+successful execution of that experiment does not validate the recorded RGB-D
+environment or a task grasp. The mask probe performs only depth consistency
+against the complete known robot and preserves all unmatched projections as
+unknown boundaries; its output alone cannot establish free-space coverage.
 <!-- END shared actual-hand execution contract and independent geometry diagnostics. -->
 
 The native simulator accepts a classified saved curve and an explicit evaluation

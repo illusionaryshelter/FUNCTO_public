@@ -227,15 +227,16 @@ def run(args):
         # This newly constructed short-reach problem owns its own duration;
         # a 0.05-s native step keeps the resulting physical probe bounded. No
         # saved skill timing or solver feasibility tolerance is changed.
-        # Reserve only 256 exported/validation points and 16 refinements for
-        # this two-anchor experiment. The native maximum export count is 181;
-        # exceeding either finite validation budget still rejects the run.
+        # Reserve 256 export slots, 384 validation points and 16 refinements
+        # for this two-anchor experiment. At most 181 native export points
+        # require 361 validation samples (each interval is subdivided twice),
+        # plus the original anchors. Exceeding this budget still rejects.
         # The production estimator accounts for every independent scene copy:
         # 416 robot spheres, three mounts and the finite coverage grid require
-        # about 434 MiB here, within both 512 MiB and the 2-GiB allocator cap.
+        # about 447 MiB here, within both 512 MiB and the 2-GiB allocator cap.
         budget = PlanningBudget(knots=16, ik_seeds=2, trajectory_seeds=1,
             ik_iterations=80, trajectory_iterations=100, maximum_trajectory_dt=.05,
-            interpolation_buffer_size=256, max_validation_points=256, max_refinement_points=16,
+            interpolation_buffer_size=256, max_validation_points=384, max_refinement_points=16,
             maximum_trajectory_solves=1, search_seconds=0., max_robot_spheres=480,
             max_scene_workspace_bytes=512 * 1024**2)
         report["planning_called"] = True
