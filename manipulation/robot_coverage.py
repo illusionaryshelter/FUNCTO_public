@@ -118,7 +118,7 @@ class RobotCoverage:
                  max_working_bytes=_MAX_WORKING_BYTES):
         if not isinstance(checker, RobotGeometryChecker):
             raise TypeError("Coverage requires the existing complete named native FK checker")
-        if (type(max_queries) is not int or not 0 < max_queries <= 4096
+        if (type(max_queries) is not int or not 0 < max_queries <= 100_000
                 or type(max_working_bytes) is not int
                 or not 0 < max_working_bytes <= _MAX_WORKING_BYTES):
             raise ValueError("Coverage needs finite state-query and at-most-2-GiB CPU budgets")

@@ -204,6 +204,10 @@ def test_query_and_cpu_work_exhaustion_are_rejections(urdf):
         build(urdf, max_working_bytes=1024)
     with pytest.raises(ValueError, match="2-GiB"):
         build(urdf, max_working_bytes=3 * 1024**3)
+    declared = build(urdf, max_queries=16_385)
+    assert declared.describe()["max_queries"] == 16_385
+    with pytest.raises(ValueError, match="state-query"):
+        build(urdf, max_queries=100_001)
 
 
 def test_input_free_evidence_is_copied_and_not_expanded(urdf):
