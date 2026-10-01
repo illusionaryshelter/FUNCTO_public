@@ -31,6 +31,9 @@ from manipulation.planning import (
     _hermite_at_parameters,
     _native_gradient_layout_type,
     _orientation_vjp_type,
+    # BEGIN native cost-configuration ownership regression.
+    _process_manager_type,
+    # END native cost-configuration ownership regression.
     _progress_for_cubic_boundaries,
     _verification_stop_preference,
     plan_trajectory,
@@ -1014,6 +1017,148 @@ class NativeIkCoverageTests(unittest.TestCase):
                     native.prepare_action_seeds.assert_called_once_with(1, 8, seed_config=None)
         self.assertEqual(torch.cuda.is_initialized(), before_cuda)
 # END installed native IK seed-coverage control flow without CUDA imports.
+
+
+# BEGIN native manager configuration ownership without GPU allocation.
+class NativeCostManagerOwnershipTests(unittest.TestCase):
+    """Run installed native constructors while excluding GPU-only resources.
+
+    Only CUDA stream creation and Warp runtime initialization are replaced.
+    Native configuration binding, cost construction, weight normalization and
+    enable/disable behavior execute unchanged on CPU tensors. These checks
+    establish lifecycle ownership, not collision or trajectory numerics.
+    """
+
+    def setUp(self):
+        before_cuda = torch.cuda.is_initialized()
+        guard = patch("torch.cuda._lazy_init", side_effect=AssertionError(
+            "Native configuration ownership tests must not initialize CUDA"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        for name, options in (
+            ("curobo._src.rollout.cost_manager.cost_manager_robot.create_cuda_stream_pair",
+             {"return_value": (None, None)}),
+            ("curobo._src.cost.cost_cspace_base.init_warp", {}),
+        ):
+            replacement = patch(name, **options)
+            replacement.start()
+            self.addCleanup(replacement.stop)
+        self.addCleanup(lambda: self.assertEqual(torch.cuda.is_initialized(), before_cuda))
+
+        from curobo._src.robot.types.joint_limits import JointLimits
+        from curobo._src.types.device_cfg import DeviceCfg
+        self.JointLimits = JointLimits
+        self.device_cfg = DeviceCfg("cpu")
+        # Empty process_mode selects native costs alone; no task, scene or FK
+        # stand-in is needed to exercise the actual integration boundary.
+        self.config_type = _process_manager_type(None, None, None, None, None, None)
+        self.raw = {
+            "self_collision_cfg": {"weight": 5000., "convert_to_binary": True},
+            "cspace_cfg": {
+                "weight": [10., 20., 30., 40., 50.],
+                "activation_distance": [0.] * 5,
+                "squared_l2_regularization_weight": [1000., 10000., 5., 0., 10000.],
+                "cost_type": "STATE",
+            },
+        }
+
+    def configuration(self):
+        return self.config_type.create(deepcopy(self.raw), device_cfg=self.device_cfg)
+
+    def transition(self, interpolation_steps=4, *, teleport=False, bound_scale=1.):
+        bounds = torch.tensor([[-1., -2.], [1., 2.]]) * bound_scale
+        limits = self.JointLimits(
+            ["first_joint", "second_joint"], bounds, bounds * 2, bounds * 3,
+            bounds * 4, bounds * 5, self.device_cfg)
+        # Native constructors only bind the self-collision metadata here;
+        # no collision forward/kernel is invoked by this lifecycle test.
+        robot = SimpleNamespace(
+            get_self_collision_config=lambda: SimpleNamespace(num_spheres=2),
+            total_spheres=2)
+        return SimpleNamespace(
+            robot_model=robot, interpolation_steps=interpolation_steps,
+            action_dim=2, teleport_mode=teleport, get_state_bounds=lambda: limits)
+
+    def manager(self, config, transition):
+        result = config.class_type(self.device_cfg)
+        result.initialize_from_config(config, transition)
+        return result
+
+    def test_repeated_managers_and_verifier_each_normalize_self_weight_once(self):
+        template = self.configuration()
+        managers = []
+        # Six users reproduce metrics/auxiliary/interpolated rollout sharing;
+        # distinct interpolation counts must use their own native divisor.
+        for steps in (4, 4, 4, 4, 4, 4, 1, 8):
+            manager = self.manager(template, self.transition(steps))
+            managers.append(manager)
+            self.assertIsNot(manager.config, template)
+            self.assertEqual(manager.get_cost("self_collision")._weight.item(), 5000. / steps)
+            self.assertTrue(manager.get_cost("self_collision").enabled)
+            torch.testing.assert_close(manager.get_cost("cspace")._weight,
+                                       torch.tensor(self.raw["cspace_cfg"]["weight"]), rtol=0, atol=0)
+            torch.testing.assert_close(
+                manager.get_cost("cspace").config.squared_l2_regularization_weight,
+                torch.tensor(self.raw["cspace_cfg"]["squared_l2_regularization_weight"]), rtol=0, atol=0)
+
+        # Exercise the production verification constructor, including rebuilds;
+        # its existing deepcopy must receive the still-unmodified template.
+        planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.device_cfg = self.device_cfg
+        planner.trajopt = SimpleNamespace(
+            config=SimpleNamespace(metrics_rollout_config=SimpleNamespace(constraint_cfg=template)),
+            transition_model=self.transition())
+        for _ in range(2):
+            planner._initialize_verification_constraints()
+            self.assertEqual(planner._verification_native.get_cost("self_collision")._weight.item(), 1250.)
+        self.assertEqual(template.self_collision_cfg.weight.item(), 5000.)
+        self.assertIsNone(template.self_collision_cfg.self_collision_kin_config)
+        self.assertIsNone(template.cspace_cfg.joint_limits)
+        self.assertEqual(len({id(manager.config) for manager in managers}), len(managers))
+
+        # Native runtime toggles must restore this instance's normalized
+        # weight and leave sibling managers enabled with their own weights.
+        managers[0].disable_cost_component("self_collision")
+        self.assertFalse(managers[0].get_cost("self_collision").enabled)
+        self.assertEqual(managers[1].get_cost("self_collision")._weight.item(), 1250.)
+        managers[0].enable_cost_component("self_collision")
+        self.assertEqual(managers[0].get_cost("self_collision")._weight.item(), 1250.)
+
+    def test_transition_binding_keeps_cspace_types_limits_and_smoothness_private(self):
+        template = self.configuration()
+        teleport_transition = self.transition(1, teleport=True)
+        state_transition = self.transition(4, bound_scale=3.)
+        teleport = self.manager(template, teleport_transition).get_cost("cspace")
+        state = self.manager(template, state_transition).get_cost("cspace")
+        # The native teleport conversion selects POSITION fields. A later
+        # STATE manager must still receive every original derivative weight.
+        self.assertEqual(teleport.config.cost_type.name, "POSITION")
+        self.assertEqual(state.config.cost_type.name, "STATE")
+        self.assertEqual(template.cspace_cfg.cost_type.name, "STATE")
+        torch.testing.assert_close(teleport._weight, torch.tensor([10., 50.]), rtol=0, atol=0)
+        torch.testing.assert_close(state._weight, torch.tensor([10., 20., 30., 40., 50.]), rtol=0, atol=0)
+        torch.testing.assert_close(state.config.squared_l2_regularization_weight,
+                                   torch.tensor([1000., 10000., 5., 0., 10000.]), rtol=0, atol=0)
+        for cost, transition in ((teleport, teleport_transition), (state, state_transition)):
+            for name in ("position", "velocity", "acceleration", "jerk", "effort"):
+                torch.testing.assert_close(getattr(cost.config.joint_limits, name),
+                                           getattr(transition.get_state_bounds(), name), rtol=0, atol=0)
+        self.assertIsNone(template.cspace_cfg.joint_limits)
+
+    def test_failed_native_binding_does_not_contaminate_a_later_manager(self):
+        template = self.configuration()
+        broken = self.transition()
+        # Native initialization binds self-collision before requesting the
+        # cspace limits. Fail at that later boundary to expose partial writes.
+        broken.get_state_bounds = Mock(side_effect=ValueError("unavailable test bounds"))
+        with self.assertRaisesRegex(ValueError, "unavailable test bounds"):
+            self.manager(template, broken)
+        healthy = self.manager(template, self.transition())
+        self.assertEqual(healthy.get_cost("self_collision")._weight.item(), 1250.)
+        self.assertEqual(template.self_collision_cfg.weight.item(), 5000.)
+        self.assertIsNone(template.self_collision_cfg.self_collision_kin_config)
+        self.assertIsNone(template.cspace_cfg.joint_limits)
+# END native manager configuration ownership without GPU allocation.
 
 
 # BEGIN preserve complete source timelines under request-sized allocation bounds.

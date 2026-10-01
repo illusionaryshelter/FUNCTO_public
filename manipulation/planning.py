@@ -883,6 +883,13 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
 
     class ProcessCostManager(RobotCostManager):
         def initialize_from_config(self, config, transition_model, scene_collision_checker=None, **kwargs):
+            # BEGIN give each native manager its own mutable cost configuration.
+            # Native initialization divides self-collision weight by its
+            # interpolation count and binds cspace limits/types in place. The
+            # rollout template is shared by several managers and rebuilds;
+            # preserve it so each instance receives the original parameters.
+            config = deepcopy(config)
+            # END give each native manager its own mutable cost configuration.
             super().initialize_from_config(config, transition_model, scene_collision_checker, **kwargs)
             self._process_mode = config.process_mode
             self._dense_counts = None
