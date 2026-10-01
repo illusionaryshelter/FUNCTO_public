@@ -510,6 +510,8 @@ class RecordedSimulation:
                 # an execution delay or a physical tracking tolerance.
                 add("feedback_clock", field, value, expected=expected_sim_time)
         current_time = float(self.native_data.time)
+        if not np.isfinite(current_time) or abs(current_time-expected_sim_time) > 1e-8:
+            add("feedback_clock", "native_data.time", current_time, expected=expected_sim_time)
         expected_id = f"{self._trial_id}@native_time={current_time:.17g}"
         if feedback.get("feedback_id") != expected_id:
             add("feedback_identity", "feedback_id", feedback.get("feedback_id"), expected=expected_id)
