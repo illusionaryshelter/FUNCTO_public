@@ -156,9 +156,15 @@ def run(args):
             name: measured[name] for name in feedback["finger_joint_names"]}
         if not torch.cuda.is_available():
             raise RuntimeError("This explicit local planner test requires CUDA access")
+        if args.torch_memory_mib not in (2048, 4096) or args.scene_workspace_mib not in (1024, 2048):
+            raise ValueError("Use only the explicitly bounded local Torch and scene allocations")
         torch.set_num_threads(2)
-        torch.cuda.set_per_process_memory_fraction(2*1024**3/torch.cuda.get_device_properties(0).total_memory)
+        torch.cuda.set_per_process_memory_fraction(
+            args.torch_memory_mib*1024**2/torch.cuda.get_device_properties(0).total_memory)
         torch.cuda.reset_peak_memory_stats()
+        report["resource_limits"] = {"torch_allocator_bytes": args.torch_memory_mib*1024**2,
+                                     "scene_workspace_bytes": args.scene_workspace_mib*1024**2,
+                                     "mapping_bytes": 1024**3}
         device = DeviceCfg("cuda:0")
         hand, hand_report, entrance_fk = binary_hand(robot, feedback, problem, device=device)
         report["gripper"] = hand_report
@@ -256,6 +262,8 @@ def run(args):
                                 trajectory_seeds=args.trajectory_seeds,
                                 ik_iterations=80, trajectory_iterations=100,
                                 max_validation_points=args.max_validation_points,
+                                max_refinement_points=args.max_refinement_points,
+                                max_scene_workspace_bytes=args.scene_workspace_mib*1024**2,
                                 maximum_trajectory_solves=2, search_seconds=3.)
         report["planning_called"] = True
         result = plan_and_record(problem, scene, robot, args.output/"planning", budget=budget,
@@ -296,5 +304,8 @@ if __name__ == "__main__":
     parser.add_argument("--ik-seeds", type=int, default=4)
     parser.add_argument("--trajectory-seeds", type=int, default=2)
     parser.add_argument("--max-validation-points", type=int, default=2048)
+    parser.add_argument("--max-refinement-points", type=int, default=64)
+    parser.add_argument("--scene-workspace-mib", type=int, choices=(1024, 2048), default=1024)
+    parser.add_argument("--torch-memory-mib", type=int, choices=(2048, 4096), default=2048)
     run(parser.parse_args())
 # END observed skill integration using existing production scene contracts.

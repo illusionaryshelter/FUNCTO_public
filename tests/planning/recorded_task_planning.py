@@ -31,7 +31,7 @@ def _json_value(value):
     raise TypeError(f"Unsupported report value: {type(value).__name__}")
 
 
-def save_curve(path, curve, *, classification, fk=None):
+def save_curve(path, curve, *, classification, fk=None, validation_status="completed"):
     """Preserve the exact exported cubic, event identities and optional FK.
 
     ``fk`` contains independently evaluated native FK of this same exported
@@ -46,7 +46,8 @@ def save_curve(path, curve, *, classification, fk=None):
         arrays.update(fk)
     np.savez_compressed(path, **arrays)
     path.with_suffix(".json").write_text(json.dumps(
-        {"classification": classification, "events": curve.events,
+        {"classification": classification, "validation_status": validation_status,
+         "events": curve.events,
          "conditions": curve.conditions, "residuals": curve.residuals,
          "duration_seconds": curve.duration,
          "executable_until_seconds": curve.executable_until,
@@ -78,6 +79,8 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
               "required_source_anchors": len(problem.anchors),
               "candidates": []}
     original = planning._CuroboPlanner.select_candidate
+    original_export = planning._CuroboPlanner.export
+    original_curve_init = planning.JointTrajectory.__post_init__
 
     def stage_observer(method, name):
         """Expose coarse native stages without polling or changing solver work."""
@@ -93,18 +96,19 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
             return result
         return measured
 
-    def observed(planner, native_result):
-        selected, curve, attempt = original(planner, native_result)
+    def preserve_candidate(planner, curve, attempt, *, validation_status):
+        """Keep a constructed native curve without changing its acceptance."""
         index = len(report["candidates"])
         classification = ("planner_accepted" if attempt["accepted"]
                           else "rejected_diagnostic_not_executable")
         path = output/f"candidate-{index:02d}.npz"
         entry = {"path": path.name, "classification": classification,
-                 "attempt": deepcopy(attempt), "curve_saved": False}
+                 "attempt": deepcopy(attempt), "validation_status": validation_status,
+                 "curve_saved": False}
         try:
             # Save CPU evidence before optional display FK. A visualization
             # failure must not change the production candidate or its checks.
-            save_curve(path, curve, classification=classification)
+            save_curve(path, curve, classification=classification, validation_status=validation_status)
             entry["curve_saved"] = True
             # A private native FK buffer leaves the optimizer's reusable
             # buffers untouched. Preserve the exported curve's named order.
@@ -120,17 +124,43 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
                     link_p[:, :, tool_index], link_q[:, :, tool_index])
                 sampled = {"eef_position": position[0].cpu().numpy().copy(),
                            "eef_quaternion_wxyz": quaternion[0].cpu().numpy().copy()}
-            save_curve(path, curve, classification=classification, fk=sampled)
+            save_curve(path, curve, classification=classification, fk=sampled,
+                       validation_status=validation_status)
             entry["display_fk_saved"] = True
         except Exception as error:
             entry["diagnostic_error"] = f"{type(error).__name__}: {error}"
             entry["diagnostic_traceback"] = traceback.format_exc()
         report["candidates"].append(entry)
+
+    def observed_export(planner, native_result):
+        # Production constructs its exact cubic before bounded verification.
+        # Preserve that same object if validation cannot finish; do not retry
+        # validation with weaker settings or return it as a successful plan.
+        constructed = []
+
+        def capture(curve):
+            original_curve_init(curve)
+            constructed.append(curve)
+
+        try:
+            with patch.object(planning.JointTrajectory, "__post_init__", new=capture):
+                return original_export(planner, native_result)
+        except ValueError as error:
+            if len(constructed) == 1:
+                preserve_candidate(planner, constructed[0],
+                    {"accepted": False, "native_success": bool(native_result.success.all()),
+                     "export_error": str(error)}, validation_status="not_completed")
+            raise
+
+    def observed(planner, native_result):
+        selected, curve, attempt = original(planner, native_result)
+        preserve_candidate(planner, curve, attempt, validation_status="completed")
         return selected, curve, attempt
 
     try:
         with ExitStack() as stack:
             stack.enter_context(patch.object(planning._CuroboPlanner, "select_candidate", new=observed))
+            stack.enter_context(patch.object(planning._CuroboPlanner, "export", new=observed_export))
             for name in ("_initialize", "reference_seeds", "optimize"):
                 method = getattr(planning._CuroboPlanner, name)
                 stack.enter_context(patch.object(planning._CuroboPlanner, name,

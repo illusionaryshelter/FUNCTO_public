@@ -75,8 +75,13 @@ class PlanningBudget:
                 or not 0 <= self.max_refinement_points <= self.max_validation_points):
             raise ValueError("Refinement points must fit the finite validation-point budget")
         # END bound optional samples without capping a skill's source knots.
-        if type(self.max_scene_workspace_bytes) is not int or not 0 <= self.max_scene_workspace_bytes <= 1024**3:
-            raise ValueError("Scene workspaces must remain within the local one-GiB allocation budget")
+        # BEGIN allow complete observed robots within the existing 12-GiB GPU.
+        # The default stays one GiB. Larger explicit requests still pass the
+        # actual-device check with separate anchor-FK and two-GiB native
+        # allowances; current observation fields already consume free memory.
+        if type(self.max_scene_workspace_bytes) is not int or not 0 <= self.max_scene_workspace_bytes <= 2*1024**3:
+            raise ValueError("Scene workspaces must remain within the local two-GiB allocation budget")
+        # END allow complete observed robots within the existing 12-GiB GPU.
         for name in ("interpolation_dt", "maximum_trajectory_dt", "constraint_weight", "validation_joint_step"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")

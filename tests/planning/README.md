@@ -20,9 +20,12 @@ python tests/planning/probe_robot_collision.py --help
 ```
 
 The ordinary CPU suite does not discover these explicit scripts. GPU checks
-must run one at a time. Robot scripts cap the Torch allocator at 2 GiB;
+must run one at a time. Robot probes cap the Torch allocator at 2 GiB;
 standalone scene queries use their smaller declared limits. This cap does
 not include every allocation made by native libraries.
+The recorded skill runner permits an explicit 4 GiB Torch limit and 2 GiB
+scene-workspace budget, with native/FK allocations and actual free memory
+checked independently. It preserves all required source anchors.
 
 | Scripts | Scope |
 |---|---|
