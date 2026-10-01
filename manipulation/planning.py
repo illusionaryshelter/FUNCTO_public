@@ -290,15 +290,20 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     horizon = (budget.knots+4)*budget.interpolation_steps+1
     # Native LBFGS has two rollout instances and four line-search particles.
     # Include optimization/metrics, dense export and independent verification.
+    # BEGIN account for body-point guidance only in its actual optimizer roles.
+    # The dense/native metrics and final CPU-solid validation never construct
+    # a coverage FK or its backward graph. Their other scene queries remain.
     allocation_shapes = (
-        (4, budget.ik_seeds, 1), (8, budget.ik_seeds*4, 1),
-        (4, budget.trajectory_seeds, horizon+anchor_capacity),
-        (4, budget.trajectory_seeds*4, horizon+anchor_capacity),
-        (2, budget.trajectory_seeds, budget.interpolation_buffer_size+anchor_capacity),
-        (1, 1, budget.max_validation_points), (2, 1, anchor_capacity),
+        (4, budget.ik_seeds, 1, True), (8, budget.ik_seeds*4, 1, True),
+        (4, budget.trajectory_seeds, horizon+anchor_capacity, True),
+        (4, budget.trajectory_seeds*4, horizon+anchor_capacity, True),
+        (2, budget.trajectory_seeds, budget.interpolation_buffer_size+anchor_capacity, False),
+        (1, 1, budget.max_validation_points, False), (2, 1, anchor_capacity, False),
     )
-    scene_bytes = sum(copies*scene.estimated_workspace_bytes(batch, length)
-                      for copies, batch, length in allocation_shapes)
+    scene_bytes = sum(copies*scene.estimated_workspace_bytes(batch, length,
+                        robot_coverage_guidance=guidance)
+                      for copies, batch, length, guidance in allocation_shapes)
+    # END all live optimization scratch remains under the unchanged hard budget.
     if scene_bytes > budget.max_scene_workspace_bytes:
         raise ValueError("Independent scene query workspaces exceed the declared local allocation budget")
     dof, links, spheres = (len(robot_metadata["active_joint_names"]),

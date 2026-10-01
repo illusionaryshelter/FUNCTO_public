@@ -19,10 +19,61 @@ from manipulation.planning_problem import (
 from manipulation.planning_scene import (
     Attachment, CollisionOwner, ContactRule, CuroboSphereQuery, ObservedSpace,
     PlanningScene, PrismaticGripper, _self_pair_sum,
+    _coverage_halfspace_max, _coverage_plane_chunk_size, _COVERAGE_POINT_PLANE_ELEMENTS,
 )
 
 
 # BEGIN multiple-collision and cross-chunk gradient regression.
+# BEGIN preserved halfspace values/gradients and bounded backward storage.
+class CoverageGuidanceScratchTest(unittest.TestCase):
+    def test_chunk_rule_uses_all_planes_under_one_fixed_scratch_target(self):
+        for states in (2, 8, 170, 680, 4096, 65536):
+            for points in (20, 32):
+                chunk = _coverage_plane_chunk_size(states, points, 3174)
+                self.assertGreaterEqual(chunk, 1)
+                self.assertLessEqual(chunk, 3174)
+                self.assertLessEqual(states*points*chunk, max(_COVERAGE_POINT_PLANE_ELEMENTS, states*points))
+        self.assertEqual(_coverage_plane_chunk_size(8, 32, 3174), 3174)
+        self.assertEqual(_coverage_plane_chunk_size(680, 32, 3174), 48)
+
+    def test_values_unique_gradients_and_saved_tensor_shapes_match_halfspace_math(self):
+        rng = np.random.default_rng(123)
+        points = torch.tensor(rng.normal(size=(1, 8, 32, 3)), dtype=torch.float64, requires_grad=True)
+        planes = torch.tensor(rng.normal(size=(3174, 4)), dtype=torch.float64)
+        saved = []
+
+        def retain(value):
+            saved.append((tuple(value.shape), value.dtype))
+            return value
+
+        with torch.autograd.graph.saved_tensors_hooks(retain, lambda value: value):
+            optimized = _coverage_halfspace_max(points, planes)
+        self.assertNotIn(((1, 8, 32, 3174), torch.float64), saved)
+        self.assertIn(((1, 8, 32), torch.int64), saved)
+        signed = (points@planes[:, :3].T+planes[:, 3])/torch.linalg.vector_norm(planes[:, :3], dim=-1)
+        reference = signed.amax(-1)
+        self.assertTrue(bool((signed.topk(2, dim=-1).values.diff(dim=-1).abs() > 1e-10).all()))
+        torch.testing.assert_close(optimized, reference, rtol=0, atol=0)
+        first = torch.autograd.grad(optimized.sum(), points, retain_graph=True)[0]
+        second = torch.autograd.grad(reference.sum(), points)[0]
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+        old_chunks = torch.full_like(optimized, -float("inf"))
+        for begin in range(0, len(planes), 32):
+            old_chunks = torch.maximum(old_chunks, _coverage_halfspace_max(points, planes[begin:begin+32]))
+        torch.testing.assert_close(old_chunks, optimized, rtol=1e-13, atol=1e-13)
+        chunk_gradient = torch.autograd.grad(old_chunks.sum(), points)[0]
+        torch.testing.assert_close(chunk_gradient, first, rtol=1e-13, atol=1e-13)
+
+    def test_equal_planes_choose_a_valid_face_subgradient(self):
+        point = torch.zeros((1, 1, 1, 3), dtype=torch.float64, requires_grad=True)
+        planes = point.new_tensor([[1., 0., 0., 0.], [0., 1., 0., 0.]])
+        value = _coverage_halfspace_max(point, planes)
+        self.assertEqual(value.item(), 0.)
+        gradient = torch.autograd.grad(value.sum(), point)[0]
+        torch.testing.assert_close(gradient, point.new_tensor([[[[1., 0., 0.]]]]), rtol=0, atol=0)
+# END only a tie's valid subgradient selection changes, never its constraint value.
+
+
 class BatchedHandCollisionTest(unittest.TestCase):
     def test_all_pair_penetrations_and_gradients_survive_chunk_boundaries(self):
         generator = torch.Generator().manual_seed(29)
@@ -245,12 +296,12 @@ class PlanningSceneTest(unittest.TestCase):
         self.assertEqual(refined_payload-refined_robot, batch*horizon*2*(40+128))
         # Restoring the old robot unknown query changes only its real scratch;
         # neither mode silently removes the conservative shared-grid reserve.
+        without_guidance = world.estimated_workspace_bytes(batch, horizon, robot_coverage_guidance=False)
+        self.assertGreater(refined_payload, without_guidance)
         native_oracle, world.robot_coverage = world.robot_coverage, None
         ordinary = world.estimated_workspace_bytes(batch, horizon)
         world.robot_coverage = native_oracle
-        native_storage = (batch*horizon*(32*64*8+(32+12)*4)
-                          + world._free_distance.numel()*8)
-        self.assertEqual(ordinary+native_storage-refined_payload, batch*horizon*17*128)
+        self.assertEqual(ordinary-without_guidance, batch*horizon*17*128)
 
     def test_full_volume_entrance_accepts_only_exact_named_representations(self):
         baseline = np.array([.123456789])

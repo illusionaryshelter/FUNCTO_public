@@ -85,6 +85,35 @@ def _self_pair_chunk_size(states, pairs):
     return min(pairs, 512, max(1, 1_048_576 // states)) if pairs else 0
 
 
+# BEGIN bound guidance scratch while avoiding thousands of tiny IK launches.
+_COVERAGE_POINT_PLANE_ELEMENTS = 1_048_576
+
+
+def _coverage_plane_chunk_size(states, points, planes):
+    """Use the same finite point/plane scratch target at every batch size.
+
+    One plane is the irreducible query. Small IK batches can evaluate whole
+    hulls at once; larger trajectory batches divide the exact same planes.
+    """
+    if any(type(value) is not int or value <= 0 for value in (states, points, planes)):
+        raise ValueError("Coverage chunks require positive state, point and plane counts")
+    return min(planes, max(1, _COVERAGE_POINT_PLANE_ELEMENTS // (states*points)))
+
+
+def _coverage_halfspace_max(points, halfspaces):
+    """Preserve the convex value while saving indices rather than signed planes.
+
+    max(dim) and amax have identical values. At a unique maximizing face their
+    derivatives agree; at a tie max selects one valid face subgradient. Its
+    maintained Torch backward saves argmax indices, avoiding a retained
+    [states, points, planes] input when a body checkpoint is recomputed.
+    """
+    normals, offsets = halfspaces[:, :3], halfspaces[:, 3]
+    signed = (points@normals.T+offsets)/torch.linalg.vector_norm(normals, dim=-1)
+    return signed.max(dim=-1).values
+# END chunking changes neither the sample set nor the convex inequalities.
+
+
 def _pair_penetration(spheres, pairs):
     """Sum the original positive linear penetrations of these explicit pairs.
 
@@ -762,7 +791,18 @@ class PlanningScene:
             raise ValueError("Native solid coverage must use the same calibrated reference frame")
         # BEGIN immutable, bounded optimization guidance for the solid oracle.
         self._coverage_geometry = (None if robot_coverage is None else robot_coverage.guidance_geometry())
+        self._coverage_samples = ()
         if robot_coverage is not None:
+            # These identical model samples are immutable across every native
+            # objective and checkpoint recomputation; select them only once.
+            samples = []
+            for solid in self._coverage_geometry["solids"]:
+                vertices = np.asarray(solid["vertices_frame"], float)
+                faces = np.asarray(solid["faces"], dtype=int)
+                samples.append(np.concatenate((
+                    vertices[np.linspace(0, len(vertices)-1, min(16, len(vertices)), dtype=int)],
+                    vertices[faces[np.linspace(0, len(faces)-1, min(16, len(faces)), dtype=int)]].mean(1))))
+            self._coverage_samples = tuple(samples)
             free = coverage.known_free
             self._has_free_cells = bool(free.any())
             distance = distance_transform_edt(~np.pad(free, 1), sampling=coverage.voxel_size)[1:-1, 1:-1, 1:-1]
@@ -1073,24 +1113,20 @@ class PlanningScene:
                 free_cost = torch.full_like(free_cost, float("inf"))
             initial_cost = torch.full_like(free_cost, float("inf"))
             for halfspaces in planes:
-                normals, offsets = halfspaces[:, :3], halfspaces[:, 3]
                 signed_max = torch.full_like(free_cost, -float("inf"))
-                # Hull face counts do not enlarge a single live point/plane
-                # tensor. Checkpointing then avoids retaining these chunks.
-                for begin in range(0, len(halfspaces), 32):
-                    normal = normals[begin:begin+32]
-                    signed = (points@normal.T+offsets[begin:begin+32])/torch.linalg.vector_norm(normal, dim=-1)
-                    signed_max = torch.maximum(signed_max, signed.amax(-1))
+                # Keep one bounded point/plane tensor live, choosing a larger
+                # exact batch for small IK queries instead of launching a
+                # Python/GPU loop for each 32-face fragment of the same hull.
+                chunk = _coverage_plane_chunk_size(math.prod(points.shape[:-2]),
+                                                    points.shape[-2], len(halfspaces))
+                for begin in range(0, len(halfspaces), chunk):
+                    signed_max = torch.maximum(signed_max,
+                        _coverage_halfspace_max(points, halfspaces[begin:begin+chunk]))
                 initial_cost = torch.minimum(initial_cost, torch.relu(signed_max))
             return torch.minimum(free_cost, initial_cost).amax(-1)
 
         result = torch.zeros_like(progress)
-        for solid in solids:
-            vertices = np.asarray(solid["vertices_frame"], float)
-            faces = np.asarray(solid["faces"], dtype=int)
-            # Deterministic sparse native points are an optimizer aid only.
-            points = np.concatenate((vertices[np.linspace(0, len(vertices)-1, min(16, len(vertices)), dtype=int)],
-                                     vertices[faces[np.linspace(0, len(faces)-1, min(16, len(faces)), dtype=int)]].mean(1)))
+        for solid, points in zip(solids, self._coverage_samples):
             p, r = robot_link_poses[solid["frame"]]
             world = _world_points(_tensor(points, progress), p, r)
             value = (checkpoint(point_violation, world, use_reentrant=False, preserve_rng_state=False)
@@ -1138,7 +1174,7 @@ class PlanningScene:
         return reports
     # END reference volume verification never asserts controller tracking.
 
-    def estimated_workspace_bytes(self, batch, horizon):
+    def estimated_workspace_bytes(self, batch, horizon, *, robot_coverage_guidance=True):
         """Bound geometry-query work only; solver/model storage is additional.
 
         Includes one live gradient snapshot per query, reusable query buffers,
@@ -1173,14 +1209,33 @@ class PlanningScene:
             # Checkpointing frees chunk scratch rather than retaining all P.
             pair_bytes = batch*horizon*(96*chunk+32*actors["robot"])+16*pairs
         native_coverage_bytes = 0
-        if self.robot_coverage is not None:
+        if self.robot_coverage is not None and robot_coverage_guidance:
             solids = self._coverage_geometry["solids"]
-            planes = min(32, max(len(row["baseline_halfspaces_world"]) for row in solids))
+            plane_counts = [len(row["baseline_halfspaces_world"]) for row in solids]
+            planes = max(plane_counts)
             frames = len(self.robot_coverage.required_link_names)
             joints = len(self.robot_coverage.baseline_joint_names)
             # One checkpointed body query is live; all frame poses/Jacobians
             # and their gradients remain resident for its backward pass.
-            native_coverage_bytes = batch*horizon*(32*(planes+32)*8 + frames*(32+12*joints)*4)
+            states = batch*horizon
+            # Use the target itself as an upper bound, including rounding of
+            # the per-body chunk count. Twenty-point pads may choose a larger
+            # chunk than 32-point bodies, so a single 32-point chunk formula
+            # would slightly underestimate their live tensor at some sizes.
+            plane_elements = max(states*32, min(_COVERAGE_POINT_PLANE_ELEMENTS, states*32*planes))
+            # A body's checkpoint may restore its complete reduction chain.
+            # Per chunk, reserve 32 bytes per point for int64 argmax indices
+            # and retained max values/gradients, plus 32 per baseline body for
+            # relu/min chains and 128 for free-grid point operations. Bound
+            # every possible sample count (pads have 20, most bodies 32).
+            chain_bytes = 0
+            for points in range(1, 33):
+                chunks = sum(math.ceil(count/_coverage_plane_chunk_size(states, points, count))
+                             for count in plane_counts)
+                chain_bytes = max(chain_bytes, states*points*(32*chunks+32*len(solids)+128))
+            native_coverage_bytes = (plane_elements*8 + chain_bytes
+                + states*(32*32*8 + frames*(32+12*joints)*4)
+                + sum(plane_counts)*24)
             native_coverage_bytes += self._free_distance.numel()*8
         return int(query_bytes + coverage_bytes + pair_bytes + native_coverage_bytes)
         # END include checkpointed hand-pair scratch and its retained input.

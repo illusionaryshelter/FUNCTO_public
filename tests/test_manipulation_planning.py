@@ -1353,7 +1353,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
         metadata = self.robot_metadata()
         native = SimpleNamespace(num_pose_links=1, num_spheres=512, num_dof=16, num_links=64)
-        scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon: 0)
+        scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon, **kwargs: 0)
         budget = PlanningBudget(max_validation_points=8192)
         before_cuda = torch.cuda.is_initialized()
         for count in (322, 386, 8192):
@@ -1385,7 +1385,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planner.budget = PlanningBudget(max_refinement_points=0)
         planner.anchors = np.array([0., 1., 2.])
         planner.problem = object()
-        planner.scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon: batch*horizon)
+        planner.scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon, **kwargs: batch*horizon)
         planner.robot_metadata = self.robot_metadata()
         planner.progress_map = _ProgressMap(np.array([0., .5, 1.]), planner.anchors)
         planner.seed_progress = object()
@@ -1470,7 +1470,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         self.assertEqual(destroyed, ["ik", "trajectory"])
 
     def test_scene_budget_and_removed_legacy_parameter_remain_strict(self):
-        scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon: 1024**3)
+        scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon, **kwargs: 1024**3)
         with self.assertRaisesRegex(ValueError, "scene query workspaces"):
             _planning_workspace_bytes(scene, self.robot_metadata(), PlanningBudget(), 322)
         with self.assertRaises(TypeError):
