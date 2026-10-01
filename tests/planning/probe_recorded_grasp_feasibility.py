@@ -118,10 +118,11 @@ def observed_scene(args):
 
     captured = {}
 
-    def capture(problem, scene, robot, output, *, budget, provenance):
+    def capture(problem, scene, robot, output, *, budget, provenance, execution_limits):
         if captured:
             raise ValueError("The recorded runner must reach its preparation boundary exactly once")
-        captured.update(problem=problem, scene=scene, robot=robot, budget=budget, provenance=provenance)
+        captured.update(problem=problem, scene=scene, robot=robot, budget=budget, provenance=provenance,
+                        execution_limits=execution_limits)
         return SimpleNamespace(success=False)
 
     runner_args = SimpleNamespace(**vars(args))
@@ -467,7 +468,7 @@ def run(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("manifest", "robot-fixture", "feedback", "output"):
+    for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "output"):
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)

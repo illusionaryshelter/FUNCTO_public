@@ -134,7 +134,7 @@ def save_native_configuration(path, planner):
 # END preserve native representations before candidate gathering/export.
 
 
-def save_curve(path, curve, *, classification, fk=None, validation_status="completed"):
+def save_curve(path, curve, *, classification, execution_limits, fk=None, validation_status="completed"):
     """Preserve the exact exported cubic, event identities and optional FK.
 
     ``fk`` contains independently evaluated native FK of this same exported
@@ -150,6 +150,7 @@ def save_curve(path, curve, *, classification, fk=None, validation_status="compl
     np.savez_compressed(path, **arrays)
     path.with_suffix(".json").write_text(json.dumps(
         {"classification": classification, "validation_status": validation_status,
+         "execution_limits": deepcopy(execution_limits),
          "events": curve.events,
          "conditions": curve.conditions, "residuals": curve.residuals,
          "duration_seconds": curve.duration,
@@ -158,7 +159,7 @@ def save_curve(path, curve, *, classification, fk=None, validation_status="compl
         default=_json_value, indent=2, allow_nan=False)+"\n")
 
 
-def plan_and_record(problem, scene, robot, output, *, budget, provenance):
+def plan_and_record(problem, scene, robot, output, *, budget, provenance, execution_limits):
     """Call ``plan_trajectory`` once and preserve its measured outcome.
 
     The scoped observer copies checked continuations and exact native curves
@@ -178,6 +179,7 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
     report = {"scope": "current FUNCTO joint planning on explicitly supplied task inputs",
               "status": "running", "success": False, "execution_tested": False,
               "budget": asdict(budget), "provenance": deepcopy(provenance),
+              "execution_limits": deepcopy(execution_limits),
               "skill_ids": sorted({event.skill_id for event in problem.events}),
               "phase_count": problem.phase_count,
               "required_source_anchors": len(problem.anchors),
@@ -251,7 +253,8 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
         try:
             # Save CPU evidence before optional display FK. A visualization
             # failure must not change the production candidate or its checks.
-            save_curve(path, curve, classification=classification, validation_status=validation_status)
+            save_curve(path, curve, classification=classification, validation_status=validation_status,
+                       execution_limits=execution_limits)
             entry["curve_saved"] = True
             # A private native FK buffer leaves the optimizer's reusable
             # buffers untouched. Preserve the exported curve's named order.
@@ -268,7 +271,7 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
                 sampled = {"eef_position": position[0].cpu().numpy().copy(),
                            "eef_quaternion_wxyz": quaternion[0].cpu().numpy().copy()}
             save_curve(path, curve, classification=classification, fk=sampled,
-                       validation_status=validation_status)
+                       validation_status=validation_status, execution_limits=execution_limits)
             entry["display_fk_saved"] = True
         except Exception as error:
             entry["diagnostic_error"] = f"{type(error).__name__}: {error}"
@@ -333,7 +336,7 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
                       diagnostics=result.diagnostics)
         if result.trajectory is not None:
             save_curve(output/"trajectory.npz", result.trajectory,
-                       classification="planner_accepted")
+                       classification="planner_accepted", execution_limits=execution_limits)
         return result
     except KeyboardInterrupt:
         report.update(status="interrupted", interruption_reason="Explicit operator interrupt")

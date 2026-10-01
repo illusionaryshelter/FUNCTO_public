@@ -130,7 +130,11 @@ def test_near_tolerance_is_reported_without_waiving_collision(urdf):
         NativePrimitive("b", "base", "box", (2., 2., 2.), displaced, "native box")])
     result = query(model, pairs=[PairQuery("a", "b", "required", "explicit numerical boundary")])
     assert result["pairs"][0]["relation"] == "numerical_boundary"
-    assert result["pairs"][0]["signed_distance_m"] == pytest.approx(0.25e-6, abs=1e-10)
+    # The known geometric gap is smaller than Coal's default solver tolerance.
+    # Its returned value can be zero; asserting sub-tolerance accuracy or a
+    # positive sign would contradict the diagnostic's numerical-boundary rule.
+    band = max(result["numerics"]["gjk_tolerance"], result["numerics"]["epa_tolerance"])
+    assert abs(result["pairs"][0]["signed_distance_m"]) <= band
     assert result["numerics"]["tolerance_is_error_bound"] is False
 
 

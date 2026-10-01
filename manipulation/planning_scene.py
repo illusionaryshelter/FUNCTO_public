@@ -316,6 +316,11 @@ class CollisionOwner:
     attachments: tuple[Attachment, ...] = ()
     sphere_cover_error_m: float = 0.
     pose_interval: tuple = (0., 1.)
+    # BEGIN fixed robot installation policy, scoped only to robot/this-owner queries.
+    robot_excluded_spheres: tuple = ()
+    robot_exclusion_source: str | None = None
+    robot_exclusion_geometry_source: str | None = None
+    # END exclusions never apply to background or another moving actor.
 
     def __post_init__(self):
         _text(self.owner_id, "owner ID")
@@ -337,6 +342,22 @@ class CollisionOwner:
                 raise ValueError("Regrasp requires a real preceding release condition")
         if self.attachments:
             self.moving = True
+        # BEGIN accept only explicit native installation policy on complete static owners.
+        self.robot_excluded_spheres = tuple(self.robot_excluded_spheres)
+        if (len(set(self.robot_excluded_spheres)) != len(self.robot_excluded_spheres)
+                or any(type(index) is not int or index < 0 for index in self.robot_excluded_spheres)):
+            raise ValueError("Native robot installation exclusions require unique nonnegative sphere indices")
+        if self.robot_excluded_spheres:
+            if self.moving or not self.geometry_complete:
+                raise ValueError("Native installation exclusions require a complete fixed collision owner")
+            _text(self.robot_exclusion_source, "native installation pair-policy source")
+            _text(self.robot_exclusion_geometry_source, "installation policy robot geometry source")
+            if (not isinstance(self.pose_path, PosePath) or self.pose_path.motion_model is not None
+                    or not np.allclose(self.pose_path.poses, self.pose_path.poses[0], atol=1e-12, rtol=0)):
+                raise ValueError("A fixed installation exclusion cannot follow a moving pose path")
+        elif self.robot_exclusion_source is not None or self.robot_exclusion_geometry_source is not None:
+            raise ValueError("Installation exclusion provenance requires its explicit nonempty sphere set")
+        # END body-pair policy cannot grant a dynamic/contact-owner exemption.
         if self.local_spheres is not None:
             value = np.asarray(self.local_spheres, float)
             if (value.ndim != 2 or value.shape[1] != 4 or not len(value)
@@ -456,7 +477,9 @@ class ContactRule:
 class PrismaticGripper:
     """Bind native finger coordinates to a supported controller and geometry.
 
-    Position tracking binds solver joints to the declared command path. A
+    Position tracking binds solver joints to the declared command path.
+    Position bounds describe separately controlled fingers whose measured
+    range is supervised by execution; they do not add solver coordinates. A
     binary controller instead uses the whole native mechanical interval for
     every planning query, including zero progress. Progress is not elapsed
     time: it may pause while the arm and binary drive continue moving. Each
@@ -467,7 +490,9 @@ class PrismaticGripper:
     curve is never substituted to make it pass.
 
     For tracking, ``joint_bounds(progress)`` returns identical lower/upper
-    command coordinates [B,H,J]. Binary control requires ``joint_bounds=None``.
+    command coordinates [B,H,J]. Position bounds return the explicit allowed
+    actual-coordinate interval, including closing transitions. Binary control
+    requires ``joint_bounds=None``.
     ``coupling_matrix``
     and ``coupling_offset`` encode the actual drive's A q = b constraints.
     ``self_collision_pairs`` comes from the robot's declared collision-pair
@@ -479,8 +504,10 @@ class PrismaticGripper:
                  joint_bounds, coupling_matrix, coupling_offset, sphere_indices,
                  local_spheres, sphere_joint_translation, self_collision_pairs,
                  commands, source, numerical_joint_tolerance=1e-5):
-        if controller not in {"position_tracking", "binary"}:
-            raise ValueError("Controller must explicitly support tracking or binary intentions")
+        # BEGIN independent position-control intervals without solver fingers.
+        if controller not in {"position_tracking", "position_bounds", "binary"}:
+            raise ValueError("Controller must explicitly declare tracking, supervised position bounds or binary intentions")
+        # END independent position-control intervals without solver fingers.
         self.controller = controller
         self.joint_names = tuple(_text(name, "native gripper joint") for name in joint_names)
         if not self.joint_names or len(set(self.joint_names)) != len(self.joint_names):
@@ -492,9 +519,9 @@ class PrismaticGripper:
                 or np.any(self.current_positions < self.joint_limits[:, 0])
                 or np.any(self.current_positions > self.joint_limits[:, 1])):
             raise ValueError("Current finger feedback must respect native joint limits")
-        if ((controller == "position_tracking" and not callable(joint_bounds))
+        if ((controller in {"position_tracking", "position_bounds"} and not callable(joint_bounds))
                 or (controller == "binary" and joint_bounds is not None)):
-            raise TypeError("Tracking requires executable joint commands; binary control uses full mechanical bounds")
+            raise TypeError("Position control requires explicit joint bounds; binary control uses full mechanical bounds")
         self.joint_bounds = joint_bounds
         if not np.isfinite(numerical_joint_tolerance) or numerical_joint_tolerance < 0:
             raise ValueError("The numerical joint tolerance must be a finite nonnegative value")
@@ -682,6 +709,13 @@ class PlanningScene:
         if not self.robot_sphere_materials:
             raise ValueError("The actual robot sphere model and material identities are required")
         self.robot_geometry_source = _text(robot_geometry_source, "robot sphere model source")
+        # BEGIN bind installation masks to this exact robot sphere layout.
+        for owner in self.owners:
+            if owner.robot_excluded_spheres and (
+                    owner.robot_exclusion_geometry_source != self.robot_geometry_source
+                    or max(owner.robot_excluded_spheres) >= len(self.robot_sphere_materials)):
+                raise ValueError("Installation policy must match this scene's complete robot sphere model")
+        # END static owners remain ordinary obstacles to every other actor.
         # BEGIN bind occupied-space evidence to bodies still checked for collision.
         self._occupied_owner_ids = frozenset(coverage.occupancy_evidence["owners"])
         if not self._occupied_owner_ids <= set(ids):
@@ -1154,7 +1188,16 @@ class PlanningScene:
                     adjusted[..., indices, 3] = torch.minimum(adjusted[..., indices, 3], candidate)
                     # END preserve every active material permission independently.
                 local = _local_spheres(adjusted, *poses[owner.owner_id])
-                costs[f"collision/{actor}/{owner.owner_id}"] = owner.query(local, key=(actor, owner.owner_id)).sum(-1)
+                # BEGIN retain native welded/masked installation pairs without deleting geometry.
+                # Applying the mask to per-sphere costs leaves the same owner
+                # active for all other robot links and for a carried payload.
+                values = owner.query(local, key=(actor, owner.owner_id))
+                if actor == "robot" and owner.robot_excluded_spheres:
+                    enabled = values.new_ones(values.shape[-1])
+                    enabled[list(owner.robot_excluded_spheres)] = 0
+                    values = values * enabled
+                costs[f"collision/{actor}/{owner.owner_id}"] = values.sum(-1)
+                # END the observed background and unknown-space queries are unchanged.
         return costs
 
     def evaluate(self, robot_spheres, position, quaternion, progress,
@@ -1197,6 +1240,13 @@ class PlanningScene:
             "complete_geometry_required_by_coverage": tuple(sorted(self._occupied_owner_ids)),
             "background_owner_ids": tuple(sorted(self.background.owner_ids)),
             "owner_geometry_complete": {owner.owner_id: owner.geometry_complete for owner in self.owners},
+            # BEGIN report exact installation exclusions alongside ordinary owner geometry.
+            "native_installation_exclusions": {
+                owner.owner_id: {"robot_sphere_indices": owner.robot_excluded_spheres,
+                                 "policy_source": owner.robot_exclusion_source,
+                                 "robot_geometry_source": owner.robot_exclusion_geometry_source}
+                for owner in self.owners if owner.robot_excluded_spheres},
+            # END no owner-wide or background-wide exemption is implied.
             "conditional_attachments": {owner.owner_id: [relation.condition_id for relation in owner.attachments]
                                         for owner in self.owners if owner.attachments},
             "release_requires_evidence": {

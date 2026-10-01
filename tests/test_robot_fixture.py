@@ -18,7 +18,8 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent / "planning"))
 from robot_fixture import (
     _collision_query_contract, _effective_ignored_pairs, _geom_cover, _hinge_separation_certificate,
-    _interval_bounds, _interval_rotation, export_fixture, validate_fixture_collision_contract,
+    _interval_bounds, _interval_rotation, _fixed_installation_records,
+    export_fixture, fixed_installation_proxy, validate_fixture_collision_contract,
 )
 
 
@@ -288,7 +289,7 @@ class FixtureReloadTest(unittest.TestCase):
             with h5py.File(episode, "w") as stream:
                 stream.create_dataset("states/qpos", data=np.array([[-.8], [0.], [.8]]))
             arguments = dict(scene_path=source, catalog_path=catalog, episode_path=episode,
-                             root_body="anchor", visual_root="anchor", tcp_site="tool",
+                             root_body="anchor", collision_root="anchor", tcp_site="tool",
                              arm_joint_names=["spin"], finger_joint_names=[],
                              velocity_limits={"spin": 1.}, effort_limits={"spin": 2.},
                              cover_specifications={name: {"subdivisions": [1, 1, 1]}
@@ -401,6 +402,93 @@ class FixtureReloadTest(unittest.TestCase):
                 validate_fixture_collision_contract(fixture, config)
             with self.assertRaises(FileExistsError):
                 export_fixture(**arguments)
+
+
+# BEGIN full-assembly ownership and native primitive regression cases.
+class FixedInstallationTest(unittest.TestCase):
+    def test_fixed_primitives_survive_export_without_becoming_robot_spheres(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xml = '''<mujoco><compiler angle="radian"/><asset/><worldbody>
+              <body name="base" pos=".2 -.1 .8">
+                <body name="arm_root"><geom name="arm_geom" type="box" size=".1 .1 .05"/>
+                  <body name="rotor" pos="0 0 .3"><joint name="spin" type="hinge" axis="0 0 1" limited="true" range="-1 1"/>
+                    <geom name="rotor_geom" type="box" size=".1 .1 .05"/><site name="tool" pos="0 0 .1"/>
+                  </body>
+                </body>
+                <body name="installation" pos="0 0 -.2">
+                  <geom name="column" type="cylinder" size=".18 .31"/>
+                  <geom name="foot" type="box" pos=".1 0 -.35" size=".2 .25 .05"/>
+                  <geom name="visual_only" type="sphere" size=".2" contype="0" conaffinity="0"/>
+                </body>
+              </body></worldbody></mujoco>'''
+            source = root/"scene.xml"; source.write_text(xml)
+            catalog = root/"catalog.json"
+            catalog.write_text(json.dumps({"joints": [{"name": "spin", "qpos_count": 1,
+                "qvel_count": 1, "qpos_start": 0, "qvel_start": 0}]}))
+            episode = root/"episode.h5"
+            with h5py.File(episode, "w") as stream:
+                stream.create_dataset("states/qpos", data=np.array([[-.2], [.2]]))
+            fixture = export_fixture(
+                scene_path=source, catalog_path=catalog, episode_path=episode,
+                root_body="base", collision_root="arm_root", tcp_site="tool",
+                arm_joint_names=["spin"], finger_joint_names=[], velocity_limits={"spin": 1.},
+                effort_limits={"spin": 2.}, cover_specifications={
+                    name: {"subdivisions": [1, 1, 1]} for name in ("arm_geom", "rotor_geom")},
+                initial_frame=0, output=root/"fixture", binding_audit_path=catalog,
+                max_acceleration=2., max_jerk=10.)
+            config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
+            self.assertEqual(fixture["sphere_count"], 2)
+            self.assertEqual(fixture["robot_visual_root"], "base")
+            self.assertEqual(fixture["robot_collision_root"], "arm_root")
+            rows = {row["geom"]: row for row in fixture["fixed_collision_geometries"]}
+            self.assertEqual(set(rows), {"column", "foot"})
+            self.assertEqual(rows["column"]["shape_kind"], "cylinder")
+            self.assertEqual(rows["column"]["dimensions"], [.18, .62])
+            self.assertEqual(rows["foot"]["dimensions"], [.4, .5, .1])
+            # Base and arm_root are welded; a genuinely moving rotor remains
+            # an enabled pair against the same fixed installation geometry.
+            self.assertEqual(rows["column"]["robot_excluded_links"], ["arm_root"])
+            self.assertAlmostEqual(rows["column"]["T_base_geom"][2][3], -.2)
+            robot = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
+            self.assertEqual(robot.geom_type[robot.geom("column").id], mujoco.mjtGeom.mjGEOM_CYLINDER)
+            urdf = ET.parse(fixture["urdf_path"])
+            self.assertIsNotNone(urdf.find(".//collision[@name='column']/geometry/cylinder"))
+            report = validate_fixture_collision_contract(fixture, config)
+            self.assertEqual(report["complete_fixed_installation_geometry_count"], 2)
+            for key, value in (("dimensions", [.17, .62]), ("robot_excluded_links", ["arm_root", "rotor"])):
+                wrong = deepcopy(fixture)
+                wrong["fixed_collision_geometries"][0][key] = value
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, "Fixed installation native"):
+                    validate_fixture_collision_contract(wrong, config)
+            wrong = deepcopy(fixture); wrong["fixed_collision_geometries"].pop()
+            with self.assertRaisesRegex(ValueError, "Every native fixed installation"):
+                validate_fixture_collision_contract(wrong, config)
+            wrong = deepcopy(fixture); wrong["robot_visual_root"] = "arm_root"
+            with self.assertRaisesRegex(ValueError, "complete calibrated robot assembly"):
+                validate_fixture_collision_contract(wrong, config)
+
+    def test_unmodelled_moving_body_cannot_be_relabelled_as_fixed_installation(self):
+        with self.assertRaisesRegex(ValueError, "rigidly fixed"):
+            _fixed_installation_records(_model(), root_body="anchor",
+                sphere_geom_names={"anchor_geom"}, sphere_links=["anchor"])
+
+    def test_cylinder_proxy_encloses_native_side_and_end_caps(self):
+        from scipy.spatial import ConvexHull
+        prepared = fixed_installation_proxy({"geom": "column", "shape_kind": "cylinder",
+                                             "dimensions": [.18, .62]})
+        vertices = np.asarray(prepared["arguments"]["vertices"])
+        planes = ConvexHull(vertices).equations
+        # Half-step angles hit the critical side midpoints where an inscribed
+        # visual mesh would exclude the true analytic cylinder surface.
+        angles = (np.arange(128)+.5)*2*np.pi/128
+        points = np.array([[.18*np.cos(angle), .18*np.sin(angle), z]
+                           for angle in angles for z in (-.31, 0., .31)])
+        self.assertLessEqual(float((points@planes[:, :3].T+planes[:, 3]).max()), 0.)
+        self.assertEqual(prepared["approximation"]["sections"], 64)
+        self.assertLess(prepared["approximation"]["maximum_radial_expansion_m"], .0003)
+        self.assertGreater(prepared["approximation"]["minimum_axial_cover_allowance_m"], 0.)
+# END fixed geometry retains native identities and does not consume a moving sphere budget.
 
 
 if __name__ == "__main__":

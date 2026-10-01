@@ -1,9 +1,10 @@
 """Export an explicitly named native robot into a cuRobo planning fixture.
 
-The input is an expanded, fixed-base MuJoCo subtree with scalar joints and
-box/convex-mesh collision solids. Native names, axes, signs and transforms are
-retained. ``yourdfpy`` owns URDF serialization and independent FK; no planner
-or simulator scene state is admitted to this CPU-only model export.
+The input is an expanded, fixed-base MuJoCo subtree with scalar joints,
+box/convex-mesh arm solids and separately retained fixed box/cylinder
+installation primitives. Native names, axes, signs and transforms are retained.
+``yourdfpy`` owns URDF serialization and independent FK; no planner or live
+simulator scene state is admitted to this CPU-only model export.
 """
 
 # BEGIN native robot export and continuous-volume sphere-cover certificates.
@@ -25,7 +26,7 @@ from scipy.spatial import ConvexHull, HalfspaceIntersection
 from scipy.spatial.transform import Rotation
 from scipy.stats import qmc
 import trimesh
-from yourdfpy import URDF, Robot, Link, Joint, Limit, Inertial, Geometry, Mesh, Box, Collision
+from yourdfpy import URDF, Robot, Link, Joint, Limit, Inertial, Geometry, Mesh, Box, Cylinder, Collision
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -386,18 +387,212 @@ def _effective_ignored_pairs(contract):
     return result
 
 
-def _source_collision_names(scene, visual_root):
+def _source_collision_names(scene, collision_root):
     """Require the existing expanded-source contract before using any proof."""
     if scene.find("default") is not None:
         raise ValueError("Provide expanded native XML without unresolved collision defaults")
     if any(scene.find(tag) is not None and len(scene.find(tag))
            for tag in ("contact", "equality", "tendon")):
         raise ValueError("Explicit contact/equality/tendon rules require a matching exporter")
-    source_root = next((node for node in scene.iter("body") if node.get("name") == visual_root), None)
+    source_root = next((node for node in scene.iter("body") if node.get("name") == collision_root), None)
     if source_root is None:
         raise ValueError("The explicit arm/hand collision and visual root is absent")
     return {node.get("name") for node in source_root.iter("geom")
             if int(node.get("contype", "1")) or int(node.get("conaffinity", "1"))}
+
+
+# BEGIN retain known fixed installation primitives separately from arm sphere covers.
+def _fixed_installation_records(model, *, root_body, sphere_geom_names, sphere_links):
+    """Export native fixed robot geometry and only its native pair exclusions.
+
+    These bodies belong to the calibrated robot subtree. They are complete
+    static collision owners, not environment reconstructions or extra moving
+    spheres. In particular a cylinder remains an analytic cylinder here; the
+    cuRobo adapter separately records its conservative polygonal approximation.
+    """
+    root = model.body(root_body).id
+    bodies = {root}
+    for body in range(root + 1, model.nbody):
+        if int(model.body_parentid[body]) in bodies:
+            bodies.add(body)
+    enabled = [index for index in range(model.ngeom)
+               if int(model.geom_bodyid[index]) in bodies
+               and (model.geom_contype[index] or model.geom_conaffinity[index])]
+    extras = [index for index in enabled if model.geom(index).name not in sphere_geom_names]
+    if len(extras) > 32:
+        raise ValueError("Known robot installation exceeds the bounded 32-primitive contract")
+    data = mujoco.MjData(model)
+    mujoco.mj_kinematics(model, data)
+    base = _pose(data.xpos[root], data.xquat[root])
+    result = []
+    for index in extras:
+        body = int(model.geom_bodyid[index])
+        cursor = body
+        while cursor != root:
+            if cursor not in bodies or model.body_jntnum[cursor]:
+                raise ValueError("Geometry outside the arm sphere root must be rigidly fixed to the robot base")
+            cursor = int(model.body_parentid[cursor])
+        if model.body_jntnum[root]:
+            raise ValueError("A fixed installation requires the existing fixed robot base")
+        kind = model.geom_type[index]
+        if kind == mujoco.mjtGeom.mjGEOM_BOX:
+            shape_kind, dimensions = "box", (2 * model.geom_size[index]).tolist()
+        elif kind == mujoco.mjtGeom.mjGEOM_CYLINDER:
+            shape_kind = "cylinder"
+            dimensions = [float(model.geom_size[index, 0]), float(2 * model.geom_size[index, 1])]
+        else:
+            raise ValueError("Fixed robot installation accepts explicit native box or cylinder primitives")
+        if not np.isfinite(dimensions).all() or np.any(np.asarray(dimensions) <= 0):
+            raise ValueError("Native fixed primitives require finite positive metric dimensions")
+        link = model.body(body).name
+        excluded = []
+        for other in sphere_links:
+            # The existing body-pair policy requires every native geom pair
+            # to be excluded. It never borrows a sphere separation certificate.
+            policy = _native_ignored_pairs(model, [other, link])
+            if link in policy.get(other, ()):
+                excluded.append(other)
+        native_world = np.eye(4)
+        native_world[:3, :3] = data.geom_xmat[index].reshape(3, 3)
+        native_world[:3, 3] = data.geom_xpos[index]
+        result.append({
+            "geom": model.geom(index).name, "link": link,
+            "shape_kind": shape_kind, "dimensions": dimensions,
+            "T_body_geom": _native_geom_pose(model, index).tolist(),
+            "T_base_geom": (np.linalg.inv(base) @ native_world).tolist(),
+            "robot_excluded_links": excluded,
+            "source_contype": int(model.geom_contype[index]),
+            "source_conaffinity": int(model.geom_conaffinity[index]),
+            "policy_source": "native welded-body, enabled parent filter and collision masks only",
+            "source": f"Complete fixed native robot installation below {root_body}"})
+    return result
+
+
+def _validate_fixed_installation(fixture, models, sphere_geom_names, sphere_links):
+    """Rebuild installation identity, rigid placement and pair policy on reload."""
+    if (fixture["robot_visual_root"] != fixture["base_link"]
+            or not np.array_equal(fixture["T_base_visual_root"], np.eye(4))):
+        raise ValueError("Visual self-filter must contain the complete calibrated robot assembly")
+    supplied = fixture["fixed_collision_geometries"]
+    for model in models:
+        expected = _fixed_installation_records(
+            model, root_body=fixture["base_link"], sphere_geom_names=sphere_geom_names,
+            sphere_links=sphere_links)
+        if len(supplied) != len(expected):
+            raise ValueError("Every native fixed installation primitive must remain in the fixture")
+        for actual, native in zip(supplied, expected):
+            if set(actual) != set(native):
+                raise ValueError("Fixed installation records require the explicit native schema")
+            for key in native:
+                same = (np.allclose(actual[key], native[key], atol=1e-12, rtol=0)
+                        if key in {"T_body_geom", "T_base_geom"} else actual[key] == native[key])
+                if not same:
+                    raise ValueError(f"Fixed installation native geometry or policy changed: {native['geom']}/{key}")
+    return len(supplied)
+
+
+def fixed_installation_proxy(record):
+    """Prepare a bounded, outward-rounded cuRobo shape without device access.
+
+    Native cylinders are retained in the manifest for independent checking.
+    cuRobo's default cylinder tessellation is inscribed, so this adapter uses
+    a circumscribed 64-sided prism and checks its serialized float32 support
+    planes. Its small, reported enlargement is collision padding only: no
+    volume is added to observed-space evidence.
+    """
+    kind, dimensions = record["shape_kind"], np.asarray(record["dimensions"], float)
+    if (dimensions.shape != ((3,) if kind == "box" else (2,))
+            or kind not in {"box", "cylinder"} or not np.isfinite(dimensions).all()
+            or np.any(dimensions <= 0)):
+        raise ValueError("Fixed installation needs native positive box dimensions or cylinder radius/full length")
+    identity = [0., 0., 0., 1., 0., 0., 0.]
+    if kind == "box":
+        outward = np.nextafter(dimensions.astype(np.float32), np.float32(np.inf)).astype(float)
+        if not np.isfinite(outward).all() or np.any(outward < dimensions):
+            raise ValueError("Fixed native box cannot be enclosed by the serialized finite dimensions")
+        return {"kind": "cuboid", "arguments": {"name": record["geom"], "pose": identity,
+                                                   "dims": outward.tolist()},
+                "approximation": {"kind": "outward-rounded native box",
+                                  "maximum_face_expansion_m": float(((outward-dimensions)/2).max())}}
+    sections = 64
+    radius, length = dimensions
+    # The micrometre guard covers vertex quantization, independent of sensor
+    # uncertainty and intentional physical/contact tolerances.
+    outer_radius = float(np.nextafter(np.float32(radius/np.cos(np.pi/sections)+1e-6), np.float32(np.inf)))
+    half_length = float(np.nextafter(np.float32(length/2+1e-6), np.float32(np.inf)))
+    mesh = trimesh.creation.cylinder(radius=outer_radius, height=2*half_length, sections=sections)
+    vertices = np.asarray(mesh.vertices, dtype=np.float32).astype(float)
+    planes = ConvexHull(vertices).equations
+    radial = np.linalg.norm(planes[:, :2], axis=1)
+    sides = radial > .5
+    radial_allowance = float((-planes[sides, 3]/radial[sides]).min()-radius)
+    axial_allowance = float(min(vertices[:, 2].max(), -vertices[:, 2].min())-length/2)
+    if (not np.isfinite(vertices).all() or radial_allowance < 0 or axial_allowance < 0
+            or np.any(np.abs(planes[sides, 2]) > 1e-8)):
+        raise ValueError("Serialized installation prism does not enclose its native cylinder")
+    return {"kind": "mesh", "arguments": {"name": record["geom"], "pose": identity,
+                                              "vertices": vertices.tolist(), "faces": mesh.faces.tolist()},
+            "approximation": {"kind": "circumscribed native cylinder prism", "sections": sections,
+                              "maximum_radial_expansion_m": float(np.linalg.norm(vertices[:, :2], axis=1).max()-radius),
+                              "maximum_axial_expansion_m": float(half_length-length/2),
+                              "minimum_radial_cover_allowance_m": radial_allowance,
+                              "minimum_axial_cover_allowance_m": axial_allowance}}
+
+
+def create_fixed_installation_owners(fixture, *, device_cfg, T_output_base, sphere_indices_by_link):
+    """Bind validated robot primitives as existing complete static scene owners.
+
+    The runner first calls validate_fixture_collision_contract. Link indices
+    here come from the actual loaded cuRobo model, never from an assumed YAML
+    or URDF ordering. These owners remain obstacles to payloads and every
+    robot link whose native installation pair is enabled.
+    """
+    from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
+    from curobo._src.geom.types import Cuboid, Mesh as SceneMesh, SceneCfg
+    from manipulation.motion import _pose_array
+    from manipulation.planning_problem import PosePath
+    from manipulation.planning_scene import CollisionOwner, CuroboSphereQuery
+
+    base = _pose_array(T_output_base, "current calibrated robot installation base")
+    records = fixture["fixed_collision_geometries"]
+    expected_links = {row["link"] for row in fixture["collision_geometries"]}
+    if set(sphere_indices_by_link) != expected_links:
+        raise ValueError("Installation policy requires exactly the native sphere-bearing robot links")
+    flattened = [int(index) for link in expected_links for index in sphere_indices_by_link[link]]
+    if sorted(flattened) != list(range(fixture["sphere_count"])):
+        raise ValueError("Installation policy requires the complete actual native sphere/link layout")
+    owners, reports = [], []
+    for record in records:
+        prepared = fixed_installation_proxy(record)
+        owner_id = f"robot_installation/{record['geom']}"
+        if prepared["kind"] == "cuboid":
+            world = SceneCfg(cuboid=[Cuboid(**prepared["arguments"])])
+            cache = {"cuboid": 1}
+        else:
+            world = SceneCfg(mesh=[SceneMesh(**prepared["arguments"])])
+            cache = {"mesh": 1}
+        native = SceneCollision.from_config(SceneCollisionCfg(
+            device_cfg=device_cfg, scene_model=world, cache=cache))
+        query = CuroboSphereQuery(native, owner_ids=(owner_id,), source=record["source"])
+        pose = base @ _pose_array(record["T_base_geom"], "native fixed primitive base transform")
+        excluded = tuple(int(index) for link in record["robot_excluded_links"]
+                         for index in sphere_indices_by_link[link])
+        owners.append(CollisionOwner(
+            owner_id, query, PosePath(np.array([0., 1.]), np.stack((pose, pose)), record["source"]),
+            record["source"], geometry_complete=True, moving=False,
+            robot_excluded_spheres=excluded,
+            robot_exclusion_source=record["policy_source"] if excluded else None,
+            robot_exclusion_geometry_source=fixture["robot_geometry_source"] if excluded else None))
+        reports.append({"owner_id": owner_id, "native_geom": record["geom"],
+                        "native_shape_kind": record["shape_kind"], "native_dimensions": record["dimensions"],
+                        "T_output_geom": pose.tolist(), "approximation": prepared["approximation"],
+                        "robot_excluded_links": record["robot_excluded_links"],
+                        "robot_excluded_sphere_indices": list(excluded),
+                        "pair_policy_source": record["policy_source"],
+                        "geometry_complete": True, "moving_actor": False,
+                        "occupied_space_evidence_supplied": False})
+    return tuple(owners), reports
+# END separate fixed installation ownership without increasing the sphere budget.
 
 
 # BEGIN bind the actual planner FK and all padding to the certified native model.
@@ -518,7 +713,7 @@ def validate_fixture_collision_contract(fixture, robot_config):
     records = fixture["collision_geometries"]
     names = [row["geom"] for row in records]
     scene = ET.parse(fixture["source_scene_xml"]).getroot()
-    enabled = _source_collision_names(scene, fixture["robot_visual_root"])
+    enabled = _source_collision_names(scene, fixture["robot_collision_root"])
     if len(names) != len(set(names)) or set(names) != enabled:
         raise ValueError("Fixture certificates must include every original enabled collision geometry")
     kinematics = robot_config["robot_cfg"]["kinematics"]
@@ -530,6 +725,9 @@ def validate_fixture_collision_contract(fixture, robot_config):
     # BEGIN require the exact FK tree actually consumed with these spheres.
     _validate_fixture_kinematics(fixture, kinematics, (robot, source))
     # END require the exact FK tree actually consumed with these spheres.
+    # BEGIN validate the separately retained, complete fixed robot installation.
+    fixed_count = _validate_fixed_installation(fixture, (robot, source), set(names), links)
+    # END installation validation does not change articulated self-query policy.
     offsets = {name: 0 for name in links}
     minimum_allowance = np.inf
     for row in records:
@@ -598,6 +796,7 @@ def validate_fixture_collision_contract(fixture, robot_config):
         raise ValueError("Effective self-collision exclusions differ from native policy plus valid certificates")
     return {"sphere_count": fixture["sphere_count"],
             "complete_native_geometry_count": len(records),
+            "complete_fixed_installation_geometry_count": fixed_count,
             "native_enabled_sphere_pair_count": expected["native_enabled_sphere_pair_count"],
             "certificate_completed_pairs": [row["links"] for row in expected["certificate_completed_pairs"]],
             "effective_query_sphere_pair_count": expected["effective_query_sphere_pair_count"],
@@ -607,7 +806,7 @@ def validate_fixture_collision_contract(fixture, robot_config):
 # END native solid separation certificates, independent of sphere fitting.
 
 
-def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_root, tcp_site,
+def export_fixture(*, scene_path, catalog_path, episode_path, root_body, collision_root, tcp_site,
                    arm_joint_names, finger_joint_names, velocity_limits, effort_limits,
                    cover_specifications, initial_frame, output, binding_audit_path,
                    max_acceleration, max_jerk):
@@ -625,14 +824,21 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_
     # END preserve prior fixtures; each export owns a fresh artifact directory.
     scene = ET.parse(scene_path).getroot()
     # BEGIN share the same complete-source gate with reload validation.
-    enabled_geoms = _source_collision_names(scene, visual_root)
+    enabled_geoms = _source_collision_names(scene, collision_root)
     if enabled_geoms != set(cover_specifications):
         raise ValueError("Cover specification must include every native enabled geom of the explicit arm/hand root")
+    # BEGIN keep fixed native installation geometry in the calibrated robot model.
+    # Sphere export still has its existing explicit arm/hand scope and budget.
+    # All other enabled geometry under the robot root must be rigid installation
+    # geometry; _fixed_installation_records rejects an omitted movable subtree.
+    assembly_geoms = _source_collision_names(scene, root_body)
+    if not enabled_geoms <= assembly_geoms:
+        raise ValueError("The declared arm collision root must belong to the calibrated robot assembly")
     # END share the same complete-source gate with reload validation.
     names = list(arm_joint_names) + list(finger_joint_names)
     if len(set(names)) != len(names) or set(velocity_limits) != set(names) or set(effort_limits) != set(names):
         raise ValueError("Native scalar joints need unique names and explicit velocity/effort limits")
-    model = _robot_model(scene_path, root_body, list(cover_specifications))
+    model = _robot_model(scene_path, root_body, sorted(assembly_geoms))
     if model.nq != len(names) or set(names) != {model.joint(i).name for i in range(model.njnt)}:
         raise ValueError("Named arm/finger joints must cover the robot exactly")
     # Preserve options used by the native collision-pair filter. This model
@@ -662,6 +868,12 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_
         frames = np.unique(np.linspace(0, len(stream["states/qpos"])-1, 17, dtype=int))
         recorded = np.column_stack([stream["states/qpos"][frames, row["qpos_column"]] for row in binding])
     data = mujoco.MjData(model)
+    sphere_links = list(dict.fromkeys(model.body(model.geom_bodyid[model.geom(name).id]).name
+                                     for name in sorted(enabled_geoms)))
+    fixed_geometries = _fixed_installation_records(
+        model, root_body=root_body, sphere_geom_names=enabled_geoms, sphere_links=sphere_links)
+    fixed_by_geom = {record["geom"]: record for record in fixed_geometries}
+    # END preserve installation primitives without approximating them as robot spheres.
     links, joints, covers, records = [], [], {}, []
     mesh_directory = output / "collision_meshes"
     mesh_directory.mkdir(exist_ok=True)
@@ -673,6 +885,18 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_
         collisions = []
         for geom_id in np.flatnonzero(model.geom_bodyid == body):
             geom_name = model.geom(int(geom_id)).name
+            # BEGIN serialize native fixed primitives into the same robot FK tree.
+            if geom_name in fixed_by_geom:
+                fixed = fixed_by_geom[geom_name]
+                if fixed["shape_kind"] == "box":
+                    shape = Geometry(box=Box(size=np.asarray(fixed["dimensions"])))
+                else:
+                    shape = Geometry(cylinder=Cylinder(radius=fixed["dimensions"][0],
+                                                       length=fixed["dimensions"][1]))
+                collisions.append(Collision(name=geom_name, origin=np.asarray(fixed["T_body_geom"]),
+                                            geometry=shape))
+                continue
+            # END static installation has no additional moving-sphere cover.
             spheres, record, geometry = _geom_cover(model, geom_id, cover_specifications[geom_name], output/f"{geom_name}.npz")
             covers.setdefault(name, []).extend(spheres)
             if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_BOX:
@@ -771,32 +995,38 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_
             ancestor = int(model.body_parentid[ancestor])
         if ancestor in finger_roots:
             finger_links.append(name)
-    visual_root_id = model.body(visual_root).id
-    cursor = visual_root_id
+    # BEGIN separate collision-cover selection from complete visual self filtering.
+    collision_root_id = model.body(collision_root).id
+    cursor = collision_root_id
     while cursor != root_id:
         if cursor == 0 or model.body_jntnum[cursor]:
-            raise ValueError("The explicit visual root must be rigidly fixed below the model base")
+            raise ValueError("The explicit collision root must be rigidly fixed below the model base")
         cursor = int(model.body_parentid[cursor])
-    visual_transform = np.linalg.inv(base) @ _pose(data.xpos[visual_root_id], data.xquat[visual_root_id])
+    # Exclusion rows use the actual collision-link order consumed by cuRobo.
+    fixed_geometries = _fixed_installation_records(
+        model, root_body=root_body, sphere_geom_names=enabled_geoms, sphere_links=list(covers))
     manifest = {"source_scene_xml": str(scene_path), "catalog_path": str(catalog_path),
         "episode_path": str(episode_path), "binding_audit_path": str(Path(binding_audit_path).resolve()),
         "robot_mjcf_path": str(robot_mjcf), "urdf_path": str(urdf_path), "robot_config_path": str(config_path),
         "base_link": root_body, "base_pose": _pose_dict(base), "tool_link": tcp_site, "tcp_site": tcp_site,
-        "robot_visual_root": visual_root, "T_base_visual_root": visual_transform.tolist(),
+        "robot_collision_root": collision_root,
+        "robot_visual_root": root_body, "T_base_visual_root": np.eye(4).tolist(),
         "tool_transform": _pose_dict(np.eye(4)), "joint_names": names,
         "arm_joint_names": list(arm_joint_names), "finger_joint_names": list(finger_joint_names),
         "finger_link_names": finger_links,
         "planning_joint_names": list(arm_joint_names), "joint_binding": binding,
         "initial_frame": int(initial_frame), "initial_joint_positions": q0.tolist(),
         "velocity_limits": velocity_limits, "effort_limits": effort_limits,
-        "collision_geometries": records, "sphere_count": sphere_count,
+        "collision_geometries": records, "fixed_collision_geometries": fixed_geometries,
+        "sphere_count": sphere_count,
         "sphere_materials": [None] * sphere_count,
-        "robot_geometry_source": "compiled native MuJoCo arm/hand collision geoms below the declared robot_visual_root; complete convex-cell enclosing sphere cover; fixed mounts remain observed background",
-        "coverage_proof": "All native enabled convex solids below robot_visual_root partitioned into convex cells; each serialized float32 sphere encloses every cell vertex with at least 1e-6 m allowance",
+        "robot_geometry_source": "compiled native MuJoCo arm/hand collision geoms below robot_collision_root; complete convex-cell sphere cover; remaining calibrated fixed installation retained as native static primitives",
+        "coverage_proof": "All native enabled convex solids below robot_collision_root partitioned into convex cells; each serialized float32 sphere encloses every cell vertex with at least 1e-6 m allowance",
         "coverage_limit": "Conservative collision proxies, not RGB-D occupied-solid evidence; support-plane excess is not a Euclidean Hausdorff bound",
         "fk_audit": {"recorded_frames": frames.tolist(), "hypothetical_probes": len(probes),
                      "maximum_translation_error_m": max_position, "maximum_rotation_error_rad": max_rotation,
                     "consumer": "yourdfpy reloaded serialized URDF; cuRobo native FK is a separate runner check"}}
+    # END one calibrated assembly owns both visual self filtering and collision geometry.
     # BEGIN persist native policy, certified queries and effective queries separately.
     manifest.update(collision_contract)
     # Validate deserialized primitive values and the written YAML/NPZ before

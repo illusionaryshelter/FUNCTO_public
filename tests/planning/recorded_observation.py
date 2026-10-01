@@ -119,8 +119,13 @@ def prepare_robot_model(*, scene_xml: str | Path, robot_root: str,
     +1 or -1. The supplied mapping must cover every scalar robot joint exactly
     once. Measured positions are neither clipped nor replaced with defaults.
     The explicit base transform is the world pose of ``robot_root`` itself.
-    Choose the modeled arm/hand root, excluding stationary mounts absent from
-    the planner's robot collision model. Such mounts remain observed obstacles.
+    # BEGIN complete known assembly self filtering.
+    Choose the complete calibrated robot root, including its fixed mounting
+    assembly. The caller must retain those fixed bodies as explicit static
+    collision owners; removing their depth without collision ownership is not
+    a valid scene. Visual geometry determines pixel identity, while the native
+    collision primitives independently define installation collision queries.
+    # END visual self filtering does not certify free or occupied space.
     """
     camera_config = camera_config_from_calibration(calibration)
     scene_xml = Path(scene_xml).resolve()
@@ -219,6 +224,7 @@ def prepare_robot_model(*, scene_xml: str | Path, robot_root: str,
         "cloned_assets": [{"kind": node.tag, "name": node.get("name"), "file": node.get("file")}
                           for node in assets],
         "render_visibility": "existing FixedCamera groups: visual groups 1 and 2; collision group 0 hidden",
+        "fixed_installation_policy": "caller retains complete known assembly collision geometry as static owners",
     }
     return model, data, camera_config, provenance
 

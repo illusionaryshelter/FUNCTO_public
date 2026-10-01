@@ -17,16 +17,17 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import numpy as np
+import mujoco
 
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 
 from manipulation.planning import JointTrajectory
-from recorded_simulation import FixedFingerTargets, RecordedSimulation
+from recorded_simulation import ExecutionGuardError, ExecutionLimits, FixedFingerTargets, RecordedSimulation
 
 
 def _event(event_id, kind, time, evidence=None):
     return {"skill_id": "declared_skill", "event_id": event_id, "kind": kind,
-            "time": time, "requires_evidence": evidence}
+            "time": time, "requires_evidence": evidence, "stop": evidence is not None}
 
 
 def _fixture():
@@ -53,7 +54,13 @@ def _fixture():
         xmat=np.eye(3).reshape(1, 9), xpos=np.zeros((1, 3)),
         site_xmat=np.eye(3).reshape(1, 9), site_xpos=np.zeros((1, 3)))
     simulation.native_model = SimpleNamespace(
-        actuator_ctrlrange=np.vstack((np.tile([-10., 10.], (7, 1)), [0., .04], [-.04, 0.])))
+        actuator_ctrlrange=np.vstack((np.tile([-10., 10.], (7, 1)), [0., .04], [-.04, 0.])),
+        jnt_limited=np.ones(9, dtype=bool),
+        jnt_range=np.vstack((np.tile([-2., 2.], (7, 1)), [0., .04], [-.04, 0.])))
+    # BEGIN explicitly synthetic physical limits and FK for control-contract tests.
+    simulation._velocity_limits = dict(zip(simulation.joint_names, [1.]*7+[.2, .2]))
+    simulation.reference_tool_pose = lambda arm_q: np.eye(4)
+    # END explicitly synthetic physical limits and FK for control-contract tests.
 
     def step():
         # Advancing a mock clock leaves actual state independent from goals.
@@ -91,6 +98,24 @@ def _initial_feedback(simulation):
     """Explicit calibration metadata accompanies the measured robot state."""
     return {**simulation.proprioception(), "reference_frame": "declared_test_frame",
             "tool_link": "declared_test_tcp", "tool_transform": np.eye(4).tolist()}
+
+
+# BEGIN explicit mock execution policy; these values are not robot calibration.
+def _limit_values(simulation, curve):
+    finger_state = {"position_bounds": [[.01, .02], [-.02, -.014]], "maximum_speed": [.05, .05]}
+    return {"source": "Synthetic CPU contract-test limits; not measured hardware performance",
+            "joint_names": list(simulation.joint_names), "arm_joint_names": list(simulation.arm_joint_names),
+            "finger_joint_names": list(simulation.finger_joint_names),
+            "arm_position_error": [.001]*7, "arm_velocity_error": [.001]*7,
+            "tcp_position_error_m": .001, "tcp_rotation_error_rad": .001,
+            "stop_arm_velocity": [.1]*7, "initial_fingers": deepcopy(finger_state),
+            "events": [{"skill_id": event["skill_id"], "event_id": event["event_id"], **deepcopy(finger_state)}
+                       for event in curve.events if event["kind"] in ("open", "close", "hold")]}
+
+
+def _limits(simulation, curve):
+    return ExecutionLimits.from_mapping(_limit_values(simulation, curve))
+# END explicit mock execution policy; these values are not robot calibration.
 
 
 class FixedFingerTargetTests(unittest.TestCase):
@@ -172,6 +197,7 @@ class RecordedControlTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "full robot state"):
                         simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                             initial_feedback=feedback, evaluation_mode="accepted_plan", output=output,
+                            execution_limits=_limits(simulation, curve),
                             start_position_tolerance=1., start_velocity_tolerance=1.)
                     self.assertFalse(output.exists())
 
@@ -182,7 +208,8 @@ class RecordedControlTests(unittest.TestCase):
         with TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             report = simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
-                initial_feedback=initial, evaluation_mode="accepted_plan", output=output, max_physics_steps=4)
+                initial_feedback=initial, execution_limits=_limits(simulation, curve),
+                evaluation_mode="accepted_plan", output=output, max_physics_steps=4)
             self.assertEqual(report["executed_steps"], 4)
             self.assertEqual(report["status"], "stopped_for_evidence")
             self.assertFalse(report["evidence_passed"])
@@ -228,11 +255,198 @@ class RecordedControlTests(unittest.TestCase):
         with TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
             report = simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=_initial_feedback(simulation), evaluation_mode="diagnostic_rejected_candidate",
+                execution_limits=_limits(simulation, curve),
                 output=Path(temporary)/"trial", max_physics_steps=4)
         self.assertEqual([row["event_id"] for row in report["events"]], ["close-original"])
         self.assertEqual([row["event_id"] for row in report["superseded_gripper_events"]], ["open-original"])
         self.assertEqual([row["event_id"] for row in report["unapplied_gripper_events"]], ["open-original", "hold-later"])
         self.assertFalse(report["planner_accepted"])
+
+
+# BEGIN physical feedback rejection and isolated native FK regressions.
+class ExecutionGuardTests(unittest.TestCase):
+    def test_missing_limits_extra_clock_and_unbound_finger_event_fail_before_physics(self):
+        simulation, curve, value = _fixture()
+        policy = _limit_values(simulation, curve)
+        missing = deepcopy(policy)
+        missing.pop("arm_position_error")
+        with self.assertRaisesRegex(ValueError, "every physical limit"):
+            ExecutionLimits.from_mapping(missing)
+        timed = deepcopy(policy)
+        timed["events"][0]["time"] = 0.
+        with self.assertRaisesRegex(ValueError, "original event identity"):
+            ExecutionLimits.from_mapping(timed)
+        policy["events"].pop()
+        with TemporaryDirectory() as temporary:
+            output = Path(temporary)/"trial"
+            with self.assertRaisesRegex(ValueError, "match every original"):
+                simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                    initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(policy),
+                    evaluation_mode="accepted_plan", output=output)
+            self.assertFalse(output.exists())
+            self.assertEqual(simulation.native_data.time, 1.3)
+
+    def test_close_gate_uses_original_anchor_and_never_sends_rejected_close(self):
+        simulation, curve, value = _fixture()
+        curve.events[0]["time"] = 0.
+        limits = _limit_values(simulation, curve)
+        limits["arm_position_error"] = [1e-5]*7
+        initial = _initial_feedback(simulation)
+        steps = []
+
+        def step():
+            simulation.native_data.time += simulation._dt
+            elapsed = simulation.native_data.time-initial["sim_time"]
+            q, dq, _ = curve.sample(elapsed)
+            simulation.native_data.qpos[:7], simulation.native_data.qvel[:7] = q, dq
+            steps.append(simulation.native_data.ctrl.copy())
+
+        simulation._sim.step = step
+        with TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                    initial_feedback=initial, execution_limits=ExecutionLimits.from_mapping(limits),
+                    evaluation_mode="accepted_plan", output=output)
+            report = json.loads((output/"execution-report.json").read_text())
+            failure = report["feedback_failure"]
+            self.assertEqual(failure["point"], "command_event")
+            self.assertEqual(failure["event_id"], "close-original")
+            self.assertEqual(failure["curve_time_s"], .003)
+            self.assertEqual(len(steps), 2)
+            self.assertEqual(report["executed_steps"], 2)
+            self.assertEqual([event["event_id"] for event in report["events"]], ["open-original"])
+            self.assertIn("close-original", [event["event_id"] for event in report["unapplied_gripper_events"]])
+            np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.032, -.025])
+            np.testing.assert_array_equal(report["abort_hold"]["finger_position_goal"], [.032, -.025])
+            self.assertTrue(report["abort_hold"]["prepared"])
+            self.assertFalse(report["abort_hold"]["native_ctrl_written"])
+            self.assertFalse(report["abort_hold"]["physical_stop_confirmed"])
+            self.assertIsNone(report["barrier_feedback_path"])
+            self.assertTrue(Path(report["robot_feedback_path"]).name == "failure-feedback.json")
+
+    def test_post_step_failures_retain_actual_sample_and_cannot_advance_to_close(self):
+        changes = (
+            ("arm_position_tracking", lambda data: data.qpos.__setitem__(0, .11)),
+            ("actual_finger_position", lambda data: data.qpos.__setitem__(7, .025)),
+            ("actual_finger_velocity", lambda data: data.qvel.__setitem__(7, .08)),
+            ("native_joint_position", lambda data: data.qpos.__setitem__(0, 2.1)),
+            ("hardware_joint_velocity", lambda data: data.qvel.__setitem__(0, 1.1)),
+            ("tcp_tracking", lambda data: data.site_xpos.__setitem__((0, 0), .01)),
+            ("feedback_clock", lambda data: setattr(data, "time", data.time+.002)),
+            ("nonfinite_feedback", lambda data: data.qvel.__setitem__(0, np.nan)),
+        )
+        for kind, change in changes:
+            with self.subTest(kind=kind), TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
+                simulation, curve, value = _fixture()
+                initial = _initial_feedback(simulation)
+                original_step = simulation._sim.step
+                observed = []
+
+                def step():
+                    original_step()
+                    change(simulation.native_data)
+
+                simulation._sim.step = step
+                output = Path(temporary)/"trial"
+                with self.assertRaises(ExecutionGuardError):
+                    simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                        initial_feedback=initial, execution_limits=_limits(simulation, curve),
+                        evaluation_mode="accepted_plan", output=output,
+                        step_callback=lambda model, data, sample: observed.append(sample["q"].copy()))
+                report = json.loads((output/"execution-report.json").read_text())
+                self.assertEqual(report["status"], "feedback_rejected")
+                self.assertEqual(report["executed_steps"], 1)
+                self.assertEqual(report["feedback_failure"]["point"], "after_step")
+                self.assertIn(kind, [item["kind"] for item in report["feedback_failure"]["violations"]])
+                self.assertEqual(report["events"], [])
+                self.assertEqual(len(observed), 1)
+                if kind in ("feedback_clock", "native_joint_position", "nonfinite_feedback"):
+                    self.assertFalse(report["abort_hold"]["prepared"])
+                np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.026, -.023])
+                with np.load(output/"physical-trajectory.npz") as saved:
+                    self.assertEqual(saved["actual_q"].shape, (2, 9))
+                    self.assertEqual(saved["actuator_ctrl"].shape, (1, 9))
+                    np.testing.assert_array_equal(saved["actual_q"][-1], simulation.native_data.qpos)
+
+    def test_original_stop_checks_actual_velocity_without_extending_physics(self):
+        simulation, curve, value = _fixture()
+        limits = _limit_values(simulation, curve)
+        limits["stop_arm_velocity"] = [.001]*7
+        with TemporaryDirectory() as temporary, patch("recorded_simulation.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                simulation.execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                    initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
+                    evaluation_mode="accepted_plan", output=output)
+            report = json.loads((output/"execution-report.json").read_text())
+            self.assertEqual(report["executed_steps"], 4)
+            self.assertEqual(report["feedback_failure"]["curve_time_s"], .0075)
+            self.assertIn("planned_stop_velocity", [row["kind"] for row in report["feedback_failure"]["violations"]])
+            self.assertFalse(report["evidence_passed"])
+            self.assertFalse(report["barrier_crossed"])
+
+
+class ReferenceFKTests(unittest.TestCase):
+    @staticmethod
+    def _native_robot():
+        model = mujoco.MjModel.from_xml_string('''
+            <mujoco><compiler angle="radian"/><worldbody><body name="base">
+              <body name="arm"><joint name="arm_q" type="hinge" axis="0 0 1" range="-2 2"/>
+                <geom type="sphere" size=".02" mass="1"/><site name="tcp" pos=".1 0 0"/>
+              </body>
+              <body name="finger"><joint name="finger_q" type="slide" axis="0 1 0" range="0 .04"/>
+                <geom type="sphere" size=".01" mass=".1"/><site name="finger_tcp" pos=".02 0 0"/>
+              </body>
+            </body></worldbody></mujoco>''')
+        simulation = RecordedSimulation()
+        simulation.native_model, simulation.native_data = model, mujoco.MjData(model)
+        simulation.arm_joint_names, simulation.finger_joint_names = ("arm_q",), ("finger_q",)
+        simulation.joint_names = simulation.arm_joint_names+simulation.finger_joint_names
+        simulation._joint_ids = np.asarray([model.joint(name).id for name in simulation.joint_names])
+        simulation._qpos_ids = model.jnt_qposadr[simulation._joint_ids].copy()
+        simulation._base_id, simulation._site_id = model.body("base").id, model.site("tcp").id
+        simulation.native_data.qpos[:] = [.2, .013]
+        mujoco.mj_kinematics(model, simulation.native_data)
+        return simulation
+
+    def test_reference_fk_uses_isolated_data_and_never_steps_or_teleports_actual_robot(self):
+        simulation = self._native_robot()
+        actual_q = simulation.native_data.qpos.copy()
+        actual_sites = simulation.native_data.site_xpos.copy()
+        simulation._prepare_reference_fk()
+        pose = simulation.reference_tool_pose(np.asarray([.5]))
+        np.testing.assert_allclose(pose[:3, 3], [.1*np.cos(.5), .1*np.sin(.5), 0.], atol=1e-12)
+        np.testing.assert_array_equal(simulation.native_data.qpos, actual_q)
+        np.testing.assert_array_equal(simulation.native_data.site_xpos, actual_sites)
+        self.assertEqual(simulation.native_data.time, 0.)
+        self.assertIsNot(simulation._reference_data, simulation.native_data)
+
+    def test_finger_dependent_tcp_requires_a_defined_reference_finger_path(self):
+        simulation = self._native_robot()
+        simulation._site_id = simulation.native_model.site("finger_tcp").id
+        with self.assertRaisesRegex(ValueError, "only the explicitly controlled arm"):
+            simulation._prepare_reference_fk()
+
+
+class FingerConvergenceTests(unittest.TestCase):
+    def test_contact_blocked_quiet_position_is_not_command_convergence(self):
+        from probe_finger_control import convergence
+        result = convergence(np.array([0., .1, .2, .3]), np.full((4, 2), .015), np.zeros((4, 2)),
+                             np.zeros(2), np.full(2, .001), np.full(2, .001), .2)
+        self.assertFalse(result["settled_at_end"])
+        self.assertIsNone(result["first_settled_sim_time_s"])
+
+    def test_lost_target_does_not_borrow_an_earlier_stable_window(self):
+        from probe_finger_control import convergence
+        positions = np.zeros((5, 2))
+        positions[3, 0] = .01
+        result = convergence(np.arange(5)*.1, positions, np.zeros_like(positions),
+                             np.zeros(2), np.full(2, .001), np.full(2, .001), .2)
+        self.assertEqual(result["first_settled_sim_time_s"], .2)
+        self.assertFalse(result["settled_at_end"])
+        self.assertEqual(result["final_consecutive_window_s"], 0.)
+# END physical feedback rejection and isolated native FK regressions.
 
 
 if __name__ == "__main__":

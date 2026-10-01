@@ -22,7 +22,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from manipulation.robot_geometry_check import NativePrimitive, NativeSolid, PairQuery, RobotGeometryChecker
 from manipulation.tool_geometry import _collision_geometry
-from robot_fixture import _native_geom_pose, _validate_fixture_kinematics
+from robot_fixture import _native_geom_pose, validate_fixture_collision_contract
 
 
 def _read(path):
@@ -72,7 +72,7 @@ def _native_shapes(fixture, model):
         evidence[name] = {"id": index, "link": link, "vertices_frame": vertices,
                           "vertices_geometry": native["vertices"], "local": local,
                           "kind": native["collision_representation"]}
-    for row in fixture.get("fixed_collision_geometries", []):
+    for row in fixture["fixed_collision_geometries"]:
         name, link = row["geom"], row["link"]
         index, kind = model.geom(name).id, row["shape_kind"]
         expected = {"box": mujoco.mjtGeom.mjGEOM_BOX, "cylinder": mujoco.mjtGeom.mjGEOM_CYLINDER}
@@ -129,11 +129,15 @@ def _states(args, fixture, feedback, config):
 def run(args):
     start = time.monotonic()
     fixture, feedback = _read(args.fixture), _read(args.feedback)
-    config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())["robot_cfg"]["kinematics"]
+    robot_config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
+    config = robot_config["robot_cfg"]["kinematics"]
+    # Validate completeness and policy against both original source and the
+    # exported assembly BEFORE using its records. Comparing only declared
+    # records would miss an omitted primitive or a changed native exclusion.
+    validate_fixture_collision_contract(fixture, robot_config)
     model = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
     if model.nq > 64 or model.nbody > 128 or model.ngeom > 64:
         raise ValueError("Selected robot exceeds this bounded CPU diagnostic's model size")
-    _validate_fixture_kinematics(fixture, config, (model,))
     shapes, geometries = _native_shapes(fixture, model)
     checker = RobotGeometryChecker(fixture["urdf_path"], base_frame=fixture["base_link"], geometries=shapes)
     names = tuple(fixture["joint_names"])

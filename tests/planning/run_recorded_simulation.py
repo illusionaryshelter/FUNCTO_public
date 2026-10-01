@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(WORKSPACE_ROOT))
 
 # BEGIN explicit fixed finger goals alongside the exported arm cubic.
-from recorded_simulation import FixedFingerTargets, RecordedSimulation, load_saved_trajectory
+from recorded_simulation import ExecutionLimits, FixedFingerTargets, RecordedSimulation, load_saved_trajectory
 # END explicit fixed finger goals alongside the exported arm cubic.
 from recorded_skill_evaluation import NativeSkillPhysicsEvaluator
 
@@ -127,6 +127,7 @@ def run(args):
         "trajectory_path": str(args.trajectory.resolve()), "trajectory_classification": None,
         # BEGIN independent position-target input and unverified robot handoff.
         "finger_targets_path": str(args.finger_targets.resolve()),
+        "execution_limits_path": str(args.execution_limits.resolve()),
         "robot_feedback_path": None, "barrier_feedback_path": None,
         "evidence_passed": False,
         # END independent position-target input and unverified robot handoff.
@@ -169,6 +170,9 @@ def run(args):
             "tool_transform": tool_transform.tolist(),
             "feedback_id": str(args.feedback.resolve()), "source": feedback["source"]}
         finger_targets = FixedFingerTargets.from_mapping(_read(args.finger_targets))
+        # BEGIN require physical tracking and actual-hand limits explicitly.
+        execution_limits = ExecutionLimits.from_mapping(_read(args.execution_limits))
+        # END require physical tracking and actual-hand limits explicitly.
         # END preserve explicit coordinate identities for the actual handoff.
         recording = (root/manifest["source_recording"]).resolve()
         source_manifest_path = recording/"manifest.json"
@@ -183,6 +187,16 @@ def run(args):
         curve = load_saved_trajectory(args.trajectory, evaluation_mode=args.evaluation_mode)
         metadata = _read(args.trajectory.with_suffix(".json"))
         report["trajectory_classification"] = metadata["classification"]
+        # BEGIN bind accepted execution to the planner's identical hand policy.
+        planned_limits = metadata.get("execution_limits")
+        if planned_limits is None and args.evaluation_mode == "accepted_plan":
+            raise ValueError("An accepted plan must retain its physical execution limits and actual-hand contract")
+        if planned_limits is not None and planned_limits != execution_limits.describe():
+            raise ValueError("Execution limits differ from the exact contract saved with the planned curve")
+        report["planning_execution_limits_match"] = None if planned_limits is None else True
+        report["planning_hand_contract"] = ("unavailable on historical rejected diagnostic; not certified"
+                                            if planned_limits is None else "identical saved planning/execution contract")
+        # END bind accepted execution to the planner's identical hand policy.
         if {event["skill_id"] for event in curve.events} != {args.segment}:
             raise ValueError("The exported candidate must contain only the selected skill instance")
         evidence = _read(args.evaluator_evidence)
@@ -195,7 +209,7 @@ def run(args):
             catalog_path=fixture["catalog_path"], episode_path=fixture["episode_path"],
             frame_index=feedback["entry_frame"], base_link=fixture["base_link"], tcp_site=fixture["tcp_site"],
             arm_joint_names=fixture["arm_joint_names"], finger_joint_names=fixture["finger_joint_names"],
-            arm_kp=arm_config["kp"], arm_kd=arm_config["kd"])
+            arm_kp=arm_config["kp"], arm_kd=arm_config["kd"], velocity_limits=fixture["velocity_limits"])
         current = simulation.proprioception()
         differences = {"q": float(np.max(np.abs(current["q"]-np.asarray(feedback["start_q"])))),
             "dq": float(np.max(np.abs(current["dq"]-np.asarray(feedback["start_dq"])))),
@@ -242,6 +256,7 @@ def run(args):
         report["status"] = "executing"
         execution = simulation.execute(curve, evaluation_mode=args.evaluation_mode,
             finger_targets=finger_targets, initial_feedback=initial_feedback,
+            execution_limits=execution_limits,
             output=output/"execution", step_callback=observe,
             max_physics_steps=args.max_physics_steps,
             start_position_tolerance=args.start_position_tolerance,
@@ -263,6 +278,10 @@ def run(args):
         if execution is None and Path(report["execution_report_path"]).is_file():
             execution = _read(report["execution_report_path"])
             report["execution_tested"] = execution["executed_steps"] > 0
+            # BEGIN expose failed actual feedback as well as completed barriers.
+            report.update(robot_feedback_path=execution.get("robot_feedback_path"),
+                          barrier_feedback_path=execution.get("barrier_feedback_path"))
+            # END expose failed actual feedback as well as completed barriers.
         if evaluator is not None:
             try:
                 assessment = evaluator.finalize(output, execution_report=execution)
@@ -287,7 +306,7 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     # BEGIN require target positions explicitly, without the binary formatter.
-    for name in ("manifest", "robot-fixture", "feedback", "trajectory", "finger-targets", "evaluator-evidence", "output"):
+    for name in ("manifest", "robot-fixture", "feedback", "trajectory", "finger-targets", "execution-limits", "evaluator-evidence", "output"):
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--segment", required=True)
     parser.add_argument("--controller-part", required=True)

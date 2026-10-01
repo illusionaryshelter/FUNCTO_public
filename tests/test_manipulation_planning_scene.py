@@ -120,6 +120,44 @@ def inputs(progress=(.5,), positions=None, sphere_rows=None, dtype=torch.float64
     return balls, p, q, s
 
 
+# BEGIN installation exclusions are local native robot-pair policy, not scene clearing.
+class FixedInstallationPolicyTest(unittest.TestCase):
+    def mount(self, **changes):
+        options = dict(owner_id="mount", query=SphereQuery(("mount",), center=(0., 0., 0.), radius=.5),
+                       pose_path=pose_path(), source="native fixed installation", geometry_complete=True,
+                       robot_excluded_spheres=(0,), robot_exclusion_source="native welded body policy",
+                       robot_exclusion_geometry_source="synthetic_robot")
+        options.update(changes)
+        return CollisionOwner(**options)
+
+    def test_exclusion_preserves_other_robot_links_payload_background_and_unknown(self):
+        mount = self.mount()
+        payload = CollisionOwner("payload", SphereQuery(("payload",)), pose_path(), "current payload",
+                                 geometry_complete=True, moving=True, local_spheres=[[0., 0., 0., .1]])
+        current = scene((mount, payload), materials=(None, None),
+                        background=SphereQuery(("background",), center=(0., 0., 0.), radius=.25))
+        arguments = inputs(sphere_rows=[[[0., 0., 0., .1], [0., 0., 0., .1]]])
+        terms = current.components(*arguments)
+        self.assertAlmostEqual(terms["collision/robot/mount"].item(), .6)
+        self.assertAlmostEqual(terms["collision/payload/mount"].item(), .6)
+        self.assertAlmostEqual(terms["collision/robot/background"].item(), .7)
+        self.assertIn("unknown/space/robot", terms)
+        self.assertIn("unknown/space/payload", terms)
+        self.assertNotIn("unknown/space/mount", terms)
+        torch.testing.assert_close(mount.query.calls[("robot", "mount")][..., 3], arguments[0][..., 3])
+
+    def test_partial_moving_or_stale_installation_cannot_inherit_exclusion(self):
+        for change in ({"geometry_complete": False}, {"moving": True},
+                       {"pose_path": pose_path(end=(0., 0., .1))}, {"robot_excluded_spheres": (0, 0)}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.mount(**change)
+        with self.assertRaisesRegex(ValueError, "complete robot sphere model"):
+            scene((self.mount(robot_exclusion_geometry_source="another robot"),))
+        with self.assertRaisesRegex(ValueError, "complete robot sphere model"):
+            scene((self.mount(robot_excluded_spheres=(1,)),))
+# END mounting geometry remains an obstacle rather than becoming observed free volume.
+
+
 def contact_rule(**changes):
     value = ContactRule(
         rule_id="pad_to_surface", actor="robot", target_owner="surface",
