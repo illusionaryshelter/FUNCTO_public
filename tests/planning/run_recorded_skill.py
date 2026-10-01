@@ -153,6 +153,14 @@ def run(args):
         if problem.reference_frame != "world":
             raise ValueError("Recorded world camera calibration requires a world-frame planning problem")
         robot = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
+        # BEGIN verify the physical policy and separation certificates before GPU use.
+        # The fixture distinguishes native exclusions from queries completed
+        # by an all-configuration geometry proof. Recompute that contract on
+        # load; an edited ignore list is not a valid certificate.
+        from robot_fixture import validate_fixture_collision_contract
+        report["robot_collision_contract"] = validate_fixture_collision_contract(fixture, robot)
+        report["robot_collision_contract_validated"] = True
+        # END verify the physical policy and separation certificates before GPU use.
         sphere_count = sum(len(rows) for rows in robot["robot_cfg"]["kinematics"]["collision_spheres"].values())
         if not 1 <= sphere_count <= 512 or sphere_count != len(fixture["sphere_materials"]):
             raise ValueError("Actual native robot geometry/materials must agree within the 512-sphere local budget")

@@ -17,6 +17,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 import h5py
+from mpmath.ctx_iv import MPIntervalContext
 import mujoco
 import numpy as np
 from scipy.cluster.vq import kmeans2
@@ -42,6 +43,19 @@ def _pose(position, quaternion):
 def _pose_dict(transform):
     return {"position": transform[:3, 3].tolist(), "quaternion_wxyz":
             Rotation.from_matrix(transform[:3, :3]).as_quat()[[3, 0, 1, 2]].tolist()}
+
+
+# BEGIN preserve native geom quaternion scale in complete-volume covers.
+def _native_geom_pose(model, geom_id):
+    """Use MuJoCo's actual homogeneous geom matrix, not SciPy normalization."""
+    position, quaternion = model.geom_pos[geom_id], model.geom_quat[geom_id]
+    if not np.isfinite(position).all() or not np.isfinite(quaternion).all():
+        raise ValueError("Native collision geom poses must be finite")
+    result, rotation = np.eye(4), np.empty(9)
+    mujoco.mju_quat2Mat(rotation, quaternion)
+    result[:3, :3], result[:3, 3] = rotation.reshape(3, 3), position
+    return result
+# END preserve native geom quaternion scale in complete-volume covers.
 
 
 def _cover_cells(vertices, *, count=None, box_halfsize=None, subdivisions=None):
@@ -83,8 +97,12 @@ def _cover_cells(vertices, *, count=None, box_halfsize=None, subdivisions=None):
 
 def _geom_cover(model, geom_id, specification, destination):
     geometry = _collision_geometry(model, geom_id, "native_collision_proxy")
-    local = _pose(model.geom_pos[geom_id], model.geom_quat[geom_id])
+    # BEGIN preserve the native geom transform and reproducible partition input.
+    local = _native_geom_pose(model, geom_id)
     is_box = model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_BOX
+    if set(specification) != ({"subdivisions"} if is_box else {"cells"}):
+        raise ValueError("Each supported native geom needs exactly its existing partition input")
+    # END preserve the native geom transform and reproducible partition input.
     cells, sites = _cover_cells(geometry["vertices"],
         count=specification.get("cells"),
         box_halfsize=model.geom_size[geom_id] if is_box else None,
@@ -104,9 +122,13 @@ def _geom_cover(model, geom_id, specification, destination):
         margins.append(radius - distances.max())
     centers = np.asarray([sphere["center"] for sphere in spheres])
     radii = np.asarray([sphere["radius"] for sphere in spheres])
-    geom_centers = (centers - local[:3, 3]) @ local[:3, :3]
     planes = geometry["halfspaces"]
-    excess = geom_centers @ planes[:, :3].T + planes[:, 3] + radii[:, None]
+    # BEGIN evaluate metric body-space support planes under the native matrix.
+    normals_body = np.linalg.solve(local[:3, :3].T, planes[:, :3].T).T
+    normal_lengths = np.linalg.norm(normals_body, axis=1)
+    offsets_body = planes[:, 3]-normals_body @ local[:3, 3]
+    excess = (centers @ normals_body.T + offsets_body) / normal_lengths + radii[:, None]
+    # END evaluate metric body-space support planes under the native matrix.
     np.savez_compressed(destination, native_vertices=geometry["vertices"],
                         native_faces=geometry["faces"], native_halfspaces=planes,
                         T_body_geom=local, cell_vertices_body=np.asarray(proof_vertices),
@@ -116,6 +138,9 @@ def _geom_cover(model, geom_id, specification, destination):
     record = {"geom": model.geom(geom_id).name, "link": model.body(model.geom_bodyid[geom_id]).name,
               "representation": geometry["collision_representation"], "T_body_geom": local.tolist(),
               "certificate_path": str(destination), "sphere_count": len(spheres),
+              # BEGIN record the exact current partition input for independent reload.
+              "cover_specification": specification,
+              # END record the exact current partition input for independent reload.
               "minimum_cell_enclosure_margin_m": float(min(margins)),
               "maximum_support_plane_excess_m": float(excess.max()),
               "source_contype": int(model.geom_contype[geom_id]),
@@ -151,6 +176,437 @@ def _native_ignored_pairs(model, collision_links):
     return result
 
 
+# BEGIN native solid separation certificates, independent of sphere fitting.
+def _interval_bounds(value):
+    """Serialize an interval without rounding either endpoint inward.
+
+    mpmath owns all interval arithmetic. The single nextafter at this output
+    boundary only encloses conversion of each arbitrary-precision endpoint
+    to the binary64 number which JSON can round-trip exactly.
+    """
+    bounds = [float(np.nextafter(float(value.a), -np.inf)),
+              float(np.nextafter(float(value.b), np.inf))]
+    if not np.isfinite(bounds).all():
+        raise ValueError("A finite collision certificate cannot contain infinite bounds")
+    return bounds
+
+
+def _interval_rotation(context, quaternion, *, normalize):
+    """Enclose the native body/geom quaternion conventions using iv.
+
+    Compiled floating values are the inputs, not decimal reconstructions.
+    Native body FK normalizes its accumulated quaternion. Native geom FK does
+    NOT normalize the geom quaternion again: its homogeneous quadratic matrix
+    retains the compiled norm residual. Applying normalization to a geom here
+    would silently change its support points at large geometry scales.
+    C(q_body_unit*q_geom) = R_body*C(q_geom), so the native geom matrix can be
+    projected locally without assuming that it is an exact unit rotation.
+    """
+    values = np.asarray(quaternion, dtype=float)
+    if values.shape != (4,) or not np.isfinite(values).all():
+        raise ValueError("Compiled collision quaternions must be finite four-vectors")
+    q = [context.mpf(float(value)) for value in values]
+    norm = context.sqrt(sum(value * value for value in q))
+    if not (norm.a > 0 and abs(norm - 1).b <= 64 * np.finfo(float).eps):
+        raise ValueError("Compiled collision quaternions must be normalized")
+    w, x, y, z = [value / norm for value in q] if normalize else q
+    return [[w*w+x*x-y*y-z*z, 2*(x*y-z*w), 2*(x*z+y*w)],
+            [2*(x*y+z*w), w*w-x*x+y*y-z*z, 2*(y*z-x*w)],
+            [2*(x*z-y*w), 2*(y*z+x*w), w*w-x*x-y*y+z*z]]
+
+
+def _hinge_separation_certificate(model, parent, child):
+    """Prove separation of complete native solids for every hinge angle.
+
+    Each mesh is its original native convex hull; a linear projection of that
+    hull is bounded by projections of ALL compiled vertices, including a
+    nonconvex authored mesh's vertices. Boxes use their existing eight-corner
+    geometry. Hinge rotation preserves axial projections, so this argument
+    contains no angle samples and is unaffected by ancestor/descendant motion.
+    This exporter still only admits an origin-centred, single scalar joint.
+    Unknown geometry or an unproved separation leaves the query enabled.
+    """
+    if model.body_parentid[child] != parent or model.body_jntnum[child] != 1:
+        return None
+    joint = int(model.body_jntadr[child])
+    if (model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_HINGE
+            or np.any(model.jnt_pos[joint] != 0)):
+        return None
+    ids = [np.flatnonzero((model.geom_bodyid == body)
+                         & ((model.geom_contype != 0) | (model.geom_conaffinity != 0)))
+           for body in (parent, child)]
+    if any(not len(group) for group in ids):
+        return None
+    enabled = [(int(a), int(b)) for a in ids[0] for b in ids[1]
+               if (model.geom_contype[a] & model.geom_conaffinity[b])
+               or (model.geom_contype[b] & model.geom_conaffinity[a])]
+    if not enabled:
+        return None
+    if any(model.geom_type[index] not in (mujoco.mjtGeom.mjGEOM_BOX,
+                                          mujoco.mjtGeom.mjGEOM_MESH)
+           for group in ids for index in group):
+        return None
+    context = MPIntervalContext()
+    context.prec = 113
+    dot = lambda left, right: sum(a*b for a, b in zip(left, right))
+    inputs = [model.body_pos[child], model.jnt_axis[joint], model.jnt_range[joint],
+              model.geom_margin[np.concatenate(ids)], model.geom_gap[np.concatenate(ids)],
+              np.asarray([model.opt.o_margin, model.opt.ccd_tolerance])]
+    if any(not np.isfinite(value).all() for value in inputs) or model.opt.ccd_tolerance < 0:
+        raise ValueError("Native certificate geometry, margins and tolerance must be finite")
+    axis = [context.mpf(float(value)) for value in model.jnt_axis[joint]]
+    norm = context.sqrt(dot(axis, axis))
+    if not (norm.a > 0 and abs(norm-1).b <= 64*np.finfo(float).eps):
+        raise ValueError("Compiled hinge axis must be normalized")
+    axis = [value/norm for value in axis]
+    parent_rotation = _interval_rotation(context, model.body_quat[child], normalize=True)
+    parent_axis = [dot(row, axis) for row in parent_rotation]
+    parent_offset = dot(parent_axis, [context.mpf(float(value))
+                                      for value in model.body_pos[child]])
+    records, intervals = [], []
+    for group, body_axis, offset in zip(ids, (parent_axis, axis), (parent_offset, context.mpf(0))):
+        body_intervals = []
+        for index in group:
+            index = int(index)
+            geometry = _collision_geometry(model, index, "native_self_separation")
+            vertices = geometry["vertices"]
+            position = np.asarray(model.geom_pos[index])
+            if not np.isfinite(vertices).all() or not np.isfinite(position).all():
+                raise ValueError("Every enabled native collision vertex and pose must be finite")
+            rotation = _interval_rotation(context, model.geom_quat[index], normalize=False)
+            # Pull the common joint-axis linear functional into geom-local
+            # coordinates. Only this affine projection is applied to vertices;
+            # compiled mesh scaling/recentering must never be applied twice.
+            coefficients = [dot(body_axis, column) for column in zip(*rotation)]
+            translation = dot(body_axis, [context.mpf(float(value)) for value in position])-offset
+            projections = [dot(coefficients, [context.mpf(float(value)) for value in vertex])
+                           + translation for vertex in vertices]
+            bounds = _interval_bounds(context.mpf([min(value.a for value in projections),
+                                                    max(value.b for value in projections)]))
+            body_intervals.append(bounds)
+            records.append({"geom": model.geom(index).name,
+                            "body": model.body(model.geom_bodyid[index]).name,
+                            "representation": geometry["collision_representation"],
+                            "vertex_count": len(vertices),
+                            "geom_position": position.tolist(),
+                            "geom_quaternion_wxyz": model.geom_quat[index].tolist(),
+                            "contype": int(model.geom_contype[index]),
+                            "conaffinity": int(model.geom_conaffinity[index]),
+                            "margin_m": float(model.geom_margin[index]),
+                            "gap_m": float(model.geom_gap[index]),
+                            "axis_projection_interval_m": bounds})
+        intervals.append([min(row[0] for row in body_intervals),
+                          max(row[1] for row in body_intervals)])
+    separations = [context.mpf(intervals[1][0])-context.mpf(intervals[0][1]),
+                   context.mpf(intervals[0][0])-context.mpf(intervals[1][1])]
+    direction = max(range(2), key=lambda index: separations[index].a)
+    separation = separations[direction]
+    override = bool(model.opt.enableflags & int(mujoco.mjtEnableBit.mjENBL_OVERRIDE))
+    required = context.mpf(0)
+    pair_parameters = []
+    for first, second in enabled:
+        margin = float(model.opt.o_margin if override else
+                       max(model.geom_margin[first], model.geom_margin[second]))
+        gap = float(max(model.geom_gap[first], model.geom_gap[second]))
+        include = context.mpf(margin)-context.mpf(gap)
+        # Search contacts at margin, not just margin-gap. Recording both also
+        # handles a negative gap conservatively instead of hiding its effect.
+        required = max((required, context.mpf(margin), include), key=lambda value: value.b)
+        pair_parameters.append({"geoms": [model.geom(first).name, model.geom(second).name],
+                                "effective_margin_m": margin, "effective_gap_m": gap,
+                                "include_margin_interval_m": _interval_bounds(include)})
+    required += context.mpf(float(model.opt.ccd_tolerance))
+    if not separation.a > required.b:
+        return None
+    return {"kind": "direct_hinge_complete_solid_axial_separation",
+            "joint": model.joint(joint).name,
+            "parent_body": model.body(parent).name, "child_body": model.body(child).name,
+            "joint_axis_child": model.jnt_axis[joint].tolist(),
+            "joint_pivot_child": model.jnt_pos[joint].tolist(),
+            "child_position_parent": model.body_pos[child].tolist(),
+            "child_quaternion_parent_wxyz": model.body_quat[child].tolist(),
+            "native_joint_range": model.jnt_range[joint].tolist(),
+            "domain": "all real hinge angles; other joints and common rigid motion unrestricted",
+            "all_enabled_geometries": records, "native_geom_pair_parameters": pair_parameters,
+            "body_axis_projection_intervals_m": intervals,
+            "separation_direction": "child_above_parent" if direction == 0 else "parent_above_child",
+            "separation_lower_bound_m": _interval_bounds(separation)[0],
+            "required_distance_upper_bound_m": _interval_bounds(required)[1],
+            "certified_slack_lower_bound_m": _interval_bounds(separation-required)[0],
+            "margin_override_enabled": override, "option_o_margin_m": float(model.opt.o_margin),
+            "native_ccd_tolerance_m": float(model.opt.ccd_tolerance),
+            "arithmetic": "local mpmath.iv, 113 bits; compiled binary inputs; outward binary64 endpoints",
+            "native_pair_remains_enabled": True,
+            "scope": "this native self pair only; no environment, object or other-link query removed"}
+
+
+def _collision_query_contract(model, kinematics):
+    """Separate native policy from queries completed by an entity certificate."""
+    if (model.npair or model.nexclude or model.neq or model.ntendon or model.nflex or model.nplugin
+            or mujoco.get_mjcb_contactfilter() is not None):
+        raise ValueError("Collision certificates require the exporter's explicit native policy without extensions")
+    links = kinematics["collision_link_names"]
+    spheres = kinematics["collision_spheres"]
+    if len(links) != len(set(links)) or set(links) != set(spheres):
+        raise ValueError("Collision links and sphere geometry must be complete and unique")
+    native = _native_ignored_pairs(model, links)
+    completed, queries, original_count = [], [], 0
+    for index, first in enumerate(links):
+        for second in links[index+1:]:
+            if second in native.get(first, []) or first in native.get(second, []):
+                continue
+            original_count += len(spheres[first])*len(spheres[second])
+            a, b = model.body(first).id, model.body(second).id
+            parent, child = (a, b) if model.body_parentid[b] == a else (b, a)
+            # Current explicit interface has zero sphere/self buffers. A
+            # nonzero or unmodelled clearance must retain all native queries;
+            # geometric approximation excess itself is not such a clearance.
+            clearances = [kinematics["collision_sphere_buffer"],
+                          kinematics["self_collision_buffer"][first],
+                          kinematics["self_collision_buffer"][second]]
+            if not np.isfinite(clearances).all():
+                raise ValueError("Collision buffers must be finite explicit values")
+            certificate = (_hinge_separation_certificate(model, parent, child)
+                           if all(value == 0 for value in clearances) else None)
+            if certificate is None:
+                queries.append([first, second])
+            else:
+                completed.append({"links": [first, second], **certificate})
+    return {"native_policy_exclusions": native,
+            "native_enabled_sphere_pair_count": original_count,
+            "certificate_completed_pairs": completed, "effective_query_pairs": queries,
+            "effective_query_sphere_pair_count": sum(len(spheres[a])*len(spheres[b]) for a, b in queries)}
+
+
+def _effective_ignored_pairs(contract):
+    result = {name: list(others) for name, others in contract["native_policy_exclusions"].items()}
+    for certificate in contract["certificate_completed_pairs"]:
+        first, second = certificate["links"]
+        result.setdefault(first, []).append(second)
+    return result
+
+
+def _source_collision_names(scene, visual_root):
+    """Require the existing expanded-source contract before using any proof."""
+    if scene.find("default") is not None:
+        raise ValueError("Provide expanded native XML without unresolved collision defaults")
+    if any(scene.find(tag) is not None and len(scene.find(tag))
+           for tag in ("contact", "equality", "tendon")):
+        raise ValueError("Explicit contact/equality/tendon rules require a matching exporter")
+    source_root = next((node for node in scene.iter("body") if node.get("name") == visual_root), None)
+    if source_root is None:
+        raise ValueError("The explicit arm/hand collision and visual root is absent")
+    return {node.get("name") for node in source_root.iter("geom")
+            if int(node.get("contype", "1")) or int(node.get("conaffinity", "1"))}
+
+
+# BEGIN bind the actual planner FK and all padding to the certified native model.
+def _validate_fixture_kinematics(fixture, kinematics, models):
+    """Bind the consumed URDF's entire tree, not just the certified hinge.
+
+    The current exporter has one explicit configuration shape. Extra loader
+    fields can replace fixed transforms, add links or change joint offsets;
+    accepting them would let the GPU move spheres using unproved kinematics.
+    Feedback-dependent lock/default positions remain free because the proof
+    covers every angle. All buffers remain the exporter's explicit zero.
+    """
+    fields = {"format_version", "urdf_path", "asset_root_path", "base_link", "tool_frames",
+              "use_global_cumul", "collision_link_names", "mesh_link_names", "collision_spheres",
+              "collision_sphere_buffer", "self_collision_buffer", "self_collision_ignore",
+              "lock_joints", "cspace"}
+    cspace_fields = {"joint_names", "default_joint_position", "cspace_distance_weight",
+                     "null_space_weight", "max_acceleration", "max_jerk"}
+    if set(kinematics) != fields or set(kinematics["cspace"]) != cspace_fields:
+        raise ValueError("Fixture kinematics must use only the explicit exporter fields")
+    path = Path(kinematics["urdf_path"])
+    if (not path.is_absolute() or path != Path(fixture["urdf_path"])
+            or Path(kinematics["asset_root_path"]) != path.parent
+            or kinematics["format_version"] != 2.0
+            or kinematics["base_link"] != fixture["base_link"]
+            or kinematics["tool_frames"] != [fixture["tcp_site"]]
+            or fixture["tool_link"] != fixture["tcp_site"]
+            or kinematics["mesh_link_names"] != kinematics["collision_link_names"]
+            or kinematics["use_global_cumul"] is not True):
+        raise ValueError("Fixture planner paths, base, tools or representation changed")
+    buffers = kinematics["self_collision_buffer"]
+    if (not isinstance(buffers, dict) or set(buffers) != set(kinematics["collision_link_names"])
+            or kinematics["collision_sphere_buffer"] != 0
+            or any(value != 0 for value in buffers.values())):
+        raise ValueError("Every global and per-link collision buffer must remain explicitly zero")
+    joint_names = fixture["joint_names"]
+    if (kinematics["cspace"]["joint_names"] != joint_names
+            or len(joint_names) != len(set(joint_names))
+            or not set(kinematics["lock_joints"]).issubset(joint_names)):
+        raise ValueError("Fixture configuration-space joints no longer match the native binding")
+    actual = URDF.load(path, load_meshes=False)
+    actual_links = [link.name for link in actual.robot.links]
+    actual_joints = [joint.name for joint in actual.robot.joints]
+    if len(actual_links) != len(set(actual_links)) or len(actual_joints) != len(set(actual_joints)):
+        raise ValueError("Fixture URDF links and joints must be unique")
+
+    def require_joint(name, parent, child, kind, position, quaternion, axis=None, limits=None):
+        joint = actual.joint_map.get(name)
+        pose = _pose(position, quaternion)
+        # yourdfpy writes xyz/RPY with Python's exact float round-trip and
+        # reloads them with these same mature trimesh transformations. Compare
+        # that canonical serialized matrix exactly, not a loose FK tolerance.
+        serialized_pose = trimesh.transformations.compose_matrix(
+            translate=trimesh.transformations.translation_from_matrix(pose),
+            angles=trimesh.transformations.euler_from_matrix(pose))
+        if (joint is None or (joint.parent, joint.child, joint.type) != (parent, child, kind)
+                or joint.mimic is not None or not np.array_equal(joint.origin, serialized_pose)
+                or (axis is not None and not np.array_equal(joint.axis, axis))
+                or (limits is not None and (joint.limit is None or
+                    not np.array_equal([joint.limit.lower, joint.limit.upper], limits)))):
+            raise ValueError(f"Actual planner URDF joint differs from original native FK: {name}")
+
+    for model in models:
+        root = model.body(fixture["base_link"]).id
+        if model.body_parentid[root] != 0 or model.body_jntnum[root]:
+            raise ValueError("Fixture native base must remain a fixed direct world child")
+        bodies = {root}
+        for body in range(root+1, model.nbody):
+            if model.body_parentid[body] in bodies:
+                bodies.add(body)
+        expected_links = {model.body(body).name for body in bodies} | {fixture["tcp_site"]}
+        if set(actual_links) != expected_links:
+            raise ValueError("Actual planner URDF does not contain the complete native base subtree")
+        expected_joints, native_joints = set(), set()
+        for body in sorted(bodies-{root}):
+            name = model.body(body).name
+            count = model.body_jntnum[body]
+            if count > 1:
+                raise ValueError("Fixture FK requires at most one native scalar joint per body")
+            joint_name, kind, axis, limits = f"{name}_fixed", "fixed", None, None
+            if count:
+                index = int(model.body_jntadr[body])
+                if (model.jnt_type[index] not in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)
+                        or np.any(model.jnt_pos[index] != 0) or not model.jnt_limited[index]
+                        or model.qpos0[model.jnt_qposadr[index]] != 0):
+                    # This URDF has no joint offset. A native nonzero ref
+                    # changes q into q-ref even though the static pose agrees.
+                    raise ValueError("Fixture FK requires origin-centred bounded scalar joints with zero ref")
+                joint_name = model.joint(index).name
+                native_joints.add(joint_name)
+                kind = "revolute" if model.jnt_type[index] == mujoco.mjtJoint.mjJNT_HINGE else "prismatic"
+                axis, limits = model.jnt_axis[index], model.jnt_range[index]
+            expected_joints.add(joint_name)
+            require_joint(joint_name, model.body(model.body_parentid[body]).name, name, kind,
+                          model.body_pos[body], model.body_quat[body], axis, limits)
+        site = model.site(fixture["tcp_site"]).id
+        if model.site_bodyid[site] not in bodies:
+            raise ValueError("Fixture TCP must remain attached to its native base subtree")
+        tcp_joint = f"{fixture['tcp_site']}_fixed"
+        expected_joints.add(tcp_joint)
+        require_joint(tcp_joint, model.body(model.site_bodyid[site]).name, fixture["tcp_site"], "fixed",
+                      model.site_pos[site], model.site_quat[site])
+        if set(actual_joints) != expected_joints or set(joint_names) != native_joints:
+            raise ValueError("Actual planner URDF joint inventory differs from original native FK")
+# END bind the actual planner FK and all padding to the certified native model.
+
+
+def validate_fixture_collision_contract(fixture, robot_config):
+    """Reload source geometry and re-prove every completed self query on CPU.
+
+    A saved list of ignored names is never sufficient evidence. Every native
+    enabled geometry is matched to its original cover input, the serialized
+    spheres are matched to the enclosing-cell evidence, and the query contract
+    is recomputed from BOTH the original source and exported robot model.
+    Pose feedback/default joint positions are deliberately not certificate
+    inputs: this certificate is valid throughout its stated hinge domain.
+    """
+    records = fixture["collision_geometries"]
+    names = [row["geom"] for row in records]
+    scene = ET.parse(fixture["source_scene_xml"]).getroot()
+    enabled = _source_collision_names(scene, fixture["robot_visual_root"])
+    if len(names) != len(set(names)) or set(names) != enabled:
+        raise ValueError("Fixture certificates must include every original enabled collision geometry")
+    kinematics = robot_config["robot_cfg"]["kinematics"]
+    links = kinematics["collision_link_names"]
+    if set(links) != {row["link"] for row in records}:
+        raise ValueError("Fixture collision-link ownership does not match all native geometries")
+    robot = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
+    source = mujoco.MjModel.from_xml_path(fixture["source_scene_xml"])
+    # BEGIN require the exact FK tree actually consumed with these spheres.
+    _validate_fixture_kinematics(fixture, kinematics, (robot, source))
+    # END require the exact FK tree actually consumed with these spheres.
+    offsets = {name: 0 for name in links}
+    minimum_allowance = np.inf
+    for row in records:
+        with np.load(row["certificate_path"], allow_pickle=False) as saved:
+            for model in (robot, source):
+                index = model.geom(row["geom"]).id
+                native = _collision_geometry(model, index, "native_certificate_revalidation")
+                expected_pose = _native_geom_pose(model, index)
+                if (model.body(model.geom_bodyid[index]).name != row["link"]
+                        or row["representation"] != native["collision_representation"]
+                        or not np.array_equal(saved["native_vertices"], native["vertices"])
+                        or not np.array_equal(saved["T_body_geom"], expected_pose)
+                        or row["source_contype"] != model.geom_contype[index]
+                        or row["source_conaffinity"] != model.geom_conaffinity[index]):
+                    raise ValueError(f"Native geometry or pose changed for {row['geom']}")
+            centers, radii = saved["sphere_centers_body"], saved["sphere_radii"]
+            count = len(radii)
+            vertex_offsets = saved["cell_vertex_offsets"]
+            vertices = saved["cell_vertices_body"]
+            if (centers.shape != (count, 3) or count != row["sphere_count"] or count < 1
+                    or vertex_offsets.shape != (count+1,) or vertex_offsets[0] != 0
+                    or vertex_offsets[-1] != len(vertices) or np.any(np.diff(vertex_offsets) < 4)
+                    or vertices.ndim != 2 or vertices.shape[1] != 3
+                    or not all(np.isfinite(value).all() for value in (centers, radii, vertices))
+                    or np.any(radii <= 0)):
+                raise ValueError("Invalid complete-cell sphere-cover evidence")
+            # Rebuild the complete partition from the ORIGINAL convex solid,
+            # not from a saved subset of cell vertices. Matching only native
+            # vertices plus arbitrary enclosed points would permit holes.
+            specification = row["cover_specification"]
+            is_box = source.geom_type[index] == mujoco.mjtGeom.mjGEOM_BOX
+            cells, sites = _cover_cells(native["vertices"], count=specification.get("cells"),
+                box_halfsize=source.geom_size[index] if is_box else None,
+                subdivisions=specification.get("subdivisions"))
+            rebuilt = [cell @ expected_pose[:3, :3].T+expected_pose[:3, 3] for cell in cells]
+            rebuilt_offsets = np.cumsum([0]+[len(cell) for cell in rebuilt])
+            if (not np.array_equal(vertex_offsets, rebuilt_offsets)
+                    or not np.array_equal(vertices, np.concatenate(rebuilt))
+                    or not np.array_equal(saved["partition_sites_geom"],
+                                          np.empty((0, 3)) if sites is None else sites)):
+                raise ValueError("Saved sphere cells do not match a complete native-solid partition")
+            start = offsets[row["link"]]
+            balls = kinematics["collision_spheres"][row["link"]][start:start+count]
+            if (len(balls) != count
+                    or not np.array_equal([ball["center"] for ball in balls], centers)
+                    or not np.array_equal([ball["radius"] for ball in balls], radii)):
+                raise ValueError(f"Serialized spheres differ from their cover evidence: {row['geom']}")
+            for index in range(count):
+                cell = vertices[vertex_offsets[index]:vertex_offsets[index+1]]
+                allowance = radii[index]-np.linalg.norm(cell-centers[index], axis=1).max()
+                if allowance < 1e-6:
+                    raise ValueError("A serialized sphere lost its required complete-cell enclosure allowance")
+                minimum_allowance = min(minimum_allowance, allowance)
+            offsets[row["link"]] += count
+    if (any(offsets[name] != len(kinematics["collision_spheres"][name]) for name in links)
+            or sum(offsets.values()) != fixture["sphere_count"]
+            or not 1 <= fixture["sphere_count"] <= 480):
+        raise ValueError("Fixture sphere count or complete collision ownership changed")
+    expected = _collision_query_contract(robot, kinematics)
+    source_expected = _collision_query_contract(source, kinematics)
+    if source_expected != expected:
+        raise ValueError("Exported collision certificate no longer matches its original native source")
+    if any(fixture[key] != value for key, value in expected.items()):
+        raise ValueError("Saved collision policy/certificate/effective queries failed fresh validation")
+    if kinematics["self_collision_ignore"] != _effective_ignored_pairs(expected):
+        raise ValueError("Effective self-collision exclusions differ from native policy plus valid certificates")
+    return {"sphere_count": fixture["sphere_count"],
+            "complete_native_geometry_count": len(records),
+            "native_enabled_sphere_pair_count": expected["native_enabled_sphere_pair_count"],
+            "certificate_completed_pairs": [row["links"] for row in expected["certificate_completed_pairs"]],
+            "effective_query_sphere_pair_count": expected["effective_query_sphere_pair_count"],
+            "minimum_cell_enclosure_allowance_m": float(minimum_allowance),
+            "source_and_robot_certificate_equal": True,
+            "scope": "CPU static geometry and self-query contract; no feedback-pose, scene or trajectory claim"}
+# END native solid separation certificates, independent of sphere fitting.
+
+
 def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_root, tcp_site,
                    arm_joint_names, finger_joint_names, velocity_limits, effort_limits,
                    cover_specifications, initial_frame, output, binding_audit_path,
@@ -164,19 +620,15 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_
     scene_path, catalog_path, episode_path = [Path(value).resolve() for value in
                                             (scene_path, catalog_path, episode_path)]
     output = Path(output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    # BEGIN preserve prior fixtures; each export owns a fresh artifact directory.
+    output.mkdir(parents=True, exist_ok=False)
+    # END preserve prior fixtures; each export owns a fresh artifact directory.
     scene = ET.parse(scene_path).getroot()
-    if scene.find("default") is not None:
-        raise ValueError("Provide expanded native XML without unresolved collision defaults")
-    source_visual_root = next((node for node in scene.iter("body") if node.get("name") == visual_root), None)
-    if source_visual_root is None:
-        raise ValueError("The explicit arm/hand collision and visual root is absent")
-    enabled_geoms = {node.get("name") for node in source_visual_root.iter("geom")
-                     if int(node.get("contype", "1")) or int(node.get("conaffinity", "1"))}
+    # BEGIN share the same complete-source gate with reload validation.
+    enabled_geoms = _source_collision_names(scene, visual_root)
     if enabled_geoms != set(cover_specifications):
         raise ValueError("Cover specification must include every native enabled geom of the explicit arm/hand root")
-    if any(scene.find(tag) is not None and len(scene.find(tag)) for tag in ("contact", "equality", "tendon")):
-        raise ValueError("Explicit contact/equality/tendon rules require a matching exporter")
+    # END share the same complete-source gate with reload validation.
     names = list(arm_joint_names) + list(finger_joint_names)
     if len(set(names)) != len(names) or set(velocity_limits) != set(names) or set(effort_limits) != set(names):
         raise ValueError("Native scalar joints need unique names and explicit velocity/effort limits")
@@ -246,6 +698,10 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_
             native = model.joint(joint_id).name
             if np.any(model.jnt_pos[joint_id] != 0) or model.jnt_type[joint_id] not in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
                 raise ValueError("Only origin-centred scalar hinge/slide joints are supported")
+            # BEGIN reject a native offset absent from the explicit URDF contract.
+            if model.qpos0[model.jnt_qposadr[joint_id]] != 0:
+                raise ValueError("Exported scalar joints require zero native ref")
+            # END reject a native offset absent from the explicit URDF contract.
             if not model.jnt_limited[joint_id] or min(velocity_limits[native], effort_limits[native]) <= 0:
                 raise ValueError("Exported scalar joints require finite explicit native limits")
             joint.name, joint.type = native, "revolute" if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_HINGE else "prismatic"
@@ -301,6 +757,10 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_
         "cspace": {"joint_names": names, "default_joint_position": q0.tolist(),
                    "cspace_distance_weight": [1.] * len(names), "null_space_weight": [1.] * len(names),
                    "max_acceleration": float(max_acceleration), "max_jerk": float(max_jerk)}}}}
+    # BEGIN replace only the queries completed by a native-entity certificate.
+    collision_contract = _collision_query_contract(model, config["robot_cfg"]["kinematics"])
+    config["robot_cfg"]["kinematics"]["self_collision_ignore"] = _effective_ignored_pairs(collision_contract)
+    # END replace only the queries completed by a native-entity certificate.
     config_path = output / "robot.yml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     finger_roots = {int(model.jnt_bodyid[model.joint(name).id]) for name in finger_joint_names}
@@ -336,7 +796,14 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, visual_
         "coverage_limit": "Conservative collision proxies, not RGB-D occupied-solid evidence; support-plane excess is not a Euclidean Hausdorff bound",
         "fk_audit": {"recorded_frames": frames.tolist(), "hypothetical_probes": len(probes),
                      "maximum_translation_error_m": max_position, "maximum_rotation_error_rad": max_rotation,
-                     "consumer": "yourdfpy reloaded serialized URDF; cuRobo native FK is a separate runner check"}}
+                    "consumer": "yourdfpy reloaded serialized URDF; cuRobo native FK is a separate runner check"}}
+    # BEGIN persist native policy, certified queries and effective queries separately.
+    manifest.update(collision_contract)
+    # Validate deserialized primitive values and the written YAML/NPZ before
+    # publishing a usable manifest. This does not trust the generating model.
+    manifest["collision_contract_validation"] = validate_fixture_collision_contract(
+        json.loads(json.dumps(manifest, allow_nan=False)), yaml.safe_load(config_path.read_text()))
+    # END persist native policy, certified queries and effective queries separately.
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     return manifest
 
