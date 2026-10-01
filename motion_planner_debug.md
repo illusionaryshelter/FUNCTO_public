@@ -92,6 +92,8 @@ Pinocchio 的 Python distribution 是 `pin`，导入名是 `pinocchio`。当前�
 
 独立执行验收的范围仅为机器人及已知固定安装实体。required 对必须明确分离；边界数值与穿透均不获得隐式接触许可。excluded 对仍保存原始距离与来源；球代理分离证书不转换成原生实体对的永久排除。未来实际两指不被冻结为当前反馈或命令值，故该门槛不宣称完整未来碰撞路径已获独立证明。
 
+机器人模型通过 `mechanical_contact_pairs` 显式声明合法机械接触，独立实体查询将这些精确 geom 对标为 `mechanical_contact`，保留距离和实际接触证据。物理接触启用与接触是否违法是不同语义；MuJoCo 仍处理允许对的软接触，完整关节域、FK 和实际速度守卫保持生效。规划与执行消费同一模型声明；只有两 link 间全部原生启用 geom 对均被许可时，fixture 才能精确映射为 cuRobo 的 link-ignore，否则拒绝扩大许可。声明不依赖技能、控制指令或历史失败距离。
+
 具体库能力、环境可用性与实现验收记录在[实施目录](../sim-version-plans/2026-10-01-functo-long-task/engineering-backend-implementation/implementation-result.md)。独立检查必须保留所有查询对及其启用/排除来源，不能将有限构型比较外推为全域证明。
 
 ## 5. 执行反馈和事件推进
@@ -103,6 +105,8 @@ Pinocchio 的 Python distribution 是 `pin`，导入名是 `pinocchio`。当前�
 事件到期仍须满足实际执行条件。当前执行守卫在每个原生步骤前后检查具名 q/dq、原生限位、速度、arm/TCP 跟踪和手指有效范围；在 close 生效前，检查对应原事件状态的允许误差。异常时保存已发生的最后样本、具体违反项及未应用事件，然后停止物理积分。故障保持输出只是已准备的命令，不表示已经完成物理制停。
 
 控制容差、指位实际范围和超时必须显式给出来源。完整安装控制探针支持两种明确输入：以实测 q/dq 构造的新诊断参考，或连同原 ExecutionLimits 加载的已接受正式曲线。前者的工程跟踪区间只用于对应控制实验，不能升级为技能标定。保留 contact geom pair、有效接触力、actuator force、实际 q/dq/ctrl 和逐步独立几何结果，以区分接触、控制跟踪和模型问题。
+
+`arm_control_saturated_coordinates` 只统计机械臂 torque ctrl 裁剪；手指原生 force limit 的启用标志、范围、实际触限次数与时间另行报告。到达力限是观测事实，不能单独推断未裁剪需求、跟踪失败或物理标定。
 
 独立夹爪资产不能默认代表整机安装上下文。手掌若焊接到 world，MuJoCo 的父子碰撞过滤具有 world 例外，会产生整机安装时被原生规则排除的掌指接触。当前力记录与完整模型的零积分查询已确认这一差异；孤立资产的未收敛不作为整机跟踪范围证据。控制标定应复用完整原生安装与现有执行控制器，不能通过删接触或改参数“修正”探针。参见 [MuJoCo 碰撞过滤规则](https://mujoco.readthedocs.io/en/latest/computation/index.html#collision-detection)。
 

@@ -143,6 +143,15 @@ does not certify observed obstacles, unknown space, future finger geometry or
 continuous collision between steps. Source-native excluded pairs retain raw
 distances; sphere separation certificates do not exclude native entity pairs.
 
+Robot fixtures require an explicit `mechanical_contact_pairs` list (`[]` means
+none). Each entry names exactly two native geoms and the robot-model source of
+their permitted contact. Native physics remains enabled; independent execution
+queries retain the raw distances under the distinct `mechanical_contact` policy.
+The same declaration enters planning only when the native link-ignore interface
+can represent it exactly: every enabled geom pair between those links must be
+explicitly permitted. Partial coverage is rejected. Re-export older fixtures
+with an explicit declaration instead of inferring permission from contact flags.
+
 `probe_mounted_execution.py` constructs a new, explicitly identified control
 reference from the measured q/dq, supplied arm displacement and move/hold times.
 Without `--execution-limits` it measures the backend without inventing a pass
@@ -153,6 +162,10 @@ historical curve archives through `load_saved_trajectory`. Reports retain
 native parameters, requested/applied torques, actual robot state, complete
 bounded contacts and independent robot geometry results. All paths, source
 controller identity, step/contact budgets and reference parameters are explicit.
+The `arm_control_saturated_coordinates` counter covers arm torque clipping only;
+the probe separately counts actual finger force samples at enabled native force
+limits. Touching a force boundary is recorded as an observation, not converted
+into a tracking failure or proof of excess unclipped demand.
 
 The same mounted execution probe also accepts `--trajectory` with the original
 `--execution-limits`. This mode loads an already accepted archive and executes

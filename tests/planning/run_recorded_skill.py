@@ -165,7 +165,9 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
                   "mechanical_limits": limits.tolist(), "controller": "position_bounds",
                   "execution_limits": execution_limits.describe(),
                   "enabled_self_collision_pairs": len(self_pairs),
-                  "contact_permissions": "No current finite material-patch permission has been certified"}
+                  # BEGIN separate object-contact evidence from robot mechanics.
+                  "contact_permissions": "No current finite material-patch object-contact permission has been certified; robot mechanical contacts use the validated native pair contract"}
+                  # END a robot-local permission cannot certify a task grasp.
     # BEGIN bind fixed installation pair policy to the actual native sphere ordering.
     sphere_indices_by_link = {
         link: [int(index) for index in parameters.get_sphere_index_from_link_name(link).cpu().tolist()]

@@ -54,7 +54,7 @@ class NativeSeparationTest(unittest.TestCase):
     def test_separated_native_solids_complete_only_their_overlapping_sphere_query(self):
         model, config = _model(), _config()
         before = deepcopy(config)
-        contract = _collision_query_contract(model, config)
+        contract = _collision_query_contract(model, config, mechanical_contact_pairs=[])
         self.assertEqual(contract["native_policy_exclusions"], {})
         self.assertEqual(contract["native_enabled_sphere_pair_count"], 1)
         self.assertEqual(contract["effective_query_pairs"], [])
@@ -120,7 +120,7 @@ class NativeSeparationTest(unittest.TestCase):
     def test_fixed_child_keeps_its_own_geometry_and_query(self):
         model = _model(extra_child='<body name="mount" pos="0 0 .3"><geom name="mount_geom" type="box" size=".1 .1 .1"/></body>')
         config = _config(("anchor", "rotor", "mount"))
-        contract = _collision_query_contract(model, config)
+        contract = _collision_query_contract(model, config, mechanical_contact_pairs=[])
         self.assertEqual(contract["native_policy_exclusions"], {"rotor": ["mount"]})
         self.assertEqual([row["links"] for row in contract["certificate_completed_pairs"]], [["anchor", "rotor"]])
         self.assertEqual(contract["effective_query_pairs"], [["anchor", "mount"]])
@@ -133,7 +133,7 @@ class NativeSeparationTest(unittest.TestCase):
         from curobo._src.robot.types.self_collision_params import SelfCollisionKinematicsCfg
         model = _model(extra_child='<body name="mount" pos="0 0 .3"><geom name="mount_geom" type="box" size=".1 .1 .1"/></body>')
         config = _config(("anchor", "rotor", "mount"))
-        contract = _collision_query_contract(model, config)
+        contract = _collision_query_contract(model, config, mechanical_contact_pairs=[])
         # This is the same installed builder used by KinematicsLoader before
         # kernels run; it checks actual library semantics on bounded CPU data.
         native = SelfCollisionKinematicsCfg.create_from_link_pairs(
@@ -211,13 +211,13 @@ class NativeSeparationTest(unittest.TestCase):
             config = _config()
             config["collision_sphere_buffer"] = global_buffer
             config["self_collision_buffer"]["anchor"] = local_buffer
-            contract = _collision_query_contract(_model(), config)
+            contract = _collision_query_contract(_model(), config, mechanical_contact_pairs=[])
             self.assertEqual(contract["certificate_completed_pairs"], [])
             self.assertEqual(contract["effective_query_pairs"], [["anchor", "rotor"]])
 
     def test_native_mask_policy_is_not_relabelled_as_a_geometric_certificate(self):
         model = _model(); model.geom_contype[:] = 0; model.geom_conaffinity[:] = 0
-        contract = _collision_query_contract(model, _config())
+        contract = _collision_query_contract(model, _config(), mechanical_contact_pairs=[])
         self.assertEqual(contract["native_policy_exclusions"], {"anchor": ["rotor"]})
         self.assertEqual(contract["certificate_completed_pairs"], [])
         self.assertEqual(contract["native_enabled_sphere_pair_count"], 0)
@@ -225,7 +225,7 @@ class NativeSeparationTest(unittest.TestCase):
     def test_explicit_pair_rules_require_a_matching_exporter(self):
         model = _model(extra_scene='<contact><pair geom1="anchor_geom" geom2="rotor_geom"/></contact>')
         with self.assertRaisesRegex(ValueError, "without extensions"):
-            _collision_query_contract(model, _config())
+            _collision_query_contract(model, _config(), mechanical_contact_pairs=[])
 
     def test_large_native_geom_norm_residual_cannot_be_normalized_away(self):
         model = _model(); model.opt.ccd_tolerance = 0
@@ -274,6 +274,186 @@ class NativeSeparationTest(unittest.TestCase):
         self.assertEqual(iv.prec, original)
 
 
+# BEGIN exact mechanical-contact declarations without widening native link policy.
+class MechanicalContactContractTest(unittest.TestCase):
+    @staticmethod
+    def permission(first="anchor_geom", second="rotor_geom"):
+        return {"first": first, "second": second,
+                "source": "Explicit model permission for these two mechanical contact solids"}
+
+    def test_permission_is_separate_from_native_exclusions_and_separation_proofs(self):
+        mount = '<body name="other_part" pos="0 0 .3"><geom name="other_geom" type="box" size=".1 .1 .1"/></body>'
+        model = _model(joint_type="slide", extra_child=mount)
+        config = _config(("anchor", "rotor", "other_part"))
+        before = deepcopy(config)
+        native_masks = (model.geom_contype.copy(), model.geom_conaffinity.copy(), int(model.opt.disableflags))
+        declaration = [self.permission()]
+        contract = _collision_query_contract(model, config, mechanical_contact_pairs=declaration)
+        self.assertEqual(contract["mechanical_contact_pairs"], declaration)
+        self.assertEqual(contract["mechanical_contact_link_exclusions"], {"anchor": ["rotor"]})
+        self.assertEqual(contract["mechanical_contact_sphere_pair_count"], 1)
+        self.assertEqual(contract["native_policy_exclusions"], {"rotor": ["other_part"]})
+        self.assertEqual(contract["native_enabled_sphere_pair_count"], 2)
+        self.assertEqual(contract["certificate_completed_pairs"], [])
+        self.assertEqual(contract["effective_query_pairs"], [["anchor", "other_part"]])
+        self.assertEqual(contract["effective_query_sphere_pair_count"], 1)
+        self.assertEqual(_effective_ignored_pairs(contract),
+                         {"rotor": ["other_part"], "anchor": ["rotor"]})
+        self.assertEqual(config, before)
+        np.testing.assert_array_equal(model.geom_contype, native_masks[0])
+        np.testing.assert_array_equal(model.geom_conaffinity, native_masks[1])
+        self.assertEqual(int(model.opt.disableflags), native_masks[2])
+
+    def test_exact_permission_precedes_a_possible_geometric_certificate(self):
+        # The hinge's solids also happen to be provably separated. The saved
+        # reason must still retain the explicit mechanical-contact declaration
+        # instead of recategorizing it as native-disabled or a separation proof.
+        contract = _collision_query_contract(_model(), _config(),
+                                             mechanical_contact_pairs=[self.permission()])
+        self.assertEqual(contract["certificate_completed_pairs"], [])
+        self.assertEqual(contract["native_policy_exclusions"], {})
+        self.assertEqual(contract["native_enabled_sphere_pair_count"], 1)
+        self.assertEqual(contract["mechanical_contact_sphere_pair_count"], 1)
+        self.assertEqual(contract["effective_query_pairs"], [])
+
+    def test_partial_permission_rejects_same_link_other_enabled_geometry(self):
+        extra = '<geom name="other_geom" type="box" size=".1 .1 .1" pos="0 0 -.4"/>'
+        model = _model(extra_child=extra)
+        with self.assertRaisesRegex(ValueError, "Partial geom mechanical contact"):
+            _collision_query_contract(model, _config(), mechanical_contact_pairs=[self.permission()])
+        # Explicitly permitting BOTH physical pairs makes the maintained link
+        # representation exact. Neither a robot name nor geom-name suffix is
+        # used to infer this permission.
+        declared = [self.permission(), self.permission(second="other_geom")]
+        contract = _collision_query_contract(model, _config(), mechanical_contact_pairs=declared)
+        self.assertEqual(contract["mechanical_contact_pairs"], declared)
+        self.assertEqual(contract["mechanical_contact_link_exclusions"], {"anchor": ["rotor"]})
+        self.assertEqual(contract["mechanical_contact_sphere_pair_count"], 1)
+
+    def test_native_masked_extra_geometry_does_not_expand_permission(self):
+        extra = '<geom name="masked_from_anchor" type="box" size=".1 .1 .1" contype="2" conaffinity="2"/>'
+        model = _model(extra_child=extra)
+        contract = _collision_query_contract(model, _config(), mechanical_contact_pairs=[self.permission()])
+        self.assertEqual(contract["mechanical_contact_link_exclusions"], {"anchor": ["rotor"]})
+        self.assertEqual(contract["mechanical_contact_pairs"], [self.permission()])
+        # An already-disabled individual pair cannot be mislabeled as enabled
+        # mechanical contact, even when its link has another enabled geom.
+        with self.assertRaisesRegex(ValueError, "native-enabled geom pair"):
+            _collision_query_contract(model, _config(),
+                mechanical_contact_pairs=[self.permission(second="masked_from_anchor")])
+
+    def test_empty_permission_retains_the_complete_separation_requirement(self):
+        contract = _collision_query_contract(_model(joint_type="slide"), _config(),
+                                             mechanical_contact_pairs=[])
+        self.assertEqual(contract["mechanical_contact_pairs"], [])
+        self.assertEqual(contract["mechanical_contact_link_exclusions"], {})
+        self.assertEqual(contract["mechanical_contact_sphere_pair_count"], 0)
+        self.assertEqual(contract["effective_query_pairs"], [["anchor", "rotor"]])
+
+    def test_ambiguous_missing_and_foreign_geom_declarations_fail(self):
+        first = self.permission()
+        bad = [None, (), {}, [dict(first, source="")], [dict(first, source=None)],
+               [dict(first, extra="unrecognized")], [{"first": "anchor_geom", "second": "rotor_geom"}],
+               [dict(first, first="missing")], [dict(first, second="anchor_geom")],
+               [first, deepcopy(first)], [first, self.permission("rotor_geom", "anchor_geom")]]
+        for declaration in bad:
+            with self.subTest(declaration=declaration), self.assertRaises(ValueError):
+                _collision_query_contract(_model(), _config(), mechanical_contact_pairs=declaration)
+        mount = '<body name="other_part"><geom name="other_geom" type="box" size=".1 .1 .1"/></body>'
+        model = _model(extra_child=mount)
+        with self.assertRaisesRegex(ValueError, "sphere-cover link scope"):
+            _collision_query_contract(model, _config(),
+                                      mechanical_contact_pairs=[self.permission(second="other_geom")])
+        with self.assertRaisesRegex(ValueError, "native-enabled geom pair"):
+            _collision_query_contract(model, _config(("anchor", "rotor", "other_part")),
+                mechanical_contact_pairs=[self.permission("rotor_geom", "other_geom")])
+
+    def test_mechanical_contact_cannot_silently_disable_physics(self):
+        for disabled in (mujoco.mjtDisableBit.mjDSBL_CONTACT, mujoco.mjtDisableBit.mjDSBL_CONSTRAINT):
+            model = _model()
+            model.opt.disableflags |= int(disabled)
+            with self.subTest(disabled=disabled), self.assertRaisesRegex(ValueError, "contact and constraint"):
+                _collision_query_contract(model, _config(), mechanical_contact_pairs=[self.permission()])
+
+    def test_installed_curobo_pair_builder_keeps_other_geometry_queries(self):
+        import torch
+        from curobo.types import DeviceCfg
+        from curobo._src.robot.types.self_collision_params import SelfCollisionKinematicsCfg
+        mount = '<body name="other_part"><geom name="other_geom" type="box" size=".1 .1 .1"/></body>'
+        model, config = _model(joint_type="slide", extra_child=mount), _config(("anchor", "rotor", "other_part"))
+        contract = _collision_query_contract(model, config, mechanical_contact_pairs=[self.permission()])
+        native = SelfCollisionKinematicsCfg.create_from_link_pairs(
+            collision_link_names=config["collision_link_names"],
+            link_name_to_sphere_index={name: index for index, name in enumerate(config["collision_link_names"])},
+            self_collision_link_pair_ignores=_effective_ignored_pairs(contract),
+            self_collision_link_padding=deepcopy(config["self_collision_buffer"]),
+            all_link_spheres=torch.tensor([[0., 0., 0., 2.]]*3),
+            link_index_to_sphere_index=torch.tensor([0, 1, 2], dtype=torch.int16),
+            device_cfg=DeviceCfg(torch.device("cpu")))
+        self.assertEqual(native.collision_pairs.tolist(), [[0, 2]])
+        self.assertEqual(native.collision_pairs.device.type, "cpu")
+        self.assertFalse(torch.cuda.is_initialized())
+
+    def test_export_reload_requires_shared_permission_and_validates_derived_ignores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/"scene.xml"; source.write_text(_scene(joint_type="slide"))
+            catalog = root/"catalog.json"
+            catalog.write_text(json.dumps({"joints": [{"name": "spin", "qpos_count": 1,
+                "qvel_count": 1, "qpos_start": 0, "qvel_start": 0}]}))
+            episode = root/"episode.h5"
+            with h5py.File(episode, "w") as stream:
+                stream.create_dataset("states/qpos", data=np.array([[-.2], [.2]]))
+            declaration = [self.permission()]
+            arguments = dict(scene_path=source, catalog_path=catalog, episode_path=episode,
+                root_body="anchor", collision_root="anchor", tcp_site="tool",
+                arm_joint_names=["spin"], finger_joint_names=[], velocity_limits={"spin": 1.},
+                effort_limits={"spin": 2.}, cover_specifications={
+                    name: {"subdivisions": [1, 1, 1]} for name in ("anchor_geom", "rotor_geom")},
+                initial_frame=0, output=root/"fixture", binding_audit_path=catalog,
+                max_acceleration=2., max_jerk=10., mechanical_contact_pairs=declaration)
+            missing_argument = dict(arguments); del missing_argument["mechanical_contact_pairs"]
+            with self.assertRaisesRegex(TypeError, "mechanical_contact_pairs"):
+                export_fixture(**missing_argument)
+            export_fixture(**arguments)
+            fixture = json.loads((root/"fixture/manifest.json").read_text())
+            config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
+            self.assertEqual(fixture["mechanical_contact_pairs"], declaration)
+            self.assertEqual(fixture["mechanical_contact_link_exclusions"], {"anchor": ["rotor"]})
+            self.assertEqual(config["robot_cfg"]["kinematics"]["self_collision_ignore"], {"anchor": ["rotor"]})
+            report = validate_fixture_collision_contract(fixture, config)
+            self.assertEqual(report["mechanical_contact_pairs"], declaration)
+            self.assertEqual(report["mechanical_contact_sphere_pair_count"], 1)
+            self.assertEqual(report["native_enabled_sphere_pair_count"], 1)
+            self.assertEqual(report["certificate_completed_pairs"], [])
+            self.assertEqual(report["effective_query_sphere_pair_count"], 0)
+            for field, replacement in (("mechanical_contact_pairs", []),
+                                       ("mechanical_contact_link_exclusions", {}),
+                                       ("mechanical_contact_sphere_pair_count", 0)):
+                wrong = deepcopy(fixture); wrong[field] = replacement
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    validate_fixture_collision_contract(wrong, config)
+            missing = deepcopy(fixture); del missing["mechanical_contact_pairs"]
+            with self.assertRaisesRegex(ValueError, "explicit mechanical_contact_pairs"):
+                validate_fixture_collision_contract(missing, config)
+            wrong_config = deepcopy(config)
+            wrong_config["robot_cfg"]["kinematics"]["self_collision_ignore"] = {}
+            with self.assertRaisesRegex(ValueError, "Effective self-collision exclusions"):
+                validate_fixture_collision_contract(fixture, wrong_config)
+            # Both models must retain the declared native-enabled masks. A
+            # downstream edit to either side cannot justify the saved ignore.
+            for path in (source, Path(fixture["robot_mjcf_path"])):
+                original = path.read_text()
+                tree = ET.fromstring(original)
+                tree.find(".//geom[@name='rotor_geom']").set("contype", "2")
+                tree.find(".//geom[@name='rotor_geom']").set("conaffinity", "2")
+                path.write_text(ET.tostring(tree, encoding="unicode"))
+                with self.subTest(native_source=path.name), self.assertRaises(ValueError):
+                    validate_fixture_collision_contract(fixture, config)
+                path.write_text(original)
+# END mechanical contact declarations preserve every unpermitted native query.
+
+
 class FixtureReloadTest(unittest.TestCase):
     # BEGIN physical endpoint precision and original-source binding regression.
     def test_named_position_limits_preserve_native_double_endpoints(self):
@@ -294,7 +474,7 @@ class FixtureReloadTest(unittest.TestCase):
                 effort_limits={"spin": 2.}, cover_specifications={
                     name: {"subdivisions": [1, 1, 1]} for name in ("anchor_geom", "rotor_geom")},
                 initial_frame=0, output=root/"fixture", binding_audit_path=catalog,
-                max_acceleration=2., max_jerk=10.)
+                max_acceleration=2., max_jerk=10., mechanical_contact_pairs=[])
             fixture = json.loads((root/"fixture/manifest.json").read_text())
             config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
             self.assertEqual(fixture["position_limits"], {"spin": [0., .04]})
@@ -358,7 +538,7 @@ class FixtureReloadTest(unittest.TestCase):
                              cover_specifications={name: {"subdivisions": [1, 1, 1]}
                                                    for name in ("anchor_geom", "rotor_geom", "mount_geom")},
                              initial_frame=0, output=root/"fixture", binding_audit_path=catalog,
-                             max_acceleration=2., max_jerk=10.)
+                             max_acceleration=2., max_jerk=10., mechanical_contact_pairs=[])
             export_fixture(**arguments)
             fixture = json.loads((root/"fixture/manifest.json").read_text())
             config = yaml.safe_load((root/"fixture/robot.yml").read_text())
@@ -499,7 +679,7 @@ class FixedInstallationTest(unittest.TestCase):
                 effort_limits={"spin": 2.}, cover_specifications={
                     name: {"subdivisions": [1, 1, 1]} for name in ("arm_geom", "rotor_geom")},
                 initial_frame=0, output=root/"fixture", binding_audit_path=catalog,
-                max_acceleration=2., max_jerk=10.)
+                max_acceleration=2., max_jerk=10., mechanical_contact_pairs=[])
             config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
             self.assertEqual(fixture["sphere_count"], 2)
             self.assertEqual(fixture["robot_visual_root"], "base")

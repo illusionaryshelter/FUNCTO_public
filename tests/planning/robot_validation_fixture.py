@@ -82,10 +82,24 @@ def build_robot_validator(fixture, *, reference_frame, T_reference_base, tool_fr
     source_model = mujoco.MjModel.from_xml_path(fixture["source_scene_xml"])
     if policy != _native_pair_policies(source_model, geometry_names):
         raise ValueError("Independent pair policy differs between original source and exported robot")
-    pairs = [PairQuery(first, second, identity,
-                       f"{fixture['source_scene_xml']} and {fixture['robot_mjcf_path']}: {reason}; "
-                       "no sphere-certificate exclusion")
-             for first, second, identity, reason in policy]
+    # BEGIN use the same explicit mechanical contract as native planning queries.
+    # Fixture validation above independently binds every declaration to both
+    # source and exported geometry; nothing is inferred from geom names or
+    # contact flags. Enabled physical contacts remain enabled in MuJoCo.
+    permitted = {frozenset((row["first"], row["second"])): row
+                 for row in fixture["mechanical_contact_pairs"]}
+    pairs = []
+    for first, second, identity, reason in policy:
+        declaration = permitted.get(frozenset((first, second)))
+        if declaration is not None:
+            if identity != "required":
+                raise ValueError("Mechanical contact must remain an enabled native physical pair")
+            identity = "mechanical_contact"
+            reason += f"; explicit robot mechanical permission: {declaration['source']}"
+        pairs.append(PairQuery(first, second, identity,
+            f"{fixture['source_scene_xml']} and {fixture['robot_mjcf_path']}: {reason}; "
+            "no sphere-certificate exclusion"))
+    # END query all native solids while separating legality from contact physics.
     checker = RobotGeometryChecker(fixture["urdf_path"], base_frame=fixture["base_link"], geometries=shapes)
     for name in fixture["joint_names"]:
         if not np.array_equal(checker.joint_limits[name], model.jnt_range[model.joint(name).id]):

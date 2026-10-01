@@ -341,8 +341,73 @@ def _hinge_separation_certificate(model, parent, child):
             "scope": "this native self pair only; no environment, object or other-link query removed"}
 
 
-def _collision_query_contract(model, kinematics):
-    """Separate native policy from queries completed by an entity certificate."""
+# BEGIN explicit model contact permission, separate from physical filtering.
+def _mechanical_contact_contract(model, links, pairs, native_exclusions):
+    """Map exact geom permissions only when native link ignores are exact.
+
+    MuJoCo contact enablement asks physics to resolve a pair; it is not itself
+    a requirement that the two solids always remain separated. The caller may
+    therefore explicitly permit mechanical contact between named native geoms.
+    This declaration never changes their native contact masks or model state.
+
+    The maintained cuRobo YAML interface ignores whole link pairs. Use it only
+    when every native-enabled geom pair between those links is explicitly
+    permitted. A mixed link pair with an unpermitted geom is unsupported here,
+    rather than broadening permission to that geom or editing kernel buffers.
+    """
+    if not isinstance(pairs, list):
+        raise ValueError("mechanical_contact_pairs must be an explicit list; use [] for no permission")
+    disabled = int(mujoco.mjtDisableBit.mjDSBL_CONTACT) | int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+    if pairs and int(model.opt.disableflags) & disabled:
+        raise ValueError("Mechanical contact permission requires native contact and constraint processing")
+    link_order = {name: index for index, name in enumerate(links)}
+    declared, requested, link_pairs = [], set(), set()
+
+    def enabled(first, second):
+        return bool((model.geom_contype[first] & model.geom_conaffinity[second])
+                    or (model.geom_contype[second] & model.geom_conaffinity[first]))
+
+    for row in pairs:
+        if (not isinstance(row, dict) or set(row) != {"first", "second", "source"}
+                or any(not isinstance(row[key], str) or not row[key].strip()
+                       for key in ("first", "second", "source"))):
+            raise ValueError("Every mechanical contact needs exactly first, second and nonempty source strings")
+        first, second = row["first"], row["second"]
+        identity = frozenset((first, second))
+        if len(identity) != 2 or identity in requested:
+            raise ValueError("Mechanical contact geom pairs must be distinct and unique in either order")
+        ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in (first, second)]
+        if any(index < 0 for index in ids):
+            raise ValueError("Mechanical contact permission names an absent native geom")
+        bodies = [int(model.geom_bodyid[index]) for index in ids]
+        names = [model.body(index).name for index in bodies]
+        if any(name not in link_order for name in names):
+            raise ValueError("Mechanical contact geoms must belong to the complete sphere-cover link scope")
+        if (bodies[0] == bodies[1] or names[1] in native_exclusions.get(names[0], ())
+                or names[0] in native_exclusions.get(names[1], ()) or not enabled(*ids)):
+            raise ValueError("Mechanical contact permission must retain a native-enabled geom pair")
+        requested.add(identity)
+        link_pairs.add(tuple(sorted(names, key=link_order.__getitem__)))
+        # Preserve the explicit declaration and its provenance without
+        # inferring permission from geom names, materials, poses or contacts.
+        declared.append({key: row[key] for key in ("first", "second", "source")})
+
+    exclusions = {}
+    for first, second in sorted(link_pairs, key=lambda pair: (link_order[pair[0]], link_order[pair[1]])):
+        first_geoms = np.flatnonzero(model.geom_bodyid == model.body(first).id)
+        second_geoms = np.flatnonzero(model.geom_bodyid == model.body(second).id)
+        for a in first_geoms:
+            for b in second_geoms:
+                if enabled(a, b) and frozenset((model.geom(a).name, model.geom(b).name)) not in requested:
+                    raise ValueError(
+                        "Partial geom mechanical contact permission cannot use a whole-link ignore: "
+                        f"unpermitted native-enabled pair {model.geom(a).name} / {model.geom(b).name}")
+        exclusions.setdefault(first, []).append(second)
+    return declared, exclusions
+
+
+def _collision_query_contract(model, kinematics, *, mechanical_contact_pairs):
+    """Separate native filtering, explicit mechanical contact and separation proofs."""
     if (model.npair or model.nexclude or model.neq or model.ntendon or model.nflex or model.nplugin
             or mujoco.get_mjcb_contactfilter() is not None):
         raise ValueError("Collision certificates require the exporter's explicit native policy without extensions")
@@ -351,12 +416,18 @@ def _collision_query_contract(model, kinematics):
     if len(links) != len(set(links)) or set(links) != set(spheres):
         raise ValueError("Collision links and sphere geometry must be complete and unique")
     native = _native_ignored_pairs(model, links)
+    mechanical, contact_exclusions = _mechanical_contact_contract(
+        model, links, mechanical_contact_pairs, native)
     completed, queries, original_count = [], [], 0
     for index, first in enumerate(links):
         for second in links[index+1:]:
             if second in native.get(first, []) or first in native.get(second, []):
                 continue
             original_count += len(spheres[first])*len(spheres[second])
+            if second in contact_exclusions.get(first, ()) or first in contact_exclusions.get(second, ()):
+                # Contact remains active in physics. Only this completely
+                # authorized link pair leaves the planner's separation set.
+                continue
             a, b = model.body(first).id, model.body(second).id
             parent, child = (a, b) if model.body_parentid[b] == a else (b, a)
             # Current explicit interface has zero sphere/self buffers. A
@@ -375,16 +446,24 @@ def _collision_query_contract(model, kinematics):
                 completed.append({"links": [first, second], **certificate})
     return {"native_policy_exclusions": native,
             "native_enabled_sphere_pair_count": original_count,
+            "mechanical_contact_pairs": mechanical,
+            "mechanical_contact_link_exclusions": contact_exclusions,
+            "mechanical_contact_sphere_pair_count": sum(
+                len(spheres[first])*len(spheres[second])
+                for first, others in contact_exclusions.items() for second in others),
             "certificate_completed_pairs": completed, "effective_query_pairs": queries,
             "effective_query_sphere_pair_count": sum(len(spheres[a])*len(spheres[b]) for a, b in queries)}
 
 
 def _effective_ignored_pairs(contract):
     result = {name: list(others) for name, others in contract["native_policy_exclusions"].items()}
+    for first, others in contract["mechanical_contact_link_exclusions"].items():
+        result.setdefault(first, []).extend(others)
     for certificate in contract["certificate_completed_pairs"]:
         first, second = certificate["links"]
         result.setdefault(first, []).append(second)
     return result
+# END mechanical contact never disables native physics or widens a geom permission.
 
 
 def _source_collision_names(scene, collision_root):
@@ -727,6 +806,13 @@ def validate_fixture_collision_contract(fixture, robot_config):
     Pose feedback/default joint positions are deliberately not certificate
     inputs: this certificate is valid throughout its stated hinge domain.
     """
+    # BEGIN require an explicit shared model-level mechanical contact policy.
+    # Old artifacts do not acquire implicit permissions. Both original and
+    # exported native models must independently validate the same declaration.
+    if "mechanical_contact_pairs" not in fixture:
+        raise ValueError("Fixture needs explicit mechanical_contact_pairs; re-export with [] for no permission")
+    mechanical_contact_pairs = fixture["mechanical_contact_pairs"]
+    # END permission provenance is required even when the explicit list is empty.
     records = fixture["collision_geometries"]
     names = [row["geom"] for row in records]
     scene = ET.parse(fixture["source_scene_xml"]).getroot()
@@ -803,18 +889,25 @@ def validate_fixture_collision_contract(fixture, robot_config):
             or sum(offsets.values()) != fixture["sphere_count"]
             or not 1 <= fixture["sphere_count"] <= 480):
         raise ValueError("Fixture sphere count or complete collision ownership changed")
-    expected = _collision_query_contract(robot, kinematics)
-    source_expected = _collision_query_contract(source, kinematics)
+    # BEGIN share contact declarations while re-deriving both native contracts.
+    expected = _collision_query_contract(robot, kinematics, mechanical_contact_pairs=mechanical_contact_pairs)
+    source_expected = _collision_query_contract(source, kinematics, mechanical_contact_pairs=mechanical_contact_pairs)
+    # END no saved link ignore is sufficient evidence of an exact geom permission.
     if source_expected != expected:
         raise ValueError("Exported collision certificate no longer matches its original native source")
     if any(fixture[key] != value for key, value in expected.items()):
         raise ValueError("Saved collision policy/certificate/effective queries failed fresh validation")
     if kinematics["self_collision_ignore"] != _effective_ignored_pairs(expected):
-        raise ValueError("Effective self-collision exclusions differ from native policy plus valid certificates")
+        raise ValueError("Effective self-collision exclusions differ from native policy, mechanical permissions and valid certificates")
     return {"sphere_count": fixture["sphere_count"],
             "complete_native_geometry_count": len(records),
             "complete_fixed_installation_geometry_count": fixed_count,
             "native_enabled_sphere_pair_count": expected["native_enabled_sphere_pair_count"],
+            # BEGIN report mechanical permission separately from native filtering and proofs.
+            "mechanical_contact_pairs": expected["mechanical_contact_pairs"],
+            "mechanical_contact_link_exclusions": expected["mechanical_contact_link_exclusions"],
+            "mechanical_contact_sphere_pair_count": expected["mechanical_contact_sphere_pair_count"],
+            # END explicit permission leaves native physical contacts enabled.
             "certificate_completed_pairs": [row["links"] for row in expected["certificate_completed_pairs"]],
             "effective_query_sphere_pair_count": expected["effective_query_sphere_pair_count"],
             "minimum_cell_enclosure_allowance_m": float(minimum_allowance),
@@ -823,16 +916,20 @@ def validate_fixture_collision_contract(fixture, robot_config):
 # END native solid separation certificates, independent of sphere fitting.
 
 
+# BEGIN require mechanical permission as an explicit export input, including [].
 def export_fixture(*, scene_path, catalog_path, episode_path, root_body, collision_root, tcp_site,
                    arm_joint_names, finger_joint_names, velocity_limits, effort_limits,
                    cover_specifications, initial_frame, output, binding_audit_path,
-                   max_acceleration, max_jerk):
+                   max_acceleration, max_jerk, mechanical_contact_pairs):
     """Build one exact native model and its explicitly budgeted collision cover.
 
     Velocity/effort limits and the initial recorded frame are explicit inputs;
     MJCF has no velocity-limit field. No coordinate is clipped or re-signed.
+    Mechanical contact permissions are explicit native geom pairs with a
+    model-level source; [] declares that there is no such permission.
     Unsupported source features fail before artifacts can be used for planning.
     """
+    # END no compatibility default silently supplies a missing model policy.
     scene_path, catalog_path, episode_path = [Path(value).resolve() for value in
                                             (scene_path, catalog_path, episode_path)]
     output = Path(output).resolve()
@@ -999,7 +1096,10 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, collisi
                    "cspace_distance_weight": [1.] * len(names), "null_space_weight": [1.] * len(names),
                    "max_acceleration": float(max_acceleration), "max_jerk": float(max_jerk)}}}}
     # BEGIN replace only the queries completed by a native-entity certificate.
-    collision_contract = _collision_query_contract(model, config["robot_cfg"]["kinematics"])
+    # BEGIN compile exact mechanical permissions through the maintained native YAML interface.
+    collision_contract = _collision_query_contract(
+        model, config["robot_cfg"]["kinematics"], mechanical_contact_pairs=mechanical_contact_pairs)
+    # END completed proofs and declared contacts remain separate manifest records.
     config["robot_cfg"]["kinematics"]["self_collision_ignore"] = _effective_ignored_pairs(collision_contract)
     # END replace only the queries completed by a native-entity certificate.
     config_path = output / "robot.yml"

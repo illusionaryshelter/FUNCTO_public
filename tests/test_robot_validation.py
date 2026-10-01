@@ -93,6 +93,33 @@ def test_numerical_contact_boundary_is_not_a_contact_permission(model):
     assert result["violations"][0]["relation"] == "numerical_boundary"
 
 
+# BEGIN legal model contact is distinct from filtering or blanket collision removal.
+@pytest.mark.parametrize("finger", [-.01000025, 0.])
+def test_explicit_mechanical_contact_preserves_boundary_and_overlap_evidence(model, finger):
+    permitted = PairQuery("first", "second", "mechanical_contact", "Declared robot-local mechanical contact")
+    gate = validator(model, [permitted])
+    result = gate.check_state(feedback(finger=finger), stage="after_step", trajectory_time=.1)
+    assert result["passed"] is True
+    assert len(result["mechanical_contacts"]) == 1
+    assert result["mechanical_contacts"][0]["policy"] == "mechanical_contact"
+    assert result["mechanical_contacts"][0]["signed_distance_m"] == result["distances_m"][0]
+    assert result["min_required_clearance_m"] is None
+    assert gate.describe()["pair_order"][0]["source"] == permitted.source
+    # An identical unpermitted pair still fails; closeness never grants permission.
+    assert validator(model).check_state(feedback(finger=finger), stage="after_step", trajectory_time=.1)["passed"] is False
+
+
+def test_mechanical_contact_cannot_exempt_joint_or_fk_checks(model):
+    gate = validator(model, [PairQuery("first", "second", "mechanical_contact", "Robot mechanical contact")])
+    state = feedback(finger=0., arm_speed=2.)
+    state["tool_pose"][0, 3] += .001
+    result = gate.check_state(state, stage="after_step", trajectory_time=.1)
+    assert result["passed"] is False
+    assert {row["kind"] for row in result["violations"]} == {"independent_joint_velocity", "independent_model_fk"}
+    assert result["mechanical_contacts"][0]["signed_distance_m"] < 0
+# END contact permission changes only the declared geometry-pair acceptance.
+
+
 @pytest.mark.parametrize("field,kind", [("base_pose", "base:translation_m"), ("tool_pose", "tcp:translation_m")])
 def test_backend_base_and_tcp_are_checked_against_independent_fk(model, field, kind):
     state = feedback()

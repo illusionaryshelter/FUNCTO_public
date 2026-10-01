@@ -52,12 +52,15 @@ class NativeSolid:
     source: str
 
 
+# BEGIN distinguish legal mechanical contact from native collision filtering.
 @dataclass(frozen=True)
 class PairQuery:
     """Caller-supplied policy identity; even excluded pairs retain raw results.
 
-    ``required`` participates in the caller's collision contract; ``excluded``
-    has an explicit exclusion source; ``diagnostic`` makes no policy claim.
+    ``required`` must remain separated; ``mechanical_contact`` explicitly
+    permits contact between exactly these two robot solids within their
+    independently checked mechanical joint domain. ``excluded`` records native
+    filtering; ``diagnostic`` makes no acceptance claim. All retain distances.
     No pair is inferred from adjacency, a robot name, or a task name.
     """
 
@@ -65,6 +68,7 @@ class PairQuery:
     second: str
     policy: str
     source: str
+# END a physics-enabled contact is not inherently an illegal robot state.
 
 
 @dataclass(frozen=True)
@@ -231,8 +235,10 @@ class RobotGeometryChecker:
             identity = frozenset((pair.first, pair.second))
             if identity in identities:
                 raise ValueError("Duplicate unordered geometry pair")
-            if pair.policy not in ("required", "excluded", "diagnostic"):
-                raise ValueError("Pair policy must be required, excluded, or diagnostic")
+            # BEGIN query permitted mechanical contacts without deleting evidence.
+            if pair.policy not in ("required", "excluded", "diagnostic", "mechanical_contact"):
+                raise ValueError("Pair policy must be required, excluded, diagnostic, or mechanical_contact")
+            # END permission affects acceptance, never the underlying distance.
             _name(pair.source, "pair policy source")
             identities.add(identity)
             pair_list.append(pair)

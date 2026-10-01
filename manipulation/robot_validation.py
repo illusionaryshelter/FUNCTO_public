@@ -32,9 +32,12 @@ class RobotStateValidator:
     Constructor transforms and identity tolerances describe a model binding,
     not physical tracking error. The executor separately supervises its shared
     ExecutionLimits. Every required pair must be positively separated beyond
-    Coal's reported numerical boundary; neither penetration nor a boundary
-    result receives an implicit contact allowance. Excluded pairs retain raw
-    distances and their original native policy provenance.
+    Coal's reported numerical boundary. A model-declared ``mechanical_contact``
+    pair permits exactly those two solids to contact within the independently
+    checked mechanical joint domain, including native soft-contact overlap.
+    Native-filtered and mechanically permitted pairs still retain raw distances
+    and their distinct policy provenance. No permission is inferred from
+    proximity, a control command, native contact enablement or a task name.
     """
 
     name = "pinocchio_coal_robot_state"
@@ -72,9 +75,11 @@ class RobotStateValidator:
         self.pairs = tuple(pairs)
         expected = {frozenset(pair) for pair in combinations(checker.geometry_names, 2)}
         supplied = [frozenset((pair.first, pair.second)) for pair in self.pairs]
+        # BEGIN model-level mechanical permissions are separate pair identities.
         if (len(supplied) != len(set(supplied)) or set(supplied) != expected
-                or any(pair.policy not in ("required", "excluded") for pair in self.pairs)):
-            raise ValueError("Acceptance requires a complete unique required/excluded policy for every native geometry pair")
+                or any(pair.policy not in ("required", "excluded", "mechanical_contact") for pair in self.pairs)):
+            raise ValueError("Acceptance requires a complete unique required/excluded/mechanical_contact policy for every native geometry pair")
+        # END every native solid pair is still queried exactly once.
         for pair in self.pairs:
             _name(pair.source, "native pair policy source")
 
@@ -151,9 +156,14 @@ class RobotStateValidator:
                                    "measured": row["signed_distance_m"], "pair_index": index,
                                    "relation": row["relation"], "evidence": deepcopy(row)})
         required = [row["signed_distance_m"] for row in result["pairs"] if row["policy"] == "required"]
+        # BEGIN retain legal contact evidence while keeping all scalar/FK guards.
+        mechanical_contacts = [deepcopy(row) for row in result["pairs"]
+                               if row["policy"] == "mechanical_contact" and row["relation"] != "separated"]
+        # END allowed contact does not imply separation or stable task Holding.
         return {"passed": not violations, "violations": violations, "stage": stage,
                 "trajectory_time": float(trajectory_time),
                 "distances_m": [row["signed_distance_m"] for row in result["pairs"]],
+                "mechanical_contacts": mechanical_contacts,
                 "min_required_clearance_m": min(required) if required else None,
                 "base_model_error": base_error, "tcp_model_error": tool_error,
                 "actual_joint_positions": result["joint_positions"],
