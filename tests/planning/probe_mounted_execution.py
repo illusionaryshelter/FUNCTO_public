@@ -19,10 +19,12 @@ import traceback
 
 import mujoco
 import numpy as np
+import yaml
 from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from manipulation.execution import ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
+from manipulation.gripper_trajectory import FingerTrajectory
 from manipulation.planning import JointTrajectory
 from recorded_simulation import restore_recorded_simulation, load_saved_trajectory
 from robot_validation_fixture import build_robot_validator
@@ -157,6 +159,38 @@ def run(args):
                 np.array([0., args.move_seconds, duration]), np.stack((q0, target, target)),
                 np.stack((dq0, np.zeros(narm), np.zeros(narm))),
                 np.array([0., args.move_seconds / duration, 1.]), np.array([0., 1., 1.]), events, (), {})
+        # BEGIN new diagnostic commands use the same production C1 reference.
+        # A saved planner archive is never regenerated here. Only an explicitly
+        # requested new control experiment owns new goals and timing. Native
+        # cspace acceleration bounds constrain this reference; they do not
+        # declare calibrated actual actuator acceleration or tracking error.
+        target_contract = FixedFingerTargets(tuple(backend.finger_joint_names),
+            "Explicit bounded control experiment; no source skill event", targets)
+        if not args.trajectory and events:
+            robot_config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
+            cspace = robot_config["robot_cfg"]["kinematics"]["cspace"]
+            configured_names = tuple(cspace["joint_names"])
+            acceleration = np.asarray(cspace["max_acceleration"], dtype=float)
+            if acceleration.ndim == 0:
+                acceleration = np.full(len(configured_names), float(acceleration))
+            if (acceleration.shape != (len(configured_names),) or not np.isfinite(acceleration).all()
+                    or np.any(acceleration <= 0.) or len(set(configured_names)) != len(configured_names)):
+                raise ValueError("Control references require the explicit native cspace acceleration bounds")
+            selected_acceleration = acceleration[[configured_names.index(name) for name in backend.finger_joint_names]]
+            velocity = np.array([backend.velocity_limits[name] for name in backend.finger_joint_names])
+            curve.finger_trajectory = FingerTrajectory.build(
+                joint_names=backend.finger_joint_names, initial_position=initial["q"][narm:],
+                initial_velocity=initial["dq"][narm:],
+                commands=target_contract.bind(curve, finger_joint_names=backend.finger_joint_names,
+                                               ctrlrange=backend.finger_ctrlrange),
+                duration=curve.duration, executable_until=curve.executable_until, timestep=backend.timestep,
+                position_limits=backend.joint_ranges[narm:].T,
+                velocity_limits=np.stack((-velocity, velocity)),
+                acceleration_limits=np.stack((-selected_acceleration, selected_acceleration)),
+                source=f"New explicitly requested mounted control diagnostic; native reference bounds from {fixture['robot_config_path']}; not a contact prediction",
+                feedback_id=initial["feedback_id"], timestamp_s=initial["timestamp_s"])
+        finger_reference = curve.finger_trajectory
+        # END measurement and supervision sample this identical saved reference.
         count = int(np.ceil(duration / backend.timestep - 1e-10))
         if not 0 < count <= args.max_physics_steps <= 5000 or not 0 < args.max_contact_rows <= 100000:
             raise ValueError("This small diagnostic is limited to 5000 steps and 100000 contact rows")
@@ -167,10 +201,22 @@ def run(args):
         report.update(restore=restored, native_timestep_s=backend.timestep,
                       reference_duration_s=duration, initial_feedback=_json(initial),
                       arm_delta=delta.tolist(), finger_target=fingers.tolist(),
+                      finger_reference=None if finger_reference is None else finger_reference.describe(),
                       controller_configuration=part, independent_validator=validator.describe())
-        np.savez(output / "control-reference.npz", joint_names=curve.joint_names,
-                 times=curve.times, position=curve.position, velocity=curve.velocity,
-                 progress_u=curve.progress_u, progress_s=curve.progress_s)
+        # BEGIN retain the exact new diagnostic reference separately from physics.
+        reference_arrays = dict(joint_names=curve.joint_names, times=curve.times, position=curve.position,
+                                velocity=curve.velocity, progress_u=curve.progress_u, progress_s=curve.progress_s)
+        if finger_reference is not None:
+            reference_arrays.update(finger_joint_names=finger_reference.joint_names,
+                finger_times=finger_reference.times, finger_position=finger_reference.position,
+                finger_velocity=finger_reference.velocity)
+        np.savez(output / "control-reference.npz", **reference_arrays)
+        (output / "control-reference.json").write_text(json.dumps({
+            "classification": "planner_accepted" if args.trajectory else "diagnostic_control_reference",
+            "events": curve.events, "duration": curve.duration, "executable_until": curve.executable_until,
+            "finger_trajectory": None if finger_reference is None else finger_reference.describe(),
+            "scope": "Exact command reference; no actual motion or Holding assertion"}, indent=2, allow_nan=False) + "\n")
+        # END no reference is reconstructed from measured execution outcomes.
         model, data = backend.native_model, backend.native_data
         robot_root = model.body(fixture["base_link"]).id
         actuator_ids = [model.actuator(name).id for name in backend.actuator_names]
@@ -203,11 +249,15 @@ def run(args):
         def capture(elapsed):
             feedback = backend.proprioception()
             q, dq, _ = curve.sample(min(elapsed, duration))
+            reference_fingers = (finger_reference.sample(min(elapsed, duration)) if finger_reference is not None
+                                 else (np.full(len(backend.finger_joint_names), np.nan),
+                                       np.full(len(backend.finger_joint_names), np.nan)))
             tcp = backend.reference_tool_pose(q)
             # Preserve the completed physical sample before any evaluator can
             # reject nonfinite feedback; terminal evidence must not disappear.
             samples.append({"time": elapsed, "q": feedback["q"], "dq": feedback["dq"],
                             "reference_q": q, "reference_dq": dq, "tcp": feedback["tool_pose"],
+                            "reference_finger_q": reference_fingers[0], "reference_finger_dq": reference_fingers[1],
                             "reference_tcp": tcp, "ctrl": backend.actuator_control.copy(),
                             "actuator_force": data.actuator_force[actuator_ids].copy(),
                             "qfrc_actuator": data.qfrc_actuator[dof_ids].copy(),
@@ -241,8 +291,7 @@ def run(args):
             executor = TrajectoryExecutor(backend, geometry_checker=validator)
             execution = executor.execute(curve, evaluation_mode=("accepted_plan" if args.trajectory
                                                                   else "diagnostic_control_reference"),
-                finger_targets=FixedFingerTargets(tuple(backend.finger_joint_names),
-                    "Explicit bounded control experiment; no source skill event", targets),
+                finger_targets=target_contract,
                 initial_feedback=initial, execution_limits=limits, output=output / "execution",
                 max_physics_steps=args.max_physics_steps,
                 start_position_tolerance=args.start_position_tolerance,
@@ -257,7 +306,11 @@ def run(args):
             for index in range(count):
                 elapsed = (index + 1) * backend.timestep
                 q, _, _ = curve.sample(min(elapsed, duration))
-                control = backend.apply_control(q, fingers)
+                # BEGIN diagnostic measurement uses the same synchronous command.
+                finger_command = (finger_reference.sample(min(elapsed, duration))[0]
+                                  if finger_reference is not None else fingers)
+                control = backend.apply_control(q, finger_command)
+                # END actual finger q/dq still come only from native feedback.
                 controls.append({"time": index * backend.timestep,
                                  "requested_arm_torque": control["requested_arm_torque"],
                                  "arm_torque_saturated": control["arm_torque_saturated"]})

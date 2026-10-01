@@ -20,6 +20,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from manipulation.execution import ExecutionLimits
+from manipulation.gripper_trajectory import FingerTrajectory
 from manipulation.robosuite_execution import RobosuiteExecutionBackend
 
 def load_saved_trajectory(path, *, evaluation_mode, execution_limits):
@@ -46,6 +47,36 @@ def load_saved_trajectory(path, *, evaluation_mode, execution_limits):
             arrays["position"].copy(), arrays["velocity"].copy(), arrays["progress_u"].copy(),
             arrays["progress_s"].copy(), tuple(metadata["events"]), tuple(metadata["conditions"]),
             metadata["residuals"])
+        # BEGIN load the exact planner finger polynomial and cross-check its arrays.
+        command_events = [row for row in curve.events if row["kind"] in ("open", "close", "hold")]
+        if "finger_trajectory" not in metadata:
+            raise ValueError("Saved trajectories must explicitly declare their finger_trajectory field")
+        saved_fingers = metadata["finger_trajectory"]
+        finger_arrays = {"finger_joint_names", "finger_times", "finger_position", "finger_velocity"}
+        if saved_fingers is None:
+            if command_events or finger_arrays & set(arrays.files):
+                raise ValueError("Finger command events require the complete saved planning finger reference")
+            curve.finger_trajectory = None
+        else:
+            if not finger_arrays <= set(arrays.files):
+                raise ValueError("Saved finger reference requires all named polynomial arrays")
+            fingers = FingerTrajectory.from_mapping(saved_fingers)
+            if (fingers.duration != curve.duration or fingers.executable_until != curve.executable_until
+                    or tuple(arrays["finger_joint_names"].tolist()) != fingers.joint_names
+                    or not np.array_equal(arrays["finger_times"], fingers.times)
+                    or not np.array_equal(arrays["finger_position"], fingers.position)
+                    or not np.array_equal(arrays["finger_velocity"], fingers.velocity)):
+                raise ValueError("Saved arm/finger arrays and metadata must describe the same original clock and polynomial")
+            originals = {(row["skill_id"], row["event_id"]): row for row in command_events}
+            if len(originals) != len(command_events) or set(originals) != {
+                    (row["skill_id"], row["event_id"]) for row in fingers.events}:
+                raise ValueError("Saved finger reference event identities differ from the original arm trajectory")
+            for row in fingers.events:
+                original = originals[(row["skill_id"], row["event_id"])]
+                if any(key not in row or row[key] != value for key, value in original.items()):
+                    raise ValueError("Saved finger events changed an original command, time or progress anchor")
+            curve.finger_trajectory = fingers
+        # END reload never generates a replacement finger trajectory.
     if curve.next_verification != metadata["next_verification"]:
         raise ValueError("The saved evidence barrier must be preserved exactly")
     return curve

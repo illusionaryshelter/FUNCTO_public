@@ -20,6 +20,8 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from .gripper_trajectory import FingerTrajectory
+
 # BEGIN independent named finger targets bound to the exported event clock.
 @dataclass(frozen=True)
 class FixedFingerTargets:
@@ -128,7 +130,8 @@ class ExecutionLimits:
     No physical tolerance is inferred from controller gains, numerical solver
     tolerances, actuator targets or a previously failed execution. Finger
     bounds describe permitted *actual* positions after each original event;
-    targets may lie outside them when contact prevents complete closure.
+    targets may lie outside them when contact prevents complete closure. These
+    intervals are runtime protection limits, never a planning geometry sweep.
     One arm/TCP tracking band applies to the path and to command-event gates.
     Event times are owned exclusively by ``JointTrajectory``.
     """
@@ -232,20 +235,12 @@ class ExecutionLimits:
             if (np.any(bounds[:, 0] < ranges[narm:, 0]) or np.any(bounds[:, 1] > ranges[narm:, 1])
                     or np.any(np.asarray(row["maximum_speed"]) > speed[narm:])):
                 raise ValueError("Actual finger intervals must remain within native position and hardware velocity limits")
-        # BEGIN commands cannot narrow actual geometry without new feedback.
-        # A command is applied on the next native step, while planning modes
-        # change at the original progress anchor. Containing the preceding
-        # interval covers this delay without moving an event or pretending a
-        # servo has already converged. A tighter interval belongs to a new
-        # measured binding after the original evidence barrier, not a command.
-        previous = np.asarray(self.initial_fingers["position_bounds"])
-        for event in sorted(commands, key=lambda item: item["progress"]):
-            current = np.asarray(rows[(event["skill_id"], event["event_id"])]["position_bounds"])
-            if np.any(current[:, 0] > previous[:, 0]) or np.any(current[:, 1] < previous[:, 1]):
-                raise ValueError("A command cannot narrow the previous actual finger interval; "
-                                 "use fresh measured feedback at the original evidence barrier before rebinding")
-            previous = current
-        # END commands cannot narrow actual geometry without new feedback.
+        # BEGIN actual protection intervals are no longer future geometry.
+        # Their old monotone enlargement rule existed only to cover a planning
+        # full-stroke union. Timed nominal geometry now has its own saved
+        # reference. A new runtime interval is checked against real feedback
+        # after its command activates; it never proves the actuator converged.
+        # END runtime limits do not construct a hand or certify future motion.
         if np.any(np.asarray(self.stop_arm_velocity) > speed[:narm]):
             raise ValueError("Stop-speed limits cannot exceed the named hardware limits")
         return {"joint_ranges": ranges, "maximum_speed": speed,
@@ -412,8 +407,9 @@ class TrajectoryExecutor:
         runner does not certify a grasp, bypass a barrier, or advance a skill.
         The last native step can finish less than one timestep after the
         barrier's clock time, but its commanded q/dq/progress is clamped to the
-        barrier itself. Finger events use their original retimed times and
-        are applied on the next native step, without changing the arm cubic.
+        barrier itself. Finger events use the archived reference's original
+        retimed times and native activation ticks, without changing the arm
+        cubic. The same saved C1 finger reference is sampled at each arm query.
         The complete measured entrance is checked independently of all goals.
         No goal from the later curve is sent to an actuator. Physical tracking
         and actual finger intervals require an explicit ``ExecutionLimits``;
@@ -480,6 +476,21 @@ class TrajectoryExecutor:
         finger_bounds = backend.finger_ctrlrange
         command_events = finger_targets.bind(trajectory, finger_joint_names=backend.finger_joint_names,
                                              ctrlrange=finger_bounds)
+        # BEGIN execute the exact archived finger reference, never a new ramp.
+        finger_reference = trajectory.finger_trajectory
+        if command_events and not isinstance(finger_reference, FingerTrajectory):
+            raise ValueError("Original finger events require the exact saved planning FingerTrajectory")
+        if finger_reference is not None and not isinstance(finger_reference, FingerTrajectory):
+            raise ValueError("A supplied finger reference must be the validated original FingerTrajectory")
+        finger_reference_report = None
+        if finger_reference is not None:
+            speeds = np.array([backend.velocity_limits[name] for name in backend.finger_joint_names])
+            finger_reference_report = finger_reference.validate_execution(
+                trajectory, command_events, initial_feedback=initial_feedback, timestep=backend.timestep,
+                position_limits=backend.joint_ranges[narm:].T,
+                velocity_limits=np.stack((-speeds, speeds)))
+            command_events = deepcopy(list(finger_reference.events))
+        # END missing event references have no position-step fallback.
         # BEGIN one physical contract shared by path checks and event gates.
         limit_binding = execution_limits.bind(trajectory,
             joint_names=backend.joint_names, arm_joint_names=backend.arm_joint_names,
@@ -513,11 +524,15 @@ class TrajectoryExecutor:
                                      "tolerance_scope": "float32 trajectory export roundoff only; does not authorize another episode entrance"},
             "barrier_discretization": "ceil native steps; final command q/dq/progress clamped to original barrier; physical clock may overrun by less than one timestep",
             "executed_steps": 0, "barrier_crossed": False,
-            "gripper_command_timing": "original retimed events applied at the next native step start; less than one native timestep late",
+            "gripper_command_timing": "original retimed event identities activate at their saved ceil-to-native-step tick; every subsequent position command samples the same archived finger reference and arm clock",
             "finger_targets": {"joint_names": finger_targets.joint_names, "source": finger_targets.source,
                                "bound_events": deepcopy(command_events)},
+            "finger_reference": None if finger_reference is None else finger_reference.describe(),
+            "finger_reference_bounds": finger_reference_report,
+            "finger_reference_actual_tracking_certified": False,
             "command_record_semantics": "sample zero uses curve q(0) and restored finger ctrl; each later command_q combines the arm goal sampled at min(step end, barrier) with the finger goal applied during that step",
-            "arm_curve_dq_semantics": "arm cubic derivative at curve_time, recorded only; no desired finger velocity is invented for position-target steps",
+            "arm_curve_dq_semantics": "arm cubic derivative at curve_time, recorded independently of actual velocity",
+            "finger_reference_semantics": "reference_finger_q/dq are the archived C1 nominal command at curve_time, not actual feedback; absent references are NaN and explicitly unprovided; physical contact can prevent target attainment without proving a tracking failure or Holding",
             "actuator_control_semantics": "one native torque/position ctrl row per executed attempt, timestamped at step start; actual q/dq are separately recorded after each completed step",
             # BEGIN preserve the two clocks and meanings needed for dynamics review.
             "actual_dynamics_semantics": "actual_qacc and actual_actuator_force use the initial refreshed native state and every completed post-step mj_forward state at elapsed/sim_time; qacc is native forward acceleration, not differentiated dq; force is native actuator output, not mixed-unit ctrl",
@@ -545,10 +560,18 @@ class TrajectoryExecutor:
 
         def record(elapsed, desired_arm_q, arm_curve_dq, progress, feedback=None):
             feedback = backend.proprioception() if feedback is None else feedback
+            # BEGIN retain reference and actual fingers as separate evidence.
+            reference_fingers = (finger_reference.sample(min(float(elapsed), stop))
+                                 if finger_reference is not None else
+                                 (np.full(len(backend.finger_joint_names), np.nan),
+                                  np.full(len(backend.finger_joint_names), np.nan)))
+            # END unknown desired velocity is not manufactured from a target.
             return {"elapsed": float(elapsed), "sim_time": feedback["sim_time"],
                     "curve_time": min(float(elapsed), stop),
                     "command_q": np.concatenate((np.asarray(desired_arm_q), target_positions)),
                     "arm_curve_dq": np.asarray(arm_curve_dq).copy(),
+                    "reference_finger_q": reference_fingers[0].copy(),
+                    "reference_finger_dq": reference_fingers[1].copy(),
                     "q": feedback["q"], "dq": feedback["dq"], "tool_pose": feedback["tool_pose"],
                     # BEGIN synchronized native dynamics, including failed samples.
                     "qacc": feedback["qacc"], "actuator_force": feedback["actuator_force"],
@@ -622,7 +645,7 @@ class TrajectoryExecutor:
                 before = backend.proprioception()
                 guard(before, curve_time=min(elapsed, stop), physical_elapsed=elapsed, point="before_step")
                 due = []
-                while event_index < len(command_events) and command_events[event_index]["time"] <= elapsed + 1e-12:
+                while event_index < len(command_events) and command_events[event_index]["activation_step"] <= index:
                     due.append(command_events[event_index])
                     event_index += 1
                 next_command = command
@@ -635,12 +658,18 @@ class TrajectoryExecutor:
                     guard(before, curve_time=float(due[-1]["time"]), physical_elapsed=elapsed,
                           point="command_event", event=due[-1])
                     next_command = due[-1]["kind"]
-                    next_finger_positions = np.asarray(due[-1]["finger_positions"], dtype=float)
                     # The pre-event state belongs to the old interval. Only an
                     # actually applied command selects its declared new one.
                     next_finger_state = deepcopy(limit_binding["event_fingers"][(due[-1]["skill_id"], due[-1]["event_id"])])
                 next_time = (index + 1) * backend.timestep
                 q, dq, progress = trajectory.sample(min(next_time, stop))
+                # BEGIN one synchronous 7+2 command query, with independent feedback.
+                # A future event's ramp starts at its saved activation tick.
+                # At that boundary its q/dq remain C1 with the prior hold, so
+                # sampling this step's endpoint cannot issue an early closure.
+                if finger_reference is not None:
+                    next_finger_positions, _ = finger_reference.sample(min(next_time, stop))
+                # END native GRIP receives the same named reference as planning.
                 control = backend.apply_control(q, next_finger_positions)
                 # BEGIN aggregate only the backend's named arm clipping count.
                 arm_control_saturation_count += control["arm_control_saturated_coordinates"]
@@ -699,7 +728,7 @@ class TrajectoryExecutor:
                 unapplied_gripper_events=[deepcopy(event) for event in command_events
                                           if (event["skill_id"], event["event_id"]) not in applied_ids],
                 maximum_arm_tracking_error_rad=float(np.max(np.abs(actual_q[:, :narm]-command_q[:, :narm]))),
-                maximum_finger_position_tracking_error=float(np.max(np.abs(actual_q[:, narm:]-command_q[:, narm:]))),
+                maximum_finger_command_position_difference=float(np.max(np.abs(actual_q[:, narm:]-command_q[:, narm:]))),
                 # BEGIN preserve the arm-only meaning in the report field.
                 arm_control_saturated_coordinates=arm_control_saturation_count,
                 # END never describe this as all-actuator saturation.
@@ -714,6 +743,9 @@ class TrajectoryExecutor:
                 curve_time=np.asarray([row["curve_time"] for row in samples]),
                 sim_time=np.asarray([row["sim_time"] for row in samples]),
                 command_q=command_q, arm_curve_dq=np.asarray([row["arm_curve_dq"] for row in samples]),
+                reference_finger_provided=np.asarray(finger_reference is not None),
+                reference_finger_q=np.asarray([row["reference_finger_q"] for row in samples]),
+                reference_finger_dq=np.asarray([row["reference_finger_dq"] for row in samples]),
                 actual_q=actual_q, actual_dq=np.asarray([row["dq"] for row in samples]),
                 # BEGIN keep every actual dynamics sample aligned with elapsed/sim_time.
                 actual_qacc=np.asarray([row["qacc"] for row in samples]),
