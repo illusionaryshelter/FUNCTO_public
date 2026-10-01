@@ -1,4 +1,4 @@
-# Native planning checks
+# Planning checks and visualization
 
 These scripts exercise FUNCTO's production `manipulation.planning*` modules
 against the installed cuRobo V2 and OMPL backends. They include synthetic
@@ -26,6 +26,9 @@ not include every allocation made by native libraries.
 
 | Scripts | Scope |
 |---|---|
+| `check_recorded_task_inputs.py` | CPU replay of manifest-declared task references and input completeness; preserves candidate ambiguity and independent snapshots |
+| `check_recorded_robot_binding.py` | CPU comparison of an explicitly mapped recorded robot and planning URDF, including collision-sphere coverage counterexamples |
+| `visualize_recorded_task.py` | Local HTML and PNG presentation of those input audits and task-space references; does not run joint planning or simulation |
 | `probe_ompl_constraints.py` | CPU OMPL projection and connection contracts |
 | `probe_scalar_progress_clock.py`, `diagnose_moving_gripper_capacity.py`, `probe_collision_suffix_capacity.py` | CPU representation and interpolation diagnostics |
 | `probe_fk_gradient.py`, `probe_process_gradient.py` | Native FK and full-process derivative checks |
@@ -46,3 +49,12 @@ file path; they are not a second production planning package. Historical JSON,
 trajectory and log artifacts remain in the workspace's stage records and are
 not runtime dependencies. In particular, `probe_ur10e_future_branch.py` takes
 its independently generated IK audit through `--audit`.
+
+Recorded-task checks take explicit input paths through their CLI or manifest;
+the scripts contain no fixed episode or task sequence. Run input audits with
+`CUDA_VISIBLE_DEVICES=''`. Their `reference_not_planned` curves are grounding
+references, and successful recomputation does not establish candidate selection,
+complete collision inputs, or robot execution. The robot audit reads only the
+declared robot subtree and proprioception columns; a rigid TCP calibration does
+not repair mismatched collision geometry. Use each script's `--help` for its
+required paths and mappings.
