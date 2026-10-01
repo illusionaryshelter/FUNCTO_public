@@ -33,6 +33,8 @@ checked independently. It preserves all required source anchors.
 | `check_recorded_robot_binding.py` | CPU comparison of an explicitly mapped recorded robot and planning URDF, including collision-sphere coverage counterexamples |
 | `visualize_recorded_task.py` | Local HTML and PNG presentation of those input audits and task-space references; does not run joint planning or simulation |
 | `robot_fixture.py`, `prepare_recorded_task.py` | Explicit native robot geometry, named proprioception, FK checks and current planning-problem preparation |
+| `check_recorded_robot_geometry.py` | Independent Pinocchio FK and Coal convex/analytic-solid pair distances for complete named recorded states; CPU only |
+| `probe_finger_control.py` | Bounded native asset control diagnostic with actual q/dq, actuator/generalized forces, contact identities and explicit convergence thresholds |
 | `recorded_observation.py`, `recorded_owner_geometry.py`, `detect_recorded_owners.py` | Current robot/owner masks and explicitly bound offline carrier geometry; no current object truth enters planning |
 | `run_recorded_skill.py`, `recorded_task_planning.py` | Current bounded joint planning, unchanged skill constraints and classified diagnostic curve export |
 | `recorded_simulation.py`, `recorded_skill_evaluation.py`, `run_recorded_simulation.py` | Native joint-controlled physics up to the next evidence barrier, with separate task evaluation and calibrated videos |
@@ -75,6 +77,59 @@ selections. These must identify evidenced original approach entrances before
 contact/closing; neither script infers a dataset-specific index or silently uses
 the grasp pose. Missing selections remain reported input failures.
 <!-- END explicit pre-grasp selection for recorded grasp requests. -->
+
+<!-- BEGIN shared actual-hand execution contract and independent geometry diagnostics. -->
+Recorded planning and execution require the same `--execution-limits` JSON,
+validated by `ExecutionLimits` in `recorded_simulation.py`. It supplies complete
+ordered joint names, a source, arm/TCP tracking limits, actual finger position
+and speed intervals for the initial state and every original command event,
+and the velocity threshold for original stops. It contains no duplicate event
+clock and has no physical defaults. Position targets remain the separate
+explicit `--finger-targets` input to execution. Planning optimizes only the arm;
+`position_bounds` conservatively covers the supervised actual finger intervals.
+
+Each command's position interval must contain its preceding interval until new
+feedback is bound. Commands can take effect at the next native step, so a
+command event alone cannot justify narrowing the geometry before it is applied.
+Narrower bounds require new feedback at the existing evidence barrier. Saved
+curves retain the exact limits, and accepted execution requires the same input.
+These limits must be calibrated; the CPU tests' synthetic numbers and a failed
+asset probe are not execution calibration.
+
+Fixture export uses `collision_root` for the articulated sphere scope. The
+visual self-filter covers the complete calibrated assembly. Fixed installation
+primitives remain in the native model and as static collision owners, with
+native pair exclusions scoped only to the corresponding robot query. The
+manifest preserves native double-precision `position_limits` as well as velocity
+limits. Regenerate older fixtures; they are not silently upgraded.
+
+The independent checker needs the robotics distribution `pin` (Python import
+`pinocchio`) and Coal. If an unrelated same-name package shadows this installed
+distribution, select the existing distribution only for the launched process:
+
+```bash
+python -c 'from importlib.metadata import distribution; from pathlib import Path; import runpy,sys; d=distribution("pin"); roots=[d.locate_file(f).resolve().parent.parent for f in d.files if str(f).endswith("/pinocchio/__init__.py")]; assert len(roots)==1; script=Path(sys.argv[1]).resolve(); sys.path[:0]=[str(roots[0]),str(script.parent)]; sys.argv=sys.argv[1:]; runpy.run_path(str(script),run_name="__main__")' \
+  tests/planning/check_recorded_robot_geometry.py --help
+```
+
+The checker consumes an explicit `--fixture`, complete `--feedback`, optional
+repeated `--saved-state-report`, explicit `--pair-policy` when acceptance-related
+pair identities are needed, and a new `--output` JSON path. Raw intersections of
+excluded pairs remain in the report. Default distance tolerances are numerical
+settings, not proven error bounds or collision exemptions.
+
+Native planner records keep seed controls, rollout q/dq, formal interpolation,
+valid sample counts and their distinct dt/knot_dt values. Constructed configs
+are saved as JSON plus NPZ tensors; observer errors remain visible. Controls
+are not a sampled joint path. Execution adds actual q/dq/TCP, applied controls,
+event gates and the first feedback violation. Stopping simulation and preparing
+a hold command do not establish physical braking or Holding.
+
+The finger asset probe preserves its input model's contact topology. A hand
+welded directly to world can have different parent collision filtering from
+the same hand attached to a movable arm. Use its contact/force records to inspect
+that distinction; calibrate whole-robot control in its original mounted context.
+<!-- END shared actual-hand execution contract and independent geometry diagnostics. -->
 
 The native simulator accepts a classified saved curve and an explicit evaluation
 mode. A rejected candidate may be run only as an isolated diagnostic; its physics

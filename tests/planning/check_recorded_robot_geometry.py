@@ -119,6 +119,11 @@ def _states(args, fixture, feedback, config):
             states.append({"kind": "saved_state", "source": str(path.resolve()),
                            "saved_index": index, "mode": row["mode"], "source_frame": row["source_frame"],
                            "rank": row["rank"], "named_q": values,
+                           # A probe mode identifies constraints it attempted,
+                           # not success. Preserve the producer's status so a
+                           # failed seed is never read as an accepted IK state.
+                           "source_native_success": row.get("native_success"),
+                           "source_pose_limits_passed": row.get("pose_limits_passed"),
                            "locked_joint_source": str(Path(source_fixture["robot_config_path"]).resolve()),
                            "reference_tool_pose": row["tool_pose"]})
     if len(states) > 129:

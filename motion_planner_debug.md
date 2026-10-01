@@ -89,6 +89,8 @@ Pinocchio 的 Python distribution 是 `pin`，导入名是 `pinocchio`。当前�
 
 控制容差、指位实际范围和超时必须显式给出来源。现有控制探针只证明目标透传，尚未建立可靠跟踪范围；应保留 contact geom pair、有效接触力、actuator force 和实际 q/dq/ctrl，以区分接触、控制跟踪和模型问题。
 
+独立夹爪资产不能默认代表整机安装上下文。手掌若焊接到 world，MuJoCo 的父子碰撞过滤具有 world 例外，会产生整机安装时被原生规则排除的掌指接触。当前力记录与完整模型的零积分查询已确认这一差异；孤立资产的未收敛不作为整机跟踪范围证据。控制标定应复用完整原生安装与现有执行控制器，不能通过删接触或改参数“修正”探针。参见 [MuJoCo 碰撞过滤规则](https://mujoco.readthedocs.io/en/latest/computation/index.html#collision-detection)。
+
 反馈门槛不等于自动新增停车。原接近段、close 后的 EEF 尾段和稳定抓持屏障均保留；不满足门槛时失败，而不是擅自改写演示路径。是否允许等待由原事件和过程要求决定。
 
 `barrier_command_reached` 只表示指令达到屏障时间，不表示实际到位。Holding 仍需当前观测及独立稳定抓持证据，不能由控制命令或规划 success 推导。
