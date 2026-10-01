@@ -140,6 +140,8 @@ def replay_precision(torch, variant, report):
                "local_replacement": "Inverse-base rotation only: GEMM to existing quaternion_rotate"
                    if variant == "local_inverse_quaternion" else None}
     report["precision_variant"] = details
+    if variant == "global_ieee" and prior["float32_matmul_precision"] not in ("highest", "high"):
+        raise ValueError("IEEE replay requires cuRoBo's original legacy TF32 flag policy")
     try:
         if variant == "global_ieee":
             torch.backends.cuda.matmul.allow_tf32 = False
@@ -153,10 +155,10 @@ def replay_precision(torch, variant, report):
             yield
     finally:
         if variant == "global_ieee":
+            # Match cuRoBo's legacy flag setter for both changes. The installed
+            # Torch rejects mixing it with set_float32_matmul_precision; its
+            # original high/highest policy is fully encoded by this flag.
             torch.backends.cuda.matmul.allow_tf32 = prior["cuda_matmul_allow_tf32"]
-            # Restoring the precision string also preserves a possible prior
-            # 'medium' setting, which the boolean flag alone cannot encode.
-            torch.set_float32_matmul_precision(prior["float32_matmul_precision"])
         details["after"] = precision_snapshot(torch)
         details["settings_restored"] = details["after"] == prior
         details["native_state_function_restored"] = planning._timed_native_state is original
