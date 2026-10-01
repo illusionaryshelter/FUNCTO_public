@@ -347,8 +347,9 @@ def self_forward_probe(planner, rollout, actions, witness_joint, arrays, report,
                     selected_pairs[time_index] = active
                     pair_score = (radius[i]+radius[j])**2-np.sum((geometry[i, :3]-geometry[j, :3])**2)
                     selected_gap[time_index] = maximum-max(0., float(pair_score))
-                    expected[i, :3] = weight*(geometry[j, :3]-geometry[i, :3])
-                    expected[j, :3] = -expected[i, :3]
+                    if maximum > 0:
+                        expected[i, :3] = weight*(geometry[j, :3]-geometry[i, :3])
+                        expected[j, :3] = -expected[i, :3]
                 elif len(active) != 0:
                     raise ValueError("Native self gradient unexpectedly writes more than one sphere pair")
                 elif maximum > 0:
@@ -379,6 +380,11 @@ def self_forward_probe(planner, rollout, actions, witness_joint, arrays, report,
             with patch.object(cost, "forward", new=record_input):
                 evaluated = rollout.evaluate_action(x)
             self_value = terms(evaluated.costs_and_constraints)["constraint:self_collision"]
+            # BEGIN detect native cost-buffer mutation during later components.
+            # The hook snapshot precedes custom process/scene/coverage work;
+            # preserve the collection value after those same computations.
+            late_self_value = self_value.detach().clone()
+            # END compare values without altering the native gradient graph.
             loss = self_value.sum()
             action_gradient = sphere_gradient = None
             if gradient:
@@ -386,11 +392,13 @@ def self_forward_probe(planner, rollout, actions, witness_joint, arrays, report,
                 action_gradient, sphere_gradient = cpu(action_grad), cpu(sphere_grad)
             spheres = cpu(captured["sphere_snapshot"])
             values = cpu(captured["output_snapshot"]).reshape(-1)
+            late_values = cpu(late_self_value).reshape(-1)
             state = cpu(evaluated.state.joint_state.position)
         exact = cpu_exact(spheres, sphere_gradient)
         arrays[f"self_audit.{label}.spheres"] = spheres
         arrays[f"self_audit.{label}.joint_position"] = state
         arrays[f"self_audit.{label}.gpu_per_time"] = values
+        arrays[f"self_audit.{label}.gpu_collection_per_time"] = late_values
         for key, data in exact.items():
             arrays[f"self_audit.{label}.cpu_{key}"] = data
         if gradient:
@@ -399,6 +407,8 @@ def self_forward_probe(planner, rollout, actions, witness_joint, arrays, report,
         errors = values-exact["values"]
         worst = np.argsort(-np.abs(errors), kind="stable")[:5]
         result = {"label": label, "gradient_enabled": gradient,
+            "hook_vs_collection_identical": bool(np.array_equal(values, late_values)),
+            "hook_vs_collection_maximum_difference": float(np.abs(values-late_values).max()),
             "gpu_sum_float32": float(values.sum(dtype=np.float32)),
             "gpu_per_time_sum_float64": float(values.sum(dtype=np.float64)),
             "cpu_sum_float64": float(exact["values"].sum()),
