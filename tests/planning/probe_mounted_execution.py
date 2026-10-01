@@ -24,7 +24,7 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from manipulation.execution import ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
 from manipulation.planning import JointTrajectory
-from recorded_simulation import restore_recorded_simulation
+from recorded_simulation import restore_recorded_simulation, load_saved_trajectory
 from robot_validation_fixture import build_robot_validator
 
 
@@ -68,20 +68,13 @@ def run(args):
             arm_kp=part["kp"], arm_kd=part["kd"], velocity_limits=fixture["velocity_limits"])
         initial = backend.proprioception()
         narm = len(backend.arm_joint_names)
-        delta = np.asarray(args.arm_delta, dtype=float)
-        if delta.shape != (narm,) or not np.isfinite(delta).all():
-            raise ValueError("arm-delta requires one finite displacement per named arm joint")
-        duration = args.move_seconds + args.hold_seconds
-        if (not np.isfinite([args.move_seconds, args.hold_seconds]).all()
-                or args.move_seconds <= 0 or args.hold_seconds <= 0):
-            raise ValueError("Move and final-hold durations must be explicit, finite and positive")
-        count = int(np.ceil(duration / backend.timestep))
-        if not 0 < count <= args.max_physics_steps <= 5000 or not 0 < args.max_contact_rows <= 100000:
-            raise ValueError("This small diagnostic is limited to 5000 steps and 100000 contact rows")
         q0, dq0 = np.asarray(initial["q"][:narm]), np.asarray(initial["dq"][:narm])
-        target = q0 + delta
+        limits = ExecutionLimits.from_mapping(read_json(args.execution_limits)) if args.execution_limits else None
         events, targets = (), ()
         fingers = backend.finger_control.copy()
+        if args.trajectory and (limits is None or args.move_seconds is not None or args.hold_seconds is not None
+                                or args.finger_targets is not None or args.finger_command is not None):
+            raise ValueError("A saved planned baseline requires its identical limits and cannot receive new timing/finger events")
         if args.finger_targets is not None:
             if args.finger_command is None:
                 raise ValueError("Explicit finger targets require their declared command kind")
@@ -95,14 +88,36 @@ def run(args):
                         "kind": args.finger_command, "positions": fingers.tolist()},)
         elif args.finger_command is not None:
             raise ValueError("A finger command requires its independent position targets")
-        # The first derivative is measured, not silently replaced by zero.
-        # This explicitly new diagnostic curve has a stationary final hold;
-        # it does not trim, retime or modify any original skill trajectory.
-        curve = JointTrajectory(tuple(backend.arm_joint_names),
-            np.array([0., args.move_seconds, duration]), np.stack((q0, target, target)),
-            np.stack((dq0, np.zeros(narm), np.zeros(narm))),
-            np.array([0., args.move_seconds / duration, 1.]), np.array([0., 1., 1.]),
-            events, (), {})
+        # BEGIN either preserve an accepted exported baseline or construct a
+        # separately labelled diagnostic; there is no resampling or relabelling.
+        if args.trajectory:
+            curve = load_saved_trajectory(args.trajectory, evaluation_mode="accepted_plan", execution_limits=limits)
+            if curve.events or curve.conditions:
+                raise ValueError("Use run_recorded_simulation for skills with events or evidence conditions")
+            duration, delta = curve.duration, curve.position[-1] - curve.position[0]
+            report.update(mode="saved_planned_baseline", planner_accepted=True,
+                          trajectory_source=str(args.trajectory.resolve()),
+                          planning_scope="Use the source planner's declared scene scope; no recorded-scene acceptance is implied")
+        else:
+            delta = np.asarray(args.arm_delta, dtype=float)
+            if delta.shape != (narm,) or not np.isfinite(delta).all():
+                raise ValueError("arm-delta requires one finite displacement per named arm joint")
+            if (args.move_seconds is None or args.hold_seconds is None
+                    or not np.isfinite([args.move_seconds, args.hold_seconds]).all()
+                    or args.move_seconds <= 0 or args.hold_seconds <= 0):
+                raise ValueError("Move and final-hold durations must be explicit, finite and positive")
+            duration = args.move_seconds + args.hold_seconds
+            target = q0 + delta
+            # The entrance derivative is measured, not replaced by zero. This
+            # new control reference does not modify an original skill curve.
+            curve = JointTrajectory(tuple(backend.arm_joint_names),
+                np.array([0., args.move_seconds, duration]), np.stack((q0, target, target)),
+                np.stack((dq0, np.zeros(narm), np.zeros(narm))),
+                np.array([0., args.move_seconds / duration, 1.]), np.array([0., 1., 1.]), events, (), {})
+        count = int(np.ceil(duration / backend.timestep - 1e-10))
+        if not 0 < count <= args.max_physics_steps <= 5000 or not 0 < args.max_contact_rows <= 100000:
+            raise ValueError("This small diagnostic is limited to 5000 steps and 100000 contact rows")
+        # END exact saved baseline / separately classified control reference.
         validator = build_robot_validator(fixture, reference_frame=initial["reference_frame"],
             T_reference_base=initial["base_pose"], tool_frame=initial["tool_link"],
             T_frame_tcp=initial["tool_transform"])
@@ -176,15 +191,16 @@ def run(args):
         capture(0.)
         report["status"] = "running"
         if args.execution_limits:
-            limits = ExecutionLimits.from_mapping(read_json(args.execution_limits))
             report["execution_limits"] = limits.describe()
             executor = TrajectoryExecutor(backend, geometry_checker=validator)
-            execution = executor.execute(curve, evaluation_mode="diagnostic_control_reference",
+            execution = executor.execute(curve, evaluation_mode=("accepted_plan" if args.trajectory
+                                                                  else "diagnostic_control_reference"),
                 finger_targets=FixedFingerTargets(tuple(backend.finger_joint_names),
                     "Explicit bounded control experiment; no source skill event", targets),
                 initial_feedback=initial, execution_limits=limits, output=output / "execution",
                 max_physics_steps=args.max_physics_steps,
-                start_position_tolerance=0., start_velocity_tolerance=0.,
+                start_position_tolerance=args.start_position_tolerance,
+                start_velocity_tolerance=args.start_velocity_tolerance,
                 step_callback=lambda model, data, record: capture(record["elapsed"]))
             report["execution"] = execution
             report["steps_completed"] = execution["executed_steps"]
@@ -294,13 +310,17 @@ if __name__ == "__main__":
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--controller-part", required=True)
     parser.add_argument("--frame-index", type=int, required=True)
-    parser.add_argument("--arm-delta", nargs="+", type=float, required=True)
-    parser.add_argument("--move-seconds", type=float, required=True)
-    parser.add_argument("--hold-seconds", type=float, required=True)
+    reference = parser.add_mutually_exclusive_group(required=True)
+    reference.add_argument("--arm-delta", nargs="+", type=float)
+    reference.add_argument("--trajectory", type=Path)
+    parser.add_argument("--move-seconds", type=float)
+    parser.add_argument("--hold-seconds", type=float)
     parser.add_argument("--max-physics-steps", type=int, required=True)
     parser.add_argument("--max-contact-rows", type=int, required=True)
     parser.add_argument("--finger-targets", nargs="+", type=float)
     parser.add_argument("--finger-command", choices=("open", "close", "hold"))
     parser.add_argument("--execution-limits", type=Path)
+    parser.add_argument("--start-position-tolerance", type=float, default=0.)
+    parser.add_argument("--start-velocity-tolerance", type=float, default=0.)
     run(parser.parse_args())
 # END complete-context control diagnostic.
