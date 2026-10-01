@@ -76,6 +76,8 @@ def test_effective_config_uses_constructed_values_and_rejects_opaque_objects(tmp
         trajopt=SimpleNamespace(config=config, horizon=8, action_horizon=6),
         robot_dict={"kinematics": {"joint_names": ["b", "a"]}}, joint_names=("b", "a"),
         progress_map=SimpleNamespace(u=np.array([0., 1.]), s=np.array([0., 2.])),
+        formal_clock={"duration": 4.5, "interpolation_dt": .025, "valid_count": 181,
+                      "source": "explicit test formal clock"},
         _verification_native=native_verifier())
     config.weight[0] = 9.
     target = tmp_path / "configuration"
@@ -83,6 +85,7 @@ def test_effective_config_uses_constructed_values_and_rejects_opaque_objects(tmp
     document = json.loads(target.with_suffix(".json").read_text())
     assert document["ik"]["robot_config"]["reference"] == "bounded_robot_input"
     assert document["ik"]["control_space"]["enum"].endswith("Space.BSPLINE")
+    assert document["formal_clock"] == planner.formal_clock
     with np.load(target.with_suffix(".npz"), allow_pickle=False) as saved:
         np.testing.assert_array_equal(saved[document["ik"]["weight"]["npz_key"]], [9., 5.])
         # BEGIN all four runtime matrices retain native ordering and dtype.

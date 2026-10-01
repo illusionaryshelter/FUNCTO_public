@@ -118,6 +118,9 @@ class JointTrajectory:
     events: tuple[dict, ...]
     conditions: tuple[dict, ...]
     residuals: dict[str, float]
+    # BEGIN archive the exact independently controlled finger reference.
+    finger_trajectory: object | None = None
+    # END a missing hand curve is valid only for plans without hand events.
     _curve: CubicHermiteSpline = field(init=False, repr=False)
 
     def __post_init__(self):
@@ -967,8 +970,115 @@ def _verification_stop_preference(progress, joint_velocity, stop_progress):
 # END preserve a gradient toward the explicit verification-stop command.
 
 
+# BEGIN one formal output clock and native named-body FK for timed hand geometry.
+def _formal_native_clock(trajopt):
+    """Use native interpolation counting, including its extra spline samples."""
+    import torch
+    from curobo._src.types.control_space import ControlSpace
+    from curobo._src.util.trajectory import calculate_traj_steps
+    config = trajopt.config
+    if config.minimum_trajectory_dt != config.maximum_trajectory_dt:
+        raise ValueError("A separately timed hand requires one fixed request-wide native dt")
+    dt = torch.tensor([config.maximum_trajectory_dt], dtype=torch.float32)
+    knot_dt = dt*trajopt.interpolation_steps
+    interpolation_dt = torch.tensor([config.interpolation_dt], dtype=torch.float32)
+    control = trajopt.transition_model.control_space
+    if control not in ControlSpace.bspline_types():
+        raise ValueError("The formal clock must use the selected native spline representation")
+    horizon = ControlSpace.spline_total_knots(control, trajopt.action_horizon)+1
+    counts, _ = calculate_traj_steps(knot_dt, interpolation_dt, horizon, nearest_int=True)
+    count = int(counts.item())
+    return {"duration": (count-1)*float(interpolation_dt.item()),
+            "interpolation_dt": float(interpolation_dt.item()), "valid_count": count,
+            "source": "native calculate_traj_steps, fixed float32 spline clock"}
+
+
+class _RobotCoverageFK:
+    """An independent same-model FK buffer for native solid body frames."""
+
+    def __init__(self, problem, scene, robot_dict, device_cfg):
+        self.problem, self.scene = problem, scene
+        self.fk = None
+        if scene.robot_coverage is None:
+            return
+        from curobo.kinematics import Kinematics, KinematicsCfg
+        from curobo.types import JointState
+        from curobo.content import get_assets_path
+        from curobo._src.util.config_io import join_path
+        from pathlib import Path
+        self.JointState = JointState
+        configuration = deepcopy(robot_dict)
+        kinematics = configuration["robot_cfg"]["kinematics"]
+        urdf = join_path(kinematics.get("external_asset_path") or get_assets_path(), kinematics["urdf_path"])
+        if Path(urdf).resolve() != Path(scene._coverage_geometry["urdf_path"]).resolve():
+            raise ValueError("Native coverage FK must use the exact independently checked URDF")
+        locks = kinematics.get("lock_joints", {})
+        if scene.gripper is not None and scene.gripper.controller == "timed_reference":
+            for name in scene.gripper.joint_names:
+                if name not in locks:
+                    raise ValueError("Coverage may unlock only the explicitly independent finger joints")
+                del locks[name]
+        self.fk = Kinematics(KinematicsCfg.from_robot_yaml_file(
+            configuration, tool_frames=list(scene.robot_coverage.required_link_names), device_cfg=device_cfg),
+            compute_jacobian=True, compute_spheres=False, compute_com=False)
+        if set(self.fk.joint_names) != set(scene.robot_coverage.baseline_joint_names):
+            raise ValueError("Coverage FK and the native solid oracle must use exactly the same full joint set")
+        self._quaternion = _orientation_vjp_type()
+        self._layout = _native_gradient_layout_type()
+
+    def poses(self, joint_position, joint_names, trajectory_time):
+        if self.fk is None:
+            return None
+        import torch
+        from scipy.spatial.transform import Rotation
+        from .planning_problem import quaternion_multiply
+        names, full = self.scene.full_robot_positions(joint_position, joint_names, trajectory_time)
+        columns = [names.index(name) for name in self.fk.joint_names]
+        q = full[..., columns].contiguous()
+        state = self.fk.compute_kinematics(self.JointState.from_position(q, joint_names=self.fk.joint_names))
+        p = self._layout.apply(state.tool_poses.position)
+        r = self._quaternion.apply(q, state.tool_poses.quaternion.detach(), state.tool_jacobians[..., 3:, :].detach())
+        base = torch.as_tensor(self.problem.base_pose, dtype=q.dtype, device=q.device)
+        base_quaternion = torch.as_tensor(Rotation.from_matrix(self.problem.base_pose[:3, :3]).as_quat()[[3, 0, 1, 2]],
+                                          dtype=q.dtype, device=q.device)
+        p = p@base[:3, :3].T+base[:3, 3]
+        r = quaternion_multiply(base_quaternion, r)
+        return {name: (p[..., index, :], r[..., index, :]) for index, name in enumerate(self.fk.tool_frames)}
+
+
+def _timed_native_state(state, problem, scene, joint_names, trajectory_time):
+    """Replace only timed finger spheres before the unchanged native costs.
+
+    cuRobo still owns the arm FK and all native collision pairs. A shallow
+    state copy keeps its buffers immutable while the ordinary Torch graph
+    carries finger geometry derivatives through the same actual TCP pose.
+    """
+    hand = scene.gripper
+    if hand is None or hand.controller != "timed_reference":
+        return state
+    import torch
+    q = state.joint_state.position
+    tool = state.tool_poses
+    index = tool.tool_frames.index(problem.tool_link)
+    layout = _native_gradient_layout_type()
+    r = _orientation_vjp_type().apply(q, tool.quaternion.detach(),
+                                     state.cuda_robot_model_state.tool_jacobians[..., 3:, :].detach())
+    p, r = problem.transform_tool_pose(layout.apply(tool.position)[:, :, index], r[:, :, index])
+    spheres = problem.transform_robot_spheres(layout.apply(state.robot_spheres))
+    progress = torch.zeros_like(trajectory_time)  # Timed state depends exclusively on elapsed time.
+    fingers, half, _ = hand.state(progress, q, joint_names, trajectory_time=trajectory_time)
+    spheres = hand.spheres(spheres, p, r, fingers, half)
+    base = torch.as_tensor(problem.base_pose, dtype=q.dtype, device=q.device)
+    spheres = torch.cat(((spheres[..., :3]-base[:3, 3])@base[:3, :3], spheres[..., 3:4]), -1)
+    result = copy(state)
+    result.cuda_robot_model_state = copy(state.cuda_robot_model_state)
+    result.cuda_robot_model_state.robot_spheres = spheres.contiguous()
+    return result
+# END extra FK changes neither the optimizer variables nor its single IK target.
+
+
 def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_progress,
-                          refinement_parameters=()):
+                          refinement_parameters=(), *, clock=None, seed_parameter=None, robot_dict=None):
     """Build V2's documented manager extension after GPU use is requested.
 
     Configuration construction must return the derived type and class_type;
@@ -1000,6 +1110,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
                 return
             transition_model.robot_model.compute_jacobian = True
             self._scene = scene.clone_for_rollout()
+            self._coverage_fk = (_RobotCoverageFK(problem, self._scene, robot_dict, self.device_cfg)
+                                 if scene.robot_coverage is not None
+                                 and self._process_mode in {"seed_optimizer", "trajectory_optimizer"} else None)
             self._joint_names = tuple(transition_model.joint_names)
             self._tool_index = transition_model.robot_model.tool_frames.index(problem.tool_link)
             self._map_u = self.device_cfg.to_device(progress_map.u)
@@ -1019,6 +1132,16 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
             self._dense_counts = counts.reshape(-1).long()
 
         def compute_costs(self, state, cost_collection=None, goal=None, **kwargs):
+            if self._process_mode and self._scene.gripper is not None and self._scene.gripper.controller == "timed_reference":
+                batch, horizon = state.joint_state.position.shape[:2]
+                if self._process_mode.startswith("seed_"):
+                    query_time = (seed_parameter*clock["duration"]).expand(batch, horizon)
+                else:
+                    counts = (torch.full((batch,), horizon, dtype=torch.long, device=state.joint_state.position.device)
+                              if self._dense_counts is None else self._dense_counts)
+                    query_time = (torch.arange(horizon, device=counts.device, dtype=state.joint_state.position.dtype)[None]
+                                  /(counts[:, None]-1)).clamp(0, 1)*clock["duration"]
+                state = _timed_native_state(state, problem, self._scene, self._joint_names, query_time)
             collection = super().compute_costs(state, cost_collection, goal, **kwargs)
             if not self._process_mode:
                 return collection
@@ -1036,9 +1159,14 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
                 progress = seed_progress.expand(batch, horizon)
                 position, quaternion = problem.transform_tool_pose(position, quaternion)
                 scene_value = self._scene.evaluate(problem.transform_robot_spheres(spheres), position, quaternion,
-                                                   progress, q, self._joint_names)
+                                                   progress, q, self._joint_names,
+                                                   trajectory_time=(seed_parameter*clock["duration"]).expand(batch, horizon))
                 if self._process_mode == "seed_optimizer":
                     scene_value = scene_value.square()
+                    if self._coverage_fk is not None:
+                        query_time = (seed_parameter*clock["duration"]).expand(batch, horizon)
+                        scene_value = scene_value+self._scene.robot_coverage_guidance(
+                            self._coverage_fk.poses(q, self._joint_names, query_time), progress).square()
                 collection.add(scene_value.unsqueeze(-1) * budget.constraint_weight, "process_scene")
                 return collection
 
@@ -1062,7 +1190,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
             progress = torch.cat((progress, anchor_s), 1)
             # End-point families consume a whole ordered trajectory and the
             # actual functional-event FK.  No nearest-grid event substitution.
-            order = torch.argsort(torch.cat((u, anchor_u), 1), dim=1, stable=True)
+            all_u = torch.cat((u, anchor_u), 1)
+            order = torch.argsort(all_u, dim=1, stable=True)
             inverse = torch.argsort(order, dim=1)
 
             def ordered(value):
@@ -1072,9 +1201,11 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
             position, quaternion = problem.transform_tool_pose(ordered(position), ordered(quaternion))
             spheres = problem.transform_robot_spheres(ordered(spheres))
             q, dq, progress = ordered(q), ordered(dq), ordered(progress)
+            trajectory_time = ordered(all_u)*clock["duration"]
             process_value = problem.evaluate(position, quaternion, progress, q, self._joint_names,
                                              joint_velocity=dq)
-            scene_value = self._scene.evaluate(spheres, position, quaternion, progress, q, self._joint_names)
+            scene_value = self._scene.evaluate(spheres, position, quaternion, progress, q, self._joint_names,
+                                               trajectory_time=trajectory_time)
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
             values = [("skill_process", process_value), ("process_scene", scene_value)]
             # A squared optimizer penalty has a gradient proportional to
@@ -1082,6 +1213,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
             # nonnegative values and therefore their original zero sets.
             if self._process_mode == "trajectory_optimizer":
                 values = [(name, value.square()) for name, value in values]
+                if self._coverage_fk is not None:
+                    values.append(("robot_new_volume_guidance", self._scene.robot_coverage_guidance(
+                        self._coverage_fk.poses(q, self._joint_names, trajectory_time), progress).square()))
                 # BEGIN retain a gradient toward source-declared pose equalities.
                 # The problem owns equality-axis selection and its complete
                 # endpoint-family reference; free pose axes gain no target.
@@ -1256,7 +1390,11 @@ class _CuroboPlanner:
         self.anchors = anchors
         self.robot_dict = robot_dict
         self.seed_progress = self.device_cfg.to_device([[0.]])
-        self._manager_type = _process_manager_type(problem, scene, self.progress_map, self.anchors, budget, self.seed_progress)
+        self.seed_parameter = self.device_cfg.to_device([[0.]])
+        self.formal_clock = {}
+        self._manager_type = _process_manager_type(
+            problem, scene, self.progress_map, self.anchors, budget, self.seed_progress,
+            clock=self.formal_clock, seed_parameter=self.seed_parameter, robot_dict=self.robot_dict)
         self.refinement_parameters = np.empty(0)
 
         def configuration(name, mode):
@@ -1342,7 +1480,23 @@ class _CuroboPlanner:
         self._optimizer_class = ProcessTrajectoryOptimizer
         self._optimizer_config_class = TrajectoryOptimizerCfg
         self.trajopt = ProcessTrajectoryOptimizer(TrajectoryOptimizerCfg.create(**deepcopy(self._trajectory_configuration)))
+        self._bind_formal_clock()
         self._initialize_verification_constraints()
+
+    # BEGIN bind the independently controlled fingers to native formal output.
+    def _bind_formal_clock(self):
+        self.formal_clock.clear()
+        self.formal_clock.update(_formal_native_clock(self.trajopt))
+        hand = self.scene.gripper
+        if hand is not None:
+            hand.bind_clock(self.formal_clock["duration"], self.progress_map)
+        self.finger_trajectory = None if hand is None else hand.finger_trajectory
+
+    def _seed_u(self, progress):
+        """Choose the earliest plateau point for initializer-only state queries."""
+        values, indices = np.unique(self.progress_map.s, return_index=True)
+        return float(np.interp(progress, values, self.progress_map.u[indices]))
+    # END formal export always evaluates its actual time, not this seed inverse.
 
     # BEGIN bind occupancy evidence to the actual bounded current robot model.
     def _validate_occupied_robot_geometry(self):
@@ -1445,7 +1599,9 @@ class _CuroboPlanner:
                 # Calling this component directly also owns its one-state
                 # workspace; the full manager normally performs that setup.
                 native_self.setup_batch_tensors(*q.shape[:2])
-                components["native:self_collision"] = native_self.forward(state.robot_spheres)
+                actual_state = _timed_native_state(self._RobotState(joint_state=measured, cuda_robot_model_state=state),
+                    self.problem, self._verification_scene, self.joint_names, q.new_zeros(q.shape[:2]))
+                components["native:self_collision"] = native_self.forward(actual_state.cuda_robot_model_state.robot_spheres)
             tool = state.tool_poses
             tool_index = tool.tool_frames.index(self.problem.tool_link)
             position, quaternion = self.problem.transform_tool_pose(
@@ -1453,9 +1609,14 @@ class _CuroboPlanner:
             progress = q.new_zeros(q.shape[:2])
             for name, value in self._verification_scene.components(
                     self.problem.transform_robot_spheres(state.robot_spheres),
-                    position, quaternion, progress, q, self.joint_names).items():
+                    position, quaternion, progress, q, self.joint_names,
+                    trajectory_time=torch.zeros_like(progress)).items():
                 components[f"scene:{name}"] = value
             residuals = {name: float(value.max().item()) for name, value in components.items()}
+            coverage = self._verification_scene.check_robot_coverage(
+                q, self.joint_names, torch.zeros_like(progress), entrance=True)
+            if coverage:
+                residuals["scene:unknown/new_robot_volume"] = float(any(not item["passed"] for item in coverage))
         failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
         # BEGIN preserve nonfinite failures in strict JSON diagnostics.
         # JSON null plus the explicit component list retains the rejection
@@ -1468,6 +1629,7 @@ class _CuroboPlanner:
             "passed": not failed, "residuals": residuals, "failed_components": failed,
             "nonfinite_components": nonfinite,
             "joint_names": list(self.joint_names), "joint_bounds": joint_bounds,
+            "robot_coverage": coverage,
             "scope": {
                 "kind": "necessary_conditions_at_fixed_measured_entrance",
                 "progress": 0., "active_joint_position_velocity": "native_effective_limits",
@@ -1524,6 +1686,7 @@ class _CuroboPlanner:
         for u in control_u:
             progress = float(np.interp(u, self.progress_map.u, self.progress_map.s))
             self.seed_progress.fill_(progress)
+            self.seed_parameter.fill_(float(u))
             result = self.ik.solve_pose(self._goal(progress), current_state=self.start,
                                        seed_config=previous, return_seeds=self.budget.ik_seeds)
             candidates = self.ik.get_active_js(result.js_solution).position
@@ -1575,10 +1738,13 @@ class _CuroboPlanner:
         self.anchor_capacity = capacity
         self.scene_workspace_bytes, self.anchor_fk_workspace_bytes = scene_bytes, anchor_fk_bytes
         manager_type = _process_manager_type(self.problem, self.scene, progress_map, self.anchors,
-                                             self.budget, self.seed_progress, parameters)
+                                             self.budget, self.seed_progress, parameters,
+                                             clock=self.formal_clock, seed_parameter=self.seed_parameter,
+                                             robot_dict=self.robot_dict)
         self._trajectory_configuration["cost_manager_config_instance_type"] = manager_type
         self.trajopt = self._optimizer_class(
             self._optimizer_config_class.create(**deepcopy(self._trajectory_configuration)))
+        self._bind_formal_clock()
         self._initialize_verification_constraints()
         # END apply the same point and memory admission to every new clock.
 
@@ -1591,6 +1757,7 @@ class _CuroboPlanner:
             if time.monotonic() >= deadline:
                 return None
             self.seed_progress.fill_(float(progress))
+            self.seed_parameter.fill_(self._seed_u(float(progress)))
             result = self.ik.solve_pose(self._goal(progress), current_state=self.start,
                                        seed_config=previous, return_seeds=self.budget.ik_seeds)
             options = self.ik.get_active_js(result.js_solution).position
@@ -1738,11 +1905,22 @@ class _CuroboPlanner:
                     process = fixed_problem.evaluate(p, r, s, js.position, self.joint_names,
                                                      joint_velocity=js.velocity)
                     scene = fixed_scene.evaluate(fixed_problem.transform_robot_spheres(state.robot_spheres),
-                                                 p, r, s, js.position, self.joint_names)
+                                                 p, r, s, js.position, self.joint_names,
+                                                 trajectory_time=torch.full_like(s, self._seed_u(float(values[-1]))
+                                                                                 *self.formal_clock["duration"]))
                     native = self._verification_native.compute_costs(
-                        self._RobotState(joint_state=js, cuda_robot_model_state=state))
+                        _timed_native_state(self._RobotState(joint_state=js, cuda_robot_model_state=state),
+                            fixed_problem, fixed_scene, self.joint_names,
+                            torch.full_like(s, self._seed_u(float(values[-1]))*self.formal_clock["duration"])))
                     terms = {"process": process, "scene": scene,
                              **{f"native:{name}": value for name, value in zip(native.names, native.values)}}
+                    coverage = fixed_scene.check_robot_coverage(
+                        js.position, self.joint_names,
+                        torch.full_like(s, self._seed_u(float(values[-1]))*self.formal_clock["duration"]),
+                        entrance=bool(values[-1] == 0 and np.array_equal(
+                            values[:-1], self.start.position[0].detach().cpu().numpy())))
+                    if coverage:
+                        terms["unknown/new_robot_volume"] = s.new_tensor([[float(any(not row["passed"] for row in coverage))]])
                     accepted = all(bool(torch.isfinite(term).all()) and bool((term <= 0).all())
                                    for term in terms.values())
                     if not accepted and len(invalid_states) < 3:
@@ -1969,6 +2147,9 @@ class _CuroboPlanner:
                 or not np.isfinite(dt) or dt <= 0):
             raise ValueError("Native interpolation produced an invalid finite joint curve")
         times = np.arange(len(position), dtype=float) * dt
+        if (len(times) != self.formal_clock["valid_count"] or dt != self.formal_clock["interpolation_dt"]
+                or times[-1] != self.formal_clock["duration"]):
+            raise ValueError("Native candidate changed the physical clock bound to the finger reference")
         anchor_pairs = self.progress_map.anchor_parameters(self.anchors)
         event_records = []
         for event in self.problem.events:
@@ -1978,6 +2159,7 @@ class _CuroboPlanner:
         trajectory = JointTrajectory(self.joint_names, times, position, velocity,
                                      self.progress_map.u.copy(), self.progress_map.s.copy(),
                                      tuple(event_records), deepcopy(self.problem.conditions), {})
+        trajectory.finger_trajectory = self.finger_trajectory
         # BEGIN complete the existing native acceleration bound between samples.
         # These are the actual verification manager's named limits, after
         # native model construction. Input YAML scalars and sampled right-side
@@ -2027,9 +2209,11 @@ class _CuroboPlanner:
             p, r = self.problem.transform_tool_pose(tool.position[:, :, tool_index], tool.quaternion[:, :, tool_index])
             components = self.problem.residuals(p, r, s_t, q_t, self.joint_names, joint_velocity=dq_t)
             components["scene"] = self._verification_scene.evaluate(
-                self.problem.transform_robot_spheres(state.robot_spheres), p, r, s_t, q_t, self.joint_names)
+                self.problem.transform_robot_spheres(state.robot_spheres), p, r, s_t, q_t, self.joint_names,
+                trajectory_time=self.device_cfg.to_device(queries[None]))
             native_constraints = self._verification_native.compute_costs(
-                self._RobotState(joint_state=joint_state, cuda_robot_model_state=state))
+                _timed_native_state(self._RobotState(joint_state=joint_state, cuda_robot_model_state=state),
+                    self.problem, self._verification_scene, self.joint_names, self.device_cfg.to_device(queries[None])))
             for name, value in zip(native_constraints.names, native_constraints.values):
                 components[f"native:{name}"] = value
             residuals = {name: float(value.max().item()) for name, value in components.items()}
@@ -2052,6 +2236,24 @@ class _CuroboPlanner:
                 "u": queries/times[-1],
                 "violations": violation.detach().cpu().numpy().reshape(-1),
             }
+            # CPU solid subtraction is the unknown-space acceptance gate.
+            # Preserve its exact failure coordinates for bounded refinement;
+            # sparse point guidance above cannot cancel these binary verdicts.
+            coverage = self._verification_scene.check_robot_coverage(
+                torch.as_tensor(q[None, :1], dtype=torch.float64), self.joint_names,
+                torch.as_tensor(queries[None, :1], dtype=torch.float64), entrance=True)
+            coverage += self._verification_scene.check_robot_coverage(
+                torch.as_tensor(q[None, 1:], dtype=torch.float64), self.joint_names,
+                torch.as_tensor(queries[None, 1:], dtype=torch.float64))
+            if coverage:
+                unknown = np.asarray([0. if row["passed"] else 1. for row in coverage])
+                residuals["unknown/new_robot_volume"] = float(unknown.max())
+                self.last_validation["violations"] = np.maximum(self.last_validation["violations"], unknown)
+                self.last_validation["robot_coverage"] = {
+                    "queries": len(coverage), "passed": bool(not unknown.any()),
+                    "failed": [{"time_s": float(queries[index]), "result": row}
+                               for index, row in enumerate(coverage) if not row["passed"]][:16],
+                    "scope": "native solid volume at every exported validation sample; not continuous collision proof"}
         residuals["initial_position"] = max(0., float(np.max(np.abs(position[0]-self.start.position[0].detach().cpu().numpy())))
                                               - self.problem.numerical.joint)
         residuals["initial_velocity"] = max(0., float(np.max(np.abs(velocity[0]-self.start.velocity[0].detach().cpu().numpy())))

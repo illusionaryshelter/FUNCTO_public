@@ -950,8 +950,10 @@ native limits, native self collision and scene components at actual entrance
 FK. A failed necessary condition returns `initial_state_infeasible` with its
 individual residuals and no trajectory. This check does not invent unmeasured
 acceleration, jerk, torque or locked-joint velocity. A conservative binary-hand
-or unknown-space violation describes the declared model's feasibility, rather
-than proving current physical contact.
+violation describes that controller model's feasibility, rather than proving
+current physical contact. An independently commanded hand uses its measured
+entrance and synchronous finger reference instead of the union of its entire
+mechanical travel.
 <!-- END retain native smoothness and reject an infeasible fixed entrance. -->
 
 | Module | Responsibility |
@@ -960,6 +962,9 @@ than proving current physical contact.
 | `planning_scene` | Share observed-space, owner, contact, payload and gripper constraints across optimization, search and final checks |
 | `planning_observation` | Convert calibrated current RGB-D and explicit pixel masks into owner-separated native Mapper fields and conservative coverage |
 | `planning` | Bound native work, solve the complete window, refine failing samples and export the verified cubic joint curve |
+| `robot_coverage` | Check newly entered native robot volume against frozen initial model occupancy and original depth-proven free cells |
+| `gripper_trajectory` | Preserve a named C1 finger command reference on the formal arm clock, separately from measured finger motion |
+| `execution` / `robosuite_execution` | Gate original events and measured full robot state, then send the saved references through native controllers |
 
 ```python
 from manipulation.planning_problem import build_planning_problem
@@ -1028,7 +1033,14 @@ with the problem. Dedicated material contact proxies can receive bounded local
 allowances; complete targets and whole finger links are not removed to permit
 contact. An actuated hand requires its measured coordinates, actual drive
 coupling, controller capability and calibrated geometry. Position tracking uses
-the supplied executable command path; binary control uses a conservative
+the supplied executable command path. Independently commanded fingers can use
+`timed_reference`, with seven arm optimization coordinates and a separately
+named finger curve on the same formal native output clock. Its reference
+starts at measured finger q/dq, retains original command identities and the
+evidence barrier, and is saved and reloaded without regeneration. Hardware
+protection intervals apply to actual feedback; they do not define future hand
+geometry. Contact can keep actual fingers away from a closing target, so the
+reference does not certify tracking or Holding. Binary control uses a conservative
 mechanical envelope at every query, including repeated zero progress, and may
 therefore remain uncertified. Progress can pause while the fingers move, so it
 cannot identify the instant of the initial feedback.
@@ -1099,6 +1111,20 @@ against the planner's actual FK, locked joints and collision model. Outer
 collision proxies, partial reconstructions, watertightness alone and future
 predicted poses cannot establish solid occupancy. Added occupied coverage
 keeps every collision check active; unobserved exterior gaps remain unknown.
+
+<!-- BEGIN distinguish initial model occupancy from observed free space. -->
+With an explicit valid-initial-state assumption, `RobotCoverage` freezes the
+same native robot solid model at complete measured q0 as V0. It accepts a
+queried state only when `V(q) \ (V0 ∪ F)` is empty, where F contains the
+original depth-proven free cells. No collision sphere, installation obstacle
+or unobserved exterior is added to F. Original free cells remain separate from
+optional occupied-solid evidence. Sparse native geometry points guide the
+optimizer; bounded CPU solid Boolean queries decide whole-volume coverage at
+the entrance, search states and exported validation samples. Numerical and
+resource failures reject the query. This model assumption is not a claim that
+hidden environment geometry has been observed, and these state queries do not
+provide a continuous swept-volume certificate.
+<!-- END initial-model assumptions never modify observation evidence. -->
 
 Success requires both native acceptance and independent checks of the exported
 curve. Planning uses the request's `maximum_trajectory_dt` as both native time

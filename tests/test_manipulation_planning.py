@@ -25,6 +25,8 @@ from manipulation.planning import (
     # END shared production calculus.
     _CuroboPlanner,
     _ProgressMap,
+    _formal_native_clock,
+    _timed_native_state,
     # BEGIN actual-anchor allocation and projection preflight regressions.
     _anchor_capacity,
     _planning_workspace_bytes,
@@ -128,10 +130,14 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     planner.JointState = SimpleNamespace
     planner._RobotState = SimpleNamespace
     planner.trajopt = SimpleNamespace(get_active_js=lambda state: state)
+    planner.formal_clock = {"valid_count": position.shape[1], "interpolation_dt": dt,
+                            "duration": (position.shape[1]-1)*dt}
+    planner.finger_trajectory = None
     planner.start = SimpleNamespace(position=position[:, 0], velocity=velocity[:, 0])
     planner._verification_fk = CartesianKinematics()
     planner._verification_scene = SimpleNamespace(
-        evaluate=lambda spheres, p, r, s, q, names: torch.zeros_like(s))
+        gripper=None, evaluate=lambda spheres, p, r, s, q, names, **kwargs: torch.zeros_like(s),
+        check_robot_coverage=lambda *args, **kwargs: [])
     # BEGIN give the real exporter explicit, finite native acceleration bounds.
     limits = SimpleNamespace(joint_names=list(problem.joint_names),
         acceleration=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64))
@@ -144,6 +150,91 @@ def export_fixture(problem, progress_map, position, velocity, dt):
 
 
 class PlannerCalculusTests(unittest.TestCase):
+    # BEGIN formal time and complete-volume gates are independent of point costs.
+    def test_formal_spline_clock_reuses_native_count_not_rollout_duration(self):
+        from curobo._src.types.control_space import ControlSpace
+        native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=.05,
+            maximum_trajectory_dt=.05, interpolation_dt=.025), interpolation_steps=4,
+            transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3), action_horizon=16)
+        clock = _formal_native_clock(native)
+        self.assertEqual(clock["valid_count"], 181)
+        self.assertEqual(clock["duration"], 180*float(np.float32(.025)))
+        self.assertNotEqual(clock["duration"], 80*float(np.float32(.05)))
+        native.config.minimum_trajectory_dt = .04
+        with self.assertRaisesRegex(ValueError, "fixed request-wide"):
+            _formal_native_clock(native)
+
+    def test_export_full_volume_rejection_is_hard_even_when_all_gpu_costs_zero(self):
+        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+        planner, native = export_fixture(problem, mapping, np.zeros((2, 3)), np.zeros((2, 3)), 1.)
+        calls = []
+
+        def coverage(q, names, t, *, entrance=False):
+            calls.append((q.numpy().copy(), t.numpy().copy(), entrance))
+            return [{"passed": bool(value != .5), "failure": None if value != .5 else "new_unknown_volume"}
+                    for value in t.reshape(-1).tolist()]
+
+        planner._verification_scene.check_robot_coverage = coverage
+        curve, count = planner.export(native)
+        self.assertEqual(count, 3)
+        self.assertEqual(curve.residuals["unknown/new_robot_volume"], 1.)
+        self.assertTrue(calls[0][2])
+        self.assertFalse(calls[1][2])
+        self.assertEqual(calls[1][0].dtype, np.float64)
+        self.assertEqual(planner.last_validation["robot_coverage"]["failed"][0]["time_s"], .5)
+
+    def test_initializer_plateau_inverse_is_explicitly_earliest(self):
+        planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.progress_map = _ProgressMap(np.array([0., .2, .4, 1.]), np.array([0., 1., 1., 2.]))
+        self.assertEqual(planner._seed_u(1.), .2)
+
+    def test_native_self_collision_receives_timed_spheres_without_mutating_fk(self):
+        from manipulation.planning_scene import PrismaticGripper
+        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        q = torch.tensor([[[.3, .1, 0.]]], dtype=torch.float64, requires_grad=True)
+        quaternion = q.new_tensor([[[[1., 0., 0., 0.]]]])
+        original = torch.cat((q[:, :, None]+q.new_tensor([.04, 0., 0.]),
+                              q.new_full((1, 1, 1, 1), .001)), -1)
+        kinematics = SimpleNamespace(robot_spheres=original,
+            tool_poses=SimpleNamespace(tool_frames=[problem.tool_link], position=q[:, :, None], quaternion=quaternion),
+            tool_jacobians=q.new_zeros((1, 1, 1, 6, 3)))
+
+        class State:
+            def __init__(self):
+                self.joint_state = SimpleNamespace(position=q)
+                self.cuda_robot_model_state = kinematics
+
+            @property
+            def robot_spheres(self):
+                return self.cuda_robot_model_state.robot_spheres
+
+            @property
+            def tool_poses(self):
+                return self.cuda_robot_model_state.tool_poses
+
+        hand = PrismaticGripper(controller="timed_reference", joint_names=("finger",),
+            current_positions=[.04], joint_limits=[[0, .04]], joint_bounds=None,
+            finger_trajectory_factory=lambda *_: None, coupling_matrix=np.empty((0, 1)), coupling_offset=[],
+            sphere_indices=(0,), local_spheres=[[0, 0, 0, .001]],
+            sphere_joint_translation=[[[1], [0], [0]]], self_collision_pairs=(),
+            commands=[{"skill_id": "test", "event_id": "close", "command": "close", "progress": 0.}],
+            source="analytic timed native-self input")
+        hand.finger_trajectory = SimpleNamespace(sample_torch=lambda t: (
+            (.04-.02*t)[..., None], torch.full((*t.shape, 1), -.02, dtype=t.dtype)))
+        original_state = State()
+        replaced = _timed_native_state(original_state, problem, SimpleNamespace(gripper=hand),
+                                         problem.joint_names, q.new_tensor([[1.]]))
+        self.assertIsNot(replaced.cuda_robot_model_state, original_state.cuda_robot_model_state)
+        self.assertAlmostEqual(original_state.robot_spheres[0, 0, 0, 0].item(), .34)
+        self.assertAlmostEqual(replaced.robot_spheres[0, 0, 0, 0].item(), .32)
+        # The process manager wraps the returned sphere tensor again before
+        # concatenating anchors. This layout identity remains idempotent.
+        wrapped = _native_gradient_layout_type().apply(replaced.robot_spheres)
+        gradient = torch.autograd.grad(wrapped[..., 0].sum(), q)[0]
+        torch.testing.assert_close(gradient, q.new_tensor([[[1., 0., 0.]]]), rtol=0, atol=0)
+    # END no nominal point objective can bypass native volume acceptance.
+
     # BEGIN independent full-horizon endpoint-family gradient regression.
     def test_coupled_endpoint_and_release_frame_vjp_matches_scipy_whole_horizon(self):
         # Event poses are optimization variables. Their derivatives must reach
@@ -1282,6 +1373,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planner.robot_metadata = self.robot_metadata()
         planner.progress_map = _ProgressMap(np.array([0., .5, 1.]), planner.anchors)
         planner.seed_progress = object()
+        planner.seed_parameter, planner.formal_clock, planner.robot_dict = object(), {}, {}
         planner.refinement_parameters = np.empty(0)
         planner.torch = SimpleNamespace(cuda=SimpleNamespace(
             mem_get_info=Mock(return_value=(12*1024**3, 12*1024**3)),
@@ -1313,6 +1405,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planner._optimizer_config_class = SimpleNamespace(create=Mock(return_value="new configuration"))
         planner._optimizer_class = Mock(return_value=SimpleNamespace(destroy=Mock()))
         planner._initialize_verification_constraints = Mock()
+        planner._bind_formal_clock = Mock()
         mapping = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
         with patch("manipulation.planning._process_manager_type", return_value="new manager") as manager, \
                 patch("manipulation.planning.gc.collect", wraps=gc.collect) as collect:
@@ -1816,6 +1909,7 @@ class InitialStatePreflightTests(unittest.TestCase):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.problem, planner.joint_names = problem, problem.joint_names
         planner.torch, planner.JointState = torch, SimpleNamespace
+        planner._RobotState = SimpleNamespace
         planner.start = SimpleNamespace(
             position=torch.tensor([position], dtype=torch.float64),
             velocity=torch.tensor([velocity], dtype=torch.float64))
@@ -1843,8 +1937,8 @@ class InitialStatePreflightTests(unittest.TestCase):
                 position=torch.stack((q+7., q), dim=2), quaternion=quaternion))
 
         planner._verification_fk = SimpleNamespace(compute_kinematics=Mock(side_effect=fk))
-        planner._verification_scene = SimpleNamespace(components=Mock(return_value={
-            scene_name: torch.tensor([[scene_value]], dtype=torch.float64)}))
+        planner._verification_scene = SimpleNamespace(gripper=None, check_robot_coverage=Mock(return_value=[]),
+            components=Mock(return_value={scene_name: torch.tensor([[scene_value]], dtype=torch.float64)}))
         planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes, planner.anchor_capacity = 64, 32, 4
         planner.reference_seeds = Mock(side_effect=AssertionError("an infeasible fixed entrance must stop before IK"))
         planner.optimize, planner.ompl_seed, planner.close = Mock(), Mock(), Mock()

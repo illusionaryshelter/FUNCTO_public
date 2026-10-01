@@ -211,7 +211,7 @@ class ObservedSpace:
     """
 
     def __init__(self, known, *, origin, voxel_size, observation_ids, reference_frame,
-                 occupancy_evidence=None):
+                 occupancy_evidence=None, known_free=None):
         mask = np.asarray(known)
         if (mask.dtype != np.bool_ or mask.ndim != 3 or min(mask.shape) < 2
                 or mask.size > 8_000_000):
@@ -248,11 +248,32 @@ class ObservedSpace:
         if owner_ids != set(evidence["owners"]) or has_robot != (evidence["robot"] is not None):
             raise ValueError("Occupied coverage solid identities and current body evidence disagree")
         self.occupancy_evidence = deepcopy(evidence)
+        # BEGIN preserve raw observed free cells separately from occupied evidence.
+        # The solid-volume oracle must never reinterpret occupied interiors as
+        # free space. Existing pure-observation masks already have this meaning.
+        if known_free is None and evidence["solids"]:
+            self._known_free = None
+        else:
+            free = mask if known_free is None else np.asarray(known_free)
+            if free.dtype != np.bool_ or free.shape != mask.shape or np.any(free & ~mask):
+                raise ValueError("Raw free evidence must be a boolean subset of the known grid")
+            self._known_free = free.copy()
+            self._known_free.flags.writeable = False
+        # END no collision model or initial-state assumption changes this mask.
         # END retain the physical bodies used to prove occupied interiors.
         distance = distance_transform_edt(np.pad(mask, 1), sampling=voxel_size)[1:-1, 1:-1, 1:-1]
         distance = np.maximum(distance - math.sqrt(3) * voxel_size, 0)
         self._distance = torch.from_numpy(distance.astype(np.float32))[None, None]
         self._shape_xyz = np.array(mask.shape[::-1], float)
+
+    @property
+    def known_free(self):
+        """Return an owned read-only copy of the original observed free mask."""
+        if self._known_free is None:
+            raise ValueError("Occupied coverage requires separate raw known_free evidence")
+        result = self._known_free.copy()
+        result.flags.writeable = False
+        return result
 
     def violation(self, spheres):
         centre = spheres[..., :3]
@@ -478,8 +499,8 @@ class PrismaticGripper:
     """Bind native finger coordinates to a supported controller and geometry.
 
     Position tracking binds solver joints to the declared command path.
-    Position bounds describe separately controlled fingers whose measured
-    range is supervised by execution; they do not add solver coordinates. A
+    A timed reference describes independently controlled fingers using the
+    same formal elapsed time as the arm, without adding solver coordinates. A
     binary controller instead uses the whole native mechanical interval for
     every planning query, including zero progress. Progress is not elapsed
     time: it may pause while the arm and binary drive continue moving. Each
@@ -490,8 +511,8 @@ class PrismaticGripper:
     curve is never substituted to make it pass.
 
     For tracking, ``joint_bounds(progress)`` returns identical lower/upper
-    command coordinates [B,H,J]. Position bounds return the explicit allowed
-    actual-coordinate interval, including closing transitions. Binary control
+    command coordinates [B,H,J]. A timed reference is a nominal command curve,
+    not an assertion about future actual tracking or contact. Binary control
     requires ``joint_bounds=None``.
     ``coupling_matrix``
     and ``coupling_offset`` encode the actual drive's A q = b constraints.
@@ -503,10 +524,11 @@ class PrismaticGripper:
     def __init__(self, *, controller, joint_names, current_positions, joint_limits,
                  joint_bounds, coupling_matrix, coupling_offset, sphere_indices,
                  local_spheres, sphere_joint_translation, self_collision_pairs,
-                 commands, source, numerical_joint_tolerance=1e-5):
+                 commands, source, numerical_joint_tolerance=1e-5,
+                 finger_trajectory_factory=None):
         # BEGIN independent position-control intervals without solver fingers.
-        if controller not in {"position_tracking", "position_bounds", "binary"}:
-            raise ValueError("Controller must explicitly declare tracking, supervised position bounds or binary intentions")
+        if controller not in {"position_tracking", "timed_reference", "binary"}:
+            raise ValueError("Controller must declare solver tracking, a timed reference or binary intentions")
         # END independent position-control intervals without solver fingers.
         self.controller = controller
         self.joint_names = tuple(_text(name, "native gripper joint") for name in joint_names)
@@ -519,9 +541,13 @@ class PrismaticGripper:
                 or np.any(self.current_positions < self.joint_limits[:, 0])
                 or np.any(self.current_positions > self.joint_limits[:, 1])):
             raise ValueError("Current finger feedback must respect native joint limits")
-        if ((controller in {"position_tracking", "position_bounds"} and not callable(joint_bounds))
-                or (controller == "binary" and joint_bounds is not None)):
-            raise TypeError("Position control requires explicit joint bounds; binary control uses full mechanical bounds")
+        if ((controller == "position_tracking" and not callable(joint_bounds))
+                or (controller != "position_tracking" and joint_bounds is not None)):
+            raise TypeError("Only solver position tracking consumes progress-indexed joint bounds")
+        if ((controller == "timed_reference") != callable(finger_trajectory_factory)):
+            raise TypeError("Timed fingers require their explicit physical-clock trajectory factory")
+        self.finger_trajectory_factory = finger_trajectory_factory
+        self.finger_trajectory = None
         self.joint_bounds = joint_bounds
         if not np.isfinite(numerical_joint_tolerance) or numerical_joint_tolerance < 0:
             raise ValueError("The numerical joint tolerance must be a finite nonnegative value")
@@ -571,10 +597,36 @@ class PrismaticGripper:
             raise ValueError("Gripper skill/event identities must be unique")
         self.source = _text(source, "gripper calibration and timing source")
 
-    def state(self, progress, joint_position, joint_names):
+    # BEGIN a separately controlled hand follows the same formal physical clock.
+    def bind_clock(self, duration, progress_map):
+        if self.controller != "timed_reference":
+            return
+        trajectory = self.finger_trajectory_factory(duration, progress_map)
+        if (tuple(trajectory.joint_names) != self.joint_names
+                or trajectory.duration != duration
+                or not np.array_equal(trajectory.sample(np.array([0.]))[0][0], self.current_positions)):
+            raise ValueError("Finger reference must preserve named measured entrance and formal duration")
+        self.finger_trajectory = trajectory
+
+    def state(self, progress, joint_position, joint_names, *, trajectory_time=None):
         expected = (*progress.shape, len(self.joint_names))
         limits = _tensor(self.joint_limits, progress)
         measured = _tensor(self.current_positions, progress)
+        if self.controller == "timed_reference":
+            if self.finger_trajectory is None or trajectory_time is None or trajectory_time.shape != progress.shape:
+                raise ValueError("Timed finger geometry requires its bound trajectory and actual query time")
+            coordinates, _ = self.finger_trajectory.sample_torch(trajectory_time)
+            if coordinates.shape != expected:
+                raise ValueError("Named finger samples must align with the scene query")
+            tolerance = self.numerical_joint_tolerance
+            violations = (torch.relu(limits[:, 0]-coordinates-tolerance).sum(-1)
+                          + torch.relu(coordinates-limits[:, 1]-tolerance).sum(-1))
+            if len(self.coupling_matrix):
+                coupling = _tensor(self.coupling_matrix, progress)
+                violations = violations + torch.relu(
+                    (coordinates @ coupling.T-_tensor(self.coupling_offset, progress)).abs()
+                    - tolerance*coupling.abs().sum(-1)).sum(-1)
+            return coordinates, torch.zeros_like(coordinates), violations
         if self.controller == "binary":
             # BEGIN binary progress cannot identify the measured initial instant.
             # Neither a repeated zero-progress sample nor an isolated IK/search
@@ -614,6 +666,7 @@ class PrismaticGripper:
                                          - _tensor(self.coupling_offset, progress)).abs()
                                          - coupling_tolerance).sum(-1)
         return coordinates, half, violations
+    # END nominal finger geometry never asserts that commands equal actual feedback.
 
     def spheres(self, robot_spheres, position, quaternion, coordinates, half):
         local = _tensor(self.local_spheres, position)
@@ -691,7 +744,7 @@ class PlanningScene:
 
     def __init__(self, *, background, owners, coverage, reference_frame,
                  robot_sphere_materials, robot_geometry_source,
-                 contacts=(), gripper=None, has_gripper=True,
+                 contacts=(), gripper=None, has_gripper=True, robot_coverage=None,
                  numerical_position_tolerance_m=1e-4, numerical_rotation_tolerance_rad=1e-3):
         self.background = background
         self.owners = tuple(owners)
@@ -704,6 +757,18 @@ class PlanningScene:
         if coverage.reference_frame != reference_frame:
             raise ValueError("Observation coverage and FK must use the same calibrated frame")
         self.coverage = coverage
+        self.robot_coverage = robot_coverage
+        if robot_coverage is not None and robot_coverage.reference_frame != reference_frame:
+            raise ValueError("Native solid coverage must use the same calibrated reference frame")
+        # BEGIN immutable, bounded optimization guidance for the solid oracle.
+        self._coverage_geometry = (None if robot_coverage is None else robot_coverage.guidance_geometry())
+        if robot_coverage is not None:
+            free = coverage.known_free
+            self._has_free_cells = bool(free.any())
+            distance = distance_transform_edt(~np.pad(free, 1), sampling=coverage.voxel_size)[1:-1, 1:-1, 1:-1]
+            self._free_distance = torch.from_numpy(distance.astype(np.float32))[None, None]
+            self._free_mask = torch.from_numpy(free.astype(np.float32))[None, None]
+        # END sparse points guide optimization; only full solid CSG accepts coverage.
         self.observation_report = None
         self.robot_sphere_materials = tuple(robot_sphere_materials)
         if not self.robot_sphere_materials:
@@ -727,6 +792,9 @@ class PlanningScene:
             raise ValueError("Occupied robot evidence must use this scene's complete native collision model")
         self.required_robot_links = (() if robot_evidence is None
                                      else tuple(sorted(robot_evidence["link_poses_output"])))
+        if robot_coverage is not None:
+            self.required_robot_links = tuple(sorted(set(self.required_robot_links)
+                                                       | set(robot_coverage.required_link_names)))
         # END bind occupied-space evidence to bodies still checked for collision.
         if (not np.isfinite(numerical_position_tolerance_m) or not np.isfinite(numerical_rotation_tolerance_rad)
                 or min(numerical_position_tolerance_m, numerical_rotation_tolerance_rad) < 0):
@@ -784,6 +852,22 @@ class PlanningScene:
         """
         if self.reference_frame != problem.reference_frame:
             raise ValueError("Problem and collision scene require the same reference frame")
+        # BEGIN bind the frozen initial-volume assumption to this exact entrance.
+        if self.robot_coverage is not None:
+            evidence = self._coverage_geometry
+            if not np.array_equal(evidence["T_reference_base"], problem.base_pose):
+                raise ValueError("Native coverage and planning must share the exact calibrated base pose")
+            named = dict(zip(self.robot_coverage.baseline_joint_names, self.robot_coverage.baseline_joint_positions))
+            if any(name not in named or named[name] != value for name, value in zip(problem.joint_names, problem.start_q)):
+                raise ValueError("Native coverage baseline must use the exact measured arm entrance")
+            hand_names = () if self.gripper is None else self.gripper.joint_names
+            if set(named) != set(problem.joint_names) | set(hand_names):
+                raise ValueError("Native coverage requires the complete arm and explicitly controlled hand coordinates")
+            if self.gripper is not None and (
+                    self.gripper.controller != "timed_reference"
+                    or any(named[name] != value for name, value in zip(hand_names, self.gripper.current_positions))):
+                raise ValueError("Native coverage requires the measured hand and its same-clock nominal reference")
+        # END model-relative V0 cannot be relabelled from another feedback epoch.
         by_id = {owner.owner_id: owner for owner in self.owners}
         background_ids = set(self.background.owner_ids)
         condition_rows = [row for row in problem.conditions if "condition_id" in row]
@@ -955,6 +1039,105 @@ class PlanningScene:
             owner.query = owner.query.clone_for_rollout()
         return result
 
+    # BEGIN native solid guidance plus a mandatory independent volume verdict.
+    def robot_coverage_guidance(self, robot_link_poses, progress):
+        """Guide native body samples toward F or V0; this is not a certificate.
+
+        At most 32 real mesh points per body enter a checkpointed query. The
+        exact original convex solids and raw free voxels remain owned by the
+        CPU oracle, which checks every final validation state separately.
+        """
+        if self.robot_coverage is None:
+            return torch.zeros_like(progress)
+        if robot_link_poses is None or set(robot_link_poses) != set(self.robot_coverage.required_link_names):
+            raise ValueError("Native solid guidance requires every actual named body pose")
+        solids = self._coverage_geometry["solids"]
+        planes = [_tensor(row["baseline_halfspaces_world"], progress) for row in solids]
+        distance_grid = self._free_distance.to(device=progress.device, dtype=progress.dtype)
+        mask_grid = self._free_mask.to(device=progress.device, dtype=progress.dtype)
+        origin = _tensor(self.coverage.origin, progress)
+        shape = _tensor(self.coverage._shape_xyz, progress)
+
+        def point_violation(points):
+            coordinates = (points-origin)/self.coverage.voxel_size
+            clipped = torch.maximum(torch.zeros_like(coordinates), torch.minimum(coordinates, shape-1))
+            grid = 2*clipped/(shape-1)-1
+            sample_grid = grid.reshape(1, 1, 1, -1, 3)
+            distance = F.grid_sample(distance_grid, sample_grid, align_corners=True,
+                                     mode="bilinear", padding_mode="border").reshape(points.shape[:-1])
+            inside = F.grid_sample(mask_grid, sample_grid, align_corners=True,
+                                   mode="nearest", padding_mode="zeros").reshape(points.shape[:-1]) > .5
+            outside = torch.linalg.vector_norm(points-(origin+clipped*self.coverage.voxel_size), dim=-1)
+            free_cost = torch.where(inside & (outside == 0), torch.zeros_like(distance), distance+outside)
+            if not self._has_free_cells:
+                free_cost = torch.full_like(free_cost, float("inf"))
+            initial_cost = torch.full_like(free_cost, float("inf"))
+            for halfspaces in planes:
+                normals, offsets = halfspaces[:, :3], halfspaces[:, 3]
+                signed_max = torch.full_like(free_cost, -float("inf"))
+                # Hull face counts do not enlarge a single live point/plane
+                # tensor. Checkpointing then avoids retaining these chunks.
+                for begin in range(0, len(halfspaces), 32):
+                    normal = normals[begin:begin+32]
+                    signed = (points@normal.T+offsets[begin:begin+32])/torch.linalg.vector_norm(normal, dim=-1)
+                    signed_max = torch.maximum(signed_max, signed.amax(-1))
+                initial_cost = torch.minimum(initial_cost, torch.relu(signed_max))
+            return torch.minimum(free_cost, initial_cost).amax(-1)
+
+        result = torch.zeros_like(progress)
+        for solid in solids:
+            vertices = np.asarray(solid["vertices_frame"], float)
+            faces = np.asarray(solid["faces"], dtype=int)
+            # Deterministic sparse native points are an optimizer aid only.
+            points = np.concatenate((vertices[np.linspace(0, len(vertices)-1, min(16, len(vertices)), dtype=int)],
+                                     vertices[faces[np.linspace(0, len(faces)-1, min(16, len(faces)), dtype=int)]].mean(1)))
+            p, r = robot_link_poses[solid["frame"]]
+            world = _world_points(_tensor(points, progress), p, r)
+            value = (checkpoint(point_violation, world, use_reentrant=False, preserve_rng_state=False)
+                     if torch.is_grad_enabled() and world.requires_grad else point_violation(world))
+            result = torch.maximum(result, value)
+        return result
+
+    def full_robot_positions(self, joint_position, joint_names, trajectory_time):
+        """Compose named arm and nominal finger coordinates without guessing."""
+        names = tuple(joint_names)
+        values = joint_position
+        if self.gripper is not None and self.gripper.controller == "timed_reference":
+            hand = self.gripper
+            if set(names) & set(hand.joint_names):
+                raise ValueError("Independent finger coordinates must not duplicate active arm coordinates")
+            fingers, _ = hand.finger_trajectory.sample_torch(trajectory_time)
+            values = torch.cat((values, fingers), -1)
+            names += hand.joint_names
+        return names, values
+
+    def check_robot_coverage(self, joint_position, joint_names, trajectory_time, *, entrance=False):
+        if self.robot_coverage is None:
+            return []
+        names, positions = self.full_robot_positions(joint_position, joint_names, trajectory_time)
+        values = positions.detach().cpu().numpy().reshape(-1, len(names))
+        reports = []
+        for row in values:
+            query = row
+            representation = None
+            if entrance:
+                columns = [self.robot_coverage.baseline_joint_names.index(name) for name in names]
+                baseline = self.robot_coverage.baseline_joint_positions[columns]
+                rounded = baseline.astype(np.float32).astype(float)
+                # A mixed arm-native/CPU-finger entrance is accepted only if
+                # every original value is exactly one declared representation.
+                # Rounding an arbitrary nearby value first would hide motion.
+                if not np.all((row == baseline) | (row == rounded)):
+                    raise ValueError("Coverage entrance must exactly preserve measured or native float32 coordinates")
+                query = baseline if np.array_equal(row, baseline) else rounded
+                representation = "measured_float64" if np.array_equal(row, baseline) else "exact_named_native_float32_binding"
+            report = self.robot_coverage.check_state(joint_names=names, joint_positions=query, entrance=entrance)
+            if representation is not None:
+                report = {**report, "entrance_representation": representation}
+            reports.append(report)
+        return reports
+    # END reference volume verification never asserts controller tracking.
+
     def estimated_workspace_bytes(self, batch, horizon):
         """Bound geometry-query work only; solver/model storage is additional.
 
@@ -981,7 +1164,17 @@ class PlanningScene:
             # accumulated gradients and explicit int64 pair indices as well.
             # Checkpointing frees chunk scratch rather than retaining all P.
             pair_bytes = batch*horizon*(96*chunk+32*actors["robot"])+16*pairs
-        return int(query_bytes + coverage_bytes + pair_bytes)
+        native_coverage_bytes = 0
+        if self.robot_coverage is not None:
+            solids = self._coverage_geometry["solids"]
+            planes = min(32, max(len(row["baseline_halfspaces_world"]) for row in solids))
+            frames = len(self.robot_coverage.required_link_names)
+            joints = len(self.robot_coverage.baseline_joint_names)
+            # One checkpointed body query is live; all frame poses/Jacobians
+            # and their gradients remain resident for its backward pass.
+            native_coverage_bytes = batch*horizon*(32*(planes+32)*8 + frames*(32+12*joints)*4)
+            native_coverage_bytes += self._free_distance.numel()*8
+        return int(query_bytes + coverage_bytes + pair_bytes + native_coverage_bytes)
         # END include checkpointed hand-pair scratch and its retained input.
 
     def project_residual(self, progress, joint_position, joint_names):
@@ -1086,7 +1279,7 @@ class PlanningScene:
                 (active & ~certain).to(progress.dtype))
 
     def components(self, robot_spheres, position, quaternion, progress,
-                   joint_position=None, joint_names=None):
+                   joint_position=None, joint_names=None, *, trajectory_time=None):
         """Return nonnegative [B,H] terms; no term can cancel a violation.
 
         Required event anchors must be included by the caller. On a mode
@@ -1104,7 +1297,8 @@ class PlanningScene:
         coordinates = half = None
         spheres = robot_spheres
         if self.gripper is not None:
-            coordinates, half, costs["gripper/controller"] = self.gripper.state(progress, joint_position, joint_names)
+            coordinates, half, costs["gripper/controller"] = self.gripper.state(
+                progress, joint_position, joint_names, trajectory_time=trajectory_time)
             spheres = self.gripper.spheres(spheres, position, quaternion, coordinates, half)
             # BEGIN retain every declared pair without a per-pair Python graph.
             if self.gripper.self_collision_pairs:
@@ -1161,7 +1355,11 @@ class PlanningScene:
                          + torch.relu(rotation - self.numerical_rotation_tolerance_rad))
                 costs[f"attachment/start/{owner.owner_id}/{index}"] = error * boundary.to(progress.dtype)
         for actor, (actor_spheres, actor_pose) in actors.items():
-            costs[f"unknown/space/{actor}"] = self.coverage.violation(actor_spheres).amax(-1)
+            # A point objective cannot decide whole-volume coverage. Native
+            # metrics retain all other scene terms; the planner must invoke
+            # check_robot_coverage at entrance, search and final acceptance.
+            if actor != "robot" or self.robot_coverage is None:
+                costs[f"unknown/space/{actor}"] = self.coverage.violation(actor_spheres).amax(-1)
             costs[f"collision/{actor}/background"] = self.background(actor_spheres, key=(actor, "background")).sum(-1)
             for owner in self.owners:
                 if actor == owner.owner_id:
@@ -1201,9 +1399,10 @@ class PlanningScene:
         return costs
 
     def evaluate(self, robot_spheres, position, quaternion, progress,
-                 joint_position=None, joint_names=None):
+                 joint_position=None, joint_names=None, *, trajectory_time=None):
         terms = self.components(robot_spheres, position, quaternion, progress,
-                                joint_position=joint_position, joint_names=joint_names)
+                                joint_position=joint_position, joint_names=joint_names,
+                                trajectory_time=trajectory_time)
         return torch.stack(tuple(terms.values())).sum(0)
 
     # BEGIN optimize toward an actual tracking command inside its numerical band.
@@ -1258,7 +1457,13 @@ class PlanningScene:
             "gripper_controller": None if self.gripper is None else self.gripper.controller,
             "gripper_timing_contract": (None if self.gripper is None else
                                         "time-independent full mechanical envelope" if self.gripper.controller == "binary"
+                                        else "same-time named C1 command reference; actual full q/dq supervised separately"
+                                        if self.gripper.controller == "timed_reference"
                                         else "native position tracking; final solver joint-rate limits apply"),
+            "robot_new_volume_coverage": (None if self.robot_coverage is None else {
+                "initial_state_assumption": "native solid V0 at measured full named q0 is a valid initial occupied volume",
+                "acceptance": "CPU full-volume V(q) minus (V0 union original observed free cells)",
+                "optimizer": "bounded native body points only; not a coverage certificate"}),
             "numerical_joint_tolerance": None if self.gripper is None else self.gripper.numerical_joint_tolerance,
             "gripper_projection_dimension": (0 if self.gripper is None or self.gripper.controller != "position_tracking"
                                              else len(self.gripper._drive_basis)),

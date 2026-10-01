@@ -36,6 +36,8 @@ checked independently. It preserves all required source anchors.
 | `check_recorded_robot_geometry.py` | Independent Pinocchio FK and Coal convex/analytic-solid pair distances for complete named recorded states; CPU only |
 | `probe_finger_control.py` | Bounded native asset control diagnostic with actual q/dq, actuator/generalized forces, contact identities and explicit convergence thresholds |
 | `probe_mounted_execution.py` | Complete mounted-scene control measurement or explicitly supervised diagnostic reference through the production backend/executor; preserves measured entrance velocity |
+| `probe_controller_takeover.py` | Short measured-position hold versus unchanged-curve comparison, retaining native torque position/damping/compensation terms |
+| `robot_coverage_fixture.py` | Bind the complete native robot solid model and original free-cell evidence to an explicit initial-state assumption |
 | `probe_mounted_planning.py` | Bounded native free-reach planning with complete fixed mounts and explicitly synthetic known space; retains accepted curve and effective solver configuration |
 | `probe_recorded_robot_mask.py` | One calibrated recorded RGB-D view with the complete known robot assembly, fixed-mount coverage checks and actual OpenGL device metadata |
 | `recorded_observation.py`, `recorded_owner_geometry.py`, `detect_recorded_owners.py` | Current robot/owner masks and explicitly bound offline carrier geometry; no current object truth enters planning |
@@ -88,17 +90,33 @@ ordered joint names, a source, arm/TCP tracking limits, actual finger position
 and speed intervals for the initial state and every original command event,
 and the velocity threshold for original stops. It contains no duplicate event
 clock and has no physical defaults. Position targets remain the separate
-explicit `--finger-targets` input to execution. Planning optimizes only the arm;
-`position_bounds` conservatively covers the supervised actual finger intervals.
+explicit `--finger-targets` input to both planning and execution. Planning
+optimizes only the arm; a saved named `FingerTrajectory` supplies the nominal
+hand at the same formal output time. Actual position intervals remain feedback
+guards and no longer create mechanical-travel geometry envelopes.
 
 Each command's position interval must contain its preceding interval until new
 feedback is bound. Commands can take effect at the next native step, so a
-command event alone cannot justify narrowing the geometry before it is applied.
+command event alone cannot justify narrowing the actual-state guard before it is applied.
 Narrower bounds require new feedback at the existing evidence barrier. Saved
 curves retain the exact limits, and every physical trial requires the same input.
-Historical curves without this contract remain diagnostic evidence, not executable inputs.
+Historical curves without the complete current arm/finger contract remain
+diagnostic evidence, not executable inputs. The same finger polynomial is
+verified during planning, archived, checked against its named arrays on reload,
+and sampled during execution. Original event times and native-tick activation
+times are both retained. A position target or reference is never Holding evidence.
 These limits must be calibrated; the CPU tests' synthetic numbers and a failed
 asset probe are not execution calibration.
+
+<!-- BEGIN explicit new-volume contract for recorded planning. -->
+`run_recorded_skill.py` also requires `--initial-state-assumption-source`.
+This records the caller's basis for using the native robot solid model at
+measured q0 as V0. Its CPU oracle checks `V(q) \ (V0 ∪ F)` at the original
+validation states, using the unchanged depth-free grid F. Mount geometry stays
+in collision owners and does not enlarge V0. Native-model occupancy is not
+claimed as observed free space. The original grid and complete measured
+entrance are archived for independent diagnosis.
+<!-- END unknown-space acceptance remains separate from collision proxies. -->
 
 Fixture export uses `collision_root` for the articulated sphere scope. The
 visual self-filter covers the complete calibrated assembly. Fixed installation

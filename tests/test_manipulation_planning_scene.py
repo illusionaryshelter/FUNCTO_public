@@ -171,6 +171,79 @@ def contact_rule(**changes):
 
 
 class PlanningSceneTest(unittest.TestCase):
+    # BEGIN timed fingers and native-volume guidance have separate contracts.
+    @staticmethod
+    def timed_gripper():
+        initial = np.array([.03, -.02])
+
+        def factory(duration, mapping):
+            def sample(times):
+                t = np.asarray(times)[..., None]/duration
+                return initial*(1-t), np.broadcast_to(-initial/duration, (*t.shape[:-1], 2))
+
+            def sample_torch(times):
+                q0 = times.new_tensor(initial)
+                return q0*(1-times[..., None]/duration), (-q0/duration).expand(*times.shape, 2)
+
+            return SimpleNamespace(joint_names=("left", "right"), duration=duration,
+                                   sample=sample, sample_torch=sample_torch)
+
+        return PrismaticGripper(controller="timed_reference", joint_names=("left", "right"),
+            current_positions=initial, joint_limits=[[0, .04], [-.04, 0]], joint_bounds=None,
+            finger_trajectory_factory=factory, coupling_matrix=np.empty((0, 2)), coupling_offset=[],
+            sphere_indices=(0, 1), local_spheres=[[0, 0, 0, .001], [0, 0, 0, .001]],
+            sphere_joint_translation=[[[1, 0], [0, 0], [0, 0]], [[0, 1], [0, 0], [0, 0]]],
+            self_collision_pairs=((0, 1),), commands=[{"skill_id": "timed", "event_id": "close",
+                "command": "close", "progress": 0.}], source="analytic independent finger reference")
+
+    def test_timed_fingers_use_time_during_progress_pause_without_full_range_inflation(self):
+        hand = self.timed_gripper()
+        hand.bind_clock(1., None)
+        progress = torch.zeros((1, 2), dtype=torch.float64)
+        times = torch.tensor([[0., .5]], dtype=torch.float64)
+        q, half, violations = hand.state(progress, None, None, trajectory_time=times)
+        np.testing.assert_array_equal(q[0, 0], [.03, -.02])
+        np.testing.assert_array_equal(q[0, 1], [.015, -.01])
+        self.assertEqual(half.abs().max().item(), 0.)
+        self.assertEqual(violations.max().item(), 0.)
+        world = scene(materials=(None, None), gripper=hand, has_gripper=True,
+                      background=SphereQuery(("background",), center=(.015, 0, 0), radius=.001))
+        args = inputs((0., 0.), sphere_rows=[[[.03, 0, 0, .001], [-.02, 0, 0, .001]]]*2)
+        costs = world.components(*args, trajectory_time=times)
+        self.assertEqual(costs["collision/robot/background"][0, 0].item(), 0.)
+        self.assertGreater(costs["collision/robot/background"][0, 1].item(), 0.)
+        with self.assertRaisesRegex(ValueError, "actual query time"):
+            world.components(*args)
+
+    def test_raw_free_evidence_is_owned_readonly_and_not_filled_from_occupied_cells(self):
+        mask = np.ones((4, 4, 4), bool)
+        free = mask.copy()
+        free[1, 1, 1] = False
+        observed = coverage(mask, known_free=free)
+        free[:] = True
+        self.assertFalse(observed.known_free[1, 1, 1])
+        with self.assertRaises(ValueError):
+            observed.known_free[1, 1, 1] = True
+
+    def test_full_volume_entrance_accepts_only_exact_named_representations(self):
+        baseline = np.array([.123456789])
+        received = []
+        oracle = SimpleNamespace(reference_frame="world", required_link_names=("body",),
+            baseline_joint_names=("q",), baseline_joint_positions=baseline,
+            guidance_geometry=lambda: {"solids": []},
+            check_state=lambda **kwargs: received.append(kwargs) or {"passed": True})
+        world = scene(robot_coverage=oracle)
+        q = torch.tensor([[[float(np.float32(baseline[0]))]]], dtype=torch.float64)
+        world.check_robot_coverage(q, ("q",), torch.zeros((1, 1)), entrance=True)
+        self.assertTrue(received[0]["entrance"])
+        changed = q+np.spacing(q.item())
+        with self.assertRaisesRegex(ValueError, "exactly preserve"):
+            world.check_robot_coverage(changed, ("q",), torch.zeros((1, 1)), entrance=True)
+        world.check_robot_coverage(changed, ("q",), torch.zeros((1, 1)), entrance=False)
+        self.assertEqual(received[-1]["joint_positions"][0], changed.item())
+        self.assertFalse(received[-1]["entrance"])
+    # END command references never substitute for physical finger feedback.
+
     def test_partial_scene_cannot_be_declared_without_coverage_and_provenance(self):
         with self.assertRaisesRegex(ValueError, "coverage"):
             scene(coverage=None)

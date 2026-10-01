@@ -27,51 +27,58 @@ PROJECT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT))
 
 
-# BEGIN one actual-finger interval contract shared by planning and execution.
-def event_finger_bounds(execution_limits, events):
-    """Return retiming-independent actual bounds at original progress events.
+# BEGIN independent finger reference on the planner's exact physical clock.
+def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ctrlrange,
+                              position_limits, velocity_limits, acceleration_limits):
+    """Bind original events once the native formal duration/map are known.
 
-    At an event progress both pre-command and post-command states can occur,
-    so the query covers their union. The post-event interval must include the
-    whole physical closing transition; position targets are never substituted
-    for this measured-state contract. Bounds persist across progress plateaus.
+    Actual-position protection bounds are deliberately absent from this
+    constructor. They continue guarding measured feedback in the executor;
+    they cannot predict a hand shape or replace the original position goals.
+    The returned reference starts at measured q/dq and remains a command,
+    including when physical contact prevents a target from being reached.
     """
-    import torch
+    from manipulation.gripper_trajectory import FingerTrajectory
 
-    rows = {(row["skill_id"], row["event_id"]): row for row in execution_limits.events}
-    commands = sorted((event for event in events if event.kind in {"open", "close", "hold"}),
-                      key=lambda event: event.progress)
-    identities = [(event.skill_id, event.event_id) for event in commands]
-    if len(set(identities)) != len(identities) or set(identities) != set(rows):
-        raise ValueError("Actual finger bounds must match the original planner command events exactly")
-    initial = np.asarray(execution_limits.initial_fingers["position_bounds"])
-    schedule = [(float(event.progress), np.asarray(rows[identity]["position_bounds"]))
-                for event, identity in zip(commands, identities)]
+    names = tuple(feedback["finger_joint_names"])
+    measured = dict(zip(feedback["joint_names"], feedback["start_q"]))
+    speeds = dict(zip(feedback["joint_names"], feedback["start_dq"]))
 
-    def bounds(progress):
-        shape = (*progress.shape, len(execution_limits.finger_joint_names))
-        lower = torch.as_tensor(initial[:, 0], dtype=progress.dtype, device=progress.device).expand(shape)
-        upper = torch.as_tensor(initial[:, 1], dtype=progress.dtype, device=progress.device).expand(shape)
-        for boundary, interval in schedule:
-            lo = torch.as_tensor(interval[:, 0], dtype=progress.dtype, device=progress.device)
-            hi = torch.as_tensor(interval[:, 1], dtype=progress.dtype, device=progress.device)
-            exact = (progress == boundary)[..., None]
-            after = (progress > boundary)[..., None]
-            lower = torch.where(exact, torch.minimum(lower, lo), torch.where(after, lo, lower))
-            upper = torch.where(exact, torch.maximum(upper, hi), torch.where(after, hi, upper))
-        return lower, upper
+    def build(duration_s, progress_map):
+        events = []
+        for event in problem.events:
+            parameters = progress_map.anchor_parameters([event.progress])[:, 0]
+            events.append({**asdict(event), "time": float(parameters[0]*duration_s),
+                           "hold_until": float(parameters[-1]*duration_s)})
+        barriers = [row["time"] for row in events if row["requires_evidence"] is not None]
+        stop = min(barriers) if barriers else duration_s
+        commands = finger_targets.bind(SimpleNamespace(events=events, duration=duration_s),
+            finger_joint_names=names, ctrlrange=ctrlrange)
+        velocity = np.asarray([velocity_limits[name] for name in names])
+        acceleration = np.asarray([acceleration_limits[name] for name in names])
+        return FingerTrajectory.build(joint_names=names,
+            initial_position=[measured[name] for name in names],
+            initial_velocity=[speeds[name] for name in names], commands=commands,
+            duration=duration_s, executable_until=stop, timestep=timestep,
+            position_limits=np.asarray([position_limits[name] for name in names]).T,
+            velocity_limits=np.stack((-velocity, velocity)),
+            acceleration_limits=np.stack((-acceleration, acceleration)),
+            source=(f"Original explicit actuator targets: {finger_targets.source}; C1 command reference "
+                    "under native planner acceleration bounds, not calibrated actual acceleration/tracking limits"),
+            feedback_id=feedback["feedback_id"], timestamp_s=feedback["sim_time_s"])
 
-    return bounds
+    return build
+# END full mechanical intervals no longer select future hand geometry.
 
 
 def position_controlled_hand(robot, feedback, problem, *, device, execution_limits,
-                             position_limits, velocity_limits):
+                             position_limits, velocity_limits, trajectory_factory):
     """Calibrate the affine hand from the supplied native robot, not a name.
 
     Native axes and sphere ordering are measured by FK. Independent position
     actuators have no invented equal-width mechanical coupling. Native FK
     locks fingers at measured q; the scene replaces their proxies with the
-    actual intervals supervised by the same execution-limit input.
+    separately bound synchronous reference. Measured q/dq remains distinct.
     """
     import torch
     from curobo.kinematics import Kinematics, KinematicsCfg
@@ -149,25 +156,28 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
         raise ValueError(f"Native finger geometry is not affine in the declared TCP: {error} m")
     pairs = native.get_self_collision_config().collision_pairs.cpu().numpy()
     self_pairs = tuple(tuple(int(i) for i in pair) for pair in pairs if set(pair)&set(indices))
+    # BEGIN same-time finger reference, without full mechanical-range unions.
     hand = PrismaticGripper(
-        controller="position_bounds", joint_names=finger_names,
+        controller="timed_reference", joint_names=finger_names,
         current_positions=initial[columns], joint_limits=limits,
-        joint_bounds=event_finger_bounds(execution_limits, problem.events),
+        joint_bounds=None, finger_trajectory_factory=trajectory_factory,
         coupling_matrix=np.empty((0, len(columns))), coupling_offset=np.empty(0),
         sphere_indices=indices, local_spheres=local_spheres,
         sphere_joint_translation=affine, self_collision_pairs=self_pairs,
         commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id,
                         "command": event.kind, "progress": event.progress}
                        for event in problem.events if event.kind in {"open", "close", "hold"}),
-        source=f"Native robot FK and supervised independent position control: {execution_limits.source}")
+        source=f"Native robot FK and synchronous independent position reference: {execution_limits.source}")
     report = {"affine_fk_max_error_m": error, "native_sphere_count": native.total_spheres,
                   "finger_sphere_indices": list(indices), "current_fingers": initial[columns].tolist(),
-                  "mechanical_limits": limits.tolist(), "controller": "position_bounds",
+                  "mechanical_limits": limits.tolist(), "controller": "timed_reference",
+                  "geometry_scope": "same-time command reference; actual full named q/dq is separately supervised",
                   "execution_limits": execution_limits.describe(),
                   "enabled_self_collision_pairs": len(self_pairs),
                   # BEGIN separate object-contact evidence from robot mechanics.
                   "contact_permissions": "No current finite material-patch object-contact permission has been certified; robot mechanical contacts use the validated native pair contract"}
                   # END a robot-local permission cannot certify a task grasp.
+    # END actual hardware intervals do not become nominal robot volumes.
     # BEGIN bind fixed installation pair policy to the actual native sphere ordering.
     sphere_indices_by_link = {
         link: [int(index) for index in parameters.get_sphere_index_from_link_name(link).cpu().tolist()]
@@ -183,7 +193,7 @@ def run(args):
     from recorded_observation import render_robot_mask
     from recorded_task_planning import plan_and_record
     # BEGIN use the production execution contract shared with the executor.
-    from manipulation.execution import ExecutionLimits
+    from manipulation.execution import ExecutionLimits, FixedFingerTargets
     # END production execution contract.
     from manipulation.planning import PlanningBudget
     from manipulation.planning_observation import build_scene_from_rgbd
@@ -208,6 +218,11 @@ def run(args):
         scene_input = json.loads((root/candidate["scene_path"]).read_text())
         fixture = json.loads(args.robot_fixture.read_text())
         feedback = json.loads(args.feedback.read_text())
+        # BEGIN preserve the same explicit snapshot identity used by execution.
+        feedback["feedback_id"] = str(args.feedback.resolve())
+        finger_targets = FixedFingerTargets.from_mapping(json.loads(args.finger_targets.read_text()))
+        report["finger_targets_path"] = str(args.finger_targets.resolve())
+        # END targets remain a separate input from measured feedback.
         execution_limits = ExecutionLimits.from_mapping(json.loads(args.execution_limits.read_text()))
         report["execution_limits_path"] = str(args.execution_limits.resolve())
         measured = dict(zip(feedback["joint_names"], feedback["start_q"]))
@@ -240,6 +255,26 @@ def run(args):
             raise ValueError("Actual native robot geometry/materials must agree within the 512-sphere local budget")
         robot["robot_cfg"]["kinematics"]["lock_joints"] = {
             name: measured[name] for name in feedback["finger_joint_names"]}
+        # BEGIN read native command timing/ranges from the selected robot model.
+        # No world/object state enters planning through this hardware binding.
+        import mujoco
+        native_model = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
+        finger_actuators = []
+        for name in feedback["finger_joint_names"]:
+            joint_id = native_model.joint(name).id
+            selected = np.flatnonzero((native_model.actuator_trntype == mujoco.mjtTrn.mjTRN_JOINT)
+                & (native_model.actuator_trnid[:, 0] == joint_id))
+            if len(selected) != 1:
+                raise ValueError("Each native finger requires its single explicit position actuator")
+            finger_actuators.append(int(selected[0]))
+        reference_factory = finger_trajectory_factory(problem, feedback, finger_targets,
+            timestep=float(native_model.opt.timestep),
+            ctrlrange=native_model.actuator_ctrlrange[finger_actuators].copy(),
+            position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
+            acceleration_limits={name: float(robot["robot_cfg"]["kinematics"]["cspace"]["max_acceleration"])
+                                 for name in feedback["finger_joint_names"]})
+        del native_model
+        # END the finger factory binds only after the native formal clock exists.
         if not torch.cuda.is_available():
             raise RuntimeError("This explicit local planner test requires CUDA access")
         if args.torch_memory_mib not in (2048, 4096) or args.scene_workspace_mib not in (1024, 2048):
@@ -254,7 +289,8 @@ def run(args):
         device = DeviceCfg("cuda:0")
         hand, hand_report, entrance_fk = position_controlled_hand(
             robot, feedback, problem, device=device, execution_limits=execution_limits,
-            position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"])
+            position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
+            trajectory_factory=reference_factory)
         report["gripper"] = hand_report
         carrier_id = scene_input["carrier_id"]
         carrier_phases = [phase for phase in problem.phases
@@ -353,42 +389,36 @@ def run(args):
                 numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
             scene.observation_report = observed_report
         report["fixed_robot_installation"] = fixed_report
-        # END observed depth and the existing unknown-space policy are not widened.
+        # END fixed installation remains independently collision checked.
+        # BEGIN same-model baseline occupancy, separate from observed free F.
+        from robot_coverage_fixture import build_robot_coverage
+        from manipulation.planning_scene import PlanningScene
+        coverage = build_robot_coverage(fixture, feedback, scene.coverage,
+            initialization_source=args.initial_state_assumption_source,
+            max_queries=(2*args.trajectory_seeds+2)*args.max_validation_points+1)
+        observed_report = scene.observation_report
+        scene = PlanningScene(background=scene.background, owners=scene.owners, coverage=scene.coverage,
+            reference_frame=scene.reference_frame, robot_sphere_materials=scene.robot_sphere_materials,
+            robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
+            robot_coverage=coverage, numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
+            numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
+        scene.observation_report = observed_report
+        report["robot_coverage"] = scene.robot_coverage.describe()
+        np.savez_compressed(args.output/"observed-free.npz", known_free=scene.coverage.known_free,
+            origin=scene.coverage.origin, voxel_size=np.asarray(scene.coverage.voxel_size),
+            observation_ids=np.asarray(scene.coverage.observation_ids))
+        report["robot_coverage"]["original_free_grid_path"] = "observed-free.npz"
         scene.validate_problem(problem)
-        # Independent entrance diagnostics use the same measured FK as the
-        # native hand calibration. They expose pre-existing scene violations;
-        # they do not select a candidate or waive an optimization constraint.
-        with torch.no_grad():
-            # BEGIN preserve exact entrance queries for independent scene diagnosis.
-            # These arrays describe the already declared measured state and
-            # supervised finger envelope. They do not alter collision costs,
-            # mark unknown cells free, or select a planning candidate.
-            entrance_spheres = device.to_device(entrance_fk["robot_spheres"])[None, None]
-            entrance_position = device.to_device(entrance_fk["tool_position"])[None, None]
-            entrance_quaternion = device.to_device(entrance_fk["tool_quaternion"])[None, None]
-            entrance_progress = device.to_device([[0.]])
-            entrance_q = device.to_device(problem.start_q)[None, None]
-            terms = scene.components(
-                entrance_spheres, entrance_position, entrance_quaternion,
-                entrance_progress, entrance_q, problem.joint_names)
-            report["initial_scene_components"] = {name: float(value.max()) for name, value in terms.items()}
-            coordinates, half, _ = hand.state(entrance_progress, entrance_q, problem.joint_names)
-            envelope = hand.spheres(entrance_spheres, entrance_position, entrance_quaternion,
-                                    coordinates, half)
-            arrays = {"measured_robot_spheres": entrance_spheres[0, 0].cpu().numpy(),
-                      "actual_finger_envelope_spheres": envelope[0, 0].cpu().numpy(),
-                      "unknown_per_sphere": scene.coverage.violation(envelope)[0, 0].cpu().numpy(),
-                      "background_per_sphere": scene.background(
-                          envelope, key=("entrance_diagnostic", "background"))[0, 0].cpu().numpy(),
-                      "finger_interval_center": coordinates[0, 0].cpu().numpy(),
-                      "finger_interval_half_width": half[0, 0].cpu().numpy()}
-            np.savez_compressed(args.output/"entrance-scene.npz", **arrays)
-            report["entrance_geometry_diagnostic"] = {
-                "path": "entrance-scene.npz", "sphere_count": len(arrays["unknown_per_sphere"]),
-                "unknown_sphere_count": int(np.count_nonzero(arrays["unknown_per_sphere"] > 0)),
-                "background_sphere_count": int(np.count_nonzero(arrays["background_per_sphere"] > 0)),
-                "scope": "Measured q0 with the same actual-finger interval and original scene; native collision costs retain their own units"}
-            # END read-only entrance evidence; original planner inputs remain unchanged.
+        # Only native measured data is available here. The planner owns the
+        # single entrance verdict after binding the formal finger clock.
+        np.savez_compressed(args.output/"entrance-scene.npz",
+            measured_robot_spheres=entrance_fk["robot_spheres"],
+            joint_names=np.asarray(feedback["joint_names"]),
+            actual_q=np.asarray(feedback["start_q"]), actual_dq=np.asarray(feedback["start_dq"]))
+        report["entrance_geometry_diagnostic"] = {
+            "path": "entrance-scene.npz", "sphere_count": len(entrance_fk["robot_spheres"]),
+            "scope": "Measured native q0; the formally bound planner performs the only entrance verdict"}
+        # END no uncertainty envelope is labelled as the current hand state.
         budget = PlanningBudget(knots=args.knots, interpolation_buffer_size=args.interpolation_buffer_size,
                                 max_robot_spheres=512, ik_seeds=args.ik_seeds,
                                 trajectory_seeds=args.trajectory_seeds,
@@ -403,7 +433,10 @@ def run(args):
                                  provenance={**provenance, "robot_fixture": str(args.robot_fixture),
                                              "current_views": list(observations),
                                              "old_selection_comparison_only": segment["grounding"]["status"]})
-        report.update(status="completed", planning_success=result.success)
+        report.update(status="completed", planning_success=result.success,
+                      initial_state=result.diagnostics["initial_state"],
+                      robot_coverage={**scene.robot_coverage.describe(),
+                                      "original_free_grid_path": "observed-free.npz"})
     except KeyboardInterrupt:
         report.update(status="interrupted", interruption_reason="Explicit operator interrupt")
         (args.output/"exception.txt").write_text(traceback.format_exc())
@@ -419,7 +452,7 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "output"):
+    for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "finger-targets", "output"):
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)
@@ -436,6 +469,8 @@ if __name__ == "__main__":
     parser.add_argument("--depth-error", type=float, required=True)
     parser.add_argument("--robot-depth-tolerance", type=float, required=True)
     parser.add_argument("--robot-depth-tolerance-source", required=True)
+    parser.add_argument("--initial-state-assumption-source", required=True,
+                        help="Explicit provenance for accepting the frozen native robot model occupancy at measured q0")
     parser.add_argument("--knots", type=int, default=16)
     parser.add_argument("--interpolation-buffer-size", type=int, default=768)
     parser.add_argument("--ik-seeds", type=int, default=4)

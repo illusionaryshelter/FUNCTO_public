@@ -155,6 +155,9 @@ def save_native_configuration(path, planner):
               "transition_horizon": planner.trajopt.horizon,
               "action_horizon": planner.trajopt.action_horizon,
               "progress_u": planner.progress_map.u, "progress_s": planner.progress_map.s,
+              # BEGIN distinguish the formal execution clock from raw rollouts.
+              "formal_clock": planner.formal_clock,
+              # END every hand reference uses this same native output clock.
               # BEGIN retain runtime bounds in addition to existing configs.
               "verification_joint_limits": verification_joint_limits(planner)}
               # END native names and all four matrices keep their actual dtype.
@@ -182,6 +185,13 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
                   position=curve.position, velocity=curve.velocity,
                   progress_u=curve.progress_u, progress_s=curve.progress_s,
                   classification=np.asarray(classification))
+    # BEGIN archive the already planned hand curve without regenerating it.
+    fingers = curve.finger_trajectory
+    if fingers is not None:
+        arrays.update(finger_joint_names=np.asarray(fingers.joint_names),
+                      finger_times=fingers.times, finger_position=fingers.position,
+                      finger_velocity=fingers.velocity)
+    # END commanded and actual finger positions remain separate artifacts.
     if fk is not None:
         arrays.update(fk)
     # BEGIN reuse production polynomial checks with the actual named limits.
@@ -203,6 +213,7 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
     path.with_suffix(".json").write_text(json.dumps(
         {"classification": classification, "validation_status": validation_status,
          "execution_limits": deepcopy(execution_limits),
+         "finger_trajectory": None if fingers is None else fingers.describe(),
          "events": curve.events,
          "conditions": curve.conditions, "residuals": curve.residuals,
          "duration_seconds": curve.duration,

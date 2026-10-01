@@ -1,81 +1,72 @@
-"""CPU checks for independently controlled fingers under one actual-state contract."""
+"""Recorded adapter checks for one shared arm/finger clock and actual entrance."""
+
+# BEGIN actual protection intervals no longer stand in for hand trajectories.
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 
 import numpy as np
 import pytest
-import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
-from manipulation.planning_scene import PrismaticGripper
-# BEGIN exercise the production contract, independently of recording setup.
-from manipulation.execution import ExecutionLimits
-# END production execution contract.
-from run_recorded_skill import event_finger_bounds
+sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
+from manipulation.execution import FixedFingerTargets
+from manipulation.planning import _ProgressMap
+from manipulation.planning_problem import PlanningEvent
+from run_recorded_skill import finger_trajectory_factory
 
 
-def limits():
-    return ExecutionLimits(source="Synthetic interval regression; not physical calibration",
-        joint_names=("arm", "left", "right"), arm_joint_names=("arm",),
-        finger_joint_names=("left", "right"), arm_position_error=[.01],
-        arm_velocity_error=[.02], tcp_position_error_m=.003, tcp_rotation_error_rad=.01,
-        stop_arm_velocity=[.01],
-        initial_fingers={"position_bounds": [[.03, .04], [-.03, -.02]], "maximum_speed": [.1, .1]},
-        events=({"skill_id": "s", "event_id": "close", "position_bounds": [[.005, .04], [-.03, -.004]],
-                 "maximum_speed": [.1, .1]},
-                {"skill_id": "s", "event_id": "hold", "position_bounds": [[.004, .04], [-.03, -.003]],
-                 "maximum_speed": [.01, .01]}))
+def inputs():
+    feedback = {"joint_names": ["arm", "right", "left"], "finger_joint_names": ["left", "right"],
+                "start_q": [1., -.0395, .039], "start_dq": [.1, -.0002, .0001],
+                "feedback_id": "actual-snapshot", "sim_time_s": 2.5}
+    events = [PlanningEvent("open", "s", 0., 0, "open", "source"),
+              PlanningEvent("close", "s", .5, 183, "close", "source"),
+              PlanningEvent("verify", "s", 1., 197, "verification", "source", "Holding", True)]
+    targets = FixedFingerTargets(("left", "right"), "explicit targets", (
+        {"skill_id": "s", "event_id": "open", "kind": "open", "positions": [.04, -.04]},
+        {"skill_id": "s", "event_id": "close", "kind": "close", "positions": [0., 0.]}))
+    return SimpleNamespace(events=events), feedback, targets
 
 
-def events():
-    return [SimpleNamespace(skill_id="s", event_id="close", kind="close", progress=.5),
-            SimpleNamespace(skill_id="s", event_id="hold", kind="hold", progress=.8)]
+def factory(problem, feedback, targets):
+    return finger_trajectory_factory(problem, feedback, targets, timestep=.01,
+        ctrlrange=[[0., .04], [-.04, 0.]],
+        position_limits={"left": [0., .04], "right": [-.04, 0.]},
+        velocity_limits={"left": .2, "right": .2},
+        acceleration_limits={"left": 15., "right": 15.})
 
 
-def test_original_progress_boundaries_cover_both_actual_intervals():
-    bounds = event_finger_bounds(limits(), events())
-    lower, upper = bounds(torch.tensor([[0., .49, .5, .6, .8, .9]], dtype=torch.float64))
-    np.testing.assert_allclose(lower[0], [[.03, -.03], [.03, -.03], [.005, -.03],
-                                        [.005, -.03], [.004, -.03], [.004, -.03]])
-    np.testing.assert_allclose(upper[0], [[.04, -.02], [.04, -.02], [.04, -.004],
-                                        [.04, -.004], [.04, -.003], [.04, -.003]])
-    # Repeating a boundary at a later clock time must not narrow its geometry.
-    repeat = bounds(torch.tensor([[.5, .5]], dtype=torch.float64))
-    torch.testing.assert_close(repeat[0][0, 0], repeat[0][0, 1])
-    with pytest.raises(ValueError, match="original planner command events"):
-        event_finger_bounds(limits(), events()[:1])
+def test_finger_clock_preserves_measured_entrance_and_original_plateau_event():
+    problem, feedback, targets = inputs()
+    # Closing occurs at the first end of this progress plateau. The hand keeps
+    # moving as physical time passes even though progress is exactly constant.
+    progress = _ProgressMap(np.array([0., .4, .6, 1.]), np.array([0., .5, .5, 1.]))
+    curve = factory(problem, feedback, targets)(3., progress)
+    q, dq = curve.sample(0.)
+    np.testing.assert_array_equal(q, [.039, -.0395])
+    np.testing.assert_array_equal(dq, [.0001, -.0002])
+    assert curve.executable_until == 3.
+    assert curve.duration == 3.
+    assert curve.joint_names == ("left", "right")
+    assert not np.array_equal(curve.sample(1.2)[0], curve.sample(1.3)[0])
+    np.testing.assert_allclose(curve.sample(3.)[0], [0., 0.], atol=1e-15)
+    assert feedback["start_q"] == [1., -.0395, .039]
 
 
-def test_position_bounds_do_not_add_finger_solver_coordinates_and_cover_asymmetry():
-    bound = event_finger_bounds(limits(), events())
-    hand = PrismaticGripper(controller="position_bounds", joint_names=("left", "right"),
-        current_positions=[.035, -.028], joint_limits=[[0., .04], [-.04, 0.]],
-        joint_bounds=bound, coupling_matrix=np.empty((0, 2)), coupling_offset=np.empty(0),
-        sphere_indices=(0, 1), local_spheres=[[0., 0., 0., .002], [0., .1, 0., .003]],
-        sphere_joint_translation=[[[1., 0.], [0., 0.], [0., 0.]],
-                                  [[0., 0.], [0., 1.], [0., 0.]]],
-        self_collision_pairs=(),
-        commands=tuple({"skill_id": e.skill_id, "event_id": e.event_id,
-                        "command": e.kind, "progress": e.progress} for e in events()),
-        source="Native prismatic axes and explicit test execution limits")
-    progress = torch.tensor([[0., .5, .6, .9]], dtype=torch.float64)
-    coordinates, half, violations = hand.state(progress, torch.zeros((1, 4, 1)), ("arm",))
-    assert torch.all(violations == 0)
-    lower, upper = bound(progress)
-    torch.testing.assert_close(coordinates-half, lower)
-    torch.testing.assert_close(coordinates+half, upper)
-    assert not torch.allclose(coordinates[..., 0], -coordinates[..., 1])
-    proxy = hand.spheres(torch.zeros((1, 4, 2, 4), dtype=torch.float64),
-                        torch.zeros((1, 4, 3), dtype=torch.float64),
-                        torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64).expand(1, 4, 4),
-                        coordinates, half)
-    # Both endpoints of each independent affine translation remain covered.
-    for endpoint in (lower, upper):
-        centers = torch.zeros((1, 4, 2, 3), dtype=torch.float64)
-        centers[..., 0, 0] = endpoint[..., 0]
-        centers[..., 1, 1] = .1+endpoint[..., 1]
-        residual = torch.linalg.vector_norm(centers-proxy[..., :3], dim=-1)
-        residual += torch.tensor([.002, .003])
-        assert torch.all(residual <= proxy[..., 3]+1e-9)
+def test_edited_target_identity_is_rejected_before_curve_generation():
+    problem, feedback, targets = inputs()
+    edited = FixedFingerTargets(targets.joint_names, targets.source, targets.events[:1])
+    with pytest.raises(ValueError, match="original command event"):
+        factory(problem, feedback, edited)(3., _ProgressMap(np.array([0., 1.]), np.array([0., 1.])))
+
+
+def test_missing_named_reference_limit_cannot_be_replaced_by_actual_hardware_interval():
+    problem, feedback, targets = inputs()
+    with pytest.raises(KeyError, match="right"):
+        finger_trajectory_factory(problem, feedback, targets, timestep=.01,
+            ctrlrange=[[0., .04], [-.04, 0.]],
+            position_limits={"left": [0., .04], "right": [-.04, 0.]},
+            velocity_limits={"left": .2, "right": .2}, acceleration_limits={"left": 15.})(
+                3., _ProgressMap(np.array([0., 1.]), np.array([0., 1.])))
+# END goals, actual feedback and time-varying reference retain separate meanings.
