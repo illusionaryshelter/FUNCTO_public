@@ -266,6 +266,210 @@ def single_state_probe(planner, rollout, goal, witness, arrays, report, save):
     result["physical_limits_identical"] = first == second
 
 
+# BEGIN isolate native self forward repeatability and its actual timed inputs.
+def self_forward_probe(planner, rollout, actions, witness_joint, arrays, report, save):
+    """Audit one saved candidate without modifying native costs or geometry.
+
+    Capture the tensor passed to the enabled native self-collision component,
+    including timed finger replacement. CPU float64 recomputation implements
+    that kernel's maximum squared overlap, not a different collision metric.
+    Each CPU iteration owns at most one state's pair array; all saved sphere
+    arrays together are below 32 MiB for the admitted 81-by-416 fixture.
+    """
+    torch = planner.torch
+    cost = rollout.constraint_manager.get_cost("self_collision")
+    if cost is None or not cost.enabled or cost.config.convert_to_binary:
+        raise ValueError("Self audit requires the original enabled, non-binary optimizer component")
+    config = cost.config.self_collision_kin_config
+    pairs = cpu(config.collision_pairs).astype(np.int64)
+    padding = cpu(config.sphere_padding).astype(np.float64)
+    weight = float(cpu(cost._weight).reshape(-1)[0])
+    names = list(planner.joint_names)
+    joint = names.index(witness_joint)
+    control = actions.shape[1]-1
+    direction = torch.zeros_like(actions)
+    direction[0, control, joint] = 1
+    arrays["self_audit.joint_names"] = np.asarray(names)
+    arrays["self_audit.controls"] = cpu(actions)
+    arrays["self_audit.collision_pairs"] = pairs
+    arrays["self_audit.sphere_padding"] = padding
+    audit = {"scope": "Original one-particle rollout, native self component only; no optimizer step",
+        "joint": witness_joint, "control": int(control), "weight": weight,
+        "convert_to_binary": bool(cost.config.convert_to_binary),
+        "use_grad_input": bool(cost.config.use_grad_input),
+        "sphere_count": int(config.num_spheres), "pair_count": int(len(pairs)),
+        "num_blocks_per_batch": int(config.num_blocks_per_batch),
+        "max_threads_per_block": int(config.max_threads_per_block),
+        "cpu_formula": "0.5*w*max(0, max_valid_pair((ri+padding_i+rj+padding_j)^2 - sum((ci-cj)^2)))",
+        "gradient_scope": "Center coordinates only; radii are constant in the audited control direction",
+        "repeatability": [], "epsilon_ladder": []}
+    report["self_forward_audit"] = audit
+
+    def cpu_exact(spheres, sphere_gradient=None):
+        # A single [P,3] float64 array is at most 3 MiB under the production
+        # 512-sphere cap. Do not create an [H,P,3] tensor or autograd graph.
+        horizon = spheres.shape[1]
+        values = np.zeros(horizon)
+        argmax = np.zeros((horizon, 2), dtype=np.int64)
+        gaps = np.zeros(horizon)
+        ties = np.zeros(horizon, dtype=np.int64)
+        center_gradient = np.zeros_like(spheres, dtype=np.float64)
+        selected_gap = np.zeros(horizon)
+        native_center_error = np.zeros(horizon)
+        selected_pairs = np.full((horizon, 2), -1, dtype=np.int64)
+        for time_index, value in enumerate(spheres[0]):
+            geometry = value.astype(np.float64)
+            radius = geometry[:, 3]+padding
+            first, second = pairs[:, 0], pairs[:, 1]
+            delta = geometry[first, :3]-geometry[second, :3]
+            score = (radius[first]+radius[second])**2-np.sum(delta*delta, axis=-1)
+            score *= (radius[first] >= 0) & (radius[second] >= 0)
+            selected = int(score.argmax())
+            maximum = max(0., float(score[selected]))
+            values[time_index] = .5*weight*maximum
+            argmax[time_index] = pairs[selected]
+            ordered = np.partition(score, len(score)-2)[-2:]
+            gaps[time_index] = float(ordered.max()-ordered.min())
+            ties[time_index] = int(np.count_nonzero(score == score[selected]))
+            if maximum > 0:
+                i, j = pairs[selected]
+                center_gradient[0, time_index, i, :3] = weight*(geometry[j, :3]-geometry[i, :3])
+                center_gradient[0, time_index, j, :3] = -center_gradient[0, time_index, i, :3]
+            if sphere_gradient is not None:
+                actual = sphere_gradient[0, time_index]
+                active = np.flatnonzero(np.any(actual != 0, axis=-1))
+                # Native max selects one pair, with arbitrary pair identity
+                # only when scores tie. Compare that chosen pair's score and
+                # derivative, rather than rejecting a valid tie subgradient.
+                expected = np.zeros_like(actual, dtype=np.float64)
+                if len(active) == 2:
+                    i, j = active
+                    selected_pairs[time_index] = active
+                    pair_score = (radius[i]+radius[j])**2-np.sum((geometry[i, :3]-geometry[j, :3])**2)
+                    selected_gap[time_index] = maximum-max(0., float(pair_score))
+                    expected[i, :3] = weight*(geometry[j, :3]-geometry[i, :3])
+                    expected[j, :3] = -expected[i, :3]
+                elif len(active) != 0:
+                    raise ValueError("Native self gradient unexpectedly writes more than one sphere pair")
+                elif maximum > 0:
+                    selected_gap[time_index] = maximum
+                native_center_error[time_index] = float(np.max(np.abs(actual[:, :3]-expected[:, :3])))
+        return {"values": values, "argmax": argmax, "top_two_score_gap": gaps,
+                "exact_tie_count": ties, "center_gradient": center_gradient,
+                "native_selected_pair": selected_pairs, "native_selected_score_gap": selected_gap,
+                "native_center_gradient_error": native_center_error}
+
+    def evaluate(value, gradient, label):
+        captured = {}
+        original = cost.forward
+
+        def record_input(spheres):
+            if captured:
+                raise ValueError("Expected one native self component per original rollout")
+            # Keep the graph tensor only until this call's immediate backward.
+            # Detached snapshots own storage, independent of native buffers.
+            captured["input"] = spheres
+            captured["sphere_snapshot"] = spheres.detach().clone()
+            result = original(spheres)
+            captured["output_snapshot"] = result.detach().clone()
+            return result
+
+        with torch.set_grad_enabled(gradient):
+            x = value.detach().clone().requires_grad_(gradient)
+            with patch.object(cost, "forward", new=record_input):
+                evaluated = rollout.evaluate_action(x)
+            self_value = terms(evaluated.costs_and_constraints)["constraint:self_collision"]
+            loss = self_value.sum()
+            action_gradient = sphere_gradient = None
+            if gradient:
+                action_grad, sphere_grad = torch.autograd.grad(loss, (x, captured["input"]))
+                action_gradient, sphere_gradient = cpu(action_grad), cpu(sphere_grad)
+            spheres = cpu(captured["sphere_snapshot"])
+            values = cpu(captured["output_snapshot"]).reshape(-1)
+            state = cpu(evaluated.state.joint_state.position)
+        exact = cpu_exact(spheres, sphere_gradient)
+        arrays[f"self_audit.{label}.spheres"] = spheres
+        arrays[f"self_audit.{label}.joint_position"] = state
+        arrays[f"self_audit.{label}.gpu_per_time"] = values
+        for key, data in exact.items():
+            arrays[f"self_audit.{label}.cpu_{key}"] = data
+        if gradient:
+            arrays[f"self_audit.{label}.action_gradient"] = action_gradient
+            arrays[f"self_audit.{label}.sphere_gradient"] = sphere_gradient
+        errors = values-exact["values"]
+        worst = np.argsort(-np.abs(errors), kind="stable")[:5]
+        result = {"label": label, "gradient_enabled": gradient,
+            "gpu_sum_float32": float(values.sum(dtype=np.float32)),
+            "gpu_per_time_sum_float64": float(values.sum(dtype=np.float64)),
+            "cpu_sum_float64": float(exact["values"].sum()),
+            "maximum_forward_difference": float(np.abs(errors).max()),
+            "worst_forward_samples": [{"sample": int(i), "gpu": float(values[i]),
+                "cpu_float64": float(exact["values"][i]), "cpu_argmax": exact["argmax"][i].tolist(),
+                "cpu_top_two_score_gap": float(exact["top_two_score_gap"][i])} for i in worst]}
+        if gradient:
+            result.update(action_directional_derivative=float(action_gradient[0, control, joint]),
+                maximum_native_center_gradient_error=float(exact["native_center_gradient_error"].max()),
+                maximum_native_selected_score_gap=float(exact["native_selected_score_gap"].max()))
+        return result, spheres, values, exact, action_gradient, sphere_gradient, state
+
+    baseline = None
+    for repetition in range(3):
+        for gradient in (False, True):
+            label = f"repeat_{repetition}_{'grad' if gradient else 'no_grad'}"
+            result = evaluate(actions, gradient, label)
+            if baseline is None:
+                baseline = result
+            row, spheres, values, exact, action_grad, sphere_grad, state = result
+            row["versus_first_input"] = {
+                "spheres_identical": bool(np.array_equal(spheres, baseline[1])),
+                "sphere_maximum_absolute_difference": float(np.abs(spheres-baseline[1]).max()),
+                "joint_positions_identical": bool(np.array_equal(state, baseline[6])),
+                "gpu_per_time_identical": bool(np.array_equal(values, baseline[2])),
+                "gpu_maximum_absolute_difference": float(np.abs(values-baseline[2]).max())}
+            audit["repeatability"].append(row)
+            if gradient and repetition == 0:
+                analytic = result
+            save(f"self_audit:{label}")
+
+    for epsilon in (.01, .003, .001, .0003, .0001, .00003):
+        lower = evaluate(actions-epsilon*direction, False, f"epsilon_{epsilon}_lower")
+        upper = evaluate(actions+epsilon*direction, False, f"epsilon_{epsilon}_upper")
+        lo_q = cpu(actions-epsilon*direction)[0, control, joint]
+        hi_q = cpu(actions+epsilon*direction)[0, control, joint]
+        span = float(hi_q-lo_q)
+        gpu_fd = (upper[2].astype(np.float64)-lower[2].astype(np.float64))/span
+        cpu_fd = (upper[3]["values"]-lower[3]["values"])/span
+        sphere_direction = (upper[1].astype(np.float64)-lower[1].astype(np.float64))/span
+        # Contract the baseline sphere derivative with the measured sphere
+        # directional change, separating FK/VJP behavior from native max FD.
+        cpu_chain = np.sum(analytic[3]["center_gradient"]*sphere_direction, axis=(0, 2, 3))
+        native_chain = np.sum(analytic[5].astype(np.float64)[..., :3]
+                              *sphere_direction[..., :3], axis=(0, 2, 3))
+        mismatch = gpu_fd-cpu_fd
+        worst = np.argsort(-np.abs(mismatch), kind="stable")[:5]
+        row = {"epsilon": epsilon, "actual_coordinate_span": span,
+            "lower": lower[0], "upper": upper[0],
+            "gpu_central_derivative_sum_float64": float(gpu_fd.sum()),
+            "cpu_central_derivative_sum_float64": float(cpu_fd.sum()),
+            "baseline_action_analytic_derivative": analytic[0]["action_directional_derivative"],
+            "baseline_cpu_sphere_gradient_times_sphere_fd": float(cpu_chain.sum()),
+            "baseline_native_sphere_gradient_times_sphere_fd": float(native_chain.sum()),
+            "maximum_radius_directional_change": float(np.abs(sphere_direction[..., 3]).max()),
+            "cpu_argmax_changed_samples": int(np.any(upper[3]["argmax"] != lower[3]["argmax"], axis=1).sum()),
+            "worst_gpu_vs_cpu_fd_samples": [{"sample": int(i), "gpu_fd": float(gpu_fd[i]),
+                "cpu_fd": float(cpu_fd[i]), "lower_gpu": float(lower[2][i]), "upper_gpu": float(upper[2][i]),
+                "lower_cpu_argmax": lower[3]["argmax"][i].tolist(),
+                "upper_cpu_argmax": upper[3]["argmax"][i].tolist(),
+                "baseline_cpu_argmax": analytic[3]["argmax"][i].tolist(),
+                "lower_cpu_score_gap": float(lower[3]["top_two_score_gap"][i]),
+                "upper_cpu_score_gap": float(upper[3]["top_two_score_gap"][i])} for i in worst]}
+        arrays[f"self_audit.epsilon_{epsilon}.gpu_fd_per_time"] = gpu_fd
+        arrays[f"self_audit.epsilon_{epsilon}.cpu_fd_per_time"] = cpu_fd
+        audit["epsilon_ladder"].append(row)
+        save(f"self_audit:epsilon:{epsilon}")
+# END isolate native self forward repeatability and its actual timed inputs.
+
+
 def replay(problem, scene, robot, budget, args, report, save, arrays):
     """Initialize once, bind the installed native goal lifecycle, then replay."""
     import torch
@@ -371,6 +575,13 @@ def replay(problem, scene, robot, budget, args, report, save, arrays):
             "dt": float(seed_goal.dt.item()), "tool_pose_tracking_disabled_as_in_production": True}
         archive = {"native": native, "native_names": native_info["states"]["js_solution"]["joint_names"]}
         save("planner_initialized_without_solve")
+        # BEGIN optional focused audit preserves all original input/goal checks.
+        if args.self_forward_audit:
+            actions = planner.device_cfg.to_device(native["solution"]).reshape(
+                expected_shape[0], *expected_shape[2:])
+            self_forward_probe(planner, rollout, actions, witness["joint"], arrays, report, save)
+            return
+        # END focused audit performs no broad objective replay or solve.
         for label, value in (("seed", seed.reshape(expected_shape[0], *expected_shape[2:])),
                              ("native_solution", planner.device_cfg.to_device(native["solution"]).reshape(
                                  expected_shape[0], *expected_shape[2:]))):
@@ -483,6 +694,10 @@ def parse_args():
     parser.add_argument("--max-refinement-points", type=int, default=16)
     parser.add_argument("--scene-workspace-mib", type=int, choices=(2048,), default=2048)
     parser.add_argument("--torch-memory-mib", type=int, choices=(4096,), default=4096)
+    # BEGIN opt-in isolation of the observed native self finite-difference gap.
+    parser.add_argument("--self-forward-audit", action="store_true",
+                        help="Only replay saved native_solution: repeated actual self inputs and epsilon ladder")
+    # END the default archived objective probe remains unchanged.
     return parser.parse_args()
 
 
