@@ -9,7 +9,8 @@ caller owns the observed scene, robot binding and separate physics evaluator.
 # BEGIN current-planner invocation with scoped diagnostic curve recording.
 from copy import deepcopy
 from contextlib import ExitStack
-from dataclasses import asdict
+from dataclasses import asdict, fields, is_dataclass
+from enum import Enum
 import json
 from pathlib import Path
 import resource
@@ -29,6 +30,108 @@ def _json_value(value):
     if isinstance(value, np.generic):
         return value.item()
     raise TypeError(f"Unsupported report value: {type(value).__name__}")
+
+
+# BEGIN preserve native representations before candidate gathering/export.
+def _cpu_array(value):
+    """Detach an owned CPU copy; recording cannot alias reusable solver buffers."""
+    import torch
+
+    array = value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
+    if array.dtype.hasobject:
+        raise TypeError("Diagnostic arrays must not contain Python objects")
+    return array.copy()
+
+
+def save_native_result(path, result, joint_names):
+    """Save all returned seeds before gather drops their native intermediates.
+
+    Shapes remain native. In particular, ``solution`` contains B-spline
+    controls, whereas ``js_solution`` contains the rollout. The interpolated
+    buffer includes padding; only ``interpolated_last_tstep`` defines each
+    seed's valid prefix. No time array is invented from another layer's dt.
+    """
+    path = Path(path)
+    arrays = {"active_joint_names": np.asarray(joint_names)}
+    metadata = {"batch_size": int(result.batch_size), "num_seeds": int(result.num_seeds),
+                "classification": "native_diagnostic_not_executable",
+                "control_point_semantics": "solution is not a joint trajectory",
+                "states": {}}
+    for name in ("solution", "optimized_seeds", "success", "seed_rank", "seed_cost",
+                 "interpolated_last_tstep"):
+        value = getattr(result, name)
+        if value is not None:
+            arrays[name] = _cpu_array(value)
+    for name in ("js_solution", "interpolated_trajectory"):
+        state = getattr(result, name)
+        metadata["states"][name] = None if state is None else {"joint_names": state.joint_names}
+        if state is None:
+            continue
+        for field in ("position", "velocity", "acceleration", "jerk", "dt", "knot_dt"):
+            value = getattr(state, field)
+            if value is not None:
+                arrays[f"{name}.{field}"] = _cpu_array(value)
+    metadata["arrays"] = {key: {"shape": list(value.shape), "dtype": str(value.dtype)}
+                          for key, value in arrays.items()}
+    np.savez_compressed(path, **arrays)
+    path.with_suffix(".json").write_text(json.dumps(metadata, default=_json_value,
+                                                   indent=2, allow_nan=False)+"\n")
+
+
+def save_native_configuration(path, planner):
+    """Record constructed configs, without traversing live solver objects.
+
+    cuRobo configuration dataclasses contain tensors and Python class types;
+    save tensors in NPZ and classes by qualified name. The repeated native
+    robot_config is represented by the checked input robot dictionary below.
+    Its parsed runtime objects are intentionally outside this config record.
+    Unsupported values fail with their precise field path, rather than a
+    repr string which could falsely suggest the configuration was preserved.
+    """
+    import torch
+
+    arrays = {}
+
+    def encode(value, key):
+        if isinstance(value, Enum):
+            return {"enum": f"{type(value).__module__}.{type(value).__qualname__}.{value.name}"}
+        if value is None or isinstance(value, (str, bool, int, float)):
+            return value
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (np.ndarray, torch.Tensor)):
+            arrays[key] = _cpu_array(value)
+            return {"npz_key": key, "shape": list(arrays[key].shape), "dtype": str(arrays[key].dtype)}
+        if isinstance(value, (Path, torch.device, torch.dtype)):
+            return str(value)
+        if isinstance(value, type):
+            return {"class": f"{value.__module__}.{value.__qualname__}"}
+        if is_dataclass(value):
+            return {field.name: ({"reference": "bounded_robot_input",
+                                  "scope": "parsed robot internals not serialized"}
+                                 if field.name == "robot_config" else
+                                 encode(getattr(value, field.name), f"{key}.{field.name}"))
+                    for field in fields(value)}
+        if isinstance(value, dict) and all(isinstance(name, str) for name in value):
+            return {name: encode(item, f"{key}.{name}") for name, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [encode(item, f"{key}.{index}") for index, item in enumerate(value)]
+        raise TypeError(f"Unsupported native config {key}: {type(value).__name__}")
+
+    values = {"ik": planner.ik.config, "trajopt": planner.trajopt.config,
+              "bounded_robot_input": planner.robot_dict,
+              "active_joint_names": planner.joint_names,
+              "transition_horizon": planner.trajopt.horizon,
+              "action_horizon": planner.trajopt.action_horizon,
+              "progress_u": planner.progress_map.u, "progress_s": planner.progress_map.s}
+    document = encode(values, "configuration")
+    # JSON serialization happens before either file is written: NaN or an
+    # unsupported configuration cannot leave an apparently complete record.
+    rendered = json.dumps(document, indent=2, allow_nan=False)+"\n"
+    path = Path(path)
+    np.savez_compressed(path.with_suffix(".npz"), **arrays)
+    path.with_suffix(".json").write_text(rendered)
+# END preserve native representations before candidate gathering/export.
 
 
 def save_curve(path, curve, *, classification, fk=None, validation_status="completed"):
@@ -78,10 +181,13 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
               "skill_ids": sorted({event.skill_id for event in problem.events}),
               "phase_count": problem.phase_count,
               "required_source_anchors": len(problem.anchors),
-              "candidates": []}
+              "candidates": [], "native_results": [], "effective_configurations": [],
+              "optimizer_inputs": []}
     original = planning._CuroboPlanner.select_candidate
     original_export = planning._CuroboPlanner.export
     original_curve_init = planning.JointTrajectory.__post_init__
+    native_trace = None
+    configuration_index = 0
 
     def record_stage(stage):
         try:
@@ -96,7 +202,38 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
             stage = {"stage": name, "state": "started",
                      "elapsed_seconds": time.monotonic()-started}
             record_stage(stage)
+            # BEGIN copy the exact optimizer input before native buffer reuse.
+            if name == "optimize":
+                path = output/f"optimizer-input-{len(report['optimizer_inputs']):02d}.npz"
+                entry = {"path": path.name, "saved": False}
+                try:
+                    np.savez_compressed(path, seed_controls=_cpu_array(args[0]),
+                        joint_names=np.asarray(planner.joint_names),
+                        start_q=_cpu_array(planner.start.position),
+                        start_dq=_cpu_array(planner.start.velocity),
+                        progress_u=planner.progress_map.u.copy(),
+                        progress_s=planner.progress_map.s.copy())
+                    entry["saved"] = True
+                except Exception as error:
+                    entry["error"] = f"{type(error).__name__}: {error}"
+                report["optimizer_inputs"].append(entry)
+            # END copy the exact optimizer input before native buffer reuse.
             result = method(planner, *args, **kwargs)
+            # BEGIN save effective settings after construction and each solve.
+            # Refinement can replace the optimizer. Capture the instance that
+            # actually produced the next result, not only its input YAML.
+            if name in ("_initialize", "optimize"):
+                nonlocal configuration_index
+                path = output/f"effective-config-{configuration_index:02d}"
+                configuration_index += 1
+                entry = {"path": path.with_suffix(".json").name, "stage": name, "saved": False}
+                try:
+                    save_native_configuration(path, planner)
+                    entry["saved"] = True
+                except Exception as error:
+                    entry["error"] = f"{type(error).__name__}: {error}"
+                report["effective_configurations"].append(entry)
+            # END save effective settings after construction and each solve.
             stage.update(state="completed", elapsed_seconds=time.monotonic()-started)
             record_stage(stage)
             return result
@@ -110,7 +247,7 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
         path = output/f"candidate-{index:02d}.npz"
         entry = {"path": path.name, "classification": classification,
                  "attempt": deepcopy(attempt), "validation_status": validation_status,
-                 "curve_saved": False}
+                 "curve_saved": False, "native_result": native_trace}
         try:
             # Save CPU evidence before optional display FK. A visualization
             # failure must not change the production candidate or its checks.
@@ -163,6 +300,22 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
             raise
 
     def observed(planner, native_result):
+        # BEGIN retain every native seed before production gathers a candidate.
+        nonlocal native_trace
+        path = output/f"native-result-{len(report['native_results']):02d}.npz"
+        native_trace = path.name
+        entry = {"path": path.name, "saved": False,
+                 "optimizer_input": report["optimizer_inputs"][-1]["path"]
+                 if report["optimizer_inputs"] else None,
+                 "effective_configuration": report["effective_configurations"][-1]["path"]
+                 if report["effective_configurations"] else None}
+        try:
+            save_native_result(path, native_result, planner.joint_names)
+            entry["saved"] = True
+        except Exception as error:
+            entry["error"] = f"{type(error).__name__}: {error}"
+        report["native_results"].append(entry)
+        # END retain every native seed before production gathers a candidate.
         selected, curve, attempt = original(planner, native_result)
         preserve_candidate(planner, curve, attempt, validation_status="completed")
         return selected, curve, attempt
