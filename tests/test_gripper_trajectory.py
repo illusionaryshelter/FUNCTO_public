@@ -1,0 +1,167 @@
+"""CPU reference/clock contracts; no robot dynamics or contact are simulated."""
+
+# BEGIN named C1 references preserve measured origins and original event clocks.
+from copy import deepcopy
+from types import SimpleNamespace
+import unittest
+
+import numpy as np
+import torch
+
+from manipulation.gripper_trajectory import FingerTrajectory
+
+
+def _arguments():
+    return {
+        "joint_names": ("finger_a", "finger_b"),
+        "initial_position": [.03, -.025], "initial_velocity": [.0006, -.0003],
+        "commands": [
+            {"skill_id": "s", "event_id": "open", "kind": "open", "time": 0., "progress": 0.,
+             "finger_positions": [.035, -.034], "target_source": "explicit CPU test command"},
+            {"skill_id": "s", "event_id": "close", "kind": "close", "time": .3005, "progress": .6,
+             "finger_positions": [.005, -.008], "target_source": "explicit CPU test command"},
+            {"skill_id": "s", "event_id": "later", "kind": "open", "time": .9, "progress": 1.,
+             "finger_positions": [.035, -.034], "target_source": "unexecuted future command"}],
+        "duration": 1., "executable_until": .8, "timestep": .002,
+        "position_limits": [[0., -.04], [.04, 0.]],
+        "velocity_limits": [[-.2, -.2], [.2, .2]],
+        "acceleration_limits": [[-15., -15.], [15., 15.]],
+        "source": "Declared CPU nominal reference; no physical tracking claim",
+        "feedback_id": "same measured entrance", "timestamp_s": 42.,
+    }
+
+
+class FingerTrajectoryTests(unittest.TestCase):
+    def test_measured_q_and_nonzero_dq_are_preserved_before_the_first_open_target(self):
+        arguments = _arguments()
+        reference = FingerTrajectory.build(**arguments)
+        q, dq = reference.sample(0.)
+        np.testing.assert_array_equal(q, arguments["initial_position"])
+        np.testing.assert_array_equal(dq, arguments["initial_velocity"])
+        self.assertFalse(np.array_equal(q, arguments["commands"][0]["finger_positions"]))
+        self.assertFalse(np.isclose(q.sum(), 0.))
+        self.assertIn("not measured", reference.describe()["scope"])
+        self.assertIn("not a calibrated", reference.describe()["limits_scope"])
+
+    def test_non_grid_event_is_not_moved_or_issued_early(self):
+        reference = FingerTrajectory.build(**_arguments())
+        event = reference.events[1]
+        self.assertEqual(event["time"], .3005)
+        self.assertEqual(event["activation_step"], 151)
+        self.assertEqual(event["applied_time_s"], .302)
+        self.assertEqual(event["application_delay_s"], .302 - .3005)
+        for time_s in (.3005, .301, .302):
+            np.testing.assert_array_equal(reference.sample(time_s)[0], [.035, -.034])
+        after, _ = reference.sample(.304)
+        self.assertLess(after[0], .035)
+        self.assertGreater(after[1], -.034)
+
+    def test_native_reference_bounds_and_c1_are_checked_without_a_c2_gate(self):
+        reference = FingerTrajectory.build(**_arguments())
+        self.assertTrue(reference.describe()["bounds_report"]["bounds_satisfied"])
+        coefficients = reference._curve.c
+        width = np.diff(reference.times)[:, None]
+        left_dq = (3 * coefficients[0] * width + 2 * coefficients[1]) * width + coefficients[2]
+        np.testing.assert_allclose(left_dq[:-1], reference.velocity[1:-1], atol=1e-12, rtol=0.)
+        ddq_jumps = 2 * coefficients[1, 1:] - (6 * coefficients[0] * width + 2 * coefficients[1])[:-1]
+        self.assertGreater(float(np.max(np.abs(ddq_jumps))), 0.)
+
+    def test_barrier_ends_the_reference_commands_and_future_suffix_is_only_nominal(self):
+        reference = FingerTrajectory.build(**_arguments())
+        self.assertFalse(reference.events[-1]["in_executable_prefix"])
+        before = reference.sample(reference.executable_until)[0]
+        for time_s in (.8, .9, 1.):
+            q, dq = reference.sample(time_s)
+            np.testing.assert_array_equal(q, before)
+            np.testing.assert_array_equal(dq, [0., 0.])
+        self.assertNotIn("later", [row["event_id"] for row in reference.segments])
+
+    def test_unreachable_deadline_and_late_native_activation_are_rejected(self):
+        arguments = _arguments()
+        arguments["commands"][1]["time"] = .79
+        with self.assertRaisesRegex(ValueError, "before 0.8"):
+            FingerTrajectory.build(**arguments)
+        arguments["commands"][1]["time"] = .7995
+        with self.assertRaisesRegex(ValueError, "activate before.*barrier"):
+            FingerTrajectory.build(**arguments)
+
+    def test_initial_velocity_is_not_zeroed_to_make_a_bound_pass(self):
+        arguments = _arguments()
+        arguments["initial_velocity"][0] = .21
+        with self.assertRaisesRegex(ValueError, "initial finger q/dq"):
+            FingerTrajectory.build(**arguments)
+
+    def test_repeated_native_tick_keeps_original_events_but_only_last_goal_is_active(self):
+        arguments = _arguments()
+        arguments["commands"][0]["time"] = .001
+        arguments["commands"].insert(1, {**deepcopy(arguments["commands"][0]),
+            "event_id": "superseding-open", "time": .0015, "finger_positions": [.036, -.035]})
+        reference = FingerTrajectory.build(**arguments)
+        self.assertTrue(reference.events[0]["superseded"])
+        self.assertFalse(reference.events[1]["superseded"])
+        self.assertNotIn("open", [row["event_id"] for row in reference.segments])
+        self.assertIn("superseding-open", [row["event_id"] for row in reference.segments])
+        np.testing.assert_array_equal(reference.sample(0.)[1], arguments["initial_velocity"])
+
+    def test_serialized_curve_roundtrip_is_exact_and_tampering_is_rejected(self):
+        reference = FingerTrajectory.build(**_arguments())
+        mapping = reference.describe()
+        loaded = FingerTrajectory.from_mapping(mapping)
+        np.testing.assert_array_equal(loaded._curve.c, reference._curve.c)
+        for original, rebuilt in zip(reference.sample(np.linspace(0., 1., 401)), loaded.sample(np.linspace(0., 1., 401))):
+            np.testing.assert_array_equal(original, rebuilt)
+        changed = deepcopy(mapping)
+        changed["events"][1]["applied_time_s"] = changed["events"][1]["time"]
+        with self.assertRaisesRegex(ValueError, "metadata differs"):
+            FingerTrajectory.from_mapping(changed)
+        changed = deepcopy(mapping)
+        changed["position"][1][0] += 1e-5
+        with self.assertRaises(ValueError):
+            FingerTrajectory.from_mapping(changed)
+        mapping["position"][0][0] += .001
+        self.assertEqual(reference.position[0, 0], .03)
+
+    def test_torch_uses_the_same_polynomial_and_has_the_same_time_derivative(self):
+        reference = FingerTrajectory.build(**_arguments())
+        times = torch.tensor([[.011, .151, .323, .551, .81]], dtype=torch.float64, requires_grad=True)
+        q, dq = reference.sample_torch(times)
+        expected_q, expected_dq = reference.sample(times.detach().numpy())
+        np.testing.assert_allclose(q.detach().numpy(), expected_q, atol=1e-15, rtol=1e-13)
+        np.testing.assert_allclose(dq.detach().numpy(), expected_dq, atol=1e-15, rtol=1e-13)
+        q.sum().backward()
+        np.testing.assert_allclose(times.grad.numpy(), expected_dq.sum(-1), atol=1e-15, rtol=1e-13)
+        for invalid in (torch.tensor([-1.]), torch.tensor([1.01]), torch.tensor([float("nan")])):
+            with self.assertRaises(ValueError):
+                reference.sample_torch(invalid)
+
+    def test_execution_binding_rejects_changed_feedback_clock_target_or_hardware(self):
+        arguments = _arguments()
+        reference = FingerTrajectory.build(**arguments)
+        trajectory = SimpleNamespace(duration=1., executable_until=.8)
+        feedback = {"joint_names": ["arm", "finger_b", "finger_a"],
+                    "finger_joint_names": ["finger_a", "finger_b"],
+                    "q": [1., -.025, .03], "dq": [0., -.0003, .0006],
+                    "feedback_id": arguments["feedback_id"], "timestamp_s": 42.}
+        options = dict(initial_feedback=feedback, timestep=.002,
+                       position_limits=arguments["position_limits"], velocity_limits=arguments["velocity_limits"])
+        self.assertTrue(reference.validate_execution(trajectory, arguments["commands"], **options)["bounds_satisfied"])
+        feedback["dq"][2] = 0.
+        with self.assertRaisesRegex(ValueError, "measured initial q/dq"):
+            reference.validate_execution(trajectory, arguments["commands"], **options)
+        feedback["dq"][2] = .0006
+        wrong = deepcopy(arguments["commands"])
+        wrong[1]["finger_positions"][0] += .001
+        with self.assertRaisesRegex(ValueError, "every exact original"):
+            reference.validate_execution(trajectory, wrong, **options)
+        options["timestep"] = .001
+        with self.assertRaisesRegex(ValueError, "clock and identity"):
+            reference.validate_execution(trajectory, arguments["commands"], **options)
+        options["timestep"] = .002
+        options["velocity_limits"] = [[-.1, -.1], [.1, .1]]
+        with self.assertRaisesRegex(ValueError, "hardware speed"):
+            reference.validate_execution(trajectory, arguments["commands"], **options)
+# END these references make no claim about future measured motion or Holding.
+
+
+if __name__ == "__main__":
+    unittest.main()
