@@ -92,7 +92,8 @@ Each command's position interval must contain its preceding interval until new
 feedback is bound. Commands can take effect at the next native step, so a
 command event alone cannot justify narrowing the geometry before it is applied.
 Narrower bounds require new feedback at the existing evidence barrier. Saved
-curves retain the exact limits, and accepted execution requires the same input.
+curves retain the exact limits, and every physical trial requires the same input.
+Historical curves without this contract remain diagnostic evidence, not executable inputs.
 These limits must be calibrated; the CPU tests' synthetic numbers and a failed
 asset probe are not execution calibration.
 

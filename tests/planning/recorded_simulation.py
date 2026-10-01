@@ -27,7 +27,7 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
-def load_saved_trajectory(path, *, evaluation_mode):
+def load_saved_trajectory(path, *, evaluation_mode, execution_limits):
     """Load the exported cubic without smoothing, retiming or relabelling it."""
     from manipulation.planning import JointTrajectory
 
@@ -37,6 +37,13 @@ def load_saved_trajectory(path, *, evaluation_mode):
                 "diagnostic_rejected_candidate": "rejected_diagnostic_not_executable"}
     if evaluation_mode not in expected or metadata["classification"] != expected[evaluation_mode]:
         raise ValueError("Execution mode must retain the saved planner classification")
+    # BEGIN require one recorded physical contract for every execution mode.
+    if not isinstance(execution_limits, ExecutionLimits):
+        raise ValueError("Loading an executable curve requires explicit ExecutionLimits")
+    if ("execution_limits" not in metadata
+            or metadata["execution_limits"] != execution_limits.describe()):
+        raise ValueError("Saved curve and execution must contain identical physical execution limits")
+    # END a rejected diagnostic is not an exemption from actual-hand binding.
     with np.load(path, allow_pickle=False) as arrays:
         if str(arrays["classification"].item()) != expected[evaluation_mode]:
             raise ValueError("Saved trajectory arrays and metadata disagree on planner status")

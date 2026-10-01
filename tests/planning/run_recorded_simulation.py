@@ -184,19 +184,16 @@ def run(args):
             raise ValueError("This trajectory executor requires the recorded absolute joint controller and uninterpolated GRIP")
         if Path(fixture["episode_path"]).resolve() != recording/"episode.h5":
             raise ValueError("Simulator fixture and input manifest refer to different source episodes")
-        curve = load_saved_trajectory(args.trajectory, evaluation_mode=args.evaluation_mode)
+        curve = load_saved_trajectory(args.trajectory, evaluation_mode=args.evaluation_mode,
+                                      execution_limits=execution_limits)
         metadata = _read(args.trajectory.with_suffix(".json"))
         report["trajectory_classification"] = metadata["classification"]
-        # BEGIN bind accepted execution to the planner's identical hand policy.
-        planned_limits = metadata.get("execution_limits")
-        if planned_limits is None and args.evaluation_mode == "accepted_plan":
-            raise ValueError("An accepted plan must retain its physical execution limits and actual-hand contract")
-        if planned_limits is not None and planned_limits != execution_limits.describe():
-            raise ValueError("Execution limits differ from the exact contract saved with the planned curve")
-        report["planning_execution_limits_match"] = None if planned_limits is None else True
-        report["planning_hand_contract"] = ("unavailable on historical rejected diagnostic; not certified"
-                                            if planned_limits is None else "identical saved planning/execution contract")
-        # END bind accepted execution to the planner's identical hand policy.
+        # BEGIN bind every physical trial to its identical recorded hand policy.
+        # The saved-curve loader already checked classification and exact limits
+        # before any simulator restoration or physical command can take place.
+        report["planning_execution_limits_match"] = True
+        report["planning_hand_contract"] = "identical saved planning/execution contract"
+        # END bind every physical trial to its identical recorded hand policy.
         if {event["skill_id"] for event in curve.events} != {args.segment}:
             raise ValueError("The exported candidate must contain only the selected skill instance")
         evidence = _read(args.evaluator_evidence)

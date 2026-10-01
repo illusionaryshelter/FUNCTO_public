@@ -22,7 +22,7 @@ import mujoco
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 
 from manipulation.planning import JointTrajectory
-from recorded_simulation import ExecutionGuardError, ExecutionLimits, FixedFingerTargets, RecordedSimulation
+from recorded_simulation import ExecutionGuardError, ExecutionLimits, FixedFingerTargets, RecordedSimulation, load_saved_trajectory
 
 
 def _event(event_id, kind, time, evidence=None):
@@ -116,6 +116,34 @@ def _limit_values(simulation, curve):
 def _limits(simulation, curve):
     return ExecutionLimits.from_mapping(_limit_values(simulation, curve))
 # END explicit mock execution policy; these values are not robot calibration.
+
+
+# BEGIN require the saved hand contract even for rejected physical diagnostics.
+class SavedExecutionContractTests(unittest.TestCase):
+    def test_all_execution_modes_require_the_same_complete_saved_limits(self):
+        from recorded_task_planning import save_curve
+
+        simulation, curve, _ = _fixture()
+        limits = _limits(simulation, curve)
+        for mode, classification in (("accepted_plan", "planner_accepted"),
+                                     ("diagnostic_rejected_candidate", "rejected_diagnostic_not_executable")):
+            with self.subTest(mode=mode), TemporaryDirectory() as temporary:
+                path = Path(temporary)/"curve.npz"
+                save_curve(path, curve, classification=classification, execution_limits=limits.describe())
+                loaded = load_saved_trajectory(path, evaluation_mode=mode, execution_limits=limits)
+                self.assertEqual(loaded.events, curve.events)
+                metadata_path = path.with_suffix(".json")
+                original = json.loads(metadata_path.read_text())
+                for missing in (True, False):
+                    metadata = deepcopy(original)
+                    if missing:
+                        del metadata["execution_limits"]
+                    else:
+                        metadata["execution_limits"]["initial_fingers"]["position_bounds"][0][0] += .001
+                    metadata_path.write_text(json.dumps(metadata))
+                    with self.assertRaisesRegex(ValueError, "identical physical execution limits"):
+                        load_saved_trajectory(path, evaluation_mode=mode, execution_limits=limits)
+# END historical diagnostic files cannot enter another execution path.
 
 
 class FixedFingerTargetTests(unittest.TestCase):
