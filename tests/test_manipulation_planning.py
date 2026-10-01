@@ -26,6 +26,7 @@ from manipulation.planning import (
     _CuroboPlanner,
     _ProgressMap,
     _formal_native_clock,
+    _fixed_spline_grid,
     _timed_native_state,
     # BEGIN actual-anchor allocation and projection preflight regressions.
     _anchor_capacity,
@@ -151,18 +152,75 @@ def export_fixture(problem, progress_map, position, velocity, dt):
 
 class PlannerCalculusTests(unittest.TestCase):
     # BEGIN formal time and complete-volume gates are independent of point costs.
-    def test_formal_spline_clock_reuses_native_count_not_rollout_duration(self):
+    # BEGIN fixed-clock sampling regressions; no native CUDA execution here.
+    def test_formal_spline_clock_preserves_raw_duration_and_exact_dense_grid(self):
         from curobo._src.types.control_space import ControlSpace
-        native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=.05,
-            maximum_trajectory_dt=.05, interpolation_dt=.025), interpolation_steps=4,
-            transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3), action_horizon=16)
-        clock = _formal_native_clock(native)
-        self.assertEqual(clock["valid_count"], 181)
-        self.assertEqual(clock["duration"], 180*float(np.float32(.025)))
-        self.assertNotEqual(clock["duration"], 80*float(np.float32(.05)))
+        for native_dt, subdivisions, count in ((.2, 32, 641), (.05, 8, 161)):
+            with self.subTest(native_dt=native_dt):
+                native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=native_dt,
+                    maximum_trajectory_dt=native_dt, interpolation_dt=.025), interpolation_steps=4,
+                    transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3), action_horizon=16)
+                clock = _formal_native_clock(native)
+                self.assertEqual(clock["valid_count"], count)
+                self.assertEqual(clock["subdivisions"], subdivisions)
+                self.assertEqual(clock["duration"], 80*float(np.float32(native_dt)))
+                self.assertEqual(clock["duration"], (count-1)*float(np.float32(.025)))
+                self.assertEqual(np.float32(clock["interpolation_dt"]*subdivisions), np.float32(clock["knot_dt"]))
         native.config.minimum_trajectory_dt = .04
         with self.assertRaisesRegex(ValueError, "fixed request-wide"):
             _formal_native_clock(native)
+
+    def test_exact_grid_supports_general_representable_clock_and_rejects_retiming(self):
+        grid = _fixed_spline_grid(intervals=10, native_dt=.125,
+                                 interpolation_steps=3, interpolation_dt=.03125)
+        self.assertEqual((grid["subdivisions"], grid["valid_count"], grid["duration"]), (12, 121, 3.75))
+        cases = ((.2, 4, .03), (.20625, 4, .025), (.2, 3, .025),
+                 (float(np.nextafter(np.float32(.2), np.float32(np.inf))), 4, .025))
+        for native_dt, steps, output_dt in cases:
+            with self.subTest(native_dt=native_dt, steps=steps, output_dt=output_dt):
+                with self.assertRaisesRegex(ValueError, "Exact output grid"):
+                    _fixed_spline_grid(intervals=20, native_dt=native_dt,
+                                       interpolation_steps=steps, interpolation_dt=output_dt)
+        for output_dt in (0., 1e-50, 1e50, float("nan"), float("inf")):
+            with self.subTest(output_dt=output_dt):
+                with self.assertRaisesRegex(ValueError, "finite positive native float32"):
+                    _fixed_spline_grid(intervals=20, native_dt=.2,
+                                       interpolation_steps=4, interpolation_dt=output_dt)
+
+    def test_budget_admits_only_the_required_fixed_capacity_without_losing_limits(self):
+        budget = PlanningBudget(knots=16, interpolation_buffer_size=641)
+        self.assertEqual(budget.interpolation_buffer_size, 641)
+        self.assertEqual(budget.max_validation_points, 4096)
+        with self.assertRaisesRegex(ValueError, "Interpolation buffer"):
+            PlanningBudget(knots=16, interpolation_buffer_size=640)
+        with self.assertRaisesRegex(ValueError, "Interpolation buffer"):
+            PlanningBudget(interpolation_buffer_size=2049)
+        with self.assertRaisesRegex(ValueError, "Exact output grid"):
+            PlanningBudget(interpolation_dt=.03)
+
+    def test_nonzero_boundary_cubic_survives_same_time_dense_export(self):
+        # SciPy evaluates one continuous cubic independently of the grid
+        # helper. Coarse and dense samples must share its physical clock.
+        grid = _fixed_spline_grid(intervals=10, native_dt=.2,
+                                 interpolation_steps=4, interpolation_dt=.025)
+        q0, dq0 = np.array([.3, -.8]), np.array([.17, -.09])
+        controls = np.array([[.6, -.4], [.4, .2], [-.2, .7], [.1, -.3], [.8, .1], [.5, .6]])
+        coefficients = np.vstack((q0 + np.array([-1., 0., 1., 2.])[:, None]*dq0*grid["knot_dt"],
+                                  controls, np.repeat(controls[-1:], 3, axis=0)))
+        oracle = BSpline(np.arange(-3., 14.)*grid["knot_dt"], coefficients, 3, axis=0)
+        dense_times = np.arange(grid["valid_count"])*grid["interpolation_dt"]
+        exported = JointTrajectory(("joint_a", "joint_b"), dense_times, oracle(dense_times),
+            oracle(dense_times, 1), np.array([0., 1.]), np.array([0., 1.]), (), (), {})
+        times = np.unique(np.r_[np.arange(41)*grid["native_dt"],
+                                (dense_times[:-1]+dense_times[1:])/2, grid["duration"]])
+        for order, tolerance in ((0, 1e-12), (1, 1e-11), (2, 1e-9)):
+            np.testing.assert_allclose(exported._curve(times, order), oracle(times, order),
+                                       rtol=0, atol=tolerance)
+        np.testing.assert_allclose(exported.sample([0.])[0][0], q0, rtol=0, atol=1e-14)
+        np.testing.assert_allclose(exported.sample([0.])[1][0], dq0, rtol=0, atol=1e-14)
+        self.assertEqual(exported.duration, 40*grid["native_dt"])
+    # END no synthetic zero-speed case substitutes for boundary preservation.
+
 
     def test_export_full_volume_rejection_is_hard_even_when_all_gpu_costs_zero(self):
         problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))

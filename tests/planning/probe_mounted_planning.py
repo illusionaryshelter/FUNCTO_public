@@ -228,8 +228,10 @@ def run(args):
         # a 0.05-s native step keeps the resulting physical probe bounded. No
         # saved skill timing or solver feasibility tolerance is changed.
         # Reserve 256 export slots, 384 validation points and 16 refinements
-        # for this two-anchor experiment. At most 181 native export points
-        # require 361 validation samples (each interval is subdivided twice),
+        # BEGIN capacity for dense sampling of the unchanged native clock.
+        # for this two-anchor experiment. Its 161 native export points
+        # require 321 validation samples (each interval is subdivided twice),
+        # END no extra spline interval or physical retiming is introduced.
         # plus the original anchors. Exceeding this budget still rejects.
         # The production estimator accounts for every independent scene copy:
         # 416 robot spheres, three mounts and the finite coverage grid require

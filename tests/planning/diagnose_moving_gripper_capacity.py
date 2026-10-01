@@ -22,7 +22,8 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 # END project-local imports.
-from manipulation.planning import _ProgressMap, _progress_for_cubic_boundaries
+from manipulation.planning import (PlanningBudget, _ProgressMap, _fixed_spline_grid,
+                                   _progress_for_cubic_boundaries)
 from probe_moving_gripper_gpu import tracking_command
 
 
@@ -67,6 +68,9 @@ def run(output):
     command_spline = BSpline(np.arange(-3., 16.), command_coefficients, 3)
     u = np.linspace(0., 1., 8193)
     results = []
+    # BEGIN use the production exact clock for this default-timing diagnostic.
+    timing = PlanningBudget()
+    # END only the native control capacity varies in this experiment.
     for knots in (8, 12, 16, 24):
         progress_map, _ = _progress_for_cubic_boundaries(
             _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), knots, np.zeros(9),
@@ -108,7 +112,12 @@ def run(output):
                         "dual_certificate_lower_bound_m": float(certificate),
                         "continuous_error_for_lp_controls_m": maximum, "continuous_worst_u": worst_u,
                         "native_controls_m": controls.tolist(), "progress_map_keys": len(progress_map.u),
-                        "required_interpolation_buffer_size": (knots+4)*33+1})
+                        # BEGIN preserve the native duration in the reported output capacity.
+                        "required_interpolation_buffer_size": _fixed_spline_grid(
+                            intervals=knots+4, native_dt=timing.maximum_trajectory_dt,
+                            interpolation_steps=timing.interpolation_steps,
+                            interpolation_dt=timing.interpolation_dt)["valid_count"]})
+                        # END no hard-coded extra subdivision.
     report = {"scope": "CPU scalar cubic capacity audit; not a robot plan or gradient certification",
               "fixed_command": "tracking_command(8), piecewise cubic in progress, .035m to .015m",
               "grid_points": len(u), "native_finger_tolerance_m": 1e-5,

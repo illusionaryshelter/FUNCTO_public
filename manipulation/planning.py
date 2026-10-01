@@ -22,6 +22,42 @@ from scipy.interpolate import BSpline, CubicHermiteSpline
 from scipy.optimize import linear_sum_assignment
 
 
+# BEGIN one exact output grid for the unchanged native cubic clock.
+def _fixed_spline_grid(*, intervals, native_dt, interpolation_steps, interpolation_dt):
+    """Admit an output grid only when it preserves the native physical clock.
+
+    The installed dense kernel reconstructs its knot interval as float32
+    ``output_dt * subdivisions``. Check that product AND the saved binary64
+    time axes before using it. Rounding only proposes an integer subdivision
+    count; it never authorizes retiming an incompatible input.
+    """
+    if (type(intervals) is not int or intervals < 1
+            or type(interpolation_steps) is not int or interpolation_steps < 1):
+        raise ValueError("Native spline intervals and subdivisions must be positive integers")
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        raw_dt = np.float32(native_dt)
+        output_dt = np.float32(interpolation_dt)
+        knot_dt = np.float32(raw_dt * np.float32(interpolation_steps))
+    if (not np.isfinite([raw_dt, output_dt, knot_dt]).all()
+            or min(raw_dt, output_dt, knot_dt) <= 0):
+        raise ValueError("Spline timing requires finite positive native float32 intervals")
+    subdivisions = int(round(float(knot_dt) / float(output_dt)))
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        reconstructed = np.float32(output_dt * np.float32(subdivisions))
+    if (subdivisions < 1 or reconstructed != knot_dt
+            or float(output_dt) * subdivisions != float(knot_dt)
+            or float(raw_dt) * interpolation_steps != float(knot_dt)):
+        raise ValueError("Exact output grid must preserve the native spline knot interval; retiming is unsupported")
+    count = intervals * subdivisions + 1
+    duration = intervals * float(knot_dt)
+    if (count - 1) * float(output_dt) != duration:
+        raise ValueError("Exact output grid changed the native spline duration")
+    return {"native_dt": float(raw_dt), "knot_dt": float(knot_dt),
+            "interpolation_dt": float(output_dt), "subdivisions": subdivisions,
+            "valid_count": count, "duration": duration}
+# END incompatible grids never change dt, controls, or boundary derivatives.
+
+
 @dataclass(frozen=True)
 class PlanningBudget:
     """Explicit local resource and numerical-work limits, for a single request.
@@ -87,11 +123,14 @@ class PlanningBudget:
                 raise ValueError(f"{name} must be finite and positive")
         if not np.isfinite(self.search_seconds) or self.search_seconds < 0:
             raise ValueError("search_seconds must be finite and nonnegative")
-        # V2 uses degree+1 virtual knots and floor(knot_dt / output_dt)+1
-        # samples per knot interval.  Validate before native buffers exist.
-        maximum_count = ((self.knots + 4)
-                         * int(self.maximum_trajectory_dt * self.interpolation_steps / self.interpolation_dt + 1)
-                         + 1)
+        # BEGIN admit the exact grid before any native buffer allocation.
+        # The selected cubic has degree+1 virtual intervals. Output sampling
+        # must preserve its original physical clock, including nonzero dq0.
+        grid = _fixed_spline_grid(intervals=self.knots + 4,
+            native_dt=self.maximum_trajectory_dt, interpolation_steps=self.interpolation_steps,
+            interpolation_dt=self.interpolation_dt)
+        maximum_count = grid["valid_count"]
+        # END retain all original buffer, validation and workspace bounds.
         native_count = (self.knots + 4) * self.interpolation_steps + 1
         if (self.interpolation_buffer_size < maximum_count
                 or self.interpolation_buffer_size <= native_count
@@ -977,25 +1016,21 @@ def _verification_stop_preference(progress, joint_velocity, stop_progress):
 
 # BEGIN one formal output clock and native named-body FK for timed hand geometry.
 def _formal_native_clock(trajopt):
-    """Use native interpolation counting, including its extra spline samples."""
-    import torch
+    """Bind hand, native rollout and dense export to one unchanged cubic clock."""
+    # BEGIN use the same admitted grid as the native interpolation adapter.
     from curobo._src.types.control_space import ControlSpace
-    from curobo._src.util.trajectory import calculate_traj_steps
     config = trajopt.config
     if config.minimum_trajectory_dt != config.maximum_trajectory_dt:
         raise ValueError("A separately timed hand requires one fixed request-wide native dt")
-    dt = torch.tensor([config.maximum_trajectory_dt], dtype=torch.float32)
-    knot_dt = dt*trajopt.interpolation_steps
-    interpolation_dt = torch.tensor([config.interpolation_dt], dtype=torch.float32)
     control = trajopt.transition_model.control_space
-    if control not in ControlSpace.bspline_types():
-        raise ValueError("The formal clock must use the selected native spline representation")
-    horizon = ControlSpace.spline_total_knots(control, trajopt.action_horizon)+1
-    counts, _ = calculate_traj_steps(knot_dt, interpolation_dt, horizon, nearest_int=True)
-    count = int(counts.item())
-    return {"duration": (count-1)*float(interpolation_dt.item()),
-            "interpolation_dt": float(interpolation_dt.item()), "valid_count": count,
-            "source": "native calculate_traj_steps, fixed float32 spline clock"}
+    if control != ControlSpace.BSPLINE_3:
+        raise ValueError("The formal clock must use the selected native cubic spline representation")
+    grid = _fixed_spline_grid(
+        intervals=ControlSpace.spline_total_knots(control, trajopt.action_horizon),
+        native_dt=config.maximum_trajectory_dt, interpolation_steps=trajopt.interpolation_steps,
+        interpolation_dt=config.interpolation_dt)
+    return {**grid, "source": "unchanged native cubic clock with exact float32 output grid"}
+    # END dense sampling never invents a new physical duration.
 
 
 class _RobotCoverageFK:
@@ -1474,13 +1509,57 @@ class _CuroboPlanner:
 
         class ProcessTrajectoryOptimizer(TrajectoryOptimizer):
             def get_interpolated_trajectory(self, js_optimized):
-                state, counts, updated = super().get_interpolated_trajectory(js_optimized)
+                # BEGIN preserve raw controls and boundary derivatives on one clock.
+                from curobo._src.curobolib.cuda_ops.trajectory import get_bspline_interpolation
+                from curobo._src.util.trajectory import TrajInterpolationType
+
+                grid = _formal_native_clock(self)
+                if self.config.interpolation_type != TrajInterpolationType.BSPLINE_KNOTS_CUDA:
+                    raise ValueError("Exact native cubic export requires the configured B-spline interpolation")
+                batch = js_optimized.position.shape[0]
+                if (js_optimized.position.ndim != 3 or not 1 <= batch <= self.config.num_seeds
+                        or js_optimized.position.shape[1:] != (self.horizon, self.action_dim)
+                        or js_optimized.knot is None
+                        or js_optimized.knot.shape != (batch, self.action_horizon, self.action_dim)):
+                    raise ValueError("Native interpolation state does not match the bounded active-joint layout")
+                # Only a few timing scalars synchronize here. No trajectory
+                # array is copied to CPU, and no action or derivative is changed.
+                for name, expected in (("dt", grid["native_dt"]), ("knot_dt", grid["knot_dt"])):
+                    value = getattr(js_optimized, name)
+                    if (value is None or value.numel() != batch
+                            or value.dtype != torch.float32 or not bool((value == expected).all())):
+                        raise ValueError("Native result changed the fixed request-wide spline clock")
+                capacity = self.config.interpolation_buffer_size
+                if (grid["valid_count"] > capacity or capacity <= self.horizon or capacity > 2048):
+                    raise ValueError("Native interpolation exceeds its declared fixed buffer capacity")
+                shape = (batch, capacity, self.action_dim)
+                if self._interpolated_traj_buffer is None or self._interpolated_traj_buffer.shape[0] != batch:
+                    self._interpolated_traj_buffer = JointState.zeros(shape, self.device_cfg,
+                                                                     joint_names=self.joint_names)
+                elif self._interpolated_traj_buffer.shape != shape:
+                    raise ValueError("Native interpolation buffer changed its declared shape")
+                if self._interpolation_dt_buffer is None or self._interpolation_dt_buffer.shape != (batch,):
+                    self._interpolation_dt_buffer = torch.full((batch,), grid["interpolation_dt"],
+                        dtype=torch.float32, device=self.device_cfg.device)
+                elif not bool((self._interpolation_dt_buffer == grid["interpolation_dt"]).all()):
+                    raise ValueError("Native interpolation buffer changed its exact output dt")
+                counts = torch.full((batch,), grid["valid_count"], dtype=torch.int32,
+                                    device=self.device_cfg.device)
+                goal = self.core._goal_buffer
+                js_optimized.control_space = self.transition_model.control_space
+                state = get_bspline_interpolation(js_optimized, self._interpolated_traj_buffer,
+                    self._interpolation_dt_buffer, current_state=goal.current_js,
+                    goal_state=goal.seed_goal_js, start_idx=goal.idxs_current_js,
+                    goal_idx=goal.idxs_seed_goal_js,
+                    use_implicit_goal_state=goal.seed_enable_implicit_goal_js,
+                    interpolated_horizon=counts, bspline_degree=3)
                 rollout = self.additional_metrics_rollouts["interpolated_rollout"]
-                # Native interpolation has different valid lengths per seed.
-                # Padded final states must not stretch the progress schedule.
+                # Both managers retain valid-prefix masking before the native
+                # caller computes dense metrics and its original success flag.
                 rollout.constraint_manager.set_dense_counts(counts)
                 rollout.metrics_constraint_manager.set_dense_counts(counts)
-                return state, counts, updated
+                return state, counts, False
+                # END no native resize, retiming, interpolation switch or metric bypass.
 
         self._optimizer_class = ProcessTrajectoryOptimizer
         self._optimizer_config_class = TrajectoryOptimizerCfg
