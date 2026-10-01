@@ -54,6 +54,9 @@ def _fixture():
     simulation.native_data = SimpleNamespace(
         qpos=np.r_[np.linspace(.1, .7, 7), .012, -.017],
         qvel=np.r_[np.linspace(.01, .07, 7), .03, -.04],
+        # BEGIN synthetic native dynamics are independent of mock q/dq/ctrl.
+        qacc=np.linspace(-.4, .4, 9), actuator_force=np.arange(1., 10.),
+        # END these sentinel arrays do not represent physical integration.
         ctrl=np.r_[np.zeros(7), .026, -.023], time=1.3,
         xmat=np.eye(3).reshape(1, 9), xpos=np.zeros((1, 3)),
         site_xmat=np.eye(3).reshape(1, 9), site_xpos=np.zeros((1, 3)))
@@ -319,6 +322,47 @@ class RecordedControlTests(unittest.TestCase):
             self.assertNotIn("object_pose", actual)
             self.assertNotIn("contact", actual)
 
+    # BEGIN raw dynamics and clipped command evidence remain independently timed.
+    def test_native_dynamics_and_requested_applied_torque_are_recorded_without_differencing(self):
+        simulation, curve, value = _fixture()
+        initial = _initial_feedback(simulation)
+        expected_acceleration = [simulation.native_data.qacc.copy()]
+        expected_force = [simulation.native_data.actuator_force.copy()]
+        advance = simulation._sim.step
+
+        def step():
+            advance()
+            # q/dq deliberately stay constant while the mock exposes distinct
+            # native telemetry. Differentiating dq or copying ctrl would fail.
+            simulation.native_data.qacc += .25
+            simulation.native_data.actuator_force += 2.
+            expected_acceleration.append(simulation.native_data.qacc.copy())
+            expected_force.append(simulation.native_data.actuator_force.copy())
+
+        simulation._sim.step = step
+        simulation._arm_controller.run_controller = lambda: np.full(7, 5.*len(simulation.arm_goals))
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            report = _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(value),
+                initial_feedback=initial, execution_limits=_limits(simulation, curve),
+                evaluation_mode="accepted_plan", output=output, max_physics_steps=4)
+            with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
+                np.testing.assert_array_equal(saved["actual_qacc"], expected_acceleration)
+                np.testing.assert_array_equal(saved["actual_actuator_force"], expected_force)
+                self.assertEqual(len(saved["elapsed"]), len(expected_force))
+                np.testing.assert_array_equal(saved["actuator_names"], simulation.actuator_names)
+                np.testing.assert_array_equal(saved["arm_actuator_names"], simulation.actuator_names[:7])
+                np.testing.assert_array_equal(saved["requested_arm_torque"][:, 0], [5., 10., 15., 20.])
+                np.testing.assert_array_equal(saved["applied_arm_torque"][:, 0], [5., 10., 10., 10.])
+                np.testing.assert_array_equal(saved["applied_arm_torque"], saved["actuator_ctrl"][:, :7])
+                np.testing.assert_array_equal(saved["arm_torque_saturated"][:, 0], [False, False, True, True])
+                np.testing.assert_allclose(np.diff(saved["control_elapsed"]), simulation.timestep, atol=1e-15)
+            self.assertEqual(report["arm_control_saturated_coordinates"], 14)
+            final = json.loads(Path(report["barrier_feedback_path"]).read_text())
+            np.testing.assert_array_equal(final["qacc"], expected_acceleration[-1])
+            np.testing.assert_array_equal(final["actuator_force"], expected_force[-1])
+    # END telemetry does not claim physical dynamics from the mocked clock.
+
     def test_superseded_events_and_commands_at_barrier_are_not_reported_as_applied(self):
         simulation, curve, value = _fixture()
         curve.events[0]["time"], curve.events[1]["time"] = .0005, .0015
@@ -336,6 +380,31 @@ class RecordedControlTests(unittest.TestCase):
 
 # BEGIN physical feedback rejection and isolated native FK regressions.
 class ExecutionGuardTests(unittest.TestCase):
+    # BEGIN reject malformed telemetry without adding physical spike thresholds.
+    def test_native_dynamics_require_finite_values_and_exact_actuator_order(self):
+        backend, curve, _ = _fixture()
+        executor = _executor(backend)
+        limits = _limits(backend, curve)
+        binding = limits.bind(curve, joint_names=backend.joint_names, arm_joint_names=backend.arm_joint_names,
+            finger_joint_names=backend.finger_joint_names, native_joint_ranges=backend.joint_ranges,
+            named_velocity_limits=backend.velocity_limits)
+        q, dq, _ = curve.sample(0.)
+        for field in ("actuator_names", "qacc", "actuator_force"):
+            with self.subTest(field=field):
+                feedback = backend.proprioception()
+                if field == "actuator_names":
+                    feedback[field] = feedback[field][::-1]
+                else:
+                    feedback[field][2] = np.nan
+                failures = executor._execution_violations(feedback, q, dq, np.eye(4),
+                    limits=limits, binding=binding, finger_state=limits.initial_fingers,
+                    expected_sim_time=backend.sim_time)
+                expected = "feedback_identity" if field == "actuator_names" else "nonfinite_feedback"
+                self.assertTrue(any(row["kind"] == expected and row["name"].startswith(field)
+                                    for row in failures))
+                self.assertEqual(backend.sim_time, 1.3)
+    # END no actuator output is issued by telemetry validation.
+
     def test_non_grid_close_cannot_narrow_actual_interval_before_new_feedback(self):
         simulation, curve, value = _fixture()
         self.assertEqual(curve.events[1]["time"], .003)
@@ -612,6 +681,24 @@ class GeometryExecutionTests(unittest.TestCase):
 
 # BEGIN concrete native backend binding, independent of recorded datasets.
 class RobosuiteBackendTests(unittest.TestCase):
+    # BEGIN telemetry cannot confuse native actuator columns with joint columns.
+    def test_native_dynamics_use_named_indices_and_independent_copies(self):
+        backend, _, _ = _fixture()
+        backend._qvel_ids = np.array([6, 5, 4, 3, 2, 1, 0, 8, 7])
+        backend._actuator_ids = np.array([3, 4, 5, 6, 0, 1, 2, 8, 7])
+        acceleration = backend.native_data.qacc[backend._qvel_ids].copy()
+        force = backend.native_data.actuator_force[backend._actuator_ids].copy()
+        feedback = backend.proprioception()
+        self.assertEqual(feedback["actuator_names"], backend.actuator_names)
+        np.testing.assert_array_equal(feedback["qacc"], acceleration)
+        np.testing.assert_array_equal(feedback["actuator_force"], force)
+        backend.native_data.qacc[:] = 100.
+        backend.native_data.actuator_force[:] = -100.
+        np.testing.assert_array_equal(feedback["qacc"], acceleration)
+        np.testing.assert_array_equal(feedback["actuator_force"], force)
+        self.assertEqual(backend.sim_time, 1.3)
+    # END feedback sampling neither aliases native arrays nor advances physics.
+
     @staticmethod
     def _simulator(*, arm_attributes='gaintype="fixed" dyntype="none" gear="1"'):
         from robosuite.utils.binding_utils import MjSim

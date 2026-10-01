@@ -358,6 +358,14 @@ class RobosuiteExecutionBackend:
                 "source": self._feedback_source, "timestamp_s": timestamp,
                 "q": self.native_data.qpos[self._qpos_ids].copy(),
                 "dq": self.native_data.qvel[self._qvel_ids].copy(),
+                # BEGIN preserve native dynamics in their independent named orders.
+                # qacc is the acceleration from the refreshed native forward
+                # state, not a finite difference of logged velocities. Force
+                # belongs to actuators; position-servo ctrl is not a force.
+                "qacc": self.native_data.qacc[self._qvel_ids].copy(),
+                "actuator_names": self.actuator_names,
+                "actuator_force": self.native_data.actuator_force[self._actuator_ids].copy(),
+                # END raw dynamics remain separate from commands and limits.
                 "base_pose": base, "tool_pose": tool, "sim_time": timestamp,
                 "actuator_ctrl": {"joint_names": self.joint_names,
                     "actuator_names": self._actuator_names,

@@ -318,11 +318,14 @@ class TrajectoryExecutor:
         def add(kind, name, measured, **allowed):
             failures.append({"kind": kind, "name": name, "measured": measured, **allowed})
 
+        # BEGIN actuator force has its own named native order.
         for field, expected in (("joint_names", backend.joint_names),
                                 ("arm_joint_names", backend.arm_joint_names),
-                                ("finger_joint_names", backend.finger_joint_names)):
+                                ("finger_joint_names", backend.finger_joint_names),
+                                ("actuator_names", backend.actuator_names)):
             if tuple(feedback.get(field, ())) != expected:
                 add("feedback_identity", field, feedback.get(field), expected=list(expected))
+        # END do not infer actuator order from joint labels.
         for field, expected in (("trial_id", backend.trial_id), ("source", backend.feedback_source)):
             if feedback.get(field) != expected:
                 add("feedback_identity", field, feedback.get(field), expected=expected)
@@ -340,14 +343,18 @@ class TrajectoryExecutor:
         if feedback.get("feedback_id") != expected_id:
             add("feedback_identity", "feedback_id", feedback.get("feedback_id"), expected=expected_id)
         actual = {}
-        for field in ("q", "dq"):
+        # BEGIN require finite native telemetry without inventing acceleration
+        # or force-spike thresholds. Hardware/tracking guards remain separate.
+        for field, names in (("q", backend.joint_names), ("dq", backend.joint_names),
+                             ("qacc", backend.joint_names), ("actuator_force", backend.actuator_names)):
             value = np.asarray(feedback.get(field), dtype=float)
-            if value.shape != (len(backend.joint_names),):
-                add("feedback_shape", field, list(value.shape), expected=[len(backend.joint_names)])
+            if value.shape != (len(names),):
+                add("feedback_shape", field, list(value.shape), expected=[len(names)])
                 continue
             actual[field] = value
             for index in np.flatnonzero(~np.isfinite(value)):
-                add("nonfinite_feedback", f"{field}:{backend.joint_names[index]}", float(value[index]))
+                add("nonfinite_feedback", f"{field}:{names[index]}", float(value[index]))
+        # END retain raw measurements; finite telemetry is not spike acceptance.
         pose = np.asarray(feedback.get("tool_pose"), dtype=float)
         if (pose.shape != (4, 4) or not np.isfinite(pose).all()
                 or not np.allclose(pose[3], [0., 0., 0., 1.], atol=1e-9, rtol=0)
@@ -512,6 +519,11 @@ class TrajectoryExecutor:
             "command_record_semantics": "sample zero uses curve q(0) and restored finger ctrl; each later command_q combines the arm goal sampled at min(step end, barrier) with the finger goal applied during that step",
             "arm_curve_dq_semantics": "arm cubic derivative at curve_time, recorded only; no desired finger velocity is invented for position-target steps",
             "actuator_control_semantics": "one native torque/position ctrl row per executed attempt, timestamped at step start; actual q/dq are separately recorded after each completed step",
+            # BEGIN preserve the two clocks and meanings needed for dynamics review.
+            "actual_dynamics_semantics": "actual_qacc and actual_actuator_force use the initial refreshed native state and every completed post-step mj_forward state at elapsed/sim_time; qacc is native forward acceleration, not differentiated dq; force is native actuator output, not mixed-unit ctrl",
+            "arm_torque_semantics": "requested_arm_torque and applied_arm_torque are pre-step controller demand and clipped arm ctrl in arm_actuator_names order at control_elapsed/control_sim_time; adjacent-row increments may be computed from these original arrays",
+            "actuator_spike_assessment": "Raw native force and command arrays retained; no force/acceleration spike threshold or all-actuator pass is inferred",
+            # END command clipping and dynamics remain distinct evidence.
             "events": [], "superseded_gripper_events": [],
             "pending_verifications": [deepcopy(event) for event in trajectory.events if event["requires_evidence"] is not None],
             "unconsumed_events": deepcopy(trajectory.events)}
@@ -538,6 +550,9 @@ class TrajectoryExecutor:
                     "command_q": np.concatenate((np.asarray(desired_arm_q), target_positions)),
                     "arm_curve_dq": np.asarray(arm_curve_dq).copy(),
                     "q": feedback["q"], "dq": feedback["dq"], "tool_pose": feedback["tool_pose"],
+                    # BEGIN synchronized native dynamics, including failed samples.
+                    "qacc": feedback["qacc"], "actuator_force": feedback["actuator_force"],
+                    # END these are measured telemetry rather than curve derivatives.
                     "reference_tool_pose": backend.reference_tool_pose(desired_arm_q),
                     "feedback": deepcopy(feedback), "finger_state": deepcopy(finger_state),
                     "geometry_check": None,
@@ -700,6 +715,10 @@ class TrajectoryExecutor:
                 sim_time=np.asarray([row["sim_time"] for row in samples]),
                 command_q=command_q, arm_curve_dq=np.asarray([row["arm_curve_dq"] for row in samples]),
                 actual_q=actual_q, actual_dq=np.asarray([row["dq"] for row in samples]),
+                # BEGIN keep every actual dynamics sample aligned with elapsed/sim_time.
+                actual_qacc=np.asarray([row["qacc"] for row in samples]),
+                actual_actuator_force=np.asarray([row["actuator_force"] for row in samples]),
+                # END no filtering or finite-difference reconstruction of native outputs.
                 actual_tool_pose=np.asarray([row["tool_pose"] for row in samples]),
                 reference_tool_pose=np.asarray([row["reference_tool_pose"] for row in samples]),
                 actual_finger_position_bounds=np.asarray([row["finger_state"]["position_bounds"] for row in samples]),
@@ -718,6 +737,10 @@ class TrajectoryExecutor:
                 actuator_names=np.asarray(backend.actuator_names),
                 actuator_ctrl=np.asarray(controls).reshape(-1, len(backend.joint_names)),
                 requested_arm_torque=np.asarray(requested_torques).reshape(-1, narm),
+                # BEGIN explicit applied arm torque has no gripper position units.
+                arm_actuator_names=np.asarray(backend.actuator_names[:narm]),
+                applied_arm_torque=np.asarray(controls).reshape(-1, len(backend.joint_names))[:, :narm],
+                # END arm commands use the existing pre-step control timestamps.
                 arm_torque_saturated=np.asarray(saturated_torques, dtype=bool).reshape(-1, narm),
                 control_elapsed=np.arange(len(controls))*backend.timestep,
                 control_sim_time=sim_start+np.arange(len(controls))*backend.timestep,

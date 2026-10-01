@@ -359,13 +359,36 @@ def run(args):
         # native hand calibration. They expose pre-existing scene violations;
         # they do not select a candidate or waive an optimization constraint.
         with torch.no_grad():
+            # BEGIN preserve exact entrance queries for independent scene diagnosis.
+            # These arrays describe the already declared measured state and
+            # supervised finger envelope. They do not alter collision costs,
+            # mark unknown cells free, or select a planning candidate.
+            entrance_spheres = device.to_device(entrance_fk["robot_spheres"])[None, None]
+            entrance_position = device.to_device(entrance_fk["tool_position"])[None, None]
+            entrance_quaternion = device.to_device(entrance_fk["tool_quaternion"])[None, None]
+            entrance_progress = device.to_device([[0.]])
+            entrance_q = device.to_device(problem.start_q)[None, None]
             terms = scene.components(
-                device.to_device(entrance_fk["robot_spheres"])[None, None],
-                device.to_device(entrance_fk["tool_position"])[None, None],
-                device.to_device(entrance_fk["tool_quaternion"])[None, None],
-                device.to_device([[0.]]), device.to_device(problem.start_q)[None, None],
-                problem.joint_names)
+                entrance_spheres, entrance_position, entrance_quaternion,
+                entrance_progress, entrance_q, problem.joint_names)
             report["initial_scene_components"] = {name: float(value.max()) for name, value in terms.items()}
+            coordinates, half, _ = hand.state(entrance_progress, entrance_q, problem.joint_names)
+            envelope = hand.spheres(entrance_spheres, entrance_position, entrance_quaternion,
+                                    coordinates, half)
+            arrays = {"measured_robot_spheres": entrance_spheres[0, 0].cpu().numpy(),
+                      "actual_finger_envelope_spheres": envelope[0, 0].cpu().numpy(),
+                      "unknown_per_sphere": scene.coverage.violation(envelope)[0, 0].cpu().numpy(),
+                      "background_per_sphere": scene.background(
+                          envelope, key=("entrance_diagnostic", "background"))[0, 0].cpu().numpy(),
+                      "finger_interval_center": coordinates[0, 0].cpu().numpy(),
+                      "finger_interval_half_width": half[0, 0].cpu().numpy()}
+            np.savez_compressed(args.output/"entrance-scene.npz", **arrays)
+            report["entrance_geometry_diagnostic"] = {
+                "path": "entrance-scene.npz", "sphere_count": len(arrays["unknown_per_sphere"]),
+                "unknown_sphere_count": int(np.count_nonzero(arrays["unknown_per_sphere"] > 0)),
+                "background_sphere_count": int(np.count_nonzero(arrays["background_per_sphere"] > 0)),
+                "scope": "Measured q0 with the same actual-finger interval and original scene; native collision costs retain their own units"}
+            # END read-only entrance evidence; original planner inputs remain unchanged.
         budget = PlanningBudget(knots=args.knots, interpolation_buffer_size=args.interpolation_buffer_size,
                                 max_robot_spheres=512, ik_seeds=args.ik_seeds,
                                 trajectory_seeds=args.trajectory_seeds,
