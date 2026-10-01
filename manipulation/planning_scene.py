@@ -1152,8 +1152,16 @@ class PlanningScene:
         actors.update({owner.owner_id: len(owner.local_spheres) for owner in self.owners if owner.moving})
         count = sum(size * (1 + len(self.owners) - int(actor != "robot")) for actor, size in actors.items())
         query_bytes = batch * horizon * count * 40
-        coverage_bytes = (batch * horizon * sum(actors.values()) * 128
+        # BEGIN count only actors that still execute whole-sphere coverage.
+        # Native robot-volume coverage replaces that one query in components;
+        # moving payloads keep their original unknown-space checks. Retain the
+        # conservative shared-grid allowance and the separate native guidance
+        # storage below. No collision term or allowed volume changes here.
+        coverage_spheres = sum(size for actor, size in actors.items()
+                               if actor != "robot" or self.robot_coverage is None)
+        coverage_bytes = (batch * horizon * coverage_spheres * 128
                           + (1 + len(actors)) * self.coverage._distance.numel() * 4)
+        # END disabled robot sphere queries cannot consume per-state scratch.
         # BEGIN include checkpointed hand-pair scratch and its retained input.
         pair_bytes = 0
         if self.gripper is not None and self.gripper.self_collision_pairs:

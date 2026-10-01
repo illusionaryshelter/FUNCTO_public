@@ -225,6 +225,33 @@ class PlanningSceneTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             observed.known_free[1, 1, 1] = True
 
+    def test_native_coverage_estimate_removes_only_disabled_robot_sphere_scratch(self):
+        # The solid body/FK layout is held constant while the robot's collision
+        # proxy resolution changes. With the native-volume oracle, additional
+        # robot balls add collision-query storage but no whole-ball unknown
+        # query. A moving payload still needs both kinds of storage.
+        world = scene()
+        world.robot_coverage = SimpleNamespace(required_link_names=("body",), baseline_joint_names=("q",))
+        world._coverage_geometry = {"solids": [{"baseline_halfspaces_world": np.zeros((32, 4))}]}
+        world._free_distance = world.coverage._distance
+        world.owners = (SimpleNamespace(owner_id="payload", moving=True, local_spheres=np.zeros((1, 4))),)
+        batch, horizon = 2, 10
+        before = world.estimated_workspace_bytes(batch, horizon)
+        world.robot_sphere_materials = (None,)*17
+        refined_robot = world.estimated_workspace_bytes(batch, horizon)
+        self.assertEqual(refined_robot-before, batch*horizon*16*2*40)
+        world.owners[0].local_spheres = np.zeros((3, 4))
+        refined_payload = world.estimated_workspace_bytes(batch, horizon)
+        self.assertEqual(refined_payload-refined_robot, batch*horizon*2*(40+128))
+        # Restoring the old robot unknown query changes only its real scratch;
+        # neither mode silently removes the conservative shared-grid reserve.
+        native_oracle, world.robot_coverage = world.robot_coverage, None
+        ordinary = world.estimated_workspace_bytes(batch, horizon)
+        world.robot_coverage = native_oracle
+        native_storage = (batch*horizon*(32*64*8+(32+12)*4)
+                          + world._free_distance.numel()*8)
+        self.assertEqual(ordinary+native_storage-refined_payload, batch*horizon*17*128)
+
     def test_full_volume_entrance_accepts_only_exact_named_representations(self):
         baseline = np.array([.123456789])
         received = []
