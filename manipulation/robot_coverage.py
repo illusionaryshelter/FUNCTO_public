@@ -134,6 +134,7 @@ class RobotCoverage:
         self.max_queries, self.max_working_bytes = max_queries, max_working_bytes
         self._queries = 0
         self._maximum_work_estimate = 0
+        self._largest_refused_work_estimate = 0
         self._maximum_native_tolerance = 0.
         mask = np.asarray(free_grid)
         if (mask.dtype != np.bool_ or mask.ndim != 3 or min(mask.shape) < 2
@@ -198,9 +199,13 @@ class RobotCoverage:
             if world_shape.is_empty():
                 raise ValueError("A native baseline component collapsed under its reference transform")
             world_shapes.append(world_shape)
-        self._baseline = self._boolean(world_shapes, manifold.OpType.Add)
-        if self._baseline.is_empty():
-            raise ValueError("The supplied native baseline must have a nonempty solid volume")
+        # V0 is this frozen union, but it need not be materialized as a global
+        # Boolean mesh. A\(B union C) == (A\B)\C lets each query subtract only
+        # intersecting components. In particular, a finely tessellated native
+        # link does not pay a face-pair product against the entire robot.
+        self._baseline_shapes = tuple(world_shapes)
+        self._baseline_bounds = np.asarray([shape.bounding_box() for shape in world_shapes], float).reshape(-1, 2, 3)
+        self._reserve_work(int(self._free.nbytes + self._free_boxes.nbytes + faces_count * 2048))
 
     @property
     def baseline_joint_positions(self):
@@ -236,6 +241,12 @@ class RobotCoverage:
             np.ascontiguousarray(vertices, dtype=np.float64),
             np.ascontiguousarray(faces, dtype=np.uint64))))
 
+    def _reserve_work(self, estimated):
+        if estimated > self.max_working_bytes:
+            self._largest_refused_work_estimate = max(self._largest_refused_work_estimate, estimated)
+            raise CoverageBudgetExceeded("Native Boolean face-pair work exceeds the CPU budget")
+        self._maximum_work_estimate = max(self._maximum_work_estimate, estimated)
+
     def _boolean(self, shapes, operation):
         # Bound potential intersecting face-pair work before handing it to the
         # maintained native engine. AABB-disjoint operands cannot create such
@@ -251,9 +262,7 @@ class RobotCoverage:
             pairs += int(counts[index]) * int(counts[:index][overlap].sum())
         estimated = int(self._free.nbytes + self._free_boxes.nbytes
                         + counts.sum() * 2048 + pairs * 128)
-        self._maximum_work_estimate = max(self._maximum_work_estimate, estimated)
-        if estimated > self.max_working_bytes:
-            raise CoverageBudgetExceeded("Native Boolean face-pair work exceeds the CPU budget")
+        self._reserve_work(estimated)
         return self._check_native(manifold.Manifold.batch_boolean(shapes, operation))
 
     def guidance_geometry(self):
@@ -284,6 +293,7 @@ class RobotCoverage:
                 "max_working_bytes": self.max_working_bytes, "max_queries": self.max_queries,
                 "queries": self._queries,
                 "maximum_native_work_estimate_bytes": self._maximum_work_estimate,
+                "largest_refused_native_work_estimate_bytes": self._largest_refused_work_estimate,
                 "maximum_native_tolerance_m": self._maximum_native_tolerance,
                 "numerical_tolerance_is_error_bound": False,
                 "acceptance_uses_volume_threshold": False,
@@ -363,7 +373,7 @@ class RobotCoverage:
             if state["joint_limit_violations"]:
                 report.update(failure="native_joint_limits", joint_limit_violations=state["joint_limit_violations"])
                 return report
-            for row in self._solids:
+            for component, row in enumerate(self._solids):
                 pose = np.asarray(state["frame_poses"][row["frame"]], float)
                 # Exact pose identity is an exact set identity, including
                 # unchanged root bodies while other joints move. It avoids
@@ -373,7 +383,21 @@ class RobotCoverage:
                 candidate = self._check_native(row["shape"].transform(pose[:3]))
                 if candidate.is_empty():
                     raise RuntimeError("A native candidate component collapsed under its reference transform")
-                bad = self._boolean((candidate, self._baseline), manifold.OpType.Subtract)
+                bounds = np.asarray(candidate.bounding_box(), float).reshape(2, 3)
+                overlapping = np.flatnonzero(
+                    np.all(self._baseline_bounds[:, 0] <= bounds[1], axis=1)
+                    & np.all(bounds[0] <= self._baseline_bounds[:, 1], axis=1)).tolist()
+                # The component's own initial body usually removes most of a
+                # nearby query. This exact ordering choice reduces subsequent
+                # work; it neither changes the union nor updates the baseline.
+                if component in overlapping:
+                    overlapping.remove(component)
+                    overlapping.insert(0, component)
+                bad = candidate
+                for index in overlapping:
+                    bad = self._boolean((bad, self._baseline_shapes[index]), manifold.OpType.Subtract)
+                    if bad.is_empty():
+                        break
                 if bad.is_empty():
                     continue
                 bounds = np.asarray(bad.bounding_box(), float).reshape(2, 3)
