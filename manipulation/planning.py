@@ -1383,6 +1383,17 @@ class _CuroboPlanner:
 
     def __init__(self, problem, scene, robot, budget, device):
         self.ik = self.trajopt = None
+        # BEGIN keep full float32 geometry through the complete native request.
+        # TF32 truncates even an identity matrix product, so its coordinate
+        # quantization can exceed the physical collision tolerance. Precision
+        # must cover backward as well as forward; a cost-only context is not
+        # sufficient. Save caller settings before cuRobo's import side effects.
+        import torch
+        self._precision_torch = torch
+        self._caller_precision = (torch.backends.cuda.matmul.allow_tf32,
+                                  torch.backends.cudnn.allow_tf32)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        # END close() restores both settings on success and initialization error.
         try:
             self._initialize(problem, scene, robot, budget, device)
         except BaseException:
@@ -1419,6 +1430,13 @@ class _CuroboPlanner:
         from curobo._src.util.config_io import load_yaml, join_path
         from curobo.content import get_task_configs_path
 
+        # BEGIN undo the native seed-IK module's global TF32 import assignment.
+        # Apply after native imports and before any native solver/FK buffers or
+        # geometry calculations. cuDNN is not used here; preserve its caller
+        # setting rather than leaking the dependency's unrelated assignment.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = self._caller_precision[1]
+        # END the single-request lifecycle owns forward and backward precision.
         self.problem, self.scene, self.budget = problem, scene, budget
         self.torch, self.JointState, self.GoalToolPose = torch, JointState, GoalToolPose
         self.device_cfg = DeviceCfg(device)
@@ -1730,13 +1748,22 @@ class _CuroboPlanner:
         # Native destroy() resets CUDA graphs. LBFGS and GradientOptCore also
         # retain each other through bound callbacks, so drop every solver
         # reference before collecting their now-unreachable tensor workspaces.
-        for name in ("ik", "trajopt"):
-            solver = getattr(self, name)
-            if solver is not None:
-                solver.destroy()
-            setattr(self, name, None)
-        del solver
-        gc.collect()
+        # BEGIN restore caller precision even if native destruction raises.
+        try:
+            for name in ("ik", "trajopt"):
+                solver = getattr(self, name)
+                if solver is not None:
+                    solver.destroy()
+                setattr(self, name, None)
+            del solver
+            gc.collect()
+        finally:
+            prior = getattr(self, "_caller_precision", None)
+            if prior is not None:
+                self._precision_torch.backends.cuda.matmul.allow_tf32 = prior[0]
+                self._precision_torch.backends.cudnn.allow_tf32 = prior[1]
+                self._caller_precision = None
+        # END repeated close() cannot overwrite a later caller setting.
         # END release native callback cycles at the request lifecycle boundary.
 
     def _goal(self, progress):
@@ -2380,18 +2407,21 @@ def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0"):
     budget = PlanningBudget() if budget is None else budget
     started = time.monotonic()
     planner = _CuroboPlanner(problem, scene, robot, budget, device)
-    diagnostics = {"backend": "curobo_v2", "batch_size": 1, "ik_seeds": budget.ik_seeds,
-                   "trajectory_seeds": budget.trajectory_seeds, "used_ompl": False,
-                   "timing_policy": "fixed_request_dt", "native_trajectory_dt": budget.maximum_trajectory_dt,
-                   "progress_parameter_error_bound": _PROGRESS_PARAMETER_ERROR,
-                   "progress_clock_max_keys": _MAX_PROGRESS_KEYS,
-                   "scene": scene.describe(), "scene_workspace_bytes": planner.scene_workspace_bytes,
-                   # BEGIN expose the request-sized native anchor allocation.
-                   "anchor_fk_workspace_bytes": planner.anchor_fk_workspace_bytes,
-                   "exact_anchor_capacity": planner.anchor_capacity,
-                   # END expose the request-sized native anchor allocation.
-                   "attempts": []}
+    # BEGIN cleanup also covers diagnostic construction failures.
+    diagnostics = {}
     try:
+        diagnostics = {"backend": "curobo_v2", "batch_size": 1, "ik_seeds": budget.ik_seeds,
+                       "trajectory_seeds": budget.trajectory_seeds, "used_ompl": False,
+                       "timing_policy": "fixed_request_dt", "native_trajectory_dt": budget.maximum_trajectory_dt,
+                       "progress_parameter_error_bound": _PROGRESS_PARAMETER_ERROR,
+                       "progress_clock_max_keys": _MAX_PROGRESS_KEYS,
+                       "scene": scene.describe(), "scene_workspace_bytes": planner.scene_workspace_bytes,
+                       # BEGIN expose the request-sized native anchor allocation.
+                       "anchor_fk_workspace_bytes": planner.anchor_fk_workspace_bytes,
+                       "exact_anchor_capacity": planner.anchor_capacity,
+                       # END expose the request-sized native anchor allocation.
+                       "attempts": []}
+        # END the planner always reaches its precision-restoring close().
         # BEGIN fixed entrance failures cannot be repaired by later IK or search.
         diagnostics["initial_state"] = planner.initial_state_diagnostics()
         if not diagnostics["initial_state"]["passed"]:
