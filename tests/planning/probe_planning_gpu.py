@@ -70,6 +70,13 @@ def main():
                      joint_position=None, joint_names=None):
             return torch.zeros_like(progress)
 
+        # BEGIN expose the same explicit empty scene to entrance diagnostics.
+        def components(self, robot_spheres, position, quaternion, progress,
+                       joint_position=None, joint_names=None):
+            """No scene constraints exist in this declared synthetic empty world."""
+            return {}
+        # END expose the same explicit empty scene to entrance diagnostics.
+
     # BEGIN apply the same explicit local resource cap as the other robot checks.
     torch.set_num_threads(2)
     if not torch.cuda.is_available():

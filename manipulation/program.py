@@ -643,7 +643,8 @@ def ground_object_program(program, scene):
 
 
 # BEGIN public joint-coordinate input documentation; holding/release logic stays shared.
-def ground_program(program, scene):
+# BEGIN carry an explicit pre-grasp boundary into the shared geometry kernel.
+def ground_program(program, scene, *, pregrasp_frame=None):
     """Generate one grasp/manipulation geometry reference from a compiled demo.
 
     ``program`` contains ``skill_kind``, ``demo`` and (for manipulation) task
@@ -678,17 +679,24 @@ def ground_program(program, scene):
     phase boundary, independent of the opening command and function event. A
     future release cannot already be observed: the returned retreat is anchored
     to its predicted boundary and must be rebound to actual feedback at runtime.
+
+    A grasp may additionally supply ``pregrasp_frame`` to preserve its bound
+    Cartesian approach from that original observation onward. Robot planning
+    requires this explicit boundary; independent geometric grounding does not.
     """
     kind, demo = program["skill_kind"], program["demo"]
     frame_name = scene.get("reference_frame")
     if not isinstance(frame_name, str) or not frame_name:
         raise ValueError("The current scene must name its common reference_frame")
     if kind == "grasp":
-        result = ground_grasp(demo, scene)
+        result = ground_grasp(demo, scene, pregrasp_frame=pregrasp_frame)
         result.update(skill_kind=kind, reference_frame=frame_name,
                       carrier_id=scene.get("carrier_id"),
                       pose_convention="column-vector reference_from_eef; metres; 4x4 SE(3)")
         return result
+    if pregrasp_frame is not None:
+        raise ValueError("pregrasp_frame only applies to grasp geometry")
+    # END carry an explicit pre-grasp boundary into the shared geometry kernel.
     if kind != "manipulation":
         raise ValueError("skill_kind must be grasp or manipulation")
     for key in ("tool_id", "tool_frame"):

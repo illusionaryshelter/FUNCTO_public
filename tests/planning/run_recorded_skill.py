@@ -142,7 +142,11 @@ def run(args):
         planning_feedback = {**feedback, "joint_names": list(active),
                              "start_q": [measured[name] for name in active],
                              "start_dq": [velocities[name] for name in active]}
-        problem, provenance = prepare_candidate(program, scene_input, planning_feedback, args.segment)
+        # BEGIN pass the requested approach boundary before reference grounding.
+        problem, provenance = prepare_candidate(
+            program, scene_input, planning_feedback, args.segment,
+            pregrasp_frame=args.pregrasp_frame)
+        # END pass the requested approach boundary before reference grounding.
         # The supplied camera calibration is explicitly world-from-camera.
         # Another output frame needs its real calibrated transform, never a
         # relabelled world observation at this narrow recorded-test boundary.
@@ -290,6 +294,10 @@ if __name__ == "__main__":
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)
+    # BEGIN recorded callers select source evidence, never a dataset constant.
+    parser.add_argument("--pregrasp-frame", type=int,
+                        help="Original source approach frame; required for grasp planning")
+    # END recorded callers select source evidence, never a dataset constant.
     parser.add_argument("--owner-mask", nargs=2, action="append", required=True,
                         metavar=("VIEW_ID", "MASK_PATH"))
     parser.add_argument("--owner-geometry", type=Path)

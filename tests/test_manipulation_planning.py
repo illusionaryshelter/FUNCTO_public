@@ -1542,6 +1542,127 @@ class ExportedCurveContractTests(unittest.TestCase):
             allocations.assert_not_called()
 
 
+# BEGIN measured-entrance necessary conditions without invented derivatives.
+class InitialStatePreflightTests(unittest.TestCase):
+    """CPU integration boundaries, without claiming native collision numerics."""
+
+    @staticmethod
+    def fixture(*, position=(.1, -.3, .5), velocity=(.7, -1.7, 2.4),
+                native_collision=0., scene_name="robot/background", scene_value=0.):
+        base = np.eye(4)
+        base[:3, :3] = Rotation.from_euler("z", .8).as_matrix()
+        base[:3, 3] = [.8, -.6, .2]
+        tool = np.eye(4)
+        tool[:3, 3] = [.02, -.03, .04]
+        problem = PlanningProblem(
+            joint_names=("cartesian_x", "cartesian_y", "cartesian_z"),
+            start_q=np.asarray(position), start_dq=np.asarray(velocity),
+            tool_link="actual_tool", reference_frame="analytic_world",
+            base_pose=base, tool_transform=tool,
+            phases=(MotionPhase("free", constant_path(), kind="free"),))
+        planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.problem, planner.joint_names = problem, problem.joint_names
+        planner.torch, planner.JointState = torch, SimpleNamespace
+        planner.start = SimpleNamespace(
+            position=torch.tensor([position], dtype=torch.float64),
+            velocity=torch.tensor([velocity], dtype=torch.float64))
+        # Native limits deliberately have a different name order. Using raw
+        # columns would accept/reject different physical axes in these cases.
+        limits = SimpleNamespace(
+            joint_names=["cartesian_z", "cartesian_x", "cartesian_y"],
+            position=torch.tensor([[-.6, -.2, -.4], [.6, .2, .4]], dtype=torch.float64),
+            velocity=torch.tensor([[-3., -1., -2.], [3., 1., 2.]], dtype=torch.float64))
+        cspace = SimpleNamespace(enabled=True, config=SimpleNamespace(joint_limits=limits),
+            forward=Mock(side_effect=AssertionError("unknown high derivatives cannot enter STATE cost")))
+        collision = SimpleNamespace(enabled=True, setup_batch_tensors=Mock(),
+            forward=Mock(return_value=torch.tensor([[native_collision]], dtype=torch.float64)))
+        planner._verification_native = SimpleNamespace(
+            get_cost={"cspace": cspace, "self_collision": collision}.get,
+            compute_costs=Mock(side_effect=AssertionError("complete manager would invent missing derivatives")))
+
+        def fk(state):
+            q = state.position
+            quaternion = q.new_zeros((1, 1, 2, 4))
+            quaternion[..., 0] = 1.
+            spheres = torch.cat((q[:, :, None], q.new_full((1, 1, 1, 1), .01)), dim=-1)
+            return SimpleNamespace(robot_spheres=spheres, tool_poses=SimpleNamespace(
+                tool_frames=["unrelated_tool", problem.tool_link],
+                position=torch.stack((q+7., q), dim=2), quaternion=quaternion))
+
+        planner._verification_fk = SimpleNamespace(compute_kinematics=Mock(side_effect=fk))
+        planner._verification_scene = SimpleNamespace(components=Mock(return_value={
+            scene_name: torch.tensor([[scene_value]], dtype=torch.float64)}))
+        planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes, planner.anchor_capacity = 64, 32, 4
+        planner.reference_seeds = Mock(side_effect=AssertionError("an infeasible fixed entrance must stop before IK"))
+        planner.optimize, planner.ompl_seed, planner.close = Mock(), Mock(), Mock()
+        return planner, cspace, collision
+
+    def test_checks_effective_named_limits_and_actual_fk_without_unknown_derivatives(self):
+        planner, cspace, collision = self.fixture()
+        result = planner.initial_state_diagnostics()
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["failed_components"], [])
+        np.testing.assert_array_equal(result["joint_bounds"]["position"]["upper"], [.2, .4, .6])
+        np.testing.assert_array_equal(result["joint_bounds"]["velocity"]["upper"], [1., 2., 3.])
+        measured = planner._verification_fk.compute_kinematics.call_args.args[0]
+        torch.testing.assert_close(measured.position[:, 0], planner.start.position, rtol=0, atol=0)
+        torch.testing.assert_close(measured.velocity[:, 0], planner.start.velocity, rtol=0, atol=0)
+        for field in ("acceleration", "jerk", "dt"):
+            self.assertIsNone(getattr(measured, field, None))
+        cspace.forward.assert_not_called()
+        planner._verification_native.compute_costs.assert_not_called()
+        collision.setup_batch_tensors.assert_called_once_with(1, 1)
+        collision.forward.assert_called_once()
+        spheres, position, quaternion, progress, joints, names = planner._verification_scene.components.call_args.args
+        expected_position = (planner.problem.base_pose[:3, :3]
+                             @ (planner.problem.start_q+planner.problem.tool_transform[:3, 3])
+                             + planner.problem.base_pose[:3, 3])
+        np.testing.assert_allclose(position[0, 0], expected_position, atol=1e-14, rtol=0)
+        np.testing.assert_allclose(spheres[0, 0, 0, :3],
+            planner.problem.base_pose[:3, :3]@planner.problem.start_q+planner.problem.base_pose[:3, 3],
+            atol=1e-14, rtol=0)
+        torch.testing.assert_close(progress, torch.zeros((1, 1), dtype=torch.float64), rtol=0, atol=0)
+        torch.testing.assert_close(joints[:, 0], planner.start.position, rtol=0, atol=0)
+        self.assertEqual(names, planner.joint_names)
+        self.assertIn("unprovided_locked_joint_velocity", result["scope"]["not_checked"])
+        self.assertIn("future_trajectory_feasibility", result["scope"]["not_checked"])
+
+    def test_each_immutable_violation_stops_before_ik_optimization_or_search(self):
+        cases = (
+            ("native:position", {"position": (.21, -.3, .5)}, .01),
+            ("native:velocity", {"velocity": (.7, -2.3, 2.4)}, .3),
+            ("native:self_collision", {"native_collision": 1.}, 1.),
+            ("scene:gripper/self", {"scene_name": "gripper/self", "scene_value": 4.5}, 4.5),
+            ("scene:unknown_space", {"scene_name": "unknown_space", "scene_value": np.nan}, np.nan),
+        )
+        scene = SimpleNamespace(describe=lambda: {"scope": "analytic entrance fixture"})
+        for component, arguments, expected in cases:
+            with self.subTest(component=component):
+                planner, _, _ = self.fixture(**arguments)
+                before = (planner.start.position.clone(), planner.start.velocity.clone())
+                with patch("manipulation.planning._CuroboPlanner", return_value=planner):
+                    result = plan_trajectory(planner.problem, scene, object(), device="cpu")
+                self.assertFalse(result.success)
+                self.assertIsNone(result.trajectory)
+                self.assertEqual(result.diagnostics["failure"], "initial_state_infeasible")
+                entrance = result.diagnostics["initial_state"]
+                self.assertEqual(entrance["failed_components"], [component])
+                actual = entrance["residuals"][component]
+                if np.isfinite(expected):
+                    self.assertAlmostEqual(actual, expected)
+                else:
+                    self.assertFalse(np.isfinite(actual))
+                self.assertEqual(result.diagnostics["attempts"], [])
+                self.assertFalse(result.diagnostics["used_ompl"])
+                planner.reference_seeds.assert_not_called()
+                planner.optimize.assert_not_called()
+                planner.ompl_seed.assert_not_called()
+                planner.close.assert_called_once_with()
+                torch.testing.assert_close(planner.start.position, before[0], rtol=0, atol=0)
+                torch.testing.assert_close(planner.start.velocity, before[1], rtol=0, atol=0)
+# END measured-entrance necessary conditions without invented derivatives.
+
+
 class PlannerRetryContractTests(unittest.TestCase):
     """Exercise authorization and finite retry semantics without native GPU work."""
 
@@ -1566,6 +1687,10 @@ class PlannerRetryContractTests(unittest.TestCase):
             ik=SimpleNamespace(config=SimpleNamespace(exit_early=False)),
             reference_ik_distinct_counts=[2, 2, 2],
             initial_seed_strategies=["reference_ik", "reference_ik_alternative"],
+            # BEGIN valid measured entrance for the independent retry fixture.
+            initial_state_diagnostics=Mock(return_value={"passed": True, "residuals": {},
+                "failed_components": [], "scope": {"kind": "analytic retry fixture"}}),
+            # END valid measured entrance for the independent retry fixture.
             reference_seeds=Mock(return_value=(torch.zeros((1, 2, 4, 3)), [2, 2, 2])),
             optimize=Mock(side_effect=native), close=Mock(), replace_schedule=Mock(),
             refinement_samples=Mock(return_value=None),

@@ -83,7 +83,8 @@ def _gripper_events(value, frames):
     return events
 
 
-def ground_grasp(demo, scene):
+# BEGIN preserve an explicitly selected Cartesian approach before contact.
+def ground_grasp(demo, scene, *, pregrasp_frame=None):
     """Bind same-tool approach/closure geometry and protect its contact suffix.
 
     ``demo`` requires ``T_carrier_eef`` (N,4,4), original ``frame_indices`` and
@@ -100,6 +101,12 @@ def ground_grasp(demo, scene):
     protected boundary through the end remain exactly that bound reference.
     There is no added lifting stage: the last source observation is the
     stable-grasp verification boundary, even if the object remains supported.
+
+    ``pregrasp_frame`` optionally protects an earlier Cartesian approach as
+    well. It is an original observation ID strictly before the contact/closing
+    boundary. The free connection ends there, before any reference warping;
+    the original protected boundary and gripper events retain their meaning.
+    Standalone geometric grounding need not select a robot planning boundary.
 
     ``status == 'candidate'`` certifies only that this geometric connection
     exists. If no free prefix exists and the current pose differs, the returned
@@ -127,6 +134,14 @@ def ground_grasp(demo, scene):
            for event in events):
         raise ValueError("The protected boundary cannot follow a closing intention")
     index = int(matches[0])
+    if pregrasp_frame is not None:
+        if (isinstance(pregrasp_frame, (bool, np.bool_))
+                or not isinstance(pregrasp_frame, (int, np.integer))):
+            raise ValueError("pregrasp_frame must be an original integer frame ID")
+        approach = np.flatnonzero(frames == pregrasp_frame)
+        if len(approach) != 1 or int(approach[0]) >= index:
+            raise ValueError("pregrasp_frame must name an observation before protected_start_frame")
+        index = int(approach[0])
     carrier = _pose_array(scene["carrier_pose"], "carrier_pose")
     current = _pose_array(scene["eef_pose"], "eef_pose")
     mapping = _pose_array(scene["region_transform"], "region_transform")
@@ -148,6 +163,7 @@ def ground_grasp(demo, scene):
         "eef_poses": output,
         "frame_indices": frames,
         "timestamps": times,
+        "pregrasp_frame": None if pregrasp_frame is None else int(pregrasp_frame),
         "protected_start_frame": int(protected),
         "entry_pose": reference[0].copy() if connection_required else output[0].copy(),
         "connection_required": bool(connection_required),
@@ -165,6 +181,7 @@ def ground_grasp(demo, scene):
         "path_scope": ("same-tool geometry candidate; no IK, complete-scene collision, "
                        "gripper-width, force, stability, or execution-time guarantee"),
     }
+# END preserve an explicitly selected Cartesian approach before contact.
 
 
 def attached_eef_reference(carrier_poses, actual_T_carrier_eef):

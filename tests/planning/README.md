@@ -37,6 +37,7 @@ checked independently. It preserves all required source anchors.
 | `run_recorded_skill.py`, `recorded_task_planning.py` | Current bounded joint planning, unchanged skill constraints and classified diagnostic curve export |
 | `recorded_simulation.py`, `recorded_skill_evaluation.py`, `run_recorded_simulation.py` | Native joint-controlled physics up to the next evidence barrier, with separate task evaluation and calibrated videos |
 | `visualize_current_recorded_task.py` | Current references, classified joint curves, actual robot feedback and physical outcomes; retains historical incomplete attempts |
+| `visualize_recorded_failure.py` | Frozen reference, commanded FK and actual TCP, plus joint position/velocity/acceleration and native limits on their recorded clocks |
 | `probe_ompl_constraints.py` | CPU OMPL projection and connection contracts |
 | `probe_scalar_progress_clock.py`, `diagnose_moving_gripper_capacity.py`, `probe_collision_suffix_capacity.py` | CPU representation and interpolation diagnostics |
 | `probe_fk_gradient.py`, `probe_process_gradient.py` | Native FK and full-process derivative checks |
@@ -66,6 +67,14 @@ complete collision inputs, or robot execution. The robot audit reads only the
 declared robot subtree and proprioception columns; a rigid TCP calibration does
 not repair mismatched collision geometry. Use each script's `--help` for its
 required paths and mappings.
+
+<!-- BEGIN explicit pre-grasp selection for recorded grasp requests. -->
+Grasp requests to `run_recorded_skill.py` require `--pregrasp-frame SOURCE_FRAME`.
+The preparation script takes repeated `--pregrasp-frame SKILL_ID SOURCE_FRAME`
+selections. These must identify evidenced original approach entrances before
+contact/closing; neither script infers a dataset-specific index or silently uses
+the grasp pose. Missing selections remain reported input failures.
+<!-- END explicit pre-grasp selection for recorded grasp requests. -->
 
 The native simulator accepts a classified saved curve and an explicit evaluation
 mode. A rejected candidate may be run only as an isolated diagnostic; its physics

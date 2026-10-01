@@ -63,6 +63,13 @@ class NoObstacleExperiment:
                  joint_position=None, joint_names=None):
         return progress*0.
 
+    # BEGIN expose the same explicit empty scene to entrance diagnostics.
+    def components(self, spheres, position, quaternion, progress,
+                   joint_position=None, joint_names=None):
+        """No scene constraints exist in this declared synthetic empty world."""
+        return {}
+    # END expose the same explicit empty scene to entrance diagnostics.
+
 
 def run(output, debug_gradient, initial_joint_velocity=0.):
     output.mkdir(parents=True, exist_ok=True)

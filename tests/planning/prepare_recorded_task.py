@@ -42,7 +42,8 @@ def read_json(path):
     return json.loads(path.read_text())
 
 
-def prepare_candidate(program, scene, feedback, skill_id):
+# BEGIN require the caller's source pre-grasp boundary for grasp planning.
+def prepare_candidate(program, scene, feedback, skill_id, *, pregrasp_frame=None):
     """Return the public PlanningProblem and explicit input provenance.
 
     The caller owns the active-joint layout. Its supplied positions and
@@ -81,7 +82,7 @@ def prepare_candidate(program, scene, feedback, skill_id):
 
     problem = build_planning_problem(
         [{"skill_id": skill_id, "program": program, "scene": prepared,
-          "barrier_can_stop": True}],
+          "barrier_can_stop": True, "pregrasp_frame": pregrasp_frame}],
         joint_names=feedback["joint_names"], start_q=feedback["start_q"],
         start_dq=feedback["start_dq"], tool_link=feedback["tool_link"],
         reference_frame=feedback["reference_frame"], base_pose=feedback["base_pose"],
@@ -96,9 +97,11 @@ def prepare_candidate(program, scene, feedback, skill_id):
         "source_frame_range": [program["demo"]["frame_indices"][0],
                                program["demo"]["frame_indices"][-1]],
         "source_timestamps": deepcopy(program["demo"]["timestamps"]),
+        "pregrasp_frame": pregrasp_frame,
         "couplings_inferred": False,
     }
     return problem, provenance
+# END require the caller's source pre-grasp boundary for grasp planning.
 
 
 def _pose_error(actual, expected):
@@ -345,7 +348,8 @@ def _write_json(path, data):
     path.write_text(json.dumps(data, indent=2, default=json_value, allow_nan=False) + "\n")
 
 
-def _prepare_segments(manifest, feedback_by_segment, output):
+# BEGIN preserve explicit per-skill source boundaries at the recorded caller.
+def _prepare_segments(manifest, feedback_by_segment, output, pregrasp_frames):
     """Run every current candidate, preserving old labels only as comparison."""
     root = Path(manifest["workspace_root"])
     rows = []
@@ -368,7 +372,8 @@ def _prepare_segments(manifest, feedback_by_segment, output):
             try:
                 problem, provenance = prepare_candidate(
                     program, read_json(root / candidate["scene_path"]),
-                    planning_feedback, identifier)
+                    planning_feedback, identifier,
+                    pregrasp_frame=pregrasp_frames.get(identifier))
                 item.update(status="passed", problem=_problem_summary(problem),
                             provenance=provenance)
             except Exception as error:
@@ -389,8 +394,13 @@ def run(args):
     identifiers = [segment["id"] for segment in manifest["segments"]]
     if not identifiers or len(set(identifiers)) != len(identifiers):
         raise ValueError("The input manifest needs unique nonempty segment identities")
+    pregrasp_frames = {}
+    for identifier, frame in args.pregrasp_frame:
+        if identifier not in identifiers or identifier in pregrasp_frames:
+            raise ValueError("Each pre-grasp selection must name a unique manifest skill")
+        pregrasp_frames[identifier] = int(frame)
     feedback = _extract_named_feedback(manifest, fixture, args.robot_fixture)
-    segments = _prepare_segments(manifest, feedback, args.output)
+    segments = _prepare_segments(manifest, feedback, args.output, pregrasp_frames)
     candidates = [candidate for segment in segments for candidate in segment["candidates"]]
     passed = sum(candidate["status"] == "passed" for candidate in candidates)
     report = {
@@ -416,12 +426,16 @@ def main():
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--robot-fixture", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--pregrasp-frame", nargs=2, action="append", default=[],
+                        metavar=("SKILL_ID", "SOURCE_FRAME"),
+                        help="Explicit source approach entrance, required for each grasp")
     args = parser.parse_args()
     report = run(args)
     print(json.dumps({"output": str(args.output.resolve()), "status": report["status"],
                       "counts": report["counts"], "elapsed_s": report["elapsed_s"],
                       "peak_process_rss_mib": report["peak_process_rss_mib"]}))
     return 0 if report["status"] == "passed" else 1
+# END preserve explicit per-skill source boundaries at the recorded caller.
 
 
 if __name__ == "__main__":

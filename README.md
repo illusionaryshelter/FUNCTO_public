@@ -942,6 +942,18 @@ participate in generation. When needed, OMPL searches ordinary or constrained
 `(q, progress)` connections and supplies an initializer for another complete
 cuRobo optimization.
 
+<!-- BEGIN retain native smoothness and reject an infeasible fixed entrance. -->
+The optimizer retains cuRobo's native trajectory regularization. Independent
+native and exported-curve constraints still determine acceptance. Before IK,
+the planner checks measured active-joint position/velocity against effective
+native limits, native self collision and scene components at actual entrance
+FK. A failed necessary condition returns `initial_state_infeasible` with its
+individual residuals and no trajectory. This check does not invent unmeasured
+acceleration, jerk, torque or locked-joint velocity. A conservative binary-hand
+or unknown-space violation describes the declared model's feasibility, rather
+than proving current physical contact.
+<!-- END retain native smoothness and reject an infeasible fixed entrance. -->
+
 | Module | Responsibility |
 |---|---|
 | `planning_problem` | Compile grounded skill instances, required motion, functional freedom, original events and actual/conditional attachment evidence |
@@ -980,6 +992,15 @@ Each skill instance supplies the same compiled `program` and bound `scene`
 already consumed by `ground_program` in the existing prepared-input flow.
 Serialized JSON matrices and NumPy matrices use the same validated pose contract;
 the builder leaves the caller's inputs unchanged.
+<!-- BEGIN explicit pre-grasp planning and preserved Cartesian approach. -->
+Each grasp entry also supplies `pregrasp_frame`, an original source observation
+strictly before `protected_start_frame`. Free planning ends at that pre-grasp.
+From there through closure, the builder constrains the complete bound Cartesian
+reference and preserves every original source vertex. Grounding only adjusts
+the earlier free connection, so it cannot warp the approach before the planner
+receives it. Closing commands and the stable-Holding evidence barrier keep their
+original source IDs. The planner rejects a missing or invalid pre-grasp boundary.
+<!-- END explicit pre-grasp planning and preserved Cartesian approach. -->
 The builder reuses that grounding implementation, including functional events,
 necessary motion and release semantics. Use those structured inputs rather
 than reconstructing requirements from the final pose arrays in `trajectory.json`.

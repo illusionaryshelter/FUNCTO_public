@@ -1159,11 +1159,11 @@ class _CuroboPlanner:
             return data
 
         ik_optimizer = configuration("ik/lbfgs_ik.yml", "seed_optimizer")
+        # BEGIN retain native trajectory smoothness without changing acceptance.
+        # Native velocity/acceleration/jerk preferences choose among curves;
+        # independent hard constraints still decide whether a curve is usable.
         trajectory_optimizer = configuration("trajopt/lbfgs_bspline_trajopt.yml", "trajectory_optimizer")
-        # First find a feasible process.  Native unconditional smoothness and
-        # energy preferences must not purchase a process violation.  Bounds
-        # retain their independent weights and final feasibility checks.
-        trajectory_optimizer["rollout"]["cost_cfg"]["cspace_cfg"]["squared_l2_regularization_weight"] = [0.]*5
+        # END retain native trajectory smoothness without changing acceptance.
         for name, config, iterations in (("IK", ik_optimizer, budget.ik_iterations),
                                          ("trajectory", trajectory_optimizer, budget.trajectory_iterations)):
             inner_iterations = config["optimizer"]["inner_iters"]
@@ -1289,6 +1289,77 @@ class _CuroboPlanner:
         self._verification_native.initialize_from_config(
             deepcopy(self.trajopt.config.metrics_rollout_config.constraint_cfg),
             self.trajopt.transition_model)
+
+    # BEGIN reject an immutable infeasible entrance before running native IK.
+    def initial_state_diagnostics(self):
+        """Check only necessary conditions known at the measured entrance.
+
+        The complete native STATE cost requires acceleration, jerk and torque
+        inputs. Those measurements are absent, so inspect its effective q/dq
+        limits directly and call its sphere-only self-collision term alone.
+        Scene terms retain their normal conservative meaning, including
+        unknown space and a binary gripper's reachable envelope; a positive
+        term need not mean that the actual robot is physically in contact.
+        """
+        torch = self.torch
+        cspace = self._verification_native.get_cost("cspace")
+        if cspace is None or not cspace.enabled:
+            raise RuntimeError("Entrance checks require the enabled native cspace constraints")
+        limits = cspace.config.joint_limits
+        if (len(limits.joint_names) != len(self.joint_names)
+                or set(limits.joint_names) != set(self.joint_names)):
+            raise RuntimeError("Native entrance limits must match the active feedback joints")
+        columns = [limits.joint_names.index(name) for name in self.joint_names]
+        q, dq = self.start.position[:, None], self.start.velocity[:, None]
+        joint_bounds = {}
+        with torch.no_grad():
+            components = {}
+            for name, values in (("position", q), ("velocity", dq)):
+                bounds = getattr(limits, name)[:, columns]
+                violations = torch.relu(bounds[0]-values) + torch.relu(values-bounds[1])
+                components[f"native:{name}"] = violations
+                joint_bounds[name] = {
+                    "measured": values[0, 0].detach().cpu().tolist(),
+                    "lower": bounds[0].detach().cpu().tolist(),
+                    "upper": bounds[1].detach().cpu().tolist(),
+                    "violation": violations[0, 0].detach().cpu().tolist(),
+                }
+            # Construct only the measured fields. Native from_position/from_numpy
+            # helpers otherwise synthesize zero acceleration and jerk tensors.
+            measured = self.JointState(position=q.contiguous(), velocity=dq.contiguous(),
+                                       joint_names=list(self.joint_names))
+            state = self._verification_fk.compute_kinematics(measured)
+            native_self = self._verification_native.get_cost("self_collision")
+            self_collision_checked = native_self is not None and native_self.enabled
+            if self_collision_checked:
+                # Calling this component directly also owns its one-state
+                # workspace; the full manager normally performs that setup.
+                native_self.setup_batch_tensors(*q.shape[:2])
+                components["native:self_collision"] = native_self.forward(state.robot_spheres)
+            tool = state.tool_poses
+            tool_index = tool.tool_frames.index(self.problem.tool_link)
+            position, quaternion = self.problem.transform_tool_pose(
+                tool.position[:, :, tool_index], tool.quaternion[:, :, tool_index])
+            progress = q.new_zeros(q.shape[:2])
+            for name, value in self._verification_scene.components(
+                    self.problem.transform_robot_spheres(state.robot_spheres),
+                    position, quaternion, progress, q, self.joint_names).items():
+                components[f"scene:{name}"] = value
+            residuals = {name: float(value.max().item()) for name, value in components.items()}
+        failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
+        return {
+            "passed": not failed, "residuals": residuals, "failed_components": failed,
+            "joint_names": list(self.joint_names), "joint_bounds": joint_bounds,
+            "scope": {
+                "kind": "necessary_conditions_at_fixed_measured_entrance",
+                "progress": 0., "active_joint_position_velocity": "native_effective_limits",
+                "native_self_collision_checked": bool(self_collision_checked),
+                "scene": "actual native FK with the declared conservative scene and gripper model",
+                "not_checked": ["acceleration", "jerk", "torque", "unprovided_locked_joint_velocity",
+                                "future_trajectory_feasibility", "physical_task_success"],
+            },
+        }
+    # END reject an immutable infeasible entrance before running native IK.
 
     def close(self):
         # BEGIN release native callback cycles at the request lifecycle boundary.
@@ -1883,6 +1954,12 @@ def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0"):
                    # END expose the request-sized native anchor allocation.
                    "attempts": []}
     try:
+        # BEGIN fixed entrance failures cannot be repaired by later IK or search.
+        diagnostics["initial_state"] = planner.initial_state_diagnostics()
+        if not diagnostics["initial_state"]["passed"]:
+            diagnostics["failure"] = "initial_state_infeasible"
+            return PlanningResult(False, None, diagnostics)
+        # END fixed entrance failures cannot be repaired by later IK or search.
         seeds, ik_success = planner.reference_seeds()
         diagnostics["reference_ik_success_counts"] = ik_success
         # BEGIN report the actual native execution and selected seed policy.

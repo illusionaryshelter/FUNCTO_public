@@ -904,7 +904,10 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
     ``skills`` is an ordered list/tuple of one or two entries containing
     ``skill_id``, the compiled ``program``, its current bound ``scene``, and
     explicit ``barrier_can_stop`` permission. Every skill keeps its complete
-    motion phases. Grounding inputs are copied. Next-skill manipulation uses
+    motion phases. A grasp additionally requires ``pregrasp_frame`` naming an
+    original observation before contact/closing: free planning ends there and
+    the remaining bound Cartesian approach is constrained throughout.
+    Grounding inputs are copied. Next-skill manipulation uses
     object geometry plus the proposed attachment, never the actual-Holding
     wrapper with invented facts.
     A caller continues execution past a barrier only after actual feedback and
@@ -980,23 +983,32 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             frame_anchor = None if predicted is None else predicted["frame_anchor"]
             if predicted is not None:
                 scene["carrier_pose"] = predicted["pose"].copy()
-            grounded = ground_program(program, scene)
-            protected = int(np.flatnonzero(frames == grounded["protected_start_frame"])[0])
+            # BEGIN end free planning at the explicit pre-grasp source frame.
+            # Select before grounding: otherwise the old free prefix would
+            # already have warped the short approach that must be preserved.
+            if spec.get("pregrasp_frame") is None:
+                raise ValueError("Every planned grasp requires an explicit pregrasp_frame")
+            grounded = ground_program(program, scene, pregrasp_frame=spec["pregrasp_frame"])
+            approach = int(np.flatnonzero(frames == grounded["pregrasp_frame"])[0])
             eef = grounded["eef_poses"]
-            if protected:
-                append_interval(0, protected, _path_from_rows(eef[:protected+1], source), "free", frame_anchor=frame_anchor)
+            if approach:
+                append_interval(0, approach, _path_from_rows(eef[:approach+1], source),
+                                "free", frame_anchor=frame_anchor)
             elif grounded["connection_required"]:
-                # No protected sample is displaced to manufacture an approach.
-                # A new free connection ends exactly at the required entrance.
+                # A pre-grasp at the first source observation still permits a
+                # free connection to that entrance, never to the grasp pose.
                 entry = _path_from_rows(np.stack((scene["eef_pose"], eef[0])), source)
                 phases.append(MotionPhase(f"{skill_id}:connection", entry, "free",
                                           metadata={"skill_id": skill_id, "no_source_frames": True,
                                                     "carrier_id": carrier_id,
                                                     "owner_initial_pose": owner_initial_poses[carrier_id].tolist()},
                                           frame_anchor=frame_anchor))
-            append_interval(protected, len(frames)-1, _path_from_rows(eef[protected:], source),
-                            metadata={"mode": "grasp", "candidate_attachment": grounded["candidate_T_carrier_eef"].tolist()},
+            append_interval(approach, len(frames)-1, _path_from_rows(eef[approach:], source),
+                            metadata={"mode": "grasp", "pregrasp_frame": grounded["pregrasp_frame"],
+                                      "protected_start_frame": grounded["protected_start_frame"],
+                                      "candidate_attachment": grounded["candidate_T_carrier_eef"].tolist()},
                             frame_anchor=frame_anchor)
+            # END end free planning at the explicit pre-grasp source frame.
             if spec.get("barrier_can_stop") is not True:
                 raise ValueError("Stable Holding verification requires an explicitly permitted hold boundary")
             carrier = scene.get("carrier_id")

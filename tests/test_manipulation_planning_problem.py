@@ -98,8 +98,10 @@ def grasp_input():
         "carrier_pose": pose((.1, .05, 0.)), "region_transform": pose(),
         "eef_pose": pose((-.1, .02, .2)),
     }
+    # BEGIN select an original pre-grasp ID independently of the contact suffix.
     return {"skill_id": "grasp", "program": {"skill_kind": "grasp", "demo": demo},
-            "scene": scene, "barrier_can_stop": True}
+            "scene": scene, "barrier_can_stop": True, "pregrasp_frame": 14}
+    # END select an original pre-grasp ID independently of the contact suffix.
 
 
 def manipulation_input():
@@ -1100,11 +1102,13 @@ class PlanningBuilderTest(unittest.TestCase):
         # END distinguish the two-skill limit from its complete five phases.
         placement, release_delta = alternative_placement(place)
         grasp_phases = [phase for phase in request.phases if phase.metadata.get("skill_id") == "grasp"]
-        nominal_grasp = np.concatenate((grasp_phases[0].reference.sample_numpy(np.linspace(0., 1., 3)),
-                                        grasp_phases[1].reference.sample_numpy(np.linspace(0., 1., 4))[1:]))
+        # BEGIN sample the explicit pre-grasp split, retaining all source nodes.
+        nominal_grasp = np.concatenate((grasp_phases[0].reference.poses,
+                                        grasp_phases[1].reference.poses[1:]))
         actual = np.concatenate((placement, (release_delta @ nominal_grasp)[1:]))
-        progress = torch.tensor([[0., 1./3, 2./3, 1., 1.5, 2., 3., 3.5,
-                                  4., 4.+1./3, 4.+2./3, 5.]], dtype=torch.float64)
+        progress = torch.tensor([[0., 1./3, 2./3, 1., 1.5, 2., 3.,
+                                  4., 4.25, 4.5, 4.75, 5.]], dtype=torch.float64)
+        # END sample the explicit pre-grasp split, retaining all source nodes.
         position, quaternion = components(actual[None])
         velocity = torch.zeros((1, progress.shape[1], 3), dtype=torch.float64)
         residuals = request.residuals(position, quaternion, progress, joint_velocity=velocity)
@@ -1137,10 +1141,11 @@ class PlanningBuilderTest(unittest.TestCase):
         self.assertEqual(transfer["scene"]["holding"]["source"], before["scene"]["holding"]["source"])
         np.testing.assert_array_equal(transfer["scene"]["initial_pose"], before["scene"]["initial_pose"])
 
-    def test_protected_first_observation_gets_an_explicit_connection(self):
+    # BEGIN constrain the original Cartesian approach before any contact.
+    def test_pregrasp_first_observation_gets_an_explicit_connection(self):
         skill = grasp_input()
         demo, scene = skill["program"]["demo"], skill["scene"]
-        demo["protected_start_frame"] = int(demo["frame_indices"][0])
+        skill["pregrasp_frame"] = int(demo["frame_indices"][0])
         request = compile_inputs(skill)
         self.assertEqual(len(request.phases), 2)
         self.assertEqual(request.phases[0].kind, "free")
@@ -1150,6 +1155,54 @@ class PlanningBuilderTest(unittest.TestCase):
                                    np.stack((scene["eef_pose"], expected[0])), atol=1e-12)
         np.testing.assert_allclose(request.phases[1].reference.poses, expected, atol=1e-12)
         self.assertEqual(request.phases[1].metadata["source_frames"], demo["frame_indices"].tolist())
+
+    def test_pregrasp_preserves_bound_tail_and_constrains_precontact_motion(self):
+        skill = grasp_input()
+        before = deepcopy(skill)
+        request = compile_inputs(skill)
+        demo, scene = skill["program"]["demo"], skill["scene"]
+        expected = scene["carrier_pose"] @ scene["region_transform"] @ demo["T_carrier_eef"]
+        free, approach = request.phases
+        self.assertEqual(free.kind, "free")
+        self.assertEqual(free.metadata["source_frames"], [11, 14])
+        self.assertEqual(approach.kind, "pose")
+        self.assertEqual(approach.metadata["source_frames"], [14, 17, 20, 23, 26])
+        self.assertEqual(approach.metadata["protected_start_frame"], 17)
+        np.testing.assert_array_equal(approach.reference.poses, expected[1:])
+        np.testing.assert_array_equal(free.reference.poses[-1], expected[1])
+        np.testing.assert_array_equal(free.reference.poses[0], scene["eef_pose"])
+        # The newly protected interval lies before the old contact boundary.
+        # An off-path displacement there must now fail a necessary pose check.
+        progress = torch.tensor([[0., 1., 1.125, 1.25, 1.5, 2.]], dtype=torch.float64)
+        position, quaternion = request.sample_reference(progress)
+        velocity = torch.zeros((1, progress.shape[1], 3), dtype=torch.float64)
+        np.testing.assert_allclose(request.evaluate(position, quaternion, progress,
+                                                    joint_velocity=velocity).numpy(), 0., atol=1e-12)
+        displaced = position.clone()
+        displaced[0, 2, 0] += .01
+        self.assertGreater(request.evaluate(displaced, quaternion, progress,
+                                            joint_velocity=velocity).max().item(), .009)
+        events = {event.event_id: event for event in request.events}
+        self.assertEqual(events["close"].source_frame, 20)
+        self.assertEqual(events["close"].progress, 1.5)
+        self.assertEqual(events["__stable_holding__"].source_frame, 26)
+        np.testing.assert_array_equal(demo["T_carrier_eef"], before["program"]["demo"]["T_carrier_eef"])
+        np.testing.assert_array_equal(demo["timestamps"], before["program"]["demo"]["timestamps"])
+        np.testing.assert_array_equal(scene["eef_pose"], before["scene"]["eef_pose"])
+        self.assertEqual(demo["gripper_events"], before["program"]["demo"]["gripper_events"])
+
+    def test_grasp_requires_a_real_pregrasp_observation_before_contact(self):
+        for value in (None, True, 1.5, 12, 17, 26):
+            skill = grasp_input()
+            skill["pregrasp_frame"] = value
+            with self.subTest(pregrasp_frame=value), self.assertRaisesRegex(ValueError, "pregrasp_frame"):
+                compile_inputs(skill)
+        skill = grasp_input()
+        skill["program"]["demo"]["protected_start_frame"] = 11
+        skill["pregrasp_frame"] = 11
+        with self.assertRaisesRegex(ValueError, "before protected_start_frame"):
+            compile_inputs(skill)
+    # END constrain the original Cartesian approach before any contact.
 
     def test_function_open_release_and_retreat_keep_distinct_source_boundaries(self):
         request = compile_inputs(manipulation_input())
