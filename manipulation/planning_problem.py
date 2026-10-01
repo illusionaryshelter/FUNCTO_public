@@ -968,8 +968,13 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
                                           "source_frames": frames[begin:end+1].tolist(), **kwargs.pop("metadata", {})},
                                 **kwargs)
             phases.append(phase)
+            # BEGIN use one exact clock value for each source vertex and event.
+            # Recomputing row/(end-begin) can differ from PosePath's stored
+            # linspace by one float64 ULP, creating two aliases of one event
+            # when the native clock later converts its anchors to float32.
             for row in range(begin, end+1):
-                frame_progress[int(frames[row])] = index+(row-begin)/max(1, end-begin)
+                frame_progress[int(frames[row])] = index+float(reference.progress[row-begin])
+            # END use one exact clock value for each source vertex and event.
             # A one-node phase still owns an endpoint, so its evidence and
             # verification barrier occur at that actual constant-pose end.
             if begin == end:

@@ -1202,6 +1202,21 @@ class PlanningBuilderTest(unittest.TestCase):
         skill["pregrasp_frame"] = 11
         with self.assertRaisesRegex(ValueError, "before protected_start_frame"):
             compile_inputs(skill)
+
+    def test_event_and_cartesian_vertex_share_the_exact_source_progress(self):
+        # A long interval exposes the one-ULP difference between independent
+        # division and linspace. One observed vertex must own one clock value.
+        skill = grasp_input()
+        demo = skill["program"]["demo"]
+        demo["frame_indices"] = 11+3*np.arange(72)
+        demo["timestamps"] = 2.+np.arange(72)*.1
+        demo["T_carrier_eef"] = np.array([pose((0., 0., z)) for z in np.linspace(.2, .02, 72)])
+        demo["protected_start_frame"] = int(demo["frame_indices"][57])
+        demo["gripper_events"][1]["frame_index"] = demo["protected_start_frame"]
+        request = compile_inputs(skill)
+        close = next(event for event in request.events if event.event_id == "close")
+        self.assertEqual(close.progress, 1.+request.phases[1].reference.progress[56])
+        self.assertEqual(len(request.anchors), 72)
     # END constrain the original Cartesian approach before any contact.
 
     def test_function_open_release_and_retreat_keep_distinct_source_boundaries(self):
