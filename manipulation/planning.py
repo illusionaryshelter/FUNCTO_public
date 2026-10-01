@@ -148,6 +148,109 @@ class JointTrajectory:
                 np.interp(query / self.duration, self.progress_u, self.progress_s))
 
 
+# BEGIN continuous acceleration bounds on the exact exported Hermite curve.
+def cubic_derivative_report(trajectory, acceleration_bounds, *, joint_names, until=None):
+    """Check each scalar cubic's acceleration range, including both knot sides.
+
+    Acceleration is affine within a cubic piece, so its extrema occur at that
+    piece's endpoints. An internal knot has two acceleration limits: evaluating
+    only ``curve(knot, 2)`` would lose the previous piece's left limit. A supplied
+    ``until`` clips the last piece at the original execution barrier; future
+    pieces do not enter that prefix report. Limits are bound by joint identity
+    and compared in binary64 without adding a numerical or physical allowance.
+
+    The input remains the original CubicHermiteSpline. Its C1 construction and
+    raw floating-point knot jumps are reported; acceleration jumps do not add a
+    C2 requirement. This checks a reference polynomial, not actual robot motion,
+    continuous collision, jerk at jumps, or actuator forces.
+    """
+    names, curve_names = tuple(joint_names), tuple(trajectory.joint_names)
+    bounds = np.asarray(acceleration_bounds, dtype=float)
+    if (not names or len(set(names)) != len(names) or len(set(curve_names)) != len(curve_names)
+            or set(names) != set(curve_names) or bounds.shape != (2, len(names))
+            or not np.isfinite(bounds).all() or np.any(bounds[0] > bounds[1])):
+        raise ValueError("Continuous acceleration checks require complete finite named lower/upper bounds")
+    bounds = bounds[:, [names.index(name) for name in curve_names]]
+    times = np.asarray(trajectory.times, dtype=float)
+    position, velocity = np.asarray(trajectory.position, dtype=float), np.asarray(trajectory.velocity, dtype=float)
+    if (times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all() or times[0] != 0.
+            or np.any(np.diff(times) <= 0.) or position.shape != (len(times), len(names))
+            or velocity.shape != position.shape or not np.isfinite(position).all()
+            or not np.isfinite(velocity).all()):
+        raise ValueError("Continuous acceleration checks require a complete finite ordered Hermite curve")
+    curve = CubicHermiteSpline(times, position, velocity, axis=0)
+    if (not np.array_equal(curve.x, trajectory._curve.x)
+            or not np.array_equal(curve.c, trajectory._curve.c)):
+        raise ValueError("Exported arrays differ from the executable Hermite polynomial")
+    stop = float(times[-1] if until is None else until)
+    if not np.isfinite(stop) or not 0. <= stop <= times[-1]:
+        raise ValueError("Derivative report interval must lie inside the original curve")
+    indices = np.flatnonzero(times[:-1] < stop)
+    if not len(indices):
+        # A zero-length prefix reports the initial right derivative only.
+        indices = np.array([0])
+    ends = np.minimum(times[indices+1], stop)
+    widths = (ends-times[indices])[:, None]
+    coefficients = curve.c[:, indices]
+    acceleration = np.stack((2*coefficients[1],
+                             6*coefficients[0]*widths+2*coefficients[1]), axis=1)
+    values = acceleration.reshape(-1, len(names))
+    endpoint_times = np.stack((times[indices], ends), axis=1).reshape(-1)
+    if not np.isfinite(values).all():
+        raise ValueError("Nonfinite analytic acceleration on the exported polynomial")
+    columns = np.arange(len(names))
+    low_indices, high_indices = values.argmin(axis=0), values.argmax(axis=0)
+    minimum, maximum = values[low_indices, columns], values[high_indices, columns]
+    lower_excess, upper_excess = np.maximum(bounds[0]-minimum, 0.), np.maximum(maximum-bounds[1], 0.)
+    excess = np.stack((lower_excess, upper_excess))
+    maximum_excess = float(excess.max())
+    witness = None
+    if maximum_excess > 0.:
+        bound_index, joint_index = np.unravel_index(excess.argmax(), excess.shape)
+        endpoint = (low_indices if bound_index == 0 else high_indices)[joint_index]
+        witness = {"joint_name": curve_names[joint_index], "time_s": float(endpoint_times[endpoint]),
+                   "segment_index": int(indices[endpoint//2]),
+                   "side": "segment_start" if endpoint % 2 == 0 else "segment_end_left_limit",
+                   "acceleration": float(values[endpoint, joint_index]),
+                   "bound": float(bounds[bound_index, joint_index]), "excess": maximum_excess}
+
+    # Only internal breakpoints of the requested interval have two executed
+    # sides. In particular, a barrier exactly at a knot excludes future ddq.
+    internal = np.flatnonzero(times[1:-1] < stop)
+    c, h = curve.c, np.diff(times)[:, None]
+    q_end = ((c[0]*h+c[1])*h+c[2])*h+c[3]
+    dq_end = (3*c[0]*h+2*c[1])*h+c[2]
+    ddq_end = 6*c[0]*h+2*c[1]
+    jumps = {
+        "position": c[3, 1:]-q_end[:-1],
+        "velocity": c[2, 1:]-dq_end[:-1],
+        "acceleration": 2*c[1, 1:]-ddq_end[:-1],
+    }
+    continuity = {"c1_by_hermite_construction": True, "internal_breakpoints": len(internal),
+                  "acceleration_jump_is_rejection": False}
+    for label, jump in jumps.items():
+        selected = jump[internal]
+        if not np.isfinite(selected).all():
+            raise ValueError("Nonfinite derivative jump on the exported polynomial")
+        continuity[f"{label}_maximum_absolute_jump"] = (
+            np.abs(selected).max(axis=0) if len(selected) else np.zeros(len(names))).tolist()
+    return {
+        "scope": "binary64 polynomial acceleration ranges and knot continuity; no actual-motion or collision certification",
+        "checked_interval_s": [0., stop], "full_curve_duration_s": float(times[-1]),
+        "joint_names": list(curve_names), "checked_piece_count": len(indices),
+        "acceleration_bounds": bounds.tolist(),
+        "acceleration": {"minimum": minimum.tolist(), "maximum": maximum.tolist(),
+                         "minimum_time_s": endpoint_times[low_indices].tolist(),
+                         "maximum_time_s": endpoint_times[high_indices].tolist(),
+                         "maximum_absolute": np.maximum(np.abs(minimum), np.abs(maximum)).tolist(),
+                         "lower_excess": lower_excess.tolist(), "upper_excess": upper_excess.tolist(),
+                         "maximum_bound_excess": maximum_excess, "bounds_satisfied": maximum_excess == 0.,
+                         "maximum_violation": witness},
+        "continuity": continuity,
+    }
+# END continuous acceleration bounds; no C2 requirement or curve modification.
+
+
 @dataclass
 class PlanningResult:
     success: bool
@@ -1875,6 +1978,17 @@ class _CuroboPlanner:
         trajectory = JointTrajectory(self.joint_names, times, position, velocity,
                                      self.progress_map.u.copy(), self.progress_map.s.copy(),
                                      tuple(event_records), deepcopy(self.problem.conditions), {})
+        # BEGIN complete the existing native acceleration bound between samples.
+        # These are the actual verification manager's named limits, after
+        # native model construction. Input YAML scalars and sampled right-side
+        # accelerations cannot substitute for the complete exported curve.
+        cspace = self._verification_native.get_cost("cspace")
+        if cspace is None or not cspace.enabled:
+            raise ValueError("Export requires enabled native joint-state limits")
+        limits = cspace.config.joint_limits
+        derivatives = cubic_derivative_report(
+            trajectory, limits.acceleration.detach().cpu().numpy(), joint_names=limits.joint_names)
+        # END no new bound, tolerance, C2 requirement or retiming is introduced.
         # Each native interval is one cubic piece.  Use its derivative extrema
         # to bound joint displacement between validation queries; endpoints
         # alone could hide a reversing excursion.
@@ -1942,6 +2056,29 @@ class _CuroboPlanner:
                                               - self.problem.numerical.joint)
         residuals["initial_velocity"] = max(0., float(np.max(np.abs(velocity[0]-self.start.velocity[0].detach().cpu().numpy())))
                                               - self.problem.numerical.velocity)
+        # BEGIN require the existing acceleration limits on every cubic piece.
+        # This residual is raw joint-coordinate acceleration excess, not a
+        # weighted native cost. The original candidate selector already rejects
+        # every positive residual. Jump magnitudes remain diagnostic only.
+        residuals["continuous_acceleration"] = derivatives["acceleration"]["maximum_bound_excess"]
+        self.last_validation["cubic_derivatives"] = derivatives
+        witness = derivatives["acceleration"]["maximum_violation"]
+        if witness is not None:
+            parameter = witness["time_s"]/times[-1]
+            self.last_validation["measurements"].update({
+                "continuous_acceleration:maximum_violation_time": witness["time_s"],
+                "continuous_acceleration:maximum_violation_u": parameter,
+                "continuous_acceleration:maximum_violation_progress": float(np.interp(
+                    parameter, self.progress_map.u, self.progress_map.s)),
+            })
+            # The existing bounded refinement consumes these coordinates and
+            # residuals, not measurements. Retain the exact analytic witness
+            # even if that time already has a sampled right-side acceleration;
+            # cubic_derivatives above identifies the failing piece and side.
+            self.last_validation["u"] = np.r_[self.last_validation["u"], parameter]
+            self.last_validation["violations"] = np.r_[
+                self.last_validation["violations"], witness["excess"]]
+        # END continuous acceleration acceptance; C1/C2 reports do not add gates.
         trajectory.residuals = residuals
         return trajectory, len(queries)
 

@@ -19,6 +19,10 @@ import torch
 
 from manipulation.planning import (
     PlanningBudget,
+    # BEGIN exact executable-polynomial acceleration regressions.
+    JointTrajectory,
+    cubic_derivative_report,
+    # END shared production calculus.
     _CuroboPlanner,
     _ProgressMap,
     # BEGIN actual-anchor allocation and projection preflight regressions.
@@ -92,8 +96,9 @@ def export_fixture(problem, progress_map, position, velocity, dt):
 
     Native integration is a separate test responsibility. Here FK maps the
     supplied three coordinates to Cartesian translation exactly; all scene
-    and native-limit residuals are empty/zero so only the requested process
-    and timing semantics can determine the result.
+    and sampled native-limit residuals are empty/zero. Explicit broad analytic
+    acceleration bounds keep ordinary fixtures focused on process/timing;
+    acceleration regressions replace those bounds with their stated values.
     """
     position = torch.as_tensor(position, dtype=torch.float64)[None]
     velocity = torch.as_tensor(velocity, dtype=torch.float64)[None]
@@ -127,8 +132,14 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     planner._verification_fk = CartesianKinematics()
     planner._verification_scene = SimpleNamespace(
         evaluate=lambda spheres, p, r, s, q, names: torch.zeros_like(s))
+    # BEGIN give the real exporter explicit, finite native acceleration bounds.
+    limits = SimpleNamespace(joint_names=list(problem.joint_names),
+        acceleration=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64))
+    cspace = SimpleNamespace(enabled=True, config=SimpleNamespace(joint_limits=limits))
     planner._verification_native = SimpleNamespace(
+        get_cost={"cspace": cspace}.get,
         compute_costs=lambda state: SimpleNamespace(names=(), values=()))
+    # END these analytic fixture bounds are not a robot-model assertion.
     return planner, SimpleNamespace(batch_size=1, num_seeds=1, get_interpolated_plan=lambda: native)
 
 
@@ -1612,7 +1623,103 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
 # END independent native-result selection and continuation regressions.
 
 
+# BEGIN exact knot-side, barrier and named-bound acceleration regressions.
+class ContinuousCubicDerivativeTests(unittest.TestCase):
+    @staticmethod
+    def curve():
+        # The moving coordinate is t**3 on [0,1], then 1+3*(t-1).
+        # All stored-knot right accelerations are zero, while the left
+        # acceleration at t=1 is six. q/dq are continuous at that same knot.
+        return JointTrajectory(("stationary", "moving"), np.array([0., 1., 2.]),
+            np.array([[0., 0.], [0., 1.], [0., 4.]]),
+            np.array([[0., 0.], [0., 3.], [0., 3.]]),
+            np.array([0., 1.]), np.array([0., 1.]), (), (), {})
+
+    def test_left_acceleration_limit_and_reordered_asymmetric_bounds(self):
+        curve = self.curve()
+        np.testing.assert_array_equal(curve._curve(curve.times, 2), np.zeros((3, 2)))
+        report = cubic_derivative_report(curve, [[-2., -.1], [5., .1]],
+                                         joint_names=("moving", "stationary"))
+        self.assertEqual(report["joint_names"], ["stationary", "moving"])
+        self.assertEqual(report["acceleration_bounds"], [[-.1, -2.], [.1, 5.]])
+        self.assertEqual(report["acceleration"]["maximum"], [0., 6.])
+        self.assertEqual(report["acceleration"]["upper_excess"], [0., 1.])
+        self.assertEqual(report["acceleration"]["maximum_violation"], {
+            "joint_name": "moving", "time_s": 1., "segment_index": 0,
+            "side": "segment_end_left_limit", "acceleration": 6., "bound": 5., "excess": 1.})
+
+    def test_prefix_clips_inside_piece_and_keeps_left_side_at_exact_barrier(self):
+        curve = self.curve()
+        arguments = dict(acceleration_bounds=[[-2., -.1], [5., .1]],
+                         joint_names=("moving", "stationary"))
+        partial = cubic_derivative_report(curve, until=.5, **arguments)
+        self.assertEqual(partial["checked_interval_s"], [0., .5])
+        self.assertEqual(partial["acceleration"]["maximum"], [0., 3.])
+        self.assertTrue(partial["acceleration"]["bounds_satisfied"])
+        exact = cubic_derivative_report(curve, until=1., **arguments)
+        self.assertEqual(exact["checked_piece_count"], 1)
+        self.assertEqual(exact["acceleration"]["maximum"], [0., 6.])
+        self.assertEqual(exact["continuity"]["internal_breakpoints"], 0)
+        self.assertFalse(exact["acceleration"]["bounds_satisfied"])
+        empty = cubic_derivative_report(curve, until=0., **arguments)
+        self.assertEqual(empty["acceleration"]["maximum"], [0., 0.])
+
+    def test_c1_curve_with_acceleration_jump_is_accepted_inside_existing_bounds(self):
+        report = cubic_derivative_report(self.curve(), [[-8., -.1], [8., .1]],
+                                         joint_names=("moving", "stationary"))
+        self.assertTrue(report["acceleration"]["bounds_satisfied"])
+        self.assertTrue(report["continuity"]["c1_by_hermite_construction"])
+        self.assertFalse(report["continuity"]["acceleration_jump_is_rejection"])
+        self.assertEqual(report["continuity"]["position_maximum_absolute_jump"], [0., 0.])
+        self.assertEqual(report["continuity"]["velocity_maximum_absolute_jump"], [0., 0.])
+        self.assertEqual(report["continuity"]["acceleration_maximum_absolute_jump"], [0., 6.])
+
+    def test_negative_acceleration_uses_lower_bound_and_curve_drift_is_rejected(self):
+        curve = self.curve()
+        curve.position *= -1.
+        curve.velocity *= -1.
+        curve.__post_init__()
+        report = cubic_derivative_report(curve, [[-.1, -5.], [.1, 20.]],
+                                         joint_names=curve.joint_names)
+        self.assertEqual(report["acceleration"]["lower_excess"], [0., 1.])
+        self.assertEqual(report["acceleration"]["maximum_violation"]["acceleration"], -6.)
+        curve.position[1, 1] += .1
+        with self.assertRaisesRegex(ValueError, "differ from.*polynomial"):
+            cubic_derivative_report(curve, [[-.1, -5.], [.1, 20.]], joint_names=curve.joint_names)
+
+    def test_missing_duplicate_and_nonfinite_effective_bounds_are_rejected(self):
+        for names, bounds in ((("moving",), [[-5.], [5.]]),
+                              (("moving", "moving"), [[-5., -5.], [5., 5.]]),
+                              (("stationary", "moving"), [[-5., -5.], [5., np.inf]])):
+            with self.subTest(names=names, bounds=bounds), self.assertRaisesRegex(ValueError, "named.*bounds"):
+                cubic_derivative_report(self.curve(), bounds, joint_names=names)
+# END acceleration jumps remain diagnostic, with no new C2 or jerk-jump gate.
+
+
 class ExportedCurveContractTests(unittest.TestCase):
+    # BEGIN the real exporter consumes the complete scalar acceleration check.
+    def test_analytic_acceleration_violation_enters_existing_candidate_residuals(self):
+        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free", require_end=False),))
+        planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
+            [[0., 0., 0.], [1., 0., 0.], [4., 0., 0.]],
+            [[0., 0., 0.], [3., 0., 0.], [3., 0., 0.]], 1.)
+        limits = planner._verification_native.get_cost("cspace").config.joint_limits
+        limits.acceleration[:, 0] = torch.tensor([-2., 5.], dtype=torch.float64)
+        trajectory, _ = planner.export(result)
+        self.assertEqual(trajectory.residuals["continuous_acceleration"], 1.)
+        self.assertEqual(planner.last_validation["cubic_derivatives"]["checked_interval_s"], [0., 2.])
+        self.assertEqual(planner.last_validation["measurements"]["continuous_acceleration:maximum_violation_time"], 1.)
+        self.assertEqual(planner.last_validation["u"][-1], .5)
+        self.assertEqual(planner.last_validation["violations"][-1], 1.)
+        planner.refinement_parameters = np.empty(0)
+        planner.trajopt.horizon = 4
+        # Neither ordinary sample failures nor pose anchors identify this
+        # knot's left acceleration. Its analytic witness must drive the same
+        # existing bounded refinement path as other curve violations.
+        self.assertIn(.5, planner.refinement_samples())
+        self.assertFalse(all(value <= 0. for value in trajectory.residuals.values()))
+    # END a zero sampled native residual cannot hide a left-limit violation.
+
     def test_multiple_native_seeds_cannot_be_flattened_into_one_export(self):
         problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),

@@ -78,13 +78,44 @@ def save_native_result(path, result, joint_names):
                                                    indent=2, allow_nan=False)+"\n")
 
 
+# BEGIN preserve the live verifier's effective named scalar bounds.
+def verification_joint_limits(planner):
+    """Copy constructed native bounds without guessing from robot YAML.
+
+    Config dataclasses can still contain ``joint_limits=None`` because each
+    live cost receives its bounds from the native transition model. Read that
+    actual cost instance, preserve its joint order/dtype, and require every
+    active joint exactly once before any curve report uses the matrices.
+    """
+    cost = planner._verification_native.get_cost("cspace")
+    if cost is None or not cost.enabled:
+        raise ValueError("Effective bounds require the enabled native verification cspace cost")
+    limits = cost.config.joint_limits
+    names = tuple(limits.joint_names)
+    if (not names or len(set(names)) != len(names) or len(set(planner.joint_names)) != len(planner.joint_names)
+            or set(names) != set(planner.joint_names)):
+        raise ValueError("Effective native limits must name every active joint exactly once")
+    result = {"source": "live planner._verification_native.get_cost('cspace').config.joint_limits",
+              "joint_names": list(names)}
+    for label in ("position", "velocity", "acceleration", "jerk"):
+        array = _cpu_array(getattr(limits, label))
+        if (array.shape != (2, len(names)) or not np.isfinite(array).all()
+                or np.any(array[0] > array[1])):
+            raise ValueError(f"Effective native {label} bounds require finite ordered lower/upper rows")
+        result[label] = array
+    return result
+# END no parsed-input fallback for effective native limits.
+
+
 def save_native_configuration(path, planner):
     """Record constructed configs, without traversing live solver objects.
 
     cuRobo configuration dataclasses contain tensors and Python class types;
     save tensors in NPZ and classes by qualified name. The repeated native
     robot_config is represented by the checked input robot dictionary below.
-    Its parsed runtime objects are intentionally outside this config record.
+    Its parsed runtime objects are intentionally outside this config record;
+    the live verifier's four effective scalar bound matrices are saved below
+    as a separate, explicitly named field.
     Unsupported values fail with their precise field path, rather than a
     repr string which could falsely suggest the configuration was preserved.
     """
@@ -123,7 +154,10 @@ def save_native_configuration(path, planner):
               "active_joint_names": planner.joint_names,
               "transition_horizon": planner.trajopt.horizon,
               "action_horizon": planner.trajopt.action_horizon,
-              "progress_u": planner.progress_map.u, "progress_s": planner.progress_map.s}
+              "progress_u": planner.progress_map.u, "progress_s": planner.progress_map.s,
+              # BEGIN retain runtime bounds in addition to existing configs.
+              "verification_joint_limits": verification_joint_limits(planner)}
+              # END native names and all four matrices keep their actual dtype.
     document = encode(values, "configuration")
     # JSON serialization happens before either file is written: NaN or an
     # unsupported configuration cannot leave an apparently complete record.
@@ -134,12 +168,15 @@ def save_native_configuration(path, planner):
 # END preserve native representations before candidate gathering/export.
 
 
-def save_curve(path, curve, *, classification, execution_limits, fk=None, validation_status="completed"):
+def save_curve(path, curve, *, classification, execution_limits, fk=None, validation_status="completed",
+               joint_limits=None):
     """Preserve the exact exported cubic, event identities and optional FK.
 
     ``fk`` contains independently evaluated native FK of this same exported
-    curve, in the problem reference frame. No reference path is substituted
-    when the planner fails or when FK has not been evaluated.
+    curve, in the problem reference frame. Native planner callers also supply
+    their effective bounds; the shared production calculus then reports both
+    the full curve and its original executable prefix. This recorder never
+    changes classification based on an additional report.
     """
     arrays = dict(joint_names=np.asarray(curve.joint_names), times=curve.times,
                   position=curve.position, velocity=curve.velocity,
@@ -147,6 +184,21 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
                   classification=np.asarray(classification))
     if fk is not None:
         arrays.update(fk)
+    # BEGIN reuse production polynomial checks with the actual named limits.
+    derivative_metadata = {}
+    if joint_limits is not None:
+        from manipulation.planning import cubic_derivative_report
+        derivative_metadata = {
+            "verification_joint_limits": joint_limits,
+            "cubic_derivatives": {
+                "full_curve": cubic_derivative_report(
+                    curve, joint_limits["acceleration"], joint_names=joint_limits["joint_names"]),
+                "executable_prefix": cubic_derivative_report(
+                    curve, joint_limits["acceleration"], joint_names=joint_limits["joint_names"],
+                    until=curve.executable_until),
+            },
+        }
+    # END full/prefix diagnostics do not relabel or resample the saved curve.
     np.savez_compressed(path, **arrays)
     path.with_suffix(".json").write_text(json.dumps(
         {"classification": classification, "validation_status": validation_status,
@@ -155,7 +207,7 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
          "conditions": curve.conditions, "residuals": curve.residuals,
          "duration_seconds": curve.duration,
          "executable_until_seconds": curve.executable_until,
-         "next_verification": curve.next_verification},
+         "next_verification": curve.next_verification, **derivative_metadata},
         default=_json_value, indent=2, allow_nan=False)+"\n")
 
 
@@ -190,6 +242,9 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
     original_curve_init = planning.JointTrajectory.__post_init__
     native_trace = None
     configuration_index = 0
+    # BEGIN retain an owned CPU copy before the native planner is released.
+    selected_joint_limits = None
+    # END no live solver reference is retained by the recording adapter.
 
     def record_stage(stage):
         try:
@@ -243,6 +298,8 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
 
     def preserve_candidate(planner, curve, attempt, *, validation_status):
         """Keep a constructed native curve without changing its acceptance."""
+        nonlocal selected_joint_limits
+        selected_joint_limits = None
         index = len(report["candidates"])
         classification = ("planner_accepted" if attempt["accepted"]
                           else "rejected_diagnostic_not_executable")
@@ -251,11 +308,15 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
                  "attempt": deepcopy(attempt), "validation_status": validation_status,
                  "curve_saved": False, "native_result": native_trace}
         try:
+            # BEGIN retain the exact verifier that produced this candidate.
+            selected_joint_limits = verification_joint_limits(planner)
+            # END no previous candidate's limits can fill a missing record.
             # Save CPU evidence before optional display FK. A visualization
             # failure must not change the production candidate or its checks.
             save_curve(path, curve, classification=classification, validation_status=validation_status,
-                       execution_limits=execution_limits)
+                       execution_limits=execution_limits, joint_limits=selected_joint_limits)
             entry["curve_saved"] = True
+            entry["analytic_derivatives_saved"] = True
             # A private native FK buffer leaves the optimizer's reusable
             # buffers untouched. Preserve the exported curve's named order.
             fk = Kinematics(planner.ik.kinematics.config,
@@ -271,7 +332,8 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
                 sampled = {"eef_position": position[0].cpu().numpy().copy(),
                            "eef_quaternion_wxyz": quaternion[0].cpu().numpy().copy()}
             save_curve(path, curve, classification=classification, fk=sampled,
-                       validation_status=validation_status, execution_limits=execution_limits)
+                       validation_status=validation_status, execution_limits=execution_limits,
+                       joint_limits=selected_joint_limits)
             entry["display_fk_saved"] = True
         except Exception as error:
             entry["diagnostic_error"] = f"{type(error).__name__}: {error}"
@@ -335,8 +397,13 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
         report.update(status="completed", success=result.success,
                       diagnostics=result.diagnostics)
         if result.trajectory is not None:
+            # BEGIN accepted artifacts retain their own effective native bounds.
+            if selected_joint_limits is None:
+                raise ValueError("Accepted curve recording requires its actual native verifier bounds")
+            # END recording failure cannot silently omit the derivative evidence.
             save_curve(output/"trajectory.npz", result.trajectory,
-                       classification="planner_accepted", execution_limits=execution_limits)
+                       classification="planner_accepted", execution_limits=execution_limits,
+                       joint_limits=selected_joint_limits)
         return result
     except KeyboardInterrupt:
         report.update(status="interrupted", interruption_reason="Explicit operator interrupt")
