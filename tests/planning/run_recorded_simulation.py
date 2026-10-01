@@ -25,7 +25,9 @@ WORKSPACE_ROOT = PROJECT_ROOT.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from recorded_simulation import RecordedSimulation, load_saved_trajectory
+# BEGIN explicit fixed finger goals alongside the exported arm cubic.
+from recorded_simulation import FixedFingerTargets, RecordedSimulation, load_saved_trajectory
+# END explicit fixed finger goals alongside the exported arm cubic.
 from recorded_skill_evaluation import NativeSkillPhysicsEvaluator
 
 
@@ -123,6 +125,11 @@ def run(args):
     started = time.monotonic()
     report = {"status": "preparing", "segment_id": args.segment,
         "trajectory_path": str(args.trajectory.resolve()), "trajectory_classification": None,
+        # BEGIN independent position-target input and unverified robot handoff.
+        "finger_targets_path": str(args.finger_targets.resolve()),
+        "robot_feedback_path": None, "barrier_feedback_path": None,
+        "evidence_passed": False,
+        # END independent position-target input and unverified robot handoff.
         "evaluation_mode": args.evaluation_mode, "physics_outcome": "not_evaluated",
         "physics_success": None, "videos": [], "video_requested": not args.no_video,
         "execution_report_path": str(output/"execution"/"execution-report.json"),
@@ -147,6 +154,22 @@ def run(args):
                 or feedback["arm_joint_names"] != fixture["arm_joint_names"]
                 or feedback["finger_joint_names"] != fixture["finger_joint_names"]):
             raise ValueError("The trial fixture and named feedback must have identical robot bindings")
+        # BEGIN preserve explicit coordinate identities for the actual handoff.
+        tool_transform = np.asarray(feedback["tool_transform"], dtype=float)
+        if (feedback["tool_link"] != fixture["tool_link"]
+                or feedback["reference_frame"] != segment["snapshot"]["reference_frame"]
+                or tool_transform.shape != (4, 4) or not np.isfinite(tool_transform).all()):
+            raise ValueError("Robot handoff requires the initial feedback's explicit tool and reference-frame binding")
+        initial_feedback = {"joint_names": feedback["joint_names"],
+            "arm_joint_names": feedback["arm_joint_names"], "finger_joint_names": feedback["finger_joint_names"],
+            "q": feedback["start_q"], "dq": feedback["start_dq"],
+            "base_pose": feedback["base_pose"], "tool_pose": feedback["eef_pose"],
+            "sim_time": feedback["sim_time_s"], "timestamp_s": feedback["sim_time_s"],
+            "reference_frame": feedback["reference_frame"], "tool_link": feedback["tool_link"],
+            "tool_transform": tool_transform.tolist(),
+            "feedback_id": str(args.feedback.resolve()), "source": feedback["source"]}
+        finger_targets = FixedFingerTargets.from_mapping(_read(args.finger_targets))
+        # END preserve explicit coordinate identities for the actual handoff.
         recording = (root/manifest["source_recording"]).resolve()
         source_manifest_path = recording/"manifest.json"
         source = _read(source_manifest_path)
@@ -172,7 +195,6 @@ def run(args):
             catalog_path=fixture["catalog_path"], episode_path=fixture["episode_path"],
             frame_index=feedback["entry_frame"], base_link=fixture["base_link"], tcp_site=fixture["tcp_site"],
             arm_joint_names=fixture["arm_joint_names"], finger_joint_names=fixture["finger_joint_names"],
-            gripper_type=args.gripper_type, policy_frequency=environment["control_freq_hz"],
             arm_kp=arm_config["kp"], arm_kd=arm_config["kd"])
         current = simulation.proprioception()
         differences = {"q": float(np.max(np.abs(current["q"]-np.asarray(feedback["start_q"])))),
@@ -188,6 +210,7 @@ def run(args):
                 "policy_frequency_hz": environment["control_freq_hz"]},
             provenance={"input_manifest": str(args.manifest.resolve()),
                 "robot_fixture": str(args.robot_fixture.resolve()), "feedback": str(args.feedback.resolve()),
+                "finger_targets": str(args.finger_targets.resolve()),
                 "program": str((root/segment["program_path"]).resolve()),
                 "evaluator_evidence": str(args.evaluator_evidence.resolve())})
         catalog = _read(fixture["catalog_path"])
@@ -218,11 +241,17 @@ def run(args):
 
         report["status"] = "executing"
         execution = simulation.execute(curve, evaluation_mode=args.evaluation_mode,
+            finger_targets=finger_targets, initial_feedback=initial_feedback,
             output=output/"execution", step_callback=observe,
             max_physics_steps=args.max_physics_steps,
             start_position_tolerance=args.start_position_tolerance,
             start_velocity_tolerance=args.start_velocity_tolerance)
         report["execution_tested"] = execution["executed_steps"] > 0
+        # BEGIN export robot-only feedback for a separately verified handoff.
+        report.update(robot_feedback_path=execution["robot_feedback_path"],
+                      barrier_feedback_path=execution["barrier_feedback_path"],
+                      handoff_status="requires current scene observation and verified holding evidence")
+        # END export robot-only feedback for a separately verified handoff.
         if videos is not None:
             videos.capture(execution["elapsed_sim_s"], final=True)
         report["status"] = "completed"
@@ -257,11 +286,12 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("manifest", "robot-fixture", "feedback", "trajectory", "evaluator-evidence", "output"):
+    # BEGIN require target positions explicitly, without the binary formatter.
+    for name in ("manifest", "robot-fixture", "feedback", "trajectory", "finger-targets", "evaluator-evidence", "output"):
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--segment", required=True)
     parser.add_argument("--controller-part", required=True)
-    parser.add_argument("--gripper-type", required=True)
+    # END require target positions explicitly, without the binary formatter.
     parser.add_argument("--evaluation-mode", required=True,
                         choices=("accepted_plan", "diagnostic_rejected_candidate"))
     camera = parser.add_mutually_exclusive_group(required=True)
