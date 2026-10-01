@@ -58,10 +58,11 @@ def save_curve(path, curve, *, classification, fk=None, validation_status="compl
 def plan_and_record(problem, scene, robot, output, *, budget, provenance):
     """Call ``plan_trajectory`` once and preserve its measured outcome.
 
-    The scoped observer copies each selected continuation *after* the normal
-    candidate checks. It neither changes selection nor lets a diagnostic
-    candidate escape as ``PlanningResult.trajectory``. All CUDA work remains
-    within the caller's explicit single-process resource budget.
+    The scoped observer copies checked continuations and exact native curves
+    whose final verification could not finish. Their validation statuses are
+    distinct. It never changes selection or lets a rejected diagnostic curve
+    escape as ``PlanningResult.trajectory``. All CUDA work stays within the
+    caller's explicit single-process resource budget.
     """
     import torch
     from curobo.kinematics import Kinematics
@@ -82,17 +83,22 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
     original_export = planning._CuroboPlanner.export
     original_curve_init = planning.JointTrajectory.__post_init__
 
+    def record_stage(stage):
+        try:
+            (output/"progress.json").write_text(json.dumps(stage)+"\n")
+            print(json.dumps(stage), flush=True)
+        except OSError as error:
+            report.setdefault("observer_errors", []).append(f"Stage record: {type(error).__name__}: {error}")
+
     def stage_observer(method, name):
         """Expose coarse native stages without polling or changing solver work."""
         def measured(planner, *args, **kwargs):
             stage = {"stage": name, "state": "started",
                      "elapsed_seconds": time.monotonic()-started}
-            (output/"progress.json").write_text(json.dumps(stage)+"\n")
-            print(json.dumps(stage), flush=True)
+            record_stage(stage)
             result = method(planner, *args, **kwargs)
             stage.update(state="completed", elapsed_seconds=time.monotonic()-started)
-            (output/"progress.json").write_text(json.dumps(stage)+"\n")
-            print(json.dumps(stage), flush=True)
+            record_stage(stage)
             return result
         return measured
 
@@ -147,9 +153,13 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance):
                 return original_export(planner, native_result)
         except ValueError as error:
             if len(constructed) == 1:
-                preserve_candidate(planner, constructed[0],
-                    {"accepted": False, "native_success": bool(native_result.success.all()),
-                     "export_error": str(error)}, validation_status="not_completed")
+                try:
+                    preserve_candidate(planner, constructed[0],
+                        {"accepted": False, "native_success": bool(native_result.success.all()),
+                         "export_error": str(error)}, validation_status="not_completed")
+                except Exception as diagnostic_error:
+                    report.setdefault("observer_errors", []).append(
+                        f"Rejected curve record: {type(diagnostic_error).__name__}: {diagnostic_error}")
             raise
 
     def observed(planner, native_result):
