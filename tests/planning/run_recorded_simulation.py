@@ -212,8 +212,11 @@ def run(args, *, observation_callback=None):
         planning_result = load_saved_trajectory(args.trajectory, execution_limits=execution_limits)
         curve = planning_result.trajectory
         # END the loader checks exact candidate, clock and physical policy.
-        metadata = _read(args.trajectory.with_suffix(".json"))
-        report["trajectory_classification"] = metadata["classification"]
+        # BEGIN use the same archive already checked by the formal loader.
+        # Ordinary inputs keep their 16 MiB bound; the complete scene archive
+        # owns its separate admission limit and is not read or decoded twice.
+        report["trajectory_classification"] = planning_result.diagnostics["archive_classification"]
+        # END reporting cannot observe a different second copy of the archive.
         # BEGIN bind every physical trial to its identical recorded hand policy.
         # The saved-curve loader already checked classification and exact limits
         # before any simulator restoration or physical command can take place.

@@ -26,7 +26,9 @@ from manipulation.planning import JointTrajectory, PlanningResult
 from manipulation.execution import ExecutionGuardError, ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
 from manipulation.gripper_trajectory import FingerTrajectory
 from manipulation.robosuite_execution import RobosuiteExecutionBackend
-from recorded_simulation import load_saved_trajectory
+# BEGIN archive admission precedes JSON allocation and formal result loading.
+from recorded_simulation import load_curve_archive, load_saved_trajectory
+# END both inspection and execution share the same bounded first read.
 # END exercise production execution through the thin recording adapter.
 
 
@@ -273,7 +275,13 @@ class SavedExecutionContractTests(unittest.TestCase):
             path = Path(temporary)/"curve.npz"
             save_curve(path, curve, classification="planner_accepted", execution_limits=limits.describe(),
                        planning_result=_result(curve))
-            loaded = load_saved_trajectory(path, execution_limits=limits)
+            # BEGIN classification is returned from the single validated decode.
+            with patch("recorded_simulation.json.loads", wraps=json.loads) as decode:
+                loaded = load_saved_trajectory(path, execution_limits=limits)
+            self.assertEqual(decode.call_count, 1)
+            self.assertEqual(loaded.diagnostics["archive_classification"], "planner_accepted")
+            self.assertEqual(loaded.execution_binding["execution_limits"], limits.describe())
+            # END the existing altered-limit and rejected-label cases still fail.
             self.assertEqual(loaded.trajectory.events, curve.events)
             self.assertEqual(loaded.trajectory.finger_trajectory.describe(), curve.finger_trajectory.describe())
             metadata_path = path.with_suffix(".json")
@@ -290,6 +298,24 @@ class SavedExecutionContractTests(unittest.TestCase):
             save_curve(path, curve, classification="rejected_diagnostic_not_executable", execution_limits=limits.describe())
             with self.assertRaisesRegex(ValueError, "not executable"):
                 load_saved_trajectory(path, execution_limits=limits)
+
+    # BEGIN oversized archives must fail before text, JSON or NPZ allocation.
+    def test_oversized_archive_is_rejected_before_read_or_decode(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary)/"oversized.npz"
+            # A sparse metadata file exercises the real filesystem size check
+            # without allocating a 64-MiB string or requiring an NPZ payload.
+            with path.with_suffix(".json").open("wb") as stream:
+                stream.truncate(64*1024**2+1)
+            with patch("recorded_simulation.Path.read_text") as read, \
+                    patch("recorded_simulation.json.loads") as decode, \
+                    patch("recorded_simulation.np.load") as arrays:
+                with self.assertRaisesRegex(ValueError, "64 MiB archive"):
+                    load_curve_archive(path)
+            read.assert_not_called()
+            decode.assert_not_called()
+            arrays.assert_not_called()
+    # END ordinary metadata bounds and physical limits are not relaxed.
 
     # BEGIN saved command curves cannot be replaced by old step targets.
     def test_saved_finger_polynomial_requires_matching_metadata_and_all_arrays(self):

@@ -29,7 +29,15 @@ def load_curve_archive(path):
     from manipulation.planning import JointTrajectory
 
     path = Path(path)
-    metadata = json.loads(path.with_suffix(".json").read_text())
+    # BEGIN bound the complete formal scene archive before its first read.
+    # Exact ESDF bytes and validation evidence are larger than ordinary input
+    # metadata. Preserve them intact under a separate explicit archive limit;
+    # reject oversized input before allocating text or decoding JSON.
+    metadata_path = path.with_suffix(".json")
+    if metadata_path.stat().st_size > 64 * 1024**2:
+        raise ValueError(f"Trajectory metadata exceeds the bounded 64 MiB archive size: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text())
+    # END the archive is parsed once, without geometry or evidence truncation.
     with np.load(path, allow_pickle=False) as arrays:
         if str(arrays["classification"].item()) != metadata["classification"]:
             raise ValueError("Saved trajectory arrays and metadata disagree on planner status")
@@ -84,9 +92,12 @@ def load_saved_trajectory(path, *, execution_limits):
         raise ValueError("Loading an executable curve requires explicit ExecutionLimits")
     if metadata.get("execution_limits") != execution_limits.describe():
         raise ValueError("Saved curve and execution must contain identical physical execution limits")
-    result = PlanningResult(True, curve, {"origin": str(Path(path).resolve())},
+    # BEGIN retain validated archive status for callers without a second read.
+    result = PlanningResult(True, curve, {"origin": str(Path(path).resolve()),
+                            "archive_classification": metadata["classification"]},
                             execution_binding=metadata.get("execution_binding"))
     check_result(result, execution_limits=execution_limits)
+    # END no classification is returned without the full formal result check.
     return result
 # END independent preflight still runs for every restored formal result.
 
