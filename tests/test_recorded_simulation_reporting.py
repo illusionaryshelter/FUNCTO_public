@@ -10,12 +10,15 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from test_recorded_simulation import _fixture, _initial_feedback, _limit_values, _result
+from test_recorded_simulation import _fixture, _initial_feedback, _limit_values, _result, _executor, _limits
+from manipulation.execution import ExecutionGuardError, FixedFingerTargets, _feedback_json
 import run_recorded_simulation as runner
 
 
 @pytest.mark.parametrize("cleanup_failure", [False, True])
-def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(tmp_path, cleanup_failure):
+@pytest.mark.parametrize("archive_write_failure", [False, True])
+def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
+        tmp_path, cleanup_failure, archive_write_failure):
     simulation, curve, targets = _fixture()
     initial = _initial_feedback(simulation)
     primary = RuntimeError("original independent geometry rejection")
@@ -24,6 +27,15 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(tmp
         "elapsed_sim_s": .002,
         "abort_hold": {"physical_steps": 1}, "dependency_hold": None,
         "robot_feedback_path": "actual_failure_feedback", "barrier_feedback_path": None,
+        "geometry_preflight": {"passed": np.bool_(True), "checked_interval_s": [0., .0075],
+            "reference_collision_checked": True, "continuous_collision_certified": False,
+            "observed_scene_checked": True, "unknown_space_checked": False,
+            "nominal_scene": {"states": "must not be duplicated into the small summary"}},
+        "feedback_failure": {"point": "after_step", "curve_time_s": .002,
+            "physical_elapsed_s": .002, "actual_feedback": initial,
+            "violations": [{"kind": "arm_position_tracking", "name": "arm_0",
+                "measured": np.float64(.11), "expected": .10002, "maximum_error": .001}]},
+        "continuation": {"actual_feedback": initial},
         "large_geometry_diagnostic": "x"*(16*1024**2+1)}
 
     def save(name, value):
@@ -69,7 +81,10 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(tmp
             self.last_execution_report = shared_report
             path = kwargs["output"]/"execution-report.json"
             path.parent.mkdir()
-            path.write_text(json.dumps(shared_report))
+            if archive_write_failure:
+                shared_report["persistence_errors"] = [{"artifact": path.name, "error": "OSError: synthetic sink failure"}]
+            else:
+                path.write_text(json.dumps(_feedback_json(shared_report)))
             raise primary
 
     class Evaluator:
@@ -86,7 +101,8 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(tmp
             return {"physics_outcome": "not_evaluated", "physics_success": None}
 
     class Sensor:
-        observations = []
+        observations = [{"effect": {"value": "F", "window": {
+            "complete_window": np.bool_(False), "continuous_sampling": np.bool_(True)}}}]
         describe_calls = 0
 
         def describe(self):
@@ -124,7 +140,10 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(tmp
             runner.run(args)
     assert raised.value is primary
     report_path = args.output/"execution"/"execution-report.json"
-    assert report_path.stat().st_size > 16*1024**2
+    if archive_write_failure:
+        assert not report_path.exists()
+    else:
+        assert report_path.stat().st_size > 16*1024**2
     assert all(Path(call.args[0]) != report_path for call in reads.call_args_list)
     assert evaluator.finalized and videos.closed
     report = json.loads((args.output/"simulation-report.json").read_text())
@@ -135,15 +154,128 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(tmp
     assert report["execution_tested"] is False
     assert report["actual_physics_tested"] is True
     assert report["robot_feedback_path"] == "actual_failure_feedback"
+    assert report["geometry_preflight_summary"] == {"passed": True, "checked_interval_s": [0., .0075],
+        "reference_collision_checked": True, "continuous_collision_certified": False,
+        "observed_scene_checked": True, "unknown_space_checked": False}
+    assert report["feedback_failure_summary"]["first_violation"] == {
+        "kind": "arm_position_tracking", "name": "arm_0", "measured": .11,
+        "expected": .10002, "maximum_error": .001}
+    assert report["feedback_failure_summary"]["actual_feedback"] == _feedback_json(initial)
+    assert report["final_robot_feedback"] == _feedback_json(initial)
+    assert bool(report["execution_persistence_errors"]) is archive_write_failure
     assert (args.output/"exception.txt").read_text().rstrip().endswith(str(primary))
     assert videos.captures[-1] == ((.002,), {"final": True})
     if cleanup_failure:
         assert "evaluation_error" in report and "tactile_write_error" in report and "video_error" in report
         assert "video_final_capture_error" in report
     else:
-        assert (args.output/"tactile-observations.json").is_file()
+        tactile = json.loads((args.output/"tactile-observations.json").read_text())
+        assert tactile["observations"][0]["effect"]["window"] == {
+            "complete_window": False, "continuous_sampling": True}
         assert report["video_final_elapsed_s"] == .002
     assert simulation.sim_time == 1.3  # No native integration occurs in these doubles.
+
+
+# BEGIN actual sensor NumPy booleans survive a real executor guard and every sink.
+@pytest.mark.parametrize("failed_sink", [None, "continuation.json", "physical-trajectory.npz",
+                                       "failure-feedback.json", "execution-report.json", "all"])
+def test_numpy_tactile_observation_survives_tracking_rejection_and_independent_writes(tmp_path, failed_sink):
+    from test_simulated_tactile import _fixture as tactile_fixture, _sensor
+
+    simulation, curve, targets = _fixture()
+    tactile_simulation, config, binding, policy, tactile_feedback = tactile_fixture()
+    sensor = _sensor(tactile_simulation, config, binding, policy)
+    initial = _initial_feedback(simulation)
+    original_step = simulation._sim.step
+
+    def step():
+        original_step()
+        simulation.native_data.qpos[0] = .11
+
+    def observe(feedback, curve_time):
+        # The real two-pad observer reads its own tiny native fixture. This
+        # test synchronizes only its clock with the mocked arm executor.
+        tactile_simulation.native_data.time = feedback["timestamp_s"]
+        return sensor(tactile_feedback(), curve_time)
+
+    simulation._sim.step = step
+    executor = _executor(simulation)
+    primary = ExecutionGuardError("original measured tracking rejection")
+    write_error = OSError("injected evidence sink failure")
+    attempted = []
+    write_text, save_npz = Path.write_text, np.savez_compressed
+
+    def attempt(path, write):
+        attempted.append(Path(path).name)
+        if failed_sink in ("all", Path(path).name):
+            raise write_error
+        return write()
+
+    with patch("manipulation.robosuite_execution.mujoco.mj_forward"), \
+            patch("manipulation.execution.ExecutionGuardError", return_value=primary), \
+            patch.object(Path, "write_text", lambda path, *a, **kw: attempt(path, lambda: write_text(path, *a, **kw))), \
+            patch.object(np, "savez_compressed", lambda path, **kw: attempt(path, lambda: save_npz(path, **kw))):
+        with pytest.raises(ExecutionGuardError) as raised:
+            executor.execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=initial, execution_limits=_limits(simulation, curve),
+                output=tmp_path/"execution", observation_callback=observe)
+    assert raised.value is primary
+    assert attempted == ["continuation.json", "physical-trajectory.npz", "failure-feedback.json", "execution-report.json"]
+    report = executor.last_execution_report
+    assert report["feedback_failure"]["point"] == "after_step"
+    assert report["feedback_failure"]["violations"][0]["kind"] == "arm_position_tracking"
+    assert report["executed_steps"] == report["abort_hold"]["physical_steps"] == 1
+    assert report["continuation"]["consumed_physics_steps"] == 2
+    raw_window = sensor.observations[-1]["effect"]["window"]
+    assert isinstance(raw_window["complete_window"], np.bool_)
+    assert isinstance(raw_window["continuous_sampling"], np.bool_)
+    failed = set(attempted if failed_sink == "all" else [] if failed_sink is None else [failed_sink])
+    assert {row["artifact"] for row in report.get("persistence_errors", [])} == failed
+    output = tmp_path/"execution"
+    if "continuation.json" not in failed:
+        continuation = json.loads((output/"continuation.json").read_text())
+        assert continuation["effects"]["task:pinch"]["value"] == "F"
+        assert continuation["effects"]["task:pinch"]["window"]["complete_window"] is False
+        assert continuation["effects"]["task:pinch"]["window"]["continuous_sampling"] is True
+    if "physical-trajectory.npz" not in failed:
+        with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
+            assert saved["actual_q"].shape == (2, 9)
+            assert saved["actual_q"][-1, 0] == .11
+    if "failure-feedback.json" not in failed:
+        feedback = json.loads((output/"failure-feedback.json").read_text())
+        assert feedback["q"] == report["continuation"]["actual_feedback"]["q"].tolist()
+        assert feedback["sim_time"] == report["continuation"]["actual_feedback"]["sim_time"]
+    if "execution-report.json" not in failed:
+        saved = json.loads((output/"execution-report.json").read_text())
+        assert saved["error"] == f"ExecutionGuardError: {primary}"
+        assert {row["artifact"] for row in saved.get("persistence_errors", [])} == failed
+
+
+def test_first_sink_failure_is_raised_after_all_writers_when_execution_did_not_raise(tmp_path):
+    simulation, curve, targets = _fixture()
+    executor = _executor(simulation)
+    first = OSError("continuation sink failed")
+    attempted = []
+
+    def fail(path, *args, **kwargs):
+        attempted.append(Path(path).name)
+        raise first if len(attempted) == 1 else OSError("later sink failed")
+
+    with patch("manipulation.robosuite_execution.mujoco.mj_forward"), \
+            patch.object(Path, "write_text", fail), patch.object(np, "savez_compressed", fail):
+        with pytest.raises(OSError) as raised:
+            executor.execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                output=tmp_path/"execution")
+    assert raised.value is first
+    assert len(attempted) == 4
+    assert len(executor.last_execution_report["persistence_errors"]) == 4
+
+
+def test_feedback_scalar_conversion_does_not_stringify_unsupported_values():
+    with pytest.raises(TypeError):
+        json.dumps(_feedback_json({"unsupported": np.complex128(1+2j)}), allow_nan=False)
+# END the online evidence verdict and primary guard remain unchanged.
 
 
 def test_video_cleanup_attempts_every_writer_camera_and_timestamp_sink(tmp_path):

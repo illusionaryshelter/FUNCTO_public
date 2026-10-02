@@ -28,7 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(WORKSPACE_ROOT))
 
 # BEGIN production execution owns control; this adapter owns recording setup.
-from manipulation.execution import ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
+from manipulation.execution import ExecutionLimits, FixedFingerTargets, TrajectoryExecutor, _feedback_json
 from recorded_simulation import restore_recorded_simulation, load_saved_trajectory
 from robot_validation_fixture import build_robot_validator
 # END production execution and explicit recording adapter.
@@ -367,6 +367,27 @@ def run(args, *, observation_callback=None):
                     evaluator_excluded_hold_physics_steps=hold_steps,
                     robot_feedback_path=execution.get("robot_feedback_path"),
                     barrier_feedback_path=execution.get("barrier_feedback_path"))
+                # BEGIN retain bounded first-failure evidence without its full binding.
+                report["execution_persistence_errors"] = execution.get("persistence_errors", [])
+                preflight = execution.get("geometry_preflight", {})
+                report["geometry_preflight_summary"] = {key: preflight[key] for key in (
+                    "passed", "checked_interval_s", "reference_collision_checked",
+                    "continuous_collision_certified", "observed_scene_checked",
+                    "unknown_space_checked", "unknown_space_certified") if key in preflight}
+                failure = execution.get("feedback_failure")
+                if failure is not None:
+                    violations = failure.get("violations", [])
+                    first = violations[0] if violations else {}
+                    report["feedback_failure_summary"] = {
+                        key: failure[key] for key in ("point", "curve_time_s", "physical_elapsed_s",
+                            "reference_arm_q", "reference_arm_dq", "actual_feedback") if key in failure}
+                    report["feedback_failure_summary"].update(violation_count=len(violations),
+                        first_violation={key: value for key, value in first.items()
+                            if value is None or isinstance(value, (str, bool, int, float, np.generic))})
+                # This is the same post-hold measurement already owned by the
+                # executor, even when its dedicated feedback writer has failed.
+                report["final_robot_feedback"] = execution.get("continuation", {}).get("actual_feedback")
+                # END no per-state geometry list or planning archive is copied.
             except Exception as error:
                 caught = caught or error
                 report.update(status="error", execution_report_error=f"{type(error).__name__}: {error}")
@@ -392,8 +413,8 @@ def run(args, *, observation_callback=None):
         if tactile is not None:
             # BEGIN one failed evidence sink cannot prevent closing native videos.
             try:
-                (output/"tactile-observations.json").write_text(json.dumps({
-                    "sensor": tactile.describe(), "observations": tactile.observations},
+                (output/"tactile-observations.json").write_text(json.dumps(_feedback_json({
+                    "sensor": tactile.describe(), "observations": tactile.observations}),
                     indent=2, allow_nan=False)+"\n")
             except Exception as error:
                 caught = caught or error
@@ -420,7 +441,7 @@ def run(args, *, observation_callback=None):
                       peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024)
         # BEGIN even the final summary write must preserve a prior execution error.
         try:
-            (output/"simulation-report.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
+            (output/"simulation-report.json").write_text(json.dumps(_feedback_json(report), indent=2, allow_nan=False)+"\n")
         except Exception as error:
             caught = caught or error
         # END all evidence sinks above have already had their cleanup opportunity.

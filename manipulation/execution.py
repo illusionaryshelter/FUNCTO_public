@@ -209,6 +209,12 @@ def _finite_array(value, shape, label, *, nonnegative=False):
 
 def _feedback_json(value):
     """Keep a failed report writable; raw nonfinite feedback remains in NPZ."""
+    # BEGIN native scalar types retain their JSON value, including NumPy bool.
+    # Convert before descending so scalar tuples/arrays still use the same
+    # feedback policy. Unsupported values remain errors; nothing is stringified.
+    if isinstance(value, np.generic):
+        value = value.item()
+    # END finite values preserve their original boolean/numeric meaning.
     if isinstance(value, np.ndarray):
         return _feedback_json(value.tolist())
     if isinstance(value, dict):
@@ -1650,6 +1656,9 @@ class TrajectoryExecutor:
 
         q, dq, progress = trajectory.sample(0.)
         samples.append(record(0., q, dq, progress))
+        # BEGIN persistence failures must not replace a measured execution error.
+        execution_error = None
+        # END retain the primary exception separately from diagnostic sinks.
         try:
             # Preflight checks the declared model/reference contract without
             # stepping or preparing an actuator goal. Formal planning success
@@ -1747,6 +1756,7 @@ class TrajectoryExecutor:
             if active:
                 report["status"] = "curve_finished"
         except Exception as error:
+            execution_error = error
             if report["status"] != "feedback_rejected":
                 report["status"] = "execution_error"
             report["error"] = f"{type(error).__name__}: {error}"
@@ -1900,11 +1910,26 @@ class TrajectoryExecutor:
                     0 if report[key] is None else report[key]["physical_steps"]
                     for key in ("abort_hold", "dependency_hold")))}
             # END finishing command playback never asserts Holding or release.
+            # BEGIN each evidence sink is independent of the primary verdict.
+            persistence_errors = []
+
+            def persist(name, write):
+                """Attempt every artifact and retain exact write failures in memory."""
+                try:
+                    write()
+                except Exception as error:
+                    persistence_errors.append(error)
+                    report.setdefault("persistence_errors", []).append({
+                        "artifact": name, "error": f"{type(error).__name__}: {error}"})
+                    return False
+                return True
+
             continuation_path = (output/"continuation.json").resolve()
-            continuation_path.write_text(json.dumps(_feedback_json(report["continuation"]),
-                                                   indent=2, allow_nan=False)+"\n")
-            report["continuation_path"] = str(continuation_path)
-            np.savez_compressed(output/"physical-trajectory.npz", joint_names=np.asarray(backend.joint_names),
+            if persist(continuation_path.name, lambda: continuation_path.write_text(
+                    json.dumps(_feedback_json(report["continuation"]), indent=2, allow_nan=False)+"\n")):
+                report["continuation_path"] = str(continuation_path)
+            persist("physical-trajectory.npz", lambda: np.savez_compressed(
+                output/"physical-trajectory.npz", joint_names=np.asarray(backend.joint_names),
                 command_joint_names=np.asarray(backend.joint_names),
                 arm_joint_names=np.asarray(backend.arm_joint_names), finger_joint_names=np.asarray(backend.finger_joint_names),
                 elapsed=np.asarray([row["elapsed"] for row in samples]),
@@ -1944,12 +1969,12 @@ class TrajectoryExecutor:
                 arm_torque_saturated=np.asarray(saturated_torques, dtype=bool).reshape(-1, narm),
                 control_elapsed=np.arange(len(controls))*backend.timestep,
                 control_sim_time=sim_start+np.arange(len(controls))*backend.timestep,
-                gripper_command=np.asarray([row["gripper_command"] for row in samples]))
+                gripper_command=np.asarray([row["gripper_command"] for row in samples])))
             if report["status"] in ("stopped_for_evidence", "curve_finished", "feedback_rejected", "execution_error", "effect_rejected"):
                 # This is a robot-only observation. A later bridge still needs
                 # a current scene observation and independently verified
                 # holding evidence before constructing an attached-object model.
-                feedback = backend.proprioception()
+                feedback = deepcopy(report["continuation"]["actual_feedback"])
                 completed = report["status"] in ("stopped_for_evidence", "curve_finished")
                 name = ("failure-feedback.json" if not completed else
                         "barrier-feedback.json" if trajectory.next_verification is not None else "final-feedback.json")
@@ -1957,11 +1982,15 @@ class TrajectoryExecutor:
                 feedback.update(evidence_passed=report["evidence_passed"], next_verification=report["next_verification"],
                     initial_feedback_id=initial_feedback["feedback_id"])
                 feedback["execution_status"] = report["status"]
-                serializable = _feedback_json(feedback)
-                feedback_path.write_text(json.dumps(serializable, indent=2, allow_nan=False)+"\n")
-                report.update(robot_feedback_path=str(feedback_path), feedback_id=feedback["feedback_id"],
-                              barrier_feedback_path=str(feedback_path) if completed and trajectory.next_verification is not None else None)
-            (output/"execution-report.json").write_text(json.dumps(_feedback_json(report), indent=2, allow_nan=False)+"\n")
+                if persist(name, lambda: feedback_path.write_text(
+                        json.dumps(_feedback_json(feedback), indent=2, allow_nan=False)+"\n")):
+                    report.update(robot_feedback_path=str(feedback_path), feedback_id=feedback["feedback_id"],
+                                  barrier_feedback_path=str(feedback_path) if completed and trajectory.next_verification is not None else None)
+            persist("execution-report.json", lambda: (output/"execution-report.json").write_text(
+                json.dumps(_feedback_json(report), indent=2, allow_nan=False)+"\n"))
+            if persistence_errors and execution_error is None:
+                raise persistence_errors[0]
+            # END failed persistence never reports success or hides an execution error.
         return report
 
 # END production trajectory execution and required physical contracts.
