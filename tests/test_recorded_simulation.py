@@ -1028,10 +1028,16 @@ class GeometryExecutionTests(unittest.TestCase):
     def test_rejected_preflight_keeps_candidate_unapplied_and_records_physical_hold(self):
         simulation, curve, targets = _fixture()
         checker = _GeometryChecker(simulation.joint_names, preflight_passed=False)
-        with TemporaryDirectory() as temporary:
+        # BEGIN callers retain the exact finalized report even when execute raises.
+        executor = TrajectoryExecutor(simulation, geometry_checker=checker)
+        self.assertIsNone(executor.last_execution_report)
+        # END no report from an earlier invocation is borrowed.
+        # BEGIN this mocked clock has no native MjData for the post-step refresh.
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            # END completing the fake hold lets the test inspect final step accounting.
             output = Path(temporary)/"trial"
             with self.assertRaisesRegex(ExecutionGuardError, "geometry preflight"):
-                TrajectoryExecutor(simulation, geometry_checker=checker).execute(_result(curve),
+                executor.execute(_result(curve),
                     finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                     execution_limits=_limits(simulation, curve), output=output)
             report = json.loads((output/"execution-report.json").read_text())
@@ -1041,6 +1047,20 @@ class GeometryExecutionTests(unittest.TestCase):
             self.assertEqual(report["events"], [])
             self.assertEqual(checker.states, [])
             self.assertTrue(report["abort_hold"]["native_ctrl_written"])
+            # BEGIN retained diagnostics include the final physical hold, not a prefix copy.
+            retained = executor.last_execution_report
+            self.assertEqual(retained["continuation"]["consumed_physics_steps"], 1)
+            self.assertEqual(retained["abort_hold"]["physical_steps"], 1)
+            self.assertEqual(retained["robot_feedback_path"], report["robot_feedback_path"])
+            self.assertEqual(retained["continuation_path"], report["continuation_path"])
+            invalid = _result(curve)
+            invalid.success = False
+            with self.assertRaises(ValueError):
+                executor.execute(invalid, finger_targets=FixedFingerTargets.from_mapping(targets),
+                    initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                    output=Path(temporary)/"invalid")
+            self.assertIsNone(executor.last_execution_report)
+            # END a rejected new binding cannot leak the prior successful cleanup object.
             self.assertAlmostEqual(simulation.native_data.time, 1.302)
             np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.026, -.023])
             with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:

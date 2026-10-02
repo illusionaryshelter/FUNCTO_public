@@ -95,8 +95,13 @@ class _TrialVideos:
                     "timing": "constant-rate MP4; exact simulation capture times are saved separately; final off-grid barrier state is included once"}
                 entry["record"] = record
                 self.records.append(record)
-        except Exception:
-            self.close()
+        except Exception as error:
+            # BEGIN preserve initialization failure while still closing every owner.
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                raise error from cleanup_error
+            # END cleanup failure is a cause, not a replacement verdict.
             raise
 
     def capture(self, elapsed, *, final=False):
@@ -114,12 +119,26 @@ class _TrialVideos:
         self._last_elapsed = float(elapsed)
 
     def close(self):
+        # BEGIN each video owns cleanup even when another evidence sink fails.
+        first_error = None
         for entry in self._entries:
-            if entry["writer"] is not None:
-                entry["writer"].release()
-            entry["camera"].close()
-            if "record" in entry:
-                np.save(entry["record"]["capture_times_path"], np.asarray(entry["times"]))
+            try:
+                if entry["writer"] is not None:
+                    entry["writer"].release()
+            except Exception as error:
+                first_error = first_error or error
+            try:
+                entry["camera"].close()
+            except Exception as error:
+                first_error = first_error or error
+            try:
+                if "record" in entry:
+                    np.save(entry["record"]["capture_times_path"], np.asarray(entry["times"]))
+            except Exception as error:
+                first_error = first_error or error
+        if first_error is not None:
+            raise first_error
+        # END every writer, native context and timestamp archive is attempted.
 
 
 # BEGIN allow an upstream observer to supply current scene/effect evidence.
@@ -157,7 +176,7 @@ def run(args, *, observation_callback=None):
         "physics_evidence_path": str(output/"physics-evidence.npz"),
         "scope": "One actual native-physics skill prefix; no next skill or full-sequence claim",
         "planner_inputs_changed": False, "execution_tested": False}
-    simulation = evaluator = videos = execution = tactile = None
+    simulation = evaluator = videos = execution = tactile = executor = None
     caught = None
     try:
         # BEGIN select one explicit online sensor source before physical I/O.
@@ -317,21 +336,41 @@ def run(args, *, observation_callback=None):
                       barrier_feedback_path=execution["barrier_feedback_path"],
                       handoff_status="requires current scene observation and verified holding evidence")
         # END export robot-only feedback for a separately verified handoff.
-        if videos is not None:
-            videos.capture(execution["elapsed_sim_s"], final=True)
         report["status"] = "completed"
     except Exception as error:
         caught = error
         report.update(status="error", error=f"{type(error).__name__}: {error}")
-        (output/"exception.txt").write_text(traceback.format_exc())
+        # BEGIN a diagnostic write cannot replace the original physical failure.
+        try:
+            (output/"exception.txt").write_text(traceback.format_exc())
+        except Exception as write_error:
+            report["exception_write_error"] = f"{type(write_error).__name__}: {write_error}"
+        # END remaining evidence finalization must still run.
     finally:
-        if execution is None and Path(report["execution_report_path"]).is_file():
-            execution = _read(report["execution_report_path"])
-            report["execution_tested"] = execution["executed_steps"] > 0
-            # BEGIN expose failed actual feedback as well as completed barriers.
-            report.update(robot_feedback_path=execution.get("robot_feedback_path"),
-                          barrier_feedback_path=execution.get("barrier_feedback_path"))
-            # END expose failed actual feedback as well as completed barriers.
+        # BEGIN recover the executor's own report without parsing its archive again.
+        # Failed preflight can produce extensive geometry diagnostics. Its
+        # in-memory report already owns those values and its real abort hold;
+        # ordinary external inputs retain the separate 16 MiB read bound.
+        if execution is None and executor is not None:
+            execution = executor.last_execution_report
+        if execution is not None:
+            try:
+                hold_steps = sum(0 if execution.get(key) is None else
+                                 execution[key]["physical_steps"]
+                                 for key in ("abort_hold", "dependency_hold"))
+                actual_steps = execution["executed_steps"] + hold_steps
+                report.update(execution_tested=execution["executed_steps"] > 0,
+                    actual_physics_tested=actual_steps > 0,
+                    trajectory_executed_steps=execution["executed_steps"],
+                    hold_physics_steps=hold_steps, actual_physics_steps=actual_steps,
+                    # Separate backend holds do not call the evaluator hook.
+                    evaluator_excluded_hold_physics_steps=hold_steps,
+                    robot_feedback_path=execution.get("robot_feedback_path"),
+                    barrier_feedback_path=execution.get("barrier_feedback_path"))
+            except Exception as error:
+                caught = caught or error
+                report.update(status="error", execution_report_error=f"{type(error).__name__}: {error}")
+        # END diagnostic extraction cannot skip evaluator or camera cleanup.
         if evaluator is not None:
             try:
                 assessment = evaluator.finalize(output, execution_report=execution)
@@ -351,10 +390,27 @@ def run(args, *, observation_callback=None):
                 caught = caught or error
                 report.update(status="error", evaluation_error=f"{type(error).__name__}: {error}")
         if tactile is not None:
-            (output/"tactile-observations.json").write_text(json.dumps({
-                "sensor": tactile.describe(), "observations": tactile.observations},
-                indent=2, allow_nan=False)+"\n")
+            # BEGIN one failed evidence sink cannot prevent closing native videos.
+            try:
+                (output/"tactile-observations.json").write_text(json.dumps({
+                    "sensor": tactile.describe(), "observations": tactile.observations},
+                    indent=2, allow_nan=False)+"\n")
+            except Exception as error:
+                caught = caught or error
+                report.update(status="error", tactile_write_error=f"{type(error).__name__}: {error}")
+            # END the primary execution exception remains the reported failure.
         if videos is not None:
+            # BEGIN capture the actual final hold state even after a guard rejection.
+            # This is a video frame only: no missing evaluator/online-observer
+            # samples are synthesized for the separate hold interval.
+            if execution is not None:
+                try:
+                    videos.capture(execution["elapsed_sim_s"], final=True)
+                    report["video_final_elapsed_s"] = execution["elapsed_sim_s"]
+                except Exception as error:
+                    caught = caught or error
+                    report.update(status="error", video_final_capture_error=f"{type(error).__name__}: {error}")
+            # END failed final capture must still release every writer/context.
             try:
                 videos.close()
             except Exception as error:
@@ -362,7 +418,12 @@ def run(args, *, observation_callback=None):
                 report.update(status="error", video_error=f"{type(error).__name__}: {error}")
         report.update(elapsed_seconds=time.monotonic()-started,
                       peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024)
-        (output/"simulation-report.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
+        # BEGIN even the final summary write must preserve a prior execution error.
+        try:
+            (output/"simulation-report.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
+        except Exception as error:
+            caught = caught or error
+        # END all evidence sinks above have already had their cleanup opportunity.
     if caught is not None:
         raise caught
     return report

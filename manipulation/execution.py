@@ -440,6 +440,11 @@ class TrajectoryExecutor:
     def __init__(self, backend, *, geometry_checker):
         self.backend = backend
         self.geometry_checker = geometry_checker
+        # BEGIN expose this invocation's existing diagnostics after an error.
+        # The caller receives the same report object, without rereading a
+        # potentially large archive or copying its complete geometry evidence.
+        self.last_execution_report = None
+        # END this is diagnostic state, never a new execution authorization.
         if (not isinstance(getattr(geometry_checker, "name", None), str)
                 or not geometry_checker.name.strip()
                 or tuple(getattr(geometry_checker, "joint_names", ())) != backend.joint_names
@@ -593,6 +598,9 @@ class TrajectoryExecutor:
         and actual finger intervals require an explicit ``ExecutionLimits``;
         rejection sends bounded device hold and records its measured result.
         """
+        # BEGIN a rejected new binding cannot expose an earlier trial report.
+        self.last_execution_report = None
+        # END this invocation publishes its own object only after creation.
         # BEGIN formal candidate handoff: labels cannot authorize commands.
         from .execution_binding import check_result, nominal_finger_sampler
         binding = check_result(result, execution_limits=execution_limits)
@@ -786,6 +794,9 @@ class TrajectoryExecutor:
             "events": [], "superseded_gripper_events": [],
             "pending_verifications": [deepcopy(event) for event in trajectory.events if event["requires_evidence"] is not None],
             "unconsumed_events": deepcopy(trajectory.events)}
+        # BEGIN retain this same object through normal return and exceptional cleanup.
+        self.last_execution_report = report
+        # END finally updates the shared report with actual hold and continuation facts.
         # BEGIN physical guard provenance and actual-event evidence.
         report.update(execution_limits=execution_limits.describe(),
             named_hardware_velocity_limits=deepcopy(backend.velocity_limits),

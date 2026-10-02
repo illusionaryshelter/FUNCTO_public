@@ -341,12 +341,22 @@ class RobotGeometryChecker:
         actors = []
         materials = binding["native_geometry_materials"]
         unmodelled_geometries = set(robot_state.get("unmodelled_geometry_names", ()))
+        # BEGIN keep explicitly owned static installation on the scene side.
+        # bind_scene admits aliases only for complete static, unattached owners.
+        # Their native solids remain in the complete robot pair query, and the
+        # target loop below still verifies their pose and checks every moving
+        # robot/payload actor against them. Adding the same installation as a
+        # robot actor would invent static-installation/background collision
+        # obligations absent from the shared planning scene contract. A fixed
+        # robot base without this explicit owner identity remains an actor.
+        static_installation = set(self._scene_native_aliases.values())
         for name, (_, shape, source, _) in self._geometries.items():
-            if name in unmodelled_geometries:
+            if name in unmodelled_geometries or name in static_installation:
                 continue
             pose = np.asarray(robot_state["geometry_poses"][name])
             actors.append({"owner": "robot", "name": name, "shape": shape, "pose": pose,
                            "vertices": self._solid_vertices[name], "material": materials.get(name), "source": source})
+        # END ownership never removes a native self pair or installation target.
         targets = []
         for row in self._scene_shapes:
             if row["owner"] not in poses:

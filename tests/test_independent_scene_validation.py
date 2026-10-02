@@ -250,6 +250,12 @@ def test_explicit_native_alias_avoids_duplicate_self_collision_but_checks_payloa
     fixture["native_geometry_names"] = ["pad"]
     fixture["geometry"]["solids"] = [{"name": "installation_proxy", "kind": "cuboid", "dimensions": [.11]*3,
         "pose": [0., 0., .049, 1., 0., 0., 0.], "source": "outward planning proxy for exact native pad"}]
+    # BEGIN a declared static owner is not a second moving robot actor.
+    # Coincident static background must not introduce a new trajectory edge;
+    # the same obstacle still applies to a moving payload below.
+    model["background"]["geometry"]["solids"] = [{"name": "static_background", "kind": "cuboid",
+        "dimensions": [.1]*3, "pose": [0., 0., .049, 1., 0., 0., 0.], "source": "static world geometry"}]
+    # END no ESDF clipping or contact allowance resolves static ownership.
     first = query(checker, model)
     assert first["passed"] and not first["pairs"]
     payload = deepcopy(fixture)
@@ -265,6 +271,58 @@ def test_explicit_native_alias_avoids_duplicate_self_collision_but_checks_payloa
     moved = query(checker, model, kind="nominal")
     assert any(row["reason"] == "fixed_native_alias_pose_changed" for row in moved["query_gaps"])
 # END alias identity never means all bodies may collide with this installation.
+
+
+# BEGIN static ownership changes only explicit aliases, never robot obligations.
+def test_nonalias_fixed_robot_base_still_collides_with_background(checker):
+    model = binding()
+    model["owners"] = []
+    model["background"]["geometry"]["solids"] = [{"name": "background", "kind": "cuboid",
+        "dimensions": [.1]*3, "pose": [0., 0., .049, 1., 0., 0., 0.], "source": "observed world obstacle"}]
+    result = query(checker, model)
+    assert not result["passed"]
+    violation = result["violations"][0]
+    assert violation["actor"] == "robot" and violation["target_owner"] == "background"
+    assert violation["evidence"]["actor_geometry"] == "pad"
+    assert violation["evidence"]["signed_distance_m"] < 0
+
+
+def test_static_alias_retains_native_robot_installation_pair_gate(checker):
+    from manipulation.robot_geometry_check import PairQuery
+    from manipulation.robot_validation import RobotStateValidator
+
+    arm_local = rigid(.049)
+    arm_local[1, 3] = -.2  # The URDF's left slide origin is +.2 on y.
+    robot = RobotGeometryChecker(checker.urdf_path, base_frame="base", geometries=[
+        NativePrimitive("installation", "base", "box", (.1, .1, .1), rigid(.049), "native installation"),
+        NativePrimitive("arm", "left", "box", (.1, .1, .1), arm_local, "native moving robot")])
+    model = binding()
+    model["native_geometry_materials"] = {}
+    target = model["owners"][0]
+    target["native_geometry_names"] = ["installation"]
+    target["geometry"]["solids"] = [{"name": "installation_proxy", "kind": "cuboid", "dimensions": [.11]*3,
+        "pose": [0., 0., .049, 1., 0., 0., 0.], "source": "outward planning installation proxy"}]
+    gate = RobotStateValidator(robot, joint_names=robot.joint_names,
+        arm_joint_names=robot.joint_names[:1], finger_joint_names=robot.joint_names[1:],
+        pairs=[PairQuery("arm", "installation", "required", "native enabled robot/installation pair")],
+        named_velocity_limits={name: 1. for name in robot.joint_names}, reference_frame="world",
+        T_reference_base=np.eye(4), tool_frame="base", T_frame_tcp=np.eye(4),
+        fk_translation_tolerance_m=1e-8, fk_rotation_tolerance_rad=1e-8, source="explicit native pair test")
+    gate.bind_scene(model, progress_at_time=lambda t: t)
+    feedback = {"joint_names": robot.joint_names, "arm_joint_names": robot.joint_names[:1],
+        "finger_joint_names": robot.joint_names[1:], "q": [0., 0.], "dq": [0., 0.],
+        "reference_frame": "world", "tool_link": "base", "tool_transform": np.eye(4),
+        "base_pose": np.eye(4), "tool_pose": np.eye(4)}
+    result = gate.check_state(feedback, stage="initial_state", trajectory_time=0.)
+    assert not result["passed"]
+    assert any(row["kind"] == "independent_robot_collision" for row in result["violations"])
+    assert len(result["distances_m"]) == 1 and result["distances_m"][0] < 0
+    rows = result["scene"]["pairs"]
+    assert len(rows) == 1 and rows[0]["actor_geometry"] == "arm"
+    assert rows[0]["target_geometry"] == "installation"
+    assert rows[0]["native_pair_evidence"]["policy"] == "required"
+    assert rows[0]["native_pair_evidence"]["signed_distance_m"] == result["distances_m"][0]
+# END complete self-policy and every moving actor-to-installation edge survive.
 
 # BEGIN exact endpoint permissions cannot hide a forbidden adjacent mode.
 def test_independent_preflight_checks_both_contact_modes_at_the_same_state(checker):
