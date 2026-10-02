@@ -25,50 +25,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # END project-local imports.
 
 
-class NoObstacleExperiment:
-    """Only for this declared empty synthetic world; never a production default."""
-    reference_frame = "robot_base"
-    required_progress_anchors = ()
-    required_robot_links = ()
+# BEGIN use the production scene contract for this explicit empty fixture.
+def no_obstacle_scene(sphere_count):
+    """Build a declared synthetic empty world, with no perception claim."""
+    from manipulation.planning_scene import ObservedSpace, PlanningScene
+    from probe_planning_gpu import EmptyBackground
 
-    def __init__(self, sphere_count):
-        self.robot_sphere_materials = (None,)*sphere_count
-
-    def clone_for_rollout(self):
-        return type(self)(len(self.robot_sphere_materials))
-
-    def validate_problem(self, problem):
-        if problem.events or problem.conditions or any(phase.metadata for phase in problem.phases):
-            raise ValueError("This declared empty experiment cannot validate interaction evidence or gripper commands")
-
-    def estimated_workspace_bytes(self, batch, horizon):
-        return 0
-
-    def validate_robot_geometry(self, current_spheres_output, link_poses_output):
-        """This explicit empty fixture contains no occupied robot evidence."""
-
-    def optimizer_preferences(self, progress, joint_position, joint_names):
-        return progress*0.
-
-    def describe(self):
-        return {"scope": "explicit synthetic no-obstacle scene", "production_environment_validation": False}
-
-    def with_fixed_endpoints(self, position, quaternion, progress):
-        return self.clone_for_rollout()
-
-    def project_residual(self, progress, joint_position, joint_names):
-        return joint_position[..., :0]
-
-    def evaluate(self, spheres, position, quaternion, progress,
-                 joint_position=None, joint_names=None):
-        return progress*0.
-
-    # BEGIN expose the same explicit empty scene to entrance diagnostics.
-    def components(self, spheres, position, quaternion, progress,
-                   joint_position=None, joint_names=None):
-        """No scene constraints exist in this declared synthetic empty world."""
-        return {}
-    # END expose the same explicit empty scene to entrance diagnostics.
+    return PlanningScene(background=EmptyBackground(), owners=(),
+        coverage=ObservedSpace(np.ones((20, 20, 20), bool), origin=[-2., -2., -2.], voxel_size=.2,
+            reference_frame="robot_base", observation_ids=("declared synthetic empty box",)),
+        reference_frame="robot_base", robot_sphere_materials=(None,)*sphere_count,
+        robot_geometry_source="Native Franka model in a declared synthetic empty fixture", has_gripper=False)
+# END there is no partial mock of the changing planner/scene interface.
 
 
 def run(output, debug_gradient, initial_joint_velocity=0.):
@@ -80,7 +48,8 @@ def run(output, debug_gradient, initial_joint_velocity=0.):
         import torch
         from curobo.kinematics import Kinematics, KinematicsCfg
         from curobo.types import JointState
-        from manipulation.planning_problem import PlanningProblem, MotionPhase, PosePath, NumericalTolerance
+        from manipulation.planning_problem import (PlanningProblem, MotionPhase, PosePath,
+            NumericalTolerance, PoseEventRequirement, PoseProcessRequirement)
         from manipulation.planning import PlanningBudget, plan_trajectory
         from manipulation import planning as planner_module
 
@@ -107,12 +76,20 @@ def run(output, debug_gradient, initial_joint_velocity=0.):
         measured_velocity = np.zeros(len(initial))
         measured_velocity[0] = initial_joint_velocity
         report["measured_initial_velocity"] = measured_velocity.tolist()
+        # BEGIN the suffix is an explicit synthetic process, separate from its seed.
+        suffix = PosePath(np.array([0., 1.]), poses[1:], "synthetic required local relation")
         problem = PlanningProblem(
             tuple(kinematics.joint_names), initial.cpu().numpy(), measured_velocity,
             "panda_hand", "robot_base", np.eye(4), np.eye(4),
-            (MotionPhase("free_approach", PosePath(np.array([0., 1.]), poses[:2], "synthetic FK targets"), "free"),
-             MotionPhase("required_local_motion", PosePath(np.array([0., 1.]), poses[1:], "synthetic FK targets"))),
-            numerical=NumericalTolerance(position_m=.001, rotation_rad=.005))
+            (MotionPhase("approach_reference", PosePath(np.array([0., 1.]), poses[:2], "synthetic FK reference")),
+             MotionPhase("local_reference", suffix)),
+            numerical=NumericalTolerance(position_m=.001, rotation_rad=.005),
+            pose_events=(PoseEventRequirement(2., np.eye(4), poses[-1], .001, .005,
+                "Independent synthetic terminal reach goal"),),
+            pose_relations=(PoseProcessRequirement(1., 2., suffix, np.zeros((6, 2)),
+                "Explicit fixture requirement to follow the local relation after free approach"),),
+            source_timestamps=np.array([0., 1., 2.]), source_progress=np.array([0., 1., 2.]))
+        # END source reference samples alone impose no pose obligation.
         # END measured nonzero boundary-velocity regression.
         budget = PlanningBudget(ik_seeds=4, trajectory_seeds=1,
                                 trajectory_iterations=125, search_seconds=0.)
@@ -156,7 +133,7 @@ def run(output, debug_gradient, initial_joint_velocity=0.):
             if debug_gradient:
                 instrumentation.enter_context(patch.object(
                     planner_module._CuroboPlanner, "optimize", new=measured_optimize))
-            result = plan_trajectory(problem, NoObstacleExperiment(kinematics.total_spheres), "franka.yml", budget=budget)
+            result = plan_trajectory(problem, no_obstacle_scene(kinematics.total_spheres), "franka.yml", budget=budget)
         # END scoped optional diagnostics.
         report.update(status="completed", success=result.success, diagnostics=result.diagnostics)
         if result.trajectory is not None:

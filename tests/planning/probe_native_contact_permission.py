@@ -58,7 +58,8 @@ def run(output):
         from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
         from curobo._src.geom.types import Cuboid, SceneCfg
         from manipulation.planning import PlanningBudget, plan_trajectory
-        from manipulation.planning_problem import MotionPhase, NumericalTolerance, PlanningProblem, PosePath
+        from manipulation.planning_problem import (MotionPhase, NumericalTolerance,
+            PlanningProblem, PosePath, PoseProcessRequirement)
         from manipulation.planning_scene import (
             CollisionOwner, ContactRule, CuroboSphereQuery, ObservedSpace, PlanningScene, _local_spheres)
 
@@ -186,11 +187,17 @@ def run(output):
             "modeling_allowance_m": rule.modeling_allowance_m,
             "geometry_error_m": rule.geometry_error_m, "minimum_thickness_m": rule.minimum_thickness_m}
 
+        # BEGIN the static contact fixture states its true pose process separately.
+        contact_reference = PosePath(np.array([0., 1.]), np.stack((tool_pose, tool_pose)),
+                                     "synthetic static contact reference")
         problem = PlanningProblem(
             names, initial.detach().cpu().numpy(), np.zeros(len(names)), "panda_hand", "robot_base", np.eye(4), np.eye(4),
-            (MotionPhase("retain_declared_contact", PosePath(np.array([0., 1.]), np.stack((tool_pose, tool_pose)),
-                                                            "synthetic static contact-feature requirement")),),
-            numerical=NumericalTolerance(position_m=1e-5, rotation_rad=1e-4))
+            (MotionPhase("contact_reference", contact_reference),),
+            numerical=NumericalTolerance(position_m=1e-5, rotation_rad=1e-4),
+            pose_relations=(PoseProcessRequirement(0., 1., contact_reference, np.zeros((6, 2)),
+                "Explicit fixture keeps one constant tool pose while independently changing contact permissions"),),
+            source_timestamps=np.array([0., 1.]), source_progress=np.array([0., 1.]))
+        # END permission and required contact remain independent scene relations.
         budget = PlanningBudget(ik_seeds=2, trajectory_seeds=2, knots=8, ik_iterations=80,
                                 trajectory_iterations=150, interpolation_buffer_size=512,
                                 maximum_trajectory_solves=2, search_seconds=0.)

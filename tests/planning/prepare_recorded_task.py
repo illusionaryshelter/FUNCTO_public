@@ -42,8 +42,8 @@ def read_json(path):
     return json.loads(path.read_text())
 
 
-# BEGIN require the caller's source pre-grasp boundary for grasp planning.
-def prepare_candidate(program, scene, feedback, skill_id, *, pregrasp_frame=None):
+# BEGIN bind current goals while retaining ordinary reference provenance.
+def prepare_candidate(program, scene, feedback, skill_id):
     """Return the public PlanningProblem and explicit input provenance.
 
     The caller owns the active-joint layout. Its supplied positions and
@@ -81,8 +81,7 @@ def prepare_candidate(program, scene, feedback, skill_id, *, pregrasp_frame=None
                         "carrier_mapping": maps[0].tolist(), "source": source})
 
     problem = build_planning_problem(
-        [{"skill_id": skill_id, "program": program, "scene": prepared,
-          "barrier_can_stop": True, "pregrasp_frame": pregrasp_frame}],
+        [{"skill_id": skill_id, "program": program, "scene": prepared}],
         joint_names=feedback["joint_names"], start_q=feedback["start_q"],
         start_dq=feedback["start_dq"], tool_link=feedback["tool_link"],
         reference_frame=feedback["reference_frame"], base_pose=feedback["base_pose"],
@@ -97,11 +96,10 @@ def prepare_candidate(program, scene, feedback, skill_id, *, pregrasp_frame=None
         "source_frame_range": [program["demo"]["frame_indices"][0],
                                program["demo"]["frame_indices"][-1]],
         "source_timestamps": deepcopy(program["demo"]["timestamps"]),
-        "pregrasp_frame": pregrasp_frame,
         "couplings_inferred": False,
     }
     return problem, provenance
-# END require the caller's source pre-grasp boundary for grasp planning.
+# END no source approach point is a mandatory waypoint.
 
 
 def _pose_error(actual, expected):
@@ -325,11 +323,13 @@ def _problem_summary(problem):
     return {
         "joint_names": list(problem.joint_names), "phase_count": problem.phase_count,
         "anchor_count": len(problem.anchors), "stop_progress": problem.stop_progress.tolist(),
-        "phases": [{"name": phase.name, "kind": phase.kind,
+        # BEGIN phase summaries expose references without invented obligations.
+        "phases": [{"name": phase.name,
                     "reference_node_count": len(phase.reference.progress),
-                    "metadata": phase.metadata, "endpoint_family": phase.endpoint_family,
-                    "frame_anchor": phase.frame_anchor}
+                    "metadata": phase.metadata}
                    for phase in problem.phases],
+        "source_time_map": problem.source_time_map,
+        # END typed goals and process relations remain the compiler's contract.
         "events": [{"event_id": event.event_id, "skill_id": event.skill_id,
                     "kind": event.kind, "source_frame": event.source_frame,
                     "progress": event.progress, "requires_evidence": event.requires_evidence,
@@ -349,7 +349,7 @@ def _write_json(path, data):
 
 
 # BEGIN preserve explicit per-skill source boundaries at the recorded caller.
-def _prepare_segments(manifest, feedback_by_segment, output, pregrasp_frames):
+def _prepare_segments(manifest, feedback_by_segment, output):
     """Run every current candidate, preserving old labels only as comparison."""
     root = Path(manifest["workspace_root"])
     rows = []
@@ -372,8 +372,7 @@ def _prepare_segments(manifest, feedback_by_segment, output, pregrasp_frames):
             try:
                 problem, provenance = prepare_candidate(
                     program, read_json(root / candidate["scene_path"]),
-                    planning_feedback, identifier,
-                    pregrasp_frame=pregrasp_frames.get(identifier))
+                    planning_feedback, identifier)
                 item.update(status="passed", problem=_problem_summary(problem),
                             provenance=provenance)
             except Exception as error:
@@ -394,13 +393,8 @@ def run(args):
     identifiers = [segment["id"] for segment in manifest["segments"]]
     if not identifiers or len(set(identifiers)) != len(identifiers):
         raise ValueError("The input manifest needs unique nonempty segment identities")
-    pregrasp_frames = {}
-    for identifier, frame in args.pregrasp_frame:
-        if identifier not in identifiers or identifier in pregrasp_frames:
-            raise ValueError("Each pre-grasp selection must name a unique manifest skill")
-        pregrasp_frames[identifier] = int(frame)
     feedback = _extract_named_feedback(manifest, fixture, args.robot_fixture)
-    segments = _prepare_segments(manifest, feedback, args.output, pregrasp_frames)
+    segments = _prepare_segments(manifest, feedback, args.output)
     candidates = [candidate for segment in segments for candidate in segment["candidates"]]
     passed = sum(candidate["status"] == "passed" for candidate in candidates)
     report = {
@@ -426,9 +420,6 @@ def main():
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--robot-fixture", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--pregrasp-frame", nargs=2, action="append", default=[],
-                        metavar=("SKILL_ID", "SOURCE_FRAME"),
-                        help="Explicit source approach entrance, required for each grasp")
     args = parser.parse_args()
     report = run(args)
     print(json.dumps({"output": str(args.output.resolve()), "status": report["status"],

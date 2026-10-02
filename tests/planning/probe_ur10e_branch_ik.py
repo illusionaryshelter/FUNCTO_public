@@ -20,7 +20,33 @@ from unittest.mock import patch
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from probe_on_endpoint_family import error, pose_matrices, safe_json
+# BEGIN independent IK diagnostics own their three small numerical helpers.
+def pose_matrices(position, quaternion):
+    """Convert native wxyz FK arrays independently through NumPy/SciPy."""
+    position, quaternion = np.asarray(position), np.asarray(quaternion)
+    result = np.broadcast_to(np.eye(4), (*position.shape[:-1], 4, 4)).copy()
+    result[..., :3, 3] = position
+    result[..., :3, :3] = Rotation.from_quat(quaternion.reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix().reshape(
+        *position.shape[:-1], 3, 3)
+    return result
+
+
+def error(first, second):
+    """Measure physical pose error without optimizer clipping or weights."""
+    return {"position_m": float(np.linalg.norm(first[:3, 3]-second[:3, 3])),
+            "rotation_rad": float(Rotation.from_matrix(first[:3, :3].T@second[:3, :3]).magnitude())}
+
+
+def safe_json(value):
+    """Keep nonfinite diagnostic evidence without emitting invalid JSON."""
+    if isinstance(value, dict):
+        return {key: safe_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [safe_json(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        return str(value)
+    return value
+# END the removed endpoint-family experiment is not an IK dependency.
 
 
 ROBOT = "ur10e.yml"

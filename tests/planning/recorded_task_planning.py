@@ -172,7 +172,7 @@ def save_native_configuration(path, planner):
 
 
 def save_curve(path, curve, *, classification, execution_limits, fk=None, validation_status="completed",
-               joint_limits=None):
+               joint_limits=None, planning_result=None):
     """Preserve the exact exported cubic, event identities and optional FK.
 
     ``fk`` contains independently evaluated native FK of this same exported
@@ -181,6 +181,20 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
     the full curve and its original executable prefix. This recorder never
     changes classification based on an additional report.
     """
+    # BEGIN accepted archives retain their exact formal authorization.
+    from manipulation.execution_binding import check_result
+    from manipulation.execution import ExecutionLimits
+    binding = None
+    if classification == "planner_accepted":
+        if planning_result is None or planning_result.trajectory is not curve:
+            raise ValueError("Accepted archives require this curve's formal PlanningResult")
+        limits = ExecutionLimits.from_mapping(execution_limits)
+        binding = check_result(planning_result, execution_limits=limits)
+        binding["execution_limits"] = limits.describe()
+        planning_result.execution_binding = deepcopy(binding)
+    elif planning_result is not None:
+        raise ValueError("Diagnostic archives cannot carry executable result authorization")
+    # END rejected curves remain diagnostic data only.
     arrays = dict(joint_names=np.asarray(curve.joint_names), times=curve.times,
                   position=curve.position, velocity=curve.velocity,
                   progress_u=curve.progress_u, progress_s=curve.progress_s,
@@ -212,6 +226,7 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
     np.savez_compressed(path, **arrays)
     path.with_suffix(".json").write_text(json.dumps(
         {"classification": classification, "validation_status": validation_status,
+         "execution_binding": binding,
          "execution_limits": deepcopy(execution_limits),
          "finger_trajectory": None if fingers is None else fingers.describe(),
          "events": curve.events,
@@ -222,7 +237,7 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
         default=_json_value, indent=2, allow_nan=False)+"\n")
 
 
-def plan_and_record(problem, scene, robot, output, *, budget, provenance, execution_limits):
+def plan_and_record(problem, scene, robot, output, *, budget, provenance, execution_limits, continuation=None):
     """Call ``plan_trajectory`` once and preserve its measured outcome.
 
     The scoped observer copies checked continuations and exact native curves
@@ -323,8 +338,10 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
         nonlocal selected_joint_limits
         selected_joint_limits = None
         index = len(report["candidates"])
-        classification = ("planner_accepted" if attempt["accepted"]
+        # BEGIN selection observers do not yet own a formal result binding.
+        classification = ("validated_candidate_pending_result" if attempt["accepted"]
                           else "rejected_diagnostic_not_executable")
+        # END only the final returned result is saved as planner_accepted.
         path = output/f"candidate-{index:02d}.npz"
         entry = {"path": path.name, "classification": classification,
                  "attempt": deepcopy(attempt), "validation_status": validation_status,
@@ -417,7 +434,9 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
                 stack.enter_context(patch.object(planning._CuroboPlanner, name,
                                                  new=stage_observer(method, name)))
             # END the observer does not repeat or bypass any entrance check.
-            result = planning.plan_trajectory(problem, scene, robot, budget=budget)
+            # BEGIN continuation consumes the original ledger and request budget.
+            result = planning.plan_trajectory(problem, scene, robot, budget=budget, continuation=continuation)
+            # END a new actual binding is never an implicit budget reset.
         report.update(status="completed", success=result.success,
                       diagnostics=result.diagnostics)
         if result.trajectory is not None:
@@ -427,7 +446,7 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
             # END recording failure cannot silently omit the derivative evidence.
             save_curve(output/"trajectory.npz", result.trajectory,
                        classification="planner_accepted", execution_limits=execution_limits,
-                       joint_limits=selected_joint_limits)
+                       joint_limits=selected_joint_limits, planning_result=result)
         return result
     except KeyboardInterrupt:
         report.update(status="interrupted", interruption_reason="Explicit operator interrupt")

@@ -47,9 +47,10 @@ def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ct
     def build(duration_s, progress_map):
         events = []
         for event in problem.events:
-            parameters = progress_map.anchor_parameters([event.progress])[:, 0]
-            events.append({**asdict(event), "time": float(parameters[0]*duration_s),
-                           "hold_until": float(parameters[-1]*duration_s)})
+            # BEGIN consume the sole device-quantized source/event binding.
+            clock = progress_map.event_clock[(event.skill_id, event.event_id)]
+            events.append({**asdict(event), **deepcopy(clock)})
+            # END hand commands cannot independently invert or retime progress.
         barriers = [row["time"] for row in events if row["requires_evidence"] is not None]
         stop = min(barriers) if barriers else duration_s
         commands = finger_targets.bind(SimpleNamespace(events=events, duration=duration_s),
@@ -67,12 +68,15 @@ def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ct
                     "under native planner acceleration bounds, not calibrated actual acceleration/tracking limits"),
             feedback_id=feedback["feedback_id"], timestamp_s=feedback["sim_time_s"])
 
+    # BEGIN expose the already bound device tick to the planning clock owner.
+    build.timestep = float(timestep)
+    # END this is device metadata, never a per-skill retiming rule.
     return build
 # END full mechanical intervals no longer select future hand geometry.
 
 
 def position_controlled_hand(robot, feedback, problem, *, device, execution_limits,
-                             position_limits, velocity_limits, trajectory_factory):
+                             position_limits, velocity_limits, trajectory_factory, execution_events=None):
     """Calibrate the affine hand from the supplied native robot, not a name.
 
     Native axes and sphere ordering are measured by FK. Independent position
@@ -84,6 +88,10 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
     from curobo.kinematics import Kinematics, KinematicsCfg
     from curobo.types import JointState
     from manipulation.planning_scene import PrismaticGripper
+
+    # BEGIN a continued request can retain full source events while binding its suffix.
+    execution_events = problem.events if execution_events is None else execution_events
+    # END the caller supplies this subset from the validated application ledger.
 
     unlocked = deepcopy(robot)
     unlocked["robot_cfg"]["kinematics"]["lock_joints"] = None
@@ -106,7 +114,7 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
     # actual hand interval. No numerical solver tolerance becomes a physical
     # tracking allowance, and no allowed interval is inferred from ctrl.
     binding = execution_limits.bind(
-        SimpleNamespace(joint_names=problem.joint_names, events=[asdict(event) for event in problem.events]),
+        SimpleNamespace(joint_names=problem.joint_names, events=[asdict(event) for event in execution_events]),
         joint_names=feedback["joint_names"], arm_joint_names=feedback["arm_joint_names"],
         finger_joint_names=finger_names,
         native_joint_ranges=[position_limits[name] for name in feedback["joint_names"]],
@@ -161,12 +169,13 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
         controller="timed_reference", joint_names=finger_names,
         current_positions=initial[columns], joint_limits=limits,
         joint_bounds=None, finger_trajectory_factory=trajectory_factory,
+        control_timestep_s=trajectory_factory.timestep,
         coupling_matrix=np.empty((0, len(columns))), coupling_offset=np.empty(0),
         sphere_indices=indices, local_spheres=local_spheres,
         sphere_joint_translation=affine, self_collision_pairs=self_pairs,
         commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id,
                         "command": event.kind, "progress": event.progress}
-                       for event in problem.events if event.kind in {"open", "close", "hold"}),
+                       for event in execution_events if event.kind in {"open", "close", "hold"}),
         source=f"Native robot FK and synchronous independent position reference: {execution_limits.source}")
     report = {"affine_fk_max_error_m": error, "native_sphere_count": native.total_spheres,
                   "finger_sphere_indices": list(indices), "current_fingers": initial[columns].tolist(),
@@ -225,17 +234,23 @@ def run(args):
         # END targets remain a separate input from measured feedback.
         execution_limits = ExecutionLimits.from_mapping(json.loads(args.execution_limits.read_text()))
         report["execution_limits_path"] = str(args.execution_limits.resolve())
+        # BEGIN retain prior fixed targets and the last actually applied protection interval.
+        continuation = None if args.continuation is None else json.loads(args.continuation.read_text())
+        if continuation is not None:
+            from manipulation.execution import continuation_execution_inputs
+            finger_targets, execution_limits = continuation_execution_inputs(
+                continuation, finger_targets, execution_limits)
+        # END unconsumed commands keep their original identities and values.
         measured = dict(zip(feedback["joint_names"], feedback["start_q"]))
         velocities = dict(zip(feedback["joint_names"], feedback["start_dq"]))
         active = tuple(feedback["arm_joint_names"])
         planning_feedback = {**feedback, "joint_names": list(active),
                              "start_q": [measured[name] for name in active],
                              "start_dq": [velocities[name] for name in active]}
-        # BEGIN pass the requested approach boundary before reference grounding.
+        # BEGIN bind true goals without a reference waypoint.
         problem, provenance = prepare_candidate(
-            program, scene_input, planning_feedback, args.segment,
-            pregrasp_frame=args.pregrasp_frame)
-        # END pass the requested approach boundary before reference grounding.
+            program, scene_input, planning_feedback, args.segment)
+        # END reference stages do not impose an approach boundary.
         # The supplied camera calibration is explicitly world-from-camera.
         # Another output frame needs its real calibrated transform, never a
         # relabelled world observation at this narrow recorded-test boundary.
@@ -290,10 +305,14 @@ def run(args):
                                      "scene_workspace_bytes": args.scene_workspace_mib*1024**2,
                                      "mapping_bytes": 1024**3}
         device = DeviceCfg("cuda:0")
+        pending_ids = (None if continuation is None else
+                       {(row["skill_id"], row["event_id"]) for row in continuation["remaining_events"]})
         hand, hand_report, entrance_fk = position_controlled_hand(
             robot, feedback, problem, device=device, execution_limits=execution_limits,
             position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
-            trajectory_factory=reference_factory)
+            trajectory_factory=reference_factory,
+            execution_events=(None if pending_ids is None else tuple(event for event in problem.events
+                if (event.skill_id, event.event_id) in pending_ids)))
         report["gripper"] = hand_report
         carrier_id = scene_input["carrier_id"]
         carrier_phases = [phase for phase in problem.phases
@@ -433,11 +452,12 @@ def run(args):
         report["planning_called"] = True
         result = plan_and_record(problem, scene, robot, args.output/"planning", budget=budget,
                                  execution_limits=execution_limits.describe(),
+                                 continuation=continuation,
                                  provenance={**provenance, "robot_fixture": str(args.robot_fixture),
                                              "current_views": list(observations),
                                              "old_selection_comparison_only": segment["grounding"]["status"]})
         report.update(status="completed", planning_success=result.success,
-                      initial_state=result.diagnostics["initial_state"],
+                      initial_state=result.diagnostics.get("initial_state"),
                       robot_coverage={**scene.robot_coverage.describe(),
                                       "original_free_grid_path": "observed-free.npz"})
     except KeyboardInterrupt:
@@ -459,10 +479,10 @@ if __name__ == "__main__":
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)
-    # BEGIN recorded callers select source evidence, never a dataset constant.
-    parser.add_argument("--pregrasp-frame", type=int,
-                        help="Original source approach frame; required for grasp planning")
-    # END recorded callers select source evidence, never a dataset constant.
+    # BEGIN same-skill continuation consumes an explicit prior execution ledger.
+    parser.add_argument("--continuation", type=Path,
+                        help="Prior continuation.json; current feedback and scene inputs must be freshly rebound")
+    # END missing current facts are binding failures, not replay defaults.
     parser.add_argument("--owner-mask", nargs=2, action="append", required=True,
                         metavar=("VIEW_ID", "MASK_PATH"))
     parser.add_argument("--owner-geometry", type=Path)

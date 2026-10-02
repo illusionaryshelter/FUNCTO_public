@@ -661,7 +661,10 @@ def create_fixed_installation_owners(fixture, *, device_cfg, T_output_base, sphe
             record["source"], geometry_complete=True, moving=False,
             robot_excluded_spheres=excluded,
             robot_exclusion_source=record["policy_source"] if excluded else None,
-            robot_exclusion_geometry_source=fixture["robot_geometry_source"] if excluded else None))
+            robot_exclusion_geometry_source=fixture["robot_geometry_source"] if excluded else None,
+            # BEGIN exact native identity for the independent installation pair policy.
+            native_geometry_names=(record["geom"],)))
+            # END the owner remains present for payload/world queries.
         reports.append({"owner_id": owner_id, "native_geom": record["geom"],
                         "native_shape_kind": record["shape_kind"], "native_dimensions": record["dimensions"],
                         "T_output_geom": pose.tolist(), "approximation": prepared["approximation"],

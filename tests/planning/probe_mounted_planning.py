@@ -26,7 +26,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from manipulation.execution import ExecutionLimits
 from manipulation.planning import PlanningBudget
-from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath
+from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath, PoseEventRequirement
 from recorded_task_planning import _json_value, plan_and_record
 from robot_fixture import create_fixed_installation_owners
 from robot_validation_fixture import build_robot_validator
@@ -41,6 +41,10 @@ class DeclaredEmptyBackground:
     """
 
     owner_ids = ()
+    # BEGIN explicit empty synthetic geometry can be independently rechecked.
+    source = "Declared synthetic empty background for mounted reach experiment"
+    independent_geometry = {"solids": [], "query_gaps": []}
+    # END the source recording's scene is outside this fixture's scope.
 
     def __call__(self, spheres, *, key):
         return spheres[..., 0] * 0.
@@ -142,9 +146,13 @@ def run(args):
                      @ np.asarray(feedback["tool_transform"]))
         problem = PlanningProblem(arm_names, actual_q[:narm], actual_dq[:narm],
             feedback["tool_link"], feedback["reference_frame"], feedback["base_pose"], feedback["tool_transform"],
+            # BEGIN the user-selected FK target is separate from its reference.
             (MotionPhase("synthetic_free_reach", PosePath(np.array([0., 1.]),
-                np.stack((feedback["eef_pose"], goal_pose)), "Pinocchio FK of explicit measured q plus arm delta"),
-                kind="free"),))
+                np.stack((feedback["eef_pose"], goal_pose)), "Pinocchio FK of explicit measured q plus arm delta")),),
+            pose_events=(PoseEventRequirement(1., np.eye(4), goal_pose, 1e-4, 1e-3,
+                "Explicit synthetic reach target from the selected named joint displacement"),),
+            source_timestamps=np.array([0., 2.]), source_progress=np.array([0., 1.]))
+            # END phase endpoints alone never create this requirement.
 
         config_path = Path(fixture["robot_config_path"])
         if config_path.stat().st_size > 16 * 1024**2:

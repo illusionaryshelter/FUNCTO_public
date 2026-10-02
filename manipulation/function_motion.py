@@ -8,6 +8,8 @@ the position objective and the translation increments under tool rotation.
 The optimizer below deliberately preserves the released xyz-Euler objective
 and sampled increment constraints. It is not an SO(3)-intrinsic optimizer, a
 collision planner, or a time-parameterized velocity/acceleration controller.
+It produces an optional initialization reference. A FunctionReferenceError
+does not invalidate a separately bound functional goal.
 """
 
 # BEGIN function-frame numerical kernel separated from semantic keypoints.
@@ -16,6 +18,12 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .motion import _errors, _pose_array, _poses_array
+
+
+# BEGIN isolate optional reference fitting from independently bound task goals.
+class FunctionReferenceError(ValueError):
+    """The sampled reference kernel failed; this is not task infeasibility."""
+# END isolate optional reference fitting from independently bound task goals.
 
 
 def _pose_pair(value, name):
@@ -103,7 +111,12 @@ def optimize_trajectory(reference_trajectory, static_pose, function_keyframes):
         "print_level": 0, "sb": "yes", "tol": 1e-10,
         "constr_viol_tol": 1e-12, "bound_relax_factor": 0., "acceptable_iter": 0,
     })
-    solution = opti.solve()
+    # BEGIN distinguish a numerical reference-fit failure from malformed input.
+    try:
+        solution = opti.solve()
+    except RuntimeError as error:
+        raise FunctionReferenceError("Function reference optimization failed") from error
+    # END distinguish a numerical reference-fit failure from malformed input.
     return np.stack((solution.value(positions), solution.value(euler_angles)), axis=1)
 
 
@@ -152,12 +165,12 @@ def transfer_function_motion(reference_poses, initial_pose, function_goals):
         angle = np.linalg.norm((pair[1] - previous_pose[1] + np.pi) % (2 * np.pi) - np.pi)
         if (distance > .01 * (index - previous_index) + 1e-7
                 or angle > angular_limits[previous_index:index].sum() + 1e-7):
-            raise ValueError("Function events are incompatible with the preserved per-node increment limits")
+            raise FunctionReferenceError("Function reference events exceed the kernel's per-node increment limits")
         previous_index, previous_pose = index, pair
     raw = optimize_trajectory(reference_pairs, initial_pair, normalized)
     raw = np.asarray(raw, dtype=float)
     if raw.shape != (len(reference), 2, 3) or not np.isfinite(raw).all():
-        raise ValueError("Function optimizer returned invalid pose pairs")
+        raise FunctionReferenceError("Function optimizer returned invalid pose pairs")
     output = np.repeat(np.eye(4)[None], len(raw), axis=0)
     output[:, :3, 3] = raw[:, 0]
     output[:, :3, :3] = Rotation.from_euler("xyz", raw[:, 1]).as_matrix()
@@ -167,7 +180,7 @@ def transfer_function_motion(reference_poses, initial_pose, function_goals):
         check = {"index": int(index), "position_error_m": float(position[0]),
                  "rotation_error_rad": float(rotation[0]), "tolerance": 1e-6}
         if position[0] > 1e-6 or rotation[0] > 1e-6:
-            raise ValueError(f"Function optimizer failed independent equality verification at node {index}")
+            raise FunctionReferenceError(f"Function optimizer failed independent equality verification at node {index}")
         checks.append(check)
     steps = np.linalg.norm(np.diff(raw[:, 0], axis=0), axis=1)
     euler_steps = np.linalg.norm(np.fmod(np.diff(raw[:, 1], axis=0) + np.pi,
@@ -178,7 +191,7 @@ def transfer_function_motion(reference_poses, initial_pose, function_goals):
     # Check the original increments independently, in metres and radians, with
     # declared numerical tolerances rather than silently accepting a bad node.
     if translation_violation > 1e-6 or angular_violation > 1e-6:
-        raise ValueError("Function optimizer violated independent per-node increment checks: "
+        raise FunctionReferenceError("Function optimizer violated independent per-node increment checks: "
                          f"{translation_violation:.6g} m, {angular_violation:.6g} rad")
     return {
         "status": "candidate",

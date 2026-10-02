@@ -104,7 +104,7 @@ def test_effective_config_uses_constructed_values_and_rejects_opaque_objects(tmp
 
 
 # BEGIN candidate reports reuse production calculus without reclassification.
-@pytest.mark.parametrize("classification", ["planner_accepted", "rejected_diagnostic_not_executable"])
+@pytest.mark.parametrize("classification", ["validated_candidate_pending_result", "rejected_diagnostic_not_executable"])
 def test_curve_record_keeps_classification_and_separates_full_curve_from_barrier(tmp_path, classification):
     from manipulation.planning import JointTrajectory
 

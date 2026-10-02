@@ -239,9 +239,9 @@ class PlanningSceneTest(unittest.TestCase):
             return SimpleNamespace(joint_names=("left", "right"), duration=duration,
                                    sample=sample, sample_torch=sample_torch)
 
-        return PrismaticGripper(controller="timed_reference", joint_names=("left", "right"),
+        return PrismaticGripper(controller="timed_reference", control_timestep_s=.002, joint_names=("left", "right"),
             current_positions=initial, joint_limits=[[0, .04], [-.04, 0]], joint_bounds=None,
-            finger_trajectory_factory=factory, coupling_matrix=np.empty((0, 2)), coupling_offset=[],
+            finger_trajectory_factory=factory, nominal_finger_trajectory_factory=factory, coupling_matrix=np.empty((0, 2)), coupling_offset=[],
             sphere_indices=(0, 1), local_spheres=[[0, 0, 0, .001], [0, 0, 0, .001]],
             sphere_joint_translation=[[[1, 0], [0, 0], [0, 0]], [[0, 1], [0, 0], [0, 0]]],
             self_collision_pairs=((0, 1),), commands=[{"skill_id": "timed", "event_id": "close",
@@ -362,7 +362,7 @@ class PlanningSceneTest(unittest.TestCase):
         values = world.components(*inputs())
         self.assertEqual(values["unknown/owner/part"].item(), 1.)
         self.assertEqual(values["collision/robot/part"].item(), 0.)
-        self.assertEqual(world.describe()["complete_geometry_required_by_coverage"], ("part",))
+        self.assertEqual(world.describe()["occupied_owner_ids"], ("part",))
         owner.geometry_complete = True
         self.assertEqual(world.evaluate(*inputs()).item(), 0.)
         # Completing geometry never exempts that same owner from collision.
@@ -378,7 +378,7 @@ class PlanningSceneTest(unittest.TestCase):
         owner = CollisionOwner("part", SphereQuery(("part",)), pose_path(), "synthetic_owner", True)
         world = scene((owner,), coverage=observed)
         problem = PlanningProblem(("joint",), np.zeros(1), np.zeros(1), "tool", "world", np.eye(4), np.eye(4),
-                                  (MotionPhase("move", pose_path(), "free"),))
+                                  (MotionPhase("move", pose_path()),))
         world.validate_problem(problem)
         owner.pose_path = pose_path(position=(.1, 0., 0.))
         with self.assertRaisesRegex(ValueError, "occupied-evidence current pose"):
@@ -405,7 +405,7 @@ class PlanningSceneTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "link FK disagree"):
             world.validate_robot_geometry([[-1., 0., 0., .05]], {"tool": moved})
         problem = PlanningProblem(("joint",), np.zeros(1), np.zeros(1), "tool", "world", np.eye(4), np.eye(4),
-                                  (MotionPhase("move", pose_path(), "free"),))
+                                  (MotionPhase("move", pose_path()),))
         world.validate_problem(problem)
         problem.start_q[0] = .000001
         with self.assertRaisesRegex(ValueError, "exact current joint feedback"):
@@ -610,12 +610,13 @@ class PlanningSceneTest(unittest.TestCase):
             CollisionOwner("payload", SphereQuery(("payload",)), pose_path(), "observation", True,
                            local_spheres=[[0, 0, 0, .05]], attachments=(a, b))
 
-    def gripper(self, controller="binary", tolerance=1e-5):
+    def gripper(self, controller="binary", tolerance=1e-5, control_timestep_s=.002):
         def bounds(progress):
             value = progress.new_full((*progress.shape, 1), .04)
             return value, value
         return PrismaticGripper(
-            controller=controller, joint_names=("finger",), current_positions=[.04], joint_limits=[[0, .04]],
+            controller=controller, control_timestep_s=control_timestep_s,
+            joint_names=("finger",), current_positions=[.04], joint_limits=[[0, .04]],
             joint_bounds=bounds if controller == "position_tracking" else None,
             coupling_matrix=np.zeros((0, 1)), coupling_offset=[], sphere_indices=(0,),
             local_spheres=[[0, 0, 0, .005]], sphere_joint_translation=[[[1.], [0.], [0.]]],
@@ -628,7 +629,8 @@ class PlanningSceneTest(unittest.TestCase):
         world = scene(gripper=self.gripper(), has_gripper=True, background=background)
         args = inputs((0., .5), sphere_rows=[[[.04, 0, 0, .005]], [[.04, 0, 0, .005]]])
         terms = world.components(*args)
-        self.assertGreater(terms["collision/robot/background"].min().item(), .01)
+        self.assertEqual(terms["collision/robot/background"].max().item(), 0.)
+        self.assertGreater(terms["unknown/collision/robot/background"].min().item(), .01)
         self.assertIn("time-independent", world.describe()["gripper_timing_contract"])
         # Neither endpoint sphere intersects this obstacle; the swept interval does.
         endpoints = torch.tensor([[[[0, 0, 0, .005], [.04, 0, 0, .005]]]], dtype=torch.float64)
@@ -648,7 +650,8 @@ class PlanningSceneTest(unittest.TestCase):
             with self.subTest(progress=progress):
                 rows = [[[position[0]+.04, 0., 0., .005]] for position in positions]
                 terms = world.components(*inputs(progress, positions=positions, sphere_rows=rows))
-                self.assertGreater(terms["collision/robot/background"].min().item(), .01)
+                self.assertEqual(terms["collision/robot/background"].max().item(), 0.)
+                self.assertGreater(terms["unknown/collision/robot/background"].min().item(), .01)
     # END paused and isolated zero-progress binary regression.
 
     def test_tracking_commands_and_coupling_use_separate_numerical_tolerance(self):
@@ -678,7 +681,7 @@ class PlanningSceneTest(unittest.TestCase):
 
     def test_tracking_projection_preserves_gradients_without_repeating_coupling(self):
         hand = PrismaticGripper(
-            controller="position_tracking", joint_names=("left", "right"),
+            controller="position_tracking", control_timestep_s=.002, joint_names=("left", "right"),
             current_positions=[.02, -.02], joint_limits=[[0, .04], [-.04, 0]],
             joint_bounds=lambda s: (s.new_tensor([.02, -.02]).expand(*s.shape, 2),
                                     s.new_tensor([.02, -.02]).expand(*s.shape, 2)),
@@ -710,7 +713,7 @@ class PlanningSceneTest(unittest.TestCase):
             width = (.04-.03*progress)[..., None]
             return width, width
         hand = PrismaticGripper(
-            controller="position_tracking", joint_names=("finger",), current_positions=[.04],
+            controller="position_tracking", control_timestep_s=.002, joint_names=("finger",), current_positions=[.04],
             joint_limits=[[0., .04]], joint_bounds=command, coupling_matrix=np.zeros((0, 1)), coupling_offset=[],
             sphere_indices=(0,), local_spheres=[[0., 0., 0., .005]],
             sphere_joint_translation=[[[0.], [0.], [1.]]], self_collision_pairs=(),
@@ -879,7 +882,7 @@ class PlanningSceneTest(unittest.TestCase):
 
     def test_tracking_drive_projection_cannot_omit_problem_coupling(self):
         hand = PrismaticGripper(
-            controller="position_tracking", joint_names=("left", "right"),
+            controller="position_tracking", control_timestep_s=.002, joint_names=("left", "right"),
             current_positions=[.02, -.02], joint_limits=[[0, .04], [-.04, 0]],
             joint_bounds=lambda s: (s.new_tensor([.02, -.02]).expand(*s.shape, 2),
                                     s.new_tensor([.02, -.02]).expand(*s.shape, 2)),
@@ -952,3 +955,52 @@ class CuroboQueryWorkspaceTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 # END CPU scene ownership, contact, release and coverage regression tests.
+
+# BEGIN formal scene snapshots carry model values rather than labels or counts.
+def test_execution_scene_binding_owns_geometry_masks_permissions_and_nominal_identity():
+    import json
+    native = SimpleNamespace(get_sphere_distance_raw=lambda *args, **kwargs: None,
+        scene_model=SimpleNamespace(cuboid=[], cylinder=[], sphere=[], capsule=[], mesh=[], voxel=[]))
+    background = CuroboSphereQuery(native, owner_ids=("background",), source="empty observed native partition")
+    target_query = CuroboSphereQuery(native, owner_ids=("target",), source="observed target body")
+    target_query.independent_geometry = {"solids": [{"name": "target_box", "kind": "cuboid", "dimensions": [.2, .3, .4],
+        "pose": [0., 0., 0., 1., 0., 0., 0.], "source": "native target dimensions"}], "query_gaps": []}
+    owner = CollisionOwner("target", target_query, pose_path(), "current target", True)
+    current = scene((owner,), background=background, native_geometry_materials={"pad_solid": "pad"})
+    snapshot = current.to_execution_binding()
+    json.dumps(snapshot, allow_nan=False)
+    assert snapshot["owners"][0]["geometry"]["solids"][0]["dimensions"] == [.2, .3, .4]
+    assert snapshot["coverage"]["known_packbits"]
+    assert snapshot["native_geometry_materials"] == {"pad_solid": "pad"}
+    target_query.independent_geometry["solids"][0]["dimensions"][0] = 9.
+    owner.pose_path.poses[:, 0, 3] = 7.
+    assert snapshot["owners"][0]["geometry"]["solids"][0]["dimensions"][0] == .2
+    assert snapshot["owners"][0]["pose_path"]["poses"][0][0][3] == 0.
+
+
+def test_binary_measured_entrance_collision_is_not_waived_by_future_unknown_width():
+    hand = PlanningSceneTest().gripper()
+    current = scene(gripper=hand, has_gripper=True,
+                    background=SphereQuery(("background",), center=(.04, 0., 0.), radius=.002))
+    args = inputs((0., 0.), sphere_rows=[[[.04, 0., 0., .005]]]*2)
+    time = torch.tensor([[0., .5]], dtype=torch.float64)
+    terms = current.components(*args, trajectory_time=time)
+    assert terms["collision/robot/background"][0, 0] > 0
+    assert terms["collision/robot/background"][0, 1] == 0
+    assert terms["unknown/collision/robot/background"][0, 1] > 0
+# END partial observations remain explicit while actual known conflicts still fail.
+
+# BEGIN device command cadence is explicit across every controller family.
+def test_gripper_device_period_is_validated_and_preserved_in_formal_scene():
+    fixture = PlanningSceneTest()
+    for invalid in (0., -.002, float("nan"), float("inf"), True):
+        with fixture.assertRaisesRegex(ValueError, "positive native control timestep"):
+            fixture.gripper(control_timestep_s=invalid)
+    for hand in (fixture.gripper("binary"), fixture.gripper("position_tracking"), fixture.timed_gripper()):
+        background = SphereQuery(("background",))
+        background.source = "synthetic sphere query for clock metadata; no native geometry proof"
+        current = scene(gripper=hand, has_gripper=True, background=background,
+                        materials=(None,)*len(hand.sphere_indices))
+        assert current.to_execution_binding()["gripper"]["control_timestep_s"] == .002
+        assert current.describe()["gripper_control_timestep_s"] == .002
+# END a tracking hand does not need a fabricated timed-reference factory.

@@ -27,6 +27,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 # END project-local imports.
 
+# BEGIN an explicit device clock belongs to this synthetic tracking fixture.
+CONTROL_TIMESTEP_S = .002
+# END this is declared input, not an inferred or factory-provided clock.
+
 
 def tracking_command(knots, initial=.035, final=.015):
     """An explicit smooth native-coordinate command, parameterized by progress.
@@ -74,7 +78,8 @@ def run(output, *, native_knots=8, interpolation_buffer_size=512):
         from manipulation.planning import PlanningBudget, plan_trajectory
         from manipulation import planning as planner_module
         from manipulation.planning_problem import (
-            JointCoupling, MotionPhase, NumericalTolerance, PlanningEvent, PlanningProblem, PosePath)
+            JointCoupling, MotionPhase, NumericalTolerance, PlanningEvent, PlanningProblem,
+            PosePath, PoseEventRequirement, PoseProcessRequirement)
         from manipulation.planning_scene import (
             CuroboSphereQuery, ObservedSpace, PlanningScene, PrismaticGripper)
 
@@ -165,11 +170,12 @@ def run(output, *, native_knots=8, interpolation_buffer_size=512):
         # END native capacity is independent of the fixed tracking command.
         events = (
             PlanningEvent("close", "moving_close", 0., 0, "close", "synthetic tracking command", stop=False),
-            PlanningEvent("verify", "moving_close", 1., 10, "hold", "synthetic feedback barrier",
-                          requires_evidence="current_synchronized_finger_feedback", stop=True),
         )
         hand = PrismaticGripper(
             controller="position_tracking", joint_names=finger_names,
+            # BEGIN native event consumption uses explicit device metadata.
+            control_timestep_s=CONTROL_TIMESTEP_S,
+            # END the continuous tracking relation remains a separate input.
             current_positions=initial[finger_columns].cpu().numpy(), joint_limits=limits,
             joint_bounds=bounds, coupling_matrix=[[1., -1.]], coupling_offset=[0.],
             sphere_indices=sphere_indices, local_spheres=local_spheres,
@@ -190,9 +196,9 @@ def run(output, *, native_knots=8, interpolation_buffer_size=512):
                               robot_geometry_source="full native Franka sphere model with active fingers",
                               gripper=hand)
 
-        # A required tool path runs throughout closing; no source event asks
-        # the robot to stop before beginning the close. The terminal barrier
-        # only prevents treating unobserved future finger feedback as actual.
+        # A separately declared fixture relation requires the tool to move
+        # throughout closing. No evidence or stop barrier is inferred from
+        # the end of this synthetic tracking window.
         source_progress = np.linspace(0., 1., 5)
         reference_q = initial.cpu().numpy()[None].repeat(len(source_progress), axis=0)
         reference_q[:, 0] += .05*source_progress
@@ -202,12 +208,21 @@ def run(output, *, native_knots=8, interpolation_buffer_size=512):
         poses = np.repeat(np.eye(4)[None], len(source_progress), axis=0)
         poses[:, :3, 3] = reference_position
         poses[:, :3, :3] = Rotation.from_quat(reference_quaternion[:, [1, 2, 3, 0]]).as_matrix()
+        # BEGIN true tool process and terminal goal are independent of the seed.
+        reference = PosePath(source_progress, poses, "synthetic native FK reference")
         problem = PlanningProblem(
             names, initial.cpu().numpy(), np.zeros(len(names)), "panda_hand", "robot_base", np.eye(4), np.eye(4),
-            (MotionPhase("move_while_closing", PosePath(source_progress, poses, "synthetic native FK targets")),),
+            (MotionPhase("move_while_closing_reference", reference),),
             events=events, couplings=(JointCoupling(finger_names, np.array([[1., -1.]]), np.array([0.]),
                                                    "explicit synthetic symmetric drive contract"),),
-            numerical=NumericalTolerance(position_m=.001, rotation_rad=.005))
+            numerical=NumericalTolerance(position_m=.001, rotation_rad=.005),
+            pose_events=(PoseEventRequirement(1., np.eye(4), poses[-1], .001, .005,
+                "Explicit fixture terminal reach while tracking both fingers"),),
+            pose_relations=(PoseProcessRequirement(0., 1., reference, np.zeros((6, 2)),
+                "Explicit synthetic requirement to move the tool throughout the closing command"),),
+            source_timestamps=2.*source_progress, source_progress=source_progress)
+        # END an ordinary reference alone cannot make this experiment pass.
+        report["control_timestep_s"] = CONTROL_TIMESTEP_S
         report["budget"] = asdict(budget)
         report["reference_tool_translation_m"] = float(np.linalg.norm(reference_position[-1]-reference_position[0]))
         report["commanded_width_m"] = [float(2*reference_q[0, finger_columns[0]]),
@@ -270,11 +285,12 @@ def run(output, *, native_knots=8, interpolation_buffer_size=512):
                     or tracking_error > hand.numerical_joint_tolerance+5e-7
                     or coupling_error > problem.numerical.joint+5e-7):
                 raise AssertionError("The accepted export must actually track both fingers while the tool moves")
-            barrier = trajectory.next_verification
-            if (barrier is None or barrier["requires_evidence"] != "current_synchronized_finger_feedback"
-                    or barrier["skill_id"] != "moving_close" or barrier["event_id"] != "verify"
-                    or trajectory.conditions):
-                raise AssertionError("Original feedback barriers must survive without fabricated Holding conditions")
+            # BEGIN completion of a synthetic reference cannot invent evidence.
+            if (trajectory.next_verification is not None or trajectory.conditions
+                    or [(event["skill_id"], event["event_id"]) for event in trajectory.events]
+                       != [("moving_close", "close")]):
+                raise AssertionError("The explicit close identity must survive without a fabricated evidence barrier")
+            # END no terminal command is scheduled outside activation coverage.
         report.update(torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                       torch_peak_reserved_bytes=torch.cuda.max_memory_reserved())
     except Exception as error:

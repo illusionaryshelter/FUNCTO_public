@@ -28,7 +28,8 @@ def run(args):
         raise ValueError("Fixture and controller must belong to the same recorded episode")
     part = manifest["environment"]["controller_config"]["body_parts"][args.controller_part]
     limits = ExecutionLimits.from_mapping(json.loads(args.execution_limits.read_text()))
-    curve = load_saved_trajectory(args.trajectory, evaluation_mode="accepted_plan", execution_limits=limits)
+    planning_result = load_saved_trajectory(args.trajectory, execution_limits=limits)
+    curve = planning_result.trajectory
     if curve.events or curve.conditions:
         raise ValueError("Takeover comparison requires an event-free control reference")
     if not np.isfinite(args.seconds) or not 0 < args.seconds <= .1:

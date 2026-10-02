@@ -23,25 +23,15 @@ from manipulation.execution import ExecutionLimits
 from manipulation.gripper_trajectory import FingerTrajectory
 from manipulation.robosuite_execution import RobosuiteExecutionBackend
 
-def load_saved_trajectory(path, *, evaluation_mode, execution_limits):
-    """Load the exported cubic without smoothing, retiming or relabelling it."""
+# BEGIN archive inspection is separate from execution authorization.
+def load_curve_archive(path):
+    """Inspect exact recorded arrays, including rejected diagnostic curves."""
     from manipulation.planning import JointTrajectory
 
     path = Path(path)
     metadata = json.loads(path.with_suffix(".json").read_text())
-    expected = {"accepted_plan": "planner_accepted",
-                "diagnostic_rejected_candidate": "rejected_diagnostic_not_executable"}
-    if evaluation_mode not in expected or metadata["classification"] != expected[evaluation_mode]:
-        raise ValueError("Execution mode must retain the saved planner classification")
-    # BEGIN require one recorded physical contract for every execution mode.
-    if not isinstance(execution_limits, ExecutionLimits):
-        raise ValueError("Loading an executable curve requires explicit ExecutionLimits")
-    if ("execution_limits" not in metadata
-            or metadata["execution_limits"] != execution_limits.describe()):
-        raise ValueError("Saved curve and execution must contain identical physical execution limits")
-    # END a rejected diagnostic is not an exemption from actual-hand binding.
     with np.load(path, allow_pickle=False) as arrays:
-        if str(arrays["classification"].item()) != expected[evaluation_mode]:
+        if str(arrays["classification"].item()) != metadata["classification"]:
             raise ValueError("Saved trajectory arrays and metadata disagree on planner status")
         curve = JointTrajectory(tuple(arrays["joint_names"].tolist()), arrays["times"].copy(),
             arrays["position"].copy(), arrays["velocity"].copy(), arrays["progress_u"].copy(),
@@ -79,7 +69,26 @@ def load_saved_trajectory(path, *, evaluation_mode, execution_limits):
         # END reload never generates a replacement finger trajectory.
     if curve.next_verification != metadata["next_verification"]:
         raise ValueError("The saved evidence barrier must be preserved exactly")
-    return curve
+    return curve, metadata
+
+
+def load_saved_trajectory(path, *, execution_limits):
+    """Restore the formal result; plain labels and diagnostics cannot execute."""
+    from manipulation.planning import PlanningResult
+    from manipulation.execution_binding import check_result
+
+    curve, metadata = load_curve_archive(path)
+    if metadata["classification"] != "planner_accepted":
+        raise ValueError("Rejected diagnostic archives are not executable PlanningResults")
+    if not isinstance(execution_limits, ExecutionLimits):
+        raise ValueError("Loading an executable curve requires explicit ExecutionLimits")
+    if metadata.get("execution_limits") != execution_limits.describe():
+        raise ValueError("Saved curve and execution must contain identical physical execution limits")
+    result = PlanningResult(True, curve, {"origin": str(Path(path).resolve())},
+                            execution_binding=metadata.get("execution_binding"))
+    check_result(result, execution_limits=execution_limits)
+    return result
+# END independent preflight still runs for every restored formal result.
 
 
 def restore_recorded_simulation(*, scene_path, catalog_path, episode_path, frame_index,

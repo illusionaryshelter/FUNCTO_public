@@ -379,12 +379,21 @@ class RobotCoverage:
                 raise ValueError("Entrance coordinates are neither measured q0 nor its exact float32 representation")
         self._queries += 1
         # BEGIN report precisely the set queried; no O input exists here.
-        report = {"passed": False, "failure": None, "canonicalized_initial_float32": canonicalized,
+        report = {"passed": False, "attempt_allowed": True, "failure": None, "canonicalized_initial_float32": canonicalized,
                   "joint_names": list(self.baseline_joint_names), "joint_positions": q.tolist(),
                   "free_evidence_deficit_volume_m3": None,
                   "residual_classification": "unclassified", "witness": None,
                   "continuous_path_certified": False}
         # END neither this volume nor its witness establishes physical penetration.
+        # BEGIN optional free-volume work cannot hide a known scalar limit.
+        limits = {name: {"position": float(value), "lower": self._checker.joint_limits[name][0],
+                         "upper": self._checker.joint_limits[name][1]}
+                  for name, value in zip(self.baseline_joint_names, q)
+                  if not self._checker.joint_limits[name][0] <= value <= self._checker.joint_limits[name][1]}
+        if limits:
+            report.update(attempt_allowed=False, failure="native_joint_limits", joint_limit_violations=limits)
+            return report
+        # END incomplete optional coverage is unresolved; mandatory collision queries are separate.
         if self._queries > self.max_queries:
             report["failure"] = "state_query_budget"
             return report
@@ -392,7 +401,7 @@ class RobotCoverage:
             state = self._checker.query(joint_names=self.baseline_joint_names, joint_positions=q,
                                         T_reference_base=self._base, pairs=(), frames=self.required_link_names)
             if state["joint_limit_violations"]:
-                report.update(failure="native_joint_limits", joint_limit_violations=state["joint_limit_violations"])
+                report.update(attempt_allowed=False, failure="native_joint_limits", joint_limit_violations=state["joint_limit_violations"])
                 return report
             for component, row in enumerate(self._solids):
                 pose = np.asarray(state["frame_poses"][row["frame"]], float)
@@ -436,14 +445,16 @@ class RobotCoverage:
                     if not np.isfinite(volume):
                         raise RuntimeError("Native new-volume query returned a nonfinite volume diagnostic")
                     # BEGIN distinguish absent free evidence from proven unknown.
-                    report.update(failure="new_volume_without_free_evidence", solid=row["name"],
+                    # BEGIN missing free evidence is an allowed unresolved attempt.
+                    report.update(attempt_allowed=True, failure="new_volume_without_free_evidence", solid=row["name"],
                                   free_evidence_deficit_volume_m3=volume,
                                   volume_scope="first failing native component; diagnostic only",
                                   free_evidence_deficit_boundary_faces=int(bad.num_tri()),
                                   witness=self._witness(bad, row, pose))
                     # END O versus unknown remains unclassified, never waived.
                     return report
-            report.update(passed=True, free_evidence_deficit_volume_m3=0., residual_classification="empty")
+            # END no coverage result grants collision permission.
+            report.update(passed=True, attempt_allowed=True, free_evidence_deficit_volume_m3=0., residual_classification="empty")
             return report
         except CoverageBudgetExceeded as error:
             report.update(failure="native_work_budget", error=str(error))

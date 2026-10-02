@@ -74,7 +74,7 @@ def on_fixture():
 
 
 class ProgramTest(unittest.TestCase):
-    def test_supplied_entry_corridor_is_checked_between_function_events(self):
+    def test_source_corridor_deviation_is_reported_without_rejecting_the_bound_goal(self):
         from itertools import product
         from manipulation.goals import InteriorRegion
         program, scene = fixture()
@@ -84,8 +84,11 @@ class ProgramTest(unittest.TestCase):
         region = InteriorRegion.from_vertices(
             list(product([-.1, .1], [-.02, .02], [-.02, .02])), "observed free entry corridor")
         scene.update(entry_region=region.to_dict(), entry_start_index=1)
-        with self.assertRaisesRegex(ValueError, "entry corridor"):
-            ground_program(program, scene)
+        # BEGIN reference deviation does not negate the independent corridor requirement.
+        result = ground_program(program, scene)
+        self.assertFalse(result["motion_checks"]["entry_corridor"]["reference_satisfies_corridor"])
+        self.assertEqual(result["function_checks"][0]["status"], "bound_goal")
+        # END reference deviation does not negate the independent corridor requirement.
         program["demo"]["T_reference_carrier"][2, 1, 3] = 0
         result = ground_program(program, scene)
         self.assertEqual(result["motion_checks"]["entry_corridor"]["checked_nodes"], 7)

@@ -36,7 +36,8 @@ class PlanningPrecisionTests(unittest.TestCase):
                 torch.backends.cuda.matmul.allow_tf32 = enabled
                 torch.backends.cudnn.allow_tf32 = not enabled
 
-                def initialize(planner, *_args):
+                # BEGIN the request initializer now binds an optional continuation.
+                def initialize(planner, *_args, continuation=None):
                     self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
                     # Both actual solver destructors must still run within the
                     # request precision scope, including any native cleanup.
@@ -57,7 +58,7 @@ class PlanningPrecisionTests(unittest.TestCase):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
 
-        def failing_initialize(*_args):
+        def failing_initialize(*_args, continuation=None):
             # Reproduce seed_ik_solver's import-time assignments before a
             # subsequent initialization failure can reach the normal reset.
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -84,10 +85,13 @@ class PlanningPrecisionTests(unittest.TestCase):
         torch.backends.cudnn.allow_tf32 = False
         scene = SimpleNamespace(describe=Mock(side_effect=ValueError("description failed")))
 
-        def initialize(planner, *_args):
+        def initialize(planner, *_args, continuation=None):
+            from manipulation.planning import PlanningBudget
+            planner.budget = PlanningBudget()
             planner.scene_workspace_bytes = 0
             planner.anchor_fk_workspace_bytes = 0
             planner.anchor_capacity = 0
+        # END fixtures retain the production initialization contract.
 
         with patch.object(_CuroboPlanner, "_initialize", autospec=True, side_effect=initialize):
             with self.assertRaisesRegex(ValueError, "description failed"):

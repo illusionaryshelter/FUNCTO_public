@@ -8,6 +8,7 @@ assumptions and do not obtain geometry from a simulator or another project.
 
 # BEGIN independent process-constraint and existing-grounding integration tests.
 from copy import deepcopy
+from dataclasses import replace
 import json
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,10 @@ import torch
 from manipulation.goals import SupportSurface
 from manipulation.motion import MotionModel, transfer_motion
 from manipulation.planning_problem import (
+    CoordinateEventRequirement,
+    MechanismRequirement,
+    PoseEventRequirement,
+    PoseProcessRequirement,
     JointCoupling,
     MotionPhase,
     NumericalTolerance,
@@ -98,10 +103,7 @@ def grasp_input():
         "carrier_pose": pose((.1, .05, 0.)), "region_transform": pose(),
         "eef_pose": pose((-.1, .02, .2)),
     }
-    # BEGIN select an original pre-grasp ID independently of the contact suffix.
-    return {"skill_id": "grasp", "program": {"skill_kind": "grasp", "demo": demo},
-            "scene": scene, "barrier_can_stop": True, "pregrasp_frame": 14}
-    # END select an original pre-grasp ID independently of the contact suffix.
+    return {"skill_id": "grasp", "program": {"skill_kind": "grasp", "demo": demo}, "scene": scene}
 
 
 def manipulation_input():
@@ -133,7 +135,7 @@ def manipulation_input():
             "carrier_frame": pose(), "reference_frame": pose(),
             "source": "independently supplied part correspondence"}},
     }
-    return {"skill_id": "transfer", "program": program, "scene": scene, "barrier_can_stop": True}
+    return {"skill_id": "transfer", "program": program, "scene": scene}
 
 
 def compile_inputs(*skills):
@@ -250,61 +252,145 @@ def alternative_placement(skill, goal=None):
     return result, release_delta
 
 
+# BEGIN current-skill reference/goal/process separation regression coverage.
 class PlanningProcessTest(unittest.TestCase):
-    # BEGIN first-arrival evidence-anchor regression for a progress plateau.
-    def test_event_anchor_uses_first_actual_fk_and_backpropagates_only_to_that_arrival(self):
-        positions = torch.tensor([[[0., 0., 0.], [1., 2., 3.], [7., 8., 9.], [10., 11., 12.]],
-                                  [[0., 0., 0.], [.1, .2, .3], [-1., -2., -3.], [-7., -8., -9.]]],
-                                 dtype=torch.float64, requires_grad=True)
-        rotations = Rotation.from_euler("xyz", [[.2, .4, -.7], [-.8, .3, 1.2],
-                                               [.9, -.6, .2], [-1.3, .1, -.5]]).as_quat()[:, [3, 0, 1, 2]]
-        quaternion = torch.tensor(np.stack((rotations, rotations[::-1].copy())),
-                                  dtype=torch.float64, requires_grad=True)
-        progress = torch.tensor([[0., 1., 1., 2.], [0., .5, 1., 1.]], dtype=torch.float64)
-        position_at_event, quaternion_at_event = anchor_pose(positions, quaternion, progress, 1.)
-        np.testing.assert_array_equal(position_at_event.detach().numpy()[:, 0], [[1., 2., 3.], [-1., -2., -3.]])
-        np.testing.assert_array_equal(quaternion_at_event.detach().numpy()[:, 0], np.stack((rotations[1], rotations[1])))
-        (position_at_event.sum()+quaternion_at_event.sum()).backward()
-        expected_position, expected_quaternion = np.zeros((2, 4, 3)), np.zeros((2, 4, 4))
-        expected_position[0, 1], expected_position[1, 2] = 1., 1.
-        expected_quaternion[0, 1], expected_quaternion[1, 2] = 1., 1.
-        np.testing.assert_array_equal(positions.grad.numpy(), expected_position)
-        np.testing.assert_array_equal(quaternion.grad.numpy(), expected_quaternion)
-        missing = anchor_pose(positions, quaternion, progress, 1.5)
-        self.assertTrue(all(not torch.isfinite(value).any() for value in missing))
-    # END first-arrival evidence-anchor regression for a progress plateau.
+    def test_ordinary_reference_never_creates_a_path_or_terminal_obligation(self):
+        request = problem([MotionPhase("reference", path([pose(), pose((.2, 0., 0.)), pose()]))])
+        progress = torch.tensor([[0., .3, .5, 1.]], dtype=torch.float64)
+        position, quaternion = components(np.array([[pose((0., .6, .3))]*4]))
+        np.testing.assert_array_equal(request.evaluate(position, quaternion, progress).numpy(), 0.)
+        np.testing.assert_array_equal(request.optimizer_preferences(position, quaternion, progress).numpy(), 0.)
+        np.testing.assert_array_equal(request.anchors, [0., 1.])
+        self.assertIsNone(request.terminal_pose_target)
+        self.assertGreater(request.measurements(position, quaternion, progress)[
+            "phase:0:original_reference_position_error_m"].min().item(), .5)
+        with self.assertRaises(TypeError):
+            MotionPhase("old implicit lock", path([pose(), pose()]), kind="pose")
 
-    def test_required_short_loop_knots_are_checked_without_locking_free_prefix_samples(self):
-        free = PosePath(np.array([0., .17, .49, 1.]),
-                        np.array([pose(), pose((.1, 0., 0.)), pose((.2, .1, 0.)), pose()]),
-                        "only the approach endpoint is required")
-        reference = PosePath(np.array([0., .501, .502, .503, 1.]),
-                             np.array([pose(), pose(), pose((.02, 0., 0.)), pose(), pose()]),
-                             "observed necessary short loop")
-        request = problem([MotionPhase("approach", free, kind="free"),
-                           MotionPhase("required_loop", reference)])
-        np.testing.assert_allclose(request.anchors, [0., 1., 1.501, 1.502, 1.503, 2.], atol=1e-12)
-        # A stopped candidate contributes no extra speed-based subdivision;
-        # the required loop itself must still make its peak unavoidable.
-        progress = torch.tensor(request.anchors[None], dtype=torch.float64)
-        position = torch.zeros((*progress.shape, 3), dtype=torch.float64)
-        quaternion = torch.zeros((*progress.shape, 4), dtype=torch.float64)
-        quaternion[..., 0] = 1.
-        self.assertGreater(request.evaluate(position, quaternion, progress).max().item(), .019)
+    def test_required_pose_relation_has_scope_and_finite_gradients(self):
+        reference = path([pose(), pose((.1, 0., 0.)), pose()])
+        relation = PoseProcessRequirement(.2, .8, reference, np.zeros((6, 2)), "required tool axis/position relation")
+        request = problem([MotionPhase("source", reference)], pose_relations=(relation,))
+        progress = torch.tensor([[0., .2, .5, .8, 1.]], dtype=torch.float64)
+        position = torch.zeros((1, 5, 3), dtype=torch.float64, requires_grad=True)
+        quaternion = torch.tensor([[[1., 0., 0., 0.]]*5], dtype=torch.float64, requires_grad=True)
+        values = request.evaluate(position, quaternion, progress)
+        self.assertGreater(values[0, 2].item(), .09)
+        self.assertEqual(values[0, 0].item(), 0.)
+        loss = values.sum()+request.optimizer_preferences(position, quaternion, progress).sum()
+        loss.backward()
+        self.assertLess(position.grad[0, 2, 0].item(), 0.)
+        self.assertTrue(torch.isfinite(quaternion.grad).all())
+        np.testing.assert_allclose(request.anchors, [0., .2, .5, .8, 1.])
 
-    def test_mechanism_pause_and_reversal_knots_are_mandatory_queries(self):
-        coordinates = np.array([[.1], [.13], [.13], [.08], [.15]])
-        knots = np.array([0., .31, .32, .33, 1.])
-        model = MotionModel("prismatic", coordinates, pose(), np.eye(3), None,
-                            1e-6, 1e-6, {"source": "independent signed mechanism"})
-        reference = PosePath(knots, model.poses(coordinates), "required pause and reversal",
-                             motion_model=model, coordinates=coordinates)
-        request = problem([MotionPhase("slide", reference)])
-        np.testing.assert_array_equal(request.anchors, knots)
-        measured = reference.sample_numpy(request.anchors)[:, 2, 3]
-        np.testing.assert_allclose(measured, [.1, .13, .13, .08, .15], atol=1e-12)
+    def test_allowed_pose_band_has_no_invented_center_preference(self):
+        bounds = np.tile([-np.inf, np.inf], (6, 1))
+        bounds[0] = [-.03, .04]
+        reference = path([pose(angles=(0., 0., np.pi/2))]*2)
+        relation = PoseProcessRequirement(0., 1., reference, bounds, "explicit process allowance")
+        request = problem([MotionPhase("source", reference)], pose_relations=(relation,))
+        progress = torch.tensor([[.5]], dtype=torch.float64)
+        position, quaternion = components(np.array([[pose((0., .035, .2), (0., 0., np.pi/2))]]))
+        self.assertEqual(request.evaluate(position, quaternion, progress).item(), 0.)
+        self.assertEqual(request.optimizer_preferences(position, quaternion, progress).item(), 0.)
+        self.assertEqual(request.project_residual(position, quaternion, progress).shape[-1], 0)
+        position[0, 0, 1] = .06
+        self.assertGreater(request.evaluate(position, quaternion, progress).item(), .019)
+        for malformed in (np.full((6, 2), np.inf), np.zeros((5, 2))):
+            with self.assertRaises(ValueError):
+                PoseProcessRequirement(0., 1., reference, malformed, "declared relation")
 
-    # BEGIN compare physical mechanism acceptance with the existing NumPy oracle.
+    def test_real_pose_event_generates_gradient_and_uses_its_own_tolerance(self):
+        goal = PoseEventRequirement(.6, pose(), pose((.1, 0., 0.)), 1e-7, 1e-7, "true functional target")
+        request = problem([MotionPhase("unrelated source", path([pose(), pose()]))], pose_events=(goal,))
+        progress = torch.tensor([[.3, .6, 1.]], dtype=torch.float64)
+        position = torch.tensor([[[.4, 0., 0.], [.100002, 0., 0.], [.4, 0., 0.]]], dtype=torch.float64, requires_grad=True)
+        quaternion = torch.tensor([[[1., 0., 0., 0.]]*3], dtype=torch.float64)
+        residual = request.evaluate(position, quaternion, progress)
+        self.assertGreater(residual[0, 1].item(), 1e-6)
+        self.assertEqual(residual[0, 0].item()+residual[0, 2].item(), 0.)
+        request.optimizer_preferences(position, quaternion, progress).sum().backward()
+        self.assertGreater(position.grad[0, 1, 0].item(), 0.)
+        self.assertEqual(position.grad[0, 0].abs().sum().item(), 0.)
+        self.assertIsNone(request.terminal_pose_target)
+
+    def test_mechanism_is_independent_of_reference_and_bounds_the_actual_coordinate(self):
+        request = compile_inputs(prismatic_input())
+        progress = torch.tensor([[0., .2, .4, 1.2, 2.]], dtype=torch.float64)
+        position, quaternion = request.sample_reference(progress)
+        position = position.clone()
+        position[0, 1, 0] = .24  # valid motion different from the source profile
+        self.assertEqual(request.evaluate(position, quaternion, progress)[0, 1].item(), 0.)
+        position[0, 1, 0] = .34  # beyond the bound current slider limit
+        self.assertGreater(request.residuals(position, quaternion, progress)["mechanism_limits:0"][0, 1].item(), .039)
+        position[0, 2, 1] += .03
+        self.assertGreater(request.residuals(position, quaternion, progress)["mechanism:0"][0, 2].item(), .02)
+        position[0, 3, 1] += 5.  # independent retreat is outside the holding scope
+        self.assertEqual(request.residuals(position, quaternion, progress)["mechanism:0"][0, 3].item(), 0.)
+
+    def test_full_candidate_winding_is_checked_without_locking_reference_velocity(self):
+        request = compile_inputs(revolute_input())
+        progress = torch.as_tensor(np.unique(np.r_[np.linspace(0., 2., 161), request.anchors])[None], dtype=torch.float64)
+        position, quaternion = request.sample_reference(progress)
+        self.assertLess(request.evaluate(position, quaternion, progress).max().item(), 1e-10)
+        stationary_p = position[..., :1, :].expand_as(position).clone()
+        stationary_q = quaternion[..., :1, :].expand_as(quaternion).clone()
+        residual = request.residuals(stationary_p, stationary_q, progress)["function_coordinate:0"]
+        self.assertGreater(residual.max().item(), 6.2)
+        # The same turn with a different speed profile reaches the explicit
+        # event and respects current limits; the reference samples are free.
+        event = request.coordinate_events[0]
+        coordinate = 2*np.pi*np.minimum(progress.numpy()[0]/event.progress, 1.)**2
+        body = event.mechanism.model.poses(coordinate[:, None])
+        actual = body @ np.linalg.inv(event.mechanism.tool_from_carrier)
+        p, q = components(actual[None])
+        self.assertLess(request.evaluate(p, q, progress).max().item(), 1e-10)
+        self.assertEqual(request.verification_issues(progress), [])
+        self.assertTrue(request.verification_issues(torch.tensor([[event.progress]])))
+
+    def test_unwrapped_event_sequence_rejects_same_pose_with_wrong_turn_history(self):
+        model = MotionModel("revolute", np.zeros((1, 1)), pose((.2, 0., 0.)), np.eye(3), np.zeros(3),
+                            1e-6, 1e-6, {"source": "current hinge"})
+        mechanism = MechanismRequirement(0., 1., model, pose(), [[0., 7.]], [0.], "current mechanism")
+        goals = (CoordinateEventRequirement(.5, mechanism, 2*np.pi, 1e-5, "first turn"),
+                 CoordinateEventRequirement(1., mechanism, 0., 1e-5, "return through reverse turn"))
+        request = problem([MotionPhase("uninformative reference", path([pose(), pose()]))], mechanisms=(mechanism,), coordinate_events=goals)
+        progress = torch.as_tensor(np.linspace(0., 1., 101)[None], dtype=torch.float64)
+        angles = 2*np.pi*(1-np.abs(2*progress.numpy()[0]-1))
+        p, q = components(model.poses(angles[:, None])[None])
+        self.assertLess(request.evaluate(p, q, progress).max().item(), 1e-10)
+        order = torch.randperm(progress.shape[-1], generator=torch.Generator().manual_seed(7))
+        self.assertLess(request.evaluate(p[:, order], q[:, order], progress[:, order]).max().item(), 1e-10)
+        p, q = components(model.poses(np.zeros((101, 1)))[None])
+        self.assertGreater(request.evaluate(p, q, progress).max().item(), 6.2)
+
+    def test_ambiguous_axis_projection_has_finite_gradients_and_is_rejected(self):
+        model = MotionModel("revolute", np.zeros((1, 1)), pose(), np.eye(3), np.array([.2, 0., 0.]),
+                            1e-6, 1e-6, {"source": "independent hinge"})
+        relation = MechanismRequirement(0., 1., model, pose(), None, [0.], "axis evidence")
+        request = problem([MotionPhase("source", path([pose(), pose()]))], mechanisms=(relation,))
+        p = torch.zeros((1, 1, 3), dtype=torch.float64, requires_grad=True)
+        q = torch.tensor([[[0., 1., 0., 0.]]], dtype=torch.float64, requires_grad=True)
+        value = request.evaluate(p, q, torch.tensor([[.5]], dtype=torch.float64))
+        self.assertGreater(value.item(), 3.)
+        value.sum().backward()
+        self.assertTrue(torch.isfinite(p.grad).all() and torch.isfinite(q.grad).all())
+
+    def test_actual_frame_calibration_and_joint_coupling_remain_independent(self):
+        base, tool = pose((.4, -.1, .2), (.2, -.3, .4)), pose((.1, .02, -.03), (.1, .2, -.1))
+        coupling = JointCoupling(("joint_b", "joint_a"), np.array([[1., 2.]]), np.array([.1]), "actual actuator relation")
+        request = problem([MotionPhase("source", path([pose(), pose()]))], base_pose=base, tool_transform=tool, couplings=(coupling,))
+        link = pose((.2, .1, .3), (.4, .2, .5))
+        p, q = components(np.array([[link]]))
+        tp, tq = request.transform_tool_pose(p, q)
+        np.testing.assert_allclose(matrices(tp, tq)[0, 0], base @ link @ tool, atol=1e-12)
+        np.testing.assert_allclose(matrices(*request.reference_to_link_pose(tp, tq))[0, 0], link, atol=1e-12)
+        actual = torch.tensor([[[.02, .06, 0.]]], dtype=torch.float64)
+        value = request.evaluate(tp, tq, torch.tensor([[.5]]), actual, request.joint_names)
+        self.assertEqual(value.item(), 0.)
+        actual[..., 1] += .01
+        self.assertGreater(request.evaluate(tp, tq, torch.tensor([[.5]]), actual, request.joint_names).item(), .009)
+
     def test_mechanism_metrics_match_source_projection_with_attachment_and_frame_changes(self):
         coordinates = {
             "prismatic": np.array([[0.], [.05], [.09]]),
@@ -344,7 +430,9 @@ class PlanningProcessTest(unittest.TestCase):
                     reference = PosePath(np.array([0., .5, 1.]), reference_body, "complete source path",
                                          motion_model=model, coordinates=current_coordinates,
                                          attachment=current_attachment)
-                    request = problem([MotionPhase("mechanism", reference)])
+                    requirement = MechanismRequirement(0., 1., model, np.linalg.inv(current_attachment), None,
+                                                       current_coordinates[0], "current physical model")
+                    request = problem([MotionPhase("mechanism", reference)], mechanisms=(requirement,))
                     on_position, on_quaternion = components((reference_body @ current_attachment)[None])
                     on_position.requires_grad_(), on_quaternion.requires_grad_()
                     accepted = request.evaluate(on_position, on_quaternion, progress)
@@ -364,1030 +452,176 @@ class PlanningProcessTest(unittest.TestCase):
                     np.testing.assert_allclose(measured["mechanism:0:rotation_error_rad"].detach().numpy()[0],
                                                oracle_rotation, atol=2e-15)
                     residuals = request.residuals(position, quaternion, progress)
-                    np.testing.assert_allclose(residuals["phase:0:mechanism"].detach().numpy(), 0., atol=1e-12)
-                    self.assertGreater(residuals["mechanism:0:mechanism"][0, 1].item(), 4e-5)
-                    self.assertGreater(residuals["mechanism:0:mechanism"][0, 2].item(), 1e-5)
+                    self.assertGreater(residuals["mechanism:0"][0, 1].item(), 4e-5)
+                    self.assertGreater(residuals["mechanism:0"][0, 2].item(), 1e-5)
                     with self.assertRaisesRegex(ValueError, "incompatible"):
                         model.coordinates_of(actual_body)
                     sum(residuals.values()).sum().backward()
                     self.assertTrue(torch.isfinite(position.grad).all())
                     self.assertTrue(torch.isfinite(quaternion.grad).all())
 
-    def test_ambiguous_axis_projection_rejects_half_turn_with_finite_gradients(self):
-        for kind, values in (("revolute", np.zeros((2, 1))), ("planar", np.zeros((2, 3)))):
-            for dtype in (torch.float32, torch.float64):
-                with self.subTest(kind=kind, dtype=dtype):
-                    model = MotionModel(kind, values, pose(), np.eye(3),
-                                        np.array([.2, 0., 0.]) if kind == "revolute" else None,
-                                        1e-6, 1e-6, {"source": "independent axis model"})
-                    reference = PosePath(np.array([0., 1.]), model.poses(values), "fixed mechanism pose",
-                                         motion_model=model, coordinates=values)
-                    request = problem([MotionPhase("mechanism", reference)])
-                    progress = torch.tensor([[.5]], dtype=dtype)
-                    position = torch.zeros((1, 1, 3), dtype=dtype, requires_grad=True)
-                    # Exactly zero scalar and axial quaternion components make
-                    # the axis projection nonunique, without relying on sin(pi).
-                    quaternion = torch.tensor([[[0., 1., 0., 0.]]], dtype=dtype, requires_grad=True)
-                    measured = request.measurements(position, quaternion, progress)
-                    self.assertAlmostEqual(measured["mechanism:0:rotation_error_rad"].item(), np.pi, places=6)
-                    residual = request.residuals(position, quaternion, progress)["mechanism:0:mechanism"]
-                    self.assertGreater(residual.item(), 3.)
-                    residual.sum().backward()
-                    self.assertTrue(torch.isfinite(position.grad).all())
-                    self.assertTrue(torch.isfinite(quaternion.grad).all())
-
-    def test_physical_mechanism_tolerances_remain_strict_inside_generic_path_allowance(self):
-        skill = prismatic_input()
-        skill["scene"]["motion_model"].update(position_tolerance=1e-6, rotation_tolerance=1e-6)
-        request = compile_inputs(skill)
-        progress = torch.as_tensor(request.anchors[None], dtype=torch.float64)
-        position, quaternion = request.sample_reference(progress)
-        position = position.clone()
-        position[0, 1, 1] += 5e-5
-        residuals = request.residuals(position, quaternion, progress,
-                                      joint_velocity=torch.zeros((*progress.shape, 3), dtype=torch.float64))
-        for name, value in residuals.items():
-            if name.startswith("mechanism:"):
-                continue
-            np.testing.assert_allclose(value.numpy(), 0., atol=1e-12)
-        self.assertGreater(residuals["mechanism:0:slide:0-3"][0, 1].item(), 4.8e-5)
-        # At the independent retreat the hand is no longer constrained by the
-        # previously held mechanism, even though the generic path still applies.
-        position, quaternion = request.sample_reference(progress)
-        position = position.clone()
-        position[0, -1, 1] += 5e-5
-        residuals = request.residuals(position, quaternion, progress,
-                                      joint_velocity=torch.zeros((*progress.shape, 3), dtype=torch.float64))
-        for name, value in residuals.items():
-            if name.startswith("mechanism:"):
-                np.testing.assert_allclose(value.numpy(), 0., atol=1e-12)
-    # END compare physical mechanism acceptance with the existing NumPy oracle.
-
-    def test_on_endpoint_moves_within_support_without_freeing_local_motion(self):
-        body = np.array([[x, y, z] for x in (-.01, .01)
-                         for y in (-.015, .015) for z in (0., .025)])
-        surface = SupportSurface(
-            origin=np.zeros(3), basis=np.array([[1., 0.], [0., 1.], [0., 0.]]),
-            normal=np.array([0., 0., 1.]),
-            boundary=np.array([[-.3, -.3], [.3, -.3], [.3, .3], [-.3, .3]]),
-            source="independent finite support fixture")
-        attachment = pose((.02, -.01, .06), (.2, -.3, .1))
-        reference = np.array([pose((0., 0., .2)), pose((.02, .01, .1)), pose((.04, 0., 0.))])
-        phase = MotionPhase("place", path(reference, attachment=attachment),
-                            endpoint_family={"end": "variable"})
-        support = SupportRequirement(1., np.linalg.inv(attachment), body, body[body[:, 2] == 0],
-                                     np.array([0., 0., -1.]), surface,
-                                     1e-6, 1e-6, 0., "specified bottom face on observed support")
-        request = problem([phase], supports=(support,))
-        goal = pose((.12, .08, 0.), (0., 0., .4))
-        # The pre-existing numerical transfer is an independent oracle for the
-        # permitted endpoint-dependent family, not an arbitrary free path.
-        alternative = transfer_motion(reference, reference[0], goal_pose=goal)["poses"] @ attachment
-        position, quaternion = components(alternative[None])
-        progress = torch.tensor([[0., .5, 1.]], dtype=torch.float64)
-        self.assertTrue(torch.all(request.evaluate(position, quaternion, progress) == 0))
-        position = position.clone()
-        position[0, 1, 1] += .025
-        terms = request.residuals(position, quaternion, progress)
-        self.assertGreater(terms["phase:0:place"][0, 1].item(), .015)
-        self.assertTrue(torch.all(terms["support:0"] == 0))
-
-    def test_on_checks_face_normal_height_and_whole_body_footprint(self):
-        body = np.array([[x, y, z] for x in (-.01, .01)
-                         for y in (-.02, .02) for z in (0., .04)])
-        surface = SupportSurface(
-            origin=np.zeros(3), basis=np.array([[1., 0.], [0., 1.], [0., 0.]]),
-            normal=np.array([0., 0., 1.]),
-            boundary=np.array([[-.15, -.1], [.15, -.1], [.15, .1], [-.15, .1]]),
-            source="finite support fixture")
-        attachment = pose((.04, -.02, .07), (.2, -.3, .1))
-        support = SupportRequirement(1., np.linalg.inv(attachment), body, body[body[:, 2] == 0],
-                                     np.array([0., 0., -1.]), surface,
-                                     1e-6, 1e-6, 0., "material lower face")
-        actual = np.array([pose((.03, .04, 0.), (0., 0., .5)),
-                           pose((.03, .04, .015)),
-                           pose((.03, .04, -.01)),
-                           pose((.03, .04, 0.), (.2, 0., 0.)),
-                           pose((.149, 0., 0.))]) @ attachment
-        position, quaternion = components(actual[None])
-        value = support.evaluate(position, quaternion, NumericalTolerance())
-        self.assertEqual(value[0, 0].item(), 0.)
-        self.assertTrue(torch.all(value[0, 1:] > .005))
-
-    def test_projection_also_enforces_declared_actuator_coupling(self):
-        coupling = JointCoupling(("left", "right"), np.array([[1., -1.]]),
-                                 np.array([.005]), "actual differential actuator relation")
-        request = problem([MotionPhase("free", path([pose(), pose()]), kind="free")],
-                          couplings=(coupling,))
-        progress = torch.tensor([[.5]], dtype=torch.float64)
-        position, quaternion = request.sample_reference(progress)
-        joints = torch.tensor([[[.02, .016]]], dtype=torch.float64)
-        equality = request.project_residual(position, quaternion, progress, 0,
-                                            joint_position=joints, joint_names=("left", "right"))
-        np.testing.assert_allclose(equality.numpy(), [[[-.001]]], atol=1e-12)
-
-    def test_free_connection_can_change_but_required_middle_motion_cannot(self):
-        entry = pose((.3, 0., 0.))
-        request = problem([
-            MotionPhase("reach", path([pose(), entry]), kind="free"),
-            MotionPhase("required_loop", path([entry, pose((.3, .1, 0.)), entry])),
-        ])
-        progress = torch.tensor([[0., .5, 1., 1.5, 2.]], dtype=torch.float64)
-        position, quaternion = request.sample_reference(progress)
-        position = position.clone()
-        position[0, 1] += torch.tensor([.1, -.2, .07])
-        self.assertTrue(torch.equal(request.evaluate(position, quaternion, progress),
-                                    torch.zeros_like(progress)))
-        # Matching both endpoints is insufficient: the required local loop has
-        # a meaningful middle position that an endpoint-only planner omits.
-        position[0, 3, 1] = 0.
-        violation = request.evaluate(position, quaternion, progress)
-        self.assertGreater(violation[0, 3].item(), .09)
-        self.assertEqual(violation[0, -1].item(), 0.)
-        self.assertEqual(violation[0, 2].item(), 0.)
-
-    def test_mode_boundary_is_one_pose_that_must_satisfy_both_sides(self):
-        entry = pose((.2, -.1, .05))
-        request = problem([
-            MotionPhase("reach", path([pose(), entry]), kind="free"),
-            MotionPhase("contact", path([entry, pose((.2, -.1, .08))])),
-        ])
-        progress = torch.tensor([[1.]], dtype=torch.float64)
-        position, quaternion = request.sample_reference(progress)
-        position = position + torch.tensor([[[.02, 0., 0.]]])
-        terms = request.residuals(position, quaternion, progress)
-        self.assertGreater(terms["phase:0:reach"].item(), .01)
-        self.assertGreater(terms["phase:1:contact"].item(), .01)
-
-    def test_required_process_drives_finite_position_and_orientation_gradients(self):
-        reference = pose((.1, -.2, .3), (.2, -.3, .4))
-        request = problem([MotionPhase("required", path([reference, reference]))])
-        progress = torch.tensor([[.2, .8]], dtype=torch.float64)
-        actual = np.repeat(reference[None, None], 2, axis=1)
-        actual[0, 0] = reference @ pose((.015, -.02, .03), (.04, -.02, .01))
-        position, quaternion = components(actual)
-        position, quaternion = position.requires_grad_(), quaternion.requires_grad_()
-        loss = request.evaluate(position, quaternion, progress)
-        self.assertGreater(loss[0, 0].item(), 0.)
-        self.assertEqual(loss[0, 1].item(), 0.)
-        loss.sum().backward()
-        self.assertTrue(torch.isfinite(position.grad).all())
-        self.assertTrue(torch.isfinite(quaternion.grad).all())
-        self.assertGreater(torch.linalg.vector_norm(position.grad[0, 0]).item(), 0.)
-        self.assertGreater(torch.linalg.vector_norm(quaternion.grad[0, 0]).item(), 0.)
-        np.testing.assert_allclose(position.grad[0, 1].numpy(), 0., atol=0.)
-        np.testing.assert_allclose(quaternion.grad[0, 1].numpy(), 0., atol=0.)
-
-    # BEGIN optimizer equality preferences preserve source freedoms and raw feasibility.
-    def test_pose_equality_preference_keeps_gradients_inside_numerical_acceptance(self):
-        request = problem([MotionPhase("required", path([pose(), pose()]))])
-        progress = torch.tensor([[.5]], dtype=torch.float64)
-        dx, rz = .5*request.numerical.position_m, .5*request.numerical.rotation_rad
-        p, q = components(pose((dx, 0., 0.), (0., 0., rz))[None, None])
-        p, q = p.requires_grad_(), q.requires_grad_()
-        self.assertEqual(request.evaluate(p, q, progress).item(), 0.)
-        preferred = request.optimizer_preferences(p, q, progress)
-        self.assertAlmostEqual(preferred.item(), dx*dx+rz*rz, places=17)
-        preferred.sum().backward()
-        np.testing.assert_allclose(p.grad.numpy(), [[[2*dx, 0., 0.]]], atol=1e-15)
-        self.assertTrue(bool(torch.isfinite(q.grad).all()))
-        self.assertGreater(float(q.grad.abs().max()), 0.)
-        torch.testing.assert_close(preferred, request.optimizer_preferences(p, -q, progress), rtol=0, atol=1e-17)
-
-    def test_nonzero_finite_equality_uses_its_actual_target_local_value(self):
-        reference = pose((.3, -.2, .1), (.2, -.4, .7))
-        bounds = np.array([[.2, .2], [-1., 1.], [-np.inf, np.inf],
-                           [-np.inf, np.inf], [-np.inf, np.inf], [-np.inf, np.inf]])
-        request = problem([MotionPhase("offset equality", path([reference, reference]), pose_bounds=bounds)])
-        error = .5*request.numerical.position_m
-        p, q = components((reference @ pose((.2+error, .7, -.8), (.2, -.3, .4)))[None, None])
-        p, q = p.requires_grad_(), q.requires_grad_()
-        progress = torch.tensor([[.5]], dtype=torch.float64)
-        self.assertEqual(request.evaluate(p, q, progress).item(), 0.)
-        preferred = request.optimizer_preferences(p, q, progress)
-        self.assertAlmostEqual(preferred.item(), error*error, places=17)
-        preferred.sum().backward()
-        np.testing.assert_allclose(p.grad.numpy()[0, 0], 2*error*reference[:3, 0], atol=2e-15)
-        np.testing.assert_allclose(q.grad.numpy(), 0., atol=1e-15)
-        np.testing.assert_array_equal(request.phases[0].pose_bounds, bounds)
-
-    def test_finite_width_and_infinite_axes_have_no_invented_center_preference(self):
-        bounds = np.array([[0., 0.], [-.8, .8], [-np.inf, np.inf],
-                           [-.5, .5], [-np.inf, np.inf], [-np.inf, np.inf]])
-        request = problem([MotionPhase("allowed axes", path([pose(), pose()]), pose_bounds=bounds)])
-        p, q = components(pose((0., .7, 10.), (.2, 0., 0.))[None, None])
-        p, q = p.requires_grad_(), q.requires_grad_()
-        progress = torch.tensor([[.4]], dtype=torch.float64)
-        self.assertEqual(request.evaluate(p, q, progress).item(), 0.)
-        preferred = request.optimizer_preferences(p, q, progress)
-        self.assertEqual(preferred.item(), 0.)
-        preferred.sum().backward()
-        self.assertTrue(bool(torch.isfinite(p.grad).all() and torch.isfinite(q.grad).all()))
-        np.testing.assert_array_equal(p.grad.numpy(), np.zeros((1, 1, 3)))
-        np.testing.assert_array_equal(q.grad.numpy(), np.zeros((1, 1, 4)))
-        unconstrained = problem([MotionPhase("fully free axes", path([pose(), pose()]),
-                                             pose_bounds=np.tile([-np.inf, np.inf], (6, 1)))])
-        self.assertEqual(unconstrained.optimizer_preferences(p, q, progress).item(), 0.)
-
-    def test_free_phase_preference_only_applies_to_its_required_endpoint(self):
-        request = problem([MotionPhase("approach", path([pose(), pose()]), kind="free"),
-                           MotionPhase("unconstrained end", path([pose(), pose()]),
-                                       kind="free", require_end=False)])
-        progress = torch.tensor([[0., 1.-.5e-7, 1., 1.+2e-7, 1.5, 2.]], dtype=torch.float64)
-        p, q = components(np.broadcast_to(pose((.01, 0., 0.)), (1, 6, 4, 4)).copy())
-        preferred = request.optimizer_preferences(p, q, progress)
-        np.testing.assert_allclose(preferred.numpy(), [[0., 1e-4, 1e-4, 0., 0., 0.]], atol=1e-18)
-        raw = request.residuals(p, q, progress)
-        np.testing.assert_array_equal(preferred.numpy() > 0, raw["phase:0:approach"].numpy() > 0)
-        np.testing.assert_array_equal(raw["phase:1:unconstrained end"].numpy(), np.zeros((1, 6)))
-
-    def test_endpoint_family_translation_yaw_and_shared_endpoint_gradient_remain_available(self):
-        attachment = pose((.02, -.01, .06), (.2, -.3, .1))
-        reference = np.array([pose((0., 0., .2)), pose((.02, .01, .1)), pose((.04, 0., 0.))])
-        request = problem([MotionPhase("allowed on family", path(reference, attachment=attachment),
-                                       endpoint_family={"end": "variable"})])
-        goals = (pose((.12, .08, 0.), (0., 0., .4)), pose((-.06, .11, 0.), (0., 0., -.7)))
-        # Existing NumPy grounding supplies each complete allowed family.
-        # Neither substantial tangential relocation nor yaw may gain a cost
-        # toward the saved nominal placement when its actual motion matches.
-        alternatives = np.stack([transfer_motion(reference, reference[0], goal_pose=goal)["poses"] @ attachment
-                                 for goal in goals])
-        p, q = components(alternatives)
-        progress = torch.tensor([[0., .5, 1.], [0., .5, 1.]], dtype=torch.float64)
-        preferred = request.optimizer_preferences(p, q, progress)
-        self.assertLess(float(preferred.max()), 1e-28)
-        np.testing.assert_array_equal(request.evaluate(p, q, progress).numpy(), np.zeros((2, 3)))
-        # A small interior defect must also differentiate through the actual
-        # selected endpoint, instead of silently freezing that family member.
-        p = p.clone()
-        p[:, 1, 0] += .5*request.numerical.position_m
-        p, q = p.requires_grad_(), q.requires_grad_()
-        preferred = request.optimizer_preferences(p, q, progress)
-        preferred.sum().backward()
-        self.assertTrue(bool(torch.isfinite(p.grad).all() and torch.isfinite(q.grad).all()))
-        self.assertGreater(float(torch.linalg.vector_norm(p.grad[:, -1])), 0.)
-
-    def test_optimizer_pose_preference_does_not_mutate_any_raw_residual(self):
-        request = problem([MotionPhase("required", path([pose(), pose()]))])
-        progress = torch.tensor([[.2, .8]], dtype=torch.float64)
-        dx = request.numerical.position_m
-        p, q = components(np.array([[pose((.5*dx, 0., 0.)), pose((2*dx, 0., 0.))]]))
-        p, q = p.requires_grad_(), q.requires_grad_()
-        before = request.residuals(p, q, progress)
-        preferred = request.optimizer_preferences(p, q, progress)
-        preferred.sum().backward()
-        after = request.residuals(p, q, progress)
-        self.assertEqual(before.keys(), after.keys())
-        for name in before:
-            torch.testing.assert_close(before[name], after[name], rtol=0, atol=0)
-        np.testing.assert_allclose(after["phase:0:required"].detach().numpy(), [[0., dx]], atol=1e-18)
-        self.assertTrue(bool(torch.all(preferred > 0)))
-    # END optimizer equality preferences preserve source freedoms and raw feasibility.
-
-    def test_quaternion_double_cover_does_not_change_physical_requirement(self):
-        reference = pose(angles=(.4, -.7, .2))
-        request = problem([MotionPhase("required", path([reference, reference]))])
-        progress = torch.tensor([[.35]], dtype=torch.float64)
-        position, quaternion = components((reference @ pose(angles=(.02, .01, -.04)))[None, None])
-        torch.testing.assert_close(request.evaluate(position, quaternion, progress),
-                                   request.evaluate(position, -quaternion, progress), rtol=0., atol=1e-12)
-
-    def test_allowed_band_is_target_local_and_not_an_equality_centerline(self):
-        reference = pose(angles=(0., 0., np.pi/2))
-        bounds = np.zeros((6, 2))
-        bounds[0] = [-.10, .10]
-        bounds[3:] = [-np.inf, np.inf]
-        phase = MotionPhase("partial", path([reference, reference]), pose_bounds=bounds)
-        request = problem([phase])
-        progress = torch.tensor([[.5]], dtype=torch.float64)
-        position, quaternion = components((reference @ pose((.08, 0., 0.), (0., 0., .4)))[None, None])
-        self.assertEqual(request.evaluate(position, quaternion, progress).item(), 0.)
-        equality = request.project_residual(position, quaternion, progress, 0)
-        # Only Y and Z are equalities. The finite X interval and free rotations
-        # must not become extra projection equations deleting valid solutions.
-        self.assertEqual(equality.shape, (1, 1, 2))
-        np.testing.assert_allclose(equality.numpy(), 0., atol=1e-12)
-        position[0, 0, 0] += .015
-        self.assertGreater(request.evaluate(position, quaternion, progress).item(), .014)
-        np.testing.assert_array_equal(phase.pose_bounds, bounds)
-
-    def test_mechanism_interpolation_keeps_hinge_arc_and_unwrapped_winding(self):
-        center = np.array([.1, -.2, .3])
-        zero = pose(center + [.2, 0., 0.], (.1, .2, -.3))
-        coordinates = np.array([[0.], [np.pi], [2*np.pi]])
-        model = MotionModel("revolute", coordinates, zero, np.eye(3), center,
-                            1e-6, 1e-6, {"source": "analytic fixed hinge"})
-        attachment = pose((.03, -.01, .04), (.2, -.1, .3))
-        reference = PosePath(np.array([0., .5, 1.]), model.poses(coordinates),
-                             "observed unwrapped mechanism coordinate fixture",
-                             motion_model=model, coordinates=coordinates, attachment=attachment)
-        query = torch.tensor([[.25, .75]], dtype=torch.float64, requires_grad=True)
-        position, quaternion = reference.sample(query)
-        expected = model.poses(np.array([[np.pi/2], [3*np.pi/2]])) @ attachment
-        np.testing.assert_allclose(matrices(position, quaternion)[0], expected, atol=1e-12, rtol=0.)
-        # A chord between the endpoints would have put the body at its axis.
-        self.assertGreater(np.linalg.norm(expected[0, :3, 3]-center), .2)
-        (position[..., 0].sum() + quaternion[..., 0].sum()).backward()
-        self.assertTrue(torch.isfinite(query.grad).all())
-        self.assertGreater(torch.linalg.vector_norm(query.grad).item(), 0.)
-
-    def test_prismatic_pause_and_reversal_remain_in_phase_reference(self):
-        coordinates = np.array([[.4], [.45], [.45], [.42], [.5]])
-        zero = pose((.2, -.1, .4), (.3, -.2, .1))
-        basis = Rotation.from_euler("xyz", [.2, .4, -.3]).as_matrix()
-        model = MotionModel("prismatic", coordinates, zero, basis, None,
-                            1e-6, 1e-6, {"source": "analytic slider"})
-        reference = PosePath(np.linspace(0., 1., 5), model.poses(coordinates),
-                             "signed source coordinates", motion_model=model, coordinates=coordinates)
-        query = np.array([.25, .375, .5, .625, .75])
-        actual = reference.sample_numpy(query)
-        measured = (actual[:, :3, 3]-zero[:3, 3]) @ basis[:, 2]
-        np.testing.assert_allclose(measured, [.45, .45, .45, .435, .42], atol=1e-12)
-
-    def test_base_and_tcp_mapping_match_independent_noncommuting_composition(self):
-        base = pose((.3, -.2, .5), (.2, .3, -.4))
-        tcp = pose((.03, -.02, .07), (-.2, .4, .1))
-        request = problem([MotionPhase("required", path([pose(), pose()]))],
-                          base_pose=base, tool_transform=tcp)
-        links = np.array([[pose((.1, .2, .3), (.1, -.5, .7)),
-                           pose((-.2, .1, .4), (-.3, .2, .6))]])
-        position, quaternion = components(links)
-        tool_position, tool_quaternion = request.transform_tool_pose(position, quaternion)
-        np.testing.assert_allclose(matrices(tool_position, tool_quaternion), base @ links @ tcp,
-                                   atol=1e-12, rtol=0.)
-        recovered = request.reference_to_link_pose(tool_position, tool_quaternion)
-        np.testing.assert_allclose(matrices(*recovered), links, atol=1e-12, rtol=0.)
-        spheres = torch.tensor([[[[.1, .2, .3, .04], [-.2, .3, .1, .02]]]], dtype=torch.float64)
-        transformed = request.transform_robot_spheres(spheres).numpy()
-        np.testing.assert_allclose(transformed[..., :3], spheres.numpy()[..., :3] @ base[:3, :3].T + base[:3, 3],
-                                   atol=1e-12)
-        np.testing.assert_array_equal(transformed[..., 3], spheres.numpy()[..., 3])
-
-    def test_named_actuator_coupling_does_not_assume_joint_array_order(self):
-        coupling = JointCoupling(("left_slide", "right_slide"), np.array([[1., -1.]]),
-                                 np.array([.005]), "declared actuator coupling")
-        request = problem([MotionPhase("free", path([pose(), pose()]), kind="free", require_end=False)],
-                          couplings=(coupling,))
-        progress = torch.tensor([[.25, .75]], dtype=torch.float64)
-        position, quaternion = request.sample_reference(progress)
-        names = ("right_slide", "arm", "left_slide")
-        joints = torch.tensor([[[.015, .7, .02], [.015, .7, .025]]], dtype=torch.float64,
-                              requires_grad=True)
-        value = request.evaluate(position, quaternion, progress, joints, names)
-        self.assertEqual(value[0, 0].item(), 0.)
-        self.assertGreater(value[0, 1].item(), .004)
-        value.sum().backward()
-        self.assertLess(joints.grad[0, 1, 0].item(), 0.)
-        self.assertGreater(joints.grad[0, 1, 2].item(), 0.)
-        self.assertEqual(joints.grad[0, 1, 1].item(), 0.)
-
-    def test_source_event_ids_are_scoped_by_skill_and_barriers_require_stops(self):
-        phases = [MotionPhase("free", path([pose(), pose()]), kind="free", require_end=False)]
-        events = (PlanningEvent("open", "first", .2, 42, "gripper", "first source intention"),
-                  PlanningEvent("open", "second", .7, 42, "gripper", "second source intention"),
-                  PlanningEvent("holding", "first", 1., 43, "verification", "observed source boundary",
-                                requires_evidence="synchronized actual Holding", stop=True))
-        request = problem(phases, events=events)
-        self.assertEqual([event.event_id for event in request.events], ["open", "open", "holding"])
-        np.testing.assert_allclose(request.anchors, [0., .2, .7, 1.])
-        progress = torch.tensor([[.7, 1.]], dtype=torch.float64)
-        position, quaternion = request.sample_reference(progress)
-        with self.assertRaisesRegex(ValueError, "velocity"):
-            request.evaluate(position, quaternion, progress)
-        velocity = torch.tensor([[[.1, .2, .3], [.02, 0., 0.]]], dtype=torch.float64)
-        value = request.evaluate(position, quaternion, progress, joint_velocity=velocity)
-        self.assertEqual(value[0, 0].item(), 0.)
-        self.assertGreater(value[0, 1].item(), .019)
-        with self.assertRaisesRegex(ValueError, "planned stop"):
-            problem(phases, events=(PlanningEvent("holding", "first", 1., 43, "verification", "source",
-                                                 requires_evidence="actual Holding"),))
-
-    # BEGIN bound named windows while preserving complete multi-phase skills.
-    def test_declared_skill_limit_combines_phase_and_event_identities(self):
-        phases = [MotionPhase(f"phase_{index}", path([pose(), pose()]),
-                              metadata={"skill_id": skill_id})
-                  for index, skill_id in enumerate(("current", "current", "current", "next", "next"))]
-        request = problem(phases)
-        self.assertEqual(request.phase_count, 5)
-        later = MotionPhase("later", path([pose(), pose()]), metadata={"skill_id": "later"})
-        with self.assertRaisesRegex(ValueError, "current skill and at most one next skill"):
-            problem([*phases, later])
-        with self.assertRaisesRegex(ValueError, "current skill and at most one next skill"):
-            problem(phases, events=(PlanningEvent("open", "later", 4.5, 42,
-                                                 "gripper", "independent original event"),))
-
-    def test_event_only_skill_ids_cannot_bypass_the_window_limit(self):
-        phase = MotionPhase("explicit_phase", path([pose(), pose()]))
-        events = tuple(PlanningEvent("open", skill_id, index / 3., index,
-                                     "gripper", "independent original event")
-                       for index, skill_id in enumerate(("current", "next", "later")))
-        with self.assertRaisesRegex(ValueError, "current skill and at most one next skill"):
-            problem([phase], events=events)
-    # END bound named windows while preserving complete multi-phase skills.
-
-    def test_numerical_acceptance_does_not_mutate_declared_skill_bounds(self):
-        declared = np.zeros((6, 2))
-        declared[0] = [-.02, .02]
-        phase = MotionPhase("bounded", path([pose(), pose()]), pose_bounds=declared)
-        numerical = NumericalTolerance(position_m=2e-5, rotation_rad=3e-4)
-        request = problem([phase], numerical=numerical)
-        progress = torch.tensor([[.5]], dtype=torch.float64)
-        position, quaternion = request.sample_reference(progress)
-        position[0, 0, 0] = .025
-        self.assertGreater(request.evaluate(position, quaternion, progress).item(), .004)
-        np.testing.assert_array_equal(phase.pose_bounds, declared)
-        self.assertEqual(request.numerical.position_m, 2e-5)
-
-    # BEGIN finite pose-error domains distinguish freedoms from empty bounds.
-    def test_empty_or_malformed_pose_bounds_are_rejected_before_evaluation(self):
-        reference = path([pose(), pose()])
-        for invalid_row in ((np.inf, np.inf), (-np.inf, -np.inf),
-                            (np.inf, -np.inf), (.2, .1), (np.nan, 0.), (0., np.nan)):
-            for axis in range(6):
-                with self.subTest(row=invalid_row, axis=axis):
-                    bounds = np.zeros((6, 2))
-                    bounds[axis] = invalid_row
-                    with self.assertRaisesRegex(ValueError, "bounds admitting finite errors"):
-                        MotionPhase("invalid", reference, pose_bounds=bounds)
-        for shape in ((6,), (2, 6), (6, 3), (1, 6, 2)):
-            with self.subTest(shape=shape), self.assertRaisesRegex(
-                    ValueError, "bounds admitting finite errors"):
-                MotionPhase("invalid", reference, pose_bounds=np.zeros(shape))
-
-    def test_one_sided_bounds_keep_nonzero_equalities_and_target_local_axes(self):
-        reference = pose((.3, -.2, .1), (.2, -.4, .7))
-        bounds = np.array([[-np.inf, .1], [-.2, np.inf], [.03, .03],
-                           [-np.inf, np.inf], [-.4, .4], [0., 0.]])
-        phase = MotionPhase("one sided", path([reference, reference]), pose_bounds=bounds)
-        request = problem([phase])
-        progress = torch.tensor([[.5]], dtype=torch.float64)
-        local_errors = ((.05, .6, .03), (-3., 4., .03), (.12, .6, .03), (.05, -.22, .03))
-        for index, translation in enumerate(local_errors):
-            with self.subTest(translation=translation):
-                position, quaternion = components(
-                    (reference @ pose(translation, (0., .25, 0.)))[None, None])
-                violation = request.evaluate(position, quaternion, progress).item()
-                if index < 2:
-                    self.assertEqual(violation, 0.)
-                    # The finite Z and rotation-Z equalities remain; the
-                    # one-sided X/Y and rotation interval add no centreline.
-                    equalities = request.project_residual(position, quaternion, progress, 0)
-                    self.assertEqual(equalities.shape, (1, 1, 2))
-                    np.testing.assert_allclose(equalities.numpy(), 0., atol=1e-12)
-                else:
-                    self.assertGreater(violation, .019)
-        np.testing.assert_array_equal(phase.pose_bounds, bounds)
-    # END finite pose-error domains distinguish freedoms from empty bounds.
-
 
 class PlanningBuilderTest(unittest.TestCase):
-    # BEGIN validate serialized public inputs and complete grounding evidence.
-    def test_json_and_array_inputs_compile_equivalently_without_mutation(self):
-        first, second = prismatic_input(), prismatic_input()
-        first["program"]["demo"]["release_frame"] = None
-        first["program"]["demo"]["gripper_events"] = []
-        second["skill_id"] = "next_slide"
-        second["scene"]["functional_bindings"]["function"]["current_coordinates"] = [.18]
-        second["scene"]["holding"]["verified"] = False
-        windows = [(grasp_input(),), (manipulation_input(),), (on_input(),),
-                   (prismatic_input(),), (revolute_input(),), (first, second)]
-        for window in windows:
-            with self.subTest(skills=[skill["skill_id"] for skill in window]):
-                encoded = json.dumps(window, default=lambda value: value.tolist(), sort_keys=True)
-                serialized = json.loads(encoded)
-                original_serialized = deepcopy(serialized)
-                arrays, lists = compile_inputs(*window), compile_inputs(*serialized)
-                np.testing.assert_array_equal(arrays.anchors, lists.anchors)
-                progress = torch.as_tensor(arrays.anchors[None], dtype=torch.float64)
-                np.testing.assert_allclose(matrices(*arrays.sample_reference(progress)),
-                                           matrices(*lists.sample_reference(progress)), atol=1e-12)
-                self.assertEqual([phase.metadata for phase in arrays.phases],
-                                 [phase.metadata for phase in lists.phases])
-                self.assertEqual(json.dumps(arrays.conditions, default=lambda value: value.tolist(), sort_keys=True),
-                                 json.dumps(lists.conditions, default=lambda value: value.tolist(), sort_keys=True))
-                self.assertEqual(serialized, original_serialized)
-                self.assertEqual(json.dumps(window, default=lambda value: value.tolist(), sort_keys=True), encoded)
-        boundary = next(item for item in lists.conditions
-                        if item["kind"] == "predicted_skill_boundary" and item["skill_id"] == "next_slide")
-        self.assertAlmostEqual(boundary["initial_pose"][0][3], .14)
-        self.assertAlmostEqual(lists.phases[2].metadata["owner_initial_pose"][0][3], .1)
+    def test_no_pregrasp_or_automatic_stop_and_source_map_keeps_irregular_seconds(self):
+        skill = grasp_input()
+        skill["program"]["demo"]["timestamps"] = np.array([2., 2.02, 2.03, 2.5, 2.7, 3.])
+        request = compile_inputs(skill)
+        self.assertEqual(len(request.phases), 1)
+        self.assertEqual(len(request.pose_events), 1)
+        self.assertEqual(request.stop_progress.tolist(), [])
+        self.assertFalse(any(event.requires_evidence for event in request.events))
+        # BEGIN independent effect assessment keeps its exact event key.
+        effect = next(row for row in request.conditions if row.get("effect_requirement"))
+        self.assertEqual((effect["skill_id"], effect["event_id"]),
+                         (skill["skill_id"], "__stable_holding__"))
+        # END effect timing alone supplies no outcome evidence.
+        self.assertEqual(request.pose_relations, ())
+        np.testing.assert_allclose(request.source_time_map["progress"], [0., .02, .03, .5, .7, 1.])
+        np.testing.assert_allclose(request.source_time_to_progress([2.025, 2.6]), [.025, .6])
+        np.testing.assert_allclose(request.progress_to_source_time([.025, .6]), [2.025, 2.6])
+        np.testing.assert_allclose(request.anchors, [0., .5, 1.])
+        self.assertIs(request.terminal_pose_target, request.pose_events[0])
+        p, q = request.sample_reference(torch.tensor([[.02, .03]], dtype=torch.float64))
+        p = p+3.
+        self.assertEqual(request.evaluate(p, q, torch.tensor([[.02, .03]])).sum().item(), 0.)
 
-    def test_missing_grounding_model_evidence_is_not_silently_free(self):
-        for missing in ("model", "diagnostics"):
-            with self.subTest(missing=missing):
-                skill = prismatic_input()
-                grounded = ground_program(skill["program"], skill["scene"])
-                if missing == "model":
-                    del grounded["motion_checks"]["model"]
-                else:
-                    del grounded["motion_checks"]["model"]["diagnostics"]
-                with patch("manipulation.program.ground_program", return_value=grounded):
-                    with self.assertRaisesRegex(KeyError, missing):
-                        compile_inputs(skill)
+    def test_only_one_current_skill_and_actual_holding_are_accepted(self):
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            compile_inputs(grasp_input(), manipulation_input())
+        skill = manipulation_input()
+        skill["scene"]["holding"]["verified"] = False
+        with self.assertRaisesRegex(ValueError, "actual holding"):
+            compile_inputs(skill)
+        a = MotionPhase("a", path([pose(), pose()]), metadata={"skill_id": "a"})
+        b = MotionPhase("b", path([pose(), pose()]), metadata={"skill_id": "b"})
+        with self.assertRaisesRegex(ValueError, "one current"):
+            problem([a, b])
 
-    def test_tool_use_keeps_its_existing_function_kernel_without_a_model_record(self):
+    def test_function_release_and_retreat_preserve_identity_without_stage_targets(self):
+        request = compile_inputs(manipulation_input())
+        self.assertEqual(len(request.phases), 2)
+        by_id = {event.event_id: event for event in request.events}
+        self.assertAlmostEqual(by_id["function"].progress, .6)
+        self.assertAlmostEqual(by_id["open"].progress, .8)
+        self.assertEqual(by_id["__release_verified__"].progress, 1.)
+        # BEGIN release observations bind to identity rather than a clock guess.
+        effect = next(row for row in request.conditions if row.get("effect_requirement"))
+        self.assertEqual((effect["skill_id"], effect["event_id"]),
+                         (by_id["__release_verified__"].skill_id, "__release_verified__"))
+        # END the predicted geometry is still distinct from the observed effect.
+        self.assertIsNone(request.terminal_pose_target)
+        self.assertEqual(request.stop_progress.tolist(), [])
+        self.assertEqual(request.phases[0].metadata["attachment_interval"], [0., 1.])
+        self.assertEqual(request.phases[1].metadata["mode"], "released_retreat")
+        p, q = request.sample_reference(torch.tensor([[2.]], dtype=torch.float64))
+        self.assertEqual(request.evaluate(p+7., q, torch.tensor([[2.]])).item(), 0.)
+
+    def test_reference_kernel_failure_keeps_real_goal_and_malformed_goal_still_fails(self):
         skill = manipulation_input()
         skill["program"]["task"]["relation"] = "tool_use"
-        body = np.array([pose((x, 0., 0.)) for x in (0., .005, .01, .015, .015, .015, .015)])
-        skill["program"]["demo"]["T_reference_carrier"] = body
-        # Isolate this adapter test from the already independently tested IPOPT
-        # solve; the real tool consumer still validates all six returned nodes.
-        solved_pairs = np.stack((body[:6, :3, 3], np.zeros((6, 3))), axis=1)
-        with patch("manipulation.function_motion.optimize_trajectory", return_value=solved_pairs):
-            grounded = ground_program(skill["program"], skill["scene"])
-            request = compile_inputs(skill)
-        self.assertNotIn("model", grounded["motion_checks"])
-        self.assertEqual(grounded["motion_checks"]["kernel"], "released_function_origin_xyz_euler_objective")
-        self.assertTrue(all(phase.reference.motion_model is None for phase in request.phases))
-        np.testing.assert_allclose(request.phases[0].reference.sample_numpy(np.linspace(0., 1., 4)),
-                                   grounded["eef_poses"][:4], atol=1e-12)
-    # END validate serialized public inputs and complete grounding evidence.
-
-    def test_declared_support_tolerances_are_not_widened_by_solver_numerics(self):
-        skill = on_input()
+        skill["scene"]["functional_bindings"]["function"]["reference_frame"] = pose((.4, 0., 0.))
+        grounded = ground_program(skill["program"], skill["scene"])
+        self.assertEqual(grounded["motion_checks"]["reference_generation"]["status"], "failed")
         request = compile_inputs(skill)
-        attachment = skill["scene"]["holding"]["T_carrier_eef"]
-        actual = np.array([pose((.02, .03, 2e-5)),
-                           pose((.02, .03, 0.), (2e-4, 0., 0.))]) @ attachment
-        position, quaternion = components(actual[None])
-        value = request.supports[0].evaluate(position, quaternion, request.numerical)
-        self.assertTrue(torch.all(value > 1e-5))
+        self.assertEqual(len(request.pose_events), 1)
+        goal = request.pose_events[0]
+        p, q = request.sample_reference(torch.tensor([[goal.progress]], dtype=torch.float64))
+        p = p.clone()
+        p[..., 0] -= .2
+        self.assertGreater(request.evaluate(p, q, torch.tensor([[goal.progress]])).item(), .19)
+        bad = deepcopy(skill)
+        del bad["scene"]["functional_bindings"]["function"]["source"]
+        with self.assertRaisesRegex(ValueError, "evidenced"):
+            compile_inputs(bad)
 
-    def test_revolute_event_measures_radians_and_retains_the_full_recorded_turn(self):
-        request = compile_inputs(revolute_input())
-        self.assertAlmostEqual(request.phases[0].reference.coordinates[-1, 0], 2*np.pi)
-        progress = torch.tensor([[0., 2./3, 1., 1.5, 2., 3.]], dtype=torch.float64)
-        actual = matrices(*request.sample_reference(progress))
-        self.assertLess(actual[0, 1, 0, 3], -.19)
-        actual[0, 2] = pose(angles=(0., 0., 2e-4)) @ actual[0, 2]
-        position, quaternion = components(actual)
-        value = request.evaluate(position, quaternion, progress,
-                                 joint_velocity=torch.zeros((1, 6, 3)))
-        self.assertGreater(value[0, 2].item(), 1e-4)
-        measurements = request.measurements(position, quaternion, progress)
-        np.testing.assert_allclose(measurements["coordinate:0:error_rad"][0, 2].item(), 2e-4, atol=1e-12)
-
-    def test_declared_coordinate_event_tolerance_keeps_its_own_metric(self):
+    def test_current_coordinate_goal_conflict_is_not_a_reference_failure(self):
         skill = prismatic_input()
-        request = compile_inputs(skill)
-        progress = torch.tensor([[0., 1., 1.5, 2., 3.]], dtype=torch.float64)
-        position, quaternion = request.sample_reference(progress)
-        position = position.clone()
-        position[0, 1, 0] += 2e-5
-        value = request.evaluate(position, quaternion, progress,
-                                 joint_velocity=torch.zeros((1, 5, 3)))
-        self.assertGreater(value[0, 1].item(), 1e-5)
-
-    def test_successor_mechanism_coordinates_start_at_the_predecessor_state(self):
-        first, second = prismatic_input(), prismatic_input()
-        first["program"]["demo"]["release_frame"] = None
-        first["program"]["demo"]["gripper_events"] = []
-        second["skill_id"] = "next_slide"
-        second["scene"]["functional_bindings"]["function"]["current_coordinates"] = [.18]
-        second["scene"]["holding"]["verified"] = False
-        request = compile_inputs(first, second)
-        previous, successor = request.phases[1], request.phases[2]
-        np.testing.assert_allclose(previous.reference.coordinates[-1], [.14], atol=1e-12)
-        np.testing.assert_allclose(successor.reference.coordinates[0], [.14], atol=1e-12)
-        np.testing.assert_allclose(successor.reference.coordinates[-1], [.18], atol=1e-12)
-        np.testing.assert_allclose(previous.reference.sample_numpy(np.array([1.]))[0],
-                                   successor.reference.sample_numpy(np.array([0.]))[0], atol=1e-12)
-        self.assertFalse(second["scene"]["holding"]["verified"])
-        self.assertEqual(second["scene"]["initial_pose"][0, 3], .1)
-
-    def test_declared_function_event_tolerance_is_not_replaced_by_global_numerics(self):
-        skill = manipulation_input()
-        request = compile_inputs(skill)
-        event = skill["program"]["demo"]["functional_events"][0]
-        self.assertEqual(event["position_tolerance_m"], 1e-7)
-        self.assertGreater(request.numerical.position_m, event["position_tolerance_m"])
-        progress = torch.tensor([[0., 1., 1.5, 2., 3.]], dtype=torch.float64)
-        nominal = matrices(*request.sample_reference(progress))
-        for defect in ("position", "rotation"):
-            actual = nominal.copy()
-            if defect == "position":
-                actual[0, 1, 0, 3] += 2e-5
-            else:
-                actual[0, 1] = actual[0, 1] @ pose(angles=(2e-4, 0., 0.))
-            position, quaternion = components(actual)
-            value = request.evaluate(position, quaternion, progress,
-                                     joint_velocity=torch.zeros((1, 5, 3)))
-            with self.subTest(defect=defect):
-                self.assertGreater(value[0, 1].item(), 1e-5)
-
-    def test_still_held_on_successor_uses_the_actual_boundary_for_its_fixed_goal_family(self):
-        place, transfer = on_input(), manipulation_input()
-        place["program"]["demo"]["release_frame"] = None
-        place["program"]["demo"]["gripper_events"] = []
-        request = compile_inputs(place, transfer)
-        nominal = ground_program(place["program"], place["scene"])
-        frame = place["program"]["demo"]["functional_events"][0]["carrier_frame"]
-        goal = pose((.12, .08, 0.), (0., 0., .7))
-        objects = nominal["object_poses"]
-        first = transfer_motion(objects[:4] @ frame, objects[0] @ frame,
-                                goal_pose=goal @ frame)["poses"] @ np.linalg.inv(frame)
-        second = transfer_motion(objects[3:] @ frame, goal @ frame)["poses"] @ np.linalg.inv(frame)
-        attachment = place["scene"]["holding"]["T_carrier_eef"]
-        held = np.concatenate((first, second[1:])) @ attachment
-        successor = request.phases[2]
-        body = successor.reference.poses
-        next_body = transfer_motion(body, second[-1], goal_pose=body[-1])["poses"]
-        final_progress = torch.tensor([[3.5, 4., 5.]], dtype=torch.float64)
-        suffix = matrices(*request.sample_reference(final_progress))[0]
-        actual = np.concatenate((held, (next_body @ attachment)[1:], suffix))
-        progress = torch.tensor([[0., 1./3, 2./3, 1., 1.+1./3, 1.+2./3, 2.,
-                                  2.+1./3, 2.+2./3, 3., 3.5, 4., 5.]], dtype=torch.float64)
-        position, quaternion = components(actual[None])
-        residuals = request.residuals(position, quaternion, progress,
-                                      joint_velocity=torch.zeros((1, progress.shape[1], 3)))
-        for name, value in residuals.items():
-            with self.subTest(term=name):
-                np.testing.assert_allclose(value.numpy(), 0., atol=1e-12)
-
-    def test_fixed_search_proposal_checks_single_states_without_freezing_the_full_problem(self):
-        skill = on_input()
-        request = compile_inputs(skill)
-        progress = torch.tensor([[0., 1./3, 2./3, 1., 1.5, 2., 3.]], dtype=torch.float64)
-        first, _ = alternative_placement(skill)
-        position, quaternion = components(first[None])
-        with self.assertRaisesRegex(ValueError, "explicitly frozen whole-window proposal"):
-            request.project_residual(position[:, 1:2], quaternion[:, 1:2], progress[:, 1:2], 0)
-        frozen = request.with_fixed_endpoints(position, quaternion, progress)
-        for row, phase_index in ((1, 0), (4, 1), (6, 2)):
-            # An OMPL callback sees one state; its endpoint family comes from
-            # the one complete proposal, never from a missing nearest sample.
-            p, q, s = position[:, row:row+1], quaternion[:, row:row+1], progress[:, row:row+1]
-            with self.subTest(phase=phase_index):
-                residual = frozen.project_residual(p, q, s, phase_index)
-                np.testing.assert_allclose(residual.numpy(), 0., atol=1e-12)
-                np.testing.assert_allclose(frozen.evaluate(p, q, s,
-                                                          joint_velocity=torch.zeros((1, 1, 3))).numpy(), 0., atol=1e-12)
-        other, _ = alternative_placement(skill, pose((.08, -.06, 0.), (0., 0., -.3)))
-        other_p, other_q = components(other[None])
-        velocity = torch.zeros((1, len(other), 3), dtype=torch.float64)
-        np.testing.assert_allclose(request.evaluate(other_p, other_q, progress,
-                                                    joint_velocity=velocity).numpy(), 0., atol=1e-12)
-        self.assertGreater(frozen.evaluate(other_p, other_q, progress,
-                                           joint_velocity=velocity).max().item(), .05)
-        np.testing.assert_allclose(request.evaluate(position, quaternion, progress,
-                                                    joint_velocity=velocity).numpy(), 0., atol=1e-12)
-        # Event 108 at progress 1.5 remains mandatory even though it is not a
-        # pose-phase boundary. A proposal must not silently round that event.
-        kept = [0, 1, 2, 3, 5, 6]
-        with self.assertRaisesRegex(ValueError, "every exact problem anchor"):
-            request.with_fixed_endpoints(position[:, kept], quaternion[:, kept], progress[:, kept])
-
-    def test_on_material_frame_family_and_retreat_follow_the_actual_release(self):
-        skill = on_input()
-        request = compile_inputs(skill)
-        actual, _ = alternative_placement(skill)
-        progress = torch.tensor([[0., 1./3, 2./3, 1., 1.5, 2., 3.]], dtype=torch.float64)
-        position, quaternion = components(actual[None])
-        velocity = torch.zeros((1, progress.shape[1], 3), dtype=torch.float64)
-        residuals = request.residuals(position, quaternion, progress, joint_velocity=velocity)
-        for name, value in residuals.items():
-            with self.subTest(term=name):
-                np.testing.assert_allclose(value.numpy(), 0., atol=1e-12)
-        # Keeping the nominal retreat after moving the placed object fails the
-        # same shared process checker; release is a physical anchor, not an ID.
-        wrong_position = position.clone()
-        wrong_position[0, -1] += torch.tensor([.03, 0., 0.])
-        self.assertGreater(request.evaluate(wrong_position, quaternion, progress,
-                                            joint_velocity=velocity)[0, -1].item(), .02)
-
-    # BEGIN independent source-reference reporting across support transfer and release.
-    def test_original_reference_reports_allowed_transfer_and_retreat_displacement(self):
-        skill = on_input()
-        request = compile_inputs(skill)
-        original = ground_program(skill["program"], skill["scene"])["eef_poses"]
-        saved = [phase.reference.poses.copy() for phase in request.phases]
-        progress = torch.tensor([[0., 1./3, 2./3, 1., 1.5, 2., 3.]], dtype=torch.float64)
-        candidates = [original, alternative_placement(skill)[0],
-                      alternative_placement(skill, pose((.08, -.06, 0.), (0., 0., -.3)))[0]]
-        for actual in candidates:
-            position, quaternion = components(actual[None])
-            # The opposite quaternion representative describes the same pose.
-            quaternion = -quaternion
-            velocity = torch.zeros((1, len(actual), 3), dtype=torch.float64)
-            np.testing.assert_allclose(request.evaluate(
-                position, quaternion, progress, joint_velocity=velocity).numpy(), 0., atol=1e-12)
-            measured = request.measurements(position, quaternion, progress)
-            relative_rotation = np.swapaxes(original[:, :3, :3], 1, 2) @ actual[:, :3, :3]
-            translation = np.einsum("nji,nj->ni", original[:, :3, :3],
-                                    actual[:, :3, 3]-original[:, :3, 3])
-            rotation = Rotation.from_matrix(relative_rotation).as_rotvec()
-            for index in range(request.phase_count):
-                mask = ((progress.numpy()[0] >= index-1e-7)
-                        & (progress.numpy()[0] <= index+1+1e-7))
-                prefix = f"phase:{index}:original_reference"
-                for unit, error in (("position", translation), ("rotation", rotation)):
-                    suffix = "m" if unit == "position" else "rad"
-                    np.testing.assert_allclose(
-                        measured[f"{prefix}_{unit}_error_{suffix}"].numpy()[0],
-                        np.where(mask, np.linalg.norm(error, axis=-1), 0.), atol=1e-12)
-                    np.testing.assert_allclose(
-                        measured[f"{prefix}_{unit}_component_error_{suffix}"].numpy()[0],
-                        np.where(mask, np.abs(error).max(axis=-1), 0.), atol=1e-12)
-                self.assertLess(measured[f"phase:{index}:position_error_m"].max().item(), 1e-12)
-            if actual is not original:
-                self.assertGreater(measured["phase:2:original_reference_position_error_m"].max().item(), .01)
-                self.assertGreater(measured["phase:2:original_reference_rotation_error_rad"].max().item(), .1)
-        for phase, before in zip(request.phases, saved):
-            np.testing.assert_array_equal(phase.reference.poses, before)
-
-    def test_original_reference_also_reports_unconstrained_free_motion(self):
-        request = problem([MotionPhase("free approach", path([pose(), pose()]),
-                                       kind="free", require_end=False)])
-        progress = torch.tensor([[0., .5, 1.]], dtype=torch.float64)
-        actual = np.array([pose(), pose((.03, -.04, 0.), (0., 0., .2)), pose()])
-        position, quaternion = components(actual[None])
-        self.assertTrue(torch.all(request.evaluate(position, quaternion, progress) == 0))
-        measured = request.measurements(position, quaternion, progress)
-        np.testing.assert_allclose(measured["phase:0:original_reference_position_error_m"].numpy(),
-                                   [[0., .05, 0.]], atol=1e-12)
-        np.testing.assert_allclose(measured["phase:0:original_reference_rotation_error_rad"].numpy(),
-                                   [[0., .2, 0.]], atol=1e-12)
-        self.assertTrue(torch.all(measured["phase:0:position_error_m"] == 0))
-    # END independent source-reference reporting.
-
-    def test_on_carrier_coordinate_gauge_does_not_move_physical_joint_requirements(self):
-        skill = on_input()
-        changed = deepcopy(skill)
-        gauge = pose((.03, -.04, .05), (.2, -.1, .3))
-        inverse = np.linalg.inv(gauge)
-        old, scene = skill["scene"], changed["scene"]
-        scene["initial_pose"] = old["initial_pose"] @ gauge
-        scene["holding"]["T_carrier_eef"] = inverse @ old["holding"]["T_carrier_eef"]
-        scene["body_points"] = old["body_points"] @ inverse[:3, :3].T + inverse[:3, 3]
-        binding = scene["functional_bindings"]["function"]
-        binding["carrier_mapping"] = inverse
-        face = binding["on_geometry"]
-        face["carrier_region_points"] = face["carrier_region_points"] @ inverse[:3, :3].T + inverse[:3, 3]
-        face["carrier_outward_normal"] = inverse[:3, :3] @ face["carrier_outward_normal"]
-        requests = (compile_inputs(skill), compile_inputs(changed))
-        progress = torch.tensor([[0., 1./3, 2./3, 1., 1.5, 2., 3.]], dtype=torch.float64)
-        np.testing.assert_allclose(matrices(*requests[0].sample_reference(progress)),
-                                   matrices(*requests[1].sample_reference(progress)), atol=1e-12)
-        actual, _ = alternative_placement(skill)
-        position, quaternion = components(actual[None])
-        velocity = torch.zeros((1, progress.shape[1], 3), dtype=torch.float64)
-        for request in requests:
-            np.testing.assert_allclose(request.evaluate(position, quaternion, progress,
-                                                        joint_velocity=velocity).numpy(), 0., atol=1e-12)
-
-    def test_regrasp_tracks_the_actual_variable_placement_instead_of_its_nominal_pose(self):
-        place, grasp = on_input(), grasp_input()
-        request = compile_inputs(place, grasp)
-        # BEGIN distinguish the two-skill limit from its complete five phases.
-        self.assertEqual(request.phase_count, 5)
-        # END distinguish the two-skill limit from its complete five phases.
-        placement, release_delta = alternative_placement(place)
-        grasp_phases = [phase for phase in request.phases if phase.metadata.get("skill_id") == "grasp"]
-        # BEGIN sample the explicit pre-grasp split, retaining all source nodes.
-        nominal_grasp = np.concatenate((grasp_phases[0].reference.poses,
-                                        grasp_phases[1].reference.poses[1:]))
-        actual = np.concatenate((placement, (release_delta @ nominal_grasp)[1:]))
-        progress = torch.tensor([[0., 1./3, 2./3, 1., 1.5, 2., 3.,
-                                  4., 4.25, 4.5, 4.75, 5.]], dtype=torch.float64)
-        # END sample the explicit pre-grasp split, retaining all source nodes.
-        position, quaternion = components(actual[None])
-        velocity = torch.zeros((1, progress.shape[1], 3), dtype=torch.float64)
-        residuals = request.residuals(position, quaternion, progress, joint_velocity=velocity)
-        for name, value in residuals.items():
-            with self.subTest(term=name):
-                np.testing.assert_allclose(value.numpy(), 0., atol=1e-12)
-
-    def test_future_manipulation_uses_candidate_without_fabricating_actual_holding(self):
-        grasp, transfer = grasp_input(), manipulation_input()
-        transfer["scene"]["holding"]["verified"] = False
-        transfer["scene"]["holding"]["source"] = "no actual future evidence"
-        transfer["scene"]["initial_pose"] = pose((-.4, -.3, -.2))
-        before = deepcopy(transfer)
-        with patch("manipulation.program.ground_program", wraps=ground_program) as actual_consumer:
-            request = compile_inputs(grasp, transfer)
-        self.assertEqual(actual_consumer.call_count, 1)
-        self.assertEqual(actual_consumer.call_args.args[0]["skill_kind"], "grasp")
-        with self.assertRaisesRegex(ValueError, "actual holding"):
-            ground_program(transfer["program"], transfer["scene"])
-        grasp_end = next(event.progress for event in request.events
-                         if event.skill_id == "grasp" and event.kind == "verification")
-        previous = request.phases[int(grasp_end)-1].reference.sample_numpy(np.array([1.]))[0]
-        successor = request.phases[int(grasp_end)].reference.sample_numpy(np.array([0.]))[0]
-        np.testing.assert_allclose(successor, previous, atol=1e-12)
-        prediction = next(item for item in request.conditions if item["kind"] == "predicted_skill_boundary")
-        np.testing.assert_allclose(prediction["initial_pose"], grasp["scene"]["carrier_pose"], atol=1e-12)
-        np.testing.assert_allclose(prediction["T_carrier_eef"],
-                                   grasp["program"]["demo"]["T_carrier_eef"][-1], atol=1e-12)
-        self.assertFalse(transfer["scene"]["holding"]["verified"])
-        self.assertEqual(transfer["scene"]["holding"]["source"], before["scene"]["holding"]["source"])
-        np.testing.assert_array_equal(transfer["scene"]["initial_pose"], before["scene"]["initial_pose"])
-
-    # BEGIN constrain the original Cartesian approach before any contact.
-    def test_pregrasp_first_observation_gets_an_explicit_connection(self):
-        skill = grasp_input()
-        demo, scene = skill["program"]["demo"], skill["scene"]
-        skill["pregrasp_frame"] = int(demo["frame_indices"][0])
-        request = compile_inputs(skill)
-        self.assertEqual(len(request.phases), 2)
-        self.assertEqual(request.phases[0].kind, "free")
-        self.assertTrue(request.phases[0].metadata["no_source_frames"])
-        expected = scene["carrier_pose"] @ scene["region_transform"] @ demo["T_carrier_eef"]
-        np.testing.assert_allclose(request.phases[0].reference.poses,
-                                   np.stack((scene["eef_pose"], expected[0])), atol=1e-12)
-        np.testing.assert_allclose(request.phases[1].reference.poses, expected, atol=1e-12)
-        self.assertEqual(request.phases[1].metadata["source_frames"], demo["frame_indices"].tolist())
-
-    def test_pregrasp_preserves_bound_tail_and_constrains_precontact_motion(self):
-        skill = grasp_input()
-        before = deepcopy(skill)
-        request = compile_inputs(skill)
-        demo, scene = skill["program"]["demo"], skill["scene"]
-        expected = scene["carrier_pose"] @ scene["region_transform"] @ demo["T_carrier_eef"]
-        free, approach = request.phases
-        self.assertEqual(free.kind, "free")
-        self.assertEqual(free.metadata["source_frames"], [11, 14])
-        self.assertEqual(approach.kind, "pose")
-        self.assertEqual(approach.metadata["source_frames"], [14, 17, 20, 23, 26])
-        self.assertEqual(approach.metadata["protected_start_frame"], 17)
-        np.testing.assert_array_equal(approach.reference.poses, expected[1:])
-        np.testing.assert_array_equal(free.reference.poses[-1], expected[1])
-        np.testing.assert_array_equal(free.reference.poses[0], scene["eef_pose"])
-        # The newly protected interval lies before the old contact boundary.
-        # An off-path displacement there must now fail a necessary pose check.
-        progress = torch.tensor([[0., 1., 1.125, 1.25, 1.5, 2.]], dtype=torch.float64)
-        position, quaternion = request.sample_reference(progress)
-        velocity = torch.zeros((1, progress.shape[1], 3), dtype=torch.float64)
-        np.testing.assert_allclose(request.evaluate(position, quaternion, progress,
-                                                    joint_velocity=velocity).numpy(), 0., atol=1e-12)
-        displaced = position.clone()
-        displaced[0, 2, 0] += .01
-        self.assertGreater(request.evaluate(displaced, quaternion, progress,
-                                            joint_velocity=velocity).max().item(), .009)
-        events = {event.event_id: event for event in request.events}
-        self.assertEqual(events["close"].source_frame, 20)
-        self.assertEqual(events["close"].progress, 1.5)
-        self.assertEqual(events["__stable_holding__"].source_frame, 26)
-        np.testing.assert_array_equal(demo["T_carrier_eef"], before["program"]["demo"]["T_carrier_eef"])
-        np.testing.assert_array_equal(demo["timestamps"], before["program"]["demo"]["timestamps"])
-        np.testing.assert_array_equal(scene["eef_pose"], before["scene"]["eef_pose"])
-        self.assertEqual(demo["gripper_events"], before["program"]["demo"]["gripper_events"])
-
-    def test_grasp_requires_a_real_pregrasp_observation_before_contact(self):
-        for value in (None, True, 1.5, 12, 17, 26):
-            skill = grasp_input()
-            skill["pregrasp_frame"] = value
-            with self.subTest(pregrasp_frame=value), self.assertRaisesRegex(ValueError, "pregrasp_frame"):
-                compile_inputs(skill)
-        skill = grasp_input()
-        skill["program"]["demo"]["protected_start_frame"] = 11
-        skill["pregrasp_frame"] = 11
-        with self.assertRaisesRegex(ValueError, "before protected_start_frame"):
+        skill["scene"]["functional_bindings"]["function"]["current_coordinates"] = [.4]
+        with self.assertRaisesRegex(ValueError, "required start or functional goal"):
             compile_inputs(skill)
 
-    def test_event_and_cartesian_vertex_share_the_exact_source_progress(self):
-        # A long interval exposes the one-ULP difference between independent
-        # division and linspace. One observed vertex must own one clock value.
-        skill = grasp_input()
-        demo = skill["program"]["demo"]
-        demo["frame_indices"] = 11+3*np.arange(72)
-        demo["timestamps"] = 2.+np.arange(72)*.1
-        demo["T_carrier_eef"] = np.array([pose((0., 0., z)) for z in np.linspace(.2, .02, 72)])
-        demo["protected_start_frame"] = int(demo["frame_indices"][57])
-        demo["gripper_events"][1]["frame_index"] = demo["protected_start_frame"]
-        request = compile_inputs(skill)
-        close = next(event for event in request.events if event.event_id == "close")
-        self.assertEqual(close.progress, 1.+request.phases[1].reference.progress[56])
-        self.assertEqual(len(request.anchors), 72)
-    # END constrain the original Cartesian approach before any contact.
-
-    def test_function_open_release_and_retreat_keep_distinct_source_boundaries(self):
-        request = compile_inputs(manipulation_input())
-        # BEGIN retain all phases of one skill within the bounded window.
-        self.assertEqual(request.phase_count, 3)
-        # END retain all phases of one skill within the bounded window.
-        events = {event.event_id: event for event in request.events}
-        self.assertEqual(events["function"].source_frame, 106)
-        self.assertEqual(events["open"].source_frame, 108)
-        self.assertEqual(events["__release_verified__"].source_frame, 110)
-        self.assertLess(events["function"].progress, events["open"].progress)
-        self.assertLess(events["open"].progress, events["__release_verified__"].progress)
-        retreat = request.phases[int(events["__release_verified__"].progress)]
-        self.assertEqual(retreat.metadata["mode"], "released_retreat")
-        self.assertTrue(events["__release_verified__"].stop)
-        self.assertEqual(retreat.metadata["source_frames"], [110, 112])
-        self.assertGreater(retreat.reference.poses[-1, 2, 3], retreat.reference.poses[0, 2, 3])
-
-    def test_current_manipulation_still_requires_real_synchronized_holding(self):
-        for defect in ("candidate", "unsynchronized"):
-            skill = manipulation_input()
-            if defect == "candidate":
-                skill["scene"]["holding"]["verified"] = False
-            else:
-                skill["scene"]["eef_pose"][0, 3] += .01
-            with self.subTest(defect=defect), self.assertRaises(ValueError):
-                compile_inputs(skill)
-
-    def test_future_manipulation_keeps_current_tool_and_release_validation(self):
-        # Conditional attachment removes an evidence prerequisite only; it
-        # cannot authorize a different TCP or redefine opening as release.
-        for defect in ("tool_id", "tool_frame", "missing_release"):
-            grasp, transfer = grasp_input(), manipulation_input()
-            transfer["scene"]["holding"]["verified"] = False
-            if defect == "missing_release":
-                transfer["program"]["demo"]["release_frame"] = None
-            else:
-                transfer["scene"][defect] = "another_tool_or_frame"
-            with self.subTest(defect=defect), self.assertRaises(ValueError):
-                compile_inputs(grasp, transfer)
-
-    def test_barriers_need_declared_safe_holds_and_cannot_reuse_a_released_attachment(self):
-        for skill in (grasp_input(), manipulation_input()):
-            skill["barrier_can_stop"] = False
-            with self.subTest(kind=skill["program"]["skill_kind"]), self.assertRaisesRegex(ValueError, "boundar"):
-                compile_inputs(skill)
-        first, second = manipulation_input(), manipulation_input()
-        second["skill_id"] = "next_transfer"
-        with self.assertRaisesRegex(ValueError, "still-held carrier"):
-            compile_inputs(first, second)
-
-    def test_regrasp_inherits_predicted_placed_object_and_previous_retreat_end(self):
-        transfer, grasp = manipulation_input(), grasp_input()
-        actual = ground_program(transfer["program"], transfer["scene"])
-        request = compile_inputs(transfer, grasp)
-        phases = [phase for phase in request.phases if phase.metadata.get("skill_id") == "grasp"]
-        np.testing.assert_allclose(phases[0].reference.poses[0], actual["eef_poses"][-1], atol=1e-12)
-        expected = (actual["object_poses"][-1] @ grasp["scene"]["region_transform"]
-                    @ grasp["program"]["demo"]["T_carrier_eef"][-1])
-        np.testing.assert_allclose(phases[-1].reference.poses[-1], expected, atol=1e-12)
-        # The stale caller scene is retained intact for future observation.
-        np.testing.assert_allclose(grasp["scene"]["carrier_pose"], pose((.1, .05, 0.)), atol=1e-12)
-
-    # BEGIN attachment provenance and exact collision-span contract regressions.
-    def test_actual_holding_spans_merge_across_skills_until_the_real_release(self):
-        first, second = manipulation_input(), manipulation_input()
-        first["skill_id"], second["skill_id"] = "carry", "place"
-        first["program"]["demo"]["release_frame"] = None
-        first["program"]["demo"]["gripper_events"] = [
-            {"event_id": "hold", "frame_index": 100, "command": "hold"}]
-        second["scene"]["holding"]["verified"] = False
-        second["scene"]["holding"]["source"] = "future sensor reading has not happened"
-        first["scene"]["holding"]["observation_ids"] = ["current_wrist_31", "current_fingers_31"]
-        original_holding = deepcopy(first["scene"]["holding"])
-        request = compile_inputs(first, second)
-        held = [phase for phase in request.phases if phase.metadata.get("mode") == "held"]
-        self.assertEqual(len(held), 4)
-        for phase in held:
-            with self.subTest(phase=phase.name):
-                self.assertEqual(phase.metadata["attachment_interval"], [0., 4.])
-                self.assertEqual(phase.metadata["attachment_condition_id"], "carry:actual_holding")
-                self.assertEqual(phase.metadata["release_condition_id"], "place:actual_release")
-                np.testing.assert_array_equal(phase.metadata["attachment"], original_holding["T_carrier_eef"])
-                np.testing.assert_array_equal(phase.metadata["owner_initial_pose"], first["scene"]["initial_pose"])
-        observed = [item for item in request.conditions if item["kind"] == "observed_attachment"]
-        self.assertEqual(len(observed), 1)
-        self.assertEqual(observed[0]["condition_id"], "carry:actual_holding")
-        self.assertEqual(observed[0]["source"]["observation_ids"], original_holding["observation_ids"])
-        self.assertTrue(observed[0]["source"]["verified"])
-        first["scene"]["holding"]["observation_ids"].append("later_external_edit")
-        self.assertEqual(observed[0]["source"]["observation_ids"], original_holding["observation_ids"])
-        self.assertFalse(second["scene"]["holding"]["verified"])
-
-    def test_still_held_window_end_does_not_manufacture_release_or_evidence(self):
+    def test_actual_entry_tool_goal_does_not_require_a_multinode_reference_fit(self):
         skill = manipulation_input()
-        skill["program"]["demo"]["release_frame"] = None
-        skill["program"]["demo"]["gripper_events"] = [
-            {"event_id": "hold", "frame_index": 100, "command": "hold"}]
+        skill["program"]["task"]["relation"] = "tool_use"
+        demo = skill["program"]["demo"]
+        demo["functional_events"][0]["frame_index"] = 100
+        demo["release_frame"] = 100
+        demo["gripper_events"][0]["frame_index"] = 100
+        with patch("manipulation.function_motion.transfer_function_motion") as fit:
+            request = compile_inputs(skill)
+        fit.assert_not_called()
+        self.assertEqual(request.pose_events[0].progress, 0.)
+        self.assertEqual(request.phase_count, 1)
+        self.assertEqual(request.phases[0].metadata["mode"], "released_retreat")
+
+    def test_support_is_a_finite_allowed_set_with_free_tangent_and_yaw(self):
+        skill = on_input()
         request = compile_inputs(skill)
-        self.assertEqual(request.phase_count, 2)
-        for phase in request.phases:
-            self.assertEqual(phase.metadata["attachment_interval"], [0., 2.])
-            self.assertIsNone(phase.metadata["release_condition_id"])
-        self.assertFalse(any(item["kind"] == "predicted_release" for item in request.conditions))
-        self.assertFalse(any(event.requires_evidence is not None for event in request.events))
-        self.assertEqual(len([item for item in request.conditions if item["kind"] == "observed_attachment"]), 1)
+        actual, _ = alternative_placement(skill)
+        progress = torch.as_tensor(request.source_time_map["progress"][None], dtype=torch.float64)
+        p, q = components(actual[None])
+        self.assertLess(request.evaluate(p, q, progress).max().item(), 1e-10)
+        self.assertEqual(request.pose_events, ())
+        self.assertEqual(request.pose_relations, ())
+        event = request.supports[0]
+        bad = pose((.7, .08, 0.)) @ skill["scene"]["holding"]["T_carrier_eef"]
+        p, q = components(np.array([[bad]]))
+        self.assertGreater(request.evaluate(p, q, torch.tensor([[event.progress]])).item(), .3)
+        lifted = pose((.02, .03, 2e-5)) @ skill["scene"]["holding"]["T_carrier_eef"]
+        p, q = components(np.array([[lifted]]))
+        self.assertGreater(event.evaluate(p, q, request.numerical).item(), 1e-5)
 
-        # A terminal grasp has a future verification barrier but no later
-        # carrying interval. It must not create a zero-length attachment or
-        # silently label its candidate as an observed Holding.
-        terminal = compile_inputs(grasp_input())
-        self.assertFalse(any("attachment_interval" in phase.metadata for phase in terminal.phases))
-        self.assertFalse(any(item["kind"] == "observed_attachment" for item in terminal.conditions))
-        barrier = next(event for event in terminal.events if event.requires_evidence is not None)
-        self.assertEqual(barrier.progress, terminal.phase_count)
+    def test_explicit_evidence_prerequisite_does_not_imply_a_stop(self):
+        skill = grasp_input()
+        skill["execution_events"] = [{"event_id": "check", "frame_index": 23,
+            "kind": "prerequisite", "source": "explicit operator dependency", "requires_evidence": "tool_ready"}]
+        request = compile_inputs(skill)
+        self.assertEqual(request.stop_progress.tolist(), [])
+        self.assertEqual(next(e for e in request.events if e.event_id == "check").requires_evidence, "tool_ready")
+        skill["execution_events"][0]["stop"] = True
+        request = compile_inputs(skill)
+        self.assertEqual(len(request.stop_progress), 1)
 
-    # BEGIN reject remote successors instead of compiling a four-skill task.
-    def test_window_rejects_more_than_current_and_next_skill(self):
-        grasp, place, regrasp, carry = grasp_input(), manipulation_input(), grasp_input(), manipulation_input()
-        regrasp["skill_id"], carry["skill_id"] = "regrasp", "carry"
-        skills = (grasp, place, regrasp, carry)
-        for count in (3, 4):
-            with self.subTest(skill_count=count):
-                with self.assertRaisesRegex(ValueError, "current skill and at most one next skill"):
-                    compile_inputs(*skills[:count])
-    # END reject remote successors instead of compiling a four-skill task.
-    # END attachment provenance and exact collision-span contract regressions.
+    def test_json_bindings_are_equivalent_and_unmodified(self):
+        for skill in (grasp_input(), manipulation_input(), on_input(), prismatic_input(), revolute_input()):
+            encoded = json.dumps(skill, default=lambda value: value.tolist(), sort_keys=True)
+            serialized = json.loads(encoded)
+            expected, actual = compile_inputs(skill), compile_inputs(serialized)
+            np.testing.assert_allclose(expected.source_time_map["progress"], actual.source_time_map["progress"])
+            progress = torch.as_tensor(expected.anchors[None], dtype=torch.float64)
+            np.testing.assert_allclose(matrices(*expected.sample_reference(progress)), matrices(*actual.sample_reference(progress)))
+            self.assertEqual(json.dumps(serialized, sort_keys=True), encoded)
 
+    def test_remaining_obligations_preserve_clock_and_explicit_actual_input_gaps(self):
+        request = compile_inputs(revolute_input())
+        remaining = request.remaining_obligations(.7, (("turn", "open"),))
+        self.assertEqual(remaining["process"]["mechanisms"][0]["remaining_scope"], (.7, 1.))
+        self.assertEqual(remaining["process"]["mechanisms"][0]["requirement"].start, 0.)
+        self.assertNotIn("open", [event.event_id for event in remaining["events"]])
+        self.assertTrue(any("lifted coordinate" in item for item in remaining["required_actual_inputs"]))
+        np.testing.assert_array_equal(remaining["source_time_map"]["source_times"], request.source_timestamps)
+        self.assertEqual(request.start_progress, 0.)
+        self.assertEqual(len(request.events), 3)
+
+    def test_suffix_keeps_original_progress_and_requires_rebound_coordinate_origin(self):
+        model = MotionModel("revolute", np.zeros((1, 1)), pose((.2, 0., 0.)), np.eye(3), np.zeros(3),
+                            1e-6, 1e-6, {"source": "current hinge"})
+        original = MechanismRequirement(0., 1., model, pose(), [[0., 7.]], [0.], "original current mechanism")
+        goal = CoordinateEventRequirement(1., original, 2*np.pi, 1e-5, "remaining full-turn goal")
+        rebound = replace(original, start=.5, initial_coordinates=np.array([3.5]), source="observed accumulated current angle")
+        options = {"start_progress": .5, "source_timestamps": np.array([5., 6.]),
+                   "source_progress": np.array([.5, 1.]), "mechanisms": (rebound,)}
+        phases = [MotionPhase("original source", path([pose(), pose()]))]
+        with self.assertRaisesRegex(ValueError, "bound mechanism instance"):
+            problem(phases, coordinate_events=(goal,), **options)
+        request = problem(phases, coordinate_events=(replace(goal, mechanism=rebound),), **options)
+        progress = torch.as_tensor(np.linspace(.5, 1., 33)[None], dtype=torch.float64)
+        p, q = components(model.poses(np.linspace(3.5, 2*np.pi, 33)[:, None])[None])
+        self.assertLess(request.evaluate(p, q, progress).max().item(), 1e-10)
+        self.assertEqual(request.verification_issues(progress), [])
+        np.testing.assert_array_equal(request.anchors, [.5, 1.])
+        np.testing.assert_allclose(request.source_time_to_progress([5., 5.5, 6.]), [.5, .75, 1.])
+# END current-skill reference/goal/process separation regression coverage.
 
 if __name__ == "__main__":
     unittest.main()
-# END independent process-constraint and existing-grounding integration tests.

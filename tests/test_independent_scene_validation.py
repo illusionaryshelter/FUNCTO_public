@@ -1,0 +1,281 @@
+"""CPU counterexamples for independent scene and finite material permissions."""
+
+# BEGIN independent scene tests use native filled solids, never planner sphere costs.
+from copy import deepcopy
+from dataclasses import asdict
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from manipulation.planning_observation import _independent_voxel_geometry
+from manipulation.planning_scene import ContactRule
+from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChecker
+from test_robot_geometry_check import URDF
+
+
+def rigid(z=0.):
+    pose = np.eye(4)
+    pose[2, 3] = z
+    return pose
+
+
+def rule(**changes):
+    args = dict(rule_id="pad_to_target", actor="robot", target_owner="target", interval=(0., 1.),
+        sphere_indices=(0,), material_id="contact_pad", feature_points=[[-.05, -.05, -.001], [.05, -.05, -.001],
+            [.05, .05, -.001], [-.05, .05, -.001]], feature_normal=[0., 0., -1.],
+        patch_origin=[0., 0., 0.], patch_axes=np.eye(3), patch_half_size=[.2, .2],
+        gap_bounds=(-.002, .002), normal_tolerance_rad=.01, modeling_allowance_m=.003,
+        geometry_error_m=.003, minimum_thickness_m=.1, source="calibrated finite pad and patch")
+    args.update(changes)
+    return asdict(ContactRule(**args))
+
+
+def binding(contacts=()):
+    return {"reference_frame": "world", "native_geometry_materials": {"pad": "contact_pad"},
+        "contacts": list(contacts), "background": {"geometry": {"solids": [], "query_gaps": []}},
+        "owners": [{"owner_id": "target", "source": "complete target box", "geometry_complete": True,
+            "moving": False, "attachments": [], "native_geometry_names": [], "pose_interval": [0., 1.],
+            "pose_path": {"progress": [0., 1.], "poses": [np.eye(4).tolist()]*2,
+                "source": "current target observation", "attachment": np.eye(4).tolist(),
+                "coordinates": None, "motion_model": None},
+            "geometry": {"solids": [{"name": "slab", "kind": "cuboid", "dimensions": [1., 1., .1],
+                "pose": [0., 0., -.05, 1., 0., 0., 0.], "source": "native target dimensions"}], "query_gaps": []}}]}
+
+
+@pytest.fixture
+def checker(tmp_path):
+    path = tmp_path / "model.urdf"
+    path.write_text(URDF)
+    return RobotGeometryChecker(path, base_frame="base", geometries=[
+        NativePrimitive("pad", "base", "box", (.1, .1, .1), rigid(.049), "complete pad native solid")])
+
+
+def query(checker, model, *, progress=.5, kind="actual", condition=None, owner_poses=None):
+    checker.bind_scene(model)
+    robot = checker.query(joint_names=checker.joint_names, joint_positions=[0., 0.],
+                          T_reference_base=np.eye(4), pairs=())
+    return checker.query_scene(robot, tool_pose=np.eye(4), progress=progress, finger_positions=[0., 0.],
+                               state_kind=kind, condition_evidence=condition, owner_poses=owner_poses)
+
+
+def test_local_permission_checks_whole_overlap_and_keeps_raw_contacts(checker):
+    result = query(checker, binding([rule()]))
+    assert result["passed"]
+    row = result["pairs"][0]
+    assert row["signed_distance_m"] < 0 and row["contacts"]
+    assert row["permission"] == "pad_to_target"
+    assert row["contact_region_checks"][0]["method"] == "whole_convex_intersection_support"
+    # A small material feature at the same nearest point cannot authorize the
+    # rest of the same pad/target overlap outside that feature.
+    narrow = rule(feature_points=[[-.01, -.01, -.001], [.01, -.01, -.001],
+                                  [.01, .01, -.001], [-.01, .01, -.001]])
+    rejected = query(checker, binding([narrow]))
+    assert not rejected["passed"] and rejected["violations"]
+    assert rejected["pairs"][0]["contact_region_checks"][0]["contained"] is False
+
+
+@pytest.mark.parametrize("change", ["material", "owner", "time", "patch", "depth"])
+def test_wrong_material_owner_patch_time_or_depth_is_not_a_pair_exemption(checker, change):
+    model = binding([rule()])
+    if change == "material":
+        model["native_geometry_materials"]["pad"] = "finger_back"
+    elif change == "owner":
+        model["contacts"][0]["target_owner"] = "other_target"
+    elif change == "time":
+        model["contacts"][0]["interval"] = [0., .4]
+    elif change == "patch":
+        model["contacts"][0]["patch_origin"] = [.3, 0., 0.]
+    else:
+        model["contacts"][0]["modeling_allowance_m"] = .0001
+    result = query(checker, model)
+    assert not result["passed"] and result["violations"]
+    assert result["pairs"][0]["permission"] is None
+
+
+def test_permission_and_required_contact_are_independent(checker):
+    model = binding([rule(required=True)])
+    model["owners"][0]["pose_path"]["poses"] = [rigid(-1.).tolist()]*2
+    result = query(checker, model)
+    assert result["pairs"][0]["relation"] == "separated"
+    assert result["violations"][0]["kind"] == "independent_required_contact"
+
+
+def test_unknown_conditional_attachment_is_not_an_automatic_holding_gate(checker):
+    model = binding()
+    owner = model["owners"][0]
+    owner["moving"] = True
+    owner["attachments"] = [{"interval": [0., 1.], "position_tool_owner": [0., 0., 0.],
+        "quaternion_tool_owner": [1., 0., 0., 0.], "condition_id": "candidate_grasp", "release_condition_id": None}]
+    result = query(checker, model)
+    assert result["passed"] and not result["query_gaps"]
+    assert not result["observed_scene_checked"]
+    assert any(row["kind"] == "conditional_scene_collision" for row in result["unresolved_assumptions"])
+    rejected = query(checker, model, condition={"candidate_grasp": False})
+    assert any(row["kind"] == "current_scene_binding_invalid" for row in rejected["violations"])
+    # A current observed target pose makes this an actual known pad conflict.
+    actual = query(checker, model, owner_poses={"target": np.eye(4)})
+    assert not actual["passed"] and actual["violations"][0]["kind"] == "independent_scene_collision"
+
+
+def test_voxel_adapter_retains_complete_field_and_detects_filled_occupancy(checker):
+    field = torch.full((8, 8, 8), -1., dtype=torch.float32)
+    field[4, 4, 4] = .01
+    voxel = SimpleNamespace(feature_tensor=field, dims=[.08]*3, voxel_size=.01,
+                            pose=[0., 0., 0., 1., 0., 0., 0.], name="observed_cells")
+    geometry = _independent_voxel_geometry(voxel, "observed depth field")
+    model = binding()
+    model["owners"][0]["geometry"] = geometry
+    row = geometry["solids"][0]
+    restored = np.frombuffer(bytes.fromhex(row["field_bytes_hex"]), dtype=row["field_dtype"])
+    np.testing.assert_array_equal(restored, field.numpy().reshape(-1))
+    result = query(checker, model)
+    assert not result["passed"] and result["violations"]
+    # Changing the occupied inventory without changing its original field is
+    # rejected before any independent geometry result can be produced.
+    modified = deepcopy(model)
+    modified["owners"][0]["geometry"]["solids"][0]["occupied_flat_indices"] = [0]
+    with pytest.raises(ValueError, match="inventory changed"):
+        query(checker, modified)
+# END counterexamples preserve actual physical violations and allowed uncertainty.
+
+# BEGIN owner predictions preserve multi-phase time and actual observation scope.
+def test_partial_observation_scope_survives_an_actual_owner_pose(checker):
+    model = binding([rule()])
+    model["owners"][0]["geometry_complete"] = False
+    result = query(checker, model, owner_poses={"target": np.eye(4)})
+    assert result["passed"] and not result["complete_scene_geometry"]
+    assert {"owner": "target", "kind": "partial_observed_geometry"} in result["unresolved_assumptions"]
+
+
+def test_global_phase_progress_is_not_silently_normalized(checker):
+    model = binding([rule(interval=(1., 2.))])
+    assert query(checker, model, progress=1.5)["passed"]
+
+
+def test_same_candidate_release_pose_is_used_after_release(checker):
+    model = binding([rule()])
+    owner = model["owners"][0]
+    owner["moving"] = True
+    owner["attachments"] = [{"interval": [0., 1.], "position_tool_owner": [0., 0., 0.],
+        "quaternion_tool_owner": [1., 0., 0., 0.], "condition_id": "held", "release_condition_id": "released"}]
+    checker.bind_scene(model)
+    checker._scene_release_predictions[("target", 0)] = {"pose": rigid(-1.), "time_s": .5}
+    robot = checker.query(joint_names=checker.joint_names, joint_positions=[0., 0.], T_reference_base=np.eye(4), pairs=())
+    result = checker.query_scene(robot, tool_pose=np.eye(4), progress=1.5, finger_positions=[0., 0.], state_kind="nominal")
+    assert result["passed"] and not result["query_gaps"]
+    assert result["pairs"][0]["relation"] == "separated"
+    assert any(row["kind"] == "predicted_release_pose" for row in result["unresolved_assumptions"])
+
+
+def test_current_owner_observation_cannot_override_a_refuted_release(checker):
+    model = binding()
+    model["owners"][0]["attachments"] = [{"interval": [0., 1.], "position_tool_owner": [0., 0., 0.],
+        "quaternion_tool_owner": [1., 0., 0., 0.], "condition_id": "held", "release_condition_id": "released"}]
+    result = query(checker, model, progress=1.5, condition={"released": False}, owner_poses={"target": rigid(-1.)})
+    assert not result["passed"]
+    assert any(row.get("reason") == "release_hypothesis_refuted" for row in result["violations"])
+# END no reference pose or unconfirmed effect creates an actual Holding/release fact.
+
+# BEGIN native installation aliases reuse exact solids without exempting payloads.
+def test_explicit_native_alias_avoids_duplicate_self_collision_but_checks_payload(checker):
+    model = binding()
+    fixture = model["owners"][0]
+    fixture["native_geometry_names"] = ["pad"]
+    fixture["geometry"]["solids"] = [{"name": "installation_proxy", "kind": "cuboid", "dimensions": [.11]*3,
+        "pose": [0., 0., .049, 1., 0., 0., 0.], "source": "outward planning proxy for exact native pad"}]
+    first = query(checker, model)
+    assert first["passed"] and not first["pairs"]
+    payload = deepcopy(fixture)
+    payload.update(owner_id="payload", moving=True, native_geometry_names=[])
+    payload["geometry"]["solids"][0]["name"] = "carried_body"
+    model["owners"].append(payload)
+    second = query(checker, model, kind="nominal")
+    assert not second["passed"]
+    assert any(row["actor"] == "payload" and row["target_owner"] == "target"
+               and row["signed_distance_m"] < 0 for row in second["pairs"])
+    # Only an unchanged native placement can identify the same solid.
+    fixture["geometry"]["solids"][0]["pose"][0] += .01
+    moved = query(checker, model, kind="nominal")
+    assert any(row["reason"] == "fixed_native_alias_pose_changed" for row in moved["query_gaps"])
+# END alias identity never means all bodies may collide with this installation.
+
+# BEGIN exact endpoint permissions cannot hide a forbidden adjacent mode.
+def test_independent_preflight_checks_both_contact_modes_at_the_same_state(checker):
+    from manipulation.robot_validation import RobotStateValidator
+    from test_robot_validation import trajectory
+
+    gate = RobotStateValidator(checker, joint_names=checker.joint_names,
+        arm_joint_names=checker.joint_names[:1], finger_joint_names=checker.joint_names[1:], pairs=(),
+        named_velocity_limits={name: 1. for name in checker.joint_names}, reference_frame="world",
+        T_reference_base=np.eye(4), tool_frame="base", T_frame_tcp=np.eye(4),
+        fk_translation_tolerance_m=1e-8, fk_rotation_tolerance_rad=1e-8, source="independent boundary fixture")
+    curve = trajectory([.03, .03], [0., 0.])
+    gate.bind_scene(binding([rule(interval=(.5, 1.))]), progress_at_time=lambda t: float(curve.sample(t)[2]))
+    result = gate._nominal_scene_preflight(curve, np.asarray([.5]))
+    exact = next(row for row in result["states"] if row["mode"] == "bound_progress")
+    preceding = next(row for row in result["states"] if row["mode"] == "before_switch")
+    assert exact["scene"]["passed"]
+    assert not preceding["scene"]["passed"] and not result["passed"]
+    assert exact["time_s"] == preceding["time_s"] == .5
+    assert exact["scene"]["pairs"][0]["signed_distance_m"] == preceding["scene"]["pairs"][0]["signed_distance_m"]
+    # A dwell at the boundary has old mode only at entry, new mode only at exit.
+    curve.progress_u = np.asarray([0., .4, .6, 1.])
+    curve.progress_s = np.asarray([0., .5, .5, 1.])
+    assert [mode for _, mode in gate._scene_progress_modes(curve, .4)] == ["bound_progress", "before_switch"]
+    assert [mode for _, mode in gate._scene_progress_modes(curve, .5)] == ["bound_progress"]
+    assert [mode for _, mode in gate._scene_progress_modes(curve, .6)] == ["bound_progress", "after_switch"]
+    curve.progress_u = curve.progress_u.astype(np.float32)
+    curve.progress_s = curve.progress_s.astype(np.float32)
+    boundary_times = gate._scene_query_times(curve, np.asarray([0., 1.]), 0., 1.)
+    entry = float(curve.progress_u[1])
+    assert entry in boundary_times
+    assert [mode for _, mode in gate._scene_progress_modes(curve, entry)] == ["bound_progress", "before_switch"]
+# END samples retain q/t/finger geometry while discrete laws change sides.
+
+# BEGIN pair ordering and complete occupied-leaf localization are invariant.
+def test_moving_owner_pair_permission_is_independent_of_owner_order(checker):
+    far = np.eye(4)
+    far[0, 3] = 3.
+    robot = RobotGeometryChecker(checker.urdf_path, base_frame="base", geometries=[
+        NativePrimitive("far", "base", "box", (.1, .1, .1), far, "unrelated native robot body")])
+    model = binding()
+    a = model["owners"][0]
+    a.update(owner_id="A", moving=True)
+    b = deepcopy(a)
+    b["owner_id"] = "B"
+    b["geometry"]["solids"] = [{"name": "pad", "kind": "cuboid", "dimensions": [.1]*3,
+        "pose": [0., 0., .049, 1., 0., 0., 0.], "source": "native moving owner pad"}]
+    model["owners"] = [a, b]
+    model["native_geometry_materials"] = {"B/pad": "contact_pad"}
+    model["contacts"] = [rule(actor="B", target_owner="A")]
+    first = query(robot, model, kind="nominal")
+    assert first["passed"]
+    assert any(row.get("permission") == "pad_to_target" for row in first["pairs"])
+    model["owners"].reverse()
+    assert query(robot, model, kind="nominal")["passed"]
+    model["contacts"][0]["required"] = True
+    model["native_geometry_materials"].clear()
+    incomplete = query(robot, model, kind="nominal")
+    assert not incomplete["passed"]
+    assert any(row["reason"] == "required_material_native_geometry_binding_missing" for row in incomplete["query_gaps"])
+
+
+def test_all_intersecting_voxel_leaves_must_fit_the_local_material_feature(checker):
+    field = torch.full((20, 20, 20), -1., dtype=torch.float32)
+    field[9, 9, 9] = field[14, 9, 9] = .01
+    voxel = SimpleNamespace(feature_tensor=field, dims=[.2]*3, voxel_size=.01,
+                            pose=[0., 0., 0., 1., 0., 0., 0.], name="observed_cells")
+    model = binding([rule()])
+    model["owners"][0]["geometry"] = _independent_voxel_geometry(voxel, "two disjoint observed occupied cells")
+    accepted = query(checker, model)
+    assert accepted["passed"]
+    check = accepted["pairs"][0]["contact_region_checks"][0]
+    assert check["method"] == "complete_occupied_leaf_intersections" and check["leaf_queries"] == 2
+    model["contacts"] = [rule(feature_points=[[-.015, -.015, -.001], [.015, -.015, -.001],
+        [.015, .015, -.001], [-.015, .015, -.001]])]
+    rejected = query(checker, model)
+    assert not rejected["passed"] and rejected["violations"]
+    assert rejected["pairs"][0]["contact_region_checks"][0]["contained"] is False
+# END no first witness or iteration order can suppress a second illegal contact.

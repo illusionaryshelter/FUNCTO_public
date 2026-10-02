@@ -480,6 +480,35 @@ def _require_mapping_memory(estimated_bytes, device):
 # END local mapping resource guard.
 
 
+# BEGIN independent finite occupied-cell model from the original mapped field.
+def _independent_voxel_geometry(voxel, source):
+    """Own every field sample and its occupied cells before native buffers move.
+
+    Coal uses the filled union of positive ESDF sample cells. This is a second
+    numerical representation of the same observed field, not a free-space
+    proof or an inferred hidden back surface. Its half-cell diagonal is exposed
+    as model discretization; it is never silently added to contact permission.
+    """
+    field = voxel.feature_tensor.detach().cpu().numpy()
+    shape = tuple(int(round(float(value)/float(voxel.voxel_size))) for value in voxel.dims)
+    if len(shape) != 3 or min(shape) < 1 or math.prod(shape) != field.size or field.size > 8_000_000:
+        raise ValueError("Independent occupied field requires the complete bounded native grid")
+    flat = np.ascontiguousarray(field.reshape(-1))
+    if not np.isfinite(flat).all():
+        raise ValueError("Independent field samples must be finite, including the native unknown sentinel")
+    occupied = np.flatnonzero(flat > 0)
+    if len(occupied) > 250_000:
+        return {"solids": [], "query_gaps": ["Independent occupied-cell inventory exceeds 250000 cells"]}
+    return {"solids": ([] if not len(occupied) else [{
+        "name": voxel.name, "kind": "voxel", "pose": list(voxel.pose), "source": source,
+        "voxel_size": float(voxel.voxel_size), "shape_xyz": list(shape),
+        "field_dtype": flat.dtype.str, "field_bytes_hex": flat.tobytes().hex(),
+        "occupied_flat_indices": occupied.tolist(), "occupancy_rule": "ESDF_sample_strictly_positive",
+        "geometry_scope": "filled occupied sample cells of the observed field; unknown cells remain unknown",
+        "cell_half_diagonal_m": math.sqrt(3)*float(voxel.voxel_size)/2}]), "query_gaps": []}
+# END neither sparsification nor a contact witness may discard occupied cells.
+
+
 def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                           reference_frame, robot_sphere_materials, robot_geometry_source,
                           gripper=None, has_gripper=True, contacts=(),
@@ -608,6 +637,9 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
             device_cfg=config_device, scene_model=SceneCfg(voxel=[voxel]), cache={"voxel": 1}))
         queries[identity] = CuroboSphereQuery(native, owner_ids=(partition_id,),
                                              source=f"current_rgbd:{','.join(normalized)}")
+        # BEGIN retain an independent filled-cell model of this same owner partition.
+        queries[identity].independent_geometry = _independent_voxel_geometry(voxel, queries[identity].source)
+        # END no GPU query or robot-sphere residual is used by independent checking.
         statistics[partition_id] = {"allocated_blocks": stats["num_allocated"],
                                     "max_blocks": config.max_blocks,
                                     "tsdf_voxel_size_m": float(config.voxel_size),

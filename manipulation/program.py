@@ -19,6 +19,46 @@ from .motion import (MotionModel, _errors, _inverse, _pose_array, _poses_array,
 from .regions import ground_relation, relation_error
 
 
+# BEGIN separate optional reference fitting from current task feasibility.
+class ReferenceGenerationError(ValueError):
+    """A source-profile fit failed after validating the independent goals."""
+
+
+def _mechanism_goal_contract(model_spec, initial, goals, coordinate_goals=None):
+    """Validate physical start/targets before any optional source-profile fit."""
+    if model_spec is None:
+        return None, None
+    model, limits = _current_model(model_spec)
+    start = _exact_coordinates(model, initial)
+    values = [start]
+    for index, goal in goals:
+        coordinate = (_exact_coordinates(model, goal) if coordinate_goals is None
+                      else np.asarray(coordinate_goals[index], float))
+        if index == 0 and not np.allclose(coordinate, start, atol=1e-8, rtol=0):
+            raise ValueError("The initial functional goal conflicts with the observed current pose")
+        values.append(coordinate)
+    if limits is not None and (np.any(np.asarray(values) < limits[:, 0]-1e-9)
+                               or np.any(np.asarray(values) > limits[:, 1]+1e-9)):
+        raise ValueError("A required start or functional goal exceeds current mechanism limits")
+    return model, limits
+
+
+def _unfitted_reference(reference, model, error, coordinates=None):
+    """Retain the bound source as a seed, with no feasibility claim about it."""
+    output = reference.copy()
+    if model is None:
+        serialized = {"kind": "free", "origin": "bound source reference"}
+    else:
+        model.coordinates = (model._coordinates_unchecked(output) if coordinates is None
+                             else np.asarray(coordinates, float).copy())
+        output = model.poses(model.coordinates)
+        serialized = model.to_dict()
+    return output, {"model": serialized, "reference_generation": {
+        "status": "failed", "reason": str(error),
+        "seed": "bound source reference; not a task feasibility result"}}
+# END separate optional reference fitting from current task feasibility.
+
+
 def _index(frame, frames, name):
     """Resolve an original frame ID without silently treating it as an index."""
     if isinstance(frame, (bool, np.bool_)) or not isinstance(frame, (int, np.integer)):
@@ -198,7 +238,7 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
                         roundoff = 8 * np.finfo(float).eps * max(
                             1., abs(float(initial_q[0])), abs(float(goal_q[0])))
                         if abs(target_delta) > roundoff:
-                            raise ValueError("Zero-net prismatic source interval cannot bind a nonzero displacement")
+                            raise ReferenceGenerationError("Zero-net prismatic source interval cannot fit a nonzero displacement")
                         scale, mode = 1., "zero_net_source_motion_preserved"
                     elif np.array_equal(goal_q, part[-1]):
                         # Identity retargeting must not needlessly round the
@@ -207,7 +247,7 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
                     else:
                         scale, mode = target_delta / source_delta, "source_progress_scaled"
                         if not np.isfinite(scale):
-                            raise ValueError("Prismatic source progress scale must be finite")
+                            raise ReferenceGenerationError("Prismatic source progress scale must be finite")
                         part = initial_q + scale * (coordinates[begin:end + 1] - coordinates[begin])
                         # Pin only floating-point endpoint arithmetic, not any
                         # interior sample or its order. A positive scale keeps
@@ -228,7 +268,7 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
             values[begin:end + 1] = part
         if limits is not None and (np.any(values < limits[:, 0] - 1e-9)
                                    or np.any(values > limits[:, 1] + 1e-9)):
-            raise ValueError("Transferred function trajectory exceeds the current mechanism limits")
+            raise ReferenceGenerationError("Transferred reference exceeds current mechanism limits")
         output = model.poses(values)
         model.coordinates = values
         diagnostics["model"] = model.to_dict()
@@ -347,9 +387,16 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
         names.add(name)
         previous = index
     goals = [(index, model.poses(value)[0]) for index, value in unique_goals.items()]
-    objects, diagnostics = _event_transfer(
-        reference[:last_held+1], initial, goals, None, spec,
-        coordinate_reference=coordinates[:last_held+1], coordinate_goals=unique_goals)
+    # BEGIN bind native goals before attempting the optional source-profile fit.
+    _mechanism_goal_contract(spec, initial, goals, unique_goals)
+    try:
+        objects, diagnostics = _event_transfer(
+            reference[:last_held+1], initial, goals, None, spec,
+            coordinate_reference=coordinates[:last_held+1], coordinate_goals=unique_goals)
+    except ReferenceGenerationError as error:
+        objects, diagnostics = _unfitted_reference(
+            reference[:last_held+1], model, error, coordinates[:last_held+1])
+    # END bind native goals before attempting the optional source-profile fit.
     actual = np.asarray(diagnostics["model"]["coordinates"], float)
     checks = []
     for event in recorded:
@@ -357,11 +404,10 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
         goal = model.poses(target)[0]
         error = float(np.max(np.abs(actual[index]-target)))
         p, r = _errors(objects[index:index+1], goal[None])
-        if error > event["coordinate_tolerance"] or max(p[0], r[0]) > 1e-8:
-            raise ValueError(f"Transferred trajectory misses joint functional event {event['event_id']!r}")
         checks.append({key: value for key, value in event.items() if key != "index"})
         checks[-1].update(constraint_kind="joint_coordinate", goal_pose=goal,
-                          actual_coordinates=actual[index].copy(), coordinate_error=error,
+                          status="bound_goal", reference_satisfies_goal=error <= event["coordinate_tolerance"],
+                          reference_coordinates=actual[index].copy(), reference_coordinate_error=error,
                           coordinate_unit="m" if model.kind == "prismatic" else "rad",
                           position_error_m=float(p[0]), rotation_error_rad=float(r[0]))
     diagnostics.update(source_coordinates_source=source_evidence,
@@ -396,10 +442,9 @@ def _check_entry_corridor(objects, scene, margin, motion_checks):
     corridor = _interior(scene["entry_region"])
     clearance = min(check_inside(pose, scene["body_points"], corridor)["minimum_clearance_m"]
                     for pose in objects[begin:])
-    if clearance < margin - 1e-7:
-        raise ValueError("Transferred object motion leaves the supplied entry corridor")
     motion_checks["entry_corridor"] = {"minimum_clearance_m": float(clearance),
                                        "margin_m": float(margin),
+                                       "reference_satisfies_corridor": bool(clearance >= margin-1e-7),
                                        "checked_nodes": len(objects)-begin,
                                        "scope": "saved controlled nodes; not continuous collision certification"}
 # END direct functional joint goals without manufactured region frames.
@@ -544,23 +589,44 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
             or model_spec.get("kind") not in {"prismatic", "revolute"}):
         raise ValueError("Articulation requires the current instance's supported mechanism model")
     function_frame = first["function_frame"]
+    # BEGIN goals/model are authoritative; source-profile fitting is optional.
+    bound_model, _ = _mechanism_goal_contract(model_spec, initial, goal_pairs)
+    if goal_pairs[0][0] == 0 and not np.allclose(goal_pairs[0][1], initial, atol=1e-8, rtol=0):
+        raise ValueError("The initial functional goal conflicts with the observed current pose")
     if task["relation"] == "tool_use":
         if model_spec is not None or motion not in {"free", "auto"}:
             raise ValueError("The function optimizer cannot silently discard a current mechanism constraint")
-        from .function_motion import transfer_function_motion
-        solved = transfer_function_motion(reference[:last_held + 1] @ function_frame,
-                                          initial @ function_frame,
-                                          [{"index": index, "pose": goal @ function_frame}
-                                           for index, goal in goal_pairs])
-        objects = solved["poses"] @ _inverse(function_frame)
-        motion_checks = solved["diagnostics"]
+        from .function_motion import FunctionReferenceError, transfer_function_motion
+        # The actual-entry goal has already been checked above. The fitting
+        # kernel accepts only later nodes; its minimum length/index contract
+        # must not reject a valid single-state controlled prefix at release.
+        fitting_goals = [{"index": index, "pose": goal @ function_frame}
+                         for index, goal in goal_pairs if index > 0]
+        if not fitting_goals:
+            objects = reference[:last_held+1].copy()
+            motion_checks = {"reference_generation": {"status": "not_needed",
+                "reason": "All functional goals are at the independently checked actual entry"}}
+        else:
+            try:
+                solved = transfer_function_motion(reference[:last_held + 1] @ function_frame,
+                                                  initial @ function_frame, fitting_goals)
+                objects = solved["poses"] @ _inverse(function_frame)
+                motion_checks = solved["diagnostics"]
+            except FunctionReferenceError as error:
+                objects, motion_checks = _unfitted_reference(reference[:last_held+1], None, error)
     else:
-        objects, motion_checks = _event_transfer(reference[:last_held + 1], initial,
-                                                 goal_pairs, function_frame, model_spec)
+        try:
+            objects, motion_checks = _event_transfer(reference[:last_held + 1], initial,
+                                                     goal_pairs, function_frame, model_spec)
+        except ReferenceGenerationError as error:
+            objects, motion_checks = _unfitted_reference(reference[:last_held+1], bound_model, error)
+    # END goals/model are authoritative; source-profile fitting is optional.
     checks = []
     for event in events:
         binding = event["binding"]
-        pose = objects[event["index"]]
+        # BEGIN inspect the independent bound target, never use seed fit as qualification.
+        pose = event["goal_pose"]
+        # END inspect the independent bound target, never use seed fit as qualification.
         if event["constraint_kind"] == "on_region":
             from .pipeline import _surface
             from .goals import check_on
@@ -595,6 +661,7 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
                 error["containment"] = {"status": "not_verified", "reason": "free interior geometry not supplied"}
         checks.append({"event_id": event["event_id"], "frame_index": event["frame_index"],
                        "constraint_kind": event["constraint_kind"],
+                       "status": "bound_goal",
                        "goal_pose": event["goal_pose"], **error})
     # BEGIN share unchanged corridor semantics with direct joint-coordinate goals.
     # The index addresses source rows, not frame IDs; released body poses still
@@ -643,8 +710,8 @@ def ground_object_program(program, scene):
 
 
 # BEGIN public joint-coordinate input documentation; holding/release logic stays shared.
-# BEGIN carry an explicit pre-grasp boundary into the shared geometry kernel.
-def ground_program(program, scene, *, pregrasp_frame=None):
+# BEGIN ground complete source references without an independent approach contract.
+def ground_program(program, scene):
     """Generate one grasp/manipulation geometry reference from a compiled demo.
 
     ``program`` contains ``skill_kind``, ``demo`` and (for manipulation) task
@@ -680,23 +747,20 @@ def ground_program(program, scene, *, pregrasp_frame=None):
     future release cannot already be observed: the returned retreat is anchored
     to its predicted boundary and must be rebound to actual feedback at runtime.
 
-    A grasp may additionally supply ``pregrasp_frame`` to preserve its bound
-    Cartesian approach from that original observation onward. Robot planning
-    requires this explicit boundary; independent geometric grounding does not.
+    Grasp source frames only initialize the current single-skill plan. Its
+    bound terminal grasp relation is a goal; no approach frame is a waypoint.
     """
     kind, demo = program["skill_kind"], program["demo"]
     frame_name = scene.get("reference_frame")
     if not isinstance(frame_name, str) or not frame_name:
         raise ValueError("The current scene must name its common reference_frame")
     if kind == "grasp":
-        result = ground_grasp(demo, scene, pregrasp_frame=pregrasp_frame)
+        result = ground_grasp(demo, scene)
         result.update(skill_kind=kind, reference_frame=frame_name,
                       carrier_id=scene.get("carrier_id"),
                       pose_convention="column-vector reference_from_eef; metres; 4x4 SE(3)")
         return result
-    if pregrasp_frame is not None:
-        raise ValueError("pregrasp_frame only applies to grasp geometry")
-    # END carry an explicit pre-grasp boundary into the shared geometry kernel.
+    # END ground complete source references without an independent approach contract.
     if kind != "manipulation":
         raise ValueError("skill_kind must be grasp or manipulation")
     for key in ("tool_id", "tool_frame"):

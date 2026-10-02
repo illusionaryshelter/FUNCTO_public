@@ -295,49 +295,63 @@ class RobosuiteExecutionBackend:
         return pose
 
 
-    def prepare_abort_hold(self, feedback, finger_positions, *, expected_sim_time):
-        """Prepare mature-controller hold output without writing ctrl or stepping.
+    # BEGIN bounded physical hold with actual feedback confirmation.
+    def abort_hold(self, feedback, finger_positions, *, expected_sim_time, stop_velocity, max_steps):
+        """Apply hold through existing controllers, then measure bounded settling.
 
-        Synchronous simulation stops on failure. This records a prospective
-        damping/hold command for a caller, not a verified physical stop. The
-        last *applied* finger goal is retained; a rejected event cannot reach
-        the gripper through fault handling.
+        The arm goal is the failed sample's actual q. The last applied finger
+        goal is retained, so an event rejected by supervision is never issued
+        by fault handling. Hold telemetry is separate from the failed curve.
+        No state reset or claimed zero velocity substitutes for feedback.
         """
         result = {"prepared": False, "native_ctrl_written": False, "physical_steps": 0,
-                  "physical_stop_confirmed": False}
+                  "physical_stop_confirmed": False, "samples": [], "controls": []}
         try:
             if (tuple(feedback.get("joint_names", ())) != self.joint_names
                     or tuple(feedback.get("arm_joint_names", ())) != self.arm_joint_names
                     or tuple(feedback.get("finger_joint_names", ())) != self.finger_joint_names
                     or feedback.get("trial_id") != self._trial_id
                     or feedback.get("source") != self._feedback_source):
-                raise ValueError("Cannot prepare a hold from unidentified feedback")
+                raise ValueError("Cannot hold from unidentified feedback")
             current_time = float(self.native_data.time)
             clocks = np.asarray([feedback.get("sim_time"), feedback.get("timestamp_s"), current_time], dtype=float)
             if (not np.isfinite(clocks).all() or np.max(np.abs(clocks-expected_sim_time)) > 1e-8
                     or feedback.get("feedback_id") != f"{self._trial_id}@native_time={current_time:.17g}"):
-                raise ValueError("Cannot prepare a hold from stale or discontinuous native feedback time")
+                raise ValueError("Cannot hold from stale or discontinuous native feedback time")
             q = _finite_array(feedback["q"], (len(self.joint_names),), "Hold feedback positions")
             _finite_array(feedback["dq"], q.shape, "Hold feedback velocities")
+            limits = _finite_array(stop_velocity, q.shape, "Named physical stop velocities")
+            if np.any(limits < 0) or type(max_steps) is not int or not 1 <= max_steps <= 10000:
+                raise ValueError("Physical hold requires finite nonnegative criteria and a bounded step count")
             ranges = self.joint_ranges
             if np.any(q < ranges[:, 0]) or np.any(q > ranges[:, 1]):
-                raise ValueError("Cannot turn out-of-range actual coordinates into a new hold goal")
-            self._arm_controller.set_goal(q[:len(self.arm_joint_names)].copy())
-            torque = _finite_array(self._arm_controller.run_controller(),
-                                    (len(self.arm_joint_names),), "Prepared hold torque")
-            bounds = self.native_model.actuator_ctrlrange[self._arm_actuators]
-            torque = np.clip(torque, bounds[:, 0], bounds[:, 1])
-            self._grip_controller.set_goal(finger_positions.copy())
-            finger_ctrl = np.asarray(self._grip_controller.run_controller(), dtype=float)
-            if not np.array_equal(finger_ctrl, finger_positions):
-                raise ValueError("Prepared hold changed the last applied native finger goal")
-            result.update(prepared=True, arm_position_goal=q[:len(self.arm_joint_names)].tolist(),
-                          finger_position_goal=finger_positions.tolist(),
-                          actuator_names=list(self._actuator_names),
-                          prospective_actuator_ctrl=np.r_[torque, finger_ctrl].tolist())
+                raise ValueError("Out-of-range actual coordinates cannot become a new hold goal")
+            goal = q[:len(self.arm_joint_names)].copy()
+            result.update(prepared=True, arm_position_goal=goal.tolist(),
+                finger_position_goal=np.asarray(finger_positions).tolist(), stop_velocity=limits.tolist())
+            for index in range(max_steps):
+                control = self.apply_control(goal, finger_positions)
+                result["native_ctrl_written"] = True
+                result["controls"].append(control["actuator_ctrl"].tolist())
+                self.step()
+                actual = self.proprioception()
+                result["physical_steps"] = index+1
+                result["samples"].append(actual)
+                measured_q = _finite_array(actual["q"], q.shape, "Hold actual positions")
+                measured_dq = _finite_array(actual["dq"], q.shape, "Hold actual velocities")
+                if np.any(measured_q < ranges[:, 0]) or np.any(measured_q > ranges[:, 1]):
+                    raise ValueError("Physical joint range invalidated during hold")
+                if abs(float(actual["sim_time"])-(current_time+(index+1)*self.timestep)) > 1e-8:
+                    raise ValueError("Native clock became discontinuous during hold")
+                if np.all(np.abs(measured_dq) <= limits):
+                    result["physical_stop_confirmed"] = True
+                    break
+            if not result["physical_stop_confirmed"]:
+                result["reason"] = "Hold budget exhausted before named stop velocity criteria were observed"
         except Exception as error:
             result["reason"] = f"{type(error).__name__}: {error}"
         return result
+    # END physical hold result preserves unconfirmed and failed stops.
 
 
     def proprioception(self):

@@ -91,7 +91,8 @@ def cartesian_problem(phases, events=()):
         joint_names=("cartesian_x", "cartesian_y", "cartesian_z"),
         start_q=np.zeros(3), start_dq=np.zeros(3), tool_link="analytic_tool",
         reference_frame="analytic_world", base_pose=np.eye(4),
-        tool_transform=np.eye(4), phases=tuple(phases), events=tuple(events))
+        tool_transform=np.eye(4), phases=tuple(phases), events=tuple(events),
+        source_timestamps=np.array([0., float(len(phases))]), source_progress=np.array([0., float(len(phases))]))
 
 
 def export_fixture(problem, progress_map, position, velocity, dt):
@@ -121,9 +122,12 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     native = SimpleNamespace(position=position, velocity=velocity,
                              dt=torch.tensor([dt], dtype=torch.float64))
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
     planner.problem = problem
     planner.budget = PlanningBudget()
-    planner.progress_map = progress_map
+    clock = {(event.skill_id, event.event_id): {"time": float(progress_map.anchor_parameters([event.progress])[0, 0]*(position.shape[1]-1)*dt),
+        "hold_until": float(progress_map.anchor_parameters([event.progress])[-1, 0]*(position.shape[1]-1)*dt)} for event in problem.events}
+    planner.progress_map = _ProgressMap(progress_map.u, progress_map.s, clock)
     planner.anchors = problem.anchors
     planner.joint_names = problem.joint_names
     planner.torch = torch
@@ -137,10 +141,12 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     planner.start = SimpleNamespace(position=position[:, 0], velocity=velocity[:, 0])
     planner._verification_fk = CartesianKinematics()
     planner._verification_scene = SimpleNamespace(
-        gripper=None, evaluate=lambda spheres, p, r, s, q, names, **kwargs: torch.zeros_like(s),
+        gripper=None, required_progress_anchors=(),
+        evaluate=lambda spheres, p, r, s, q, names, **kwargs: torch.zeros_like(s),
         check_robot_coverage=lambda *args, **kwargs: [])
     # BEGIN give the real exporter explicit, finite native acceleration bounds.
     limits = SimpleNamespace(joint_names=list(problem.joint_names),
+        position=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64),
         acceleration=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64))
     cspace = SimpleNamespace(enabled=True, config=SimpleNamespace(joint_limits=limits))
     planner._verification_native = SimpleNamespace(
@@ -223,15 +229,15 @@ class PlannerCalculusTests(unittest.TestCase):
     # END no synthetic zero-speed case substitutes for boundary preservation.
 
 
-    def test_export_full_volume_rejection_is_hard_even_when_all_gpu_costs_zero(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+    def test_export_required_query_failure_is_hard_even_when_all_gpu_costs_zero(self):
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
         mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         planner, native = export_fixture(problem, mapping, np.zeros((2, 3)), np.zeros((2, 3)), 1.)
         calls = []
 
         def coverage(q, names, t, *, entrance=False):
             calls.append((q.numpy().copy(), t.numpy().copy(), entrance))
-            return [{"passed": bool(value != .5), "failure": None if value != .5 else "new_unknown_volume"}
+            return [{"passed": bool(value != .5), "attempt_allowed": bool(value != .5), "failure": None if value != .5 else "required_query_incomplete"}
                     for value in t.reshape(-1).tolist()]
 
         planner._verification_scene.check_robot_coverage = coverage
@@ -246,7 +252,7 @@ class PlannerCalculusTests(unittest.TestCase):
     # BEGIN a rounded spline boundary is a reference state, not measured q0.
     def test_export_nearby_first_sample_gets_ordinary_volume_residual(self):
         from manipulation.planning_scene import PlanningScene
-        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
         mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         baseline = np.array([.123456789, 0., 0.])
         rounded = np.float32(baseline[0])
@@ -257,10 +263,11 @@ class PlannerCalculusTests(unittest.TestCase):
 
         def check_state(**kwargs):
             queries.append(kwargs)
-            return {"passed": False, "failure": "new_unknown_volume", "witness": {"sample": "ordinary"}}
+            return {"passed": False, "attempt_allowed": True, "failure": "new_unknown_volume", "witness": {"sample": "ordinary"}}
 
         world = PlanningScene.__new__(PlanningScene)
         world.gripper = None
+        world.required_progress_anchors = ()
         world.robot_coverage = SimpleNamespace(baseline_joint_names=planner.joint_names,
             baseline_joint_positions=baseline, check_state=check_state)
         world.evaluate = planner._verification_scene.evaluate
@@ -270,7 +277,7 @@ class PlannerCalculusTests(unittest.TestCase):
         self.assertFalse(queries[0]["entrance"])
         np.testing.assert_array_equal(queries[0]["joint_positions"], first)
         np.testing.assert_array_equal(curve.position, position)
-        self.assertEqual(curve.residuals["unknown/new_robot_volume"], 1.)
+        self.assertEqual(curve.residuals["unknown/new_robot_volume"], 0.)
         failure = planner.last_validation["robot_coverage"]["failed"][0]
         self.assertEqual(failure["time_s"], 0.)
         self.assertEqual(failure["result"]["failure"], "new_unknown_volume")
@@ -278,12 +285,13 @@ class PlannerCalculusTests(unittest.TestCase):
 
     def test_initializer_plateau_inverse_is_explicitly_earliest(self):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.progress_map = _ProgressMap(np.array([0., .2, .4, 1.]), np.array([0., 1., 1., 2.]))
         self.assertEqual(planner._seed_u(1.), .2)
 
     def test_native_self_collision_receives_timed_spheres_without_mutating_fk(self):
         from manipulation.planning_scene import PrismaticGripper
-        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
         q = torch.tensor([[[.3, .1, 0.]]], dtype=torch.float64, requires_grad=True)
         quaternion = q.new_tensor([[[[1., 0., 0., 0.]]]])
         original = torch.cat((q[:, :, None]+q.new_tensor([.04, 0., 0.]),
@@ -305,7 +313,7 @@ class PlannerCalculusTests(unittest.TestCase):
             def tool_poses(self):
                 return self.cuda_robot_model_state.tool_poses
 
-        hand = PrismaticGripper(controller="timed_reference", joint_names=("finger",),
+        hand = PrismaticGripper(controller="timed_reference", control_timestep_s=.002, joint_names=("finger",),
             current_positions=[.04], joint_limits=[[0, .04]], joint_bounds=None,
             finger_trajectory_factory=lambda *_: None, coupling_matrix=np.empty((0, 1)), coupling_offset=[],
             sphere_indices=(0,), local_spheres=[[0, 0, 0, .001]],
@@ -314,6 +322,7 @@ class PlannerCalculusTests(unittest.TestCase):
             source="analytic timed native-self input")
         hand.finger_trajectory = SimpleNamespace(sample_torch=lambda t: (
             (.04-.02*t)[..., None], torch.full((*t.shape, 1), -.02, dtype=t.dtype)))
+        hand.nominal_finger_trajectory = hand.finger_trajectory
         original_state = State()
         replaced = _timed_native_state(original_state, problem, SimpleNamespace(gripper=hand),
                                          problem.joint_names, q.new_tensor([[1.]]))
@@ -328,112 +337,6 @@ class PlannerCalculusTests(unittest.TestCase):
     # END no nominal point objective can bypass native volume acceptance.
 
     # BEGIN independent full-horizon endpoint-family gradient regression.
-    def test_coupled_endpoint_and_release_frame_vjp_matches_scipy_whole_horizon(self):
-        # Event poses are optimization variables. Their derivatives must reach
-        # earlier motion, the still-held successor and the released retreat;
-        # a correct local FK derivative alone does not establish that chain.
-        def transform(position, angles):
-            result = np.eye(4)
-            result[:3, 3] = position
-            result[:3, :3] = Rotation.from_euler("xyz", angles).as_matrix()
-            return result
-
-        attachment = transform([.08, -.04, .11], [.43, -.52, .71])
-        body = np.stack((transform([.2, -.3, .5], [.1, -.2, .3]),
-                         transform([.3, -.2, .35], [-.1, .4, .7]),
-                         transform([.4, -.1, .2], [.2, -.1, .9])))
-        held = np.stack((body[-1], transform([.42, -.08, .2], [.2, -.1, 1.])))
-        retreat = np.stack((held[-1] @ attachment,
-                            held[-1] @ attachment @ transform([.03, -.02, .07], [.1, -.15, .08])))
-        source = "independent noncommuting endpoint and release-frame fixture"
-        phases = (
-            MotionPhase("place", PosePath(np.array([0., .5, 1.]), body, source,
-                                           attachment=attachment),
-                        endpoint_family={"move_start": False, "end": "variable"}),
-            MotionPhase("hold", PosePath(np.array([0., 1.]), held, source,
-                                          attachment=attachment),
-                        endpoint_family={"move_start": True, "end": "unanchored"}),
-            MotionPhase("retreat", PosePath(np.array([0., 1.]), retreat, source),
-                        frame_anchor={"progress": 2., "reference_pose": retreat[0]}),
-        )
-        problem = cartesian_problem(phases)
-        progress = np.array([0., .2, .5, .8, 1., 1.25, 1.5, 1.8, 2., 2.2, 2.5, 2.8, 3.])
-        rng = np.random.default_rng(730)
-        # Seven explicit analytic coordinates: XYZ translation, Z/Y/X serial
-        # rotations, and an unused coordinate. This is not a robot fixture.
-        values = rng.normal(scale=.22, size=(2, len(progress), 7))
-        values[..., :3] += np.array([.3, -.1, .4])
-        values[..., 3:6] += np.array([.8, -.45, .3])
-        sample_weight = np.linspace(.4, 1.6, len(progress))[None]
-        sample_weight[:, [4, 8]] = 0.
-        phase_paths = (body, held, retreat)
-        phase_knots = (np.array([0., .5, 1.]), np.array([0., 1.]), np.array([0., 1.]))
-
-        def sample(poses, knots, local):
-            output = np.broadcast_to(np.eye(4), (len(local), 4, 4)).copy()
-            output[:, :3, 3] = np.column_stack([np.interp(local, knots, poses[:, axis, 3])
-                                                for axis in range(3)])
-            output[:, :3, :3] = Slerp(knots, Rotation.from_matrix(poses[:, :3, :3]))(local).as_matrix()
-            return output
-
-        def independent_loss(configurations):
-            quaternions, _ = serial_rotations(configurations[..., 3:])
-            rotations = Rotation.from_quat(quaternions[..., 0, :].reshape(-1, 4)[:, [1, 2, 3, 0]])
-            actual = np.broadcast_to(np.eye(4), (*configurations.shape[:2], 4, 4)).copy()
-            actual[..., :3, 3] = configurations[..., :3]
-            actual[..., :3, :3] = rotations.as_matrix().reshape(*configurations.shape[:2], 3, 3)
-            violation = np.zeros(configurations.shape[:2])
-            for batch, observed in enumerate(actual):
-                for index in range(3):
-                    local = np.clip(progress-index, 0., 1.)
-                    reference = sample(phase_paths[index], phase_knots[index], local)
-                    if index < 2:
-                        initial = body[0] if index == 0 else observed[4] @ np.linalg.inv(attachment)
-                        mapped = reference @ np.linalg.inv(phase_paths[index][0]) @ initial
-                        if index == 0:
-                            goal = observed[4] @ np.linalg.inv(attachment)
-                            mapped_end = body[-1] @ np.linalg.inv(body[0]) @ initial
-                            mapped[:, :3, 3] += local[:, None]*(goal[:3, 3]-mapped_end[:3, 3])
-                            correction = goal[:3, :3] @ mapped_end[:3, :3].T
-                            turns = Slerp([0., 1.], Rotation.from_matrix(np.stack((np.eye(3), correction))))(local)
-                            mapped[:, :3, :3] = turns.as_matrix() @ mapped[:, :3, :3]
-                        target = mapped @ attachment
-                    else:
-                        target = observed[8] @ np.linalg.inv(retreat[0]) @ reference
-                    relative = np.swapaxes(target[:, :3, :3], -1, -2) @ observed[:, :3, :3]
-                    position_error = np.einsum("hji,hj->hi", target[:, :3, :3],
-                                               observed[:, :3, 3]-target[:, :3, 3])
-                    errors = np.column_stack((position_error, Rotation.from_matrix(relative).as_rotvec()))
-                    tolerance = np.array([problem.numerical.position_m]*3+[problem.numerical.rotation_rad]*3)
-                    term = np.maximum(np.abs(errors)-tolerance, 0.).sum(-1)
-                    violation[batch] += term*((progress >= index) & (progress <= index+1))
-            return np.sum(violation**2*sample_weight)
-
-        expected = np.zeros_like(values)
-        epsilon = 2e-6
-        for index in np.ndindex(values.shape):
-            plus, minus = values.copy(), values.copy()
-            plus[index] += epsilon
-            minus[index] -= epsilon
-            expected[index] = (independent_loss(plus)-independent_loss(minus))/(2*epsilon)
-        for sign in (1., -1.):
-            with self.subTest(quaternion_sign=sign):
-                coordinates = torch.tensor(values, dtype=torch.float64, requires_grad=True)
-                quaternions, jacobians = serial_rotations(values[..., 3:])
-                orientation = _orientation_vjp_type().apply(
-                    coordinates[..., 3:], torch.tensor(sign*quaternions, dtype=torch.float64),
-                    torch.tensor(jacobians, dtype=torch.float64))[..., 0, :]
-                residual = problem.evaluate(coordinates[..., :3], orientation,
-                                            torch.tensor(np.broadcast_to(progress, values.shape[:2]).copy()))
-                loss = (residual.square()*torch.tensor(sample_weight)).sum()
-                self.assertAlmostEqual(loss.item(), independent_loss(values), places=10)
-                loss.backward()
-                np.testing.assert_allclose(coordinates.grad.numpy(), expected, rtol=2e-7, atol=2e-7)
-                np.testing.assert_array_equal(coordinates.grad.numpy()[..., -1], 0.)
-                # The event nodes have zero direct loss weight. Nonzero event
-                # gradients therefore prove the required cross-phase coupling.
-                self.assertGreater(np.linalg.norm(coordinates.grad.numpy()[:, 4, :6]), .1)
-                self.assertGreater(np.linalg.norm(coordinates.grad.numpy()[:, 8, :6]), .1)
     # END independent full-horizon endpoint-family gradient regression.
 
     def test_native_backward_receives_contiguous_gradients_after_batched_anchor_views(self):
@@ -603,7 +506,7 @@ class NativeCubicClockTests(unittest.TestCase):
 
     def test_stop_preference_never_changes_the_original_raw_acceptance_test(self):
         event = PlanningEvent("stop", "analytic", .3, 1, "verification", "test source", stop=True)
-        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),), (event,))
+        problem = cartesian_problem((MotionPhase("free", constant_path()),), (event,))
         progress = torch.tensor([[.3, .3, .4]], dtype=torch.float64)
         position = torch.zeros((1, 3, 3), dtype=torch.float64)
         quaternion = torch.zeros((1, 3, 4), dtype=torch.float64)
@@ -841,77 +744,53 @@ class NativeCubicClockTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "(?i)(float32|precision)"):
             _progress_for_cubic_boundaries(linear, 8, np.zeros(1), stop_progress=(), anchors=close)
 
-    def test_ompl_initializer_uses_the_same_warp_when_joint_motion_continues_during_a_pause(self):
-        # Real OMPL search is covered separately. This fixture supplies a
-        # declared valid q/s path and exercises the production post-search
-        # assembly, with analytic FK only. Its second edge changes q while s
-        # remains .3; interpolating q as a function of s would lose that edge.
-        event = PlanningEvent("pause-stop", "analytic-skill", .3, 10, "test stop", "fixture", stop=True)
-        problem = cartesian_problem((MotionPhase("free connection", constant_path(), kind="free"),), (event,))
-        paths = (
-            np.array([[0., 0., 0., 0.], [.3, 0., 0., .3]]),
-            np.array([[.3, 0., 0., .3], [.3, .6, 0., .3],
-                      [.6, .6, 0., .55], [1.5, .1, 0., 1.]]),
-        )
-        path = np.concatenate((paths[0], paths[1][1:]))
-        old_u = np.r_[0., np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
-        old_u /= old_u[-1]
-        source = _ProgressMap(old_u, path[:, -1])
-        expected_map, warp = _progress_for_cubic_boundaries(
-            source, 15, problem.start_dq, stop_progress=problem.stop_progress, anchors=problem.anchors)
+    # BEGIN a longer spatial route retains the identical binding and plateau time.
+    def test_ompl_initializer_preserves_clock_when_q_moves_during_progress_pause(self):
+        problem = cartesian_problem((MotionPhase("reference", constant_path()),),
+            (PlanningEvent("query", "analytic", .3, 10, "function", "fixture"),))
+        mapping = _ProgressMap(np.array([0., .25, .7, 1.]), np.array([0., .3, .3, 1.]))
+        path = np.array([[0., 0., 0., 0.], [.3, 0., 0., .25],
+                         [.3, .6, 0., .7], [1.5, .1, 0., 1.]])
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
-        planner.torch, planner.problem = torch, problem
-        planner.budget = PlanningBudget(knots=15, search_seconds=3., interpolation_buffer_size=768)
+        planner.torch, planner.problem, planner.progress_map = torch, problem, mapping
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values)
+        planner.budget = PlanningBudget(knots=15, interpolation_buffer_size=768)
         planner.anchors, planner.joint_names = problem.anchors, problem.joint_names
         planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float64))
         planner.start = SimpleNamespace(position=torch.zeros((1, 3), dtype=torch.float64))
         planner.trajopt = SimpleNamespace(action_horizon=15, transition_model=SimpleNamespace(
             action_bound_lows=torch.full((3,), -2.), action_bound_highs=torch.full((3,), 2.)))
-        candidates = torch.tensor(path[[0, 1, -1]][None, None, :, :3], dtype=torch.float64)
-        planner._boundary_candidates = lambda *args, **kwargs: candidates.clone()
-
-        class AnalyticState(SimpleNamespace):
-            @classmethod
-            def from_position(cls, position, **kwargs):
-                return cls(position=position, **kwargs)
-
+        planner.formal_clock, planner.finger_trajectory = {"duration": 2.}, None
+        planner.JointState = SimpleNamespace
         def fk(state):
             q = state.position
-            quaternion = q.new_zeros((*q.shape[:2], 1, 4))
-            quaternion[..., 0] = 1.
+            quaternion = q.new_zeros((*q.shape[:2], 1, 4)); quaternion[..., 0] = 1.
             return SimpleNamespace(tool_poses=SimpleNamespace(tool_frames=[problem.tool_link],
-                                                              position=q[:, :, None], quaternion=quaternion),
-                                   tool_jacobians=q.new_zeros((*q.shape[:2], 1, 6, 3)))
-
-        planner.JointState = AnalyticState
+                position=q[:, :, None], quaternion=quaternion),
+                tool_jacobians=q.new_zeros((*q.shape[:2], 1, 6, 3)))
         planner._verification_fk = SimpleNamespace(compute_kinematics=fk)
         planner._orientation_vjp = SimpleNamespace(apply=lambda q, quaternion, jacobian: quaternion)
         planner._native_layout = SimpleNamespace(apply=lambda value: value)
-        scene = SimpleNamespace()
-        scene.with_fixed_endpoints = lambda *args: scene
+        scene = SimpleNamespace(project_residual=lambda progress, q, names: q[..., :0])
         scene.clone_for_rollout = lambda: scene
         planner.scene = scene
-        with patch("manipulation.planning._project_boundary", side_effect=lambda value, *args, **kwargs: value), \
-                patch("manipulation.planning._ompl_stage", side_effect=[(value, {"success": True}) for value in paths]) as search:
-            seed, mapping, report = planner.ompl_seed(torch.zeros((1, 1, 15, 3)), None)
+        candidate = SimpleNamespace(duration=2., _curve=lambda moment: path[-1, :-1])
+        with patch("manipulation.planning._ompl_stage", return_value=(path, {"success": True})) as search:
+            seed, report = planner.ompl_seed(torch.zeros((1, 1, 15, 3)), candidate)
         self.assertTrue(report["success"])
-        self.assertEqual(search.call_count, 2)
-        self.assertEqual(tuple(seed.shape), (1, 1, 15, 3))
-        np.testing.assert_array_equal(mapping.u, expected_map.u)
-        np.testing.assert_array_equal(mapping.s, expected_map.s)
-        greville = (np.arange(15)+3.)/19.
-        old_parameter = np.interp(greville, warp.u, warp.s)
-        expected_q = np.column_stack([np.interp(old_parameter, old_u, path[:, index]) for index in range(3)])
-        np.testing.assert_allclose(seed.numpy()[0, 0], expected_q, atol=1e-14)
-        progress_at_controls = np.interp(greville, mapping.u, mapping.s)
-        pause_q = seed.numpy()[0, 0][progress_at_controls == .3]
-        self.assertGreaterEqual(len(pause_q), 2)
-        self.assertGreater(float(np.ptp(pause_q[:, 1])), .1)
-        # The stop is at the original pause's first arrival; validation keeps
-        # both ends of the entire pause, including the subsequent q movement.
-        pause = mapping.anchor_parameters([.3])
-        self.assertEqual(pause.shape, (2, 2))
-        np.testing.assert_allclose(np.interp(pause[:, 0], warp.u, warp.s), old_u[1:3], atol=1e-14)
+        self.assertFalse(report["clock_changed"])
+        self.assertIs(planner.progress_map, mapping)
+        self.assertEqual(search.call_count, 1)
+        np.testing.assert_array_equal(search.call_args.args[0][-1:], [0.])
+        np.testing.assert_array_equal(search.call_args.args[1][-1:], [1.])
+        self.assertIn(.25, search.call_args.kwargs["query_parameters"])
+        self.assertIn(.7, search.call_args.kwargs["query_parameters"])
+        control_u = (np.arange(15)+3.)/19.
+        expected = np.stack([np.interp(control_u, path[:, -1], path[:, j]) for j in range(3)], -1)
+        np.testing.assert_allclose(seed.numpy()[0, 0], expected, atol=1e-14)
+        paused = seed.numpy()[0, 0][(control_u >= .25) & (control_u <= .7)]
+        self.assertGreater(float(np.ptp(paused[:, 1])), .1)
+    # END spatial distance no longer creates new event times.
     # END independent native-basis progress warp and retained-path contracts.
 
     def test_every_free_action_uses_its_scipy_greville_time_without_consuming_q0(self):
@@ -932,6 +811,7 @@ class NativeCubicClockTests(unittest.TestCase):
                                    success=torch.tensor([[True, True]]))
 
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.torch = torch
         planner.budget = PlanningBudget(ik_seeds=2, trajectory_seeds=1)
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=1e-5))
@@ -977,6 +857,7 @@ class NativeCubicClockTests(unittest.TestCase):
                                    success=torch.tensor([[False, False]]))
 
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.torch = torch
         planner.budget = PlanningBudget(ik_seeds=2, trajectory_seeds=2)
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=1e-5))
@@ -1007,13 +888,14 @@ class NativeCubicClockTests(unittest.TestCase):
         self.assertIs(planner.start.position, measured_q)
         self.assertIs(planner.start.velocity, measured_dq)
 
-        # A constant alternative does not conceal a corrupt native IK result.
-        # Nonfinite candidates must still fail before any trajectory solve.
+        # A broken IK batch loses only that reference sample; the legal
+        # measured-state initializer remains available in the same budget.
         planner.ik.solve_pose = lambda *args, **kwargs: SimpleNamespace(
             js_solution=SimpleNamespace(position=torch.full((1, 2, 3), float("nan"))),
             success=torch.tensor([[False, False]]))
-        with self.assertRaisesRegex(ValueError, "nonfinite initialization"):
-            planner.reference_seeds()
+        seeds, failures = planner.reference_seeds()
+        self.assertTrue(bool(torch.isfinite(seeds).all()))
+        self.assertEqual(failures, [0]*horizon)
     # END native constant-seed initialization contract after failed pose IK.
 
 
@@ -1028,6 +910,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
 
         horizon, candidates = len(pools), len(pools[0])
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.torch = torch
         planner.budget = PlanningBudget(knots=horizon, ik_seeds=candidates, trajectory_seeds=seed_count)
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=joint_tolerance))
@@ -1314,6 +1197,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         # Exercise the production verification constructor, including rebuilds;
         # its existing deepcopy must receive the still-unmodified template.
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.device_cfg = self.device_cfg
         planner.trajopt = SimpleNamespace(
             config=SimpleNamespace(metrics_rollout_config=SimpleNamespace(constraint_cfg=template)),
@@ -1395,36 +1279,33 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         return {"active_joint_names": tuple(f"q{index}" for index in range(16)),
                 "links": 64, "spheres": 512}
 
-    def test_complete_319_node_timeline_and_all_322_clock_anchors_survive(self):
+    # BEGIN ordinary source density does not consume hard-query capacity.
+    def test_complete_reference_timeline_keeps_only_real_query_anchors(self):
         problem = self.timeline_problem()
+        self.assertEqual(sum(len(phase.reference.progress)-1 for phase in problem.phases)+1, 319)
+        np.testing.assert_array_equal(problem.anchors, [0., 2., 3.])
         mapping = self.clock(problem)
         pairs = mapping.anchor_parameters(problem.anchors)
-        self.assertEqual(len(problem.anchors), 319)
-        self.assertEqual(len(pairs), 322)
-        np.testing.assert_array_equal(np.unique(pairs[:, 1]), problem.anchors)
-        self.assertEqual(_anchor_capacity(mapping, problem.anchors, PlanningBudget()), 386)
+        self.assertEqual(len(pairs), 6)
+        self.assertEqual(_anchor_capacity(mapping, problem.anchors, PlanningBudget()), 70)
         no_refinement = PlanningBudget(max_refinement_points=0)
-        self.assertEqual(_anchor_capacity(mapping, problem.anchors, no_refinement), 322)
+        self.assertEqual(_anchor_capacity(mapping, problem.anchors, no_refinement), 6)
         with self.assertRaisesRegex(ValueError, "refinement-point budget"):
             _anchor_capacity(mapping, problem.anchors, no_refinement, [.123])
-        tight = PlanningBudget(max_validation_points=330)
-        self.assertEqual(_anchor_capacity(mapping, problem.anchors, tight), 330)
-        with self.assertRaisesRegex(ValueError, "refinement-point budget"):
-            _anchor_capacity(mapping, problem.anchors, tight, np.linspace(.1, .9, 9))
+        self.assertEqual(_anchor_capacity(mapping, problem.anchors, PlanningBudget(max_validation_points=32, max_refinement_points=26)), 32)
+    # END reference vertices remain source data instead of required IK/validation poses.
 
-    def test_total_source_and_pause_overflow_fail_before_native_construction(self):
-        for counts, maximum in (((252, 9, 60), 128), ((12, 11, 10), 32)):
-            with self.subTest(counts=counts):
-                problem = self.timeline_problem(counts)
-                scene = SimpleNamespace(validate_problem=Mock(), required_progress_anchors=(),
-                                        reference_frame=problem.reference_frame)
-                with patch("manipulation.planning._bounded_robot_configuration") as robot, \
-                        patch("manipulation.planning._process_manager_type") as manager:
-                    with self.assertRaisesRegex(ValueError, "anchors|source knots"):
-                        _CuroboPlanner(problem, scene, object(), PlanningBudget(
-                            max_validation_points=maximum, max_refinement_points=0), "cuda:0")
-                robot.assert_not_called()
-                manager.assert_not_called()
+    def test_true_scene_query_overflow_fails_before_native_construction(self):
+        problem = self.timeline_problem()
+        scene = SimpleNamespace(validate_problem=Mock(), required_progress_anchors=np.linspace(0., 3., 129),
+                                reference_frame=problem.reference_frame)
+        with patch("manipulation.planning._bounded_robot_configuration") as robot, \
+                patch("manipulation.planning._process_manager_type") as manager:
+            with self.assertRaisesRegex(ValueError, "anchors|source knots"):
+                _CuroboPlanner(problem, scene, object(), PlanningBudget(
+                    max_validation_points=128, max_refinement_points=0), "cuda:0")
+        robot.assert_not_called()
+        manager.assert_not_called()
 
     def test_native_anchor_estimate_matches_installed_meta_buffer_layout(self):
         # Execute only the installed pure buffer factory on Torch's meta
@@ -1445,7 +1326,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
         metadata = self.robot_metadata()
         native = SimpleNamespace(num_pose_links=1, num_spheres=512, num_dof=16, num_links=64)
-        scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon, **kwargs: 0)
+        scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_bytes=lambda batch, horizon, **kwargs: 0)
         budget = PlanningBudget(max_validation_points=8192)
         before_cuda = torch.cuda.is_initialized()
         for count in (322, 386, 8192):
@@ -1470,16 +1351,17 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "GPU memory"):
             _require_planning_memory(runtime, "cuda:0", 200, 600)
 
-    def test_replacement_rechecks_changed_pause_count_before_recreating_solver(self):
+    def test_refinement_rechecks_workspaces_without_retiming(self):
         import gc
         import weakref
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.budget = PlanningBudget(max_refinement_points=0)
         planner.anchors = np.array([0., 1., 2.])
         planner.problem = object()
-        planner.scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon, **kwargs: batch*horizon)
+        planner.scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_bytes=lambda batch, horizon, **kwargs: batch*horizon)
         planner.robot_metadata = self.robot_metadata()
-        planner.progress_map = _ProgressMap(np.array([0., .5, 1.]), planner.anchors)
+        planner.progress_map = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
         planner.seed_progress = object()
         planner.seed_parameter, planner.formal_clock, planner.robot_dict = object(), {}, {}
         planner.refinement_parameters = np.empty(0)
@@ -1514,10 +1396,15 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planner._optimizer_class = Mock(return_value=SimpleNamespace(destroy=Mock()))
         planner._initialize_verification_constraints = Mock()
         planner._bind_formal_clock = Mock()
+        planner._bind_physical_domains = Mock()
         mapping = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
         with patch("manipulation.planning._process_manager_type", return_value="new manager") as manager, \
-                patch("manipulation.planning.gc.collect", wraps=gc.collect) as collect:
-            planner.replace_schedule(mapping)
+                patch("manipulation.planning.gc.collect", wraps=gc.collect) as collect, \
+                patch("manipulation.planning._formal_native_clock", return_value={}):
+            original_map = planner.progress_map
+            planner.refine_validation(())
+            self.assertIs(planner.progress_map, original_map)
+            planner._bind_formal_clock.assert_not_called()
             self.assertEqual(planner.anchor_capacity, 4)
             expected = _planning_workspace_bytes(planner.scene, planner.robot_metadata, planner.budget, 4)
             self.assertEqual((planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes), expected)
@@ -1530,7 +1417,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             planner.torch.cuda.mem_get_info.return_value = 2*1024**3, 12*1024**3
             planner._optimizer_class.reset_mock()
             with self.assertRaisesRegex(ValueError, "GPU memory"):
-                planner.replace_schedule(mapping)
+                planner.refine_validation(())
             planner._optimizer_class.assert_not_called()
             self.assertIsNone(planner.trajopt)
         self.assertEqual(planner.torch.cuda.mem_get_info.call_count, 2)
@@ -1549,6 +1436,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                 destroyed.append(self.name)
 
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.ik, planner.trajopt = CyclicSolver("ik"), CyclicSolver("trajectory")
         references = (weakref.ref(planner.ik), weakref.ref(planner.trajopt))
         with patch("manipulation.planning.gc.collect", wraps=gc.collect) as collect:
@@ -1562,7 +1450,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         self.assertEqual(destroyed, ["ik", "trajectory"])
 
     def test_scene_budget_and_removed_legacy_parameter_remain_strict(self):
-        scene = SimpleNamespace(estimated_workspace_bytes=lambda batch, horizon, **kwargs: 1024**3)
+        scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_bytes=lambda batch, horizon, **kwargs: 1024**3)
         with self.assertRaisesRegex(ValueError, "scene query workspaces"):
             _planning_workspace_bytes(scene, self.robot_metadata(), PlanningBudget(), 322)
         with self.assertRaises(TypeError):
@@ -1571,10 +1459,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             PlanningBudget(max_refinement_points=-1)
 
     def test_projection_accuracy_respects_the_strictest_source_mechanism(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
         self.assertAlmostEqual(_projection_tolerance(problem), 1e-6)
         model = SimpleNamespace(position_tolerance=1e-6, rotation_tolerance=2e-6)
-        problem.phases = (SimpleNamespace(reference=SimpleNamespace(motion_model=model)),)
+        problem.mechanisms = (SimpleNamespace(model=model),)
         self.assertAlmostEqual(_projection_tolerance(problem), 1e-7)
         model.rotation_tolerance = 1e-8
         self.assertAlmostEqual(_projection_tolerance(problem), 1e-9)
@@ -1677,8 +1565,10 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
     @staticmethod
     def selection_fixture(residuals, errors=()):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.torch = torch
         planner.budget = PlanningBudget()
+        planner.seed_strategies = ["reference_ik", "reference_ik_alternative"]
         exported = []
 
         def export(candidate):
@@ -1785,6 +1675,21 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         self.assertEqual(attempt["validation_points"], 5)
         self.assertEqual(attempt["measurements"]["candidate_index"], 1)
         torch.testing.assert_close(chosen.solution, result.solution[:, 1:2])
+
+    # BEGIN provenance priority applies only after independent hard acceptance.
+    def test_verified_demo_initializer_has_priority_over_lower_native_cost(self):
+        result = self.native_candidates(flags=(True, True), native_violations=(0., 0.))
+        result.seed_cost = torch.tensor([[100., 1.]])
+        planner, exported = self.selection_fixture((0., 0.))
+        planner.seed_strategies = ["reference_ik", "measured_state_constant"]
+        _, trajectory, attempt = planner.select_candidate(result)
+        self.assertEqual(exported, [0, 1])
+        self.assertEqual(trajectory.candidate_index, 0)
+        self.assertEqual(attempt["seed_provenance"], "reference_ik")
+        planner, _ = self.selection_fixture((.01, 0.))
+        planner.seed_strategies = ["reference_ik", "measured_state_constant"]
+        self.assertEqual(planner.select_candidate(result)[1].candidate_index, 1)
+    # END a reference-derived failure never outranks an accepted alternative.
 
     def test_failed_candidates_use_per_seed_actual_constraints_instead_of_float32_rank(self):
         result = self.native_candidates(flags=(False, False), native_violations=(.02, 0.))
@@ -1900,7 +1805,7 @@ class ContinuousCubicDerivativeTests(unittest.TestCase):
 class ExportedCurveContractTests(unittest.TestCase):
     # BEGIN the real exporter consumes the complete scalar acceleration check.
     def test_analytic_acceleration_violation_enters_existing_candidate_residuals(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free", require_end=False),))
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
             [[0., 0., 0.], [1., 0., 0.], [4., 0., 0.]],
             [[0., 0., 0.], [3., 0., 0.], [3., 0., 0.]], 1.)
@@ -1922,7 +1827,7 @@ class ExportedCurveContractTests(unittest.TestCase):
     # END a zero sampled native residual cannot hide a left-limit violation.
 
     def test_multiple_native_seeds_cannot_be_flattened_into_one_export(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                          np.zeros((3, 3)), np.zeros((3, 3)), .25)
         result.num_seeds = 2
@@ -1931,30 +1836,28 @@ class ExportedCurveContractTests(unittest.TestCase):
             planner.export(result)
         result.get_interpolated_plan.assert_not_called()
 
-    def test_source_short_loop_peak_cannot_hide_between_native_samples(self):
-        # The candidate never moves. A velocity-only subdivision therefore
-        # cannot discover this required 20 mm loop unless source anchors are
-        # explicitly queried on the actual exported joint curve.
+    # BEGIN changing ordinary reference shape cannot invent a process obligation.
+    def test_reference_short_loop_does_not_require_motion_or_a_hard_anchor(self):
         knots = np.array([0., .501, .502, .503, 1.])
         reference = np.broadcast_to(np.eye(4), (len(knots), 4, 4)).copy()
         reference[:, 0, 3] = [0., 0., .02, 0., 0.]
-        phase = MotionPhase("required loop", PosePath(knots, reference, "observed narrow loop"))
-        problem = cartesian_problem((phase,))
+        problem = cartesian_problem((MotionPhase("reference loop", PosePath(knots, reference, "reference")),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                          np.zeros((9, 3)), np.zeros((9, 3)), .125)
         trajectory, _ = planner.export(result)
-        self.assertIn(.502, planner.last_validation["u"])
-        self.assertGreater(trajectory.residuals["phase:0:required loop"], .019)
-        self.assertAlmostEqual(planner.last_validation["measurements"]["phase:0:position_error_m"], .02)
+        self.assertNotIn(.502, planner.last_validation["u"])
+        self.assertTrue(all(value == 0. for value in trajectory.residuals.values()))
+        self.assertFalse(any(key.startswith("phase:") for key in trajectory.residuals))
+    # END independent PoseProcessRequirement tests cover truly required paths.
 
     def test_plateau_has_two_validation_anchors_but_one_original_event_trigger(self):
-        phases = tuple(MotionPhase(f"free {index}", constant_path(), kind="free") for index in range(3))
+        phases = tuple(MotionPhase(f"free {index}", constant_path()) for index in range(3))
         events = (
             PlanningEvent("close", "first", 1., 73, "close", "original first close"),
             PlanningEvent("verify", "first", 1., 79, "verification", "first grasp boundary",
                           "actual stable Holding feedback", True),
-            PlanningEvent("close", "second", 2., 115, "close", "original second close"),
-            PlanningEvent("verify", "second", 2., 121, "verification", "second grasp boundary",
+            PlanningEvent("close-again", "first", 2., 115, "close", "original second close"),
+            PlanningEvent("verify-again", "first", 2., 121, "verification", "second grasp boundary",
                           "another actual Holding observation", True),
         )
         problem = cartesian_problem(phases, events)
@@ -1979,7 +1882,7 @@ class ExportedCurveContractTests(unittest.TestCase):
         self.assertAlmostEqual(trajectory.executable_until, first["time"])
 
     def test_no_evidence_barrier_allows_the_complete_exported_duration(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                          np.zeros((3, 3)), np.zeros((3, 3)), .25)
         trajectory, _ = planner.export(result)
@@ -1987,7 +1890,7 @@ class ExportedCurveContractTests(unittest.TestCase):
         self.assertEqual(trajectory.executable_until, trajectory.duration)
 
     def test_excessive_curve_subdivision_is_rejected_before_allocation(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path(), kind="free"),))
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                          np.zeros((2, 3)), np.array([[1e9, 0., 0.], [-1e9, 0., 0.]]), 1.)
         with patch("manipulation.planning.np.linspace", wraps=np.linspace) as allocations:
@@ -2013,9 +1916,11 @@ class InitialStatePreflightTests(unittest.TestCase):
             start_q=np.asarray(position), start_dq=np.asarray(velocity),
             tool_link="actual_tool", reference_frame="analytic_world",
             base_pose=base, tool_transform=tool,
-            phases=(MotionPhase("free", constant_path(), kind="free"),))
+            phases=(MotionPhase("free", constant_path()),))
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.problem, planner.joint_names = problem, problem.joint_names
+        planner.budget = PlanningBudget()
         planner.torch, planner.JointState = torch, SimpleNamespace
         planner._RobotState = SimpleNamespace
         planner.start = SimpleNamespace(
@@ -2029,7 +1934,7 @@ class InitialStatePreflightTests(unittest.TestCase):
             velocity=torch.tensor([[-3., -1., -2.], [3., 1., 2.]], dtype=torch.float64))
         cspace = SimpleNamespace(enabled=True, config=SimpleNamespace(joint_limits=limits),
             forward=Mock(side_effect=AssertionError("unknown high derivatives cannot enter STATE cost")))
-        collision = SimpleNamespace(enabled=True, setup_batch_tensors=Mock(),
+        collision = SimpleNamespace(enabled=True, config=SimpleNamespace(self_collision_kin_config=SimpleNamespace(sphere_padding=0.)), setup_batch_tensors=Mock(),
             forward=Mock(return_value=torch.tensor([[native_collision]], dtype=torch.float64)))
         planner._verification_native = SimpleNamespace(
             get_cost={"cspace": cspace, "self_collision": collision}.get,
@@ -2045,7 +1950,7 @@ class InitialStatePreflightTests(unittest.TestCase):
                 position=torch.stack((q+7., q), dim=2), quaternion=quaternion))
 
         planner._verification_fk = SimpleNamespace(compute_kinematics=Mock(side_effect=fk))
-        planner._verification_scene = SimpleNamespace(gripper=None, check_robot_coverage=Mock(return_value=[]),
+        planner._verification_scene = SimpleNamespace(gripper=None, required_progress_anchors=(), check_robot_coverage=Mock(return_value=[]),
             components=Mock(return_value={scene_name: torch.tensor([[scene_value]], dtype=torch.float64)}))
         planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes, planner.anchor_capacity = 64, 32, 4
         planner.reference_seeds = Mock(side_effect=AssertionError("an infeasible fixed entrance must stop before IK"))
@@ -2147,14 +2052,15 @@ class PlannerRetryContractTests(unittest.TestCase):
             ik=SimpleNamespace(config=SimpleNamespace(exit_early=False)),
             reference_ik_distinct_counts=[2, 2, 2],
             initial_seed_strategies=["reference_ik", "reference_ik_alternative"],
+            seed_strategies=["reference_ik", "reference_ik_alternative"],
             # BEGIN valid measured entrance for the independent retry fixture.
             initial_state_diagnostics=Mock(return_value={"passed": True, "residuals": {},
                 "failed_components": [], "scope": {"kind": "analytic retry fixture"}}),
             # END valid measured entrance for the independent retry fixture.
             reference_seeds=Mock(return_value=(torch.zeros((1, 2, 4, 3)), [2, 2, 2])),
-            optimize=Mock(side_effect=native), close=Mock(), replace_schedule=Mock(),
+            optimize=Mock(side_effect=native), close=Mock(), refine_validation=Mock(),
             refinement_samples=Mock(return_value=None),
-            ompl_seed=Mock(return_value=(None, None, {"success": False})),
+            ompl_seed=Mock(return_value=(None, {"success": False})),
         )
         planner.native_diagnostics = MethodType(_CuroboPlanner.native_diagnostics, planner)
         planner.select_candidate = MethodType(_CuroboPlanner.select_candidate, planner)
@@ -2170,8 +2076,12 @@ class PlannerRetryContractTests(unittest.TestCase):
 
     def run_planner(self, planner, budget):
         scene = SimpleNamespace(describe=lambda: {"scope": "explicit analytic retry fixture"})
-        with patch("manipulation.planning._CuroboPlanner", return_value=planner):
-            result = plan_trajectory(object(), scene, object(), budget=budget)
+        # BEGIN the handoff fixture declares its real empty request ledger.
+        problem = SimpleNamespace(events=(), pose_events=(), coordinate_events=(), supports=())
+        # END accepted planning never depends on an undeclared object sentinel.
+        with patch("manipulation.planning._CuroboPlanner", return_value=planner), \
+                patch("manipulation.execution_binding.bind_candidate", return_value={"fixture": "accepted"}):
+            result = plan_trajectory(problem, scene, object(), budget=budget)
         planner.close.assert_called_once_with()
         return result
 
@@ -2212,14 +2122,14 @@ class PlannerRetryContractTests(unittest.TestCase):
         planner, _, _ = self.scripted_planner([False, True], [.004, .001])
         seed = torch.full((1, 1, 4, 3), 17.)
         mapping = _ProgressMap(np.array([0., .3, 1.]), np.array([0., .1, 1.]))
-        planner.ompl_seed.return_value = seed, mapping, {"success": True}
+        planner.ompl_seed.return_value = seed, {"success": True}
         result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
         self.assertFalse(result.success)
         self.assertIsNone(result.trajectory)
         self.assertTrue(result.diagnostics["used_ompl"])
         self.assertEqual(planner.optimize.call_count, 2)
         self.assertIs(planner.optimize.call_args_list[1].args[0], seed)
-        planner.replace_schedule.assert_called_once_with(mapping)
+        planner.refine_validation.assert_not_called()
         self.assertEqual(planner.ompl_seed.call_count, 1)
         self.assertEqual(len(result.diagnostics["attempts"]), 2)
 
@@ -2230,7 +2140,7 @@ class PlannerRetryContractTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIsNone(result.trajectory)
         self.assertEqual(planner.optimize.call_count, 3)
-        self.assertEqual(planner.replace_schedule.call_count, 2)
+        self.assertEqual(planner.refine_validation.call_count, 2)
         self.assertEqual(planner.refinement_samples.call_count, 2)
         for index in (1, 2):
             seed = planner.optimize.call_args_list[index].args[0]

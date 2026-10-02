@@ -54,14 +54,14 @@ def example():
 
 
 class GraspGeometryTest(unittest.TestCase):
-    def test_static_carrier_has_eef_motion_and_exact_protected_suffix(self):
+    def test_static_carrier_keeps_complete_bound_source_as_an_initializer(self):
         demo, scene = example()
         before_demo, before_scene = deepcopy(demo), deepcopy(scene)
         result = ground_grasp(demo, scene)
         bound = scene["carrier_pose"] @ scene["region_transform"] @ demo["T_carrier_eef"]
         self.assertGreater(np.linalg.norm(result["eef_poses"][0, :3, 3]
                                          - result["eef_poses"][-1, :3, 3]), .1)
-        np.testing.assert_allclose(result["eef_poses"][0], scene["eef_pose"], atol=1e-12)
+        np.testing.assert_allclose(result["eef_poses"], bound, atol=1e-12)
         np.testing.assert_allclose(result["eef_poses"][7:], bound[7:], atol=1e-14, rtol=0)
         other_start = deepcopy(scene)
         other_start["eef_pose"][:3, 3] += [.21, .12, -.07]
@@ -70,35 +70,36 @@ class GraspGeometryTest(unittest.TestCase):
         self.assertEqual(len(result["eef_poses"]), len(demo["T_carrier_eef"]))
         self.assertEqual(result["status"], "candidate")
         self.assertEqual(result["holding_status"], "requires_verification")
-        self.assertFalse(result["verification_barrier"]["original_support_separation_required"])
+        self.assertFalse(result["effect_requirement"]["original_support_separation_required"])
         self.assertNotIn("actual_T_carrier_eef", result)
         np.testing.assert_array_equal(demo["T_carrier_eef"], before_demo["T_carrier_eef"])
         np.testing.assert_array_equal(scene["eef_pose"], before_scene["eef_pose"])
         self.assertEqual(json.loads(json.dumps(serializable(result)))["status"], "candidate")
 
-    def test_region_changes_change_terminal_tool_relation_and_not_actual_start(self):
+    def test_region_changes_update_reference_and_goal_without_changing_actual_input(self):
         demo, scene = example()
         first = ground_grasp(demo, scene)
         scene["region_transform"][:3, 3] += [.07, -.01, .02]
         second = ground_grasp(demo, scene)
-        np.testing.assert_allclose(first["eef_poses"][0], second["eef_poses"][0])
+        self.assertFalse(np.allclose(first["eef_poses"][0], second["eef_poses"][0]))
         self.assertGreater(np.linalg.norm(first["eef_poses"][-1, :3, 3]
                                          - second["eef_poses"][-1, :3, 3]), .07)
         self.assertFalse(np.allclose(first["candidate_T_carrier_eef"],
                                     second["candidate_T_carrier_eef"]))
 
-    def test_protected_first_node_does_not_fabricate_a_connection(self):
+    # BEGIN contact evidence never creates an independent approach obligation.
+    def test_contact_evidence_at_first_row_never_requires_a_source_pose_connection(self):
         demo, scene = example()
         demo["protected_start_frame"] = int(demo["frame_indices"][0])
         result = ground_grasp(demo, scene)
-        self.assertTrue(result["connection_required"])
-        self.assertEqual(result["status"], "connection_required")
+        self.assertEqual(result["status"], "candidate")
         expected = scene["carrier_pose"] @ scene["region_transform"] @ demo["T_carrier_eef"]
         np.testing.assert_allclose(result["eef_poses"], expected, atol=1e-14, rtol=0)
-        np.testing.assert_allclose(result["entry_pose"], expected[0], atol=1e-14, rtol=0)
-        self.assertFalse(np.allclose(result["entry_pose"], scene["eef_pose"]))
-        scene["eef_pose"] = expected[0]
-        self.assertFalse(ground_grasp(demo, scene)["connection_required"])
+        self.assertNotIn("connection_required", result)
+        self.assertNotIn("entry_pose", result)
+        self.assertNotIn("verification_barrier", result)
+        np.testing.assert_allclose(result["goal_pose"], expected[-1])
+    # END contact evidence never creates an independent approach obligation.
 
     def test_original_frame_ids_timestamps_and_events_remain_separate(self):
         demo, scene = example()
@@ -108,7 +109,7 @@ class GraspGeometryTest(unittest.TestCase):
         np.testing.assert_array_equal(result["frame_indices"], demo["frame_indices"])
         np.testing.assert_array_equal(result["timestamps"], demo["timestamps"])
         self.assertEqual(result["gripper_events"], demo["gripper_events"])
-        self.assertEqual(result["verification_barrier"]["frame_index"], 121)
+        self.assertEqual(result["effect_requirement"]["frame_index"], 121)
         self.assertNotIn("gripper_qpos", result)
         result["gripper_events"][0]["command"] = "hold"
         self.assertEqual(demo["gripper_events"][0]["command"], "open")

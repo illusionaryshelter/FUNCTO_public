@@ -407,8 +407,8 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
     interference in the stated sampled scope. Missing evidence is unresolved.
     Inputs are action alternatives for an already selected owner and function,
     not mutually exclusive scene-identity hypotheses. An unverified alternative
-    does not invalidate a supported action. Select the sole supported action,
-    leave multiple supported actions ambiguous, and retain every candidate.
+    does not invalidate a supported action. Select the sole eligible action,
+    retain unresolved alternatives as eligible attempts, and retain every candidate.
     Target/semantic ambiguity belongs upstream; this module never ranks costs.
     """
     _name(reference_frame, "reference_frame")
@@ -457,30 +457,32 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
                                for event in candidate["gripper_events"])
         already_open = np.allclose(measured["joint_positions_m"], opened["joint_positions_m"],
                                    atol=_ARITHMETIC_M, rtol=0)
-        if candidate.get("connection_required") or not np.allclose(poses[0], current_pose, atol=1e-8, rtol=0):
-            report["reason"] = "Candidate lacks its verified connection from current robot feedback"
-        elif not opening_declared and not already_open:
-            report["reason"] = "No opening intention or measured open state supports the planned approach"
-        elif not len(cloud["points"]):
+        # BEGIN a reference connection/opening does not own terminal-target validity.
+        route_connected = not candidate.get("connection_required") and np.allclose(poses[0], current_pose, atol=1e-8, rtol=0)
+        opening_supported = opening_declared or already_open
+        report["reference_connection_required"] = not route_connected
+        report["reference_opening_supported"] = opening_supported
+        if not len(cloud["points"]):
             report["reason"] = "No valid current owner depth samples"
         else:
-            q0 = np.asarray(measured["joint_positions_m"])
             qopen = np.asarray(opened["joint_positions_m"])
-            opening_steps = max(1, int(np.ceil(np.abs(qopen-q0).max()/contact)))
-            for alpha in np.linspace(0., 1., opening_steps+1):
-                state = tool.at((1-alpha)*q0+alpha*qopen)
-                found = _interference(current_pose, state, geometry, cloud, tree, radius, penetration)
-                if _record_interference(report, {"phase": "initial_opening",
-                        "opening_fraction": float(alpha), "solids": found}):
-                    break
-            if not any(solid["evidence_status"] == "rejected"
-                       for record in report["interference"] for solid in record["solids"]):
-                for index, pose in _approach_samples(poses, close_index, radius, contact):
-                    report["approach_samples"] += 1
-                    found = _interference(pose, opened, geometry, cloud, tree, radius, penetration)
-                    if _record_interference(report, {"phase": "planned_open_approach",
-                            "frame_index": int(frames[index]), "solids": found}):
+            if route_connected and opening_supported:
+                q0 = np.asarray(measured["joint_positions_m"])
+                opening_steps = max(1, int(np.ceil(np.abs(qopen-q0).max()/contact)))
+                for alpha in np.linspace(0., 1., opening_steps+1):
+                    state = tool.at((1-alpha)*q0+alpha*qopen)
+                    found = _interference(current_pose, state, geometry, cloud, tree, radius, penetration)
+                    if _record_interference(report, {"phase": "initial_opening",
+                            "opening_fraction": float(alpha), "solids": found}):
                         break
+                if not any(solid["evidence_status"] == "rejected"
+                           for record in report["interference"] for solid in record["solids"]):
+                    for index, pose in _approach_samples(poses, close_index, radius, contact):
+                        report["approach_samples"] += 1
+                        found = _interference(pose, opened, geometry, cloud, tree, radius, penetration)
+                        if _record_interference(report, {"phase": "planned_open_approach",
+                                "frame_index": int(frames[index]), "solids": found}):
+                            break
             closure = _closure(poses[-1], opened, closed, cloud, contact, penetration)
             report["terminal_closure"] = closure
             # The palm does not translate with finger closure. A witnessed
@@ -518,26 +520,34 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
             approach_unknown = any(not row["phase"].startswith("terminal")
                                    and any(s["evidence_status"] == "unresolved" for s in row["solids"])
                                    for row in report["interference"])
-            report["approach_requires_replanning"] = approach_conflicts
+            report["approach_requires_replanning"] = approach_conflicts or not route_connected or not opening_supported
             report["approach_visible_geometry_status"] = ("rejected" if approach_conflicts else
                                                          "unresolved" if approach_unknown else "supported")
             report["terminal_visible_geometry_status"] = ("rejected" if terminal_conflicts else
                                                          "unresolved" if terminal_unknown else closure["status"])
-            if terminal_conflicts or approach_conflicts:
-                report.update(status="rejected", reason=("Terminal conditional tool geometry penetrates observed target"
-                              if terminal_conflicts else "This reference approach needs replanning; terminal grasp status is reported separately"))
+            # BEGIN reference-route evidence cannot veto an independently bound target.
+            if terminal_conflicts:
+                report.update(status="rejected", reason="Terminal conditional tool geometry penetrates observed target")
+            elif approach_conflicts or not route_connected or not opening_supported:
+                report.update(status="unresolved", reason=("No opening intention supports this reference approach; target remains eligible"
+                              if not opening_supported else "Reference approach requires replanning; target remains eligible"))
+            # END retain the precise failed route without deleting its target.
             elif terminal_unknown or approach_unknown:
                 report.update(status="unresolved", reason="Locally unsupported boundary positions indicate possible tool interference")
             else:
                 report.update(status=closure["status"], reason=closure["reason"])
             # END distinct position evidence; normals do not gate solid tests.
+        # END every observed terminal contradiction survives a missing reference connection.
         result[report["status"]+"_candidate_ids"].append(name)
-    result["eligible_candidate_ids"] = list(result["supported_candidate_ids"])
+    # BEGIN uncertainty authorizes an attempt, never a Holding assertion.
+    result["eligible_candidate_ids"] = sorted(result["supported_candidate_ids"] + result["unresolved_candidate_ids"])
+    # END known terminal violations remain excluded.
     eligible, unknown = result["eligible_candidate_ids"], result["unresolved_candidate_ids"]
     # BEGIN action alternatives do not compete as exclusive scene hypotheses.
-    if len(eligible) == 1:
-        result.update(status="selected", selected_candidate_id=eligible[0])
-    elif eligible:
+    selection = result["supported_candidate_ids"] or eligible
+    if len(selection) == 1:
+        result.update(status="selected", selected_candidate_id=selection[0])
+    elif selection:
         result["status"] = "ambiguous"
     elif unknown:
         result["status"] = "unresolved"

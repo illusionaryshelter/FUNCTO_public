@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 from manipulation.execution import FixedFingerTargets
-from manipulation.planning import _ProgressMap
+from manipulation.planning import _ProgressMap, _bind_event_clock
 from manipulation.planning_problem import PlanningEvent
 from run_recorded_skill import finger_trajectory_factory
 
@@ -30,11 +30,14 @@ def inputs():
 
 
 def factory(problem, feedback, targets):
-    return finger_trajectory_factory(problem, feedback, targets, timestep=.01,
+    build = finger_trajectory_factory(problem, feedback, targets, timestep=.01,
         ctrlrange=[[0., .04], [-.04, 0.]],
         position_limits={"left": [0., .04], "right": [-.04, 0.]},
         velocity_limits={"left": .2, "right": .2},
         acceleration_limits={"left": 15., "right": 15.})
+    # BEGIN the fixture uses the same sole clock owner as the planner.
+    return lambda duration, progress: build(duration, _bind_event_clock(problem, progress, duration, .01))
+    # END the finger factory itself cannot invent the binding.
 
 
 def test_finger_clock_preserves_measured_entrance_and_original_plateau_event():
@@ -68,5 +71,5 @@ def test_missing_named_reference_limit_cannot_be_replaced_by_actual_hardware_int
             ctrlrange=[[0., .04], [-.04, 0.]],
             position_limits={"left": [0., .04], "right": [-.04, 0.]},
             velocity_limits={"left": .2, "right": .2}, acceleration_limits={"left": 15.})(
-                3., _ProgressMap(np.array([0., 1.]), np.array([0., 1.])))
+                3., _bind_event_clock(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), 3., .01))
 # END goals, actual feedback and time-varying reference retain separate meanings.

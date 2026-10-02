@@ -2,7 +2,7 @@
 
 This is an explicitly empty synthetic world and a rigid Franka tool. Both
 requests use the same actual robot, starting state, endpoint and numerical
-budget. Only the required intermediate reference pose changes. This probes
+budget. Only the independently required intermediate pose changes. This probes
 generation-time process behavior; it is not perception or contact validation.
 """
 
@@ -23,7 +23,7 @@ from scipy.spatial.transform import Rotation
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 # END project-local imports.
-from probe_process_planner import NoObstacleExperiment
+from probe_process_planner import no_obstacle_scene
 
 
 def run(output, knots):
@@ -35,7 +35,8 @@ def run(output, knots):
         import torch
         from curobo.kinematics import Kinematics, KinematicsCfg
         from curobo.types import JointState
-        from manipulation.planning_problem import PlanningProblem, MotionPhase, PosePath, NumericalTolerance
+        from manipulation.planning_problem import (PlanningProblem, MotionPhase, PosePath,
+            NumericalTolerance, PoseEventRequirement)
         from manipulation.planning import PlanningBudget, plan_trajectory
 
         torch.set_num_threads(2)
@@ -62,16 +63,25 @@ def run(output, knots):
         report["identical_initial_and_final_pose"] = bool(np.array_equal(constant[[0, 2]], excursion[[0, 2]]))
         cases = {}
         for name, poses in (("hold", constant), ("excursion", excursion)):
+            # BEGIN midpoint and endpoint are declared task goals, not source locks.
             problem = PlanningProblem(tuple(fk.joint_names), q0.cpu().numpy(), np.zeros(len(q0)),
                 "panda_hand", "robot_base", np.eye(4), np.eye(4),
-                (MotionPhase("required_motion", PosePath(np.array([0., .5, 1.]), poses,
-                                                         "explicit paired synthetic target")),),
-                numerical=NumericalTolerance(position_m=.001, rotation_rad=.005))
-            result = plan_trajectory(problem, NoObstacleExperiment(fk.total_spheres), "franka.yml", budget=budget)
+                (MotionPhase("source_reference", PosePath(np.array([0., .5, 1.]), poses,
+                                                          "paired synthetic reference")),),
+                numerical=NumericalTolerance(position_m=.001, rotation_rad=.005),
+                pose_events=tuple(PoseEventRequirement(progress, np.eye(4), target, .001, .005,
+                    "Independent paired experiment midpoint/return goal")
+                    for progress, target in ((.5, poses[1]), (1., poses[-1]))),
+                source_timestamps=np.array([0., 1., 2.]), source_progress=np.array([0., .5, 1.]))
+            # END ordinary poses between these real goals remain unconstrained.
+            result = plan_trajectory(problem, no_obstacle_scene(fk.total_spheres), "franka.yml", budget=budget)
             row = {"success": result.success, "diagnostics": result.diagnostics}
             if result.trajectory is not None:
                 curve = result.trajectory
-                query = np.array([0., .5, 1.])*curve.duration
+                # BEGIN query the saved clock at the true goal progress values.
+                query = np.interp([0., .5, 1.], curve.progress_s, curve.progress_u)*curve.duration
+                query[0] = 0.
+                # END half the duration is not assumed to be half the progress.
                 q, dq, progress = curve.sample(query)
                 sample = torch.as_tensor(q[None], dtype=torch.float32, device="cuda:0").contiguous()
                 state = fk.compute_kinematics(JointState.from_position(sample, joint_names=fk.joint_names))
@@ -88,8 +98,8 @@ def run(output, knots):
             loop_problem = cases["excursion"][0]
             _, hold_p, hold_r, hold_s, hold_q = cases["hold"]
             # The hold shares both endpoint poses, but fails the actual
-            # excursion at its explicit source anchor. This is independent
-            # of the native disabled ToolPoseCost convergence fields.
+            # excursion at its independently required midpoint. This checks
+            # the material-frame goal directly, apart from native metrics.
             crossed = loop_problem.evaluate(hold_p, hold_r, hold_s, hold_q, tuple(fk.joint_names))
             report["hold_on_excursion_violation"] = crossed.detach().cpu().numpy().tolist()
             report["paired_behavior_passed"] = bool(crossed[0, 1] > .01)

@@ -136,7 +136,8 @@ def run(args):
         # BEGIN either preserve an accepted exported baseline or construct a
         # separately labelled diagnostic; there is no resampling or relabelling.
         if args.trajectory:
-            curve = load_saved_trajectory(args.trajectory, evaluation_mode="accepted_plan", execution_limits=limits)
+            planning_result = load_saved_trajectory(args.trajectory, execution_limits=limits)
+            curve = planning_result.trajectory
             if curve.events or curve.conditions:
                 raise ValueError("Use run_recorded_simulation for skills with events or evidence conditions")
             duration, delta = curve.duration, curve.position[-1] - curve.position[0]
@@ -289,8 +290,9 @@ def run(args):
         if args.execution_limits:
             report["execution_limits"] = limits.describe()
             executor = TrajectoryExecutor(backend, geometry_checker=validator)
-            execution = executor.execute(curve, evaluation_mode=("accepted_plan" if args.trajectory
-                                                                  else "diagnostic_control_reference"),
+            if not args.trajectory:
+                raise ValueError("Production execution requires a saved formal result; use the explicit diagnostic measurement path for control probes")
+            execution = executor.execute(planning_result,
                 finger_targets=target_contract,
                 initial_feedback=initial, execution_limits=limits, output=output / "execution",
                 max_physics_steps=args.max_physics_steps,

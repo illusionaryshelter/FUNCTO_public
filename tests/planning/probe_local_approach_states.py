@@ -283,7 +283,10 @@ def run(args):
     def forbidden(*unused, **kwargs):
         raise RuntimeError("This archived-state diagnostic must not call IK, optimization or path search")
 
-    def capture(problem, scene, robot, output, *, budget, provenance, execution_limits):
+    # BEGIN bind the current preparation callback without enabling a new solve.
+    def capture(problem, scene, robot, output, *, budget, provenance, execution_limits, continuation):
+        if continuation is not None:
+            raise ValueError("Static archived-state checks do not create a continuation binding")
         if report.get("planning_boundary_intercepted"):
             raise ValueError("The runner reached its planning boundary more than once")
         report["planning_boundary_intercepted"] = True
@@ -292,6 +295,8 @@ def run(args):
 
     runner_args = SimpleNamespace(**vars(args))
     runner_args.output = args.output/"scene-build"
+    runner_args.continuation = None
+    # END the archive is checked against its declared original entrance.
     try:
         original = read_json(args.source_run/"run-report.json")
         for key, value in (("segment_id", args.segment), ("candidate_id", args.candidate)):
@@ -339,7 +344,6 @@ def parse_args():
     parser.add_argument("--target-archive", nargs=2, action="append", required=True, metavar=("SOURCE_FRAME", "NPZ"))
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)
-    parser.add_argument("--pregrasp-frame", type=int)
     parser.add_argument("--owner-mask", nargs=2, action="append", required=True)
     parser.add_argument("--owner-geometry", type=Path)
     parser.add_argument("--center", type=float, nargs=3, required=True)

@@ -21,7 +21,7 @@ def _arguments():
             {"skill_id": "s", "event_id": "close", "kind": "close", "time": .3005, "progress": .6,
              "finger_positions": [.005, -.008], "target_source": "explicit CPU test command"},
             {"skill_id": "s", "event_id": "later", "kind": "open", "time": .9, "progress": 1.,
-             "finger_positions": [.035, -.034], "target_source": "unexecuted future command"}],
+             "finger_positions": [.01, -.012], "target_source": "conditional future command"}],
         "duration": 1., "executable_until": .8, "timestep": .002,
         "position_limits": [[0., -.04], [.04, 0.]],
         "velocity_limits": [[-.2, -.2], [.2, .2]],
@@ -66,20 +66,28 @@ class FingerTrajectoryTests(unittest.TestCase):
         ddq_jumps = 2 * coefficients[1, 1:] - (6 * coefficients[0] * width + 2 * coefficients[1])[:-1]
         self.assertGreater(float(np.max(np.abs(ddq_jumps))), 0.)
 
-    def test_barrier_ends_the_reference_commands_and_future_suffix_is_only_nominal(self):
+    # BEGIN a dependency barrier preserves the complete conditional curve.
+    def test_barrier_limits_authorization_and_preserves_later_original_commands(self):
         reference = FingerTrajectory.build(**_arguments())
         self.assertFalse(reference.events[-1]["in_executable_prefix"])
         before = reference.sample(reference.executable_until)[0]
-        for time_s in (.8, .9, 1.):
+        for time_s in (.8, .9):
             q, dq = reference.sample(time_s)
             np.testing.assert_array_equal(q, before)
             np.testing.assert_array_equal(dq, [0., 0.])
-        self.assertNotIn("later", [row["event_id"] for row in reference.segments])
+        self.assertFalse(np.array_equal(reference.sample(.95)[0], before))
+        np.testing.assert_allclose(reference.sample(1.)[0], [.01, -.012], atol=1e-15, rtol=0.)
+        self.assertIn("later", [row["event_id"] for row in reference.segments])
+        complete = _arguments(); complete["executable_until"] = complete["duration"]
+        whole = FingerTrajectory.build(**complete)
+        np.testing.assert_array_equal(reference._curve.c, whole._curve.c)
+        np.testing.assert_array_equal(reference.times, whole.times)
+    # END granting the suffix later cannot regenerate or replace its polynomial.
 
     def test_unreachable_deadline_and_late_native_activation_are_rejected(self):
         arguments = _arguments()
         arguments["commands"][1]["time"] = .79
-        with self.assertRaisesRegex(ValueError, "before 0.8"):
+        with self.assertRaisesRegex(ValueError, "before 0.9"):
             FingerTrajectory.build(**arguments)
         arguments["commands"][1]["time"] = .7995
         with self.assertRaisesRegex(ValueError, "activate before.*barrier"):
@@ -91,17 +99,35 @@ class FingerTrajectoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "initial finger q/dq"):
             FingerTrajectory.build(**arguments)
 
-    def test_repeated_native_tick_keeps_original_events_but_only_last_goal_is_active(self):
+    # BEGIN device quantization preserves required command semantics.
+    def test_repeated_native_tick_rejects_distinct_required_goals(self):
         arguments = _arguments()
         arguments["commands"][0]["time"] = .001
         arguments["commands"].insert(1, {**deepcopy(arguments["commands"][0]),
             "event_id": "superseding-open", "time": .0015, "finger_positions": [.036, -.035]})
+        with self.assertRaisesRegex(ValueError, "required command sequence"):
+            FingerTrajectory.build(**arguments)
+        arguments["commands"][1]["finger_positions"] = arguments["commands"][0]["finger_positions"]
         reference = FingerTrajectory.build(**arguments)
         self.assertTrue(reference.events[0]["superseded"])
         self.assertFalse(reference.events[1]["superseded"])
-        self.assertNotIn("open", [row["event_id"] for row in reference.segments])
-        self.assertIn("superseding-open", [row["event_id"] for row in reference.segments])
         np.testing.assert_array_equal(reference.sample(0.)[1], arguments["initial_velocity"])
+
+    def test_continuation_preserves_original_integer_tick_despite_float_subtraction(self):
+        from manipulation.gripper_trajectory import _commands
+        # In binary64 this relative intent is slightly later than local .2;
+        # re-running ceil would incorrectly defer the command to local .3.
+        original = .6000000000000001
+        row = {"skill_id": "s", "event_id": "open", "kind": "open", "progress": 1.,
+            "time": original-.4, "finger_positions": [.02],
+            "activation_time_s": .2, "bound_activation_step": 2,
+            "request_activation_step": 6, "request_activation_time_s": original,
+            "request_intent_time_s": original, "request_time_origin_step": 4,
+            "device_timestep_s": .1}
+        result = _commands([row], ("finger",), 1., 1., .1, np.array([[0.], [.04]]))
+        self.assertEqual(result[0]["activation_step"], 2)
+        self.assertEqual(result[0]["applied_time_s"], .2)
+    # END equivalent repeated targets remain archived with their source identities.
 
     def test_serialized_curve_roundtrip_is_exact_and_tampering_is_rejected(self):
         reference = FingerTrajectory.build(**_arguments())

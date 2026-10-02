@@ -14,7 +14,7 @@ from unittest.mock import patch
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from manipulation.function_motion import optimize_trajectory, transfer_function_motion
+from manipulation.function_motion import FunctionReferenceError, optimize_trajectory, transfer_function_motion
 
 
 def pairs(poses):
@@ -112,14 +112,16 @@ class FunctionMotionTest(unittest.TestCase):
         self.assertLess(result["diagnostics"]["max_translation_increment_violation_m"], 1e-12)
         self.assertIn("not physical velocities", result["diagnostics"]["scope"])
 
-    def test_incompatible_events_rejected_without_solver_or_relaxation(self):
+    # BEGIN source-fit failure is typed separately from malformed task input.
+    def test_reference_increment_incompatibility_is_a_typed_fit_failure(self):
         reference, _ = example()
         goal = reference[8].copy()
         goal[0, 3] += 2.
         with patch("manipulation.function_motion.optimize_trajectory") as solve:
-            with self.assertRaisesRegex(ValueError, "incompatible"):
+            with self.assertRaisesRegex(FunctionReferenceError, "per-node increment"):
                 transfer_function_motion(reference, reference[0], [{"index": 8, "pose": goal}])
         solve.assert_not_called()
+    # END source-fit failure is typed separately from malformed task input.
 
     def test_duplicate_out_of_range_and_initial_event_indices_rejected(self):
         reference, _ = example()

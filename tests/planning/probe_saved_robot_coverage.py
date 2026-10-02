@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from manipulation.execution import ExecutionLimits
 from manipulation.planning_observation import _known_free_voxels, _views
-from recorded_simulation import load_saved_trajectory
+from recorded_simulation import load_curve_archive
 from robot_coverage_fixture import build_robot_coverage
 
 
@@ -101,8 +101,7 @@ def run(args):
             if metadata["classification"] != "rejected_diagnostic_not_executable":
                 raise ValueError("This post-hoc probe requires an explicitly rejected diagnostic candidate")
             limits = ExecutionLimits.from_mapping(metadata["execution_limits"])
-            trajectory = load_saved_trajectory(path,
-                evaluation_mode="diagnostic_rejected_candidate", execution_limits=limits)
+            trajectory, _ = load_curve_archive(path)
             fingers = trajectory.finger_trajectory
             if fingers is None or np.any(times > trajectory.executable_until):
                 raise ValueError("Queries require saved fingers and must remain before the original evidence barrier")

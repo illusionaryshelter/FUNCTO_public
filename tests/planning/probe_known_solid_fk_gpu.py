@@ -100,10 +100,15 @@ def run(output):
             owners=(), coverage=coverage, reference_frame="robot_base",
             robot_sphere_materials=(None,)*kinematics.total_spheres,
             robot_geometry_source=source, has_gripper=False)
+        # BEGIN this construction-only geometry probe supplies a real source clock.
+        # No solve is requested here; the constant path is initialization data
+        # for checking exact current-robot occupancy binding, not a task goal.
         problem = PlanningProblem(tuple(kinematics.joint_names), initial.cpu().numpy(), np.zeros(len(initial)),
                                   "panda_hand", "robot_base", np.eye(4), np.eye(4),
                                   (MotionPhase("fixed_fixture", PosePath(np.array([0., 1.]), np.stack((pose, pose)),
-                                                                           "synthetic current tool pose"), "free"),))
+                                                                           "synthetic current tool reference")),),
+                                  source_timestamps=np.array([0., 1.]), source_progress=np.array([0., 1.]))
+        # END no removed phase-kind argument is passed as metadata.
         # Native installed inner iterations are IK=20 and TrajOpt=25. No
         # solve is called, but configuration still requires valid multiples.
         budget = PlanningBudget(ik_seeds=2, trajectory_seeds=1, knots=6, ik_iterations=20,

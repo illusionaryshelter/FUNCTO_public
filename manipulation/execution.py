@@ -145,8 +145,14 @@ class ExecutionLimits:
     tcp_position_error_m: float
     tcp_rotation_error_rad: float
     stop_arm_velocity: object
+    # BEGIN whole-device stop confirmation uses a declared hand criterion.
+    stop_finger_velocity: object
+    # END position goals never prove stopped fingers.
     initial_fingers: dict
     events: tuple[dict, ...]
+    # BEGIN one explicit device observation cadence, separate from robot control.
+    observation_policy: dict | None
+    # END None declares no online observation channel for the bound static model.
 
     def __post_init__(self):
         if not isinstance(self.source, str) or not self.source.strip():
@@ -163,6 +169,11 @@ class ExecutionLimits:
         for field in ("arm_position_error", "arm_velocity_error", "stop_arm_velocity"):
             value = _finite_array(getattr(self, field), (len(self.arm_joint_names),), field, nonnegative=True)
             object.__setattr__(self, field, value.tolist())
+        # BEGIN explicit measured finger stop threshold in named joint order.
+        finger_stop = _finite_array(self.stop_finger_velocity, (len(self.finger_joint_names),),
+                                    "stop_finger_velocity", nonnegative=True)
+        object.__setattr__(self, "stop_finger_velocity", finger_stop.tolist())
+        # END no stopping tolerance is inferred from allowed path velocity.
         tcp = _finite_array([self.tcp_position_error_m, self.tcp_rotation_error_rad], (2,),
                             "Physical TCP tracking tolerances", nonnegative=True)
         if tcp[1] > np.pi:
@@ -195,6 +206,21 @@ class ExecutionLimits:
         if len(set(identities)) != len(identities):
             raise ValueError("An original event cannot have duplicate actual finger intervals")
         object.__setattr__(self, "events", rows)
+        # BEGIN validate freshness requirements before any command is issued.
+        policy = self.observation_policy
+        if policy is not None:
+            if (not isinstance(policy, dict) or set(policy) != {
+                    "source", "period_s", "maximum_age_s", "required_fields"}
+                    or not isinstance(policy["source"], str) or not policy["source"].strip()
+                    or not np.isfinite([policy["period_s"], policy["maximum_age_s"]]).all()
+                    or policy["period_s"] <= 0 or policy["maximum_age_s"] < 0
+                    or not isinstance(policy["required_fields"], (tuple, list))
+                    or not set(policy["required_fields"]) <= {
+                        "binding_valid", "scene_condition_evidence", "scene_owner_poses"}
+                    or len(set(policy["required_fields"])) != len(policy["required_fields"])):
+                raise ValueError("Observation policy needs explicit cadence, age bound, required fields and source")
+            object.__setattr__(self, "observation_policy", deepcopy(policy))
+        # END future effect requirements remain separate from current feedback needs.
 
     @classmethod
     def from_mapping(cls, value):
@@ -241,7 +267,7 @@ class ExecutionLimits:
         # reference. A new runtime interval is checked against real feedback
         # after its command activates; it never proves the actuator converged.
         # END runtime limits do not construct a hand or certify future motion.
-        if np.any(np.asarray(self.stop_arm_velocity) > speed[:narm]):
+        if np.any(np.r_[self.stop_arm_velocity, self.stop_finger_velocity] > speed):
             raise ValueError("Stop-speed limits cannot exceed the named hardware limits")
         return {"joint_ranges": ranges, "maximum_speed": speed,
                 "initial_fingers": deepcopy(self.initial_fingers), "event_fingers": rows}
@@ -250,6 +276,52 @@ class ExecutionLimits:
 class ExecutionGuardError(RuntimeError):
     """Actual feedback invalidated the explicit execution contract."""
 # END explicit physical execution limits, separate from solver roundoff.
+
+
+# BEGIN derive remaining device inputs from actual application, never elapsed time.
+def continuation_execution_inputs(continuation, finger_targets, execution_limits):
+    """Carry the previous fixed device policy into its unconsumed event suffix.
+
+    This helper consumes the same executor ledger as the planner. It creates
+    no new event occurrence, tolerance or actuator target. The last actually
+    applied command determines the entrance protection interval; a rejected
+    or merely due event cannot replace it.
+    """
+    if not isinstance(finger_targets, FixedFingerTargets) or not isinstance(execution_limits, ExecutionLimits):
+        raise ValueError("Continuation needs the original explicit device inputs")
+    original = continuation["original_binding"]
+    if (continuation["candidate_id"] != original["candidate_id"]
+            or original["execution_limits"] != execution_limits.describe()):
+        raise ValueError("Continuation cannot change its original device limits or candidate identity")
+    commands = {(row["skill_id"], row["event_id"]): row for row in original["curve"]["events"]
+                if row["kind"] in ("open", "close", "hold")}
+    targets = {(row["skill_id"], row["event_id"]): row for row in finger_targets.events}
+    if set(commands) != set(targets):
+        raise ValueError("Continuation finger inputs must identify the previous candidate's exact commands")
+    if commands:
+        saved = {(row["skill_id"], row["event_id"]): row for row in original["curve"]["fingers"]["events"]}
+        for identity, target in targets.items():
+            if (target["kind"] != commands[identity]["kind"]
+                    or target["positions"] != saved[identity]["finger_positions"]):
+                raise ValueError("A remaining original command cannot receive a different actuator target")
+    pending = {(row["skill_id"], row["event_id"]) for row in continuation["remaining_events"]
+               if row["kind"] in ("open", "close", "hold")}
+    consumed = {(row["skill_id"], row["event_id"]) for name in ("applied_events", "superseded_events")
+                for row in continuation.get(name, ())}
+    if not pending <= set(commands) or set(commands)-pending != consumed or pending & consumed:
+        raise ValueError("Remaining finger inputs require an exact applied/superseded command ledger")
+    limits = execution_limits.describe()
+    intervals = {(row["skill_id"], row["event_id"]): row for row in limits["events"]}
+    applied = continuation.get("applied_events", ())
+    if applied:
+        last = applied[-1]
+        row = intervals[(last["skill_id"], last["event_id"])]
+        limits["initial_fingers"] = {key: deepcopy(row[key]) for key in ("position_bounds", "maximum_speed")}
+    limits["events"] = [row for row in limits["events"] if (row["skill_id"], row["event_id"]) in pending]
+    targets = tuple(row for row in finger_targets.events if (row["skill_id"], row["event_id"]) in pending)
+    return (FixedFingerTargets(finger_targets.joint_names, finger_targets.source, targets),
+            ExecutionLimits.from_mapping(limits))
+# END same-request continuation does not replay or relabel a completed command.
 
 
 class TrajectoryExecutor:
@@ -396,42 +468,88 @@ class TrajectoryExecutor:
         return failures
 
 
-    def execute(self, trajectory, *, finger_targets, initial_feedback, execution_limits,
-                evaluation_mode, output, step_callback=None,
+    def execute(self, result, *, finger_targets, initial_feedback, execution_limits,
+                output, step_callback=None, observation_callback=None,
                 max_physics_steps=30_000, start_position_tolerance=2e-6,
-                start_velocity_tolerance=2e-6):
-        """Follow the exact exported curve until its original evidence barrier.
+                start_velocity_tolerance=2e-6, max_hold_steps=250):
+        """Follow the exact bound curve within its authorized execution scope.
 
         ``step_callback(model, data, record)`` is an evaluator/camera hook after
         each physical step. Its output is never fed to the planner here. The
-        runner does not certify a grasp, bypass a barrier, or advance a skill.
+        ``observation_callback(feedback, curve_time)`` supplies current allowed
+        scene/effect evidence. Only a true declared prerequisite can extend
+        the authorized prefix, after independent checks of the same suffix.
         The last native step can finish less than one timestep after the
         barrier's clock time, but its commanded q/dq/progress is clamped to the
         barrier itself. Finger events use the archived reference's original
-        retimed times and native activation ticks, without changing the arm
+        bound times and native activation ticks, without changing the arm
         cubic. The same saved C1 finger reference is sampled at each arm query.
         The complete measured entrance is checked independently of all goals.
         No goal from the later curve is sent to an actuator. Physical tracking
         and actual finger intervals require an explicit ``ExecutionLimits``;
-        rejection stops simulation before another event or physical step.
+        rejection sends bounded device hold and records its measured result.
         """
+        # BEGIN formal candidate handoff: labels cannot authorize commands.
+        from .execution_binding import check_result, nominal_finger_sampler
+        binding = check_result(result, execution_limits=execution_limits)
+        trajectory = result.trajectory
+        if not callable(getattr(self.geometry_checker, "bind_scene", None)):
+            raise ValueError("Execution requires independent geometry with the bound scene scope")
+        self.geometry_checker.bind_scene(binding["scene"],
+            progress_at_time=lambda t: float(trajectory.sample(t)[2]),
+            nominal_fingers=nominal_finger_sampler(binding["scene"]))
+        if type(max_hold_steps) is not int or not 1 <= max_hold_steps <= 10_000:
+            raise ValueError("Emergency hold needs a positive bounded device step budget")
+        if observation_callback is not None and not callable(observation_callback):
+            raise ValueError("Current scene/effect observations require an explicit callable")
+        if observation_callback is not None and execution_limits.observation_policy is None:
+            raise ValueError("An observation callback needs its declared device cadence and freshness policy")
         backend = self.backend
-        if evaluation_mode not in ("accepted_plan", "diagnostic_rejected_candidate", "diagnostic_control_reference"):
-            raise ValueError("Use an explicit planned-candidate or control-reference evaluation mode")
+        # END formal candidate handoff.
         if tuple(trajectory.joint_names) != backend.arm_joint_names:
             raise ValueError("Trajectory joint names/order must equal the explicitly controlled arm")
         if not isinstance(finger_targets, FixedFingerTargets):
             raise ValueError("An explicit FixedFingerTargets input is required")
         if not isinstance(execution_limits, ExecutionLimits):
             raise ValueError("Explicit physical ExecutionLimits are required before execution")
+        # BEGIN bind calibration as well as q/dq to the actual robot entrance.
+        planned = binding["problem"]
+        for key in ("reference_frame", "tool_link"):
+            if planned.get(key) != initial_feedback.get(key):
+                raise ValueError(f"Planning and actual feedback have different {key}")
+        for key in ("base_pose", "tool_transform"):
+            expected = np.asarray(planned.get(key), dtype=float)
+            actual_frame = np.asarray(initial_feedback.get(key), dtype=float)
+            if (expected.shape != (4, 4) or actual_frame.shape != (4, 4)
+                    or not np.isfinite(expected).all() or not np.isfinite(actual_frame).all()
+                    or not np.allclose(expected, actual_frame, atol=1e-9, rtol=0)):
+                raise ValueError(f"Planning and actual feedback have different {key} calibration")
+        binding["execution_limits"] = execution_limits.describe()
+        # BEGIN the same request retains its cumulative native-step budget.
+        if type(max_physics_steps) is not int or not 0 <= max_physics_steps <= 100_000:
+            raise ValueError("Execution requires a bounded native physics-step budget")
+        physics_budget = binding.get("physics_budget", max_physics_steps)
+        prior_physics_steps = binding.get("consumed_physics_steps", 0)
+        if (type(physics_budget) is not int or not 0 <= physics_budget <= 100_000
+                or type(prior_physics_steps) is not int or prior_physics_steps < 0
+                or binding.get("remaining_physics_steps", max(0, physics_budget-prior_physics_steps))
+                   != max(0, physics_budget-prior_physics_steps)):
+            raise ValueError("Continuation physics budget lost its original cumulative accounting")
+        max_physics_steps = min(max_physics_steps, max(0, physics_budget-prior_physics_steps))
+        binding.update(physics_budget=physics_budget, consumed_physics_steps=prior_physics_steps,
+                       remaining_physics_steps=max(0, physics_budget-prior_physics_steps))
+        # END smaller execution allowances cannot enlarge the original request.
+        result.execution_binding = deepcopy(binding)
+        # END feedback/backend agreement alone cannot validate an old world/TCP binding.
         stop = float(trajectory.executable_until)
         arrays = (trajectory.times, trajectory.position, trajectory.velocity,
                   trajectory.progress_u, trajectory.progress_s, trajectory._curve.c)
         if not all(np.isfinite(value).all() for value in arrays) or not 0 <= stop <= trajectory.duration:
             raise ValueError("Only a complete finite exported trajectory may be physically evaluated")
-        count = int(np.ceil(stop/backend.timestep - 1e-10))
-        if type(max_physics_steps) is not int or not 0 <= count <= max_physics_steps <= 100_000:
+        prefix_count = int(np.ceil(stop/backend.timestep - 1e-10))
+        if type(max_physics_steps) is not int or not 0 <= prefix_count <= max_physics_steps <= 100_000:
             raise ValueError("Trajectory exceeds the explicit bounded local physics-step budget")
+        count = min(max_physics_steps, int(np.ceil(trajectory.duration/backend.timestep - 1e-10)))
         tolerances = np.asarray([start_position_tolerance, start_velocity_tolerance], float)
         if not np.isfinite(tolerances).all() or np.any(tolerances < 0):
             raise ValueError("Start-feedback numerical tolerances must be finite and nonnegative; zero requires exact equality")
@@ -506,11 +624,11 @@ class TrajectoryExecutor:
         output = Path(output)
         output.mkdir(parents=True, exist_ok=False)
         started, sim_start = time.monotonic(), float(backend.sim_time)
-        report = {"evaluation_mode": evaluation_mode,
-            "reference_origin": ("explicit_control_diagnostic" if evaluation_mode == "diagnostic_control_reference"
-                                 else "planned_candidate"),
+        report = {"reference_origin": "bound_planning_result",
+            "candidate_id": binding["candidate_id"],
+            "execution_binding": binding,
             "trial_id": backend.trial_id,
-            "planner_accepted": evaluation_mode == "accepted_plan", "status": "running",
+            "planner_accepted": True, "status": "running",
             "backend": backend.describe(), "next_verification": trajectory.next_verification,
             "evidence_passed": False, "full_trajectory_duration_s": trajectory.duration,
             "planned_stop_s": stop, "physics_timestep_s": backend.timestep,
@@ -546,17 +664,110 @@ class TrajectoryExecutor:
         report.update(execution_limits=execution_limits.describe(),
             named_hardware_velocity_limits=deepcopy(backend.velocity_limits),
             native_joint_position_ranges=limit_binding["joint_ranges"].tolist(),
-            execution_guard_scope="Actual robot tracking, declared hand intervals and independent named model checks; no scene, continuous-path or Holding certification",
+            execution_guard_scope="Actual robot tracking and independently queried bound robot/scene geometry; effect evidence remains separate",
             geometry_checker=deepcopy(self._geometry_description), geometry_preflight=None,
             geometry_check_counts={"initial_state": 0, "before_step": 0, "command_event": 0, "after_step": 0},
             last_geometry_check=None,
-            feedback_failure=None, event_gate_checks=[], abort_hold=None)
+            feedback_failure=None, event_gate_checks=[], abort_hold=None,
+            dependency_hold=None, verified_events=[], dependency_outcomes=[], extended_preflights=[],
+            evaluated_events=[], stopped_events=[], reached_events=[],
+            completed_goal_ids=deepcopy(binding.get("completed_goal_ids", [])), goal_evidence=[])
         # END physical guard provenance and actual-event evidence.
+        # BEGIN device feedback policy, declared before control I/O.
+        report["feedback_policy"] = {
+            "native_period_s": float(backend.timestep),
+            "robot_checks": "Initial state and every native step boundary, before and after integration",
+            "geometry_checks": "Every robot check and explicit event gate; same bound current scene",
+            "observations": deepcopy(execution_limits.observation_policy),
+            "timestamp_roundoff_s": 1e-8,
+            "stale_required_feedback": "Reject current obligation and send bounded hold",
+            "missing_future_effect": "Record U; block only a declared dependent operation",
+            "delivery": "Observations retain acquisition timestamps; robot feedback remains synchronous"}
+        report["observation_checks"], report["object_changes"] = [], []
+        # END physical contact evidence is distinct from absent effect observations.
         controls, requested_torques, saturated_torques, samples, event_index = [], [], [], [], 0
         command = "restored_ctrl"
+        # BEGIN evidence dependencies authorize intervals on the same clock.
+        barriers = sorted((deepcopy(event) for event in trajectory.events
+                           if event["requires_evidence"] is not None), key=lambda row: row["time"])
+        barrier_index = 0
+        # END effect-only events do not appear in this dependency sequence.
+        # BEGIN nonblocking evaluations and explicit stops keep their identities.
+        ordinary_events = sorted((deepcopy(event) for event in trajectory.events
+            if event["requires_evidence"] is None and event["kind"] not in ("open", "close", "hold")
+            and (event["kind"] in ("effect", "function") or event.get("stop", False))), key=lambda row: row["time"])
+        ordinary_index = 0
+        report["geometry_check_counts"]["event_gate"] = 0
+        # END elapsed time consumes an evaluation opportunity, never a success fact.
         # BEGIN this counter excludes native finger actuator force limiting.
         arm_control_saturation_count = 0
         # END explicit arm control clipping scope.
+        observation_cache, next_observation_poll = None, 0.
+
+        # BEGIN bounded multi-rate observation consumption without timestamp rewriting.
+        def observation_at(feedback, curve_time, elapsed):
+            nonlocal observation_cache, next_observation_poll
+            policy = execution_limits.observation_policy
+            if policy is None:
+                return None
+            now = float(feedback["timestamp_s"])
+            if float(elapsed) >= next_observation_poll-1e-12:
+                due = next_observation_poll
+                missed = max(0, int(np.floor((float(elapsed)-due+1e-12)/float(policy["period_s"]))))
+                next_observation_poll = due+(missed+1)*float(policy["period_s"])
+                observation = (None if observation_callback is None else
+                               observation_callback(deepcopy(feedback), float(curve_time)))
+                check = {"polled_at_s": now, "schedule_delay_s": max(0., float(elapsed)-due),
+                         "missed_schedule_count": missed, "new_sample": observation is not None}
+                if observation is not None:
+                    if (not isinstance(observation, dict) or not isinstance(observation.get("source"), str)
+                            or not observation["source"].strip()
+                            or not np.isfinite(observation.get("timestamp_s", np.nan))
+                            or float(observation["timestamp_s"]) > now+1e-8):
+                        raise ValueError("An observation needs its original finite acquisition time and source")
+                    if (observation_cache is not None
+                            and observation["timestamp_s"] < observation_cache["timestamp_s"]-1e-8):
+                        raise ValueError("Observation acquisition time cannot move backward")
+                    for field in ("binding_valid", "scene_condition_evidence", "scene_owner_poses", "effects"):
+                        if field in observation and (type(observation[field]) is not bool if field == "binding_valid"
+                                                    else not isinstance(observation[field], dict)):
+                            raise ValueError(f"Observation field {field} has no explicit valid value")
+                    observation_cache = deepcopy(observation)
+                    check["sample"] = deepcopy(observation)
+                    check["acquired_at_s"] = float(observation["timestamp_s"])
+                    check["age_s"] = max(0., now-float(observation["timestamp_s"]))
+                    report["object_changes"].extend(deepcopy(observation.get("object_changes", [])))
+                report["observation_checks"].append(check)
+            fresh = (observation_cache is not None
+                     and now-float(observation_cache["timestamp_s"]) <= policy["maximum_age_s"]+1e-8)
+            missing = [key for key in policy["required_fields"]
+                       if not fresh or key not in observation_cache]
+            if missing:
+                report["status"] = "feedback_rejected"
+                report["feedback_failure"] = {"point": "observation_freshness",
+                    "curve_time_s": float(curve_time), "physical_elapsed_s": float(elapsed),
+                    "actual_feedback": deepcopy(feedback), "last_applied_finger_goal": target_positions.tolist(),
+                    "rejected_event": None, "violations": [{"kind": "required_observation_unavailable",
+                        "name": key, "last_observation": deepcopy(observation_cache),
+                        "maximum_age_s": policy["maximum_age_s"]} for key in missing]}
+                raise ExecutionGuardError("Current required observation is missing or expired")
+            if observation_cache is not None and observation_cache.get("binding_valid") is False:
+                # Expiry cannot erase an observed invalidation of this binding.
+                return deepcopy(observation_cache)
+            if fresh:
+                return deepcopy(observation_cache)
+            # Losing optional future-effect evidence does not invalidate the
+            # static model. It also cannot leave an old T eligible for a gate.
+            identities = {str(event["requires_evidence"]) for event in trajectory.events
+                          if event["requires_evidence"] is not None}
+            identities.update(condition["condition_id"] for condition in trajectory.conditions
+                              if condition.get("effect_requirement") and condition.get("condition_id") is not None)
+            if observation_cache is not None:
+                identities.update(observation_cache.get("effects", {}))
+            return {"source": "Declared observation freshness policy", "timestamp_s": now,
+                    "effects": {identity: {"value": "U", "source": "No unexpired effect observation"}
+                                for identity in identities}}
+        # END missing optional effects never become missing mandatory robot feedback.
 
         def record(elapsed, desired_arm_q, arm_curve_dq, progress, feedback=None):
             feedback = backend.proprioception() if feedback is None else feedback
@@ -583,9 +794,54 @@ class TrajectoryExecutor:
 
         # BEGIN reject measured violations before changing an event's command.
         def guard(feedback, *, curve_time, physical_elapsed, point, event=None, sample=None):
+            # BEGIN consume allowed observations without native object truth.
+            observation = observation_at(feedback, curve_time, physical_elapsed)
+            if observation is not None:
+                for effect in observation.get("effects", {}).values():
+                    if (not isinstance(effect, dict) or effect.get("value") not in ("T", "F", "U")
+                            or not effect.get("source")):
+                        raise ValueError("An effect needs explicit T/F/U evidence and provenance")
+                report["latest_observation"] = deepcopy(observation)
+                if observation.get("binding_valid") is False:
+                    report["status"] = "feedback_rejected"
+                    report["feedback_failure"] = {"point": point, "curve_time_s": float(curve_time),
+                        "physical_elapsed_s": float(physical_elapsed), "actual_feedback": deepcopy(feedback),
+                        "violations": [{"kind": "current_scene_binding_invalid", "name": "bound_scene",
+                                        "evidence": deepcopy(observation)}],
+                        "last_applied_finger_goal": target_positions.tolist(),
+                        "rejected_event": None if event is None else deepcopy(event)}
+                    raise ExecutionGuardError("Current observation invalidated the bound scene; rebind from actual")
+                # Completion IDs refer to the original request collections,
+                # never a suffix list renumbered by an interrupted binding.
+                for identity in observation.get("completed_goal_ids", []):
+                    if (not isinstance(identity, (tuple, list)) or len(identity) != 2
+                            or identity[0] not in ("pose_events", "coordinate_events", "supports")
+                            or type(identity[1]) is not int or identity[1] < 0):
+                        raise ValueError("Completed goal evidence needs an original collection/index identity")
+                    key = tuple(identity)
+                    previous = {tuple(item) for item in binding.get("completed_goal_ids", [])}
+                    indexes = binding.get("goal_identities", {}).get(identity[0], [])
+                    if key not in previous:
+                        if identity[1] not in indexes:
+                            raise ValueError("Completed goal identity does not belong to this original request")
+                        local = indexes.index(identity[1])
+                        goal = binding["problem"][identity[0]][local]
+                        evidence_time = max(0., min(float(observation["timestamp_s"])-sim_start, trajectory.duration))
+                        if float(trajectory.sample(evidence_time)[2]) < float(goal["progress"])-1e-7:
+                            raise ValueError("A future goal obligation cannot be consumed before its bound clock scope")
+                    identity = list(identity)
+                    if identity not in report["completed_goal_ids"]:
+                        report["completed_goal_ids"].append(identity)
+                        report["goal_evidence"].append({"identity": identity, "value": "T",
+                            "source": observation["source"], "timestamp_s": observation["timestamp_s"],
+                            "feedback_id": feedback["feedback_id"]})
+                for key in ("scene_condition_evidence", "scene_owner_poses"):
+                    if key in observation:
+                        feedback[key] = deepcopy(observation[key])
+            # END observations never overwrite measured robot coordinates.
             reference_q, reference_dq, _ = trajectory.sample(curve_time)
             reference_tcp = backend.reference_tool_pose(reference_q)
-            barrier = trajectory.next_verification
+            barrier = barriers[barrier_index] if barrier_index < len(barriers) else None
             requires_stop = (bool(event.get("stop", False)) if event is not None else
                              bool(barrier is not None and barrier.get("stop", False)
                                   and abs(curve_time-stop) <= 1e-12))
@@ -619,12 +875,98 @@ class TrajectoryExecutor:
                 raise ExecutionGuardError(f"Actual feedback violates {point}: {failures[0]['kind']} / {failures[0]['name']}")
         # END reject measured violations before changing an event's command.
 
+        # BEGIN evaluate due effects and check measured stops without adding waits.
+        def consume_ordinary_events(feedback, elapsed):
+            nonlocal ordinary_index
+            while (ordinary_index < len(ordinary_events)
+                   and min(float(elapsed), stop) >= ordinary_events[ordinary_index]["time"]-1e-12):
+                event = ordinary_events[ordinary_index]
+                if event.get("stop", False):
+                    guard(feedback, curve_time=min(float(elapsed), stop), physical_elapsed=elapsed,
+                          point="event_gate", event=event)
+                    report["stopped_events"].append({**deepcopy(event),
+                        "checked_at_s": float(elapsed), "feedback_id": feedback["feedback_id"],
+                        "actual_arm_velocity": np.asarray(feedback["dq"])[:narm].tolist(),
+                        "maximum_absolute_velocity": list(execution_limits.stop_arm_velocity)})
+                if event["kind"] == "effect":
+                    available = deepcopy(binding.get("prior_effects", {}))
+                    available.update(report.get("latest_observation", {}).get("effects", {}))
+                    # Only a declared identity relation associates an effect
+                    # predicate with an event. Similar names/times are not proof.
+                    identities = [condition["condition_id"] for condition in trajectory.conditions
+                        if condition.get("effect_requirement") and condition.get("condition_id") is not None
+                        and condition.get("skill_id") == event["skill_id"]
+                        and condition.get("event_id") == event["event_id"]]
+                    evidence = {identity: deepcopy(available.get(identity,
+                        {"value": "U", "source": "No current effect observation supplied"}))
+                        for identity in identities}
+                    values = [row["value"] for row in evidence.values()]
+                    report["evaluated_events"].append({**deepcopy(event),
+                        "evaluation_time_s": float(elapsed), "feedback_id": feedback["feedback_id"],
+                        "effects": evidence, "evaluation": ("F" if "F" in values else
+                            "T" if values and all(value == "T" for value in values) else "U"),
+                        "source": "Bound effect predicates evaluated from explicit observed T/F/U evidence"})
+                if event["kind"] == "function":
+                    # A reached node records the clock occurrence only. Past
+                    # goals still require their separate actual completion IDs.
+                    report["reached_events"].append({**deepcopy(event),
+                        "reached_time_s": float(elapsed), "feedback_id": feedback["feedback_id"]})
+                ordinary_index += 1
+        # END unknown/false effects remain outcomes, not implicit barriers.
+
+        # BEGIN consume current T/F/U before crossing a declared dependency.
+        def release_dependencies(feedback, elapsed):
+            nonlocal barrier_index, stop
+            while barrier_index < len(barriers) and elapsed >= barriers[barrier_index]["time"]-1e-12:
+                event = barriers[barrier_index]
+                available_effects = deepcopy(binding.get("prior_effects", {}))
+                available_effects.update(report.get("latest_observation", {}).get("effects", {}))
+                evidence = available_effects.get(str(event["requires_evidence"]),
+                    {"value": "U", "source": "No current prerequisite observation"})
+                report["dependency_outcomes"].append({"event": deepcopy(event), "evidence": deepcopy(evidence),
+                    "feedback_id": feedback["feedback_id"], "physical_elapsed_s": float(elapsed)})
+                if evidence["value"] != "T":
+                    report["status"] = "effect_rejected" if evidence["value"] == "F" else "stopped_for_evidence"
+                    report["dependency_hold"] = backend.abort_hold(feedback, target_positions,
+                        expected_sim_time=sim_start+elapsed,
+                        stop_velocity=np.r_[execution_limits.stop_arm_velocity, execution_limits.stop_finger_velocity],
+                        max_steps=max_hold_steps)
+                    return False
+                report["verified_events"].append(deepcopy(event))
+                barrier_index += 1
+                previous_stop = stop
+                stop = (float(barriers[barrier_index]["time"]) if barrier_index < len(barriers)
+                        else trajectory.duration)
+                if int(np.ceil(stop/backend.timestep-1e-10)) > max_physics_steps:
+                    raise ExecutionGuardError("Remaining authorized interval exceeds the original cumulative physics budget")
+                # The curve and all clocks remain untouched. Query the newly
+                # authorized nominal interval before another native command.
+                preflight = self._geometry_result("preflight", trajectory, deepcopy(feedback),
+                    execution_limits, start_time=previous_stop, until=stop,
+                    current_time=min(float(elapsed), trajectory.duration))
+                report["extended_preflights"].append({"until": stop, "verdict": deepcopy(preflight)})
+                if not preflight["passed"]:
+                    report["status"] = "feedback_rejected"
+                    report["feedback_failure"] = {"point": "extended_geometry_preflight",
+                        "curve_time_s": min(float(elapsed), trajectory.duration),
+                        "physical_elapsed_s": float(elapsed), "actual_feedback": deepcopy(feedback),
+                        "violations": deepcopy(preflight["violations"]), "geometry_check": deepcopy(preflight),
+                        "last_applied_finger_goal": target_positions.tolist(), "rejected_event": None}
+                    raise ExecutionGuardError("Independent geometry rejected the newly authorized interval")
+                report["authorized_prefix_extended"] = True
+                report["evidence_passed"] = True
+                report["next_verification"] = (deepcopy(barriers[barrier_index])
+                    if barrier_index < len(barriers) else None)
+                report["planned_stop_s"] = stop
+            return True
+        # END unknown or false evidence causes a physical hold, never success.
+
         q, dq, progress = trajectory.sample(0.)
         samples.append(record(0., q, dq, progress))
         try:
             # Preflight checks the declared model/reference contract without
-            # stepping or preparing an actuator goal. A diagnostic reference
-            # receives exactly the same mandatory acceptance gate.
+            # stepping or preparing an actuator goal. Formal planning success
+            # does not bypass this independent current-scene acceptance gate.
             preflight = self._geometry_result("preflight", trajectory, deepcopy(initial_feedback), execution_limits)
             report["geometry_preflight"] = deepcopy(preflight)
             if not preflight["passed"]:
@@ -638,7 +980,11 @@ class TrajectoryExecutor:
                     "last_applied_finger_goal": target_positions.tolist(), "rejected_event": None}
                 raise ExecutionGuardError("Independent geometry preflight rejected the execution reference")
             guard(samples[-1]["feedback"], curve_time=0., physical_elapsed=0., point="initial_state", sample=samples[-1])
+            consume_ordinary_events(samples[-1]["feedback"], 0.)
+            active = release_dependencies(samples[-1]["feedback"], 0.)
             for index in range(count):
+                if not active:
+                    break
                 elapsed = index * backend.timestep
                 # Re-read once at each step boundary. The same snapshot gates
                 # any due event; a failed gate cannot mutate a finger goal.
@@ -655,8 +1001,10 @@ class TrajectoryExecutor:
                     # Distinct source events can fall in one native interval.
                     # Retain every identity, and never label overwritten goals
                     # as applied to a physical step.
-                    guard(before, curve_time=float(due[-1]["time"]), physical_elapsed=elapsed,
+                    # BEGIN target, permission and command share the activation tick.
+                    guard(before, curve_time=float(due[-1]["applied_time_s"]), physical_elapsed=elapsed,
                           point="command_event", event=due[-1])
+                    # END original intent time remains in the event ledger only.
                     next_command = due[-1]["kind"]
                     # The pre-event state belongs to the old interval. Only an
                     # actually applied command selects its declared new one.
@@ -702,29 +1050,44 @@ class TrajectoryExecutor:
                             # input. Retain the primary measured guard failure
                             # and its physical sample rather than masking it.
                             report["failed_sample_observer_error"] = f"{type(observer_error).__name__}: {observer_error}"
-            report["status"] = "stopped_for_evidence" if trajectory.next_verification is not None else "curve_finished"
+                consume_ordinary_events(current["feedback"], next_time)
+                active = release_dependencies(current["feedback"], next_time)
+            if active:
+                report["status"] = "curve_finished"
         except Exception as error:
             if report["status"] != "feedback_rejected":
                 report["status"] = "execution_error"
             report["error"] = f"{type(error).__name__}: {error}"
-            # Preparing controller output neither writes native ctrl nor runs
-            # another physical step, and never applies the rejected event.
+            # BEGIN send bounded hold control and preserve separate feedback.
+            # The last applied finger goal remains in force. No rejected
+            # event, source reset or artificial zero velocity is introduced.
             failure_feedback = (report["feedback_failure"]["actual_feedback"]
                                 if report["feedback_failure"] is not None else backend.proprioception())
-            report["abort_hold"] = backend.prepare_abort_hold(failure_feedback, target_positions,
-                expected_sim_time=sim_start+report["executed_steps"]*backend.timestep)
+            report["abort_hold"] = backend.abort_hold(failure_feedback, target_positions,
+                expected_sim_time=sim_start+report["executed_steps"]*backend.timestep,
+                stop_velocity=np.r_[execution_limits.stop_arm_velocity, execution_limits.stop_finger_velocity],
+                max_steps=max_hold_steps)
+            # END physical stop confirmation is distinct from loop exit.
             raise
         finally:
             actual_q = np.asarray([row["q"] for row in samples])
             command_q = np.asarray([row["command_q"] for row in samples])
             final_elapsed = float(backend.sim_time - sim_start)
             applied_ids = {(event["skill_id"], event["event_id"]) for event in report["events"]}
+            consumed_ids = applied_ids | {(event["skill_id"], event["event_id"])
+                for event in report["verified_events"] if event["kind"] not in ("open", "close", "hold")}
+            consumed_ids.update((event["skill_id"], event["event_id"])
+                                for event in report["superseded_gripper_events"])
+            consumed_ids.update((event["skill_id"], event["event_id"])
+                                for key in ("evaluated_events", "stopped_events", "reached_events") for event in report[key])
             barrier_command_reached = stop == 0 or (report["executed_steps"] > 0 and samples[-1]["curve_time"] >= stop-1e-12)
             report.update(elapsed_wall_s=time.monotonic()-started, elapsed_sim_s=final_elapsed,
                 actual_sim_stop_s=final_elapsed, last_command_sample_s=samples[-1]["curve_time"] if controls else None,
                 remaining_to_barrier_s=max(0., stop-final_elapsed),
                 physical_clock_overrun_s=max(0., final_elapsed-stop),
                 barrier_command_reached=barrier_command_reached,
+                barrier_crossed=any(samples[-1]["curve_time"] > event["time"]
+                                    for event in report["verified_events"]),
                 unapplied_gripper_events=[deepcopy(event) for event in command_events
                                           if (event["skill_id"], event["event_id"]) not in applied_ids],
                 maximum_arm_tracking_error_rad=float(np.max(np.abs(actual_q[:, :narm]-command_q[:, :narm]))),
@@ -735,7 +1098,62 @@ class TrajectoryExecutor:
                 maximum_absolute_actual_arm_velocity=float(np.max(np.abs(np.asarray([row["dq"] for row in samples])[:, :narm]))),
                 peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,
                 unconsumed_events=[deepcopy(event) for event in trajectory.events
-                                   if (event["skill_id"], event["event_id"]) not in applied_ids])
+                                   if (event["skill_id"], event["event_id"]) not in consumed_ids],
+                pending_verifications=[deepcopy(event) for event in barriers[barrier_index:]])
+            # BEGIN explicit effect outcomes and same-request continuation data.
+            observed = report.get("latest_observation", {})
+            effects = deepcopy(binding.get("prior_effects", {}))
+            effects.update(deepcopy(observed.get("effects", {})))
+            required_effects = set()
+            for condition in trajectory.conditions:
+                identity = condition.get("condition_id")
+                if identity is not None and condition.get("effect_requirement"):
+                    required_effects.add(identity)
+                    effects.setdefault(identity, {"value": "U", "source": "No current effect observation supplied"})
+            for event in trajectory.events:
+                if event.get("requires_evidence") is not None:
+                    required_effects.add(str(event["requires_evidence"]))
+                    effects.setdefault(str(event["requires_evidence"]),
+                        {"value": "U", "source": "No current effect observation supplied"})
+            report["effects"] = effects
+            required_values = [effects[identity]["value"] for identity in required_effects]
+            report["required_effect_ids"] = sorted(required_effects)
+            report["effect_result"] = ("F" if "F" in required_values else
+                "T" if required_values and all(value == "T" for value in required_values) else "U")
+            report["continuation"] = {
+                "candidate_id": binding["candidate_id"], "original_binding": binding,
+                "physics_budget": physics_budget,
+                "device_timestep_s": float(backend.timestep),
+                "elapsed_physical_s": final_elapsed, "last_curve_time_s": samples[-1]["curve_time"],
+                "request_time_origin_s": float(binding.get("request_time_origin_s", 0.)),
+                "cumulative_elapsed_physical_s": float(binding.get("request_time_origin_s", 0.))+final_elapsed,
+                "applied_events": deepcopy(report["events"]),
+                "verified_events": deepcopy(report["verified_events"]),
+                "evaluated_events": deepcopy(report["evaluated_events"]),
+                "stopped_events": deepcopy(report["stopped_events"]),
+                "reached_events": deepcopy(report["reached_events"]),
+                "completed_goal_ids": deepcopy(report["completed_goal_ids"]),
+                "goal_evidence": deepcopy(report["goal_evidence"]),
+                "superseded_events": deepcopy(report["superseded_gripper_events"]),
+                "remaining_events": deepcopy(report["unconsumed_events"]),
+                "effects": effects, "actual_feedback": deepcopy(backend.proprioception()),
+                "object_changes": deepcopy(report["object_changes"]),
+                "requires_rebind": report["status"] != "curve_finished",
+                "reason": "Remaining obligations require current actual/scene binding; applied events and original hard clock cannot be reset",
+                "consumed_physics_steps": report["executed_steps"] + sum(
+                    0 if report[key] is None else report[key]["physical_steps"]
+                    for key in ("abort_hold", "dependency_hold")),
+                "cumulative_physics_steps": prior_physics_steps+report["executed_steps"]+sum(
+                    0 if report[key] is None else report[key]["physical_steps"]
+                    for key in ("abort_hold", "dependency_hold")),
+                "remaining_physics_steps": max(0, physics_budget-prior_physics_steps-report["executed_steps"]-sum(
+                    0 if report[key] is None else report[key]["physical_steps"]
+                    for key in ("abort_hold", "dependency_hold")))}
+            # END finishing command playback never asserts Holding or release.
+            continuation_path = (output/"continuation.json").resolve()
+            continuation_path.write_text(json.dumps(_feedback_json(report["continuation"]),
+                                                   indent=2, allow_nan=False)+"\n")
+            report["continuation_path"] = str(continuation_path)
             np.savez_compressed(output/"physical-trajectory.npz", joint_names=np.asarray(backend.joint_names),
                 command_joint_names=np.asarray(backend.joint_names),
                 arm_joint_names=np.asarray(backend.arm_joint_names), finger_joint_names=np.asarray(backend.finger_joint_names),
@@ -777,7 +1195,7 @@ class TrajectoryExecutor:
                 control_elapsed=np.arange(len(controls))*backend.timestep,
                 control_sim_time=sim_start+np.arange(len(controls))*backend.timestep,
                 gripper_command=np.asarray([row["gripper_command"] for row in samples]))
-            if report["status"] in ("stopped_for_evidence", "curve_finished", "feedback_rejected", "execution_error"):
+            if report["status"] in ("stopped_for_evidence", "curve_finished", "feedback_rejected", "execution_error", "effect_rejected"):
                 # This is a robot-only observation. A later bridge still needs
                 # a current scene observation and independently verified
                 # holding evidence before constructing an attached-object model.
@@ -786,7 +1204,7 @@ class TrajectoryExecutor:
                 name = ("failure-feedback.json" if not completed else
                         "barrier-feedback.json" if trajectory.next_verification is not None else "final-feedback.json")
                 feedback_path = (output/name).resolve()
-                feedback.update(evidence_passed=False, next_verification=trajectory.next_verification,
+                feedback.update(evidence_passed=report["evidence_passed"], next_verification=report["next_verification"],
                     initial_feedback_id=initial_feedback["feedback_id"])
                 feedback["execution_status"] = report["status"]
                 serializable = _feedback_json(feedback)

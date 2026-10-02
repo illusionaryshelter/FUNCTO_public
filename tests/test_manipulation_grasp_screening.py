@@ -36,16 +36,19 @@ class GraspScreeningIntegrationTest(unittest.TestCase):
             current_joint_positions_m=self.tool.open_joint_positions_m,
             contact_tolerance_m=.001, penetration_tolerance_m=.00025)
 
-    def test_missing_observation_preserves_full_candidate_and_holding_barrier(self):
+    # BEGIN allowed incomplete observation selects an attempt, not a held-object fact.
+    def test_missing_observation_preserves_full_candidate_and_unknown_holding(self):
         program, scene, view = self.fixture()
         result = self.call(program, {"candidate": scene}, view)
-        self.assertEqual(result["status"], "unresolved")
-        self.assertIsNone(result["selected_trajectory"])
+        self.assertEqual(result["status"], "selected")
+        self.assertIsNotNone(result["selected_trajectory"])
+        self.assertIn("candidate", result["grasp_geometry_validation"]["unresolved_candidate_ids"])
         reference = result["trajectories"]["candidate"]
         np.testing.assert_array_equal(reference["eef_poses"], program["demo"]["T_carrier_eef"])
         self.assertEqual(reference["gripper_events"], program["demo"]["gripper_events"])
         self.assertEqual(reference["holding_status"], "requires_verification")
         self.assertFalse(result["robot_execution_verified"])
+    # END eligibility does not certify physical execution or effects.
 
     def test_observed_palm_penetration_rejects_but_keeps_complete_reference(self):
         program, scene, view = self.fixture()

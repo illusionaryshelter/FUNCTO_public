@@ -15,7 +15,7 @@ from copy import deepcopy
 
 import numpy as np
 
-from .motion import _inverse, _pose_array, _poses_array, transfer_motion
+from .motion import _inverse, _pose_array, _poses_array
 
 
 def validate_timeline(frame_indices, timestamps):
@@ -83,37 +83,15 @@ def _gripper_events(value, frames):
     return events
 
 
-# BEGIN preserve an explicitly selected Cartesian approach before contact.
-def ground_grasp(demo, scene, *, pregrasp_frame=None):
-    """Bind same-tool approach/closure geometry and protect its contact suffix.
+# BEGIN source grasp motion is an initializer, not a protected robot path.
+def ground_grasp(demo, scene):
+    """Bind the original same-tool reference and its independent grasp goal.
 
-    ``demo`` requires ``T_carrier_eef`` (N,4,4), original ``frame_indices`` and
-    ``timestamps``, ``protected_start_frame``, ``gripper_events``, ``tool_id``
-    and ``tool_frame``. The protected boundary must be the earliest known
-    actor-carrier contact or closing action, not the later stable-grasp frame.
-    ``scene`` requires current ``carrier_pose`` and ``eef_pose`` in one world
-    frame, ``region_transform`` mapping demo carrier-local grasp geometry to
-    current carrier-local geometry, and the same tool identity/frame names.
-
-    A fully established local correspondence A yields the candidate
-    ``T_world_eef[t] = carrier_pose @ A @ T_carrier_eef[t]``. Only a declared
-    free prefix may change to connect the current EEF pose. All nodes from the
-    protected boundary through the end remain exactly that bound reference.
-    There is no added lifting stage: the last source observation is the
-    stable-grasp verification boundary, even if the object remains supported.
-
-    ``pregrasp_frame`` optionally protects an earlier Cartesian approach as
-    well. It is an original observation ID strictly before the contact/closing
-    boundary. The free connection ends there, before any reference warping;
-    the original protected boundary and gripper events retain their meaning.
-    Standalone geometric grounding need not select a robot planning boundary.
-
-    ``status == 'candidate'`` certifies only that this geometric connection
-    exists. If no free prefix exists and the current pose differs, the returned
-    reference is explicitly ``connection_required`` and must not be executed
-    as a continuous path. ``entry_pose`` is its required geometric entrance.
-    In both cases current synchronized evidence must establish actual holding;
-    the candidate terminal transform is never an observed attachment fact.
+    Region correspondence maps the complete source motion into the current
+    scene. The actual robot state belongs to the planner; no selected source
+    frame creates an approach waypoint, Cartesian suffix lock, or stop. The
+    terminal local grasp relation is a proposed goal, never observed Holding.
+    ``protected_start_frame`` retains contact evidence identity only.
     """
     for key in ("tool_id", "tool_frame"):
         if _name(demo, key) != _name(scene, key):
@@ -125,63 +103,29 @@ def ground_grasp(demo, scene, *, pregrasp_frame=None):
     events = _gripper_events(demo["gripper_events"], frames)
     protected = demo["protected_start_frame"]
     if (isinstance(protected, (bool, np.bool_))
-            or not isinstance(protected, (int, np.integer))):
-        raise ValueError("protected_start_frame must be an original integer frame ID")
-    matches = np.flatnonzero(frames == protected)
-    if len(matches) != 1:
+            or not isinstance(protected, (int, np.integer)) or protected not in frames):
         raise ValueError("protected_start_frame must name an original observation")
-    if any(event["frame_index"] < protected and event["command"] == "close"
-           for event in events):
-        raise ValueError("The protected boundary cannot follow a closing intention")
-    index = int(matches[0])
-    if pregrasp_frame is not None:
-        if (isinstance(pregrasp_frame, (bool, np.bool_))
-                or not isinstance(pregrasp_frame, (int, np.integer))):
-            raise ValueError("pregrasp_frame must be an original integer frame ID")
-        approach = np.flatnonzero(frames == pregrasp_frame)
-        if len(approach) != 1 or int(approach[0]) >= index:
-            raise ValueError("pregrasp_frame must name an observation before protected_start_frame")
-        index = int(approach[0])
+    if any(event["frame_index"] < protected and event["command"] == "close" for event in events):
+        raise ValueError("The contact evidence boundary cannot follow a closing intention")
     carrier = _pose_array(scene["carrier_pose"], "carrier_pose")
-    current = _pose_array(scene["eef_pose"], "eef_pose")
+    _pose_array(scene["eef_pose"], "eef_pose")
     mapping = _pose_array(scene["region_transform"], "region_transform")
     bound_relative = mapping @ relative
-    reference = carrier @ bound_relative
-    output = reference.copy()
-    connection_required = index == 0 and not np.allclose(
-        current, reference[0], atol=1e-8, rtol=0)
-    if index > 0:
-        # The final prefix observation is shared with the protected suffix.
-        # Copy only earlier nodes so every protected pose remains bit-for-bit
-        # the supplied bound reference, not a numerically re-fitted version.
-        prefix = transfer_motion(reference[:index + 1], current,
-                                 kind="free", goal_pose=reference[index])
-        output[:index] = prefix["poses"][:index]
     return {
-        "status": "connection_required" if connection_required else "candidate",
-        "output_type": "eef_trajectory",
-        "eef_poses": output,
-        "frame_indices": frames,
-        "timestamps": times,
-        "pregrasp_frame": None if pregrasp_frame is None else int(pregrasp_frame),
+        "status": "candidate", "output_type": "eef_trajectory",
+        "eef_poses": carrier @ bound_relative, "frame_indices": frames, "timestamps": times,
         "protected_start_frame": int(protected),
-        "entry_pose": reference[0].copy() if connection_required else output[0].copy(),
-        "connection_required": bool(connection_required),
-        "candidate_T_carrier_eef": bound_relative[-1].copy(),
-        "gripper_events": events,
-        "tool_id": demo["tool_id"],
-        "tool_frame": demo["tool_frame"],
+        "goal_pose": carrier @ bound_relative[-1],
+        "candidate_T_carrier_eef": bound_relative[-1].copy(), "gripper_events": events,
+        "tool_id": demo["tool_id"], "tool_frame": demo["tool_frame"],
         "holding_status": "requires_verification",
-        "verification_barrier": {
-            "frame_index": int(frames[-1]),
-            "requirement": "stable_grasp_from_current_synchronized_evidence",
-            "original_support_separation_required": False,
-        },
+        "effect_requirement": {"frame_index": int(frames[-1]),
+                               "requirement": "stable_grasp_from_current_synchronized_evidence",
+                               "original_support_separation_required": False},
         "pose_convention": "column-vector world_from_eef; metres; 4x4 SE(3)",
-        "path_scope": ("same-tool geometry candidate; no IK, complete-scene collision, "
-                       "gripper-width, force, stability, or execution-time guarantee"),
+        "path_scope": "bound source initialization reference; no path or execution feasibility claim",
     }
-# END preserve an explicitly selected Cartesian approach before contact.
+# END source grasp motion is an initializer, not a protected robot path.
 
 
 def attached_eef_reference(carrier_poses, actual_T_carrier_eef):

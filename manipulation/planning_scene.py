@@ -17,7 +17,7 @@ from __future__ import annotations
 from copy import copy, deepcopy
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import math
 
 import numpy as np
@@ -294,6 +294,10 @@ class ObservedSpace:
         distance = np.maximum(distance - math.sqrt(3) * voxel_size, 0)
         self._distance = torch.from_numpy(distance.astype(np.float32))[None, None]
         self._shape_xyz = np.array(mask.shape[::-1], float)
+        # BEGIN retain exact observation masks for the execution binding.
+        self._known = mask.copy()
+        self._known.flags.writeable = False
+        # END serialization does not reconstruct free cells from a distance grid.
 
     @property
     def known_free(self):
@@ -387,6 +391,9 @@ class CollisionOwner:
     robot_excluded_spheres: tuple = ()
     robot_exclusion_source: str | None = None
     robot_exclusion_geometry_source: str | None = None
+    # BEGIN explicit aliases for native fixed installation solids already checked.
+    native_geometry_names: tuple = ()
+    # END never infer a native pair exemption from proxy sphere indices.
     # END exclusions never apply to background or another moving actor.
 
     def __post_init__(self):
@@ -400,6 +407,13 @@ class CollisionOwner:
         if type(self.geometry_complete) is not bool or type(self.moving) is not bool:
             raise ValueError("Geometry coverage and motion must be explicitly declared")
         self.attachments = tuple(self.attachments)
+        self.native_geometry_names = tuple(self.native_geometry_names)
+        if self.native_geometry_names and (self.moving or self.attachments or not self.geometry_complete):
+            raise ValueError("Native installation identities require a complete fixed owner")
+        if len(set(self.native_geometry_names)) != len(self.native_geometry_names):
+            raise ValueError("Native installation geometry identities must be unique")
+        for name in self.native_geometry_names:
+            _text(name, "native installation geometry identity")
         for index, relation in enumerate(self.attachments):
             if not isinstance(relation, Attachment):
                 raise TypeError("Owner attachments must be explicit ordered attachment spans")
@@ -544,39 +558,41 @@ class ContactRule:
 class PrismaticGripper:
     """Bind native finger coordinates to a supported controller and geometry.
 
-    Position tracking binds solver joints to the declared command path.
-    A timed reference describes independently controlled fingers using the
-    same formal elapsed time as the arm, without adding solver coordinates. A
-    binary controller instead uses the whole native mechanical interval for
-    every planning query, including zero progress. Progress is not elapsed
-    time: it may pause while the arm and binary drive continue moving. Each
-    proxy covers the *continuous* affine
-    finger sweep, not a finite collection of guessed widths. This conservative
-    envelope is independent of timing and remains valid after retiming. It
-    may prevent a grasp from being certified; a narrower unverified closure
-    curve is never substituted to make it pass.
+    Position tracking uses explicitly modeled solver coordinates. Timed
+    actuator commands and optional nominal future geometry share the bound
+    elapsed clock but remain separate objects. Binary control without a future
+    model retains its mechanical envelope only as unresolved diagnostic
+    evidence. A sampled width or command is never measured future contact.
 
-    For tracking, ``joint_bounds(progress)`` returns identical lower/upper
-    command coordinates [B,H,J]. A timed reference is a nominal command curve,
-    not an assertion about future actual tracking or contact. Binary control
-    requires ``joint_bounds=None``.
-    ``coupling_matrix``
-    and ``coupling_offset`` encode the actual drive's A q = b constraints.
-    ``self_collision_pairs`` comes from the robot's declared collision-pair
-    policy, including every enabled pair involving an enveloped gripper proxy.
-    It is not an allowed-contact list for objects.
+    ``joint_bounds(progress)`` is the solver tracking contract. Independent
+    ``finger_trajectory_factory`` supplies commands;
+    ``nominal_finger_trajectory_factory`` supplies declared future geometry.
+    ``control_timestep_s`` is the explicit native device period shared by
+    every command clock; it is not inferred from either trajectory factory.
+    Without that geometry, only the actual initial fingers and invariant
+    robot components contribute hard collision claims. Actual execution always
+    checks the measured complete state. ``coupling_matrix`` and
+    ``coupling_offset`` describe the native A q = b drive constraint.
+    ``self_collision_pairs`` is the robot's explicit geometric pair policy,
+    never object-contact permission.
     """
 
     def __init__(self, *, controller, joint_names, current_positions, joint_limits,
                  joint_bounds, coupling_matrix, coupling_offset, sphere_indices,
                  local_spheres, sphere_joint_translation, self_collision_pairs,
-                 commands, source, numerical_joint_tolerance=1e-5,
-                 finger_trajectory_factory=None):
+                 commands, source, control_timestep_s, numerical_joint_tolerance=1e-5,
+                 finger_trajectory_factory=None, nominal_finger_trajectory_factory=None):
         # BEGIN independent position-control intervals without solver fingers.
         if controller not in {"position_tracking", "timed_reference", "binary"}:
             raise ValueError("Controller must declare solver tracking, a timed reference or binary intentions")
         # END independent position-control intervals without solver fingers.
         self.controller = controller
+        # BEGIN command quantization belongs to the device, not a factory type.
+        if (isinstance(control_timestep_s, bool) or not np.isscalar(control_timestep_s)
+                or not np.isfinite(control_timestep_s) or control_timestep_s <= 0):
+            raise ValueError("Gripper commands require an explicit positive native control timestep")
+        self.control_timestep_s = float(control_timestep_s)
+        # END position tracking and independently commanded fingers share this clock.
         self.joint_names = tuple(_text(name, "native gripper joint") for name in joint_names)
         if not self.joint_names or len(set(self.joint_names)) != len(self.joint_names):
             raise ValueError("Native gripper joint names must be unique")
@@ -594,6 +610,12 @@ class PrismaticGripper:
             raise TypeError("Timed fingers require their explicit physical-clock trajectory factory")
         self.finger_trajectory_factory = finger_trajectory_factory
         self.finger_trajectory = None
+        # BEGIN commands and a contact-conditioned future geometry are separate.
+        if nominal_finger_trajectory_factory is not None and not callable(nominal_finger_trajectory_factory):
+            raise TypeError("Nominal hand geometry requires an explicit trajectory factory")
+        self.nominal_finger_trajectory_factory = nominal_finger_trajectory_factory
+        self.nominal_finger_trajectory = None
+        # END no position command is promoted to actual future contact width.
         self.joint_bounds = joint_bounds
         if not np.isfinite(numerical_joint_tolerance) or numerical_joint_tolerance < 0:
             raise ValueError("The numerical joint tolerance must be a finite nonnegative value")
@@ -645,23 +667,32 @@ class PrismaticGripper:
 
     # BEGIN a separately controlled hand follows the same formal physical clock.
     def bind_clock(self, duration, progress_map):
-        if self.controller != "timed_reference":
+        if self.controller == "position_tracking":
             return
-        trajectory = self.finger_trajectory_factory(duration, progress_map)
-        if (tuple(trajectory.joint_names) != self.joint_names
-                or trajectory.duration != duration
-                or not np.array_equal(trajectory.sample(np.array([0.]))[0][0], self.current_positions)):
-            raise ValueError("Finger reference must preserve named measured entrance and formal duration")
-        self.finger_trajectory = trajectory
+        if self.controller == "timed_reference":
+            trajectory = self.finger_trajectory_factory(duration, progress_map)
+            if (tuple(trajectory.joint_names) != self.joint_names
+                    or trajectory.duration != duration
+                    or not np.array_equal(trajectory.sample(np.array([0.]))[0][0], self.current_positions)):
+                raise ValueError("Finger reference must preserve named measured entrance and formal duration")
+            self.finger_trajectory = trajectory
+        if self.nominal_finger_trajectory_factory is not None:
+            nominal = self.nominal_finger_trajectory_factory(duration, progress_map)
+            if (tuple(nominal.joint_names) != self.joint_names or nominal.duration != duration
+                    or not np.array_equal(nominal.sample(np.array([0.]))[0][0], self.current_positions)):
+                raise ValueError("Nominal hand geometry must preserve measured entrance, names and bound clock")
+            self.nominal_finger_trajectory = nominal
 
     def state(self, progress, joint_position, joint_names, *, trajectory_time=None):
         expected = (*progress.shape, len(self.joint_names))
         limits = _tensor(self.joint_limits, progress)
         measured = _tensor(self.current_positions, progress)
-        if self.controller == "timed_reference":
-            if self.finger_trajectory is None or trajectory_time is None or trajectory_time.shape != progress.shape:
+        if self.controller == "timed_reference" or self.nominal_finger_trajectory is not None:
+            if ((self.nominal_finger_trajectory is None and self.finger_trajectory is None)
+                    or trajectory_time is None or trajectory_time.shape != progress.shape):
                 raise ValueError("Timed finger geometry requires its bound trajectory and actual query time")
-            coordinates, _ = self.finger_trajectory.sample_torch(trajectory_time)
+            model = self.nominal_finger_trajectory or self.finger_trajectory
+            coordinates, _ = model.sample_torch(trajectory_time)
             if coordinates.shape != expected:
                 raise ValueError("Named finger samples must align with the scene query")
             tolerance = self.numerical_joint_tolerance
@@ -681,6 +712,10 @@ class PrismaticGripper:
             # current_positions remains the separately checked real feedback.
             lower = limits[:, 0].expand(expected)
             upper = limits[:, 1].expand(expected)
+            if trajectory_time is not None:
+                initial = trajectory_time == 0
+                lower = torch.where(initial[..., None], measured, lower)
+                upper = torch.where(initial[..., None], measured, upper)
             # END time-independent binary envelope.
         else:
             lower, upper = self.joint_bounds(progress)
@@ -791,8 +826,12 @@ class PlanningScene:
     def __init__(self, *, background, owners, coverage, reference_frame,
                  robot_sphere_materials, robot_geometry_source,
                  contacts=(), gripper=None, has_gripper=True, robot_coverage=None,
-                 numerical_position_tolerance_m=1e-4, numerical_rotation_tolerance_rad=1e-3):
+                 numerical_position_tolerance_m=1e-4, numerical_rotation_tolerance_rad=1e-3,
+                 native_geometry_materials=None):
         self.background = background
+        # BEGIN independent solids need explicit material identity, not sphere-index guesses.
+        self.native_geometry_materials = dict(native_geometry_materials or {})
+        # END identity is serialized with the exact scene binding.
         self.owners = tuple(owners)
         ids = [owner.owner_id for owner in self.owners]
         if len(ids) != len(set(ids)) or set(ids) & set(background.owner_ids):
@@ -926,10 +965,8 @@ class PlanningScene:
             hand_names = () if self.gripper is None else self.gripper.joint_names
             if set(named) != set(problem.joint_names) | set(hand_names):
                 raise ValueError("Native coverage requires the complete arm and explicitly controlled hand coordinates")
-            if self.gripper is not None and (
-                    self.gripper.controller != "timed_reference"
-                    or any(named[name] != value for name, value in zip(hand_names, self.gripper.current_positions))):
-                raise ValueError("Native coverage requires the measured hand and its same-clock nominal reference")
+            if self.gripper is not None and any(named[name] != value for name, value in zip(hand_names, self.gripper.current_positions)):
+                raise ValueError("Native coverage baseline must preserve the actual measured hand")
         # END model-relative V0 cannot be relabelled from another feedback epoch.
         by_id = {owner.owner_id: owner for owner in self.owners}
         background_ids = set(self.background.owner_ids)
@@ -1182,11 +1219,12 @@ class PlanningScene:
         """Compose named arm and nominal finger coordinates without guessing."""
         names = tuple(joint_names)
         values = joint_position
-        if self.gripper is not None and self.gripper.controller == "timed_reference":
+        if self.gripper is not None and (self.gripper.controller == "timed_reference" or self.gripper.nominal_finger_trajectory is not None):
             hand = self.gripper
             if set(names) & set(hand.joint_names):
                 raise ValueError("Independent finger coordinates must not duplicate active arm coordinates")
-            fingers, _ = hand.finger_trajectory.sample_torch(trajectory_time)
+            model = hand.nominal_finger_trajectory or hand.finger_trajectory
+            fingers, _ = model.sample_torch(trajectory_time)
             values = torch.cat((values, fingers), -1)
             names += hand.joint_names
         return names, values
@@ -1200,10 +1238,26 @@ class PlanningScene:
         """
         if self.robot_coverage is None:
             return []
-        names, positions = self.full_robot_positions(joint_position, joint_names, trajectory_time)
+        hand = self.gripper
+        independent_unknown = (hand is not None and not set(hand.joint_names) <= set(joint_names)
+                               and hand.nominal_finger_trajectory is None)
+        if independent_unknown:
+            names = tuple(joint_names) + hand.joint_names
+            measured = _tensor(hand.current_positions, joint_position).expand(*joint_position.shape[:-1], len(hand.joint_names))
+            positions = torch.cat((joint_position, measured), -1)
+        else:
+            names, positions = self.full_robot_positions(joint_position, joint_names, trajectory_time)
         values = positions.detach().cpu().numpy().reshape(-1, len(names))
+        times = trajectory_time.detach().cpu().numpy().reshape(-1)
         reports = []
-        for row in values:
+        for row, time_s in zip(values, times):
+            if independent_unknown and time_s > 0:
+                violations = {name: float(value) for name, value in zip(joint_names, row[:len(joint_names)])
+                              if not self.robot_coverage._checker.joint_limits[name][0] <= value <= self.robot_coverage._checker.joint_limits[name][1]}
+                reports.append({"passed": False, "attempt_allowed": not violations,
+                                "failure": "native_joint_limits" if violations else "future_finger_geometry_unbound",
+                                "joint_limit_violations": violations, "scope": "no guessed future finger volume", "trajectory_time": float(time_s)})
+                continue
             query = row
             representation = None
             # BEGIN preserve unmatched native first samples as ordinary states.
@@ -1420,6 +1474,28 @@ class PlanningScene:
             if self.gripper.self_collision_pairs:
                 costs["gripper/self"] = _self_pair_sum(spheres, self.gripper._self_pair_indices)
             # END retain every declared pair without a per-pair Python graph.
+        # BEGIN an unmodelled future width does not establish a physical collision.
+        uncertain_hand = torch.zeros_like(progress, dtype=torch.bool)
+        uncertain_indices = []
+        if self.gripper is not None:
+            hand = self.gripper
+            if hand.controller in {"binary", "timed_reference"} and hand.nominal_finger_trajectory is None:
+                uncertain_hand = (torch.ones_like(progress, dtype=torch.bool) if trajectory_time is None else trajectory_time > 0)
+                uncertain_indices = [index for index, mapping in zip(hand.sphere_indices, hand.sphere_joint_translation)
+                                     if np.any(mapping != 0)]
+                if hand.self_collision_pairs:
+                    affected = [pair for pair in hand.self_collision_pairs if set(pair) & set(uncertain_indices)]
+                    unresolved = _self_pair_sum(spheres, np.asarray(affected, dtype=np.int64).reshape(-1, 2)) if affected else torch.zeros_like(progress)
+                    costs["unknown/gripper/self"] = unresolved * uncertain_hand
+                    costs["gripper/self"] = costs["gripper/self"] - costs["unknown/gripper/self"]
+        def collision_terms(values, key, actor):
+            if actor == "robot" and uncertain_indices:
+                unresolved = values[..., uncertain_indices].sum(-1) * uncertain_hand
+                costs["unknown/" + key] = unresolved
+                costs[key] = values.sum(-1) - unresolved
+            else:
+                costs[key] = values.sum(-1)
+        # END fixed palm/body conflicts remain known at every query.
         poses = {}
         release_states = {}
         for owner in self.owners:
@@ -1447,7 +1523,7 @@ class PlanningScene:
             # Otherwise a static partial front surface could let a robot enter
             # its now-known interior through an unmodelled back surface. An
             # inner occupancy mesh is never substituted for an outer collision
-            # model. The strict global requirement is intentional and explicit.
+            # model. This is diagnostic uncertainty, not a global denial gate.
             if not owner.geometry_complete and (owner.moving or owner.owner_id in self._occupied_owner_ids):
                 costs[f"unknown/owner/{owner.owner_id}"] = torch.ones_like(progress)
             # END require collision completeness for occupied owner evidence.
@@ -1476,7 +1552,8 @@ class PlanningScene:
             # check_robot_coverage at entrance, search and final acceptance.
             if actor != "robot" or self.robot_coverage is None:
                 costs[f"unknown/space/{actor}"] = self.coverage.violation(actor_spheres).amax(-1)
-            costs[f"collision/{actor}/background"] = self.background(actor_spheres, key=(actor, "background")).sum(-1)
+            collision_terms(self.background(actor_spheres, key=(actor, "background")),
+                            f"collision/{actor}/background", actor)
             for owner in self.owners:
                 if actor == owner.owner_id:
                     continue
@@ -1487,8 +1564,9 @@ class PlanningScene:
                     allowed, residual, uncertain = self._permission(
                         rule, actor_spheres, actor_pose, poses[owner.owner_id], progress, coordinates, half)
                     if rule.required:
-                        costs[f"contact/{rule.rule_id}"] = residual
-                        costs[f"unknown/contact/{rule.rule_id}"] = uncertain
+                        unresolved = uncertain_hand if actor == "robot" and rule.feature_joint_translation is not None else torch.zeros_like(progress, dtype=torch.bool)
+                        costs[f"contact/{rule.rule_id}"] = residual * ~unresolved
+                        costs[f"unknown/contact/{rule.rule_id}"] = torch.maximum(uncertain, residual * unresolved)
                     indices = list(rule.sphere_indices)
                     radius = actor_spheres[..., indices, 3]
                     costs[f"contact/proxy/{rule.rule_id}"] = torch.relu(rule.modeling_allowance_m + 1e-9 - radius).sum(-1)
@@ -1510,7 +1588,7 @@ class PlanningScene:
                     enabled = values.new_ones(values.shape[-1])
                     enabled[list(owner.robot_excluded_spheres)] = 0
                     values = values * enabled
-                costs[f"collision/{actor}/{owner.owner_id}"] = values.sum(-1)
+                collision_terms(values, f"collision/{actor}/{owner.owner_id}", actor)
                 # END the observed background and unknown-space queries are unchanged.
         return costs
 
@@ -1519,7 +1597,13 @@ class PlanningScene:
         terms = self.components(robot_spheres, position, quaternion, progress,
                                 joint_position=joint_position, joint_names=joint_names,
                                 trajectory_time=trajectory_time)
-        return torch.stack(tuple(terms.values())).sum(0)
+        # BEGIN allowed observation/model uncertainty stays diagnostic.
+        # A missing release anchor is different: the requested pose query
+        # cannot be formed and must still fail this candidate.
+        known = [value for key, value in terms.items()
+                 if not key.startswith("unknown/") or key.startswith("unknown/release_anchor/")]
+        return torch.stack(known).sum(0) if known else torch.zeros_like(progress)
+        # END known collision, required relation and physical limits stay hard.
 
     # BEGIN optimize toward an actual tracking command inside its numerical band.
     def optimizer_preferences(self, progress, joint_position, joint_names):
@@ -1545,6 +1629,109 @@ class PlanningScene:
         return ((joint_position[..., indices]-command)**2).sum(-1)
     # END optimize toward an actual tracking command inside its numerical band.
 
+    # BEGIN exact bounded scene inputs for independent execution review.
+    def to_execution_binding(self):
+        """Own the model/permission inputs; labels and counts cannot bind geometry.
+
+        Unsupported geometry remains an explicit required-query gap. Observation
+        coverage remains unresolved evidence and never supplies contact permission.
+        Native cuboids and complete convex meshes retain their filled-volume
+        semantics. We do not take the hull of an arbitrary nonconvex mesh.
+        """
+        def plain(value):
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().tolist()
+            if isinstance(value, Mapping):
+                return {str(k): plain(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [plain(v) for v in value]
+            return value
+
+        def geometry(query):
+            explicit = getattr(query, "independent_geometry", None)
+            if explicit is not None:
+                return deepcopy(explicit)
+            native = getattr(query, "scene_collision", None)
+            model = getattr(native, "scene_model", None)
+            if model is None or isinstance(model, list):
+                return {"solids": [], "query_gaps": ["No single independent native scene model"]}
+            solids, gaps = [], []
+            for kind in ("cuboid", "cylinder", "sphere", "capsule", "mesh", "voxel"):
+                for shape in getattr(model, kind, ()) or ():
+                    if len(solids) >= 4096:
+                        gaps.append("Independent scene solid budget exceeded")
+                        break
+                    row = {"name": shape.name, "kind": kind, "pose": list(shape.pose), "source": query.source}
+                    if kind == "cuboid":
+                        row["dimensions"] = list(shape.dims)
+                    elif kind in {"cylinder", "sphere"}:
+                        row["dimensions"] = [shape.radius] + ([shape.height] if kind == "cylinder" else [])
+                    elif kind == "mesh":
+                        mesh = shape.get_trimesh_mesh(process=False, transform_with_pose=False)
+                        if len(mesh.vertices) > 65536 or not mesh.is_watertight or not mesh.is_convex:
+                            gaps.append(f"{shape.name}: requires complete convex solid adaptation")
+                            continue
+                        row["vertices"] = np.asarray(mesh.vertices).tolist()
+                    else:
+                        gaps.append(f"{shape.name}: {kind} requires an independent solid adapter")
+                        continue
+                    solids.append(row)
+            return {"solids": solids, "query_gaps": gaps}
+
+        owners = []
+        for owner in self.owners:
+            path = owner.pose_path
+            owners.append({"owner_id": owner.owner_id, "source": owner.source,
+                           "geometry_complete": owner.geometry_complete, "moving": owner.moving,
+                           "geometry": geometry(owner.query),
+                           "pose_path": plain({"progress": path.progress, "poses": path.poses,
+                               "source": path.source, "attachment": path.attachment,
+                               "coordinates": path.coordinates,
+                               "motion_model": None if path.motion_model is None else asdict(path.motion_model)}),
+                           "pose_interval": list(owner.pose_interval),
+                           "attachments": plain([asdict(row) for row in owner.attachments]),
+                           "local_spheres": plain(owner.local_spheres), "sphere_materials": list(owner.sphere_materials),
+                           "sphere_cover_error_m": owner.sphere_cover_error_m,
+                           "robot_excluded_spheres": list(owner.robot_excluded_spheres),
+                           "robot_exclusion_source": owner.robot_exclusion_source,
+                           "native_geometry_names": list(owner.native_geometry_names)})
+        hand = self.gripper
+        gripper = None if hand is None else plain({
+            "controller": hand.controller, "joint_names": hand.joint_names,
+            "control_timestep_s": hand.control_timestep_s,
+            "current_positions": hand.current_positions, "joint_limits": hand.joint_limits,
+            "coupling_matrix": hand.coupling_matrix, "coupling_offset": hand.coupling_offset,
+            "commands": hand.commands, "source": hand.source,
+            "sphere_indices": hand.sphere_indices, "local_spheres": hand.local_spheres,
+            "sphere_joint_translation": hand.sphere_joint_translation,
+            "nominal_model": (None if hand.nominal_finger_trajectory is None else
+                {"times": hand.nominal_finger_trajectory.times,
+                 "position": hand.nominal_finger_trajectory.position,
+                 "velocity": hand.nominal_finger_trajectory.velocity}),
+            "command_reference": (None if hand.finger_trajectory is None else
+                {"times": hand.finger_trajectory.times, "position": hand.finger_trajectory.position,
+                 "velocity": hand.finger_trajectory.velocity})})
+        return {"reference_frame": self.reference_frame, "robot_geometry_source": self.robot_geometry_source,
+                "native_geometry_materials": deepcopy(self.native_geometry_materials),
+                "robot_sphere_materials": list(self.robot_sphere_materials), "gripper": gripper,
+                "background": {"owner_ids": sorted(self.background.owner_ids), "source": self.background.source,
+                               "geometry": geometry(self.background)},
+                "owners": owners, "contacts": plain([asdict(rule) for rule in self.contacts]),
+                "coverage": {"origin": self.coverage.origin.tolist(), "voxel_size": self.coverage.voxel_size,
+                             "shape_zyx": list(self.coverage._known.shape),
+                             "known_packbits": np.packbits(self.coverage._known).tolist(),
+                             "free_packbits": (None if self.coverage._known_free is None else
+                                               np.packbits(self.coverage._known_free).tolist()),
+                             "observation_ids": list(self.coverage.observation_ids),
+                             "occupancy_evidence": plain(self.coverage.occupancy_evidence)},
+                "observation_report": plain(self.observation_report),
+                "scope": "Supplied observed/native geometry only; hidden space remains unresolved"}
+    # END exact inputs travel with the formal result instead of mutable GPU objects.
+
     def describe(self):
         """Static scope/evidence for results; never report candidate Holding as verified."""
         return {
@@ -1552,7 +1739,7 @@ class PlanningScene:
             "observation_ids": self.coverage.observation_ids,
             "observation_build": deepcopy(self.observation_report),
             "current_occupied_evidence": deepcopy(self.coverage.occupancy_evidence),
-            "complete_geometry_required_by_coverage": tuple(sorted(self._occupied_owner_ids)),
+            "occupied_owner_ids": tuple(sorted(self._occupied_owner_ids)),
             "background_owner_ids": tuple(sorted(self.background.owner_ids)),
             "owner_geometry_complete": {owner.owner_id: owner.geometry_complete for owner in self.owners},
             # BEGIN report exact installation exclusions alongside ordinary owner geometry.
@@ -1571,14 +1758,15 @@ class PlanningScene:
             "attachment_numerical_tolerances": {"position_m": self.numerical_position_tolerance_m,
                                                 "rotation_rad": self.numerical_rotation_tolerance_rad},
             "gripper_controller": None if self.gripper is None else self.gripper.controller,
+            "gripper_control_timestep_s": None if self.gripper is None else self.gripper.control_timestep_s,
             "gripper_timing_contract": (None if self.gripper is None else
-                                        "time-independent full mechanical envelope" if self.gripper.controller == "binary"
-                                        else "same-time named C1 command reference; actual full q/dq supervised separately"
+                                        "time-independent diagnostic envelope; future width remains unresolved" if self.gripper.controller == "binary"
+                                        else "same-time named command and separately declared nominal geometry; actual q/dq supervised"
                                         if self.gripper.controller == "timed_reference"
                                         else "native position tracking; final solver joint-rate limits apply"),
             "robot_new_volume_coverage": (None if self.robot_coverage is None else {
                 "initial_state_assumption": "native solid V0 at measured full named q0 is a valid initial occupied volume",
-                "acceptance": "CPU full-volume V(q) minus (V0 union original observed free cells)",
+                "diagnostic": "CPU full-volume V(q) minus (V0 union original observed free cells); deficits remain eligible uncertainty",
                 "optimizer": "bounded native body points only; not a coverage certificate"}),
             "numerical_joint_tolerance": None if self.gripper is None else self.gripper.numerical_joint_tolerance,
             "gripper_projection_dimension": (0 if self.gripper is None or self.gripper.controller != "position_tracking"

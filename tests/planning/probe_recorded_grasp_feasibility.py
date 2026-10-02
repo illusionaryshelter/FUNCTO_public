@@ -72,9 +72,8 @@ def target_inputs(args):
     active_feedback = {**feedback, "joint_names": names,
                        "start_q": [measured[name] for name in names],
                        "start_dq": [velocity[name] for name in names]}
-    problem, provenance = prepare_candidate(program, scene, active_feedback, args.segment,
-                                            pregrasp_frame=args.pregrasp_frame)
-    grounded = ground_program(program, scene, pregrasp_frame=args.pregrasp_frame)
+    problem, provenance = prepare_candidate(program, scene, active_feedback, args.segment)
+    grounded = ground_program(program, scene)
     targets = []
     for frame in args.target_frame:
         rows = np.flatnonzero(np.asarray(grounded["frame_indices"]) == frame)
@@ -100,9 +99,9 @@ def target_inputs(args):
                                    for event in problem.events if event.source_frame == frame]})
     return problem, targets, {"program_path": str(program_path), "scene_path": str(scene_path),
         "manifest_path": str(args.manifest.resolve()), "feedback_path": str(args.feedback.resolve()),
-        "robot_fixture_path": str(args.robot_fixture.resolve()), "pregrasp_frame": args.pregrasp_frame,
+        "robot_fixture_path": str(args.robot_fixture.resolve()),
         "protected_start_frame": int(grounded["protected_start_frame"]),
-        "target_source": "current ground_program with explicit pregrasp_frame and observed candidate binding",
+        "target_source": "current ground_program reference samples with observed candidate binding; diagnostic IK queries, not hard goals",
         "builder": provenance, "ground_truth_object_state_read": False}
 
 
@@ -118,15 +117,18 @@ def observed_scene(args):
 
     captured = {}
 
-    def capture(problem, scene, robot, output, *, budget, provenance, execution_limits):
+    def capture(problem, scene, robot, output, *, budget, provenance, execution_limits, continuation):
         if captured:
             raise ValueError("The recorded runner must reach its preparation boundary exactly once")
         captured.update(problem=problem, scene=scene, robot=robot, budget=budget, provenance=provenance,
                         execution_limits=execution_limits)
-        return SimpleNamespace(success=False)
+        # BEGIN preparation metadata satisfies the runner without claiming a solve.
+        return SimpleNamespace(success=False, diagnostics={"initial_state": None})
+        # END the captured scene remains the diagnostic's actual output.
 
     runner_args = SimpleNamespace(**vars(args))
     runner_args.output = args.output/"scene-build"
+    runner_args.continuation = None
     # Required runner orchestration metadata only: capture prevents any use
     # of its trajectory budget, native trajectory allocator, or path search.
     runner_args.knots = 8
@@ -472,7 +474,6 @@ def parse_args():
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)
-    parser.add_argument("--pregrasp-frame", type=int, required=True)
     parser.add_argument("--target-frame", type=int, action="append", required=True,
                         help="One original source frame per target; repeat for at most three targets")
     parser.add_argument("--owner-mask", nargs=2, action="append", required=True, metavar=("VIEW_ID", "MASK_PATH"))
@@ -488,7 +489,7 @@ def parse_args():
     parser.add_argument("--torch-memory-mib", type=int, choices=(2048, 4096), default=2048)
     args = parser.parse_args()
     if (len(args.target_frame) > 3 or len(set(args.target_frame)) != len(args.target_frame)
-            or any(frame < 0 for frame in args.target_frame) or args.pregrasp_frame < 0):
+            or any(frame < 0 for frame in args.target_frame)):
         parser.error("Use one to three distinct nonnegative source target frames and an explicit pre-grasp frame")
     return args
 

@@ -120,8 +120,16 @@ class _TrialVideos:
                 np.save(entry["record"]["capture_times_path"], np.asarray(entry["times"]))
 
 
-def run(args):
-    """Restore and execute one skill; grade supported independent predicates."""
+# BEGIN allow an upstream observer to supply current scene/effect evidence.
+def run(args, *, observation_callback=None):
+    """Execute one skill with optional upstream current-observation evidence.
+
+    The CLI supplies no online semantic observer. Its native physics evaluator
+    grades the trial offline; it does not authorize runtime dependencies or
+    supply owner poses. A caller with an existing observation bridge may pass
+    that callback through to the production executor's evidence contract.
+    """
+# END absent observation evidence retains the executor's explicit U outcome.
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
@@ -133,7 +141,13 @@ def run(args):
         "robot_feedback_path": None, "barrier_feedback_path": None,
         "evidence_passed": False,
         # END independent position-target input and unverified robot handoff.
-        "evaluation_mode": args.evaluation_mode, "physics_outcome": "not_evaluated",
+        "execution_input": "formal_planning_result", "physics_outcome": "not_evaluated",
+        # BEGIN distinguish online evidence from the independent offline grade.
+        "online_observation_provided": observation_callback is not None,
+        "effect_evidence_scope": ("Caller-supplied observation callback; executor validates current timestamps and provenance"
+            if observation_callback is not None else
+            "No online semantic observer; offline native physics grading does not resolve execution effects"),
+        # END the recording fixture alone is not a closed-loop effect proof.
         "physics_success": None, "videos": [], "video_requested": not args.no_video,
         "execution_report_path": str(output/"execution"/"execution-report.json"),
         "physical_trajectory_path": str(output/"execution"/"physical-trajectory.npz"),
@@ -186,8 +200,10 @@ def run(args):
             raise ValueError("This trajectory executor requires the recorded absolute joint controller and uninterpolated GRIP")
         if Path(fixture["episode_path"]).resolve() != recording/"episode.h5":
             raise ValueError("Simulator fixture and input manifest refer to different source episodes")
-        curve = load_saved_trajectory(args.trajectory, evaluation_mode=args.evaluation_mode,
-                                      execution_limits=execution_limits)
+        # BEGIN restore and execute the same formal result, without label gates.
+        planning_result = load_saved_trajectory(args.trajectory, execution_limits=execution_limits)
+        curve = planning_result.trajectory
+        # END the loader checks exact candidate, clock and physical policy.
         metadata = _read(args.trajectory.with_suffix(".json"))
         report["trajectory_classification"] = metadata["classification"]
         # BEGIN bind every physical trial to its identical recorded hand policy.
@@ -261,10 +277,13 @@ def run(args):
             tool_frame=feedback["tool_link"], T_frame_tcp=tool_transform)
         executor = TrajectoryExecutor(simulation, geometry_checker=validator)
         report["status"] = "executing"
-        execution = executor.execute(curve, evaluation_mode=args.evaluation_mode,
+        execution = executor.execute(planning_result,
             finger_targets=finger_targets, initial_feedback=initial_feedback,
             execution_limits=execution_limits,
             output=output/"execution", step_callback=observe,
+            # BEGIN pass real upstream observations without reading evaluator truth.
+            observation_callback=observation_callback,
+            # END the production executor owns validation and dependency gates.
             max_physics_steps=args.max_physics_steps,
             start_position_tolerance=args.start_position_tolerance,
             start_velocity_tolerance=args.start_velocity_tolerance)
@@ -319,8 +338,6 @@ if __name__ == "__main__":
     parser.add_argument("--segment", required=True)
     parser.add_argument("--controller-part", required=True)
     # END require target positions explicitly, without the binary formatter.
-    parser.add_argument("--evaluation-mode", required=True,
-                        choices=("accepted_plan", "diagnostic_rejected_candidate"))
     camera = parser.add_mutually_exclusive_group(required=True)
     camera.add_argument("--view", action="append", dest="views")
     camera.add_argument("--no-video", action="store_true")

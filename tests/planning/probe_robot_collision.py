@@ -36,7 +36,8 @@ def run(output, knots=8):
         from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
         from curobo._src.geom.types import Cuboid, SceneCfg
         from manipulation.planning_scene import CuroboSphereQuery, ObservedSpace, PlanningScene
-        from manipulation.planning_problem import PlanningProblem, MotionPhase, PosePath, NumericalTolerance
+        from manipulation.planning_problem import (PlanningProblem, MotionPhase, PosePath,
+            NumericalTolerance, PoseEventRequirement, PoseProcessRequirement)
         from manipulation import planning
 
         torch.set_num_threads(2)
@@ -90,11 +91,19 @@ def run(output, knots=8):
         poses = np.repeat(np.eye(4)[None], 3, axis=0)
         poses[:, :3, 3] = p[[0, 2, 3]]
         poses[:, :3, :3] = Rotation.from_quat(r[[0, 2, 3]][:, [1, 2, 3, 0]]).as_matrix()
+        # BEGIN the fixture independently requires its short collision suffix.
+        suffix = PosePath(np.array([0., 1.]), poses[1:], "declared synthetic local relation")
         problem = PlanningProblem(tuple(kinematics.joint_names), initial.cpu().numpy(), np.zeros(len(initial)),
                                   "panda_hand", "robot_base", np.eye(4), np.eye(4),
-                                  (MotionPhase("free_approach", PosePath(np.array([0., 1.]), poses[:2], "synthetic target"), "free"),
-                                   MotionPhase("required_suffix", PosePath(np.array([0., 1.]), poses[1:], "synthetic necessary local path"))),
-                                  numerical=NumericalTolerance(position_m=.001, rotation_rad=.005))
+                                  (MotionPhase("approach_reference", PosePath(np.array([0., 1.]), poses[:2], "synthetic reference")),
+                                   MotionPhase("suffix_reference", suffix)),
+                                  numerical=NumericalTolerance(position_m=.001, rotation_rad=.005),
+                                  pose_events=(PoseEventRequirement(2., np.eye(4), poses[-1], .001, .005,
+                                      "Independent synthetic avoidance terminal goal"),),
+                                  pose_relations=(PoseProcessRequirement(1., 2., suffix, np.zeros((6, 2)),
+                                      "Explicit fixture requirement for the local suffix after obstacle avoidance"),),
+                                  source_timestamps=np.array([0., 2., 3.]), source_progress=np.array([0., 1., 2.]))
+        # END source phase boundaries themselves impose no robot waypoints.
         budget = planning.PlanningBudget(ik_seeds=4, trajectory_seeds=2, ik_iterations=80,
                                          knots=knots, interpolation_buffer_size=768,
                                          trajectory_iterations=150, maximum_trajectory_solves=3, search_seconds=3.)

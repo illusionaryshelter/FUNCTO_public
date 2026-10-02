@@ -224,8 +224,9 @@ def planning_label(run):
 
 def physics_label(run):
     trials = [trial for curve in run["curves"] for trial in curve["trials"]]
-    labels = [("诊断试验：" if trial["report"]["evaluation_mode"] == "diagnostic_rejected_candidate" else "")
-              + PHYSICS[trial["report"]["physics_outcome"]] for trial in trials]
+    # BEGIN current physical trials consume formal results, never label gates.
+    labels = [PHYSICS[trial["report"]["physics_outcome"]] for trial in trials]
+    # END rejected numerical candidates have no production execution mode.
     return "；".join(dict.fromkeys(labels)) if trials else "未执行物理试验"
 
 
@@ -380,7 +381,7 @@ def trial_panel(trial, output):
     """Expose evaluator outcome alongside the executor's still-pending barriers."""
     report, execution = trial["report"], trial["execution"]
     body = [f'<div class="trial"><h4>{PHYSICS[report["physics_outcome"]]} · '
-            f'{escape(report["evaluation_mode"])}</h4>', link(trial["path"], output, "仿真报告")]
+            f'{escape(report["execution_input"])}</h4>', link(trial["path"], output, "仿真报告")]
     body.append(f'<p>试验状态：{escape(report["status"])}；'
                 f'执行器读入的轨迹分类：{escape(report["trajectory_classification"])}</p>')
     if report.get("error"):

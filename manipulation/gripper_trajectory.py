@@ -17,8 +17,8 @@ from scipy.interpolate import CubicHermiteSpline, PPoly
 
 
 _SCOPE = ("Named nominal command reference, not measured finger motion or a contact prediction; "
-          "the original evidence barrier ends physical execution. A suffix beyond that barrier "
-          "holds the last nominal coordinates for conditional diagnostics only.")
+          "the full original duration retains every conditional command. The executable prefix "
+          "limits current authorization; later commands require the original dependency evidence.")
 _LIMITS_SCOPE = ("Continuous reference q/dq/ddq bounds; acceleration is the supplied native "
                  "planning bound, not a calibrated actual hardware acceleration allowance.")
 _EVENT_FIELDS = {"activation_step", "applied_time_s", "application_delay_s", "in_executable_prefix", "superseded"}
@@ -45,6 +45,11 @@ def _activation(time_s, timestep):
     No physical or numerical early-application allowance is introduced.
     """
     step = int(math.ceil(time_s / timestep))
+    # Division can round just above an integer even when that integer's
+    # native tick product equals the supplied time exactly. Recover the
+    # earliest valid product, then retain the strict no-early check below.
+    while step > 0 and (step-1)*timestep >= time_s:
+        step -= 1
     while step * timestep < time_s:
         step += 1
     return step, step * timestep
@@ -143,7 +148,29 @@ def _commands(values, names, duration, stop, timestep, position_limits):
         goal = _array(row["finger_positions"], (len(names),), "Named finger event target")
         if np.any(goal < position_limits[0]) or np.any(goal > position_limits[1]):
             raise ValueError("Finger command targets must respect the declared native reference position bounds")
-        step, applied = _activation(float(row["time"]), timestep)
+        # BEGIN a continuation subtracts native integer ticks, never re-ceils
+        # a floating difference of two already-bound physical times.
+        if "bound_activation_step" in row:
+            step = row["bound_activation_step"]
+            request_step = row.get("request_activation_step")
+            origin_step = row.get("request_time_origin_step")
+            if (type(step) is not int or type(request_step) is not int or type(origin_step) is not int
+                    or step < 0 or origin_step < 0 or request_step-origin_step != step
+                    or row.get("device_timestep_s") != timestep):
+                raise ValueError("A bound finger command requires the unchanged original native tick identities")
+            intended_step, requested_activation = _activation(float(row["request_intent_time_s"]), timestep)
+            if intended_step != request_step or row.get("request_activation_time_s") != requested_activation:
+                raise ValueError("A bound finger command changed its original intent/activation association")
+            applied = step*timestep
+        else:
+            step, applied = _activation(float(row["time"]), timestep)
+        # END the supplied original request clock remains the authority.
+        # BEGIN timing quantization is checked against the frozen binding.
+        if row.get("activation_time_s") is not None and applied != row["activation_time_s"]:
+            raise ValueError("Finger activation differs from its frozen device clock")
+        if applied >= duration:
+            raise ValueError("A command needs activation/effect coverage within the valid trajectory")
+        # END an event at T is not evidence that a command was actually applied.
         in_prefix = row["time"] < stop
         if in_prefix and applied >= stop:
             raise ValueError("An original finger command cannot activate before the evidence barrier on the native clock")
@@ -153,7 +180,14 @@ def _commands(values, names, duration, stop, timestep, position_limits):
         result.append(row)
     result.sort(key=lambda row: row["time"])
     for index, row in enumerate(result[:-1]):
-        row["superseded"] = row["activation_step"] == result[index + 1]["activation_step"]
+        # BEGIN only identical actuator goals may share an application tick.
+        next_row = result[index + 1]
+        same_tick = row["activation_step"] == next_row["activation_step"]
+        if same_tick and (row["finger_positions"] != next_row["finger_positions"]
+                          or row.get("requires_evidence") is not None):
+            raise ValueError("Device quantization erases a required command sequence")
+        row["superseded"] = same_tick
+        # END source order is never replaced by silent last-command-wins.
     return tuple(result)
 
 
@@ -249,14 +283,16 @@ class FingerTrajectory:
         if (np.any(q < bounds["position"][0]) or np.any(q > bounds["position"][1])
                 or np.any(dq < bounds["velocity"][0]) or np.any(dq > bounds["velocity"][1])):
             raise ValueError("Actual initial finger q/dq violate the declared native reference bounds")
+        # BEGIN conditional authorization never truncates the nominal polynomial.
         events = _commands(commands, names, duration, executable_until, timestep, bounds["position"])
-        active = [row for row in events if row["in_executable_prefix"] and not row["superseded"]]
+        active = [row for row in events if not row["superseded"]]
         windows = []
         if not active or active[0]["applied_time_s"] > 0.:
-            windows.append((None, 0., active[0]["applied_time_s"] if active else executable_until, q.copy()))
+            windows.append((None, 0., active[0]["applied_time_s"] if active else duration, q.copy()))
         for index, event in enumerate(active):
-            end = active[index + 1]["applied_time_s"] if index + 1 < len(active) else executable_until
+            end = active[index + 1]["applied_time_s"] if index + 1 < len(active) else duration
             windows.append((event, event["applied_time_s"], end, np.asarray(event["finger_positions"], float)))
+        # END the executor consumes only authorized parts of this same curve.
         knots, positions, velocities, segments = [0.], [q.copy()], [dq.copy()], []
 
         def append(time_s, value, rate):
@@ -270,7 +306,7 @@ class FingerTrajectory:
         for event, begin, end, goal in windows:
             if end == begin:
                 if np.any(dq != 0.):
-                    raise ValueError("A zero-length executable prefix cannot discard the actual initial finger velocity")
+                    raise ValueError("A zero-length command window cannot discard actual initial finger velocity")
                 continue
             finish = _segment(q, dq, goal, begin, end, timestep, names, bounds)
             segments.append({"kind": "initial_hold" if event is None else "command",
@@ -281,8 +317,6 @@ class FingerTrajectory:
             append(finish, goal, np.zeros(count))
             append(end, goal, np.zeros(count))
             q, dq = goal.copy(), np.zeros(count)
-        if executable_until == 0. and np.any(dq != 0.):
-            raise ValueError("A zero-length prefix cannot zero measured initial finger velocity")
         append(duration, q, dq)
         return cls(names, np.asarray(knots), np.asarray(positions), np.asarray(velocities),
                    float(duration), float(executable_until), float(timestep), bounds["position"],
@@ -294,11 +328,11 @@ class FingerTrajectory:
 
         Reconstruct only the explicitly saved knots from event targets and
         ramp endpoints. A changed archive cannot hide motion before an event,
-        replace the initial slope, or continue closure beyond the barrier.
+        replace the initial slope, or omit conditional commands in the suffix.
         """
         expected_times, expected_q, expected_dq = [0.], [self.position[0]], [self.velocity[0]]
         active = {(row["skill_id"], row["event_id"]): row for row in self.events
-                  if row["in_executable_prefix"] and not row["superseded"]}
+                  if not row["superseded"]}
         used = set()
         end = 0.
         for segment in self.segments:
@@ -306,8 +340,8 @@ class FingerTrajectory:
                     "kind", "skill_id", "event_id", "start_time_s", "ramp_end_time_s", "end_time_s", "target_positions"}:
                 raise ValueError("Every saved finger segment needs its exact source command and clock boundaries")
             begin, finish, stop = (float(segment[key]) for key in ("start_time_s", "ramp_end_time_s", "end_time_s"))
-            if not np.isfinite([begin, finish, stop]).all() or begin != end or not begin <= finish <= stop <= self.executable_until or stop <= begin:
-                raise ValueError("Saved finger segments must partition the original executable prefix")
+            if not np.isfinite([begin, finish, stop]).all() or begin != end or not begin <= finish <= stop <= self.duration or stop <= begin:
+                raise ValueError("Saved finger segments must partition the full original duration")
             goal = _array(segment["target_positions"], (len(self.joint_names),), "Saved finger segment goal")
             identity = (segment["skill_id"], segment["event_id"])
             if segment["kind"] == "initial_hold":
@@ -328,12 +362,8 @@ class FingerTrajectory:
                 elif not np.array_equal(expected_q[-1], goal) or np.any(expected_dq[-1] != 0.):
                     raise ValueError("A zero-time finger ramp cannot jump q or discard measured dq")
             end = stop
-        if used != set(active) or end != self.executable_until:
-            raise ValueError("Saved finger segments must preserve every active original command before the barrier")
-        if self.duration > end:
-            expected_times.append(self.duration)
-            expected_q.append(expected_q[-1].copy())
-            expected_dq.append(np.zeros(len(self.joint_names)))
+        if used != set(active) or end != self.duration:
+            raise ValueError("Saved finger segments must preserve every original command over the complete duration")
         if (not np.array_equal(self.times, expected_times) or not np.array_equal(self.position, expected_q)
                 or not np.array_equal(self.velocity, expected_dq)):
             raise ValueError("Saved finger arrays differ from their exact original event/reference contract")

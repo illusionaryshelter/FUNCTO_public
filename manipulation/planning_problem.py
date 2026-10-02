@@ -1,7 +1,7 @@
-"""Robot-independent requirements for a bounded, jointly planned skill window.
+"""Robot-independent requirements for one complete current skill.
 
 All poses use column vectors, metres, and wxyz quaternions. Progress indexes
-skills/phases, not time: phase i owns [i, i+1], including both boundary states.
+reference intervals, not time: phase i owns [i, i+1], including both boundary states.
 The numerical allowance below is reported separately from a skill's permitted
 motion. Nothing in this module declares an observed grasp or executes a robot.
 Torch is imported only when differentiable evaluation is requested.
@@ -10,7 +10,7 @@ Torch is imported only when differentiable evaluation is requested.
 # BEGIN shared skill-process constraints for generation and verification.
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from copy import deepcopy
 
 import numpy as np
@@ -187,46 +187,47 @@ class NumericalTolerance:
             raise ValueError("Numerical tolerances must be finite and positive")
 
 
+# BEGIN ordinary phases carry reference data without imposing robot constraints.
 @dataclass
 class MotionPhase:
-    """One fixed interaction mode, with explicit allowed pose-error intervals.
-
-    Bounds are target-local XYZ and rotation-vector components, shape (6,2).
-    Equal bounds are equalities; finite-width bounds are inequalities; an
-    unbounded component is free. ``free`` constrains only the endpoint unless
-    ``require_end=False`` supplies an independent functional endpoint instead.
-    """
+    """One reference/interaction interval; neither its nodes nor end are goals."""
     name: str
     reference: PosePath
-    kind: str = "pose"
-    pose_bounds: np.ndarray = field(default_factory=lambda: np.zeros((6, 2)))
-    require_end: bool = True
     metadata: dict = field(default_factory=dict)
-    endpoint_family: dict | None = None
-    frame_anchor: dict | None = None
 
     def __post_init__(self):
-        # BEGIN reject empty pose domains before they enter tensor residuals.
-        # Every realised pose error is finite. An infinite lower bound or a
-        # negative-infinite upper bound admits no finite value, including
-        # [+inf, +inf] and [-inf, -inf]; neither is an equality or a free axis.
-        # Valid one-sided bounds and [-inf, +inf] retain their declared scope.
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("A reference phase needs a nonempty name")
+
+
+@dataclass
+class PoseProcessRequirement:
+    """An explicitly required pose relation on an independent progress scope.
+
+    Bounds use target-local XYZ/rotation-vector components. ``source`` must
+    identify the task/model evidence requiring this relation, rather than the
+    mere existence of a demonstration path. Ordinary reference phases never
+    create this requirement. Its path is a relation target, not a joint path.
+    """
+    start: float
+    end: float
+    reference: PosePath
+    pose_bounds: np.ndarray
+    source: object
+
+    def __post_init__(self):
         self.pose_bounds = np.asarray(self.pose_bounds, float).copy()
-        if (not self.name or self.kind not in {"free", "pose"}
+        if (not self.source or not 0 <= self.start < self.end < np.inf
                 or self.pose_bounds.shape != (6, 2) or np.isnan(self.pose_bounds).any()
                 or np.any(self.pose_bounds[:, 0] > self.pose_bounds[:, 1])
                 or np.isposinf(self.pose_bounds[:, 0]).any()
                 or np.isneginf(self.pose_bounds[:, 1]).any()):
-            raise ValueError("A phase needs a name, valid kind and ordered six-axis bounds admitting finite errors")
-        # END reject empty pose domains before they enter tensor residuals.
-        if self.endpoint_family is not None and (self.kind != "pose" or self.reference.motion_model is not None):
-            raise ValueError("Free endpoint transfer applies to a necessary free-motion family, not a mechanism")
-        self._body_reference = replace(self.reference, attachment=np.eye(4))
-        if self.frame_anchor is not None:
-            self.frame_anchor = deepcopy(self.frame_anchor)
-            self.frame_anchor["reference_pose"] = _pose_array(self.frame_anchor["reference_pose"], "anchor reference pose")
-            if not np.isfinite(self.frame_anchor["progress"]) or self.frame_anchor["progress"] < 0:
-                raise ValueError("A predicted frame needs a finite source anchor")
+            raise ValueError("A required pose relation needs evidenced scope and valid six-axis bounds")
+
+    def error(self, position, quaternion, progress):
+        local = ((progress-self.start)/(self.end-self.start)).clamp(0, 1)
+        return _pose_error(position, quaternion, *self.reference.sample(local))
+# END ordinary phases carry reference data without imposing robot constraints.
 
 
 @dataclass(frozen=True)
@@ -297,18 +298,17 @@ def _compose(p, q, transform):
 
 
 # BEGIN preserve the current mechanism's original full-body compatibility metric.
-def _mechanism_errors(reference, position, quaternion):
+def _mechanism_errors(model, tool_from_carrier, position, quaternion):
     """Differentiable counterpart of MotionModel.coordinates_of's pose check.
 
     Project the actual path body onto the same physical model, then measure
     position norm and SO(3) angle. The tool offset is removed before projecting:
     a small tool error does not establish compatibility of an attached body.
-    This pointwise membership check does not recover or replace the separately
-    retained signed, unwrapped reference coordinates and progress constraints.
+    This pointwise membership check does not recover winding. The independent
+    mechanism requirement lifts the ordered actual candidate coordinates.
     """
     import torch
-    model = reference.motion_model
-    p, q = _compose(position, quaternion, _inverse(reference.attachment))
+    p, q = _compose(position, quaternion, tool_from_carrier)
     base_p = _tensor(model.reference_pose[:3, 3], p)
     base_q = _tensor(_quaternion(model.reference_pose), q)
     axis = _tensor(model.axis, p)
@@ -340,6 +340,111 @@ def _mechanism_errors(reference, position, quaternion):
     return (torch.linalg.vector_norm(error[..., :3], dim=-1),
             torch.linalg.vector_norm(error[..., 3:], dim=-1))
 # END preserve the current mechanism's original full-body compatibility metric.
+
+
+# BEGIN independently scoped current mechanism and lifted coordinate checks.
+@dataclass
+class MechanismRequirement:
+    """Current physical manifold/limits, independent of the seed reference.
+
+    Angular coordinates are lifted from the ordered candidate trajectory, with
+    the actual initial coordinate fixing its branch. A single state can check
+    manifold membership and principal-angle feasibility only; it cannot certify
+    winding. Final verification must include the complete scoped trajectory.
+    """
+    start: float
+    end: float
+    model: MotionModel
+    tool_from_carrier: np.ndarray
+    coordinate_limits: np.ndarray | None
+    initial_coordinates: np.ndarray
+    source: object
+
+    def __post_init__(self):
+        self.tool_from_carrier = _pose_array(self.tool_from_carrier, "T_tool_carrier")
+        self.initial_coordinates = np.asarray(self.initial_coordinates, float).copy()
+        if (not self.source or not 0 <= self.start <= self.end < np.inf
+                or self.model.kind == "free" or self.initial_coordinates.shape != (self.model.dimension,)
+                or not np.isfinite(self.initial_coordinates).all()):
+            raise ValueError("A mechanism requires current model evidence, scope and initial coordinates")
+        if self.coordinate_limits is not None:
+            self.coordinate_limits = np.asarray(self.coordinate_limits, float).copy()
+            if (self.coordinate_limits.shape != (self.model.dimension, 2)
+                    or not np.isfinite(self.coordinate_limits).all()
+                    or np.any(self.coordinate_limits[:, 0] > self.coordinate_limits[:, 1])):
+                raise ValueError("Current mechanism coordinate limits must be finite ordered bounds")
+
+    @property
+    def angular_column(self):
+        return 0 if self.model.kind == "revolute" else 2 if self.model.kind == "planar" else None
+
+    def coordinates(self, position, quaternion, progress):
+        """Recover actual candidate coordinates; no reference values enter the lift."""
+        import torch
+        p, q = _compose(position, quaternion, self.tool_from_carrier)
+        model = self.model
+        base_p = _tensor(model.reference_pose[:3, 3], p)
+        axis = _tensor(model.axis, p)
+        if model.kind == "prismatic":
+            return ((p-base_p)*axis).sum(-1, keepdim=True)
+        planar = (p-base_p) @ _tensor(model.basis[:, :2], p)
+        if model.kind == "translation_plane":
+            return planar
+        relative = quaternion_multiply(q, quaternion_conjugate(_tensor(_quaternion(model.reference_pose), q)))
+        along, w = (relative[..., 1:]*axis).sum(-1), relative[..., 0]
+        singular = w.square()+along.square() <= torch.finfo(q.dtype).eps**2
+        angle = torch.atan2(torch.where(singular, 0., 2*w*along),
+                            torch.where(singular, 1., w.square()-along.square()))
+        # Rollout and exact-event queries can be concatenated out of order.
+        # Sort by progress before lifting, then restore their original positions.
+        order = torch.argsort(progress, dim=-1, stable=True)
+        sorted_angle = torch.gather(angle, -1, order)
+        sorted_progress = torch.gather(progress, -1, order)
+        within = (sorted_progress >= self.start-1e-7) & (sorted_progress <= self.end+1e-7)
+        first = within.to(torch.int64).argmax(-1, keepdim=True)
+        initial_angle = torch.gather(sorted_angle, -1, first)
+        initial = float(self.initial_coordinates[self.angular_column])
+        branch = initial_angle + 2*np.pi*torch.round((initial-initial_angle)/(2*np.pi))
+        delta = sorted_angle[..., 1:]-sorted_angle[..., :-1]
+        increments = torch.atan2(torch.sin(delta), torch.cos(delta))
+        cumulative = torch.cat((torch.zeros_like(sorted_angle[..., :1]), torch.cumsum(increments, -1)), -1)
+        lifted = branch+cumulative-torch.gather(cumulative, -1, first)
+        complete_start = ((sorted_progress-self.start).abs() <= 1e-7).any(-1, keepdim=True)
+        # Without actual-start history this is only a local screening query.
+        lifted = torch.where(complete_start, lifted, angle.gather(-1, order))
+        angle = torch.gather(lifted, -1, torch.argsort(order, dim=-1))
+        return angle[..., None] if model.kind == "revolute" else torch.cat((planar, angle[..., None]), -1)
+
+    def errors(self, position, quaternion):
+        return _mechanism_errors(self.model, self.tool_from_carrier, position, quaternion)
+
+    def project_residual(self, position, quaternion, progress):
+        """Independent manifold equations; the allowed native coordinate stays free."""
+        import torch
+        p, q = _compose(position, quaternion, self.tool_from_carrier)
+        model = self.model
+        base_p, base_q = _tensor(model.reference_pose[:3, 3], p), _tensor(_quaternion(model.reference_pose), q)
+        basis = _tensor(model.basis, p)
+        relative = quaternion_multiply(q, quaternion_conjugate(base_q))
+        rotation = quaternion_rotvec(relative)
+        if model.kind in {"prismatic", "translation_plane"}:
+            translation = (p-base_p) @ (basis[:, :2] if model.kind == "prismatic" else basis[:, 2:])
+            return torch.cat((translation, rotation), -1)
+        angle = self.coordinates(position, quaternion, progress)[..., self.angular_column]
+        turn = torch.cat((torch.cos(angle[..., None]/2),
+                          torch.sin(angle[..., None]/2)*basis[:, 2]), -1)
+        if model.kind == "revolute":
+            center = _tensor(model.axis_point, p)
+            translation = p-center-quaternion_rotate(turn, (base_p-center).expand_as(p))
+        else:
+            translation = (p-base_p) @ basis[:, 2:]
+        projected = quaternion_multiply(turn, base_q)
+        off_axis = quaternion_rotvec(quaternion_multiply(q, quaternion_conjugate(projected))) @ basis[:, :2]
+        return torch.cat((translation, off_axis), -1)
+
+    def history_complete(self, progress):
+        return ((progress-self.start).abs() <= 1e-7).any(-1)
+# END independently scoped current mechanism and lifted coordinate checks.
 
 
 @dataclass
@@ -425,46 +530,39 @@ class PoseEventRequirement:
         return torch.relu(p-self.position_tolerance_m)+torch.relu(r-self.rotation_tolerance_rad)
 
 
+# BEGIN native goals compare lifted candidate coordinates, including winding.
 @dataclass
 class CoordinateEventRequirement:
-    """A native mechanism event, with distance or unwrapped-angle provenance.
-
-    FK supplies a local error around the expected lifted reference. The full
-    coordinate path is separately preserved by PosePath, so an equal final
-    rotation never substitutes for executing the demonstrated winding.
-    """
+    """A signed metric/unwrapped native event in one current mechanism."""
     progress: float
-    tool_from_carrier: np.ndarray
-    target: np.ndarray
-    axis: np.ndarray
-    kind: str
+    mechanism: MechanismRequirement
     target_coordinate: float
     tolerance: float
     source: object
 
     def __post_init__(self):
-        from .regions import _unit
-        self.tool_from_carrier = _pose_array(self.tool_from_carrier, "T_tool_carrier")
-        self.target = _pose_array(self.target, "mechanism event target")
-        self.axis = _unit(self.axis, "mechanism axis")
-        if (self.kind not in {"prismatic", "revolute"} or not self.source
+        if (self.mechanism.model.kind not in {"prismatic", "revolute"} or not self.source
+                or not self.mechanism.start <= self.progress <= self.mechanism.end
                 or not np.isfinite(self.target_coordinate) or not 0 < self.tolerance < np.inf):
-            raise ValueError("A native coordinate event needs its original units, target and threshold")
+            raise ValueError("A native event needs a current mechanism, evidenced target and threshold")
 
-    def error(self, position, quaternion):
-        p, q = _compose(position, quaternion, self.tool_from_carrier)
-        axis = _tensor(self.axis, p)
-        if self.kind == "prismatic":
-            return ((p-_tensor(self.target[:3, 3], p))*axis).sum(-1).abs()
-        # Left-relative rotation vectors are expressed in the world frame, as
-        # is the declared joint axis. The local branch is around the expected
-        # coordinate, rather than an angle recovered modulo 2pi from scratch.
-        turn = quaternion_multiply(q, quaternion_conjugate(_tensor(_quaternion(self.target), q)))
-        return (quaternion_rotvec(turn)*axis).sum(-1).abs()
+    @property
+    def kind(self):
+        return self.mechanism.model.kind
 
-    def evaluate(self, position, quaternion):
+    def error(self, position, quaternion, progress):
         import torch
-        return torch.relu(self.error(position, quaternion)-self.tolerance)
+        coordinate = self.mechanism.coordinates(position, quaternion, progress)[..., 0]
+        difference = coordinate-self.target_coordinate
+        if self.kind == "revolute":
+            local = torch.atan2(torch.sin(difference), torch.cos(difference))
+            difference = torch.where(self.mechanism.history_complete(progress)[..., None], difference, local)
+        return difference.abs()
+
+    def evaluate(self, position, quaternion, progress):
+        import torch
+        return torch.relu(self.error(position, quaternion, progress)-self.tolerance)
+# END native goals compare lifted candidate coordinates, including winding.
 
 
 @dataclass
@@ -495,14 +593,15 @@ class InteriorRequirement:
         return torch.relu(error-numerical.position_m)
 
 
+# BEGIN one current skill with separate goals, process relations and references.
 @dataclass
 class PlanningProblem:
-    """One shared joint trajectory for the current skill and at most one next.
+    """One current skill; source timing and real requirements have separate owners.
 
-    ``base_pose`` and ``tool_transform`` are mandatory calibration inputs; the
-    named robot link is never silently equated with a demonstrated TCP frame.
-    A skill may contain several phases. Low-level phase inputs need not name
-    skills, but all explicitly declared phase/event skill IDs share this limit.
+    Pose paths initialize the search and support deviation reports. Only the
+    explicit goal/process collections below constrain generated robot motion.
+    ``source_timestamps`` and ``source_progress`` retain the bound source map;
+    the planner may choose execution timing once and freeze that binding.
     """
     joint_names: tuple[str, ...]
     start_q: np.ndarray
@@ -520,78 +619,110 @@ class PlanningProblem:
     interiors: tuple[InteriorRequirement, ...] = ()
     pose_events: tuple[PoseEventRequirement, ...] = ()
     coordinate_events: tuple[CoordinateEventRequirement, ...] = ()
+    pose_relations: tuple[PoseProcessRequirement, ...] = ()
+    mechanisms: tuple[MechanismRequirement, ...] = ()
+    source_timestamps: np.ndarray | None = None
+    source_progress: np.ndarray | None = None
+    start_progress: float = 0.
 
     def __post_init__(self):
         self.joint_names = tuple(self.joint_names)
-        self.phases, self.events, self.couplings = tuple(self.phases), tuple(self.events), tuple(self.couplings)
+        for name in ("phases", "events", "couplings", "conditions", "supports", "interiors",
+                     "pose_events", "coordinate_events", "pose_relations", "mechanisms"):
+            setattr(self, name, tuple(getattr(self, name)))
         self.start_q, self.start_dq = np.asarray(self.start_q, float).copy(), np.asarray(self.start_dq, float).copy()
         if (not self.joint_names or len(set(self.joint_names)) != len(self.joint_names)
                 or any(not isinstance(n, str) or not n for n in self.joint_names)
                 or self.start_q.shape != (len(self.joint_names),) or self.start_dq.shape != self.start_q.shape
                 or not np.isfinite(self.start_q).all() or not np.isfinite(self.start_dq).all()
                 or not self.phases or not self.tool_link or not self.reference_frame):
-            raise ValueError("A planning problem needs current named joint state, calibrated frames, and phases")
+            raise ValueError("A planning problem needs current named joint state, calibrated frames and references")
         self.base_pose = _pose_array(self.base_pose, "T_reference_robot_base")
         self.tool_transform = _pose_array(self.tool_transform, "T_link_tool")
-        # BEGIN bound declared skill identities without limiting motion phases.
-        # Direct phase-level callers may omit skill identities. When supplied,
-        # phase and event IDs describe one shared window, not separate budgets.
-        skill_ids = [phase.metadata["skill_id"] for phase in self.phases
-                     if "skill_id" in phase.metadata]
+        if not np.isfinite(self.start_progress) or not 0 <= self.start_progress < self.phase_count:
+            raise ValueError("Actual entry progress must lie in the remaining original skill interval")
+        skill_ids = [phase.metadata["skill_id"] for phase in self.phases if "skill_id" in phase.metadata]
         skill_ids.extend(event.skill_id for event in self.events)
-        if any(not isinstance(skill_id, str) or not skill_id for skill_id in skill_ids):
-            raise ValueError("Declared planning skill IDs must be nonempty strings")
-        if len(set(skill_ids)) > 2:
-            raise ValueError("A planning window supports the current skill and at most one next skill")
-        # END bound declared skill identities without limiting motion phases.
-        for index, phase in enumerate(self.phases):
-            if phase.frame_anchor is not None and phase.frame_anchor["progress"] > index:
-                raise ValueError("A predicted owner frame must come from this phase's entrance or an earlier boundary")
+        if any(not isinstance(value, str) or not value for value in skill_ids) or len(set(skill_ids)) > 1:
+            raise ValueError("A planning problem contains exactly one current skill identity")
         identities = set()
         for event in self.events:
             identity = (event.skill_id, event.event_id)
             if (identity in identities or not event.event_id or not event.skill_id or not event.source
                     or not np.isfinite(event.progress) or not 0 <= event.progress <= self.phase_count
                     or type(event.source_frame) is not int or event.source_frame < 0):
-                raise ValueError("Events need unique skill/event IDs and exact original frame/progress")
+                raise ValueError("Events need unique IDs, source evidence and exact original frame/progress")
             identities.add(identity)
-            if event.requires_evidence and not event.stop:
-                raise ValueError("An evidence barrier needs a planned stop; moving verification is not supplied")
+        for requirement in (*self.pose_relations, *self.mechanisms, *self.interiors):
+            if requirement.end > self.phase_count:
+                raise ValueError("A process requirement extends beyond the current skill")
+        for requirement in (*self.pose_events, *self.coordinate_events, *self.supports):
+            if not 0 <= requirement.progress <= self.phase_count:
+                raise ValueError("A functional event lies outside the current skill")
+        # A resumed angular event must use the same newly observed coordinate
+        # origin as its manifold/limit checks. Keeping a stale event mechanism
+        # would silently reduce its turn goal to a modulo-angle query.
+        if any(not any(event.mechanism is mechanism for mechanism in self.mechanisms)
+               for event in self.coordinate_events):
+            raise ValueError("Native coordinate goals must reference the independently bound mechanism instance")
+        if (self.source_timestamps is None) != (self.source_progress is None):
+            raise ValueError("Source timing requires both timestamps and corresponding progress")
+        if self.source_timestamps is not None:
+            self.source_timestamps = np.asarray(self.source_timestamps, float).copy()
+            self.source_progress = np.asarray(self.source_progress, float).copy()
+            if (self.source_timestamps.ndim != 1 or len(self.source_timestamps) < 2
+                    or self.source_progress.shape != self.source_timestamps.shape
+                    or not np.isfinite(self.source_timestamps).all() or not np.isfinite(self.source_progress).all()
+                    or np.any(np.diff(self.source_timestamps) <= 0) or np.any(np.diff(self.source_progress) <= 0)
+                    or self.source_progress[0] != self.start_progress or self.source_progress[-1] != self.phase_count):
+                raise ValueError("The original timestamp/progress map must increase across the complete current skill")
 
     @property
     def phase_count(self):
         return len(self.phases)
 
     @property
+    def source_time_map(self):
+        """Return source seconds and progress; no phase-count clock is invented."""
+        if self.source_timestamps is None:
+            raise ValueError("The planning problem has no bound source timestamp map")
+        return {"source_times": self.source_timestamps.copy(), "progress": self.source_progress.copy()}
+
+    def source_time_to_progress(self, source_time):
+        mapping = self.source_time_map
+        return np.interp(source_time, mapping["source_times"], mapping["progress"])
+
+    def progress_to_source_time(self, progress):
+        mapping = self.source_time_map
+        return np.interp(progress, mapping["progress"], mapping["source_times"])
+
+    @property
+    def terminal_pose_target(self):
+        """A true complete terminal pose goal for native H=1 goal consumers."""
+        return next((goal for goal in self.pose_events if goal.progress == self.phase_count), None)
+
+    @property
     def anchors(self):
-        # BEGIN preserve every required reference breakpoint in generation.
-        # A short source excursion can lie wholly between uniform rollout
-        # samples.  Candidate-joint speed cannot reveal a motion it omitted,
-        # so the source breakpoints themselves are mandatory FK query sites.
-        # Free approach samples remain initializers, not process constraints.
-        return np.unique([*range(self.phase_count+1), *(e.progress for e in self.events),
-                          *(index + float(s) for index, phase in enumerate(self.phases)
-                            if phase.kind == "pose" for s in phase.reference.progress),
+        """Exact evaluation sites, never fixed IK states or mandatory robot poses."""
+        anchors = np.unique([self.start_progress, float(self.phase_count), *(e.progress for e in self.events),
                           *(r.progress for r in self.supports),
                           *(s for r in self.interiors for s in (r.start, r.end)),
                           *(r.progress for r in self.pose_events),
                           *(r.progress for r in self.coordinate_events),
-                          *(p.frame_anchor["progress"] for p in self.phases if p.frame_anchor is not None)])
-        # END preserve every required reference breakpoint in generation.
+                          *(s for r in self.mechanisms for s in (r.start, r.end)),
+                          *(r.start+float(s)*(r.end-r.start)
+                            for r in self.pose_relations for s in r.reference.progress)])
+        return anchors[anchors >= self.start_progress]
 
     @property
     def stop_progress(self):
-        return np.array([e.progress for e in self.events if e.stop], float)
+        return np.array([event.progress for event in self.events if event.stop and event.progress >= self.start_progress], float)
 
     def sample_reference(self, progress):
         import torch
         position, quaternion = self.phases[0].reference.sample(progress.clamp(0, 1))
-        if hasattr(self, "_fixed_anchors"):
-            position, quaternion = self._phase_reference(0, position, quaternion, progress)
         for index, phase in enumerate(self.phases[1:], 1):
             p, q = phase.reference.sample((progress-index).clamp(0, 1))
-            if hasattr(self, "_fixed_anchors"):
-                p, q = self._phase_reference(index, position, quaternion, progress)
             selected = (progress >= index)[..., None]
             position, quaternion = torch.where(selected, p, position), torch.where(selected, q, quaternion)
         return position, quaternion
@@ -616,156 +747,70 @@ class PlanningProblem:
         centers = quaternion_rotate(_tensor(_quaternion(self.base_pose), spheres), spheres[..., :3])
         return torch.cat((centers + _tensor(self.base_pose[:3, 3], spheres), spheres[..., 3:]), -1)
 
-    def _anchor(self, position, quaternion, progress, anchor):
-        if hasattr(self, "_fixed_anchors"):
-            p, q = self._fixed_anchors[float(anchor)]
-            return (_tensor(p, position).expand(*progress.shape[:-1], 1, 3),
-                    _tensor(q, quaternion).expand(*progress.shape[:-1], 1, 4))
-        return anchor_pose(position, quaternion, progress, anchor)
-
-    def with_fixed_endpoints(self, position, quaternion, progress):
-        """Freeze one complete search proposal; the original problem is unchanged.
-
-        All exact anchors are required. This is only for OMPL's per-state
-        projection and validity checks. Whole-window optimization must consume
-        the original problem again, so successful early boundaries stay free.
-        """
-        import torch
-        p = torch.as_tensor(position, dtype=torch.float64).detach().cpu()
-        q = torch.as_tensor(quaternion, dtype=torch.float64).detach().cpu()
-        input_s = torch.as_tensor(progress).detach().cpu()
-        if not input_s.dtype.is_floating_point:
-            input_s = input_s.to(torch.float64)
-        s = input_s.to(torch.float64)
-        if s.ndim != 2 or s.shape[0] != 1 or p.shape != (*s.shape, 3) or q.shape != (*s.shape, 4):
-            raise ValueError("A fixed whole-window proposal needs [1,A,3/4] poses and [1,A] progress")
-        frozen = deepcopy(self)
-        frozen._fixed_anchors = {}
-        for value in self.anchors:
-            # Compare in the input precision first. A native float32 event at
-            # e.g. s=17+1/3 is the same declared anchor after rounding, not a
-            # nearby trajectory sample selected by nearest-neighbour search.
-            represented = float(input_s.new_tensor(value))
-            if not (input_s == input_s.new_tensor(value)).any():
-                raise ValueError("Search proposals must include every exact problem anchor")
-            ap, aq = anchor_pose(p, q, s, represented)
-            if not torch.isfinite(ap).all() or not torch.isfinite(aq).all():
-                raise ValueError("Search proposals must include every exact problem anchor")
-            frozen._fixed_anchors[float(value)] = (ap.numpy()[0, 0].copy(), aq.numpy()[0, 0].copy())
-        return frozen
-
-    def _phase_reference(self, index, position, quaternion, progress):
-        """Differentiate the existing endpoint-transfer family, not a free path.
-
-        Material-frame B(s) is transferred as B(s) inv(B(0)) X(0), then
-        receives the same linear translation and left-Slerp endpoint correction
-        as motion.transfer_motion. Only explicitly functional endpoints move.
-        """
-        import torch
-        phase = self.phases[index]
-        local = (progress-index).clamp(0, 1)
-
-        def warped(p, q):
-            if phase.frame_anchor is None:
-                return p, q
-            ap, aq = self._anchor(position, quaternion, progress, phase.frame_anchor["progress"])
-            reference = phase.frame_anchor["reference_pose"]
-            rq, rp = _tensor(_quaternion(reference), q), _tensor(reference[:3, 3], p)
-            delta_q = quaternion_multiply(aq, quaternion_conjugate(rq))
-            return ap+quaternion_rotate(delta_q, p-rp), quaternion_multiply(delta_q, q)
-
-        if phase.endpoint_family is None:
-            p, q = phase.reference.sample(local)
-            return warped(p, q)
-        body_path = phase._body_reference
-        p, q = warped(*body_path.sample(local))
-        zero, one = torch.zeros_like(progress[..., :1]), torch.ones_like(progress[..., :1])
-        p0, q0 = warped(*body_path.sample(zero))
-        p1, q1 = warped(*body_path.sample(one))
-        if phase.endpoint_family.get("move_start", False):
-            start_p, start_q = self._anchor(position, quaternion, progress, index)
-            start_p, start_q = _compose(start_p, start_q, _inverse(phase.reference.attachment))
-        else:
-            start_p, start_q = p0, q0
-        cq = quaternion_multiply(quaternion_conjugate(q0), start_q)
-        cp = quaternion_rotate(quaternion_conjugate(q0), start_p-p0)
-        mapped_p = p+quaternion_rotate(q, cp.expand_as(p))
-        mapped_q = quaternion_multiply(q, cq)
-        mapped_end_p = p1+quaternion_rotate(q1, cp)
-        mapped_end_q = quaternion_multiply(q1, cq)
-        mode = phase.endpoint_family["end"]
-        if mode != "unanchored":
-            if mode == "variable":
-                end_p, end_q = self._anchor(position, quaternion, progress, index+1)
-                end_p, end_q = _compose(end_p, end_q, _inverse(phase.reference.attachment))
-            else:
-                end_p, end_q = p1, q1
-            mapped_p = mapped_p+local[..., None]*(end_p-mapped_end_p)
-            correction = quaternion_multiply(end_q, quaternion_conjugate(mapped_end_q)).expand_as(q)
-            identity = torch.zeros_like(correction)
-            identity[..., 0] = 1
-            mapped_q = quaternion_multiply(_slerp(identity, correction, local), mapped_q)
-        return _compose(mapped_p, mapped_q, phase.reference.attachment)
-
     def residuals(self, position, quaternion, progress, joint_position=None,
                   joint_names=None, joint_velocity=None):
-        """Nonnegative per-term violations; no term can cancel another one."""
+        """Nonnegative violations of real requirements only, without cancellation."""
         import torch
         if position.shape != (*progress.shape, 3) or quaternion.shape != (*progress.shape, 4):
-            raise ValueError("Pose arrays must align with the full progress horizon")
-        result = {"progress_bounds": torch.relu(-progress) + torch.relu(progress-self.phase_count)}
-        tolerance = _tensor([self.numerical.position_m]*3 + [self.numerical.rotation_rad]*3, position)
-        for index, phase in enumerate(self.phases):
-            local = (progress-index).clamp(0, 1)
-            p, q = self._phase_reference(index, position, quaternion, progress)
-            error = _pose_error(position, quaternion, p, q)
-            bounds = _tensor(phase.pose_bounds, position)
-            violation = (torch.relu(bounds[:, 0]-error-tolerance) + torch.relu(error-bounds[:, 1]-tolerance)).sum(-1)
-            mask = ((progress >= index-1e-7) & (progress <= index+1+1e-7)
-                    if phase.kind == "pose" else (progress-index-1).abs() <= 1e-7)
-            if phase.kind == "free" and not phase.require_end:
-                mask = torch.zeros_like(mask)
-            result[f"phase:{index}:{phase.name}"] = torch.where(mask, violation, torch.zeros_like(violation))
-            # BEGIN retain mechanism compatibility independently of path numerics.
-            model = phase.reference.motion_model
-            if model is not None:
-                body_position, body_rotation = _mechanism_errors(phase.reference, position, quaternion)
-                # Preserve coordinates_of's existing floating-point guard;
-                # the planning solver's wider pose allowances do not enter.
-                violation = (torch.relu(body_position-model.position_tolerance-1e-10)
-                             + torch.relu(body_rotation-model.rotation_tolerance-1e-10))
-                result[f"mechanism:{index}:{phase.name}"] = torch.where(mask, violation, torch.zeros_like(violation))
-            # END retain mechanism compatibility independently of path numerics.
-        for index, requirement in enumerate(self.supports):
-            violation = requirement.evaluate(position, quaternion, self.numerical)
-            result[f"support:{index}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
-                                                       violation, torch.zeros_like(violation))
-        for index, requirement in enumerate(self.interiors):
-            violation = requirement.evaluate(position, quaternion, self.numerical)
+            raise ValueError("Pose arrays must align with the complete progress horizon")
+        result = {"progress_bounds": torch.relu(self.start_progress-progress)+torch.relu(progress-self.phase_count)}
+        tolerance = _tensor([self.numerical.position_m]*3+[self.numerical.rotation_rad]*3, position)
+        for index, requirement in enumerate(self.pose_relations):
+            error = requirement.error(position, quaternion, progress)
+            bounds = _tensor(requirement.pose_bounds, position)
+            violation = (torch.relu(bounds[:, 0]-error-tolerance)+torch.relu(error-bounds[:, 1]-tolerance)).sum(-1)
             mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
-            result[f"interior:{index}"] = torch.where(mask, violation, torch.zeros_like(violation))
+            result[f"pose_relation:{index}"] = torch.where(mask, violation, 0.)
+        for index, requirement in enumerate(self.mechanisms):
+            model = requirement.model
+            p, r = requirement.errors(position, quaternion)
+            mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
+            violation = torch.relu(p-model.position_tolerance-1e-10)+torch.relu(r-model.rotation_tolerance-1e-10)
+            result[f"mechanism:{index}"] = torch.where(mask, violation, 0.)
+            if requirement.coordinate_limits is not None:
+                coordinates = requirement.coordinates(position, quaternion, progress)
+                bounds = _tensor(requirement.coordinate_limits, position)
+                excess = torch.relu(bounds[:, 0]-coordinates)+torch.relu(coordinates-bounds[:, 1])
+                angular = requirement.angular_column
+                if angular is not None:
+                    # A local state has no winding history. Check whether any
+                    # equivalent angular lift is permitted, leaving actual turn
+                    # counting to complete-trajectory evaluation below.
+                    angle = coordinates[..., angular]
+                    low, high = bounds[angular]
+                    branch = torch.ceil((low-angle)/(2*np.pi))
+                    allowed = angle+2*np.pi*branch <= high+1e-9
+                    local_excess = torch.where(allowed, 0., torch.minimum(
+                        torch.remainder(low-angle, 2*np.pi), torch.remainder(angle-high, 2*np.pi)))
+                    excess = excess.clone()
+                    excess[..., angular] = torch.where(requirement.history_complete(progress)[..., None],
+                                                       excess[..., angular], local_excess)
+                result[f"mechanism_limits:{index}"] = torch.where(mask, excess.sum(-1), 0.)
+        for index, requirement in enumerate(self.supports):
+            result[f"support:{index}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
+                requirement.evaluate(position, quaternion, self.numerical), 0.)
+        for index, requirement in enumerate(self.interiors):
+            mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
+            result[f"interior:{index}"] = torch.where(mask, requirement.evaluate(position, quaternion, self.numerical), 0.)
         for index, requirement in enumerate(self.pose_events):
-            violation = requirement.evaluate(position, quaternion)
             result[f"function_pose:{index}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
-                                                           violation, torch.zeros_like(violation))
+                requirement.evaluate(position, quaternion), 0.)
         for index, requirement in enumerate(self.coordinate_events):
-            violation = requirement.evaluate(position, quaternion)
             result[f"function_coordinate:{index}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
-                                                                 violation, torch.zeros_like(violation))
+                requirement.evaluate(position, quaternion, progress), 0.)
         if self.couplings:
             if joint_position is None or joint_names is None:
                 raise ValueError("Actuator coupling requires named robot joint positions")
             for index, coupling in enumerate(self.couplings):
                 columns = [tuple(joint_names).index(name) for name in coupling.joint_names]
-                error = joint_position[..., columns] @ _tensor(coupling.matrix.T, joint_position) - _tensor(coupling.target, joint_position)
+                error = joint_position[..., columns] @ _tensor(coupling.matrix.T, joint_position)-_tensor(coupling.target, joint_position)
                 result[f"coupling:{index}"] = torch.relu(error.abs()-self.numerical.joint).sum(-1)
         for event in self.events:
             if event.stop:
                 if joint_velocity is None:
-                    raise ValueError("Verification stops require actual joint velocity evaluation")
-                mask = (progress-event.progress).abs() <= 1e-7
-                result[f"stop:{event.skill_id}:{event.event_id}"] = torch.where(
-                    mask, torch.relu(joint_velocity.abs()-self.numerical.velocity).sum(-1), torch.zeros_like(progress))
+                    raise ValueError("An explicitly required stop needs actual joint velocity evaluation")
+                result[f"stop:{event.skill_id}:{event.event_id}"] = torch.where((progress-event.progress).abs() <= 1e-7,
+                    torch.relu(joint_velocity.abs()-self.numerical.velocity).sum(-1), 0.)
         return result
 
     def evaluate(self, position, quaternion, progress, joint_position=None,
@@ -773,124 +818,157 @@ class PlanningProblem:
         return sum(self.residuals(position, quaternion, progress, joint_position,
                                   joint_names, joint_velocity).values())
 
-    # BEGIN retain an optimizer gradient for source pose equalities.
     def optimizer_preferences(self, position, quaternion, progress):
-        """Squared source equalities, without inventing centers of allowed bands.
-
-        Equal finite bounds specify an actual pose component. Numerical
-        acceptance tolerances do not make that component a skill freedom:
-        targeting the equality also avoids stopping at the sampling grid's
-        tolerance edge. Finite-width and unbounded axes receive no preference.
-        References retain their actual functional endpoint and release-anchor
-        dependence, so a whole allowed endpoint family remains available.
-        Only the trajectory optimizer consumes this value; raw residuals and
-        final acceptance keep their original, separate tolerance contract.
-        """
+        """Retain real equality/goal gradients without attracting free reference axes."""
         import torch
-        if position.shape != (*progress.shape, 3) or quaternion.shape != (*progress.shape, 4):
-            raise ValueError("Pose arrays must align with the full progress horizon")
         result = torch.zeros_like(progress)
-        for index, phase in enumerate(self.phases):
-            equalities = (np.isfinite(phase.pose_bounds).all(axis=1)
-                          & (phase.pose_bounds[:, 0] == phase.pose_bounds[:, 1]))
-            if not equalities.any() or (phase.kind == "free" and not phase.require_end):
-                continue
-            p, q = self._phase_reference(index, position, quaternion, progress)
-            # Slice finite components before subtraction: free infinite bounds
-            # must never enter arithmetic or introduce NaNs into autograd.
-            columns = np.flatnonzero(equalities).tolist()
-            error = _pose_error(position, quaternion, p, q)[..., columns]
-            target = _tensor(phase.pose_bounds[equalities, 0], position)
-            preference = (error-target).square().sum(-1)
-            mask = ((progress >= index-1e-7) & (progress <= index+1+1e-7)
-                    if phase.kind == "pose" else (progress-index-1).abs() <= 1e-7)
-            result = result + torch.where(mask, preference, torch.zeros_like(preference))
+        for requirement in self.pose_relations:
+            exact = np.isfinite(requirement.pose_bounds).all(axis=1) & (requirement.pose_bounds[:, 0] == requirement.pose_bounds[:, 1])
+            if exact.any():
+                error = requirement.error(position, quaternion, progress)[..., exact]
+                preference = (error-_tensor(requirement.pose_bounds[exact, 0], position)).square().sum(-1)
+                mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
+                result = result+torch.where(mask, preference, 0.)
+        for requirement in self.pose_events:
+            p, r = requirement.errors(position, quaternion)
+            result = result+torch.where((progress-requirement.progress).abs() <= 1e-7, p.square()+r.square(), 0.)
+        for requirement in self.coordinate_events:
+            error = requirement.error(position, quaternion, progress)
+            result = result+torch.where((progress-requirement.progress).abs() <= 1e-7, error.square(), 0.)
         return result
-    # END retain an optimizer gradient for source pose equalities.
 
     def measurements(self, position, quaternion, progress):
-        """Report constraint-reference errors and original-reference deviations.
+        """Report source deviations separately from independent physical/goal errors."""
+        import torch
+        result = {}
+        for index, phase in enumerate(self.phases):
+            p, q = phase.reference.sample((progress-index).clamp(0, 1))
+            error = _pose_error(position, quaternion, p, q)
+            mask = (progress >= index-1e-7) & (progress <= index+1+1e-7)
+            prefix = f"phase:{index}:original_reference"
+            result[f"{prefix}_position_error_m"] = torch.where(mask, torch.linalg.vector_norm(error[..., :3], dim=-1), 0.)
+            result[f"{prefix}_rotation_error_rad"] = torch.where(mask, torch.linalg.vector_norm(error[..., 3:], dim=-1), 0.)
+            result[f"{prefix}_position_component_error_m"] = torch.where(mask, error[..., :3].abs().amax(-1), 0.)
+            result[f"{prefix}_rotation_component_error_rad"] = torch.where(mask, error[..., 3:].abs().amax(-1), 0.)
+        for index, requirement in enumerate(self.mechanisms):
+            p, r = requirement.errors(position, quaternion)
+            mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
+            result[f"mechanism:{index}:position_error_m"] = torch.where(mask, p, 0.)
+            result[f"mechanism:{index}:rotation_error_rad"] = torch.where(mask, r, 0.)
+        for index, requirement in enumerate(self.pose_events):
+            p, r = requirement.errors(position, quaternion)
+            mask = (progress-requirement.progress).abs() <= 1e-7
+            result[f"function:{index}:position_error_m"] = torch.where(mask, p, 0.)
+            result[f"function:{index}:rotation_error_rad"] = torch.where(mask, r, 0.)
+        for index, requirement in enumerate(self.coordinate_events):
+            unit = "m" if requirement.kind == "prismatic" else "rad"
+            result[f"coordinate:{index}:error_{unit}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
+                requirement.error(position, quaternion, progress), 0.)
+        return result
 
-        Existing ``*_error_*`` fields measure the reference used by the hard
-        constraints, including explicitly allowed endpoint/frame transfers.
-        ``original_reference_*`` instead compares to the grounded input path
-        at the same source progress, before any candidate-dependent transfer.
-        These deviations cover each entire phase, including free approaches;
-        they are measurements, not an invented task acceptance threshold.
+    def verification_issues(self, progress):
+        """Require actual goal/scope queries and the beginning of angular history.
+
+        Sampling resolution/continuous interval coverage remains the curve
+        verifier's responsibility. A point query alone proves no winding.
         """
         import torch
-        values = {}
-        for index, phase in enumerate(self.phases):
-            p, q = self._phase_reference(index, position, quaternion, progress)
-            error = _pose_error(position, quaternion, p, q)
-            mask = ((progress >= index-1e-7) & (progress <= index+1+1e-7)
-                    if phase.kind == "pose" else (progress-index-1).abs() <= 1e-7)
-            if phase.kind == "free" and not phase.require_end:
-                mask = torch.zeros_like(mask)
-            values[f"phase:{index}:position_error_m"] = torch.where(mask, torch.linalg.vector_norm(error[..., :3], dim=-1), 0.)
-            values[f"phase:{index}:rotation_error_rad"] = torch.where(mask, torch.linalg.vector_norm(error[..., 3:], dim=-1), 0.)
-            values[f"phase:{index}:position_component_error_m"] = torch.where(mask, error[..., :3].abs().amax(-1), 0.)
-            values[f"phase:{index}:rotation_component_error_rad"] = torch.where(mask, error[..., 3:].abs().amax(-1), 0.)
-            # BEGIN report the independently checked physical-model residuals.
-            if phase.reference.motion_model is not None:
-                body_position, body_rotation = _mechanism_errors(phase.reference, position, quaternion)
-                values[f"mechanism:{index}:position_error_m"] = torch.where(mask, body_position, 0.)
-                values[f"mechanism:{index}:rotation_error_rad"] = torch.where(mask, body_rotation, 0.)
-            # END report the independently checked physical-model residuals.
-            # BEGIN keep the original grounded reference independent of the candidate.
-            # Calling _phase_reference here would move the comparison target
-            # with the endpoint or release pose and conceal that displacement.
-            original_p, original_q = phase.reference.sample((progress-index).clamp(0, 1))
-            original_error = _pose_error(position, quaternion, original_p, original_q)
-            original_mask = (progress >= index-1e-7) & (progress <= index+1+1e-7)
-            prefix = f"phase:{index}:original_reference"
-            values[f"{prefix}_position_error_m"] = torch.where(
-                original_mask, torch.linalg.vector_norm(original_error[..., :3], dim=-1), 0.)
-            values[f"{prefix}_rotation_error_rad"] = torch.where(
-                original_mask, torch.linalg.vector_norm(original_error[..., 3:], dim=-1), 0.)
-            values[f"{prefix}_position_component_error_m"] = torch.where(
-                original_mask, original_error[..., :3].abs().amax(-1), 0.)
-            values[f"{prefix}_rotation_component_error_rad"] = torch.where(
-                original_mask, original_error[..., 3:].abs().amax(-1), 0.)
-            # END independent original-reference measurements.
-        for index, event in enumerate(self.pose_events):
-            p, r = event.errors(position, quaternion)
-            mask = (progress-event.progress).abs() <= 1e-7
-            values[f"function:{index}:position_error_m"] = torch.where(mask, p, 0.)
-            values[f"function:{index}:rotation_error_rad"] = torch.where(mask, r, 0.)
-        for index, event in enumerate(self.coordinate_events):
-            unit = "m" if event.kind == "prismatic" else "rad"
-            values[f"coordinate:{index}:error_{unit}"] = torch.where(
-                (progress-event.progress).abs() <= 1e-7, event.error(position, quaternion), 0.)
-        return values
+        query = torch.as_tensor(progress)
+        issues = []
+        for anchor in self.anchors:
+            if not ((query-anchor).abs() <= 1e-7).any(-1).all():
+                issues.append(f"required query at progress {anchor:g} is absent")
+        for index, requirement in enumerate(self.mechanisms):
+            if requirement.angular_column is not None and not requirement.history_complete(query).all():
+                issues.append(f"mechanism:{index}: angular history does not include the actual start")
+        return issues
 
-    def project_residual(self, position, quaternion, progress, phase_index,
+    # BEGIN expose remaining work without resetting source identity or the clock.
+    def remaining_obligations(self, progress, applied_ids=()):
+        """Read a suffix of this binding; this does not construct a resumed plan.
+
+        ``applied_ids`` contains (skill_id, event_id) pairs. An unapplied command
+        before ``progress`` remains visible as overdue; elapsed time is not
+        evidence that it was applied. Scope intersections retain their original
+        requirement objects so target paths are never silently reparameterized.
+        The caller must retain the original frozen clock/absolute deadlines and
+        bind synchronized actual facts before generating another trajectory.
+        """
+        if not np.isfinite(progress) or not 0 <= progress <= self.phase_count:
+            raise ValueError("Continuation progress must lie in the original current skill")
+        applied = set()
+        for identity in applied_ids:
+            if (not isinstance(identity, (tuple, list)) or len(identity) != 2
+                    or any(not isinstance(value, str) or not value for value in identity)):
+                raise ValueError("Applied event identities must be (skill_id, event_id) pairs")
+            applied.add(tuple(identity))
+        pending = [event for event in self.events if (event.skill_id, event.event_id) not in applied]
+        scoped = {}
+        for name in ("pose_relations", "mechanisms", "interiors"):
+            scoped[name] = [{"requirement": deepcopy(requirement),
+                             "remaining_scope": (max(float(progress), requirement.start), requirement.end)}
+                            for requirement in getattr(self, name) if requirement.end >= progress]
+        actual_inputs = ["synchronized actual joint positions and velocities",
+                         "original frozen execution binding, elapsed physical time and event application ledger"]
+        for index, requirement in enumerate(self.mechanisms):
+            if requirement.end >= progress and requirement.angular_column is not None:
+                actual_inputs.append(f"mechanism:{index}: observed current lifted coordinate including executed turns")
+        owners = sorted({phase.metadata["carrier_id"] for phase in self.phases
+                         if phase.metadata.get("carrier_id") is not None})
+        if owners:
+            actual_inputs.append("current owner poses and attachment/release facts for: "+", ".join(owners))
+        return {
+            "progress": float(progress), "original_phase_count": self.phase_count,
+            "phases": tuple((index, deepcopy(phase)) for index, phase in enumerate(self.phases)
+                            if index+1 >= progress),
+            "events": tuple(deepcopy(pending)),
+            "overdue_event_ids": tuple((event.skill_id, event.event_id) for event in pending
+                                       if event.progress < progress and event.kind in {"open", "close", "hold"}),
+            "goals": {name: tuple(deepcopy(requirement) for requirement in getattr(self, name)
+                                   if requirement.progress >= progress)
+                      for name in ("pose_events", "coordinate_events", "supports")},
+            "past_goal_assessment_required": tuple((name, index) for name in
+                ("pose_events", "coordinate_events", "supports") for index, requirement in
+                enumerate(getattr(self, name)) if requirement.progress < progress),
+            "process": scoped, "conditions": deepcopy(self.conditions),
+            "source_time_map": self.source_time_map, "required_actual_inputs": tuple(actual_inputs),
+            "clock_policy": "query the original frozen binding at elapsed+t; preserve absolute event deadlines",
+        }
+    # END expose remaining work without resetting source identity or the clock.
+
+    def project_residual(self, position, quaternion, progress, phase_index=None,
                          joint_position=None, joint_names=None):
-        """True pose equalities for one fixed OMPL mode, never inequality centers."""
+        """Real equality/manifold equations, never source-stage or band centers."""
         import torch
-        phase = self.phases[phase_index]
-        if (phase.endpoint_family is not None or phase.frame_anchor is not None) and not hasattr(self, "_fixed_anchors"):
-            raise ValueError("Coupled endpoint/frame projection requires one explicitly frozen whole-window proposal")
         pieces = []
-        if phase.kind != "free":
-            p, q = (self._phase_reference(phase_index, position, quaternion, progress)
-                    if hasattr(self, "_fixed_anchors") else phase.reference.sample((progress-phase_index).clamp(0, 1)))
-            error = _pose_error(position, quaternion, p, q)
-            exact = np.isfinite(phase.pose_bounds[:, 0]) & (phase.pose_bounds[:, 0] == phase.pose_bounds[:, 1])
-            pieces.append(error[..., exact] - _tensor(phase.pose_bounds[exact, 0], error))
+        for requirement in self.pose_relations:
+            exact = np.isfinite(requirement.pose_bounds[:, 0]) & (requirement.pose_bounds[:, 0] == requirement.pose_bounds[:, 1])
+            if exact.any():
+                error = requirement.error(position, quaternion, progress)[..., exact]-_tensor(requirement.pose_bounds[exact, 0], position)
+                mask = ((progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7))[..., None]
+                pieces.append(torch.where(mask, error, 0.))
+        for requirement in self.mechanisms:
+            error = requirement.project_residual(position, quaternion, progress)
+            mask = ((progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7))[..., None]
+            pieces.append(torch.where(mask, error, 0.))
         for coupling in self.couplings:
             if joint_position is None or joint_names is None:
                 raise ValueError("Projection needs named joints for actuator coupling")
             columns = [tuple(joint_names).index(name) for name in coupling.joint_names]
-            pieces.append(joint_position[..., columns] @ _tensor(coupling.matrix.T, joint_position)
-                          - _tensor(coupling.target, joint_position))
+            pieces.append(joint_position[..., columns] @ _tensor(coupling.matrix.T, joint_position)-_tensor(coupling.target, joint_position))
         return torch.cat(pieces, -1) if pieces else position[..., :0]
+# END one current skill with separate goals, process relations and references.
 
 
-def _path_from_rows(poses, source, *, model=None, coordinates=None, attachment=None):
-    return PosePath(np.linspace(0, 1, len(poses)) if len(poses) > 1 else np.array([0.]),
-                    poses, source, model, coordinates,
+# BEGIN source timestamps, rather than row counts, parameterize each reference.
+def _path_from_rows(poses, source, *, timestamps, model=None, coordinates=None, attachment=None):
+    times = np.asarray(timestamps, float)
+    if times.shape != (len(poses),) or not np.isfinite(times).all() or np.any(np.diff(times) <= 0):
+        raise ValueError("A source reference needs its original ordered timestamps")
+    progress = ((times-times[0])/(times[-1]-times[0]) if len(times) > 1 else np.array([0.]))
+    return PosePath(progress, poses, source, model, coordinates,
                     np.eye(4) if attachment is None else attachment)
+# END source timestamps, rather than row counts, parameterize each reference.
 
 
 def _model_from_diagnostics(value):
@@ -904,324 +982,166 @@ def _model_from_diagnostics(value):
     # END require the current grounding model's complete serialization.
 
 
+# BEGIN compile exactly one current skill without source-phase obligations.
 def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
                            reference_frame, base_pose, tool_transform,
                            numerical=NumericalTolerance(), couplings=()):
-    """Compile the current skill and optional next into one conditional window.
+    """Bind one current skill's actual entry, independent goals and source map.
 
-    ``skills`` is an ordered list/tuple of one or two entries containing
-    ``skill_id``, the compiled ``program``, its current bound ``scene``, and
-    explicit ``barrier_can_stop`` permission. Every skill keeps its complete
-    motion phases. A grasp additionally requires ``pregrasp_frame`` naming an
-    original observation before contact/closing: free planning ends there and
-    the remaining bound Cartesian approach is constrained throughout.
-    Grounding inputs are copied. Next-skill manipulation uses
-    object geometry plus the proposed attachment, never the actual-Holding
-    wrapper with invented facts.
-    A caller continues execution past a barrier only after actual feedback and
-    rebinds remaining work if those conditions differ.
+    Every ordinary source row remains available for initialization/deviation
+    reporting. Only explicit functional events, physical models, scoped
+    geometry and requested execution events become planning requirements.
+    Effects remain to be evaluated; they do not automatically require a stop
+    or grant evidence to a future skill.
     """
-    from .grasp import retreat_from_release, validate_timeline
-    from .program import ground_program, ground_object_program, _object_reference, _intentions
+    from .grasp import validate_timeline
+    from .program import ground_program, _current_model, _exact_coordinates
     from .pipeline import _surface, _interior
 
-    # BEGIN limit lookahead before grounding or predicting any skill state.
-    if not isinstance(skills, (list, tuple)) or not 1 <= len(skills) <= 2:
-        raise ValueError("Provide the current skill and at most one next skill")
-    # END limit lookahead before grounding or predicting any skill state.
-    phases, events, conditions, supports, interiors, pose_events, coordinate_events = [], [], [], [], [], [], []
-    previous, skill_ids, tool_identity = None, set(), None
-    predicted_objects, owner_initial_poses = {}, {}
-    for spec in skills:
-        skill_id = spec.get("skill_id")
-        if not isinstance(skill_id, str) or not skill_id or skill_id in skill_ids:
-            raise ValueError("Every window entry needs a unique skill instance ID")
-        skill_ids.add(skill_id)
-        program, scene = deepcopy(spec["program"]), deepcopy(spec["scene"])
-        demo = program["demo"]
-        frames, times = validate_timeline(demo["frame_indices"], demo["timestamps"])
-        identity = (demo.get("tool_id"), demo.get("tool_frame"))
-        if (any(not isinstance(value, str) or not value for value in identity)
-                or identity != (scene.get("tool_id"), scene.get("tool_frame"))):
-            raise ValueError("Every grounded successor requires the same demonstrated/current tool_id and tool_frame")
-        if tool_identity is not None and identity != tool_identity:
-            raise ValueError("A joint-planning window cannot silently change tools/TCP")
-        tool_identity = identity
-        if scene.get("reference_frame") != reference_frame:
-            raise ValueError("Every grounding and collision query must use the same explicit reference frame")
-        # BEGIN bind planning geometry to the first current owner observation.
-        carrier_id = scene.get("carrier_id")
-        if not isinstance(carrier_id, str) or not carrier_id:
-            raise ValueError("Every robot-planned skill needs its physical carrier identity")
-        # BEGIN normalize this copied skill's pose at the existing public boundary.
-        # JSON matrices and NumPy matrices follow the same validated contract.
-        # A repeated owner still has its own skill entrance; the first observed
-        # owner pose below remains separate collision-geometry provenance.
-        initial_key = "carrier_pose" if program["skill_kind"] == "grasp" else "initial_pose"
-        scene[initial_key] = _pose_array(scene[initial_key], "current skill carrier pose")
-        # END normalize this copied skill's pose at the existing public boundary.
-        if carrier_id not in owner_initial_poses:
-            owner_initial_poses[carrier_id] = scene[initial_key].copy()
-        # END bind planning geometry to the first current owner observation.
-        source = {"skill_id": skill_id, "frame_indices": frames.tolist(),
-                  "timestamps": times.tolist(), "kind": "current_grounding_and_original_program"}
-        first_phase = len(phases)
-        frame_progress = {}
+    if not isinstance(skills, (list, tuple)) or len(skills) != 1:
+        raise ValueError("Provide exactly one current skill")
+    spec = skills[0]
+    skill_id = spec.get("skill_id")
+    if not isinstance(skill_id, str) or not skill_id:
+        raise ValueError("The current skill needs a nonempty instance ID")
+    program, scene = deepcopy(spec["program"]), deepcopy(spec["scene"])
+    demo = program["demo"]
+    frames, times = validate_timeline(demo["frame_indices"], demo["timestamps"])
+    if len(frames) < 2:
+        raise ValueError("A robot planning request requires a source interval with positive duration")
+    identity = (demo.get("tool_id"), demo.get("tool_frame"))
+    if (any(not isinstance(value, str) or not value for value in identity)
+            or identity != (scene.get("tool_id"), scene.get("tool_frame"))):
+        raise ValueError("The current skill requires the same demonstrated/current tool_id and tool_frame")
+    if scene.get("reference_frame") != reference_frame:
+        raise ValueError("Grounding and collision queries must share one explicit reference frame")
+    carrier = scene.get("carrier_id")
+    if not isinstance(carrier, str) or not carrier:
+        raise ValueError("The current skill needs its physical carrier identity")
+    initial_key = "carrier_pose" if program["skill_kind"] == "grasp" else "initial_pose"
+    initial = _pose_array(scene[initial_key], "current skill carrier pose")
+    scene[initial_key] = initial
+    source = {"skill_id": skill_id, "frame_indices": frames.tolist(),
+              "timestamps": times.tolist(), "kind": "current_binding_and_original_source"}
+    grounded = ground_program(program, scene)
+    phases, events, conditions, supports, interiors, pose_events, coordinate_events, mechanisms = [], [], [], [], [], [], [], []
+    frame_progress = {}
 
-        def append_interval(begin, end, reference, kind="pose", **kwargs):
-            index = len(phases)
-            phase = MotionPhase(f"{skill_id}:{begin}-{end}", reference, kind=kind,
-                                metadata={"skill_id": skill_id, "carrier_id": scene.get("carrier_id"),
-                                          "owner_initial_pose": owner_initial_poses[carrier_id].tolist(),
-                                          "source_frames": frames[begin:end+1].tolist(), **kwargs.pop("metadata", {})},
-                                **kwargs)
-            phases.append(phase)
-            # BEGIN use one exact clock value for each source vertex and event.
-            # Recomputing row/(end-begin) can differ from PosePath's stored
-            # linspace by one float64 ULP, creating two aliases of one event
-            # when the native clock later converts its anchors to float32.
-            for row in range(begin, end+1):
-                frame_progress[int(frames[row])] = index+float(reference.progress[row-begin])
-            # END use one exact clock value for each source vertex and event.
-            # A one-node phase still owns an endpoint, so its evidence and
-            # verification barrier occur at that actual constant-pose end.
-            if begin == end:
-                frame_progress[int(frames[end])] = index+1.
-            return index
+    def append_interval(begin, end, path, metadata):
+        """A mode boundary partitions reference coordinates, never robot q."""
+        if begin == end:
+            frame_progress[int(frames[begin])] = float(len(phases))
+            return
+        index = len(phases)
+        phases.append(MotionPhase(f"{skill_id}:{begin}-{end}", path, metadata={
+            "skill_id": skill_id, "carrier_id": carrier, "owner_initial_pose": initial.tolist(),
+            "source_frames": frames[begin:end+1].tolist(), **metadata}))
+        for row in range(begin, end+1):
+            frame_progress[int(frames[row])] = index+float(path.progress[row-begin])
 
-        if program["skill_kind"] == "grasp":
-            if previous is not None:
-                scene["eef_pose"] = previous["eef_pose"].copy()
-            predicted = predicted_objects.get(scene.get("carrier_id"))
-            frame_anchor = None if predicted is None else predicted["frame_anchor"]
-            if predicted is not None:
-                scene["carrier_pose"] = predicted["pose"].copy()
-            # BEGIN end free planning at the explicit pre-grasp source frame.
-            # Select before grounding: otherwise the old free prefix would
-            # already have warped the short approach that must be preserved.
-            if spec.get("pregrasp_frame") is None:
-                raise ValueError("Every planned grasp requires an explicit pregrasp_frame")
-            grounded = ground_program(program, scene, pregrasp_frame=spec["pregrasp_frame"])
-            approach = int(np.flatnonzero(frames == grounded["pregrasp_frame"])[0])
-            eef = grounded["eef_poses"]
-            if approach:
-                append_interval(0, approach, _path_from_rows(eef[:approach+1], source),
-                                "free", frame_anchor=frame_anchor)
-            elif grounded["connection_required"]:
-                # A pre-grasp at the first source observation still permits a
-                # free connection to that entrance, never to the grasp pose.
-                entry = _path_from_rows(np.stack((scene["eef_pose"], eef[0])), source)
-                phases.append(MotionPhase(f"{skill_id}:connection", entry, "free",
-                                          metadata={"skill_id": skill_id, "no_source_frames": True,
-                                                    "carrier_id": carrier_id,
-                                                    "owner_initial_pose": owner_initial_poses[carrier_id].tolist()},
-                                          frame_anchor=frame_anchor))
-            append_interval(approach, len(frames)-1, _path_from_rows(eef[approach:], source),
-                            metadata={"mode": "grasp", "pregrasp_frame": grounded["pregrasp_frame"],
-                                      "protected_start_frame": grounded["protected_start_frame"],
-                                      "candidate_attachment": grounded["candidate_T_carrier_eef"].tolist()},
-                            frame_anchor=frame_anchor)
-            # END end free planning at the explicit pre-grasp source frame.
-            if spec.get("barrier_can_stop") is not True:
-                raise ValueError("Stable Holding verification requires an explicitly permitted hold boundary")
-            carrier = scene.get("carrier_id")
-            if not isinstance(carrier, str) or not carrier:
-                raise ValueError("Joint grasp planning needs a current carrier identity")
-            candidate = grounded["candidate_T_carrier_eef"].copy()
-            previous = {"carrier_id": carrier, "attachment": candidate,
-                        "object_pose": _pose_array(scene["carrier_pose"], "carrier_pose"),
-                        "eef_pose": eef[-1].copy(), "condition": f"{skill_id}:stable_holding",
-                        "attachment_condition_id": f"{skill_id}:stable_holding",
-                        "variable_pose": frame_anchor is not None}
-            predicted_objects[carrier] = {"pose": previous["object_pose"].copy(), "frame_anchor": frame_anchor}
-            conditions.append({"kind": "candidate_attachment", "skill_id": skill_id,
-                               "condition_id": f"{skill_id}:stable_holding",
-                               "carrier_id": carrier, "T_carrier_eef": candidate.tolist(),
-                               "requires_evidence": "stable_grasp_from_current_synchronized_evidence",
-                               "progress": float(len(phases))})
-            events.append(PlanningEvent("__stable_holding__", skill_id, float(len(phases)),
-                                        int(frames[-1]), "verification", source,
-                                        "stable_grasp_from_current_synchronized_evidence", True))
-        elif program["skill_kind"] == "manipulation":
-            commands = _intentions(demo["gripper_events"], frames)
-            release_frame = demo.get("release_frame")
-            if release_frame is None and any(event["command"] == "open" for event in commands):
-                raise ValueError("An opening skill needs an explicit release boundary")
-            if release_frame is not None and not any(
-                    event["command"] == "open" and event["frame_index"] <= release_frame for event in commands):
-                raise ValueError("A released skill needs an opening intention before its independent release boundary")
-            carrier = scene.get("carrier_id")
-            conditional = previous is not None
-            moving_start = conditional and previous.get("variable_pose", False)
-            if conditional:
-                if previous["carrier_id"] != carrier or previous.get("attachment") is None:
-                    raise ValueError("A successor manipulation needs the same still-held carrier or a new grasp")
-                attachment = previous["attachment"].copy()
-                attachment_condition_id = previous["attachment_condition_id"]
-                scene["initial_pose"] = previous["object_pose"].copy()
-                scene["eef_pose"] = previous["eef_pose"].copy()
-                objects_result = ground_object_program(program, scene)
-                objects = objects_result["poses"]
-                last_held = len(objects)-1
-                eef = np.empty((len(frames), 4, 4))
-                eef[:last_held+1] = objects @ attachment
-                if last_held < len(frames)-1:
-                    # Reuse the same released-hand correspondence as the
-                    # actual-Holding consumer, without fabricating its evidence.
-                    source_objects = _poses_array(demo["T_reference_carrier"], "source object poses")
-                    _, _, _, reference, first = _object_reference(
-                        demo, scene, frames, source_objects, last_held, program["task"], scene["initial_pose"])
-                    hand = reference[last_held:] @ first["carrier_binding"] @ _poses_array(demo["T_carrier_eef"], "source hand")[last_held:]
-                    eef[last_held:] = retreat_from_release(hand, eef[last_held])
-                grounded = {**objects_result, "eef_poses": eef,
-                            "gripper_events": demo["gripper_events"], "release_frame": demo.get("release_frame")}
+    if program["skill_kind"] == "grasp":
+        path = _path_from_rows(grounded["eef_poses"], source, timestamps=times)
+        candidate = grounded["candidate_T_carrier_eef"]
+        append_interval(0, len(frames)-1, path, {"mode": "grasp",
+            "protected_start_frame": grounded["protected_start_frame"],
+            "candidate_attachment": candidate.tolist()})
+        # This goal is the independently bound terminal grasp relation. Earlier
+        # source poses and the contact-evidence frame supply no extra goals.
+        pose_events.append(PoseEventRequirement(1., np.eye(4), grounded["goal_pose"],
+            numerical.position_m, numerical.rotation_rad,
+            {"kind": "bound_grasp_relation", "carrier_id": carrier, **source}))
+        # BEGIN bind effect assessment to the exact original event identity.
+        conditions.append({"kind": "candidate_attachment", "skill_id": skill_id,
+            "event_id": "__stable_holding__",
+            "condition_id": f"{skill_id}:stable_holding", "carrier_id": carrier,
+            "T_carrier_eef": candidate.tolist(), "progress": 1.,
+            "effect_requirement": "stable_grasp_from_current_synchronized_evidence"})
+        events.append(PlanningEvent("__stable_holding__", skill_id, 1., int(frames[-1]), "effect", source))
+        # END no effect association is inferred from its name or clock value.
+    elif program["skill_kind"] == "manipulation":
+        objects, eef = grounded["object_poses"], grounded["eef_poses"]
+        attachment = _pose_array(scene["holding"]["T_carrier_eef"], "actual attachment")
+        attachment_id = f"{skill_id}:actual_holding"
+        last_held = len(objects)-1
+        release = demo.get("release_frame")
+        held_end = 1. if last_held else 0.
+        conditions.append({"kind": "observed_attachment", "skill_id": skill_id,
+            "condition_id": attachment_id, "carrier_id": carrier,
+            "T_carrier_eef": attachment.tolist(), "source": deepcopy(scene["holding"]), "progress": 0.})
+        model, limits = (None, None) if scene.get("motion_model") is None else _current_model(scene["motion_model"])
+        mechanism = None
+        if model is not None:
+            mechanism = MechanismRequirement(0., held_end, model, _inverse(attachment), limits,
+                _exact_coordinates(model, initial), scene["motion_model"]["source"])
+            mechanisms.append(mechanism)
+            # Reference coordinates are optional initialization data. The
+            # authoritative mechanism above was bound directly from the scene.
+            reference_model = _model_from_diagnostics(grounded["motion_checks"]["model"])
+            coordinates = reference_model.coordinates
+        else:
+            reference_model, coordinates = None, None
+        release_id = f"{skill_id}:actual_release" if release is not None else None
+        append_interval(0, last_held, _path_from_rows(objects, source, timestamps=times[:last_held+1],
+            model=reference_model, coordinates=coordinates, attachment=attachment),
+            {"mode": "held", "attachment": attachment.tolist(), "conditional": False,
+             "attachment_condition_id": attachment_id, "attachment_interval": [0., held_end],
+             "release_condition_id": release_id})
+        if last_held < len(frames)-1:
+            append_interval(last_held, len(frames)-1,
+                _path_from_rows(eef[last_held:], source, timestamps=times[last_held:]),
+                {"mode": "released_retreat", "release_progress": held_end})
+        for event in demo["functional_events"]:
+            progress = frame_progress[int(event["frame_index"])]
+            binding = scene["functional_bindings"][event["event_id"]]
+            check = next(row for row in grounded["function_checks"] if row["event_id"] == event["event_id"])
+            if program["task"]["relation"] == "on":
+                face = binding["on_geometry"]
+                supports.append(SupportRequirement(progress, _inverse(attachment), scene["body_points"],
+                    face["carrier_region_points"], face["carrier_outward_normal"], _surface(scene["support"]),
+                    face["gap_tolerance"], face["normal_tolerance"], scene.get("margin", 0.), binding["source"]))
+            elif event.get("constraint_kind") == "joint_coordinate":
+                coordinate_events.append(CoordinateEventRequirement(progress, mechanism,
+                    float(np.asarray(check["target_coordinates"])[0]), event["coordinate_tolerance"], event["source"]))
             else:
-                grounded = ground_program(program, scene)
-                objects, eef = grounded["object_poses"], grounded["eef_poses"]
-                attachment = _pose_array(scene["holding"]["T_carrier_eef"], "actual attachment")
-                attachment_condition_id = f"{skill_id}:actual_holding"
-                conditions.append({"kind": "observed_attachment", "skill_id": skill_id,
-                                   "condition_id": attachment_condition_id, "carrier_id": carrier,
-                                   "T_carrier_eef": attachment.tolist(),
-                                   "source": deepcopy(scene["holding"]), "progress": float(first_phase)})
-                last_held = len(objects)-1
-            conditions.append({"kind": "predicted_skill_boundary", "skill_id": skill_id,
-                               "condition_id": f"{skill_id}:predicted_boundary",
-                               "depends_on": previous["condition"] if conditional else attachment_condition_id,
-                               "carrier_id": carrier, "initial_pose": scene["initial_pose"].tolist(),
-                               "predicted_end_pose": objects[-1].tolist(),
-                               "T_carrier_eef": attachment.tolist(), "progress": float(first_phase)})
-            release = demo.get("release_frame")
-            function_rows = sorted({int(np.flatnonzero(frames == event["frame_index"])[0])
-                                    for event in demo["functional_events"]})
-            knots = sorted({0, last_held, *function_rows})
-            # BEGIN distinguish the existing tool kernel from mechanism diagnostics.
-            # Tool-use motion has its own function optimizer and no FK model.
-            # Every other relation receives an explicit model from _event_transfer;
-            # missing evidence must not silently turn a mechanism into free motion.
-            model = (None if program["task"]["relation"] == "tool_use" else
-                     _model_from_diagnostics(grounded["motion_checks"]["model"]))
-            # END distinguish the existing tool kernel from mechanism diagnostics.
-            on = program["task"]["relation"] == "on"
-            if on and model is not None:
-                raise ValueError("A support endpoint family cannot override a physical mechanism")
-            function_frame = np.eye(4)
-            if on:
-                first_event = demo["functional_events"][0]
-                binding = scene["functional_bindings"][first_event["event_id"]]
-                function_frame = _pose_array(binding["carrier_mapping"], "carrier mapping") @ _pose_array(first_event["carrier_frame"], "material frame")
-            elif model is None and program["task"]["relation"] != "tool_use":
-                first_event = demo["functional_events"][0]
-                function_frame = _pose_array(scene["functional_bindings"][first_event["event_id"]]["carrier_frame"], "material frame")
-            intervals = list(zip(knots[:-1], knots[1:])) or [(0, 0)]
-            for begin, end in intervals:
-                body = objects[begin:end+1] @ function_frame
-                path_attachment = _inverse(function_frame) @ attachment
-                coords = None if model is None else model.coordinates[begin:end+1]
-                path = _path_from_rows(body, source, model=model, coordinates=coords, attachment=path_attachment)
-                family = ({"move_start": begin > 0 or moving_start,
-                           "end": "variable" if end in function_rows and end > 0 else "unanchored"}
-                          if on else None)
-                if not on and moving_start and begin == 0 and model is None and program["task"]["relation"] != "tool_use":
-                    family = {"move_start": True, "end": "fixed"}
-                append_interval(begin, end, path, endpoint_family=family,
-                                metadata={"mode": "held", "carrier_id": carrier,
-                                          "attachment": attachment.tolist(), "conditional": conditional,
-                                          "attachment_condition_id": attachment_condition_id})
-            held_end = float(len(phases))
-            if last_held < len(frames)-1:
-                # The object ceases to follow the hand at release. Its ordinary
-                # retreat geometry is an independent reference, not a payload.
-                append_interval(last_held, len(frames)-1, _path_from_rows(eef[last_held:], source),
-                                frame_anchor={"progress": held_end, "reference_pose": eef[last_held]},
-                                metadata={"mode": "released_retreat", "carrier_id": carrier,
-                                          "release_progress": held_end})
-            for event in demo["functional_events"]:
-                progress = frame_progress[int(event["frame_index"])]
-                if on:
-                    binding = scene["functional_bindings"][event["event_id"]]
-                    face = binding["on_geometry"]
-                    supports.append(SupportRequirement(progress, _inverse(attachment), scene["body_points"],
-                                                       face["carrier_region_points"], face["carrier_outward_normal"],
-                                                       _surface(scene["support"]), face["gap_tolerance"],
-                                                       face["normal_tolerance"], scene.get("margin", 0.), binding["source"]))
-                elif event.get("constraint_kind") != "joint_coordinate":
-                    binding = scene["functional_bindings"][event["event_id"]]
-                    material = _pose_array(binding["carrier_frame"], "current material function frame")
-                    check = next(check for check in grounded["function_checks"] if check["event_id"] == event["event_id"])
-                    pose_events.append(PoseEventRequirement(
-                        progress, _inverse(attachment) @ material, np.asarray(check["goal_pose"]) @ material,
-                        event["position_tolerance_m"], event["rotation_tolerance_rad"], event["source"]))
-                else:
-                    check = next(check for check in grounded["function_checks"] if check["event_id"] == event["event_id"])
-                    coordinate_events.append(CoordinateEventRequirement(
-                        progress, _inverse(attachment), np.asarray(check["goal_pose"]), model.axis,
-                        model.kind, float(np.asarray(check["target_coordinates"])[0]),
-                        event["coordinate_tolerance"], event["source"]))
-                if program["task"]["relation"] == "inside" and "interior" in scene:
-                    interior = _interior(scene["interior"])
-                    interiors.append(InteriorRequirement(progress, progress, _inverse(attachment), scene["body_points"],
-                                                         interior.halfspaces, scene.get("margin", 0.), interior.source))
-                events.append(PlanningEvent(event["event_id"], skill_id, progress, int(event["frame_index"]),
-                                            "function", event["source"]))
-            if "entry_region" in scene:
-                interior = _interior(scene["entry_region"])
-                begin = frame_progress[int(frames[scene["entry_start_index"]])]
-                interiors.append(InteriorRequirement(begin, held_end, _inverse(attachment), scene["body_points"],
-                                                     interior.halfspaces, scene.get("margin", 0.), interior.source))
-            if release is not None:
-                if spec.get("barrier_can_stop") is not True:
-                    raise ValueError("Release verification requires an explicitly permitted stop/hold boundary")
-                events.append(PlanningEvent("__release_verified__", skill_id, held_end, int(release),
-                                            "verification", source, "actual_release_from_current_feedback", True))
-                conditions.append({"kind": "predicted_release", "carrier_id": carrier,
-                                   "condition_id": f"{skill_id}:actual_release",
-                                   "progress": held_end, "T_carrier_eef": attachment.tolist(),
-                                   "nominal_pose": objects[-1].tolist(), "requires_evidence": "actual_release_from_current_feedback"})
-            frame_anchor = ({"progress": held_end, "reference_pose": eef[last_held].copy()}
-                            if release is not None else None)
-            predicted_objects[carrier] = {"pose": objects[-1].copy(), "frame_anchor": frame_anchor}
-            previous = {"carrier_id": carrier, "attachment": None if release is not None else attachment,
-                        "object_pose": objects[-1].copy(), "eef_pose": eef[-1].copy(),
-                        "attachment_condition_id": None if release is not None else attachment_condition_id,
-                        "condition": f"{skill_id}:predicted_boundary", "variable_pose": on}
-        else:
-            raise ValueError("Only compiled grasp/manipulation programs define these local windows")
-        for event in grounded["gripper_events"]:
-            events.append(PlanningEvent(event["event_id"], skill_id, frame_progress[int(event["frame_index"])],
-                                        int(event["frame_index"]), event["command"],
-                                        {"original_event": deepcopy(event), **source}))
-    # BEGIN exact collision-attachment spans shared by all held phases.
-    # A skill boundary is not a release. Consecutive manipulation phases with
-    # the same actual/candidate relation share one span until an evidenced
-    # release boundary or the end of the current planning window.
-    spans = []
-    for index, phase in enumerate(phases):
-        metadata = phase.metadata
-        if metadata.get("mode") != "held":
-            continue
-        key = (metadata["carrier_id"], metadata["attachment_condition_id"])
-        if spans and spans[-1]["key"] == key and spans[-1]["end"] == index:
-            span = spans[-1]
-            if not np.array_equal(span["attachment"], metadata["attachment"]):
-                raise ValueError("A shared Holding condition cannot change its rigid attachment")
-            span["end"] = index+1
-            span["phases"].append(phase)
-        else:
-            spans.append({"key": key, "start": index, "end": index+1,
-                          "attachment": metadata["attachment"], "phases": [phase]})
-    for span in spans:
-        releases = [item for item in conditions if item["kind"] == "predicted_release"
-                    and item["carrier_id"] == span["key"][0] and item["progress"] == span["end"]]
-        if len(releases) > 1 or (not releases and span["end"] != len(phases)):
-            raise ValueError("An attachment can end only at its actual release boundary or the window end")
-        release_id = releases[0]["condition_id"] if releases else None
-        for phase in span["phases"]:
-            phase.metadata["attachment_interval"] = [float(span["start"]), float(span["end"])]
-            phase.metadata["release_condition_id"] = release_id
-    # END exact collision-attachment spans shared by all held phases.
+                material = _pose_array(binding["carrier_frame"], "current material function frame")
+                pose_events.append(PoseEventRequirement(progress, _inverse(attachment) @ material,
+                    np.asarray(check["goal_pose"]) @ material,
+                    event["position_tolerance_m"], event["rotation_tolerance_rad"], event["source"]))
+            if program["task"]["relation"] == "inside" and "interior" in scene:
+                interior = _interior(scene["interior"])
+                interiors.append(InteriorRequirement(progress, progress, _inverse(attachment), scene["body_points"],
+                    interior.halfspaces, scene.get("margin", 0.), interior.source))
+            events.append(PlanningEvent(event["event_id"], skill_id, progress, int(event["frame_index"]), "function", event["source"]))
+        if "entry_region" in scene:
+            interior = _interior(scene["entry_region"])
+            begin = frame_progress[int(frames[scene["entry_start_index"]])]
+            interiors.append(InteriorRequirement(begin, held_end, _inverse(attachment), scene["body_points"],
+                interior.halfspaces, scene.get("margin", 0.), interior.source))
+        if release is not None:
+            # BEGIN release outcome and its event share one explicit identity.
+            conditions.append({"kind": "predicted_release", "carrier_id": carrier,
+                "skill_id": skill_id, "event_id": "__release_verified__",
+                "condition_id": release_id, "progress": held_end, "T_carrier_eef": attachment.tolist(),
+                "nominal_pose": objects[-1].tolist(), "effect_requirement": "actual_release_from_current_feedback"})
+            events.append(PlanningEvent("__release_verified__", skill_id, held_end, int(release), "effect", source))
+            # END release timing alone is not evidence of a release outcome.
+    else:
+        raise ValueError("Only compiled grasp/manipulation programs define a current skill")
+    for event in grounded["gripper_events"]:
+        events.append(PlanningEvent(event["event_id"], skill_id, frame_progress[int(event["frame_index"])],
+            int(event["frame_index"]), event["command"], {"original_event": deepcopy(event), **source}))
+    # Only explicitly supplied execution prerequisites or stops enter this list.
+    # Evidence checks and zero velocity are independent fields, not implications.
+    for event in spec.get("execution_events", ()):
+        frame = event["frame_index"]
+        if frame not in frame_progress:
+            raise ValueError("An execution event must name an original source frame")
+        events.append(PlanningEvent(event["event_id"], skill_id, frame_progress[frame], int(frame),
+            event["kind"], event["source"], event.get("requires_evidence"), event.get("stop", False)))
     return PlanningProblem(tuple(joint_names), start_q, start_dq, tool_link, reference_frame,
-                           base_pose, tool_transform, tuple(phases), tuple(events), tuple(couplings),
-                           numerical, tuple(conditions), tuple(supports), tuple(interiors),
-                           tuple(pose_events), tuple(coordinate_events))
+        base_pose, tool_transform, tuple(phases), tuple(events), tuple(couplings), numerical,
+        tuple(conditions), tuple(supports), tuple(interiors), tuple(pose_events), tuple(coordinate_events),
+        mechanisms=tuple(mechanisms), source_timestamps=times,
+        source_progress=np.asarray([frame_progress[int(frame)] for frame in frames]))
+# END compile exactly one current skill without source-phase obligations.
 # END shared skill-process constraints for generation and verification.

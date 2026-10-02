@@ -234,3 +234,70 @@ def test_source_pair_policy_rejects_disabled_contact_physics(flag_name):
         _native_pair_policies(native, ("first", "second"))
 # END reject each disabled native contact switch independently.
 # END actual-state and whole-cubic preflight regressions.
+
+# BEGIN prefix extension preserves the same curve and does not recheck expired obligations.
+def test_explicit_prefix_extension_still_checks_known_arm_with_unknown_fingers(model):
+    from test_independent_scene_validation import binding
+    scene = binding()
+    scene["owners"][0]["geometry"]["solids"][0].update(
+        dimensions=[.01, .01, .01], pose=[.095, .2, 0., 1., 0., 0., 0.])
+    curve = trajectory([.03, .09], [0., 0.], barrier=.4)
+    gate = validator(model)
+    gate.bind_scene(scene, progress_at_time=lambda t: float(curve.sample(t)[2]))
+    prefix = gate.preflight(curve, feedback(), LIMITS)
+    assert prefix["passed"] and not prefix["observed_scene_checked"]
+    assert prefix["nominal_scene"]["unresolved_assumptions"][0]["geometry_names"] == ["second"]
+    current = feedback(arm=float(curve._curve(.4)[0]), arm_speed=float(curve._curve(.4, 1)[0]))
+    extension = gate.preflight(curve, current, LIMITS, start_time=.4, until=1.)
+    assert extension["checked_interval_s"] == [.4, 1.]
+    assert not extension["passed"]
+    assert any(row["kind"] == "independent_scene_collision" for row in extension["violations"])
+    assert curve.executable_until == .4
+
+
+def test_scalar_preflight_new_interval_does_not_replay_old_peak(model):
+    curve = trajectory([.03, .03], [.4, -.4])
+    gate = validator(model)
+    assert not gate.preflight(curve, feedback(arm_speed=.4), LIMITS)["passed"]
+    actual = feedback(arm=float(curve._curve(.9)[0]), arm_speed=float(curve._curve(.9, 1)[0]))
+    renewed = gate.preflight(curve, actual, LIMITS, start_time=.9, until=1.)
+    assert renewed["passed"] and renewed["checked_interval_s"] == [.9, 1.]
+    assert renewed["actual_state"]["trajectory_time"] == .9
+# END no callback can silently expand or retime an authorized interval.
+
+# BEGIN the real validator must survive the execution adapter without losing cause.
+@pytest.mark.parametrize("failure", ["collision", "required_query_gap"])
+def test_scene_failures_keep_named_physical_evidence_through_executor(model, failure):
+    from manipulation.execution import TrajectoryExecutor
+    from test_independent_scene_validation import binding
+
+    scene = binding()
+    scene["owners"][0]["geometry"]["solids"][0].update(
+        dimensions=[.01, .01, .01], pose=[.03, .2, 0., 1., 0., 0., 0.])
+    expected = "independent_scene_collision"
+    if failure == "required_query_gap":
+        scene["owners"][0]["geometry"] = {"solids": [], "query_gaps": ["unsupported_required_native_shape"]}
+        expected = "independent_scene_query_incomplete"
+    gate = validator(model)
+    curve = trajectory([.03, .03], [0., 0.])
+    gate.bind_scene(scene, progress_at_time=lambda t: float(curve.sample(t)[2]))
+    adapter = SimpleNamespace(geometry_checker=gate, _geometry_pair_count=1)
+    for method, args, kwargs in (
+        ("check_state", (feedback(),), {"stage": "actual", "trajectory_time": 0.}),
+        ("preflight", (curve, feedback(), LIMITS), {}),
+    ):
+        result = TrajectoryExecutor._geometry_result(adapter, method, *args, **kwargs)
+        assert not result["passed"]
+        assert all(row["kind"] != "geometry_checker_error" and row["name"] for row in result["violations"])
+        assert any(row["kind"] == expected for row in result["violations"])
+        if failure == "required_query_gap":
+            assert any(row.get("reason") == "unsupported_required_native_shape" for row in result["violations"])
+
+
+def test_prefix_preflight_uses_actual_feedback_time_separately_from_authorized_start(model):
+    curve = trajectory([.03, .03], [0., 0.])
+    result = validator(model).preflight(curve, feedback(), LIMITS, start_time=.4, until=1., current_time=.5)
+    assert result["passed"]
+    assert result["checked_interval_s"] == [.4, 1.]
+    assert result["actual_state"]["trajectory_time"] == .5
+# END native device tick alignment does not relabel the actual contact-rule time.

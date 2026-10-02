@@ -119,7 +119,8 @@ class GraspValidationTest(unittest.TestCase):
             row["owner_mask"][:, 10] = True
             row["depth"][~row["owner_mask"]] += .1
         result = self.run_check(views=views)
-        self.assertEqual(result["status"], "unresolved")
+        self.assertEqual(result["status"], "selected")
+        self.assertEqual(result["eligible_candidate_ids"], ["one"])
         for row in result["observations"].values():
             self.assertEqual(row["measured_owner_samples"], 21)
             self.assertEqual(row["observable_normal_samples"], 0)
@@ -160,7 +161,8 @@ class GraspValidationTest(unittest.TestCase):
             if "right" in views:
                 views["right"]["interaction_mask"] = np.zeros((21, 21), bool)
             result = self.run_check(views=views)
-            self.assertEqual(result["status"], "unresolved")
+            self.assertEqual(result["status"], "selected")
+            self.assertEqual(result["eligible_candidate_ids"], ["one"])
             self.assertEqual(result["rejected_candidate_ids"], [])
 
     def test_non_intended_finger_interference_rejects(self):
@@ -198,11 +200,12 @@ class GraspValidationTest(unittest.TestCase):
         result = self.run_check({"one": candidate})["candidates"]["one"]
         self.assertTrue(result["approach_requires_replanning"])
         self.assertEqual(result["terminal_visible_geometry_status"], "supported")
-        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["status"], "unresolved")
 
     def test_single_sheet_does_not_become_two_sided_capture(self):
         result = self.run_check(views={"left": view(-1, 0.), "right": view(1, 0.)})
-        self.assertEqual(result["status"], "unresolved")
+        self.assertEqual(result["status"], "selected")
+        self.assertEqual(result["eligible_candidate_ids"], ["one"])
         closure = result["candidates"]["one"]["terminal_closure"]
         self.assertFalse(closure["independent_opposing_witnesses"])
 
@@ -242,7 +245,8 @@ class GraspValidationTest(unittest.TestCase):
                 result = self.run_check({"one": candidate}, views,
                                         current_eef_pose=gauge @ pose(z=-.05))
                 closure = result["candidates"]["one"]["terminal_closure"]
-                self.assertEqual(result["status"], "unresolved")
+                self.assertEqual(result["status"], "selected")
+                self.assertEqual(result["eligible_candidate_ids"], ["one"])
                 self.assertGreater(closure["signed_gap_m"], 0.)
                 self.assertLessEqual(abs(closure["opposing_witness_separation_m"]), 1e-12)
                 self.assertFalse(closure["independent_opposing_witnesses"])
@@ -257,12 +261,13 @@ class GraspValidationTest(unittest.TestCase):
         for row in views.values():
             row["T_output_camera"] = transform @ row["T_output_camera"]
         result = self.run_check({"one": candidate}, views, current_eef_pose=transform @ pose(z=-.05))
-        self.assertEqual(result["status"], "unresolved")
+        self.assertEqual(result["status"], "selected")
+        self.assertEqual(result["eligible_candidate_ids"], ["one"])
 
     def test_closed_physical_contact_limit_is_gauge_invariant(self):
         transform = pose(.3, -.1, .2)
         transform[:3, :3] = Rotation.from_rotvec([.2, -.3, .1]).as_matrix()
-        for extra, expected in ((.0012499, "selected"), (.00125, "selected"), (.0012501, "unresolved")):
+        for extra, expected in ((.0012499, "selected"), (.00125, "selected"), (.0012501, "selected")):
             for gauge in (np.eye(4), transform):
                 with self.subTest(extra=extra, gauge_changed=not np.array_equal(gauge, np.eye(4))):
                     candidate = trajectory()
@@ -300,7 +305,8 @@ class GraspValidationTest(unittest.TestCase):
         candidate = trajectory()
         candidate["gripper_events"] = [{"frame_index": 1, "command": "close"}]
         result = self.run_check({"one": candidate}, current_joint_positions_m=[.005, -.005])
-        self.assertEqual(result["status"], "unresolved")
+        self.assertEqual(result["status"], "selected")
+        self.assertEqual(result["eligible_candidate_ids"], ["one"])
         self.assertIn("No opening intention", result["candidates"]["one"]["reason"])
 
     def test_unknown_action_does_not_veto_supported_same_function_actions(self):
@@ -312,7 +318,7 @@ class GraspValidationTest(unittest.TestCase):
                 candidates["missing"] = other
                 result = self.run_check(candidates)
                 self.assertEqual(result["status"], expected)
-                self.assertEqual(result["eligible_candidate_ids"], ["valid_"+str(i) for i in range(count)])
+                self.assertEqual(result["eligible_candidate_ids"], ["missing"] + ["valid_"+str(i) for i in range(count)])
                 self.assertEqual(result["unresolved_candidate_ids"], ["missing"])
                 self.assertEqual(result["selected_candidate_id"], "valid_0" if count == 1 else None)
                 self.assertEqual(set(result["candidates"]), set(candidates))

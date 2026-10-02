@@ -44,18 +44,31 @@ def run(output):
         direction = LineSearchStrategy.scale_action(
             step, maximum, optimizer.config.step_scale,
             optimizer.config.fix_terminal_action, step.shape[1])
+        # BEGIN use the same physical-domain restriction as native line search.
+        # A diagnostic rollout must not present an out-of-domain trial as a
+        # direction that the production optimizer would actually evaluate.
+        alphas = (0., 1e-5, 1e-4, 1e-3, .01, .1, .5, 1.)
+        direction = planner.physical_domain.limit_step(x, direction,
+            x.new_tensor(alphas).reshape(1, len(alphas), 1, 1))
+        # END this preserves the common scale ratios without clipping q(t).
         report = {"baseline": baseline, "gradient_max": float(gradient.abs().max().cpu()),
                   "raw_step_max": float(step.abs().max().cpu()),
                   "scaled_step_max": float(direction.abs().max().cpu()),
                   "search": []}
-        for alpha in (0., 1e-5, 1e-4, 1e-3, .01, .1, .5, 1.):
+        for alpha in alphas:
             loss, _ = objective(x + alpha * direction)
             report["search"].append({"alpha": alpha, "loss": loss})
-        unit = gradient / gradient.abs().max()
+        # BEGIN only defined, feasible symmetric probes support differences.
+        unit = gradient / gradient.abs().max().clamp_min(torch.finfo(gradient.dtype).eps)
         for epsilon in (1e-4, 1e-5):
+            if not bool(planner.physical_domain.feasible(torch.stack((x+epsilon*unit, x-epsilon*unit))).all()):
+                report[f"directional_derivative_{epsilon}"] = {
+                    "status": "not_evaluated", "reason": "Symmetric difference leaves the physical joint domain"}
+                continue
             upper, _ = objective(x + epsilon*unit)
             lower, _ = objective(x - epsilon*unit)
             report[f"directional_derivative_{epsilon}"] = (upper-lower)/(2*epsilon)
+        # END absent finite-difference evidence is never replaced by clipping.
         report["analytic_directional_derivative"] = float((gradient*unit).sum().cpu())
         output.mkdir(parents=True, exist_ok=True)
         (output / "gradient.json").write_text(json.dumps(report, indent=2)+"\n")

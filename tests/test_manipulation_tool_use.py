@@ -203,13 +203,45 @@ class CompiledToolBridgeTest(unittest.TestCase):
         self.assertEqual(result["input_evidence"]["motion_source"], "current tracked demonstration")
         self.assertEqual(self.program_path.read_text(), before)
 
-    def test_optimizer_cannot_report_pass_after_missing_function_position_or_direction(self):
-        for position, angle in ((.01, 0.), (0., .03)):
-            self.corrupt_position, self.corrupt_rotation = position, angle
-            with self.subTest(position=position, angle=angle), self.assertRaisesRegex(
-                    ValueError, "independent equality"):
-                self.run_bridge()
-            self.assertFalse((self.output / "trajectory.json").exists())
+    # BEGIN optional fit failure preserves the independently enforced task goal.
+    def test_failed_reference_fit_preserves_position_and_direction_goal(self):
+        import torch
+        from manipulation.planning_problem import PoseEventRequirement
+
+        event = self.program["demo"]["functional_events"][0]
+        functional_frame = self.current["functional_bindings"]["functional_effect"]["carrier_frame"]
+        expected = self.expected_goal()
+        requirement = PoseEventRequirement(.7, functional_frame, expected @ functional_frame,
+            event["position_tolerance_m"], event["rotation_tolerance_rad"], event["source"])
+
+        def residual(body_pose):
+            # This bridge has no robot/attachment input. Its independent
+            # material-frame relation therefore evaluates a supplied body
+            # pose directly, without claiming actual robot execution.
+            quaternion = Rotation.from_matrix(body_pose[:3, :3]).as_quat()[[3, 0, 1, 2]]
+            return float(requirement.evaluate(torch.tensor(body_pose[:3, 3]),
+                                               torch.tensor(quaternion)))
+
+        self.assertLess(residual(expected), 1e-12)
+        for index, (position, angle) in enumerate(((.01, 0.), (0., .03))):
+            with self.subTest(position=position, angle=angle):
+                self.output = self.root / f"failed_reference_{index}"
+                self.corrupt_position, self.corrupt_rotation = position, angle
+                result = self.run_bridge()
+                self.assertEqual(result["status"], "candidate")
+                diagnostic = result["motion_checks"]["reference_generation"]
+                self.assertEqual(diagnostic["status"], "failed")
+                self.assertIn("independent equality", diagnostic["reason"])
+                goal = result["function_checks"][0]
+                self.assertEqual(goal["status"], "bound_goal")
+                np.testing.assert_allclose(goal["goal_pose"], expected, atol=1e-13)
+                saved = json.loads((self.output / "trajectory.json").read_text())
+                np.testing.assert_allclose(saved["function_checks"][0]["goal_pose"], expected, atol=1e-13)
+                wrong = expected.copy()
+                wrong[0, 3] += position
+                wrong[:3, :3] = Rotation.from_rotvec([0., 0., angle]).as_matrix() @ wrong[:3, :3]
+                self.assertGreater(residual(wrong), 1e-3)
+    # END optional fit failure preserves the independently enforced task goal.
 
     def test_missing_compilation_metadata_and_event_timeline_fail_before_solver(self):
         for mutate, message in (

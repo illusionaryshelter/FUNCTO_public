@@ -152,12 +152,15 @@ class PrismaticSourceProgressTest(unittest.TestCase):
                 interval = result["motion_checks"]["coordinate_transfer"]["intervals"][0]
                 self.assertEqual(interval["method"], "zero_net_source_motion_preserved")
 
-    def test_zero_net_source_cannot_invent_a_different_current_endpoint(self):
+    def test_zero_net_source_fit_failure_does_not_invalidate_a_current_endpoint(self):
         for prefix in ([0., .02, .02, -.01, .005, 0., 0.], [0.] * 7):
             with self.subTest(prefix=prefix):
                 program, scene = fixture(.03, prefix)
-                with self.assertRaisesRegex(ValueError, "Zero-net prismatic"):
-                    ground_program(program, scene)
+                # BEGIN native goal binding is independent of source-profile fitting.
+                result = ground_program(program, scene)
+                self.assertEqual(result["motion_checks"]["reference_generation"]["status"], "failed")
+                np.testing.assert_allclose(result["function_checks"][0]["target_coordinates"], [.43])
+                # END native goal binding is independent of source-profile fitting.
 
     def test_axis_sign_and_coordinate_origin_are_gauges_even_after_scaling(self):
         program, scene = fixture(.05)
@@ -180,12 +183,15 @@ class PrismaticSourceProgressTest(unittest.TestCase):
         shifted_result = ground_program(program, shifted)
         np.testing.assert_allclose(shifted_result["object_poses"], expected["object_poses"], atol=1e-13)
 
-    def test_complete_trajectory_limits_still_reject_an_internal_source_excursion(self):
+    def test_internal_reference_excursion_is_reported_without_losing_legal_goals(self):
         program, scene = fixture(0., [0., .02, .02, -.01, .005, 0., 0.])
         scene["motion_model"]["coordinate_limits"] = [[.395, .45]]
         # Both endpoint coordinates are .4 and legal; the retained loop is not.
-        with self.assertRaisesRegex(ValueError, "exceeds.*limits"):
-            ground_program(program, scene)
+        # BEGIN the eventual robot candidate, rather than its optional seed, owns these limits.
+        result = ground_program(program, scene)
+        self.assertEqual(result["motion_checks"]["reference_generation"]["status"], "failed")
+        np.testing.assert_allclose(result["function_checks"][0]["target_coordinates"], [.4])
+        # END the eventual robot candidate, rather than its optional seed, owns these limits.
 
     def test_equal_amplitude_keeps_the_raw_translated_source_sequence(self):
         # Identity retargeting has an independent analytic contract: translate
