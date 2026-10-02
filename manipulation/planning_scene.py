@@ -304,6 +304,23 @@ class ObservedSpace:
         result.flags.writeable = False
         return result
 
+    # BEGIN candidate metadata is private; dense evidence is shared read-only.
+    def clone_for_rollout(self):
+        """Copy mutable metadata while retaining immutable private grid storage.
+
+        The distance tensor and raw-free array have no mutating scene API.
+        They are request evidence, not candidate state: callers must construct
+        a new ObservedSpace for an observation update and must not modify its
+        private grids during planning. Sharing them avoids one dense-grid
+        allocation per optimizer rollout.
+        """
+        result = copy(self)
+        result.origin = self.origin.copy()
+        result._shape_xyz = self._shape_xyz.copy()
+        result.occupancy_evidence = deepcopy(self.occupancy_evidence)
+        return result
+    # END rule/relationship edits cannot rewrite another candidate's metadata.
+
     def violation(self, spheres):
         centre = spheres[..., :3]
         coordinates = (centre - _tensor(self.origin, centre)) / self.voxel_size
@@ -789,6 +806,12 @@ class PlanningScene:
         self.robot_coverage = robot_coverage
         if robot_coverage is not None and robot_coverage.reference_frame != reference_frame:
             raise ValueError("Native solid coverage must use the same calibrated reference frame")
+        # BEGIN the guidance grid and the mandatory volume oracle are one input.
+        if robot_coverage is not None:
+            robot_coverage.validate_observation_grid(
+                known_free=coverage.known_free, origin=coverage.origin,
+                voxel_size=coverage.voxel_size, reference_frame=coverage.reference_frame)
+        # END frame names alone cannot bind independent free-cell evidence.
         # BEGIN immutable, bounded optimization guidance for the solid oracle.
         self._coverage_geometry = (None if robot_coverage is None else robot_coverage.guidance_geometry())
         self._coverage_samples = ()
@@ -1072,12 +1095,33 @@ class PlanningScene:
     # END bind one collision scene to the exact generated skill problem.
 
     def clone_for_rollout(self):
+        # BEGIN isolate candidate policy and relationships without GPU copies.
+        # Native SceneCollision geometry is shared read-only by its query
+        # clones. A world update must build a new request, never mutate this
+        # shared field while any rollout/backward still consumes it. The
+        # robot oracle is likewise shared so its cumulative request budget
+        # cannot be restarted by making another candidate.
         result = copy(self)
         result.background = self.background.clone_for_rollout()
         result.owners = tuple(copy(owner) for owner in self.owners)
         for owner in result.owners:
             owner.query = owner.query.clone_for_rollout()
+            owner.pose_path = deepcopy(owner.pose_path)
+            owner.attachments = deepcopy(owner.attachments)
+            owner.local_spheres = (None if owner.local_spheres is None else owner.local_spheres.copy())
+        result.contacts = deepcopy(self.contacts)
+        result.gripper = deepcopy(self.gripper)
+        result.coverage = self.coverage.clone_for_rollout()
+        result.observation_report = deepcopy(self.observation_report)
+        result._coverage_geometry = deepcopy(self._coverage_geometry)
+        result._coverage_samples = tuple(points.copy() for points in self._coverage_samples)
+        # Tensor.clone keeps the candidate's release-state autograd lineage;
+        # deepcopy cannot copy non-leaf tensors and detach would drop gradients.
+        result._fixed_release_poses = {
+            key: tuple(value.clone() for value in pose)
+            for key, pose in self._fixed_release_poses.items()}
         return result
+        # END private rule/anchor edits cannot contaminate parent or siblings.
 
     # BEGIN native solid guidance plus a mandatory independent volume verdict.
     def robot_coverage_guidance(self, robot_link_poses, progress):

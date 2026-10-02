@@ -211,6 +211,23 @@ class RobotCoverage:
     def baseline_joint_positions(self):
         return _readonly(self._baseline_q)
 
+    # BEGIN bind scene guidance and acceptance to exactly the same original F.
+    def validate_observation_grid(self, *, known_free, origin, voxel_size, reference_frame):
+        """Reject a different grid without copying or rebuilding its CSG boxes.
+
+        Equal frame labels alone do not establish equal evidence. Every cell,
+        the centre of cell zero, and the metric resolution belong to this
+        request's fixed oracle input; numerical tolerances cannot enlarge F.
+        """
+        free = np.asarray(known_free)
+        if (reference_frame != self.reference_frame
+                or not np.array_equal(np.asarray(origin), self.origin)
+                or voxel_size != self.voxel_size
+                or free.dtype != np.bool_
+                or not np.array_equal(free, self._free)):
+            raise ValueError("Scene and native coverage require the exact same original free grid, origin, resolution and frame")
+    # END guidance cannot authorize another oracle's wider free region.
+
     def _named(self, names, positions):
         names, values = tuple(names), np.asarray(positions)
         if (len(names) != len(set(names)) or set(names) != set(self.baseline_joint_names)
@@ -279,6 +296,7 @@ class RobotCoverage:
 
     def describe(self):
         return {"predicate": "V(q) minus (V0 union F) is empty",
+                "residual_classification": "unclassified: no occupied-space input; F deficit does not establish unknown or collision",
                 "reference_frame": self.reference_frame,
                 "initialization_source": self.initialization_source,
                 "initial_validity_is_assumption": True,
@@ -301,7 +319,7 @@ class RobotCoverage:
                 "scope": "native-model whole-volume floating-point state queries only"}
 
     def _witness(self, bad, row, pose):
-        """Find an interior unknown point; a Boolean cut-face corner is insufficient.
+        """Find an interior F-deficit point; a cut-face corner is insufficient.
 
         Ray intervals inside the native result supply candidates. Independent
         convex/box membership checks confirm that a returned point is inside
@@ -360,10 +378,13 @@ class RobotCoverage:
             else:
                 raise ValueError("Entrance coordinates are neither measured q0 nor its exact float32 representation")
         self._queries += 1
+        # BEGIN report precisely the set queried; no O input exists here.
         report = {"passed": False, "failure": None, "canonicalized_initial_float32": canonicalized,
                   "joint_names": list(self.baseline_joint_names), "joint_positions": q.tolist(),
-                  "unknown_volume_m3": None, "witness": None,
+                  "free_evidence_deficit_volume_m3": None,
+                  "residual_classification": "unclassified", "witness": None,
                   "continuous_path_certified": False}
+        # END neither this volume nor its witness establishes physical penetration.
         if self._queries > self.max_queries:
             report["failure"] = "state_query_budget"
             return report
@@ -414,13 +435,15 @@ class RobotCoverage:
                     volume = float(bad.volume())
                     if not np.isfinite(volume):
                         raise RuntimeError("Native new-volume query returned a nonfinite volume diagnostic")
-                    report.update(failure="new_volume_in_unknown", solid=row["name"],
-                                  unknown_volume_m3=volume,
+                    # BEGIN distinguish absent free evidence from proven unknown.
+                    report.update(failure="new_volume_without_free_evidence", solid=row["name"],
+                                  free_evidence_deficit_volume_m3=volume,
                                   volume_scope="first failing native component; diagnostic only",
-                                  unknown_boundary_faces=int(bad.num_tri()),
+                                  free_evidence_deficit_boundary_faces=int(bad.num_tri()),
                                   witness=self._witness(bad, row, pose))
+                    # END O versus unknown remains unclassified, never waived.
                     return report
-            report.update(passed=True, unknown_volume_m3=0.)
+            report.update(passed=True, free_evidence_deficit_volume_m3=0., residual_classification="empty")
             return report
         except CoverageBudgetExceeded as error:
             report.update(failure="native_work_budget", error=str(error))

@@ -206,11 +206,19 @@ class MotionPhase:
     frame_anchor: dict | None = None
 
     def __post_init__(self):
+        # BEGIN reject empty pose domains before they enter tensor residuals.
+        # Every realised pose error is finite. An infinite lower bound or a
+        # negative-infinite upper bound admits no finite value, including
+        # [+inf, +inf] and [-inf, -inf]; neither is an equality or a free axis.
+        # Valid one-sided bounds and [-inf, +inf] retain their declared scope.
         self.pose_bounds = np.asarray(self.pose_bounds, float).copy()
         if (not self.name or self.kind not in {"free", "pose"}
                 or self.pose_bounds.shape != (6, 2) or np.isnan(self.pose_bounds).any()
-                or np.any(self.pose_bounds[:, 0] > self.pose_bounds[:, 1])):
-            raise ValueError("A phase needs a name, valid kind and ordered six-axis bounds")
+                or np.any(self.pose_bounds[:, 0] > self.pose_bounds[:, 1])
+                or np.isposinf(self.pose_bounds[:, 0]).any()
+                or np.isneginf(self.pose_bounds[:, 1]).any()):
+            raise ValueError("A phase needs a name, valid kind and ordered six-axis bounds admitting finite errors")
+        # END reject empty pose domains before they enter tensor residuals.
         if self.endpoint_family is not None and (self.kind != "pose" or self.reference.motion_model is not None):
             raise ValueError("Free endpoint transfer applies to a necessary free-motion family, not a mechanism")
         self._body_reference = replace(self.reference, attachment=np.eye(4))

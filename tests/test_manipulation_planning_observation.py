@@ -12,6 +12,7 @@ from manipulation.planning_observation import (
     _mapper_memory_bound, _partition_masks, _require_mapping_memory, _views,
     build_scene_from_rgbd, observed_space_from_rgbd,
 )
+from manipulation.planning_scene import ObservedSpace
 
 
 def view(depth=None):
@@ -176,6 +177,54 @@ class PlanningObservationTest(unittest.TestCase):
             _views({"too_large": record}, "world", (.1, 3.))
 
     # BEGIN whole-cell physical occupancy evidence and contradictory-input tests.
+    def test_rgbd_solids_preserve_original_free_grid(self):
+        record, frames, solids = solid_fixture()
+        options = dict(origin=[-.6, -.6, .7], shape=(33, 25, 25), voxel_size=.05,
+                       depth_error_m=.01, reference_frame="world", depth_range_m=(.1, 3.))
+        original = observed_space_from_rgbd({"current": record}, **options)
+        occupied = observed_space_from_rgbd({"current": record}, known_solids=solids,
+                                            owner_frames=frames, **options)
+        np.testing.assert_array_equal(occupied.known_free, original.known_free)
+        self.assertFalse(occupied.known_free[16, 12, 12])
+        with self.assertRaises(ValueError):
+            occupied.known_free[:] = True
+        self.assertEqual(occupied.violation(torch.tensor([[[[0., 0., 1.5, .04]]]])).item(), 0.)
+
+    def test_native_rgbd_builder_preserves_free_before_device_allocation(self):
+        # Exercise the actual mapper builder up to its device admission gate.
+        # Only native mapping is blocked; rays, solid evidence and ObservedSpace
+        # construction run normally, so this checks their production wiring.
+        from curobo.perception import MapperCfg
+        record, frames, solids = solid_fixture()
+        cfg = MapperCfg(extent_meters_xyz=(1.4, 1.4, 1.4), voxel_size=.05,
+                        extent_esdf_meters_xyz=(1.4, 1.4, 1.4), esdf_voxel_size=.05,
+                        grid_center=torch.tensor([0., 0., 1.5]),
+                        image_height=96, image_width=96, device="cuda:0")
+        spaces = []
+
+        def capture_space(*args, **kwargs):
+            result = ObservedSpace(*args, **kwargs)
+            spaces.append(result)
+            return result
+
+        with patch("manipulation.planning_observation.ObservedSpace", side_effect=capture_space), \
+                patch("manipulation.planning_observation._require_mapping_memory",
+                      side_effect=ValueError("stop before native mapping")), \
+                patch("curobo.perception.Mapper") as mapper:
+            with self.assertRaisesRegex(ValueError, "stop before native mapping"):
+                build_scene_from_rgbd({"current": record}, frames, mapper_cfg=cfg, depth_error_m=.01,
+                    reference_frame="world", robot_sphere_materials=(None,),
+                    robot_geometry_source="synthetic_robot", has_gripper=False,
+                    known_solids=solids, max_mapping_bytes=1024**3)
+            mapper.assert_not_called()
+        self.assertEqual(len(spaces), 1)
+        space = spaces[0]
+        original = observed_space_from_rgbd({"current": record}, origin=space.origin,
+            shape=space.known_free.shape, voxel_size=space.voxel_size, depth_error_m=.01,
+            reference_frame="world", depth_range_m=(cfg.depth_minimum_distance, cfg.depth_maximum_distance))
+        np.testing.assert_array_equal(space.known_free, original.known_free)
+        self.assertGreater(len(space.occupancy_evidence["solids"]), 0)
+
     def test_current_physical_solid_adds_its_interior_but_not_hidden_air_or_backspace(self):
         record, frames, solids = solid_fixture()
         options = dict(origin=[-.6, -.6, .7], shape=(33, 25, 25), voxel_size=.05,

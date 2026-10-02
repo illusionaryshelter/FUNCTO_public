@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from manipulation.robot_coverage import CoverageBudgetExceeded, RobotCoverage, _free_rectangles
 from manipulation.robot_geometry_check import NativeSolid, RobotGeometryChecker
+from manipulation.planning_scene import ObservedSpace, PlanningScene
 
 
 URDF = """<robot name="coverage_slides">
@@ -69,10 +70,16 @@ def test_exact_cell_merging_preserves_holes_and_disconnected_evidence():
 def test_q0_passes_with_no_observed_free_volume_but_new_volume_fails(urdf):
     coverage = build(urdf)
     current = query(coverage, 0., entrance=True)
-    assert current["passed"] and current["unknown_volume_m3"] == 0
+    assert current["passed"] and current["free_evidence_deficit_volume_m3"] == 0
+    assert current["residual_classification"] == "empty"
     future = query(coverage, .08)
-    assert not future["passed"] and future["failure"] == "new_volume_in_unknown"
-    assert future["unknown_volume_m3"] > 0
+    assert not future["passed"] and future["failure"] == "new_volume_without_free_evidence"
+    assert future["free_evidence_deficit_volume_m3"] > 0
+    # BEGIN F/V0 alone cannot identify occupied material versus unknown space.
+    assert future["residual_classification"] == "unclassified"
+    assert "unknown_volume_m3" not in future
+    assert "unknown_boundary_faces" not in future
+    # END the failed predicate keeps its original, strictly positive residual.
     assert future["witness"] is not None
     witness = np.asarray(future["witness"]["point_reference"])
     assert witness[0] > .05
@@ -96,6 +103,45 @@ def test_new_volume_in_actual_free_cells_passes_without_baseline_mutation(urdf):
     assert not query(coverage, .5)["passed"]  # Grid exterior remains unknown.
 
 
+# BEGIN scene/oracle evidence identity and cumulative request-budget regressions.
+def test_scene_and_oracle_require_identical_original_free_grid(urdf):
+    from types import SimpleNamespace
+    free = np.ones((7, 7, 7), bool)
+    oracle = build(urdf, free=free, max_queries=1)
+
+    class EmptyQuery:
+        owner_ids = frozenset()
+
+        def clone_for_rollout(self):
+            return EmptyQuery()
+
+    def make_scene(mask, *, origin=(-.3, -.3, -.3), voxel_size=.1, frame="world"):
+        observed = ObservedSpace(mask, origin=origin, voxel_size=voxel_size,
+                                 reference_frame=frame, observation_ids=("current_grid",))
+        return PlanningScene(background=EmptyQuery(), owners=(), coverage=observed,
+            reference_frame="world", robot_sphere_materials=(None,),
+            robot_geometry_source="synthetic native body", has_gripper=False,
+            robot_coverage=oracle)
+
+    world = make_scene(free.copy())
+    changed = free.copy()
+    changed[3, 3, 3] = False
+    for mask, options in ((changed, {}),
+                          (free, {"origin": (np.nextafter(-.3, 0.), -.3, -.3)}),
+                          (free, {"voxel_size": np.nextafter(.1, 1.)})):
+        with pytest.raises(ValueError, match="exact same original free grid"):
+            make_scene(mask, **options)
+    with pytest.raises(ValueError, match="same calibrated frame"):
+        make_scene(free, frame="different_frame")
+
+    first, second = world.clone_for_rollout(), world.clone_for_rollout()
+    assert first.robot_coverage is oracle and second.robot_coverage is oracle
+    assert query(first.robot_coverage, 0., entrance=True)["passed"]
+    exhausted = query(second.robot_coverage, 0., entrance=True)
+    assert not exhausted["passed"] and exhausted["failure"] == "state_query_budget"
+# END cloning a candidate neither widens F nor restarts proof work.
+
+
 def test_unknown_voxel_inside_robot_volume_is_not_missed_by_surface_vertices(urdf):
     free = np.ones((7, 7, 7), bool)
     free[3, 3, 3] = False
@@ -104,8 +150,8 @@ def test_unknown_voxel_inside_robot_volume_is_not_missed_by_surface_vertices(urd
     # unknown cell is enclosed in its interior. Surface-point checks cannot
     # establish this full-volume predicate.
     result = query(coverage, 0.)
-    assert not result["passed"] and result["failure"] == "new_volume_in_unknown"
-    assert result["unknown_volume_m3"] > 0
+    assert not result["passed"] and result["failure"] == "new_volume_without_free_evidence"
+    assert result["free_evidence_deficit_volume_m3"] > 0
     assert result["witness"] is not None
     assert np.max(np.abs(result["witness"]["point_reference"])) < .05
 
@@ -160,7 +206,7 @@ def test_initial_float32_binding_is_exact_and_never_used_for_future_samples(urdf
 def test_small_nonzero_sliver_has_no_user_acceptance_threshold(urdf):
     coverage = build(urdf)
     result = query(coverage, 1e-7)
-    assert not result["passed"] and 0 < result["unknown_volume_m3"] < 1e-8
+    assert not result["passed"] and 0 < result["free_evidence_deficit_volume_m3"] < 1e-8
     assert not result["numerics"]["volume_threshold_used"]
     assert not coverage.describe()["acceptance_uses_volume_threshold"]
 

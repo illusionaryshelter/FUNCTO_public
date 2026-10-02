@@ -309,6 +309,7 @@ class PlanningSceneTest(unittest.TestCase):
         oracle = SimpleNamespace(reference_frame="world", required_link_names=("body",),
             baseline_joint_names=("q", "finger"), baseline_joint_positions=baseline,
             guidance_geometry=lambda: {"solids": []},
+            validate_observation_grid=lambda **kwargs: None,
             check_state=lambda **kwargs: received.append(kwargs) or {"passed": kwargs["entrance"]})
         world = scene(robot_coverage=oracle)
         # BEGIN each named coordinate, including the independent finger, must

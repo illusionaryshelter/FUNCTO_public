@@ -798,6 +798,47 @@ class PlanningProcessTest(unittest.TestCase):
         np.testing.assert_array_equal(phase.pose_bounds, declared)
         self.assertEqual(request.numerical.position_m, 2e-5)
 
+    # BEGIN finite pose-error domains distinguish freedoms from empty bounds.
+    def test_empty_or_malformed_pose_bounds_are_rejected_before_evaluation(self):
+        reference = path([pose(), pose()])
+        for invalid_row in ((np.inf, np.inf), (-np.inf, -np.inf),
+                            (np.inf, -np.inf), (.2, .1), (np.nan, 0.), (0., np.nan)):
+            for axis in range(6):
+                with self.subTest(row=invalid_row, axis=axis):
+                    bounds = np.zeros((6, 2))
+                    bounds[axis] = invalid_row
+                    with self.assertRaisesRegex(ValueError, "bounds admitting finite errors"):
+                        MotionPhase("invalid", reference, pose_bounds=bounds)
+        for shape in ((6,), (2, 6), (6, 3), (1, 6, 2)):
+            with self.subTest(shape=shape), self.assertRaisesRegex(
+                    ValueError, "bounds admitting finite errors"):
+                MotionPhase("invalid", reference, pose_bounds=np.zeros(shape))
+
+    def test_one_sided_bounds_keep_nonzero_equalities_and_target_local_axes(self):
+        reference = pose((.3, -.2, .1), (.2, -.4, .7))
+        bounds = np.array([[-np.inf, .1], [-.2, np.inf], [.03, .03],
+                           [-np.inf, np.inf], [-.4, .4], [0., 0.]])
+        phase = MotionPhase("one sided", path([reference, reference]), pose_bounds=bounds)
+        request = problem([phase])
+        progress = torch.tensor([[.5]], dtype=torch.float64)
+        local_errors = ((.05, .6, .03), (-3., 4., .03), (.12, .6, .03), (.05, -.22, .03))
+        for index, translation in enumerate(local_errors):
+            with self.subTest(translation=translation):
+                position, quaternion = components(
+                    (reference @ pose(translation, (0., .25, 0.)))[None, None])
+                violation = request.evaluate(position, quaternion, progress).item()
+                if index < 2:
+                    self.assertEqual(violation, 0.)
+                    # The finite Z and rotation-Z equalities remain; the
+                    # one-sided X/Y and rotation interval add no centreline.
+                    equalities = request.project_residual(position, quaternion, progress, 0)
+                    self.assertEqual(equalities.shape, (1, 1, 2))
+                    np.testing.assert_allclose(equalities.numpy(), 0., atol=1e-12)
+                else:
+                    self.assertGreater(violation, .019)
+        np.testing.assert_array_equal(phase.pose_bounds, bounds)
+    # END finite pose-error domains distinguish freedoms from empty bounds.
+
 
 class PlanningBuilderTest(unittest.TestCase):
     # BEGIN validate serialized public inputs and complete grounding evidence.

@@ -1,118 +1,327 @@
-## 1. 当前的进展和缺口，实际上已经可以划清
+我建议把方案收敛成：
 
-根据你提供的结果：
+> **演示提供抓持目标和运动初始解；cuRobo 负责求解与时间处理；需要时 OMPL 提供另一条路径初始解；Pinocchio＋Coal 负责一致的几何验证。全部使用固定的后端配置，不按 skill 调权重、距离或接入点。**
 
-**已经修好的，是输入与状态表示错误。** 当前手形不再被全行程包络替代；机器人自身占据空间不再被当成起点未知障碍；发送的参考也不再被当成实际反馈。起点现在能通过并进入求解，说明这些修改确实移除了原来的阻塞。
+这里有真实可调用的接口，不需要另写一个新的轨迹优化算法。
 
-**尚未解决的，是完整抓杯轨迹的可行性。** `view_a` 的严重越限和 `view_b` 的厘米级位姿误差，都不是之前毫米级 `pose_bounds` 的问题。现在不应该通过放宽容差继续推进。
+------
 
-**执行层另有两个真实问题。** 接管瞬态和指位滞后需要修，但它们没有参与这次未执行的抓杯规划，不能用于解释规划失败。
+## 1. 先划清“不调参”的含义
 
-因此，133 项测试通过说明相应接口和逻辑获得了验证，**不等于抓杯规划、夹爪跟踪或接管行为已经通过验收。** 你目前对这些证据的区分是准确的。
+**可以做到：新增 `grasp_mug`、`grasp_bowl` 等技能时，不修改后端参数、不新增动作名称分支。**
 
-## 2. 最优先分清：这些越限轨迹，是“失败候选”，还是被求解器误报为成功？
+不能诚实地承诺：数值系统完全没有容差、采样分辨率、规划预算和机器人速度限制。它们是机器人与求解器配置，不是技能模板。
 
-这是下一步最有价值的检查。
+两者应当严格分离：
 
-我核对了 cuRobo 当前公开代码：轨迹结果的 `success` 会结合可行性、位姿收敛及插值后可行性；但求解失败时，仍可能返回带失败标记的结果对象。因此，**“返回了一条轨迹”不代表“宣告这条轨迹合法”。** 下面涉及的接口细节应再与你们锁定的提交核对。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/solver/solver_trajopt_result.py)
+| 固定在机器人／后端配置中        | 随技能调用传入的数据                 |
+| ------------------------------- | ------------------------------------ |
+| 机器人模型、TCP、关节顺序与限位 | 当前机器人状态                       |
+| 夹爪几何、开口范围、控制接口    | 演示来源的目标交互位姿               |
+| 碰撞模型与验证精度              | 当前场景与对象绑定                   |
+| 求解器默认配置、计算预算        | 演示运动参考                         |
+| 执行与停止条件                  | 已有的接触／开合事件、明确的过程要求 |
 
-| 具体情况                                          | 应该归到哪里                           |
-| ------------------------------------------------- | -------------------------------------- |
-| cuRobo 自己判失败，独立验收也判失败               | 求解没有成功；保留下来的是诊断候选     |
-| cuRobo 判成功，独立验收发现同一时刻的同一关节越限 | 两端的配置、状态解释或可行性评估不一致 |
-| 原始关节解合法，导出或重载后才越限                | 曲线转换、索引、插值或保存重载的问题   |
+cuRoboV2 的 `MotionPlannerCfg.create()` 文档也明确建议：一般集成代码传入机器人、场景和容量配置，其余任务 YAML 保留默认设置。**可以冻结一份后端配置使用，而不是见一个技能调一遍。** 默认值是否覆盖某次请求，由求解结果决定；失败不是自动修改参数的理由。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.motion_planner.html)
 
-**这三种情况不能用同一套办法修。**
-
-特别是 `view_a` 的约 5.16 rad，超过约 2.90 rad 上限约 2.26 rad，显然不是浮点容差。但仅凭这个数，仍然不能断言“关节配置肯定又错了”：失败优化候选可能本来就严重违约。先看它在何处被判失败，以及在哪一步开始越限。
-
-还有一个具体的接口风险值得排除：cuRobo 的 `solution` 在相关轨迹求解代码中保存的是优化变量；实际关节状态另在 `js_solution` 和插值结果中。**不同控制空间下，不能把 `solution` 数组不加区分地当成关节位置。** 我不是说你们已经犯了这个错误，而是这项核对比继续调整权重便宜得多。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/solver/solver_trajopt.py)
-
-你们已有保存与重载流程，只需对同一个候选对齐检查：
+我们的要求可以落实为：
 
 ```
-求解器内部关节状态
-        ↓
-导出的连续曲线
-        ↓
-重载后、按同一时刻采样的关节状态
+同一 robot profile
+同一 planner profile
+同一后端代码
+
+新增 skill → 只新增 SkillRecord 中的数据
 ```
 
-不要比较三个数组的相同下标，要比较**相同关节名、相同时间、相同物理含义**。
+这和 TaskFlux 已确定的“不按动作名字新增 generator”一致。   
 
-## 3. 现在最大的工程风险：验收越来越完整，但生成端未必使用了同样的条件
+------
 
-这不是说你们一定存在这个问题，而是**当前最应该核实的地方**。
+## 2. 一个具体发现：前面把 cuRobo 的接口说得太笼统了
 
-你们现在的独立验收包含限位、完整自碰撞、局部位姿要求、新增 unknown 体积等。但是：
+**“目标”“参考轨迹”“优化初始解”不能放进同一个参数。**
 
-> **这些要求进入了报告，不代表它们已经影响了 IK、第一轮优化、第二轮优化和 OMPL 的搜索。**
+我核对到，当前 cuRoboV2 的 `TrajectoryOptimizer.solve_pose()` 有独立入口：
 
-cuRobo 本身就分别配置优化用的 rollout 和评估用的 rollout；某个检查出现在评估配置中，不能据此推断它在优化阶段同样启用。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/docs/guides/optimization_motion.rst)
+```
+goal_tool_poses   # 要到达的工具位姿current_state    # 当前关节状态seed_config      # 用于生成初始轨迹的关节配置seed_traj        # 已有的轨迹初始解goal_state       # 显式目标关节状态
+```
 
-我建议先只核对下面四项，不再扩展更多检查：
+这些都是实际源码中的参数。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/solver/solver_trajopt.py)
 
-| 要求         | 生成过程中要确认的事情                                   |
-| ------------ | -------------------------------------------------------- |
-| 关节限位     | 使用的是同一组物理关节限位，而不是只限制另一种优化变量   |
-| 自碰撞       | 同一手形、同一合法接触规则；代理与原生几何差异有明确处理 |
-| 局部位姿     | 约束作用于要求的整个后缀，而不只是最后一个位姿           |
-| 新增 unknown | 它能影响搜索方向或状态有效性，不是只在末尾否决           |
+而且发现了两处值得特别注意的实现细节。
 
-**最简单的接线验证，是拿已经保存的违例状态回放。** 把那个关节约 5.16 rad 的状态分别送入优化侧评估和独立验收，查看两边对应关节的限位残差。先核对“是否都识别出同一种违例”，再讨论权重和迭代次数。
+**第一，不能只看 `GoalToolPose` 的类型说明，就认为整条 Cartesian 参考已经接通。** 文档称它支持 `horizon > 1` 的逐时刻目标，但我检查的公开 `main` 调用链中，`ToolPoseCost.forward()` 对目标执行 `squeeze(1)`，下层又要求目标是四维张量，并按静态目标索引。多时刻目标在这条路径上存在明显的不一致。**我没有检查我们本机版本，不能说这就是我们当前卡住的原因，但不能再给我们一段“整条轨迹直接塞进去”的伪可用代码。**[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.types.html)
 
-对于 OMPL，新增 unknown 检查应进入现有 `StateValidityChecker`，边之间的检查应由 `MotionValidator` 覆盖；这就是它的现成扩展位置，不需要新增规划架构。[Open Motion Planning Library](https://ompl.kavrakilab.org/stateValidation.html)
+**第二，`seed_traj` 的实际输入需要包含种子维度。** 当前 `SeedManager` 明确检查：
 
-对于 cuRobo，则要确认现有 unknown 表示是否真正参与优化。**如果目前只接了入口和出口检查，那么起点修好以后，它仍可能反复生成穿入 unknown 的候选。** 此时该修的是这一条接线，而不是再加一轮完整抓杯重试。
+```
+[batch, num_seeds, action_horizon, dof]
+```
 
-也不要把同一条坏候选的“四种违例”立即当作四个独立问题。严重越限可能把机械臂带到错误位置，进一步产生自碰撞、位姿误差和 unknown 违例。先定位最早出现的不一致，往往能一起消掉几个后果。
+而不是只传一个 `[时间点数, 关节数]` 数组。这里 `action_horizon` 来自求解器，不是视频帧数。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/solver/manager_seed.py)
 
-## 4. 怎样避免继续陷进去：冻结一个输入，只做两个诊断
+所以，现在最明确、能对接已有实现的入口是：
 
-### 诊断一：检查“生成端与验收端是否在解同一个问题”
+> **静态交互目标走 `goal_tool_poses`；演示转换得到的关节路径走 `seed_traj`。**
 
-保留一个抓杯候选、同一场景快照、同一实测起点、同一参考和同一时间设置。记录原始求解结果的成功标记，并完成上面的四项接线核对。
+不先要求完成一个新的、持续追踪演示的代价函数。
 
-同时复用已有的短轨迹正例，但先确认它在**当前这份场景与规则下**仍然合法。让它走同一条求解、导出、重载调用路径。这能回答：
+------
 
-> 现在的整条调用路径能不能保住一个已知合法结果？
+## 3. 我建议的具体 runtime：固定目标，多种初始解，同一个验证出口
 
-不要为了这个对照关闭真实场景障碍，也不要把不同场景下通过的结果直接算作本场景正例。
+以下处理的是我们现在给出的这种请求：
 
-### 诊断二：检查“演示要求的局部接近段，在当前场景证据下能否找到连续合法实现”
+> **参考运动＋目标交互位姿＋机器人模型＋当前场景。**
 
-只检查你们已经确定的局部接近段，不改变抓法，也不重新发明 pre-grasp。
+演示参考可以帮助求解，但不是“所有中间帧都必须经过”的硬性路径。SkillRecord 已明确要求保持的过程约束仍然要检查，不能默默删除。
 
-先确认关键位置及中间位置能找到满足限位、自碰撞和已知场景碰撞要求的关节状态，再检查这些状态能否连续连接。**逐点有 IK 解，不等于整段可连续执行；单次 IK 失败也不能当成不可达证明。**
+### 第一步：编译一个运动请求，不让求解器看到技能名称
 
-然后在这类其余条件已合法的候选上定位新增 unknown。这里的顺序很重要：
+建议后端实际收到的是：
 
-> **一条越限且偏离目标的轨迹进入 unknown，不证明完成正确抓杯也必须进入 unknown。**
+```
+MotionRequest
+    current_joint_state
+    goal_tool_pose
+    reference_tool_path
+    scene_snapshot
+    gripper_state_before_interaction
+    interaction_events
+    explicit_path_requirements
+```
 
-你们已经证明当前候选确有新增体积进入未观测区域，所以不能再归因于首点薄层误差。但仍未证明所有合法实现都会这样。
+`grasp_mug`、`grasp_bowl` 不进入规划算法的判断条件。它们只影响 Executor 已经实例化出来的对象、目标和事件数据。
 
-如果其余要求已满足的候选反复卡在同一块遮挡区域，最直接的工程处理是**补一次能覆盖该区域的观测，再用同一输入重跑**，而不是继续放松 unknown 规则或增加优化轮数。反过来，如果合法候选能留在已证明空间中，那么问题就在现有搜索为何没有找到它。
+这一接口正对应文档中 Executor 的职责：把技能内容实例化为候选末端运动、开合时序和过程要求，再交给共享后端。   
 
-这两个诊断足够。现在不需要新求解器、自动证书系统或更多通用抽象。
+### 第二步：检查目标本身，而不是先要求整条参考可执行
 
-## 5. 两个执行问题要继续修，但单独验收
+先求目标交互位姿的 IK 候选，检查关节限位、机器人自身碰撞和当前阶段不允许的环境碰撞。
 
-### 接管瞬态：现在已经不是“来源不明的 spike”
+这里要特别注意：
 
-你已经定位到入口非零速度带来的阻尼响应。这很有价值，但**有解释不等于已经满足接管要求**。
+**用于到达的夹爪状态，与抓持完成后的夹爪状态不是同一个东西。**
 
-robosuite 当前 `JOINT_POSITION` 实现中的速度项使用 `-joint_vel`，并不是读取外部参考速度后计算“参考速度减实际速度”。所以，即使轨迹参考从实测速度开始，或者目标位置等于实测位置，也不自动消除这一阻尼项。[GitHub](https://raw.githubusercontent.com/ARISE-Initiative/robosuite/master/robosuite/controllers/parts/generic/joint_pos.py)
+对于我们讨论的抓取，应当用演示／夹爪适配已经给出的到达前开口状态检查运动，再执行闭合事件。不能拿“已经闭合并接触物体”的几何状态，去要求整个接近过程完全无接触。
 
-对当前抓取执行，我会优先保持同一个控制器持续工作，从稳定保持状态进入规划与执行，避免在尚有明显速度时突然切换控制律。需要重新读取稳定后的状态，不能直接把模拟器速度写成零来让测试通过。
+如果终点都不合法，应返回具体原因，而不是继续在 reference weight 或 approach distance 上寻找答案。
 
-如果系统确实要求运动中接管，那就明确把控制输出连续性列为尚未支持的能力；**不要继续靠“位置参考连续”代替这项验证。** 这并不要求现在增加一个高级控制库。
+### 第三步：把演示转成一个关节空间初始解
 
-### 两指滞后：同步指令已经正确，但跟踪能力尚未达标
+这里不再要求它是“已经可执行的演示后缀”。这里的演示就是FUNCTO原先生成的参考轨迹。
 
-最大约 16.4 mm 的滞后不能被“最终剩余约 1.32 mm”掩盖。结束时接近目标，不代表运动过程中实际手形接近规划手形。
+处理方式可以固定为：
 
-最有信息量的下一项对照，是保持相同闭合路径，延长闭合时间，观察峰值滞后是否显著下降。这只是定位执行带宽与参考速度的关系，不是自动修改演示，也不是直接调整增益。
+```
+迁移后的 Cartesian 参考
+    ↓
+按求解器所需数量重采样
+    ↓
+由终端 IK 配置向前回溯，使用邻近解作 IK seed
+    ↓
+得到关节路径初始解
+    ↓
+把边界配置设置为真实当前状态、已验证终端状态
+```
 
-如果确定需要重定时，应在机械臂与两指的共同时间线上处理。**不能只让手指晚到，而机械臂按原时刻开始下一步。** 更不能用“名义闭合时间到了”作为抓住物体的判据。
+这里的“向前回溯”指从演示末端向更早的采样求解。
 
-同时，末尾增加等待只能改善末态，不能消除之前运动过程中已经发生的手形偏差。这一点要保留在执行验收里。
+**这条初始解允许暂时碰撞，也允许不平滑。** 因为它只是优化器的起点，不能直接执行。若某条演示无法产生基本可用的关节初始解，丢弃的是这个初始解，不是宣布这个 skill 永远无法执行。
+
+关键区别是：
+
+> 我们不再先花力气证明每一个演示 pose 都能严格跟踪，再开始规划。
+
+当前机器人起点与演示起点不同，可能使这个初始解质量变差，但这不构成循环依赖：真实起点始终由 `current_state` 提供。
+
+cuRobo 自己的图规划支路也是把几何路径插值到 `action_horizon`，然后作为 `seed_traj` 交给轨迹优化；并不把插值路径直接当作最终执行命令。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/motion/motion_planner.py)
+
+### 第四步：先尝试演示初始解，失败再使用路径搜索初始解
+
+固定流程即可：
+
+```
+演示初始解 → cuRobo 轨迹优化
+                    │
+               验证通过？
+                /       \
+              是         否
+              ↓          ↓
+            候选     cuRobo 图规划／OMPL
+                           ↓
+                    路径初始解
+                           ↓
+                    同一个轨迹优化器
+                           ↓
+                        同一个验证器
+```
+
+**这不是按 skill 分支，而是按求解结果分支。**
+
+cuRoboV2 原生 `MotionPlanner` 已经采用了“IK＋轨迹优化，必要时图规划提供 seed”的流程；我们不需要重新实现这一套搜索逻辑。OMPL 可以在既定共享后端里承担额外的路径搜索，不需要每次都把两套完整规划串行跑一遍。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/motion/motion_planner.py)
+
+也不需要引入新的参考权重来控制这套流程。可以固定采用：
+
+> 优先接受通过验证的演示初始解结果；没有结果时，接受同一目标、同一明确约束下的其他合法规划结果。
+
+**代价必须说清楚：演示作为初始解，不保证输出完整保留演示形状。** 这是该接口的确定含义，不是等待解决的研究问题。若某段运动已经被 SkillRecord 标为必须保持，就按要求验证；不能仅因为终点到了就放行。
+
+我们已经接受执行可能失败，那么就不需要再把“自动证明所有未表述的过程语义”设成发出第一条命令的前提。
+
+------
+
+## 4. cuRobo、OMPL、Pinocchio、Coal 各自只做自己的事
+
+我不建议再加 MoveIt、Drake 或另一个优化框架。我们现有组合可以这样分工：
+
+| 组件          | 固定职责                                                     |
+| ------------- | ------------------------------------------------------------ |
+| **cuRoboV2**  | IK、轨迹优化、已有图规划、时间处理，产生关节轨迹候选         |
+| **OMPL**      | 必要时搜索从当前关节状态到目标关节状态的几何路径，提供替代初始解 |
+| **Pinocchio** | 统一正运动学、TCP 与关节顺序转换，更新机器人碰撞几何位置     |
+| **Coal**      | 场景和机器人几何的碰撞／距离查询，服务 OMPL 和最终验证       |
+
+Pinocchio 有直接更新几何位姿及计算碰撞的接口，Coal 提供碰撞与距离运算；OMPL 则要求使用方提供状态／运动有效性检查。它们本来就是可以这样组合的组件，不需要它们先理解 `grasp_mug`。[Gepetto Web](https://gepettoweb.laas.fr/doc/stack-of-tasks/pinocchio/master/doxygen-html/md_doc_b_examples_c_collisions.html?utm_source=chatgpt.com)
+
+最容易让集成“什么都规划不出来”的，反而是下面这些接口不一致：
+
+| 需要核对的项目                             | 可能导致的结果               |
+| ------------------------------------------ | ---------------------------- |
+| 世界坐标系与机器人基座坐标系不一致         | IK 目标被放错位置            |
+| TCP 实际是法兰，目标却按夹爪中心定义       | 到达姿态系统性错误           |
+| 四元数 `wxyz`／`xyzw` 混用                 | 姿态错误或大量 IK 失败       |
+| 关节排序、mimic joints、夹爪锁定状态不一致 | 两个库看到不同的机器人       |
+| cuRobo 球近似与 Coal 网格不一致            | 一方认为可行，另一方全部拒绝 |
+| 抓持目标接触被当成禁止碰撞                 | 目标配置天然不可达           |
+| 把参考点数当成优化器 action horizon        | 张量尺寸或轨迹表示错误       |
+
+这些是**需要逐项检查的候选原因，不是我对我们本机故障的诊断**。但应先把它们记录出来，而不是在没有错误归因的情况下调规划参数。
+
+### 接触不能靠“关掉手指全部碰撞”解决
+
+预期接触应按**接触部件—目标对象—执行阶段**处理，其他碰撞仍要检查。Pinocchio 的碰撞对可以单独激活／停用，能够承载这种统一策略。[Gepetto Web](https://gepettoweb.laas.fr/doc/stack-of-tasks/pinocchio/devel/doxygen-html/structpinocchio_1_1GeometryData.html?utm_source=chatgpt.com)
+
+cuRobo 的公开 `plan_grasp()` 会使用固定接近偏移，并可以禁用指定 link 的碰撞。因此，它并不适合未经适配直接作为我们这里的统一 grasp 实现。尤其不能为了让规划成功，永久取消手指对所有障碍的检测。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.motion_planner.html)
+
+------
+
+## 5. 真正需要接上的 cuRobo 调用，长这样
+
+下面展示的是**现有 API 的核心接线参考代码**，不是声称已经在我们本机运行过的完整后端，并且只保留了核心调用，仅供参考。前提是 `planner` 已按我们的机器人和场景创建，`q_goal` 是已核验的目标 IK，`seed_bank` 是已转换的关节初始解。
+
+```
+import torch
+
+from curobo.types import GoalToolPose, JointState
+
+
+def solve_from_demo_seeds(
+    planner,
+    q_current: torch.Tensor,       # [1, dof]
+    q_goal: torch.Tensor,          # [1, dof]
+    goal_position: torch.Tensor,  # [3]，规划基座坐标系
+    goal_quaternion: torch.Tensor,# [4]，wxyz
+    seed_bank: torch.Tensor,       # [1, seeds, action_horizon, dof]
+):
+    solver = planner.trajopt_solver
+
+    if len(planner.tool_frames) != 1:
+        raise ValueError("此适配函数要求一个已配置的 TCP。")
+
+    expected_tail = (solver.action_horizon, solver.action_dim)
+    if seed_bank.ndim != 4 or tuple(seed_bank.shape[-2:]) != expected_tail:
+        raise ValueError(
+            f"seed_bank 应为 [1, seeds, {expected_tail[0]}, "
+            f"{expected_tail[1]}]，实际为 {tuple(seed_bank.shape)}"
+        )
+
+    current = JointState.from_position(
+        q_current, joint_names=planner.joint_names
+    )
+    terminal = JointState.from_position(
+        q_goal, joint_names=planner.joint_names
+    )
+
+    goal = GoalToolPose(
+        tool_frames=planner.tool_frames,
+        position=goal_position.reshape(1, 1, 1, 1, 3),
+        quaternion=goal_quaternion.reshape(1, 1, 1, 1, 4),
+    )
+
+    # 使用固定 solver profile 的种子数量，不随 skill 名称修改。
+    count = solver.config.num_seeds
+    terminal_seeds = q_goal[:, None, :].expand(
+        -1, count, -1
+    ).contiguous()
+
+    result = solver.solve_pose(
+        goal_tool_poses=goal,
+        current_state=current,
+        goal_state=terminal,
+        seed_config=terminal_seeds,
+        seed_traj=seed_bank,
+    )
+
+    # 此处仅返回候选；不能在这里直接认定“抓持成功”或下发硬件。
+    return result
+```
+
+`solve_pose()` 和 `seed_traj` 路径在源码中真实存在；上面的四维种子布局按 `SeedManager` 的实际检查写，而不是只照抄上层 docstring。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/solver/solver_trajopt.py)
+
+**还需要写的是适配代码，不是新的算法：**
+
+- 把当前关节状态、目标 TCP、场景转换到同一约定。
+- 把演示 IK 路径或 OMPL 路径重采样成种子。
+- 读取返回轨迹，统一验证并交给控制器。
+
+不能直接把离线视频中的 `[N,4,4]` 位姿数组填进 `seed_traj`；那是 Cartesian 轨迹，不是关节初始解。
+
+------
+
+## 6. 什么时候允许开始执行？
+
+这里应该采用**可检查的放行条件**，而不是“对技能语义有足够信心”这种无法落地的条件。
+
+对返回候选，检查：
+
+**实际起点正确；终端 TCP 满足演示抓持目标；关节与运动限制满足；整段路径没有禁止碰撞；已明确声明的过程要求通过；夹爪事件可执行。**
+
+碰撞不能只检查优化器的稀疏节点。OMPL 文档明确指出，离散运动检查过粗会漏掉节点之间的碰撞；检查精度属于共享验证配置。[Open Motion Planning Library](https://ompl.kavrakilab.org/stateValidation.html?utm_source=chatgpt.com)
+
+通过后，后端输出：
+
+```
+CANDIDATE_READY
+    timed_joint_trajectory
+    gripper_events
+    validation_report
+    scene_version
+```
+
+Executor 执行；执行中目标移动、跟踪失效或控制异常则中断／回报。终端由观测确认是否真的建立抓持，不把规划成功直接写成 `Holding = TRUE`。这正是 TaskFlux 文档要求的“候选与实际后果分开”。   
+
+如果失败，报告也应当具体：
+
+```
+INVALID_START
+NO_VALID_GOAL_IK
+NO_PATH_WITHIN_BUDGET
+COLLISION_VALIDATION_FAILED
+EXPLICIT_CONSTRAINT_VIOLATION
+EXECUTION_FAILED
+```
+
+**“有限预算内没找到路径”不是“这个技能理论上不成立”，也不是“现在必须增加一种新表示”。** TaskFlux 已要求区分这些情况。
+
+
+
+
+
+源码核查发现三个关键问题：
+
+- 当前编译器把演示后缀默认锁为逐帧位姿约束；取消硬锁时，必须同时保留真正的目标消费。
+- 固定cuRobo的dt仍不够：现有OMPL分支会改变progress，进而移动夹爪事件。
+- 接触候选即使获准尝试，仍可能被下游旧筛选条件再次拒绝；独立场景验证和执行交接也尚未贯通。

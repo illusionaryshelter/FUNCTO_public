@@ -398,11 +398,15 @@ def observed_space_from_rgbd(views, *, origin, shape, voxel_size, depth_error_m,
     normalized = _views(views, reference_frame, depth_range_m)
     known = _known_free_voxels(normalized, origin=origin, shape=shape, voxel_size=voxel_size,
                                depth_error_m=depth_error_m)
+    # BEGIN retain original ray evidence before adding current solid interiors.
+    # K may grow by O below; the robot volume oracle must still consume F.
+    known_free = known.copy()
     records, evidence = _known_solid_evidence(known_solids, owner_frames, current_robot, normalized, reference_frame)
     _add_known_solid_voxels(known, records, origin=origin, voxel_size=voxel_size)
     return ObservedSpace(known, origin=origin, voxel_size=voxel_size,
                          observation_ids=tuple(normalized), reference_frame=reference_frame,
-                         occupancy_evidence=evidence)
+                         occupancy_evidence=evidence, known_free=known_free)
+    # END occupied cells never become observed-free cells.
 
 
 def _partition_masks(views, owner_ids):
@@ -558,6 +562,8 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
     origin = center-(np.asarray(shape_xyz)-1)*mapper_cfg.esdf_voxel_size/2
     known = _known_free_voxels(normalized, origin=origin, shape=shape_xyz[::-1],
                                voxel_size=mapper_cfg.esdf_voxel_size, depth_error_m=depth_error_m)
+    # BEGIN preserve the same raw F used by the CPU-only RGB-D builder.
+    known_free = known.copy()
     free_count = int(known.sum())
     records, evidence = _known_solid_evidence(known_solids, owner_frames, current_robot, normalized, reference_frame)
     if evidence["robot"] is not None and (
@@ -567,7 +573,8 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
     occupied_count = _add_known_solid_voxels(known, records, origin=origin, voxel_size=mapper_cfg.esdf_voxel_size)
     coverage = ObservedSpace(known, origin=origin, voxel_size=mapper_cfg.esdf_voxel_size,
                              observation_ids=tuple(normalized), reference_frame=reference_frame,
-                             occupancy_evidence=evidence)
+                             occupancy_evidence=evidence, known_free=known_free)
+    # END native mapping and occupied-solid evidence cannot widen F.
     _require_mapping_memory(sum(estimates.values()), mapper_cfg.device)
     config_device = DeviceCfg(device=mapper_cfg.device)
     queries, statistics = {}, {}

@@ -136,7 +136,10 @@ def run(args):
                 })
                 print(json.dumps({"candidate": path.stem, "time_s": float(moment),
                     "passed": result["passed"], "failure": result.get("failure"),
-                    "unknown_volume_m3": result.get("unknown_volume_m3"),
+                    # BEGIN preserve the oracle's actual F-deficit semantics.
+                    "free_evidence_deficit_volume_m3": result.get("free_evidence_deficit_volume_m3"),
+                    "residual_classification": result["residual_classification"],
+                    # END no occupied-space classification is inferred here.
                     "witness": result.get("witness")}, allow_nan=False), flush=True)
         report["status"] = "completed"
     except Exception as error:
