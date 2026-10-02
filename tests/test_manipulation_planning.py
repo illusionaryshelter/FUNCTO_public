@@ -219,6 +219,7 @@ class PlannerCalculusTests(unittest.TestCase):
         np.testing.assert_allclose(exported.sample([0.])[0][0], q0, rtol=0, atol=1e-14)
         np.testing.assert_allclose(exported.sample([0.])[1][0], dq0, rtol=0, atol=1e-14)
         self.assertEqual(exported.duration, 40*grid["native_dt"])
+
     # END no synthetic zero-speed case substitutes for boundary preservation.
 
 

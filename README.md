@@ -932,6 +932,11 @@ optimization or proof of complete `inside`/physical execution.
 <!-- BEGIN complete-window constrained robot planning. -->
 ### Plan a robot trajectory for grounded skills
 
+The [Motion Planner PRD](motion_planner_prd.md) defines the system and component
+contracts, acceptance criteria, existing implementation gaps, and decisions
+that still require approval. It is a requirements baseline for review, not a
+claim that the current planner or physical execution has passed every gate.
+
 Grounding produces the interaction requirements and geometric reference.
 `manipulation.planning.plan_trajectory` uses cuRobo V2 to solve one joint
 trajectory through the current skill and at most one explicitly supplied next
