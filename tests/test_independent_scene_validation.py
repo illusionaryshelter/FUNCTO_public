@@ -76,6 +76,23 @@ def test_local_permission_checks_whole_overlap_and_keeps_raw_contacts(checker):
     assert rejected["pairs"][0]["contact_region_checks"][0]["contained"] is False
 
 
+# BEGIN an observed local bar may touch only part of a larger native pad.
+def test_partial_target_patch_permits_only_the_actual_solid_intersection(checker):
+    model = binding([rule(patch_half_size=[.015, .015])])
+    model["owners"][0]["geometry"]["solids"][0]["dimensions"] = [.02, .02, .1]
+    accepted = query(checker, model)
+    assert accepted["passed"] and accepted["pairs"][0]["permission"] == "pad_to_target"
+    # The same owner also has material outside this small permitted region.
+    # A second complete target solid cannot borrow the first bar's contact.
+    model["owners"][0]["geometry"]["solids"].append({"name": "outside_bar", "kind": "cuboid",
+        "dimensions": [.01, .01, .1], "pose": [.03, 0., -.05, 1., 0., 0., 0.],
+        "source": "independent second observed component"})
+    rejected = query(checker, model)
+    assert not rejected["passed"] and rejected["violations"]
+    assert any(row.get("target_geometry") == "outside_bar" and row["permission"] is None for row in rejected["pairs"])
+# END a larger feature is legal only where the whole physical overlap is local.
+
+
 @pytest.mark.parametrize("change", ["material", "owner", "time", "patch", "depth"])
 def test_wrong_material_owner_patch_time_or_depth_is_not_a_pair_exemption(checker, change):
     model = binding([rule()])
@@ -102,6 +119,18 @@ def test_permission_and_required_contact_are_independent(checker):
     assert result["violations"][0]["kind"] == "independent_required_contact"
 
 
+def test_required_contact_cannot_use_an_empty_part_of_the_declared_patch(checker):
+    for solids in ([], [{"name": "remote_target", "kind": "cuboid", "dimensions": [.01]*3,
+                         "pose": [.3, 0., -.005, 1., 0., 0., 0.], "source": "complete remote target"}]):
+        model = binding([rule(required=True)])
+        model["owners"][0]["geometry"]["solids"] = solids
+        result = query(checker, model)
+        assert not result["passed"]
+        assert result["violations"][0]["reason"] == "required_target_occupancy_absent_from_finite_region"
+        model["contacts"][0]["required"] = False
+        assert query(checker, model)["passed"]
+
+
 def test_unknown_conditional_attachment_is_not_an_automatic_holding_gate(checker):
     model = binding()
     owner = model["owners"][0]
@@ -120,8 +149,10 @@ def test_unknown_conditional_attachment_is_not_an_automatic_holding_gate(checker
 
 
 def test_voxel_adapter_retains_complete_field_and_detects_filled_occupancy(checker):
-    field = torch.full((8, 8, 8), -1., dtype=torch.float32)
-    field[4, 4, 4] = .01
+    # BEGIN native ESDF is negative inside and positive outside.
+    field = torch.full((8, 8, 8), 1., dtype=torch.float32)
+    field[4, 4, 4] = -.01
+    # END the known occupied cell matches the installed native query.
     voxel = SimpleNamespace(feature_tensor=field, dims=[.08]*3, voxel_size=.01,
                             pose=[0., 0., 0., 1., 0., 0., 0.], name="observed_cells")
     geometry = _independent_voxel_geometry(voxel, "observed depth field")
@@ -138,6 +169,40 @@ def test_voxel_adapter_retains_complete_field_and_detects_filled_occupancy(check
     modified["owners"][0]["geometry"]["solids"][0]["occupied_flat_indices"] = [0]
     with pytest.raises(ValueError, match="inventory changed"):
         query(checker, modified)
+
+
+# BEGIN native field signs, zero surfaces and positive sentinels reach both consumers.
+@pytest.mark.parametrize("sample, occupied", [(-.01, True), (0., True), (-0., True), (.01, False), (10000., False)])
+def test_completed_native_esdf_sign_reaches_contact_and_coal(checker, sample, occupied):
+    from manipulation.contact_geometry import ContactCellGeometry
+    # In the installed completed native ESDF, missing sites are +1e4,
+    # negative values are interiors, and both signs of zero are surfaces.
+    # The test cell lies strictly inside the independent robot's native box.
+    field = torch.full((8, 8, 8), 10000., dtype=torch.float32)
+    field[4, 4, 4] = sample
+    voxel = SimpleNamespace(feature_tensor=field, dims=[.08]*3, voxel_size=.01,
+                            pose=[0., 0., 0., 1., 0., 0., 0.], name="completed_native_field")
+    geometry = _independent_voxel_geometry(voxel, "completed native ESDF contract")
+    cells = ContactCellGeometry(geometry)
+    assert cells.complete and len(cells.centres) == int(occupied)
+    assert geometry["field_summary"]["occupied_cells"] == int(occupied)
+    assert geometry["field_summary"]["positive_cells"] == 512-int(occupied)
+    model = binding()
+    model["owners"][0]["geometry"] = geometry
+    result = query(checker, model)
+    assert result["passed"] is not occupied
+    row = geometry["solids"][0]
+    assert row["occupancy_rule"] == "ESDF_sample_nonpositive"
+    # Byte equality includes an empty union, -0 and all unknown sentinels.
+    assert bytes.fromhex(row["field_bytes_hex"]) == field.numpy().tobytes()
+    if occupied:
+        np.testing.assert_allclose(cells.centres, [[.005, .005, .005]])
+    row["occupancy_rule"] = "ESDF_sample_strictly_positive"
+    with pytest.raises(ValueError, match="original bound field"):
+        ContactCellGeometry(geometry)
+    with pytest.raises(ValueError, match="inventory changed"):
+        query(checker, model)
+# END positive field values never supply target material or observed-free evidence.
 # END counterexamples preserve actual physical violations and allowed uncertainty.
 
 # BEGIN owner predictions preserve multi-phase time and actual observation scope.
@@ -263,8 +328,10 @@ def test_moving_owner_pair_permission_is_independent_of_owner_order(checker):
 
 
 def test_all_intersecting_voxel_leaves_must_fit_the_local_material_feature(checker):
-    field = torch.full((20, 20, 20), -1., dtype=torch.float32)
-    field[9, 9, 9] = field[14, 9, 9] = .01
+    # BEGIN preserve the two physical occupied cells with native ESDF signs.
+    field = torch.full((20, 20, 20), 1., dtype=torch.float32)
+    field[9, 9, 9] = field[14, 9, 9] = -.01
+    # END positive surrounding cells must never become contact target material.
     voxel = SimpleNamespace(feature_tensor=field, dims=[.2]*3, voxel_size=.01,
                             pose=[0., 0., 0., 1., 0., 0., 0.], name="observed_cells")
     model = binding([rule()])

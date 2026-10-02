@@ -404,7 +404,9 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
     finger trajectory, force-closure test or whole-arm/environment certificate.
 
     `supported` means opposing visible contact geometry and no target surface
-    interference in the stated sampled scope. Missing evidence is unresolved.
+    interference at the explicitly bound nominal goal. Missing evidence or a
+    conflict at that one member is unresolved for the complete task allowed
+    set: neither the source endpoint nor a failed centre proves it empty.
     Inputs are action alternatives for an already selected owner and function,
     not mutually exclusive scene-identity hypotheses. An unverified alternative
     does not invalidate a supported action. Select the sole eligible action,
@@ -435,6 +437,9 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
         _name(name, "candidate ID")
         candidate = candidates[name]
         poses = _poses_array(candidate["eef_poses"], "Candidate EEF poses")
+        # BEGIN terminal diagnostics consume the independent goal, not source[-1].
+        nominal_goal = _pose_array(candidate["goal_pose"], "Candidate nominal grasp goal")
+        # END checking one member cannot certify allowed-set infeasibility.
         frames = np.asarray(candidate["frame_indices"])
         if (candidate.get("reference_frame") != reference_frame
                 or candidate.get("tool_id") != tool.tool_id or candidate.get("tool_frame") != tool.tool_frame
@@ -452,6 +457,11 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
                   "current_joint_positions_m": np.asarray(measured["joint_positions_m"]).copy(),
                   "planned_approach_joint_positions_m": np.asarray(opened["joint_positions_m"]).copy(),
                   "approach_tool_motion_sample_step_m": contact}
+        # BEGIN state the scope even when current geometry is missing.
+        report.update(terminal_checked_pose=nominal_goal.copy(),
+                      terminal_goal_scope="one explicitly bound nominal goal member",
+                      allowed_set_infeasibility_proven=False)
+        # END the full original grasp goal remains eligible for planning.
         result["candidates"][name] = report
         opening_declared = any(event["command"] == "open" and event["frame_index"] <= closing[0]
                                for event in candidate["gripper_events"])
@@ -483,11 +493,11 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
                         if _record_interference(report, {"phase": "planned_open_approach",
                                 "frame_index": int(frames[index]), "solids": found}):
                             break
-            closure = _closure(poses[-1], opened, closed, cloud, contact, penetration)
+            closure = _closure(nominal_goal, opened, closed, cloud, contact, penetration)
             report["terminal_closure"] = closure
             # The palm does not translate with finger closure. A witnessed
             # palm conflict is valid even when contact width is unresolved.
-            palm = [row for row in _interference(poses[-1], opened, geometry, cloud, tree, radius, penetration)
+            palm = [row for row in _interference(nominal_goal, opened, geometry, cloud, tree, radius, penetration)
                     if row["role"] == "palm"]
             _record_interference(report, {"phase": "terminal_palm", "solids": palm})
             if closure["closure_fraction"] is not None:
@@ -502,7 +512,7 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
                 for fraction in np.linspace(0., 1., steps+1):
                     state = tool.at((1-fraction)*qopen+fraction*joint)
                     closure["conditional_closure_samples"] += 1
-                    found = _interference(poses[-1], state, geometry, cloud, tree, radius, penetration)
+                    found = _interference(nominal_goal, state, geometry, cloud, tree, radius, penetration)
                     if _record_interference(report, {"phase": "terminal_conditional_closure",
                             "closure_fraction": float(fraction*alpha), "solids": found}):
                         break
@@ -525,13 +535,13 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
                                                          "unresolved" if approach_unknown else "supported")
             report["terminal_visible_geometry_status"] = ("rejected" if terminal_conflicts else
                                                          "unresolved" if terminal_unknown else closure["status"])
-            # BEGIN reference-route evidence cannot veto an independently bound target.
+            # BEGIN neither the reference route nor a failed centre deletes its goal set.
             if terminal_conflicts:
-                report.update(status="rejected", reason="Terminal conditional tool geometry penetrates observed target")
+                report.update(status="unresolved", reason="Nominal goal member penetrates observed target; allowed-set feasibility remains unresolved")
             elif approach_conflicts or not route_connected or not opening_supported:
                 report.update(status="unresolved", reason=("No opening intention supports this reference approach; target remains eligible"
                               if not opening_supported else "Reference approach requires replanning; target remains eligible"))
-            # END retain the precise failed route without deleting its target.
+            # END retain precise geometric witnesses without an unsupported empty-set claim.
             elif terminal_unknown or approach_unknown:
                 report.update(status="unresolved", reason="Locally unsupported boundary positions indicate possible tool interference")
             else:
@@ -541,7 +551,7 @@ def screen_grasp_candidates(candidates, views, tool, *, reference_frame,
         result[report["status"]+"_candidate_ids"].append(name)
     # BEGIN uncertainty authorizes an attempt, never a Holding assertion.
     result["eligible_candidate_ids"] = sorted(result["supported_candidate_ids"] + result["unresolved_candidate_ids"])
-    # END known terminal violations remain excluded.
+    # END a nominal-member violation is not a proof against every allowed member.
     eligible, unknown = result["eligible_candidate_ids"], result["unresolved_candidate_ids"]
     # BEGIN action alternatives do not compete as exclusive scene hypotheses.
     selection = result["supported_candidate_ids"] or eligible

@@ -24,7 +24,9 @@ class GraspScreeningIntegrationTest(unittest.TestCase):
                                {"event_id": "closing", "frame_index": 20, "command": "close"}]}}
         scene = {"carrier_id": "observed_owner", "reference_frame": "world",
                  "tool_id": self.tool.tool_id, "tool_frame": self.tool.tool_frame,
-                 "eef_pose": np.eye(4), "carrier_pose": np.eye(4), "region_transform": np.eye(4)}
+                 "eef_pose": np.eye(4), "carrier_pose": np.eye(4), "region_transform": np.eye(4),
+                 "grasp_goal": {"T_carrier_eef": np.eye(4), "position_tolerance_m": .002,
+                                "rotation_tolerance_rad": .03, "source": "declared screening fixture task relation"}}
         view = {"owner_id": "observed_owner", "reference_frame": "world",
                 "depth": np.ones((15, 15)), "owner_mask": np.zeros((15, 15), bool),
                 "K": np.array([[1000., 0., 7.], [0., 1000., 7.], [0., 0., 1.]]),
@@ -50,7 +52,7 @@ class GraspScreeningIntegrationTest(unittest.TestCase):
         self.assertFalse(result["robot_execution_verified"])
     # END eligibility does not certify physical execution or effects.
 
-    def test_observed_palm_penetration_rejects_but_keeps_complete_reference(self):
+    def test_nominal_palm_penetration_retains_goal_set_and_complete_reference(self):
         program, scene, view = self.fixture()
         geom = next(g for g in self.tool.collision_geometries if g["role"] == "palm")
         state = self.tool.at(self.tool.open_joint_positions_m)
@@ -59,7 +61,11 @@ class GraspScreeningIntegrationTest(unittest.TestCase):
         view["T_output_camera"][:3, 3] = center - [0., 0., 1.]
         view["owner_mask"][:] = True
         result = self.call(program, {"candidate": scene}, view)
-        self.assertEqual(result["grasp_geometry_validation"]["candidates"]["candidate"]["status"], "rejected")
+        report = result["grasp_geometry_validation"]["candidates"]["candidate"]
+        self.assertEqual(report["status"], "unresolved")
+        self.assertEqual(report["terminal_visible_geometry_status"], "rejected")
+        self.assertFalse(report["allowed_set_infeasibility_proven"])
+        self.assertIn("candidate", result["grasp_geometry_validation"]["eligible_candidate_ids"])
         self.assertIn("candidate", result["trajectories"])
         np.testing.assert_array_equal(result["trajectories"]["candidate"]["eef_poses"][1:],
                                       program["demo"]["T_carrier_eef"][1:])

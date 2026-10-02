@@ -1297,6 +1297,85 @@ class FingerConvergenceTests(unittest.TestCase):
 
 # BEGIN actual event deadlines and retry identities use measured physical clocks.
 # BEGIN actual direction obligations use actual measured coordinates/rates.
+# BEGIN final source commands retain real activation and bounded common-clock coverage.
+class TerminalSourceCommandTests(unittest.TestCase):
+    @staticmethod
+    def fixture():
+        from manipulation.planning import (PlanningBudget, _initial_timing, _progress_for_cubic_boundaries,
+            _fixed_spline_grid, _bind_event_clock)
+        from manipulation.planning_problem import PlanningEvent
+        from run_recorded_skill import finger_trajectory_factory
+
+        simulation, _, _ = _fixture()
+        simulation.native_data.qvel[:] = 0.
+        commands = (PlanningEvent("source-open", "declared_skill", 0., 0, "open", "original first source frame"),
+                    PlanningEvent("source-last-close", "declared_skill", 1., 197, "close", "original last source frame"))
+        problem = SimpleNamespace(events=commands, pose_events=(), coordinate_events=(), supports=(),
+            source_time_map={"source_times": [10., 10.1], "progress": [0., 1.]})
+        budget, source = _initial_timing(problem, PlanningBudget(knots=6))
+        mapping, _ = _progress_for_cubic_boundaries(source, budget.knots, np.zeros(7),
+            stop_progress=(), anchors=np.array([0., 1.]))
+        grid = _fixed_spline_grid(intervals=budget.knots+4, native_dt=budget.maximum_trajectory_dt,
+            interpolation_steps=budget.interpolation_steps, interpolation_dt=budget.interpolation_dt)
+        duration = grid["duration"]
+        mapping = _bind_event_clock(problem, mapping, duration, simulation.timestep)
+        events = tuple({**record["event"], **{key: deepcopy(value) for key, value in record.items() if key != "event"}}
+                       for record in mapping.event_clock.values())
+        q = simulation.native_data.qpos[:7].copy()
+        curve = JointTrajectory(simulation.arm_joint_names, np.array([0., duration]), np.stack([q, q]),
+            np.zeros((2, 7)), mapping.u, mapping.s, events, (), {})
+        targets = {"joint_names": list(simulation.finger_joint_names),
+            "source": "Explicit small CPU terminal command; no actual contact claim",
+            "events": [{"skill_id": "declared_skill", "event_id": "source-open", "kind": "open", "positions": [.012, -.017]},
+                       {"skill_id": "declared_skill", "event_id": "source-last-close", "kind": "close", "positions": [.01205, -.01705]}]}
+        actual = _initial_feedback(simulation)
+        input_feedback = {**actual, "start_q": actual["q"], "start_dq": actual["dq"], "sim_time_s": actual["timestamp_s"]}
+        factory = finger_trajectory_factory(problem, input_feedback, FixedFingerTargets.from_mapping(targets),
+            timestep=simulation.timestep, ctrlrange=simulation.finger_ctrlrange,
+            position_limits=dict(zip(simulation.joint_names, simulation.joint_ranges)),
+            velocity_limits=dict(zip(simulation.finger_joint_names, [.2, .2])),
+            acceleration_limits=dict(zip(simulation.finger_joint_names, [1000., 1000.])))
+        curve.finger_trajectory = factory(duration, mapping)
+        return simulation, curve, targets, problem, mapping
+
+    def test_last_source_command_uses_formal_terminal_plateau_and_is_actually_applied(self):
+        simulation, curve, targets, _, mapping = self.fixture()
+        terminal = curve.events[-1]
+        self.assertEqual(terminal["source_frame"], 197)
+        self.assertEqual(terminal["progress"], 1.)
+        self.assertLess(terminal["activation_time_s"], curve.duration)
+        self.assertEqual(float(mapping.anchor_parameters([1.])[0, 0]*curve.duration), terminal["activation_time_s"])
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                output=Path(temporary)/"trial")
+        self.assertEqual(report["status"], "curve_finished")
+        applied = report["events"][-1]
+        self.assertEqual(applied["event_id"], "source-last-close")
+        self.assertEqual(applied["source_frame"], 197)
+        self.assertEqual(applied["applied_at_s"], terminal["activation_time_s"])
+        np.testing.assert_allclose(curve.finger_trajectory.sample(curve.duration)[0], [.01205, -.01705], rtol=0, atol=1e-15)
+        self.assertEqual(report["unapplied_gripper_events"], [])
+
+    def test_terminal_command_with_no_formal_coverage_or_missed_deadline_remains_rejected(self):
+        from manipulation.planning import _ProgressMap, _bind_event_clock, _validate_bound_event_times
+        from manipulation.planning_problem import EventTimeConstraint, TimeBindingError
+        from dataclasses import replace
+        simulation, curve, _, problem, mapping = self.fixture()
+        with self.assertRaisesRegex(ValueError, "activation/effect coverage"):
+            _bind_event_clock(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
+                              curve.duration, simulation.timestep)
+        terminal = problem.events[-1]
+        bound = mapping.event_clock[(terminal.skill_id, terminal.event_id, terminal.occurrence)]
+        problem.events = (problem.events[0], replace(terminal, timing=(EventTimeConstraint(
+            check_target="activation", window_s=(None, bound["activation_time_s"]-simulation.timestep),
+            time_basis="request_physical", origin_time_s=0., source="Original hard terminal-command deadline"),)))
+        rebound = _bind_event_clock(problem, _ProgressMap(mapping.u, mapping.s), curve.duration, simulation.timestep)
+        with self.assertRaises(TimeBindingError):
+            _validate_bound_event_times(problem, rebound, curve.duration)
+# END source-frame coverage does not authorize post-validation retiming or deadline changes.
+
+
 class ActualDirectionEvidenceTests(unittest.TestCase):
     @staticmethod
     def fixture(kind="local_rate", *, start=0., end=1.):
@@ -1445,6 +1524,182 @@ class ActualDirectionEvidenceTests(unittest.TestCase):
 # END clock progress and earlier attempts cannot certify actual direction.
 
 
+# BEGIN actual task accuracy keeps the original allowed set, owner and clock.
+class ActualPoseGoalTests(unittest.TestCase):
+    @staticmethod
+    def fixture(*, progress=.5, actual_relation=None):
+        simulation, curve, targets = _fixture()
+        curve.events[2].update(kind="function", requires_evidence=None, stop=False)
+        _bind_fingers(simulation, curve, targets)
+        result = _result(curve)
+        result.execution_binding["problem"]["pose_events"] = [{"progress": progress,
+            "tool_from_function": np.eye(4).tolist(), "target": np.eye(4).tolist(),
+            "position_tolerance_m": .001, "rotation_tolerance_rad": .01,
+            "source": "Original synthetic 1 mm functional task requirement", "actual_relation": actual_relation}]
+        result.execution_binding["goal_identities"] = {"pose_events": [7]}
+        result.execution_binding["validation"]["inputs"]["problem"] = deepcopy(result.execution_binding["problem"])
+        values = _limit_values(simulation, curve)
+        values["tcp_position_error_m"] = .005
+        values["tcp_rotation_error_rad"] = .02
+        return simulation, curve, targets, result, ExecutionLimits.from_mapping(values)
+
+    @staticmethod
+    def run_trial(fixture, *, observe=None, step_callback=None, rejects=False):
+        simulation, curve, targets, result, limits = fixture
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            if rejects:
+                with unittest.TestCase().assertRaises(ExecutionGuardError):
+                    _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                        initial_feedback=_initial_feedback(simulation), execution_limits=limits, output=output,
+                        observation_callback=observe, step_callback=step_callback)
+                return json.loads((output/"execution-report.json").read_text())
+            return _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=_initial_feedback(simulation), execution_limits=limits, output=output,
+                observation_callback=observe, step_callback=step_callback)
+
+    def test_two_mm_actual_miss_fails_one_mm_goal_inside_five_mm_tracking_band(self):
+        fixture = self.fixture()
+        fixture[0].native_data.site_xpos[0, 0] = .002
+        def observer(feedback, curve_time):
+            return {"source": "An untrusted pose-completion label cannot replace measurement",
+                "timestamp_s": feedback["timestamp_s"], "completed_goal_ids": [["pose_events", 7]]}
+        report = self.run_trial(fixture, observe=observer, rejects=True)
+        self.assertEqual(report["pose_goal_result"], "F")
+        self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "actual_pose_goal_violated")
+        self.assertEqual(report["completed_goal_ids"], [])
+        proof = report["goal_evidence"][-1]
+        self.assertAlmostEqual(proof["position_error_m"], .002)
+        self.assertEqual(proof["requirement"]["position_tolerance_m"], .001)
+        self.assertAlmostEqual(proof["evaluated_curve_time_s"], .006)
+        self.assertTrue(report["abort_hold"]["native_ctrl_written"])
+
+    def test_within_original_tolerance_completes_once_with_original_identity(self):
+        fixture = self.fixture()
+        simulation = fixture[0]
+        simulation.native_data.site_xpos[0, 0] = .0005
+        def after_step(model, data, row):
+            # The once-goal has already been measured at .006 s. A later
+            # departure inside the engineering band adds no invented hold goal.
+            if row["elapsed"] >= .008:
+                simulation.native_data.site_xpos[0, 0] = .003
+        report = self.run_trial(fixture, step_callback=after_step)
+        self.assertEqual(report["status"], "curve_finished")
+        self.assertEqual(report["pose_goal_result"], "T")
+        self.assertEqual(report["completed_goal_ids"], [["pose_events", 7]])
+        self.assertEqual(len(report["pose_goal_checks"]), 1)
+        proof = report["goal_evidence"][-1]
+        self.assertTrue(proof["completion_verified"])
+        self.assertAlmostEqual(proof["position_error_m"], .0005)
+        self.assertEqual(proof["candidate_id"], fixture[3].execution_binding["candidate_id"])
+        self.assertEqual(report["continuation"]["completed_goal_ids"], [["pose_events", 7]])
+
+    def test_owner_relative_goal_without_current_owner_is_unknown_only_when_due(self):
+        fixture = self.fixture(actual_relation={"target_owner_id": "current_part", "T_owner_target": np.eye(4).tolist()})
+        report = self.run_trial(fixture, rejects=True)
+        self.assertEqual(report["pose_goal_result"], "U")
+        self.assertEqual(report["executed_steps"], 3)
+        self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "actual_pose_goal_unverified")
+        self.assertIsNone(report["goal_evidence"][-1]["actual_target_pose"])
+        self.assertIn("current_part", report["goal_evidence"][-1]["reason"])
+        self.assertTrue(report["continuation"]["requires_rebind"])
+
+    def test_current_owner_pose_changes_relative_result_without_changing_frozen_world_target(self):
+        for shift, expected in ((.0004, "T"), (.002, "F")):
+            fixture = self.fixture(actual_relation={"target_owner_id": "current_part", "T_owner_target": np.eye(4).tolist()})
+            current = np.eye(4)
+            current[0, 3] = shift
+            def observe(feedback, curve_time):
+                return {"source": "Explicit current calibrated owner observation", "timestamp_s": feedback["timestamp_s"],
+                    "scene_owner_poses": {"current_part": current.tolist()}}
+            with self.subTest(shift=shift):
+                report = self.run_trial(fixture, observe=observe, rejects=expected == "F")
+                self.assertEqual(report["pose_goal_result"], expected)
+                self.assertAlmostEqual(report["goal_evidence"][-1]["position_error_m"], shift)
+
+    def test_functional_time_uses_first_nonzero_plateau_entrance(self):
+        fixture = self.fixture()
+        simulation, curve, _, result, _ = fixture
+        curve.progress_u = np.asarray([0., .4, .7, 1.])
+        curve.progress_s = np.asarray([0., .5, .5, 1.])
+        from manipulation.execution_binding import curve_snapshot
+        result.execution_binding["curve"] = curve_snapshot(curve)
+        simulation.native_data.site_xpos[0, 0] = .0005
+        report = self.run_trial(fixture)
+        proof = report["goal_evidence"][-1]
+        self.assertAlmostEqual(proof["scheduled_curve_time_s"], .0048)
+        self.assertAlmostEqual(proof["evaluated_curve_time_s"], .006)
+        self.assertEqual(proof["identity"], ["pose_events", 7])
+
+    def test_one_ulp_future_functional_time_never_uses_the_earlier_native_tick(self):
+        scheduled = .010000000000000002
+        fixture = self.fixture(progress=scheduled/.012)
+        report = self.run_trial(fixture)
+        proof = report["goal_evidence"][-1]
+        self.assertEqual(proof["scheduled_curve_time_s"], scheduled)
+        self.assertEqual(proof["device_due_time_s"], .012)
+        self.assertEqual(proof["physical_elapsed_s"], .012)
+        self.assertEqual(proof["evaluated_curve_time_s"], .012)
+
+    def test_terminal_actual_tick_preserves_the_clipped_original_curve_time(self):
+        fixture = self.fixture(progress=1.)
+        simulation, old, targets, result, limits = fixture
+        duration = .011
+        q, dq = old.sample(0.)[:2]
+        curve = JointTrajectory(old.joint_names, np.asarray([0., duration]),
+            np.stack((q, q+dq*duration)), np.stack((dq, dq)), old.progress_u, old.progress_s,
+            old.events, old.conditions, {})
+        _bind_fingers(simulation, curve, targets)
+        result.trajectory = curve
+        from manipulation.execution_binding import curve_snapshot
+        result.execution_binding["curve"] = curve_snapshot(curve)
+        report = self.run_trial((simulation, curve, targets, result, limits))
+        proof = report["goal_evidence"][-1]
+        self.assertEqual(proof["scheduled_curve_time_s"], duration)
+        self.assertEqual(proof["device_due_time_s"], .012)
+        self.assertEqual(proof["physical_elapsed_s"], .012)
+        self.assertEqual(proof["evaluated_curve_time_s"], duration)
+
+    def test_held_function_needs_current_relation_and_consumes_full_material_transform(self):
+        from manipulation.execution import _actual_pose_goal
+        from manipulation.planning_problem import PoseEventRequirement
+        tool_from_function = np.eye(4)
+        tool_from_function[0, 3] = .1
+        requirement = PoseEventRequirement(.5, tool_from_function, tool_from_function, .001, .01,
+            "Explicit synthetic held material", actual_relation={"function_owner_id": "held",
+                "T_owner_function": np.eye(4), "attachment_condition_id": "actual_holding"})
+        feedback = {"tool_pose": np.eye(4), "timestamp_s": 2., "source": "Actual named robot feedback", "feedback_id": "robot:2"}
+        self.assertEqual(_actual_pose_goal(requirement, feedback, None)["value"], "U")
+        observed = {"timestamp_s": 2., "source": "Actual synchronized holding observation",
+                    "scene_condition_evidence": {"actual_holding": True}}
+        proof = _actual_pose_goal(requirement, feedback, observed)
+        self.assertEqual(proof["value"], "T")
+        np.testing.assert_array_equal(proof["actual_function_pose"], tool_from_function)
+
+    def test_upstream_nonpose_completion_keeps_acquisition_clock_when_delivery_is_delayed(self):
+        simulation, curve, targets = _fixture()
+        curve.events[2].update(kind="function", requires_evidence=None, stop=False)
+        _bind_fingers(simulation, curve, targets)
+        result = _result(curve)
+        result.execution_binding["problem"]["coordinate_events"] = [{
+            "progress": 1., "source": "Explicit upstream native coordinate goal contract"}]
+        result.execution_binding["goal_identities"] = {"coordinate_events": [3]}
+        result.execution_binding["validation"]["inputs"]["problem"] = deepcopy(result.execution_binding["problem"])
+        values = _limit_values(simulation, curve)
+        values["observation_policy"]["maximum_age_s"] = .01
+        def observer(feedback, curve_time):
+            return {"source": "Explicit delayed upstream coordinate evaluation",
+                "timestamp_s": feedback["timestamp_s"]-(.001 if curve_time >= .002 else 0.),
+                "completed_goal_ids": [["coordinate_events", 3]] if curve_time >= .002 else []}
+        report = self.run_trial((simulation, curve, targets, result, ExecutionLimits.from_mapping(values)), observe=observer)
+        proof = report["goal_evidence"][-1]
+        self.assertAlmostEqual(proof["physical_elapsed_s"], .001)
+        self.assertAlmostEqual(proof["evaluated_curve_time_s"], .001)
+        self.assertAlmostEqual(proof["consumer_elapsed_s"], .002)
+        self.assertAlmostEqual(proof["timestamp_s"], 1.301)
+# END these mock controller checks do not claim a formal physical grasp success.
+
+
 class PhysicalEventTimingTests(unittest.TestCase):
     @staticmethod
     def window(target, lower, upper, **details):
@@ -1476,7 +1731,12 @@ class PhysicalEventTimingTests(unittest.TestCase):
             _bind_fingers(simulation, curve, targets)
             result = _result(curve)
             result.execution_binding.update(request_time_origin_s=20., goal_identities={"pose_events": [0]})
-            result.execution_binding["problem"]["pose_events"] = [{"progress": 1.}]
+            # BEGIN the executor independently measures the original pose set.
+            result.execution_binding["problem"]["pose_events"] = [{"progress": 1.,
+                "tool_from_function": np.eye(4).tolist(), "target": np.eye(4).tolist(),
+                "position_tolerance_m": .001, "rotation_tolerance_rad": .01,
+                "source": "Explicit fixed-world CPU arrival goal", "actual_relation": None}]
+            # END an upstream completed-goal label alone has no pose authority.
             result.execution_binding["validation"]["inputs"]["problem"] = deepcopy(result.execution_binding["problem"])
             def observe(feedback, curve_time):
                 return {"source": "Synthetic measured completion before soft source progress 1",

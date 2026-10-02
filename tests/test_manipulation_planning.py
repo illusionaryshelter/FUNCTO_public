@@ -825,9 +825,8 @@ class NativeCubicClockTests(unittest.TestCase):
         planner.budget = PlanningBudget(ik_seeds=2, trajectory_seeds=1)
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=1e-5))
         planner.start = SimpleNamespace(position=torch.tensor([[-10.]]))
-        planner.seed_progress = torch.zeros((1, 1))
         # BEGIN explicitly model the native initializer's independent time input.
-        planner.seed_parameter = torch.zeros_like(planner.seed_progress)
+        planner.seed_parameter = torch.zeros((1, 1))
         # END progress alone cannot identify a point on a pause interval.
         planner.progress_map = mapping
         planner.trajopt = SimpleNamespace(action_horizon=count)
@@ -871,9 +870,8 @@ class NativeCubicClockTests(unittest.TestCase):
         planner.budget = PlanningBudget(ik_seeds=2, trajectory_seeds=2)
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=1e-5))
         planner.start = SimpleNamespace(position=measured_q, velocity=measured_dq)
-        planner.seed_progress = torch.zeros((1, 1))
         # BEGIN failed pose IK still receives the real control-point clock.
-        planner.seed_parameter = torch.zeros_like(planner.seed_progress)
+        planner.seed_parameter = torch.zeros((1, 1))
         # END diagnostic failure does not remove the independent time input.
         planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         planner.trajopt = SimpleNamespace(action_horizon=horizon,
@@ -925,9 +923,8 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=joint_tolerance))
         planner.start = SimpleNamespace(position=torch.zeros((1, 3), dtype=torch.float64),
                                         velocity=torch.tensor([[.1, -.2, .3]], dtype=torch.float64))
-        planner.seed_progress = torch.zeros((1, 1), dtype=torch.float64)
         # BEGIN seed selection fixtures retain the production time parameter.
-        planner.seed_parameter = torch.zeros_like(planner.seed_progress)
+        planner.seed_parameter = torch.zeros((1, 1), dtype=torch.float64)
         # END no implicit default clock is added to the production planner.
         planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         generator = TrajectorySeedGenerator(horizon, 3, DeviceCfg("cpu"))
@@ -1153,7 +1150,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         self.device_cfg = DeviceCfg("cpu")
         # Empty process_mode selects native costs alone; no task, scene or FK
         # stand-in is needed to exercise the actual integration boundary.
-        self.config_type = _process_manager_type(None, None, None, None, None, None)
+        self.config_type = _process_manager_type(None, None, None, None, None)
         self.raw = {
             "self_collision_cfg": {"weight": 5000., "convert_to_binary": True},
             "cspace_cfg": {
@@ -1261,6 +1258,111 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         self.assertEqual(template.self_collision_cfg.weight.item(), 5000.)
         self.assertIsNone(template.self_collision_cfg.self_collision_kin_config)
         self.assertIsNone(template.cspace_cfg.joint_limits)
+
+    # BEGIN reference IK is numerical initialization, with full trajectory checks retained.
+    def test_reference_ik_cost_graph_skips_scene_while_trajectory_keeps_scene_and_guidance(self):
+        from curobo._src.rollout.cost_manager.cost_manager_robot import RobotCostManager
+        from curobo._src.rollout.metrics import CostCollection
+
+        def kinematics(joints):
+            q = joints.position
+            p = torch.cat((q, torch.zeros_like(q[..., :1])), -1)
+            r = q.new_zeros((*q.shape[:2], 1, 4)); r[..., 0] = 1.
+            return SimpleNamespace(tool_poses=SimpleNamespace(position=p.unsqueeze(-2), quaternion=r),
+                tool_jacobians=q.new_zeros((*q.shape[:2], 1, 6, 2)),
+                robot_spheres=torch.cat((p, torch.full_like(p[..., :1], .01)), -1).unsqueeze(-2))
+
+        def native_cost(manager, state, cost_collection=None, goal=None, **kwargs):
+            collection = CostCollection()
+            collection.add(state.joint_state.position.square().sum(-1, keepdim=True), "native")
+            return collection
+
+        for mode in ("seed_optimizer", "seed_metrics", "trajectory_optimizer", "trajectory_metrics"):
+            with self.subTest(mode=mode):
+                q = torch.tensor([[[.1, .2], [.3, .4]]], requires_grad=True)
+                joints = SimpleNamespace(position=q, velocity=torch.zeros_like(q), dt=torch.tensor([1.]))
+                native = kinematics(joints)
+                state = SimpleNamespace(joint_state=joints, tool_poses=native.tool_poses,
+                    cuda_robot_model_state=native, robot_spheres=native.robot_spheres)
+                mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+                problem = SimpleNamespace(tool_link="tool", start_progress=0., phase_count=1.,
+                    mechanisms=(), stop_progress=(), transform_tool_pose=lambda p, r: (p, r),
+                    transform_robot_spheres=lambda value: value,
+                    evaluate=Mock(side_effect=lambda p, *args, **kwargs: p.square().sum(-1)),
+                    optimizer_preferences=Mock(side_effect=lambda p, *args, **kwargs: p[..., 0]*0))
+                scene = SimpleNamespace(gripper=None, robot_coverage=object(),
+                    required_progress_anchors=(0., 1.),
+                    evaluate=Mock(side_effect=lambda spheres, p, *args, **kwargs: p.square().sum(-1)),
+                    robot_coverage_guidance=Mock(side_effect=lambda poses, progress: poses.square().sum(-1)),
+                    optimizer_preferences=lambda progress, *args: torch.zeros_like(progress))
+                scene.clone_for_rollout = Mock(return_value=scene)
+                transition = self.transition()
+                transition.joint_names = ("first_joint", "second_joint")
+                transition.robot_model.tool_frames = ["tool"]
+                transition.robot_model.config = object()
+                with patch("manipulation.planning._native_gradient_layout_type",
+                           return_value=SimpleNamespace(apply=lambda value: value)), \
+                     patch("manipulation.planning._orientation_vjp_type",
+                           return_value=SimpleNamespace(apply=lambda q, r, jacobian: r)), \
+                     patch("curobo.kinematics.Kinematics", return_value=SimpleNamespace(
+                           compute_kinematics=kinematics)) as anchor_fk, \
+                     patch("manipulation.planning._RobotCoverageFK", return_value=SimpleNamespace(
+                           poses=lambda q, *args: q)) as coverage_fk, \
+                     patch.object(RobotCostManager, "compute_costs", autospec=True,
+                                  side_effect=native_cost) as native_evaluate:
+                    config_type = _process_manager_type(problem, scene, mapping, (0., 1.),
+                        PlanningBudget(), clock={"duration": 1.}, seed_parameter=torch.tensor([[.4]]))
+                    config = config_type.create({"process_mode": mode}, device_cfg=self.device_cfg)
+                    manager = self.manager(config, transition)
+                    collection = manager.compute_costs(state)
+                    native_evaluate.assert_called_once()
+                    loss = sum(value.sum() for value in collection.values)
+                    loss.backward()
+                    self.assertTrue(bool(torch.isfinite(q.grad).all()))
+                    if mode.startswith("seed_"):
+                        self.assertEqual(collection.names, ["native"])
+                        torch.testing.assert_close(q.grad, 2*q.detach(), rtol=0., atol=0.)
+                        problem.evaluate.assert_not_called()
+                        scene.evaluate.assert_not_called()
+                        scene.robot_coverage_guidance.assert_not_called()
+                        anchor_fk.assert_not_called()
+                        coverage_fk.assert_not_called()
+                    else:
+                        self.assertIn("skill_process", collection.names)
+                        self.assertIn("process_scene", collection.names)
+                        problem.evaluate.assert_called_once()
+                        scene.evaluate.assert_called_once()
+                        anchor_fk.assert_called_once()
+                        self.assertTrue(bool((q.grad > 2*q.detach()).all()))
+                        if mode == "trajectory_optimizer":
+                            coverage_fk.assert_called_once()
+                            scene.robot_coverage_guidance.assert_called_once()
+                        else:
+                            coverage_fk.assert_not_called()
+                            scene.robot_coverage_guidance.assert_not_called()
+
+    def test_reference_ik_still_supplies_same_clock_finger_geometry_to_native_costs(self):
+        from curobo._src.rollout.cost_manager.cost_manager_robot import RobotCostManager
+
+        for mode in ("seed_optimizer", "seed_metrics"):
+            with self.subTest(mode=mode):
+                scene = SimpleNamespace(gripper=SimpleNamespace(controller="timed_reference"))
+                scene.clone_for_rollout = lambda: scene
+                transition = self.transition()
+                transition.joint_names = ("first_joint", "second_joint")
+                config_type = _process_manager_type(None, scene, None, None, None,
+                    clock={"duration": 2.}, seed_parameter=torch.tensor([[.375]]))
+                config = config_type.create({"process_mode": mode}, device_cfg=self.device_cfg)
+                manager = self.manager(config, transition)
+                state = SimpleNamespace(joint_state=SimpleNamespace(position=torch.zeros((3, 1, 2))))
+                timed_state, native_costs = object(), object()
+                with patch("manipulation.planning._timed_native_state", return_value=timed_state) as timed, \
+                     patch.object(RobotCostManager, "compute_costs", return_value=native_costs) as native:
+                    self.assertIs(manager.compute_costs(state), native_costs)
+                native.assert_called_once_with(timed_state, None, None)
+                self.assertIs(timed.call_args.args[0], state)
+                torch.testing.assert_close(timed.call_args.args[4], torch.full((3, 1), .75), rtol=0., atol=0.)
+    # END reference success cannot bypass scene, process, or trajectory acceptance.
 # END native manager configuration ownership without GPU allocation.
 
 
@@ -1316,6 +1418,56 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         robot.assert_not_called()
         manager.assert_not_called()
 
+    # BEGIN mandatory native midpoints must fit before any expensive initialization.
+    def test_clock_validation_lower_bound_refuses_512_before_native_and_admits_1536(self):
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
+        problem.source_timestamps = np.array([0., 16.])
+        scene = SimpleNamespace(validate_problem=Mock(), required_progress_anchors=(), gripper=None,
+                                reference_frame=problem.reference_frame)
+        before_cuda = torch.cuda.is_initialized()
+        for capacity in (512, 1536):
+            with self.subTest(capacity=capacity):
+                budget = PlanningBudget(knots=16, maximum_trajectory_dt=.2, interpolation_steps=4,
+                    interpolation_dt=.025, interpolation_buffer_size=768, max_validation_points=capacity)
+                with patch("torch.cuda._lazy_init", side_effect=AssertionError("preflight must stay CPU-only")), \
+                     patch("manipulation.planning._bounded_robot_configuration",
+                           side_effect=RuntimeError("metadata boundary reached after preflight")) as robot, \
+                     patch("manipulation.planning._process_manager_type") as manager:
+                    if capacity == 512:
+                        with self.assertRaisesRegex(ValueError, "requires at least 1281 points, allowed 512") as error:
+                            _CuroboPlanner(problem, scene, object(), budget, "cuda:0")
+                        self.assertIn("duration_s=16.00000023841858", str(error.exception))
+                        self.assertIn("interpolation_dt_s=0.02500000037252903", str(error.exception))
+                        self.assertIn("native_samples=641", str(error.exception))
+                        robot.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "metadata boundary reached"):
+                            _CuroboPlanner(problem, scene, object(), budget, "cuda:0")
+                        robot.assert_called_once()
+                    manager.assert_not_called()
+                self.assertEqual(budget.max_validation_points, capacity)
+                self.assertEqual(budget.maximum_trajectory_dt, .2)
+        self.assertEqual(torch.cuda.is_initialized(), before_cuda)
+
+    def test_constant_curve_keeps_midpoints_and_extra_anchor_after_preflight_lower_bound(self):
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
+        mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+        dt = float(np.float32(.025))
+        planner, result = export_fixture(problem, mapping, np.zeros((641, 3)), np.zeros((641, 3)), dt)
+        planner.anchors = np.array([0., .3333, 1.])
+        planner.budget = PlanningBudget(knots=16, interpolation_buffer_size=768, max_validation_points=1281)
+        with self.assertRaisesRegex(ValueError, "Final curve validation"):
+            planner.export(result)
+        # Passing the binding lower bound is not a claim that every actual
+        # candidate fits it. Keep the off-grid anchor and original midpoint
+        # rule; the explicitly larger capacity admits the same exact curve.
+        planner.budget = PlanningBudget(knots=16, interpolation_buffer_size=768, max_validation_points=1536)
+        trajectory, count = planner.export(result)
+        self.assertEqual(count, 1282)
+        self.assertEqual(trajectory.duration, 640*dt)
+        self.assertIn(.3333, planner.last_validation["u"])
+    # END neither impossible admission nor a later overflow weakens verification.
+
     def test_native_anchor_estimate_matches_installed_meta_buffer_layout(self):
         # Execute only the installed pure buffer factory on Torch's meta
         # device: no native library import, GPU context or physical allocation.
@@ -1335,7 +1487,8 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
         metadata = self.robot_metadata()
         native = SimpleNamespace(num_pose_links=1, num_spheres=512, num_dof=16, num_links=64)
-        scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_bytes=lambda batch, horizon, **kwargs: 0)
+        scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
+                                {"retained": 0, "live": 0, "shared_cpu": 0})
         budget = PlanningBudget(max_validation_points=8192)
         before_cuda = torch.cuda.is_initialized()
         for count in (322, 386, 8192):
@@ -1368,10 +1521,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planner.budget = PlanningBudget(max_refinement_points=0)
         planner.anchors = np.array([0., 1., 2.])
         planner.problem = object()
-        planner.scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_bytes=lambda batch, horizon, **kwargs: batch*horizon)
+        planner.scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
+                                        {"retained": batch*horizon, "live": 0, "shared_cpu": 0})
         planner.robot_metadata = self.robot_metadata()
         planner.progress_map = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
-        planner.seed_progress = object()
         planner.seed_parameter, planner.formal_clock, planner.robot_dict = object(), {}, {}
         planner.refinement_parameters = np.empty(0)
         planner.torch = SimpleNamespace(cuda=SimpleNamespace(
@@ -1459,13 +1612,77 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         self.assertEqual(destroyed, ["ik", "trajectory"])
 
     def test_scene_budget_and_removed_legacy_parameter_remain_strict(self):
-        scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_bytes=lambda batch, horizon, **kwargs: 1024**3)
+        scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
+                                {"retained": 1024**3, "live": 0, "shared_cpu": 0})
         with self.assertRaisesRegex(ValueError, "scene query workspaces"):
             _planning_workspace_bytes(scene, self.robot_metadata(), PlanningBudget(), 322)
         with self.assertRaises(TypeError):
             PlanningBudget(max_anchors=128)
         with self.assertRaisesRegex(ValueError, "Refinement points"):
             PlanningBudget(max_refinement_points=-1)
+
+    # BEGIN a large finite scene must fit by lifetime, without dropping queries.
+    def test_scene_allocation_keeps_all_caches_and_only_one_sequential_live_graph(self):
+        from dataclasses import replace
+        from manipulation.planning_scene import PlanningScene
+        world = PlanningScene.__new__(PlanningScene)
+        world.required_progress_anchors = (0., 1.)
+        world.robot_sphere_materials = (None,)*416
+        world.owners = tuple(SimpleNamespace(moving=False) for _ in range(4))
+        world.coverage = SimpleNamespace(_distance=SimpleNamespace(numel=lambda: 503840))
+        world.gripper = SimpleNamespace(self_collision_pairs=range(28672))
+        world.robot_coverage = SimpleNamespace(required_link_names=range(13), baseline_joint_names=range(9))
+        # Broadcast views supply metadata only: no native buffers, tree, large
+        # sampled cloud or GPU context is constructed for this admission test.
+        planes = (200, 3174, 300, 300, 300, 300, 200, 200, 200, 32, 12, 32, 12)
+        world._coverage_geometry = {"solids": [{"baseline_halfspaces_world": np.broadcast_to(0., (n, 4))}
+                                                for n in planes]}
+        world._free_distance = world.coverage._distance
+        world.contacts = tuple(SimpleNamespace(_feature_edge_normals=np.zeros((4, 3))) for _ in range(2))
+        cells = SimpleNamespace(pair_chunk=32768, centres=np.empty((0, 3)), halves=np.empty((0, 3)),
+                                rotations=np.empty((0, 3, 3)))
+        world._contact_cells = {"target": cells}
+        budget = PlanningBudget(ik_seeds=2, trajectory_seeds=1, knots=16, interpolation_steps=4,
+            interpolation_buffer_size=768, max_refinement_points=16, max_validation_points=512)
+        metadata = {"active_joint_names": range(7), "links": 13, "spheres": 416}
+        cuda_before = torch.cuda.is_initialized()
+        empty_bytes, _ = _planning_workspace_bytes(world, metadata, budget, 22)
+        cells.centres = np.broadcast_to(0., (250000, 3))
+        cells.halves = np.broadcast_to(0., (250000, 3))
+        cells.rotations = np.broadcast_to(0., (250000, 3, 3))
+        with patch.object(world, "estimated_workspace_allocation", wraps=world.estimated_workspace_allocation) as estimate:
+            complete_bytes, _ = _planning_workspace_bytes(world, metadata, budget, 22)
+        self.assertEqual(complete_bytes-empty_bytes, 250000*15*8)
+        self.assertLess(complete_bytes, 1024**3)
+        self.assertGreater(complete_bytes, 900*1024**2)
+        self.assertTrue(any(call.args == (4, 3*(81+22))
+                            and call.kwargs["robot_coverage_horizon"] == 81+22
+                            for call in estimate.call_args_list))
+        with self.assertRaisesRegex(ValueError, "required .* allowed"):
+            _planning_workspace_bytes(world, metadata, replace(budget, max_scene_workspace_bytes=900*1024**2), 22)
+        # BEGIN complete validation must fit both planner and native-query guards.
+        from manipulation.planning_scene import CuroboSphereQuery
+        cells.centres = np.broadcast_to(0., (45655, 3))
+        cells.halves = np.broadcast_to(0., (45655, 3))
+        cells.rotations = np.broadcast_to(0., (45655, 3, 3))
+        expanded = replace(budget, max_validation_points=1536, max_scene_workspace_bytes=2*1024**3)
+        complete_bytes, _ = _planning_workspace_bytes(world, metadata, expanded, 20)
+        self.assertEqual(complete_bytes, 1380440104)
+        self.assertLess(complete_bytes, expanded.max_scene_workspace_bytes)
+        query = CuroboSphereQuery(SimpleNamespace(get_sphere_distance_raw=lambda *args, **kwargs: None),
+                                 owner_ids=("fixture",), source="complete validation allocation metadata")
+        native_spheres = 3*expanded.max_validation_points*metadata["spheres"]
+        self.assertLessEqual(native_spheres, query.max_query_spheres)
+        self.assertLessEqual(native_spheres*20+8, query.max_cache_bytes)
+        # BEGIN complete refined coverage still fits without dropping samples.
+        maximum_robot_query = 3*expanded.max_validation_points*expanded.max_robot_spheres
+        self.assertLessEqual(maximum_robot_query, query.max_query_spheres)
+        self.assertLessEqual(query.max_query_spheres*20+8, query.max_cache_bytes)
+        self.assertGreater(3*3072*metadata["spheres"], query.max_query_spheres)
+        # END both the sphere bound and byte bound remain finite and enforced.
+        # END additional samples are admitted intact, never thinned to fit cache.
+        self.assertEqual(torch.cuda.is_initialized(), cuda_before)
+    # END the original three mode queries and every finite-cell pair remain.
 
     def test_projection_accuracy_respects_the_strictest_source_mechanism(self):
         problem = cartesian_problem((MotionPhase("free", constant_path()),))

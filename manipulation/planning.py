@@ -339,32 +339,49 @@ def _anchor_capacity(progress_map, anchors, budget, refinement_parameters=()):
 def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     """Estimate the independent scene queries and all native anchor FK buffers.
 
-    The main native rollout retains its original control horizon. Each custom
+    The main native rollout retains its original control horizon. Each trajectory
     manager evaluates the required anchors with a separate native FK model,
     then folds their penalties into that rollout's existing final cost column.
     """
     horizon = (budget.knots+4)*budget.interpolation_steps+1
     # Native LBFGS has two rollout instances and four line-search particles.
     # Include optimization/metrics, dense export and independent verification.
-    # BEGIN account for body-point guidance only in its actual optimizer roles.
+    # BEGIN reference-only IK owns no independent scene query workspaces.
+    # Reference IK retains native pose/self-collision and physical q-domain
+    # costs. Scene/coverage queries belong to complete trajectory candidates.
     # The dense/native metrics and final CPU-solid validation never construct
     # a coverage FK or its backward graph. Their other scene queries remain.
     allocation_shapes = (
-        (4, budget.ik_seeds, 1, True), (8, budget.ik_seeds*4, 1, True),
         (4, budget.trajectory_seeds, horizon+anchor_capacity, True),
         (4, budget.trajectory_seeds*4, horizon+anchor_capacity, True),
         (2, budget.trajectory_seeds, budget.interpolation_buffer_size+anchor_capacity, False),
         (1, 1, budget.max_validation_points, False), (2, 1, anchor_capacity, False),
     )
-    # Scene mode switches reuse FK but query exact, left and right material
-    # permissions. Account for their bounded three-way query tensor here.
+    # END source reference IK no longer reserves unused scene/coverage buffers.
+    # BEGIN use actual sequential native forward/backward memory lifetimes.
+    # Scene switches still query every exact/left/right sample. Only native
+    # query buffers persist across rollouts. Installed gradient_opt_core
+    # executes evaluate_action then backward(retain_graph=False) before another
+    # initial/exploration rollout; metrics consume its detached best action.
+    # CUDA graphs are explicitly disabled in both native solver factories.
+    # The final two anchor-shaped reserves also cover the simultaneous OMPL
+    # chart-scene stack: at most anchor_capacity one-state scene clones, whose
+    # aggregate sphere buffers fit one such reserve. Scalar slots are counted
+    # below per state as well, so this split cannot hide many small caches.
     scene_factor = 3 if scene.required_progress_anchors else 1
-    scene_bytes = sum(copies*scene.estimated_workspace_bytes(batch, scene_factor*length,
-                        robot_coverage_guidance=guidance)
-                      for copies, batch, length, guidance in allocation_shapes)
+    allocations = [(copies, scene.estimated_workspace_allocation(batch, scene_factor*length,
+                        robot_coverage_horizon=length if guidance else 0))
+                   for copies, batch, length, guidance in allocation_shapes]
+    scene_bytes = (sum(copies*value["retained"] for copies, value in allocations)
+                   + max(value["live"] for _, value in allocations)
+                   + max(value["shared_cpu"] for _, value in allocations))
+    # END geometry/query sets and the unchanged hard memory budget are preserved.
     # END all live optimization scratch remains under the unchanged hard budget.
     if scene_bytes > budget.max_scene_workspace_bytes:
-        raise ValueError("Independent scene query workspaces exceed the declared local allocation budget")
+        # BEGIN report the actual bound so a refused trial is reproducible.
+        raise ValueError("Independent scene query workspaces exceed the declared local allocation budget: "
+                         f"required {int(scene_bytes)} bytes, allowed {budget.max_scene_workspace_bytes} bytes")
+        # END reporting a shortfall does not alter the allocation contract.
     dof, links, spheres = (len(robot_metadata["active_joint_names"]),
                            robot_metadata["links"], robot_metadata["spheres"])
     # Installed KinematicsFusedFunction.create_buffers uses float32 and this
@@ -372,8 +389,10 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     # pose/COM values and gradients (22 floats), sphere values/gradients (8*S),
     # a 6*D Jacobian and two D joint gradients, and 12*L cumulative transforms.
     # The same conservative rollout counts above give 22*K anchor batches.
-    # Main FK, verification, model storage and other native allocations retain
-    # the separate two-GiB allowance in the device-memory preflight below.
+    # Main FK, general pose/sphere transform graphs, verification, model and
+    # optimizer/trajectory storage retain the separate two-GiB allowance in
+    # the device-memory preflight below. The scene budget is specifically for
+    # dedicated geometry queries, not a claim about all planner allocations.
     bytes_per_state = 4*(22+8*spheres+8*dof+12*links)
     anchor_fk_bytes = 22*budget.trajectory_seeds*anchor_capacity*bytes_per_state
     return int(scene_bytes), int(anchor_fk_bytes)
@@ -385,7 +404,9 @@ def _require_planning_memory(torch, device, scene_bytes, anchor_fk_bytes):
     CollisionBuffer and native FK buffers use torch.zeros. Unused capacity in
     this process's Torch allocator can therefore serve those tensors after a
     schedule replacement. Existing Mapper fields are already allocated. The
-    separate native allowance must still fit driver-reported free memory.
+    separate two-GiB allowance covers main FK, general pose/sphere transform
+    graphs, solver/model and trajectory storage; it must still fit driver-
+    reported free memory independently of the geometry-query tensor cache.
     """
     free_bytes, _ = torch.cuda.mem_get_info(device)
     reusable_torch_bytes = max(0, torch.cuda.memory_reserved(device)-torch.cuda.memory_allocated(device))
@@ -814,6 +835,11 @@ def _obligation_contract(problem):
     contract = {}
     for collection, names in columns.items():
         contract[collection] = [{"type": type(item).__name__, **{name: plain(getattr(item, name)) for name in names},
+            # BEGIN rebinding cannot turn an owner-relative goal into a world goal.
+            **({"actual_relation": (None if item.actual_relation is None else
+                {key: plain(value) for key, value in item.actual_relation.items()
+                 if not key.startswith("T_")})} if collection == "pose_events" else {}),
+            # END current local transforms remain rebindable geometric inputs.
             **({"kind": item.model.kind} if collection == "mechanisms" else {})}
             for item in getattr(problem, collection, ())]
     contract["conditions"] = [{name: plain(row[name]) for name in
@@ -868,6 +894,7 @@ def _request_work_ledger(problem, budget, previous=None, continuation=None):
     """Copy an append-only request record, never mutate a caller's failed result."""
     from .execution_binding import plain
     ledger = ({"request_id": uuid4().hex, "planning_budget": asdict(budget),
+        "requires_continuation": False,
         "consumed_planning": {**dict.fromkeys(_PLANNING_COUNTS, 0),
                               **dict.fromkeys(_PLANNING_SECONDS, 0.)},
         "original_events": plain(problem.events), "obligation_contract": _obligation_contract(problem),
@@ -876,6 +903,7 @@ def _request_work_ledger(problem, budget, previous=None, continuation=None):
         "effects": {}, "effect_history": [], "binding_records": []}
         if previous is None else deepcopy(previous))
     if (not isinstance(ledger.get("request_id"), str) or not ledger["request_id"]
+            or type(ledger.get("requires_continuation")) is not bool
             or ledger.get("planning_budget") != asdict(budget)):
         raise ContinuationBindingError("A same-request ledger cannot reset its identity or planning budget")
     if not isinstance(ledger.get("obligation_contract"), dict):
@@ -893,6 +921,8 @@ def _request_work_ledger(problem, budget, previous=None, continuation=None):
     if continuation is not None:
         original = continuation["original_binding"]
         old = original["request_ledger"]
+        if old["requires_continuation"] and not ledger["requires_continuation"]:
+            raise ContinuationBindingError("A request cannot erase its actual execution continuation requirement")
         if old["request_id"] != ledger["request_id"]:
             raise ContinuationBindingError("Execution and planning ledgers belong to different requests")
         if (ledger["original_events"] != old["original_events"]
@@ -919,6 +949,7 @@ def _request_work_ledger(problem, budget, previous=None, continuation=None):
                 if record not in ledger["event_records"]:
                     ledger["event_records"].append(record)
         ledger["effects"].update(deepcopy(continuation.get("effects", {})))
+        ledger["requires_continuation"] = True
     return ledger
 
 
@@ -940,6 +971,193 @@ def _check_work_budget(budget, consumed, *, started, initial_seconds, stage=None
 # END derived capacities include every declared native candidate, without new services.
 
 
+# BEGIN completion evidence is checked before removing any original goal.
+def _verified_completed_goals(continuation, original, all_goals, *, elapsed,
+                              curve_elapsed, timestep, progress_map):
+    """Consume concrete actual-goal records, never a bare completion label.
+
+    The frozen execution binding owns each goal's geometry and physical clock.
+    A freshly rebound target can move, so current observations cannot rewrite
+    a previous candidate's proof. Previously accepted proofs remain in the
+    request ledger; new pose proofs additionally retain their actual poses and
+    metric errors, which are recomputed against the original allowed set here.
+    """
+    from .motion import _pose_array
+    from .planning_problem import EventTimeConstraint, PoseEventRequirement, resolve_event_window, TimeBindingError
+    from .gripper_trajectory import _activation
+    from .execution import _actual_pose_goal
+
+    def identities(rows):
+        if (not isinstance(rows, (tuple, list)) or any(
+                not isinstance(row, (tuple, list)) or len(row) != 2
+                or not isinstance(row[0], str) or type(row[1]) is not int
+                for row in rows)):
+            raise ContinuationBindingError("Completed goals need original collection/index identities")
+        values = {tuple(row) for row in rows}
+        if not values <= all_goals:
+            raise ContinuationBindingError("Completed goal identity does not belong to the original request")
+        return values
+
+    previous = identities(original.get("completed_goal_ids", []))
+    claimed = identities(continuation.get("completed_goal_ids", []))
+    ledger = original["request_ledger"]
+    if not previous <= identities(ledger["completed_goal_ids"]):
+        raise ContinuationBindingError("Prior completed goals lack their preserved request ledger")
+    for identity in previous:
+        if not any(tuple(row.get("identity", ())) == identity
+                   and row.get("value") == "T" and row.get("completion_verified") is True
+                   and isinstance(row.get("candidate_id"), str) and row["candidate_id"]
+                   for row in ledger["goal_evidence"]):
+            raise ContinuationBindingError("Prior completed goals lack their preserved actual T evidence")
+    new = claimed-previous
+    if not new:
+        return previous | claimed
+    feedback = continuation["actual_feedback"]
+    timestamp = feedback.get("timestamp_s")
+    if (isinstance(timestamp, bool) or not isinstance(timestamp, (float, int))
+            or not np.isfinite(timestamp)):
+        raise ContinuationBindingError("Goal completion needs synchronized actual continuation time")
+    origin = float(timestamp)-elapsed
+    active_events = {}
+    for event in (*ledger["timing_events"], *original["curve"].get("events", ())):
+        event_id = event_occurrence_key(event)
+        if event_id[:2] not in active_events or event_id[2] >= event_occurrence_key(active_events[event_id[:2]])[2]:
+            active_events[event_id[:2]] = event
+    for identity in new:
+        proofs = [row for row in continuation.get("goal_evidence", ())
+                  if isinstance(row, dict) and tuple(row.get("identity", ())) == identity]
+        verified = False
+        for row in proofs:
+            if (row.get("candidate_id") != original["candidate_id"] or row.get("value") != "T"
+                    or row.get("completion_verified") is not True
+                    or any(not isinstance(row.get(key), str) or not row[key].strip()
+                           for key in ("source", "feedback_id"))):
+                continue
+            times = [row.get(key) for key in ("timestamp_s", "physical_elapsed_s", "evaluated_curve_time_s")]
+            if (any(isinstance(value, bool) or not isinstance(value, (float, int))
+                    or not np.isfinite(value) for value in times)):
+                continue
+            acquired, physical, curve_time = times
+            if (not 0 <= physical <= elapsed+1e-8 or not 0 <= curve_time <= curve_elapsed+1e-8
+                    or abs(acquired-origin-physical) > 1e-8):
+                continue
+            goals = original["problem"][identity[0]]
+            indices = original.get("goal_identities", {}).get(identity[0], list(range(len(goals))))
+            if identity[1] not in indices:
+                continue
+            requirement = goals[indices.index(identity[1])]
+            if row.get("requirement") != requirement or not row.get("measurement_sources"):
+                continue
+            if identity[0] == "pose_events":
+                scheduled = row.get("scheduled_curve_time_s")
+                expected = float(progress_map.anchor_parameters([requirement["progress"]])[0, 0]
+                                 * original["curve"]["duration"])
+                if (not isinstance(scheduled, (float, int)) or not np.isfinite(scheduled)
+                        or abs(scheduled-expected) > 1e-8
+                        or row.get("device_due_time_s") != _activation(scheduled, timestep)[1]):
+                    continue
+                # An explicit arrival window permits an observed member at
+                # any original physical time in that window. Without one,
+                # only the first native acquisition of the bound point counts.
+                arrivals = [item for event in active_events.values() for item in event.get("timing", ())
+                            if item["check_target"] == "arrival" and tuple(item["goal_id"]) == identity]
+                if arrivals:
+                    try:
+                        windows = [resolve_event_window(EventTimeConstraint(**item),
+                            continuation.get("history", ())) for item in arrivals]
+                    except (TypeError, ValueError, TimeBindingError):
+                        continue
+                    lower = max((value for value, _ in windows if value is not None), default=None)
+                    upper = min((value for _, value in windows if value is not None), default=None)
+                    request_time = float(original.get("request_time_origin_s", 0.))+physical
+                    if (row.get("evaluation_window_s") != [lower, upper]
+                            or (lower is not None and request_time < lower-1e-9)
+                            or (upper is not None and request_time > upper+1e-9)):
+                        continue
+                else:
+                    native_due = _activation(scheduled, timestep)[1]
+                    # BEGIN a passed dependency extends the same frozen curve.
+                    # executable_until is its initial prerequisite prefix, not
+                    # a permanent end: actual T may authorize later intervals.
+                    # U/F ends this execution after a hold, so the acquisition
+                    # still uses the original native tick and final curve cap.
+                    first_tick = min(native_due, original["curve"]["duration"])
+                    if (row.get("evaluation_window_s") is not None
+                            or abs(curve_time-first_tick) > 1e-8 or abs(physical-native_due) > 1e-8):
+                        continue
+                    # END no initial-prefix clamp discards a later actual goal proof.
+                try:
+                    # Reconstruct the original raw measurements, so two
+                    # mutually consistent but shifted result poses cannot
+                    # override a fixed target or fabricate an owner pose.
+                    sources = row["measurement_sources"]
+                    if not isinstance(sources, list) or not all(isinstance(item, dict) for item in sources):
+                        continue
+                    measured_feedback = {"timestamp_s": acquired, "feedback_id": row["feedback_id"]}
+                    observation = {"scene_owner_poses": {}, "scene_condition_evidence": {}}
+                    for item in sources:
+                        if not isinstance(item.get("source"), str) or not item["source"].strip():
+                            raise ValueError("Raw actual measurements require provenance")
+                        when = float(item["timestamp_s"])
+                        if not np.isfinite(when):
+                            raise ValueError("Raw actual measurement timestamps must be finite")
+                        if item["kind"] == "actual_robot_tcp":
+                            if abs(when-acquired) > 1e-8 or item["feedback_id"] != row["feedback_id"]:
+                                raise ValueError("Actual TCP measurement uses another feedback sample")
+                            pose = _pose_array(item["pose"], "Measured TCP pose").tolist()
+                            if "tool_pose" in measured_feedback and measured_feedback["tool_pose"] != pose:
+                                raise ValueError("Actual TCP measurements disagree")
+                            measured_feedback.update(tool_pose=pose, source=item["source"])
+                        elif item["kind"] in ("current_owner_pose", "current_verified_attachment"):
+                            policy = original["execution_limits"]["observation_policy"]
+                            # BEGIN current-state freshness matches the executor's observation policy.
+                            # A still-current owner/holding sample may predate
+                            # this binding; only event/effect occurrence proof
+                            # has a separate binding-origin eligibility rule.
+                            if (policy is None or when > acquired+1e-8
+                                    or acquired-when > policy["maximum_age_s"]+1e-8):
+                                raise ValueError("Current owner/attachment evidence is not applicable")
+                            # END future or expired state observations remain inadmissible.
+                            if ("timestamp_s" in observation and
+                                    (observation["timestamp_s"] != when or observation["source"] != item["source"])):
+                                raise ValueError("Current owner measurements lack one synchronized observation")
+                            observation.update(timestamp_s=when, source=item["source"])
+                            if item["kind"] == "current_owner_pose":
+                                pose = _pose_array(item["pose"], "Measured owner pose").tolist()
+                                previous_pose = observation["scene_owner_poses"].get(item["owner_id"])
+                                if previous_pose is not None and previous_pose != pose:
+                                    raise ValueError("Current owner measurements disagree")
+                                observation["scene_owner_poses"][item["owner_id"]] = pose
+                            else:
+                                if item["value"] is not True:
+                                    raise ValueError("Attachment observation is not verified")
+                                observation["scene_condition_evidence"][item["condition_id"]] = True
+                        else:
+                            raise ValueError("Pose evidence contains an unsupported measurement source")
+                    actual_check = _actual_pose_goal(PoseEventRequirement(**requirement), measured_feedback,
+                        observation if "timestamp_s" in observation else None)
+                    if actual_check["value"] != "T":
+                        continue
+                    if any(not np.allclose(_pose_array(row.get(key), key), actual_check[key], atol=1e-10, rtol=0)
+                           for key in ("actual_function_pose", "actual_target_pose")):
+                        continue
+                    position, rotation = actual_check["position_error_m"], actual_check["rotation_error_rad"]
+                    recorded = np.asarray([row.get("position_error_m"), row.get("rotation_error_rad")], float)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (not np.isfinite(recorded).all()
+                        or not np.allclose(recorded, [position, rotation], atol=1e-10, rtol=0)
+                        or position > requirement["position_tolerance_m"]
+                        or rotation > requirement["rotation_tolerance_rad"]):
+                    continue
+            verified = True
+            break
+        if not verified:
+            raise ContinuationBindingError("Goal completion needs actual allowed-set T evidence from this executed candidate")
+    return previous | claimed
+# END effect success and source progress cannot erase a distinct task goal.
+
+
 def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
     """Validate a fresh actual/scene binding without replaying consumed events.
 
@@ -958,6 +1176,13 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
     original = continuation["original_binding"]
     if continuation.get("candidate_id") != original.get("candidate_id"):
         raise ContinuationBindingError("Continuation candidate identity differs from its original binding")
+    # BEGIN physical window origins retain their original actual history.
+    previous_history = original["request_ledger"]["history"]
+    history = continuation.get("history", [])
+    if (not isinstance(history, (list, tuple))
+            or list(history[:len(previous_history)]) != previous_history):
+        raise ContinuationBindingError("Continuation cannot erase or rewrite original physical timing history")
+    # END a later repeated fact cannot move an already observed window origin.
     _restore_original_direction_origins(problem, original["request_ledger"]["obligation_contract"])
     if _obligation_contract(problem) != original["request_ledger"]["obligation_contract"]:
         raise ContinuationBindingError("A fresh binding cannot remove, reorder or change original goal/process obligations")
@@ -1088,8 +1313,12 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
         due = row.get("activation_time_s") if row.get("activation_time_s") is not None else row["time"]
         if due < elapsed and rebind is None:
             raise ContinuationBindingError(f"Unconsumed event {identity} is overdue on the frozen schedule; an explicit rebind is required")
-    completed_goals = {tuple(value) for value in original.get("completed_goal_ids", ())}
-    completed_goals.update(tuple(value) for value in continuation.get("completed_goal_ids", ()))
+    # BEGIN consumed goals require the executor's actual allowance/time proof.
+    all_goals = {(name, index) for name in ("pose_events", "coordinate_events", "supports")
+                 for index in range(len(getattr(problem, name)))}
+    completed_goals = _verified_completed_goals(continuation, original, all_goals,
+        elapsed=elapsed, curve_elapsed=curve_elapsed, timestep=float(timestep), progress_map=original_map)
+    # END an ID, progress traversal, or observed effect cannot consume a pose goal.
     # Actual direction completion is not implied by traversing source progress.
     all_directions = {(index, column) for index, mechanism in enumerate(problem.mechanisms)
                       for column in range(len(mechanism.directions))}
@@ -2070,7 +2299,7 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
 # END query-side selection never changes the command or nominal hand clock.
 
 
-def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_progress,
+def _process_manager_type(problem, scene, progress_map, anchors, budget,
                           refinement_parameters=(), *, clock=None, seed_parameter=None, robot_dict=None):
     """Build V2's documented manager extension after GPU use is requested.
 
@@ -2103,12 +2332,20 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
                 return
             transition_model.robot_model.compute_jacobian = True
             self._scene = scene.clone_for_rollout()
+            self._joint_names = tuple(transition_model.joint_names)
+            # BEGIN ordinary reference IK does not certify a task trajectory.
+            # The retained private hand clock supplies native self-collision
+            # geometry, but nominal pose samples need neither scene coverage
+            # nor functional/attachment feasibility. Those checks remain on
+            # every full trajectory and on independent search/verification.
+            if self._process_mode.startswith("seed_"):
+                return
+            # END do not allocate coverage or anchor FK for reference IK.
             self._coverage_fk = (_RobotCoverageFK(problem, self._scene, robot_dict, self.device_cfg)
                                  if scene.robot_coverage is not None
                                  and (scene.gripper is None or scene.gripper.controller == "position_tracking"
                                       or scene.gripper.nominal_finger_trajectory is not None)
-                                 and self._process_mode in {"seed_optimizer", "trajectory_optimizer"} else None)
-            self._joint_names = tuple(transition_model.joint_names)
+                                 and self._process_mode == "trajectory_optimizer" else None)
             self._tool_index = transition_model.robot_model.tool_frames.index(problem.tool_link)
             self._map_u = self.device_cfg.to_device(progress_map.u)
             self._map_s = self.device_cfg.to_device(progress_map.s)
@@ -2139,8 +2376,14 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
                 state = _timed_native_state(state, problem, self._scene, self._joint_names, query_time,
                                             sphere_padding=_native_collision_padding(self))
             collection = super().compute_costs(state, cost_collection, goal, **kwargs)
-            if not self._process_mode:
+            # BEGIN native IK remains an initializer even if its reference collides.
+            # Native pose, physical joint-domain and self-collision evaluation
+            # above are unchanged. Only complete candidate curves receive the
+            # scene/process penalties below; a reference IK success is never
+            # a planning, goal-completion or execution authorization.
+            if not self._process_mode or self._process_mode.startswith("seed_"):
                 return collection
+            # END full trajectory constraints still run in both optimizer/metrics.
             q, dq = state.joint_state.position, state.joint_state.velocity
             batch, horizon, _ = q.shape
             tool = state.tool_poses
@@ -2149,31 +2392,12 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
             position = native_layout.apply(tool.position)[:, :, self._tool_index]
             quaternion = quaternion[:, :, self._tool_index]
             # BEGIN local native-coordinate rates use differentiable physical J(q) dq.
-            need_rates = (not self._process_mode.startswith("seed_") and any(
-                direction.kind == "local_rate" for mechanism in problem.mechanisms for direction in mechanism.directions))
+            need_rates = any(direction.kind == "local_rate" for mechanism in problem.mechanisms
+                             for direction in mechanism.directions)
             twist = (torch.einsum("...kd,...d->...k", native_layout.apply(
                 state.cuda_robot_model_state.tool_jacobians)[:, :, self._tool_index], dq) if need_rates else None)
             # END Jacobian backward retains dJ/dq as well as the velocity derivative.
             spheres = native_layout.apply(state.robot_spheres)
-            if self._process_mode.startswith("seed_"):
-                # IK is only an initializer: use its target phase for collision
-                # permissions, while the complete process belongs to TrajOpt.
-                progress = seed_progress.expand(batch, horizon)
-                position, quaternion = problem.transform_tool_pose(position, quaternion)
-                scene_value = _scene_boundary_evaluate(self._scene, problem, progress_map,
-                    problem.transform_robot_spheres(spheres), position, quaternion, progress,
-                    q, self._joint_names,
-                    trajectory_time=(seed_parameter*clock["duration"]).expand(batch, horizon),
-                    normalized_time=seed_parameter.expand(batch, horizon))
-                if self._process_mode == "seed_optimizer":
-                    scene_value = scene_value.square()
-                    if self._coverage_fk is not None:
-                        query_time = (seed_parameter*clock["duration"]).expand(batch, horizon)
-                        scene_value = scene_value+self._scene.robot_coverage_guidance(
-                            self._coverage_fk.poses(q, self._joint_names, query_time), progress).square()
-                collection.add(scene_value.unsqueeze(-1) * budget.constraint_weight, "process_scene")
-                return collection
-
             counts = (torch.full((batch,), horizon, dtype=torch.long, device=q.device)
                       if self._dense_counts is None else self._dense_counts)
             u = (torch.arange(horizon, device=q.device, dtype=q.dtype)[None, :]
@@ -2401,6 +2625,21 @@ class _CuroboPlanner:
         initial_clock = _fixed_spline_grid(intervals=budget.knots+4,
             native_dt=budget.maximum_trajectory_dt, interpolation_steps=budget.interpolation_steps,
             interpolation_dt=budget.interpolation_dt)
+        # BEGIN reject an intrinsically undersized export budget before native allocation.
+        # Export checks at least two subdivisions of every native output
+        # interval, even for a constant curve. This is a necessary lower
+        # bound only: actual joint motion and exact semantic anchors can add
+        # queries, whose unchanged limits are still checked by export().
+        minimum_validation_points = 2*(initial_clock["valid_count"]-1)+1
+        if minimum_validation_points > budget.max_validation_points:
+            raise ValueError(
+                "Final curve validation requires at least "
+                f"{minimum_validation_points} points, allowed {budget.max_validation_points}; "
+                f"bound clock duration_s={initial_clock['duration']!r}, "
+                f"interpolation_dt_s={initial_clock['interpolation_dt']!r}, "
+                f"native_samples={initial_clock['valid_count']} "
+                "(two subdivisions per output interval; anchors or motion may require more)")
+        # END admission never changes the clock, resolution, anchors or declared capacity.
         if continuation is None:
             self.progress_map = _bind_event_clock(problem, self.progress_map, initial_clock["duration"],
                 None if scene.gripper is None else scene.gripper.control_timestep_s)
@@ -2446,13 +2685,12 @@ class _CuroboPlanner:
         self.ik = self.trajopt = None
         self.anchors = anchors
         self.robot_dict = robot_dict
-        self.seed_progress = self.device_cfg.to_device([[problem.start_progress]])
         self.seed_parameter = self.device_cfg.to_device([[0.]])
         # BEGIN native callbacks inherit the admitted clock during construction.
         self.formal_clock = dict(initial_clock)
         # END construction cannot observe a missing or independently chosen clock.
         self._manager_type = _process_manager_type(
-            problem, scene, self.progress_map, self.anchors, budget, self.seed_progress,
+            problem, scene, self.progress_map, self.anchors, budget,
             clock=self.formal_clock, seed_parameter=self.seed_parameter, robot_dict=self.robot_dict)
         self.refinement_parameters = np.empty(0)
 
@@ -2823,6 +3061,8 @@ class _CuroboPlanner:
         successful IK candidate, or both complete chains coincide numerically,
         use the primary chain and a measured-state initializer instead. Every
         initializer still requires the complete-process optimizer and checks.
+        Native IK success describes pose/joint/self-collision initialization;
+        it does not certify scene coverage, task goals or the complete path.
         """
         torch, count = self.torch, self.budget.trajectory_seeds
         # BEGIN bounded distinct IK chains and measured-state initialization.
@@ -2839,7 +3079,6 @@ class _CuroboPlanner:
         control_u = (np.arange(self.trajopt.action_horizon)+3.)/(self.trajopt.action_horizon+4.)
         for u in control_u:
             progress = float(np.interp(u, self.progress_map.u, self.progress_map.s))
-            self.seed_progress.fill_(progress)
             self.seed_parameter.fill_(float(u))
             result = self.ik.solve_pose(self._goal(progress), current_state=self.start,
                                        seed_config=previous, return_seeds=self.budget.ik_seeds)
@@ -2899,7 +3138,7 @@ class _CuroboPlanner:
         self.anchor_capacity = capacity
         self.scene_workspace_bytes, self.anchor_fk_workspace_bytes = scene_bytes, anchor_fk_bytes
         manager_type = _process_manager_type(self.problem, self.scene, progress_map, self.anchors,
-                                             self.budget, self.seed_progress, parameters,
+                                             self.budget, parameters,
                                              clock=self.formal_clock, seed_parameter=self.seed_parameter,
                                              robot_dict=self.robot_dict)
         self._trajectory_configuration["cost_manager_config_instance_type"] = manager_type
@@ -3566,7 +3805,27 @@ def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0", cont
             original_budget = PlanningBudget(**previous["planning_budget"])
         else:
             original_budget = PlanningBudget() if budget is None else budget
-        ledger = _request_work_ledger(problem, original_budget, previous)
+        # BEGIN execution facts enter a trusted work ledger only after validation.
+        # An executor may already have appended its new observations to the
+        # supplied ledger. Keep their computation history, but restore the
+        # last frozen binding's facts until this continuation passes. A failed
+        # request must never return unverified completion IDs as trusted facts.
+        execution_fields = ("history", "event_records", "timing_events", "timing_checks",
+            "completed_goal_ids", "goal_evidence", "completed_direction_ids", "direction_evidence",
+            "effects", "effect_history")
+        ledger_input = previous
+        if isinstance(continuation, dict) and isinstance(continuation.get("original_binding"), dict):
+            original_ledger = continuation["original_binding"]["request_ledger"]
+            ledger_input = deepcopy(previous)
+            for name in execution_fields:
+                ledger_input[name] = deepcopy(original_ledger[name])
+            diagnostics["continuation_facts_pending_validation"] = {
+                name: deepcopy(continuation[name]) for name in (*execution_fields, "actual_feedback")
+                if name in continuation}
+        ledger = _request_work_ledger(problem, original_budget, ledger_input)
+        if continuation is not None:
+            ledger["requires_continuation"] = True
+        # END pending facts remain diagnostics, not completed obligations.
         consumed = ledger["consumed_planning"]
         initial_seconds = consumed["planning_seconds"]
         request_budget = asdict(original_budget)
@@ -3593,9 +3852,6 @@ def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0", cont
                 raise ContinuationBindingError("Continuation requires its original formal execution binding")
             if previous is None:
                 raise ContinuationBindingError("Continuation lacks the original cumulative request ledger")
-            ledger = _request_work_ledger(problem, original_budget, ledger, continuation)
-            consumed = ledger["consumed_planning"]
-            diagnostics["consumed_planning"] = consumed
             # Binding owns its filtered obligations and hand occurrences. The
             # caller retains the full source problem after any failed attempt;
             # the scene clone shares only immutable geometry and the existing
@@ -3604,10 +3860,16 @@ def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0", cont
             current = deepcopy(continuation)
             current["consumed_planning"] = deepcopy(consumed)
             budget, prior = _prepare_continuation(problem, scene, original_budget, current, rebind=rebind)
+            # BEGIN commit actual facts only after their identities, clock and proofs pass.
+            ledger = _request_work_ledger(problem, original_budget, ledger, continuation)
+            consumed = ledger["consumed_planning"]
+            diagnostics["consumed_planning"] = consumed
+            diagnostics.pop("continuation_facts_pending_validation", None)
+            # END a rejected continuation still retains its real planning work counters.
             prior["history"] = deepcopy(ledger["history"])
             prior["timing_events"] = deepcopy(ledger["timing_events"])
         else:
-            if ledger["event_records"] or ledger["history"]:
+            if ledger["requires_continuation"] or any(ledger[name] for name in execution_fields if name != "timing_events"):
                 raise ContinuationBindingError("An executed request needs its actual continuation facts before another binding")
             if plain(problem.events) != ledger["original_events"]:
                 raise ContinuationBindingError("A failed-request retry changed the original event/source requirements")

@@ -127,6 +127,11 @@ class SphereQuery:
 class BoxQuery(SphereQuery):
     def __init__(self, owner):
         super().__init__((owner,))
+        # BEGIN the contact query consumes a complete independent solid model.
+        self.independent_geometry = {"solids": [{"name": "test_box", "kind": "cuboid",
+            "dimensions": [.8, .8, .2], "pose": [0., 0., -.1, 1., 0., 0., 0.],
+            "source": "explicit analytic test box"}], "query_gaps": []}
+        # END no sphere-distance witness invents finite target occupancy.
 
     def clone_for_rollout(self):
         return BoxQuery(next(iter(self.owner_ids)))
@@ -213,7 +218,7 @@ def contact_rule(**changes):
     value = ContactRule(
         rule_id="pad_to_surface", actor="robot", target_owner="surface",
         interval=(0., 1.), sphere_indices=(0,), material_id="pad",
-        feature_points=[[-.003, -.003, -.01], [.003, -.003, -.01], [.003, .003, -.01], [-.003, .003, -.01]],
+        feature_points=[[-.012, -.012, -.01], [.012, -.012, -.01], [.012, .012, -.01], [-.012, .012, -.01]],
         feature_normal=[0., 0., -1.], patch_origin=[0., 0., 0.], patch_axes=np.eye(3),
         patch_half_size=[.03, .03], gap_bounds=(-.002, .002), normal_tolerance_rad=.01,
         modeling_allowance_m=.002, geometry_error_m=.003, minimum_thickness_m=.02,
@@ -290,10 +295,10 @@ class PlanningSceneTest(unittest.TestCase):
         before = world.estimated_workspace_bytes(batch, horizon)
         world.robot_sphere_materials = (None,)*17
         refined_robot = world.estimated_workspace_bytes(batch, horizon)
-        self.assertEqual(refined_robot-before, batch*horizon*16*2*40)
+        self.assertEqual(refined_robot-before, batch*horizon*16*2*60)
         world.owners[0].local_spheres = np.zeros((3, 4))
         refined_payload = world.estimated_workspace_bytes(batch, horizon)
-        self.assertEqual(refined_payload-refined_robot, batch*horizon*2*(40+128))
+        self.assertEqual(refined_payload-refined_robot, batch*horizon*2*(60+128))
         # Restoring the old robot unknown query changes only its real scratch;
         # neither mode silently removes the conservative shared-grid reserve.
         without_guidance = world.estimated_workspace_bytes(batch, horizon, robot_coverage_guidance=False)
@@ -471,11 +476,11 @@ class PlanningSceneTest(unittest.TestCase):
         both = scene((target, other), materials=("pad",), contacts=(contact_rule(),))
         self.assertGreater(both.evaluate(*args).item(), .0009)
 
-    def test_feature_footprint_and_normal_guard_contact_margin(self):
+    def test_partial_feature_overlap_and_normal_guard_contact_margin(self):
         target = CollisionOwner("surface", BoxQuery("surface"), pose_path(), "measured_surface", True)
         args = inputs(positions=[[0., 0., .009]], sphere_rows=[[[0., 0., .009, .01]]])
-        large = contact_rule(feature_points=[[-.05, -.003, -.01], [.05, -.003, -.01], [.05, .003, -.01], [-.05, .003, -.01]])
-        self.assertGreater(scene((target,), materials=("pad",), contacts=(large,)).evaluate(*args).item(), .0009)
+        large = contact_rule(feature_points=[[-.05, -.012, -.01], [.05, -.012, -.01], [.05, .012, -.01], [-.05, .012, -.01]])
+        self.assertEqual(scene((target,), materials=("pad",), contacts=(large,)).evaluate(*args).item(), 0.)
         backwards = contact_rule(feature_normal=[0, 0, 1])
         self.assertGreater(scene((target,), materials=("pad",), contacts=(backwards,)).evaluate(*args).item(), .0009)
         with self.assertRaisesRegex(ValueError, "whole links"):
@@ -496,8 +501,9 @@ class PlanningSceneTest(unittest.TestCase):
             values = world.evaluate(*args)
             torch.testing.assert_close(values[0, :3], torch.zeros(3, dtype=torch.float64))
             self.assertGreater(values[0, 3].item(), .0009)
-            adjusted = target.query.calls[("robot", "surface")][0, :, 0, 3]
-            torch.testing.assert_close(adjusted, torch.tensor([.008, .008, .008, .01], dtype=torch.float64))
+            ordinary = target.query.calls[("robot", "surface")][0, :, 0, 3]
+            torch.testing.assert_close(ordinary, torch.tensor([.01]*4, dtype=torch.float64))
+            self.assertGreater(world._contact_cells["surface"].last_report["permitted_pairs"], 0)
             # Material permission is scoped to its owner. The same physical
             # robot retains its complete original radius for every other one.
             torch.testing.assert_close(other.query.calls[("robot", "other")][..., 3], args[0][..., 3])
@@ -740,8 +746,8 @@ class PlanningSceneTest(unittest.TestCase):
             commands=[{"skill_id": "moving_close", "event_id": "close", "occurrence": 0, "command": "close", "progress": 0.}],
             source="explicit affine finger model and position-tracking command")
         target = CollisionOwner("surface", BoxQuery("surface"), pose_path(), "known test surface", True)
-        rule = contact_rule(feature_points=[[-.003, -.003, -.005], [.003, -.003, -.005],
-                                             [.003, .003, -.005], [-.003, .003, -.005]],
+        rule = contact_rule(feature_points=[[-.005, -.005, -.005], [.005, -.005, -.005],
+                                             [.005, .005, -.005], [-.005, .005, -.005]],
                             feature_joint_translation=np.tile(np.array([[[0.], [0.], [1.]]]), (4, 1, 1)))
         world = scene((target,), materials=("pad",), contacts=(rule,), gripper=hand, has_gripper=True)
         args = inputs((0., .25, .5, .75, 1.), positions=[[-.02+.02*s, 0., -.006] for s in (0., .25, .5, .75, 1.)])
@@ -958,6 +964,37 @@ class RawQuery:
 
 
 class CuroboQueryWorkspaceTest(unittest.TestCase):
+    # BEGIN shape replacement preserves outstanding values and gradients.
+    def test_replaced_shape_frees_cache_but_preserves_both_backward_snapshots(self):
+        import weakref
+        query = CuroboSphereQuery(RawQuery(), owner_ids=("fixture",), source="test_kernel_contract",
+                                 max_buffers=1, max_cache_bytes=48)
+        first = torch.tensor([[[[.2, 0, 0, .1]]]], requires_grad=True)
+        second = torch.tensor([[[[-.6, 0, 0, .1]], [[.7, 0, 0, .1]]]], requires_grad=True)
+        a = query(first, key="same")
+        old_buffer = weakref.ref(next(iter(query._buffers.values()))[1])
+        b = query(second, key="same")
+        self.assertIsNone(old_buffer())
+        self.assertEqual(len(query._buffers), 1)
+        self.assertEqual(query._cache_bytes, 48)
+        current = next(iter(query._buffers.values()))[1]
+        query(second.detach(), key="same")
+        self.assertIs(next(iter(query._buffers.values()))[1], current)
+        (3*a.sum()+2*b.sum()).backward()
+        torch.testing.assert_close(first.grad[..., 0], torch.full((1, 1, 1), 1.2))
+        torch.testing.assert_close(second.grad[..., 0], torch.tensor([[[-2.4], [2.8]]]))
+        self.assertAlmostEqual(a.item(), .04, places=6)
+        torch.testing.assert_close(b, torch.tensor([[[.36], [.49]]]))
+        oversized = torch.zeros((1, 3, 1, 4))
+        with self.assertRaisesRegex(ValueError, "total query cache"):
+            query(oversized, key="same")
+        self.assertIs(next(iter(query._buffers.values()))[1], current)
+        self.assertEqual(query._cache_bytes, 48)
+        with self.assertRaisesRegex(ValueError, "bounded workspace cache"):
+            query.max_cache_bytes = 128
+            query(first.detach(), key="another")
+    # END cache limits still reject a genuinely inadmissible replacement.
+
     def test_reused_kernel_buffers_cannot_overwrite_unbackpropagated_queries(self):
         query = CuroboSphereQuery(RawQuery(), owner_ids=("fixture",), source="test_kernel_contract")
         first = torch.tensor([[[[.2, 0, 0, .1]]]], requires_grad=True)
@@ -977,6 +1014,13 @@ class CuroboQueryWorkspaceTest(unittest.TestCase):
         query(value, key="first")
         with self.assertRaisesRegex(ValueError, "total query cache"):
             query(value, key="second")
+        # BEGIN reject the complete query before making it contiguous or allocating.
+        default = CuroboSphereQuery(RawQuery(), owner_ids=("fixture",), source="bounded native query")
+        oversized = value.expand(1, 1, default.max_query_spheres+1, 4)
+        with self.assertRaisesRegex(ValueError, "sphere.*budget|sphere.*limit|sphere.*bound"):
+            default(oversized, key="oversized")
+        self.assertFalse(default._buffers)
+        # END a broadcast view exercises admission without a large allocation.
 
 
 if __name__ == "__main__":
@@ -1016,6 +1060,84 @@ def test_binary_measured_entrance_collision_is_not_waived_by_future_unknown_widt
     assert terms["collision/robot/background"][0, 1] == 0
     assert terms["unknown/collision/robot/background"][0, 1] > 0
 # END partial observations remain explicit while actual known conflicts still fail.
+
+# BEGIN independent known/unknown reductions preserve exact hard evidence.
+def test_future_unknown_spheres_cannot_create_roundoff_or_erase_known_penetration():
+    """Exercise both scene query routes and evaluate, not just a sum helper.
+
+    The synthetic values have only uncertain finger collisions. Different
+    float32 reduction widths leave one ULP after total-minus-unknown; a much
+    smaller real fixed-body collision must nevertheless survive independently.
+    """
+    generator = torch.Generator().manual_seed(1)
+    values = torch.zeros((1, 1, 416), dtype=torch.float32)
+    for _ in range(25):
+        values[..., 272:] = torch.rand((1, 1, 144), generator=generator)*.001
+    assert (values.sum(-1)-values[..., 272:].sum(-1)).item() == 2**-27
+
+    class PrescribedQuery(SphereQuery):
+        def __call__(self, spheres, *, key):
+            return self.values.expand(*spheres.shape[:2], spheres.shape[-2])
+
+    hand = PrismaticGripper(
+        controller="binary", control_timestep_s=.002, joint_names=("finger",),
+        current_positions=[.04], joint_limits=[[0., .04]], joint_bounds=None,
+        coupling_matrix=np.empty((0, 1)), coupling_offset=[],
+        sphere_indices=tuple(range(272, 416)),
+        local_spheres=np.tile([0., 0., 0., .005], (144, 1)),
+        sphere_joint_translation=np.tile([[[1.], [0.], [0.]]], (144, 1, 1)),
+        self_collision_pairs=(), commands=[{"skill_id": "test", "event_id": "close",
+            "occurrence": 0, "command": "close", "progress": 0.}], source="synthetic uncertain fingers")
+    args = inputs((0., .5), sphere_rows=[[[-1., 0., 0., .005]]*416]*2, dtype=torch.float32)
+    times = torch.tensor([[0., .5]], dtype=torch.float32)
+    for target in ("background", "owner"):
+        query = PrescribedQuery((target,))
+        options = {"background": query} if target == "background" else {
+            "owners": (CollisionOwner("owner", query, pose_path(), "synthetic owner", True),)}
+        current = scene(materials=(None,)*416, gripper=hand, has_gripper=True, **options)
+        key = "collision/robot/"+target
+        for known_value in (0., 2**-40):
+            query.values = values.clone()
+            query.values[..., 0] = known_value
+            query.values.requires_grad_()
+            terms = current.components(*args, trajectory_time=times)
+            assert terms[key][0, 1].item() == known_value
+            assert terms[key][0, 0].item() == query.values.sum().item()
+            assert terms["unknown/"+key][0, 0].item() == 0.
+            assert terms["unknown/"+key][0, 1].item() == query.values[..., 272:].sum().item()
+            assert current.evaluate(*args, trajectory_time=times)[0, 1].item() == known_value
+            gradient = torch.autograd.grad(terms[key][0, 1], query.values)[0]
+            assert torch.equal(gradient[..., :272], torch.ones_like(gradient[..., :272]))
+            assert torch.equal(gradient[..., 272:], torch.zeros_like(gradient[..., 272:]))
+
+
+def test_future_unknown_self_pairs_do_not_erase_small_known_pair_or_its_gradient():
+    """A fixed palm pair stays hard even while another pair uses unknown width."""
+    hand = PrismaticGripper(
+        controller="binary", control_timestep_s=.002, joint_names=("finger",),
+        current_positions=[.04], joint_limits=[[0., .04]], joint_bounds=None,
+        coupling_matrix=np.empty((0, 1)), coupling_offset=[], sphere_indices=(0, 1),
+        local_spheres=[[0., 0., 0., 2**-15], [.5, 0., 0., .1]],
+        sphere_joint_translation=[[[0.], [0.], [0.]], [[0.], [1.], [0.]]],
+        self_collision_pairs=((0, 2), (1, 3)), commands=[{"skill_id": "test", "event_id": "close",
+            "occurrence": 0, "command": "close", "progress": 0.}], source="synthetic fixed palm and moving finger")
+    current = scene(materials=(None,)*4, gripper=hand, has_gripper=True)
+    rows = [[0., 0., 0., 2**-15], [.5, .04, 0., .1],
+            [2**-14-2**-30, 0., 0., 2**-15], [.5, .02, 0., .1]]
+    args = inputs((0., .5), sphere_rows=[rows, rows], dtype=torch.float32)
+    args[0].requires_grad_()
+    times = torch.tensor([[0., .5]], dtype=torch.float32)
+    terms = current.components(*args, trajectory_time=times)
+    assert terms["gripper/self"][0, 0].item() > .1
+    assert terms["unknown/gripper/self"][0, 0].item() == 0.
+    assert terms["gripper/self"][0, 1].item() == 2**-30
+    assert terms["unknown/gripper/self"][0, 1].item() > .2
+    assert current.evaluate(*args, trajectory_time=times)[0, 1].item() == 2**-30
+    gradient = torch.autograd.grad(terms["gripper/self"][0, 1], args[0])[0]
+    assert gradient[0, 1, 2, 0].item() == -1.
+    assert gradient[0, 1, 3].count_nonzero().item() == 0
+# END no tolerance, clipping, or unknown reduction can alter known components.
+
 
 # BEGIN device command cadence is explicit across every controller family.
 def test_gripper_device_period_is_validated_and_preserved_in_formal_scene():

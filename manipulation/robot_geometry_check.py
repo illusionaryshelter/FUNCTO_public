@@ -253,6 +253,10 @@ class RobotGeometryChecker:
                     self._scene_native_aliases[owner_id] = aliases[0]
             for record in partition["geometry"]["solids"]:
                 shape, vertices, local_pose = _scene_shape(record)
+                # BEGIN a fully validated positive-only field has no occupied solid.
+                if shape is None:
+                    continue
+                # END the original field remains owned in the execution binding.
                 self._scene_shapes.append({"owner": owner_id, "name": record["name"], "shape": shape,
                                            "vertices": vertices, "local_pose": local_pose, "source": record["source"]})
         if len(self._scene_shapes) * (len(self._geometries)+len(self._scene_shapes)) > 100000:
@@ -437,6 +441,8 @@ class RobotGeometryChecker:
                     actor_pose = tool_pose if actor["owner"] == "robot" else poses[actor["owner"]]
                     region, reason = _feature_region(rule, actor_pose, poses[target["owner"]], finger_positions)
                     evidence = {"rule_id": rule["rule_id"], "actor": actor["owner"], "target_owner": target["owner"], "reason": reason}
+                    if reason == "finite_material_patch_region_query_incomplete":
+                        incomplete = True
                     if region is not None and value >= -rule["modeling_allowance_m"]-rule["numerical_position_tolerance_m"]:
                         evidence.update(_overlap_within_region(_world_vertices(actor["vertices"], actor["pose"]),
                                                                _world_vertices(target["vertices"], target["pose"]), region))
@@ -462,8 +468,9 @@ class RobotGeometryChecker:
                                            "scope": "predicted owner geometry; not confirmed actual collision"})
                     else:
                         violations.append(issue)
-        # Required contact uses the complete material feature relation; mere
-        # permission for an intersecting pair cannot prove that relation holds.
+        # Required contact additionally needs actual supplied target occupancy
+        # in the finite region; an abstract patch can contain unobserved air.
+        required_checks = []
         for rule in binding["contacts"]:
             if not rule["required"] or not rule["interval"][0] <= progress <= rule["interval"][1]:
                 continue
@@ -476,10 +483,25 @@ class RobotGeometryChecker:
                 gaps.append({"rule_id": rule["rule_id"], "reason": "required_material_native_geometry_binding_missing"})
                 continue
             actor_pose = tool_pose if rule["actor"] == "robot" else poses[rule["actor"]]
-            _, reason = _feature_region(rule, actor_pose, poses[rule["target_owner"]], finger_positions)
+            region, reason = _feature_region(rule, actor_pose, poses[rule["target_owner"]], finger_positions)
+            if reason == "finite_material_patch_region_query_incomplete":
+                gaps.append({"rule_id": rule["rule_id"], "reason": reason})
+                continue
             if reason == "missing_named_finger_geometry" and state_kind == "nominal":
                 unresolved.append({"rule_id": rule["rule_id"], "kind": "future_material_feature_geometry_unbound"})
                 continue
+            if region is not None:
+                checks = [_solid_intersects_region(_world_vertices(target["vertices"], target["pose"]), region)
+                          for target in targets if target["owner"] == rule["target_owner"]]
+                found = any(check.get("completed") and check.get("intersects") for check in checks)
+                required_checks.append({"rule_id": rule["rule_id"], "target_components": checks,
+                                        "target_occupancy_in_region": found})
+                if not found and any(not check.get("completed") for check in checks):
+                    gaps.append({"rule_id": rule["rule_id"], "reason": "required_target_occupancy_query_incomplete",
+                                 "target_components": checks})
+                    continue
+                if not found:
+                    reason = "required_target_occupancy_absent_from_finite_region"
             if reason:
                 issue = {"kind": "independent_required_contact", "rule_id": rule["rule_id"], "reason": reason}
                 if rule["actor"] in uncertain_owners or rule["target_owner"] in uncertain_owners:
@@ -490,6 +512,7 @@ class RobotGeometryChecker:
             unresolved.append({"kind": "future_finger_geometry_unbound", "geometry_names": sorted(unmodelled_geometries)})
         return {"passed": not violations and not gaps, "violations": violations, "query_gaps": gaps,
                 "unresolved_assumptions": unresolved, "pairs": rows, "state_kind": state_kind,
+                "required_contact_checks": required_checks,
                 "progress": float(progress), "observed_scene_checked": not gaps and not uncertain_owners and not unmodelled_geometries,
                 "supplied_scene_models_checked": not gaps,
                 "complete_scene_geometry": all(owner["geometry_complete"] for owner, _ in self._scene_owners.values()),
@@ -607,7 +630,7 @@ def _scene_shape(record):
         size = float(record["voxel_size"])
         indices = np.asarray(record["occupied_flat_indices"], dtype=np.int64)
         if (shape_xyz.shape != (3,) or np.any(shape_xyz <= 0) or np.prod(shape_xyz) > 8_000_000
-                or not np.isfinite(size) or size <= 0 or indices.ndim != 1 or not 0 < len(indices) <= 250_000
+                or not np.isfinite(size) or size <= 0 or indices.ndim != 1 or len(indices) > 250_000
                 or len(np.unique(indices)) != len(indices) or np.any(indices < 0) or np.any(indices >= np.prod(shape_xyz))):
             raise ValueError("Independent voxel solids require their complete bounded occupied-cell inventory")
         dtype = np.dtype(record["field_dtype"])
@@ -615,9 +638,15 @@ def _scene_shape(record):
             raise ValueError("Independent field samples require a supported finite floating dtype")
         field = np.frombuffer(bytes.fromhex(record["field_bytes_hex"]), dtype=dtype)
         if (field.size != np.prod(shape_xyz) or not np.isfinite(field).all()
-                or record["occupancy_rule"] != "ESDF_sample_strictly_positive"
-                or not np.array_equal(indices, np.flatnonzero(field > 0))):
+                # BEGIN independently verify the completed native ESDF convention.
+                or record["occupancy_rule"] != "ESDF_sample_nonpositive"
+                or not np.array_equal(indices, np.flatnonzero(field <= 0))):
+                # END preserve every negative interior and signed-zero boundary cell.
             raise ValueError("Occupied-cell inventory changed from the exact original field")
+        # BEGIN an empty union is legitimate only after exact complete-field validation.
+        if not len(indices):
+            return None, None, _pose7(record["pose"])
+        # END positive-only or unknown-sentinel fields never create Coal obstacles.
         ijk = np.column_stack(np.unravel_index(indices, tuple(shape_xyz)))
         # OctoMap's lattice is anchored at zero. Build in positive grid-cell
         # coordinates, then apply the native lower grid corner exactly once.
@@ -659,15 +688,13 @@ def _feature_region(rule, actor_pose, target_pose, finger_positions):
     normal = actor_pose[:3, :3] @ np.asarray(rule["feature_normal"], float)
     axes = target_pose[:3, :3] @ np.asarray(rule["patch_axes"], float)
     origin = target_pose[:3, :3] @ np.asarray(rule["patch_origin"], float) + target_pose[:3, 3]
-    patch = (world-origin) @ axes
     tolerance = float(rule["numerical_position_tolerance_m"])
     angle = np.arctan2(np.linalg.norm(np.cross(normal, axes[:, 2])), -normal @ axes[:, 2])
     if angle > rule["normal_tolerance_rad"] + rule["numerical_angle_tolerance_rad"]:
         return None, "material_normal_outside_permission"
-    if np.any(np.abs(patch[:, :2]) > np.asarray(rule["patch_half_size"]) + tolerance):
-        return None, "material_feature_outside_target_patch"
-    if np.any(patch[:, 2] < rule["gap_bounds"][0]-tolerance) or np.any(patch[:, 2] > rule["gap_bounds"][1]+tolerance):
-        return None, "material_feature_outside_gap_bounds"
+    # BEGIN a larger pad may contact only a finite part of the target patch.
+    # Do not demand containment of the whole feature. The complete solid
+    # intersection below must lie in every supplied material/patch halfspace.
     # SVD supplies a basis for this supplied planar polygon. ConvexHull in 2D
     # produces all its edge inequalities, including a nonrectangular feature.
     basis = np.linalg.svd(world-world[0], full_matrices=True)[2][:2].T
@@ -692,7 +719,76 @@ def _feature_region(rule, actor_pose, target_pose, finger_positions):
         axis = sign * axes[:, 2]
         rows.append(axis)
         bounds.append(float(axis @ origin + allowance + tolerance))
-    return (np.asarray(rows), np.asarray(bounds)), None
+    # Evaluate gap on the corresponding point projected onto the ACTUAL
+    # material plane, rather than on unrelated corners outside the patch.
+    height = float(normal @ world[0])
+    cosine = float(axes[:, 2] @ normal)
+    gap_axis = axes[:, 2]-cosine*normal
+    gap_offset = cosine*height-float(axes[:, 2] @ origin)
+    for sign, limit in ((1., rule["gap_bounds"][1]), (-1., -rule["gap_bounds"][0])):
+        rows.append(sign*gap_axis)
+        bounds.append(float(limit-sign*gap_offset+tolerance))
+    region = np.asarray(rows), np.asarray(bounds)
+    from scipy.optimize import linprog
+    feasible = linprog(np.zeros(3), A_ub=region[0], b_ub=region[1], bounds=[(None, None)]*3,
+                      method="highs", options={"primal_feasibility_tolerance": 1e-9,
+                                               "dual_feasibility_tolerance": 1e-9})
+    if feasible.status == 2:
+        return None, "finite_material_patch_gap_region_empty"
+    if not feasible.success:
+        return None, "finite_material_patch_region_query_incomplete"
+    return region, None
+    # END only the finite overlap, not the entire material face, needs permission.
+
+
+# BEGIN required contact needs a complete occupied target in the allowed region.
+def _solid_intersects_region(vertices, region):
+    """Check existential intersection independently of planner sphere costs."""
+    from scipy.optimize import linprog
+    from scipy.spatial import ConvexHull
+    options = {"primal_feasibility_tolerance": 1e-9, "dual_feasibility_tolerance": 1e-9}
+    if vertices is None:
+        return {"completed": False, "reason": "required_curved_target_needs_complete_region_adapter"}
+    if isinstance(vertices, dict):
+        # An axis-aligned outer bound of the complete finite region safely
+        # rejects disjoint occupied leaves before any per-leaf allocation.
+        lower, upper = np.empty(3), np.empty(3)
+        for index, axis in enumerate(np.eye(3)):
+            for sign in (-1., 1.):
+                result = linprog(sign*axis, A_ub=region[0], b_ub=region[1],
+                                 bounds=[(None, None)]*3, method="highs", options=options)
+                if not result.success:
+                    return {"completed": result.status == 2, "intersects": False,
+                            "reason": "required_region_empty" if result.status == 2 else "required_region_bounds_incomplete"}
+                if sign == 1.:
+                    lower[index] = result.x[index]
+                else:
+                    upper[index] = result.x[index]
+        boxes, pose = vertices["voxel_boxes"], vertices["pose"]
+        centres = boxes[:, :3] @ pose[:3, :3].T+pose[:3, 3]
+        extent = boxes[:, 3:4]/2*np.abs(pose[:3, :3]).sum(axis=1)
+        selected = np.flatnonzero(np.all(centres+extent >= lower, axis=1)
+                                  & np.all(centres-extent <= upper, axis=1))
+        if len(selected) > 4096:
+            return {"completed": False, "reason": "required_target_leaf_query_budget", "candidate_leaves": len(selected)}
+        for count, index in enumerate(selected, start=1):
+            cell = _world_vertices(_box_vertices([boxes[index, 3]]*3)+boxes[index, :3], pose)
+            result = _solid_intersects_region(cell, region)
+            if not result["completed"] or result["intersects"]:
+                return {**result, "leaf_queries": count, "candidate_leaves": len(selected)}
+        return {"completed": True, "intersects": False, "leaf_queries": len(selected),
+                "method": "complete_target_region_feasibility"}
+    planes = ConvexHull(vertices).equations
+    result = linprog(np.zeros(3), A_ub=np.concatenate((region[0], planes[:, :3])),
+                     b_ub=np.r_[region[1], -planes[:, 3]], bounds=[(None, None)]*3,
+                     method="highs", options=options)
+    if result.status == 2:
+        return {"completed": True, "intersects": False, "method": "complete_target_region_feasibility"}
+    if not result.success:
+        return {"completed": False, "reason": "required_target_region_query_incomplete", "solver_status": int(result.status)}
+    return {"completed": True, "intersects": True, "witness": result.x.tolist(),
+            "method": "complete_target_region_feasibility", "numerical_certificate": False}
+# END permission-only rules never invent required occupancy or contact force.
 
 
 def _overlap_within_region(first_vertices, second_vertices, region):

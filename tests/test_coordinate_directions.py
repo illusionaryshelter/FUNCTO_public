@@ -247,26 +247,26 @@ class CoordinateDirectionTest(unittest.TestCase):
         self.assertAlmostEqual(request.mechanisms[0].initial_coordinates[0], 2*np.pi)
         self.assertAlmostEqual(request.coordinate_events[0].absolute_target, 2*np.pi)
 
-    def test_full_pose_goal_screens_legal_lift_without_selecting_turn_count(self):
-        from manipulation.program import _mechanism_goal_contract
+    def test_actual_entry_branch_validation_does_not_select_a_future_goal_member(self):
+        # BEGIN only immutable actual entry has a pose-to-coordinate precondition.
+        from manipulation.program import _mechanism_entry_contract
         skill = revolute_input()
         spec, initial = skill["scene"]["motion_model"], skill["scene"]["initial_pose"]
         spec.update(initial_coordinates=[2*np.pi], coordinate_limits=[[2*np.pi-.1, 2*np.pi+.1]],
                     initial_coordinates_source="actual one-turn entry")
-        # The same pose is legal at the entrance and at a later functional
-        # goal, although its independently recovered principal angle is zero.
-        model, _ = _mechanism_goal_contract(spec, initial, [(0, initial), (1, initial)])
+        model, limits = _mechanism_entry_contract(spec, initial)
         np.testing.assert_allclose(model.coordinates, [[0.]])
-        outside = model.poses(np.array([[2*np.pi+.2]]))[0]
+        np.testing.assert_allclose(limits, [[2*np.pi-.1, 2*np.pi+.1]])
+        # A physically forbidden actual branch cannot be replaced by another
+        # equivalent pose, even though future pose-only allowed sets stay free.
+        spec["initial_coordinates"] = [0.]
         with self.assertRaisesRegex(ValueError, "exceeds current mechanism limits"):
-            _mechanism_goal_contract(spec, initial, [(1, outside)])
-        # A named absolute coordinate zero remains physically forbidden;
-        # the pose-only existential screening must not rewrite that target.
-        with self.assertRaisesRegex(ValueError, "exceeds current mechanism limits"):
-            _mechanism_goal_contract(spec, initial, [(1, initial)], {1: np.array([0.])})
+            _mechanism_entry_contract(spec, initial)
+        spec["initial_coordinates"] = [2*np.pi]
         spec["coordinate_limits"] = [[0., 4*np.pi]]
-        _mechanism_goal_contract(spec, initial, [(1, initial)])
+        _mechanism_entry_contract(spec, initial)
         self.assertEqual(spec["initial_coordinates"], [2*np.pi])
+        # END fresh actual branch evidence remains distinct from task targets.
 
 
 if __name__ == "__main__":

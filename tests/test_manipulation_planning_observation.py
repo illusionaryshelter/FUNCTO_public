@@ -2,6 +2,7 @@
 
 # BEGIN pixel ownership and observed-free volume tests without CUDA execution.
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -9,7 +10,8 @@ import torch
 
 from manipulation.planning_observation import (
     _add_known_solid_voxels, _known_free_voxels, _known_solid_evidence,
-    _mapper_memory_bound, _partition_masks, _require_mapping_memory, _views,
+    _mapper_memory_bound, _owner_mapper_config, _partition_masks, _require_mapping_memory,
+    _require_native_voxel_layout, _views,
     build_scene_from_rgbd, observed_space_from_rgbd,
 )
 from manipulation.planning_scene import ObservedSpace
@@ -128,6 +130,130 @@ class PlanningObservationTest(unittest.TestCase):
                                   reference_frame="world", robot_sphere_materials=(None,),
                                   robot_geometry_source="explicit_model", has_gripper=False,
                                   max_mapping_bytes=1024)
+
+    # BEGIN refined owner grids retain all current depth evidence and CPU admission.
+    @staticmethod
+    def refined_owner_fixture():
+        from curobo.perception import MapperCfg
+        first, second = view(), view()
+        for record in (first, second):
+            record["depth"][:] = 1.
+            record["owner_masks"] = {"part": np.zeros((96, 96), bool)}
+        first["owner_masks"]["part"][[42, 48, 52], [43, 49, 54]] = True
+        second["owner_masks"]["part"][[41, 50, 55], [45, 52, 57]] = True
+        first["depth"][42, 43] = .93
+        second["depth"][55, 57] = 1.08
+        # A labelled invalid depth must remain unknown, while the most distant
+        # valid point from the other view must remain inside the owner grid.
+        second["owner_masks"]["part"][30, 30] = True
+        second["depth"][30, 30] = np.nan
+        second["T_output_camera"][:3, 3] = [.04, -.02, .03]
+        pose = np.eye(4)
+        angle = .63
+        pose[:2, :2] = [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+        pose[:3, 3] = [.02, -.01, 1.]
+        cfg = MapperCfg(extent_meters_xyz=(.5, .5, .5), voxel_size=.02,
+            extent_esdf_meters_xyz=(.5, .5, .5), esdf_voxel_size=.025,
+            grid_center=torch.tensor([0., 0., 1.]),
+            image_height=96, image_width=96, device="cuda:0")
+        return {"first": first, "second": second}, {"part": {
+            "T_output_owner": pose, "source": "Current calibrated two-view owner pose"}}, cfg
+
+    def test_refined_owner_grid_encloses_every_valid_label_from_both_rotated_views(self):
+        views, frames, cfg = self.refined_owner_fixture()
+        normalized = _views(views, "world", (.1, 3.))
+        masks = _partition_masks(normalized, frames)
+        pose, voxel, error = frames["part"]["T_output_owner"], .005, .003
+        refined = _owner_mapper_config(cfg, normalized, masks, "part", pose, voxel, error)
+        points = []
+        for record in views.values():
+            for row, column in np.argwhere(record["owner_masks"]["part"] & np.isfinite(record["depth"])):
+                camera = np.linalg.solve(record["K"], [column, row, 1.])*record["depth"][row, column]
+                world = record["T_output_camera"][:3, :3]@camera+record["T_output_camera"][:3, 3]
+                points.append(pose[:3, :3].T@(world-pose[:3, 3]))
+        points = np.asarray(points)
+        self.assertEqual(len(points), 6)
+        padding = 4*voxel+error
+        lower = refined.grid_center.numpy()-np.asarray(refined.extent_meters_xyz)/2
+        upper = refined.grid_center.numpy()+np.asarray(refined.extent_meters_xyz)/2
+        np.testing.assert_allclose(lower, points.min(axis=0)-padding, atol=1e-8)
+        np.testing.assert_allclose(upper, points.max(axis=0)+padding, atol=1e-8)
+        self.assertTrue(np.all(points >= lower+padding-1e-8))
+        self.assertTrue(np.all(points <= upper-padding+1e-8))
+        self.assertEqual(refined.voxel_size, voxel)
+        self.assertEqual(refined.esdf_voxel_size, voxel)
+        self.assertEqual(refined.truncation_distance, 2*voxel)
+        self.assertEqual(cfg.voxel_size, .02)
+        self.assertEqual(cfg.esdf_voxel_size, .025)
+        np.testing.assert_array_equal(cfg.grid_center.numpy(), [0., 0., 1.])
+        self.assertTrue(np.isnan(views["second"]["depth"][30, 30]))
+
+    def test_refinement_preserves_background_free_space_and_budgets_all_partitions(self):
+        views, frames, cfg = self.refined_owner_fixture()
+        spaces, configs, budgets = [], [], []
+
+        def capture_space(*args, **kwargs):
+            result = ObservedSpace(*args, **kwargs)
+            spaces.append(result)
+            return result
+
+        def capture_budget(config):
+            configs.append(config)
+            return _mapper_memory_bound(config)
+
+        def stop_before_native(estimated, device):
+            budgets.append(estimated)
+            raise ValueError("CPU admission stop")
+
+        options = dict(mapper_cfg=cfg, depth_error_m=.003, reference_frame="world",
+            robot_sphere_materials=(None,), robot_geometry_source="Declared synthetic robot",
+            has_gripper=False, max_mapping_bytes=1024**3)
+        with patch("manipulation.planning_observation.ObservedSpace", side_effect=capture_space), \
+                patch("manipulation.planning_observation._mapper_memory_bound", side_effect=capture_budget), \
+                patch("manipulation.planning_observation._require_mapping_memory", side_effect=stop_before_native), \
+                patch("torch.cuda.mem_get_info", side_effect=AssertionError("CPU audit touched CUDA")), \
+                patch("curobo.perception.Mapper") as mapper:
+            for resolution in (None, .005):
+                with self.assertRaisesRegex(ValueError, "CPU admission stop"):
+                    build_scene_from_rgbd(views, frames, owner_voxel_size_m=resolution, **options)
+            mapper.assert_not_called()
+        self.assertEqual(len(configs), 4)
+        self.assertIs(configs[0], cfg)
+        self.assertIs(configs[2], cfg)
+        self.assertEqual(configs[3].voxel_size, .005)
+        for index, budget in enumerate(budgets):
+            self.assertEqual(budget, sum(_mapper_memory_bound(config) for config in configs[index*2:index*2+2]))
+        np.testing.assert_array_equal(spaces[0].known_free, spaces[1].known_free)
+        np.testing.assert_array_equal(spaces[0].origin, spaces[1].origin)
+        self.assertEqual(spaces[0].voxel_size, spaces[1].voxel_size)
+        # Each allocation fits separately; their combined allocation does not.
+        # The real builder must reject their sum before live-device admission.
+        individual = [_mapper_memory_bound(config) for config in configs[2:]]
+        with patch("manipulation.planning_observation._require_mapping_memory") as memory, \
+                patch("curobo.perception.Mapper") as mapper:
+            with self.assertRaisesRegex(ValueError, "declared budget"):
+                build_scene_from_rgbd(views, frames, owner_voxel_size_m=.005,
+                    **{**options, "max_mapping_bytes": max(individual)})
+            memory.assert_not_called()
+            mapper.assert_not_called()
+
+    def test_refinement_rejects_invalid_resolution_or_empty_evidence_before_cuda(self):
+        views, frames, cfg = self.refined_owner_fixture()
+        options = dict(mapper_cfg=cfg, depth_error_m=.003, reference_frame="world",
+            robot_sphere_materials=(None,), robot_geometry_source="Declared synthetic robot",
+            has_gripper=False, max_mapping_bytes=1024**3)
+        with patch("torch.cuda.mem_get_info", side_effect=AssertionError("CPU rejection touched CUDA")) as memory, \
+                patch("curobo.perception.Mapper") as mapper:
+            for resolution in (0., -.001, float("nan"), float("inf")):
+                with self.subTest(resolution=resolution), self.assertRaisesRegex(ValueError, "positive metres"):
+                    build_scene_from_rgbd(views, frames, owner_voxel_size_m=resolution, **options)
+            for record in views.values():
+                record["depth"][record["owner_masks"]["part"]] = 0.
+            with self.assertRaisesRegex(ValueError, "current valid depth"):
+                build_scene_from_rgbd(views, frames, owner_voxel_size_m=.005, **options)
+            memory.assert_not_called()
+            mapper.assert_not_called()
+    # END owner precision does not change background evidence or bypass budgets.
 
     # BEGIN resource limits must fail before native mapping allocation.
     def test_mapping_hard_limit_and_missing_hand_fail_without_cuda_access(self):
@@ -305,6 +431,107 @@ class PlanningObservationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "geometry budget"):
             _known_solid_evidence(solids, frames, None, views, "world")
     # END whole-cell physical occupancy evidence and contradictory-input tests.
+
+
+# BEGIN native float grid parameters must index the exact completed field.
+class NativeVoxelLayoutTest(unittest.TestCase):
+    @staticmethod
+    def native_fixture(shape, requested_size, name="observed_background"):
+        """Run actual native metadata construction, isolating only pose kernels.
+
+        The identity pose has no effect on grid-size arithmetic. Replacing its
+        helper avoids compiling Warp transforms in a CPU regression, while
+        VoxelData computes and stores its real float32 params and field view.
+        """
+        from curobo._src.geom.data.data_voxel import VoxelData
+        from curobo._src.geom.types import VoxelGrid
+        from curobo._src.types.device_cfg import DeviceCfg
+
+        class IdentityPose:
+            @classmethod
+            def from_batch_list(cls, rows, *, device_cfg):
+                assert rows == [[0., 0., 0., 1., 0., 0., 0.]]
+                assert device_cfg.device.type == "cpu"
+                return cls()
+
+            def inverse(self):
+                return self
+
+            def get_pose_vector(self):
+                return torch.tensor([[0., 0., 0., 1., 0., 0., 0.]], dtype=torch.float32)
+
+        size = torch.tensor(requested_size, dtype=torch.float32).item()
+        field = torch.full(shape, 10000., dtype=torch.float16)
+        field.reshape(-1)[0] = -.01
+        voxel = VoxelGrid(name=name, pose=[0., 0., 0., 1., 0., 0., 0.],
+            dims=[count*size for count in shape], voxel_size=size,
+            feature_tensor=field, feature_dtype=field.dtype)
+        with patch("curobo._src.geom.data.data_voxel.Pose", IdentityPose):
+            storage = VoxelData.create_from_voxel_grids([voxel], DeviceCfg("cpu"))
+        assert storage.features.data_ptr() == field.data_ptr()
+        return voxel, SimpleNamespace(data=SimpleNamespace(voxels=storage))
+
+    def test_truncated_native_dimensions_are_rejected_without_repair(self):
+        cases = [((3, 2, 2), .0015, (2, 2, 2)),
+                 ((2, 3, 2), .0015, (2, 2, 2)),
+                 ((2, 2, 3), .0015, (2, 2, 2)),
+                 ((49, 2, 2), .015, (48, 2, 2))]
+        for shape, size, truncated in cases:
+            with self.subTest(shape=shape, size=size):
+                voxel, native = self.native_fixture(shape, size)
+                field = voxel.feature_tensor.clone()
+                params = native.data.voxels.params.clone()
+                self.assertEqual(tuple(params[0, 0, :3].to(torch.int32).tolist()), truncated)
+                with self.assertRaisesRegex(ValueError, "Unsupported native ESDF grid layout") as raised:
+                    _require_native_voxel_layout(voxel, native)
+                self.assertIn(f"field_shape_xyz={shape}", str(raised.exception))
+                self.assertIn(f"native_truncated_shape_xyz={truncated}", str(raised.exception))
+                self.assertIn("native_params_xyz=", str(raised.exception))
+                torch.testing.assert_close(voxel.feature_tensor, field, rtol=0., atol=0.)
+                torch.testing.assert_close(native.data.voxels.params, params, rtol=0., atol=0.)
+
+    def test_correct_native_integer_layout_allows_positive_roundoff(self):
+        # Unequal XYZ dimensions include the current two owner-grid sizes and
+        # background size. They exercise general metadata, not task identities.
+        for shape, size in (((108, 111, 115), .0015), ((95, 135, 93), .0015), ((94, 67, 80), .015)):
+            with self.subTest(shape=shape):
+                voxel, native = self.native_fixture(shape, size)
+                params = native.data.voxels.params.clone()
+                _require_native_voxel_layout(voxel, native)
+                self.assertEqual(tuple(params[0, 0, :3].to(torch.int32).tolist()), shape)
+                torch.testing.assert_close(native.data.voxels.params, params, rtol=0., atol=0.)
+                self.assertEqual(voxel.feature_tensor.shape, torch.Size(shape))
+                if shape == (95, 135, 93):
+                    self.assertEqual(params[0, 0, 2].item(), 93.00000762939453)
+
+    def test_rgbd_builder_rejects_layout_before_query_or_independent_export(self):
+        from curobo.perception import MapperCfg
+        from curobo.types import DeviceCfg
+        voxel, native = self.native_fixture((3, 2, 2), .0015)
+        cfg = MapperCfg(extent_meters_xyz=(.06, .06, .06), voxel_size=.015,
+            extent_esdf_meters_xyz=(.06, .06, .06), esdf_voxel_size=.015,
+            image_height=96, image_width=96, device="cuda:0")
+        with patch("manipulation.planning_observation._require_mapping_memory"), \
+                patch("curobo.perception.Mapper") as mapper, \
+                patch("curobo.types.DeviceCfg", return_value=DeviceCfg("cpu")), \
+                patch("curobo.types.CameraObservation", side_effect=lambda **values: SimpleNamespace(**values)), \
+                patch("curobo.types.Pose.from_matrix", return_value=SimpleNamespace()), \
+                patch("curobo._src.geom.collision.collision_scene.SceneCollision.from_config", return_value=native) as create, \
+                patch("manipulation.planning_observation.CuroboSphereQuery") as query, \
+                patch("manipulation.planning_observation._independent_voxel_geometry") as export:
+            mapper.return_value.get_stats.return_value = {
+                "allocation_failures": 0, "num_allocated": 0, "active_blocks": 0, "free_count": 0}
+            mapper.return_value.compute_esdf.return_value = voxel
+            with self.assertRaisesRegex(ValueError, "native_truncated_shape_xyz=\\(2, 2, 2\\)"):
+                build_scene_from_rgbd({"current": view()}, {}, mapper_cfg=cfg, depth_error_m=.001,
+                    reference_frame="world", robot_sphere_materials=(None,),
+                    robot_geometry_source="Explicit CPU robot fixture", has_gripper=False,
+                    max_mapping_bytes=1024**3)
+            mapper.return_value.compute_esdf.assert_called_once()
+            create.assert_called_once()
+            query.assert_not_called()
+            export.assert_not_called()
+# END no mismatched native world is silently reinterpreted by its consumers.
 
 
 if __name__ == "__main__":

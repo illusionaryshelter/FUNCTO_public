@@ -34,6 +34,9 @@ from .planning_problem import (
 from .planning_problem import event_occurrence_key
 # END source names alone do not identify an explicitly repeated operation.
 from .motion import _inverse, _pose_array
+# BEGIN material permission uses complete finite target intersections.
+from .contact_geometry import ContactCellGeometry, query_geometry
+# END the ordinary collision query still owns all other pairs.
 
 
 def _array(value, shape, label):
@@ -171,9 +174,16 @@ class CuroboSphereQuery:
     finite cache via ``clone_for_rollout``.
     """
 
+    # BEGIN bound complete validation for the admitted robot geometry capacity.
+    # Three million sphere queries fit the existing 64-MiB buffer at 20 bytes
+    # per sphere plus scalar weights. This also admits 1536 validation times
+    # at all three mode sides for the existing 512-sphere robot limit. The
+    # planner separately bounds every rollout's retained/live allocations;
+    # cumulative cache bytes and semantic slots remain checked below.
     def __init__(self, scene_collision, *, owner_ids, source,
-                 max_query_spheres=2_000_000, max_buffers=64,
-                 max_cache_bytes=32 * 1024 * 1024):
+                 max_query_spheres=3_000_000, max_buffers=64,
+                 max_cache_bytes=64 * 1024 * 1024):
+        # END this storage limit changes no geometry, sampling or query values.
         if not callable(getattr(scene_collision, "get_sphere_distance_raw", None)):
             raise TypeError("A cuRobo V2 SceneCollision query is required")
         self.scene_collision = scene_collision
@@ -205,21 +215,33 @@ class CuroboSphereQuery:
         from curobo._src.geom.collision.buffer_collision import CollisionBuffer
 
         shape = tuple(spheres.shape)
-        slot = (key, shape, str(spheres.device))
+        # BEGIN one current shape per semantic query, with owned saved gradients.
+        # A rollout can change its validation horizon. Old shape buffers have
+        # no future consumer: every outstanding backward owns the clone below.
+        # Replace them before allocating the new shape, rather than retaining
+        # one GPU allocation for every historical horizon in this request.
+        slot = (key, str(spheres.device))
+        byte_count = math.prod(shape[:-1]) * 5 * 4 + 8
+        previous = self._buffers.get(slot)
+        previous_bytes = 0 if previous is None else math.prod(previous[0][:-1]) * 5 * 4 + 8
+        if self._cache_bytes-previous_bytes+byte_count > self.max_cache_bytes:
+            raise ValueError("Collision workspaces exceed the total query cache byte limit")
+        if previous is not None and previous[0] != shape:
+            del self._buffers[slot]
+            self._cache_bytes -= previous_bytes
+            del previous
         if slot not in self._buffers:
             if len(self._buffers) >= self.max_buffers:
                 raise ValueError("Collision query exceeds its bounded workspace cache")
-            byte_count = math.prod(shape[:-1]) * 5 * 4 + 8
-            if self._cache_bytes + byte_count > self.max_cache_bytes:
-                raise ValueError("Collision workspaces exceed the total query cache byte limit")
             config = self.scene_collision.device_cfg
             if not config.is_same_torch_device(spheres.device):
                 raise ValueError("Query and cuRobo scene must share a device")
             self._buffers[slot] = (
-                CollisionBuffer.from_shape(spheres.shape, config),
+                shape, CollisionBuffer.from_shape(spheres.shape, config),
                 spheres.new_ones(1), spheres.new_zeros(1))
             self._cache_bytes += byte_count
-        buffer, weight, activation = self._buffers[slot]
+        _, buffer, weight, activation = self._buffers[slot]
+        # END shape replacement changes storage only, never native query values.
         with torch.autograd.graph.saved_tensors_hooks(lambda value: value.clone(), lambda value: value):
             value = self.scene_collision.get_sphere_distance_raw(
                 spheres.contiguous(), buffer, weight, activation, return_loss=True)
@@ -486,9 +508,10 @@ class CollisionOwner:
 class ContactRule:
     """A material feature / owner patch permission, never a link exemption.
 
-    The material points form a planar convex feature; checking every vertex
-    against a rectangular patch covers the full feature, not merely a sphere
-    centre. For robot actors they are tool-local. For owner actors they are
+    The material points form a complete planar convex feature. Permission
+    covers only its actual finite intersection with the target patch; a pad
+    may extend beyond a smaller contact patch. For robot actors they are
+    tool-local. For owner actors they are
     owner-local. Optional affine joint translations represent calibrated
     prismatic finger motion and use the scene's declared gripper coordinates.
     The patch normal points out of the target; actor normals oppose it.
@@ -532,6 +555,13 @@ class ContactRule:
             raise ValueError("Material normal must be unit length")
         if np.max(np.abs((points - points[0]) @ self.feature_normal)) > 1e-8:
             raise ValueError("Material contact vertices must lie in their declared plane")
+        # BEGIN retain all convex feature edges for complete overlap checks.
+        from scipy.spatial import ConvexHull
+        basis = np.linalg.svd(points-points[0], full_matrices=True)[2][:2].T
+        edges = ConvexHull((points-points[0]) @ basis).equations
+        self._feature_edge_normals = edges[:, :2] @ basis.T
+        self._feature_edge_offsets = edges[:, 2]
+        # END a nearest contact point cannot stand in for this finite polygon.
         self.patch_origin = _array(self.patch_origin, (3,), "patch origin")
         self.patch_axes = _array(self.patch_axes, (3, 3), "patch axes")
         if (not np.allclose(self.patch_axes.T @ self.patch_axes, np.eye(3), atol=1e-6)
@@ -551,6 +581,8 @@ class ContactRule:
             value = np.asarray(self.feature_joint_translation, float)
             if (value.ndim != 3 or value.shape[:2] != points.shape or not np.isfinite(value).all()):
                 raise ValueError("Prismatic material offsets need shape [vertices,3,joints]")
+            if not np.allclose(value, value[:1], atol=1e-10, rtol=0):
+                raise ValueError("A native prismatic material face must translate rigidly")
             self.feature_joint_translation = value.copy()
         if (not np.isfinite(self.numerical_position_tolerance_m)
                 or not np.isfinite(self.numerical_angle_tolerance_rad)
@@ -820,10 +852,11 @@ def _validate_contact_and_gripper_inputs(owner_materials, robot_materials, conta
 class PlanningScene:
     """One scene contract for optimizer rollout, search and final checks.
 
-    ``robot_sphere_materials`` assigns a specific material contact feature or
-    None to *every* robot sphere. Such spheres must cover only that feature;
-    palm/finger noncontact volume needs separate unmodified proxies. Geometry
-    calibration and coverage of those proxies belong to the supplied model.
+    ``robot_sphere_materials`` assigns a specific native material solid or
+    None to *every* robot sphere. A permission still names its finite contact
+    face: side/back overlaps of that same solid remain checked outside the
+    face's thin region. Palm and adjacent finger bodies keep their separate
+    unmodified proxies. Geometry calibration and coverage belong to the model.
     Missing gripper information is rejected rather than assuming open fingers.
     A robot without a gripper must explicitly pass ``has_gripper=False``.
     """
@@ -914,6 +947,11 @@ class PlanningScene:
             self.robot_sphere_materials, contacts, gripper, has_gripper)
         self.gripper = gripper
         # END shared CPU-only hand/material validation.
+        # BEGIN own the complete finite target inventory once per binding.
+        contacted = {rule.target_owner for rule in self.contacts}
+        self._contact_cells = {owner.owner_id: ContactCellGeometry(query_geometry(owner.query))
+                               for owner in self.owners if owner.owner_id in contacted}
+        # END unsupported inventories remain explicit permission-query gaps.
         self._fixed_release_poses = {}
         anchors = [x for owner in self.owners for relation in owner.attachments for x in relation.interval]
         anchors.extend(x for rule in self.contacts for x in rule.interval)
@@ -1154,6 +1192,12 @@ class PlanningScene:
             owner.attachments = deepcopy(owner.attachments)
             owner.local_spheres = (None if owner.local_spheres is None else owner.local_spheres.copy())
         result.contacts = deepcopy(self.contacts)
+        # BEGIN immutable target cells/tree are shared; query diagnostics are private.
+        result._contact_cells = {name: copy(value) for name, value in self._contact_cells.items()}
+        for value in result._contact_cells.values():
+            value.last_report = None
+            value.last_required_report = None
+        # END one rollout cannot overwrite another's last complete contact audit.
         result.gripper = deepcopy(self.gripper)
         result.coverage = self.coverage.clone_for_rollout()
         result.observation_report = deepcopy(self.observation_report)
@@ -1288,20 +1332,35 @@ class PlanningScene:
         return reports
     # END reference volume verification never asserts controller tracking.
 
-    def estimated_workspace_bytes(self, batch, horizon, *, robot_coverage_guidance=True):
-        """Bound geometry-query work only; solver/model storage is additional.
+    # BEGIN distinguish retained native buffers from one live query/backward.
+    def estimated_workspace_allocation(self, batch, horizon, *, robot_coverage_horizon):
+        """Return retained, live and shared-CPU bytes for one scene rollout.
 
-        Includes one live gradient snapshot per query, reusable query buffers,
-        whole-sphere coverage interpolation and its grid. Backend consumers
-        must sum their independent rollout allocations and their own robot,
-        optimizer, FK and trajectory allocations before choosing GPU budgets.
+        Native buffers persist per semantic key at the latest shape. Graph
+        snapshots and checkpoint scratch live through one forward/backward;
+        independent sequential native evaluations do not retain each other's
+        graphs. Coverage guidance uses its own original FK horizon, without
+        the scene's exact/left/right material-mode expansion. Robot/solver/FK
+        storage remains additional to these geometry-query allocations.
         """
         if type(batch) is not int or type(horizon) is not int or min(batch, horizon) <= 0:
             raise ValueError("Workspace estimation needs positive batch/horizon sizes")
+        if (type(robot_coverage_horizon) is not int
+                or not 0 <= robot_coverage_horizon <= horizon):
+            raise ValueError("Coverage guidance horizon must fit the original scene horizon")
         actors = {"robot": len(self.robot_sphere_materials)}
         actors.update({owner.owner_id: len(owner.local_spheres) for owner in self.owners if owner.moving})
         count = sum(size * (1 + len(self.owners) - int(actor != "robot")) for actor, size in actors.items())
-        query_bytes = batch * horizon * count * 40
+        slots = sum(1+len(self.owners)-int(actor != "robot") for actor in actors)
+        # Count scalar slots per state as well. This also bounds a stack of
+        # one-state OMPL scenes by one equivalent multi-state allocation.
+        retained_bytes = batch*horizon*(count*20 + slots*8)
+        # Native CollisionBuffer owns distance + four-gradient floats (20B).
+        # The current graph additionally owns the gradient snapshot (16B),
+        # output clone (4B), return_loss backward product (16B), and its scalar
+        # incoming gradient (4B). Reserve every query's backward simultaneously
+        # even though autograd actually consumes those native nodes in turn.
+        query_bytes = batch*horizon*count*40
         # BEGIN count only actors that still execute whole-sphere coverage.
         # Native robot-volume coverage replaces that one query in components;
         # moving payloads keep their original unknown-space checks. Retain the
@@ -1323,7 +1382,7 @@ class PlanningScene:
             # Checkpointing frees chunk scratch rather than retaining all P.
             pair_bytes = batch*horizon*(96*chunk+32*actors["robot"])+16*pairs
         native_coverage_bytes = 0
-        if self.robot_coverage is not None and robot_coverage_guidance:
+        if self.robot_coverage is not None and robot_coverage_horizon:
             solids = self._coverage_geometry["solids"]
             plane_counts = [len(row["baseline_halfspaces_world"]) for row in solids]
             planes = max(plane_counts)
@@ -1331,7 +1390,7 @@ class PlanningScene:
             joints = len(self.robot_coverage.baseline_joint_names)
             # One checkpointed body query is live; all frame poses/Jacobians
             # and their gradients remain resident for its backward pass.
-            states = batch*horizon
+            states = batch*robot_coverage_horizon
             # Use the target itself as an upper bound, including rounding of
             # the per-body chunk count. Twenty-point pads may choose a larger
             # chunk than 32-point bodies, so a single 32-point chunk formula
@@ -1351,8 +1410,23 @@ class PlanningScene:
                 + states*(32*32*8 + frames*(32+12*joints)*4)
                 + sum(plane_counts)*24)
             native_coverage_bytes += self._free_distance.numel()*8
-        return int(query_bytes + coverage_bytes + pair_bytes + native_coverage_bytes)
+        # BEGIN finite contact witnesses never allocate the raw Cartesian product.
+        shared_cpu_bytes = sum(value.centres.nbytes+value.halves.nbytes+value.rotations.nbytes
+                               for value in self._contact_cells.values())
+        contact_bytes = (sum(value.pair_chunk*1600 for value in self._contact_cells.values())
+                         + (batch*horizon*len(self.robot_sphere_materials)*64 if self._contact_cells else 0))
+        contact_bytes += batch*horizon*sum((len(rule._feature_edge_normals)+10)*32 for rule in self.contacts)
+        # END CPU neighbor lists separately obey a two-million-pair admission cap.
+        return {"retained": int(retained_bytes),
+                "live": int(query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes+contact_bytes),
+                "shared_cpu": int(shared_cpu_bytes)}
         # END include checkpointed hand-pair scratch and its retained input.
+
+    def estimated_workspace_bytes(self, batch, horizon, *, robot_coverage_guidance=True):
+        """Bound one complete query, including its persistent native buffers."""
+        return sum(self.estimated_workspace_allocation(batch, horizon,
+            robot_coverage_horizon=horizon if robot_coverage_guidance else 0).values())
+    # END callers sum caches across rollouts but only one sequential live graph.
 
     def project_residual(self, progress, joint_position, joint_names):
         """Independent executable finger-drive equalities for OMPL projection.
@@ -1419,6 +1493,7 @@ class PlanningScene:
     # END neither a source reference nor a sibling branch supplies release FK.
 
     def _permission(self, rule, actor_spheres, actor_pose, target_pose, progress, coordinates, half):
+        # BEGIN complete finite overlap, without requiring the whole pad in the patch.
         points = _tensor(rule.feature_points, progress)
         if rule.feature_joint_translation is not None:
             mapping = _tensor(rule.feature_joint_translation, progress)
@@ -1431,34 +1506,50 @@ class PlanningScene:
         world = _world_points(points, *actor_pose)
         target_local = quaternion_rotate(quaternion_conjugate(target_pose[1]).unsqueeze(-2),
                                          world - target_pose[0].unsqueeze(-2))
-        patch_points = ((target_local - _tensor(rule.patch_origin, progress))
-                        @ _tensor(rule.patch_axes, progress))
-        footprint = torch.relu(patch_points[..., :2].abs()
-                               - _tensor(rule.patch_half_size, progress)).amax(dim=(-1, -2))
-        # A large proxy must not borrow a small feature's permission while its
-        # other side touches the same owner outside the observed patch. Requiring
-        # the entire projected sphere disk inside the patch is conservative and
-        # needs no unavailable per-obstacle witness from an accumulated query.
-        proxies = _local_spheres(actor_spheres[..., list(rule.sphere_indices), :], *target_pose)
-        proxy_points = ((proxies[..., :3] - _tensor(rule.patch_origin, progress))
-                        @ _tensor(rule.patch_axes, progress))
-        proxy_footprint = torch.relu(proxy_points[..., :2].abs() + proxies[..., 3:4]
-                                     - _tensor(rule.patch_half_size, progress)).amax(dim=(-1, -2))
-        footprint = torch.maximum(footprint, proxy_footprint)
-        heights = patch_points[..., 2]
-        gap = (torch.relu(rule.gap_bounds[0] - heights).amax(-1)
-               + torch.relu(heights - rule.gap_bounds[1]).amax(-1))
         actor_normal = quaternion_rotate(actor_pose[1], _tensor(rule.feature_normal, progress))
         target_normal = quaternion_rotate(target_pose[1], _tensor(rule.patch_axes[:, 2], progress))
         angle = torch.atan2(torch.linalg.vector_norm(torch.linalg.cross(actor_normal, target_normal), dim=-1),
                             -(actor_normal * target_normal).sum(-1))
         normal = torch.relu(angle - rule.normal_tolerance_rad - rule.numerical_angle_tolerance_rad)
-        residual = (torch.relu(footprint - rule.numerical_position_tolerance_m)
-                    + torch.relu(gap - rule.numerical_position_tolerance_m) + normal)
         active = _interval(progress, rule.interval)
-        allowed = active & certain & (residual <= 0)
-        return (allowed, residual * active.to(progress.dtype),
+        inverse_target = quaternion_conjugate(target_pose[1])
+        material_normal = quaternion_rotate(inverse_target, actor_normal)
+        edges_world = quaternion_rotate(actor_pose[1].unsqueeze(-2), _tensor(rule._feature_edge_normals, progress))
+        edge_normals = quaternion_rotate(inverse_target.unsqueeze(-2), edges_world)
+        origin = target_local[..., 0, :]
+        tolerance = rule.numerical_position_tolerance_m
+        rows = [edge_normals]
+        bounds = [(edge_normals*origin.unsqueeze(-2)).sum(-1)-_tensor(rule._feature_edge_offsets, progress)+tolerance]
+        material_height = (material_normal*origin).sum(-1)
+        for sign in (-1., 1.):
+            rows.append(sign*material_normal.unsqueeze(-2))
+            bounds.append((sign*material_height+rule.modeling_allowance_m+tolerance).unsqueeze(-1))
+        patch_axes, patch_origin = _tensor(rule.patch_axes, progress), _tensor(rule.patch_origin, progress)
+        for column, width in enumerate((*rule.patch_half_size, rule.modeling_allowance_m)):
+            for sign in (-1., 1.):
+                axis = sign*patch_axes[:, column]
+                rows.append(axis.expand(*progress.shape, 1, 3))
+                bounds.append((axis@patch_origin+width+tolerance).expand(*progress.shape, 1))
+        # A contact point belongs to the material's thin extrusion. Project
+        # it back onto that actual face before evaluating the declared gap;
+        # this allows a curved target to touch just part of a larger pad.
+        patch_normal = patch_axes[:, 2]
+        cosine = (material_normal*patch_normal).sum(-1)
+        gap_axis = patch_normal-cosine.unsqueeze(-1)*material_normal
+        gap_offset = cosine*material_height-patch_normal@patch_origin
+        for sign, limit in ((1., rule.gap_bounds[1]), (-1., -rule.gap_bounds[0])):
+            rows.append((sign*gap_axis).unsqueeze(-2))
+            bounds.append((limit-sign*gap_offset+tolerance).unsqueeze(-1))
+        region_normals, region_bounds = torch.cat(rows, dim=-2), torch.cat(bounds, dim=-1)
+        residual = normal
+        policy = {"sphere_indices": rule.sphere_indices, "active": active & certain,
+                  "normals": region_normals, "bounds": region_bounds,
+                  "feature_points": target_local,
+                  "allowance": rule.modeling_allowance_m,
+                  "normal_valid": normal <= 0}
+        return (policy, residual * active.to(progress.dtype),
                 (active & ~certain).to(progress.dtype))
+        # END the target-cell query checks every possible material overlap.
 
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time=None):
@@ -1495,16 +1586,35 @@ class PlanningScene:
                 uncertain_hand = (torch.ones_like(progress, dtype=torch.bool) if trajectory_time is None else trajectory_time > 0)
                 uncertain_indices = [index for index, mapping in zip(hand.sphere_indices, hand.sphere_joint_translation)
                                      if np.any(mapping != 0)]
+                # BEGIN partition by identity once, before numeric reductions.
+                uncertain_set = set(uncertain_indices)
+                known_indices = [index for index in range(spheres.shape[-2])
+                                 if index not in uncertain_set]
+                # END the same robot partition applies to every scene owner.
                 if hand.self_collision_pairs:
-                    affected = [pair for pair in hand.self_collision_pairs if set(pair) & set(uncertain_indices)]
+                    affected = [pair for pair in hand.self_collision_pairs if set(pair) & uncertain_set]
                     unresolved = _self_pair_sum(spheres, np.asarray(affected, dtype=np.int64).reshape(-1, 2)) if affected else torch.zeros_like(progress)
                     costs["unknown/gripper/self"] = unresolved * uncertain_hand
-                    costs["gripper/self"] = costs["gripper/self"] - costs["unknown/gripper/self"]
+                    # BEGIN known pairs are independent nonnegative evidence.
+                    # Subtracting differently rounded all/unknown reductions
+                    # can invent a positive violation or erase a small real
+                    # one. Sum the unaffected pairs themselves; measured
+                    # entrance states still retain every declared pair.
+                    known_pairs = [pair for pair in hand.self_collision_pairs
+                                   if not set(pair) & uncertain_set]
+                    known = _self_pair_sum(spheres, np.asarray(known_pairs, dtype=np.int64).reshape(-1, 2))
+                    costs["gripper/self"] = torch.where(
+                        uncertain_hand, known, costs["gripper/self"])
+                    # END unknown pair values remain separately diagnostic.
         def collision_terms(values, key, actor):
             if actor == "robot" and uncertain_indices:
                 unresolved = values[..., uncertain_indices].sum(-1) * uncertain_hand
                 costs["unknown/" + key] = unresolved
-                costs[key] = values.sum(-1) - unresolved
+                # BEGIN preserve known per-sphere values before any reduction.
+                # No tolerance or clamp may hide a true positive component.
+                known = values[..., known_indices].sum(-1)
+                costs[key] = torch.where(uncertain_hand, known, values.sum(-1))
+                # END initial measured fingers retain their full query values.
             else:
                 costs[key] = values.sum(-1)
         # END fixed palm/body conflicts remain known at every query.
@@ -1569,33 +1679,39 @@ class PlanningScene:
             for owner in self.owners:
                 if actor == owner.owner_id:
                     continue
-                adjusted = actor_spheres
+                # BEGIN local permission is evaluated per complete target cell.
+                policies = []
                 for rule in self.contacts:
                     if rule.actor != actor or rule.target_owner != owner.owner_id:
                         continue
-                    allowed, residual, uncertain = self._permission(
+                    policy, residual, uncertain = self._permission(
                         rule, actor_spheres, actor_pose, poses[owner.owner_id], progress, coordinates, half)
+                    if actor == "robot" and rule.feature_joint_translation is not None:
+                        policy["active"] = policy["active"] & ~uncertain_hand
                     if rule.required:
                         unresolved = uncertain_hand if actor == "robot" and rule.feature_joint_translation is not None else torch.zeros_like(progress, dtype=torch.bool)
+                        cells = self._contact_cells[owner.owner_id]
+                        residual = residual+(cells.required_contact(policy) if cells.complete else policy["active"].to(progress.dtype))
                         costs[f"contact/{rule.rule_id}"] = residual * ~unresolved
-                        costs[f"unknown/contact/{rule.rule_id}"] = torch.maximum(uncertain, residual * unresolved)
-                    indices = list(rule.sphere_indices)
-                    radius = actor_spheres[..., indices, 3]
-                    costs[f"contact/proxy/{rule.rule_id}"] = torch.relu(rule.modeling_allowance_m + 1e-9 - radius).sum(-1)
-                    adjusted = adjusted.clone()
-                    # BEGIN combine independent permissions without resetting or stacking.
-                    # Each rule shrinks the original proxy at most once. A
-                    # later inactive rule cannot undo an earlier active one,
-                    # and adjacent intervals meeting at one anchor select the
-                    # larger single allowance rather than adding both.
-                    candidate = radius - allowed[..., None].to(radius.dtype) * rule.modeling_allowance_m
-                    adjusted[..., indices, 3] = torch.minimum(adjusted[..., indices, 3], candidate)
-                    # END preserve every active material permission independently.
-                local = _local_spheres(adjusted, *poses[owner.owner_id])
+                        costs[f"unknown/contact/{rule.rule_id}"] = torch.maximum(uncertain, unresolved.to(progress.dtype))
+                    policies.append(policy)
+                local = _local_spheres(actor_spheres, *poses[owner.owner_id])
                 # BEGIN retain native welded/masked installation pairs without deleting geometry.
                 # Applying the mask to per-sphere costs leaves the same owner
                 # active for all other robot links and for a carried payload.
                 values = owner.query(local, key=(actor, owner.owner_id))
+                if policies:
+                    cells = self._contact_cells[owner.owner_id]
+                    if cells.complete:
+                        finite_values, enabled = cells.query(local, policies)
+                        values = torch.where(enabled, finite_values, values)
+                    else:
+                        # A missing complete model cannot grant an exemption.
+                        # Retain the ordinary collision and expose its exact
+                        # unsupported permission query separately.
+                        costs[f"unknown/contact_model/{actor}/{owner.owner_id}"] = torch.stack(
+                            [policy["active"].to(progress.dtype) for policy in policies]).amax(0)
+                # END other materials/owners retain their original full query.
                 if actor == "robot" and owner.robot_excluded_spheres:
                     enabled = values.new_ones(values.shape[-1])
                     enabled[list(owner.robot_excluded_spheres)] = 0
@@ -1663,36 +1779,9 @@ class PlanningScene:
                 return [plain(v) for v in value]
             return value
 
-        def geometry(query):
-            explicit = getattr(query, "independent_geometry", None)
-            if explicit is not None:
-                return deepcopy(explicit)
-            native = getattr(query, "scene_collision", None)
-            model = getattr(native, "scene_model", None)
-            if model is None or isinstance(model, list):
-                return {"solids": [], "query_gaps": ["No single independent native scene model"]}
-            solids, gaps = [], []
-            for kind in ("cuboid", "cylinder", "sphere", "capsule", "mesh", "voxel"):
-                for shape in getattr(model, kind, ()) or ():
-                    if len(solids) >= 4096:
-                        gaps.append("Independent scene solid budget exceeded")
-                        break
-                    row = {"name": shape.name, "kind": kind, "pose": list(shape.pose), "source": query.source}
-                    if kind == "cuboid":
-                        row["dimensions"] = list(shape.dims)
-                    elif kind in {"cylinder", "sphere"}:
-                        row["dimensions"] = [shape.radius] + ([shape.height] if kind == "cylinder" else [])
-                    elif kind == "mesh":
-                        mesh = shape.get_trimesh_mesh(process=False, transform_with_pose=False)
-                        if len(mesh.vertices) > 65536 or not mesh.is_watertight or not mesh.is_convex:
-                            gaps.append(f"{shape.name}: requires complete convex solid adaptation")
-                            continue
-                        row["vertices"] = np.asarray(mesh.vertices).tolist()
-                    else:
-                        gaps.append(f"{shape.name}: {kind} requires an independent solid adapter")
-                        continue
-                    solids.append(row)
-            return {"solids": solids, "query_gaps": gaps}
+        # BEGIN execution and finite permission use one owned native inventory.
+        geometry = query_geometry
+        # END independent Coal still evaluates its own complete solid intersections.
 
         owners = []
         for owner in self.owners:
@@ -1733,6 +1822,11 @@ class PlanningScene:
                 "background": {"owner_ids": sorted(self.background.owner_ids), "source": self.background.source,
                                "geometry": geometry(self.background)},
                 "owners": owners, "contacts": plain([asdict(rule) for rule in self.contacts]),
+                "contact_query_models": {identity: {"complete_cells": len(value.centres),
+                    "query_gaps": list(value.gaps), "cell_half_diagonal_m": value.cell_half_diagonal_m,
+                    "maximum_candidate_pairs": value.max_candidate_pairs,
+                    "scope": "complete filled-cell union for material pairs; ESDF remains the ordinary nonmaterial representation"}
+                    for identity, value in self._contact_cells.items()},
                 "coverage": {"origin": self.coverage.origin.tolist(), "voxel_size": self.coverage.voxel_size,
                              "shape_zyx": list(self.coverage._known.shape),
                              "known_packbits": np.packbits(self.coverage._known).tolist(),
@@ -1754,6 +1848,9 @@ class PlanningScene:
             "occupied_owner_ids": tuple(sorted(self._occupied_owner_ids)),
             "background_owner_ids": tuple(sorted(self.background.owner_ids)),
             "owner_geometry_complete": {owner.owner_id: owner.geometry_complete for owner in self.owners},
+            "contact_queries": {identity: {"complete_cells": len(value.centres), "query_gaps": list(value.gaps),
+                "last_report": deepcopy(value.last_report), "required_report": deepcopy(value.last_required_report)}
+                for identity, value in self._contact_cells.items()},
             # BEGIN report exact installation exclusions alongside ordinary owner geometry.
             "native_installation_exclusions": {
                 owner.owner_id: {"robot_sphere_indices": owner.robot_excluded_spheres,

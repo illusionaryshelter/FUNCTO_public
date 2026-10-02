@@ -46,22 +46,171 @@ def continuation(request, *, elapsed=.4, curve_time=.4, applied=(), completed=()
     original = {"candidate_id": "previous", "planning_budget": asdict(budget),
         "consumed_planning": deepcopy(ledger["consumed_planning"]), "request_ledger": ledger,
         "physics_budget": 1000, "consumed_physics_steps": 0,
-        "problem": {"events": plain(request.events)}, "request_events": plain(request.events),
-        "curve": {"duration": 1., "progress_u": [0., 1.], "progress_s": [0., 1.], "events": rows}}
+        # BEGIN preserve the original functional allowed sets for actual proof checking.
+        "problem": plain(request), "request_events": plain(request.events),
+        # END completion IDs alone are not execution evidence.
+        "curve": {"duration": 1., "progress_u": [0., 1.], "progress_s": [0., 1.],
+                  "events": rows, "executable_until": 1.}}
     return {"candidate_id": "previous", "original_binding": original,
         "physics_budget": 1000, "cumulative_physics_steps": round(elapsed/.01),
         "remaining_physics_steps": 1000-round(elapsed/.01), "consumed_physics_steps": round(elapsed/.01),
         "device_timestep_s": .01, "elapsed_physical_s": elapsed, "last_curve_time_s": curve_time,
-        "actual_feedback": {"joint_names": ["q"], "q": [0.], "dq": [0.]},
+        "actual_feedback": {"joint_names": ["q"], "q": [0.], "dq": [0.], "timestamp_s": elapsed},
         "remaining_events": [row for row in rows if event_occurrence_key(row) not in applied],
         "applied_events": [row for row in rows if event_occurrence_key(row) in applied],
         "completed_goal_ids": [list(value) for value in completed],
+        # BEGIN these fixtures explicitly measured identity poses at their point goals.
+        "goal_evidence": [{"identity": list(value), "value": "T", "candidate_id": "previous",
+            "completion_verified": True, "source": "actual fixed-frame task measurement",
+            "feedback_id": "task-feedback-"+str(value[1]),
+            "timestamp_s": request.pose_events[value[1]].progress,
+            "physical_elapsed_s": request.pose_events[value[1]].progress,
+            "evaluated_curve_time_s": request.pose_events[value[1]].progress,
+            "scheduled_curve_time_s": request.pose_events[value[1]].progress, "evaluation_window_s": None,
+            "device_due_time_s": request.pose_events[value[1]].progress,
+            "requirement": plain(request.pose_events[value[1]]),
+            "actual_function_pose": np.eye(4).tolist(), "actual_target_pose": np.eye(4).tolist(),
+            "position_error_m": 0., "rotation_error_rad": 0., "measurement_sources": [{
+                "kind": "actual_robot_tcp", "source": "actual TCP", "pose": np.eye(4).tolist(),
+                "feedback_id": "task-feedback-"+str(value[1]),
+                "timestamp_s": request.pose_events[value[1]].progress}]}
+            for value in completed],
+        # END timestamps are independent facts, not inferred source progress at runtime.
         "history": [{"skill_id": row["skill_id"], "event_id": row["event_id"], "occurrence": row["occurrence"],
                      "check_target": "activation", "time_s": row["time"], "value": "T", "source": "actual controller"}
                     for row in rows if event_occurrence_key(row) in applied]}
 
 
 class PhysicalTimeRequirementsTest(unittest.TestCase):
+    # BEGIN a continuation cannot convert labels or altered measurements into task completion.
+    def test_pose_completion_rechecks_original_allowance_clock_and_candidate(self):
+        goal = PoseEventRequirement(.2, np.eye(4), np.eye(4), .001, .01, "original narrow task goal")
+        request = problem(goals=(goal,))
+        actual = continuation(request, elapsed=.4, completed=(("pose_events", 0),))
+        mutations = {
+            "label only": lambda row: row.pop("goal_evidence"),
+            "wrong candidate": lambda row: row["goal_evidence"][0].update(candidate_id="different"),
+            "not verified": lambda row: row["goal_evidence"][0].update(completion_verified=False),
+            "missing measurement source": lambda row: row["goal_evidence"][0].update(measurement_sources=[]),
+            "late acquisition": lambda row: row["goal_evidence"][0].update(
+                timestamp_s=.25, physical_elapsed_s=.25, evaluated_curve_time_s=.25),
+            "inconsistent timestamp": lambda row: row["goal_evidence"][0].update(timestamp_s=.3),
+            "changed tolerance": lambda row: row["goal_evidence"][0]["requirement"].update(position_tolerance_m=.1),
+            "invented window": lambda row: row["goal_evidence"][0].update(evaluation_window_s=[0., 1.]),
+            "unlisted goal": lambda row: row.update(completed_goal_ids=[["pose_events", 7]]),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                changed = deepcopy(actual)
+                mutate(changed)
+                with self.assertRaises(ContinuationBindingError):
+                    _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, changed)
+        for recorded_error in (0., .002):
+            with self.subTest(recorded_error=recorded_error):
+                changed = deepcopy(actual)
+                changed["goal_evidence"][0]["actual_function_pose"][0][3] = .002
+                changed["goal_evidence"][0]["position_error_m"] = recorded_error
+                with self.assertRaisesRegex(ContinuationBindingError, "actual allowed-set T evidence"):
+                    _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, changed)
+
+        # A self-consistent relative difference does not authorize moving the
+        # original fixed world target together with the measured tool.
+        changed = deepcopy(actual)
+        for key in ("actual_function_pose", "actual_target_pose"):
+            changed["goal_evidence"][0][key][0][3] = 1.
+        changed["goal_evidence"][0]["measurement_sources"][0]["pose"][0][3] = 1.
+        with self.assertRaisesRegex(ContinuationBindingError, "actual allowed-set T evidence"):
+            _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, changed)
+        # The following native sample is not the first sample of this point,
+        # even though it falls within one device period of the nominal time.
+        changed = deepcopy(actual)
+        changed["goal_evidence"][0].update(timestamp_s=.21, physical_elapsed_s=.21, evaluated_curve_time_s=.21)
+        changed["goal_evidence"][0]["measurement_sources"][0]["timestamp_s"] = .21
+        with self.assertRaisesRegex(ContinuationBindingError, "actual allowed-set T evidence"):
+            _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, changed)
+
+    def test_pose_completion_requires_current_owner_measurements_for_relative_goals(self):
+        for function_observed in (False, True):
+            relation = {"target_owner_id": "target", "T_owner_target": np.eye(4)}
+            if function_observed:
+                relation.update(function_owner_id="actor", T_owner_function=np.eye(4), attachment_condition_id="actual_hold")
+            goal = PoseEventRequirement(.2, np.eye(4), np.eye(4), .001, .01, "relative task", actual_relation=relation)
+            request = problem(goals=(goal,))
+            actual = continuation(request, elapsed=.4, completed=(("pose_events", 0),))
+            actual["original_binding"]["execution_limits"] = {"observation_policy": {
+                "source": "current synchronized owner observation", "period_s": .01,
+                "maximum_age_s": .01, "required_fields": []}}
+            with self.subTest(function_observed=function_observed, missing=True):
+                with self.assertRaisesRegex(ContinuationBindingError, "actual allowed-set T evidence"):
+                    _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, actual)
+            owners = ["target", "actor"] if function_observed else ["target"]
+            sources = [] if function_observed else deepcopy(actual["goal_evidence"][0]["measurement_sources"])
+            sources += [{"kind": "current_owner_pose", "owner_id": owner, "pose": np.eye(4).tolist(),
+                         "source": "current RGB-D observation", "timestamp_s": .2} for owner in owners]
+            actual["goal_evidence"][0]["measurement_sources"] = sources
+            with self.subTest(function_observed=function_observed, missing=False):
+                _, result = _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, actual)
+                self.assertEqual(result["goal_identities"]["pose_events"], [])
+            stale = deepcopy(actual)
+            for item in stale["goal_evidence"][0]["measurement_sources"]:
+                if item["kind"] == "current_owner_pose":
+                    item["timestamp_s"] = .18
+            with self.subTest(function_observed=function_observed, stale=True):
+                with self.assertRaisesRegex(ContinuationBindingError, "actual allowed-set T evidence"):
+                    _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, stale)
+
+    # BEGIN an actual passed dependency can authorize a later goal on the same clock.
+    def test_pose_completion_after_verified_dependency_uses_full_original_curve(self):
+        barrier = PlanningEvent("dependency", "s", .1, 1, "verify", "declared prerequisite",
+                                requires_evidence="Ready")
+        goal = PoseEventRequirement(.2, np.eye(4), np.eye(4), .001, .01, "required post-barrier goal")
+        request = problem((barrier,), (goal,))
+        actual = continuation(request, elapsed=.4, completed=(("pose_events", 0),))
+        # The frozen candidate initially authorizes only the .1 prefix. The
+        # executor records this dependency as verified before reaching .2;
+        # no stop/hold or new physical origin is inserted into this binding.
+        actual["original_binding"]["curve"]["executable_until"] = .1
+        actual["remaining_events"] = []
+        actual["verified_events"] = deepcopy(actual["original_binding"]["curve"]["events"])
+        actual["effects"] = {"Ready": {"value": "T", "source": "synchronized actual prerequisite observation"}}
+        _, result = _prepare_continuation(request, SimpleNamespace(gripper=None), None, actual)
+        self.assertEqual(result["goal_identities"]["pose_events"], [])
+        self.assertIn(("pose_events", 0), result["completed_goal_ids"])
+        self.assertEqual(result["original_duration"], 1.)
+        self.assertEqual(result["elapsed"], .4)
+        self.assertIn(("s", "dependency", 0), result["consumed_events"])
+    # END the original initial prefix is not a permanent task-proof deadline.
+
+    def test_pose_completion_uses_original_arrival_window_instead_of_source_time(self):
+        timing = EventTimeConstraint("arrival", (.1, .3), "request_physical", "original early arrival window",
+                                     origin_time_s=0., goal_id=("pose_events", 0))
+        event = PlanningEvent("arrive", "s", .8, 1, "function", "source", timing=(timing,))
+        goal = PoseEventRequirement(.8, np.eye(4), np.eye(4), .001, .01, "original task goal")
+        original = problem((event,), (goal,))
+        for acquisition, accepted in ((.2, True), (.35, False)):
+            with self.subTest(acquisition=acquisition):
+                request = deepcopy(original)
+                actual = continuation(request, elapsed=.4, completed=(("pose_events", 0),))
+                actual["goal_evidence"][0].update(timestamp_s=acquisition, physical_elapsed_s=acquisition,
+                    evaluated_curve_time_s=acquisition, evaluation_window_s=[.1, .3])
+                actual["goal_evidence"][0]["measurement_sources"][0]["timestamp_s"] = acquisition
+                if accepted:
+                    _, result = _prepare_continuation(request, SimpleNamespace(gripper=None), None, actual)
+                    self.assertEqual(result["goal_identities"]["pose_events"], [])
+                else:
+                    with self.assertRaisesRegex(ContinuationBindingError, "actual allowed-set T evidence"):
+                        _prepare_continuation(request, SimpleNamespace(gripper=None), None, actual)
+
+    def test_same_request_cannot_remove_actual_owner_dependency(self):
+        goal = PoseEventRequirement(.8, np.eye(4), np.eye(4), .001, .01, "same functional target",
+            actual_relation={"target_owner_id": "observed_target", "T_owner_target": np.eye(4)})
+        request = problem(goals=(goal,))
+        actual = continuation(request)
+        changed = problem(goals=(replace(goal, actual_relation=None),))
+        with self.assertRaisesRegex(ContinuationBindingError, "goal/process obligations"):
+            _prepare_continuation(changed, SimpleNamespace(gripper=None), None, actual)
+    # END task tolerance and current-owner dependencies survive retries unchanged.
+
     def test_compiler_annotates_original_commands_and_goals_without_adding_actions(self):
         from test_manipulation_planning_problem import compile_inputs, grasp_input, manipulation_input
         grasp = grasp_input()
@@ -347,6 +496,47 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
         self.assertIn("native initialization gap", result.diagnostics["reason"])
         self.assertEqual(plain(request), before)
         self.assertEqual(result.request_ledger["consumed_planning"]["initializations"], 2)
+
+    # BEGIN failed continuation work cannot publish unverified completion authority.
+    def test_rejected_completion_cannot_poison_a_failed_work_ledger(self):
+        goal = PoseEventRequirement(.2, np.eye(4), np.eye(4), .001, .01, "required even without discrete events")
+        request = problem(goals=(goal,))
+        actual = continuation(request, completed=(("pose_events", 0),))
+        actual["goal_evidence"][0]["completion_verified"] = False
+        # The executor output already carries appended facts. They still
+        # need validation before a planning failure can return a trusted ledger.
+        actual["request_ledger"] = deepcopy(actual["original_binding"]["request_ledger"])
+        for key in ("completed_goal_ids", "goal_evidence"):
+            actual["request_ledger"][key] = deepcopy(actual[key])
+        scene = SimpleNamespace(gripper=None, required_progress_anchors=())
+        scene.clone_for_rollout = lambda: deepcopy(scene)
+        with patch("manipulation.planning._CuroboPlanner") as native:
+            failed = plan_trajectory(request, scene, {}, continuation=actual)
+            self.assertFalse(failed.success)
+            self.assertIn("actual allowed-set T evidence", failed.diagnostics["reason"])
+            self.assertEqual(failed.request_ledger["completed_goal_ids"], [])
+            self.assertEqual(failed.request_ledger["goal_evidence"], [])
+            self.assertTrue(failed.request_ledger["requires_continuation"])
+            self.assertEqual(failed.request_ledger["consumed_planning"]["binding_attempts"], 2)
+            self.assertIn("continuation_facts_pending_validation", failed.diagnostics)
+            retried = plan_trajectory(request, scene, {}, request_ledger=failed.request_ledger)
+            self.assertFalse(retried.success)
+            self.assertIn("actual continuation facts", retried.diagnostics["reason"])
+            native.assert_not_called()
+
+    def test_continuation_cannot_replace_an_original_actual_time_origin(self):
+        event = PlanningEvent("origin", "s", 0., 0, "close", "original command")
+        request = problem((event,))
+        actual = continuation(request, applied={("s", "origin", 0)})
+        preserved = deepcopy(actual["history"])
+        actual["original_binding"]["request_ledger"]["history"] = preserved
+        for replacement in ([], [{**preserved[0], "time_s": .2}]):
+            with self.subTest(replacement=replacement):
+                changed = deepcopy(actual)
+                changed["history"] = replacement
+                with self.assertRaisesRegex(ContinuationBindingError, "original physical timing history"):
+                    _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, changed)
+    # END source progress and failed retries cannot move physical origins or consume goals.
 
     def test_failed_first_initialization_does_not_mutate_callers_hand_or_problem(self):
         request = problem((PlanningEvent("future", "s", .8, 2, "open", "source"),))

@@ -48,6 +48,11 @@ def example():
         "tool_id": demo["tool_id"],
         "tool_frame": demo["tool_frame"],
     }
+    # BEGIN explicit fixture goal and task accuracy, independent of the reference.
+    scene["grasp_goal"] = {"T_carrier_eef": scene["region_transform"] @ relative[-1],
+        "position_tolerance_m": .002, "rotation_tolerance_rad": .03,
+        "source": "fixture task permits a 2 mm / .03 rad grasp relation around this supplied current pose"}
+    # END the production binder never supplies these values from numerical tolerances.
     scene["eef_pose"] = scene["carrier_pose"] @ scene["region_transform"] @ relative[0]
     scene["eef_pose"][:3, 3] += [.10, -.03, .02]
     return demo, scene
@@ -76,7 +81,7 @@ class GraspGeometryTest(unittest.TestCase):
         np.testing.assert_array_equal(scene["eef_pose"], before_scene["eef_pose"])
         self.assertEqual(json.loads(json.dumps(serializable(result)))["status"], "candidate")
 
-    def test_region_changes_update_reference_and_goal_without_changing_actual_input(self):
+    def test_reference_correspondence_changes_do_not_rewrite_the_explicit_goal(self):
         demo, scene = example()
         first = ground_grasp(demo, scene)
         scene["region_transform"][:3, 3] += [.07, -.01, .02]
@@ -84,8 +89,12 @@ class GraspGeometryTest(unittest.TestCase):
         self.assertFalse(np.allclose(first["eef_poses"][0], second["eef_poses"][0]))
         self.assertGreater(np.linalg.norm(first["eef_poses"][-1, :3, 3]
                                          - second["eef_poses"][-1, :3, 3]), .07)
-        self.assertFalse(np.allclose(first["candidate_T_carrier_eef"],
-                                    second["candidate_T_carrier_eef"]))
+        np.testing.assert_array_equal(first["goal_pose"], second["goal_pose"])
+        np.testing.assert_array_equal(first["candidate_T_carrier_eef"], second["candidate_T_carrier_eef"])
+        scene["grasp_goal"]["T_carrier_eef"][:3, 3] += [.04, .01, -.02]
+        third = ground_grasp(demo, scene)
+        np.testing.assert_array_equal(third["eef_poses"], second["eef_poses"])
+        self.assertFalse(np.allclose(third["goal_pose"], second["goal_pose"]))
 
     # BEGIN contact evidence never creates an independent approach obligation.
     def test_contact_evidence_at_first_row_never_requires_a_source_pose_connection(self):
@@ -114,11 +123,30 @@ class GraspGeometryTest(unittest.TestCase):
         result["gripper_events"][0]["command"] = "hold"
         self.assertEqual(demo["gripper_events"][0]["command"], "open")
 
-    def test_end_boundary_does_not_own_a_second_gripper_command(self):
-        demo, scene = example()
-        demo["gripper_events"][-1]["frame_index"] = int(demo["frame_indices"][-1])
-        with self.assertRaisesRegex(ValueError, "\\[first, last\\)"):
-            ground_grasp(demo, scene)
+    # BEGIN source-terminal commands retain identity without claiming coverage/effects.
+    def test_source_end_retains_explicit_open_close_and_hold_intentions(self):
+        for command in ("open", "close", "hold"):
+            with self.subTest(command=command):
+                demo, scene = example()
+                event = {"event_id": "last-command", "frame_index": int(demo["frame_indices"][-1]), "command": command}
+                demo["gripper_events"].append(event)
+                result = ground_grasp(demo, scene)
+                self.assertEqual(result["gripper_events"][-1], event)
+                self.assertEqual(result["holding_status"], "requires_verification")
+    # END device activation and actual Holding remain independently checked.
+
+    def test_grasp_goal_requires_an_explicit_relation_accuracy_and_evidence(self):
+        for field in ("T_carrier_eef", "position_tolerance_m", "rotation_tolerance_rad", "source"):
+            demo, scene = example()
+            del scene["grasp_goal"][field]
+            with self.subTest(missing=field), self.assertRaisesRegex(ValueError, "grasp_goal requires"):
+                ground_grasp(demo, scene)
+        for field, invalid in (("position_tolerance_m", 0.), ("position_tolerance_m", True),
+                               ("rotation_tolerance_rad", np.pi), ("source", "  "), ("source", {})):
+            demo, scene = example()
+            scene["grasp_goal"][field] = invalid
+            with self.subTest(field=field, invalid=invalid), self.assertRaises(ValueError):
+                ground_grasp(demo, scene)
 
     def test_closing_cannot_be_hidden_inside_a_free_prefix(self):
         demo, scene = example()
@@ -149,8 +177,10 @@ class GraspGeometryTest(unittest.TestCase):
         changed["carrier_pose"] = scene["carrier_pose"] @ np.linalg.inv(current_gauge)
         changed["region_transform"] = (current_gauge @ scene["region_transform"]
                                         @ np.linalg.inv(demo_gauge))
+        changed["grasp_goal"]["T_carrier_eef"] = current_gauge @ scene["grasp_goal"]["T_carrier_eef"]
         np.testing.assert_allclose(ground_grasp(changed_demo, changed)["eef_poses"],
                                    first["eef_poses"], atol=1e-11)
+        np.testing.assert_allclose(ground_grasp(changed_demo, changed)["goal_pose"], first["goal_pose"], atol=1e-11)
 
     def test_actual_attachment_controls_holding_and_release_is_independent(self):
         carrier = np.repeat(pose((.2, .1, .3))[None], 5, axis=0)

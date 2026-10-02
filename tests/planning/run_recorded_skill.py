@@ -187,7 +187,7 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
                   "execution_limits": execution_limits.describe(),
                   "enabled_self_collision_pairs": len(self_pairs),
                   # BEGIN separate object-contact evidence from robot mechanics.
-                  "contact_permissions": "No current finite material-patch object-contact permission has been certified; robot mechanical contacts use the validated native pair contract"}
+                  "contact_permissions": "Bound separately from explicit native material faces and current owner-patch declarations"}
                   # END a robot-local permission cannot certify a task grasp.
     # END actual hardware intervals do not become nominal robot volumes.
     # BEGIN bind fixed installation pair policy to the actual native sphere ordering.
@@ -320,6 +320,25 @@ def run(args):
             position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
             trajectory_factory=reference_factory)
         report["gripper"] = hand_report
+        # BEGIN bind the same material identity for sphere and independent native checks.
+        # No material declaration suppresses collision on its own. The finite
+        # target patch, active interval and error allowances remain explicit
+        # current-scene inputs, independently of the calibrated robot faces.
+        from robot_fixture import bind_fixture_contact_materials
+        from manipulation.contact_binding import build_material_contact_rules
+        contact_inputs = json.loads(args.contact_bindings.read_text())
+        if not isinstance(contact_inputs, dict) or set(contact_inputs) != {"material_faces", "contacts", "source"}:
+            raise ValueError("Contact bindings need explicit material_faces, contacts and source")
+        if not isinstance(contact_inputs["source"], str) or not contact_inputs["source"].strip():
+            raise ValueError("Contact bindings require a current evidence source")
+        material_binding = bind_fixture_contact_materials(
+            fixture, robot, entrance_fk["sphere_indices_by_link"], feedback,
+            contact_inputs["material_faces"])
+        contacts = build_material_contact_rules(material_binding, contact_inputs["contacts"])
+        report["contact_binding"] = {"path": str(args.contact_bindings.resolve()),
+            "source": contact_inputs["source"], "materials": material_binding,
+            "rule_ids": [rule.rule_id for rule in contacts]}
+        # END unknown object surfaces do not become whole-owner exemptions.
         carrier_id = scene_input["carrier_id"]
         carrier_phases = [phase for phase in problem.phases
                           if phase.metadata.get("carrier_id") == carrier_id]
@@ -374,9 +393,13 @@ def run(args):
                 "T_output_owner": owner_pose,
                 "source": str(root/candidate["scene_path"])}}, mapper_cfg=config,
             depth_error_m=args.depth_error, reference_frame=problem.reference_frame,
-            robot_sphere_materials=tuple(fixture["sphere_materials"]),
+            robot_sphere_materials=tuple(material_binding["robot_sphere_materials"]),
             robot_geometry_source=fixture["robot_geometry_source"], gripper=hand,
+            # BEGIN keep contact identities and finite permissions on the observed scene.
+            contacts=contacts, native_geometry_materials=material_binding["native_geometry_materials"],
+            owner_voxel_size_m=args.owner_voxel_size,
             max_mapping_bytes=1024**3)
+            # END the RGB-D partition remains partial.
         report["observation_build"] = scene.observation_report
         if args.owner_geometry is not None:
             # Replace only this explicitly partitioned carrier's partial query
@@ -394,7 +417,12 @@ def run(args):
                 background=scene.background, owners=(owner,), coverage=scene.coverage,
                 reference_frame=scene.reference_frame,
                 robot_sphere_materials=scene.robot_sphere_materials,
-                robot_geometry_source=scene.robot_geometry_source, gripper=hand)
+                # BEGIN preserve contact contracts when substituting explicit owner geometry.
+                robot_geometry_source=scene.robot_geometry_source, gripper=hand,
+                contacts=scene.contacts, native_geometry_materials=scene.native_geometry_materials,
+                numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
+                numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
+                # END the replacement does not relax any robot material permission.
             scene.observation_report = observed_report
             report["complete_carrier_geometry"] = prepared["provenance"]
         # BEGIN retain self-filtered installation as complete static collision owners.
@@ -413,6 +441,9 @@ def run(args):
                 background=scene.background, owners=(*scene.owners, *fixed_owners), coverage=scene.coverage,
                 reference_frame=scene.reference_frame, robot_sphere_materials=scene.robot_sphere_materials,
                 robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
+                # BEGIN native identity survives fixed-installation augmentation.
+                native_geometry_materials=scene.native_geometry_materials,
+                # END both geometry checkers retain identical material bindings.
                 numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
                 numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
             scene.observation_report = observed_report
@@ -428,6 +459,9 @@ def run(args):
         scene = PlanningScene(background=scene.background, owners=scene.owners, coverage=scene.coverage,
             reference_frame=scene.reference_frame, robot_sphere_materials=scene.robot_sphere_materials,
             robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
+            # BEGIN robot occupancy evidence preserves object-contact identity.
+            native_geometry_materials=scene.native_geometry_materials,
+            # END occupancy does not grant or remove contact permissions.
             robot_coverage=coverage, numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
             numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
         scene.observation_report = observed_report
@@ -454,7 +488,12 @@ def run(args):
                                 max_validation_points=args.max_validation_points,
                                 max_refinement_points=args.max_refinement_points,
                                 max_scene_workspace_bytes=args.scene_workspace_mib*1024**2,
-                                maximum_trajectory_solves=2, search_seconds=3.)
+                                # BEGIN expose the existing cumulative work contract.
+                                # The supplied ledger must match these values;
+                                # flags cannot reset or enlarge it implicitly.
+                                maximum_trajectory_solves=args.maximum_trajectory_solves,
+                                planning_seconds=args.planning_seconds, search_seconds=3.)
+        # END reviewed input revisions remain caller-owned.
         report["planning_called"] = True
         result = plan_and_record(problem, scene, robot, args.output/"planning", budget=budget,
                                  execution_limits=execution_limits.describe(),
@@ -481,8 +520,10 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "finger-targets", "output"):
+    # BEGIN finite material bindings are required recorded-test inputs.
+    for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "finger-targets", "contact-bindings", "output"):
         parser.add_argument("--"+name, type=Path, required=True)
+    # END callers can explicitly declare an empty permission list.
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)
     # BEGIN same-skill continuation consumes an explicit prior execution ledger.
@@ -499,6 +540,9 @@ if __name__ == "__main__":
     parser.add_argument("--center", type=float, nargs=3, required=True)
     parser.add_argument("--extent", type=float, nargs=3, required=True)
     parser.add_argument("--voxel-size", type=float, required=True)
+    # BEGIN current owner precision is declared before a planning result exists.
+    parser.add_argument("--owner-voxel-size", type=float, required=True)
+    # END the mapper retains every current labelled sample in the refined field.
     parser.add_argument("--depth-error", type=float, required=True)
     parser.add_argument("--robot-depth-tolerance", type=float, required=True)
     parser.add_argument("--robot-depth-tolerance-source", required=True)
@@ -510,6 +554,10 @@ if __name__ == "__main__":
     parser.add_argument("--trajectory-seeds", type=int, default=2)
     parser.add_argument("--max-validation-points", type=int, default=2048)
     parser.add_argument("--max-refinement-points", type=int, default=64)
+    # BEGIN make the existing request work limits reviewable in run commands.
+    parser.add_argument("--maximum-trajectory-solves", type=int, default=2)
+    parser.add_argument("--planning-seconds", type=float, default=120.)
+    # END the production PlanningBudget and ledger checks validate these inputs.
     parser.add_argument("--scene-workspace-mib", type=int, choices=(1024, 2048), default=1024)
     parser.add_argument("--torch-memory-mib", type=int, choices=(2048, 4096), default=2048)
     run(parser.parse_args())

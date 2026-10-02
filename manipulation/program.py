@@ -24,37 +24,21 @@ class ReferenceGenerationError(ValueError):
     """A source-profile fit failed after validating the independent goals."""
 
 
-def _mechanism_goal_contract(model_spec, initial, goals, coordinate_goals=None):
-    """Validate physical start/targets before any optional source-profile fit."""
+def _mechanism_entry_contract(model_spec, initial, *, require_lift=False):
+    """Validate immutable actual entry without selecting a goal-set member.
+
+    A full-frame target's centre need not lie on the mechanism or within its
+    limits: another pose in the declared task allowed set may be feasible.
+    The typed goal and physical mechanism remain separate solver obligations.
+    Native scalar goals additionally admit exact interval-intersection checks
+    where their signed coordinate meaning is explicitly supplied.
+    """
     if model_spec is None:
         return None, None
     model, limits = _current_model(model_spec)
-    start = _current_initial_coordinates(model_spec, model, initial,
-                                         require_lift=coordinate_goals is not None)
-    values = [start]
-    for index, goal in goals:
-        coordinate = (_exact_coordinates(model, goal) if coordinate_goals is None
-                      else np.asarray(coordinate_goals[index], float))
-        # BEGIN a full pose goal permits any physically legal angular lift.
-        # This value is used only for existential limit screening below; it
-        # is not exported as a coordinate target or a turn-count requirement.
-        # Explicit native coordinate goals retain their exact signed value.
-        angular = 0 if model.kind == "revolute" else 2 if model.kind == "planar" else None
-        if coordinate_goals is None and angular is not None and limits is not None:
-            low, high = limits[angular]
-            first = int(np.ceil((low-coordinate[angular]-1e-9)/(2*np.pi)))
-            last = int(np.floor((high-coordinate[angular]+1e-9)/(2*np.pi)))
-            if first <= last:
-                coordinate[angular] += 2*np.pi*first
-        same_start = (np.allclose(goal, initial, atol=1e-8, rtol=0) if coordinate_goals is None
-                      else np.allclose(coordinate, start, atol=1e-8, rtol=0))
-        if index == 0 and not same_start:
-            raise ValueError("The initial functional goal conflicts with the observed current pose")
-        # END equal SE(3) goals neither select a winding nor become false limit failures.
-        values.append(coordinate)
-    if limits is not None and (np.any(np.asarray(values) < limits[:, 0]-1e-9)
-                               or np.any(np.asarray(values) > limits[:, 1]+1e-9)):
-        raise ValueError("A required start or functional goal exceeds current mechanism limits")
+    start = _current_initial_coordinates(model_spec, model, initial, require_lift=require_lift)
+    if limits is not None and (np.any(start < limits[:, 0]-1e-9) or np.any(start > limits[:, 1]+1e-9)):
+        raise ValueError("The observed current start exceeds current mechanism limits")
     return model, limits
 
 
@@ -101,9 +85,13 @@ def _intentions(events, frames):
     for event in events:
         name = event.get("event_id")
         index = _index(event.get("frame_index"), frames, "gripper event")
-        if (not isinstance(name, str) or not name or name in seen
-                or index <= previous or index == len(frames) - 1):
-            raise ValueError("Gripper events must be unique, ordered, and own actions in [first,last)")
+        # BEGIN retain source-end commands for the shared physical clock.
+        # The planner/device consumers check post-activation coverage. Source
+        # validation only checks identity and declared ordering, not an
+        # assumed absence of control intent at the final observation.
+        if (not isinstance(name, str) or not name or name in seen or index <= previous):
+            raise ValueError("Gripper events must be unique and ordered on original source observations")
+        # END source ownership never certifies actual command execution.
         if event.get("command") not in {"open", "close", "hold"}:
             raise ValueError("Gripper intentions must be open, close or hold")
         seen.add(name)
@@ -209,8 +197,9 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
     functional frame, not on an arbitrary body origin. Constrained intervals
     stay in one caller-bound current FK model; we never fit a new axis after
     each event. A model projection is allowed only for the soft reference.
-    Required event targets and the observed initial pose must be exactly on
-    the model, and the final output is independently checked by the caller.
+    This fitting attempt uses nominal event centres on the model. Failure to
+    fit one such centre is a reference-generation failure; the separately
+    retained typed goal allowed sets do not acquire exact pose equalities.
 
     Native joint events additionally supply their complete coordinate reference
     and indexed coordinate goals. These are not recovered from their FK poses:
@@ -223,7 +212,7 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
     """
     knots = [(0, start)] + [(index, goal) for index, goal in goals if index != 0]
     if goals and goals[0][0] == 0 and not np.allclose(goals[0][1], start, atol=1e-8, rtol=0):
-        raise ValueError("The initial function event conflicts with the observed current pose")
+        raise ReferenceGenerationError("The nominal initial reference event differs from the actual entry member")
     output = np.empty_like(reference)
     diagnostics = {"phase": "source sample index; physical timestamps retained separately"}
     native = coordinate_reference is not None
@@ -269,14 +258,20 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
         # END native prismatic progress diagnostics.
         for position, (begin, initial) in enumerate(knots):
             end, goal = knots[position + 1] if position + 1 < len(knots) else (len(reference) - 1, None)
-            initial_q = ((coordinates[0].copy() if begin == 0 else coordinate_goals[begin].copy())
-                         if native else _exact_coordinates(model, initial))
+            try:
+                initial_q = ((coordinates[0].copy() if begin == 0 else coordinate_goals[begin].copy())
+                             if native else _exact_coordinates(model, initial))
+            except ValueError as error:
+                raise ReferenceGenerationError("A nominal reference knot is outside the current mechanism") from error
             if angular is not None and not native:
                 initial_q[angular] += 2 * np.pi * np.round(
                     (coordinates[begin, angular] - initial_q[angular]) / (2 * np.pi))
             part = coordinates[begin:end + 1] - coordinates[begin] + initial_q
             if goal is not None:
-                goal_q = coordinate_goals[end].copy() if native else _exact_coordinates(model, goal)
+                try:
+                    goal_q = coordinate_goals[end].copy() if native else _exact_coordinates(model, goal)
+                except ValueError as error:
+                    raise ReferenceGenerationError("A nominal reference goal is outside the current mechanism") from error
                 if angular is not None and not native:
                     goal_q[angular] += 2 * np.pi * np.round(
                         (part[-1, angular] - goal_q[angular]) / (2 * np.pi))
@@ -397,7 +392,7 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
         raise ValueError("Joint-coordinate goals require an evidenced current articulation motion_model")
     if task.get("motion", "free") not in {"free", "auto", spec["kind"]}:
         raise ValueError("Constrained motion requires a compatible evidenced current motion_model")
-    model, _ = _current_model(spec)
+    model, limits = _mechanism_entry_contract(spec, initial, require_lift=True)
     source_evidence = _joint_source(demo.get("motion_coordinates_source"), "motion_coordinates_source")
     raw = np.asarray(demo.get("motion_coordinates"))
     if raw.ndim == 1:
@@ -455,9 +450,11 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
                 raise ValueError("Absolute coordinate goals do not declare an entry-delta origin")
             target = raw_target
         # END no continuation's new actual state resets an original increment target.
-        if index in unique_goals and not np.allclose(unique_goals[index], target, atol=1e-8, rtol=0):
-            raise ValueError("Same-frame functional events require consistent coordinate goals")
-        unique_goals[index] = target
+        # BEGIN nominal centres are preferences inside original scalar allowed sets.
+        # Preserve every event and its target below. Only the common interval
+        # selects a reference member; it never rewrites any task obligation.
+        unique_goals.setdefault(index, target.copy())
+        # END distinct centres may describe compatible simultaneous requirements.
         recorded.append({"event_id": name, "index": index, "frame_index": int(frames[index]),
                          "source_coordinate_value": source_value, "target_coordinates": target,
                          "coordinate_tolerance": tolerance, "source": evidence,
@@ -466,9 +463,26 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
                             entry_coordinates=entry, entry_source=entry_source)
         names.add(name)
         previous = index
+    # BEGIN intersect explicitly declared scalar bands and current physical limits.
+    # These one-dimensional intersections are exact feasibility checks; no
+    # reference centre or principal-angle surrogate can reject another member.
+    for index, preferred in unique_goals.items():
+        same_scope = [event for event in recorded if event["index"] == index]
+        lower = max(float(event["target_coordinates"][0]-event["coordinate_tolerance"]) for event in same_scope)
+        upper = min(float(event["target_coordinates"][0]+event["coordinate_tolerance"]) for event in same_scope)
+        if limits is not None:
+            lower, upper = max(lower, float(limits[0, 0])), min(upper, float(limits[0, 1]))
+        if lower > upper:
+            raise ValueError("Coordinate goal allowed sets do not intersect each other or current mechanism limits")
+        if index == 0:
+            if not lower <= initial_coordinates[0] <= upper:
+                raise ValueError("The initial coordinate goal allowed set excludes the observed current pose")
+            unique_goals[index] = initial_coordinates.copy()
+        else:
+            unique_goals[index] = np.asarray([min(upper, max(lower, float(preferred[0])))])
+    # END clipping selects a seed member only; actual state and original goals stay intact.
     goals = [(index, model.poses(value)[0]) for index, value in unique_goals.items()]
     # BEGIN bind native goals before attempting the optional source-profile fit.
-    _mechanism_goal_contract(spec, initial, goals, unique_goals)
     try:
         objects, diagnostics = _event_transfer(
             reference[:last_held+1], initial, goals, None, spec,
@@ -581,7 +595,7 @@ def _functional_events(demo, scene, frames, poses, last_held, task, initial):
             preferred = source_binding @ poses[index] @ _inverse(mapping)
             function_frame = mapping @ _pose_array(event["carrier_frame"], "Source material function frame")
             from .pipeline import _surface
-            from .regions import ground_on
+            from .regions import SupportReferenceNotFound, ground_on
             face = binding["on_geometry"]
             surface = _surface(scene["support"])
             # The free tangential-position preference belongs to a material
@@ -594,18 +608,34 @@ def _functional_events(demo, scene, frames, poses, last_held, task, initial):
             function_body = _inverse(function_frame)
             body_points = np.asarray(scene["body_points"], float)
             contact_points = np.asarray(face["carrier_region_points"], float)
-            grounded = ground_on(preferred @ function_frame,
-                                body_points @ function_body[:3, :3].T + function_body[:3, 3],
-                                contact_points @ function_body[:3, :3].T + function_body[:3, 3],
-                                function_body[:3, :3] @ face["carrier_outward_normal"],
-                                surface, margin=scene.get("margin", 0.),
-                                gap_tolerance=face["gap_tolerance"],
-                                normal_tolerance=face["normal_tolerance"],
-                                antiparallel_axis=face.get("antiparallel_axis"))
+            # BEGIN optional support initialization cannot delete the goal.
+            # Catch only its dedicated nominal-member/search failure. Invalid
+            # geometry and missing task inputs retain their original errors.
+            # An unavailable preference branch or exact-normal member is only
+            # a seed failure; SupportRequirement still consumes all geometry.
+            reference_failure = None
+            try:
+                grounded = ground_on(preferred @ function_frame,
+                                    body_points @ function_body[:3, :3].T + function_body[:3, 3],
+                                    contact_points @ function_body[:3, :3].T + function_body[:3, 3],
+                                    function_body[:3, :3] @ face["carrier_outward_normal"],
+                                    surface, margin=scene.get("margin", 0.),
+                                    gap_tolerance=face["gap_tolerance"],
+                                    normal_tolerance=face["normal_tolerance"],
+                                    antiparallel_axis=face.get("antiparallel_axis"))
+            except SupportReferenceNotFound as error:
+                reference_failure = {"status": "failed", "reason": str(error),
+                                     "scope": "optional support reference initialization"}
+                grounded = {"goal_pose": preferred @ function_frame,
+                            "freedom": {"required": "specified face on finite support with opposing signed normals",
+                                        "reference_generation": reference_failure}}
+            # END no selected nominal member is promoted to a feasibility proof.
             relation = {"goal_pose": grounded["goal_pose"] @ function_body,
                         "carrier_binding": mapping, "reference_binding": source_binding,
                         "function_frame": function_frame,
                         "constraint_kind": "on_region", "freedom": grounded["freedom"]}
+            if reference_failure is not None:
+                relation["reference_generation"] = reference_failure
             # END direct partial on relation.
         else:
             relation = ground_relation(poses[index], event["carrier_frame"], binding["carrier_frame"],
@@ -654,15 +684,33 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
     # its goals are constrained by finite support, without a target frame.
     first = events[0]
     reference = first["reference_binding"] @ source @ _inverse(first["carrier_binding"])
-    # Several regions can constrain one physical event. They must agree on
-    # one candidate body pose; never average conflicting region transforms.
-    # Every original relation is still checked independently after transfer.
+    # BEGIN retain simultaneous allowed sets without equating their centres.
+    # The first nominal member initializes reference fitting only. Every
+    # original relation remains independently represented in function_checks
+    # and in the downstream typed goals. Triangle-inequality envelopes can
+    # prove some contradictions without solving or shrinking the intersection.
     unique_goals = {}
-    for event in events:
+    for event_index, event in enumerate(events):
         index, goal = event["index"], event["goal_pose"]
-        if index in unique_goals and not np.allclose(unique_goals[index], goal, atol=1e-8, rtol=0):
-            raise ValueError("Same-frame functional regions require consistent pose candidates")
-        unique_goals[index] = goal
+        if event["constraint_kind"] == "functional_frame":
+            for previous_event in events[:event_index]:
+                if previous_event["index"] != index or previous_event["constraint_kind"] != "functional_frame":
+                    continue
+                position_error, rotation_error = _errors(goal[None], previous_event["goal_pose"][None])
+                translation_bound = sum(item["position_tolerance_m"]
+                    + 2*np.linalg.norm(item["function_frame"][:3, 3])*np.sin(min(np.pi, item["rotation_tolerance_rad"])/2)
+                    for item in (event, previous_event))
+                rotation_bound = event["rotation_tolerance_rad"]+previous_event["rotation_tolerance_rad"]
+                if position_error[0] > translation_bound or rotation_error[0] > rotation_bound:
+                    raise ValueError("Same-frame functional allowed sets are provably inconsistent")
+            if index == 0:
+                position_error, rotation_error = _errors((initial @ event["function_frame"])[None],
+                                                         (goal @ event["function_frame"])[None])
+                if (position_error[0] > event["position_tolerance_m"]
+                        or rotation_error[0] > event["rotation_tolerance_rad"]):
+                    raise ValueError("The initial functional allowed set excludes the observed current pose")
+        unique_goals.setdefault(index, initial.copy() if index == 0 else goal)
+    # END compatible noncentral members are left to the shared goal consumers.
     goal_pairs = list(unique_goals.items())
     motion = task.get("motion", "free")
     model_spec = scene.get("motion_model")
@@ -673,9 +721,7 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
         raise ValueError("Articulation requires the current instance's supported mechanism model")
     function_frame = first["function_frame"]
     # BEGIN goals/model are authoritative; source-profile fitting is optional.
-    bound_model, _ = _mechanism_goal_contract(model_spec, initial, goal_pairs)
-    if goal_pairs[0][0] == 0 and not np.allclose(goal_pairs[0][1], initial, atol=1e-8, rtol=0):
-        raise ValueError("The initial functional goal conflicts with the observed current pose")
+    bound_model, _ = _mechanism_entry_contract(model_spec, initial)
     if task["relation"] == "tool_use":
         if model_spec is not None or motion not in {"free", "auto"}:
             raise ValueError("The function optimizer cannot silently discard a current mechanism constraint")
@@ -708,7 +754,7 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
     for event in events:
         binding = event["binding"]
         # BEGIN inspect the independent bound target, never use seed fit as qualification.
-        pose = event["goal_pose"]
+        pose = initial if event["index"] == 0 else event["goal_pose"]
         # END inspect the independent bound target, never use seed fit as qualification.
         if event["constraint_kind"] == "on_region":
             from .pipeline import _surface
@@ -723,8 +769,17 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
                                     normal_tolerance=face["normal_tolerance"])
             error["body_checks"] = check_on(pose, scene["body_points"], surface)
             error["freedom"] = deepcopy(event["freedom"])
-            if (not error["valid"] or error["body_checks"]["support_gap_m"] > 1e-7
-                    or error["body_checks"]["minimum_boundary_clearance_m"] < scene.get("margin", 0.) - 1e-7):
+            # BEGIN the declared face owns contact; other body samples need clearance.
+            # The original gap band allows a small positive face height. Requiring
+            # a different body sample to touch exactly would shrink that allowed set.
+            body_world = np.asarray(scene["body_points"], float) @ pose[:3, :3].T+pose[:3, 3]
+            minimum_height = float(np.min((body_world-surface.origin) @ surface.normal))
+            error["body_checks"]["minimum_signed_height_m"] = minimum_height
+            satisfies = (error["valid"] and minimum_height >= -1e-7
+                         and error["body_checks"]["minimum_boundary_clearance_m"] >= scene.get("margin", 0.) - 1e-7)
+            # END this matches the independent face-contact and body-clearance roles.
+            error["checked_member_satisfies_support"] = bool(satisfies)
+            if event["index"] == 0 and not satisfies:
                 raise ValueError("Transferred function event violates the specified support face or full body bounds")
         else:
             error = relation_error(_inverse(_pose_array(scene["reference_pose"], "Reference pose")) @ pose,
@@ -737,15 +792,19 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
                 from .pipeline import _interior
                 from .goals import check_inside
                 inside = check_inside(pose, scene["body_points"], _interior(scene["interior"]))
-                if inside["minimum_clearance_m"] < scene.get("margin", 0.) - 1e-7:
+                satisfies = inside["minimum_clearance_m"] >= scene.get("margin", 0.) - 1e-7
+                if event["index"] == 0 and not satisfies:
                     raise ValueError("Function event violates supplied free interior geometry")
-                error["containment"] = {"status": "verified_on_supplied_geometry", **inside}
+                error["containment"] = {"status": "checked_member_inside" if satisfies else "checked_member_outside",
+                                        "scope": "one nominal member; the original interior and pose allowed sets remain required", **inside}
             else:
                 error["containment"] = {"status": "not_verified", "reason": "free interior geometry not supplied"}
         checks.append({"event_id": event["event_id"], "frame_index": event["frame_index"],
                        "constraint_kind": event["constraint_kind"],
                        "status": "bound_goal",
                        "goal_pose": event["goal_pose"], **error})
+        if "reference_generation" in event:
+            checks[-1]["reference_generation"] = deepcopy(event["reference_generation"])
     # BEGIN share unchanged corridor semantics with direct joint-coordinate goals.
     # The index addresses source rows, not frame IDs; released body poses still
     # require new observations and are not included in this geometry check.
@@ -804,6 +863,14 @@ def ground_program(program, scene):
     a current carrier frame and metric event tolerances. Their explicit
     ``scene.reference_pose`` embeds the current reference owner's local frame
     in ``scene.reference_frame`` (the common output frame).
+
+    # BEGIN explicit current grasp goal, separate from source-reference motion.
+    Grasp scenes require ``grasp_goal`` with current carrier-local
+    ``T_carrier_eef``, positive task ``position_tolerance_m`` and
+    ``rotation_tolerance_rad`` (strictly below pi), plus a nonempty ``source``.
+    Region correspondence still transforms the ordinary demonstration;
+    changing that reference cannot silently rewrite the independent grasp goal.
+    # END no device/numerical tolerance or last reference sample supplies this input.
 
     Articulation events may instead declare ``constraint_kind=joint_coordinate``.
     Source ``motion_coordinates`` / ``motion_coordinates_source`` preserve the

@@ -15,7 +15,7 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 
 from manipulation.goals import SupportSurface, check_on
-from manipulation.regions import (align_axis, bind_observations, bind_region,
+from manipulation.regions import (SupportReferenceNotFound, align_axis, bind_observations, bind_region,
                                   check_region_on, function_frame, ground_on,
                                   ground_relation, match_functional_region,
                                   relation_error, sample_region_pixels,
@@ -454,7 +454,7 @@ class SupportRegionTest(unittest.TestCase):
         wrong = check_region_on(upright, self.rim, [0, 0, -1], self.surface, **self.tolerances)
         self.assertFalse(wrong["valid"])
         self.assertAlmostEqual(wrong["max_abs_gap_m"], .2)
-        with self.assertRaisesRegex(ValueError, "Specified functional contact face"):
+        with self.assertRaisesRegex(SupportReferenceNotFound, "Specified functional contact face"):
             ground_on(upright, self.body, self.rim, [0, 0, -1], self.surface, **self.tolerances)
         # A directed normal is checked, even when all face points lie on plane.
         wrong_normal = check_region_on(upright, self.bottom, [0, 0, 1], self.surface, **self.tolerances)
@@ -472,7 +472,7 @@ class SupportRegionTest(unittest.TestCase):
 
     def test_opposite_axis_placement_needs_geometric_branch_and_bad_tolerances_reject(self):
         upside_down = pose((0., np.pi, 0.), self.surface.origin)
-        with self.assertRaisesRegex(ValueError, "antiparallel_axis"):
+        with self.assertRaisesRegex(SupportReferenceNotFound, "antiparallel_axis"):
             ground_on(upside_down, self.body, self.bottom, [0, 0, -1], self.surface, **self.tolerances)
         result = ground_on(upside_down, self.body, self.bottom, [0, 0, -1], self.surface,
                            antiparallel_axis=[1, 0, 0], **self.tolerances)

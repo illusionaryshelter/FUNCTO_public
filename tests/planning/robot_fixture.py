@@ -1161,6 +1161,78 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, collisi
     return manifest
 
 
+# BEGIN bind exact native material geometry to the runtime sphere ordering.
+def bind_fixture_contact_materials(fixture, robot_cfg, sphere_indices_by_link,
+                                  feedback, material_faces):
+    """Bind explicit pad faces without labeling any adjacent finger or palm.
+
+    The caller supplies the sphere indices from its actual loaded kinematics.
+    Per-link cover records are checked against both serialized YAML spheres
+    and their saved native certificates before they acquire a material ID.
+    Only the isolated robot MJCF is loaded; task-object truth is never read.
+    """
+    from manipulation.contact_binding import calibrate_box_material_features
+
+    kinematics = robot_cfg["robot_cfg"]["kinematics"]
+    links = kinematics["collision_link_names"]
+    if set(sphere_indices_by_link) != set(links):
+        raise ValueError("Material binding needs every actual native collision-link sphere index")
+    indices = [int(index) for link in links for index in sphere_indices_by_link[link]]
+    if (len(indices) != fixture["sphere_count"] or sorted(indices) != list(range(len(indices)))
+            or any(len(sphere_indices_by_link[link]) != len(kinematics["collision_spheres"][link]) for link in links)):
+        raise ValueError("Runtime sphere ownership must be an exact partition of the fixture")
+    declarations = {row["native_geometry"]: row for row in material_faces}
+    if len(declarations) != len(material_faces):
+        raise ValueError("One native geometry cannot acquire multiple material identities")
+    model = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
+    materials = calibrate_box_material_features(model, tcp_site=fixture["tcp_site"],
+        joint_positions=dict(zip(feedback["joint_names"], feedback["start_q"])),
+        finger_joint_names=feedback["finger_joint_names"], material_faces=material_faces)
+    offsets = {name: 0 for name in links}
+    sphere_materials = [None]*len(indices)
+    bound_geometries = {}
+    for record in fixture["collision_geometries"]:
+        link, count = record["link"], record["sphere_count"]
+        start = offsets[link]
+        offsets[link] += count
+        if record["geom"] not in declarations:
+            continue
+        declaration = declarations[record["geom"]]
+        material = materials[declaration["material_id"]]
+        geom = model.geom(record["geom"]).id
+        native = _collision_geometry(model, geom, "material_certificate_revalidation")
+        with np.load(record["certificate_path"], allow_pickle=False) as saved:
+            centers, radii = saved["sphere_centers_body"], saved["sphere_radii"]
+            balls = kinematics["collision_spheres"][link][start:start+count]
+            if (count != len(radii) or model.body(model.geom_bodyid[geom]).name != link
+                    or not np.array_equal(saved["native_vertices"], native["vertices"])
+                    or not np.array_equal(saved["T_body_geom"], _native_geom_pose(model, geom))
+                    or not np.array_equal([ball["center"] for ball in balls], centers)
+                    or not np.array_equal([ball["radius"] for ball in balls], radii)):
+                raise ValueError(f"Material geometry differs from its native sphere cover: {record['geom']}")
+            normal_geom = np.eye(3)[declaration["face_axis"]]*declaration["face_sign"]
+            pose = saved["T_body_geom"]
+            normal_body = pose[:3, :3] @ normal_geom
+            normal_body /= np.linalg.norm(normal_body)
+            face_body = pose[:3, 3]+pose[:3, :3] @ (normal_geom*model.geom_size[geom, declaration["face_axis"]])
+            # This is a directional support excess, not a claimed Euclidean
+            # mesh-error bound or an automatically granted contact allowance.
+            material["normal_cover_excess_m"] = float(np.max((centers-face_body) @ normal_body+radii))
+        selected = [int(index) for index in sphere_indices_by_link[link][start:start+count]]
+        material["sphere_indices"] = selected
+        material["cover_certificate_path"] = record["certificate_path"]
+        for index in selected:
+            sphere_materials[index] = declaration["material_id"]
+        bound_geometries[record["geom"]] = declaration["material_id"]
+    if (set(bound_geometries) != set(declarations)
+            or any(offsets[link] != len(sphere_indices_by_link[link]) for link in links)):
+        raise ValueError("Native material or complete collision-sphere ownership was not found")
+    return {"robot_sphere_materials": sphere_materials,
+            "native_geometry_materials": bound_geometries, "materials": materials,
+            "source": "Explicit native robot box faces, exact cover certificates and runtime sphere identities; no object-contact permission inferred"}
+# END all nonmaterial robot geometry keeps its original collision contract.
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", type=Path, required=True, help="Explicit exporter keyword arguments as JSON")

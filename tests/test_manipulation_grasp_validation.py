@@ -68,6 +68,9 @@ def view(side, half_width=.005, shift_y=0., shift_z=0.):
 def trajectory():
     return {"reference_frame": "world", "tool_id": Tool.tool_id, "tool_frame": Tool.tool_frame,
             "eef_poses": np.array([pose(z=-.05), pose(), pose()]), "frame_indices": [0, 1, 2],
+            # BEGIN the nominal goal is explicit and independent of source endpoints.
+            "goal_pose": pose(),
+            # END this geometry screen checks one member, not an entire goal set.
             "gripper_events": [{"frame_index": 0, "command": "open"}, {"frame_index": 1, "command": "close"}],
             "connection_required": False}
 
@@ -149,7 +152,7 @@ class GraspValidationTest(unittest.TestCase):
         result = self.run_check(views={"left": view(-1), "right": view(1),
                                       "weak": weak, "solid": view(-1, .023)})
         row = result["candidates"]["one"]
-        self.assertEqual(row["status"], "rejected")
+        self.assertEqual(row["status"], "unresolved")
         records = [r for r in row["interference"] if r["phase"] == "planned_open_approach"]
         self.assertGreaterEqual(len(records), 2)
         self.assertTrue(all(s["evidence_status"] == "unresolved" for s in records[0]["solids"]))
@@ -165,10 +168,11 @@ class GraspValidationTest(unittest.TestCase):
             self.assertEqual(result["eligible_candidate_ids"], ["one"])
             self.assertEqual(result["rejected_candidate_ids"], [])
 
-    def test_non_intended_finger_interference_rejects(self):
+    def test_non_intended_finger_interference_does_not_reject_the_entire_goal_set(self):
         views = {"left": view(-1), "right": view(1), "interfering": view(-1, .023)}
         result = self.run_check(views=views)
-        self.assertEqual(result["candidates"]["one"]["status"], "rejected")
+        self.assertEqual(result["candidates"]["one"]["status"], "unresolved")
+        self.assertFalse(result["candidates"]["one"]["allowed_set_infeasibility_proven"])
         self.assertTrue(result["candidates"]["one"]["interference"])
 
     def test_intermediate_closure_collision_is_checked(self):
@@ -184,7 +188,7 @@ class GraspValidationTest(unittest.TestCase):
 
         views = {"left": view(-1), "right": view(1), "protrusion": view(-1, .013, shift_y=.03)}
         row = self.run_check(views=views, tool=ExtraFingerTool())["candidates"]["one"]
-        self.assertEqual(row["status"], "rejected")
+        self.assertEqual(row["status"], "unresolved")
         self.assertFalse(row["approach_requires_replanning"])
         conflicts = [r for r in row["interference"] if r["phase"] == "terminal_conditional_closure"]
         self.assertTrue(conflicts)
@@ -236,6 +240,7 @@ class GraspValidationTest(unittest.TestCase):
             with self.subTest(gauge_changed=not np.array_equal(gauge, np.eye(4))):
                 candidate = trajectory()
                 candidate["eef_poses"] = gauge @ candidate["eef_poses"]
+                candidate["goal_pose"] = gauge @ candidate["goal_pose"]
                 # Both cameras measure the same plane x=+0.3 mm. Its visible
                 # normals face opposite cameras, and different sample IDs do
                 # not imply distinct material sides or positive thickness.
@@ -257,6 +262,7 @@ class GraspValidationTest(unittest.TestCase):
         transform[:3, :3] = Rotation.from_rotvec([.2, -.3, .1]).as_matrix()
         candidate = trajectory()
         candidate["eef_poses"] = transform @ candidate["eef_poses"]
+        candidate["goal_pose"] = transform @ candidate["goal_pose"]
         views = {"left": view(-1, 0.), "right": view(1, 0.)}
         for row in views.values():
             row["T_output_camera"] = transform @ row["T_output_camera"]
@@ -272,6 +278,7 @@ class GraspValidationTest(unittest.TestCase):
                 with self.subTest(extra=extra, gauge_changed=not np.array_equal(gauge, np.eye(4))):
                     candidate = trajectory()
                     candidate["eef_poses"] = gauge @ candidate["eef_poses"]
+                    candidate["goal_pose"] = gauge @ candidate["goal_pose"]
                     views = {"left": view(-1, .005), "right": view(1, .005+extra)}
                     for row in views.values():
                         row["T_output_camera"] = gauge @ row["T_output_camera"]
@@ -284,6 +291,7 @@ class GraspValidationTest(unittest.TestCase):
         candidates = {"z": trajectory(), "a": trajectory()}
         for row in candidates.values():
             row["eef_poses"] = transform @ row["eef_poses"]
+            row["goal_pose"] = transform @ row["goal_pose"]
         views = {"left": view(-1), "right": view(1)}
         for row in views.values():
             row["T_output_camera"] = transform @ row["T_output_camera"]
@@ -311,7 +319,7 @@ class GraspValidationTest(unittest.TestCase):
 
     def test_unknown_action_does_not_veto_supported_same_function_actions(self):
         other = trajectory()
-        other["eef_poses"][-1] = pose(y=.05)
+        other["goal_pose"] = pose(y=.05)
         for count, expected in ((1, "selected"), (2, "ambiguous")):
             with self.subTest(supported_actions=count):
                 candidates = {"valid_"+str(i): trajectory() for i in range(count)}
@@ -322,6 +330,18 @@ class GraspValidationTest(unittest.TestCase):
                 self.assertEqual(result["unresolved_candidate_ids"], ["missing"])
                 self.assertEqual(result["selected_candidate_id"], "valid_0" if count == 1 else None)
                 self.assertEqual(set(result["candidates"]), set(candidates))
+
+    # BEGIN source endpoint edits cannot substitute a new independent grasp goal.
+    def test_source_endpoint_change_does_not_change_nominal_goal_geometry(self):
+        candidate = trajectory()
+        expected = self.run_check({"one": candidate})["candidates"]["one"]
+        candidate["eef_poses"][-1] = pose(y=.05)
+        actual = self.run_check({"one": candidate})["candidates"]["one"]
+        self.assertEqual(actual["terminal_closure"]["status"], expected["terminal_closure"]["status"])
+        self.assertEqual(actual["terminal_closure"]["signed_gap_m"], expected["terminal_closure"]["signed_gap_m"])
+        np.testing.assert_array_equal(actual["terminal_checked_pose"], pose())
+        self.assertFalse(actual["allowed_set_infeasibility_proven"])
+    # END ordinary source motion remains separate from nominal goal diagnostics.
 
 
 if __name__ == "__main__":

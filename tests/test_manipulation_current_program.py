@@ -71,6 +71,8 @@ def fixture(kind="manipulation"):
     owners = {"carrier": current}
     if kind == "grasp":
         demo["protected_start_frame"] = 12
+        scene["grasp_goal"] = {"T_carrier_eef": pose(z=.03), "position_tolerance_m": .002,
+                               "rotation_tolerance_rad": .03, "source": "declared current-program fixture task relation"}
         return {"skill_kind": kind, "demo": demo}, scene, {"grasp": source}, owners
     reference = deepcopy(source)
     reference.update(owner_id="old_reference", region_id="demonstrated_target")
@@ -399,8 +401,13 @@ class CurrentProgramTest(unittest.TestCase):
             bound = bind_current_scene(program, scene, templates, owners, client=client())
         np.testing.assert_array_equal(bound["support"]["boundary"], tiny.boundary)
         from manipulation.program import ground_program
-        with self.assertRaises(ValueError):
-            ground_program(program, bound)
+        # BEGIN failed bounded placement keeps the exact observed support.
+        grounded = ground_program(program, bound)
+        check = grounded["function_checks"][0]
+        self.assertEqual(check["reference_generation"]["status"], "failed")
+        self.assertFalse(check["checked_member_satisfies_support"])
+        np.testing.assert_array_equal(bound["support"]["boundary"], tiny.boundary)
+        # END this diagnostic seed is not a placement or feasibility certificate.
 
     def test_upstream_visible_carrier_contact_remains_available_without_ground_truth(self):
         source, current = evidence()

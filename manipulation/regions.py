@@ -25,6 +25,18 @@ from .motion import _inverse, _pose_array
 from .observations import _intrinsics, _mask, backproject, rigid_registration
 
 
+# BEGIN finite placement search failure does not erase the support relation.
+class SupportReferenceNotFound(ValueError):
+    """The existing support initializer could not provide a nominal member.
+
+    This may be a missing preferred alignment branch, a failed exact-normal
+    height member or an exhausted bounded yaw search. It carries no claim that
+    the continuous allowed set is empty. Invalid numerical/structural geometry
+    keeps its ordinary input error; callers retain the original support relation.
+    """
+# END malformed geometry continues to raise its original input error.
+
+
 def _vector(value, name):
     vector = np.asarray(value, dtype=float)
     if vector.shape != (3,) or not np.isfinite(vector).all():
@@ -217,19 +229,30 @@ def ground_on(preferred_pose, body_points, carrier_region_points,
     support and body geometry. The output certifies this sampled geometric
     relation only, not hidden-shape coverage, force stability or collision-free
     robot execution. The finite yaw search is not a global infeasibility proof.
-    A missing antiparallel branch is rejected by ``align_axis``.
+    A missing antiparallel branch or failed exact-normal height member is a
+    reference-initialization failure, not a proof against the allowed relation.
     """
     _support_arguments(support, margin, gap_tolerance, normal_tolerance)
     body = _points(body_points, "body_points", minimum=3)
     region = _points(carrier_region_points, "carrier_region_points", minimum=1)
     outward = _unit(carrier_outward_normal, "carrier_outward_normal")
     preferred = _pose_array(preferred_pose, "preferred_pose")
-    preferred[:3, :3] = align_axis(preferred[:3, :3], outward,
-                                  -support.normal, antiparallel_axis=antiparallel_axis)
+    # BEGIN an unavailable preference branch cannot erase the allowed set.
+    try:
+        preferred[:3, :3] = align_axis(preferred[:3, :3], outward,
+                                      -support.normal, antiparallel_axis=antiparallel_axis)
+    except ValueError as error:
+        if str(error) != "Opposite axes need an explicit geometric antiparallel_axis":
+            raise
+        raise SupportReferenceNotFound(
+            "Preferred support alignment needs an explicit antiparallel_axis; "
+            "the original allowed relation remains unresolved") from error
+    # END malformed supplied axes still retain their structural input errors.
     # BEGIN search only genuine free yaw, without using a support tangent gauge.
-    # Plane height and signed normal do not change under yaw. Reject a wrong
-    # face once, before trying bounded footprint candidates; no yaw can move a
-    # cup rim onto the support while keeping its lower body above that plane.
+    # Plane height and signed normal do not change under this exact-normal yaw
+    # search. A failed height member makes this initializer unavailable. It
+    # does not prove that a pose within the declared angular/gap ranges fails:
+    # a permitted small tilt can lift a lower protrusion beside the contact face.
     height_pose = preferred.copy()
     rotated_body = body @ preferred[:3, :3].T
     plane_height = float((preferred[:3, 3] - support.origin) @ support.normal)
@@ -239,9 +262,10 @@ def ground_on(preferred_pose, body_points, carrier_region_points,
                                normal_tolerance=normal_tolerance, margin=margin)
     if (vertical["max_abs_gap_m"] > gap_tolerance + 1e-10
             or vertical["normal_error_rad"] > normal_tolerance + 1e-10):
-        raise ValueError("Specified functional contact face does not satisfy support: "
-                         f"gap={vertical['max_abs_gap_m']:.6g} m, "
-                         f"normal={vertical['normal_error_rad']:.6g} rad")
+        raise SupportReferenceNotFound("Specified functional contact face fails the preferred exact-normal member: "
+                                       f"gap={vertical['max_abs_gap_m']:.6g} m, "
+                                       f"normal={vertical['normal_error_rad']:.6g} rad; "
+                                       "this is not a proof against the task allowed set")
 
     checked, last_region = 0, None
     # 0, +/-5, ... +/-175, 180 degrees covers one full circle. The tangent
@@ -291,8 +315,8 @@ def ground_on(preferred_pose, body_points, carrier_region_points,
                         "antiparallel_branch": "explicit geometric axis" if antiparallel_axis is not None else None}}
     detail = ("; specified functional contact face boundary violation="
               f"{last_region['boundary_violation_m']:.6g} m" if last_region is not None else "")
-    raise ValueError("No accepted placement candidate in bounded 5-degree yaw search; "
-                     "this is not a proof of global infeasibility" + detail)
+    raise SupportReferenceNotFound("No accepted placement candidate in bounded 5-degree yaw search; "
+                                   "this is not a proof of global infeasibility" + detail)
     # END free-yaw search with independent full-body and contact-face checks.
 # END partial support-region consumption.
 

@@ -50,6 +50,8 @@ def compiled(kind):
         return {"skill_kind": "grasp", "demo": demo}, {
             "reference_frame": "output", "carrier_id": "current_rigid",
             "carrier_pose": pose(), "region_transform": pose(), "eef_pose": pose(z=.1),
+            "grasp_goal": {"T_carrier_eef": pose(), "position_tolerance_m": .002,
+                           "rotation_tolerance_rad": .03, "source": "declared registration fixture task relation"},
             "tool_id": "parallel_gripper", "tool_frame": "eef_site"}
     program["demo"].update(carrier_id="source_payload", reference_id="source_rigid")
     scene.update(reference_frame="output", reference_id="current_rigid")

@@ -764,6 +764,13 @@ class PoseEventRequirement:
     These acceptance thresholds are not inferred freedom for the neighbouring
     motion. In particular, a larger generic solver tolerance never replaces a
     tighter threshold already specified by the source functional event.
+
+    ``actual_relation=None`` explicitly describes a fixed tool calibration
+    against a fixed world target. Owner-relative goals instead name the
+    currently observed target owner and its material target transform. A held
+    function additionally names its owner/material frame and the already bound
+    attachment condition. The execution consumer must obtain fresh owner poses
+    or a currently verified attachment; planning-time poses are not observations.
     """
     progress: float
     tool_from_function: np.ndarray
@@ -771,6 +778,9 @@ class PoseEventRequirement:
     position_tolerance_m: float
     rotation_tolerance_rad: float
     source: object
+    # BEGIN explicit execution geometry; provenance remains opaque evidence.
+    actual_relation: dict | None = None
+    # END no runtime owner relation is inferred from an event name or source.
 
     def __post_init__(self):
         self.tool_from_function = _pose_array(self.tool_from_function, "T_tool_function")
@@ -779,6 +789,28 @@ class PoseEventRequirement:
                 or not 0 < self.position_tolerance_m < np.inf
                 or not 0 < self.rotation_tolerance_rad < np.pi):
             raise ValueError("A material-frame event needs finite metric thresholds and its original source")
+        # BEGIN validate each explicitly requested current material-frame input.
+        if self.actual_relation is not None:
+            relation = self.actual_relation
+            allowed = {"function_owner_id", "T_owner_function", "attachment_condition_id",
+                       "target_owner_id", "T_owner_target"}
+            if not isinstance(relation, dict) or not relation or set(relation)-allowed:
+                raise ValueError("actual_relation must declare supported current owner-frame inputs")
+            relation = deepcopy(relation)
+            for owner_key, pose_key in (("function_owner_id", "T_owner_function"),
+                                        ("target_owner_id", "T_owner_target")):
+                if (owner_key in relation) != (pose_key in relation):
+                    raise ValueError("An actual owner relation needs its owner ID and material transform")
+                if owner_key in relation:
+                    if not isinstance(relation[owner_key], str) or not relation[owner_key].strip():
+                        raise ValueError("An actual owner relation needs a nonempty owner ID")
+                    relation[pose_key] = _pose_array(relation[pose_key], pose_key)
+            condition = relation.get("attachment_condition_id")
+            if "attachment_condition_id" in relation and (
+                    "function_owner_id" not in relation or not isinstance(condition, str) or not condition.strip()):
+                raise ValueError("An actual attachment relation needs its function owner and condition ID")
+            self.actual_relation = relation
+        # END absent current evidence remains an execution-level unknown.
 
     def errors(self, position, quaternion):
         import torch
@@ -1431,11 +1463,18 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
         append_interval(0, len(frames)-1, path, {"mode": "grasp",
             "protected_start_frame": grounded["protected_start_frame"],
             "candidate_attachment": candidate.tolist()})
-        # This goal is the independently bound terminal grasp relation. Earlier
-        # source poses and the contact-evidence frame supply no extra goals.
+        # BEGIN grasp precision belongs to the explicit current task relation.
+        # The shared PoseEvent preserves its entire metric/angle allowed set;
+        # its nominal transform is an initializer, not an extra exact equality.
+        # Source poses and the contact-evidence frame supply no extra goals.
+        grasp_goal = grounded["grasp_goal"]
         pose_events.append(PoseEventRequirement(1., np.eye(4), grounded["goal_pose"],
-            numerical.position_m, numerical.rotation_rad,
-            {"kind": "bound_grasp_relation", "carrier_id": carrier, **source}))
+            grasp_goal["position_tolerance_m"], grasp_goal["rotation_tolerance_rad"],
+            {"kind": "bound_grasp_relation", "carrier_id": carrier,
+             "binding_source": deepcopy(grasp_goal["source"]), **source},
+            actual_relation={"target_owner_id": carrier,
+                             "T_owner_target": grasp_goal["T_carrier_eef"]}))
+        # END numerical convergence settings cannot widen or supply grasp task accuracy.
         # BEGIN bind effect assessment to the exact original event identity.
         conditions.append({"kind": "candidate_attachment", "skill_id": skill_id,
             "event_id": "__stable_holding__",
@@ -1498,7 +1537,14 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
                 material = _pose_array(binding["carrier_frame"], "current material function frame")
                 pose_events.append(PoseEventRequirement(progress, _inverse(attachment) @ material,
                     np.asarray(check["goal_pose"]) @ material,
-                    event["position_tolerance_m"], event["rotation_tolerance_rad"], event["source"]))
+                    event["position_tolerance_m"], event["rotation_tolerance_rad"], event["source"],
+                    # BEGIN current carrier/reference observations own actual satisfaction.
+                    actual_relation={"function_owner_id": carrier, "T_owner_function": material,
+                        "attachment_condition_id": attachment_id,
+                        "target_owner_id": scene["reference_id"],
+                        "T_owner_target": _inverse(_pose_array(scene["reference_pose"], "Reference pose"))
+                                          @ np.asarray(check["goal_pose"]) @ material}))
+                    # END the initial reference-owner pose only binds planning coordinates.
             if program["task"]["relation"] == "inside" and "interior" in scene:
                 interior = _interior(scene["interior"])
                 interiors.append(InteriorRequirement(progress, progress, _inverse(attachment), scene["body_points"],

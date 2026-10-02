@@ -15,7 +15,8 @@ from copy import deepcopy
 
 import numpy as np
 
-from .motion import _inverse, _pose_array, _poses_array
+from .motion import _inverse, _pose_array, _poses_array, _tolerances
+from .gripper_state import _source
 
 
 def validate_timeline(frame_indices, timestamps):
@@ -50,10 +51,12 @@ def _name(record, key):
 def _gripper_events(value, frames):
     """Check explicit intentions without deriving commands from measured qpos.
 
-    Observations own both boundaries; commands own ``[first, last)``. Requiring
-    an observed source frame avoids silently snapping an event to a different
-    time when a caller has decimated a trajectory. Retiming belongs to the
-    robot backend and must carry these original event IDs with it.
+    # BEGIN source end ownership is independent of device execution coverage.
+    An explicitly owned command may use either source boundary. Requiring an
+    observed frame avoids silently snapping an event after decimation. The
+    shared physical clock must still provide a real activation tick and the
+    required post-command coverage; accepting a source ID does not prove that.
+    # END no last source observation is silently converted into a command.
     """
     if not isinstance(value, list) or not value:
         raise ValueError("gripper_events must contain explicit grasp intentions")
@@ -67,8 +70,8 @@ def _gripper_events(value, frames):
         command = event.get("command")
         if (isinstance(frame, (bool, np.bool_))
                 or not isinstance(frame, (int, np.integer))
-                or int(frame) not in frame_set or int(frame) == int(frames[-1])):
-            raise ValueError("Gripper event frame_index must name a source observation in [first, last)")
+                or int(frame) not in frame_set):
+            raise ValueError("Gripper event frame_index must name an original source observation")
         if event_id in ids or int(frame) <= previous:
             raise ValueError("Gripper event IDs must be unique and event frames strictly increasing")
         if command not in {"open", "close", "hold"}:
@@ -78,8 +81,11 @@ def _gripper_events(value, frames):
         events.append(deepcopy(event))
     if not any(event["command"] == "close" for event in events):
         raise ValueError("Independent grasp needs an explicit close intention")
-    if events[-1]["command"] == "open":
-        raise ValueError("Independent grasp must finish closing or holding, not releasing")
+    # BEGIN an intention does not establish or refute the actual grasp effect.
+    # A terminal open is retained like close/hold. A required Holding result
+    # remains independently evaluated; source-command validation cannot infer
+    # object attachment from the command name or silently delete the operation.
+    # END actual effects, device coverage and dependencies remain separate.
     return events
 
 
@@ -90,8 +96,12 @@ def ground_grasp(demo, scene):
     Region correspondence maps the complete source motion into the current
     scene. The actual robot state belongs to the planner; no selected source
     frame creates an approach waypoint, Cartesian suffix lock, or stop. The
-    terminal local grasp relation is a proposed goal, never observed Holding.
-    ``protected_start_frame`` retains contact evidence identity only.
+    grasp relation is explicitly supplied in ``scene.grasp_goal`` as the
+    current carrier-local ``T_carrier_eef``, task ``position_tolerance_m`` and
+    ``rotation_tolerance_rad``, and their ``source``. It is independent of
+    ordinary reference samples and never observed Holding. Numerical solver
+    tolerances do not supply missing task precision. ``protected_start_frame``
+    retains contact evidence identity only.
     """
     for key in ("tool_id", "tool_frame"):
         if _name(demo, key) != _name(scene, key):
@@ -109,14 +119,29 @@ def ground_grasp(demo, scene):
         raise ValueError("The contact evidence boundary cannot follow a closing intention")
     carrier = _pose_array(scene["carrier_pose"], "carrier_pose")
     _pose_array(scene["eef_pose"], "eef_pose")
+    # BEGIN independently bind the current grasp relation and its allowed set.
+    goal = scene.get("grasp_goal")
+    required = {"T_carrier_eef", "position_tolerance_m", "rotation_tolerance_rad", "source"}
+    if not isinstance(goal, dict) or not required <= set(goal):
+        raise ValueError("grasp_goal requires explicit T_carrier_eef, task position/rotation tolerances and source")
+    if any(isinstance(goal[name], (bool, np.bool_)) for name in
+           ("position_tolerance_m", "rotation_tolerance_rad")):
+        raise ValueError("Grasp task tolerances must be metric numbers, not booleans")
+    position_tolerance, rotation_tolerance = _tolerances(
+        goal["position_tolerance_m"], goal["rotation_tolerance_rad"])
+    grasp_goal = {"T_carrier_eef": _pose_array(goal["T_carrier_eef"], "grasp_goal.T_carrier_eef"),
+                  "position_tolerance_m": position_tolerance,
+                  "rotation_tolerance_rad": rotation_tolerance,
+                  "source": _source(goal["source"], "Grasp task goal and allowed set")}
+    # END neither the demonstration endpoint nor engineering epsilon fills this contract.
     mapping = _pose_array(scene["region_transform"], "region_transform")
     bound_relative = mapping @ relative
     return {
         "status": "candidate", "output_type": "eef_trajectory",
         "eef_poses": carrier @ bound_relative, "frame_indices": frames, "timestamps": times,
         "protected_start_frame": int(protected),
-        "goal_pose": carrier @ bound_relative[-1],
-        "candidate_T_carrier_eef": bound_relative[-1].copy(), "gripper_events": events,
+        "goal_pose": carrier @ grasp_goal["T_carrier_eef"], "grasp_goal": grasp_goal,
+        "candidate_T_carrier_eef": grasp_goal["T_carrier_eef"].copy(), "gripper_events": events,
         "tool_id": demo["tool_id"], "tool_frame": demo["tool_frame"],
         "holding_status": "requires_verification",
         "effect_requirement": {"frame_index": int(frames[-1]),

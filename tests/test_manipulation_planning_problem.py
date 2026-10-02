@@ -102,6 +102,11 @@ def grasp_input():
         "tool_id": "parallel_gripper", "tool_frame": "calibrated_tcp",
         "carrier_pose": pose((.1, .05, 0.)), "region_transform": pose(),
         "eef_pose": pose((-.1, .02, .2)),
+        # BEGIN this fixture declares task accuracy separately from solver precision.
+        "grasp_goal": {"T_carrier_eef": pose((0., 0., .02)),
+                       "position_tolerance_m": 1e-4, "rotation_tolerance_rad": 1e-3,
+                       "source": "explicit analytic grasp goal and task allowed set"},
+        # END no production default derives these values from the source endpoint.
     }
     return {"skill_id": "grasp", "program": {"skill_kind": "grasp", "demo": demo}, "scene": scene}
 
@@ -540,7 +545,7 @@ class PlanningBuilderTest(unittest.TestCase):
     def test_current_coordinate_goal_conflict_is_not_a_reference_failure(self):
         skill = prismatic_input()
         skill["scene"]["functional_bindings"]["function"]["current_coordinates"] = [.4]
-        with self.assertRaisesRegex(ValueError, "required start or functional goal"):
+        with self.assertRaisesRegex(ValueError, "allowed sets do not intersect"):
             compile_inputs(skill)
 
     def test_actual_entry_tool_goal_does_not_require_a_multinode_reference_fit(self):

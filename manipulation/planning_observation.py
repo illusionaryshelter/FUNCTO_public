@@ -480,11 +480,41 @@ def _require_mapping_memory(estimated_bytes, device):
 # END local mapping resource guard.
 
 
+# BEGIN reject native index layouts that disagree with the complete mapped field.
+def _require_native_voxel_layout(voxel, native):
+    """Admit the same XYZ field for native queries and independent geometry.
+
+    The installed VoxelData stores float32 ``dims / voxel_size`` parameters;
+    both Warp SDF entry points truncate them to integers. Floating division
+    can put an integer grid size just below its exact value, changing native
+    cell centres and flattening strides. Compare those actual parameters to
+    the completed mapper tensor before publishing either consumer. This is
+    an admission check, never a repair of native discretization or field data.
+    """
+    storage = native.data.voxels
+    layer = storage.get_idx(voxel.name)
+    values = storage.params[0, layer, :3].detach().cpu()
+    field_shape = tuple(int(value) for value in voxel.feature_tensor.shape)
+    if len(field_shape) != 3 or not bool(torch.isfinite(values).all()):
+        raise ValueError("Completed native ESDF needs a dense XYZ field and finite grid params")
+    # Python int, like the installed wp.int32 conversion, truncates rather
+    # than rounds. A value just above an integer may still index correctly.
+    native_shape = tuple(int(value) for value in values.tolist())
+    declared_shape = tuple(int(round(float(value)/float(voxel.voxel_size))) for value in voxel.dims)
+    if native_shape != field_shape or declared_shape != field_shape:
+        raise ValueError(
+            f"Unsupported native ESDF grid layout for {voxel.name}: "
+            f"field_shape_xyz={field_shape}, native_truncated_shape_xyz={native_shape}, "
+            f"native_params_xyz={values.tolist()}, declared_shape_xyz={declared_shape}, "
+            f"dims_m={list(voxel.dims)}, voxel_size_m={float(voxel.voxel_size)}")
+# END no rounding repair, reshape or alternate field enters either consumer.
+
+
 # BEGIN independent finite occupied-cell model from the original mapped field.
 def _independent_voxel_geometry(voxel, source):
     """Own every field sample and its occupied cells before native buffers move.
 
-    Coal uses the filled union of positive ESDF sample cells. This is a second
+    Coal uses the filled union of nonpositive ESDF sample cells. This is a second
     numerical representation of the same observed field, not a free-space
     proof or an inferred hidden back surface. Its half-cell diagonal is exposed
     as model discretization; it is never silently added to contact permission.
@@ -496,24 +526,76 @@ def _independent_voxel_geometry(voxel, source):
     flat = np.ascontiguousarray(field.reshape(-1))
     if not np.isfinite(flat).all():
         raise ValueError("Independent field samples must be finite, including the native unknown sentinel")
-    occupied = np.flatnonzero(flat > 0)
+    # BEGIN match the completed native ESDF's negative-inside sign convention.
+    # Installed data_voxel.compute_local_sdf returns the field without a sign
+    # flip; collision penetration is radius - sdf. After compute_esdf's full-
+    # grid write, missing sites have +1e4, whereas +/-0 is a surface seed. Keep
+    # the closed surface as well as every negative interior cell. Positive
+    # samples are not objects, and do not by themselves prove observed free
+    # space: that remains the independent raw-ray coverage contract.
+    occupied = np.flatnonzero(flat <= 0)
+    field_summary = {"shape_xyz": list(shape), "total_cells": int(flat.size),
+        "negative_cells": int(np.count_nonzero(flat < 0)), "zero_cells": int(np.count_nonzero(flat == 0)),
+        "positive_cells": int(np.count_nonzero(flat > 0)), "occupied_cells": int(len(occupied)),
+        "occupancy_rule": "ESDF_sample_nonpositive", "occupied_cell_limit": 250_000}
+    # END zero has no epsilon band, and positive native unknown sentinels stay out.
     if len(occupied) > 250_000:
-        return {"solids": [], "query_gaps": ["Independent occupied-cell inventory exceeds 250000 cells"]}
-    return {"solids": ([] if not len(occupied) else [{
+        return {"solids": [], "query_gaps": ["Independent occupied-cell inventory exceeds 250000 cells"],
+                "field_summary": field_summary}
+    # BEGIN an empty occupied union still owns and exposes its complete field.
+    return {"solids": [{
         "name": voxel.name, "kind": "voxel", "pose": list(voxel.pose), "source": source,
         "voxel_size": float(voxel.voxel_size), "shape_xyz": list(shape),
         "field_dtype": flat.dtype.str, "field_bytes_hex": flat.tobytes().hex(),
-        "occupied_flat_indices": occupied.tolist(), "occupancy_rule": "ESDF_sample_strictly_positive",
+        "occupied_flat_indices": occupied.tolist(), "occupancy_rule": "ESDF_sample_nonpositive",
         "geometry_scope": "filled occupied sample cells of the observed field; unknown cells remain unknown",
-        "cell_half_diagonal_m": math.sqrt(3)*float(voxel.voxel_size)/2}]), "query_gaps": []}
+        "cell_half_diagonal_m": math.sqrt(3)*float(voxel.voxel_size)/2}], "query_gaps": [],
+        "field_summary": field_summary}
+    # END validators may omit an empty solid only after checking every sample.
 # END neither sparsification nor a contact witness may discard occupied cells.
+
+
+# BEGIN independently bounded owner resolution on the same current RGB-D input.
+def _owner_mapper_config(config, views, masks, owner_id, pose, voxel_size, depth_error_m):
+    """Enclose every labelled depth sample in a finite owner-local grid.
+
+    The background and raw free-space grid keep their own resolution. This
+    tighter grid spends precision on the observed owner's surfaces without
+    asserting unseen geometry or dropping a labelled surface to save memory.
+    Padding covers truncation and complete sample cells; memory admission is
+    still applied to all partitions together before any native allocation.
+    """
+    if not np.isfinite(voxel_size) or voxel_size <= 0:
+        raise ValueError("Owner field resolution must be explicit positive metres")
+    clouds = []
+    inverse = _inverse(pose)
+    for name, view in views.items():
+        rows, columns = np.nonzero(masks[name][owner_id] & (view["depth"] > 0))
+        pixels = np.column_stack((columns, rows, np.ones(len(rows))))
+        camera = (pixels @ np.linalg.inv(view["K"]).T) * view["depth"][rows, columns, None]
+        transform = inverse @ view["T_output_camera"]
+        clouds.append(camera @ transform[:3, :3].T + transform[:3, 3])
+    points = np.concatenate(clouds)
+    if not len(points):
+        raise ValueError("A refined owner field needs current labelled valid depth samples")
+    lower, upper = points.min(axis=0), points.max(axis=0)
+    padding = 4*voxel_size+depth_error_m
+    extent = tuple(upper-lower+2*padding)
+    return replace(config, grid_center=torch.as_tensor((lower+upper)/2, dtype=torch.float32),
+        extent_meters_xyz=extent, extent_esdf_meters_xyz=extent,
+        voxel_size=voxel_size, esdf_voxel_size=voxel_size,
+        truncation_distance=2*voxel_size, max_visible_blocks_per_integration=None)
+# END refined owner fields remain partial collision geometry.
 
 
 def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                           reference_frame, robot_sphere_materials, robot_geometry_source,
                           gripper=None, has_gripper=True, contacts=(),
                           known_solids=None, current_robot=None,
-                          max_mapping_bytes=256*1024**2):
+                          max_mapping_bytes=256*1024**2,
+                          # BEGIN owner precision is independent of whole-scene extent.
+                          native_geometry_materials=None, owner_voxel_size_m=None):
+                          # END no owner sample is omitted by the refinement.
     """Fuse a current snapshot into a partial, explicitly partitioned scene.
 
     Each view additionally requires image, owner_masks and robot_mask. Empty
@@ -578,6 +660,12 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
     world_extent = np.asarray(mapper_cfg.get_actual_extent())
     esdf_extent = np.ceil(np.asarray(mapper_cfg.extent_esdf_meters_xyz)/mapper_cfg.esdf_voxel_size)*mapper_cfg.esdf_voxel_size
     for identity, (pose, _) in frames.items():
+        # BEGIN use all current labelled samples to bound an explicitly refined field.
+        if owner_voxel_size_m is not None:
+            configs[identity] = _owner_mapper_config(mapper_cfg, normalized, masks, identity,
+                pose, owner_voxel_size_m, depth_error_m)
+            continue
+        # END unchanged background coverage cannot certify an unseen owner surface.
         inverse = _inverse(pose)
         configs[identity] = replace(mapper_cfg,
             grid_center=torch.as_tensor(inverse[:3, :3]@center+inverse[:3, 3], dtype=torch.float32),
@@ -635,6 +723,9 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
         voxel.name = partition_id
         native = SceneCollision.from_config(SceneCollisionCfg(
             device_cfg=config_device, scene_model=SceneCfg(voxel=[voxel]), cache={"voxel": 1}))
+        # BEGIN validate native indexing before a query or solid can be published.
+        _require_native_voxel_layout(voxel, native)
+        # END a mismatched complete field remains unsupported, not executable.
         queries[identity] = CuroboSphereQuery(native, owner_ids=(partition_id,),
                                              source=f"current_rgbd:{','.join(normalized)}")
         # BEGIN retain an independent filled-cell model of this same owner partition.
@@ -645,6 +736,14 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                                     "tsdf_voxel_size_m": float(config.voxel_size),
                                     "esdf_voxel_size_m": float(config.esdf_voxel_size),
                                     "truncation_distance_m": float(config.truncation_distance),
+                                    # BEGIN record the finite field actually queried.
+                                    "grid_center_local_m": config.grid_center.cpu().tolist(),
+                                    "extent_esdf_meters_xyz": list(config.extent_esdf_meters_xyz),
+                                    "occupied_cell_half_diagonal_m": math.sqrt(3)*config.esdf_voxel_size/2,
+                                    # BEGIN disclose counts even when a finite inventory refuses admission.
+                                    "independent_field": queries[identity].independent_geometry["field_summary"],
+                                    # END a resource refusal cannot masquerade as an empty observed target.
+                                    # END voxel resolution is not a sensor-error certificate.
                                     "estimated_buffers_bytes": estimates[identity]}
         del mapper, observation
     owners = [CollisionOwner(identity, queries[identity],
@@ -654,7 +753,10 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
     result = PlanningScene(background=queries[None], owners=owners, coverage=coverage,
                            reference_frame=reference_frame, robot_sphere_materials=robot_sphere_materials,
                            robot_geometry_source=robot_geometry_source, contacts=contacts,
-                           gripper=gripper, has_gripper=has_gripper)
+                           # BEGIN preserve the independently calibrated native material identities.
+                           gripper=gripper, has_gripper=has_gripper,
+                           native_geometry_materials=native_geometry_materials)
+                           # END the mapping does not itself create a contact permission.
     result.observation_report = {"source": "current calibrated RGB-D and explicit current physical-solid evidence", "partitions": statistics,
                                  "known_free_voxels": free_count, "additional_known_occupied_voxels": occupied_count,
                                  "known_voxels": int(known.sum()), "coverage_voxels": int(known.size),

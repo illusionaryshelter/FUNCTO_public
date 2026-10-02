@@ -150,14 +150,20 @@ class ProgramTest(unittest.TestCase):
         basis = Rotation.from_rotvec([0, np.pi / 2, 0]).as_matrix()
         scene["motion_model"] = {"kind": "prismatic", "reference_pose": pose(), "basis": basis,
                                   "source": "observed axis", "coordinate_limits": [[0, .04]]}
-        with self.assertRaisesRegex(ValueError, "mechanism limits"):
-            ground_program(program, scene)
+        # BEGIN a nominal member outside physical limits is a failed seed.
+        limited = ground_program(program, scene)
+        self.assertEqual(limited["motion_checks"]["reference_generation"]["status"], "failed")
+        np.testing.assert_allclose(limited["function_checks"][0]["goal_pose"], pose(x=.05))
+        # END the independent downstream mechanism and allowed set remain required.
         scene["motion_model"]["coordinate_limits"] = [[0, .2]]
         valid = ground_program(program, scene)
         np.testing.assert_allclose(valid["object_poses"][5], pose(x=.05), atol=1e-9)
         scene["functional_bindings"]["effect"]["reference_frame"] = pose(y=.1)
-        with self.assertRaisesRegex(ValueError, "incompatible"):
-            ground_program(program, scene)
+        # BEGIN off-axis goal centres likewise do not alter their original goal.
+        off_axis = ground_program(program, scene)
+        self.assertEqual(off_axis["motion_checks"]["reference_generation"]["status"], "failed")
+        np.testing.assert_allclose(off_axis["function_checks"][0]["goal_pose"], pose(x=.05, y=.1))
+        # END actual entrance ownership and mechanism validation stay mandatory.
 
     def test_multiple_function_events_remain_internal_constraints(self):
         program, scene = fixture()
@@ -188,11 +194,11 @@ class ProgramTest(unittest.TestCase):
             np.testing.assert_allclose(new_check["goal_pose"], world @ old_check["goal_pose"], atol=1e-9)
             self.assertLess(new_check["position_error_m"], 1e-9)
 
-    def test_soft_reference_projection_cannot_project_a_hard_function_goal(self):
+    def test_soft_reference_projection_cannot_rewrite_a_function_allowed_set(self):
         program, scene = fixture()
         program["task"] = {"relation": "articulation", "motion": "prismatic"}
-        # An off-axis *reference* sample may be projected. Both actual start
-        # and function target remain required poses of the current mechanism.
+        # An off-axis reference sample may be projected. The actual start is
+        # immutable; the full functional allowed set remains independently required.
         program["demo"]["T_reference_carrier"][2, 1, 3] = .02
         scene["motion_model"] = {
             "kind": "prismatic", "reference_pose": pose(),
@@ -212,11 +218,13 @@ class ProgramTest(unittest.TestCase):
         changed["motion_model"]["basis"] = world[:3, :3] @ scene["motion_model"]["basis"]
         second = ground_program(program, changed)
         np.testing.assert_allclose(second["object_poses"], world @ first["object_poses"], atol=1e-9)
-        # The same deviation at the required event may not be silently
-        # repaired by the reference projection that was allowed above.
+        # BEGIN a nominal event outside the model is not projected into its goal.
+        # The seed failure is explicit and the original target remains intact.
         program["demo"]["T_reference_carrier"][5, 1, 3] = .02
-        with self.assertRaisesRegex(ValueError, "incompatible"):
-            ground_program(program, scene)
+        result = ground_program(program, scene)
+        self.assertEqual(result["motion_checks"]["reference_generation"]["status"], "failed")
+        np.testing.assert_allclose(result["function_checks"][0]["goal_pose"], pose(x=.05, y=.02))
+        # END task feasibility is assessed against actual members downstream.
 
     def test_last_internal_event_at_release_remains_exact_and_has_a_retreat(self):
         program, scene = fixture()
@@ -255,8 +263,15 @@ class ProgramTest(unittest.TestCase):
         # The carrier can rest on its lower face while the requested (wrong)
         # top region is 2 cm above the support. Whole-body checks alone pass.
         scene["functional_bindings"]["effect"]["on_geometry"]["carrier_region_points"][:, 2] = .02
-        with self.assertRaisesRegex(ValueError, "functional contact face"):
+        # BEGIN this failed nominal face remains explicitly unsatisfied.
+        # Its failure is not an input-shape error or an empty-set certificate.
+        result = ground_program(program, scene)
+        self.assertEqual(result["function_checks"][0]["reference_generation"]["status"], "failed")
+        self.assertFalse(result["function_checks"][0]["checked_member_satisfies_support"])
+        scene["functional_bindings"]["effect"]["on_geometry"]["carrier_outward_normal"] = [0., 0., 0.]
+        with self.assertRaisesRegex(ValueError, "nonzero"):
             ground_program(program, scene)
+        # END the real support requirement still includes the declared face.
 
     def test_invalid_inside_margin_cannot_bypass_containment_checks(self):
         program, scene = fixture()
@@ -290,7 +305,7 @@ class ProgramTest(unittest.TestCase):
         self.assertEqual(len(result["function_checks"]), 2)
         np.testing.assert_allclose(result["object_poses"][5], pose(x=.05), atol=1e-9)
         binding["reference_frame"] = pose(x=.07)
-        with self.assertRaisesRegex(ValueError, "consistent pose candidates"):
+        with self.assertRaisesRegex(ValueError, "allowed sets are provably inconsistent"):
             ground_program(program, scene)
 
     def test_cached_region_binding_checks_both_owners_and_preserves_owner_local_coordinates(self):

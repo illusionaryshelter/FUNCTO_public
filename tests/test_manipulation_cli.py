@@ -28,6 +28,8 @@ class ManipulationCLITest(unittest.TestCase):
                 "gripper_events": [{"event_id": "close", "frame_index": 11, "command": "close"}]},
                 "scene": {"reference_frame": "world", "carrier_id": "object",
                           "carrier_pose": np.eye(4), "eef_pose": np.eye(4),
+                          "grasp_goal": {"T_carrier_eef": poses[-1].copy(), "position_tolerance_m": .002,
+                                         "rotation_tolerance_rad": .03, "source": "declared CLI fixture task relation"},
                           "region_transform": np.eye(4), "tool_id": "gripper", "tool_frame": "eef"}}
             write_json(root / "program.json", program)
             output = root / "run"

@@ -153,9 +153,11 @@ class PlanningBindingTest(unittest.TestCase):
                         "ik_queries": 24, "search_queries": 0, "validation_passes": 2, "validation_queries": 20,
                         "trajectory_solves": 2, "search_seconds": .7, "planning_seconds": 1.},
                     "physics_budget": 1000, "consumed_physics_steps": 100,
-                    "problem": {"events": plain(problem.events)},
+                    # BEGIN a real continuation retains all original task geometry.
+                    "problem": plain(problem),
+                    # END pose completion is checked against this frozen binding.
                     "curve": {"duration": 1., "progress_u": [0., .5, 1.],
-                              "progress_s": [0., .8, 1.], "events": rows}}
+                              "progress_s": [0., .8, 1.], "events": rows, "executable_until": 1.}}
         from manipulation.planning import _request_work_ledger
         ledger = _request_work_ledger(problem, budget)
         ledger["consumed_planning"] = deepcopy(original["consumed_planning"])
@@ -226,9 +228,78 @@ class PlanningBindingTest(unittest.TestCase):
         with self.assertRaisesRegex(ContinuationBindingError, "Past goal pose_events:0"):
             _prepare_continuation(problem, SimpleNamespace(gripper=None), None, continuation)
         continuation["completed_goal_ids"] = [["pose_events", 0]]
+        # BEGIN an ID alone cannot remove an independently required pose goal.
+        continuation["actual_feedback"]["timestamp_s"] = .25
+        with self.assertRaisesRegex(ContinuationBindingError, "actual allowed-set T evidence"):
+            _prepare_continuation(problem, SimpleNamespace(gripper=None), None, continuation)
+        from manipulation.execution_binding import plain
+        continuation["goal_evidence"] = [{"identity": ["pose_events", 0], "value": "T",
+            "candidate_id": "candidate", "completion_verified": True, "source": "actual fixed-frame measurement",
+            "feedback_id": "measured-at-first-native-tick", "timestamp_s": .063, "physical_elapsed_s": .063,
+            "evaluated_curve_time_s": .063, "scheduled_curve_time_s": .0625, "evaluation_window_s": None,
+            "device_due_time_s": .063,
+            "requirement": plain(problem.pose_events[0]), "actual_function_pose": np.eye(4).tolist(),
+            "actual_target_pose": np.eye(4).tolist(), "position_error_m": 0., "rotation_error_rad": 0.,
+            "measurement_sources": [{"kind": "actual_robot_tcp", "source": "synchronized actual TCP",
+                "feedback_id": "measured-at-first-native-tick", "timestamp_s": .063,
+                "pose": np.eye(4).tolist()}]}]
+        # END the nonuniform source map reaches s=.1 at t=.0625, then measures t=.063.
         _, prior = _prepare_continuation(problem, SimpleNamespace(gripper=None), None, continuation)
         self.assertEqual(prior["goal_identities"]["pose_events"], [1])
         self.assertEqual(problem.pose_events[0].progress, .9)
+
+    # BEGIN continuation preserves the same current-state freshness as execution.
+    def test_executor_prebinding_owner_or_holding_sample_keeps_its_valid_pose_proof(self):
+        from manipulation.execution import ExecutionLimits
+        from manipulation.planning import _verified_completed_goals
+        from test_recorded_simulation import ActualPoseGoalTests
+
+        relations = ({"target_owner_id": "current_part", "T_owner_target": np.eye(4).tolist()},
+            {"function_owner_id": "held_part", "T_owner_function": np.eye(4).tolist(),
+             "attachment_condition_id": "current_holding"})
+        for relation in relations:
+            with self.subTest(relation=relation):
+                simulation, curve, targets, result, limits = ActualPoseGoalTests.fixture(
+                    progress=0., actual_relation=relation)
+                policy = limits.describe()
+                policy["observation_policy"]["maximum_age_s"] = .001
+                limits = ExecutionLimits.from_mapping(policy)
+                # The synthetic executor fixture needs only the original
+                # empty fact ledger for this concrete proof handoff. The
+                # production executor constructs every new completion row.
+                result.execution_binding["request_ledger"] = {
+                    "completed_goal_ids": [], "goal_evidence": [], "timing_events": []}
+                def observe(feedback, curve_time):
+                    return {"source": "Current scene sample acquired half a millisecond before feedback",
+                        "timestamp_s": feedback["timestamp_s"]-.0005,
+                        "scene_owner_poses": {"current_part": np.eye(4).tolist()},
+                        "scene_condition_evidence": {"current_holding": True}}
+                report = ActualPoseGoalTests.run_trial(
+                    (simulation, curve, targets, result, limits), observe=observe)
+                self.assertEqual(report["pose_goal_result"], "T")
+                continuation = report["continuation"]
+                original = continuation["original_binding"]
+                proof = continuation["goal_evidence"][0]
+                scene_source = next(row for row in proof["measurement_sources"]
+                    if row["kind"] in ("current_owner_pose", "current_verified_attachment"))
+                self.assertAlmostEqual(proof["timestamp_s"], 1.3)
+                self.assertAlmostEqual(scene_source["timestamp_s"], 1.2995)
+                options = dict(elapsed=continuation["elapsed_physical_s"],
+                    curve_elapsed=continuation["last_curve_time_s"], timestep=simulation.timestep,
+                    progress_map=_ProgressMap(curve.progress_u, curve.progress_s))
+                self.assertEqual(_verified_completed_goals(continuation, original, {("pose_events", 7)}, **options),
+                                 {("pose_events", 7)})
+                # Fresh state may predate this binding, but a future sample
+                # or a stale sample still cannot certify the same actual goal.
+                for acquisition in (1.3005, 1.298):
+                    forged = deepcopy(continuation)
+                    source = next(row for row in forged["goal_evidence"][0]["measurement_sources"]
+                        if row["kind"] in ("current_owner_pose", "current_verified_attachment"))
+                    source["timestamp_s"] = acquisition
+                    with self.subTest(acquisition=acquisition), self.assertRaisesRegex(
+                            ContinuationBindingError, "actual allowed-set T evidence"):
+                        _verified_completed_goals(forged, original, {("pose_events", 7)}, **options)
+    # END event/effect occurrence eligibility remains a separate original-clock check.
 
     def test_continuation_cannot_reset_budget_actual_or_event_identity(self):
         for mutation, message in (("budget", "cannot reset"), ("actual", "Fresh planning actual"),
