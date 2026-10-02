@@ -7,6 +7,9 @@ IK, GPU execution, collision geometry or physical grasp certification.
 
 # BEGIN independent calculus, exact-anchor and execution-boundary regressions.
 from copy import deepcopy
+# BEGIN preserve the complete event payload in the shared test clock.
+from dataclasses import asdict
+# END the exported occurrence must match its frozen source metadata.
 import json
 from types import MethodType, SimpleNamespace
 import unittest
@@ -125,8 +128,10 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
     planner.problem = problem
     planner.budget = PlanningBudget()
-    clock = {(event.skill_id, event.event_id): {"time": float(progress_map.anchor_parameters([event.progress])[0, 0]*(position.shape[1]-1)*dt),
+    # BEGIN the mock uses the same exact occurrence clock as the native exporter.
+    clock = {(event.skill_id, event.event_id, event.occurrence): {"event": asdict(event), "time": float(progress_map.anchor_parameters([event.progress])[0, 0]*(position.shape[1]-1)*dt),
         "hold_until": float(progress_map.anchor_parameters([event.progress])[-1, 0]*(position.shape[1]-1)*dt)} for event in problem.events}
+    # END the source event pair cannot silently match a later attempt.
     planner.progress_map = _ProgressMap(progress_map.u, progress_map.s, clock)
     planner.anchors = problem.anchors
     planner.joint_names = problem.joint_names
@@ -318,7 +323,7 @@ class PlannerCalculusTests(unittest.TestCase):
             finger_trajectory_factory=lambda *_: None, coupling_matrix=np.empty((0, 1)), coupling_offset=[],
             sphere_indices=(0,), local_spheres=[[0, 0, 0, .001]],
             sphere_joint_translation=[[[1], [0], [0]]], self_collision_pairs=(),
-            commands=[{"skill_id": "test", "event_id": "close", "command": "close", "progress": 0.}],
+            commands=[{"skill_id": "test", "event_id": "close", "occurrence": 0, "command": "close", "progress": 0.}],
             source="analytic timed native-self input")
         hand.finger_trajectory = SimpleNamespace(sample_torch=lambda t: (
             (.04-.02*t)[..., None], torch.full((*t.shape, 1), -.02, dtype=t.dtype)))
@@ -483,17 +488,16 @@ class NativeCubicClockTests(unittest.TestCase):
         return BSpline(np.arange(-3., count+8.), coefficients, 3)
 
     # BEGIN exact-stop objective separate from physical feasibility tolerance.
-    def test_stop_preference_has_an_interior_gradient_and_covers_each_plateau_once(self):
+    def test_stop_preference_has_an_interior_gradient_at_each_event_once(self):
         progress = torch.tensor([[.2, .3, .3, .3+0.5e-7, .3+2e-7, .6],
                                  [.3, .3, .3, .4, .6, .7]], dtype=torch.float64)
         velocity = torch.tensor([.25e-4, -.5e-4, .75e-4], dtype=torch.float64)
         velocity = velocity.expand(2, 6, 3).clone().requires_grad_(True)
         result = _verification_stop_preference(progress, velocity, [.3, .3, .6])
-        # The union of explicit events owns the objective; duplicate event
-        # progress does not double its weight. Every saved plateau point and
-        # the declared 1e-7 event comparison band receives the same target.
-        selected = np.array([[False, True, True, True, False, True],
-                             [True, True, True, False, True, False]])
+        # Duplicate queries and later plateau samples do not turn a single
+        # stop event into an unrequested maintained stop objective.
+        selected = np.array([[False, True, False, False, False, True],
+                             [True, False, False, False, True, False]])
         expected = np.where(selected, np.sum(velocity.detach().numpy()**2, axis=-1), 0.)
         np.testing.assert_array_equal(result.detach().numpy(), expected)
         result.sum().backward()
@@ -520,9 +524,13 @@ class NativeCubicClockTests(unittest.TestCase):
         self.assertEqual(before.keys(), after.keys())
         for name in before:
             torch.testing.assert_close(before[name], after[name], rtol=0, atol=0)
-        np.testing.assert_allclose(after["stop:analytic:stop"].detach().numpy(), [[0., .25e-4, 0.]], atol=1e-20)
+        np.testing.assert_array_equal(after["stop:analytic:stop"].detach().numpy(), [[0., 0., 0.]])
         self.assertGreater(float(objective[0, 0].detach()), 0.)
+        self.assertEqual(float(objective[0, 1].detach()), 0.)
         self.assertEqual(float(objective[0, 2].detach()), 0.)
+        bad_first = velocity.detach().clone(); bad_first[0, 0, 0] = 1.25e-4
+        rejected = problem.residuals(position, quaternion, progress, joint_velocity=bad_first)
+        np.testing.assert_allclose(rejected["stop:analytic:stop"].numpy(), [[.25e-4, 0., 0.]], atol=1e-20)
     # END exact-stop objective separate from physical feasibility tolerance.
 
     # BEGIN installed native retiming clamp contract without CUDA imports.
@@ -771,7 +779,8 @@ class NativeCubicClockTests(unittest.TestCase):
         planner._verification_fk = SimpleNamespace(compute_kinematics=fk)
         planner._orientation_vjp = SimpleNamespace(apply=lambda q, quaternion, jacobian: quaternion)
         planner._native_layout = SimpleNamespace(apply=lambda value: value)
-        scene = SimpleNamespace(project_residual=lambda progress, q, names: q[..., :0])
+        scene = SimpleNamespace(project_residual=lambda progress, q, names: q[..., :0],
+                                required_progress_anchors=())
         scene.clone_for_rollout = lambda: scene
         planner.scene = scene
         candidate = SimpleNamespace(duration=2., _curve=lambda moment: path[-1, :-1])
@@ -1996,6 +2005,7 @@ class InitialStatePreflightTests(unittest.TestCase):
             ("scene:unknown_space", {"scene_name": "unknown_space", "scene_value": np.nan}, np.nan),
         )
         scene = SimpleNamespace(describe=lambda: {"scope": "analytic entrance fixture"})
+        scene.clone_for_rollout = lambda: deepcopy(scene)
         for component, arguments, expected in cases:
             with self.subTest(component=component):
                 planner, _, _ = self.fixture(**arguments)
@@ -2076,6 +2086,7 @@ class PlannerRetryContractTests(unittest.TestCase):
 
     def run_planner(self, planner, budget):
         scene = SimpleNamespace(describe=lambda: {"scope": "explicit analytic retry fixture"})
+        scene.clone_for_rollout = lambda: deepcopy(scene)
         # BEGIN the handoff fixture declares its real empty request ledger.
         problem = SimpleNamespace(events=(), pose_events=(), coordinate_events=(), supports=())
         # END accepted planning never depends on an undeclared object sentinel.
@@ -2162,8 +2173,10 @@ class PlannerRetryContractTests(unittest.TestCase):
     def test_export_rejection_releases_native_resources(self):
         planner, _, _ = self.scripted_planner([True], [0.])
         planner.export.side_effect = ValueError("finite sample budget exceeded")
-        with self.assertRaisesRegex(ValueError, "finite sample budget"):
-            self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=1))
+        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=1))
+        self.assertFalse(result.success)
+        self.assertIn("finite sample budget", result.diagnostics["reason"])
+        self.assertEqual(result.request_ledger["consumed_planning"]["validation_passes"], 1)
         planner.close.assert_called_once_with()
 
 

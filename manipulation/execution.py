@@ -21,6 +21,36 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .gripper_trajectory import FingerTrajectory
+# BEGIN physical time checks share the planner's explicit occurrence contract.
+from .planning_problem import EventTimeConstraint, TimeBindingError, event_occurrence_key, resolve_event_window
+# END an original name alone never identifies a retried action.
+
+
+def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condition_id=None):
+    """Compare one actual witness with its own original physical-time windows.
+
+    The caller supplies a measured activation/arrival/acquisition timestamp.
+    No reference event time or planning prediction can stand in for it here.
+    Unresolved origins remain U and retain their precise missing requirement.
+    """
+    checks = []
+    for index, value in enumerate(event.get("timing", ())):
+        constraint = value if isinstance(value, EventTimeConstraint) else EventTimeConstraint(**value)
+        if (constraint.check_target != check_target
+                or (check_target == "arrival" and tuple(constraint.goal_id) != tuple(goal_id or ()))
+                or (check_target == "effect" and constraint.condition_id != condition_id)):
+            continue
+        check = {"skill_id": event["skill_id"], "event_id": event["event_id"],
+                 "occurrence": event["occurrence"], "check_target": check_target,
+                 "constraint_index": index, "time_s": float(time_s), "source": deepcopy(constraint.source)}
+        try:
+            lower, upper = resolve_event_window(constraint, history)
+            check.update(window_s=[lower, upper], value=("T" if
+                (lower is None or time_s >= lower-1e-9) and (upper is None or time_s <= upper+1e-9) else "F"))
+        except TimeBindingError as error:
+            check.update(value="U", reason=str(error), origin_event=deepcopy(constraint.origin_event))
+        checks.append(check)
+    return checks
 
 # BEGIN independent named finger targets bound to the exported event clock.
 @dataclass(frozen=True)
@@ -81,6 +111,8 @@ class FixedFingerTargets:
             raise ValueError("Finger target validation requires finite native actuator control ranges")
         targets = {(row["skill_id"], row["event_id"]): row for row in self.events}
         commands = [event for event in trajectory.events if event["kind"] in ("open", "close", "hold")]
+        for event in commands:
+            event_occurrence_key(event)
         identities = [(event["skill_id"], event["event_id"]) for event in commands]
         if len(set(identities)) != len(identities) or set(identities) != set(targets):
             raise ValueError("Finger targets must match every original command event exactly, without missing or extra events")
@@ -248,6 +280,8 @@ class ExecutionLimits:
         if np.any(speed <= 0):
             raise ValueError("Hardware velocity limits must be finite and positive")
         commands = [event for event in trajectory.events if event["kind"] in ("open", "close", "hold")]
+        for event in commands:
+            event_occurrence_key(event)
         if any(not isinstance(event.get("progress"), (int, float, np.floating))
                or not np.isfinite(event["progress"]) or event["progress"] < 0 for event in commands):
             raise ValueError("Actual hand intervals require each command's original finite progress anchor")
@@ -279,48 +313,51 @@ class ExecutionGuardError(RuntimeError):
 
 
 # BEGIN derive remaining device inputs from actual application, never elapsed time.
-def continuation_execution_inputs(continuation, finger_targets, execution_limits):
-    """Carry the previous fixed device policy into its unconsumed event suffix.
+def continuation_execution_inputs(continuation, finger_targets, execution_limits, *, rebind=None):
+    """Select remaining or explicitly retried original device policies.
 
-    This helper consumes the same executor ledger as the planner. It creates
-    no new event occurrence, tolerance or actuator target. The last actually
-    applied command determines the entrance protection interval; a rejected
-    or merely due event cannot replace it.
+    The request retains one immutable full device policy. A retry chooses a
+    new occurrence of an existing original event, never new actuator targets
+    or looser physical limits. The actual last applied interval is preserved
+    independently of the candidate's event clock and occurrence numbering.
     """
     if not isinstance(finger_targets, FixedFingerTargets) or not isinstance(execution_limits, ExecutionLimits):
         raise ValueError("Continuation needs the original explicit device inputs")
     original = continuation["original_binding"]
-    if (continuation["candidate_id"] != original["candidate_id"]
-            or original["execution_limits"] != execution_limits.describe()):
-        raise ValueError("Continuation cannot change its original device limits or candidate identity")
-    commands = {(row["skill_id"], row["event_id"]): row for row in original["curve"]["events"]
-                if row["kind"] in ("open", "close", "hold")}
-    targets = {(row["skill_id"], row["event_id"]): row for row in finger_targets.events}
-    if set(commands) != set(targets):
-        raise ValueError("Continuation finger inputs must identify the previous candidate's exact commands")
-    if commands:
-        saved = {(row["skill_id"], row["event_id"]): row for row in original["curve"]["fingers"]["events"]}
-        for identity, target in targets.items():
-            if (target["kind"] != commands[identity]["kind"]
-                    or target["positions"] != saved[identity]["finger_positions"]):
-                raise ValueError("A remaining original command cannot receive a different actuator target")
+    if continuation["candidate_id"] != original["candidate_id"]:
+        raise ValueError("Continuation must retain its exact candidate identity")
+    supplied = {"finger_targets": {"joint_names": list(finger_targets.joint_names),
+        "source": finger_targets.source, "events": list(deepcopy(finger_targets.events))},
+        "execution_limits": execution_limits.describe()}
+    policy = continuation["device_policy"]
+    if supplied != policy:
+        raise ValueError("A continuation or retry cannot change the original full device policy")
+    commands = {(row["skill_id"], row["event_id"]): row for row in policy["finger_targets"]["events"]}
     pending = {(row["skill_id"], row["event_id"]) for row in continuation["remaining_events"]
                if row["kind"] in ("open", "close", "hold")}
-    consumed = {(row["skill_id"], row["event_id"]) for name in ("applied_events", "superseded_events")
-                for row in continuation.get(name, ())}
-    if not pending <= set(commands) or set(commands)-pending != consumed or pending & consumed:
-        raise ValueError("Remaining finger inputs require an exact applied/superseded command ledger")
-    limits = execution_limits.describe()
-    intervals = {(row["skill_id"], row["event_id"]): row for row in limits["events"]}
-    applied = continuation.get("applied_events", ())
-    if applied:
-        last = applied[-1]
-        row = intervals[(last["skill_id"], last["event_id"])]
-        limits["initial_fingers"] = {key: deepcopy(row[key]) for key in ("position_bounds", "maximum_speed")}
+    if not pending <= set(commands):
+        raise ValueError("Remaining commands must belong to the original request device policy")
+    if rebind is not None:
+        if not isinstance(rebind, dict) or rebind.get("kind") not in ("remaining", "retry") or not rebind.get("source"):
+            raise ValueError("Device rebind needs an explicit remaining/retry decision and source")
+        retries = rebind.get("retry_event_ids", ())
+        if any(not isinstance(row, (list, tuple)) or len(row) != 2 for row in retries):
+            raise ValueError("Retried command identities must be original skill/event pairs")
+        if rebind["kind"] == "remaining" and retries:
+            raise ValueError("Remaining work cannot implicitly replay an applied command")
+        retry_ids = {tuple(row) for row in retries}
+        source_events = {(row["skill_id"], row["event_id"]) for row in continuation["request_ledger"]["original_events"]}
+        if not retry_ids <= source_events:
+            raise ValueError("Retried events must belong to the immutable original request")
+        pending.update(retry_ids & set(commands))
+    limits = deepcopy(policy["execution_limits"])
+    limits["initial_fingers"] = deepcopy(continuation["active_finger_interval"])
     limits["events"] = [row for row in limits["events"] if (row["skill_id"], row["event_id"]) in pending]
-    targets = tuple(row for row in finger_targets.events if (row["skill_id"], row["event_id"]) in pending)
+    targets = tuple(row for row in policy["finger_targets"]["events"]
+                    if (row["skill_id"], row["event_id"]) in pending)
     return (FixedFingerTargets(finger_targets.joint_names, finger_targets.source, targets),
             ExecutionLimits.from_mapping(limits))
+
 # END same-request continuation does not replay or relabel a completed command.
 
 
@@ -525,6 +562,28 @@ class TrajectoryExecutor:
                     or not np.allclose(expected, actual_frame, atol=1e-9, rtol=0)):
                 raise ValueError(f"Planning and actual feedback have different {key} calibration")
         binding["execution_limits"] = execution_limits.describe()
+        # BEGIN one immutable device policy survives every same-request binding.
+        if "device_policy" not in binding:
+            binding["device_policy"] = {"finger_targets": {
+                "joint_names": list(finger_targets.joint_names), "source": finger_targets.source,
+                "events": list(deepcopy(finger_targets.events))},
+                "execution_limits": execution_limits.describe()}
+        policy = binding["device_policy"]
+        if not isinstance(policy, dict) or set(policy) != {"finger_targets", "execution_limits"}:
+            raise ValueError("The request must retain its complete original device policy")
+        original_targets = FixedFingerTargets.from_mapping(policy["finger_targets"])
+        original_limits = ExecutionLimits.from_mapping(policy["execution_limits"])
+        original_rows = {(row["skill_id"], row["event_id"]): row for row in original_targets.events}
+        original_intervals = {(row["skill_id"], row["event_id"]): row for row in original_limits.events}
+        current_limits = execution_limits.describe()
+        if (finger_targets.joint_names != original_targets.joint_names or finger_targets.source != original_targets.source
+                or any(row != original_rows.get((row["skill_id"], row["event_id"])) for row in finger_targets.events)
+                or any(row != original_intervals.get((row["skill_id"], row["event_id"])) for row in execution_limits.events)
+                or any(value != policy["execution_limits"][key] for key, value in current_limits.items()
+                       if key not in {"events", "initial_fingers"})
+                or current_limits["initial_fingers"] != binding.get("active_finger_interval", original_limits.initial_fingers)):
+            raise ValueError("A new occurrence cannot change its original actuator policy or physical protection limits")
+        # END candidate subsets never erase a previously consumed command's policy.
         # BEGIN the same request retains its cumulative native-step budget.
         if type(max_physics_steps) is not int or not 0 <= max_physics_steps <= 100_000:
             raise ValueError("Execution requires a bounded native physics-step budget")
@@ -672,6 +731,58 @@ class TrajectoryExecutor:
             dependency_hold=None, verified_events=[], dependency_outcomes=[], extended_preflights=[],
             evaluated_events=[], stopped_events=[], reached_events=[],
             completed_goal_ids=deepcopy(binding.get("completed_goal_ids", [])), goal_evidence=[])
+        # BEGIN direction obligations retain original scope identities and actual evidence.
+        report["completed_direction_ids"] = deepcopy(binding.get("completed_direction_ids", []))
+        report["direction_evidence"] = deepcopy(binding.get("direction_evidence", []))
+        report["direction_checks"] = []
+        mechanisms = binding["problem"].get("mechanisms", [])
+        direction_ids = binding.get("direction_identities", [])
+        direction_requirements = {}
+        if any(row.get("directions") for row in mechanisms):
+            if len(direction_ids) != len(mechanisms):
+                raise ValueError("Direction evidence needs the original mechanism/direction identities")
+            for mechanism, identities in zip(mechanisms, direction_ids):
+                if len(identities) != len(mechanism.get("directions", [])):
+                    raise ValueError("Direction identities must cover every retained requirement")
+                for requirement, identity in zip(mechanism.get("directions", []), identities):
+                    if (not isinstance(identity, (tuple, list)) or len(identity) != 2
+                            or any(type(index) is not int or index < 0 for index in identity)
+                            or tuple(identity) in direction_requirements):
+                        raise ValueError("Direction identity must be a unique original nonnegative index pair")
+                    direction_requirements[tuple(identity)] = deepcopy(requirement)
+        direction_starts = {}
+        direction_end_times = {}
+        for identity, requirement in direction_requirements.items():
+            end = float(requirement["end"])
+            matches = np.flatnonzero(np.abs(np.asarray(trajectory.progress_s)-end) <= 1e-12)
+            end_u = (float(trajectory.progress_u[matches[-1]]) if matches.size else
+                     float(np.interp(end, trajectory.progress_s, trajectory.progress_u)))
+            direction_end_times[identity] = (end_u*trajectory.duration
+                if end <= float(trajectory.progress_s[-1])+1e-12 else float("inf"))
+        direction_boundary_polls = set()
+        retried_directions = {tuple(row) for row in binding.get("retry_direction_ids", [])}
+        for row in report["direction_evidence"]:
+            key = tuple(row["identity"])
+            if key not in retried_directions and row.get("scope_started_at_s") is not None:
+                direction_starts[key] = float(row["scope_started_at_s"])
+        report["direction_evidence_scope"] = (
+            "Explicit allowed observer facts from actual coordinates/rates; acquisition intervals and "
+            "declared observation cadence retained. Source progress selects the obligation only and "
+            "never proves physical direction. Sampled evidence does not certify unobserved intersample motion.")
+        # END completed reference playback cannot complete a direction requirement.
+        # BEGIN actual occurrence history uses the original request physical clock.
+        report["history"] = deepcopy(binding.get("request_ledger", {}).get("history", []))
+        report["effect_history"] = deepcopy(binding.get("effect_history", []))
+        timing_events = deepcopy(binding["timing_events"])
+        report["timing_checks"] = deepcopy(binding["timing_checks"])
+        active_timing_events = {}
+        for event in timing_events:
+            identity = event_occurrence_key(event)
+            current = active_timing_events.get(identity[:2])
+            if current is None or current["occurrence"] < identity[2]:
+                active_timing_events[identity[:2]] = event
+        request_origin = float(binding.get("request_time_origin_s", 0.))
+        # END elapsed native time includes holds, unlike ordinary source timing.
         # END physical guard provenance and actual-event evidence.
         # BEGIN device feedback policy, declared before control I/O.
         report["feedback_policy"] = {
@@ -683,6 +794,9 @@ class TrajectoryExecutor:
             "stale_required_feedback": "Reject current obligation and send bounded hold",
             "missing_future_effect": "Record U; block only a declared dependent operation",
             "delivery": "Observations retain acquisition timestamps; robot feedback remains synchronous"}
+        report["feedback_policy"]["direction_boundary_observations"] = (
+            "The same declared observer is also polled once at each actual native scope entrance/end; "
+            "periodic phase is unchanged. A sensor that cannot supply current boundary evidence leaves U.")
         report["observation_checks"], report["object_changes"] = [], []
         # END physical contact evidence is distinct from absent effect observations.
         controls, requested_torques, saturated_torques, samples, event_index = [], [], [], [], 0
@@ -695,7 +809,9 @@ class TrajectoryExecutor:
         # BEGIN nonblocking evaluations and explicit stops keep their identities.
         ordinary_events = sorted((deepcopy(event) for event in trajectory.events
             if event["requires_evidence"] is None and event["kind"] not in ("open", "close", "hold")
-            and (event["kind"] in ("effect", "function") or event.get("stop", False))), key=lambda row: row["time"])
+            and (event["kind"] in ("effect", "function") or event.get("stop", False)
+                 or any(item["check_target"] == "activation" for item in event.get("timing", ())))),
+            key=lambda row: row["time"])
         ordinary_index = 0
         report["geometry_check_counts"]["event_gate"] = 0
         # END elapsed time consumes an evaluation opportunity, never a success fact.
@@ -704,6 +820,280 @@ class TrajectoryExecutor:
         # END explicit arm control clipping scope.
         observation_cache, next_observation_poll = None, 0.
 
+        # BEGIN current direction guards consume measured intervals on the native clock.
+        def check_directions(observation, feedback, curve_time, elapsed):
+            """Require current scoped proof, while leaving future/net-prefix unknowns open.
+
+            An observer owns coordinate/rate measurement and its T/F/U decision.
+            This boundary owns identity, acquisition freshness, interval coverage,
+            and physical stopping. In particular, an old completed attempt or a
+            planned coordinate derivative cannot provide a new actual witness.
+            """
+            now = float(feedback["timestamp_s"])
+            facts = [] if observation is None else observation.get("directions", [])
+            if not isinstance(facts, list):
+                raise ValueError("Direction observations require an explicit fact list")
+            by_id = {}
+            for fact in facts:
+                identity = fact.get("identity") if isinstance(fact, dict) else None
+                if (not isinstance(identity, (list, tuple)) or len(identity) != 2
+                        or any(type(index) is not int or index < 0 for index in identity)
+                        or tuple(identity) not in direction_requirements or tuple(identity) in by_id):
+                    raise ValueError("A direction fact must identify one retained original requirement")
+                interval = np.asarray(fact.get("acquisition_interval_s"), dtype=float)
+                if (fact.get("value") not in ("T", "F", "U")
+                        or not isinstance(fact.get("source"), str) or not fact["source"].strip()
+                        or type(fact.get("scope_complete")) is not bool
+                        or interval.shape != (2,) or not np.isfinite(interval).all()
+                        or interval[0] > interval[1] or interval[1] > float(observation["timestamp_s"])+1e-8):
+                    raise ValueError("A direction fact needs T/F/U, source and its actual acquisition interval")
+                by_id[tuple(identity)] = fact
+            failures = []
+            progress = float(trajectory.sample(curve_time)[2])
+            policy = execution_limits.observation_policy
+            for identity, requirement in direction_requirements.items():
+                if list(identity) in report["completed_direction_ids"]:
+                    continue
+                active = progress >= float(requirement["start"])-1e-12
+                if active and identity not in direction_starts:
+                    # A suffix beginning inside a scope needs its saved actual
+                    # beginning. Resetting this origin would erase earlier motion.
+                    if (float(trajectory.progress_s[0]) <= requirement["start"]+1e-12
+                            or identity in retried_directions):
+                        direction_starts[identity] = now
+                scope_start = direction_starts.get(identity)
+                at_end = float(curve_time) >= direction_end_times[identity]-1e-12
+                fact = by_id.get(identity)
+                fresh = (fact is not None and policy is not None
+                    and now-float(fact["acquisition_interval_s"][1]) <= policy["maximum_age_s"]+1e-8
+                    and float(fact["acquisition_interval_s"][1]) >= sim_start-1e-8
+                    and (scope_start is None or float(fact["acquisition_interval_s"][1]) >= scope_start-1e-8))
+                row = None
+                if fact is not None or active:
+                    retained = fact if fact is not None else {"value": "U", "scope_complete": False,
+                        "source": "Executor has no applicable actual direction observation",
+                        "acquisition_interval_s": [now, now]}
+                    row = {**deepcopy(retained), "identity": list(identity),
+                        "candidate_id": binding["candidate_id"], "observed_at_s": now if observation is None else float(observation["timestamp_s"]),
+                        "scope_started_at_s": scope_start, "scope_ended_at_s": now if at_end else None,
+                        "observation_policy": deepcopy(policy), "feedback_id": feedback["feedback_id"]}
+                # A monotone observer first acquires a baseline. Its first
+                # finite interval is due at the next declared observation tick;
+                # there is no displacement claim at a zero-length entrance.
+                interval_due = (scope_start is None or policy is None or
+                    now >= scope_start+float(policy["period_s"])-1e-8)
+                required_now = active and (at_end or requirement["kind"] == "local_rate"
+                    or (requirement["kind"] == "monotone" and interval_due))
+                value = fact["value"] if fresh else "U"
+                covered = False
+                if fresh and value == "T" and at_end and fact["scope_complete"]:
+                    declared_net_origin = (requirement["kind"] == "net"
+                        and requirement.get("origin_coordinate") is not None and bool(requirement.get("origin_source")))
+                    covered = (float(fact["acquisition_interval_s"][1]) >= now-1e-8 and
+                        (declared_net_origin or (scope_start is not None
+                         and float(fact["acquisition_interval_s"][0]) <= scope_start+1e-8)))
+                if covered:
+                    report["completed_direction_ids"].append(list(identity))
+                if row is not None:
+                    # Preserve the observer's raw scope claim separately from
+                    # the executor's checked acquisition coverage. Continuation
+                    # cannot promote an unaccepted raw T into completion.
+                    row["completion_verified"] = covered
+                    if row not in report["direction_evidence"]:
+                        report["direction_evidence"].append(row)
+                if not active:
+                    continue
+                # A partial net displacement can recover before its endpoint.
+                # Monotone/rate F instead refutes an already applicable interval.
+                violated = value == "F" and (requirement["kind"] != "net" or at_end)
+                unresolved = required_now and (value != "T" or (at_end and not covered))
+                check = {"identity": list(identity), "kind": requirement["kind"],
+                    "curve_time_s": float(curve_time), "physical_elapsed_s": float(elapsed),
+                    "required_now": required_now, "scope_complete": covered,
+                    "value": "F" if violated else "U" if unresolved else value,
+                    "evidence": deepcopy(fact), "scope_started_at_s": scope_start}
+                if check not in report["direction_checks"]:
+                    report["direction_checks"].append(check)
+                if violated or unresolved:
+                    failures.append({"kind": "actual_direction_violated" if violated else "actual_direction_unverified",
+                        "name": "/".join(map(str, identity)), "evidence": check})
+            if failures:
+                report["status"] = "feedback_rejected"
+                report["feedback_failure"] = {"point": "actual_direction", "curve_time_s": float(curve_time),
+                    "physical_elapsed_s": float(elapsed), "actual_feedback": deepcopy(feedback),
+                    "violations": failures, "last_applied_finger_goal": target_positions.tolist(), "rejected_event": None}
+                raise ExecutionGuardError("Current actual coordinate direction is violated or unverified")
+        # END future unknown direction facts never create an automatic entrance barrier.
+
+        # BEGIN measured witnesses and deadlines retain occurrence-level identity.
+        def effect_timestamp(identity, fact, observation):
+            """Distinguish current predicate sampling from a witnessed past occurrence.
+
+            A newly read assessment of an explicitly declared occurred-event
+            fact can remain T. Its actual witness time and occurrence identity
+            stay unchanged; the observation's fresh delivery time cannot be
+            relabelled as a new physical event or used by a later retry.
+            """
+            acquired = float(observation["timestamp_s"])
+            kind = fact.get("evidence_kind")
+            conditions = [row for row in trajectory.conditions if row.get("condition_id") == identity]
+            if (fact["value"] == "T" and any(row.get("evidence_kind") == "occurred_event" for row in conditions)
+                    and kind != "occurred_event"):
+                raise ValueError("An occurred-event T needs explicit witness semantics and acquisition time")
+            if kind == "occurred_event":
+                if len(conditions) != 1 or conditions[0].get("evidence_kind") != "occurred_event":
+                    raise ValueError("Historical event truth needs its independently declared occurred-event condition")
+                if fact["value"] != "T":
+                    return acquired
+                witnessed = fact.get("witness_timestamp_s")
+                if (isinstance(witnessed, bool) or not isinstance(witnessed, (int, float, np.floating)) or not np.isfinite(witnessed)
+                        or witnessed > acquired+1e-8):
+                    raise ValueError("An occurred-event T needs its finite original witness acquisition time")
+                identity_key = event_occurrence_key(fact.get("event", {}))
+                expected_pair = (conditions[0].get("skill_id"), conditions[0].get("event_id"))
+                available = [event_occurrence_key(row) for row in
+                    (*binding.get("request_events", ()), *timing_events, *trajectory.events)
+                    if (row["skill_id"], row["event_id"]) == expected_pair]
+                if not available or identity_key != max(available, key=lambda key: key[2]):
+                    raise ValueError("An occurred-event witness cannot be borrowed from another event or retry")
+                return float(witnessed)
+            if kind not in (None, "current_state") or "witness_timestamp_s" in fact or "event" in fact:
+                raise ValueError("A historical effect witness requires an explicit occurred-event evidence kind")
+            return acquired
+
+        def witness(event, check_target, time_s, value, source, **details):
+            """Append actual evidence without changing an existing first T origin."""
+            row = {"skill_id": event["skill_id"], "event_id": event["event_id"],
+                   "occurrence": event["occurrence"], "check_target": check_target,
+                   "time_s": float(time_s), "value": value, "source": source, **deepcopy(details)}
+            previous = [item for item in report["history"]
+                        if event_occurrence_key(item) == event_occurrence_key(row)
+                        and item["check_target"] == check_target and item["value"] == "T"
+                        and item.get("condition_id") == row.get("condition_id")
+                        and item.get("goal_id") == row.get("goal_id")]
+            if value != "T" or not previous:
+                if row not in report["history"]:
+                    report["history"].append(row)
+            return row
+
+        def timed_witness(event, check_target, time_s, value, source, **details):
+            checks = _timing_checks(event, check_target, time_s, report["history"],
+                goal_id=details.get("goal_id"), condition_id=details.get("condition_id"))
+            for check in checks:
+                check["evidence_value"] = value
+                if check not in report["timing_checks"]:
+                    report["timing_checks"].append(check)
+            # Geometry/effect truth is retained independently even when its
+            # actual occurrence misses the declared clock obligation.
+            witness(event, check_target, time_s, value, source, **details)
+            return checks
+
+        def reject_timing(feedback, elapsed, checks, *, event=None, point="event_time"):
+            candidate_ids = {event_occurrence_key(row) for row in trajectory.events}
+            # An actual future occurrence in this same candidate can supply
+            # a relative origin later. Preserve this check as pending until
+            # then; neither a prediction nor an old missing origin is used.
+            checks = [row for row in checks if not (row["value"] == "U"
+                and row.get("origin_event") is not None
+                and event_occurrence_key(row["origin_event"]) in candidate_ids)]
+            failures = [{"kind": "event_time_outside_window" if row["value"] == "F" else "event_time_unresolved",
+                         "name": f"{row['skill_id']}/{row['event_id']}/{row['occurrence']}/{row['check_target']}",
+                         "evidence": deepcopy(row)} for row in checks if row["value"] != "T"]
+            if not failures:
+                return
+            report["status"] = "feedback_rejected"
+            report["feedback_failure"] = {"point": point, "curve_time_s": min(float(elapsed), stop),
+                "physical_elapsed_s": float(elapsed), "actual_feedback": deepcopy(feedback),
+                "violations": failures, "last_applied_finger_goal": target_positions.tolist(),
+                "rejected_event": deepcopy(event)}
+            raise ExecutionGuardError("An actual event did not satisfy its original physical-time requirement")
+
+        def resolve_pending_timing(feedback, elapsed):
+            """Recheck retained actual witnesses once their future origin exists."""
+            events = {event_occurrence_key(row): row for row in timing_events}
+            for pending in list(report["timing_checks"]):
+                if pending["value"] != "U" or pending.get("origin_event") is None:
+                    continue
+                event = events[event_occurrence_key(pending)]
+                constraint = event["timing"][pending["constraint_index"]]
+                facts = [row for row in report["history"]
+                    if event_occurrence_key(row) == event_occurrence_key(event) and row["value"] == "T"
+                    and row["check_target"] == constraint["check_target"]
+                    and (constraint["check_target"] != "arrival"
+                         or tuple(row.get("goal_id", ())) == tuple(constraint["goal_id"]))
+                    and (constraint["check_target"] != "effect" or row.get("condition_id") == constraint["condition_id"])]
+                if not facts:
+                    continue
+                fact = facts[0]
+                checks = _timing_checks(event, fact["check_target"], fact["time_s"], report["history"],
+                    goal_id=fact.get("goal_id"), condition_id=fact.get("condition_id"))
+                for check in checks:
+                    check["evidence_value"] = "T"
+                    if check not in report["timing_checks"]:
+                        report["timing_checks"].append(check)
+                active = active_timing_events[event_occurrence_key(event)[:2]]
+                if active["occurrence"] == event["occurrence"]:
+                    reject_timing(feedback, elapsed, checks, event=event)
+
+        def check_deadlines(feedback, elapsed):
+            """An expired absent witness is incomplete U, never a fabricated F."""
+            now = request_origin+float(elapsed)
+            for event in active_timing_events.values():
+                for index, item in enumerate(event.get("timing", ())):
+                    constraint = EventTimeConstraint(**item)
+                    try:
+                        window = resolve_event_window(constraint, report["history"])
+                    except TimeBindingError:
+                        continue
+                    if window[1] is None or now <= window[1]+1e-9:
+                        continue
+                    if any(row["constraint_index"] == index and row["value"] == "T"
+                           and row.get("evidence_value") == "T"
+                           and event_occurrence_key(row) == event_occurrence_key(event)
+                           for row in report["timing_checks"]):
+                        continue
+                    check = {"skill_id": event["skill_id"], "event_id": event["event_id"],
+                        "occurrence": event["occurrence"], "check_target": constraint.check_target,
+                        "constraint_index": index, "time_s": now, "window_s": list(window),
+                        "value": "U", "source": constraint.source,
+                        "reason": "Original deadline expired without an applicable actual witness"}
+                    report["timing_checks"].append(check)
+                    reject_timing(feedback, elapsed, [check], event=event, point="expired_event_window")
+
+        def observe_timed_effects(observation, feedback, elapsed):
+            """Use acquisition time for effects; cached old binding truth is ineligible."""
+            for event in active_timing_events.values():
+                identities = {item["condition_id"] for item in event.get("timing", ())
+                              if item["check_target"] == "effect"}
+                for identity in identities:
+                    evidence = observation.get("effects", {}).get(identity)
+                    if evidence is None:
+                        continue
+                    acquisition = request_origin+effect_timestamp(identity, evidence, observation)-sim_start
+                    if acquisition < request_origin-1e-9 and evidence.get("evidence_kind") != "occurred_event":
+                        continue
+                    indexes = [index for index, item in enumerate(event.get("timing", ()))
+                               if item["check_target"] == "effect" and item["condition_id"] == identity]
+                    if all(any(row["constraint_index"] == index and row["value"] == "T"
+                               and row.get("evidence_value") == "T"
+                               and event_occurrence_key(row) == event_occurrence_key(event)
+                               for row in report["timing_checks"]) for index in indexes):
+                        continue
+                    checks = _timing_checks(event, "effect", acquisition, report["history"], condition_id=identity)
+                    # A state observed before the opening of an effect window
+                    # is not that window's completion witness. A later fresh
+                    # observation may establish T without any invented wait.
+                    if (not (evidence.get("evidence_kind") == "occurred_event" and evidence["value"] == "T")
+                            and any("window_s" in row and row["window_s"][0] is not None
+                                    and acquisition < row["window_s"][0]-1e-9 for row in checks)):
+                        continue
+                    checks = timed_witness(event, "effect", acquisition, evidence["value"], evidence["source"],
+                        condition_id=identity, feedback_id=feedback["feedback_id"],
+                        timestamp_s=observation["timestamp_s"])
+                    if evidence["value"] == "T":
+                        reject_timing(feedback, elapsed, checks, event=event)
+        # END no predicted origin or elapsed reference node proves actual completion.
+
         # BEGIN bounded multi-rate observation consumption without timestamp rewriting.
         def observation_at(feedback, curve_time, elapsed):
             nonlocal observation_cache, next_observation_poll
@@ -711,14 +1101,34 @@ class TrajectoryExecutor:
             if policy is None:
                 return None
             now = float(feedback["timestamp_s"])
-            if float(elapsed) >= next_observation_poll-1e-12:
+            # Direction interval boundaries need an actual measurement even
+            # when the native tick does not align with the periodic observer.
+            # This is the same allowed channel, not interpolation of old facts;
+            # its sensor may still return None or an unchanged acquisition time.
+            progress = float(trajectory.sample(curve_time)[2])
+            boundaries = []
+            for identity, requirement in direction_requirements.items():
+                if list(identity) in report["completed_direction_ids"]:
+                    continue
+                for side, reached in (("start", progress >= requirement["start"]-1e-12),
+                                      ("end", curve_time >= direction_end_times[identity]-1e-12)):
+                    key = (*identity, side)
+                    if reached and key not in direction_boundary_polls:
+                        boundaries.append(key)
+            periodic = float(elapsed) >= next_observation_poll-1e-12
+            if periodic or boundaries:
                 due = next_observation_poll
-                missed = max(0, int(np.floor((float(elapsed)-due+1e-12)/float(policy["period_s"]))))
-                next_observation_poll = due+(missed+1)*float(policy["period_s"])
+                missed = max(0, int(np.floor((float(elapsed)-due+1e-12)/float(policy["period_s"])))) if periodic else 0
+                if periodic:
+                    next_observation_poll = due+(missed+1)*float(policy["period_s"])
+                direction_boundary_polls.update(boundaries)
                 observation = (None if observation_callback is None else
                                observation_callback(deepcopy(feedback), float(curve_time)))
                 check = {"polled_at_s": now, "schedule_delay_s": max(0., float(elapsed)-due),
-                         "missed_schedule_count": missed, "new_sample": observation is not None}
+                         "missed_schedule_count": missed, "new_sample": observation is not None,
+                         "poll_reason": "periodic_and_direction_boundary" if periodic and boundaries else
+                             "periodic" if periodic else "direction_boundary",
+                         "direction_boundaries": [list(value) for value in boundaries]}
                 if observation is not None:
                     if (not isinstance(observation, dict) or not isinstance(observation.get("source"), str)
                             or not observation["source"].strip()
@@ -732,6 +1142,19 @@ class TrajectoryExecutor:
                         if field in observation and (type(observation[field]) is not bool if field == "binding_valid"
                                                     else not isinstance(observation[field], dict)):
                             raise ValueError(f"Observation field {field} has no explicit valid value")
+                    # BEGIN all acquired T/F/U facts survive later verdict changes.
+                    for identity, fact in observation.get("effects", {}).items():
+                        if (not isinstance(fact, dict) or fact.get("value") not in ("T", "F", "U")
+                                or not fact.get("source")):
+                            raise ValueError("An effect needs explicit T/F/U evidence and provenance")
+                        row = {"condition_id": identity, **deepcopy(fact),
+                            "timestamp_s": effect_timestamp(identity, fact, observation),
+                            "observed_at_s": float(observation["timestamp_s"]),
+                            "time_s": request_origin+effect_timestamp(identity, fact, observation)-sim_start,
+                            "candidate_id": binding["candidate_id"], "observation_source": observation["source"]}
+                        if row not in report["effect_history"]:
+                            report["effect_history"].append(row)
+                    # END a latest-value snapshot never erases an earlier observation.
                     observation_cache = deepcopy(observation)
                     check["sample"] = deepcopy(observation)
                     check["acquired_at_s"] = float(observation["timestamp_s"])
@@ -755,7 +1178,13 @@ class TrajectoryExecutor:
                 # Expiry cannot erase an observed invalidation of this binding.
                 return deepcopy(observation_cache)
             if fresh:
-                return deepcopy(observation_cache)
+                current = deepcopy(observation_cache)
+                if float(current["timestamp_s"]) < sim_start-1e-8:
+                    current["effects"] = {key: {"value": "U",
+                        "source": "Historical acquisition predates this actual occurrence binding"}
+                        for key in current.get("effects", {})}
+                    current["completed_goal_ids"] = []
+                return current
             # Losing optional future-effect evidence does not invalidate the
             # static model. It also cannot leave an old T eligible for a gate.
             identities = {str(event["requires_evidence"]) for event in trajectory.events
@@ -824,13 +1253,18 @@ class TrajectoryExecutor:
                     if key not in previous:
                         if identity[1] not in indexes:
                             raise ValueError("Completed goal identity does not belong to this original request")
-                        local = indexes.index(identity[1])
-                        goal = binding["problem"][identity[0]][local]
-                        evidence_time = max(0., min(float(observation["timestamp_s"])-sim_start, trajectory.duration))
-                        if float(trajectory.sample(evidence_time)[2]) < float(goal["progress"])-1e-7:
-                            raise ValueError("A future goal obligation cannot be consumed before its bound clock scope")
                     identity = list(identity)
                     if identity not in report["completed_goal_ids"]:
+                        # BEGIN an arrival obligation consumes actual completion time.
+                        arrival_time = request_origin+float(observation["timestamp_s"])-sim_start
+                        for arrival_event in active_timing_events.values():
+                            if any(item["check_target"] == "arrival" and list(item["goal_id"]) == identity
+                                   for item in arrival_event.get("timing", ())):
+                                checks = timed_witness(arrival_event, "arrival", arrival_time, "T",
+                                    observation["source"], goal_id=identity, feedback_id=feedback["feedback_id"],
+                                    timestamp_s=observation["timestamp_s"])
+                                reject_timing(feedback, physical_elapsed, checks, event=arrival_event)
+                        # END a reference anchor cannot replace an observed goal arrival.
                         report["completed_goal_ids"].append(identity)
                         report["goal_evidence"].append({"identity": identity, "value": "T",
                             "source": observation["source"], "timestamp_s": observation["timestamp_s"],
@@ -838,6 +1272,10 @@ class TrajectoryExecutor:
                 for key in ("scene_condition_evidence", "scene_owner_poses"):
                     if key in observation:
                         feedback[key] = deepcopy(observation[key])
+                observe_timed_effects(observation, feedback, physical_elapsed)
+            check_directions(observation, feedback, curve_time, physical_elapsed)
+            resolve_pending_timing(feedback, physical_elapsed)
+            check_deadlines(feedback, physical_elapsed)
             # END observations never overwrite measured robot coordinates.
             reference_q, reference_dq, _ = trajectory.sample(curve_time)
             reference_tcp = backend.reference_tool_pose(reference_q)
@@ -860,7 +1298,8 @@ class TrajectoryExecutor:
             check = {"point": point, "curve_time_s": float(curve_time),
                      "physical_elapsed_s": float(physical_elapsed), "passed": not failures}
             if event is not None:
-                check.update(skill_id=event["skill_id"], event_id=event["event_id"], kind=event["kind"])
+                check.update(skill_id=event["skill_id"], event_id=event["event_id"],
+                             occurrence=event["occurrence"], kind=event["kind"])
                 check["geometry_check"] = deepcopy(geometry)
                 report["event_gate_checks"].append(deepcopy(check))
             if failures:
@@ -889,8 +1328,7 @@ class TrajectoryExecutor:
                         "actual_arm_velocity": np.asarray(feedback["dq"])[:narm].tolist(),
                         "maximum_absolute_velocity": list(execution_limits.stop_arm_velocity)})
                 if event["kind"] == "effect":
-                    available = deepcopy(binding.get("prior_effects", {}))
-                    available.update(report.get("latest_observation", {}).get("effects", {}))
+                    available = deepcopy(report.get("latest_observation", {}).get("effects", {}))
                     # Only a declared identity relation associates an effect
                     # predicate with an event. Similar names/times are not proof.
                     identities = [condition["condition_id"] for condition in trajectory.conditions
@@ -900,6 +1338,23 @@ class TrajectoryExecutor:
                     evidence = {identity: deepcopy(available.get(identity,
                         {"value": "U", "source": "No current effect observation supplied"}))
                         for identity in identities}
+                    # BEGIN every effect occurrence retains its actual observation fact.
+                    observation = report.get("latest_observation", {})
+                    for identity, fact in evidence.items():
+                        acquired = effect_timestamp(identity, fact, observation) if observation else sim_start+elapsed
+                        acquisition = request_origin+acquired-sim_start
+                        # Historical facts remain in request history only. A
+                        # pre-binding sample cannot certify this occurrence.
+                        if acquisition < request_origin-1e-9 and fact.get("evidence_kind") != "occurred_event":
+                            fact.update(value="U", source="No current occurrence observation supplied")
+                        checks = _timing_checks(event, "effect", acquisition, report["history"], condition_id=identity)
+                        if (not (fact.get("evidence_kind") == "occurred_event" and fact["value"] == "T")
+                                and any("window_s" in row and row["window_s"][0] is not None
+                                        and acquisition < row["window_s"][0]-1e-9 for row in checks)):
+                            fact.update(value="U", source="No effect acquisition inside the declared window")
+                        timed_witness(event, "effect", acquisition, fact["value"], fact["source"],
+                            condition_id=identity, feedback_id=feedback["feedback_id"])
+                    # END effect truth and task-time acceptance remain separate evidence.
                     values = [row["value"] for row in evidence.values()]
                     report["evaluated_events"].append({**deepcopy(event),
                         "evaluation_time_s": float(elapsed), "feedback_id": feedback["feedback_id"],
@@ -911,6 +1366,10 @@ class TrajectoryExecutor:
                     # goals still require their separate actual completion IDs.
                     report["reached_events"].append({**deepcopy(event),
                         "reached_time_s": float(elapsed), "feedback_id": feedback["feedback_id"]})
+                if event["kind"] not in ("open", "close", "hold"):
+                    checks = timed_witness(event, "activation", request_origin+float(elapsed), "T",
+                        "Actual executor occurrence of the original non-command event", feedback_id=feedback["feedback_id"])
+                    reject_timing(feedback, elapsed, checks, event=event)
                 ordinary_index += 1
         # END unknown/false effects remain outcomes, not implicit barriers.
 
@@ -919,10 +1378,26 @@ class TrajectoryExecutor:
             nonlocal barrier_index, stop
             while barrier_index < len(barriers) and elapsed >= barriers[barrier_index]["time"]-1e-12:
                 event = barriers[barrier_index]
-                available_effects = deepcopy(binding.get("prior_effects", {}))
-                available_effects.update(report.get("latest_observation", {}).get("effects", {}))
+                checks = _timing_checks(event, "activation", request_origin+float(elapsed), report["history"])
+                reject_timing(feedback, elapsed, checks, event=event)
+                available_effects = deepcopy(report.get("latest_observation", {}).get("effects", {}))
                 evidence = available_effects.get(str(event["requires_evidence"]),
                     {"value": "U", "source": "No current prerequisite observation"})
+                if evidence["value"] == "T":
+                    # A fresh-enough state sample can still predate an effect's
+                    # required acquisition window. Its raw T cannot authorize
+                    # a dependent operation until that separate obligation has
+                    # an actual, occurrence-matched in-window witness.
+                    for timed_event in active_timing_events.values():
+                        for constraint_index, constraint in enumerate(timed_event.get("timing", ())):
+                            if (constraint["check_target"] != "effect"
+                                    or constraint["condition_id"] != str(event["requires_evidence"])):
+                                continue
+                            witnessed = any(event_occurrence_key(row) == event_occurrence_key(timed_event)
+                                and row["constraint_index"] == constraint_index and row["value"] == "T"
+                                and row.get("evidence_value") == "T" for row in report["timing_checks"])
+                            if not witnessed:
+                                evidence = {"value": "U", "source": "Required effect has no actual acquisition in its original time window"}
                 report["dependency_outcomes"].append({"event": deepcopy(event), "evidence": deepcopy(evidence),
                     "feedback_id": feedback["feedback_id"], "physical_elapsed_s": float(elapsed)})
                 if evidence["value"] != "T":
@@ -933,6 +1408,12 @@ class TrajectoryExecutor:
                         max_steps=max_hold_steps)
                     return False
                 report["verified_events"].append(deepcopy(event))
+                # Only actual dependency evaluation activates this event;
+                # the verified prerequisite remains separately sourced above.
+                if event["kind"] not in ("open", "close", "hold"):
+                    timed_witness(event, "activation", request_origin+float(elapsed), "T",
+                        "Actual prerequisite gate accepted before entering its dependent interval",
+                        feedback_id=feedback["feedback_id"])
                 barrier_index += 1
                 previous_stop = stop
                 stop = (float(barriers[barrier_index]["time"]) if barrier_index < len(barriers)
@@ -1004,6 +1485,8 @@ class TrajectoryExecutor:
                     # BEGIN target, permission and command share the activation tick.
                     guard(before, curve_time=float(due[-1]["applied_time_s"]), physical_elapsed=elapsed,
                           point="command_event", event=due[-1])
+                    checks = _timing_checks(due[-1], "activation", request_origin+elapsed, report["history"])
+                    reject_timing(before, elapsed, checks, event=due[-1])
                     # END original intent time remains in the event ledger only.
                     next_command = due[-1]["kind"]
                     # The pre-event state belongs to the old interval. Only an
@@ -1027,6 +1510,9 @@ class TrajectoryExecutor:
                     report["superseded_gripper_events"].extend(deepcopy(due[:-1]))
                     report["events"].append({**due[-1], "applied_at_s": elapsed,
                         "application_delay_s": max(0., elapsed-due[-1]["time"])})
+                    timed_witness(due[-1], "activation", request_origin+elapsed, "T",
+                        "Native actuator control written for this exact original event occurrence",
+                        feedback_id=before["feedback_id"])
                 controls.append(control["actuator_ctrl"].copy())
                 requested_torques.append(control["requested_arm_torque"].copy())
                 saturated_torques.append(control["arm_torque_saturated"].copy())
@@ -1073,12 +1559,12 @@ class TrajectoryExecutor:
             actual_q = np.asarray([row["q"] for row in samples])
             command_q = np.asarray([row["command_q"] for row in samples])
             final_elapsed = float(backend.sim_time - sim_start)
-            applied_ids = {(event["skill_id"], event["event_id"]) for event in report["events"]}
-            consumed_ids = applied_ids | {(event["skill_id"], event["event_id"])
+            applied_ids = {event_occurrence_key(event) for event in report["events"]}
+            consumed_ids = applied_ids | {event_occurrence_key(event)
                 for event in report["verified_events"] if event["kind"] not in ("open", "close", "hold")}
-            consumed_ids.update((event["skill_id"], event["event_id"])
+            consumed_ids.update(event_occurrence_key(event)
                                 for event in report["superseded_gripper_events"])
-            consumed_ids.update((event["skill_id"], event["event_id"])
+            consumed_ids.update(event_occurrence_key(event)
                                 for key in ("evaluated_events", "stopped_events", "reached_events") for event in report[key])
             barrier_command_reached = stop == 0 or (report["executed_steps"] > 0 and samples[-1]["curve_time"] >= stop-1e-12)
             report.update(elapsed_wall_s=time.monotonic()-started, elapsed_sim_s=final_elapsed,
@@ -1089,7 +1575,7 @@ class TrajectoryExecutor:
                 barrier_crossed=any(samples[-1]["curve_time"] > event["time"]
                                     for event in report["verified_events"]),
                 unapplied_gripper_events=[deepcopy(event) for event in command_events
-                                          if (event["skill_id"], event["event_id"]) not in applied_ids],
+                                          if event_occurrence_key(event) not in applied_ids],
                 maximum_arm_tracking_error_rad=float(np.max(np.abs(actual_q[:, :narm]-command_q[:, :narm]))),
                 maximum_finger_command_position_difference=float(np.max(np.abs(actual_q[:, narm:]-command_q[:, narm:]))),
                 # BEGIN preserve the arm-only meaning in the report field.
@@ -1098,12 +1584,11 @@ class TrajectoryExecutor:
                 maximum_absolute_actual_arm_velocity=float(np.max(np.abs(np.asarray([row["dq"] for row in samples])[:, :narm]))),
                 peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,
                 unconsumed_events=[deepcopy(event) for event in trajectory.events
-                                   if (event["skill_id"], event["event_id"]) not in consumed_ids],
+                                   if event_occurrence_key(event) not in consumed_ids],
                 pending_verifications=[deepcopy(event) for event in barriers[barrier_index:]])
             # BEGIN explicit effect outcomes and same-request continuation data.
             observed = report.get("latest_observation", {})
-            effects = deepcopy(binding.get("prior_effects", {}))
-            effects.update(deepcopy(observed.get("effects", {})))
+            effects = deepcopy(observed.get("effects", {}))
             required_effects = set()
             for condition in trajectory.conditions:
                 identity = condition.get("condition_id")
@@ -1120,8 +1605,52 @@ class TrajectoryExecutor:
             report["required_effect_ids"] = sorted(required_effects)
             report["effect_result"] = ("F" if "F" in required_values else
                 "T" if required_values and all(value == "T" for value in required_values) else "U")
+            # BEGIN completion of the cubic is independent of hard-time obligations.
+            timing_values = []
+            for event in active_timing_events.values():
+                for index, constraint in enumerate(event.get("timing", ())):
+                    checks = [row for row in report["timing_checks"]
+                              if event_occurrence_key(row) == event_occurrence_key(event)
+                              and row["constraint_index"] == index]
+                    value = ("T" if any(row["value"] == "T" and row.get("evidence_value") == "T" for row in checks)
+                             else "F" if any(row["value"] == "F" and row.get("evidence_value") == "T" for row in checks)
+                             else "U")
+                    timing_values.append(value)
+                    if not checks:
+                        report["timing_checks"].append({"skill_id": event["skill_id"],
+                            "event_id": event["event_id"], "occurrence": event["occurrence"],
+                            "check_target": constraint["check_target"], "constraint_index": index,
+                            "time_s": request_origin+final_elapsed, "value": "U", "source": constraint["source"],
+                            "reason": "Execution ended without an applicable actual witness"})
+            report["timing_result"] = (None if not timing_values else "F" if "F" in timing_values
+                else "T" if all(value == "T" for value in timing_values) else "U")
+            # BEGIN direction completion is an independent actual-evidence verdict.
+            direction_values = ["T" if list(identity) in report["completed_direction_ids"] else
+                "F" if any(tuple(row["identity"]) == identity and row["value"] == "F"
+                           for row in report["direction_checks"]) else "U"
+                for identity in direction_requirements]
+            report["direction_result"] = (None if not direction_values else "F" if "F" in direction_values
+                else "T" if all(value == "T" for value in direction_values) else "U")
+            # END a finished cubic cannot hide unresolved scoped obligations.
+            request_ledger = deepcopy(binding.get("request_ledger", {}))
+            request_ledger["history"] = deepcopy(report["history"])
+            request_ledger["effect_history"] = deepcopy(report["effect_history"])
+            request_ledger["timing_events"] = deepcopy(timing_events)
+            request_ledger["timing_checks"] = deepcopy(report["timing_checks"])
+            for key in ("goal_evidence", "completed_goal_ids", "direction_evidence", "completed_direction_ids"):
+                rows = request_ledger.setdefault(key, [])
+                rows.extend(deepcopy(row) for row in report[key] if row not in rows)
+            report["request_ledger"] = request_ledger
+            # END partial or late physical evidence is never rounded into success.
             report["continuation"] = {
                 "candidate_id": binding["candidate_id"], "original_binding": binding,
+                "request_ledger": request_ledger, "history": deepcopy(report["history"]),
+                "effect_history": deepcopy(report["effect_history"]),
+                "timing_checks": deepcopy(report["timing_checks"]),
+                "timing_events": deepcopy(timing_events),
+                "device_policy": deepcopy(binding["device_policy"]),
+                "active_finger_interval": {key: deepcopy(finger_state[key])
+                    for key in ("position_bounds", "maximum_speed")},
                 "physics_budget": physics_budget,
                 "device_timestep_s": float(backend.timestep),
                 "elapsed_physical_s": final_elapsed, "last_curve_time_s": samples[-1]["curve_time"],
@@ -1134,11 +1663,15 @@ class TrajectoryExecutor:
                 "reached_events": deepcopy(report["reached_events"]),
                 "completed_goal_ids": deepcopy(report["completed_goal_ids"]),
                 "goal_evidence": deepcopy(report["goal_evidence"]),
+                "completed_direction_ids": deepcopy(report["completed_direction_ids"]),
+                "direction_evidence": deepcopy(report["direction_evidence"]),
                 "superseded_events": deepcopy(report["superseded_gripper_events"]),
                 "remaining_events": deepcopy(report["unconsumed_events"]),
                 "effects": effects, "actual_feedback": deepcopy(backend.proprioception()),
                 "object_changes": deepcopy(report["object_changes"]),
-                "requires_rebind": report["status"] != "curve_finished",
+                "requires_rebind": (report["status"] != "curve_finished"
+                    or report["timing_result"] not in (None, "T")
+                    or report["direction_result"] not in (None, "T")),
                 "reason": "Remaining obligations require current actual/scene binding; applied events and original hard clock cannot be reset",
                 "consumed_physics_steps": report["executed_steps"] + sum(
                     0 if report[key] is None else report[key]["physical_steps"]

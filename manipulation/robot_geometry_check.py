@@ -410,6 +410,19 @@ class RobotGeometryChecker:
                 row["contacts"] = [{"position": np.asarray(contact.pos).tolist(), "normal": np.asarray(contact.normal).tolist(),
                                     "penetration_depth": float(contact.penetration_depth)} for contact in result.getContacts()]
                 row["contact_report_truncated"] = result.numContacts() >= request.num_max_contacts
+                # BEGIN resolve a Coal numerical boundary using complete solid intersections.
+                # A sub-tolerance positive gap can be reported by GJK as zero
+                # distance/contact. Infeasibility of the complete convex
+                # intersection is a finished separation query, not missing
+                # contact evidence. Preserve Coal's raw values unchanged.
+                if abs(value) <= boundary:
+                    overlap = _overlap_within_region(_world_vertices(first["vertices"], first["pose"]),
+                        _world_vertices(second["vertices"], second["pose"]), (np.zeros((1, 3)), np.zeros(1)))
+                    row["boundary_intersection_check"] = overlap
+                    if overlap.get("completed") and overlap.get("intersection_empty"):
+                        row["relation"] = "numerical_boundary_with_proven_empty_intersection"
+                        continue
+                # END no contact allowance is used to establish disjoint geometry.
                 # BEGIN unordered physical pairs may have either directed
                 # material permission. Enumeration order must not choose law.
                 possible_rules = [(actor, target, rule) for actor, target in ((first, second), (second, first))
@@ -427,6 +440,9 @@ class RobotGeometryChecker:
                     if region is not None and value >= -rule["modeling_allowance_m"]-rule["numerical_position_tolerance_m"]:
                         evidence.update(_overlap_within_region(_world_vertices(actor["vertices"], actor["pose"]),
                                                                _world_vertices(target["vertices"], target["pose"]), region))
+                        if evidence.get("intersection_empty") and value < -boundary:
+                            evidence.update(completed=False, contained=False,
+                                reason="penetrating_distance_disagrees_with_empty_solid_intersection")
                         incomplete |= not evidence["completed"]
                         if evidence.get("contained"):
                             row["permission"] = rule["rule_id"]
@@ -684,8 +700,9 @@ def _overlap_within_region(first_vertices, second_vertices, region):
 
     Every inequality of the finite material/patch region is maximized over
     the entire intersection. One Coal contact witness is insufficient here.
-    Failed/infeasible numerical queries stay gaps; no arbitrary epsilon turns
-    an uncompleted whole-region check into permission.
+    A proven infeasible intersection is empty and contained vacuously. Other
+    failed queries remain gaps; no contact allowance or enlarged epsilon
+    turns an uncompleted whole-region check into permission.
     """
     from scipy.optimize import linprog
     from scipy.spatial import ConvexHull
@@ -722,14 +739,16 @@ def _overlap_within_region(first_vertices, second_vertices, region):
                 check = _overlap_within_region(a, b, region)
                 # HiGHS infeasibility here proves these two complete convex
                 # leaves have no volume intersection. Keep that raw status.
-                if check.get("solver_status") == 2:
+                if check.get("completed") and check.get("intersection_empty"):
                     continue
                 evidence.append(check)
                 intersecting += 1
                 if not check.get("completed") or not check.get("contained"):
                     return {**check, "leaf_queries": len(evidence), "scope": "all potentially overlapping occupied leaves"}
         if not intersecting:
-            return {"completed": False, "reason": "coal_boundary_without_resolved_volume_intersection"}
+            return {"completed": True, "contained": True, "intersection_empty": True,
+                    "leaf_queries": len(first)*len(second), "method": "complete_occupied_leaf_intersections",
+                    "numerical_certificate": False}
         return {"completed": True, "contained": True, "leaf_queries": len(evidence),
                 "method": "complete_occupied_leaf_intersections", "numerical_certificate": False}
     equations = np.concatenate([ConvexHull(first_vertices).equations, ConvexHull(second_vertices).equations])
@@ -739,6 +758,12 @@ def _overlap_within_region(first_vertices, second_vertices, region):
         result = linprog(-axis, A_ub=A, b_ub=b, bounds=[(None, None)]*3, method="highs",
                          options={"primal_feasibility_tolerance": 1e-9, "dual_feasibility_tolerance": 1e-9})
         if not result.success:
+            # BEGIN distinguish a completed empty-set proof from a failed solver query.
+            if result.status == 2:
+                return {"completed": True, "contained": True, "intersection_empty": True,
+                        "solver_status": int(result.status), "method": "empty_complete_convex_intersection",
+                        "numerical_certificate": False}
+            # END infeasibility is a geometric result; other statuses remain incomplete.
             return {"completed": False, "reason": "overlap_support_query_incomplete", "solver_status": int(result.status)}
         value = float(axis @ result.x-bound)
         maxima.append(value)

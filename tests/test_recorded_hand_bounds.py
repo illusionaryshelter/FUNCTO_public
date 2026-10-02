@@ -26,7 +26,7 @@ def inputs():
     targets = FixedFingerTargets(("left", "right"), "explicit targets", (
         {"skill_id": "s", "event_id": "open", "kind": "open", "positions": [.04, -.04]},
         {"skill_id": "s", "event_id": "close", "kind": "close", "positions": [0., 0.]}))
-    return SimpleNamespace(events=events), feedback, targets
+    return SimpleNamespace(events=events, pose_events=(), coordinate_events=(), supports=()), feedback, targets
 
 
 def factory(problem, feedback, targets):
@@ -72,4 +72,22 @@ def test_missing_named_reference_limit_cannot_be_replaced_by_actual_hardware_int
             position_limits={"left": [0., .04], "right": [-.04, 0.]},
             velocity_limits={"left": .2, "right": .2}, acceleration_limits={"left": 15.})(
                 3., _bind_event_clock(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), 3., .01))
+
+
+# BEGIN a new occurrence consumes only its exact candidate clock payload.
+def test_retry_factory_uses_new_occurrence_even_when_source_problem_contains_consumed_events():
+    from dataclasses import replace
+    problem, feedback, targets = inputs()
+    subset = FixedFingerTargets(targets.joint_names, targets.source, targets.events[1:])
+    build = finger_trajectory_factory(problem, feedback, subset, timestep=.01,
+        ctrlrange=[[0., .04], [-.04, 0.]], position_limits={"left": [0., .04], "right": [-.04, 0.]},
+        velocity_limits={"left": .2, "right": .2}, acceleration_limits={"left": 15., "right": 15.})
+    retry = SimpleNamespace(events=[replace(problem.events[1], occurrence=1)],
+                            pose_events=(), coordinate_events=(), supports=())
+    mapping = _bind_event_clock(retry, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), 3., .01)
+    curve = build(3., mapping)
+    assert [(row["event_id"], row["occurrence"]) for row in curve.events] == [("close", 1)]
+    assert curve.events[0]["source_frame"] == 183
+    assert problem.events[1].occurrence == 0
+# END an earlier occurrence cannot overwrite or be replayed by a hand closure.
 # END goals, actual feedback and time-varying reference retain separate meanings.

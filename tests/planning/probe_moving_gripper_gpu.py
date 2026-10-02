@@ -180,7 +180,7 @@ def run(output, *, native_knots=8, interpolation_buffer_size=512):
             joint_bounds=bounds, coupling_matrix=[[1., -1.]], coupling_offset=[0.],
             sphere_indices=sphere_indices, local_spheres=local_spheres,
             sphere_joint_translation=affine, self_collision_pairs=self_pairs,
-            commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id,
+            commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id, "occurrence": event.occurrence,
                             "command": event.kind, "progress": event.progress} for event in events),
             source="explicit synthetic position-tracking drive; geometry calibrated against native Franka FK")
         native_scene = SceneCollision.from_config(SceneCollisionCfg(

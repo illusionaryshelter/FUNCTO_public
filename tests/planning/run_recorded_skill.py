@@ -46,10 +46,13 @@ def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ct
 
     def build(duration_s, progress_map):
         events = []
-        for event in problem.events:
+        for identity, clock in progress_map.event_clock.items():
             # BEGIN consume the sole device-quantized source/event binding.
-            clock = progress_map.event_clock[(event.skill_id, event.event_id)]
-            events.append({**asdict(event), **deepcopy(clock)})
+            from manipulation.planning_problem import event_occurrence_key
+            event = deepcopy(clock["event"])
+            if event_occurrence_key(event) != identity:
+                raise ValueError("A finger reference needs the exact bound event occurrence metadata")
+            events.append({**event, **{key: deepcopy(value) for key, value in clock.items() if key != "event"}})
             # END hand commands cannot independently invert or retime progress.
         barriers = [row["time"] for row in events if row["requires_evidence"] is not None]
         stop = min(barriers) if barriers else duration_s
@@ -174,7 +177,7 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
         sphere_indices=indices, local_spheres=local_spheres,
         sphere_joint_translation=affine, self_collision_pairs=self_pairs,
         commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id,
-                        "command": event.kind, "progress": event.progress}
+                        "occurrence": event.occurrence, "command": event.kind, "progress": event.progress}
                        for event in execution_events if event.kind in {"open", "close", "hold"}),
         source=f"Native robot FK and synchronous independent position reference: {execution_limits.source}")
     report = {"affine_fk_max_error_m": error, "native_sphere_count": native.total_spheres,
@@ -236,10 +239,17 @@ def run(args):
         report["execution_limits_path"] = str(args.execution_limits.resolve())
         # BEGIN retain prior fixed targets and the last actually applied protection interval.
         continuation = None if args.continuation is None else json.loads(args.continuation.read_text())
+        rebind = None if args.rebind is None else json.loads(args.rebind.read_text())
+        request_ledger = None if args.request_ledger is None else json.loads(args.request_ledger.read_text())
+        if args.request_ledger is not None and not isinstance(request_ledger, dict):
+            raise ValueError("An explicitly supplied planning ledger cannot be null or reset to a new request")
+        report["request_ledger_input"] = None if args.request_ledger is None else str(args.request_ledger.resolve())
+        if rebind is not None and continuation is None:
+            raise ValueError("An explicit same-goal rebind requires the previous execution ledger")
         if continuation is not None:
             from manipulation.execution import continuation_execution_inputs
             finger_targets, execution_limits = continuation_execution_inputs(
-                continuation, finger_targets, execution_limits)
+                continuation, finger_targets, execution_limits, rebind=rebind)
         # END unconsumed commands keep their original identities and values.
         measured = dict(zip(feedback["joint_names"], feedback["start_q"]))
         velocities = dict(zip(feedback["joint_names"], feedback["start_dq"]))
@@ -305,14 +315,10 @@ def run(args):
                                      "scene_workspace_bytes": args.scene_workspace_mib*1024**2,
                                      "mapping_bytes": 1024**3}
         device = DeviceCfg("cuda:0")
-        pending_ids = (None if continuation is None else
-                       {(row["skill_id"], row["event_id"]) for row in continuation["remaining_events"]})
         hand, hand_report, entrance_fk = position_controlled_hand(
             robot, feedback, problem, device=device, execution_limits=execution_limits,
             position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
-            trajectory_factory=reference_factory,
-            execution_events=(None if pending_ids is None else tuple(event for event in problem.events
-                if (event.skill_id, event.event_id) in pending_ids)))
+            trajectory_factory=reference_factory)
         report["gripper"] = hand_report
         carrier_id = scene_input["carrier_id"]
         carrier_phases = [phase for phase in problem.phases
@@ -452,7 +458,7 @@ def run(args):
         report["planning_called"] = True
         result = plan_and_record(problem, scene, robot, args.output/"planning", budget=budget,
                                  execution_limits=execution_limits.describe(),
-                                 continuation=continuation,
+                                 continuation=continuation, rebind=rebind, request_ledger=request_ledger,
                                  provenance={**provenance, "robot_fixture": str(args.robot_fixture),
                                              "current_views": list(observations),
                                              "old_selection_comparison_only": segment["grounding"]["status"]})
@@ -482,6 +488,10 @@ if __name__ == "__main__":
     # BEGIN same-skill continuation consumes an explicit prior execution ledger.
     parser.add_argument("--continuation", type=Path,
                         help="Prior continuation.json; current feedback and scene inputs must be freshly rebound")
+    parser.add_argument("--rebind", type=Path,
+                        help="Explicit remaining/retry decision JSON preserving original IDs and physical deadlines")
+    parser.add_argument("--request-ledger", type=Path,
+                        help="Prior request-ledger.json, including failed planning work; execution history also requires --continuation")
     # END missing current facts are binding failures, not replay defaults.
     parser.add_argument("--owner-mask", nargs=2, action="append", required=True,
                         metavar=("VIEW_ID", "MASK_PATH"))

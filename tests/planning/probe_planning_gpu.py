@@ -67,8 +67,13 @@ def main():
     tool_link, sphere_count = kinematics.tool_frames[0], kinematics.total_spheres
     del state, actual, kinematics
     gc.collect()
-    budget = PlanningBudget(max_validation_points=256, max_refinement_points=32,
-                            search_seconds=1., maximum_trajectory_solves=2)
+    # BEGIN explicit integration budget; task precision and device policy stay fixed.
+    # The archived 1 s / 256-query run exhausted its finite OMPL connection
+    # budget for the changed goal. This probe grants bounded additional search
+    # work; it does not change production defaults or relax an acceptance gate.
+    budget = PlanningBudget(max_validation_points=512, max_refinement_points=32,
+                            search_seconds=3., maximum_trajectory_solves=3)
+    # END keep the complete budget in every probe report.
     rows = []
     for name, reference_bend, goal_offset in (("straight", 0., .015),
             ("bent_same_goal", .02, .015), ("changed_goal", .02, .03)):

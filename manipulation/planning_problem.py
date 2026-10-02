@@ -10,7 +10,7 @@ Torch is imported only when differentiable evaluation is requested.
 # BEGIN shared skill-process constraints for generation and verification.
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from copy import deepcopy
 
 import numpy as np
@@ -230,6 +230,101 @@ class PoseProcessRequirement:
 # END ordinary phases carry reference data without imposing robot constraints.
 
 
+# BEGIN explicit physical-time relations and occurrence-aware evidence identities.
+class TimeBindingError(ValueError):
+    """An explicit event-time relation cannot be resolved from its own evidence."""
+
+
+def event_occurrence_key(event):
+    """Identify one occurrence; original event names alone never identify a retry."""
+    get = event.get if isinstance(event, dict) else lambda key: getattr(event, key)
+    identity = (get("skill_id"), get("event_id"), get("occurrence"))
+    if (any(not isinstance(value, str) or not value for value in identity[:2])
+            or type(identity[2]) is not int or identity[2] < 0):
+        raise TimeBindingError("Event evidence requires skill_id, event_id and nonnegative occurrence")
+    return identity
+
+
+@dataclass(frozen=True)
+class EventTimeConstraint:
+    """An evidenced window in the original request's physical seconds.
+
+    Offsets are relative to exactly one explicit origin. A goal arrival and
+    an observed effect name their separate evidence targets. Planning wall
+    time and demonstration timestamps are never substituted for physics time.
+    """
+    check_target: str
+    window_s: tuple[float | None, float | None]
+    time_basis: str
+    source: object
+    origin_time_s: float | None = None
+    origin_event: dict | None = None
+    goal_id: tuple[str, int] | None = None
+    condition_id: str | None = None
+
+    def __post_init__(self):
+        window = tuple(self.window_s)
+        if (self.check_target not in {"activation", "arrival", "effect"}
+                or self.time_basis != "request_physical" or not self.source
+                or len(window) != 2 or all(value is None for value in window)
+                or any(value is not None and not np.isfinite(value) for value in window)
+                or (None not in window and window[0] > window[1])):
+            raise TimeBindingError("A time requirement needs an explicit physical-time window and source")
+        if (self.origin_time_s is None) == (self.origin_event is None):
+            raise TimeBindingError("A time requirement needs exactly one explicit origin")
+        if self.origin_time_s is not None and not np.isfinite(self.origin_time_s):
+            raise TimeBindingError("Physical origin time must be finite")
+        if self.origin_event is not None:
+            event_occurrence_key(self.origin_event)
+            if self.origin_event.get("check_target") not in {"activation", "arrival", "effect"}:
+                raise TimeBindingError("Origin event must identify its witnessed check target")
+        if self.check_target == "arrival":
+            if (self.goal_id is None or len(self.goal_id) != 2
+                    or self.goal_id[0] not in {"pose_events", "coordinate_events", "supports"}
+                    or type(self.goal_id[1]) is not int or self.goal_id[1] < 0):
+                raise TimeBindingError("An arrival window needs the original goal collection and index")
+            object.__setattr__(self, "goal_id", tuple(self.goal_id))
+        if self.check_target == "effect" and (not isinstance(self.condition_id, str) or not self.condition_id):
+            raise TimeBindingError("An effect window needs its independently evaluated condition ID")
+        object.__setattr__(self, "window_s", window)
+        object.__setattr__(self, "origin_event", deepcopy(self.origin_event))
+
+
+def resolve_event_window(constraint, history, *, predicted_origins=()):
+    """Resolve an absolute window; only actual T witnesses can be past origins.
+
+    Predictions are accepted only when the caller explicitly supplies them for
+    a future origin in this candidate. They are never appended to real history.
+    Repeated observations of the same occurrence use its first actual T
+    witness. Retries cannot inherit it because their occurrence is different.
+    """
+    if isinstance(constraint, dict):
+        constraint = EventTimeConstraint(**constraint)
+    origin = constraint.origin_time_s
+    if origin is None:
+        key = event_occurrence_key(constraint.origin_event)
+        target = constraint.origin_event["check_target"]
+        def selected(row):
+            return (event_occurrence_key(row) == key and row.get("check_target") == target
+                    and ("goal_id" not in constraint.origin_event or tuple(row.get("goal_id") or ())
+                         == tuple(constraint.origin_event["goal_id"]))
+                    and ("condition_id" not in constraint.origin_event
+                         or row.get("condition_id") == constraint.origin_event["condition_id"]))
+        witnesses = [row for row in history if selected(row) and row.get("value") == "T"]
+        identities = {(str(row.get("goal_id")), row.get("condition_id")) for row in witnesses}
+        if len(identities) > 1:
+            raise TimeBindingError("An ambiguous origin must name its goal_id or condition_id")
+        values = [row["time_s"] for row in witnesses]
+        if not values:
+            values = [row["time_s"] for row in predicted_origins
+                      if selected(row)]
+        if not values or not np.isfinite(values).all():
+            raise TimeBindingError("Time origin lacks one unambiguous actual witness or explicit candidate prediction")
+        origin = float(min(values))
+    return tuple(None if value is None else float(origin)+value for value in constraint.window_s)
+# END explicit physical-time relations and occurrence-aware evidence identities.
+
+
 @dataclass(frozen=True)
 class PlanningEvent:
     """Original source identity plus a unique skill-instance location.
@@ -245,6 +340,16 @@ class PlanningEvent:
     source: object
     requires_evidence: str | None = None
     stop: bool = False
+    # BEGIN a retry is a new occurrence of the original event, with original deadlines.
+    occurrence: int = 0
+    timing: tuple[EventTimeConstraint, ...] = ()
+
+    def __post_init__(self):
+        event_occurrence_key(self)
+        object.__setattr__(self, "timing", tuple(
+            value if isinstance(value, EventTimeConstraint) else EventTimeConstraint(**value)
+            for value in self.timing))
+    # END source identity and evidence history survive binding changes.
 
 
 @dataclass
@@ -267,6 +372,27 @@ def _pose_error(position, quaternion, target_position, target_quaternion):
     inverse = quaternion_conjugate(target_quaternion)
     return torch.cat((quaternion_rotate(inverse, position-target_position),
                       quaternion_rotvec(quaternion_multiply(inverse, quaternion))), -1)
+
+
+# BEGIN point events use one actual arrival, even when progress has a plateau.
+def _first_event_query(progress, anchor, trajectory_time=None):
+    """Select exactly one earliest event query, never an entire progress plateau.
+
+    Complete rollout callers append exact anchors after the regular samples,
+    so they provide actual query times. Ordered CPU/export queries may omit
+    times. Duplicate representations of the same physical instant count once.
+    """
+    import torch
+    matches = (progress-anchor).abs() <= 1e-7
+    if trajectory_time is not None:
+        if trajectory_time.shape != progress.shape:
+            raise ValueError("Event query times must align with the complete progress horizon")
+        earliest = torch.where(matches, trajectory_time, float("inf")).amin(-1, keepdim=True)
+        matches = matches & (trajectory_time == earliest)
+    first = matches.to(torch.int64).argmax(-1, keepdim=True)
+    indices = torch.arange(progress.shape[-1], device=progress.device)
+    return matches & (indices == first)
+# END separate process requirements alone impose a maintained relation.
 
 
 def anchor_pose(position, quaternion, progress, anchor):
@@ -343,6 +469,39 @@ def _mechanism_errors(model, tool_from_carrier, position, quaternion):
 
 
 # BEGIN independently scoped current mechanism and lifted coordinate checks.
+@dataclass(frozen=True)
+class CoordinateDirectionRequirement:
+    """An evidenced signed change, monotonicity, or physical coordinate rate.
+
+    ``minimum`` is a displacement for ``net`` and a rate for ``local_rate``;
+    ``monotone`` uses zero and permits only the stated displacement tolerance.
+    No direction is inferred from the demonstration's coordinate sequence.
+    """
+    start: float
+    end: float
+    coordinate_index: int
+    kind: str
+    sign: int
+    minimum: float
+    tolerance: float
+    source: object
+    origin_coordinate: float | None = None
+    origin_source: object = None
+
+    def __post_init__(self):
+        if (not self.source or not 0 <= self.start < self.end < np.inf
+                or type(self.coordinate_index) is not int or self.coordinate_index < 0
+                or self.kind not in {"net", "monotone", "local_rate"}
+                or type(self.sign) is not int or self.sign not in {-1, 1}
+                or not 0 <= self.minimum < np.inf or not 0 <= self.tolerance < np.inf
+                or (self.kind == "monotone" and self.minimum != 0)):
+            raise ValueError("Coordinate direction needs an evidenced scope, signed kind and finite threshold")
+        if ((self.origin_coordinate is None) != (self.origin_source is None)
+                or (self.origin_coordinate is not None and
+                    (self.kind != "net" or not np.isfinite(self.origin_coordinate) or not self.origin_source))):
+            raise ValueError("A net direction origin needs its actual coordinate and evidence together")
+
+
 @dataclass
 class MechanismRequirement:
     """Current physical manifold/limits, independent of the seed reference.
@@ -359,8 +518,10 @@ class MechanismRequirement:
     coordinate_limits: np.ndarray | None
     initial_coordinates: np.ndarray
     source: object
+    directions: tuple[CoordinateDirectionRequirement, ...] = ()
 
     def __post_init__(self):
+        self.directions = tuple(self.directions)
         self.tool_from_carrier = _pose_array(self.tool_from_carrier, "T_tool_carrier")
         self.initial_coordinates = np.asarray(self.initial_coordinates, float).copy()
         if (not self.source or not 0 <= self.start <= self.end < np.inf
@@ -373,12 +534,19 @@ class MechanismRequirement:
                     or not np.isfinite(self.coordinate_limits).all()
                     or np.any(self.coordinate_limits[:, 0] > self.coordinate_limits[:, 1])):
                 raise ValueError("Current mechanism coordinate limits must be finite ordered bounds")
+        if any(not isinstance(value, CoordinateDirectionRequirement)
+               or value.coordinate_index >= self.model.dimension
+               or value.end > self.end for value in self.directions):
+            raise ValueError("Coordinate directions must lie within their current mechanism and coordinate dimension")
+        self.directions = tuple(replace(value, origin_coordinate=float(self.initial_coordinates[value.coordinate_index]),
+            origin_source=self.source) if value.kind == "net" and value.start == self.start
+            and value.origin_coordinate is None else value for value in self.directions)
 
     @property
     def angular_column(self):
         return 0 if self.model.kind == "revolute" else 2 if self.model.kind == "planar" else None
 
-    def coordinates(self, position, quaternion, progress):
+    def coordinates(self, position, quaternion, progress, *, trajectory_time=None):
         """Recover actual candidate coordinates; no reference values enter the lift."""
         import torch
         p, q = _compose(position, quaternion, self.tool_from_carrier)
@@ -396,8 +564,12 @@ class MechanismRequirement:
         angle = torch.atan2(torch.where(singular, 0., 2*w*along),
                             torch.where(singular, 1., w.square()-along.square()))
         # Rollout and exact-event queries can be concatenated out of order.
-        # Sort by progress before lifting, then restore their original positions.
-        order = torch.argsort(progress, dim=-1, stable=True)
+        # Physical time orders motion even when progress is on a plateau.
+        # Progress is sufficient only for a local seed query with no clock.
+        if trajectory_time is not None and (trajectory_time.shape != progress.shape
+                or not bool(torch.isfinite(trajectory_time).all())):
+            raise ValueError("Coordinate history needs finite physical times aligned with its queries")
+        order = torch.argsort(progress if trajectory_time is None else trajectory_time, dim=-1, stable=True)
         sorted_angle = torch.gather(angle, -1, order)
         sorted_progress = torch.gather(progress, -1, order)
         within = (sorted_progress >= self.start-1e-7) & (sorted_progress <= self.end+1e-7)
@@ -444,6 +616,96 @@ class MechanismRequirement:
 
     def history_complete(self, progress):
         return ((progress-self.start).abs() <= 1e-7).any(-1)
+
+    # BEGIN true coordinate rates and path-dependent direction obligations.
+    def coordinate_rates(self, quaternion, tool_linear_velocity, tool_angular_velocity):
+        """Map actual reference-frame tool twist to native carrier coordinates."""
+        import torch
+        offset = quaternion_rotate(quaternion, _tensor(self.tool_from_carrier[:3, 3], quaternion).expand_as(tool_linear_velocity))
+        linear = tool_linear_velocity+torch.linalg.cross(tool_angular_velocity, offset)
+        axis = _tensor(self.model.axis, linear)
+        if self.model.kind == "prismatic":
+            return (linear*axis).sum(-1, keepdim=True)
+        planar = linear @ _tensor(self.model.basis[:, :2], linear)
+        if self.model.kind == "translation_plane":
+            return planar
+        carrier_q = quaternion_multiply(quaternion, _tensor(_quaternion(self.tool_from_carrier), quaternion))
+        relative = quaternion_multiply(carrier_q,
+            quaternion_conjugate(_tensor(_quaternion(self.model.reference_pose), quaternion)))
+        w, vector = relative[..., :1], relative[..., 1:]
+        along = (vector*axis).sum(-1, keepdim=True)
+        # Differentiate the same projected angle used by coordinates(), not
+        # just omega dot axis. They coincide on the exact manifold; this form
+        # also handles its explicitly permitted small off-axis pose errors.
+        numerator = w*(w*(tool_angular_velocity*axis).sum(-1, keepdim=True)
+            +(torch.linalg.cross(tool_angular_velocity, vector)*axis).sum(-1, keepdim=True))
+        numerator = numerator+along*(tool_angular_velocity*vector).sum(-1, keepdim=True)
+        angular = numerator/(w.square()+along.square()).clamp_min(torch.finfo(w.dtype).eps**2)
+        return angular if self.model.kind == "revolute" else torch.cat((planar, angular), -1)
+
+    def direction_residuals(self, position, quaternion, progress, *, trajectory_time,
+                            tool_linear_velocity=None, tool_angular_velocity=None, mode="trajectory",
+                            use_tolerance=True):
+        """Check finite ordered queries; only final curves use instantaneous rates.
+
+        A geometric OMPL path uses physical-time secants solely to screen a
+        seed. Its downstream cubic must still pass true J(q) dq rate checks.
+        Single-state seed membership deliberately proves no path direction.
+        """
+        import torch
+        if mode not in {"trajectory", "path", "point"}:
+            raise ValueError("Unknown coordinate direction query mode")
+        if not self.directions or mode == "point":
+            return {}
+        if trajectory_time is None or trajectory_time.shape != progress.shape:
+            raise ValueError("Coordinate direction checks need the actual physical-time queries")
+        order = torch.argsort(trajectory_time, dim=-1, stable=True)
+        restore = torch.argsort(order, dim=-1)
+        times = torch.gather(trajectory_time, -1, order)
+        scoped_progress = torch.gather(progress, -1, order)
+        coordinates = self.coordinates(position, quaternion, progress, trajectory_time=trajectory_time)
+        coordinates = torch.gather(coordinates, -2, order[..., None].expand_as(coordinates))
+        rates = None
+        if any(value.kind == "local_rate" for value in self.directions) and mode == "trajectory":
+            if tool_linear_velocity is None or tool_angular_velocity is None:
+                raise ValueError("Local coordinate rate requires the actual tool twist from J(q) dq")
+            rates = self.coordinate_rates(quaternion, tool_linear_velocity, tool_angular_velocity)
+            rates = torch.gather(rates, -2, order[..., None].expand_as(rates))
+        result = {}
+        for index, direction in enumerate(self.directions):
+            tolerance = direction.tolerance if use_tolerance else 0.
+            active = (scoped_progress >= max(direction.start, self.start)-1e-7) & (scoped_progress <= direction.end+1e-7)
+            values = coordinates[..., direction.coordinate_index]
+            violation = torch.zeros_like(values)
+            if direction.kind == "net":
+                at_start = (scoped_progress-direction.start).abs() <= 1e-7
+                at_end = (scoped_progress-direction.end).abs() <= 1e-7
+                first = at_start.to(torch.int64).argmax(-1, keepdim=True)
+                last = progress.shape[-1]-1-torch.flip(at_end, [-1]).to(torch.int64).argmax(-1, keepdim=True)
+                origin = values.gather(-1, first) if direction.origin_coordinate is None else direction.origin_coordinate
+                change = direction.sign*(values.gather(-1, last)-origin)
+                error = torch.relu(direction.minimum-change-tolerance)
+                complete = at_end.any(-1, keepdim=True) & (at_start.any(-1, keepdim=True)
+                    if direction.origin_coordinate is None else torch.ones_like(at_start[..., :1]))
+                error = torch.where(complete, error, float("inf"))
+                # A continuation keeps the original requirement identity but
+                # does not replay a scope wholly before its actual suffix.
+                error = torch.where(scoped_progress.amin(-1, keepdim=True) > direction.end+1e-7, 0., error)
+                violation = violation.scatter(-1, last, error)
+            elif direction.kind == "local_rate" and rates is not None:
+                violation = torch.where(active, torch.relu(direction.minimum-
+                    direction.sign*rates[..., direction.coordinate_index]-tolerance), 0.)
+            else:
+                elapsed = times[..., 1:]-times[..., :-1]
+                pair = active[..., 1:] & active[..., :-1] & (elapsed > 0)
+                signed = direction.sign*(values[..., 1:]-values[..., :-1])
+                if direction.kind == "local_rate":
+                    signed = signed/elapsed.clamp_min(torch.finfo(elapsed.dtype).tiny)
+                error = torch.relu(direction.minimum-signed-tolerance)
+                violation = torch.cat((violation[..., :1], torch.where(pair, error, 0.)), -1)
+            result[f"direction:{index}:{direction.kind}"] = torch.gather(violation, -1, restore)
+        return result
+    # END true coordinate rates and path-dependent direction obligations.
 # END independently scoped current mechanism and lifted coordinate checks.
 
 
@@ -539,29 +801,40 @@ class CoordinateEventRequirement:
     target_coordinate: float
     tolerance: float
     source: object
+    coordinate_mode: str = "absolute"
+    coordinate_origin: float | None = None
 
     def __post_init__(self):
         if (self.mechanism.model.kind not in {"prismatic", "revolute"} or not self.source
                 or not self.mechanism.start <= self.progress <= self.mechanism.end
                 or not np.isfinite(self.target_coordinate) or not 0 < self.tolerance < np.inf):
-            raise ValueError("A native event needs a current mechanism, evidenced target and threshold")
+                raise ValueError("A native event needs a current mechanism, evidenced target and threshold")
+        if (self.coordinate_mode not in {"absolute", "entry_delta"}
+                or (self.coordinate_mode == "absolute" and self.coordinate_origin is not None)
+                or (self.coordinate_mode == "entry_delta" and (self.coordinate_origin is None
+                    or not np.isfinite(self.coordinate_origin)))):
+            raise ValueError("An entry-delta goal needs its explicitly preserved original entry coordinate")
+
+    @property
+    def absolute_target(self):
+        return self.target_coordinate if self.coordinate_mode == "absolute" else self.coordinate_origin+self.target_coordinate
 
     @property
     def kind(self):
         return self.mechanism.model.kind
 
-    def error(self, position, quaternion, progress):
+    def error(self, position, quaternion, progress, *, trajectory_time=None):
         import torch
-        coordinate = self.mechanism.coordinates(position, quaternion, progress)[..., 0]
-        difference = coordinate-self.target_coordinate
+        coordinate = self.mechanism.coordinates(position, quaternion, progress, trajectory_time=trajectory_time)[..., 0]
+        difference = coordinate-self.absolute_target
         if self.kind == "revolute":
             local = torch.atan2(torch.sin(difference), torch.cos(difference))
             difference = torch.where(self.mechanism.history_complete(progress)[..., None], difference, local)
         return difference.abs()
 
-    def evaluate(self, position, quaternion, progress):
+    def evaluate(self, position, quaternion, progress, *, trajectory_time=None):
         import torch
-        return torch.relu(self.error(position, quaternion, progress)-self.tolerance)
+        return torch.relu(self.error(position, quaternion, progress, trajectory_time=trajectory_time)-self.tolerance)
 # END native goals compare lifted candidate coordinates, including winding.
 
 
@@ -710,6 +983,7 @@ class PlanningProblem:
                           *(r.progress for r in self.pose_events),
                           *(r.progress for r in self.coordinate_events),
                           *(s for r in self.mechanisms for s in (r.start, r.end)),
+                          *(s for r in self.mechanisms for d in r.directions for s in (d.start, d.end)),
                           *(r.start+float(s)*(r.end-r.start)
                             for r in self.pose_relations for s in r.reference.progress)])
         return anchors[anchors >= self.start_progress]
@@ -747,13 +1021,29 @@ class PlanningProblem:
         centers = quaternion_rotate(_tensor(_quaternion(self.base_pose), spheres), spheres[..., :3])
         return torch.cat((centers + _tensor(self.base_pose[:3, 3], spheres), spheres[..., 3:]), -1)
 
+    # BEGIN preserve physical velocity through the calibrated base/TCP transform.
+    def transform_tool_velocity(self, linear, angular, link_quaternion):
+        """Transform native base-frame link twist to reference-frame tool twist."""
+        import torch
+        base = _tensor(_quaternion(self.base_pose), linear)
+        world_linear, world_angular = quaternion_rotate(base, linear), quaternion_rotate(base, angular)
+        tool_orientation = quaternion_multiply(base, link_quaternion)
+        offset = quaternion_rotate(tool_orientation, _tensor(self.tool_transform[:3, 3], linear).expand_as(linear))
+        return world_linear+torch.linalg.cross(world_angular, offset), world_angular
+    # END preserve physical velocity through the calibrated base/TCP transform.
+
     def residuals(self, position, quaternion, progress, joint_position=None,
-                  joint_names=None, joint_velocity=None):
+                  joint_names=None, joint_velocity=None, *, trajectory_time=None, point_goal_ids=None,
+                  tool_linear_velocity=None, tool_angular_velocity=None, direction_mode="trajectory"):
         """Nonnegative violations of real requirements only, without cancellation."""
         import torch
         if position.shape != (*progress.shape, 3) or quaternion.shape != (*progress.shape, 4):
             raise ValueError("Pose arrays must align with the complete progress horizon")
         result = {"progress_bounds": torch.relu(self.start_progress-progress)+torch.relu(progress-self.phase_count)}
+        selected_goals = None if point_goal_ids is None else set(point_goal_ids)
+        def event_mask(collection, index, requirement):
+            return (_first_event_query(progress, requirement.progress, trajectory_time)
+                    if selected_goals is None or (collection, index) in selected_goals else torch.zeros_like(progress, dtype=torch.bool))
         tolerance = _tensor([self.numerical.position_m]*3+[self.numerical.rotation_rad]*3, position)
         for index, requirement in enumerate(self.pose_relations):
             error = requirement.error(position, quaternion, progress)
@@ -768,7 +1058,7 @@ class PlanningProblem:
             violation = torch.relu(p-model.position_tolerance-1e-10)+torch.relu(r-model.rotation_tolerance-1e-10)
             result[f"mechanism:{index}"] = torch.where(mask, violation, 0.)
             if requirement.coordinate_limits is not None:
-                coordinates = requirement.coordinates(position, quaternion, progress)
+                coordinates = requirement.coordinates(position, quaternion, progress, trajectory_time=trajectory_time)
                 bounds = _tensor(requirement.coordinate_limits, position)
                 excess = torch.relu(bounds[:, 0]-coordinates)+torch.relu(coordinates-bounds[:, 1])
                 angular = requirement.angular_column
@@ -786,18 +1076,22 @@ class PlanningProblem:
                     excess[..., angular] = torch.where(requirement.history_complete(progress)[..., None],
                                                        excess[..., angular], local_excess)
                 result[f"mechanism_limits:{index}"] = torch.where(mask, excess.sum(-1), 0.)
+            for name, value in requirement.direction_residuals(position, quaternion, progress,
+                    trajectory_time=trajectory_time, tool_linear_velocity=tool_linear_velocity,
+                    tool_angular_velocity=tool_angular_velocity, mode=direction_mode).items():
+                result[f"mechanism:{index}:{name}"] = value
         for index, requirement in enumerate(self.supports):
-            result[f"support:{index}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
+            result[f"support:{index}"] = torch.where(event_mask("supports", index, requirement),
                 requirement.evaluate(position, quaternion, self.numerical), 0.)
         for index, requirement in enumerate(self.interiors):
             mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
             result[f"interior:{index}"] = torch.where(mask, requirement.evaluate(position, quaternion, self.numerical), 0.)
         for index, requirement in enumerate(self.pose_events):
-            result[f"function_pose:{index}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
+            result[f"function_pose:{index}"] = torch.where(event_mask("pose_events", index, requirement),
                 requirement.evaluate(position, quaternion), 0.)
         for index, requirement in enumerate(self.coordinate_events):
-            result[f"function_coordinate:{index}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
-                requirement.evaluate(position, quaternion, progress), 0.)
+            result[f"function_coordinate:{index}"] = torch.where(event_mask("coordinate_events", index, requirement),
+                requirement.evaluate(position, quaternion, progress, trajectory_time=trajectory_time), 0.)
         if self.couplings:
             if joint_position is None or joint_names is None:
                 raise ValueError("Actuator coupling requires named robot joint positions")
@@ -809,16 +1103,20 @@ class PlanningProblem:
             if event.stop:
                 if joint_velocity is None:
                     raise ValueError("An explicitly required stop needs actual joint velocity evaluation")
-                result[f"stop:{event.skill_id}:{event.event_id}"] = torch.where((progress-event.progress).abs() <= 1e-7,
+                result[f"stop:{event.skill_id}:{event.event_id}"] = torch.where(_first_event_query(progress, event.progress, trajectory_time),
                     torch.relu(joint_velocity.abs()-self.numerical.velocity).sum(-1), 0.)
         return result
 
     def evaluate(self, position, quaternion, progress, joint_position=None,
-                 joint_names=None, joint_velocity=None):
+                 joint_names=None, joint_velocity=None, *, trajectory_time=None, point_goal_ids=None,
+                 tool_linear_velocity=None, tool_angular_velocity=None, direction_mode="trajectory"):
         return sum(self.residuals(position, quaternion, progress, joint_position,
-                                  joint_names, joint_velocity).values())
+                                  joint_names, joint_velocity, trajectory_time=trajectory_time,
+                                  point_goal_ids=point_goal_ids, tool_linear_velocity=tool_linear_velocity,
+                                  tool_angular_velocity=tool_angular_velocity, direction_mode=direction_mode).values())
 
-    def optimizer_preferences(self, position, quaternion, progress):
+    def optimizer_preferences(self, position, quaternion, progress, *, trajectory_time=None,
+                              tool_linear_velocity=None, tool_angular_velocity=None):
         """Retain real equality/goal gradients without attracting free reference axes."""
         import torch
         result = torch.zeros_like(progress)
@@ -831,13 +1129,44 @@ class PlanningProblem:
                 result = result+torch.where(mask, preference, 0.)
         for requirement in self.pose_events:
             p, r = requirement.errors(position, quaternion)
-            result = result+torch.where((progress-requirement.progress).abs() <= 1e-7, p.square()+r.square(), 0.)
+            # BEGIN scale real goal objectives by their declared functional accuracy.
+            # Raw metres/radians squared make a precise goal arbitrarily weak
+            # beside native smoothness costs. This fixed rule changes numerical
+            # conditioning only; residuals and final allowed sets stay in their
+            # original units, and free support/region axes gain no target.
+            preference = (p/requirement.position_tolerance_m).square()+(r/requirement.rotation_tolerance_rad).square()
+            result = result+torch.where(_first_event_query(progress, requirement.progress, trajectory_time), preference, 0.)
+            # END goal precision is input semantics, never a per-skill weight.
         for requirement in self.coordinate_events:
-            error = requirement.error(position, quaternion, progress)
-            result = result+torch.where((progress-requirement.progress).abs() <= 1e-7, error.square(), 0.)
+            error = requirement.error(position, quaternion, progress, trajectory_time=trajectory_time)
+            # BEGIN use the same relative-accuracy rule for native coordinate goals.
+            result = result+torch.where(_first_event_query(progress, requirement.progress, trajectory_time),
+                                        (error/requirement.tolerance).square(), 0.)
+            # END absolute and entry-relative goals retain their own metric tolerance.
+        # BEGIN direction objectives use one semantic scale and the stated threshold.
+        # Prefer reaching the declared minimum rather than resting at the
+        # outer edge of its tolerated error. This is an optimizer preference;
+        # acceptance still uses each original allowance in raw physical units.
+        for requirement in self.mechanisms:
+            values = requirement.direction_residuals(position, quaternion, progress,
+                trajectory_time=trajectory_time, tool_linear_velocity=tool_linear_velocity,
+                tool_angular_velocity=tool_angular_velocity, use_tolerance=False)
+            for direction, residual in zip(requirement.directions, values.values()):
+                if direction.tolerance > 0:
+                    scale = direction.tolerance
+                elif direction.minimum > 0:
+                    scale = direction.minimum
+                else:
+                    scale = (requirement.model.rotation_tolerance if direction.coordinate_index == requirement.angular_column
+                             else requirement.model.position_tolerance)
+                    if direction.kind == "local_rate":
+                        duration = (trajectory_time.amax(-1, keepdim=True)-trajectory_time.amin(-1, keepdim=True))
+                        scale = scale/duration.clamp_min(torch.finfo(duration.dtype).eps)
+                result = result+(residual/scale).square()
+        # END no per-skill weights or extra hard direction constraints are added.
         return result
 
-    def measurements(self, position, quaternion, progress):
+    def measurements(self, position, quaternion, progress, *, trajectory_time=None):
         """Report source deviations separately from independent physical/goal errors."""
         import torch
         result = {}
@@ -857,13 +1186,13 @@ class PlanningProblem:
             result[f"mechanism:{index}:rotation_error_rad"] = torch.where(mask, r, 0.)
         for index, requirement in enumerate(self.pose_events):
             p, r = requirement.errors(position, quaternion)
-            mask = (progress-requirement.progress).abs() <= 1e-7
+            mask = _first_event_query(progress, requirement.progress, trajectory_time)
             result[f"function:{index}:position_error_m"] = torch.where(mask, p, 0.)
             result[f"function:{index}:rotation_error_rad"] = torch.where(mask, r, 0.)
         for index, requirement in enumerate(self.coordinate_events):
             unit = "m" if requirement.kind == "prismatic" else "rad"
-            result[f"coordinate:{index}:error_{unit}"] = torch.where((progress-requirement.progress).abs() <= 1e-7,
-                requirement.error(position, quaternion, progress), 0.)
+            result[f"coordinate:{index}:error_{unit}"] = torch.where(_first_event_query(progress, requirement.progress, trajectory_time),
+                requirement.error(position, quaternion, progress, trajectory_time=trajectory_time), 0.)
         return result
 
     def verification_issues(self, progress):
@@ -887,22 +1216,23 @@ class PlanningProblem:
     def remaining_obligations(self, progress, applied_ids=()):
         """Read a suffix of this binding; this does not construct a resumed plan.
 
-        ``applied_ids`` contains (skill_id, event_id) pairs. An unapplied command
+        ``applied_ids`` contains (skill_id, event_id, occurrence) triples. An unapplied command
         before ``progress`` remains visible as overdue; elapsed time is not
         evidence that it was applied. Scope intersections retain their original
         requirement objects so target paths are never silently reparameterized.
-        The caller must retain the original frozen clock/absolute deadlines and
-        bind synchronized actual facts before generating another trajectory.
+        Ordinary continuation retains the frozen clock. Explicit rebinding may
+        rebuild the schedule while retaining declared absolute time relations.
         """
         if not np.isfinite(progress) or not 0 <= progress <= self.phase_count:
             raise ValueError("Continuation progress must lie in the original current skill")
         applied = set()
         for identity in applied_ids:
-            if (not isinstance(identity, (tuple, list)) or len(identity) != 2
-                    or any(not isinstance(value, str) or not value for value in identity)):
-                raise ValueError("Applied event identities must be (skill_id, event_id) pairs")
+            if (not isinstance(identity, (tuple, list)) or len(identity) != 3
+                    or any(not isinstance(value, str) or not value for value in identity[:2])
+                    or type(identity[2]) is not int or identity[2] < 0):
+                raise ValueError("Applied event identities must be (skill_id, event_id, occurrence) triples")
             applied.add(tuple(identity))
-        pending = [event for event in self.events if (event.skill_id, event.event_id) not in applied]
+        pending = [event for event in self.events if event_occurrence_key(event) not in applied]
         scoped = {}
         for name in ("pose_relations", "mechanisms", "interiors"):
             scoped[name] = [{"requirement": deepcopy(requirement),
@@ -922,7 +1252,7 @@ class PlanningProblem:
             "phases": tuple((index, deepcopy(phase)) for index, phase in enumerate(self.phases)
                             if index+1 >= progress),
             "events": tuple(deepcopy(pending)),
-            "overdue_event_ids": tuple((event.skill_id, event.event_id) for event in pending
+            "overdue_event_ids": tuple(event_occurrence_key(event) for event in pending
                                        if event.progress < progress and event.kind in {"open", "close", "hold"}),
             "goals": {name: tuple(deepcopy(requirement) for requirement in getattr(self, name)
                                    if requirement.progress >= progress)
@@ -932,31 +1262,87 @@ class PlanningProblem:
                 enumerate(getattr(self, name)) if requirement.progress < progress),
             "process": scoped, "conditions": deepcopy(self.conditions),
             "source_time_map": self.source_time_map, "required_actual_inputs": tuple(actual_inputs),
-            "clock_policy": "query the original frozen binding at elapsed+t; preserve absolute event deadlines",
+            "clock_policy": "ordinary continuation uses elapsed+t; explicit rebinding preserves declared physical-time relations",
         }
     # END expose remaining work without resetting source identity or the clock.
 
+    # BEGIN projection scopes and true goal sets are shared with the seed planner.
+    def projection_requirements(self, progress, side="at"):
+        """Select actual equations in a scope; a boundary can be queried one-sided."""
+        if side not in {"at", "left", "right"} or not np.isfinite(progress):
+            raise ValueError("Projection scope needs finite progress and at/left/right side")
+        selected = []
+        for collection in ("pose_relations", "mechanisms"):
+            for index, requirement in enumerate(getattr(self, collection)):
+                active = (requirement.start <= progress <= requirement.end if side == "at" else
+                          requirement.start < progress <= requirement.end if side == "left" else
+                          requirement.start <= progress < requirement.end)
+                if collection == "pose_relations":
+                    bounds = requirement.pose_bounds
+                    active = active and bool((np.isfinite(bounds[:, 0]) & (bounds[:, 0] == bounds[:, 1])).any())
+                if active:
+                    selected.append((collection, index))
+        return tuple(selected)+tuple(("couplings", index) for index in range(len(self.couplings)))
+
+    def goal_requirements_at(self, progress):
+        """Identify original true goals at this progress, never reference endpoints."""
+        return tuple((name, index) for name in ("pose_events", "coordinate_events", "supports")
+                     for index, goal in enumerate(getattr(self, name)) if abs(goal.progress-progress) <= 1e-7)
+
+    def goal_residual(self, position, quaternion, progress, *, goal_ids):
+        """Differentiable violations of allowed goal sets for initialization only.
+
+        Winding acceptance still requires the complete ordered candidate path;
+        a local coordinate query is only a modulo-angle seed screening query.
+        """
+        import torch
+        pieces = []
+        for collection, index in goal_ids:
+            if collection not in {"pose_events", "coordinate_events", "supports"}:
+                raise ValueError("Unknown true goal collection")
+            goal = getattr(self, collection)[index]
+            if collection == "pose_events":
+                p, r = goal.errors(position, quaternion)
+                pieces.extend((torch.relu(p-goal.position_tolerance_m)[..., None],
+                               torch.relu(r-goal.rotation_tolerance_rad)[..., None]))
+            elif collection == "coordinate_events":
+                pieces.append(goal.evaluate(position, quaternion, progress)[..., None])
+            else:
+                pieces.append(goal.evaluate(position, quaternion, self.numerical)[..., None])
+        return torch.cat(pieces, -1) if pieces else position[..., :0]
+
     def project_residual(self, position, quaternion, progress, phase_index=None,
-                         joint_position=None, joint_names=None):
+                         joint_position=None, joint_names=None, active_requirements=None):
         """Real equality/manifold equations, never source-stage or band centers."""
         import torch
         pieces = []
-        for requirement in self.pose_relations:
+        selected = None if active_requirements is None else set(active_requirements)
+        if selected is not None and any(name not in {"pose_relations", "mechanisms", "couplings"}
+                or not 0 <= index < len(getattr(self, name)) for name, index in selected):
+            raise ValueError("Unknown active projection requirement")
+        for index, requirement in enumerate(self.pose_relations):
+            if selected is not None and ("pose_relations", index) not in selected:
+                continue
             exact = np.isfinite(requirement.pose_bounds[:, 0]) & (requirement.pose_bounds[:, 0] == requirement.pose_bounds[:, 1])
             if exact.any():
                 error = requirement.error(position, quaternion, progress)[..., exact]-_tensor(requirement.pose_bounds[exact, 0], position)
                 mask = ((progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7))[..., None]
-                pieces.append(torch.where(mask, error, 0.))
-        for requirement in self.mechanisms:
+                pieces.append(torch.where(mask, error, 0.) if selected is None else error)
+        for index, requirement in enumerate(self.mechanisms):
+            if selected is not None and ("mechanisms", index) not in selected:
+                continue
             error = requirement.project_residual(position, quaternion, progress)
             mask = ((progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7))[..., None]
-            pieces.append(torch.where(mask, error, 0.))
-        for coupling in self.couplings:
+            pieces.append(torch.where(mask, error, 0.) if selected is None else error)
+        for index, coupling in enumerate(self.couplings):
+            if selected is not None and ("couplings", index) not in selected:
+                continue
             if joint_position is None or joint_names is None:
                 raise ValueError("Projection needs named joints for actuator coupling")
             columns = [tuple(joint_names).index(name) for name in coupling.joint_names]
             pieces.append(joint_position[..., columns] @ _tensor(coupling.matrix.T, joint_position)-_tensor(coupling.target, joint_position))
         return torch.cat(pieces, -1) if pieces else position[..., :0]
+    # END projection selects equations without inactive zero rows or invented poses.
 # END one current skill with separate goals, process relations and references.
 
 
@@ -995,7 +1381,7 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
     or grant evidence to a future skill.
     """
     from .grasp import validate_timeline
-    from .program import ground_program, _current_model, _exact_coordinates
+    from .program import ground_program, _current_model, _current_initial_coordinates
     from .pipeline import _surface, _interior
 
     if not isinstance(skills, (list, tuple)) or len(skills) != 1:
@@ -1072,7 +1458,10 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
         mechanism = None
         if model is not None:
             mechanism = MechanismRequirement(0., held_end, model, _inverse(attachment), limits,
-                _exact_coordinates(model, initial), scene["motion_model"]["source"])
+                _current_initial_coordinates(scene["motion_model"], model, initial,
+                    require_lift=bool(spec.get("coordinate_directions")) or any(
+                        event.get("constraint_kind") == "joint_coordinate" for event in demo["functional_events"])),
+                scene["motion_model"]["source"])
             mechanisms.append(mechanism)
             # Reference coordinates are optional initialization data. The
             # authoritative mechanism above was bound directly from the scene.
@@ -1101,7 +1490,10 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
                     face["gap_tolerance"], face["normal_tolerance"], scene.get("margin", 0.), binding["source"]))
             elif event.get("constraint_kind") == "joint_coordinate":
                 coordinate_events.append(CoordinateEventRequirement(progress, mechanism,
-                    float(np.asarray(check["target_coordinates"])[0]), event["coordinate_tolerance"], event["source"]))
+                    float(np.asarray(check["raw_target_coordinates"])[0]), event["coordinate_tolerance"],
+                    {"event": event["source"], "binding": check["binding_source"], "entry": check["entry_source"]},
+                    coordinate_mode=check["coordinate_mode"], coordinate_origin=None if check["entry_coordinates"] is None
+                    else float(np.asarray(check["entry_coordinates"])[0])))
             else:
                 material = _pose_array(binding["carrier_frame"], "current material function frame")
                 pose_events.append(PoseEventRequirement(progress, _inverse(attachment) @ material,
@@ -1111,7 +1503,11 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
                 interior = _interior(scene["interior"])
                 interiors.append(InteriorRequirement(progress, progress, _inverse(attachment), scene["body_points"],
                     interior.halfspaces, scene.get("margin", 0.), interior.source))
-            events.append(PlanningEvent(event["event_id"], skill_id, progress, int(event["frame_index"]), "function", event["source"]))
+            # Original timing and explicit execution requirements annotate
+            # this same occurrence; a deadline never creates a second action.
+            events.append(PlanningEvent(event["event_id"], skill_id, progress, int(event["frame_index"]),
+                "function", event["source"], event.get("requires_evidence"), event.get("stop", False),
+                event.get("occurrence", 0), tuple(event.get("timing", ()))))
         if "entry_region" in scene:
             interior = _interior(scene["entry_region"])
             begin = frame_progress[int(frames[scene["entry_start_index"]])]
@@ -1129,7 +1525,8 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
         raise ValueError("Only compiled grasp/manipulation programs define a current skill")
     for event in grounded["gripper_events"]:
         events.append(PlanningEvent(event["event_id"], skill_id, frame_progress[int(event["frame_index"])],
-            int(event["frame_index"]), event["command"], {"original_event": deepcopy(event), **source}))
+            int(event["frame_index"]), event["command"], {"original_event": deepcopy(event), **source},
+            event.get("requires_evidence"), event.get("stop", False), event.get("occurrence", 0), tuple(event.get("timing", ()))))
     # Only explicitly supplied execution prerequisites or stops enter this list.
     # Evidence checks and zero velocity are independent fields, not implications.
     for event in spec.get("execution_events", ()):
@@ -1137,7 +1534,23 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
         if frame not in frame_progress:
             raise ValueError("An execution event must name an original source frame")
         events.append(PlanningEvent(event["event_id"], skill_id, frame_progress[frame], int(frame),
-            event["kind"], event["source"], event.get("requires_evidence"), event.get("stop", False)))
+            event["kind"], event["source"], event.get("requires_evidence"), event.get("stop", False),
+            event.get("occurrence", 0), tuple(event.get("timing", ()))))
+    # BEGIN only explicit native direction declarations become process obligations.
+    direction_specs = spec.get("coordinate_directions", ())
+    if direction_specs:
+        if len(mechanisms) != 1:
+            raise ValueError("Coordinate directions require one independently evidenced current mechanism")
+        directions = []
+        for row in direction_specs:
+            if row["start_frame"] not in frame_progress or row["end_frame"] not in frame_progress:
+                raise ValueError("A coordinate direction must name original source scope frames")
+            directions.append(CoordinateDirectionRequirement(frame_progress[row["start_frame"]],
+                frame_progress[row["end_frame"]], row["coordinate_index"], row["kind"], row["sign"],
+                row["minimum"], row["tolerance"], row["source"], row.get("origin_coordinate"), row.get("origin_source")))
+        mechanisms[0].directions = tuple(directions)
+        mechanisms[0].__post_init__()
+    # END reference increments alone never imply monotonicity or minimum rate.
     return PlanningProblem(tuple(joint_names), start_q, start_dq, tool_link, reference_frame,
         base_pose, tool_transform, tuple(phases), tuple(events), tuple(couplings), numerical,
         tuple(conditions), tuple(supports), tuple(interiors), tuple(pose_events), tuple(coordinate_events),

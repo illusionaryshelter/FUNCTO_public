@@ -244,7 +244,7 @@ class PlanningSceneTest(unittest.TestCase):
             finger_trajectory_factory=factory, nominal_finger_trajectory_factory=factory, coupling_matrix=np.empty((0, 2)), coupling_offset=[],
             sphere_indices=(0, 1), local_spheres=[[0, 0, 0, .001], [0, 0, 0, .001]],
             sphere_joint_translation=[[[1, 0], [0, 0], [0, 0]], [[0, 1], [0, 0], [0, 0]]],
-            self_collision_pairs=((0, 1),), commands=[{"skill_id": "timed", "event_id": "close",
+            self_collision_pairs=((0, 1),), commands=[{"skill_id": "timed", "event_id": "close", "occurrence": 0,
                 "command": "close", "progress": 0.}], source="analytic independent finger reference")
 
     def test_timed_fingers_use_time_during_progress_pause_without_full_range_inflation(self):
@@ -531,21 +531,41 @@ class PlanningSceneTest(unittest.TestCase):
         self.assertFalse(any(key.startswith("attachment/boundary") for key in components))
         self.assertIn("payload", world.describe()["release_requires_evidence"])
 
-    def test_missing_release_anchor_fails_and_search_can_freeze_whole_candidate(self):
+    def test_missing_release_anchor_fails_and_selected_prefix_supplies_history(self):
         world = self.payload_scene()
         balls, p, q, s = inputs((.5, 1.5), positions=[[0., 0, 0], [1., 0, 0]])
         missing = world.components(balls, p, q, s)["unknown/release_anchor/payload/0"]
         torch.testing.assert_close(missing, torch.tensor([[0., 1.]], dtype=torch.float64))
         with self.assertRaisesRegex(ValueError, "exact release"):
-            world.with_fixed_endpoints(p, q, s)
+            world.with_release_history(p, q, s)
         _, ep, eq, es = inputs((0., 1.), positions=[[0., 0, 0], [.5, 0, 0]])
-        fixed = world.with_fixed_endpoints(ep, eq, es)
+        fixed = world.with_release_history(ep, eq, es)
         args = inputs((1.5,), positions=[[1.2, 0, 0]])
         fixed.evaluate(*args)
         torch.testing.assert_close(fixed.background.calls[("payload", "background")][..., 0, 0],
                                    torch.tensor([[.8]], dtype=torch.float64))
         self.assertIsNot(fixed.background, world.background)
         self.assertFalse(world._fixed_release_poses)
+
+    # BEGIN only reached releases are inherited, with private sibling poses.
+    def test_search_prefix_does_not_freeze_future_release_or_overwrite_first_pose(self):
+        world = self.payload_scene()
+        _, p, q, s = inputs((.5,), positions=[[.1, 0., 0.]])
+        before = world.with_release_history(p, q, s)
+        self.assertFalse(before._fixed_release_poses)
+        _, p, q, s = inputs((1.,), positions=[[.5, 0., 0.]])
+        first = before.with_release_history(p, q, s)
+        _, p, q, s = inputs((1.,), positions=[[.8, 0., 0.]])
+        sibling = before.with_release_history(p, q, s)
+        _, p, q, s = inputs((1., 1.5), positions=[[1.1, 0., 0.], [1.3, 0., 0.]])
+        extended = first.with_release_history(p, q, s)
+        key = ("payload", 0)
+        self.assertAlmostEqual(first._fixed_release_poses[key][0][0, 0, 0].item(), .8)
+        self.assertAlmostEqual(extended._fixed_release_poses[key][0][0, 0, 0].item(), .8)
+        self.assertAlmostEqual(sibling._fixed_release_poses[key][0][0, 0, 0].item(), 1.1)
+        self.assertFalse(world._fixed_release_poses)
+        self.assertFalse(before._fixed_release_poses)
+    # END the selected search history is never written into actual scene facts.
 
     def test_payload_keeps_noncontact_robot_collision_and_partial_cover_unknown(self):
         world = self.payload_scene()
@@ -574,7 +594,7 @@ class PlanningSceneTest(unittest.TestCase):
         bad[1] = args[1].clone()
         bad[1][0, 4, 0] = .1
         self.assertGreater(world.components(*bad)["attachment/start/payload/1"][0, 4].item(), .49)
-        frozen = world.with_fixed_endpoints(args[1], args[2], args[3])
+        frozen = world.with_release_history(args[1], args[2], args[3])
         later = inputs((2.5,), positions=[[1., 0, 0]])
         frozen.components(*later)
         self.assertEqual(len(frozen._fixed_release_poses), 2)
@@ -598,7 +618,7 @@ class PlanningSceneTest(unittest.TestCase):
                                attachments=(relation,))
         world = scene((owner,))
         args = inputs((17., anchor), positions=[[0., 0, 0], [.5, 0, 0]], dtype=torch.float32)
-        fixed = world.with_fixed_endpoints(args[1], args[2], args[3])
+        fixed = world.with_release_history(args[1], args[2], args[3])
         self.assertEqual(len(fixed._fixed_release_poses), 1)
         result = fixed.components(*inputs((18.,), positions=[[1., 0, 0]], dtype=torch.float32))
         self.assertFalse(any(key.startswith("unknown/release_anchor") for key in result))
@@ -620,7 +640,7 @@ class PlanningSceneTest(unittest.TestCase):
             joint_bounds=bounds if controller == "position_tracking" else None,
             coupling_matrix=np.zeros((0, 1)), coupling_offset=[], sphere_indices=(0,),
             local_spheres=[[0, 0, 0, .005]], sphere_joint_translation=[[[1.], [0.], [0.]]],
-            self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "cmd", "command": "close", "progress": 0.}],
+            self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "cmd", "occurrence": 0, "command": "close", "progress": 0.}],
             source="synthetic_drive_and_tool", numerical_joint_tolerance=tolerance)
 
     # BEGIN binary zero-progress queries must retain the physical sweep envelope.
@@ -687,7 +707,7 @@ class PlanningSceneTest(unittest.TestCase):
                                     s.new_tensor([.02, -.02]).expand(*s.shape, 2)),
             coupling_matrix=[[1., 1.]], coupling_offset=[0.], sphere_indices=(0,),
             local_spheres=[[0, 0, 0, .005]], sphere_joint_translation=[[[1., 0], [0., 0], [0., 0]]],
-            self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "drive", "command": "hold", "progress": 0.}],
+            self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "drive", "occurrence": 0, "command": "hold", "progress": 0.}],
             source="synthetic_coupled_native_drive")
         world = scene(gripper=hand, has_gripper=True)
         q = torch.tensor([[[.03, -.03]]], dtype=torch.float64, requires_grad=True)
@@ -717,7 +737,7 @@ class PlanningSceneTest(unittest.TestCase):
             joint_limits=[[0., .04]], joint_bounds=command, coupling_matrix=np.zeros((0, 1)), coupling_offset=[],
             sphere_indices=(0,), local_spheres=[[0., 0., 0., .005]],
             sphere_joint_translation=[[[0.], [0.], [1.]]], self_collision_pairs=(),
-            commands=[{"skill_id": "moving_close", "event_id": "close", "command": "close", "progress": 0.}],
+            commands=[{"skill_id": "moving_close", "event_id": "close", "occurrence": 0, "command": "close", "progress": 0.}],
             source="explicit affine finger model and position-tracking command")
         target = CollisionOwner("surface", BoxQuery("surface"), pose_path(), "known test surface", True)
         rule = contact_rule(feature_points=[[-.003, -.003, -.005], [.003, -.003, -.005],
@@ -822,7 +842,7 @@ class PlanningSceneTest(unittest.TestCase):
         # No real release means search can evaluate a subpath without asking
         # for the artificial window end as a frozen physical event.
         subset = inputs((.5,), positions=[[.1, 0., 0.]])
-        fixed = world.with_fixed_endpoints(subset[1], subset[2], subset[3])
+        fixed = world.with_release_history(subset[1], subset[2], subset[3])
         self.assertFalse(fixed._fixed_release_poses)
         self.assertFalse(any(key.startswith("unknown/release_anchor") for key in fixed.components(*subset)))
         owner = world.owners[0]
@@ -867,15 +887,22 @@ class PlanningSceneTest(unittest.TestCase):
         event = PlanningEvent("cmd", "skill", 0., 0, "close", "original_command")
         problem = PlanningProblem(("finger",), np.array([.04]), np.zeros(1), "tool", "world", np.eye(4), np.eye(4),
                                   (MotionPhase("free", pose_path()),), events=(event,))
-        with self.assertRaisesRegex(ValueError, "skill/event/command/progress"):
+        with self.assertRaisesRegex(ValueError, "skill/event/occurrence/command/progress"):
             scene().validate_problem(problem)
         hand = self.gripper("position_tracking")
         world = scene(gripper=hand, has_gripper=True)
         world.validate_problem(problem)
         hand.commands = ({**hand.commands[0], "skill_id": "another_instance"},)
-        with self.assertRaisesRegex(ValueError, "skill/event/command/progress"):
+        with self.assertRaisesRegex(ValueError, "skill/event/occurrence/command/progress"):
             world.validate_problem(problem)
         hand.commands = ({**hand.commands[0], "skill_id": "skill"},)
+        # BEGIN retry geometry must bind the new occurrence of the same command.
+        hand.commands = ({**hand.commands[0], "occurrence": 1},)
+        with self.assertRaisesRegex(ValueError, "occurrence"):
+            world.validate_problem(problem)
+        problem.events = (PlanningEvent("cmd", "skill", 0., 0, "close", "original_command", occurrence=1),)
+        world.validate_problem(problem)
+        # END preserving the original source ID alone cannot authorize a retry.
         problem.start_q[0] = .02
         with self.assertRaisesRegex(ValueError, "current native feedback"):
             world.validate_problem(problem)
@@ -888,7 +915,7 @@ class PlanningSceneTest(unittest.TestCase):
                                     s.new_tensor([.02, -.02]).expand(*s.shape, 2)),
             coupling_matrix=[[1., 1.]], coupling_offset=[0.], sphere_indices=(0,),
             local_spheres=[[0, 0, 0, .005]], sphere_joint_translation=[[[1., 0], [0., 0], [0., 0]]],
-            self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "drive", "command": "hold", "progress": 0.}],
+            self_collision_pairs=(), commands=[{"skill_id": "skill", "event_id": "drive", "occurrence": 0, "command": "hold", "progress": 0.}],
             source="actual_native_coupling")
         event = PlanningEvent("drive", "skill", 0., 0, "hold", "original_command")
         problem = PlanningProblem(("left", "right"), np.array([.02, -.02]), np.zeros(2), "tool", "world",

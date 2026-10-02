@@ -15,6 +15,10 @@ import math
 import numpy as np
 from scipy.interpolate import CubicHermiteSpline, PPoly
 
+# BEGIN one occurrence identity across planning, commands and saved polynomials.
+from .planning_problem import event_occurrence_key
+# END a repeated source event is not the same physical command occurrence.
+
 
 _SCOPE = ("Named nominal command reference, not measured finger motion or a contact prediction; "
           "the full original duration retains every conditional command. The executable prefix "
@@ -131,16 +135,20 @@ def _commands(values, names, duration, stop, timestep, position_limits):
     if not isinstance(values, (list, tuple)):
         raise ValueError("Finger command events must be an explicit ordered sequence")
     result, identities = [], set()
-    required = {"skill_id", "event_id", "kind", "time", "progress", "finger_positions"}
+    # BEGIN require the occurrence that the Executor explicitly bound.
+    required = {"skill_id", "event_id", "occurrence", "kind", "time", "progress", "finger_positions"}
+    # END original event names remain provenance, not a unique attempt identity.
     for value in values:
         if not isinstance(value, dict) or not required <= value.keys():
             raise ValueError("Finger commands require original timed event identities and named position goals")
         row = {key: deepcopy(item) for key, item in value.items() if key not in _EVENT_FIELDS}
         for label in ("skill_id", "event_id"):
             _text(row[label], label)
-        identity = (row["skill_id"], row["event_id"])
+        # BEGIN retries retain their source event and have a distinct occurrence.
+        identity = event_occurrence_key(row)
         if identity in identities or row["kind"] not in ("open", "close", "hold"):
-            raise ValueError("Finger command identities must be unique original open/close/hold events")
+            raise ValueError("Finger command identities must be unique open/close/hold occurrences")
+        # END a repeated occurrence is rejected before a polynomial is generated.
         identities.add(identity)
         if (not np.isfinite(row["time"]) or not 0. <= row["time"] <= duration
                 or not np.isfinite(row["progress"]) or row["progress"] < 0.):
@@ -312,6 +320,9 @@ class FingerTrajectory:
             segments.append({"kind": "initial_hold" if event is None else "command",
                 "skill_id": None if event is None else event["skill_id"],
                 "event_id": None if event is None else event["event_id"],
+                # BEGIN each ramp is bound to the exact command occurrence.
+                "occurrence": None if event is None else event["occurrence"],
+                # END an initial hold is not a retry of a source operation.
                 "start_time_s": float(begin), "ramp_end_time_s": float(finish),
                 "end_time_s": float(end), "target_positions": goal.tolist()})
             append(finish, goal, np.zeros(count))
@@ -331,22 +342,27 @@ class FingerTrajectory:
         replace the initial slope, or omit conditional commands in the suffix.
         """
         expected_times, expected_q, expected_dq = [0.], [self.position[0]], [self.velocity[0]]
-        active = {(row["skill_id"], row["event_id"]): row for row in self.events
+        # BEGIN archive validation matches each ramp to its own occurrence.
+        active = {event_occurrence_key(row): row for row in self.events
                   if not row["superseded"]}
+        # END equal source names cannot cause a retry to overwrite an old ramp.
         used = set()
         end = 0.
         for segment in self.segments:
             if not isinstance(segment, dict) or set(segment) != {
-                    "kind", "skill_id", "event_id", "start_time_s", "ramp_end_time_s", "end_time_s", "target_positions"}:
+                    "kind", "skill_id", "event_id", "occurrence", "start_time_s", "ramp_end_time_s", "end_time_s", "target_positions"}:
                 raise ValueError("Every saved finger segment needs its exact source command and clock boundaries")
             begin, finish, stop = (float(segment[key]) for key in ("start_time_s", "ramp_end_time_s", "end_time_s"))
             if not np.isfinite([begin, finish, stop]).all() or begin != end or not begin <= finish <= stop <= self.duration or stop <= begin:
                 raise ValueError("Saved finger segments must partition the full original duration")
             goal = _array(segment["target_positions"], (len(self.joint_names),), "Saved finger segment goal")
-            identity = (segment["skill_id"], segment["event_id"])
+            # BEGIN initial holds have no source operation; commands use the strict key.
+            identity = ((segment["skill_id"], segment["event_id"], segment["occurrence"])
+                        if segment["kind"] == "initial_hold" else event_occurrence_key(segment))
             if segment["kind"] == "initial_hold":
-                if begin != 0. or identity != (None, None) or not np.array_equal(goal, self.position[0]):
+                if begin != 0. or identity != (None, None, None) or not np.array_equal(goal, self.position[0]):
                     raise ValueError("The initial hold must retain actual initial finger coordinates")
+            # END segment identities cannot silently revert to source-only matching.
             elif segment["kind"] == "command" and identity in active and identity not in used:
                 event = active[identity]
                 if begin != event["applied_time_s"] or not np.array_equal(goal, event["finger_positions"]):

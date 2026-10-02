@@ -40,17 +40,17 @@ class PlanningBindingTest(unittest.TestCase):
         problem = self.problem((event,))
         original = _ProgressMap(np.array([0., .37, .9, 1.]), np.array([0., .5, 1., 1.]))
         bound = _bind_event_clock(problem, original, 1., .2)
-        record = bound.event_clock[("current", "close")]
+        record = bound.event_clock[("current", "close", 0)]
         self.assertEqual(record["intent_time_s"], .37)
         self.assertEqual(record["time"], .37)
         self.assertEqual(record["activation_time_s"], .4)
         self.assertAlmostEqual(bound.anchor_parameters([.5])[0, 0], .4)
         np.testing.assert_array_equal(original.u, [0., .37, .9, 1.])
 
-    def test_no_command_coverage_or_merged_ticks_is_a_binding_conflict(self):
-        events = (PlanningEvent("open", "current", .31, 1, "open", "original"),
+    def test_uncovered_commands_or_required_occurrence_conflicts_reject_binding(self):
+        events = (PlanningEvent("open", "current", .31, 1, "open", "original", stop=True),
                   PlanningEvent("close", "current", .32, 2, "close", "original"))
-        with self.assertRaisesRegex(ValueError, "merges or reverses"):
+        with self.assertRaisesRegex(ValueError, "required physical occurrence"):
             _bind_event_clock(self.problem(events), _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), 1., .5)
         terminal = PlanningEvent("close", "current", 1., 3, "close", "original")
         with self.assertRaisesRegex(ValueError, "activation/effect coverage"):
@@ -75,6 +75,7 @@ class PlanningBindingTest(unittest.TestCase):
         problem.pose_events = (goal,)
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.problem, planner.torch = problem, torch
+        planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float32))
         planner.GoalToolPose = SimpleNamespace
         self.assertIsNone(planner._terminal_goal())
@@ -86,6 +87,8 @@ class PlanningBindingTest(unittest.TestCase):
         torch.testing.assert_close(planner._terminal_goal().position, native.position)
         goal.target[0, 3] = .5
         self.assertAlmostEqual(float(planner._terminal_goal().position.flatten()[0]), .4, places=6)
+        planner.progress_map = _ProgressMap(np.array([0., .8, 1.]), np.array([0., 1., 1.]))
+        self.assertIsNone(planner._terminal_goal())
 
     def test_nonfinite_single_ik_seed_does_not_hide_a_valid_success(self):
         candidates = np.array([[np.nan, 0.], [1., 2.], [3., 4.]])
@@ -122,7 +125,7 @@ class PlanningBindingTest(unittest.TestCase):
                               requires_evidence="Holding")
         original = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         bound = _bind_event_clock(self.problem((event,)), original, 1., .1)
-        record = bound.event_clock[("current", "effect")]
+        record = bound.event_clock[("current", "effect", 0)]
         self.assertEqual(record["intent_time_s"], .37)
         self.assertEqual(record["consumption_time_s"], .4)
         self.assertEqual(record["time"], .4)
@@ -146,11 +149,17 @@ class PlanningBindingTest(unittest.TestCase):
                     device_timestep_s=timestep)
         budget = PlanningBudget(maximum_trajectory_solves=4, search_seconds=2.)
         original = {"candidate_id": "candidate", "planning_budget": asdict(budget),
-                    "consumed_planning": {"trajectory_solves": 2, "search_seconds": .7},
+                    "consumed_planning": {"binding_attempts": 1, "initializations": 1, "ik_batches": 1,
+                        "ik_queries": 24, "search_queries": 0, "validation_passes": 2, "validation_queries": 20,
+                        "trajectory_solves": 2, "search_seconds": .7, "planning_seconds": 1.},
                     "physics_budget": 1000, "consumed_physics_steps": 100,
                     "problem": {"events": plain(problem.events)},
                     "curve": {"duration": 1., "progress_u": [0., .5, 1.],
                               "progress_s": [0., .8, 1.], "events": rows}}
+        from manipulation.planning import _request_work_ledger
+        ledger = _request_work_ledger(problem, budget)
+        ledger["consumed_planning"] = deepcopy(original["consumed_planning"])
+        original["request_ledger"] = ledger
         return {"candidate_id": "candidate", "original_binding": original,
                 "physics_budget": 1000, "cumulative_physics_steps": 100+local_steps,
                 "remaining_physics_steps": 900-local_steps, "consumed_physics_steps": local_steps,
@@ -177,8 +186,8 @@ class PlanningBindingTest(unittest.TestCase):
         times = np.linspace(0., .75, 101)
         np.testing.assert_allclose(np.interp(times/duration, mapping.u, mapping.s),
             np.interp(times+.25, [0., .5, 1.], [0., .8, 1.]), atol=1e-15)
-        self.assertEqual(mapping.event_clock[("current", "close")]["activation_time_s"], .65)
-        self.assertEqual(mapping.event_clock[("current", "close")]["request_intent_time_s"], .9)
+        self.assertEqual(mapping.event_clock[("current", "close", 0)]["activation_time_s"], .65)
+        self.assertEqual(mapping.event_clock[("current", "close", 0)]["request_intent_time_s"], .9)
 
     def test_continuation_never_replays_applied_events_or_guesses_past_effects(self):
         events = (PlanningEvent("earlier", "current", .1, 1, "close", "task"),
@@ -190,24 +199,24 @@ class PlanningBindingTest(unittest.TestCase):
         continuation["remaining_events"] = continuation["remaining_events"][1:]
         with self.assertRaisesRegex(ContinuationBindingError, "actual application or verification"):
             _prepare_continuation(problem, SimpleNamespace(gripper=None), None, continuation)
-        continuation["applied_events"] = [{"skill_id": "current", "event_id": "earlier"}]
+        continuation["applied_events"] = [{"skill_id": "current", "event_id": "earlier", "occurrence": 0}]
         _, prior = _prepare_continuation(problem, SimpleNamespace(gripper=None), None, continuation)
         self.assertEqual([event.event_id for event in problem.events], ["later"])
-        self.assertEqual(prior["consumed_events"], [("current", "earlier")])
+        self.assertEqual(prior["consumed_events"], [("current", "earlier", 0)])
 
     def test_unknown_ordinary_effect_evaluation_does_not_block_remaining_motion(self):
         events = (PlanningEvent("observe", "current", .1, 1, "effect", "task"),
                   PlanningEvent("later", "current", .9, 2, "open", "task"))
         problem = self.problem(events)
         continuation = self.continuation(problem)
-        continuation["evaluated_events"] = [{"skill_id": "current", "event_id": "observe",
+        continuation["evaluated_events"] = [{"skill_id": "current", "event_id": "observe", "occurrence": 0,
             "kind": "effect", "time": .1, "evaluation_time_s": .1, "evaluation": "U",
             "effects": {}, "source": "current scene has no conclusive effect observation"}]
         continuation["effects"] = {"Holding": {"value": "U", "source": "occluded"}}
         _, prior = _prepare_continuation(problem, SimpleNamespace(gripper=None), None, continuation)
         self.assertEqual([event.event_id for event in problem.events], ["later"])
         self.assertEqual(prior["effects"]["Holding"]["value"], "U")
-        self.assertEqual(prior["consumed_events"], [("current", "observe")])
+        self.assertEqual(prior["consumed_events"], [("current", "observe", 0)])
 
     def test_continuation_requires_past_goal_proof_and_preserves_original_indices(self):
         problem = self.problem()

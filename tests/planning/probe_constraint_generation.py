@@ -742,6 +742,8 @@ def run(args):
     runner_args = SimpleNamespace(**vars(args))
     runner_args.output = args.output/"scene-build"
     runner_args.continuation = None
+    runner_args.rebind = None  # This diagnostic constructs its initial binding only.
+    runner_args.request_ledger = None  # The diagnostic is a distinct explicitly bounded request.
     # END this diagnostic retains its original recorded entrance.
     try:
         original = read_json(args.source_run/"run-report.json")

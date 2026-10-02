@@ -318,6 +318,10 @@ class JointCoordinateGoalTest(unittest.TestCase):
                                  "basis": np.eye(3), "axis_point": np.array([0., 0., .1]),
                                  "source": "supplied signed hinge fixture", "coordinate_limits": [[0., 7.]]}
         start_q = .2
+        # BEGIN actual multi-turn branch is explicit fixture evidence.
+        scene["motion_model"].update(initial_coordinates=[start_q],
+            initial_coordinates_source="measured current hinge branch, independent of its periodic pose")
+        # END a principal-looking pose alone does not identify the current turns.
         rotation = Rotation.from_rotvec([0., 0., start_q]).as_matrix()
         initial = zero.copy()
         initial[:3, :3] = rotation

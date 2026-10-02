@@ -18,49 +18,13 @@ from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChec
 from manipulation.robosuite_execution import RobosuiteExecutionBackend
 
 
-_XML = """<mujoco>
-  <compiler angle="radian"/>
-  <option timestep=".002" gravity="0 0 0"/>
-  <default><joint damping="1"/><geom friction=".8 .01 .001" solref=".004 1"/></default>
-  <worldbody>
-    <geom name="target_slab" type="box" pos="0 0 -.05" size=".3 .3 .05"/>
-    <body name="base">
-      <body name="arm" pos="0 0 .07">
-        <joint name="arm_q" type="slide" axis="0 0 1" range="-.04 .04"/>
-        <geom name="pad" type="box" size=".05 .05 .05" mass=".2"/>
-        <site name="tcp" pos="0 0 -.05"/>
-        <body name="left" pos="0 .15 .1">
-          <joint name="left_q" type="slide" axis="0 1 0" range="0 .04"/>
-          <geom name="left_pad" type="box" size=".01 .01 .01" mass=".02"/>
-        </body>
-        <body name="right" pos="0 -.15 .1">
-          <joint name="right_q" type="slide" axis="0 1 0" range="-.04 0"/>
-          <geom name="right_pad" type="box" size=".01 .01 .01" mass=".02"/>
-        </body>
-      </body>
-    </body>
-  </worldbody>
-  <actuator>
-    <motor name="arm_motor" joint="arm_q" ctrllimited="true" ctrlrange="-10 10"/>
-    <position name="left_servo" joint="left_q" kp="100" ctrllimited="true" ctrlrange="0 .04"/>
-    <position name="right_servo" joint="right_q" kp="100" ctrllimited="true" ctrlrange="-.04 0"/>
-  </actuator>
-</mujoco>"""
-
-_URDF = """<robot name="cpu_press_fixture">
-  <link name="base"/><link name="arm"/><link name="left"/><link name="right"/><link name="tcp"/>
-  <joint name="arm_q" type="prismatic"><parent link="base"/><child link="arm"/>
-    <origin xyz="0 0 .07"/><axis xyz="0 0 1"/>
-    <limit lower="-.04" upper=".04" effort="10" velocity="1"/></joint>
-  <joint name="left_q" type="prismatic"><parent link="arm"/><child link="left"/>
-    <origin xyz="0 .15 .1"/><axis xyz="0 1 0"/>
-    <limit lower="0" upper=".04" effort="10" velocity="1"/></joint>
-  <joint name="right_q" type="prismatic"><parent link="arm"/><child link="right"/>
-    <origin xyz="0 -.15 .1"/><axis xyz="0 1 0"/>
-    <limit lower="-.04" upper="0" effort="10" velocity="1"/></joint>
-  <joint name="tcp_fixed" type="fixed"><parent link="arm"/><child link="tcp"/>
-    <origin xyz="0 0 -.05"/></joint>
-</robot>"""
+# BEGIN share the exact native model with the formal planner/contact probe.
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
+from contact_fixture import native_model_text
+_XML, _URDF = native_model_text()
+# END the original CPU test retains its 0.1 m square pad.
 
 
 def _scene(rule):
@@ -111,6 +75,13 @@ def test_native_contact_is_permitted_locally_and_actual_state_remains_distinct(t
     geometry.bind_scene(_scene(contact))
     initial = backend.proprioception()
     peak_force, saw_contact = 0., False
+    # BEGIN direction evidence uses the calibrated physical mechanism channel.
+    # This native fixture has exactly one prismatic arm coordinate along world
+    # z; its measured q/dq are therefore the actual carrier coordinate/rate.
+    # The observer's acquisition interval spans actual native samples and is
+    # deliberately independent of the commanded goal and progress variable.
+    direction_samples = []
+    # END no object direction is inferred from an unconfirmed grasp or FK alone.
     pad_id, slab_id = model.geom("pad").id, model.geom("target_slab").id
     for index in range(400):
         # A deliberately specified control reference, not planner output. The
@@ -118,6 +89,9 @@ def test_native_contact_is_permitted_locally_and_actual_state_remains_distinct(t
         goal = -.026*min((index+1)/150., 1.)
         backend.apply_control(np.asarray([goal]), np.asarray([.01, -.01]))
         backend.step()
+        measured = backend.proprioception()
+        direction_samples.append({"timestamp_s": float(measured["timestamp_s"]),
+            "coordinate": float(measured["q"][0]), "rate": float(measured["dq"][0])})
         for contact_index in range(backend.native_data.ncon):
             actual_contact = backend.native_data.contact[contact_index]
             if {int(actual_contact.geom1), int(actual_contact.geom2)} != {pad_id, slab_id}:
@@ -130,6 +104,19 @@ def test_native_contact_is_permitted_locally_and_actual_state_remains_distinct(t
     assert saw_contact and peak_force > .1
     assert actual["sim_time"] > initial["sim_time"]+.79
     assert actual["q"][0] > -.023 and abs(actual["q"][0]+.026) > .003
+    # BEGIN actual displacement/rate can refute a perfectly advanced command.
+    assert min(row["rate"] for row in direction_samples) < -.001
+    actual_net = -(direction_samples[-1]["coordinate"]-float(initial["q"][0]))
+    assert actual_net < .025 < .026  # The commanded travel is not measured travel.
+    direction_fact = {"identity": [0, 0], "value": "T" if actual_net >= .025 else "F",
+        "source": "Calibrated world-z prismatic q sensor in the actual native mechanism",
+        "acquisition_interval_s": [float(initial["timestamp_s"]), direction_samples[-1]["timestamp_s"]],
+        "scope_complete": True, "measured_signed_displacement": actual_net,
+        "observed_sample_count": len(direction_samples), "sampling_period_s": backend.timestep}
+    assert direction_fact["value"] == "F"
+    assert abs(direction_fact["acquisition_interval_s"][1]-direction_fact["acquisition_interval_s"][0]-.8) < 1e-10
+    record_property("actual_direction_evidence", direction_fact)
+    # END physical contact and source timing cannot turn this direction F into T.
     state = geometry.query(joint_names=actual["joint_names"], joint_positions=actual["q"],
         T_reference_base=actual["base_pose"], pairs=(), frames=("tcp",))
     np.testing.assert_allclose(state["frame_poses"]["tcp"], actual["tool_pose"], atol=1e-10)
@@ -163,3 +150,48 @@ def test_native_contact_is_permitted_locally_and_actual_state_remains_distinct(t
     assert final_peak_mib < 16*1024
     # END fixture growth and total process limit remain separately visible.
 # END real contact complements mocked execution sequencing regressions.
+
+
+# BEGIN replay the real formal probe's near-contact feedback without CUDA.
+def test_complete_solid_empty_intersection_resolves_coal_numerical_boundary(tmp_path):
+    from probe_contact_execution_gpu import build_native
+
+    backend, validator, _, _, _ = build_native(tmp_path)
+    rule = ContactRule(rule_id="press", actor="robot", target_owner="target", interval=(0., 1.),
+        sphere_indices=(0,), material_id="press_face",
+        feature_points=[[-.005,-.005,0.],[.005,-.005,0.],[.005,.005,0.],[-.005,.005,0.]],
+        feature_normal=[0.,0.,-1.], patch_origin=[0.,0.,0.], patch_axes=np.eye(3), patch_half_size=[.1,.1],
+        gap_bounds=(-.0025,.0025), normal_tolerance_rad=.01, modeling_allowance_m=.003,
+        geometry_error_m=.003, minimum_thickness_m=.1, source="unchanged formal probe finite contact permission")
+
+    def check(arm_q, *, permit):
+        backend.native_data.qpos[0] = arm_q
+        mujoco.mj_forward(backend.native_model, backend.native_data)
+        actual = backend.proprioception()
+        binding = _scene(rule)
+        if not permit:
+            binding["contacts"] = []
+        validator.bind_scene(binding, progress_at_time=lambda _: 1.)
+        return validator.check_state(actual, stage="saved_actual_replay", trajectory_time=0.)
+
+    # This exact q was rejected after native step 434 in the formal planner
+    # probe. The actual face has +0.178556 micrometres clearance, while Coal
+    # reports a zero-distance numerical boundary. Complete convex halfspaces
+    # resolve it as disjoint without any task permission or wider tolerance.
+    separated = check(-.019999821444431916, permit=False)
+    assert separated["passed"]
+    pad = next(row for row in separated["scene"]["pairs"] if row["actor_geometry"] == "pad")
+    assert pad["signed_distance_m"] == 0.
+    assert pad["relation"] == "numerical_boundary_with_proven_empty_intersection"
+    assert pad["boundary_intersection_check"]["intersection_empty"]
+    assert pad["permission"] is None
+
+    # A true overlap still needs the complete local material permission; an
+    # empty-intersection result cannot become a whole-pair contact exception.
+    penetrating = check(-.0201, permit=False)
+    assert not penetrating["passed"] and penetrating["violations"]
+    permitted = check(-.0201, permit=True)
+    assert permitted["passed"]
+    pad = next(row for row in permitted["scene"]["pairs"] if row["actor_geometry"] == "pad")
+    assert pad["permission"] == "press"
+# END physical separation and allowed local overlap remain separate query results.

@@ -237,7 +237,8 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
         default=_json_value, indent=2, allow_nan=False)+"\n")
 
 
-def plan_and_record(problem, scene, robot, output, *, budget, provenance, execution_limits, continuation=None):
+def plan_and_record(problem, scene, robot, output, *, budget, provenance, execution_limits,
+                    continuation=None, rebind=None, request_ledger=None):
     """Call ``plan_trajectory`` once and preserve its measured outcome.
 
     The scoped observer copies checked continuations and exact native curves
@@ -435,10 +436,21 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
                                                  new=stage_observer(method, name)))
             # END the observer does not repeat or bypass any entrance check.
             # BEGIN continuation consumes the original ledger and request budget.
-            result = planning.plan_trajectory(problem, scene, robot, budget=budget, continuation=continuation)
+            result = planning.plan_trajectory(problem, scene, robot, budget=budget,
+                continuation=continuation, rebind=rebind, request_ledger=request_ledger)
             # END a new actual binding is never an implicit budget reset.
         report.update(status="completed", success=result.success,
                       diagnostics=result.diagnostics)
+        # BEGIN failed planning attempts retain the same reusable work ledger.
+        report["request_ledger_path"] = None
+        if result.request_ledger is not None:
+            ledger_path = output / "request-ledger.json"
+            ledger_path.write_text(json.dumps(result.request_ledger, default=_json_value,
+                                             indent=2, allow_nan=False)+"\n")
+            report["request_ledger_path"] = str(ledger_path.resolve())
+        else:
+            report["request_ledger_unavailable"] = "Request identity was rejected before a valid work ledger could be initialized"
+        # END a CLI restart cannot silently reset spent initialization/solve work.
         if result.trajectory is not None:
             # BEGIN accepted artifacts retain their own effective native bounds.
             if selected_joint_limits is None:

@@ -16,11 +16,13 @@ from copy import copy, deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 import gc
 import time
+from uuid import uuid4
 from types import SimpleNamespace
 
 import numpy as np
 from scipy.interpolate import BSpline, CubicHermiteSpline
 from scipy.optimize import linear_sum_assignment
+from .planning_problem import event_occurrence_key
 
 # BEGIN reusable physical-domain contract for native numerical iterates.
 from .physical_joint_domain import (CubicJointDomain, JointPositionDomain,
@@ -100,6 +102,9 @@ class PlanningBudget:
     validation_joint_step: float = 0.025
     search_seconds: float = 3.0
     maximum_trajectory_solves: int = 3
+    # BEGIN wall work is cumulative across binding attempts, independently of physics.
+    planning_seconds: float = 120.0
+    # END a stage may finish over this limit, but its candidate cannot be accepted.
     random_seed: int = 123
 
     def __post_init__(self):
@@ -124,7 +129,7 @@ class PlanningBudget:
         if type(self.max_scene_workspace_bytes) is not int or not 0 <= self.max_scene_workspace_bytes <= 2*1024**3:
             raise ValueError("Scene workspaces must remain within the local two-GiB allocation budget")
         # END allow complete observed robots within the existing 12-GiB GPU.
-        for name in ("interpolation_dt", "maximum_trajectory_dt", "constraint_weight", "validation_joint_step"):
+        for name in ("interpolation_dt", "maximum_trajectory_dt", "constraint_weight", "validation_joint_step", "planning_seconds"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         if not np.isfinite(self.search_seconds) or self.search_seconds < 0:
@@ -306,6 +311,9 @@ class PlanningResult:
     diagnostics: dict
     # BEGIN bind accepted candidates to their executable input and clock.
     execution_binding: dict | None = None
+    # BEGIN even a failed initialization returns the reusable same-request ledger.
+    request_ledger: dict | None = None
+    # END formal execution authorization remains independent of retained history.
     # END failed results never carry an execution authorization.
 
 
@@ -603,8 +611,10 @@ def _bind_event_clock(problem, progress_map, duration, timestep=None):
     from .gripper_trajectory import _activation
     source = {}
     command_keys = []
+    tick_progress = set()
+    tick_entries = []
     for event in problem.events:
-        identity = (event.skill_id, event.event_id)
+        identity = event_occurrence_key(event)
         parameters = progress_map.anchor_parameters([event.progress])[:, 0]
         intent = float(parameters[0]*duration)
         command = event.kind in {"open", "close", "hold"}
@@ -615,14 +625,45 @@ def _bind_event_clock(problem, progress_map, duration, timestep=None):
         if needs_tick:
             if applied > duration or (command and applied == duration):
                 raise ValueError("A bound command has no activation/effect coverage inside the valid trajectory")
-            command_keys.append((float(parameters[0]), applied/duration))
-        source[identity] = {"intent_time_s": intent, "activation_time_s": applied if command else None,
+            tick_entries.append((event, step, float(parameters[0]), applied/duration))
+        source[identity] = {"event": asdict(event), "intent_time_s": intent, "activation_time_s": applied if command else None,
                             "consumption_time_s": applied if needs_tick and not command else None}
         if command:
             source[identity].update(bound_activation_step=step, request_activation_step=step,
                 request_activation_time_s=applied, request_intent_time_s=intent,
                 request_time_origin_step=0, device_timestep_s=float(timestep))
-    moves = dict([(0., 0.), (1., 1.)]+command_keys)
+    # Multiple ordinary intentions on the same actuator tick share the
+    # controller's existing last-intention policy. Preserve every identity;
+    # supersession here is a schedule prediction, not an application fact.
+    by_step = {}
+    for entry in tick_entries:
+        if entry[0].kind in {"open", "close", "hold"}:
+            by_step.setdefault(entry[1], []).append(entry)
+    superseded = set()
+    true_goals = {goal.progress for name in ("pose_events", "coordinate_events", "supports")
+                  for goal in getattr(problem, name)}
+    for entries in by_step.values():
+        ordered = sorted(entries, key=lambda item: (item[2], item[0].source_frame))
+        for event, _, _, _ in ordered[:-1]:
+            if (event.stop or event.requires_evidence is not None or event.progress in true_goals
+                    or any(item.check_target == "activation" for item in event.timing)):
+                raise ValueError("Device quantization supersedes a command with a required physical occurrence")
+            key = event_occurrence_key(event)
+            superseded.add(key)
+            source[key]["scheduled_superseded_by"] = event_occurrence_key(ordered[-1][0])
+    for event, _, before_u, after_u in tick_entries:
+        if event_occurrence_key(event) not in superseded:
+            command_keys.append((before_u, after_u))
+            tick_progress.add(event.progress)
+    # Independent functional events retain their own bound physical instant.
+    # Only queries explicitly sharing a command's progress move to its tick;
+    # ordinary reference samples between these anchors remain interpolated.
+    independent = [event.progress for event in problem.events if event.progress not in tick_progress]
+    independent += [goal.progress for name in ("pose_events", "coordinate_events", "supports")
+                    for goal in getattr(problem, name) if goal.progress not in tick_progress]
+    fixed = [(float(value), float(value)) for value in
+             progress_map.anchor_parameters(independent)[:, 0]] if independent else []
+    moves = dict([(0., 0.), (1., 1.)]+fixed+command_keys)
     before = np.asarray(sorted(moves))
     after = np.asarray([moves[value] for value in before])
     if after[0] != 0 or after[-1] != 1 or np.any(np.diff(after) <= 0):
@@ -633,7 +674,7 @@ def _bind_event_clock(problem, progress_map, duration, timestep=None):
     keys = np.union1d(progress_map.u, before)
     mapping = _ProgressMap(np.interp(keys, before, after), np.interp(keys, progress_map.u, progress_map.s))
     for event in problem.events:
-        record = source[(event.skill_id, event.event_id)]
+        record = source[event_occurrence_key(event)]
         parameters = mapping.anchor_parameters([event.progress])[:, 0]
         record.update(time=(record["intent_time_s"] if record["activation_time_s"] is not None
                             else (record["consumption_time_s"] if record["consumption_time_s"] is not None
@@ -643,13 +684,263 @@ def _bind_event_clock(problem, progress_map, duration, timestep=None):
 # END OMPL/refinement/export only read this record and never repeat quantization.
 
 
+# BEGIN hard time requirements inspect the final tick-bound schedule.
+def _validate_bound_event_times(problem, progress_map, duration, origin_s=0., history=(),
+                                goal_identities=None, timing_events=()):
+    """Check explicit windows against actual history or this tick-bound proposal.
+
+    Consumed nodes may still own an unresolved time relation. Their recorded
+    witness survives while a future origin is supplied by this candidate.
+    Only the latest selected occurrence of an original event owns the current
+    completion obligation; older attempts remain unchanged in the ledger.
+    """
+    from .planning_problem import PlanningEvent, TimeBindingError, resolve_event_window
+    goal_identities = ({name: list(range(len(getattr(problem, name))))
+                       for name in ("pose_events", "coordinate_events", "supports")}
+                      if goal_identities is None else goal_identities)
+    current = {event_occurrence_key(event): event for event in problem.events}
+    all_events = {event_occurrence_key(row): PlanningEvent(**row) for row in timing_events}
+    all_events.update(current)
+    latest = {}
+    for key in all_events:
+        latest[key[:2]] = max(latest.get(key[:2], -1), key[2])
+    predicted, planned, checks = [], {}, []
+
+    def candidate_fact(key, target, value, **identity):
+        predicted.append({"skill_id": key[0], "event_id": key[1], "occurrence": key[2],
+                          "check_target": target, "time_s": origin_s+value, **identity})
+
+    # A declared future origin can be another current command, goal arrival
+    # or effect observation node even when the origin has no own time window.
+    for key, event in current.items():
+        record = progress_map.event_clock[key]
+        if record.get("activation_time_s") is not None:
+            candidate_fact(key, "activation", record["activation_time_s"])
+        for collection in ("pose_events", "coordinate_events", "supports"):
+            for index, goal in enumerate(getattr(problem, collection)):
+                if abs(goal.progress-event.progress) <= 1e-7:
+                    candidate_fact(key, "arrival", float(progress_map.anchor_parameters([goal.progress])[0, 0]*duration),
+                                   goal_id=[collection, goal_identities[collection][index]])
+        for condition in getattr(problem, "conditions", ()):
+            if (condition.get("skill_id"), condition.get("event_id")) == key[:2] and condition.get("effect_requirement"):
+                candidate_fact(key, "effect", record["time"], condition_id=condition["condition_id"])
+        for constraint in event.timing:
+            if constraint.check_target == "activation":
+                value = record.get("activation_time_s")
+                if value is None:
+                    raise TimeBindingError("An activation window requires a real device command activation")
+            elif constraint.check_target == "arrival":
+                collection, original_index = constraint.goal_id
+                if original_index not in goal_identities[collection]:
+                    raise TimeBindingError("An arrival requirement refers to a goal absent from this occurrence")
+                goal = getattr(problem, collection)[goal_identities[collection].index(original_index)]
+                value = float(progress_map.anchor_parameters([goal.progress])[0, 0]*duration)
+            else:
+                value = record["time"]
+            identity = {"goal_id": None if constraint.goal_id is None else list(constraint.goal_id),
+                        "condition_id": constraint.condition_id}
+            candidate_fact(key, constraint.check_target, value, **identity)
+            planned[(key, constraint.check_target, constraint.goal_id, constraint.condition_id)] = origin_s+value
+
+    for key, event in all_events.items():
+        if key[2] != latest[key[:2]]:
+            continue
+        for constraint in event.timing:
+            facts = [row for row in history if event_occurrence_key(row) == key and row.get("value") == "T"
+                and row.get("check_target") == constraint.check_target
+                and (constraint.goal_id is None or tuple(row.get("goal_id", ())) == constraint.goal_id)
+                and (constraint.condition_id is None or row.get("condition_id") == constraint.condition_id)]
+            value = min(row["time_s"] for row in facts) if facts else planned.get(
+                (key, constraint.check_target, constraint.goal_id, constraint.condition_id))
+            # A pending observed effect can be assessed again from fresh actual
+            # data. An absent consumed activation/arrival witness cannot be
+            # reconstructed from a demonstration or its former scheduled time.
+            if value is None:
+                if constraint.check_target != "effect":
+                    raise TimeBindingError("A consumed timed event lacks its actual occurrence witness")
+                value = origin_s
+            earliest, latest_time = resolve_event_window(constraint, history, predicted_origins=predicted)
+            if constraint.check_target == "effect":
+                # An old true state observed before this effect window is
+                # history, not a completion witness for the timed obligation.
+                applicable = [row for row in facts if (earliest is None or row["time_s"] >= earliest-1e-9)
+                              and (latest_time is None or row["time_s"] <= latest_time+1e-9)]
+                facts = applicable
+                value = (min(row["time_s"] for row in facts) if facts else max(origin_s,
+                    planned.get((key, constraint.check_target, constraint.goal_id, constraint.condition_id), origin_s),
+                    origin_s if earliest is None else earliest))
+            if latest_time is not None and value > latest_time+1e-9:
+                raise TimeBindingError(f"Event {key} {constraint.check_target} exceeds its original physical deadline")
+            if constraint.check_target != "effect" and earliest is not None and value < earliest-1e-9:
+                raise TimeBindingError(f"Event {key} {constraint.check_target} precedes its explicit physical window")
+            checks.append({"event": key, "check_target": constraint.check_target,
+                "scheduled_request_time_s": value, "window_s": [earliest, latest_time],
+                "status": "requires_actual_effect_evidence" if constraint.check_target == "effect" and not facts
+                          else "actual_time_inside_window" if facts else "scheduled_time_inside_window"})
+    return checks
+
+# END computation time is accounted separately and cannot shift these origins.
+
+
 
 # BEGIN same-request continuation consumes facts and the original clock.
 class ContinuationBindingError(ValueError):
     """Remaining work lacks facts, budget or a compatible original clock."""
 
 
-def _prepare_continuation(problem, scene, budget, continuation):
+# BEGIN one ledger accounts for successful, failed and rebound work alike.
+_PLANNING_COUNTS = ("binding_attempts", "initializations", "ik_batches", "ik_queries", "search_queries",
+                    "trajectory_solves", "validation_passes", "validation_queries")
+_PLANNING_SECONDS = ("search_seconds", "planning_seconds")
+
+
+def _obligation_contract(problem):
+    """Keep original semantic identities and thresholds, allowing fresh geometry.
+
+    Current poses, attachment transforms and observed surfaces are rebindable
+    inputs. A new observation cannot erase a goal/process, reorder its original
+    index, or relax a declared functional threshold under the same request ID.
+    """
+    from .execution_binding import plain
+    columns = {
+        "pose_events": ("progress", "source", "position_tolerance_m", "rotation_tolerance_rad"),
+        "coordinate_events": ("progress", "source", "target_coordinate", "tolerance", "kind", "coordinate_mode", "coordinate_origin"),
+        "supports": ("progress", "source", "margin", "gap_tolerance", "normal_tolerance"),
+        "pose_relations": ("start", "end", "source", "pose_bounds"),
+        "mechanisms": ("end", "source", "directions"),
+        "interiors": ("start", "end", "source", "margin"),
+        "couplings": ("joint_names", "matrix", "target", "source"),
+    }
+    contract = {}
+    for collection, names in columns.items():
+        contract[collection] = [{"type": type(item).__name__, **{name: plain(getattr(item, name)) for name in names},
+            **({"kind": item.model.kind} if collection == "mechanisms" else {})}
+            for item in getattr(problem, collection, ())]
+    contract["conditions"] = [{name: plain(row[name]) for name in
+        ("condition_id", "kind", "skill_id", "event_id", "effect_requirement", "requires_evidence") if name in row}
+        for row in getattr(problem, "conditions", ())]
+    contract["source_time_map"] = {name: plain(getattr(problem, name, None))
+                                   for name in ("source_timestamps", "source_progress")}
+    contract["source_phases"] = [{"source": plain(phase.reference.source),
+                                  "skill_id": phase.metadata.get("skill_id")}
+                                 for phase in getattr(problem, "phases", ())]
+    return contract
+
+
+def _restore_original_direction_origins(problem, contract):
+    """Retain actual net-change baselines without freezing fresh mechanism poses.
+
+    A compiler can derive an entrance baseline from its freshly observed
+    initial coordinate. That is correct only for a new request. For the same
+    request, recover the original evidenced baseline when every direction
+    instruction is unchanged. An explicitly different baseline is rejected
+    by the semantic contract instead of silently accepted as a new goal.
+    """
+    from .execution_binding import plain
+    saved_mechanisms = contract["mechanisms"]
+    if not saved_mechanisms or len(saved_mechanisms) != len(getattr(problem, "mechanisms", ())):
+        return
+    for mechanism, saved in zip(problem.mechanisms, saved_mechanisms):
+        if len(mechanism.directions) != len(saved["directions"]):
+            continue
+        directions = []
+        for direction, original in zip(mechanism.directions, saved["directions"]):
+            current = plain(direction)
+            semantics = lambda row: {name: value for name, value in row.items()
+                                     if name not in {"origin_coordinate", "origin_source"}}
+            automatic = (direction.start == mechanism.start
+                and direction.origin_coordinate == float(mechanism.initial_coordinates[direction.coordinate_index])
+                and plain(direction.origin_source) == plain(mechanism.source))
+            if (direction.kind == "net" and original["origin_coordinate"] is not None
+                    and semantics(current) == semantics(original)
+                    and (direction.origin_coordinate is None or automatic)):
+                direction = replace(direction, origin_coordinate=original["origin_coordinate"],
+                                    origin_source=deepcopy(original["origin_source"]))
+            directions.append(direction)
+        mechanism.directions = tuple(directions)
+
+
+class PlanningWorkExhausted(ValueError):
+    """The original request has no remaining admitted computation budget."""
+
+
+def _request_work_ledger(problem, budget, previous=None, continuation=None):
+    """Copy an append-only request record, never mutate a caller's failed result."""
+    from .execution_binding import plain
+    ledger = ({"request_id": uuid4().hex, "planning_budget": asdict(budget),
+        "consumed_planning": {**dict.fromkeys(_PLANNING_COUNTS, 0),
+                              **dict.fromkeys(_PLANNING_SECONDS, 0.)},
+        "original_events": plain(problem.events), "obligation_contract": _obligation_contract(problem),
+        "history": [], "event_records": [], "timing_events": [], "timing_checks": [],
+        "completed_goal_ids": [], "goal_evidence": [], "completed_direction_ids": [], "direction_evidence": [],
+        "effects": {}, "effect_history": [], "binding_records": []}
+        if previous is None else deepcopy(previous))
+    if (not isinstance(ledger.get("request_id"), str) or not ledger["request_id"]
+            or ledger.get("planning_budget") != asdict(budget)):
+        raise ContinuationBindingError("A same-request ledger cannot reset its identity or planning budget")
+    if not isinstance(ledger.get("obligation_contract"), dict):
+        raise ContinuationBindingError("The request ledger lacks its original goal/process identity contract")
+    consumed = ledger.get("consumed_planning", {})
+    for name in (*_PLANNING_COUNTS, *_PLANNING_SECONDS):
+        value = consumed.get(name)
+        if (not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0
+                or (name in _PLANNING_COUNTS and type(value) is not int)):
+            raise ContinuationBindingError("The request ledger needs every cumulative planning counter")
+    for name in ("original_events", "history", "event_records", "timing_events", "timing_checks", "completed_goal_ids", "goal_evidence",
+                 "completed_direction_ids", "direction_evidence", "effect_history", "binding_records"):
+        if not isinstance(ledger.get(name), list):
+            raise ContinuationBindingError(f"The request ledger lacks its append-only {name}")
+    if continuation is not None:
+        original = continuation["original_binding"]
+        old = original["request_ledger"]
+        if old["request_id"] != ledger["request_id"]:
+            raise ContinuationBindingError("Execution and planning ledgers belong to different requests")
+        if (ledger["original_events"] != old["original_events"]
+                or ledger["obligation_contract"] != old["obligation_contract"]):
+            raise ContinuationBindingError("A request ledger cannot rewrite original source or goal/process identities")
+        if not {tuple(value) for value in old["completed_goal_ids"]} <= {tuple(value) for value in ledger["completed_goal_ids"]}:
+            raise ContinuationBindingError("A request ledger cannot erase historical completed goals")
+        if not {tuple(value) for value in old["completed_direction_ids"]} <= {tuple(value) for value in ledger["completed_direction_ids"]}:
+            raise ContinuationBindingError("A request ledger cannot erase historical completed directions")
+        if any(consumed[name] < old["consumed_planning"][name] for name in consumed):
+            raise ContinuationBindingError("Cumulative planning work must retain all prior attempts")
+        for name in ("history", "event_records", "timing_events", "timing_checks", "goal_evidence", "direction_evidence", "effect_history", "binding_records"):
+            if ledger[name][:len(old[name])] != old[name]:
+                raise ContinuationBindingError(f"The request ledger rewrote prior {name}")
+        # Append actual execution facts once; a historical T is retained here,
+        # not promoted to currently applicable scene evidence in a new binding.
+        for name in ("history", "timing_checks", "goal_evidence", "completed_goal_ids", "completed_direction_ids", "direction_evidence", "effect_history"):
+            for row in continuation.get(name, ()):
+                if row not in ledger[name]:
+                    ledger[name].append(deepcopy(row))
+        for name in ("applied_events", "superseded_events", "evaluated_events", "stopped_events", "reached_events", "verified_events"):
+            for row in continuation.get(name, ()):
+                record = {"record_kind": name, **deepcopy(row)}
+                if record not in ledger["event_records"]:
+                    ledger["event_records"].append(record)
+        ledger["effects"].update(deepcopy(continuation.get("effects", {})))
+    return ledger
+
+
+def _check_work_budget(budget, consumed, *, started, initial_seconds, stage=None):
+    """Check at stage boundaries; report real elapsed overrun, never pretend preemption."""
+    consumed["planning_seconds"] = initial_seconds+time.monotonic()-started
+    cap = budget.maximum_trajectory_solves
+    if consumed["planning_seconds"] >= budget.planning_seconds:
+        raise PlanningWorkExhausted("The original cumulative planning wall-time budget is exhausted")
+    stage_caps = {"binding_attempts": cap, "initializations": cap, "ik_batches": cap,
+        "ik_queries": budget.max_validation_points*budget.ik_seeds*cap,
+        "trajectory_solves": cap,
+        "validation_passes": cap*budget.trajectory_seeds,
+        "validation_queries": budget.max_validation_points*cap*budget.trajectory_seeds+cap,
+        "search_queries": budget.max_validation_points*cap}
+    for name, limit in stage_caps.items():
+        if consumed[name] > limit or (stage == name and consumed[name] >= limit):
+            raise PlanningWorkExhausted(f"The original cumulative {name} budget is exhausted")
+# END derived capacities include every declared native candidate, without new services.
+
+
+def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
     """Validate a fresh actual/scene binding without replaying consumed events.
 
     A continuation is the executor's existing result record. It is not a
@@ -658,18 +949,25 @@ def _prepare_continuation(problem, scene, budget, continuation):
     survive; angular history and past goal effects require supplied facts.
     """
     from .execution_binding import plain
+    from .planning_problem import event_occurrence_key
+    if rebind is not None and (not isinstance(rebind, dict)
+            or rebind.get("kind") not in {"remaining", "retry"} or not rebind.get("source")):
+        raise ContinuationBindingError("An explicit rebind needs remaining/retry kind and its executor source")
     if not isinstance(continuation, dict) or not isinstance(continuation.get("original_binding"), dict):
         raise ContinuationBindingError("Continuation requires its original formal execution binding")
     original = continuation["original_binding"]
     if continuation.get("candidate_id") != original.get("candidate_id"):
         raise ContinuationBindingError("Continuation candidate identity differs from its original binding")
+    _restore_original_direction_origins(problem, original["request_ledger"]["obligation_contract"])
+    if _obligation_contract(problem) != original["request_ledger"]["obligation_contract"]:
+        raise ContinuationBindingError("A fresh binding cannot remove, reorder or change original goal/process obligations")
     if "planning_budget" not in original or "consumed_planning" not in original:
         raise ContinuationBindingError("Continuation lacks the original cumulative planning budget")
     request_budget = PlanningBudget(**original["planning_budget"])
     if budget is not None and asdict(budget) != asdict(request_budget):
         raise ContinuationBindingError("A continuation cannot reset or enlarge its original planning budget")
     consumed = deepcopy(continuation.get("consumed_planning", original["consumed_planning"]))
-    for key in ("trajectory_solves", "search_seconds"):
+    for key in (*_PLANNING_COUNTS, *_PLANNING_SECONDS):
         value = consumed.get(key)
         if (not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0
                 or value < original["consumed_planning"].get(key, 0)):
@@ -726,82 +1024,189 @@ def _prepare_continuation(problem, scene, budget, continuation):
             or abs(actual_elapsed-elapsed) > 1e-8):
         raise ContinuationBindingError("Actual elapsed physics time differs from its native device step ledger")
     if (not isinstance(duration, (int, float)) or not isinstance(elapsed, (int, float))
-            or not np.isfinite([duration, elapsed]).all() or not 0 <= elapsed < duration):
+            or not np.isfinite([duration, elapsed]).all() or elapsed < 0 or duration <= 0
+            or (rebind is None and elapsed >= duration)):
         raise ContinuationBindingError("The remaining original physical clock is exhausted or unavailable")
     old_u, old_s = np.asarray(curve.get("progress_u"), float), np.asarray(curve.get("progress_s"), float)
     try:
         original_map = _ProgressMap(old_u, old_s)
     except ValueError as error:
         raise ContinuationBindingError("Continuation has no complete frozen progress map") from error
-    start_progress = float(np.interp(elapsed/duration, original_map.u, original_map.s))
-    if start_progress >= problem.phase_count:
+    curve_elapsed = elapsed if rebind is None else continuation.get("last_curve_time_s")
+    if not isinstance(curve_elapsed, (int, float)) or not np.isfinite(curve_elapsed) or not 0 <= curve_elapsed <= duration:
+        raise ContinuationBindingError("Rebinding requires the last actually executed curve time, separately from hold time")
+    start_progress = float(np.interp(curve_elapsed/duration, original_map.u, original_map.s))
+    if start_progress >= problem.phase_count and rebind is None:
         raise ContinuationBindingError("The original skill progress is finished; unresolved effects need assessment or an explicit same-goal retry")
-    request_events = deepcopy(original.get("request_events", original["problem"]["events"]))
+    request_events = deepcopy(original["request_ledger"]["original_events"])
     source_events = {(row["skill_id"], row["event_id"]): row for row in request_events}
     current_events = {(event.skill_id, event.event_id): event for event in problem.events}
     if set(current_events) != set(source_events):
         raise ContinuationBindingError("Fresh continuation must retain the original skill and event identities before filtering")
     for identity, event in current_events.items():
-        if plain(event) != source_events[identity]:
+        current, source = plain(event), deepcopy(source_events[identity])
+        current.pop("occurrence")
+        source.pop("occurrence")
+        if current != source:
             raise ContinuationBindingError("Continuation changed an original event/source/goal association")
     remaining_rows = continuation.get("remaining_events")
     if not isinstance(remaining_rows, (list, tuple)):
         raise ContinuationBindingError("Continuation lacks its consumed/unconsumed event ledger")
-    pending_ids = {(row["skill_id"], row["event_id"]) for row in remaining_rows}
+    pending_ids = {event_occurrence_key(row) for row in remaining_rows}
+    old_occurrences = {event_occurrence_key(row): row for row in curve.get("events", ())}
     old_rows = {(row["skill_id"], row["event_id"]): row for row in curve.get("events", ())}
-    if not pending_ids <= set(old_rows):
+    if not pending_ids <= set(old_occurrences):
         raise ContinuationBindingError("Remaining event ledger does not belong to the original candidate")
     applied = set(tuple(value) for value in original.get("consumed_events", ()))
     for row in (*continuation.get("applied_events", ()), *continuation.get("superseded_events", ())):
-        applied.add((row["skill_id"], row["event_id"]))
+        applied.add(event_occurrence_key(row))
     if applied & pending_ids:
         raise ContinuationBindingError("An applied command cannot be replayed as an unconsumed event")
-    evaluated = {(row["skill_id"], row["event_id"]) for row in continuation.get("evaluated_events", ())}
-    stopped = {(row["skill_id"], row["event_id"]) for row in continuation.get("stopped_events", ())}
-    reached = {(row["skill_id"], row["event_id"]) for row in continuation.get("reached_events", ())}
+    evaluated = {event_occurrence_key(row) for row in continuation.get("evaluated_events", ())}
+    stopped = {event_occurrence_key(row) for row in continuation.get("stopped_events", ())}
+    reached = {event_occurrence_key(row) for row in continuation.get("reached_events", ())}
     witnessed = applied | evaluated | stopped | reached | {
-        (row["skill_id"], row["event_id"]) for row in continuation.get("verified_events", ())}
+        event_occurrence_key(row) for row in continuation.get("verified_events", ())}
     # Ordinary effect evaluation consumes its observation node even when
     # the value is F/U. It never claims a successful effect or a held object.
     for identity in evaluated:
-        event = current_events.get(identity)
+        event = current_events.get(identity[:2])
         if (event is None or event.kind != "effect" or event.requires_evidence is not None
                 or (event.stop and identity not in stopped)):
             raise ContinuationBindingError("An evaluation ledger entry is not an ordinary effect node")
         pending_ids.discard(identity)
     for identity in reached:
-        event = current_events.get(identity)
+        event = current_events.get(identity[:2])
         if event is None or event.kind != "function" or event.requires_evidence is not None:
             raise ContinuationBindingError("A reached-node ledger entry is not an independent functional event")
         pending_ids.discard(identity)
-    consumed_events = set(source_events)-pending_ids
+    consumed_events = (set(old_occurrences)-pending_ids) | applied
     if not consumed_events <= witnessed:
         raise ContinuationBindingError("Consumed events need actual application or verification ledger entries")
     for identity in pending_ids:
-        row = old_rows[identity]
+        row = old_occurrences[identity]
         due = row.get("activation_time_s") if row.get("activation_time_s") is not None else row["time"]
-        if due < elapsed:
-            raise ContinuationBindingError(f"Unconsumed event {identity} is overdue on the original hard clock")
+        if due < elapsed and rebind is None:
+            raise ContinuationBindingError(f"Unconsumed event {identity} is overdue on the frozen schedule; an explicit rebind is required")
     completed_goals = {tuple(value) for value in original.get("completed_goal_ids", ())}
     completed_goals.update(tuple(value) for value in continuation.get("completed_goal_ids", ()))
+    # Actual direction completion is not implied by traversing source progress.
+    all_directions = {(index, column) for index, mechanism in enumerate(problem.mechanisms)
+                      for column in range(len(mechanism.directions))}
+    completed_directions = {tuple(value) for value in original.get("completed_direction_ids", ())}
+    claimed_directions = {tuple(value) for value in continuation.get("completed_direction_ids", ())}
+    if not (completed_directions | claimed_directions) <= all_directions:
+        raise ContinuationBindingError("A direction completion must retain its original mechanism/direction identity")
+    for identity in claimed_directions-completed_directions:
+        direction = problem.mechanisms[identity[0]].directions[identity[1]]
+        rows = [row for row in continuation.get("direction_evidence", ())
+                if tuple(row.get("identity", ())) == identity and row.get("candidate_id") == original["candidate_id"]
+                and row.get("value") == "T" and row.get("scope_complete") is True
+                and row.get("completion_verified") is True
+                and isinstance(row.get("source"), str) and row["source"].strip()]
+        # BEGIN completion consumes the executor's covered actual scope.
+        # An observer's raw scope_complete label is retained as evidence but
+        # cannot alone turn a short or stale interval into a completed guard.
+        # Net displacement needs its original coordinate origin and endpoint;
+        # monotone/rate obligations additionally cover the whole observed scope.
+        declared_net_origin = (direction.kind == "net" and direction.origin_coordinate is not None
+                               and bool(direction.origin_source))
+        verified = False
+        for row in rows:
+            interval = np.asarray(row.get("acquisition_interval_s"), float)
+            scope_start, scope_end = row.get("scope_started_at_s"), row.get("scope_ended_at_s")
+            if (interval.shape != (2,) or not np.isfinite(interval).all() or interval[0] > interval[1]
+                    or not isinstance(scope_end, (int, float)) or not np.isfinite(scope_end)
+                    or interval[1] < scope_end-1e-8):
+                continue
+            scope_covered = (isinstance(scope_start, (int, float)) and np.isfinite(scope_start)
+                             and scope_start <= scope_end and interval[0] <= scope_start+1e-8)
+            if declared_net_origin or scope_covered:
+                verified = True
+                break
+        if not verified:
+            raise ContinuationBindingError("Direction completion needs actual scoped T evidence from this executed candidate")
+        # END continuation cannot upgrade an observer's unverified completion label.
+    completed_directions.update(claimed_directions)
+    # BEGIN explicit rebinding preserves obligations but rebuilds the soft schedule.
+    retry_ids, retry_goals, retry_directions = set(), set(), set()
+    if rebind is not None and rebind["kind"] == "retry":
+        retry_ids = {tuple(value) for value in rebind.get("retry_event_ids", ())}
+        retry_goals = {tuple(value) for value in rebind.get("retry_goal_ids", ())}
+        retry_directions = {tuple(value) for value in rebind.get("retry_direction_ids", ())}
+        all_goals = {(name, index) for name in ("pose_events", "coordinate_events", "supports")
+                     for index in range(len(getattr(problem, name)))}
+        if (not retry_ids <= set(source_events) or not retry_goals <= all_goals or not retry_directions <= all_directions
+                or not (retry_ids or retry_goals or retry_directions)):
+            raise ContinuationBindingError("A same-goal retry must select original event/goal identities")
+    selected_events = {}
+    for identity in pending_ids:
+        selected_events[identity[:2]] = replace(current_events[identity[:2]], occurrence=identity[2])
+    for identity in retry_ids:
+        if any(key[:2] == identity for key in pending_ids):
+            raise ContinuationBindingError("Retry selects consumed occurrences; pending work uses remaining rebind")
+        occurrences = [key[2] for key in (*old_occurrences, *applied) if key[:2] == identity]
+        occurrences.extend(event_occurrence_key(row)[2] for row in continuation.get("history", ())
+                           if event_occurrence_key(row)[:2] == identity)
+        selected_events[identity] = replace(current_events[identity], occurrence=max(occurrences, default=0)+1)
+    remaining_goal_ids = {(name, index) for name in ("pose_events", "coordinate_events", "supports")
+        for index in range(len(getattr(problem, name))) if (name, index) not in completed_goals or (name, index) in retry_goals}
+    if rebind is not None:
+        required_progress = [event.progress for event in selected_events.values()]
+        required_progress += [getattr(problem, name)[index].progress for name, index in remaining_goal_ids]
+        required_progress += [problem.mechanisms[index].directions[column].start for index, column in retry_directions]
+        if required_progress:
+            start_progress = min(start_progress, min(required_progress))
+        # A terminal unresolved effect/goal needs a nonempty new source window;
+        # taking the preceding source interval proposes timing only, not q or a
+        # re-execution of already consumed commands.
+        if start_progress >= problem.phase_count:
+            start_progress = float(problem.source_progress[-2])
+    # END original frame/progress associations remain unchanged across occurrences.
     for collection in ("pose_events", "coordinate_events", "supports"):
         for index, requirement in enumerate(getattr(problem, collection)):
-            if requirement.progress < start_progress and (collection, index) not in completed_goals:
+            if rebind is None and requirement.progress < start_progress and (collection, index) not in completed_goals:
                 raise ContinuationBindingError(f"Past goal {collection}:{index} needs actual completion evidence")
     for index, requirement in enumerate(problem.mechanisms):
+        for column, direction in enumerate(requirement.directions):
+            if (direction.end < start_progress and (index, column) not in completed_directions
+                    and (index, column) not in retry_directions):
+                raise ContinuationBindingError(f"Past direction {index}:{column} needs actual scoped completion evidence or an explicit retry")
+        if any(direction.kind == "net" and direction.origin_coordinate is None
+               and direction.start < start_progress <= direction.end for direction in requirement.directions):
+            raise ContinuationBindingError(f"mechanism:{index} net direction needs its actually observed original scope-start coordinate")
         if (requirement.end >= start_progress and requirement.angular_column is not None
-                and requirement.start != start_progress):
+                and requirement.start != start_progress
+                and not requirement.model.diagnostics.get("initial_coordinates_source")
+                and requirement.model.diagnostics.get("initial_coordinate_convention")
+                    != "unique actual angular branch within current physical limits"):
             raise ContinuationBindingError(f"mechanism:{index} needs current observed lifted coordinates and a fresh actual-start scope")
     # Goal ledger identities always use the original request's collection
     # indices. Filtering a remaining suffix must never renumber a proof.
     goal_identities = {collection: [index for index, item in enumerate(getattr(problem, collection))
-                                  if item.progress >= start_progress]
+                                  if item.progress >= start_progress and (collection, index) in remaining_goal_ids]
                        for collection in ("pose_events", "coordinate_events", "supports")}
+    direction_identities = [[(index, column) for column in range(len(item.directions))]
+                            for index, item in enumerate(problem.mechanisms) if item.end >= start_progress]
     rebound = deepcopy(problem)
     rebound.start_progress = start_progress
-    rebound.events = tuple(event for event in rebound.events if (event.skill_id, event.event_id) in pending_ids)
+    rebound.events = tuple(deepcopy(event) for event in selected_events.values())
+    # BEGIN a measured angular branch anchors this binding's actual suffix.
+    # The compiler validates this explicit lifted coordinate against fresh
+    # observed pose. Move only the mechanism's coordinate-history entrance;
+    # original direction scopes, net origins and entry-delta targets remain.
+    # Mutating the private object also preserves coordinate-goal references
+    # to this same mechanism instead of creating two inconsistent lift scopes.
+    for mechanism in rebound.mechanisms:
+        if (mechanism.angular_column is not None and mechanism.start < start_progress <= mechanism.end
+                and (mechanism.model.diagnostics.get("initial_coordinates_source")
+                     or mechanism.model.diagnostics.get("initial_coordinate_convention")
+                        == "unique actual angular branch within current physical limits")):
+            mechanism.start = start_progress
+    # END reference angles cannot supply this actual branch evidence.
     for collection in ("pose_events", "coordinate_events", "supports"):
-        setattr(rebound, collection, tuple(item for item in getattr(rebound, collection) if item.progress >= start_progress))
+        setattr(rebound, collection, tuple(item for index, item in enumerate(getattr(rebound, collection))
+                                           if index in goal_identities[collection]))
     for collection in ("pose_relations", "mechanisms", "interiors"):
         setattr(rebound, collection, tuple(item for item in getattr(rebound, collection) if item.end >= start_progress))
     source_time = problem.progress_to_source_time(start_progress)
@@ -809,9 +1214,22 @@ def _prepare_continuation(problem, scene, budget, continuation):
     rebound.source_timestamps = np.r_[source_time, problem.source_timestamps[selected]]
     rebound.source_progress = np.r_[start_progress, problem.source_progress[selected]]
     rebound.__post_init__()
-    # The existing hand factory closes over this fresh problem object. Update
-    # its declared fields only after all validation succeeds so it sees the
-    # same remaining events; no independent command list is manufactured.
+    # A hand factory consumes only this candidate's clock event records. Keep
+    # the scene's declared command identities in that same selected set; its
+    # original source policy is validated before changing occurrence numbers.
+    if hand is not None:
+        policies = {(row["skill_id"], row["event_id"]): row for row in hand.commands}
+        commands = []
+        for event in rebound.events:
+            if event.kind not in {"open", "close", "hold"}:
+                continue
+            policy = policies.get((event.skill_id, event.event_id))
+            if policy is None or policy["command"] != event.kind or policy["progress"] != event.progress:
+                raise ContinuationBindingError("Rebinding cannot invent or change an original hand command policy")
+            commands.append({**deepcopy(policy), "occurrence": event.occurrence})
+        hand.commands = tuple(commands)
+    # Only the private binding problem is filtered after validation succeeds.
+    # Hand factories consume event metadata from the same frozen clock.
     for item in fields(problem):
         if item.init:
             setattr(problem, item.name, getattr(rebound, item.name))
@@ -819,12 +1237,22 @@ def _prepare_continuation(problem, scene, budget, continuation):
         "actual_elapsed": float(actual_elapsed), "elapsed_device_steps": local_steps,
         "device_timestep_s": float(timestep),
         "u": original_map.u.copy(), "s": original_map.s.copy(),
-        "events": {identity: deepcopy(old_rows[identity]) for identity in pending_ids},
+        "events": {identity: deepcopy(old_occurrences[identity]) for identity in pending_ids},
         "request_budget": asdict(request_budget), "consumed_planning": consumed,
         "physics_budget": physics_cap, "consumed_physics_steps": physics_consumed,
         "remaining_physics_steps": physics_remaining,
         "request_events": request_events, "consumed_events": sorted(consumed_events),
         "goal_identities": goal_identities,
+        "retry_goal_ids": sorted(retry_goals),
+        "direction_identities": direction_identities, "retry_direction_ids": sorted(retry_directions),
+        "completed_direction_ids": sorted(completed_directions),
+        "rebind": deepcopy(rebind),
+        "scene_anchors": np.asarray(scene.required_progress_anchors, float).copy() if rebind is not None else None,
+        "control_timestep_s": timestep if rebind is not None else None,
+        "history": deepcopy(continuation.get("history", ())),
+        "timing_events": deepcopy(continuation.get("request_ledger", original["request_ledger"])["timing_events"]),
+        "device_policy": deepcopy(continuation.get("device_policy")),
+        "active_finger_interval": deepcopy(continuation.get("active_finger_interval")),
         "completed_goal_ids": sorted(completed_goals), "effects": deepcopy(continuation.get("effects", {})),
         "previous_request_time_origin_s": float(original.get("request_time_origin_s", 0.)),
         "request_time_origin_s": float(original.get("request_time_origin_s", 0.))+float(elapsed),
@@ -832,7 +1260,28 @@ def _prepare_continuation(problem, scene, budget, continuation):
 
 
 def _continuation_timing(problem, budget, continuation):
-    """Keep s(elapsed+t), extending only a final plateau to the native grid."""
+    """Use the original suffix, or rebuild every clock consumer for an explicit rebind."""
+    # BEGIN explicit rebind is a new synchronized binding with original time origins.
+    if continuation.get("rebind") is not None:
+        selected, mapping = _initial_timing(problem, budget)
+        anchors = np.unique(np.r_[problem.anchors, continuation["scene_anchors"]])
+        anchors = anchors[anchors >= problem.start_progress]
+        mapping, _ = _progress_for_cubic_boundaries(mapping, selected.knots, problem.start_dq,
+            stop_progress=problem.stop_progress, anchors=anchors)
+        grid = _fixed_spline_grid(intervals=selected.knots+4, native_dt=selected.maximum_trajectory_dt,
+            interpolation_steps=selected.interpolation_steps, interpolation_dt=selected.interpolation_dt)
+        mapping = _bind_event_clock(problem, mapping, grid["duration"], continuation["control_timestep_s"])
+        for record in mapping.event_clock.values():
+            record["request_intent_time_s"] = continuation["request_time_origin_s"]+record["intent_time_s"]
+            if record.get("activation_time_s") is not None:
+                record["request_time_origin_step"] = continuation["request_time_origin_step"]
+                record["request_activation_step"] = continuation["request_time_origin_step"]+record["bound_activation_step"]
+                record["request_activation_time_s"] = continuation["request_time_origin_s"]+record["activation_time_s"]
+        _validate_bound_event_times(problem, mapping, grid["duration"],
+            continuation["request_time_origin_s"], continuation["history"], continuation["goal_identities"],
+            continuation["timing_events"])
+        return selected, mapping
+    # END ordinary same-binding continuation retains its already frozen schedule.
     remaining = continuation["original_duration"]-continuation["elapsed"]
     proposal = SimpleNamespace(source_time_map={
         "source_times": np.array([0., remaining]),
@@ -875,6 +1324,7 @@ def _continuation_timing(problem, budget, continuation):
         elif record.get("time", 0.) < 0:
             raise ContinuationBindingError("A pending event missed its original physical time")
         clock[identity] = record
+        record["event"] = asdict(next(event for event in problem.events if event_occurrence_key(event) == identity))
     return selected, _ProgressMap(seconds/grid["duration"], progress, clock)
 # END a new actual binding retains past results and original pending clocks.
 
@@ -1247,6 +1697,97 @@ def _ompl_stage(start, goal, lower, upper, valid, equality, *, tolerance,
         information.setMotionValidator(native_validator)
 
 
+# BEGIN native boundary projection keeps allowed goals as sets of solutions.
+def _independent_projection(equality, witness):
+    """Select independent local equations without dropping their validity test.
+
+    OMPL's fixed-codimension adapter cannot store inactive zero rows or
+    duplicate equations. Pivoting selects coordinates for its Newton step;
+    the complete original relations still decide state and edge acceptance.
+    """
+    from scipy.linalg import qr
+    jacobian = np.asarray(equality(witness, True), float)
+    if not len(jacobian):
+        return equality, 0
+    if not np.isfinite(jacobian).all():
+        return None, 0
+    _, triangular, order = qr(jacobian.T, pivoting=True, mode="economic")
+    rank = int(np.linalg.matrix_rank(triangular, tol=1e-7))
+    if not rank:
+        # A singular real relation is a failed local chart, never an ordinary
+        # unconstrained search substituted for the missing manifold.
+        return None, 0
+    rows = np.sort(order[:rank])
+    return lambda value, derivative: equality(value, derivative)[rows], rank
+
+
+def _project_allowed_boundary(value, residual, process_count, tolerance, lower, upper, *, deadline):
+    """Use native OMPL Newton projection into true boundary allowed sets.
+
+    The callback concatenates signed process equations and nonnegative goal
+    violations. It adds no nominal target or equation for a free direction.
+    Independent rows are refreshed between bounded native Newton iterations,
+    so a satisfied band contributes no fictitious equality. Time is fixed.
+    Physical bounds and the original goal thresholds are checked unchanged.
+    """
+    from ompl import base as ob
+    from scipy.linalg import qr
+    point = np.asarray(value, float).copy()
+    dimension = len(point)
+    if not np.isfinite(point).all() or np.any(point < lower) or np.any(point > upper):
+        return None
+    for _ in range(24):
+        if time.monotonic() >= deadline:
+            return None
+        error = np.asarray(residual(point, False), float)
+        if not np.isfinite(error).all():
+            return None
+        if (np.all(np.abs(error[:process_count]) <= tolerance)
+                and np.all(error[process_count:] <= 0)):
+            return point if np.all(point >= lower) and np.all(point <= upper) else None
+        jacobian = np.asarray(residual(point, True), float)
+        if not np.isfinite(jacobian).all():
+            return None
+        # The last coordinate is the frozen query time, not a Newton degree
+        # of freedom. Choosing rows on the joint columns also permits a full
+        # D-DOF pose goal in the D+1 dimensional time-state representation.
+        _, triangular, order = qr(jacobian[:, :-1].T, pivoting=True, mode="economic")
+        rank = int(np.linalg.matrix_rank(triangular, tol=1e-7))
+        if not rank:
+            return None
+        rows = np.sort(order[:rank])
+
+        class AllowedBoundary(ob.Constraint):
+            def __init__(self):
+                # The callback's goal entries already subtract the original
+                # allowed error. A positive Newton convergence allowance here
+                # would stop just outside that set (notably at a support
+                # plane). One native step must act on every positive goal
+                # violation; our outer test still uses the declared process
+                # projection tolerance and exact original goal membership.
+                super().__init__(dimension, rank, np.finfo(float).tiny)
+                self.setMaxIterations(1)
+
+            def function(self, values, output):
+                output[:] = residual(np.asarray(values), False)[rows]
+
+            def jacobian(self, values, output):
+                result = residual(np.asarray(values), True)[rows].copy()
+                result[:, -1] = 0.
+                output[:] = result
+
+        constraint = AllowedBoundary()
+        # A one-iteration return of False means not yet converged, not an
+        # invalid numeric update. The next iteration verifies every original
+        # residual and selects its current independent rows again.
+        constraint.project(point)
+        point[-1] = value[-1]
+        if not np.isfinite(point).all() or np.any(point < lower) or np.any(point > upper):
+            return None
+    return None
+# END boundary witnesses remain revisable proposals within the same goal.
+
+
 def _project_boundary(value, equality, tolerance, *, deadline=None):
     """Refine an IK boundary using native projection while preserving its s.
 
@@ -1348,8 +1889,8 @@ def _native_gradient_layout_type():
 
 
 # BEGIN preserve a gradient toward the explicit verification-stop command.
-def _verification_stop_preference(progress, joint_velocity, stop_progress):
-    """Squared speed at declared stops, including every sample of a pause.
+def _verification_stop_preference(progress, joint_velocity, stop_progress, *, trajectory_time=None):
+    """Squared speed at each declared stop's first physical occurrence.
 
     A verification stop commands zero velocity. Its numerical acceptance
     band still belongs exclusively to PlanningProblem.residuals(). Keeping
@@ -1357,10 +1898,11 @@ def _verification_stop_preference(progress, joint_velocity, stop_progress):
     its floating-point edge; ordinary motion receives no added objective.
     """
     import torch
+    from .planning_problem import _first_event_query
     stopped = torch.zeros_like(progress, dtype=torch.bool)
     for value in np.unique(stop_progress):
         # Use exactly the same progress support as the hard stop residual.
-        stopped = stopped | ((progress-value).abs() <= 1e-7)
+        stopped = stopped | _first_event_query(progress, value, trajectory_time)
     return torch.where(stopped, joint_velocity.square().sum(-1), torch.zeros_like(progress))
 # END preserve a gradient toward the explicit verification-stop command.
 
@@ -1606,6 +2148,12 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
                                                state.cuda_robot_model_state.tool_jacobians[..., 3:, :].detach())
             position = native_layout.apply(tool.position)[:, :, self._tool_index]
             quaternion = quaternion[:, :, self._tool_index]
+            # BEGIN local native-coordinate rates use differentiable physical J(q) dq.
+            need_rates = (not self._process_mode.startswith("seed_") and any(
+                direction.kind == "local_rate" for mechanism in problem.mechanisms for direction in mechanism.directions))
+            twist = (torch.einsum("...kd,...d->...k", native_layout.apply(
+                state.cuda_robot_model_state.tool_jacobians)[:, :, self._tool_index], dq) if need_rates else None)
+            # END Jacobian backward retains dJ/dq as well as the velocity derivative.
             spheres = native_layout.apply(state.robot_spheres)
             if self._process_mode.startswith("seed_"):
                 # IK is only an initializer: use its target phase for collision
@@ -1639,6 +2187,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
             anchor_quaternion = orientation_vjp.apply(anchor_q, anchor_state.tool_poses.quaternion.detach(),
                                                       anchor_state.tool_jacobians[..., 3:, :].detach())
             anchor_position = native_layout.apply(anchor_state.tool_poses.position)[:, :, self._tool_index]
+            if need_rates:
+                anchor_twist = torch.einsum("...kd,...d->...k", native_layout.apply(
+                    anchor_state.tool_jacobians)[:, :, self._tool_index], anchor_dq)
+                twist = torch.cat((twist, anchor_twist), 1)
             position = torch.cat((position, anchor_position), 1)
             quaternion = torch.cat((quaternion, anchor_quaternion[:, :, self._tool_index]), 1)
             spheres = torch.cat((spheres, native_layout.apply(anchor_state.robot_spheres)), 1)
@@ -1654,12 +2206,16 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
                 index = order.reshape(*order.shape, *((1,)*(value.ndim-2))).expand_as(value)
                 return value.gather(1, index)
 
-            position, quaternion = problem.transform_tool_pose(ordered(position), ordered(quaternion))
+            link_quaternion = ordered(quaternion)
+            tool_linear, tool_angular = ((None, None) if twist is None else problem.transform_tool_velocity(
+                ordered(twist)[..., :3], ordered(twist)[..., 3:], link_quaternion))
+            position, quaternion = problem.transform_tool_pose(ordered(position), link_quaternion)
             spheres = problem.transform_robot_spheres(ordered(spheres))
             q, dq, progress = ordered(q), ordered(dq), ordered(progress)
             trajectory_time = ordered(all_u)*clock["duration"]
             process_value = problem.evaluate(position, quaternion, progress, q, self._joint_names,
-                                             joint_velocity=dq)
+                joint_velocity=dq, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear,
+                tool_angular_velocity=tool_angular)
             scene_value = _scene_boundary_evaluate(self._scene, problem, progress_map,
                 spheres, position, quaternion, progress, q, self._joint_names,
                 trajectory_time=trajectory_time, normalized_time=ordered(all_u))
@@ -1677,7 +2233,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
                 # The problem owns equality-axis selection and its complete
                 # endpoint-family reference; free pose axes gain no target.
                 values.append(("skill_pose_equality_preference", problem.optimizer_preferences(
-                    position, quaternion, progress)))
+                    position, quaternion, progress, trajectory_time=trajectory_time,
+                    tool_linear_velocity=tool_linear, tool_angular_velocity=tool_angular)))
                 # END retain a gradient toward source-declared pose equalities.
                 # A position-tracking gripper has an exact physical command,
                 # even inside its numerical acceptance band. Preserve a
@@ -1688,7 +2245,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, seed_pr
                     progress, q, self._joint_names)))
                 # BEGIN optimize the actual zero-speed verification command.
                 values.append(("verification_stop_preference", _verification_stop_preference(
-                    progress, dq, problem.stop_progress)))
+                    progress, dq, problem.stop_progress, trajectory_time=trajectory_time)))
                 # END optimize the actual zero-speed verification command.
             for name, value in values:
                 value = value.gather(1, inverse)
@@ -1847,6 +2404,17 @@ class _CuroboPlanner:
         if continuation is None:
             self.progress_map = _bind_event_clock(problem, self.progress_map, initial_clock["duration"],
                 None if scene.gripper is None else scene.gripper.control_timestep_s)
+        # BEGIN freeze synchronized hand inputs before any rollout owns a clone.
+        # IK, trajectory managers and independent verification each deep-copy
+        # the scene. Binding only the parent after their construction leaves
+        # those copies without a command/nominal polynomial. The admitted grid
+        # already defines the exact native duration; verify it against the
+        # constructed solver below without regenerating these commands.
+        hand = scene.gripper
+        if hand is not None:
+            hand.bind_clock(initial_clock["duration"], self.progress_map)
+        self.finger_trajectory = None if hand is None else hand.finger_trajectory
+        # END every private scene receives the same already frozen hand clock.
         self.anchor_capacity = _anchor_capacity(self.progress_map, anchors, budget)
         robot_dict, self.robot_metadata = _bounded_robot_configuration(robot, problem, scene, budget)
         self.scene_workspace_bytes, self.anchor_fk_workspace_bytes = _planning_workspace_bytes(
@@ -1880,7 +2448,9 @@ class _CuroboPlanner:
         self.robot_dict = robot_dict
         self.seed_progress = self.device_cfg.to_device([[problem.start_progress]])
         self.seed_parameter = self.device_cfg.to_device([[0.]])
-        self.formal_clock = {}
+        # BEGIN native callbacks inherit the admitted clock during construction.
+        self.formal_clock = dict(initial_clock)
+        # END construction cannot observe a missing or independently chosen clock.
         self._manager_type = _process_manager_type(
             problem, scene, self.progress_map, self.anchors, budget, self.seed_progress,
             clock=self.formal_clock, seed_parameter=self.seed_parameter, robot_dict=self.robot_dict)
@@ -1911,16 +2481,17 @@ class _CuroboPlanner:
             metrics_rollout=configuration("metrics_base.yml", "seed_metrics"),
             device_cfg=self.device_cfg, num_seeds=budget.ik_seeds, seed_solver_num_seeds=budget.ik_seeds,
             max_batch_size=1, max_goalset=1, use_cuda_graph=False,
-            # BEGIN every optimized IK action uses the same full physical domain.
-            # The optional LM pre-solver has its own narrowed/clamped domain.
-            # Existing Halton initialization and native L-BFGS already supply
-            # all budgeted branches through the domain-restricted core.
-            use_lm_seed=False,
-            # END no independent optimizer may precede the checked native core.
             position_tolerance=problem.numerical.position_m,
             orientation_tolerance=problem.numerical.rotation_rad,
             cost_manager_config_instance_type=self._manager_type,
             override_optimizer_num_iters={"lbfgs": budget.ik_iterations}, random_seed=budget.random_seed)
+        # BEGIN configure the checked physical domain through the native API.
+        # The factory does not expose this dataclass field. Set it before
+        # constructing the solver so the optional LM pre-solver cannot use its
+        # separate narrowed/clamped domain. Halton seeds and native L-BFGS still
+        # supply the declared branches through the domain-restricted core.
+        ik_cfg.use_lm_seed = False
+        # END no independent optimizer may precede the checked native core.
         # BEGIN evaluate the declared alternative IK branches before returning.
         # Native early exit only requires one successful seed per batch. Two
         # requested trajectory branches must let all budgeted IK seeds run
@@ -2030,12 +2601,12 @@ class _CuroboPlanner:
 
     # BEGIN bind the independently controlled fingers to native formal output.
     def _bind_formal_clock(self):
-        self.formal_clock.clear()
-        self.formal_clock.update(_formal_native_clock(self.trajopt))
-        hand = self.scene.gripper
-        if hand is not None:
-            hand.bind_clock(self.formal_clock["duration"], self.progress_map)
-        self.finger_trajectory = None if hand is None else hand.finger_trajectory
+        # BEGIN confirm native construction preserved the already bound inputs.
+        native = _formal_native_clock(self.trajopt)
+        if any(native.get(name) != value for name, value in self.formal_clock.items()):
+            raise ValueError("Native solver changed the admitted synchronized clock")
+        self.formal_clock.update(native)
+        # END do not regenerate hand commands after private rollouts were cloned.
 
     def _seed_u(self, progress):
         """Choose the earliest plateau point for initializer-only state queries."""
@@ -2341,15 +2912,15 @@ class _CuroboPlanner:
         self._bind_physical_domains()
         # END schedule changes require a separately bound planning request.
 
-    # BEGIN whole-window spatial search on the already bound physical time.
+    # BEGIN scoped spatial search on one already bound physical clock.
     def ompl_seed(self, initial_seed, candidate_trajectory):
         """Return a spatial initializer and evidence; never produce a new clock.
 
-        A failed complete curve and the finite reference controls provide
-        endpoint witnesses. Intermediate reference/phase vertices do not
-        become mandatory IK configurations. Variable-scope equalities stay
-        in the exact validity relation; a global projection manifold is used
-        only when its independent equality rows exist over the whole window.
+        Only real relation switches, goal times and scene switches divide
+        local OMPL charts. Their boundary configurations are sampled and
+        projected into the original allowed sets, then revised on failure.
+        Reference controls initialize these proposals without fixing them.
+        A selected prefix supplies its actual release FK to its child scene.
         """
         torch = self.torch
         deadline = time.monotonic()+self.budget.search_seconds
@@ -2358,9 +2929,10 @@ class _CuroboPlanner:
         lower = self.trajopt.transition_model.action_bound_lows.detach().cpu().numpy().reshape(-1)
         upper = self.trajopt.transition_model.action_bound_highs.detach().cpu().numpy().reshape(-1)
         tolerance = _projection_tolerance(self.problem)
-        fixed_scene = self.scene.clone_for_rollout()
         map_u, map_s = self.device_cfg.to_device(self.progress_map.u), self.device_cfg.to_device(self.progress_map.s)
-        query_u = self.progress_map.anchor_parameters(self.anchors)[:, 0]
+        anchor_pairs = self.progress_map.anchor_parameters(self.anchors)
+        query_u = anchor_pairs[:, 0]
+        anchor_progress = dict(anchor_pairs)
         if self.finger_trajectory is not None:
             query_u = np.unique(np.r_[query_u,
                 [event["applied_time_s"]/self.formal_clock["duration"] for event in self.finger_trajectory.events]])
@@ -2368,11 +2940,42 @@ class _CuroboPlanner:
         # float64 times by one ULP would vanish in the native float32 inputs.
         query_u = np.unique(query_u)
         start = np.r_[self.start.position[0].detach().cpu().numpy(), 0.]
-        endpoints = [candidate_trajectory._curve(candidate_trajectory.duration)]
-        endpoints.extend(initial_seed[0, :, -1].detach().cpu().numpy())
+        # Ordinary source phases and reference sample density never create
+        # search boundaries. Plateaus retain both physical-time endpoints.
+        boundary_times = [0., 1.]
+        for name in ("pose_relations", "mechanisms", "interiors"):
+            for requirement in getattr(self.problem, name):
+                if requirement.start >= self.problem.start_progress:
+                    boundary_times.append(self.progress_map.anchor_parameters([requirement.start])[0, 0])
+                if requirement.end >= self.problem.start_progress:
+                    boundary_times.append(self.progress_map.anchor_parameters([requirement.end])[-1, 0])
+        goals_by_time = {}
+        for name in ("pose_events", "coordinate_events", "supports"):
+            for index, requirement in enumerate(getattr(self.problem, name)):
+                parameter = self.progress_map.anchor_parameters([requirement.progress])[0, 0]
+                boundary_times.append(parameter)
+                goals_by_time.setdefault(float(parameter), []).append((name, index))
+        scene_anchors = [value for value in self.scene.required_progress_anchors
+                         if value >= self.problem.start_progress]
+        if scene_anchors:
+            boundary_times.extend(self.progress_map.anchor_parameters(scene_anchors)[:, 0])
+        boundaries = np.unique(boundary_times)
+        report["chart_times"] = boundaries.tolist()
+        work = {"state_queries": 0}
+        rng = np.random.default_rng(self.budget.random_seed)
+        source_controls = initial_seed[0].detach().cpu().numpy()
+        control_u = (np.arange(self.trajopt.action_horizon)+3.)/(self.trajopt.action_horizon+4.)
         invalid_states = []
 
+        def goals_at_time(parameter):
+            return tuple(goals_by_time.get(float(parameter), ()))
+
         def state_parts(values):
+            count = int(np.prod(values.shape[:-1]))
+            if (time.monotonic() >= deadline
+                    or work["state_queries"]+count > self.budget.max_validation_points):
+                raise TimeoutError("The shared OMPL time/state-query budget was exhausted")
+            work["state_queries"] += count
             joints = values[..., :-1].contiguous()
             zero = torch.zeros_like(joints)
             js = self.JointState(position=joints, velocity=zero, acceleration=zero, jerk=zero,
@@ -2386,45 +2989,58 @@ class _CuroboPlanner:
             p, r = self.problem.transform_tool_pose(position[:, :, index], quaternion[:, :, index])
             return js, state, p, r, _torch_interpolate(map_u, map_s, values[..., -1])
 
-        def residual_function(values):
-            js, _, p, r, progress = state_parts(values.reshape(1, 1, -1))
-            phase = min(self.problem.phase_count-1, int(progress.detach().item()))
-            process = self.problem.project_residual(p, r, progress, phase, js.position, self.joint_names)
-            drive = fixed_scene.project_residual(progress, js.position, self.joint_names)
-            return torch.cat((process, drive), -1).reshape(-1)
+        def equations(scene, active, goals=()):
+            cache = {}
+            def residual_function(values):
+                js, _, p, r, progress = state_parts(values.reshape(1, 1, -1))
+                process = self.problem.project_residual(p, r, progress,
+                    joint_position=js.position, joint_names=self.joint_names, active_requirements=active)
+                drive = scene.project_residual(progress, js.position, self.joint_names)
+                goal = self.problem.goal_residual(p, r, progress, goal_ids=goals)
+                return torch.cat((process, drive, goal), -1).reshape(-1)
 
-        def equality(values, derivative):
-            if time.monotonic() >= deadline:
-                raise TimeoutError("The whole time-state search budget was exhausted")
-            values_t = self.device_cfg.to_device(np.asarray(values))
-            if derivative:
-                with torch.enable_grad():
-                    if residual_function(values_t).numel() == 0:
-                        return np.empty((0, len(values)))
-                    answer = torch.autograd.functional.jacobian(residual_function, values_t,
-                        create_graph=False, vectorize=False)
-            else:
-                with torch.no_grad():
-                    answer = residual_function(values_t)
-            return answer.detach().cpu().numpy().astype(float)
+            def evaluate(values, derivative):
+                # Native setup, Newton projection and geodesic export often
+                # repeat an identical query. Cache only immutable CPU numeric
+                # answers for this exact chart/scene; no tensor graph or
+                # result is shared with a different candidate branch.
+                key = (np.asarray(values, dtype=float).tobytes(), derivative)
+                if key in cache:
+                    return cache[key]
+                values_t = self.device_cfg.to_device(np.asarray(values))
+                if derivative:
+                    with torch.enable_grad():
+                        if residual_function(values_t).numel() == 0:
+                            return np.empty((0, len(values)))
+                        answer = torch.autograd.functional.jacobian(residual_function, values_t,
+                            create_graph=False, vectorize=False)
+                else:
+                    with torch.no_grad():
+                        answer = residual_function(values_t)
+                result = answer.detach().cpu().numpy().astype(float)
+                if len(cache) < self.budget.max_validation_points:
+                    cache[key] = result
+                return result
+            return evaluate
 
-        def valid(values):
+        def valid(values, scene):
             with torch.no_grad():
                 values_t = self.device_cfg.to_device(values[None, None])
                 js, state, p, r, progress = state_parts(values_t)
                 clock_time = values_t[..., -1]*self.formal_clock["duration"]
                 terms = {"process": self.problem.evaluate(p, r, progress, js.position,
-                    self.joint_names, joint_velocity=js.velocity),
-                    "scene": _scene_boundary_evaluate(fixed_scene, self.problem, self.progress_map,
+                    self.joint_names, joint_velocity=js.velocity,
+                    point_goal_ids=goals_at_time(float(values[-1])), direction_mode="point"),
+                    "scene": _scene_boundary_evaluate(scene, self.problem, self.progress_map,
                         self.problem.transform_robot_spheres(state.robot_spheres), p, r, progress,
                         js.position, self.joint_names, trajectory_time=clock_time,
                         normalized_time=values_t[..., -1])}
                 native = self._verification_native.compute_costs(_timed_native_state(
                     self._RobotState(joint_state=js, cuda_robot_model_state=state), self.problem,
-                    fixed_scene, self.joint_names, clock_time,
+                    scene, self.joint_names, clock_time,
                     sphere_padding=_native_collision_padding(self._verification_native)))
                 terms.update({f"native:{name}": value for name, value in zip(native.names, native.values)})
-                coverage = fixed_scene.check_robot_coverage(js.position, self.joint_names, clock_time,
+                coverage = scene.check_robot_coverage(js.position, self.joint_names, clock_time,
                     entrance=bool(values[-1] == 0 and np.array_equal(values, start)))
                 if coverage:
                     terms["robot_query_incomplete"] = progress.new_tensor([[float(any(
@@ -2436,48 +3052,119 @@ class _CuroboPlanner:
                         "terms": {name: float(term.max().item()) for name, term in terms.items()}})
                 return accepted
 
-        for branch, endpoint in enumerate(endpoints):
-            if time.monotonic() >= deadline:
-                break
-            goal = np.r_[endpoint, 1.]
-            invalid_states.clear()
-            try:
-                # OMPL requires constant codimension. Scoped constraints are
-                # still checked by valid() at every edge/query sample.
-                probes = np.unique(np.r_[0., query_u, (query_u[:-1]+query_u[1:])/2., 1.])
-                ranks = []
-                for parameter in probes:
-                    witness = start+(goal-start)*parameter
-                    jac = equality(witness, True)
-                    ranks.append((len(jac), np.linalg.matrix_rank(jac, tol=1e-7) if len(jac) else 0))
-                projected = bool(ranks and ranks[0][0] and len(set(ranks)) == 1 and ranks[0][0] == ranks[0][1])
-                constraint = equality if projected else lambda value, derivative: (
-                    np.empty((0, len(value))) if derivative else np.empty(0))
-                if projected:
-                    goal = _project_boundary(goal, equality, tolerance, deadline=deadline)
-                    if goal is None:
-                        report["branches"].append({"failure": "terminal_witness_projection_failed"})
+        def proposals(begin, parameter):
+            yield np.r_[candidate_trajectory._curve(parameter*candidate_trajectory.duration), parameter]
+            for controls in source_controls:
+                yield np.r_[[np.interp(parameter, control_u, controls[:, column])
+                             for column in range(len(self.joint_names))], parameter]
+            yield np.r_[begin[:-1], parameter]
+            # Sampling the actual joint box permits different support tangents,
+            # yaw and redundant IK branches. There is no reference corridor.
+            while True:
+                yield np.r_[rng.uniform(lower, upper), parameter]
+
+        # An explicit stack permits bounded backtracking without recursive
+        # depth or copying all prior path samples into every branch frame.
+        scene = self.scene.clone_for_rollout()
+        frames = [{"start": start, "scene": scene, "proposals": proposals(start, boundaries[1]),
+                   "attempts": 0, "path": None}]
+        try:
+            while frames and time.monotonic() < deadline:
+                stage = len(frames)-1
+                frame = frames[-1]
+                lo, hi = boundaries[stage:stage+2]
+                # Every visit receives finite alternative members; exhausting
+                # them returns to the preceding allowed set, not a new clock.
+                if frame["attempts"] >= self.budget.ik_seeds:
+                    frames.pop()
+                    continue
+                frame["attempts"] += 1
+                begin, scene = frame["start"], frame["scene"]
+                goal = next(frame["proposals"])
+                goal_s = float(anchor_progress.get(hi, np.interp(hi, self.progress_map.u, self.progress_map.s)))
+                middle_s = float(np.interp((lo+hi)/2, self.progress_map.u, self.progress_map.s))
+                active = self.problem.projection_requirements(middle_s)
+                boundary_active = self.problem.projection_requirements(goal_s)
+                goal_ids = goals_at_time(float(hi))
+                boundary_equations = equations(scene, boundary_active)
+                process_count = len(boundary_equations(goal, False))
+                goal = _project_allowed_boundary(goal, equations(scene, boundary_active, goal_ids),
+                    process_count, tolerance, np.r_[lower, lo], np.r_[upper, hi], deadline=deadline)
+                evidence = {"chart": stage, "time_interval": [float(lo), float(hi)],
+                            "goals": list(goal_ids), "attempt": frame["attempts"]}
+                if goal is None:
+                    report["branches"].append({**evidence, "failure": "allowed_boundary_projection_failed"})
+                    continue
+                evidence["boundary_state"] = goal.tolist()
+                constraint, rank = _independent_projection(equations(scene, active), goal)
+                if constraint is None:
+                    report["branches"].append({**evidence, "failure": "singular_active_relation_chart"})
+                    continue
+                invalid_states.clear()
+                # Reserve work for alternate boundary members and later
+                # charts. All chart construction and queries share deadline.
+                remaining_stages = len(boundaries)-1-stage
+                seconds = max(0., deadline-time.monotonic())/(remaining_stages+1)
+                validity_cache = {}
+                def stage_valid(value):
+                    key = np.asarray(value, dtype=float).tobytes()
+                    if key not in validity_cache:
+                        validity_cache[key] = valid(value, scene)
+                    return validity_cache[key]
+                path, stage_report = _ompl_stage(begin, goal, np.r_[lower, lo], np.r_[upper, hi],
+                    stage_valid, constraint, tolerance=tolerance,
+                    step=self.budget.validation_joint_step, seconds=seconds,
+                    sample_limit=self.budget.max_validation_points-work["state_queries"],
+                    query_parameters=query_u[(query_u >= lo) & (query_u <= hi)])
+                evidence.update(stage_report, independent_equalities=rank,
+                                first_invalid_states=deepcopy(invalid_states))
+                report["branches"].append(evidence)
+                if path is None:
+                    continue
+                path = path[np.r_[True, np.any(path[1:] != path[:-1], axis=1)]]
+                if np.any(np.diff(path[:, -1]) <= 0):
+                    evidence["failure"] = "nonmonotone_or_instantaneous_joint_motion"
+                    continue
+                frame["path"] = path
+                if sum(len(item["path"])-1 for item in frames)+1 > self.budget.max_validation_points:
+                    evidence["failure"] = "whole_path_sample_budget"
+                    continue
+                if stage+2 < len(boundaries):
+                    # This exact endpoint is the selected prefix's release
+                    # FK. It is never taken from a demonstration or failed
+                    # whole-curve witness, and sibling scenes remain private.
+                    with torch.no_grad():
+                        _, _, p, r, progress = state_parts(self.device_cfg.to_device(goal[None, None]))
+                        child_scene = scene.with_release_history(p, r, progress)
+                    frames.append({"start": goal, "scene": child_scene,
+                        "proposals": proposals(goal, boundaries[stage+2]), "attempts": 0, "path": None})
+                    continue
+                whole_path = np.concatenate((frames[0]["path"], *(item["path"][1:] for item in frames[1:])))
+                # Local angular goal screening cannot prove winding. Recheck
+                # the ordered full path with its actual start and all goal
+                # queries before using it as a complete spatial initializer.
+                with torch.no_grad():
+                    positions, rotations, progress_values = [], [], []
+                    for chunk in np.array_split(whole_path, max(1, int(np.ceil(len(whole_path)/32)))):
+                        _, _, p, r, progress = state_parts(self.device_cfg.to_device(chunk[None]))
+                        positions.append(p.clone()); rotations.append(r.clone()); progress_values.append(progress.clone())
+                    full_progress = torch.cat(progress_values, 1)
+                    q = self.device_cfg.to_device(whole_path[None, :, :-1])
+                    process = self.problem.evaluate(torch.cat(positions, 1), torch.cat(rotations, 1),
+                        full_progress, q, self.joint_names, joint_velocity=torch.zeros_like(q),
+                        trajectory_time=self.device_cfg.to_device(whole_path[None, :, -1])*self.formal_clock["duration"],
+                        direction_mode="path")
+                    if (not bool(torch.isfinite(process).all()) or not bool((process <= 0).all())
+                            or self.problem.verification_issues(full_progress)):
+                        evidence["failure"] = "complete_path_process_or_history_rejected"
                         continue
-                path, evidence = _ompl_stage(start, goal, np.r_[lower, 0.], np.r_[upper, 1.],
-                    valid, constraint, tolerance=tolerance, step=self.budget.validation_joint_step,
-                    seconds=max(0., deadline-time.monotonic()), sample_limit=self.budget.max_validation_points,
-                    query_parameters=query_u)
-            except TimeoutError:
-                path, evidence = None, {"failure": "whole_search_time_budget_exhausted"}
-            evidence["first_invalid_states"] = deepcopy(invalid_states)
-            report["branches"].append(evidence)
-            if path is None:
-                continue
-            keep = np.r_[True, np.any(path[1:] != path[:-1], axis=1)]
-            path = path[keep]
-            if np.any(np.diff(path[:, -1]) <= 0):
-                report["branches"][-1]["failure"] = "nonmonotone_or_instantaneous_joint_motion"
-                continue
-            control_u = (np.arange(self.trajopt.action_horizon)+3.)/(self.trajopt.action_horizon+4.)
-            controls = np.stack([np.interp(control_u, path[:, -1], path[:, column])
-                for column in range(len(self.joint_names))], axis=-1)
-            report.update(success=True, samples=len(path), selected_branch=branch)
-            return self.physical_domain.initialize(self.device_cfg.to_device(controls[None, None])), report
+                controls = np.stack([np.interp(control_u, whole_path[:, -1], whole_path[:, column])
+                    for column in range(len(self.joint_names))], axis=-1)
+                report.update(success=True, samples=len(whole_path), state_queries=work["state_queries"])
+                return self.physical_domain.initialize(self.device_cfg.to_device(controls[None, None])), report
+        except TimeoutError:
+            report["budget_exhausted"] = True
+        report["state_queries"] = work["state_queries"]
         report["failure"] = "no_complete_time_state_seed_within_budget"
         return None, report
     # END OMPL has no schedule replacement return value or side effect.
@@ -2508,6 +3195,13 @@ class _CuroboPlanner:
         target = self.problem.terminal_pose_target
         if target is None:
             return None
+        # BEGIN a once-only goal before a terminal progress plateau is not H=1.
+        # Native H=1 acts at physical T. A true event at the first arrival of
+        # its progress belongs solely to ProcessCost when that arrival is
+        # earlier; repeating it at T would invent an extra endpoint goal.
+        if self.progress_map.anchor_parameters([target.progress])[0, 0] != 1.:
+            return None
+        # END the native terminal consumer must share the real event time.
         from scipy.spatial.transform import Rotation
         pose = target.target @ np.linalg.inv(target.tool_from_function)
         position = self.device_cfg.to_device(pose[:3, 3][None, None])
@@ -2681,8 +3375,13 @@ class _CuroboPlanner:
         anchor_pairs = self.progress_map.anchor_parameters(self.anchors)
         event_records = []
         for event in self.problem.events:
-            event_records.append({**asdict(event),
-                                  **self.progress_map.event_clock[(event.skill_id, event.event_id)]})
+            # BEGIN export the same flattened command record as the bound hand.
+            clock = self.progress_map.event_clock[event_occurrence_key(event)]
+            if clock["event"] != asdict(event):
+                raise ValueError("Exported event differs from its frozen occurrence binding")
+            event_records.append({**deepcopy(clock["event"]),
+                                  **{key: deepcopy(value) for key, value in clock.items() if key != "event"}})
+            # END the internal event payload is provenance, not a second command field.
         trajectory = JointTrajectory(self.joint_names, times, position, velocity,
                                      self.progress_map.u.copy(), self.progress_map.s.copy(),
                                      tuple(event_records), deepcopy(self.problem.conditions), {})
@@ -2734,7 +3433,15 @@ class _CuroboPlanner:
             tool = state.tool_poses
             tool_index = tool.tool_frames.index(self.problem.tool_link)
             p, r = self.problem.transform_tool_pose(tool.position[:, :, tool_index], tool.quaternion[:, :, tool_index])
-            components = self.problem.residuals(p, r, s_t, q_t, self.joint_names, joint_velocity=dq_t)
+            tool_linear, tool_angular = None, None
+            if any(direction.kind == "local_rate" for mechanism in self.problem.mechanisms
+                   for direction in mechanism.directions):
+                twist = torch.einsum("...kd,...d->...k", state.tool_jacobians[:, :, tool_index], dq_t)
+                tool_linear, tool_angular = self.problem.transform_tool_velocity(
+                    twist[..., :3], twist[..., 3:], tool.quaternion[:, :, tool_index])
+            components = self.problem.residuals(p, r, s_t, q_t, self.joint_names, joint_velocity=dq_t,
+                trajectory_time=self.device_cfg.to_device(queries[None]), tool_linear_velocity=tool_linear,
+                tool_angular_velocity=tool_angular)
             components["scene"] = _scene_boundary_evaluate(self._verification_scene,
                 self.problem, self.progress_map, self.problem.transform_robot_spheres(state.robot_spheres),
                 p, r, s_t, q_t, self.joint_names,
@@ -2748,7 +3455,8 @@ class _CuroboPlanner:
                 components[f"native:{name}"] = value
             residuals = {name: float(value.max().item()) for name, value in components.items()}
             measurements = {name: float(value.max().item()) for name, value in
-                            self.problem.measurements(p, r, s_t).items()}
+                            self.problem.measurements(p, r, s_t,
+                                trajectory_time=self.device_cfg.to_device(queries[None])).items()}
             # Retain failing curve coordinates for bounded mesh refinement.
             # Nonfinite terms always fail acceptance and are never clipped.
             violation = torch.zeros_like(s_t)
@@ -2765,6 +3473,10 @@ class _CuroboPlanner:
                 "numerical_tolerances": asdict(self.problem.numerical),
                 "u": queries/times[-1],
                 "violations": violation.detach().cpu().numpy().reshape(-1),
+                "coordinate_direction_resolution": {"query_count": len(queries),
+                    "maximum_physical_time_gap_s": float(np.max(np.diff(queries))),
+                    "local_rate": "instantaneous native geometric Jacobian times actual cubic joint velocity",
+                    "scope": "finite query validation; no continuous-time sign certificate"},
             }
             # Coverage remains evidence; only an actual query/binding failure
             # contributes a rejection. Missing observed free space is allowed.
@@ -2825,139 +3537,300 @@ class _CuroboPlanner:
         return trajectory, len(queries)
 
 
-def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0", continuation=None):
-    """Generate and verify a complete-window robot trajectory with cuRobo V2.
+# BEGIN request-wide execution, failure and rebind accounting.
+def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0", continuation=None,
+                    request_ledger=None, rebind=None):
+    """Generate one fully checked candidate within the original request budget.
 
-    ``robot`` is an existing V2 robot YAML path or configuration dictionary.
-    Scene geometry, calibration, measured joints and skill tolerances are
-    explicit inputs; a robot name never supplies missing perception evidence.
-    GPU work starts only when this function is called.
+    ``request_ledger`` continues failed planning attempts. ``continuation``
+    carries actual execution facts. An explicit ``rebind`` rebuilds the soft
+    schedule of remaining work or creates selected retry occurrences; ordinary
+    continuation preserves the original frozen clock. Every return, including
+    initialization failure, carries the cumulative ledger. No GPU stage is
+    claimed to be preemptible: elapsed overrun rejects its candidate.
     """
-    prior = None
-    if continuation is not None:
-        try:
-            budget, prior = _prepare_continuation(problem, scene, budget, continuation)
-        except (ContinuationBindingError, ValueError) as error:
-            return PlanningResult(False, None, {"failure": "continuation_binding_gap", "reason": str(error)})
-    budget = PlanningBudget() if budget is None else budget
-    request_budget = asdict(budget) if prior is None else prior["request_budget"]
-    consumed = {"trajectory_solves": 0, "search_seconds": 0.} if prior is None else deepcopy(prior["consumed_planning"])
+    from .execution_binding import bind_candidate, plain
+    from .planning_problem import TimeBindingError
     started = time.monotonic()
+    prior = planner = ledger = None
+    initial_seconds = 0.
+    original_export = original_ik_solve = None
+    diagnostics = {"attempts": []}
+    outcome = PlanningResult(False, None, diagnostics)
+    stage = "request_binding"
     try:
+        previous = request_ledger
+        if previous is None and isinstance(continuation, dict) and isinstance(continuation.get("original_binding"), dict):
+            previous = continuation.get("request_ledger", continuation["original_binding"].get("request_ledger"))
+        if previous is not None:
+            original_budget = PlanningBudget(**previous["planning_budget"])
+        else:
+            original_budget = PlanningBudget() if budget is None else budget
+        ledger = _request_work_ledger(problem, original_budget, previous)
+        consumed = ledger["consumed_planning"]
+        initial_seconds = consumed["planning_seconds"]
+        request_budget = asdict(original_budget)
+        diagnostics.update(planning_budget=request_budget, consumed_planning=consumed)
+        def check(next_stage=None):
+            _check_work_budget(original_budget, consumed, started=started,
+                               initial_seconds=initial_seconds, stage=next_stage)
+        check("binding_attempts")
+        consumed["binding_attempts"] += 1
+        if previous is not None and budget is not None and asdict(budget) != asdict(original_budget):
+            raise ContinuationBindingError("A same request cannot reset or enlarge its original planning budget")
+        # BEGIN each admitted binding owns mutable problem and device state.
+        # Initial clock construction can bind a hand before native allocation
+        # fails. A private problem is therefore required for both first and
+        # subsequent attempts, just as for remaining-obligation filtering.
+        problem = deepcopy(problem)
+        if previous is not None:
+            _restore_original_direction_origins(problem, ledger["obligation_contract"])
+        # END each admitted binding owns mutable problem and device state.
+        if _obligation_contract(problem) != ledger["obligation_contract"]:
+            raise ContinuationBindingError("A same request cannot remove, reorder or change original goal/process obligations")
+        if continuation is not None:
+            if not isinstance(continuation, dict) or not isinstance(continuation.get("original_binding"), dict):
+                raise ContinuationBindingError("Continuation requires its original formal execution binding")
+            if previous is None:
+                raise ContinuationBindingError("Continuation lacks the original cumulative request ledger")
+            ledger = _request_work_ledger(problem, original_budget, ledger, continuation)
+            consumed = ledger["consumed_planning"]
+            diagnostics["consumed_planning"] = consumed
+            # Binding owns its filtered obligations and hand occurrences. The
+            # caller retains the full source problem after any failed attempt;
+            # the scene clone shares only immutable geometry and the existing
+            # cumulative robot oracle, never a reset query allowance.
+            scene = scene.clone_for_rollout()
+            current = deepcopy(continuation)
+            current["consumed_planning"] = deepcopy(consumed)
+            budget, prior = _prepare_continuation(problem, scene, original_budget, current, rebind=rebind)
+            prior["history"] = deepcopy(ledger["history"])
+            prior["timing_events"] = deepcopy(ledger["timing_events"])
+        else:
+            if ledger["event_records"] or ledger["history"]:
+                raise ContinuationBindingError("An executed request needs its actual continuation facts before another binding")
+            if plain(problem.events) != ledger["original_events"]:
+                raise ContinuationBindingError("A failed-request retry changed the original event/source requirements")
+            if rebind is not None and (not rebind.get("source") or rebind.get("kind") != "remaining"):
+                raise ContinuationBindingError("Creating retry occurrences requires an actual execution continuation")
+            remaining_solves = original_budget.maximum_trajectory_solves-consumed["trajectory_solves"]
+            if remaining_solves <= 0:
+                raise PlanningWorkExhausted("The original cumulative trajectory-solve budget is exhausted")
+            budget = replace(original_budget, maximum_trajectory_solves=remaining_solves,
+                search_seconds=max(0., original_budget.search_seconds-consumed["search_seconds"]))
+            # BEGIN initial bindings have the same isolation as continuations.
+            # Geometry and the cumulative robot oracle remain shared through
+            # the scene's defined clone API; mutable hand clocks do not.
+            scene = scene.clone_for_rollout()
+            # END initial bindings have the same isolation as continuations.
+        check("initializations")
+        stage = "initialization"
+        consumed["initializations"] += 1
         planner = _CuroboPlanner(problem, scene, robot, budget, device, continuation=prior)
-    except ContinuationBindingError as error:
-        return PlanningResult(False, None, {"failure": "continuation_binding_gap", "reason": str(error),
-            "planning_budget": request_budget, "consumed_planning": consumed})
-    # BEGIN cleanup also covers diagnostic construction failures.
-    diagnostics = {}
-    try:
-        diagnostics = {"backend": "curobo_v2", "batch_size": 1, "ik_seeds": budget.ik_seeds,
-                       "trajectory_seeds": budget.trajectory_seeds, "used_ompl": False,
-                       "timing_policy": "source_proposal_then_frozen_binding",
-                       "native_trajectory_dt": planner.budget.maximum_trajectory_dt,
-                       "progress_parameter_error_bound": _PROGRESS_PARAMETER_ERROR,
-                       "progress_clock_max_keys": _MAX_PROGRESS_KEYS,
-                       "scene": scene.describe(), "scene_workspace_bytes": planner.scene_workspace_bytes,
-                       # BEGIN expose the request-sized native anchor allocation.
-                       "anchor_fk_workspace_bytes": planner.anchor_fk_workspace_bytes,
-                       "exact_anchor_capacity": planner.anchor_capacity,
-                       # END expose the request-sized native anchor allocation.
-                       "attempts": [], "planning_budget": request_budget, "consumed_planning": consumed}
-        # END the planner always reaches its precision-restoring close().
-        # BEGIN fixed entrance failures cannot be repaired by later IK or search.
+        check()
+        diagnostics.update(backend="curobo_v2", batch_size=1, ik_seeds=budget.ik_seeds,
+            trajectory_seeds=budget.trajectory_seeds, used_ompl=False,
+            timing_policy="explicit_rebind_then_frozen" if rebind is not None else "source_proposal_then_frozen_binding",
+            native_trajectory_dt=planner.budget.maximum_trajectory_dt,
+            progress_parameter_error_bound=_PROGRESS_PARAMETER_ERROR, progress_clock_max_keys=_MAX_PROGRESS_KEYS,
+            scene=scene.describe(), scene_workspace_bytes=planner.scene_workspace_bytes,
+            anchor_fk_workspace_bytes=planner.anchor_fk_workspace_bytes, exact_anchor_capacity=planner.anchor_capacity)
+        stage = "initial_state_verification"
+        consumed["validation_queries"] += 1
         diagnostics["initial_state"] = planner.initial_state_diagnostics()
+        check()
         if not diagnostics["initial_state"]["passed"]:
             diagnostics["failure"] = "initial_state_infeasible"
-            return PlanningResult(False, None, diagnostics)
-        # END fixed entrance failures cannot be repaired by later IK or search.
+            return outcome
+        grid = _fixed_spline_grid(intervals=planner.budget.knots+4,
+            native_dt=planner.budget.maximum_trajectory_dt, interpolation_steps=planner.budget.interpolation_steps,
+            interpolation_dt=planner.budget.interpolation_dt)
+        diagnostics["event_time_checks"] = _validate_bound_event_times(problem, planner.progress_map, grid["duration"],
+            0. if prior is None else prior["request_time_origin_s"], ledger["history"],
+            None if prior is None else prior["goal_identities"], ledger["timing_events"])
+
+        # Count actual export passes for all declared candidates. An export
+        # exception consumes its admitted maximum query allowance because its
+        # partial native work cannot be reconstructed from a missing result.
+        original_export = planner.export
+        def tracked_export(*args, **kwargs):
+            check("validation_passes")
+            consumed["validation_passes"] += 1
+            queries = budget.max_validation_points
+            try:
+                exported = original_export(*args, **kwargs)
+                queries = int(exported[1])
+                return exported
+            finally:
+                consumed["validation_queries"] += queries
+                check()
+        planner.export = tracked_export
+        # Reference IK and any later native IK calls share the same counter.
+        # Seed proposal loops with no native IK are charged by search work.
+        if callable(getattr(planner.ik, "solve_pose", None)):
+            original_ik_solve = planner.ik.solve_pose
+            def tracked_ik(*args, **kwargs):
+                check("ik_queries")
+                goal = args[0] if args else kwargs["goal_tool_poses"]
+                # return_seeds is only an output count; native IK still
+                # evaluates its configured seed population for each goal.
+                queries = int(goal.batch_size)*max(int(planner.ik.config.num_seeds),
+                                                   int(kwargs.get("return_seeds", 1)))
+                if consumed["ik_queries"]+queries > original_budget.max_validation_points*original_budget.ik_seeds*original_budget.maximum_trajectory_solves:
+                    raise PlanningWorkExhausted("The original cumulative ik_queries budget is exhausted")
+                consumed["ik_queries"] += queries
+                try:
+                    return original_ik_solve(*args, **kwargs)
+                finally:
+                    check()
+            planner.ik.solve_pose = tracked_ik
+        check("ik_batches")
+        consumed["ik_batches"] += 1
+        stage = "reference_ik"
         seeds, ik_success = planner.reference_seeds()
-        diagnostics["reference_ik_success_counts"] = ik_success
-        # BEGIN report the actual native execution and selected seed policy.
-        diagnostics["ik_exit_early"] = bool(planner.ik.config.exit_early)
-        diagnostics["reference_ik_distinct_counts"] = planner.reference_ik_distinct_counts
-        diagnostics["initial_seed_strategies"] = planner.initial_seed_strategies
-        # END report the actual native execution and selected seed policy.
-        reference_seeds = seeds
-        searched = False
+        check()
+        diagnostics.update(reference_ik_success_counts=ik_success,
+            ik_exit_early=bool(planner.ik.config.exit_early),
+            reference_ik_distinct_counts=planner.reference_ik_distinct_counts,
+            initial_seed_strategies=planner.initial_seed_strategies)
+        reference_seeds, searched = seeds, False
         for iteration in range(budget.maximum_trajectory_solves):
+            check("trajectory_solves")
             consumed["trajectory_solves"] += 1
-            result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
+            stage = "trajectory_optimization_and_verification"
+            native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
+            check()
             native_success = attempt["native_success"]
             diagnostics["attempts"].append(attempt)
             diagnostics.update(attempt)
             if attempt["accepted"]:
-                diagnostics["executable_until"] = trajectory.executable_until
-                diagnostics["next_verification"] = trajectory.next_verification
-                # BEGIN formal execution handoff uses this exact verified candidate.
-                from .execution_binding import bind_candidate
+                diagnostics.update(executable_until=trajectory.executable_until,
+                                   next_verification=trajectory.next_verification)
                 binding = bind_candidate(trajectory, problem=problem, scene=scene,
                     validation=planner.last_validation, native_report=attempt)
-                binding.update(planning_budget=deepcopy(request_budget), consumed_planning=deepcopy(consumed),
-                    request_events=([asdict(event) for event in problem.events] if prior is None else prior["request_events"]),
+                for event in problem.events:
+                    if event.timing and not any(event_occurrence_key(row) == event_occurrence_key(event)
+                                                for row in ledger["timing_events"]):
+                        ledger["timing_events"].append(plain(event))
+                retry_goal_ids = set() if prior is None else set(prior["retry_goal_ids"])
+                retry_direction_ids = set() if prior is None else set(prior["retry_direction_ids"])
+                binding.update(planning_budget=deepcopy(request_budget),
+                    request_events=deepcopy(ledger["original_events"]),
                     consumed_events=[] if prior is None else prior["consumed_events"],
-                    goal_identities=({collection: list(range(len(getattr(problem, collection))))
-                                      for collection in ("pose_events", "coordinate_events", "supports")}
-                                     if prior is None else prior["goal_identities"]),
-                    completed_goal_ids=[] if prior is None else prior["completed_goal_ids"],
-                    prior_effects={} if prior is None else prior["effects"],
-                    request_time_origin_s=0. if prior is None else prior["request_time_origin_s"])
-                binding["request_time_origin_step"] = 0 if prior is None else prior["request_time_origin_step"]
+                    goal_identities=({name: list(range(len(getattr(problem, name))))
+                        for name in ("pose_events", "coordinate_events", "supports")}
+                        if prior is None else prior["goal_identities"]),
+                    completed_goal_ids=[deepcopy(value) for value in
+                                        (ledger["completed_goal_ids"] if prior is None else prior["completed_goal_ids"])
+                                        if tuple(value) not in retry_goal_ids],
+                    goal_evidence=deepcopy(ledger["goal_evidence"]),
+                    direction_identities=([[(index, column) for column in range(len(mechanism.directions))]
+                        for index, mechanism in enumerate(getattr(problem, "mechanisms", ()))]
+                        if prior is None else deepcopy(prior["direction_identities"])),
+                    completed_direction_ids=[deepcopy(value) for value in
+                        (ledger["completed_direction_ids"] if prior is None else prior["completed_direction_ids"])
+                        if tuple(value) not in retry_direction_ids],
+                    retry_direction_ids=sorted(retry_direction_ids),
+                    direction_evidence=deepcopy(ledger["direction_evidence"]),
+                    history=deepcopy(ledger["history"]), effect_history=deepcopy(ledger["effect_history"]),
+                    timing_events=deepcopy(ledger["timing_events"]), timing_checks=deepcopy(ledger["timing_checks"]),
+                    request_time_origin_s=0. if prior is None else prior["request_time_origin_s"],
+                    request_time_origin_step=0 if prior is None else prior["request_time_origin_step"])
                 if prior is not None:
-                    binding.update({name: prior[name] for name in (
-                        "physics_budget", "consumed_physics_steps", "remaining_physics_steps")})
-                return PlanningResult(True, trajectory, diagnostics, binding)
-                # END a diagnostic label alone never authorizes execution.
+                    binding.update({name: deepcopy(prior[name]) for name in (
+                        "physics_budget", "consumed_physics_steps", "remaining_physics_steps",
+                        "device_policy", "active_finger_interval")})
+                # All work required to qualify and bind this candidate must
+                # finish within budget. Cleanup after that fact is recorded,
+                # but cannot erase an already available qualified candidate.
+                check()
+                diagnostics["qualified_candidate_elapsed_seconds"] = time.monotonic()-started
+                outcome.success, outcome.trajectory, outcome.execution_binding = True, trajectory, binding
+                return outcome
             if iteration+1 >= budget.maximum_trajectory_solves:
                 break
-
+            stage = "validation_refinement"
             additional = planner.refinement_samples()
-            # A native success invalidated between its rollout samples calls
-            # for exact witness constraints on this same cubic first.
+            check()
             if native_success and additional is not None:
-                seeds = result.solution.detach().clone()
+                seeds = native_result.solution.detach().clone()
                 planner.seed_strategies = [attempt["seed_provenance"]]
                 planner.refine_validation(additional)
-                attempt["next_action"] = "refine_uncovered_curve_samples"
-                attempt["refinement_parameters"] = additional.tolist()
+                attempt.update(next_action="refine_uncovered_curve_samples", refinement_parameters=additional.tolist())
+                check()
                 continue
-
             if not searched and budget.search_seconds > 0:
-                searched = True
+                searched, stage = True, "bounded_seed_search"
                 search_started = time.monotonic()
-                path_seed, search_report = planner.ompl_seed(reference_seeds, trajectory)
-                consumed["search_seconds"] += time.monotonic()-search_started
+                try:
+                    path_seed, search_report = planner.ompl_seed(reference_seeds, trajectory)
+                    consumed["search_queries"] += int(search_report.get("state_queries", 0))
+                except Exception:
+                    consumed["search_queries"] += budget.max_validation_points
+                    raise
+                finally:
+                    consumed["search_seconds"] += time.monotonic()-search_started
+                check()
                 diagnostics["ompl"] = search_report
                 if path_seed is not None:
-                    seeds = path_seed
-                    planner.seed_strategies = ["ompl"]
+                    seeds, planner.seed_strategies = path_seed, ["ompl"]
                     diagnostics["used_ompl"] = True
                     attempt["next_action"] = "optimize_complete_ompl_seed"
                     continue
-
             if additional is not None:
-                seeds = result.solution.detach().clone()
+                seeds = native_result.solution.detach().clone()
                 planner.seed_strategies = [attempt["seed_provenance"]]
                 planner.refine_validation(additional)
-                attempt["next_action"] = "refine_uncovered_curve_samples"
-                attempt["refinement_parameters"] = additional.tolist()
+                attempt.update(next_action="refine_uncovered_curve_samples", refinement_parameters=additional.tolist())
+                check()
                 continue
             break
-
         diagnostics["failure"] = ("exported_curve_constraint_violation" if diagnostics["native_success"]
                                   else "complete_process_optimization_not_feasible")
-        return PlanningResult(False, None, diagnostics)
-    except JointDomainInitializationError as error:
-        diagnostics["failure"] = "physical_domain_initializer_not_constructed"
-        diagnostics["reason"] = str(error)
-        return PlanningResult(False, None, diagnostics)
+        return outcome
+    except Exception as error:
+        diagnostics.update(failure=("cumulative_planning_budget_exhausted" if isinstance(error, PlanningWorkExhausted)
+            else "continuation_binding_gap" if isinstance(error, ContinuationBindingError)
+            else "event_time_requirement_unsatisfied" if isinstance(error, TimeBindingError)
+            else "physical_domain_initializer_not_constructed" if isinstance(error, JointDomainInitializationError)
+            else "planning_stage_failed"), failed_stage=stage, reason=str(error), error_type=type(error).__name__)
+        outcome.success, outcome.trajectory, outcome.execution_binding = False, None, None
+        return outcome
     finally:
-        # BEGIN report the final admitted schedule's actual capacity estimates.
-        diagnostics["scene_workspace_bytes"] = planner.scene_workspace_bytes
-        diagnostics["anchor_fk_workspace_bytes"] = planner.anchor_fk_workspace_bytes
-        diagnostics["exact_anchor_capacity"] = planner.anchor_capacity
-        # END report the final admitted schedule's actual capacity estimates.
+        if planner is not None:
+            if original_export is not None:
+                planner.export = original_export
+            if original_ik_solve is not None:
+                planner.ik.solve_pose = original_ik_solve
+            for name in ("scene_workspace_bytes", "anchor_fk_workspace_bytes", "anchor_capacity"):
+                diagnostics["exact_anchor_capacity" if name == "anchor_capacity" else name] = getattr(planner, name)
+            try:
+                planner.close()
+            except Exception as error:
+                outcome.success, outcome.trajectory, outcome.execution_binding = False, None, None
+                diagnostics.update(failure="planner_cleanup_failed", reason=str(error))
         diagnostics["elapsed_seconds"] = time.monotonic()-started
-        planner.close()
+        if ledger is not None:
+            ledger["consumed_planning"]["planning_seconds"] = initial_seconds+diagnostics["elapsed_seconds"]
+            if ledger["consumed_planning"]["planning_seconds"] >= ledger["planning_budget"]["planning_seconds"]:
+                diagnostics["wall_time_overrun_s"] = ledger["consumed_planning"]["planning_seconds"]-ledger["planning_budget"]["planning_seconds"]
+                diagnostics["planning_budget_exhausted"] = True
+                diagnostics["budget_exhausted_after_qualification"] = outcome.success
+            ledger["binding_records"].append({
+                "candidate_id": None if outcome.execution_binding is None else outcome.execution_binding.get("candidate_id"),
+                "mode": "initial" if previous is None else "continuation" if rebind is None else
+                        rebind.get("kind") if isinstance(rebind, dict) else "invalid_rebind",
+                "source": deepcopy(rebind.get("source")) if isinstance(rebind, dict) else None,
+                "request_time_origin_s": (None if continuation is not None and prior is None else
+                                           0. if prior is None else prior["request_time_origin_s"]),
+                "accepted": outcome.success, "failed_stage": diagnostics.get("failed_stage"),
+                "failure": diagnostics.get("failure"), "reason": diagnostics.get("reason"),
+                "consumed_planning": deepcopy(ledger["consumed_planning"])})
+            outcome.request_ledger = deepcopy(ledger)
+            if outcome.execution_binding is not None:
+                outcome.execution_binding["consumed_planning"] = deepcopy(ledger["consumed_planning"])
+                outcome.execution_binding["request_ledger"] = deepcopy(ledger)
+# END every admitted attempt retains its work even when no curve was produced.
 
 
 # END complete-window robot planning and generation-time process constraints.

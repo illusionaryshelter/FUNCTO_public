@@ -30,6 +30,9 @@ from torch.utils.checkpoint import checkpoint
 from .planning_problem import (
     PosePath, quaternion_conjugate, quaternion_multiply, quaternion_rotate, quaternion_rotvec,
 )
+# BEGIN scene commands and planner events share exact occurrence identities.
+from .planning_problem import event_occurrence_key
+# END source names alone do not identify an explicitly repeated operation.
 from .motion import _inverse, _pose_array
 
 
@@ -652,7 +655,8 @@ class PrismaticGripper:
             raise ValueError("Self-collision pair declarations must be unique")
         self._self_pair_indices = np.asarray(self.self_collision_pairs, dtype=np.int64).reshape(-1, 2)
         # END reject duplicate declarations before batched summation.
-        self.commands = tuple(commands)
+        # BEGIN own each bound occurrence so later retry input cannot alter this scene.
+        self.commands = tuple(deepcopy(commands))
         if not self.commands:
             raise ValueError("Gripper geometry must be bound to explicit controller events")
         for event in self.commands:
@@ -660,9 +664,10 @@ class PrismaticGripper:
             _text(event.get("skill_id"), "gripper skill instance ID")
             if event.get("command") not in {"open", "close", "hold"} or not np.isfinite(event.get("progress", np.nan)):
                 raise ValueError("Gripper events need native command intentions and progress")
-        identities = [(event["skill_id"], event["event_id"]) for event in self.commands]
+        identities = [event_occurrence_key(event) for event in self.commands]
         if len(set(identities)) != len(identities):
-            raise ValueError("Gripper skill/event identities must be unique")
+            raise ValueError("Gripper event occurrence identities must be unique")
+        # END the same original event may recur only under an explicit new occurrence.
         self.source = _text(source, "gripper calibration and timing source")
 
     # BEGIN a separately controlled hand follows the same formal physical clock.
@@ -1087,13 +1092,15 @@ class PlanningScene:
                                 for index, _ in enumerate(owner.attachments)}
         if used_attachments != declared_attachments:
             raise ValueError("Every collision attachment must belong to the problem's held phases")
-        expected_commands = Counter((event.skill_id, event.event_id, event.kind, event.progress)
+        # BEGIN every geometry command belongs to this exact candidate occurrence.
+        expected_commands = Counter((*event_occurrence_key(event), event.kind, event.progress)
                                     for event in problem.events if event.kind in {"open", "close", "hold"})
         actual_commands = Counter() if self.gripper is None else Counter(
-            (event["skill_id"], event["event_id"], event["command"], event["progress"])
+            (*event_occurrence_key(event), event["command"], event["progress"])
             for event in self.gripper.commands)
         if actual_commands != expected_commands:
-            raise ValueError("Problem and gripper must share exact skill/event/command/progress identities")
+            raise ValueError("Problem and gripper must share exact skill/event/occurrence/command/progress identities")
+        # END old command intent cannot accidentally authorize a repeated occurrence.
         hand = self.gripper
         # BEGIN bind optional occupied finger evidence to actual feedback.
         # A native model can lock binary fingers at its default open width,
@@ -1387,24 +1394,29 @@ class PlanningScene:
         return (p + quaternion_rotate(q, _tensor(relation.position_tool_owner, p)),
                 quaternion_multiply(q, _tensor(relation.quaternion_tool_owner, q))), matches.any(-1)
 
-    def with_fixed_endpoints(self, position, quaternion, progress):
-        """Freeze a whole OMPL candidate's release states, not the final solve.
+    # BEGIN selected search prefixes own their actual release history.
+    def with_release_history(self, position, quaternion, progress):
+        """Copy release FK from an already selected prefix into a child branch.
 
-        The full optimizer uses the original scene, so release anchors remain
-        shared decision variables there. Search receives only a candidate copy
-        with the exact proposed anchor poses and fresh collision work buffers.
+        Future releases remain variables. The first reached occurrence of a
+        release owns its pose, including on a progress plateau; extending a
+        branch cannot replace it with the later hand pose. Full optimization
+        still uses the original scene, where releases remain shared decisions.
         """
         result = self.clone_for_rollout()
-        result._fixed_release_poses = {}
         for owner in self.owners:
             for index, relation in enumerate(owner.attachments):
-                if relation.release_condition_id is None:
+                key = (owner.owner_id, index)
+                if relation.release_condition_id is None or key in result._fixed_release_poses:
+                    continue
+                if not bool((progress >= relation.interval[1]-1e-7).any()):
                     continue
                 pose, found = self._release_pose(relation, position, quaternion, progress)
                 if not bool(found.all()):
-                    raise ValueError("A search candidate must include its exact release anchor")
-                result._fixed_release_poses[(owner.owner_id, index)] = pose
+                    raise ValueError("A selected search prefix must include its exact release anchor")
+                result._fixed_release_poses[key] = pose
         return result
+    # END neither a source reference nor a sibling branch supplies release FK.
 
     def _permission(self, rule, actor_spheres, actor_pose, target_pose, progress, coordinates, half):
         points = _tensor(rule.feature_points, progress)

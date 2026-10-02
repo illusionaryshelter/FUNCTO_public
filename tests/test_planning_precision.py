@@ -6,9 +6,11 @@ geometry accuracy; the frozen-input GPU precision audit covers that evidence.
 """
 
 from types import SimpleNamespace
+from copy import deepcopy
 import unittest
 from unittest.mock import Mock, patch
 
+import numpy as np
 import torch
 
 from manipulation.planning import _CuroboPlanner, plan_trajectory
@@ -84,6 +86,7 @@ class PlanningPrecisionTests(unittest.TestCase):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = False
         scene = SimpleNamespace(describe=Mock(side_effect=ValueError("description failed")))
+        scene.clone_for_rollout = lambda: deepcopy(scene)
 
         def initialize(planner, *_args, continuation=None):
             from manipulation.planning import PlanningBudget
@@ -94,9 +97,37 @@ class PlanningPrecisionTests(unittest.TestCase):
         # END fixtures retain the production initialization contract.
 
         with patch.object(_CuroboPlanner, "_initialize", autospec=True, side_effect=initialize):
-            with self.assertRaisesRegex(ValueError, "description failed"):
-                plan_trajectory(None, scene, None, device="cpu")
+            # BEGIN failed requests retain accounting and restore caller precision.
+            result = plan_trajectory(SimpleNamespace(events=()), scene, None, device="cpu")
+            self.assertFalse(result.success)
+            self.assertEqual(result.diagnostics["reason"], "description failed")
+            self.assertEqual(result.request_ledger["consumed_planning"]["initializations"], 1)
+            # END a structured failure does not bypass native cleanup.
         self.assertEqual(self.flags(), (True, False))
+
+
+# BEGIN optimizer conditioning respects each goal's real functional accuracy.
+class FunctionalGoalScalingTests(unittest.TestCase):
+    def test_equal_relative_errors_have_equal_objectives_without_relaxing_raw_goals(self):
+        from manipulation.planning_problem import PlanningProblem, PoseEventRequirement
+        objective = []
+        for tolerance in (1e-2, 1e-4):
+            goal = PoseEventRequirement(1., np.eye(4), np.eye(4), tolerance, .01, "declared precision")
+            # BEGIN this pose-only fixture explicitly has no mechanism directions.
+            problem = SimpleNamespace(pose_relations=(), pose_events=(goal,), coordinate_events=(), mechanisms=())
+            # END the full problem contract remains strict in production.
+            p = torch.tensor([[[2*tolerance, 0., 0.]]], requires_grad=True)
+            q = torch.tensor([[[1., 0., 0., 0.]]])
+            value = PlanningProblem.optimizer_preferences(problem, p, q, torch.ones(1, 1))
+            objective.append(float(value.detach()))
+            self.assertGreater(float(goal.evaluate(p, q).detach()), 0.)
+            derivative = torch.autograd.grad(value.sum(), p)[0]
+            self.assertTrue(torch.isfinite(derivative).all())
+            self.assertGreater(float(derivative[0, 0, 0]), 0.)
+            inside = torch.tensor([[[.5*tolerance, 0., 0.]]])
+            self.assertEqual(float(goal.evaluate(inside, q)), 0.)
+        self.assertAlmostEqual(*objective, places=5)
+# END optimizer scaling never alters raw acceptance or invents target freedom.
 
 
 if __name__ == "__main__":

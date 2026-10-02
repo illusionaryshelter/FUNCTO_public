@@ -229,6 +229,9 @@ def revolute_input():
     scene["motion_model"] = {
         "kind": "revolute", "reference_pose": zero, "basis": np.eye(3), "axis_point": center,
         "source": "independent current hinge axis and signed angle convention", "coordinate_limits": [[0., 7.]],
+        # BEGIN the fixture knows its actual turn branch independently of pose.
+        "initial_coordinates": [0.], "initial_coordinates_source": "explicit measured zero-turn fixture entrance",
+        # END a multi-turn physical domain does not identify this branch by itself.
     }
     scene["functional_bindings"]["function"]["current_coordinates"] = [2*np.pi]
     return skill
@@ -594,7 +597,7 @@ class PlanningBuilderTest(unittest.TestCase):
 
     def test_remaining_obligations_preserve_clock_and_explicit_actual_input_gaps(self):
         request = compile_inputs(revolute_input())
-        remaining = request.remaining_obligations(.7, (("turn", "open"),))
+        remaining = request.remaining_obligations(.7, (("turn", "open", 0),))
         self.assertEqual(remaining["process"]["mechanisms"][0]["remaining_scope"], (.7, 1.))
         self.assertEqual(remaining["process"]["mechanisms"][0]["requirement"].start, 0.)
         self.assertNotIn("open", [event.event_id for event in remaining["events"]])

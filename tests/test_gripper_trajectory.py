@@ -16,11 +16,11 @@ def _arguments():
         "joint_names": ("finger_a", "finger_b"),
         "initial_position": [.03, -.025], "initial_velocity": [.0006, -.0003],
         "commands": [
-            {"skill_id": "s", "event_id": "open", "kind": "open", "time": 0., "progress": 0.,
+            {"skill_id": "s", "event_id": "open", "occurrence": 0, "kind": "open", "time": 0., "progress": 0.,
              "finger_positions": [.035, -.034], "target_source": "explicit CPU test command"},
-            {"skill_id": "s", "event_id": "close", "kind": "close", "time": .3005, "progress": .6,
+            {"skill_id": "s", "event_id": "close", "occurrence": 0, "kind": "close", "time": .3005, "progress": .6,
              "finger_positions": [.005, -.008], "target_source": "explicit CPU test command"},
-            {"skill_id": "s", "event_id": "later", "kind": "open", "time": .9, "progress": 1.,
+            {"skill_id": "s", "event_id": "later", "occurrence": 0, "kind": "open", "time": .9, "progress": 1.,
              "finger_positions": [.01, -.012], "target_source": "conditional future command"}],
         "duration": 1., "executable_until": .8, "timestep": .002,
         "position_limits": [[0., -.04], [.04, 0.]],
@@ -118,7 +118,7 @@ class FingerTrajectoryTests(unittest.TestCase):
         # In binary64 this relative intent is slightly later than local .2;
         # re-running ceil would incorrectly defer the command to local .3.
         original = .6000000000000001
-        row = {"skill_id": "s", "event_id": "open", "kind": "open", "progress": 1.,
+        row = {"skill_id": "s", "event_id": "open", "occurrence": 0, "kind": "open", "progress": 1.,
             "time": original-.4, "finger_positions": [.02],
             "activation_time_s": .2, "bound_activation_step": 2,
             "request_activation_step": 6, "request_activation_time_s": original,
@@ -128,6 +128,36 @@ class FingerTrajectoryTests(unittest.TestCase):
         self.assertEqual(result[0]["activation_step"], 2)
         self.assertEqual(result[0]["applied_time_s"], .2)
     # END equivalent repeated targets remain archived with their source identities.
+
+    # BEGIN explicit retries retain independent ramps and survive exact reload.
+    def test_repeated_source_command_uses_a_distinct_occurrence(self):
+        arguments = _arguments()
+        arguments["commands"][-1].update(event_id="open", occurrence=1)
+        reference = FingerTrajectory.build(**arguments)
+        repeated = [row for row in reference.events if row["event_id"] == "open"]
+        self.assertEqual([row["occurrence"] for row in repeated], [0, 1])
+        self.assertNotEqual(repeated[0]["applied_time_s"], repeated[1]["applied_time_s"])
+        mapping = reference.describe()
+        self.assertEqual(FingerTrajectory.from_mapping(mapping).describe(), mapping)
+        changed = deepcopy(mapping)
+        changed["segments"][-1]["occurrence"] = 0
+        with self.assertRaisesRegex(ValueError, "introduce or duplicate"):
+            FingerTrajectory.from_mapping(changed)
+
+    def test_missing_duplicate_or_invalid_occurrence_cannot_identify_a_retry(self):
+        for invalid in (None, -1, True, 0.5):
+            arguments = _arguments()
+            arguments["commands"][-1]["occurrence"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "occurrence"):
+                FingerTrajectory.build(**arguments)
+        arguments = _arguments()
+        arguments["commands"][-1]["event_id"] = "open"
+        with self.assertRaisesRegex(ValueError, "unique.*occurrences"):
+            FingerTrajectory.build(**arguments)
+        del arguments["commands"][-1]["occurrence"]
+        with self.assertRaisesRegex(ValueError, "original timed event identities"):
+            FingerTrajectory.build(**arguments)
+    # END reloading cannot turn an applied source occurrence into a new command.
 
     def test_serialized_curve_roundtrip_is_exact_and_tampering_is_rejected(self):
         reference = FingerTrajectory.build(**_arguments())

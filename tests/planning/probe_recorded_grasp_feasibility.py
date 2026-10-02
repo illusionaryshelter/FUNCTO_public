@@ -129,6 +129,8 @@ def observed_scene(args):
     runner_args = SimpleNamespace(**vars(args))
     runner_args.output = args.output/"scene-build"
     runner_args.continuation = None
+    runner_args.rebind = None  # This diagnostic constructs its initial binding only.
+    runner_args.request_ledger = None  # The diagnostic is a distinct explicitly bounded request.
     # Required runner orchestration metadata only: capture prevents any use
     # of its trajectory budget, native trajectory allocator, or path search.
     runner_args.knots = 8

@@ -31,7 +31,7 @@ from recorded_simulation import load_saved_trajectory
 
 
 def _event(event_id, kind, time, evidence=None):
-    return {"skill_id": "declared_skill", "event_id": event_id, "kind": kind,
+    return {"skill_id": "declared_skill", "event_id": event_id, "occurrence": 0, "kind": kind,
             "time": time, "progress": time, "requires_evidence": evidence, "stop": evidence is not None}
 
 
@@ -158,6 +158,7 @@ def _result(curve):
                     "reference_frame": "world", "tool_link": "declared_test_tcp",
                     "base_pose": np.eye(4).tolist(), "tool_transform": np.eye(4).tolist()},
         "scene": {"gripper": None, "source": "scripted checker fixture"},
+        "timing_events": [deepcopy(event) for event in curve.events if event.get("timing")], "timing_checks": [],
         "validation": {"candidate_id": identity, "completed": True,
             "native": {"accepted": True, "scope": "scripted sequencing evidence"},
             "export": {"u": [0., 1.], "violations": [0., 0.]}}, "execution_limits": None})
@@ -809,7 +810,7 @@ class DependencyExecutionTests(unittest.TestCase):
                          {key: last[key] for key in ("position_bounds", "maximum_speed")})
         changed = deepcopy(targets)
         changed["events"][-1]["positions"][0] += .001
-        with self.assertRaisesRegex(ValueError, "different actuator target"):
+        with self.assertRaisesRegex(ValueError, "original full device policy"):
             continuation_execution_inputs(report["continuation"], FixedFingerTargets.from_mapping(changed), limits)
     # END emergency hold is bounded separately and never resets the task budget.
 
@@ -1292,6 +1293,448 @@ class FingerConvergenceTests(unittest.TestCase):
         self.assertFalse(result["settled_at_end"])
         self.assertEqual(result["final_consecutive_window_s"], 0.)
 # END physical feedback rejection and isolated native FK regressions.
+
+
+# BEGIN actual event deadlines and retry identities use measured physical clocks.
+# BEGIN actual direction obligations use actual measured coordinates/rates.
+class ActualDirectionEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def fixture(kind="local_rate", *, start=0., end=1.):
+        simulation, curve, targets = _fixture()
+        curve.events[2].update(kind="function", requires_evidence=None, stop=False)
+        _bind_fingers(simulation, curve, targets)
+        result = _result(curve)
+        requirement = {"start": start, "end": end, "coordinate_index": 0,
+            "kind": kind, "sign": 1, "minimum": .005 if kind != "monotone" else 0.,
+            "tolerance": 0., "source": "Explicit synthetic direction requirement",
+            "origin_coordinate": float(simulation.native_data.qpos[0]) if kind == "net" else None,
+            "origin_source": "Actual mock coordinate at original entrance" if kind == "net" else None}
+        binding = result.execution_binding
+        binding["problem"]["mechanisms"] = [{"directions": [requirement]}]
+        binding["validation"]["inputs"]["problem"] = deepcopy(binding["problem"])
+        binding.update(direction_identities=[[[3, 7]]], completed_direction_ids=[], direction_evidence=[],
+                       retry_direction_ids=[])
+        return simulation, curve, targets, result
+
+    @staticmethod
+    def execute(simulation, curve, targets, result, observer, output):
+        return _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+            initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+            output=output, observation_callback=observer)
+
+    def test_measured_rate_completes_original_direction_and_preserves_observation_interval(self):
+        simulation, curve, targets, result = self.fixture()
+        start = simulation.sim_time
+        def observe(feedback, curve_time):
+            # Mock q is intentionally static; this rate-specific proof reads
+            # the separately supplied actual dq, never the cubic derivative.
+            return {"source": "Explicit actual joint-rate channel", "timestamp_s": feedback["timestamp_s"],
+                "directions": [{"identity": [3, 7], "value": "T" if feedback["dq"][0] >= .005 else "F",
+                    "source": "Actual dq[0] from declared mechanism coordinate sensor",
+                    "measured_rate": float(feedback["dq"][0]), "acquisition_interval_s": [start, feedback["timestamp_s"]],
+                    "scope_complete": curve_time >= curve.duration}]}
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = self.execute(simulation, curve, targets, result, observe, Path(temporary)/"trial")
+        self.assertEqual(report["status"], "curve_finished")
+        self.assertEqual(report["direction_result"], "T")
+        self.assertEqual(report["completed_direction_ids"], [[3, 7]])
+        self.assertEqual(report["continuation"]["completed_direction_ids"], [[3, 7]])
+        self.assertEqual(report["request_ledger"]["direction_evidence"], report["direction_evidence"])
+        final = report["direction_evidence"][-1]
+        self.assertTrue(final["completion_verified"])
+        self.assertEqual(final["candidate_id"], result.execution_binding["candidate_id"])
+        self.assertAlmostEqual(final["acquisition_interval_s"][1]-final["acquisition_interval_s"][0], curve.duration)
+
+    def test_current_false_or_unknown_holds_and_future_unknown_does_not_block_entrance(self):
+        for value, start, expected_steps, expected in (("F", 0., 0, "F"), ("U", 0., 0, "U"),
+                                                      ("U", .5, 3, "U")):
+            simulation, curve, targets, result = self.fixture(start=start)
+            def observe(feedback, curve_time):
+                return {"source": "Explicit actual direction observer", "timestamp_s": feedback["timestamp_s"],
+                    "directions": [{"identity": [3, 7], "value": value, "source": "Current actual rate assessment",
+                        "acquisition_interval_s": [feedback["timestamp_s"]]*2, "scope_complete": False}]}
+            with self.subTest(value=value, start=start), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+                output = Path(temporary)/"trial"
+                with self.assertRaises(ExecutionGuardError):
+                    self.execute(simulation, curve, targets, result, observe, output)
+                report = json.loads((output/"execution-report.json").read_text())
+            self.assertEqual(report["executed_steps"], expected_steps)
+            self.assertEqual(report["direction_result"], expected)
+            self.assertTrue(report["abort_hold"]["native_ctrl_written"])
+            self.assertEqual(report["completed_direction_ids"], [])
+
+    def test_net_completion_uses_actual_displacement_and_cannot_follow_reference_progress(self):
+        simulation, curve, targets, result = self.fixture("net")
+        initial = float(simulation.native_data.qpos[0])
+        def observe(feedback, curve_time):
+            change = float(feedback["q"][0])-initial
+            return {"source": "Actual coordinate sensor", "timestamp_s": feedback["timestamp_s"],
+                "directions": [{"identity": [3, 7], "value": "T" if change >= .005 else "F",
+                    "source": "Measured displacement from original actual coordinate", "measured_change": change,
+                    "acquisition_interval_s": [feedback["timestamp_s"]]*2, "scope_complete": curve_time >= curve.duration}]}
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                self.execute(simulation, curve, targets, result, observe, output)
+            report = json.loads((output/"execution-report.json").read_text())
+        self.assertEqual(report["executed_steps"], 6)
+        self.assertEqual(report["direction_result"], "F")
+        self.assertEqual(report["completed_direction_ids"], [])
+        self.assertTrue(all(row["measured_change"] == 0. for row in report["direction_evidence"]))
+
+    def test_scope_complete_without_full_actual_interval_remains_unverified(self):
+        simulation, curve, targets, result = self.fixture("monotone")
+        def observe(feedback, curve_time):
+            return {"source": "Actual short-interval observer", "timestamp_s": feedback["timestamp_s"],
+                "directions": [{"identity": [3, 7], "value": "T", "source": "Only this actual sample interval",
+                    "acquisition_interval_s": [feedback["timestamp_s"]]*2, "scope_complete": True}]}
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                self.execute(simulation, curve, targets, result, observe, output)
+            report = json.loads((output/"execution-report.json").read_text())
+        self.assertEqual(report["direction_result"], "U")
+        self.assertEqual(report["executed_steps"], 6)
+        self.assertEqual(report["completed_direction_ids"], [])
+
+        self.assertTrue(report["direction_evidence"][-1]["scope_complete"])
+        self.assertFalse(report["direction_evidence"][-1]["completion_verified"])
+
+    def test_retry_preserves_old_completion_fact_but_requires_new_acquisition(self):
+        simulation, curve, targets, result = self.fixture()
+        historical = {"identity": [3, 7], "candidate_id": "previous attempt", "value": "T",
+            "source": "Old actual full-scope evidence", "scope_complete": True,
+            "scope_started_at_s": 1., "acquisition_interval_s": [1., 1.2]}
+        result.execution_binding.update(retry_direction_ids=[[3, 7]], direction_evidence=[historical])
+        def observe(feedback, curve_time):
+            return {"source": "Fresh assessment carrying an old witness", "timestamp_s": feedback["timestamp_s"],
+                    "directions": [historical]}
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                self.execute(simulation, curve, targets, result, observe, output)
+            report = json.loads((output/"execution-report.json").read_text())
+        self.assertEqual(report["direction_evidence"][0], historical)
+        self.assertEqual(report["direction_result"], "U")
+        self.assertEqual(report["completed_direction_ids"], [])
+        self.assertEqual(report["executed_steps"], 0)
+
+    def test_nonperiodic_scope_boundaries_acquire_actual_evidence_without_moving_periodic_phase(self):
+        simulation, curve, targets, result = self.fixture(start=.25, end=.75)
+        initial_time = simulation.sim_time
+        sampled = []
+        def observe(feedback, curve_time):
+            sampled.append(curve_time)
+            return {"source": "Actual rate observer available at declared boundary polls",
+                "timestamp_s": feedback["timestamp_s"], "directions": [{"identity": [3, 7], "value": "T",
+                    "source": "Actual sensor interval retained by the observer",
+                    "acquisition_interval_s": [initial_time, feedback["timestamp_s"]],
+                    "scope_complete": curve_time >= .009}]}
+        limits = _limit_values(simulation, curve)
+        limits["observation_policy"].update(period_s=.006, maximum_age_s=.006)
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
+                output=Path(temporary)/"trial", observation_callback=observe)
+        # Scope boundaries .003/.009 reach native guards .004/.010; the
+        # ordinary .006/.012 acquisitions keep their original phase.
+        np.testing.assert_allclose(sampled, [0., .004, .006, .010, .012])
+        self.assertEqual(report["direction_result"], "T")
+        boundaries = [row for row in report["observation_checks"] if row["poll_reason"] == "direction_boundary"]
+        np.testing.assert_allclose([row["polled_at_s"]-initial_time for row in boundaries], [.004, .010])
+# END clock progress and earlier attempts cannot certify actual direction.
+
+
+class PhysicalEventTimingTests(unittest.TestCase):
+    @staticmethod
+    def window(target, lower, upper, **details):
+        return {"check_target": target, "window_s": [lower, upper],
+                "time_basis": "request_physical", "source": "Explicit synthetic physical deadline",
+                "origin_time_s": 0., "origin_event": None, "goal_id": None, "condition_id": None,
+                **details}
+
+    def test_missed_activation_deadline_holds_before_actuator_application(self):
+        simulation, curve, targets = _fixture()
+        curve.events[1]["timing"] = [self.window("activation", None, .0035)]
+        _bind_fingers(simulation, curve, targets)
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                    initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve), output=output)
+            report = json.loads((output/"execution-report.json").read_text())
+        self.assertEqual([row["event_id"] for row in report["events"]], ["open-original"])
+        self.assertEqual(report["feedback_failure"]["point"], "expired_event_window")
+        self.assertEqual(report["timing_result"], "U")
+        self.assertTrue(report["abort_hold"]["native_ctrl_written"])
+
+    def test_actual_arrival_is_checked_on_original_request_time_not_reference_progress(self):
+        for upper, accepted in ((20.005, True), (20.003, False)):
+            simulation, curve, targets = _fixture()
+            curve.events[2].update(kind="function", requires_evidence=None, stop=False,
+                timing=[self.window("arrival", 20.003, upper, goal_id=["pose_events", 0])])
+            _bind_fingers(simulation, curve, targets)
+            result = _result(curve)
+            result.execution_binding.update(request_time_origin_s=20., goal_identities={"pose_events": [0]})
+            result.execution_binding["problem"]["pose_events"] = [{"progress": 1.}]
+            result.execution_binding["validation"]["inputs"]["problem"] = deepcopy(result.execution_binding["problem"])
+            def observe(feedback, curve_time):
+                return {"source": "Synthetic measured completion before soft source progress 1",
+                    "timestamp_s": feedback["timestamp_s"],
+                    "completed_goal_ids": [["pose_events", 0]] if curve_time >= .004 else []}
+            with self.subTest(upper=upper), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+                output = Path(temporary)/"trial"
+                if accepted:
+                    report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                        initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                        output=output, observation_callback=observe)
+                else:
+                    with self.assertRaises(ExecutionGuardError):
+                        _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                            initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                            output=output, observation_callback=observe)
+                    report = json.loads((output/"execution-report.json").read_text())
+            self.assertEqual(report["timing_result"], "T" if accepted else "F")
+            arrival = next(row for row in report["history"] if row["check_target"] == "arrival")
+            self.assertAlmostEqual(arrival["time_s"], 20.004)
+            self.assertEqual(arrival["value"], "T")
+            self.assertEqual(report["completed_goal_ids"], [["pose_events", 0]] if accepted else [])
+
+    def test_effect_window_uses_new_acquisition_and_preserves_old_false_true_history(self):
+        for fresh in (False, True):
+            simulation, curve, targets = _fixture()
+            event = curve.events[2]
+            event.update(kind="effect", requires_evidence=None, stop=False, occurrence=1,
+                timing=[self.window("effect", .005, .009, condition_id="touch")])
+            curve.conditions = ({"condition_id": "touch", "effect_requirement": "synthetic contact",
+                                 "skill_id": event["skill_id"], "event_id": event["event_id"]},)
+            _bind_fingers(simulation, curve, targets)
+            previous = [{"skill_id": event["skill_id"], "event_id": event["event_id"], "occurrence": 0,
+                "check_target": "effect", "time_s": value, "value": truth, "source": "previous physical occurrence"}
+                for value, truth in ((-.02, "F"), (-.01, "T"))]
+            result = _result(curve)
+            result.execution_binding["request_ledger"] = {"history": deepcopy(previous)}
+            values = _limit_values(simulation, curve)
+            values["observation_policy"]["maximum_age_s"] = .1
+            def observe(feedback, curve_time):
+                return {"source": "synthetic independently timestamped effect",
+                    "timestamp_s": feedback["timestamp_s"] if fresh else 1.29,
+                    "effects": {"touch": {"value": "T" if curve_time >= .006 or not fresh else "F" if curve_time == .002 else "U",
+                        "source": "current physical sample" if fresh else "earlier binding sample"}}}
+            with self.subTest(fresh=fresh), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+                output = Path(temporary)/"trial"
+                if fresh:
+                    report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                        initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(values),
+                        output=output, observation_callback=observe)
+                else:
+                    with self.assertRaises(ExecutionGuardError):
+                        _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                            initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(values),
+                            output=output, observation_callback=observe)
+                    report = json.loads((output/"execution-report.json").read_text())
+            self.assertEqual(report["history"][:2], previous)
+            self.assertEqual(report["timing_result"], "T" if fresh else "U")
+            current_true = [row for row in report["history"] if row["occurrence"] == 1 and row["value"] == "T"
+                            and row["check_target"] == "effect"]
+            self.assertEqual(len(current_true), 1 if fresh else 0)
+            if fresh:
+                self.assertAlmostEqual(current_true[0]["time_s"], .006)
+                self.assertEqual({row["value"] for row in report["effect_history"]}, {"F", "U", "T"})
+                self.assertEqual(report["continuation"]["request_ledger"]["effect_history"], report["effect_history"])
+
+    def test_relative_future_origin_rechecks_the_retained_actual_activation(self):
+        simulation, curve, targets = _fixture()
+        curve.events[2].update(kind="function", requires_evidence=None, stop=False)
+        curve.events[0]["timing"] = [self.window("activation", -.008, -.008,
+            origin_time_s=None, origin_event={"skill_id": "declared_skill", "event_id": "hold-later",
+                                             "occurrence": 0, "check_target": "activation"})]
+        _bind_fingers(simulation, curve, targets)
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                output=Path(temporary)/"trial")
+        self.assertEqual(report["status"], "curve_finished")
+        self.assertEqual(report["timing_result"], "T")
+        checks = [row for row in report["timing_checks"] if row["event_id"] == "open-original"]
+        self.assertEqual({row["value"] for row in checks}, {"U", "T"})
+        actual = next(row for row in report["history"] if row["event_id"] == "open-original")
+        self.assertAlmostEqual(actual["time_s"], .002)
+
+    def test_early_effect_state_is_not_a_witness_inside_a_later_window(self):
+        simulation, curve, targets = _fixture()
+        curve.events[2].update(kind="effect", requires_evidence=None, stop=False,
+            timing=[self.window("effect", .005, .009, condition_id="touch")])
+        curve.conditions = ({"condition_id": "touch", "effect_requirement": "windowed contact",
+                             "skill_id": "declared_skill", "event_id": "holding-original"},)
+        _bind_fingers(simulation, curve, targets)
+        limits = _limit_values(simulation, curve)
+        limits["observation_policy"].update(period_s=.1, maximum_age_s=.1)
+        def observe(feedback, curve_time):
+            return {"source": "single early physical sample", "timestamp_s": feedback["timestamp_s"],
+                    "effects": {"touch": {"value": "T", "source": "predicate true before window opens"}}}
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError):
+                _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                    initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
+                    output=output, observation_callback=observe)
+            report = json.loads((output/"execution-report.json").read_text())
+        self.assertEqual(report["timing_result"], "U")
+        self.assertEqual(report["evaluated_events"][0]["evaluation"], "U")
+        self.assertEqual(report["effect_history"][0]["value"], "T")
+        self.assertFalse(any(row["value"] == "T" and row["check_target"] == "effect" for row in report["history"]))
+
+    def test_dependency_cannot_borrow_true_state_acquired_before_required_effect_window(self):
+        simulation, curve, targets = _fixture()
+        curve.events[2]["timing"] = [self.window("effect", .007, .009, condition_id="Holding")]
+        _bind_fingers(simulation, curve, targets)
+        limits = _limit_values(simulation, curve)
+        limits["observation_policy"].update(period_s=.1, maximum_age_s=.1)
+        def observe(feedback, curve_time):
+            return {"source": "early independently measured state", "timestamp_s": feedback["timestamp_s"],
+                    "effects": {"Holding": {"value": "T", "source": "true before required acquisition window"}}}
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
+                output=Path(temporary)/"trial", observation_callback=observe)
+        self.assertEqual(report["status"], "stopped_for_evidence")
+        self.assertEqual(report["dependency_outcomes"][0]["evidence"]["value"], "U")
+        self.assertEqual(report["timing_result"], "U")
+        self.assertTrue(report["dependency_hold"]["native_ctrl_written"])
+        self.assertNotIn("hold-later", [row["event_id"] for row in report["events"]])
+
+    def test_occurred_event_keeps_original_witness_time_and_rejects_borrowed_retry_identity(self):
+        for witness_occurrence, witness_time, outcome in ((1, 1.304, "valid"), (0, 1.304, "borrowed"), (1, 1.302, "outside")):
+            simulation, curve, targets = _fixture()
+            event = curve.events[2]
+            event.update(kind="effect", requires_evidence=None, stop=False, occurrence=1,
+                timing=[self.window("effect", .004, .006, condition_id="touch_happened")])
+            curve.conditions = ({"condition_id": "touch_happened", "effect_requirement": "contact happened once",
+                "evidence_kind": "occurred_event", "skill_id": event["skill_id"], "event_id": event["event_id"]},)
+            _bind_fingers(simulation, curve, targets)
+            def observe(feedback, curve_time):
+                fact = {"value": "U", "source": "explicit event log assessment", "evidence_kind": "occurred_event"}
+                if curve_time >= .004:
+                    fact.update(value="T", witness_timestamp_s=witness_time,
+                        event={"skill_id": event["skill_id"], "event_id": event["event_id"], "occurrence": witness_occurrence},
+                        witness={"force_n": .02, "source": "synthetic physical sample at time 1.304"})
+                return {"source": "new reading of an explicitly declared immutable event fact",
+                    "timestamp_s": feedback["timestamp_s"], "effects": {"touch_happened": fact}}
+            with self.subTest(witness_occurrence=witness_occurrence, outcome=outcome), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+                output = Path(temporary)/"trial"
+                if outcome == "valid":
+                    report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                        initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                        output=output, observation_callback=observe)
+                else:
+                    expected = ValueError if outcome == "borrowed" else ExecutionGuardError
+                    with self.assertRaises(expected):
+                        _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                            initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                            output=output, observation_callback=observe)
+                    report = json.loads((output/"execution-report.json").read_text())
+            if outcome == "valid":
+                self.assertEqual(report["timing_result"], "T")
+                witness = next(row for row in report["history"] if row["check_target"] == "effect" and row["value"] == "T")
+                self.assertAlmostEqual(witness["time_s"], .004)
+                latest = report["effect_history"][-1]
+                self.assertAlmostEqual(latest["timestamp_s"], 1.304)
+                self.assertGreater(latest["observed_at_s"], latest["timestamp_s"])
+                self.assertEqual(report["evaluated_events"][0]["evaluation"], "T")
+            else:
+                self.assertTrue(report["abort_hold"]["native_ctrl_written"])
+                if outcome == "borrowed":
+                    self.assertFalse(any(row["value"] == "T" and row["check_target"] == "effect" for row in report["history"]))
+                else:
+                    self.assertEqual(report["timing_result"], "F")
+                    actual = next(row for row in report["history"] if row["check_target"] == "effect" and row["value"] == "T")
+                    self.assertAlmostEqual(actual["time_s"], .002)
+
+    def test_retry_satisfies_current_occurrence_without_erasing_previous_unknown_window(self):
+        simulation, curve, targets = _fixture()
+        event = curve.events[2]
+        event.update(kind="effect", requires_evidence=None, stop=False, occurrence=1,
+            timing=[self.window("effect", 0., .015, condition_id="touch")])
+        curve.conditions = ({"condition_id": "touch", "effect_requirement": "current contact",
+                             "skill_id": event["skill_id"], "event_id": event["event_id"]},)
+        _bind_fingers(simulation, curve, targets)
+        result = _result(curve)
+        previous_event = {**deepcopy(event), "occurrence": 0}
+        previous_check = {"skill_id": event["skill_id"], "event_id": event["event_id"], "occurrence": 0,
+            "check_target": "effect", "constraint_index": 0, "time_s": .003, "value": "U",
+            "source": "old attempt ended without actual contact"}
+        result.execution_binding.update(request_time_origin_s=.004,
+            timing_events=[previous_event, deepcopy(event)], timing_checks=[previous_check])
+        def observe(feedback, curve_time):
+            return {"source": "new occurrence tactile sample", "timestamp_s": feedback["timestamp_s"],
+                    "effects": {"touch": {"value": "T" if curve_time >= .006 else "U", "source": "new measured predicate"}}}
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                output=Path(temporary)/"trial", observation_callback=observe)
+        self.assertEqual(report["timing_result"], "T")
+        self.assertEqual(report["timing_checks"][0], previous_check)
+        self.assertEqual(report["continuation"]["timing_events"], [previous_event, event])
+        self.assertFalse(report["continuation"]["requires_rebind"])
+
+    def test_continuation_resolves_old_actual_witness_without_reissuing_its_command(self):
+        simulation, curve, targets = _fixture()
+        original_policy = {"finger_targets": deepcopy(targets), "execution_limits": _limits(simulation, curve).describe()}
+        previous_event = deepcopy(curve.events[0])
+        previous_event["timing"] = [self.window("activation", -.010, -.010, origin_time_s=None,
+            origin_event={"skill_id": "declared_skill", "event_id": "close-original",
+                          "occurrence": 0, "check_target": "activation"})]
+        previous_fact = {"skill_id": "declared_skill", "event_id": "open-original", "occurrence": 0,
+            "check_target": "activation", "time_s": .002, "value": "T", "source": "old actual actuator write"}
+        previous_check = {**previous_fact, "constraint_index": 0, "value": "U", "evidence_value": "T",
+            "origin_event": previous_event["timing"][0]["origin_event"], "reason": "Waiting for later actual close"}
+        curve.events = tuple(curve.events[1:])
+        curve.events[1].update(kind="function", requires_evidence=None, stop=False)
+        targets["events"] = targets["events"][1:]
+        _bind_fingers(simulation, curve, targets)
+        result = _result(curve)
+        result.execution_binding.update(request_time_origin_s=.008, timing_events=[previous_event],
+            timing_checks=[previous_check], request_ledger={"history": [previous_fact]}, device_policy=original_policy)
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                output=Path(temporary)/"trial")
+        self.assertEqual(report["timing_result"], "T")
+        self.assertEqual(report["history"][0], previous_fact)
+        self.assertEqual([row["event_id"] for row in report["events"]], ["close-original", "hold-later"])
+
+    def test_explicit_retry_reselects_original_device_policy_without_replaying_other_commands(self):
+        from manipulation.execution import continuation_execution_inputs
+        simulation, curve, targets = _fixture()
+        result = _result(curve)
+        result.execution_binding["request_ledger"] = {"original_events": deepcopy(list(curve.events)), "history": []}
+        fixed, limits = FixedFingerTargets.from_mapping(targets), _limits(simulation, curve)
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _executor(simulation).execute(result, finger_targets=fixed,
+                initial_feedback=_initial_feedback(simulation), execution_limits=limits, output=Path(temporary)/"trial")
+        retried, retried_limits = continuation_execution_inputs(report["continuation"], fixed, limits,
+            rebind={"kind": "retry", "source": "explicit same-goal executor decision",
+                    "retry_event_ids": [["declared_skill", "close-original"]], "retry_goal_ids": []})
+        self.assertEqual([row["event_id"] for row in retried.events], ["close-original", "hold-later"])
+        self.assertEqual(retried_limits.initial_fingers, report["continuation"]["active_finger_interval"])
+        self.assertEqual(report["continuation"]["device_policy"]["finger_targets"], targets)
+
+        # A caller bypassing the selection helper still cannot sneak a new
+        # target through a freshly accepted candidate and its new reference.
+        next_backend, next_curve, changed = _fixture()
+        changed["events"][1]["positions"][0] += .00001
+        next_curve.events[1]["occurrence"] = 1
+        _bind_fingers(next_backend, next_curve, changed)
+        next_result = _result(next_curve)
+        next_result.execution_binding["device_policy"] = deepcopy(report["continuation"]["device_policy"])
+        with TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "original actuator policy"):
+                _executor(next_backend).execute(next_result, finger_targets=FixedFingerTargets.from_mapping(changed),
+                    initial_feedback=_initial_feedback(next_backend), execution_limits=_limits(next_backend, next_curve),
+                    output=Path(temporary)/"trial")
+        self.assertEqual(next_backend.arm_goals, [])
+# END deadline failures cannot be hidden by a successful reference-clock lookup.
 
 
 if __name__ == "__main__":

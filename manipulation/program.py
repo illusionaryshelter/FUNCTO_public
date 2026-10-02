@@ -29,13 +29,28 @@ def _mechanism_goal_contract(model_spec, initial, goals, coordinate_goals=None):
     if model_spec is None:
         return None, None
     model, limits = _current_model(model_spec)
-    start = _exact_coordinates(model, initial)
+    start = _current_initial_coordinates(model_spec, model, initial,
+                                         require_lift=coordinate_goals is not None)
     values = [start]
     for index, goal in goals:
         coordinate = (_exact_coordinates(model, goal) if coordinate_goals is None
                       else np.asarray(coordinate_goals[index], float))
-        if index == 0 and not np.allclose(coordinate, start, atol=1e-8, rtol=0):
+        # BEGIN a full pose goal permits any physically legal angular lift.
+        # This value is used only for existential limit screening below; it
+        # is not exported as a coordinate target or a turn-count requirement.
+        # Explicit native coordinate goals retain their exact signed value.
+        angular = 0 if model.kind == "revolute" else 2 if model.kind == "planar" else None
+        if coordinate_goals is None and angular is not None and limits is not None:
+            low, high = limits[angular]
+            first = int(np.ceil((low-coordinate[angular]-1e-9)/(2*np.pi)))
+            last = int(np.floor((high-coordinate[angular]+1e-9)/(2*np.pi)))
+            if first <= last:
+                coordinate[angular] += 2*np.pi*first
+        same_start = (np.allclose(goal, initial, atol=1e-8, rtol=0) if coordinate_goals is None
+                      else np.allclose(coordinate, start, atol=1e-8, rtol=0))
+        if index == 0 and not same_start:
             raise ValueError("The initial functional goal conflicts with the observed current pose")
+        # END equal SE(3) goals neither select a winding nor become false limit failures.
         values.append(coordinate)
     if limits is not None and (np.any(np.asarray(values) < limits[:, 0]-1e-9)
                                or np.any(np.asarray(values) > limits[:, 1]+1e-9)):
@@ -103,6 +118,9 @@ def _current_model(value):
     a hinge) axis point, all in the result reference frame. A source fit or an
     action name alone does not establish a new instance's mechanism. Optional
     coordinate limits have shape (dimension,2) and are checked on every node.
+    ``initial_coordinates`` with ``initial_coordinates_source`` binds a fresh
+    actual lifted angular branch. A turn-sensitive request without this input
+    requires exactly one angular member within its physical coordinate limits.
     """
     kind = value.get("kind")
     dimensions = {"prismatic": 1, "revolute": 1, "planar": 3, "translation_plane": 2}
@@ -138,6 +156,48 @@ def _exact_coordinates(model, pose):
     if p[0] > 1e-8 or r[0] > 1e-8:
         raise ValueError("A required function/start pose is incompatible with the current mechanism")
     return coordinates
+
+
+# BEGIN actual observed angular branch is independent of reference and target origin.
+def _current_initial_coordinates(model_spec, model, pose, *, require_lift=False):
+    """Preserve an evidenced lifted actual coordinate after checking its FK.
+
+    Without an explicit observation, pose alone fixes only a principal angle.
+    An original entry-delta target has its own separate immutable origin and
+    must not be inferred from this fresh actual measurement during a rebind.
+    """
+    if "initial_coordinates" not in model_spec:
+        if "initial_coordinates_source" in model_spec:
+            raise ValueError("Actual coordinate evidence requires its initial_coordinates value")
+        coordinates = _exact_coordinates(model, pose)
+        angular = 0 if model.kind == "revolute" else 2 if model.kind == "planar" else None
+        if angular is not None:
+            limits = model_spec.get("coordinate_limits")
+            if limits is not None:
+                low, high = np.asarray(limits, float)[angular]
+                first = int(np.ceil((low-coordinates[angular]-1e-9)/(2*np.pi)))
+                last = int(np.floor((high-coordinates[angular]+1e-9)/(2*np.pi)))
+                if first > last:
+                    raise ValueError("The actual initial angle has no member within current coordinate limits")
+                if first != last:
+                    raise ValueError("Ambiguous actual angular branch requires observed initial_coordinates and initial_coordinates_source")
+                coordinates[angular] += 2*np.pi*first
+                model.diagnostics["initial_coordinate_convention"] = "unique actual angular branch within current physical limits"
+            elif require_lift:
+                raise ValueError("An actual angular turn obligation requires observed initial_coordinates and initial_coordinates_source")
+        return coordinates
+    coordinates = np.asarray(model_spec["initial_coordinates"])
+    if (coordinates.shape != (model.dimension,) or coordinates.dtype.kind not in "iuf"
+            or not np.isfinite(coordinates).all()):
+        raise ValueError("Observed initial_coordinates must match the current mechanism dimension")
+    source = _joint_source(model_spec.get("initial_coordinates_source"), "Observed initial_coordinates")
+    p, r = _errors(pose[None], model.poses(coordinates))
+    if p[0] > 1e-8 or r[0] > 1e-8:
+        raise ValueError("Observed initial_coordinates disagree with the actual current pose")
+    model.diagnostics["initial_coordinates_source"] = source
+    model.diagnostics["initial_coordinate_convention"] = "explicit observed signed/lifted current coordinate"
+    return coordinates.astype(float, copy=True)
+# END same SE(3) does not erase supplied actual turns.
 
 
 # BEGIN native coordinate events share the existing constrained transfer kernel.
@@ -306,21 +366,25 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
     ``coordinate_value`` at its original source frame and a positive
     ``coordinate_tolerance``. The current binding declares
     ``current_coordinates`` in the caller's current model, matching owner IDs
-    and its own evidence source. Distance units are metres; angle units are
+    and its own evidence source. Its ``coordinate_mode`` is ``absolute`` by
+    default; ``entry_delta`` instead adds these values to explicitly supplied
+    original-request ``entry_coordinates`` with ``entry_source`` evidence.
+    The increment origin never follows a continuation's new actual state.
+    Distance units are metres; angle units are
     unwrapped radians. The caller must bind the same signed coordinate sense
     on source and current mechanisms; fitting the source does not establish a
     current joint axis or a new instance's limits.
 
-    The observed initial pose defines the current initial coordinate q0. The
+    The observed initial pose and any evidenced lifted coordinate define q0. The
     soft reference is q_ref=q_demo-q_demo[0]+q0. Native prismatic intervals
     between hard events then scale their source progress to the explicit
     current endpoint displacement; same-endpoint zero-net loops remain intact.
     After the final event, metric source increments remain unchanged.
-    For revolute motion, q0 is the principal relative angle about this model's
-    reference pose: a pose cannot reveal already accumulated revolutions.
-    Current goals/limits must use that starting convention. Setting the model
-    reference pose to the current start explicitly defines q0=0; recorded and
-    requested winding after that start is still retained in native coordinates.
+    For revolute motion, a pose cannot reveal accumulated revolutions. Supply
+    ``motion_model.initial_coordinates`` and its ``initial_coordinates_source``
+    or physical limits selecting exactly one equivalent angle. Merely setting
+    a reference pose does not observe the actual turn count. Original target
+    origins and fresh current lifted coordinates remain independent inputs.
     Functional goals are evaluated directly by current FK, without a reference-owner
     functional frame. ``scene.carrier_mapping`` explicitly maps source carrier
     coordinates into current carrier coordinates for the existing released-hand
@@ -346,7 +410,7 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
         raise ValueError("Joint-coordinate grounding requires an explicit carrier_mapping")
     mapping = _pose_array(scene["carrier_mapping"], "Current carrier_mapping")
     mapping_source = _joint_source(scene.get("carrier_mapping_source"), "carrier_mapping_source")
-    initial_coordinates = _exact_coordinates(model, initial)
+    initial_coordinates = _current_initial_coordinates(spec, model, initial, require_lift=True)
     coordinates = source_coordinates-source_coordinates[0]+initial_coordinates
     reference = model.poses(coordinates)
 
@@ -376,7 +440,21 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
         binding_source = _joint_source(binding.get("source"), "Current joint binding")
         if binding.get("carrier_id") != scene["carrier_id"] or binding.get("reference_id") != scene["reference_id"]:
             raise ValueError("Functional binding owners disagree with the selected current entities")
-        target = _coordinate_vector(binding.get("current_coordinates"), "Current functional coordinates")
+        # BEGIN absolute and original-entry increment targets keep distinct identities.
+        coordinate_mode = binding.get("coordinate_mode", "absolute")
+        if coordinate_mode not in {"absolute", "entry_delta"}:
+            raise ValueError("Current joint coordinate_mode must be absolute or entry_delta")
+        raw_target = _coordinate_vector(binding.get("current_coordinates"), "Current functional coordinates")
+        entry, entry_source = None, None
+        if coordinate_mode == "entry_delta":
+            entry = _coordinate_vector(binding.get("entry_coordinates"), "Original request entry coordinates")
+            entry_source = _joint_source(binding.get("entry_source"), "Original request coordinate entry")
+            target = entry+raw_target
+        else:
+            if "entry_coordinates" in binding or "entry_source" in binding:
+                raise ValueError("Absolute coordinate goals do not declare an entry-delta origin")
+            target = raw_target
+        # END no continuation's new actual state resets an original increment target.
         if index in unique_goals and not np.allclose(unique_goals[index], target, atol=1e-8, rtol=0):
             raise ValueError("Same-frame functional events require consistent coordinate goals")
         unique_goals[index] = target
@@ -384,6 +462,8 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
                          "source_coordinate_value": source_value, "target_coordinates": target,
                          "coordinate_tolerance": tolerance, "source": evidence,
                          "binding_source": binding_source})
+        recorded[-1].update(coordinate_mode=coordinate_mode, raw_target_coordinates=raw_target,
+                            entry_coordinates=entry, entry_source=entry_source)
         names.add(name)
         previous = index
     goals = [(index, model.poses(value)[0]) for index, value in unique_goals.items()]
@@ -415,9 +495,12 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
                        source_initial_coordinates=source_coordinates[0].copy(),
                        current_initial_coordinates=initial_coordinates.copy(),
                        initial_coordinate_convention=(
-                           "principal relative angle from the current reference pose; pre-existing revolutions are not inferred"
+                           "explicit observed signed/lifted current coordinate"
+                           if "initial_coordinates" in spec else
+                           model.diagnostics.get("initial_coordinate_convention", "principal relative angle from the current reference pose; pre-existing revolutions are not inferred")
                            if model.kind == "revolute" else
                            "metric displacement from the current reference pose"),
+                       current_initial_coordinates_source=deepcopy(spec.get("initial_coordinates_source")),
                        # BEGIN distinguish source reference from constrained retargeting.
                        coordinate_reference=(
                            "source coordinates shifted to observed current start; between hard events, "
@@ -727,7 +810,10 @@ def ground_program(program, scene):
     full observed signed scalar sequence; event ``coordinate_value`` and
     ``coordinate_tolerance`` describe its source function state. Current
     bindings provide ``current_coordinates`` with source/owner evidence in the
-    already bound ``scene.motion_model``. No reference pose or surrogate region
+    already bound ``scene.motion_model``. These are absolute unless explicitly
+    marked ``coordinate_mode=entry_delta`` with preserved ``entry_coordinates``
+    and ``entry_source`` from the original request entrance.
+    No reference pose or surrogate region
     frame is needed. ``scene.carrier_mapping`` / ``carrier_mapping_source``
     explicitly transport source body-local hand geometry through release.
 
