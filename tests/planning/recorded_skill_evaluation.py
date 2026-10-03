@@ -25,11 +25,112 @@ from collect.preprocess.segmentation import (
     DEFAULT_SETTINGS, _bridge_gaps, _first_stable_grasp, _resolve_actor, _runs,
 )
 from manipulation.execution import _actual_pose_goal, pose_goal_schedule
+# BEGIN explicit evaluator roles reuse the existing execution-scope validator.
+from manipulation.execution_binding import validate_result_only_goal_ids
+# END result-only execution scope alone does not change a goal's grading role.
 from manipulation.motion import _inverse, _pose_array
 from manipulation.planning_problem import (
     EventTimeConstraint, PoseEventRequirement, PosePath, TimeBindingError,
     _model_from_diagnostics, resolve_event_window,
 )
+
+
+# BEGIN explicitly diagnostic goals retain measurements without vetoing skill effects.
+def validate_diagnostic_goal_ids(binding, trajectory, values):
+    """Validate an explicit grading role without changing execution obligations.
+
+    Result-only means that the executor does not wait for a goal; it does not
+    mean that the goal is optional for success. A diagnostic goal must be named
+    separately and already belong to that result-only policy. Reuse the same
+    terminal/arrival/contact checks, and reject a goal used as a subsequent
+    event's time origin. Process and effect predicates cannot be selected here.
+    """
+    # A previous completion must not bypass the shared arrival/terminal checks
+    # when assigning a grading role. The binding itself remains untouched.
+    selected = validate_result_only_goal_ids({**binding, "completed_goal_ids": []}, trajectory, values)
+    declared = binding.get("device_policy", {}).get("result_only_goal_ids", [])
+    for identity in selected:
+        if identity not in declared:
+            raise ValueError("A diagnostic goal must already be an explicit result-only goal")
+        for event in (*trajectory.events, *binding.get("timing_events", ())):
+            if any(tuple((item.get("origin_event") or {}).get("goal_id") or ()) == tuple(identity)
+                   for item in event.get("timing", ())):
+                raise ValueError("A goal used by a subsequent event cannot be diagnostic")
+    return selected
+
+
+def summarize_skill_evidence(report, *, binding, trajectory, diagnostic_goal_ids=()):
+    """Regrade saved components without measuring, simulating or mutating them.
+
+    The caller supplies the same formal binding/curve plus the newly declared
+    diagnostic identities. Every goal retains its original T/F/U and metrics.
+    All unselected goals, original effects, processes and terminal predicates
+    remain required. Complete acquisition and full-curve execution are also
+    required; this result never becomes an online observation or dependency fact.
+    """
+    selected = validate_diagnostic_goal_ids(binding, trajectory, diagnostic_goal_ids)
+    if report["candidate_id"] != binding["candidate_id"]:
+        raise ValueError("Evidence and grading roles must refer to the same formal candidate")
+    goals = deepcopy(report["functional_goal_evidence"])
+    expected = {(collection, index) for collection in ("pose_events", "coordinate_events", "supports")
+                for index in binding.get("goal_identities", {}).get(collection, [])}
+    identities = [tuple(row["identity"]) for row in goals]
+    if len(set(identities)) != len(identities) or set(identities) != expected:
+        raise ValueError("Grading must retain exactly every current original goal identity")
+    for row in goals:
+        row["evaluation_role"] = "diagnostic" if row["identity"] in selected else "required"
+    other = {name: deepcopy(report[name]) for name in
+             ("effect_evidence", "process_evidence", "terminal_evidence")}
+    # Saved coverage describes acquisition, not whether a later caller retained
+    # every required component. Match the original binding before aggregating.
+    effect_ids = [row.get("condition_id") for row in other["effect_evidence"]]
+    expected_effects = {row["condition_id"] for row in binding["problem"].get("conditions", [])
+                        if row.get("effect_requirement")}
+    if len(set(effect_ids)) != len(effect_ids) or set(effect_ids) != expected_effects:
+        raise ValueError("Grading must retain exactly every original required effect")
+    process_ids = [tuple(row.get("identity", ())) for row in other["process_evidence"]]
+    expected_processes = {(collection, index)
+        for collection in ("mechanisms", "pose_relations", "interiors", "couplings")
+        for index in range(len(binding["problem"].get(collection, [])))}
+    if len(set(process_ids)) != len(process_ids) or set(process_ids) != expected_processes:
+        raise ValueError("Grading must retain exactly every original process obligation")
+    kind = report["evaluation_kind"]
+    if kind not in ("grasp", "manipulation"):
+        raise ValueError("Grading needs the original supported skill kind")
+    terminal_ids = [row.get("predicate") for row in other["terminal_evidence"]]
+    expected_terminal = {"stable_grasp_at_final_stop"} if kind == "grasp" else set()
+    if len(set(terminal_ids)) != len(terminal_ids) or set(terminal_ids) != expected_terminal:
+        raise ValueError("Grading must retain the original final-stop obligations")
+    for rows in other.values():
+        for row in rows:
+            row["evaluation_role"] = "required"
+    components = goals + [row for rows in other.values() for row in rows]
+    if any(row["value"] not in ("T", "F", "U") for row in components):
+        raise ValueError("Every saved evidence component needs an explicit T/F/U value")
+    required = [row for row in components if row["evaluation_role"] == "required"]
+    values = [row["value"] for row in required]
+    if not report["evidence_coverage"]["complete"]:
+        passed, outcome = None, "incomplete_evidence"
+    elif not report["completed_current_curve"]:
+        passed, outcome = None, "not_evaluated"
+    elif "F" in values:
+        passed, outcome = False, "failed"
+    elif not values or "U" in values:
+        passed, outcome = None, "unverified"
+    else:
+        passed, outcome = True, "passed"
+    return {
+        "physics_success": passed, "physics_outcome": outcome,
+        "functional_goal_evidence": goals, **other,
+        "evaluation_policy": {
+            "diagnostic_goal_ids": deepcopy(selected),
+            "required_goal_ids": [row["identity"] for row in goals if row["evaluation_role"] == "required"],
+            "criterion_source": "Explicit diagnostic_goal_ids declared by the evaluator caller. Unselected original goals, bound skill effects, scoped processes and declared terminal predicates retain their required roles.",
+            "scope": "Explicit evaluator grading roles only; no change to planning, execution or runtime facts",
+        },
+        "success_definition": "The complete current curve is physically observed and every required goal, original effect, scoped process and final-stop predicate is T. Explicit diagnostic goals retain their original metrics and T/F/U but do not veto success; unsupported or unobserved required predicates remain U.",
+    }
+# END offline grading roles never alter evidence values or execution authorization.
 
 
 def _body_pose(data, index):
@@ -292,7 +393,7 @@ class NativeSkillPhysicsEvaluator:
     def __init__(self, model, *, catalog, actor, target_body_name,
                  finger_joint_names, tcp_site, binding_source, program,
                  reference_body_name, planning_result, evaluation_owner_bindings,
-                 maximum_contact_rows=1_000_000):
+                 maximum_contact_rows=1_000_000, diagnostic_goal_ids=()):
         self._model = model
         self._skill_kind = program["skill_kind"]
         if self._skill_kind not in ("grasp", "manipulation"):
@@ -361,6 +462,10 @@ class NativeSkillPhysicsEvaluator:
         # BEGIN original requirements and native frame identities stay evaluator-local.
         self._planning_result = planning_result
         self._goals = _FunctionalGoalEvaluator(model, catalog, planning_result, evaluation_owner_bindings)
+        # BEGIN the caller must explicitly declare any diagnostic-only goals.
+        self._diagnostic_goal_ids = validate_diagnostic_goal_ids(
+            planning_result.execution_binding, planning_result.trajectory, diagnostic_goal_ids)
+        # END default grading still requires every original functional goal.
         # END formal curve/scene data is read without adding a runtime observation.
         self._samples, self._contacts, self._offsets = [], [], [0]
 
@@ -451,13 +556,16 @@ class NativeSkillPhysicsEvaluator:
             "missing_normal_elapsed_intervals_s": [[a*timestep, b*timestep] for a, b in missing_ranges],
             "retained_elapsed_interval_s": None if not len(elapsed) else [float(elapsed[0]), float(elapsed[-1])]}
         if not self._samples:
+            # BEGIN preserve explicit roles even when no evidence was captured.
             report = {"evaluation_kind": self._skill_kind, "physics_outcome": "incomplete_evidence",
                 "physics_success": None, "sample_count": 0, "native_contact_rows": 0,
                 "evidence_collection": capture_state, "evidence_coverage": coverage,
                 "executor_evidence_sink": None if execution_report is None else
                     deepcopy(execution_report["independent_evidence_sink"]),
                 "candidate_id": self._planning_result.execution_binding["candidate_id"],
-                "completed_physical_prefix": False, "completed_current_curve": False}
+                "completed_physical_prefix": False, "completed_current_curve": False,
+                "evaluation_policy": {"diagnostic_goal_ids": deepcopy(self._diagnostic_goal_ids)}}
+            # END missing evidence never yields a successful grade.
             (output/"evaluation-report.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
             return report
         # END missing states are reported without fabricated samples or frames.
@@ -558,31 +666,24 @@ class NativeSkillPhysicsEvaluator:
                 "sample_sim_time_s": float(times[-1]), "sample_elapsed_s": float(elapsed[-1]),
                 "source": "Original independent grasp evaluator final stable-window requirement",
                 "scope": "Separate from the original functional/effect checkpoint; both must hold"})
-        values = [row["value"] for row in goal_evidence + effect_evidence + process_evidence + terminal_evidence]
-        # BEGIN collection failure leaves the physical verdict unknown.
-        if not coverage["complete"]:
-            passed, outcome = None, "incomplete_evidence"
-        elif not full_curve_completed:
-            passed, outcome = None, "not_evaluated"
-        elif "F" in values:
-            passed, outcome = False, "failed"
-        elif not values or "U" in values:
-            passed, outcome = None, "unverified"
-        else:
-            passed, outcome = True, "passed"
-        # END partial component observations never authorize overall success.
-        # END unknown or out-of-scope predicates never become an overall success/failure.
+        # BEGIN one pure aggregation path supports both live capture and saved evidence.
+        grade = summarize_skill_evidence({"candidate_id": binding["candidate_id"],
+            "evaluation_kind": self._skill_kind,
+            "functional_goal_evidence": goal_evidence, "effect_evidence": effect_evidence,
+            "process_evidence": process_evidence, "terminal_evidence": terminal_evidence,
+            "evidence_coverage": coverage, "completed_current_curve": full_curve_completed},
+            binding=binding, trajectory=trajectory, diagnostic_goal_ids=self._diagnostic_goal_ids)
+        # END no pose metric, original effect time or runtime observation is changed.
         target_q = np.asarray([row[7] for row in self._samples])
         target_dq = np.asarray([row[8] for row in self._samples])
-        report = {"evaluation_kind": self._skill_kind, "physics_outcome": outcome,
-            "physics_success": passed, "completed_physical_prefix": completed,
+        # BEGIN saved reports retain the shared explicit roles and unchanged metrics.
+        report = {"evaluation_kind": self._skill_kind, **grade,
+            "completed_physical_prefix": completed,
             "evidence_collection": capture_state, "evidence_coverage": coverage,
             "executor_evidence_sink": None if execution_report is None else
                 deepcopy(execution_report["independent_evidence_sink"]),
             "completed_current_curve": full_curve_completed,
             "candidate_id": binding["candidate_id"],
-            "functional_goal_evidence": goal_evidence, "effect_evidence": effect_evidence,
-            "process_evidence": process_evidence, "terminal_evidence": terminal_evidence,
             "evaluation_owner_bindings": self._goals.describe_bindings(),
             "task_contract": self._task_contract,
             "binding": self.binding, "settings_source": "collect.preprocess.segmentation.DEFAULT_SETTINGS",
@@ -590,7 +691,6 @@ class NativeSkillPhysicsEvaluator:
             "sample_count": len(times), "native_contact_rows": self._offsets[-1],
             "contact_sampling": "synchronized post-step mj_forward state, including an initial setup sample; native solved constraints and geometry are evaluator-only",
             "contact_force_scope": "diagnostic native force at the sampled state; force magnitude is not a grasp acceptance criterion",
-            "success_definition": "The complete current curve is physically observed and every original functional goal, required effect, scoped process predicate and declared final-stop predicate is T; unsupported or unobserved predicates remain U",
             "component_evidence": {
                 "configured_finger_contacts_at_stop": touches[-1].tolist(),
                 "configured_finger_contact_absence_at_stop_s": absence_duration,
@@ -606,6 +706,7 @@ class NativeSkillPhysicsEvaluator:
                        "Simulator truth is used only by this independent evaluator; it never updates runtime owner poses, completed goals, effect history or a dependency barrier",
                        "Separate abort/dependency holds are not trajectory observations and cannot supply a missing goal or stable window"],
             }
+        # END role assignment does not remove any measured component.
         if self._skill_kind == "grasp":
             report.update(analysis)
         else:

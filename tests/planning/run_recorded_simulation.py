@@ -183,6 +183,9 @@ def run(args, *, observation_callback=None):
             "No online semantic observer; offline native physics grading does not resolve execution effects"),
         # END the recording fixture alone is not a closed-loop effect proof.
         "physics_success": None, "videos": [], "video_requested": not args.no_video,
+        # BEGIN explicit scoring roles remain distinct from execution gates.
+        "diagnostic_goal_ids": deepcopy(args.diagnostic_goal_ids),
+        # END only the independent evaluator consumes this goal-role declaration.
         "execution_report_path": str(output/"execution"/"execution-report.json"),
         "physical_trajectory_path": str(output/"execution"/"physical-trajectory.npz"),
         "evaluation_report_path": str(output/"evaluation-report.json"),
@@ -330,6 +333,9 @@ def run(args, *, observation_callback=None):
                 finger_joint_names=fixture["finger_joint_names"], tcp_site=fixture["tcp_site"],
                 program=program, reference_body_name=reference_name,
                 planning_result=planning_result, evaluation_owner_bindings=evidence["evaluation_owner_bindings"],
+                # BEGIN retained goal metrics can be explicitly diagnostic.
+                diagnostic_goal_ids=args.diagnostic_goal_ids,
+                # END required effects and execution arrival gates remain separate.
                 binding_source={"path": str(args.evaluator_evidence.resolve()),
                     "source_segment_id": segment["source_library_segment"],
                     "fields_used": ["actor identity and contact-group names", "carrier_body_name",
@@ -556,6 +562,11 @@ if __name__ == "__main__":
     parser.add_argument("--result-only-goal", action="append", type=_goal_identity,
                         dest="result_only_goal_ids", default=[],
                         help="Original collection:index to evaluate as a result without an online dependency; repeat for each explicit goal")
+    # BEGIN completion scoring is an explicit caller choice, not a task-name branch.
+    parser.add_argument("--diagnostic-goal", action="append", type=_goal_identity,
+                        dest="diagnostic_goal_ids", default=[],
+                        help="Already result-only goal to retain as a metric without vetoing original skill effects; repeat for each goal")
+    # END the evaluator validates that execution obligations cannot be downgraded.
     # END require target positions explicitly, without the binary formatter.
     camera = parser.add_mutually_exclusive_group(required=True)
     camera.add_argument("--view", action="append", dest="views")
@@ -563,6 +574,13 @@ if __name__ == "__main__":
     parser.add_argument("--max-physics-steps", type=int, default=30_000)
     parser.add_argument("--start-position-tolerance", type=float, default=2e-6)
     parser.add_argument("--start-velocity-tolerance", type=float, default=2e-6)
-    outcome = run(parser.parse_args())
+    # BEGIN opt-in host profiling includes setup, execution, evidence and export.
+    parser.add_argument("--profile-runtime", action="store_true",
+                        help="Record host function timings under output/runtime-profile; disabled by default")
+    args = parser.parse_args()
+    from manipulation.runtime_profiling import run_with_optional_profile
+    outcome = run_with_optional_profile(run, args, enabled=args.profile_runtime,
+                                       output=args.output/"runtime-profile")
+    # END profiling does not change native steps, callbacks or task verdicts.
     print(json.dumps({key: outcome[key] for key in ("status", "trajectory_path", "physics_outcome", "videos")}, indent=2))
 # END manifest-driven physical trial with independent evidence and video.

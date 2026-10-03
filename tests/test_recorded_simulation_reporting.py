@@ -50,7 +50,9 @@ def _runner_inputs(tmp_path, simulation, curve, targets, initial):
         feedback=save("feedback.json", feedback), finger_targets=save("targets.json", targets),
         execution_limits=save("limits.json", _limit_values(simulation, curve)),
         evaluator_evidence=save("evidence.json", evidence),
-        result_only_goal_ids=[],
+        # BEGIN the test caller supplies the explicit independent scoring policy.
+        result_only_goal_ids=[], diagnostic_goal_ids=[],
+        # END no production compatibility default is needed for an old test double.
         segment="declared_skill", controller_part="test_arm", views=["test_view"], no_video=False,
         max_physics_steps=30000, start_position_tolerance=2e-6, start_velocity_tolerance=2e-6)
     result = _result(curve)

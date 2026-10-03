@@ -27,6 +27,27 @@ The recorded skill runner permits an explicit 4 GiB Torch limit and 2 GiB
 scene-workspace budget, with native/FK allocations and actual free memory
 checked independently. It preserves all required source anchors.
 
+<!-- BEGIN optional runtime measurement and explicit independent scoring roles. -->
+`run_recorded_skill.py` and `run_recorded_simulation.py` accept
+`--profile-runtime`, disabled by default. It records the calling thread with
+Python's `cProfile` and writes `runtime-profile/runtime.pstats` plus
+`runtime-profile/runtime.json` under the fresh run directory. The JSON ranks
+function self time, cumulative time, call counts, and file self time. Self time
+excludes callees and is additive; cumulative rows overlap and must not be
+summed. Measurements include profiler overhead, which still consumes existing
+wall-time budgets. Asynchronous GPU kernels, child processes and other threads
+are not independently timed. The same opt-in wrapper is available as
+`manipulation.runtime_profiling.run_with_optional_profile` for other entry points.
+
+The simulation runner also accepts repeated `--diagnostic-goal COLLECTION:INDEX`
+declarations. An identity must already be explicitly `--result-only-goal` and
+must not carry an execution arrival or subsequent-event obligation. Its original
+T/F/U and pose errors remain reported, but it does not veto the original skill
+effects. Unselected goals, effects, process requirements, final stability, and
+complete evidence remain required. Omitting this option preserves strict goal
+grading; result-only execution scope alone does not imply diagnostic grading.
+<!-- END neither profiling nor offline scoring supplies runtime observations. -->
+
 | Scripts | Scope |
 |---|---|
 | `check_recorded_task_inputs.py` | CPU replay of manifest-declared task references and input completeness; preserves candidate ambiguity and independent snapshots |

@@ -12,7 +12,12 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
-from recorded_skill_evaluation import NativeSkillPhysicsEvaluator, _FunctionalGoalEvaluator
+# BEGIN explicit role validation and pure aggregation share the live evaluator path.
+from recorded_skill_evaluation import (
+    NativeSkillPhysicsEvaluator, _FunctionalGoalEvaluator,
+    summarize_skill_evidence, validate_diagnostic_goal_ids,
+)
+# END these helpers consume saved evidence without running physics.
 from collect.preprocess.segmentation import DEFAULT_SETTINGS
 
 
@@ -32,7 +37,10 @@ def _fixture(*, mapped=True, goal_progress=1., duration=.4):
         "target": (owner_entry @ owner_target).tolist(), "position_tolerance_m": .001,
         "rotation_tolerance_rad": np.deg2rad(1.), "source": "Original synthetic material-frame allowed set",
         "actual_relation": {"target_owner_id": "declared_material", "T_owner_target": owner_target.tolist()}}
-    curve = SimpleNamespace(duration=duration, progress_u=np.array([0., 1.]), progress_s=np.array([0., 1.]))
+    # BEGIN retain the event contract consumed by the existing result-only validator.
+    curve = SimpleNamespace(duration=duration, progress_u=np.array([0., 1.]),
+                            progress_s=np.array([0., 1.]), events=[])
+    # END a synthetic curve declares its actual empty event list.
     path = {"progress": [0., 1.], "poses": [owner_entry.tolist(), owner_entry.tolist()],
         "source": "Explicit observed entry owner frame", "motion_model": None,
         "coordinates": None, "attachment": np.eye(4).tolist()}
@@ -52,7 +60,8 @@ def _fixture(*, mapped=True, goal_progress=1., duration=.4):
     return model, result, goals, owner_entry, native_entry, owner_target, catalog, mappings
 
 
-def _history(*, mapped=True, goal_progress=1., duration=.4, until=None, error=None, moving=False):
+def _history(*, mapped=True, goal_progress=1., duration=.4, until=None, error=None, moving=False,
+             diagnostic_goal_ids=()):
     model, result, goals, owner_entry, native_entry, owner_target, _, _ = _fixture(
         mapped=mapped, goal_progress=goal_progress, duration=duration)
     until = duration if until is None else until
@@ -61,6 +70,10 @@ def _history(*, mapped=True, goal_progress=1., duration=.4, until=None, error=No
     offset = np.linalg.inv(native_entry) @ owner_entry
     evaluator = NativeSkillPhysicsEvaluator.__new__(NativeSkillPhysicsEvaluator)
     evaluator._model, evaluator._planning_result, evaluator._goals = model, result, goals
+    # BEGIN match constructor role validation in this explicit non-physics double.
+    evaluator._diagnostic_goal_ids = validate_diagnostic_goal_ids(
+        result.execution_binding, result.trajectory, diagnostic_goal_ids)
+    # END tests cannot bypass the same bound eligibility checks.
     evaluator._target, evaluator._reference, evaluator._target_joints = 0, None, []
     evaluator._skill_kind = "grasp"
     evaluator._task_contract = {"skill_kind": "grasp", "scope": "Explicit synthetic history"}
@@ -130,6 +143,139 @@ def test_stable_grasp_cannot_override_original_functional_accuracy_failure(tmp_p
     assert goal["value"] == "F"
     assert goal["measurement"]["position_error_m"] == pytest.approx(.002, abs=1e-14)
     assert report["physics_outcome"] == "failed" and report["physics_success"] is False
+
+
+# BEGIN diagnostic pose metrics cannot veto valid effects or excuse real obligations.
+def test_explicit_diagnostic_pose_failure_preserves_metrics_and_allows_original_effect_success(tmp_path):
+    evaluator, result = _history(error=lambda time: [.002, 0., 0.],
+                                 diagnostic_goal_ids=[["pose_events", 7]])
+    binding_before = deepcopy(result.execution_binding)
+    execution = _completed(evaluator)
+    execution_before = deepcopy(execution)
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=execution)
+    goal = report["functional_goal_evidence"][0]
+    assert goal["value"] == "F" and goal["evaluation_role"] == "diagnostic"
+    assert goal["position_tolerance_m"] == .001
+    assert goal["measurement"]["position_error_m"] == pytest.approx(.002, abs=1e-14)
+    assert report["effect_evidence"][0]["value"] == report["terminal_evidence"][0]["value"] == "T"
+    assert report["effect_evidence"][0]["evaluation_role"] == "required"
+    assert report["physics_success"] is True and report["physics_outcome"] == "passed"
+    assert report["evaluation_policy"]["diagnostic_goal_ids"] == [["pose_events", 7]]
+    assert report["evaluation_policy"]["required_goal_ids"] == []
+    # Regrading is explicit each time: a saved role is not an automatic waiver.
+    report_before = deepcopy(report)
+    strict = summarize_skill_evidence(report, binding=result.execution_binding, trajectory=result.trajectory)
+    assert strict["physics_success"] is False and strict["functional_goal_evidence"][0]["value"] == "F"
+    assert strict["functional_goal_evidence"][0]["evaluation_role"] == "required"
+    assert report == report_before and result.execution_binding == binding_before
+    assert execution == execution_before  # Offline T cannot add completed goals or effects.
+
+
+def _saved_components():
+    """An explicit completed report whose pose alone misses its required set."""
+    _, result, *_ = _fixture()
+    report = {"candidate_id": result.execution_binding["candidate_id"], "evaluation_kind": "grasp",
+        "functional_goal_evidence": [{"identity": ["pose_events", 7], "value": "F"}],
+        "effect_evidence": [{"condition_id": "declared_stability", "value": "T"}],
+        "process_evidence": [], "terminal_evidence": [{"predicate": "stable_grasp_at_final_stop", "value": "T"}],
+        "evidence_coverage": {"complete": True}, "completed_current_curve": True}
+    return report, result
+
+
+@pytest.mark.parametrize("component", ["effect_evidence", "process_evidence", "terminal_evidence"])
+@pytest.mark.parametrize("value,outcome,success", [("F", "failed", False), ("U", "unverified", None)])
+def test_diagnostic_pose_cannot_waive_effect_process_or_terminal_failure_or_unknown(component, value, outcome, success):
+    report, result = _saved_components()
+    if component == "process_evidence":
+        result.execution_binding["problem"]["interiors"] = [{"source": "Required synthetic process"}]
+        report[component] = [{"identity": ["interiors", 0], "value": value}]
+    else:
+        report[component][0]["value"] = value
+    grade = summarize_skill_evidence(report, binding=result.execution_binding,
+        trajectory=result.trajectory, diagnostic_goal_ids=[["pose_events", 7]])
+    assert grade["physics_outcome"] == outcome and grade["physics_success"] is success
+    assert grade[component][0]["evaluation_role"] == "required"
+
+
+@pytest.mark.parametrize("complete,finished,outcome", [
+    (False, True, "incomplete_evidence"), (True, False, "not_evaluated"),
+])
+def test_diagnostic_pose_cannot_waive_missing_evidence_or_incomplete_curve(complete, finished, outcome):
+    report, result = _saved_components()
+    report["evidence_coverage"]["complete"], report["completed_current_curve"] = complete, finished
+    grade = summarize_skill_evidence(report, binding=result.execution_binding,
+        trajectory=result.trajectory, diagnostic_goal_ids=[["pose_events", 7]])
+    assert grade["physics_success"] is None and grade["physics_outcome"] == outcome
+
+
+def test_unselected_result_only_goal_remains_a_required_functional_goal():
+    report, result = _saved_components()
+    binding = result.execution_binding
+    binding["goal_identities"]["pose_events"].append(9)
+    binding["problem"]["pose_events"].append(deepcopy(binding["problem"]["pose_events"][0]))
+    binding["device_policy"]["result_only_goal_ids"].append(["pose_events", 9])
+    report["functional_goal_evidence"].append({"identity": ["pose_events", 9], "value": "F"})
+    grade = summarize_skill_evidence(report, binding=binding, trajectory=result.trajectory,
+                                    diagnostic_goal_ids=[["pose_events", 7]])
+    assert grade["physics_success"] is False
+    assert grade["evaluation_policy"]["required_goal_ids"] == [["pose_events", 9]]
+    assert grade["functional_goal_evidence"][1]["evaluation_role"] == "required"
+
+
+@pytest.mark.parametrize("violation", ["undeclared", "midcurve", "arrival", "contact_gate",
+                                     "successor_origin", "process", "unknown", "duplicate", "completed_arrival"])
+def test_diagnostic_role_rejects_online_or_unbound_obligations(violation):
+    _, result, *_ = _fixture()
+    binding, selected = result.execution_binding, [["pose_events", 7]]
+    if violation == "undeclared":
+        binding["device_policy"]["result_only_goal_ids"] = []
+    elif violation == "midcurve":
+        binding["problem"]["pose_events"][0]["progress"] = .5
+    elif violation in ("arrival", "completed_arrival"):
+        binding["timing_events"] = [{"timing": [{"check_target": "arrival", "goal_id": ["pose_events", 7]}]}]
+        if violation == "completed_arrival":
+            binding["completed_goal_ids"] = [["pose_events", 7]]
+    elif violation == "contact_gate":
+        binding["problem"]["conditions"].append({"kind": "grasp_contact_activation",
+                                                "arrival_goal_id": ["pose_events", 7]})
+    elif violation == "successor_origin":
+        binding["timing_events"] = [{"timing": [{"check_target": "effect",
+            "origin_event": {"goal_id": ["pose_events", 7]}}]}]
+    elif violation == "process":
+        selected = [["pose_relations", 0]]
+    elif violation == "unknown":
+        selected = [["pose_events", 99]]
+    elif violation == "duplicate":
+        selected *= 2
+    with pytest.raises(ValueError):
+        validate_diagnostic_goal_ids(binding, result.trajectory, selected)
+
+
+@pytest.mark.parametrize("corruption", ["candidate", "missing_goal", "duplicate_goal"])
+def test_offline_regrading_rejects_mismatched_or_removed_goal_evidence(corruption):
+    report, result = _saved_components()
+    if corruption == "candidate":
+        report["candidate_id"] = "a-different-candidate"
+    elif corruption == "missing_goal":
+        report["functional_goal_evidence"] = []
+    else:
+        report["functional_goal_evidence"] *= 2
+    with pytest.raises(ValueError):
+        summarize_skill_evidence(report, binding=result.execution_binding,
+            trajectory=result.trajectory, diagnostic_goal_ids=[["pose_events", 7]])
+
+
+@pytest.mark.parametrize("component", ["effect_evidence", "process_evidence", "terminal_evidence"])
+@pytest.mark.parametrize("corruption", ["missing", "duplicate"])
+def test_offline_regrading_cannot_delete_or_duplicate_required_components(component, corruption):
+    report, result = _saved_components()
+    result.execution_binding["problem"]["interiors"] = [{"source": "Required synthetic process"}]
+    report["process_evidence"] = [{"identity": ["interiors", 0], "value": "T"}]
+    report[component] = [] if corruption == "missing" else report[component] * 2
+    with pytest.raises(ValueError):
+        summarize_skill_evidence(report, binding=result.execution_binding,
+            trajectory=result.trajectory, diagnostic_goal_ids=[["pose_events", 7]])
+# END explicit diagnostic roles never auto-select all result-only goals.
 
 
 # BEGIN incomplete GT histories cannot inherit a successful retained prefix.

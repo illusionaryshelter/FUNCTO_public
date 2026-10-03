@@ -603,5 +603,12 @@ if __name__ == "__main__":
     # END the production PlanningBudget and ledger checks validate these inputs.
     parser.add_argument("--scene-workspace-mib", type=int, choices=(1024, 2048), default=1024)
     parser.add_argument("--torch-memory-mib", type=int, choices=(2048, 4096), default=2048)
-    run(parser.parse_args())
+    # BEGIN opt-in host profiling covers preparation, planning and persistence.
+    parser.add_argument("--profile-runtime", action="store_true",
+                        help="Record host function timings under output/runtime-profile; disabled by default")
+    args = parser.parse_args()
+    from manipulation.runtime_profiling import run_with_optional_profile
+    run_with_optional_profile(run, args, enabled=args.profile_runtime,
+                              output=args.output/"runtime-profile")
+    # END ordinary runs do not construct a profiler or write timing artifacts.
 # END observed skill integration using existing production scene contracts.
