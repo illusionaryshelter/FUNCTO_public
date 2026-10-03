@@ -158,6 +158,61 @@ def test_native_contact_is_permitted_locally_and_actual_state_remains_distinct(t
 # END real contact complements mocked execution sequencing regressions.
 
 
+# BEGIN a finger position fault must not disable bounded native arm stopping.
+def test_native_arm_stop_keeps_the_original_finger_position_fault_visible(record_property):
+    """Three scalar coordinates and at most 250 CPU steps; no task execution.
+
+    The declared initial fault places one finger just beyond its native range.
+    Stopping may change the state only through native integration. It does not
+    certify the failed motion or replace its invalid finger q by a legal q.
+    """
+    from robosuite.utils.binding_utils import MjSim
+
+    model = mujoco.MjModel.from_xml_string('''
+      <mujoco><option timestep=".002" gravity="0 0 0"/>
+        <default><geom contype="0" conaffinity="0"/></default>
+        <worldbody><body name="base"><body name="arm">
+          <joint name="arm_q" type="hinge" axis="0 0 1" range="-2 2"/>
+          <inertial pos="0 0 0" mass="1" diaginertia=".1 .1 .1"/>
+          <site name="tcp" pos=".1 0 0"/>
+          <body name="left"><joint name="left_q" type="slide" axis="0 1 0" range="0 .04" damping="1"/>
+            <geom type="sphere" size=".01" mass=".1"/></body>
+          <body name="right"><joint name="right_q" type="slide" axis="0 1 0" range="-.04 0" damping="1"/>
+            <geom type="sphere" size=".01" mass=".1"/></body>
+        </body></body></worldbody>
+        <actuator><motor name="arm_motor" joint="arm_q" ctrllimited="true" ctrlrange="-10 10"/>
+          <position name="left_servo" joint="left_q" kp="1000" ctrllimited="true" ctrlrange="0 .04"/>
+          <position name="right_servo" joint="right_q" kp="1000" ctrllimited="true" ctrlrange="-.04 0"/>
+        </actuator>
+      </mujoco>''')
+    sim = MjSim(model)
+    sim.data._data.qpos[:] = [.02, .0400003, -.04]
+    sim.data._data.qvel[:] = [.4, 0., 0.]
+    sim.data._data.ctrl[:] = [0., .04, -.04]
+    mujoco.mj_forward(model, sim.data._data)
+    backend = RobosuiteExecutionBackend(sim, base_link="base", tcp_site="tcp",
+        arm_joint_names=("arm_q",), finger_joint_names=("left_q", "right_q"),
+        arm_kp=1000., arm_kd=200., velocity_limits={"arm_q": 1., "left_q": 1., "right_q": 1.},
+        source="Explicit isolated native fault-stop fixture")
+    initial = backend.proprioception()
+    result = backend.abort_hold(initial, np.array([.04, -.04]), expected_sim_time=initial["sim_time"],
+        stop_velocity=np.array([.01, .001, .001]), max_steps=250)
+    assert initial["q"][1] > backend.joint_ranges[1, 1]
+    assert initial["dq"][0] == .4
+    assert result["prepared"] and result["native_ctrl_written"]
+    assert 1 < result["physical_steps"] <= 250
+    assert result["physical_stop_confirmed"]
+    assert np.all(np.abs(result["samples"][-1]["dq"]) <= [.01, .001, .001])
+    fault = result["joint_position_violation_samples"][0]
+    assert fault["phase"] == "entry"
+    assert fault["violations"][0]["joint_name"] == "left_q"
+    assert fault["violations"][0]["measured"] == initial["q"][1]
+    assert fault["violations"][0]["upper"] == .04
+    assert all(control["actuator_ctrl"][1:] == [.04, -.04] for control in result["controls"])
+    record_property("isolated_native_stop_steps", result["physical_steps"])
+# END position-domain failure remains distinct from actual velocity convergence.
+
+
 # BEGIN replay the real formal probe's near-contact feedback without CUDA.
 def test_complete_solid_empty_intersection_resolves_coal_numerical_boundary(tmp_path):
     from probe_contact_execution_gpu import build_native

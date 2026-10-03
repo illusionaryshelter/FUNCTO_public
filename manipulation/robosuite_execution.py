@@ -356,8 +356,12 @@ class RobosuiteExecutionBackend:
         by fault handling. Hold telemetry is separate from the failed curve.
         No state reset or claimed zero velocity substitutes for feedback.
         """
+        # BEGIN fault stopping preserves position faults separately from speed convergence.
         result = {"prepared": False, "native_ctrl_written": False, "physical_steps": 0,
-                  "physical_stop_confirmed": False, "samples": [], "controls": []}
+                  "physical_stop_confirmed": False, "samples": [], "controls": [],
+                  "joint_position_bounds_satisfied": None, "joint_position_violation_samples": [],
+                  "physical_stop_scope": "Measured named stop velocities; does not clear the original execution fault or certify restored joint position bounds"}
+        # END a stopped actuator does not imply that its physical fault disappeared.
         try:
             if (tuple(feedback.get("joint_names", ())) != self.joint_names
                     or tuple(feedback.get("arm_joint_names", ())) != self.arm_joint_names
@@ -376,9 +380,28 @@ class RobosuiteExecutionBackend:
             if np.any(limits < 0) or type(max_steps) is not int or not 1 <= max_steps <= 10000:
                 raise ValueError("Physical hold requires finite nonnegative criteria and a bounded step count")
             ranges = self.joint_ranges
-            if np.any(q < ranges[:, 0]) or np.any(q > ranges[:, 1]):
-                raise ValueError("Out-of-range actual coordinates cannot become a new hold goal")
-            goal = q[:len(self.arm_joint_names)].copy()
+            # BEGIN only arm coordinates become new hold targets.
+            # Fingers retain the last commanded native positions, independently
+            # checked against ctrlrange by apply_control. Their actual soft-limit
+            # excursion must remain a reported fault, but cannot suppress the
+            # bounded stop of a still-moving, in-range arm. No actual is clipped.
+            narm = len(self.arm_joint_names)
+
+            def retain_position_faults(positions, *, phase, sim_time):
+                outside = np.flatnonzero((positions < ranges[:, 0]) | (positions > ranges[:, 1]))
+                result["joint_position_bounds_satisfied"] = not bool(outside.size)
+                if outside.size:
+                    result["joint_position_violation_samples"].append({
+                        "phase": phase, "sim_time": float(sim_time),
+                        "violations": [{"joint_name": self.joint_names[int(j)],
+                            "measured": float(positions[j]), "lower": float(ranges[j, 0]),
+                            "upper": float(ranges[j, 1])} for j in outside]})
+                return outside
+
+            if np.any(retain_position_faults(q, phase="entry", sim_time=current_time) < narm):
+                raise ValueError("Out-of-range actual arm coordinates cannot become a new hold goal")
+            goal = q[:narm].copy()
+            # END the normal executor still rejects every arm and finger limit violation.
             # BEGIN holds explicitly record their own complete reference.
             result.update(prepared=True, arm_position_goal=goal.tolist(),
                 arm_velocity_goal=np.zeros_like(goal).tolist(),
@@ -406,12 +429,26 @@ class RobosuiteExecutionBackend:
                 actual = self.proprioception()
                 result["physical_steps"] = index+1
                 result["samples"].append(actual)
+                # BEGIN report the latest position evidence even when velocity is invalid.
+                # Unknown new q must not inherit an earlier in-range verdict.
+                # A finite position fault is retained before dq validation so
+                # that invalid velocity cannot erase the independently known q.
+                result["joint_position_bounds_satisfied"] = None
                 measured_q = _finite_array(actual["q"], q.shape, "Hold actual positions")
+                outside = retain_position_faults(measured_q, phase="after_step",
+                                                sim_time=actual["sim_time"])
+                # END all subsequent stop checks refer to this actual sample.
                 measured_dq = _finite_array(actual["dq"], q.shape, "Hold actual velocities")
-                if np.any(measured_q < ranges[:, 0]) or np.any(measured_q > ranges[:, 1]):
-                    raise ValueError("Physical joint range invalidated during hold")
-                if abs(float(actual["sim_time"])-(current_time+(index+1)*self.timestep)) > 1e-8:
+                # BEGIN retain ongoing finger faults while completing arm deceleration.
+                if np.any(outside < narm):
+                    raise ValueError("Physical arm joint range invalidated during hold")
+                # END speed convergence below never certifies position-domain recovery.
+                # BEGIN an invalid native clock cannot confirm a physical stop.
+                actual_time = float(actual["sim_time"])
+                if (not np.isfinite(actual_time)
+                        or abs(actual_time-(current_time+(index+1)*self.timestep)) > 1e-8):
                     raise ValueError("Native clock became discontinuous during hold")
+                # END NaN cannot pass through an otherwise false comparison.
                 if np.all(np.abs(measured_dq) <= limits):
                     result["physical_stop_confirmed"] = True
                     break

@@ -1044,6 +1044,91 @@ class ExecutionGuardTests(unittest.TestCase):
                     self.assertEqual(saved["actuator_ctrl"].shape, (1, 9))
                     np.testing.assert_array_equal(saved["actual_q"][-1], simulation.native_data.qpos)
 
+    # BEGIN a real guard failure remains failed after a separately confirmed mock stop.
+    def test_native_finger_overrun_keeps_primary_failure_and_counts_bounded_arm_stop(self):
+        simulation, curve, targets = _fixture()
+        initial = _initial_feedback(simulation)
+        limits = _limit_values(simulation, curve)
+        limits["stop_arm_velocity"] = [.01]*7
+        overshoot = np.nextafter(.04, np.inf)
+        commands, physical_samples, hold_entry = [], [], {}
+
+        def scripted_step():
+            # These three states are prescribed telemetry, not an integrator:
+            # one rejected trajectory step followed by two genuine backend
+            # hold calls, whose mocked feedback converges only on the second.
+            commands.append(simulation.native_data.ctrl.copy())
+            simulation.native_data.time += simulation.timestep
+            if len(commands) == 1:
+                q, dq, _, _ = curve.sample(simulation.timestep)
+                simulation.native_data.qpos[:7], simulation.native_data.qvel[:7] = q, dq
+                simulation.native_data.qpos[7] = overshoot
+                hold_entry["q"] = simulation.native_data.qpos.copy()
+                hold_entry["dq"] = simulation.native_data.qvel.copy()
+            else:
+                simulation.native_data.qvel[:7] = .02 if len(commands) == 2 else 0.
+                simulation.native_data.qvel[7:] = 0.
+            # The finger position remains out of bounds throughout stopping.
+            # No test callback or backend is allowed to clip that measured q.
+            self.assertEqual(simulation.native_data.qpos[7], overshoot)
+
+        simulation._sim.step = scripted_step
+        executor = _executor(simulation)
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaisesRegex(ExecutionGuardError, "native_joint_position") as caught:
+                _execute_bound(executor, _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                    initial_feedback=initial, execution_limits=ExecutionLimits.from_mapping(limits),
+                    output=output, max_physics_steps=20, max_hold_steps=3,
+                    step_callback=lambda model, data, row: physical_samples.append(deepcopy(row)))
+            report = json.loads((output/"execution-report.json").read_text())
+            self.assertEqual(report["status"], "feedback_rejected")
+            self.assertEqual(report["error"], f"ExecutionGuardError: {caught.exception}")
+            self.assertEqual(report["executed_steps"], 1)
+            self.assertEqual(report["feedback_failure"]["point"], "after_step")
+            self.assertEqual(report["feedback_failure"]["curve_time_s"], simulation.timestep)
+            failures = report["feedback_failure"]["violations"]
+            self.assertEqual([row["kind"] for row in failures],
+                             ["native_joint_position", "actual_finger_position"])
+            self.assertEqual(failures[0]["measured"], overshoot)
+            np.testing.assert_array_equal(report["feedback_failure"]["actual_feedback"]["dq"], hold_entry["dq"])
+            self.assertEqual(report["events"], [])
+            self.assertIn("close-original", [row["event_id"] for row in report["unconsumed_events"]])
+            self.assertFalse(report["evidence_passed"])
+            self.assertEqual(report["completed_goal_ids"], [])
+            hold = report["abort_hold"]
+            self.assertTrue(hold["native_ctrl_written"])
+            self.assertTrue(hold["physical_stop_confirmed"])
+            self.assertFalse(hold["joint_position_bounds_satisfied"])
+            self.assertEqual(hold["physical_steps"], 2)
+            self.assertEqual(len(hold["joint_position_violation_samples"]), 3)
+            for command in commands:
+                np.testing.assert_array_equal(command[7:], commands[0][7:])
+            for control in hold["controls"]:
+                np.testing.assert_array_equal(control["reference_arm_q"], hold_entry["q"][:7])
+                np.testing.assert_array_equal(control["reference_arm_dq"], np.zeros(7))
+                np.testing.assert_array_equal(control["reference_arm_ddq"], np.zeros(7))
+                np.testing.assert_array_equal(control["actuator_ctrl"][7:], commands[0][7:])
+            continuation = report["continuation"]
+            self.assertTrue(continuation["requires_rebind"])
+            self.assertTrue(continuation["request_ledger"]["requires_continuation"])
+            self.assertEqual(continuation["consumed_physics_steps"], 3)
+            self.assertEqual(continuation["cumulative_physics_steps"], 3)
+            self.assertEqual(continuation["remaining_physics_steps"], 17)
+            self.assertAlmostEqual(continuation["elapsed_physical_s"], 3*simulation.timestep)
+            np.testing.assert_array_equal(continuation["actual_feedback"]["q"], hold_entry["q"])
+            np.testing.assert_array_equal(continuation["actual_feedback"]["dq"], np.zeros(9))
+            self.assertEqual(len(physical_samples), 1)
+            self.assertIsNotNone(executor.last_execution_report["feedback_failure"])
+            with np.load(output/"physical-trajectory.npz") as saved:
+                # The original failed sample remains the curve endpoint;
+                # separately counted hold feedback must not replace its dq.
+                self.assertEqual(saved["actual_q"].shape, (2, 9))
+                self.assertEqual(saved["actuator_ctrl"].shape, (1, 9))
+                np.testing.assert_array_equal(saved["actual_q"][-1], hold_entry["q"])
+                np.testing.assert_array_equal(saved["actual_dq"][-1], hold_entry["dq"])
+    # END converged hold velocity never upgrades the original task or position fault.
+
     def test_original_stop_checks_actual_velocity_without_extending_physics(self):
         simulation, curve, value = _fixture()
         limits = _limit_values(simulation, curve)
