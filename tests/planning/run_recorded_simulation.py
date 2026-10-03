@@ -1,9 +1,9 @@
 """Run an exported skill prefix in its recorded native scene and retain physics.
 
 All scene, morphology, candidate and camera identities are explicit inputs.
-Object poses are read only by setup and the independent physics evaluator.
-An explicitly configured simulated tactile sensor may provide current contact
-feedback without exposing an object's hidden pose or the evaluator's grade.
+Object poses and native contacts are read only by the independent evaluator.
+Runtime observations must come from an explicitly supplied usable observation
+channel; simulator truth never supplies runtime owner poses or effect evidence.
 ``--no-video`` is a CPU-only execution option; selecting one or two ``--view``
 arguments creates native renderers and must run separately from CUDA planning.
 """
@@ -29,7 +29,9 @@ sys.path.insert(0, str(WORKSPACE_ROOT))
 
 # BEGIN production execution owns control; this adapter owns recording setup.
 from manipulation.execution import ExecutionLimits, FixedFingerTargets, TrajectoryExecutor, _feedback_json
+from manipulation.execution_binding import rebind_execution_result
 from recorded_simulation import restore_recorded_simulation, load_saved_trajectory
+from recorded_task_planning import save_curve
 from robot_validation_fixture import build_robot_validator
 # END production execution and explicit recording adapter.
 from recorded_skill_evaluation import NativeSkillPhysicsEvaluator
@@ -47,6 +49,17 @@ def _one(rows, key, value):
     if len(found) != 1:
         raise ValueError(f"Expected one explicit {key}={value!r}; found {len(found)}")
     return found[0]
+
+
+# BEGIN result-only scope always names one original formal goal identity.
+def _goal_identity(value):
+    """Parse a CLI identity without inferring a goal from its task or label."""
+    collection, separator, raw_index = value.partition(":")
+    if (not separator or collection not in ("pose_events", "coordinate_events", "supports")
+            or not raw_index.isdecimal()):
+        raise argparse.ArgumentTypeError("Use an original goal identity such as pose_events:0")
+    return [collection, int(raw_index)]
+# END semantic rebind checks membership, uniqueness and hard dependencies.
 
 
 class _TrialVideos:
@@ -145,10 +158,10 @@ class _TrialVideos:
 def run(args, *, observation_callback=None):
     """Execute one skill with optional upstream current-observation evidence.
 
-    The CLI optionally binds an explicitly configured simulated tactile sensor.
-    Its native physics evaluator remains independent and never authorizes a
-    runtime dependency or supplies owner poses. A caller can instead provide
-    its own existing allowed-observation callback through the same contract.
+    The native physics evaluator remains independent and never authorizes a
+    runtime dependency or supplies owner poses. A caller may provide an
+    existing proprioceptive or visual observation callback through the same
+    contract; the CLI does not create a semantic sensor from simulator truth.
     """
 # END absent observation evidence retains the executor's explicit U outcome.
     output = args.output.resolve()
@@ -176,15 +189,9 @@ def run(args, *, observation_callback=None):
         "physics_evidence_path": str(output/"physics-evidence.npz"),
         "scope": "One actual native-physics skill prefix; no next skill or full-sequence claim",
         "planner_inputs_changed": False, "execution_tested": False}
-    simulation = evaluator = videos = execution = tactile = executor = None
+    simulation = evaluator = videos = execution = executor = None
     caught = None
     try:
-        # BEGIN select one explicit online sensor source before physical I/O.
-        tactile_configuration = None if args.tactile_observer is None else _read(args.tactile_observer)
-        if tactile_configuration is not None and observation_callback is not None:
-            raise ValueError("Select either the declared tactile sensor or the caller's observation callback")
-        report["tactile_observer_input"] = None if args.tactile_observer is None else str(args.tactile_observer.resolve())
-        # END offline evaluation is never selected as a runtime observation source.
         manifest, fixture, feedback = _read(args.manifest), _read(args.robot_fixture), _read(args.feedback)
         root = Path(manifest["workspace_root"])
         segment = _one(manifest["segments"], "id", args.segment)
@@ -228,7 +235,7 @@ def run(args, *, observation_callback=None):
         if Path(fixture["episode_path"]).resolve() != recording/"episode.h5":
             raise ValueError("Simulator fixture and input manifest refer to different source episodes")
         # BEGIN restore and execute the same formal result, without label gates.
-        planning_result = load_saved_trajectory(args.trajectory, execution_limits=execution_limits)
+        planning_result = load_saved_trajectory(args.trajectory)
         curve = planning_result.trajectory
         # END the loader checks exact candidate, clock and physical policy.
         # BEGIN use the same archive already checked by the formal loader.
@@ -236,12 +243,6 @@ def run(args, *, observation_callback=None):
         # owns its separate admission limit and is not read or decoded twice.
         report["trajectory_classification"] = planning_result.diagnostics["archive_classification"]
         # END reporting cannot observe a different second copy of the archive.
-        # BEGIN bind every physical trial to its identical recorded hand policy.
-        # The saved-curve loader already checked classification and exact limits
-        # before any simulator restoration or physical command can take place.
-        report["planning_execution_limits_match"] = True
-        report["planning_hand_contract"] = "identical saved planning/execution contract"
-        # END bind every physical trial to its identical recorded hand policy.
         if {event["skill_id"] for event in curve.events} != {args.segment}:
             raise ValueError("The exported candidate must contain only the selected skill instance")
         evidence = _read(args.evaluator_evidence)
@@ -265,6 +266,27 @@ def run(args, *, observation_callback=None):
         if max(differences.values()) > 1e-9:
             raise ValueError(f"Restored native feedback differs from the selected observed entrance: {differences}")
         # END restoration is independent of trajectory execution.
+        # BEGIN explicitly rebind the unchanged curve to the current device contract.
+        source_candidate = planning_result.execution_binding["candidate_id"]
+        planning_result = rebind_execution_result(planning_result,
+            controller_policy=simulation.describe()["controller_policy"],
+            result_only_goal_ids=args.result_only_goal_ids, finger_targets=finger_targets,
+            execution_limits=execution_limits,
+            source={"kind": "explicit_recorded_trial_execution_contract",
+                "source_trajectory": str(args.trajectory.resolve()),
+                "source_candidate_id": source_candidate})
+        rebound_path = output/"rebound-planning"/"trajectory.npz"
+        rebound_path.parent.mkdir()
+        save_curve(rebound_path, planning_result.trajectory, classification="planner_accepted",
+            execution_limits=execution_limits.describe(), planning_result=planning_result)
+        report.update(source_candidate_id=source_candidate,
+            execution_candidate_id=planning_result.execution_binding["candidate_id"],
+            rebound_trajectory_path=str(rebound_path),
+            result_only_goal_ids=deepcopy(args.result_only_goal_ids),
+            controller_policy=simulation.describe()["controller_policy"],
+            planning_execution_limits_match=True,
+            planning_hand_contract="Explicit rebound device policy; physical limits and original finger polynomial are preserved")
+        # END no solve, clock change, source archive mutation or truth feedback occurs.
         report.update(restored_feedback_errors=differences, restore=restore_report,
             original_controller_configuration={"source": str(source_manifest_path),
                 "part": args.controller_part, "configuration": deepcopy(arm_config),
@@ -274,18 +296,6 @@ def run(args, *, observation_callback=None):
                 "finger_targets": str(args.finger_targets.resolve()),
                 "program": str((root/segment["program_path"]).resolve()),
                 "evaluator_evidence": str(args.evaluator_evidence.resolve())})
-        # BEGIN bind simulated touch to the same current owner and material identities.
-        if tactile_configuration is not None:
-            from simulated_tactile import SimulatedTactileObserver
-            tactile = SimulatedTactileObserver(simulation, tactile_configuration,
-                execution_binding=planning_result.execution_binding,
-                observation_policy=execution_limits.observation_policy,
-                maximum_samples=args.max_physics_steps+1)
-            observation_callback = tactile
-            report.update(online_observation_provided=True, tactile_sensor=tactile.describe(),
-                tactile_observations_path=str(output/"tactile-observations.json"),
-                effect_evidence_scope="Explicit simulated tactile pinching evidence; no observed object pose, attachment, or offline-evaluator input")
-        # END an observed pinch does not manufacture an actual rigid attachment.
         catalog = _read(fixture["catalog_path"])
         reference_role = program["demo"]["roles"].get("reference")
         reference_name = None
@@ -295,9 +305,12 @@ def run(args, *, observation_callback=None):
             actor=actor, target_body_name=source_segment["carrier_body_name"],
             finger_joint_names=fixture["finger_joint_names"], tcp_site=fixture["tcp_site"],
             program=program, reference_body_name=reference_name,
+            planning_result=planning_result, evaluation_owner_bindings=evidence["evaluation_owner_bindings"],
             binding_source={"path": str(args.evaluator_evidence.resolve()),
                 "source_segment_id": segment["source_library_segment"],
-                "fields_used": ["actor identity and contact-group names", "carrier_body_name", "reference body identity and declared source function requirements"],
+                "fields_used": ["actor identity and contact-group names", "carrier_body_name",
+                    "reference body identity and declared source function requirements",
+                    "evaluation_owner_bindings: explicit observed owner IDs and native body names"],
                 "original_contact_outcome_or_object_trajectory_used": False})
         evaluator.observe(simulation.native_model, simulation.native_data, {"elapsed": 0.})
         if not args.no_video:
@@ -396,30 +409,9 @@ def run(args, *, observation_callback=None):
             try:
                 assessment = evaluator.finalize(output, execution_report=execution)
                 report.update(physics_outcome=assessment["physics_outcome"], physics_success=assessment["physics_success"])
-                # BEGIN retain the independent sensor/oracle outcomes side by side.
-                if tactile is not None:
-                    rows = tactile.observations
-                    value = "U" if not rows else rows[-1]["effect"]["value"]
-                    offline = assessment["physics_success"]
-                    report["effect_evidence_comparison"] = {"online_tactile_value": value,
-                        "offline_stable_grasp": offline,
-                        "agreement_of_reported_outcomes": (None if value == "U" or offline is None else
-                                                           (value == "T") == offline),
-                        "scope": "Distinct tests: current tactile pinching versus offline full target-relative pose stability; disagreement is retained and never changes runtime evidence"}
-                # END native object truth cannot retroactively authorize control.
             except Exception as error:
                 caught = caught or error
                 report.update(status="error", evaluation_error=f"{type(error).__name__}: {error}")
-        if tactile is not None:
-            # BEGIN one failed evidence sink cannot prevent closing native videos.
-            try:
-                (output/"tactile-observations.json").write_text(json.dumps(_feedback_json({
-                    "sensor": tactile.describe(), "observations": tactile.observations}),
-                    indent=2, allow_nan=False)+"\n")
-            except Exception as error:
-                caught = caught or error
-                report.update(status="error", tactile_write_error=f"{type(error).__name__}: {error}")
-            # END the primary execution exception remains the reported failure.
         if videos is not None:
             # BEGIN capture the actual final hold state even after a guard rejection.
             # This is a video frame only: no missing evaluator/online-observer
@@ -457,10 +449,9 @@ if __name__ == "__main__":
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--segment", required=True)
     parser.add_argument("--controller-part", required=True)
-    # BEGIN optional declared online tactile sensing; the default remains U.
-    parser.add_argument("--tactile-observer", type=Path,
-                        help="Explicit simulated two-pad tactile sensor/owner/effect/threshold JSON; independent from offline task evaluation")
-    # END no native object pose is implicitly admitted as an observation.
+    parser.add_argument("--result-only-goal", action="append", type=_goal_identity,
+                        dest="result_only_goal_ids", default=[],
+                        help="Original collection:index to evaluate as a result without an online dependency; repeat for each explicit goal")
     # END require target positions explicitly, without the binary formatter.
     camera = parser.add_mutually_exclusive_group(required=True)
     camera.add_argument("--view", action="append", dest="views")

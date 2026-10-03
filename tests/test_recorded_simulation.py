@@ -54,6 +54,13 @@ def _fixture():
     simulation._trial_id = str(uuid4())
     simulation._feedback_source = "explicit mocked robot feedback; no physical integration"
     simulation._description = {"scope": "mocked integration clock only"}
+    # BEGIN the sequencing fixture declares the same complete controller contract.
+    simulation._description["controller_policy"] = {
+        "mode": "joint_trajectory_q_dq_ddq", "arm_joint_names": list(simulation.arm_joint_names),
+        "kp": [1.]*7, "kd": [1.]*7, "native_timestep_s": simulation._dt,
+        "reference_derivatives": ["q", "dq", "ddq"], "sampling_phase": "clamped_step_endpoint",
+        "acceleration_knot_side": "right_internal_last_left"}
+    # END this declared toy policy is not a physical robot model.
     simulation.native_data = SimpleNamespace(
         qpos=np.r_[np.linspace(.1, .7, 7), .012, -.017],
         qvel=np.r_[np.linspace(.01, .07, 7), .03, -.04],
@@ -85,9 +92,20 @@ def _fixture():
         policy_freq=1/simulation._dt, use_action_scaling=False)
     simulation._grip_controller.set_goal(simulation.native_data.ctrl[7:].copy())
     simulation.arm_goals = []
-    simulation._arm_controller = SimpleNamespace(
-        set_goal=lambda goal: simulation.arm_goals.append(goal.copy()),
-        run_controller=lambda: np.zeros(7))
+    # BEGIN model only the controller arithmetic, independently of mock integration.
+    controller = SimpleNamespace(mass_matrix=np.eye(7), kp=np.ones(7), kd=np.ones(7),
+        joint_pos=simulation.native_data.qpos[:7].copy(), joint_vel=simulation.native_data.qvel[:7].copy(),
+        torque_compensation=np.zeros(7))
+
+    def set_goal(goal):
+        simulation.arm_goals.append(goal.copy())
+        controller.joint_pos = simulation.native_data.qpos[:7].copy()
+        controller.joint_vel = simulation.native_data.qvel[:7].copy()
+
+    controller.set_goal = set_goal
+    controller.run_controller = lambda: simulation.arm_goals[-1]-controller.joint_pos-controller.joint_vel
+    simulation._arm_controller = controller
+    # END real backend feedforward consumes explicit current matrices and named state.
     q, dq = simulation.native_data.qpos[:7], simulation.native_data.qvel[:7]
     events = (_event("open-original", "open", .001),
               _event("close-original", "close", .003),
@@ -175,6 +193,28 @@ def _executor(backend):
 # END explicit fake geometry verdicts only for execution sequencing tests.
 
 
+# BEGIN sequencing tests explicitly prepare their new synthetic execution binding.
+def _execute_bound(executor, result, *, result_only_goal_ids=(), **kwargs):
+    """Bind fresh fixture evidence, then call the production executor unchanged.
+
+    Existing device/continuation policies pass through untouched so rejection
+    tests cannot silently migrate them. Tests of source-only authorization use
+    TrajectoryExecutor.execute directly instead of this fixture setup helper.
+    """
+    from manipulation.execution_binding import rebind_execution_result
+
+    if (isinstance(result, PlanningResult) and result.success is True
+            and isinstance(result.execution_binding, dict)
+            and "device_policy" not in result.execution_binding):
+        rebound = rebind_execution_result(result,
+            controller_policy=executor.backend.describe()["controller_policy"],
+            result_only_goal_ids=list(result_only_goal_ids), finger_targets=kwargs["finger_targets"],
+            execution_limits=kwargs["execution_limits"], source="Explicit CPU sequencing fixture device binding")
+        result.execution_binding = rebound.execution_binding
+    return executor.execute(result, **kwargs)
+# END fixture setup does not weaken the production executor's mandatory rebind gate.
+
+
 def _initial_feedback(simulation):
     """Explicit calibration metadata accompanies the measured robot state."""
     return {**simulation.proprioception(), "tool_transform": simulation.tool_transform.tolist()}
@@ -238,7 +278,7 @@ class SavedExecutionContractTests(unittest.TestCase):
             change(result)
             with self.subTest(change=change), TemporaryDirectory() as temporary:
                 with self.assertRaises(ValueError):
-                    _executor(simulation).execute(result,
+                    _execute_bound(_executor(simulation), result,
                         finger_targets=FixedFingerTargets.from_mapping(targets),
                         initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                         output=Path(temporary)/"trial")
@@ -246,7 +286,7 @@ class SavedExecutionContractTests(unittest.TestCase):
                 self.assertEqual(simulation.arm_goals, [])
         simulation, curve, targets = _fixture()
         with TemporaryDirectory() as temporary, self.assertRaisesRegex(ValueError, "formal PlanningResult"):
-            _executor(simulation).execute(curve, finger_targets=FixedFingerTargets.from_mapping(targets),
+            _execute_bound(_executor(simulation), curve, finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                 output=Path(temporary)/"trial")
     # END execution rejects stale binding before any actuator side effect.
@@ -261,7 +301,7 @@ class SavedExecutionContractTests(unittest.TestCase):
             result.execution_binding["validation"]["inputs"]["problem"][key] = value
             with self.subTest(key=key), TemporaryDirectory() as temporary:
                 with self.assertRaisesRegex(ValueError, "Planning and actual"):
-                    _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                    _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                         initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                         output=Path(temporary)/"trial")
                 self.assertEqual(simulation.arm_goals, [])
@@ -277,7 +317,7 @@ class SavedExecutionContractTests(unittest.TestCase):
                        planning_result=_result(curve))
             # BEGIN classification is returned from the single validated decode.
             with patch("recorded_simulation.json.loads", wraps=json.loads) as decode:
-                loaded = load_saved_trajectory(path, execution_limits=limits)
+                loaded = load_saved_trajectory(path)
             self.assertEqual(decode.call_count, 1)
             self.assertEqual(loaded.diagnostics["archive_classification"], "planner_accepted")
             self.assertEqual(loaded.execution_binding["execution_limits"], limits.describe())
@@ -293,11 +333,11 @@ class SavedExecutionContractTests(unittest.TestCase):
                 else:
                     metadata["execution_limits"]["initial_fingers"]["position_bounds"][0][0] += .001
                 metadata_path.write_text(json.dumps(metadata))
-                with self.assertRaisesRegex(ValueError, "identical physical execution limits"):
-                    load_saved_trajectory(path, execution_limits=limits)
+                with self.assertRaisesRegex(ValueError, "physical contract|execution limits|every physical limit"):
+                    load_saved_trajectory(path)
             save_curve(path, curve, classification="rejected_diagnostic_not_executable", execution_limits=limits.describe())
             with self.assertRaisesRegex(ValueError, "not executable"):
-                load_saved_trajectory(path, execution_limits=limits)
+                load_saved_trajectory(path)
 
     # BEGIN oversized archives must fail before text, JSON or NPZ allocation.
     def test_oversized_archive_is_rejected_before_read_or_decode(self):
@@ -332,14 +372,14 @@ class SavedExecutionContractTests(unittest.TestCase):
             missing["finger_trajectory"] = None
             metadata_path.write_text(json.dumps(missing))
             with self.assertRaisesRegex(ValueError, "complete saved planning finger reference"):
-                load_saved_trajectory(path, execution_limits=limits)
+                load_saved_trajectory(path)
             metadata_path.write_text(json.dumps(metadata))
             with np.load(path, allow_pickle=False) as saved:
                 arrays = {name: saved[name].copy() for name in saved.files}
             arrays["finger_velocity"][0, 0] += .001
             np.savez_compressed(path, **arrays)
             with self.assertRaisesRegex(ValueError, "same original clock and polynomial"):
-                load_saved_trajectory(path, execution_limits=limits)
+                load_saved_trajectory(path)
     # END loading retains the original named reference without regeneration.
 # END historical diagnostic files cannot enter another execution path.
 
@@ -416,7 +456,7 @@ class RecordedControlTests(unittest.TestCase):
             with self.subTest(mutation=mutation), TemporaryDirectory() as temporary:
                 output = Path(temporary)/"trial"
                 with self.assertRaises(ValueError):
-                    _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+                    _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                         initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                         output=output)
                 self.assertFalse(output.exists())
@@ -428,7 +468,7 @@ class RecordedControlTests(unittest.TestCase):
         curve.events, value["events"], curve.finger_trajectory = (), [], None
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
-            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+            report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                 output=output)
             self.assertIsNone(report["finger_reference"])
@@ -455,7 +495,7 @@ class RecordedControlTests(unittest.TestCase):
         _bind_fingers(simulation, curve, value)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
-            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+            report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                 output=output)
             self.assertEqual(report["status"], "stopped_for_evidence")
@@ -485,7 +525,7 @@ class RecordedControlTests(unittest.TestCase):
                 with self.subTest(field=field, column=column), TemporaryDirectory() as temporary:
                     output = Path(temporary)/"trial"
                     with self.assertRaisesRegex(ValueError, "full robot state"):
-                        _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+                        _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                             initial_feedback=feedback, output=output,
                             execution_limits=_limits(simulation, curve),
                             start_position_tolerance=1., start_velocity_tolerance=1.)
@@ -497,7 +537,7 @@ class RecordedControlTests(unittest.TestCase):
         original_events = deepcopy(curve.events)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
-            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+            report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=initial, execution_limits=_limits(simulation, curve),
                 output=output, max_physics_steps=4)
             self.assertEqual(report["executed_steps"], 4)
@@ -562,7 +602,7 @@ class RecordedControlTests(unittest.TestCase):
         simulation._arm_controller.run_controller = lambda: np.full(7, 5.*len(simulation.arm_goals))
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
-            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+            report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=initial, execution_limits=_limits(simulation, curve),
                 output=output, max_physics_steps=4)
             with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
@@ -572,12 +612,14 @@ class RecordedControlTests(unittest.TestCase):
                 self.assertEqual(report["dependency_hold"]["physical_steps"], 1)
                 np.testing.assert_array_equal(saved["actuator_names"], simulation.actuator_names)
                 np.testing.assert_array_equal(saved["arm_actuator_names"], simulation.actuator_names[:7])
-                np.testing.assert_array_equal(saved["requested_arm_torque"][:, 0], [5., 10., 15., 20.])
-                np.testing.assert_array_equal(saved["applied_arm_torque"][:, 0], [5., 10., 10., 10.])
+                # BEGIN the issued demand also contains the explicit 0.01-rad/s reference term.
+                np.testing.assert_allclose(saved["requested_arm_torque"][:, 0], [5.01, 10.01, 15.01, 20.01], atol=1e-9, rtol=0.)
+                np.testing.assert_allclose(saved["applied_arm_torque"][:, 0], [5.01, 10., 10., 10.], atol=1e-9, rtol=0.)
                 np.testing.assert_array_equal(saved["applied_arm_torque"], saved["actuator_ctrl"][:, :7])
-                np.testing.assert_array_equal(saved["arm_torque_saturated"][:, 0], [False, False, True, True])
+                np.testing.assert_array_equal(saved["arm_torque_saturated"][:, 0], [False, True, True, True])
+                # END native force sentinels above remain independent of these controller demands.
                 np.testing.assert_allclose(np.diff(saved["control_elapsed"]), simulation.timestep, atol=1e-15)
-            self.assertEqual(report["arm_control_saturated_coordinates"], 14)
+            self.assertEqual(report["arm_control_saturated_coordinates"], 21)
             final = json.loads(Path(report["barrier_feedback_path"]).read_text())
             np.testing.assert_array_equal(final["qacc"], expected_acceleration[-1])
             np.testing.assert_array_equal(final["actuator_force"], expected_force[-1])
@@ -614,7 +656,7 @@ class DependencyExecutionTests(unittest.TestCase):
                     "binding_valid": True}
 
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=ExecutionLimits.from_mapping(limits), output=Path(temporary)/"trial",
                 observation_callback=observe)
@@ -637,7 +679,7 @@ class DependencyExecutionTests(unittest.TestCase):
                 with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
                     output = Path(temporary)/"trial"
                     with self.assertRaisesRegex(ValueError, "explicit valid value"):
-                        _executor(simulation).execute(_result(curve),
+                        _execute_bound(_executor(simulation), _result(curve),
                             finger_targets=FixedFingerTargets.from_mapping(targets),
                             initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
                             output=output, observation_callback=observe)
@@ -658,7 +700,7 @@ class DependencyExecutionTests(unittest.TestCase):
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                _executor(simulation).execute(_result(curve),
+                _execute_bound(_executor(simulation), _result(curve),
                     finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                     execution_limits=ExecutionLimits.from_mapping(limits), output=output, observation_callback=observe)
             report = json.loads((output/"execution-report.json").read_text())
@@ -682,7 +724,7 @@ class DependencyExecutionTests(unittest.TestCase):
                     if curve_time == 0 else None)
 
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=ExecutionLimits.from_mapping(limits), output=Path(temporary)/"trial",
                 observation_callback=observe)
@@ -702,7 +744,7 @@ class DependencyExecutionTests(unittest.TestCase):
                                 "unrelated_observation": {"value": "U", "source": "not a required effect"}}}
 
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial", observation_callback=observe)
         self.assertEqual(report["status"], "curve_finished")
@@ -721,7 +763,7 @@ class DependencyExecutionTests(unittest.TestCase):
                     "effects": {"Holding": {"value": "F", "source": "independent synthetic result"}}}
 
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial", observation_callback=observe)
         self.assertEqual(report["status"], "effect_rejected")
@@ -738,7 +780,7 @@ class DependencyExecutionTests(unittest.TestCase):
             "skill_id": "declared_skill", "event_id": "holding-original"},)
         _bind_fingers(simulation, curve, targets)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial")
         self.assertEqual(report["status"], "curve_finished")
@@ -759,7 +801,7 @@ class DependencyExecutionTests(unittest.TestCase):
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                _executor(simulation).execute(_result(curve),
+                _execute_bound(_executor(simulation), _result(curve),
                     finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                     execution_limits=ExecutionLimits.from_mapping(limits), output=output, max_hold_steps=2)
             report = json.loads((output/"execution-report.json").read_text())
@@ -774,7 +816,7 @@ class DependencyExecutionTests(unittest.TestCase):
         curve.events[2].update(kind="function", requires_evidence=None, stop=True, time=.008)
         _bind_fingers(simulation, curve, targets)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial")
         self.assertEqual(report["status"], "curve_finished")
@@ -789,7 +831,7 @@ class DependencyExecutionTests(unittest.TestCase):
         curve.events[2].update(kind="function", requires_evidence=None, stop=False)
         _bind_fingers(simulation, curve, targets)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial")
         self.assertEqual(report["reached_events"][0]["event_id"], "holding-original")
@@ -798,12 +840,19 @@ class DependencyExecutionTests(unittest.TestCase):
         self.assertEqual(report["goal_evidence"], [])
 
     def test_resumed_candidate_cannot_receive_a_fresh_default_step_budget(self):
+        from manipulation.execution_binding import rebind_execution_result
+
         simulation, curve, targets = _fixture()
-        result = _result(curve)
+        # BEGIN model a legitimately bound candidate before any steps were consumed.
+        result = rebind_execution_result(_result(curve),
+            controller_policy=simulation.describe()["controller_policy"], result_only_goal_ids=[],
+            finger_targets=FixedFingerTargets.from_mapping(targets), execution_limits=_limits(simulation, curve),
+            source="Original controller policy before the synthetic continuation")
+        # END the resumed budget remains the subject of this regression.
         result.execution_binding.update(physics_budget=5, consumed_physics_steps=3, remaining_physics_steps=2)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             with self.assertRaisesRegex(ValueError, "physics-step budget"):
-                _executor(simulation).execute(result,
+                _execute_bound(_executor(simulation), result,
                     finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                     execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial")
         self.assertEqual(simulation.arm_goals, [])
@@ -811,7 +860,7 @@ class DependencyExecutionTests(unittest.TestCase):
     def test_hold_cost_is_cumulative_even_when_the_task_step_budget_is_spent(self):
         simulation, curve, targets = _fixture()
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial", max_physics_steps=4)
         self.assertTrue(report["dependency_hold"]["native_ctrl_written"])
@@ -825,7 +874,7 @@ class DependencyExecutionTests(unittest.TestCase):
         limits = _limits(simulation, curve)
         fixed = FixedFingerTargets.from_mapping(targets)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve), finger_targets=fixed,
+            report = _execute_bound(_executor(simulation), _result(curve), finger_targets=fixed,
                 initial_feedback=_initial_feedback(simulation), execution_limits=limits,
                 output=Path(temporary)/"trial")
         remaining_targets, remaining_limits = continuation_execution_inputs(report["continuation"], fixed, limits)
@@ -863,7 +912,7 @@ class ExecutionGuardTests(unittest.TestCase):
         binding = limits.bind(curve, joint_names=backend.joint_names, arm_joint_names=backend.arm_joint_names,
             finger_joint_names=backend.finger_joint_names, native_joint_ranges=backend.joint_ranges,
             named_velocity_limits=backend.velocity_limits)
-        q, dq, _ = curve.sample(0.)
+        q, dq, _, _ = curve.sample(0.)
         for field in ("actuator_names", "qacc", "actuator_force"):
             with self.subTest(field=field):
                 feedback = backend.proprioception()
@@ -891,7 +940,7 @@ class ExecutionGuardTests(unittest.TestCase):
         policy["events"][1]["position_bounds"] = [[.011, .019], [-.019, -.015]]
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
-            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+            report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(policy),
                 output=output)
             self.assertEqual(report["executed_steps"], 4)
@@ -916,7 +965,7 @@ class ExecutionGuardTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             output = Path(temporary)/"trial"
             with self.assertRaisesRegex(ValueError, "match every original"):
-                _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+                _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                     initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(policy),
                     output=output)
             self.assertFalse(output.exists())
@@ -934,12 +983,12 @@ class ExecutionGuardTests(unittest.TestCase):
         def step():
             simulation.native_data.time += simulation._dt
             elapsed = simulation.native_data.time-initial["sim_time"]
-            q, dq, _ = curve.sample(min(elapsed, curve.executable_until))
+            q, dq, _, _ = curve.sample(min(elapsed, curve.executable_until))
             simulation.native_data.qpos[:7], simulation.native_data.qvel[:7] = q, dq
 
         simulation._sim.step = step
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(value), initial_feedback=initial,
                 execution_limits=ExecutionLimits.from_mapping(limits), output=Path(temporary)/"trial")
         close = next(row for row in report["events"] if row["event_id"] == "close-original")
@@ -976,7 +1025,7 @@ class ExecutionGuardTests(unittest.TestCase):
                 simulation._sim.step = step
                 output = Path(temporary)/"trial"
                 with self.assertRaises(ExecutionGuardError):
-                    _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+                    _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                         initial_feedback=initial, execution_limits=_limits(simulation, curve),
                         output=output,
                         step_callback=lambda model, data, sample: observed.append(sample["q"].copy()))
@@ -1002,7 +1051,7 @@ class ExecutionGuardTests(unittest.TestCase):
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
+                _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                     initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
                     output=output)
             report = json.loads((output/"execution-report.json").read_text())
@@ -1037,7 +1086,7 @@ class GeometryExecutionTests(unittest.TestCase):
             # END completing the fake hold lets the test inspect final step accounting.
             output = Path(temporary)/"trial"
             with self.assertRaisesRegex(ExecutionGuardError, "geometry preflight"):
-                executor.execute(_result(curve),
+                _execute_bound(executor, _result(curve),
                     finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                     execution_limits=_limits(simulation, curve), output=output)
             report = json.loads((output/"execution-report.json").read_text())
@@ -1056,7 +1105,7 @@ class GeometryExecutionTests(unittest.TestCase):
             invalid = _result(curve)
             invalid.success = False
             with self.assertRaises(ValueError):
-                executor.execute(invalid, finger_targets=FixedFingerTargets.from_mapping(targets),
+                _execute_bound(executor, invalid, finger_targets=FixedFingerTargets.from_mapping(targets),
                     initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                     output=Path(temporary)/"invalid")
             self.assertIsNone(executor.last_execution_report)
@@ -1075,7 +1124,7 @@ class GeometryExecutionTests(unittest.TestCase):
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                TrajectoryExecutor(simulation, geometry_checker=checker).execute(_result(curve),
+                _execute_bound(TrajectoryExecutor(simulation, geometry_checker=checker), _result(curve),
                     finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                     execution_limits=_limits(simulation, curve), output=output)
             report = json.loads((output/"execution-report.json").read_text())
@@ -1099,7 +1148,7 @@ class GeometryExecutionTests(unittest.TestCase):
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                TrajectoryExecutor(simulation, geometry_checker=checker).execute(_result(curve),
+                _execute_bound(TrajectoryExecutor(simulation, geometry_checker=checker), _result(curve),
                     finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                     execution_limits=_limits(simulation, curve), output=output,
                     step_callback=lambda model, data, sample: observed.append(sample["geometry_check"]))
@@ -1123,7 +1172,7 @@ class GeometryExecutionTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                TrajectoryExecutor(simulation, geometry_checker=checker).execute(_result(curve),
+                _execute_bound(TrajectoryExecutor(simulation, geometry_checker=checker), _result(curve),
                     finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                     execution_limits=_limits(simulation, curve), output=output)
             report = json.loads((output/"execution-report.json").read_text())
@@ -1138,7 +1187,7 @@ class GeometryExecutionTests(unittest.TestCase):
         simulation, curve, targets = _fixture()
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
-            report = _executor(simulation).execute(_result(curve),
+            report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=_limits(simulation, curve), output=output,
                 start_position_tolerance=0., start_velocity_tolerance=0.)
@@ -1159,7 +1208,7 @@ class GeometryExecutionTests(unittest.TestCase):
             with self.subTest(field=field), TemporaryDirectory() as temporary:
                 output = Path(temporary)/"trial"
                 with self.assertRaises(ValueError):
-                    _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                    _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                         initial_feedback=initial, execution_limits=_limits(simulation, curve),
                         output=output)
                 self.assertFalse(output.exists())
@@ -1231,7 +1280,7 @@ class RobosuiteBackendTests(unittest.TestCase):
         self.assertEqual(backend._arm_controller.input_type, "absolute")
         self.assertIsNone(backend._arm_controller.interpolator)
         self.assertIsNone(backend._grip_controller.interpolator)
-        control = backend.apply_control(np.asarray([1.]), np.asarray([.004, -.009]))
+        control = backend.apply_control(np.asarray([1.]), np.zeros(1), np.zeros(1), np.asarray([.004, -.009]))
         # BEGIN the backend reports only arm torque command clipping here.
         self.assertEqual(control["arm_control_saturated_coordinates"], 1)
         # END native gripper force limiting is a separate observation.
@@ -1392,7 +1441,7 @@ class TerminalSourceCommandTests(unittest.TestCase):
         self.assertLess(terminal["activation_time_s"], curve.duration)
         self.assertEqual(float(mapping.anchor_parameters([1.])[0, 0]*curve.duration), terminal["activation_time_s"])
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+            report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                 output=Path(temporary)/"trial")
         self.assertEqual(report["status"], "curve_finished")
@@ -1443,7 +1492,7 @@ class ActualDirectionEvidenceTests(unittest.TestCase):
 
     @staticmethod
     def execute(simulation, curve, targets, result, observer, output):
-        return _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+        return _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
             initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
             output=output, observation_callback=observer)
 
@@ -1558,7 +1607,7 @@ class ActualDirectionEvidenceTests(unittest.TestCase):
         limits = _limit_values(simulation, curve)
         limits["observation_policy"].update(period_s=.006, maximum_age_s=.006)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+            report = _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
                 output=Path(temporary)/"trial", observation_callback=observe)
         # Scope boundaries .003/.009 reach native guards .004/.010; the
@@ -1596,11 +1645,11 @@ class ActualPoseGoalTests(unittest.TestCase):
             output = Path(temporary)/"trial"
             if rejects:
                 with unittest.TestCase().assertRaises(ExecutionGuardError):
-                    _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                    _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                         initial_feedback=_initial_feedback(simulation), execution_limits=limits, output=output,
                         observation_callback=observe, step_callback=step_callback)
                 return json.loads((output/"execution-report.json").read_text())
-            return _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+            return _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=_initial_feedback(simulation), execution_limits=limits, output=output,
                 observation_callback=observe, step_callback=step_callback)
 
@@ -1761,7 +1810,7 @@ class PhysicalEventTimingTests(unittest.TestCase):
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                     initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve), output=output)
             report = json.loads((output/"execution-report.json").read_text())
         self.assertEqual([row["event_id"] for row in report["events"]], ["open-original"])
@@ -1791,12 +1840,12 @@ class PhysicalEventTimingTests(unittest.TestCase):
             with self.subTest(upper=upper), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
                 output = Path(temporary)/"trial"
                 if accepted:
-                    report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                    report = _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                         initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                         output=output, observation_callback=observe)
                 else:
                     with self.assertRaises(ExecutionGuardError):
-                        _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                        _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                             initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                             output=output, observation_callback=observe)
                     report = json.loads((output/"execution-report.json").read_text())
@@ -1830,12 +1879,12 @@ class PhysicalEventTimingTests(unittest.TestCase):
             with self.subTest(fresh=fresh), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
                 output = Path(temporary)/"trial"
                 if fresh:
-                    report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                    report = _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                         initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(values),
                         output=output, observation_callback=observe)
                 else:
                     with self.assertRaises(ExecutionGuardError):
-                        _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                        _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                             initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(values),
                             output=output, observation_callback=observe)
                     report = json.loads((output/"execution-report.json").read_text())
@@ -1857,7 +1906,7 @@ class PhysicalEventTimingTests(unittest.TestCase):
                                              "occurrence": 0, "check_target": "activation"})]
         _bind_fingers(simulation, curve, targets)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+            report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                 output=Path(temporary)/"trial")
         self.assertEqual(report["status"], "curve_finished")
@@ -1882,7 +1931,7 @@ class PhysicalEventTimingTests(unittest.TestCase):
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             with self.assertRaises(ExecutionGuardError):
-                _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                     initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
                     output=output, observation_callback=observe)
             report = json.loads((output/"execution-report.json").read_text())
@@ -1901,7 +1950,7 @@ class PhysicalEventTimingTests(unittest.TestCase):
             return {"source": "early independently measured state", "timestamp_s": feedback["timestamp_s"],
                     "effects": {"Holding": {"value": "T", "source": "true before required acquisition window"}}}
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+            report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(limits),
                 output=Path(temporary)/"trial", observation_callback=observe)
         self.assertEqual(report["status"], "stopped_for_evidence")
@@ -1930,13 +1979,13 @@ class PhysicalEventTimingTests(unittest.TestCase):
             with self.subTest(witness_occurrence=witness_occurrence, outcome=outcome), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
                 output = Path(temporary)/"trial"
                 if outcome == "valid":
-                    report = _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                    report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                         initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                         output=output, observation_callback=observe)
                 else:
                     expected = ValueError if outcome == "borrowed" else ExecutionGuardError
                     with self.assertRaises(expected):
-                        _executor(simulation).execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                        _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                             initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                             output=output, observation_callback=observe)
                     report = json.loads((output/"execution-report.json").read_text())
@@ -1973,10 +2022,10 @@ class PhysicalEventTimingTests(unittest.TestCase):
         result.execution_binding.update(request_time_origin_s=.004,
             timing_events=[previous_event, deepcopy(event)], timing_checks=[previous_check])
         def observe(feedback, curve_time):
-            return {"source": "new occurrence tactile sample", "timestamp_s": feedback["timestamp_s"],
+            return {"source": "new occurrence upstream sample", "timestamp_s": feedback["timestamp_s"],
                     "effects": {"touch": {"value": "T" if curve_time >= .006 else "U", "source": "new measured predicate"}}}
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+            report = _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                 output=Path(temporary)/"trial", observation_callback=observe)
         self.assertEqual(report["timing_result"], "T")
@@ -1986,7 +2035,10 @@ class PhysicalEventTimingTests(unittest.TestCase):
 
     def test_continuation_resolves_old_actual_witness_without_reissuing_its_command(self):
         simulation, curve, targets = _fixture()
-        original_policy = {"finger_targets": deepcopy(targets), "execution_limits": _limits(simulation, curve).describe()}
+        # BEGIN a resumed occurrence inherits all four immutable device-policy fields.
+        original_policy = {"finger_targets": deepcopy(targets), "execution_limits": _limits(simulation, curve).describe(),
+            "controller_policy": simulation.describe()["controller_policy"], "result_only_goal_ids": []}
+        # END no position-only authorization is manufactured by the continuation fixture.
         previous_event = deepcopy(curve.events[0])
         previous_event["timing"] = [self.window("activation", -.010, -.010, origin_time_s=None,
             origin_event={"skill_id": "declared_skill", "event_id": "close-original",
@@ -2003,7 +2055,7 @@ class PhysicalEventTimingTests(unittest.TestCase):
         result.execution_binding.update(request_time_origin_s=.008, timing_events=[previous_event],
             timing_checks=[previous_check], request_ledger={"history": [previous_fact]}, device_policy=original_policy)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+            report = _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                 output=Path(temporary)/"trial")
         self.assertEqual(report["timing_result"], "T")
@@ -2017,7 +2069,7 @@ class PhysicalEventTimingTests(unittest.TestCase):
         result.execution_binding["request_ledger"] = {"original_events": deepcopy(list(curve.events)), "history": []}
         fixed, limits = FixedFingerTargets.from_mapping(targets), _limits(simulation, curve)
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _executor(simulation).execute(result, finger_targets=fixed,
+            report = _execute_bound(_executor(simulation), result, finger_targets=fixed,
                 initial_feedback=_initial_feedback(simulation), execution_limits=limits, output=Path(temporary)/"trial")
         retried, retried_limits = continuation_execution_inputs(report["continuation"], fixed, limits,
             rebind={"kind": "retry", "source": "explicit same-goal executor decision",
@@ -2036,11 +2088,189 @@ class PhysicalEventTimingTests(unittest.TestCase):
         next_result.execution_binding["device_policy"] = deepcopy(report["continuation"]["device_policy"])
         with TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(ValueError, "original actuator policy"):
-                _executor(next_backend).execute(next_result, finger_targets=FixedFingerTargets.from_mapping(changed),
+                _execute_bound(_executor(next_backend), next_result, finger_targets=FixedFingerTargets.from_mapping(changed),
                     initial_feedback=_initial_feedback(next_backend), execution_limits=_limits(next_backend, next_curve),
                     output=Path(temporary)/"trial")
         self.assertEqual(next_backend.arm_goals, [])
 # END deadline failures cannot be hidden by a successful reference-clock lookup.
+
+
+# BEGIN explicit trajectory-device rebinding and terminal result-only obligations.
+class TrajectoryDeviceBindingTests(unittest.TestCase):
+    @staticmethod
+    def bind(simulation, result, targets, limits, result_ids=()):
+        from manipulation.execution_binding import rebind_execution_result
+
+        return rebind_execution_result(result,
+            controller_policy=simulation.describe()["controller_policy"],
+            result_only_goal_ids=list(result_ids), finger_targets=FixedFingerTargets.from_mapping(targets),
+            execution_limits=limits, source={"kind": "explicit CPU contract test", "input": "unchanged formal fixture"})
+
+    def test_source_and_old_position_policy_never_authorize_control_without_explicit_rebind(self):
+        simulation, curve, targets = _fixture()
+        fixed, limits = FixedFingerTargets.from_mapping(targets), _limits(simulation, curve)
+        for old_policy in (None, {"finger_targets": targets, "execution_limits": limits.describe()}):
+            result = _result(curve)
+            if old_policy is not None:
+                result.execution_binding["device_policy"] = old_policy
+            with self.subTest(policy=old_policy is not None), TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(ValueError, "explicit complete device rebind"):
+                    _executor(simulation).execute(result, finger_targets=fixed, execution_limits=limits,
+                        initial_feedback=_initial_feedback(simulation), output=Path(temporary)/"trial")
+        self.assertEqual(simulation.arm_goals, [])
+        self.assertEqual(simulation.sim_time, 1.3)
+
+    def test_rebind_preserves_original_curve_proofs_and_every_consumed_planning_counter(self):
+        simulation, curve, targets = _fixture()
+        source = _result(curve)
+        source.execution_binding["execution_limits"] = _limits(simulation, curve).describe()
+        ledger = {"request_id": "same request", "requires_continuation": False,
+            "planning_budget": {"maximum_trajectory_solves": 4, "planning_seconds": 240.},
+            "consumed_planning": {"trajectory_solves": 3, "planning_seconds": 126.85213026600104},
+            "history": [{"source": "preserved prior planning fact"}]}
+        source.execution_binding["request_ledger"] = deepcopy(ledger)
+        original = deepcopy(source.execution_binding)
+        values = _limits(simulation, curve).describe()
+        values.update(source="Same physical limits; optional observation channel removed", observation_policy=None)
+        rebound = self.bind(simulation, source, targets, ExecutionLimits.from_mapping(values))
+        self.assertEqual(source.execution_binding, original)
+        self.assertIs(rebound.trajectory, source.trajectory)
+        self.assertNotEqual(rebound.execution_binding["candidate_id"], original["candidate_id"])
+        self.assertEqual(rebound.execution_binding["validation"]["source_candidate_id"], original["candidate_id"])
+        self.assertEqual(rebound.execution_binding["request_ledger"], ledger)
+        self.assertEqual(rebound.request_ledger, ledger)
+        for key in ("curve", "problem", "scene"):
+            self.assertEqual(rebound.execution_binding[key], original[key])
+        for key in ("native", "export", "inputs"):
+            self.assertEqual(rebound.execution_binding["validation"][key], original["validation"][key])
+        self.assertEqual(simulation.arm_goals, [])
+
+    def test_rebind_cannot_relax_physical_or_required_observation_limits_or_reset_an_execution(self):
+        for change in ("physical", "required_observation", "executed"):
+            simulation, curve, targets = _fixture()
+            source = _result(curve)
+            old = _limits(simulation, curve).describe()
+            if change == "required_observation":
+                old["observation_policy"]["required_fields"] = ["binding_valid"]
+            source.execution_binding["execution_limits"] = deepcopy(old)
+            changed = deepcopy(old)
+            if change == "physical":
+                changed["arm_position_error"][0] += .001
+            elif change == "required_observation":
+                changed["observation_policy"] = None
+            else:
+                source.execution_binding["request_ledger"] = {"requires_continuation": True}
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.bind(simulation, source, targets, ExecutionLimits.from_mapping(changed))
+            self.assertEqual(simulation.arm_goals, [])
+
+    def test_changed_controller_gain_or_phase_is_rejected_before_preflight_or_control(self):
+        for key, value in (("kp", [2.]*7), ("sampling_phase", "step_start"),
+                           ("reference_derivatives", ["q", "dq"]), ("kd", [float("nan")]*7)):
+            simulation, curve, targets = _fixture()
+            result = self.bind(simulation, _result(curve), targets, _limits(simulation, curve))
+            result.execution_binding["device_policy"]["controller_policy"][key] = value
+            executor = _executor(simulation)
+            with self.subTest(key=key), TemporaryDirectory() as temporary, self.assertRaises(ValueError):
+                executor.execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                    execution_limits=_limits(simulation, curve), initial_feedback=_initial_feedback(simulation),
+                    output=Path(temporary)/"trial")
+            self.assertEqual(executor.geometry_checker.preflight_inputs, [])
+            self.assertEqual(simulation.arm_goals, [])
+
+    def test_endpoint_q_dq_ddq_and_torque_terms_keep_the_same_clipped_reference_clock(self):
+        simulation, old, targets = _fixture()
+        old.events[2].update(kind="effect", requires_evidence=None, stop=False)
+        duration, acceleration = .011, np.full(7, .05)
+        q, dq = old.sample(0.)[:2]
+        curve = JointTrajectory(old.joint_names, np.asarray([0., duration]),
+            np.stack((q, q+dq*duration+.5*acceleration*duration**2)),
+            np.stack((dq, dq+acceleration*duration)), old.progress_u, old.progress_s,
+            old.events, old.conditions, {})
+        _bind_fingers(simulation, curve, targets)
+        initial = _initial_feedback(simulation)
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            report = _execute_bound(_executor(simulation), _result(curve),
+                finger_targets=FixedFingerTargets.from_mapping(targets), execution_limits=_limits(simulation, curve),
+                initial_feedback=initial, output=output)
+            with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
+                self.assertEqual(saved["curve_time"][-1], duration)
+                self.assertEqual(saved["elapsed"][-1], .012)
+                query = np.minimum(saved["control_elapsed"]+simulation.timestep, duration)
+                expected = curve.sample(query)
+                for key, values in zip(("reference_arm_q", "reference_arm_dq", "reference_arm_ddq"), expected[:3]):
+                    np.testing.assert_array_equal(saved[key], values)
+                np.testing.assert_array_equal(saved["arm_curve_ddq"], curve.sample(saved["curve_time"])[2])
+                terms = [saved[name] for name in ("arm_position_feedback_torque", "arm_velocity_feedback_torque",
+                    "arm_velocity_feedforward_torque", "arm_acceleration_feedforward_torque", "arm_bias_torque")]
+                np.testing.assert_allclose(saved["requested_arm_torque"], sum(terms), rtol=0., atol=1e-15)
+                np.testing.assert_array_equal(saved["actual_qacc"][0], initial["qacc"])
+                self.assertFalse(np.array_equal(saved["actual_qacc"][0, :7], saved["arm_curve_ddq"][0]))
+        self.assertEqual(report["status"], "curve_finished")
+        np.testing.assert_array_equal(simulation.native_data.qvel, initial["dq"])
+
+    def test_result_only_missing_or_false_terminal_pose_keeps_tail_without_claiming_completion(self):
+        for kind in ("missing_owner", "measured_miss"):
+            relation = ({"target_owner_id": "current_part", "T_owner_target": np.eye(4).tolist()}
+                        if kind == "missing_owner" else None)
+            simulation, curve, targets, source, limits = ActualPoseGoalTests.fixture(progress=1., actual_relation=relation)
+            curve.progress_u, curve.progress_s = np.asarray([0., .5, 1.]), np.asarray([0., 1., 1.])
+            from manipulation.execution_binding import curve_snapshot
+            source.execution_binding["curve"] = curve_snapshot(curve)
+            if kind == "measured_miss":
+                simulation.native_data.site_xpos[0, 0] = .002
+            result = self.bind(simulation, source, targets, limits, [["pose_events", 7]])
+            with self.subTest(kind=kind), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+                report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                    execution_limits=limits, initial_feedback=_initial_feedback(simulation), output=Path(temporary)/"trial")
+            self.assertEqual(report["status"], "curve_finished")
+            self.assertEqual(report["executed_steps"], 6)
+            self.assertEqual(report["pose_goal_result"], "U" if kind == "missing_owner" else "F")
+            self.assertIsNone(report["execution_pose_goal_result"])
+            self.assertEqual(report["completed_goal_ids"], [])
+            self.assertEqual(len(report["pose_goal_checks"]), 1)
+            self.assertEqual(report["pose_goal_checks"][0]["physical_elapsed_s"], .006)
+            self.assertFalse(report["pose_goal_checks"][0]["required_for_execution"])
+            self.assertFalse(report["continuation"]["requires_rebind"])
+            self.assertEqual(report["continuation"]["device_policy"], result.execution_binding["device_policy"])
+
+    def test_result_only_selection_cannot_remove_nonterminal_or_arrival_obligations(self):
+        for kind in ("nonterminal", "arrival", "unknown", "duplicate"):
+            simulation, curve, targets, result, limits = ActualPoseGoalTests.fixture(progress=.5 if kind == "nonterminal" else 1.)
+            selected = [["pose_events", 7]]
+            if kind == "arrival":
+                curve.events[2]["timing"] = [PhysicalEventTimingTests.window("arrival", 0., .012, goal_id=["pose_events", 7])]
+                from manipulation.execution_binding import curve_snapshot
+                result.execution_binding["curve"] = curve_snapshot(curve)
+            elif kind == "unknown":
+                selected = [["pose_events", 8]]
+            elif kind == "duplicate":
+                selected *= 2
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                self.bind(simulation, result, targets, limits, selected)
+            self.assertEqual(simulation.arm_goals, [])
+
+    def test_result_only_goal_does_not_release_an_independent_unknown_effect_dependency(self):
+        from manipulation.execution_binding import curve_snapshot
+
+        simulation, curve, targets, source, limits = ActualPoseGoalTests.fixture(progress=1.,
+            actual_relation={"target_owner_id": "current_part", "T_owner_target": np.eye(4).tolist()})
+        curve.progress_u, curve.progress_s = np.asarray([0., .5, 1.]), np.asarray([0., 1., 1.])
+        curve.events[2].update(kind="verification", requires_evidence="Holding", stop=True)
+        _bind_fingers(simulation, curve, targets)
+        source.execution_binding["curve"] = curve_snapshot(curve)
+        result = self.bind(simulation, source, targets, limits, [["pose_events", 7]])
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                execution_limits=limits, initial_feedback=_initial_feedback(simulation), output=Path(temporary)/"trial")
+        self.assertEqual(report["status"], "stopped_for_evidence")
+        self.assertEqual(report["executed_steps"], 4)
+        self.assertEqual(report["pose_goal_result"], "U")
+        self.assertTrue(report["dependency_hold"]["native_ctrl_written"])
+        self.assertNotIn("hold-later", [row["event_id"] for row in report["events"]])
+        self.assertEqual(report["completed_goal_ids"], [])
+# END result grading cannot change online control prerequisites or original mathematical goals.
 
 
 if __name__ == "__main__":

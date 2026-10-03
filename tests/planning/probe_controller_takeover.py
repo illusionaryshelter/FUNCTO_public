@@ -1,9 +1,10 @@
 """Compare measured-position hold and an unchanged curve at controller takeover.
 
-Both trials restore the same full integration state and prime the existing
-absolute position controller with measured q. No gain, velocity, native ctrl,
-physics parameter or curve coefficient is reset to remove a transient. This
-bounded diagnostic is not a task acceptance or a Holding observation.
+Both trials restore the same full integration state. The hold explicitly uses
+measured q and zero reference dq/ddq; the moving trial uses the unchanged
+curve's analytic q/dq/ddq. No actual velocity, restored native ctrl, physics
+parameter or curve coefficient is reset to remove a transient. This bounded
+diagnostic is not task acceptance or a Holding observation.
 """
 
 # BEGIN separate initialization effects from reference-curve motion.
@@ -28,16 +29,24 @@ def run(args):
         raise ValueError("Fixture and controller must belong to the same recorded episode")
     part = manifest["environment"]["controller_config"]["body_parts"][args.controller_part]
     limits = ExecutionLimits.from_mapping(json.loads(args.execution_limits.read_text()))
-    planning_result = load_saved_trajectory(args.trajectory, execution_limits=limits)
+    # BEGIN source validation is separate from the current control diagnostic.
+    from manipulation.execution_binding import check_result
+    planning_result = load_saved_trajectory(args.trajectory)
+    check_result(planning_result, execution_limits=limits)
+    # END this probe does not promote its control measurements to task proof.
     curve = planning_result.trajectory
     if curve.events or curve.conditions:
         raise ValueError("Takeover comparison requires an event-free control reference")
     if not np.isfinite(args.seconds) or not 0 < args.seconds <= .1:
         raise ValueError("Takeover diagnostic is limited to 100 milliseconds per trial")
+    # BEGIN endpoint clamping may cover one native tick, not extend the curve.
+    if args.seconds > curve.duration:
+        raise ValueError("Takeover duration cannot exceed the unchanged reference interval")
+    # END no repeated terminal velocity/acceleration is synthesized after it.
     args.output.mkdir(parents=True, exist_ok=False)
     report = {"scope": "controller takeover A/B; no task acceptance", "gpu_used": False,
               "gains_or_physics_changed": False, "trial": {}, "trajectory": str(args.trajectory.resolve()),
-              "initial_target": "measured q in both trials; priming does not write ctrl or step"}
+              "initial_target": "hold: measured q with zero reference dq/ddq; trajectory: one unchanged analytic curve sample"}
     for mode in ("hold", "trajectory"):
         backend, restored = restore_recorded_simulation(
             scene_path=fixture["source_scene_xml"], catalog_path=fixture["catalog_path"],
@@ -50,13 +59,12 @@ def run(args):
         if tuple(curve.joint_names) != backend.arm_joint_names:
             raise ValueError("Reference must preserve the named arm layout")
         q0 = np.asarray(initial["q"][:narm]).copy()
-        qref, dqref, _ = curve.sample(0.)
+        # BEGIN entrance validation retains the actual nonzero velocity.
+        qref, dqref, _, _ = curve.sample(0.)
         if max(np.max(np.abs(qref-q0)), np.max(np.abs(dqref-initial["dq"][:narm]))) > 2e-6:
             raise ValueError("Reference and restored measured entrance disagree")
-        # This existing private controller is inspected only by the diagnostic.
-        # set_goal updates the native controller, without changing actuators.
-        controller = backend._arm_controller
-        controller.set_goal(q0.copy())
+        report["controller_policy"] = backend.describe()["controller_policy"]
+        # END there is no diagnostic-only mutation of controller state.
         validator = build_robot_validator(fixture, reference_frame=initial["reference_frame"],
             T_reference_base=initial["base_pose"], tool_frame=initial["tool_link"],
             T_frame_tcp=initial["tool_transform"])
@@ -66,24 +74,29 @@ def run(args):
             raise ValueError("Takeover comparison exceeds 100 native steps")
         actual, controls, geometry = [initial], [], []
         for index in range(count):
-            q = q0 if mode == "hold" else curve.sample((index+1)*backend.timestep)[0]
-            result = backend.apply_control(q, fingers)
-            position = controller.kp * (controller.goal_qpos-controller.joint_pos)
-            damping = -controller.kd * controller.joint_vel
-            if controller.use_torque_compensation:
-                position = controller.mass_matrix @ position
-                damping = controller.mass_matrix @ damping
-                compensation = controller.torque_compensation.copy()
+            # BEGIN decompose the actual unified controller demand.
+            if mode == "hold":
+                q, dq, ddq = q0, np.zeros(narm), np.zeros(narm)
             else:
-                compensation = np.zeros(narm)
-            # Report a decomposition of the controller's actual demand, not
-            # a replacement control law or torque inferred from accelerations.
-            reconstructed = position+damping+compensation
+                q, dq, ddq, _ = curve.sample(min((index+1)*backend.timestep, curve.duration))
+            result = backend.apply_control(q, dq, ddq, fingers)
+            position = result["arm_position_feedback_torque"]
+            damping = result["arm_velocity_feedback_torque"]
+            velocity_feedforward = result["arm_velocity_feedforward_torque"]
+            acceleration_feedforward = result["arm_acceleration_feedforward_torque"]
+            compensation = result["arm_bias_torque"]
+            reconstructed = position+damping+velocity_feedforward+acceleration_feedforward+compensation
             if not np.allclose(reconstructed, result["requested_arm_torque"], atol=1e-12, rtol=1e-12):
                 raise RuntimeError("Native torque decomposition does not match actual controller demand")
-            controls.append({"goal": np.asarray(q).copy(), "position_torque": position.copy(),
+            controls.append({"goal": np.asarray(q).copy(), "reference_dq": np.asarray(dq).copy(),
+                             "reference_ddq": np.asarray(ddq).copy(), "position_torque": position.copy(),
                              "damping_torque": damping.copy(), "compensation_torque": compensation,
-                             "requested_torque": result["requested_arm_torque"].copy()})
+                             "velocity_feedforward_torque": velocity_feedforward.copy(),
+                             "acceleration_feedforward_torque": acceleration_feedforward.copy(),
+                             "requested_torque": result["requested_arm_torque"].copy(),
+                             "actuator_ctrl": result["actuator_ctrl"].copy(),
+                             "arm_torque_saturated": result["arm_torque_saturated"].copy()})
+            # END every component belongs to the same pre-step reference/state.
             backend.step()
             state = backend.proprioception()
             actual.append(state)

@@ -142,7 +142,7 @@ def run(output, debug_gradient, initial_joint_velocity=0.):
                      progress_u=t.progress_u, progress_s=t.progress_s)
             report["duration"] = t.duration
             # BEGIN independent boundary-velocity check on the actual curve.
-            _, actual_velocity, _ = t.sample(0.)
+            _, actual_velocity, _, _ = t.sample(0.)
             report["exported_initial_velocity"] = actual_velocity.tolist()
             report["initial_velocity_max_error"] = float(np.max(np.abs(actual_velocity-measured_velocity)))
             if report["initial_velocity_max_error"] > problem.numerical.velocity:

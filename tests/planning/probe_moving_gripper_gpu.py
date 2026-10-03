@@ -234,7 +234,9 @@ def run(output, *, native_knots=8, interpolation_buffer_size=512):
             """Measure actual exported candidates, including rejected ones."""
             curve, count = original_export(planner, native_result)
             times = np.linspace(0., curve.duration, 401)
-            coordinates, _, progress = curve.sample(times)
+            # BEGIN the joint sample exposes acceleration before progress.
+            coordinates, _, _, progress = curve.sample(times)
+            # END hand diagnostics use the unchanged shared progress clock.
             with torch.no_grad():
                 native_q = device.to_device(coordinates)[None].contiguous()
                 native_s = device.to_device(progress)[None]
@@ -258,7 +260,9 @@ def run(output, *, native_knots=8, interpolation_buffer_size=512):
         if result.trajectory is not None:
             trajectory = result.trajectory
             sample_times = np.linspace(0., trajectory.duration, 401)
-            q, dq, progress = trajectory.sample(sample_times)
+            # BEGIN evaluate all reference components at these exact times.
+            q, dq, ddq, progress = trajectory.sample(sample_times)
+            # END this probe does not finite-difference the saved curve.
             _, p, _ = fk(q)
             width = q[:, finger_columns].sum(-1)
             closing = np.diff(width) < -1e-6

@@ -193,12 +193,21 @@ class JointTrajectory:
         return self.duration if barrier is None else float(barrier["time"])
 
     def sample(self, times):
-        """Return q, dq and progress on the actual exported joint curve."""
+        # BEGIN one exact polynomial query owns all three control references.
+        """Return q, dq, ddq and progress at the same finite curve time.
+
+        SciPy evaluates an internal breakpoint on its right-hand piece; the
+        final endpoint uses the last piece's left limit.  Thus acceleration
+        is the analytic, one-sided second derivative of this saved C1 curve,
+        not an estimated derivative, a new smoothing pass, or actual qacc.
+        Independent acceleration validation still checks both knot sides.
+        """
         query = np.asarray(times, dtype=float)
         if not np.isfinite(query).all() or np.any(query < 0) or np.any(query > self.duration):
             raise ValueError("Trajectory queries must lie within its finite time interval")
-        return (self._curve(query), self._curve(query, 1),
+        return (self._curve(query), self._curve(query, 1), self._curve(query, 2),
                 np.interp(query / self.duration, self.progress_u, self.progress_s))
+        # END no q-only or derivative-free control sampling fallback.
 
 
 # BEGIN continuous acceleration bounds on the exact exported Hermite curve.
@@ -3658,7 +3667,9 @@ class _CuroboPlanner:
         queries = np.unique(np.concatenate((dense_times, anchor_pairs[:, 0]*times[-1])))
         if len(queries) > self.budget.max_validation_points:
             raise ValueError("Final curve validation exceeds its declared finite sample budget")
-        q, dq, progress = trajectory.sample(queries)
+        # BEGIN export validation shares the exact q/dq/ddq control sampler.
+        q, dq, _ddq, progress = trajectory.sample(queries)
+        # END acceleration bounds are validated independently on both knot sides.
         q_t = self.device_cfg.to_device(q[None])
         dq_t = self.device_cfg.to_device(dq[None])
         s_t = self.device_cfg.to_device(progress[None])

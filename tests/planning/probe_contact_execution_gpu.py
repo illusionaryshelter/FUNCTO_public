@@ -1,8 +1,9 @@
-"""Bounded formal planning through real contact and observed effect evidence.
+"""Bounded formal planning with independent native contact result grading.
 
 The explicit fixture has one arm axis and two distant free fingers. The native
 planner, accepted binding, independent Coal validator, executor and MuJoCo all
-consume the same model. No accepted PlanningResult or contact fact is fabricated.
+consume the same model. Contact truth stays in the offline report and never
+confirms a runtime effect or releases an evidence dependency.
 Run GPU mode serially; --cpu-check validates the native fixture without CUDA.
 """
 
@@ -68,8 +69,7 @@ def build_native(output):
         arm_position_error=[.003], arm_velocity_error=[.2], tcp_position_error_m=.003,
         tcp_rotation_error_rad=.001, stop_arm_velocity=[.01], stop_finger_velocity=[.01, .01],
         initial_fingers=interval, events=({"skill_id": "press_fixture", "event_id": "hold", **interval},),
-        observation_policy={"source": "explicit native tactile fixture observer", "period_s": .01,
-                            "maximum_age_s": .02, "required_fields": []})
+        observation_policy=None)
     covers = {"arm": [{"center": [0., 0., 0.], "radius": float(np.linalg.norm([PAD_WIDTH/2, PAD_WIDTH/2, .05]))}],
               "left": [{"center": [0., 0., 0.], "radius": float(np.sqrt(3)*.01)}],
               "right": [{"center": [0., 0., 0.], "radius": float(np.sqrt(3)*.01)}]}
@@ -86,7 +86,7 @@ def build_native(output):
 
 
 def build_problem(backend):
-    """Declare a terminal contact-band goal and separately observed contact effect."""
+    """Declare a terminal contact-band goal and independently graded contact effect."""
     from manipulation.planning_problem import MotionPhase, NumericalTolerance, PlanningEvent, PlanningProblem, PoseEventRequirement, PosePath
     initial = backend.proprioception()
     end = initial["tool_pose"].copy()
@@ -96,9 +96,9 @@ def build_problem(backend):
     return PlanningProblem(NAMES[:1], initial["q"][:1], initial["dq"][:1], "tcp", "world",
         initial["base_pose"], np.eye(4), (MotionPhase("press_reference", reference),),
         events=(PlanningEvent("hold", "press_fixture", 0., 0, "hold", "explicit free-finger hold"),
-                PlanningEvent("contact_effect", "press_fixture", 1., 1, "effect", "observe physical contact")),
+                PlanningEvent("contact_effect", "press_fixture", 1., 1, "effect", "independently evaluate physical contact")),
         conditions=({"condition_id": "press_contact", "skill_id": "press_fixture", "event_id": "contact_effect",
-                     "effect_requirement": "positive native tactile pad/slab contact in the terminal contact band"},),
+                     "effect_requirement": "positive native pad/slab contact evaluated independently in the terminal contact band"},),
         pose_events=(PoseEventRequirement(1., np.eye(4), end, .0015, .001,
                      "explicit fixture contact-band goal: TCP z in [-.0025,.0005] m"),),
         numerical=NumericalTolerance(position_m=1e-4, rotation_rad=1e-4),
@@ -163,6 +163,27 @@ def build_scene(device, robot, backend, targets, problem):
         contacts=(rule,), gripper=hand, native_geometry_materials={"pad": "press_face"})
 
 
+# BEGIN native contact truth is an output-only sample, never an observer value.
+def _record_contact_truth(model, data, record, *, pad_id, slab_id, goal, contact_log):
+    """Append an independent result diagnostic and deliberately return no evidence."""
+    from manipulation.execution import _actual_pose_goal
+
+    force_peak = 0.
+    for index in range(data.ncon):
+        contact = data.contact[index]
+        if ({int(contact.geom1), int(contact.geom2)} == {pad_id, slab_id}
+                and contact.exclude == 0 and contact.efc_address >= 0):
+            force = np.zeros(6)
+            mujoco.mj_contactForce(model, data, index, force)
+            force_peak = max(force_peak, abs(float(force[0])))
+    measured = _actual_pose_goal(goal, record["feedback"], None)
+    contact_log.append({"timestamp_s": float(data.time), "elapsed_s": record["elapsed"],
+        "curve_time_s": record["curve_time"], "normal_force_n": force_peak,
+        "goal_measurement": measured, "value": "T" if force_peak > .01 and measured["value"] == "T" else "F",
+        "scope": "Independent native truth only; no runtime observation or completion label is returned"})
+# END the step callback cannot supply an effect to the executor.
+
+
 def run(output, *, cpu_check=False):
     output.mkdir(parents=True, exist_ok=False)
     start = time.monotonic()
@@ -184,7 +205,8 @@ def run(output, *, cpu_check=False):
         import torch
         from curobo.types import DeviceCfg
         from manipulation.planning import PlanningBudget, plan_trajectory
-        from manipulation.execution import TrajectoryExecutor
+        from manipulation.execution import TrajectoryExecutor, pose_goal_schedule
+        from manipulation.execution_binding import rebind_execution_result
         if not torch.cuda.is_available():
             raise RuntimeError("This formal native probe requires explicitly authorized CUDA access")
         torch.set_num_threads(2)
@@ -202,37 +224,34 @@ def run(output, *, cpu_check=False):
             (output/"request-ledger.json").write_text(json.dumps(result.request_ledger, indent=2, allow_nan=False)+"\n")
         if not result.success:
             raise AssertionError("Formal planner did not accept this declared contact fixture")
+        result = rebind_execution_result(result, controller_policy=backend.describe()["controller_policy"],
+            result_only_goal_ids=[], finger_targets=targets, execution_limits=limits,
+            source="Explicit synthetic contact probe device contract; original pose goal remains online")
         contact_log = []
         pad_id, slab_id = backend.native_model.geom("pad").id, backend.native_model.geom("target_slab").id
-        def observe(feedback, curve_time):
-            force_peak = 0.
-            for i in range(backend.native_data.ncon):
-                contact = backend.native_data.contact[i]
-                if {int(contact.geom1),int(contact.geom2)} == {pad_id,slab_id}:
-                    force = np.zeros(6)
-                    mujoco.mj_contactForce(backend.native_model, backend.native_data, i, force)
-                    force_peak = max(force_peak, abs(float(force[0])))
-            in_goal = -.0025 <= float(feedback["tool_pose"][2,3]) <= .0005
-            truth = force_peak > .01 and in_goal
-            contact_log.append({"timestamp_s": feedback["timestamp_s"], "curve_time_s": curve_time,
-                                "normal_force_n": force_peak, "actual_tcp_z_m": float(feedback["tool_pose"][2,3]),
-                                "value": "T" if truth else "U"})
-            return {"source": "explicit native tactile observer for this fully specified fixture",
-                    "timestamp_s": feedback["timestamp_s"], "effects": {"press_contact": {
-                        "value": "T" if truth else "U", "source": "positive pad/slab normal force and actual contact band"}},
-                    "completed_goal_ids": [["pose_events",0]] if truth else []}
+        def collect_result(model, data, record):
+            _record_contact_truth(model, data, record, pad_id=pad_id, slab_id=slab_id,
+                                  goal=problem.pose_events[0], contact_log=contact_log)
         execution = TrajectoryExecutor(backend, geometry_checker=validator).execute(result,
             finger_targets=targets, initial_feedback=initial, execution_limits=limits, output=output/"execution",
-            observation_callback=observe, max_physics_steps=1000, max_hold_steps=100)
+            step_callback=collect_result, max_physics_steps=1000, max_hold_steps=100)
         report["execution"] = {key: execution[key] for key in
             ("status","effect_result","effects","executed_steps","geometry_preflight","evaluated_events","completed_goal_ids")}
         report["contacts"] = contact_log
+        _, due = pose_goal_schedule(result.trajectory, problem.pose_events[0].progress, DT)
+        checkpoint = next((row for row in contact_log if row["elapsed_s"] >= due), None)
+        report["independent_contact_result"] = {"value": "U" if checkpoint is None else checkpoint["value"],
+            "device_due_time_s": due, "measurement": checkpoint,
+            "runtime_effect_value": execution["effect_result"]}
         report["gpu_peak_allocated_mib"] = torch.cuda.max_memory_allocated()/1024**2
         report["gpu_peak_reserved_mib"] = torch.cuda.max_memory_reserved()/1024**2
-        if execution["status"] != "curve_finished" or execution["effect_result"] != "T" or not any(
-                row["value"] == "T" for row in contact_log):
-            raise AssertionError("Formal playback must finish with real independently observed contact effect")
-        report["status"] = "contact_effect_observed"
+        if (execution["status"] != "curve_finished" or execution["effect_result"] != "U"
+                or any(row.get("condition_id") == "press_contact" and row.get("value") == "T"
+                       for row in execution["effect_history"])):
+            raise AssertionError("Independent truth cannot become online effect evidence or release a dependency")
+        if checkpoint is None or checkpoint["value"] != "T":
+            raise AssertionError("The original contact checkpoint lacks a passing independent native result")
+        report["status"] = "independent_contact_result_observed"
         return report
     except Exception as error:
         report.update(status="failed", error=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())

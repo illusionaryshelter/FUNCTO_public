@@ -335,7 +335,9 @@ def test_independent_preflight_checks_both_contact_modes_at_the_same_state(check
         T_reference_base=np.eye(4), tool_frame="base", T_frame_tcp=np.eye(4),
         fk_translation_tolerance_m=1e-8, fk_rotation_tolerance_rad=1e-8, source="independent boundary fixture")
     curve = trajectory([.03, .03], [0., 0.])
-    gate.bind_scene(binding([rule(interval=(.5, 1.))]), progress_at_time=lambda t: float(curve.sample(t)[2]))
+    # BEGIN the joint sample now includes analytic acceleration before progress.
+    gate.bind_scene(binding([rule(interval=(.5, 1.))]), progress_at_time=lambda t: float(curve.sample(t)[3]))
+    # END independent contact modes still consume the original progress clock.
     result = gate._nominal_scene_preflight(curve, np.asarray([.5]))
     exact = next(row for row in result["states"] if row["mode"] == "bound_progress")
     preceding = next(row for row in result["states"] if row["mode"] == "before_switch")

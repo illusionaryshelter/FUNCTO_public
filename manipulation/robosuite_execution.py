@@ -1,8 +1,10 @@
 """Native MuJoCo control through installed robosuite joint/gripper controllers.
 
 Bind an already initialized MjSim without loading a recording or resetting its
-state. Absolute arm positions and independent native finger positions go to
-mature controllers once per native physics step, without a second interpolator.
+state. Absolute arm q/dq/ddq from one trajectory sample and independent native
+finger positions go to mature controllers once per native physics step. The
+arm adapter adds analytic trajectory feedforward using the controller's own
+native mass matrix; no second interpolator or full-scene inverse dynamics runs.
 Only actuator ctrl is written after binding; FK uses separate MjData.
 """
 
@@ -115,11 +117,14 @@ class RobosuiteExecutionBackend:
                     "qvel": self._qvel_ids[start:stop].tolist(),
                     "actuators": self._actuator_ids[start:stop].tolist()}
 
+        # BEGIN native mass/bias compensation is part of the trajectory law.
         bounds = model.actuator_ctrlrange[self._arm_actuators]
         self._arm_controller = JointPositionController(self._sim, indexes(0, narm),
             actuator_range=(bounds[:, 0], bounds[:, 1]), ref_name=tcp_site,
             input_type="absolute", kp=float(arm_kp), kd=float(arm_kd), damping_ratio=1,
-            policy_freq=1/self._dt, lite_physics=False, interpolator=None)
+            policy_freq=1/self._dt, lite_physics=False, interpolator=None,
+            use_torque_compensation=True)
+        # END derivative feedforward uses this same compensated controller.
         bounds = model.actuator_ctrlrange[self._finger_actuators]
         # BEGIN resume raw native command state without binary action memory.
         # Contact can keep actual q away from ctrl. Initialization therefore
@@ -140,7 +145,7 @@ class RobosuiteExecutionBackend:
         self._prepare_reference_fk()
         # END isolated robot FK for physical TCP tracking checks.
         self._description = {
-            "backend": "robosuite native MuJoCo joint-position and gripper controllers",
+            "backend": "robosuite native MuJoCo trajectory-state and gripper controllers",
             "source": source, "trial_id": self._trial_id,
             "joint_names": list(self.joint_names), "arm_joint_names": list(self.arm_joint_names),
             "finger_joint_names": list(self.finger_joint_names),
@@ -150,11 +155,22 @@ class RobosuiteExecutionBackend:
             "actuator_ctrlrange": model.actuator_ctrlrange[self._actuator_ids].tolist(),
             "actuator_forcelimited": model.actuator_forcelimited[self._actuator_ids].astype(bool).tolist(),
             "actuator_forcerange": model.actuator_forcerange[self._actuator_ids].tolist(),
-            "arm_controller": "robosuite JointPositionController, absolute q, native torque actuators",
+            # BEGIN bind the complete trajectory-control contract by joint name.
+            "arm_controller": "robosuite JointPositionController plus same-curve dq/ddq feedforward, native torque actuators",
             "arm_kp": float(arm_kp), "arm_kd": float(arm_kd),
             "effective_arm_kp": self._arm_controller.kp.tolist(),
             "effective_arm_kd": self._arm_controller.kd.tolist(),
-            "arm_interpolator": None, "desired_velocity_feedforward": False,
+            "arm_interpolator": None, "desired_velocity_feedforward": True,
+            "desired_acceleration_feedforward": True,
+            "controller_policy": {
+                "mode": "joint_trajectory_q_dq_ddq",
+                "arm_joint_names": list(self.arm_joint_names),
+                "kp": self._arm_controller.kp.tolist(), "kd": self._arm_controller.kd.tolist(),
+                "native_timestep_s": self.timestep,
+                "reference_derivatives": ["q", "dq", "ddq"],
+                "sampling_phase": "clamped_step_endpoint",
+                "acceleration_knot_side": "right_internal_last_left"},
+            # END this policy cannot be inferred from a q-only authorization.
             "gripper_controller": "robosuite SimpleGripController, use_action_scaling=False",
             "gripper_command_frequency_hz": 1/self.timestep,
             "initial_finger_position_ctrl": restored_ctrl.tolist(),
@@ -223,21 +239,49 @@ class RobosuiteExecutionBackend:
     def describe(self):
         return deepcopy(self._description)
 
-    def apply_control(self, arm_q, finger_positions):
-        """Write one absolute arm goal and independent native finger targets.
+    # BEGIN mandatory trajectory derivatives through the native arm controller.
+    def apply_control(self, arm_q, arm_dq, arm_ddq, finger_positions):
+        """Apply one named q/dq/ddq reference and native finger positions.
 
-        This method does not integrate physics. The caller records the exact
-        returned controls before calling step(), so rejected measurements can
-        never be mistaken for an unapplied physical command.
+        Every arm vector follows ``arm_joint_names`` from this binding. The
+        executor samples all three at its declared clamped step endpoint;
+        none is substituted by measured velocity or finite differences here.
+        Installed robosuite supplies the position/damping torque, mass matrix
+        and bias at the same current state. Adding M*(Kd*dq_ref + ddq_ref)
+        yields M*(ddq_ref + Kp*(q_ref-q) + Kd*(dq_ref-dq)) + bias, without
+        changing gains or canceling unknown contact/passive forces.
+
+        This method writes only actuator ctrl and does not integrate physics.
+        Its raw torque components and references belong to the same call;
+        saturation is applied only to their total, never to each component.
         """
-        arm_q = _finite_array(arm_q, (len(self.arm_joint_names),), "Absolute arm position goal")
+        narm = len(self.arm_joint_names)
+        arm_q = _finite_array(arm_q, (narm,), "Named arm reference positions")
+        arm_dq = _finite_array(arm_dq, (narm,), "Named arm reference velocities")
+        arm_ddq = _finite_array(arm_ddq, (narm,), "Named arm reference accelerations")
         finger_positions = _finite_array(finger_positions, (len(self.finger_joint_names),), "Native finger position goals")
         bounds = self.finger_ctrlrange
         if np.any(finger_positions < bounds[:, 0]) or np.any(finger_positions > bounds[:, 1]):
             raise ValueError("Finger position goals must remain inside native control bounds")
         self._grip_controller.set_goal(finger_positions.copy())
         self._arm_controller.set_goal(arm_q.copy())
-        torque = _finite_array(self._arm_controller.run_controller(), (len(self.arm_joint_names),), "Native arm torque")
+        controller = self._arm_controller
+        position_controller_torque = _finite_array(controller.run_controller(), (narm,), "Native position-controller torque")
+        # run_controller has refreshed this complete state and only marks it
+        # for the next update; reading its arrays performs no extra simulation
+        # or forward/inverse dynamics call. Their order is our arm joint order.
+        mass = _finite_array(controller.mass_matrix, (narm, narm), "Native arm mass matrix")
+        kp = _finite_array(controller.kp, (narm,), "Native named arm proportional gains")
+        kd = _finite_array(controller.kd, (narm,), "Native named arm damping gains")
+        actual_q = _finite_array(controller.joint_pos, (narm,), "Controller current arm positions")
+        actual_dq = _finite_array(controller.joint_vel, (narm,), "Controller current arm velocities")
+        bias = _finite_array(controller.torque_compensation, (narm,), "Native arm bias torque")
+        position_feedback = _finite_array(mass @ (kp * (arm_q-actual_q)), (narm,), "Arm position-feedback torque")
+        velocity_feedback = _finite_array(mass @ (-kd * actual_dq), (narm,), "Arm velocity-feedback torque")
+        velocity_feedforward = _finite_array(mass @ (kd * arm_dq), (narm,), "Arm velocity-feedforward torque")
+        acceleration_feedforward = _finite_array(mass @ arm_ddq, (narm,), "Arm acceleration-feedforward torque")
+        torque = _finite_array(position_controller_torque + velocity_feedforward + acceleration_feedforward,
+                               (narm,), "Native trajectory-controller torque")
         bounds = self.native_model.actuator_ctrlrange[self._arm_actuators]
         bounded = np.clip(torque, bounds[:, 0], bounds[:, 1])
         finger_ctrl = np.asarray(self._grip_controller.run_controller(), dtype=float)
@@ -248,8 +292,16 @@ class RobosuiteExecutionBackend:
         # BEGIN arm control clipping is separate from native finger force limits.
         return {"actuator_ctrl": self.actuator_control,
                 "requested_arm_torque": torque.copy(), "arm_torque_saturated": bounded != torque,
-                "arm_control_saturated_coordinates": int(np.count_nonzero(bounded != torque))}
+                "arm_control_saturated_coordinates": int(np.count_nonzero(bounded != torque)),
+                "reference_arm_q": arm_q.copy(), "reference_arm_dq": arm_dq.copy(),
+                "reference_arm_ddq": arm_ddq.copy(),
+                "arm_position_feedback_torque": position_feedback.copy(),
+                "arm_velocity_feedback_torque": velocity_feedback.copy(),
+                "arm_velocity_feedforward_torque": velocity_feedforward.copy(),
+                "arm_acceleration_feedforward_torque": acceleration_feedforward.copy(),
+                "arm_bias_torque": bias.copy()}
         # END count only the arm controller's clipped torque coordinates.
+    # END no derivative-free fallback or mutation of physical q/dq/qacc.
 
     def step(self):
         """Integrate exactly one native step and refresh derived feedback."""
@@ -327,12 +379,29 @@ class RobosuiteExecutionBackend:
             if np.any(q < ranges[:, 0]) or np.any(q > ranges[:, 1]):
                 raise ValueError("Out-of-range actual coordinates cannot become a new hold goal")
             goal = q[:len(self.arm_joint_names)].copy()
+            # BEGIN holds explicitly record their own complete reference.
             result.update(prepared=True, arm_position_goal=goal.tolist(),
+                arm_velocity_goal=np.zeros_like(goal).tolist(),
+                arm_acceleration_goal=np.zeros_like(goal).tolist(),
+                arm_joint_names=list(self.arm_joint_names),
+                finger_joint_names=list(self.finger_joint_names),
+                actuator_names=list(self.actuator_names),
                 finger_position_goal=np.asarray(finger_positions).tolist(), stop_velocity=limits.tolist())
+            # END reference derivatives do not overwrite actual measured dq.
             for index in range(max_steps):
-                control = self.apply_control(goal, finger_positions)
+                # BEGIN physical hold has explicit zero desired derivatives.
+                # Actual nonzero velocity remains in the measured damping
+                # term; zeroing the reference does not reset native state.
+                control = self.apply_control(goal, np.zeros_like(goal), np.zeros_like(goal), finger_positions)
+                # END hold uses the same strict trajectory-state interface.
                 result["native_ctrl_written"] = True
-                result["controls"].append(control["actuator_ctrl"].tolist())
+                # BEGIN retain hold torque demands, components and saturation.
+                # A bounded safety hold is a real control sequence too; its
+                # telemetry must not collapse back to the old q-only record.
+                result["controls"].append({"control_sim_time": self.sim_time,
+                    **{key: value.tolist() if isinstance(value, np.ndarray) else value
+                       for key, value in control.items()}})
+                # END each row precedes exactly its following native hold step.
                 self.step()
                 actual = self.proprioception()
                 result["physical_steps"] = index+1

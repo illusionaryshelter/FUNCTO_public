@@ -82,7 +82,9 @@ def run(output, knots):
                 query = np.interp([0., .5, 1.], curve.progress_s, curve.progress_u)*curve.duration
                 query[0] = 0.
                 # END half the duration is not assumed to be half the progress.
-                q, dq, progress = curve.sample(query)
+                # BEGIN preserve the goal clock in the q/dq/ddq sample layout.
+                q, dq, _, progress = curve.sample(query)
+                # END only the requested functional times define these goals.
                 sample = torch.as_tensor(q[None], dtype=torch.float32, device="cuda:0").contiguous()
                 state = fk.compute_kinematics(JointState.from_position(sample, joint_names=fk.joint_names))
                 position = state.tool_poses.position[:, :, 0].detach().clone()

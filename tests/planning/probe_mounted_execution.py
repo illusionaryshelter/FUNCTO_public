@@ -136,7 +136,9 @@ def run(args):
         # BEGIN either preserve an accepted exported baseline or construct a
         # separately labelled diagnostic; there is no resampling or relabelling.
         if args.trajectory:
-            planning_result = load_saved_trajectory(args.trajectory, execution_limits=limits)
+            # BEGIN check the archive's own contract before an explicit rebind.
+            planning_result = load_saved_trajectory(args.trajectory)
+            # END new physical limits are checked at device binding below.
             curve = planning_result.trajectory
             if curve.events or curve.conditions:
                 raise ValueError("Use run_recorded_simulation for skills with events or evidence conditions")
@@ -249,7 +251,9 @@ def run(args):
 
         def capture(elapsed):
             feedback = backend.proprioception()
-            q, dq, _ = curve.sample(min(elapsed, duration))
+            # BEGIN retain the complete same-time reference for diagnostics.
+            q, dq, ddq, _ = curve.sample(min(elapsed, duration))
+            # END measured acceleration remains a separate native channel.
             reference_fingers = (finger_reference.sample(min(elapsed, duration)) if finger_reference is not None
                                  else (np.full(len(backend.finger_joint_names), np.nan),
                                        np.full(len(backend.finger_joint_names), np.nan)))
@@ -257,7 +261,11 @@ def run(args):
             # Preserve the completed physical sample before any evaluator can
             # reject nonfinite feedback; terminal evidence must not disappear.
             samples.append({"time": elapsed, "q": feedback["q"], "dq": feedback["dq"],
-                            "reference_q": q, "reference_dq": dq, "tcp": feedback["tool_pose"],
+                            "reference_q": q, "reference_dq": dq, "reference_ddq": ddq,
+                            # BEGIN native acceleration is not a reference derivative.
+                            "qacc": feedback["qacc"],
+                            # END retain both acceleration channels independently.
+                            "tcp": feedback["tool_pose"],
                             "reference_finger_q": reference_fingers[0], "reference_finger_dq": reference_fingers[1],
                             "reference_tcp": tcp, "ctrl": backend.actuator_control.copy(),
                             "actuator_force": data.actuator_force[actuator_ids].copy(),
@@ -292,6 +300,14 @@ def run(args):
             executor = TrajectoryExecutor(backend, geometry_checker=validator)
             if not args.trajectory:
                 raise ValueError("Production execution requires a saved formal result; use the explicit diagnostic measurement path for control probes")
+            # BEGIN authorize this device contract separately from source proof.
+            from manipulation.execution_binding import rebind_execution_result
+            planning_result = rebind_execution_result(planning_result,
+                controller_policy=backend.describe()["controller_policy"],
+                result_only_goal_ids=[], finger_targets=target_contract,
+                execution_limits=limits,
+                source="Explicit mounted-robot trajectory-controller probe binding")
+            # END the executor still performs the complete independent preflight.
             execution = executor.execute(planning_result,
                 finger_targets=target_contract,
                 initial_feedback=initial, execution_limits=limits, output=output / "execution",
@@ -307,15 +323,17 @@ def run(args):
             # claims that the production executor enforced a supplied contract.
             for index in range(count):
                 elapsed = (index + 1) * backend.timestep
-                q, _, _ = curve.sample(min(elapsed, duration))
+                # BEGIN every device call receives one same-time q/dq/ddq tuple.
+                q, dq, ddq, _ = curve.sample(min(elapsed, duration))
                 # BEGIN diagnostic measurement uses the same synchronous command.
                 finger_command = (finger_reference.sample(min(elapsed, duration))[0]
                                   if finger_reference is not None else fingers)
-                control = backend.apply_control(q, finger_command)
+                control = backend.apply_control(q, dq, ddq, finger_command)
+                # END diagnostic input never substitutes zero moving derivatives.
                 # END actual finger q/dq still come only from native feedback.
-                controls.append({"time": index * backend.timestep,
-                                 "requested_arm_torque": control["requested_arm_torque"],
-                                 "arm_torque_saturated": control["arm_torque_saturated"]})
+                # BEGIN retain all reference, torque-component and clipping data.
+                controls.append({"time": index * backend.timestep, **control})
+                # END each demand remains paired with its exact control tick.
                 # BEGIN aggregate only arm command clipping, with no legacy alias.
                 report["arm_control_saturated_coordinates"] += control["arm_control_saturated_coordinates"]
                 # END finger force-limit observations are summarized from samples.
@@ -350,8 +368,11 @@ def run(args):
             else:
                 report["control_evidence"] = str(output / "measurement.npz")
             arrays = {key: np.asarray([row[key] for row in samples]) for key in samples[0]}
-            arrays.update({"control_" + key: np.asarray([row[key] for row in controls])
-                           for key in ("time", "requested_arm_torque", "arm_torque_saturated")})
+            # BEGIN supervised mode owns a separate production control archive.
+            if controls:
+                arrays.update({"control_" + key: np.asarray([row[key] for row in controls])
+                               for key in controls[0]})
+            # END measurement mode preserves every component returned by its backend.
             arrays.update(contacts=np.asarray(contact_rows, dtype=float).reshape(-1, 26),
                           contact_offsets=np.asarray(contact_offsets, dtype=int))
             np.savez_compressed(output / "measurement.npz", **arrays)

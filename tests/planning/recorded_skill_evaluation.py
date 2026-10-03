@@ -1,11 +1,11 @@
 """Independent native-physics evidence for an explicitly identified skill.
 
 This module is evaluator-only: native object identity, live object poses and
-contacts never enter a planning problem or an observation builder. Grasp
-stability uses the collector's existing segmentation predicates and defaults.
-Grasp grading certifies its measured interval only. Manipulation traces retain
-native carrier/reference poses, scalar joints and contacts, while unsupported
-task goals remain explicitly unverified.
+contacts never enter a planning problem or an observation builder. Original
+functional pose sets use their bound material frames, thresholds and clocks;
+grasp stability uses the collector's existing segmentation predicates. A grade
+requires the entire current curve and all relevant supported obligations.
+Unmapped frames, unsupported predicates and unobserved intervals remain unknown.
 """
 
 # BEGIN independent native skill evidence with original collector predicates.
@@ -24,6 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from collect.preprocess.segmentation import (
     DEFAULT_SETTINGS, _bridge_gaps, _first_stable_grasp, _resolve_actor, _runs,
 )
+from manipulation.execution import _actual_pose_goal, pose_goal_schedule
+from manipulation.motion import _inverse, _pose_array
+from manipulation.planning_problem import (
+    EventTimeConstraint, PoseEventRequirement, PosePath, TimeBindingError,
+    _model_from_diagnostics, resolve_event_window,
+)
 
 
 def _body_pose(data, index):
@@ -36,6 +42,170 @@ def _site_pose(data, index):
     pose = np.eye(4)
     pose[:3, :3], pose[:3, 3] = data.site_xmat[index].reshape(3, 3), data.site_xpos[index]
     return pose
+
+
+# BEGIN truth stays inside the independent evaluator's original-goal measurements.
+class _FunctionalGoalEvaluator:
+    """Bind observed owner frames to native bodies without changing the candidate.
+
+    The initial rigid offset is evaluator-only calibration. Subsequent native
+    motion moves that same frame; a native body origin is never silently used
+    as the original observed material frame. No returned row is runtime input.
+    """
+
+    def __init__(self, model, catalog, planning_result, owner_bindings):
+        self._model = model
+        self._trajectory = planning_result.trajectory
+        self._binding = planning_result.execution_binding
+        if (planning_result.success is not True or self._trajectory is None
+                or not isinstance(self._binding, dict)):
+            raise ValueError("Independent goal grading requires the same formal execution result")
+        problem = self._binding["problem"]
+        if problem["reference_frame"] != "world":
+            raise ValueError("Native truth grading requires an explicit world-frame candidate binding")
+        self._requirements = {}
+        self._unsupported_goals = []
+        for collection in ("pose_events", "coordinate_events", "supports"):
+            rows = problem.get(collection, [])
+            identities = self._binding.get("goal_identities", {}).get(collection, [])
+            if (len(rows) != len(identities) or len(set(identities)) != len(identities)
+                    or any(type(index) is not int or index < 0 for index in identities)):
+                raise ValueError("Independent grading needs every original collection/index identity")
+            for row, index in zip(rows, identities):
+                identity = (collection, index)
+                if collection == "pose_events":
+                    self._requirements[identity] = PoseEventRequirement(**deepcopy(row))
+                else:
+                    self._unsupported_goals.append({"identity": list(identity), "value": "U",
+                        "requirement": deepcopy(row),
+                        "reason": "No native coordinate/support predicate with its original frame/coordinate binding is supplied"})
+        owners = self._binding["scene"].get("owners", [])
+        self._owners = {}
+        if not isinstance(owner_bindings, list):
+            raise ValueError("evaluation_owner_bindings must be an explicit list")
+        entry_progress = float(problem.get("start_progress", 0.))
+        for row in owner_bindings:
+            if (not isinstance(row, dict) or set(row) != {"owner_id", "native_body_name"}
+                    or any(not isinstance(value, str) or not value.strip() for value in row.values())):
+                raise ValueError("Each evaluator owner binding needs exactly owner_id and native_body_name")
+            identity, name = row["owner_id"], row["native_body_name"]
+            if identity in self._owners:
+                raise ValueError("Evaluator owner bindings must be unique")
+            selected = [owner for owner in owners if owner["owner_id"] == identity]
+            bodies = [body for body in catalog["bodies"] if body["name"] == name]
+            if (len(selected) != 1 or len(bodies) != 1
+                    or model.body(name).id != bodies[0]["id"]):
+                raise ValueError("Evaluator owner/native body identities must match one declared scene/catalog body")
+            owner = selected[0]
+            lower, upper = owner["pose_interval"]
+            if not lower <= entry_progress <= upper or upper <= lower:
+                raise ValueError("An evaluator owner binding requires its current entry pose interval")
+            path = deepcopy(owner["pose_path"])
+            if path["motion_model"] is not None:
+                path["motion_model"] = _model_from_diagnostics(path["motion_model"])
+            entry_pose = PosePath(**path).sample_numpy((entry_progress-lower)/(upper-lower))
+            self._owners[identity] = {"owner_id": identity, "native_body_name": name,
+                "native_body_id": int(bodies[0]["id"]),
+                "T_world_owner_entry": _pose_array(entry_pose, "Bound evaluator owner entry pose"),
+                "T_body_owner": None}
+        self._owner_pose_samples = []
+
+    def observe(self, data):
+        """Read and validate native transforms; do not publish observations."""
+        poses = {}
+        for identity, binding in self._owners.items():
+            body = _pose_array(_body_pose(data, binding["native_body_id"]), "Native evaluator body pose")
+            if binding["T_body_owner"] is None:
+                binding["T_body_owner"] = _pose_array(
+                    _inverse(body) @ binding["T_world_owner_entry"], "Evaluator material-frame calibration")
+            poses[identity] = _pose_array(body @ binding["T_body_owner"], "Actual evaluator owner frame")
+        self._owner_pose_samples.append(poses)
+
+    def describe_bindings(self):
+        return [{key: value.tolist() if isinstance(value, np.ndarray) else value
+                 for key, value in row.items()} for row in self._owners.values()]
+
+    def _measure(self, identity, index, times, tools):
+        feedback = {"tool_pose": tools[index], "source": "Independent evaluator native TCP pose",
+            "timestamp_s": float(times[index]),
+            "feedback_id": f"{self._binding['candidate_id']}@native_evaluator_time={times[index]:.17g}"}
+        # This local dictionary is only an argument to the shared pure metric
+        # calculation. It is never supplied to an executor or an observer hook.
+        observation = {"scene_owner_poses": self._owner_pose_samples[index],
+            "timestamp_s": float(times[index]), "source": "Independent evaluator calibrated native owner poses"}
+        measured = _actual_pose_goal(self._requirements[identity], feedback, observation)
+        measured["source"] = "Independent evaluator applies the original functional allowed set to native truth"
+        return measured
+
+    def evaluate(self, times, elapsed, tools, execution_report, *, full_curve_completed):
+        """Grade original goal times using trajectory samples, excluding holds."""
+        evidence = deepcopy(self._unsupported_goals)
+        origin = float(self._binding.get("request_time_origin_s", 0.))
+        request_times = origin + times-times[0]
+        history = [] if execution_report is None else execution_report.get("history", [])
+        timing_events = self._binding.get("timing_events", [])
+        result_only = self._binding.get("device_policy", {}).get("result_only_goal_ids", [])
+        for identity, requirement in self._requirements.items():
+            scheduled, due = pose_goal_schedule(self._trajectory, requirement.progress, self._model.opt.timestep)
+            row = {"identity": list(identity), "value": "U", "query_count": 0,
+                "execution_scope": "result" if list(identity) in result_only else "execution",
+                "progress": requirement.progress,
+                "scheduled_curve_time_s": float(scheduled) if np.isfinite(scheduled) else None,
+                "device_due_time_s": float(due) if np.isfinite(due) else None,
+                "position_tolerance_m": requirement.position_tolerance_m,
+                "rotation_tolerance_rad": requirement.rotation_tolerance_rad,
+                "requirement_source": deepcopy(requirement.source),
+                "scope": "Independent result evidence only; does not update runtime completion or release a dependency"}
+            arrivals = [item for event in timing_events for item in event.get("timing", ())
+                        if item["check_target"] == "arrival" and tuple(item["goal_id"]) == identity]
+            if arrivals:
+                try:
+                    windows = [resolve_event_window(EventTimeConstraint(**item), history) for item in arrivals]
+                except TimeBindingError as error:
+                    row["reason"] = f"Original arrival window is unresolved: {error}"
+                    evidence.append(row)
+                    continue
+                lower = max((value[0] for value in windows if value[0] is not None), default=None)
+                upper = min((value[1] for value in windows if value[1] is not None), default=None)
+                row["arrival_window_s"] = [lower, upper]
+                mask = np.ones(len(times), dtype=bool)
+                if lower is not None:
+                    mask &= request_times >= lower-1e-9
+                if upper is not None:
+                    mask &= request_times <= upper+1e-9
+                indexes = np.flatnonzero(mask)
+                closed = full_curve_completed or (upper is not None and request_times[-1] >= upper-1e-9)
+            else:
+                # Shared strict activation chooses the first native sample,
+                # including the first arrival on a progress plateau. Later
+                # playback or hold motion cannot repair a missed point goal.
+                indexes = np.flatnonzero(elapsed >= due)[:1]
+                closed = bool(indexes.size)
+            if not indexes.size:
+                row["reason"] = "No trajectory sample covers the original goal time or arrival window"
+                evidence.append(row)
+                continue
+            unknown = False
+            for index in indexes:
+                measured = self._measure(identity, int(index), times, tools)
+                row["query_count"] += 1
+                unknown |= measured["value"] == "U"
+                if measured["value"] == "T":
+                    break
+            row.update(sample_index=int(index), sample_sim_time_s=float(times[index]),
+                       sample_elapsed_s=float(elapsed[index]), measurement=measured)
+            row["value"] = ("T" if measured["value"] == "T" else "U" if not closed or unknown else "F")
+            if not closed and measured["value"] != "T":
+                row["reason"] = "Execution ended before the original arrival opportunity closed"
+            evidence.append(row)
+        return evidence
+
+    def arrays(self):
+        identities = list(self._owners)
+        poses = np.asarray([[row[key] for key in identities] for row in self._owner_pose_samples])
+        return {"evaluation_owner_ids": np.asarray(identities, dtype=str),
+                "evaluation_owner_poses_world": poses.reshape(len(self._owner_pose_samples), len(identities), 4, 4)}
+# END truth measurements have no route back into the runtime request ledger.
 
 
 def _analyze_history(times, touches, tool_poses, target_poses, fingers,
@@ -117,7 +287,7 @@ class NativeSkillPhysicsEvaluator:
 
     def __init__(self, model, *, catalog, actor, target_body_name,
                  finger_joint_names, tcp_site, binding_source, program,
-                 reference_body_name,
+                 reference_body_name, planning_result, evaluation_owner_bindings,
                  maximum_contact_rows=1_000_000):
         self._model = model
         self._skill_kind = program["skill_kind"]
@@ -184,6 +354,10 @@ class NativeSkillPhysicsEvaluator:
             "native_target_scalar_joints": [{key: joint[key] for key in
                 ("name", "type", "range", "qpos_start", "qvel_start")} for joint in self._target_joints],
             "scope": "evaluator-only native identities; never supplied to planning"}
+        # BEGIN original requirements and native frame identities stay evaluator-local.
+        self._planning_result = planning_result
+        self._goals = _FunctionalGoalEvaluator(model, catalog, planning_result, evaluation_owner_bindings)
+        # END formal curve/scene data is read without adding a runtime observation.
         self._samples, self._contacts, self._offsets = [], [], [0]
 
     def observe(self, model, data, record):
@@ -217,6 +391,7 @@ class NativeSkillPhysicsEvaluator:
         if not np.isfinite(tool).all() or not np.isfinite(target).all() or not np.isfinite(fingers).all():
             raise ValueError("Actual grasp evidence became non-finite")
         reference = None if self._reference is None else _body_pose(data, self._reference)
+        self._goals.observe(data)
         self._samples.append((now, float(record["elapsed"]), tool, target, fingers, touch,
                               reference, data.qpos[self._target_qpos].copy(), data.qvel[self._target_qvel].copy()))
         self._contacts.append(contacts)
@@ -250,21 +425,109 @@ class NativeSkillPhysicsEvaluator:
         release_confirmed = bool(final_absence is not None
             and np.any(any_touch[:final_absence[0]])
             and absence_duration >= self.settings["release_absence_s"]-1e-9)
-        passed = bool(analysis["stable_grasp_at_stop"]) if completed and self._skill_kind == "grasp" else None
-        outcome = ("not_evaluated" if not completed else "unverified" if self._skill_kind != "grasp"
-                   else "passed" if passed else "failed")
+        # BEGIN a component grasp predicate cannot replace the full original contract.
+        trajectory = self._planning_result.trajectory
+        full_curve_completed = bool(completed and execution_report["status"] == "curve_finished"
+            and elapsed[-1] >= pose_goal_schedule(trajectory, float(trajectory.progress_s[-1]),
+                                                self._model.opt.timestep)[1]
+            and elapsed[-1] >= trajectory.duration)
+        goal_evidence = self._goals.evaluate(times, elapsed, tools, execution_report,
+                                             full_curve_completed=full_curve_completed)
+        effect_evidence = []
+        binding = self._planning_result.execution_binding
+        for condition in binding["problem"].get("conditions", []):
+            predicate = condition.get("effect_requirement")
+            if not predicate:
+                continue
+            row = {"condition_id": condition["condition_id"], "skill_id": condition.get("skill_id"),
+                "event_id": condition.get("event_id"), "predicate": predicate, "value": "U"}
+            owner = self._goals._owners.get(condition.get("carrier_id"))
+            if owner is None or owner["native_body_id"] != self._target:
+                row["reason"] = "The original effect owner has no explicit mapping to this evaluated native body"
+                effect_evidence.append(row)
+                continue
+            _, due = pose_goal_schedule(trajectory, float(condition["progress"]), self._model.opt.timestep)
+            row["device_due_time_s"] = float(due) if np.isfinite(due) else None
+            indexes = np.flatnonzero(elapsed >= due)[:1]
+            if not indexes.size:
+                row["reason"] = "Execution did not cover this original effect time"
+                effect_evidence.append(row)
+                continue
+            index = int(indexes[0])
+            row.update(sample_index=index, sample_sim_time_s=float(times[index]),
+                       sample_elapsed_s=float(elapsed[index]))
+            timed = [item for event in binding.get("timing_events", []) for item in event.get("timing", ())
+                if item["check_target"] == "effect" and item["condition_id"] == condition["condition_id"]]
+            if timed:
+                row["reason"] = "Timed native effect acquisition is not established by a terminal contact snapshot"
+            elif predicate == "stable_grasp_from_current_synchronized_evidence":
+                if times[index]-times[0] < self.settings["stable_grasp_s"]-1e-9:
+                    row["reason"] = "No complete original stable-grasp interval was observed before this effect time"
+                else:
+                    prefix, _, _, _ = _analyze_history(times[:index+1], touches[:index+1],
+                        tools[:index+1], targets[:index+1], fingers[:index+1], self._finger_limits, self.settings)
+                    row.update(value="T" if prefix["stable_grasp_at_stop"] else "F",
+                        measurement=prefix, settings=deepcopy(self.settings),
+                        source="Independent native contact and target-relative stability evaluation")
+            elif predicate == "actual_release_from_current_feedback":
+                prior_touch = np.any(touches[:index+1], axis=1)
+                absent = next(((a, b) for a, b in _runs(~prior_touch) if b == index+1), None)
+                if not np.any(prior_touch):
+                    row["reason"] = "No preceding native target contact was observed for this release occurrence"
+                elif times[index]-times[0] < self.settings["release_absence_s"]-1e-9:
+                    row["reason"] = "The original release observation interval is not covered"
+                else:
+                    duration = 0. if absent is None else float(times[index]-times[absent[0]])
+                    row.update(value="T" if duration >= self.settings["release_absence_s"]-1e-9 else "F",
+                        contact_absence_s=duration, required_absence_s=self.settings["release_absence_s"],
+                        source="Independent native contact-absence evaluation")
+            else:
+                row["reason"] = "No evaluator predicate is supplied for this original effect requirement"
+            effect_evidence.append(row)
+        process_evidence = []
+        for collection in ("mechanisms", "pose_relations", "interiors", "couplings"):
+            for index, requirement in enumerate(binding["problem"].get(collection, [])):
+                process_evidence.append({"identity": [collection, index], "value": "U",
+                    "source": deepcopy(requirement.get("source")),
+                    "reason": "No complete native process predicate with the original frame/coordinate semantics is supplied"})
+        # The existing grasp contract also requires stability at its final
+        # stop. An earlier original effect witness is not a license to lose
+        # the grasp before completion, and a late grasp cannot repair it.
+        terminal_evidence = []
+        if self._skill_kind == "grasp":
+            terminal_evidence.append({"predicate": "stable_grasp_at_final_stop",
+                "value": ("U" if not full_curve_completed
+                    or times[-1]-times[0] < self.settings["stable_grasp_s"]-1e-9
+                    else "T" if analysis["stable_grasp_at_stop"] else "F"),
+                "sample_sim_time_s": float(times[-1]), "sample_elapsed_s": float(elapsed[-1]),
+                "source": "Original independent grasp evaluator final stable-window requirement",
+                "scope": "Separate from the original functional/effect checkpoint; both must hold"})
+        values = [row["value"] for row in goal_evidence + effect_evidence + process_evidence + terminal_evidence]
+        if not full_curve_completed:
+            passed, outcome = None, "not_evaluated"
+        elif "F" in values:
+            passed, outcome = False, "failed"
+        elif not values or "U" in values:
+            passed, outcome = None, "unverified"
+        else:
+            passed, outcome = True, "passed"
+        # END unknown or out-of-scope predicates never become an overall success/failure.
         target_q = np.asarray([row[7] for row in self._samples])
         target_dq = np.asarray([row[8] for row in self._samples])
         report = {"evaluation_kind": self._skill_kind, "physics_outcome": outcome,
             "physics_success": passed, "completed_physical_prefix": completed,
+            "completed_current_curve": full_curve_completed,
+            "candidate_id": binding["candidate_id"],
+            "functional_goal_evidence": goal_evidence, "effect_evidence": effect_evidence,
+            "process_evidence": process_evidence, "terminal_evidence": terminal_evidence,
+            "evaluation_owner_bindings": self._goals.describe_bindings(),
             "task_contract": self._task_contract,
             "binding": self.binding, "settings_source": "collect.preprocess.segmentation.DEFAULT_SETTINGS",
             "settings": self.settings, "finger_stability_limits": self._finger_limits.tolist(),
             "sample_count": len(times), "native_contact_rows": self._offsets[-1],
             "contact_sampling": "synchronized post-step mj_forward state, including an initial setup sample; native solved constraints and geometry are evaluator-only",
             "contact_force_scope": "diagnostic native force at the sampled state; force magnitude is not a grasp acceptance criterion",
-            "success_definition": ("At the stopping state, every configured finger contact group touches the same target body throughout a 0.2 s stable interval under the original gap/motion thresholds"
-                if self._skill_kind == "grasp" else "No manipulation task-success predicate is inferred from grasp stability or source demonstration success"),
+            "success_definition": "The complete current curve is physically observed and every original functional goal, required effect, scoped process predicate and declared final-stop predicate is T; unsupported or unobserved predicates remain U",
             "component_evidence": {
                 "configured_finger_contacts_at_stop": touches[-1].tolist(),
                 "configured_finger_contact_absence_at_stop_s": absence_duration,
@@ -274,22 +537,16 @@ class NativeSkillPhysicsEvaluator:
                 "target_scalar_joint_positions_at_entry": target_q[0].tolist(),
                 "target_scalar_joint_positions_at_stop": target_q[-1].tolist(),
                 "target_scalar_joint_displacements": (target_q[-1]-target_q[0]).tolist()},
-            "limits": ["Only the measured grasp prefix is evaluated; no following skill is executed",
+            "limits": ["Only this current curve and its actually sampled intervals are evaluated; no following skill is executed",
                        "Stable contact on a supported object does not certify a subsequent lift or load-bearing motion",
                        "This task predicate does not replace planner collision acceptance or certify every robot/environment contact",
-                       "Simulator truth is used only by this independent evaluator; the executor evidence barrier is not automatically released"],
+                       "Simulator truth is used only by this independent evaluator; it never updates runtime owner poses, completed goals, effect history or a dependency barrier",
+                       "Separate abort/dependency holds are not trajectory observations and cannot supply a missing goal or stable window"],
             }
         if self._skill_kind == "grasp":
             report.update(analysis)
         else:
             report["grasp_stability_diagnostic"] = analysis
-            report["unverified_requirements"] = [
-                {"requirement": self._task_contract["task"], "status": "unverified",
-                 "reason": "Live carrier motion and contacts are recorded; no task-specific support, cavity, or planner-coordinate to native-joint predicate has been established"},
-                {"requirement": "functional events", "status": "unverified",
-                 "reason": "Source event identities and tolerances are retained; this diagnostic does not assume a current native goal frame or coordinate sign/zero binding"},
-                {"requirement": "post-barrier continuation", "status": "not_executed",
-                 "reason": "The original evidence barrier remains in force even when a component contact predicate is measured"}]
         contacts = np.concatenate(self._contacts, axis=0)
         extra = {"reference_pose_world": np.asarray([row[6] for row in self._samples])} if self._reference is not None else {}
         np.savez_compressed(output/"physics-evidence.npz", sim_time=times, elapsed=elapsed,
@@ -303,7 +560,7 @@ class NativeSkillPhysicsEvaluator:
             contact_exclude=contacts[:, 2].astype(np.int32), contact_efc_address=contacts[:, 3].astype(np.int32),
             contact_distance_m=contacts[:, 4], contact_position_world=contacts[:, 5:8],
             contact_frame=contacts[:, 8:17].reshape(-1, 3, 3), contact_force=contacts[:, 17:23],
-            contact_force_valid=contacts[:, 23].astype(bool), **extra)
+            contact_force_valid=contacts[:, 23].astype(bool), **extra, **self._goals.arrays())
         (output/"evaluation-report.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
         return report
 # END independent native skill evidence with original collector predicates.

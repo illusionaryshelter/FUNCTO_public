@@ -28,6 +28,24 @@ from .motion import _pose_array
 # END an original name alone never identifies a retried action.
 
 
+# BEGIN shared functional clock for runtime evidence and independent result grading.
+def pose_goal_schedule(trajectory, progress, timestep):
+    """Return the first original progress time and its strict native due tick.
+
+    A terminal progress plateau starts at its first matching knot. The
+    physical observation uses the first device tick covering that time;
+    one-ULP future times cannot borrow the preceding tick. This function
+    supplies timing only and never constructs an owner pose or goal witness.
+    """
+    matches = np.flatnonzero(np.abs(np.asarray(trajectory.progress_s)-progress) <= 1e-12)
+    first_u = (float(trajectory.progress_u[matches[0]]) if matches.size else
+               float(np.interp(progress, trajectory.progress_s, trajectory.progress_u)))
+    scheduled = (first_u*trajectory.duration
+                 if progress <= float(trajectory.progress_s[-1])+1e-12 else float("inf"))
+    return scheduled, (_activation(scheduled, timestep)[1] if np.isfinite(scheduled) else float("inf"))
+# END both consumers keep the original first-arrival clock without sharing observations.
+
+
 def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condition_id=None):
     """Compare one actual witness with its own original physical-time windows.
 
@@ -403,8 +421,13 @@ def continuation_execution_inputs(continuation, finger_targets, execution_limits
         "source": finger_targets.source, "events": list(deepcopy(finger_targets.events))},
         "execution_limits": execution_limits.describe()}
     policy = continuation["device_policy"]
-    if supplied != policy:
+    # BEGIN continuation retains the complete controller and result-obligation policy.
+    if (not isinstance(policy, dict) or set(policy) != {
+            "finger_targets", "execution_limits", "controller_policy", "result_only_goal_ids"}
+            or original.get("device_policy") != policy
+            or supplied != {key: policy[key] for key in supplied}):
         raise ValueError("A continuation or retry cannot change the original full device policy")
+    # END selecting remaining commands never upgrades a historical position-only controller.
     commands = {(row["skill_id"], row["event_id"]): row for row in policy["finger_targets"]["events"]}
     pending = {(row["skill_id"], row["event_id"]) for row in continuation["remaining_events"]
                if row["kind"] in ("open", "close", "hold")}
@@ -608,13 +631,14 @@ class TrajectoryExecutor:
         self.last_execution_report = None
         # END this invocation publishes its own object only after creation.
         # BEGIN formal candidate handoff: labels cannot authorize commands.
-        from .execution_binding import check_result, nominal_finger_sampler
+        from .execution_binding import (check_result, nominal_finger_sampler,
+            validate_controller_policy, validate_result_only_goal_ids)
         binding = check_result(result, execution_limits=execution_limits)
         trajectory = result.trajectory
         if not callable(getattr(self.geometry_checker, "bind_scene", None)):
             raise ValueError("Execution requires independent geometry with the bound scene scope")
         self.geometry_checker.bind_scene(binding["scene"],
-            progress_at_time=lambda t: float(trajectory.sample(t)[2]),
+            progress_at_time=lambda t: float(trajectory.sample(t)[3]),
             nominal_fingers=nominal_finger_sampler(binding["scene"]))
         if type(max_hold_steps) is not int or not 1 <= max_hold_steps <= 10_000:
             raise ValueError("Emergency hold needs a positive bounded device step budget")
@@ -643,15 +667,19 @@ class TrajectoryExecutor:
                     or not np.allclose(expected, actual_frame, atol=1e-9, rtol=0)):
                 raise ValueError(f"Planning and actual feedback have different {key} calibration")
         binding["execution_limits"] = execution_limits.describe()
-        # BEGIN one immutable device policy survives every same-request binding.
-        if "device_policy" not in binding:
-            binding["device_policy"] = {"finger_targets": {
-                "joint_names": list(finger_targets.joint_names), "source": finger_targets.source,
-                "events": list(deepcopy(finger_targets.events))},
-                "execution_limits": execution_limits.describe()}
-        policy = binding["device_policy"]
-        if not isinstance(policy, dict) or set(policy) != {"finger_targets", "execution_limits"}:
-            raise ValueError("The request must retain its complete original device policy")
+        # BEGIN only an explicitly rebound controller policy authorizes this backend.
+        policy = binding.get("device_policy")
+        if not isinstance(policy, dict) or set(policy) != {
+                "finger_targets", "execution_limits", "controller_policy", "result_only_goal_ids"}:
+            raise ValueError("Execution requires an explicit complete device rebind; historical position-only authorization is invalid")
+        declared_controller = validate_controller_policy(policy["controller_policy"], joint_names=backend.arm_joint_names)
+        actual_controller = validate_controller_policy(backend.describe().get("controller_policy"), joint_names=backend.arm_joint_names)
+        if (declared_controller != actual_controller
+                or declared_controller["native_timestep_s"] != float(backend.timestep)):
+            raise ValueError("The bound controller policy differs from the actual backend mode, gains or clock")
+        result_goal_ids = {tuple(identity) for identity in validate_result_only_goal_ids(
+            binding, trajectory, policy["result_only_goal_ids"])}
+        # END there is no implicit q-only migration or global optional-check switch.
         original_targets = FixedFingerTargets.from_mapping(policy["finger_targets"])
         original_limits = ExecutionLimits.from_mapping(policy["execution_limits"])
         original_rows = {(row["skill_id"], row["event_id"]): row for row in original_targets.events}
@@ -693,7 +721,10 @@ class TrajectoryExecutor:
         tolerances = np.asarray([start_position_tolerance, start_velocity_tolerance], float)
         if not np.isfinite(tolerances).all() or np.any(tolerances < 0):
             raise ValueError("Start-feedback numerical tolerances must be finite and nonnegative; zero requires exact equality")
-        start_q, start_dq, _ = trajectory.sample(0.)
+        # BEGIN all arm references share one analytic position/velocity/acceleration query.
+        start_q, start_dq, start_ddq, _ = trajectory.sample(0.)
+        _finite_array(start_ddq, start_q.shape, "Initial arm reference acceleration")
+        # END a missing or nonfinite derivative is never a position-only fallback.
         actual = backend.proprioception()
         for key, names in (("joint_names", backend.joint_names), ("arm_joint_names", backend.arm_joint_names),
                            ("finger_joint_names", backend.finger_joint_names)):
@@ -780,7 +811,7 @@ class TrajectoryExecutor:
                                      "position_tolerance": float(tolerances[0]),
                                      "velocity_tolerance": float(tolerances[1]),
                                      "tolerance_scope": "float32 trajectory export roundoff only; does not authorize another episode entrance"},
-            "barrier_discretization": "ceil native steps; final command q/dq/progress clamped to original barrier; physical clock may overrun by less than one timestep",
+            "barrier_discretization": "ceil native steps; final command q/dq/ddq/progress clamped to original barrier; physical clock may overrun by less than one timestep",
             "executed_steps": 0, "barrier_crossed": False,
             "gripper_command_timing": "original retimed event identities activate at their saved ceil-to-native-step tick; every subsequent position command samples the same archived finger reference and arm clock",
             "finger_targets": {"joint_names": finger_targets.joint_names, "source": finger_targets.source,
@@ -790,6 +821,9 @@ class TrajectoryExecutor:
             "finger_reference_actual_tracking_certified": False,
             "command_record_semantics": "sample zero uses curve q(0) and restored finger ctrl; each later command_q combines the arm goal sampled at min(step end, barrier) with the finger goal applied during that step",
             "arm_curve_dq_semantics": "arm cubic derivative at curve_time, recorded independently of actual velocity",
+            # BEGIN analytic reference acceleration is distinct from measured qacc.
+            "arm_curve_ddq_semantics": "Same Hermite query as reference q/dq at curve_time; right internal-knot acceleration and last-piece left acceleration at the endpoint",
+            # END reference acceleration jumps do not add a C2 requirement.
             "finger_reference_semantics": "reference_finger_q/dq are the archived C1 nominal command at curve_time, not actual feedback; absent references are NaN and explicitly unprovided; physical contact can prevent target attainment without proving a tracking failure or Holding",
             "actuator_control_semantics": "one native torque/position ctrl row per executed attempt, timestamped at step start; actual q/dq are separately recorded after each completed step",
             # BEGIN preserve the two clocks and meanings needed for dynamics review.
@@ -828,18 +862,13 @@ class TrajectoryExecutor:
                 raise ValueError("Actual pose goals require unique original nonnegative indexes")
             requirement = PoseEventRequirement(**deepcopy(row))
             pose_requirements[identity] = requirement
-            matches = np.flatnonzero(np.abs(np.asarray(trajectory.progress_s)-requirement.progress) <= 1e-12)
-            first_u = (float(trajectory.progress_u[matches[0]]) if matches.size else
-                       float(np.interp(requirement.progress, trajectory.progress_s, trajectory.progress_u)))
-            pose_goal_times[identity] = (first_u*trajectory.duration
-                if requirement.progress <= float(trajectory.progress_s[-1])+1e-12 else float("inf"))
-            pose_goal_device_times[identity] = (_activation(pose_goal_times[identity], backend.timestep)[1]
-                if np.isfinite(pose_goal_times[identity]) else float("inf"))
-        pose_goal_queries = set()
+            pose_goal_times[identity], pose_goal_device_times[identity] = pose_goal_schedule(
+                trajectory, requirement.progress, backend.timestep)
+        pose_goal_queries, evaluated_result_goals = set(), set()
         report["pose_goal_checks"] = []
         report["pose_goal_scope"] = (
             "Original functional allowed sets evaluated from actual TCP and explicitly required current owner/holding observations; "
-            "scheduled first-arrival native sample or declared actual-arrival window. Reference tracking and tactile effects are separate.")
+            "scheduled first-arrival native sample or declared actual-arrival window. Explicit result-only goals record T/F/U without an online dependency; reference tracking and effect observations remain separate.")
         # END a source-progress crossing selects evaluation but cannot prove attainment.
         # BEGIN direction obligations retain original scope identities and actual evidence.
         report["completed_direction_ids"] = deepcopy(binding.get("completed_direction_ids", []))
@@ -910,6 +939,12 @@ class TrajectoryExecutor:
         report["observation_checks"], report["object_changes"] = [], []
         # END physical contact evidence is distinct from absent effect observations.
         controls, requested_torques, saturated_torques, samples, event_index = [], [], [], [], 0
+        # BEGIN retain each native controller component on the command clock.
+        control_terms = {name: [] for name in (
+            "reference_arm_q", "reference_arm_dq", "reference_arm_ddq",
+            "arm_position_feedback_torque", "arm_velocity_feedback_torque",
+            "arm_velocity_feedforward_torque", "arm_acceleration_feedforward_torque", "arm_bias_torque")}
+        # END these values come from the actual issued controller calculation.
         command = "restored_ctrl"
         # BEGIN evidence dependencies authorize intervals on the same clock.
         barriers = sorted((deepcopy(event) for event in trajectory.events
@@ -959,7 +994,7 @@ class TrajectoryExecutor:
                     raise ValueError("A direction fact needs T/F/U, source and its actual acquisition interval")
                 by_id[tuple(identity)] = fact
             failures = []
-            progress = float(trajectory.sample(curve_time)[2])
+            progress = float(trajectory.sample(curve_time)[3])
             policy = execution_limits.observation_policy
             for identity, requirement in direction_requirements.items():
                 if list(identity) in report["completed_direction_ids"]:
@@ -1209,7 +1244,10 @@ class TrajectoryExecutor:
             """Evaluate original pose sets without accepting observer T labels.
 
             Without a declared arrival window, the first native observation at
-            the original functional clock is mandatory. An explicit arrival
+            the original functional clock is the evaluation opportunity. Only
+            execution obligations require that result to be T before advancing;
+            explicitly result-only goals keep F/U without stopping the tail.
+            An explicit arrival
             window instead permits a later actual witness inside that window;
             intermediate misses do not erase the remaining opportunity. No
             native step, source clock, sensor effect, or engineering tracking
@@ -1218,7 +1256,7 @@ class TrajectoryExecutor:
             now = request_origin+float(feedback["timestamp_s"])-sim_start
             failures = []
             for identity, requirement in pose_requirements.items():
-                if list(identity) in report["completed_goal_ids"]:
+                if list(identity) in report["completed_goal_ids"] or identity in evaluated_result_goals:
                     continue
                 scheduled = pose_goal_times[identity]
                 arrivals = [(event, item) for event in active_timing_events.values()
@@ -1258,7 +1296,8 @@ class TrajectoryExecutor:
                     "evaluated_curve_time_s": float(curve_time), "physical_elapsed_s": float(elapsed),
                     "scheduled_curve_time_s": scheduled, "device_due_time_s": pose_goal_device_times[identity],
                     "requirement": deepcopy(raw),
-                    "completion_verified": False, "evaluation_window_s": [lower, upper] if arrivals else None}
+                    "completion_verified": False, "evaluation_window_s": [lower, upper] if arrivals else None,
+                    "evaluation_scope": "result" if identity in result_goal_ids else "execution"}
                 evidence["time_value"] = "U" if unresolved else "T" if in_window else "F"
                 if unresolved:
                     evidence["time_reason"] = "; ".join(unresolved)
@@ -1267,6 +1306,7 @@ class TrajectoryExecutor:
                 # rejects it. A missed window does not make that geometry false.
                 report["goal_evidence"].append(deepcopy(evidence))
                 check = {"identity": list(identity), "value": evidence["value"], "required_now": required,
+                    "required_for_execution": identity not in result_goal_ids,
                     "curve_time_s": float(curve_time), "physical_elapsed_s": float(elapsed),
                     "completion_verified": evidence["completion_verified"], "evidence": deepcopy(evidence)}
                 report["pose_goal_checks"].append(check)
@@ -1278,10 +1318,14 @@ class TrajectoryExecutor:
                         reject_timing(feedback, elapsed, checks, event=event)
                 if evidence["completion_verified"]:
                     report["completed_goal_ids"].append(list(identity))
-                if required and not evidence["completion_verified"]:
+                # BEGIN result evaluation cannot invent a dependency on missing terminal owner feedback.
+                if identity in result_goal_ids:
+                    evaluated_result_goals.add(identity)
+                if required and identity not in result_goal_ids and not evidence["completion_verified"]:
                     failures.append({"kind": "actual_pose_goal_violated" if evidence["value"] == "F"
                                      else "actual_pose_goal_unverified", "name": "/".join(map(str, identity)),
                                      "evidence": check})
+                # END explicit online/arrival obligations retain the original rejection path.
             if failures:
                 report["status"] = "feedback_rejected"
                 report["feedback_failure"] = {"point": "actual_pose_goal", "curve_time_s": float(curve_time),
@@ -1301,7 +1345,7 @@ class TrajectoryExecutor:
             # when the native tick does not align with the periodic observer.
             # This is the same allowed channel, not interpolation of old facts;
             # its sensor may still return None or an unchanged acquisition time.
-            progress = float(trajectory.sample(curve_time)[2])
+            progress = float(trajectory.sample(curve_time)[3])
             boundaries = []
             for identity, requirement in direction_requirements.items():
                 if list(identity) in report["completed_direction_ids"]:
@@ -1394,7 +1438,7 @@ class TrajectoryExecutor:
                                 for identity in identities}}
         # END missing optional effects never become missing mandatory robot feedback.
 
-        def record(elapsed, desired_arm_q, arm_curve_dq, progress, feedback=None):
+        def record(elapsed, desired_arm_q, arm_curve_dq, arm_curve_ddq, progress, feedback=None):
             feedback = backend.proprioception() if feedback is None else feedback
             # BEGIN retain reference and actual fingers as separate evidence.
             reference_fingers = (finger_reference.sample(min(float(elapsed), stop))
@@ -1406,6 +1450,9 @@ class TrajectoryExecutor:
                     "curve_time": min(float(elapsed), stop),
                     "command_q": np.concatenate((np.asarray(desired_arm_q), target_positions)),
                     "arm_curve_dq": np.asarray(arm_curve_dq).copy(),
+                    # BEGIN record the commanded polynomial derivative, never differentiated actual velocity.
+                    "arm_curve_ddq": np.asarray(arm_curve_ddq).copy(),
+                    # END q/dq/ddq retain exactly the same clipped reference clock.
                     "reference_finger_q": reference_fingers[0].copy(),
                     "reference_finger_dq": reference_fingers[1].copy(),
                     "q": feedback["q"], "dq": feedback["dq"], "tool_pose": feedback["tool_pose"],
@@ -1485,7 +1532,7 @@ class TrajectoryExecutor:
             check_directions(observation, feedback, curve_time, physical_elapsed)
             resolve_pending_timing(feedback, physical_elapsed)
             # END observations never overwrite measured robot coordinates.
-            reference_q, reference_dq, _ = trajectory.sample(curve_time)
+            reference_q, reference_dq, _, _ = trajectory.sample(curve_time)
             reference_tcp = backend.reference_tool_pose(reference_q)
             barrier = barriers[barrier_index] if barrier_index < len(barriers) else None
             requires_stop = (bool(event.get("stop", False)) if event is not None else
@@ -1654,8 +1701,8 @@ class TrajectoryExecutor:
             return True
         # END unknown or false evidence causes a physical hold, never success.
 
-        q, dq, progress = trajectory.sample(0.)
-        samples.append(record(0., q, dq, progress))
+        q, dq, ddq, progress = trajectory.sample(0.)
+        samples.append(record(0., q, dq, ddq, progress))
         # BEGIN persistence failures must not replace a measured execution error.
         execution_error = None
         # END retain the primary exception separately from diagnostic sinks.
@@ -1708,7 +1755,7 @@ class TrajectoryExecutor:
                     # actually applied command selects its declared new one.
                     next_finger_state = deepcopy(limit_binding["event_fingers"][(due[-1]["skill_id"], due[-1]["event_id"])])
                 next_time = (index + 1) * backend.timestep
-                q, dq, progress = trajectory.sample(min(next_time, stop))
+                q, dq, ddq, progress = trajectory.sample(min(next_time, stop))
                 # BEGIN one synchronous 7+2 command query, with independent feedback.
                 # A future event's ramp starts at its saved activation tick.
                 # At that boundary its q/dq remain C1 with the prior hold, so
@@ -1716,7 +1763,9 @@ class TrajectoryExecutor:
                 if finger_reference is not None:
                     next_finger_positions, _ = finger_reference.sample(min(next_time, stop))
                 # END native GRIP receives the same named reference as planning.
-                control = backend.apply_control(q, next_finger_positions)
+                # BEGIN the backend receives the same endpoint q/dq/ddq as the saved reference.
+                control = backend.apply_control(q, dq, ddq, next_finger_positions)
+                # END actuator interpretation cannot change the candidate's clock or polynomial.
                 # BEGIN aggregate only the backend's named arm clipping count.
                 arm_control_saturation_count += control["arm_control_saturated_coordinates"]
                 # END native finger force limits are measured separately.
@@ -1731,8 +1780,12 @@ class TrajectoryExecutor:
                 controls.append(control["actuator_ctrl"].copy())
                 requested_torques.append(control["requested_arm_torque"].copy())
                 saturated_torques.append(control["arm_torque_saturated"].copy())
+                # BEGIN preserve native feedforward and feedback terms independently.
+                for name in control_terms:
+                    control_terms[name].append(_finite_array(control[name], (narm,), name))
+                # END no term is reconstructed from post-step telemetry.
                 backend.step()
-                current = record(next_time, q, dq, progress)
+                current = record(next_time, q, dq, ddq, progress)
                 report["executed_steps"] = index + 1
                 samples.append(current)
                 # Preserve the completed physical sample, including independent
@@ -1846,7 +1899,14 @@ class TrajectoryExecutor:
                            for row in report["pose_goal_checks"]) else "U" for identity in pose_requirements]
             report["pose_goal_result"] = (None if not pose_values else "F" if "F" in pose_values
                 else "T" if all(value == "T" for value in pose_values) else "U")
-            # END a successful tactile predicate cannot replace a missing owner pose.
+            # END an effect predicate cannot replace a missing owner pose.
+            # BEGIN only online pose obligations can require another execution binding.
+            execution_pose_values = [value for identity, value in zip(pose_requirements, pose_values)
+                                     if identity not in result_goal_ids]
+            report["execution_pose_goal_result"] = (None if not execution_pose_values else
+                "F" if "F" in execution_pose_values else
+                "T" if all(value == "T" for value in execution_pose_values) else "U")
+            # END result-only U remains visible without authorizing a fake completion or forcing a new run.
             # BEGIN direction completion is an independent actual-evidence verdict.
             direction_values = ["T" if list(identity) in report["completed_direction_ids"] else
                 "F" if any(tuple(row["identity"]) == identity and row["value"] == "F"
@@ -1898,7 +1958,7 @@ class TrajectoryExecutor:
                 "requires_rebind": (report["status"] != "curve_finished"
                     or report["timing_result"] not in (None, "T")
                     or report["direction_result"] not in (None, "T")
-                    or report["pose_goal_result"] not in (None, "T")),
+                    or report["execution_pose_goal_result"] not in (None, "T")),
                 "reason": "Remaining obligations require current actual/scene binding; applied events and original hard clock cannot be reset",
                 "consumed_physics_steps": report["executed_steps"] + sum(
                     0 if report[key] is None else report[key]["physical_steps"]
@@ -1936,6 +1996,10 @@ class TrajectoryExecutor:
                 curve_time=np.asarray([row["curve_time"] for row in samples]),
                 sim_time=np.asarray([row["sim_time"] for row in samples]),
                 command_q=command_q, arm_curve_dq=np.asarray([row["arm_curve_dq"] for row in samples]),
+                # BEGIN analytic derivatives and torque terms preserve their separate sample clocks.
+                arm_curve_ddq=np.asarray([row["arm_curve_ddq"] for row in samples]),
+                **{name: np.asarray(values).reshape(-1, narm) for name, values in control_terms.items()},
+                # END command terms have one row per native control write; state samples include time zero.
                 reference_finger_provided=np.asarray(finger_reference is not None),
                 reference_finger_q=np.asarray([row["reference_finger_q"] for row in samples]),
                 reference_finger_dq=np.asarray([row["reference_finger_dq"] for row in samples]),

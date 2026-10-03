@@ -243,7 +243,9 @@ def test_explicit_prefix_extension_still_checks_known_arm_with_unknown_fingers(m
         dimensions=[.01, .01, .01], pose=[.095, .2, 0., 1., 0., 0., 0.])
     curve = trajectory([.03, .09], [0., 0.], barrier=.4)
     gate = validator(model)
-    gate.bind_scene(scene, progress_at_time=lambda t: float(curve.sample(t)[2]))
+    # BEGIN use progress after the same-curve q/dq/ddq sample components.
+    gate.bind_scene(scene, progress_at_time=lambda t: float(curve.sample(t)[3]))
+    # END no derivative can replace the original scene progress clock.
     prefix = gate.preflight(curve, feedback(), LIMITS)
     assert prefix["passed"] and not prefix["observed_scene_checked"]
     assert prefix["nominal_scene"]["unresolved_assumptions"][0]["geometry_names"] == ["second"]
@@ -280,7 +282,9 @@ def test_scene_failures_keep_named_physical_evidence_through_executor(model, fai
         expected = "independent_scene_query_incomplete"
     gate = validator(model)
     curve = trajectory([.03, .03], [0., 0.])
-    gate.bind_scene(scene, progress_at_time=lambda t: float(curve.sample(t)[2]))
+    # BEGIN use progress after the same-curve q/dq/ddq sample components.
+    gate.bind_scene(scene, progress_at_time=lambda t: float(curve.sample(t)[3]))
+    # END no derivative can replace the original scene progress clock.
     adapter = SimpleNamespace(geometry_checker=gate, _geometry_pair_count=1)
     for method, args, kwargs in (
         ("check_state", (feedback(),), {"stage": "actual", "trajectory_time": 0.}),

@@ -208,7 +208,9 @@ def run(output):
             raise AssertionError("Complete native optimization and exported validation must accept the permitted fixture")
         curve = result.trajectory
         times = np.linspace(0., curve.duration, 401)
-        q, dq, s = curve.sample(times)
+        # BEGIN explicit acceleration slot keeps progress in its own channel.
+        q, dq, _, s = curve.sample(times)
+        # END permission queries retain their original shared clock.
         native = fk(q)
         progress = device.to_device(s)[None]
         report["paired_export_checks"] = {}

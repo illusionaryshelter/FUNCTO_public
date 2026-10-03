@@ -108,7 +108,9 @@ def run(args):
             names = tuple(trajectory.joint_names) + tuple(fingers.joint_names)
             if len(set(names)) != len(names) or set(names) != set(baseline_names):
                 raise ValueError("Original arm and finger polynomials must name every actual baseline coordinate once")
-            arm_q, arm_dq, progress = trajectory.sample(times)
+            # BEGIN keep coverage on the same four-part trajectory sample.
+            arm_q, arm_dq, _, progress = trajectory.sample(times)
+            # END acceleration is available but is not a coverage predicate.
             finger_q, finger_dq = fingers.sample(times)
             positions = np.concatenate((arm_q, finger_q), axis=1)
             velocities = np.concatenate((arm_dq, finger_dq), axis=1)

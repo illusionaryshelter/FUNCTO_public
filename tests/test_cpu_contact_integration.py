@@ -87,7 +87,13 @@ def test_native_contact_is_permitted_locally_and_actual_state_remains_distinct(t
         # A deliberately specified control reference, not planner output. The
         # controller cannot force the actual pad through the physical slab.
         goal = -.026*min((index+1)/150., 1.)
-        backend.apply_control(np.asarray([goal]), np.asarray([.01, -.01]))
+        # BEGIN supply the actual derivatives of this declared linear probe.
+        # The right-hand sample at the ramp/hold corner has zero speed. This
+        # diagnostic has a velocity jump and makes no C1 planning claim.
+        speed = -.026/(150*backend.timestep) if index+1 < 150 else 0.
+        backend.apply_control(np.asarray([goal]), np.asarray([speed]),
+                              np.zeros(1), np.asarray([.01, -.01]))
+        # END measured contact still cannot grant runtime permission.
         backend.step()
         measured = backend.proprioception()
         direction_samples.append({"timestamp_s": float(measured["timestamp_s"]),

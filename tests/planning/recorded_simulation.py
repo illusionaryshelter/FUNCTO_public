@@ -80,18 +80,27 @@ def load_curve_archive(path):
     return curve, metadata
 
 
-def load_saved_trajectory(path, *, execution_limits):
-    """Restore the formal result; plain labels and diagnostics cannot execute."""
+def load_saved_trajectory(path):
+    """Validate a formal source archive against its own original physical limits.
+
+    Loading does not adopt a new controller or observation contract. A caller
+    must explicitly bind that contract before the source can be executed.
+    """
     from manipulation.planning import PlanningResult
     from manipulation.execution_binding import check_result
 
     curve, metadata = load_curve_archive(path)
     if metadata["classification"] != "planner_accepted":
         raise ValueError("Rejected diagnostic archives are not executable PlanningResults")
-    if not isinstance(execution_limits, ExecutionLimits):
-        raise ValueError("Loading an executable curve requires explicit ExecutionLimits")
-    if metadata.get("execution_limits") != execution_limits.describe():
-        raise ValueError("Saved curve and execution must contain identical physical execution limits")
+    # BEGIN source verification consumes the saved contract, never proposed limits.
+    if not isinstance(metadata.get("execution_limits"), dict):
+        raise ValueError("Saved execution limits must contain the original explicit physical contract")
+    execution_limits = ExecutionLimits.from_mapping(metadata["execution_limits"])
+    if (metadata["execution_limits"] != execution_limits.describe()
+            or not isinstance(metadata.get("execution_binding"), dict)
+            or metadata["execution_binding"].get("execution_limits") != metadata["execution_limits"]):
+        raise ValueError("Saved execution limits do not retain their complete explicit contract")
+    # END a later rebind independently checks every proposed physical field.
     # BEGIN retain validated archive status for callers without a second read.
     result = PlanningResult(True, curve, {"origin": str(Path(path).resolve()),
                             "archive_classification": metadata["classification"]},
@@ -148,6 +157,6 @@ def restore_recorded_simulation(*, scene_path, catalog_path, episode_path, frame
         "sim_time": recorded_time, "integration_state_spec": deepcopy(state_spec),
         "state_read_scope": "Full integration state is used only for explicit simulator setup; planning receives named robot feedback and RGB-D",
         "controller_binding": backend.describe(),
-        "python_controller_history": "New absolute joint-position and independent gripper goals; prior Python/composite IK history is not restored"}
+        "python_controller_history": "New synchronized q/dq/ddq arm reference and independent gripper goals under the declared controller policy; prior Python/composite IK history is not restored"}
     return backend, report
 # END explicit recording adapters; no production execution implementation.

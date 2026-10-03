@@ -10,7 +10,9 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from test_recorded_simulation import _fixture, _initial_feedback, _limit_values, _result, _executor, _limits
+from test_recorded_simulation import (
+    _fixture, _initial_feedback, _limit_values, _result, _executor, _limits, _execute_bound,
+)
 from manipulation.execution import ExecutionGuardError, FixedFingerTargets, _feedback_json
 import run_recorded_simulation as runner
 
@@ -63,12 +65,13 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
                      "interpolation": None, "kp": 1., "kd": 1.}}}}})
     evidence = {"actor": {"entity_name": "test_robot", "eef_site_name": simulation.tool_link,
         "contact_geom_groups": []}, "segments": [{"segment_id": "declared_skill", "interaction": "grasp",
-        "carrier_body_name": "test_owner"}]}
+        "carrier_body_name": "test_owner"}], "evaluation_owner_bindings": []}
     args = SimpleNamespace(output=tmp_path/"trial", trajectory=tmp_path/"formal.npz",
         manifest=save("manifest.json", manifest), robot_fixture=save("fixture.json", fixture),
         feedback=save("feedback.json", feedback), finger_targets=save("targets.json", targets),
         execution_limits=save("limits.json", _limit_values(simulation, curve)),
-        evaluator_evidence=save("evidence.json", evidence), tactile_observer=save("tactile.json", {}),
+        evaluator_evidence=save("evidence.json", evidence),
+        result_only_goal_ids=[],
         segment="declared_skill", controller_part="test_arm", views=["test_view"], no_video=False,
         max_physics_steps=30000, start_position_tolerance=2e-6, start_velocity_tolerance=2e-6)
     result = _result(curve)
@@ -100,17 +103,6 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
                 raise ValueError("independent evaluator cleanup failure")
             return {"physics_outcome": "not_evaluated", "physics_success": None}
 
-    class Sensor:
-        observations = [{"effect": {"value": "F", "window": {
-            "complete_window": np.bool_(False), "continuous_sampling": np.bool_(True)}}}]
-        describe_calls = 0
-
-        def describe(self):
-            self.describe_calls += 1
-            if cleanup_failure and self.describe_calls > 1:
-                raise ValueError("tactile persistence failure")
-            return {"scope": "synthetic reporting test"}
-
     class Videos:
         records = []
         closed = False
@@ -126,7 +118,7 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
             if cleanup_failure:
                 raise ValueError("video close failure")
 
-    executor, evaluator, sensor, videos = Executor(), Evaluator(), Sensor(), Videos()
+    executor, evaluator, videos = Executor(), Evaluator(), Videos()
     with ExitStack() as stack:
         stack.enter_context(patch.object(runner, "load_saved_trajectory", return_value=result))
         stack.enter_context(patch.object(runner, "restore_recorded_simulation", return_value=(simulation, {})))
@@ -134,7 +126,6 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
         stack.enter_context(patch.object(runner, "TrajectoryExecutor", return_value=executor))
         stack.enter_context(patch.object(runner, "NativeSkillPhysicsEvaluator", return_value=evaluator))
         stack.enter_context(patch.object(runner, "_TrialVideos", return_value=videos))
-        stack.enter_context(patch("simulated_tactile.SimulatedTactileObserver", return_value=sensor))
         reads = stack.enter_context(patch.object(runner, "_read", wraps=runner._read))
         with pytest.raises(RuntimeError) as raised:
             runner.run(args)
@@ -154,6 +145,9 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
     assert report["execution_tested"] is False
     assert report["actual_physics_tested"] is True
     assert report["robot_feedback_path"] == "actual_failure_feedback"
+    assert report["source_candidate_id"] == result.execution_binding["candidate_id"]
+    assert report["execution_candidate_id"] != report["source_candidate_id"]
+    assert Path(report["rebound_trajectory_path"]).is_file()
     assert report["geometry_preflight_summary"] == {"passed": True, "checked_interval_s": [0., .0075],
         "reference_collision_checked": True, "continuous_collision_certified": False,
         "observed_scene_checked": True, "unknown_space_checked": False}
@@ -166,25 +160,18 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
     assert (args.output/"exception.txt").read_text().rstrip().endswith(str(primary))
     assert videos.captures[-1] == ((.002,), {"final": True})
     if cleanup_failure:
-        assert "evaluation_error" in report and "tactile_write_error" in report and "video_error" in report
+        assert "evaluation_error" in report and "video_error" in report
         assert "video_final_capture_error" in report
     else:
-        tactile = json.loads((args.output/"tactile-observations.json").read_text())
-        assert tactile["observations"][0]["effect"]["window"] == {
-            "complete_window": False, "continuous_sampling": True}
         assert report["video_final_elapsed_s"] == .002
     assert simulation.sim_time == 1.3  # No native integration occurs in these doubles.
 
 
-# BEGIN actual sensor NumPy booleans survive a real executor guard and every sink.
+# BEGIN generic upstream NumPy booleans survive the executor and every sink.
 @pytest.mark.parametrize("failed_sink", [None, "continuation.json", "physical-trajectory.npz",
                                        "failure-feedback.json", "execution-report.json", "all"])
-def test_numpy_tactile_observation_survives_tracking_rejection_and_independent_writes(tmp_path, failed_sink):
-    from test_simulated_tactile import _fixture as tactile_fixture, _sensor
-
+def test_numpy_observation_survives_tracking_rejection_and_independent_writes(tmp_path, failed_sink):
     simulation, curve, targets = _fixture()
-    tactile_simulation, config, binding, policy, tactile_feedback = tactile_fixture()
-    sensor = _sensor(tactile_simulation, config, binding, policy)
     initial = _initial_feedback(simulation)
     original_step = simulation._sim.step
 
@@ -193,10 +180,13 @@ def test_numpy_tactile_observation_survives_tracking_rejection_and_independent_w
         simulation.native_data.qpos[0] = .11
 
     def observe(feedback, curve_time):
-        # The real two-pad observer reads its own tiny native fixture. This
-        # test synchronizes only its clock with the mocked arm executor.
-        tactile_simulation.native_data.time = feedback["timestamp_s"]
-        return sensor(tactile_feedback(), curve_time)
+        # Explicit generic upstream evidence exercises serialization only.
+        # It neither reads native object state nor synthesizes a sensor.
+        return {"source": "Synthetic CPU upstream observation",
+            "timestamp_s": feedback["timestamp_s"],
+            "effects": {"test:observed_state": {"value": "U",
+                "source": "Synthetic CPU observation quality flags",
+                "metrics": {"measurement_valid": np.bool_(False), "frame_received": np.bool_(True)}}}}
 
     simulation._sim.step = step
     executor = _executor(simulation)
@@ -216,7 +206,7 @@ def test_numpy_tactile_observation_survives_tracking_rejection_and_independent_w
             patch.object(Path, "write_text", lambda path, *a, **kw: attempt(path, lambda: write_text(path, *a, **kw))), \
             patch.object(np, "savez_compressed", lambda path, **kw: attempt(path, lambda: save_npz(path, **kw))):
         with pytest.raises(ExecutionGuardError) as raised:
-            executor.execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+            _execute_bound(executor, _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=initial, execution_limits=_limits(simulation, curve),
                 output=tmp_path/"execution", observation_callback=observe)
     assert raised.value is primary
@@ -226,17 +216,17 @@ def test_numpy_tactile_observation_survives_tracking_rejection_and_independent_w
     assert report["feedback_failure"]["violations"][0]["kind"] == "arm_position_tracking"
     assert report["executed_steps"] == report["abort_hold"]["physical_steps"] == 1
     assert report["continuation"]["consumed_physics_steps"] == 2
-    raw_window = sensor.observations[-1]["effect"]["window"]
-    assert isinstance(raw_window["complete_window"], np.bool_)
-    assert isinstance(raw_window["continuous_sampling"], np.bool_)
+    raw_metrics = report["latest_observation"]["effects"]["test:observed_state"]["metrics"]
+    assert isinstance(raw_metrics["measurement_valid"], np.bool_)
+    assert isinstance(raw_metrics["frame_received"], np.bool_)
     failed = set(attempted if failed_sink == "all" else [] if failed_sink is None else [failed_sink])
     assert {row["artifact"] for row in report.get("persistence_errors", [])} == failed
     output = tmp_path/"execution"
     if "continuation.json" not in failed:
         continuation = json.loads((output/"continuation.json").read_text())
-        assert continuation["effects"]["task:pinch"]["value"] == "F"
-        assert continuation["effects"]["task:pinch"]["window"]["complete_window"] is False
-        assert continuation["effects"]["task:pinch"]["window"]["continuous_sampling"] is True
+        assert continuation["effects"]["test:observed_state"]["value"] == "U"
+        assert continuation["effects"]["test:observed_state"]["metrics"]["measurement_valid"] is False
+        assert continuation["effects"]["test:observed_state"]["metrics"]["frame_received"] is True
     if "physical-trajectory.npz" not in failed:
         with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
             assert saved["actual_q"].shape == (2, 9)
@@ -264,7 +254,7 @@ def test_first_sink_failure_is_raised_after_all_writers_when_execution_did_not_r
     with patch("manipulation.robosuite_execution.mujoco.mj_forward"), \
             patch.object(Path, "write_text", fail), patch.object(np, "savez_compressed", fail):
         with pytest.raises(OSError) as raised:
-            executor.execute(_result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+            _execute_bound(executor, _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
                 initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                 output=tmp_path/"execution")
     assert raised.value is first
