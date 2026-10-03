@@ -2320,10 +2320,22 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
             right |= matching & (normalized_time >= normalized_time.new_tensor(parameters[-1]))
     lower = torch.where(left, torch.nextafter(progress, torch.full_like(progress, -float("inf"))), progress)
     upper = torch.where(right, torch.nextafter(progress, torch.full_like(progress, float("inf"))), progress)
+    # BEGIN an arrival authorizes its explicit pair before same-state mode probes.
+    # Keep the previous material/attachment law, but never revoke a new pair
+    # permission by applying that law counterfactually to an already-arrived
+    # state. Earlier actual samples and all interval-end probes stay unchanged.
+    permission_lower = lower
+    for rule in scene.robot_owner_permissions:
+        arrival = progress.new_tensor(rule.interval[0])
+        permission_lower = torch.where((progress == arrival) & (lower < arrival), progress, permission_lower)
+    # END equality is in the native query dtype; no tolerance advances arrival.
     repeated = lambda value: torch.cat((value, value, value), dim=1)
     terms = scene.evaluate(repeated(spheres), repeated(position), repeated(quaternion),
         torch.cat((progress, lower, upper), dim=1), repeated(joint_position), joint_names,
-        trajectory_time=repeated(trajectory_time))
+        # BEGIN pair authorization and other discontinuous laws retain separate scope.
+        trajectory_time=repeated(trajectory_time),
+        robot_owner_permission_progress=torch.cat((progress, permission_lower, upper), dim=1))
+        # END q, physical time and the command clock are unchanged.
     return torch.stack(terms.split(progress.shape[1], dim=1)).amax(0)
 # END query-side selection never changes the command or nominal hand clock.
 

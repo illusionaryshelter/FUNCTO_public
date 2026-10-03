@@ -124,12 +124,25 @@ class RobotStateValidator:
         self.checker.bind_scene(binding)
 
     def _scene_state(self, robot_state, tool_pose, finger_positions, time_s, *, state_kind, feedback=None,
-                     progress=None):
+                     progress=None, active_robot_owner_permissions=frozenset()):
         feedback = feedback or {}
+        # BEGIN an old material-mode probe retains the pair permission just earned at arrival.
+        bound_progress = float(self._progress_at_time(float(time_s)))
+        progress = bound_progress if progress is None else progress
+        permission_progress = progress
+        if state_kind == "nominal" and progress < bound_progress and any(
+                rule["interval"][0] == bound_progress
+                for rule in self._scene_binding.get("robot_owner_permissions", ())):
+            permission_progress = bound_progress
+        # END all other scene laws still see their requested adjacent progress.
         return self.checker.query_scene(robot_state, tool_pose=tool_pose,
-            progress=float(self._progress_at_time(float(time_s)) if progress is None else progress), finger_positions=finger_positions,
+            progress=float(progress), finger_positions=finger_positions,
             state_kind=state_kind, owner_poses=feedback.get("scene_owner_poses"),
-            condition_evidence=feedback.get("scene_condition_evidence"))
+            condition_evidence=feedback.get("scene_condition_evidence"),
+            # BEGIN only actual execution carries arrival-latched authorization.
+            active_robot_owner_permissions=(None if state_kind == "nominal" else active_robot_owner_permissions),
+            robot_owner_permission_progress=permission_progress)
+            # END nominal geometry remains explicitly conditional on the bound arrival.
 
     # BEGIN release anchors come from the same executable cubic and bound clock.
     def _bind_release_predictions(self, trajectory):
@@ -184,6 +197,10 @@ class RobotStateValidator:
                 if event.get(key) is not None:
                     values.append(float(event[key]))
         anchors = [value for rule in self._scene_binding["contacts"] for value in rule["interval"]]
+        # BEGIN independent validation samples each explicit pair-policy boundary.
+        anchors += [value for rule in self._scene_binding.get("robot_owner_permissions", ())
+                    for value in rule["interval"]]
+        # END these boundaries do not replace the measured execution arrival latch.
         anchors += [value for owner in self._scene_binding["owners"]
                     for relation in owner["attachments"] for value in relation["interval"]]
         # Use the same binary64 clock arithmetic as sample() and the mode
@@ -218,6 +235,15 @@ class RobotStateValidator:
         anchors = {value for rule in self._scene_binding["contacts"] for value in rule["interval"]}
         anchors.update(value for owner in self._scene_binding["owners"]
                        for relation in owner["attachments"] for value in relation["interval"])
+        # BEGIN arrival is checked before enabling the new pair policy at this state.
+        # A counterfactual old collision law at that same already-arrived state
+        # would undo the declared permission. Its preceding trajectory samples
+        # retain the old law; an interval end still checks the subsequent law.
+        pair_ends = {rule["interval"][1]
+                     for rule in self._scene_binding.get("robot_owner_permissions", ())}
+        ordinary_anchors = set(anchors)
+        anchors.update(pair_ends)
+        # END finite material/attachment boundaries retain their original checks.
         s, u = np.asarray(trajectory.progress_s, float), np.asarray(trajectory.progress_u, float)
         for anchor in sorted(anchors):
             if not s[0] <= anchor <= s[-1]:
@@ -228,7 +254,7 @@ class RobotStateValidator:
             else:
                 right = int(np.searchsorted(s, anchor))
                 first = last = float(np.interp(anchor, s[right-1:right+1], u[right-1:right+1])*trajectory.duration)
-            if time_s == first and anchor > s[0]:
+            if time_s == first and anchor > s[0] and anchor in ordinary_anchors:
                 modes.append((float(np.nextafter(anchor, -np.inf)), "before_switch"))
             if time_s == last and anchor < s[-1]:
                 modes.append((float(np.nextafter(anchor, np.inf)), "after_switch"))
@@ -325,7 +351,7 @@ class RobotStateValidator:
         return {"translation_m": float(np.linalg.norm(actual[:3, 3]-expected[:3, 3])),
                 "rotation_rad": float(Rotation.from_matrix(expected[:3, :3].T @ actual[:3, :3]).magnitude())}
 
-    def check_state(self, feedback, *, stage, trajectory_time):
+    def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset()):
         """Gate full actual q, after the executor validates identity and time.
 
         Clock freshness and physical tracking use the execution layer's own
@@ -399,7 +425,10 @@ class RobotStateValidator:
         # BEGIN current scene geometry consumes actual q and current explicit evidence.
         if hasattr(self, "_scene_binding"):
             fingers = np.asarray(feedback["q"], float)[len(self.arm_joint_names):]
-            scene = self._scene_state(result, expected_tool, fingers, trajectory_time, state_kind="actual", feedback=feedback)
+            # BEGIN the execution epoch alone authorizes a measured-arrival permission.
+            scene = self._scene_state(result, expected_tool, fingers, trajectory_time, state_kind="actual", feedback=feedback,
+                                      active_robot_owner_permissions=active_robot_owner_permissions)
+            # END actual time by itself cannot remove a robot/owner collision.
             report["scene"] = scene
             report["violations"].extend(_scene_gate_violations(scene))
             report["query_gaps"] = scene["query_gaps"]
@@ -408,7 +437,8 @@ class RobotStateValidator:
         return report
         # END commands and nominal predictions never replace measured fingers.
 
-    def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0., until=None, current_time=None):
+    def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0., until=None, current_time=None,
+                  active_robot_owner_permissions=frozenset()):
         """Check actual entrance and reference cubic q/dq over its whole prefix.
 
         Each scalar cubic's exact polynomial derivative supplies its critical
@@ -432,7 +462,10 @@ class RobotStateValidator:
         # END device tick alignment must not silently shift a contact-rule interval.
         if hasattr(self, "_scene_binding"):
             self._bind_release_predictions(trajectory)
-        initial = self.check_state(initial_feedback, stage="preflight_actual_state", trajectory_time=float(current_time))
+        # BEGIN continuation preflight consumes this execution's same arrival latch.
+        initial = self.check_state(initial_feedback, stage="preflight_actual_state", trajectory_time=float(current_time),
+                                   active_robot_owner_permissions=active_robot_owner_permissions)
+        # END a newly created validator does not infer prior arrival from progress.
         times = np.asarray(trajectory.times, dtype=float)
         positions, velocities = np.asarray(trajectory.position, dtype=float), np.asarray(trajectory.velocity, dtype=float)
         expected_shape = (len(times), len(self.arm_joint_names))

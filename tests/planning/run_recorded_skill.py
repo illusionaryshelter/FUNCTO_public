@@ -320,25 +320,46 @@ def run(args):
             position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
             trajectory_factory=reference_factory)
         report["gripper"] = hand_report
-        # BEGIN bind the same material identity for sphere and independent native checks.
-        # No material declaration suppresses collision on its own. The finite
-        # target patch, active interval and error allowances remain explicit
-        # current-scene inputs, independently of the calibrated robot faces.
-        from robot_fixture import bind_fixture_contact_materials
+        # BEGIN bind grasp arrival to the exact native hand/observed-owner pair.
+        # Whole-hand grasp contact uses the problem's explicit arrival/close
+        # condition. Finite material faces remain a separate optional policy
+        # for tasks that explicitly need a particular local contact region.
+        from robot_fixture import bind_fixture_contact_materials, bind_fixture_gripper_geometry
         from manipulation.contact_binding import build_material_contact_rules
-        contact_inputs = json.loads(args.contact_bindings.read_text())
-        if not isinstance(contact_inputs, dict) or set(contact_inputs) != {"material_faces", "contacts", "source"}:
-            raise ValueError("Contact bindings need explicit material_faces, contacts and source")
-        if not isinstance(contact_inputs["source"], str) or not contact_inputs["source"].strip():
-            raise ValueError("Contact bindings require a current evidence source")
-        material_binding = bind_fixture_contact_materials(
-            fixture, robot, entrance_fk["sphere_indices_by_link"], feedback,
-            contact_inputs["material_faces"])
-        contacts = build_material_contact_rules(material_binding, contact_inputs["contacts"])
-        report["contact_binding"] = {"path": str(args.contact_bindings.resolve()),
-            "source": contact_inputs["source"], "materials": material_binding,
-            "rule_ids": [rule.rule_id for rule in contacts]}
-        # END unknown object surfaces do not become whole-owner exemptions.
+        from manipulation.planning_scene import RobotOwnerContactPermission
+        activations = [row for row in problem.conditions if row.get("kind") == "grasp_contact_activation"]
+        contacts, pair_permissions = (), ()
+        material_binding = {"robot_sphere_materials": [None]*sphere_count, "native_geometry_materials": {}}
+        if activations:
+            if args.contact_bindings is not None:
+                raise ValueError("Pose-gated grasp uses its bound whole-hand permission, not obsolete finite grasp patches")
+            hand_binding = bind_fixture_gripper_geometry(
+                fixture, robot, entrance_fk["sphere_indices_by_link"], feedback["finger_joint_names"])
+            pair_permissions = tuple(RobotOwnerContactPermission(
+                rule_id=row["condition_id"], target_owner=row["carrier_id"],
+                native_geometry_names=tuple(hand_binding["native_geometry_names"]),
+                sphere_indices=tuple(hand_binding["sphere_indices"]), interval=tuple(row["interval"]),
+                arrival_goal_id=tuple(row["arrival_goal_id"]), activation_event=row["activation_event"],
+                source=f"{hand_binding['source']}; frozen perception arrival: {row['condition_id']}")
+                for row in activations)
+            report["contact_binding"] = {"policy": "measured_pose_arrival_before_close",
+                "hand_geometry": hand_binding, "permissions": [asdict(rule) for rule in pair_permissions]}
+        elif args.contact_bindings is not None:
+            contact_inputs = json.loads(args.contact_bindings.read_text())
+            if not isinstance(contact_inputs, dict) or set(contact_inputs) != {"material_faces", "contacts", "source"}:
+                raise ValueError("Contact bindings need explicit material_faces, contacts and source")
+            if not isinstance(contact_inputs["source"], str) or not contact_inputs["source"].strip():
+                raise ValueError("Contact bindings require a current evidence source")
+            material_binding = bind_fixture_contact_materials(
+                fixture, robot, entrance_fk["sphere_indices_by_link"], feedback,
+                contact_inputs["material_faces"])
+            contacts = build_material_contact_rules(material_binding, contact_inputs["contacts"])
+            report["contact_binding"] = {"policy": "explicit_finite_material_contacts",
+                "path": str(args.contact_bindings.resolve()), "source": contact_inputs["source"],
+                "materials": material_binding, "rule_ids": [rule.rule_id for rule in contacts]}
+        else:
+            report["contact_binding"] = {"policy": "no_robot_object_contact_permission"}
+        # END permissions affect software collision legality, never native physical contact.
         carrier_id = scene_input["carrier_id"]
         carrier_phases = [phase for phase in problem.phases
                           if phase.metadata.get("carrier_id") == carrier_id]
@@ -397,6 +418,9 @@ def run(args):
             robot_geometry_source=fixture["robot_geometry_source"], gripper=hand,
             # BEGIN keep contact identities and finite permissions on the observed scene.
             contacts=contacts, native_geometry_materials=material_binding["native_geometry_materials"],
+            # BEGIN both independent and planner models retain the exact pair policy.
+            robot_owner_permissions=pair_permissions,
+            # END a current measured arrival is still required by execution.
             owner_voxel_size_m=args.owner_voxel_size,
             max_mapping_bytes=1024**3)
             # END the RGB-D partition remains partial.
@@ -420,6 +444,9 @@ def run(args):
                 # BEGIN preserve contact contracts when substituting explicit owner geometry.
                 robot_geometry_source=scene.robot_geometry_source, gripper=hand,
                 contacts=scene.contacts, native_geometry_materials=scene.native_geometry_materials,
+                # BEGIN replacing owner geometry preserves the declared grasp policy.
+                robot_owner_permissions=scene.robot_owner_permissions,
+                # END the owner identity remains unchanged.
                 numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
                 numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
                 # END the replacement does not relax any robot material permission.
@@ -443,6 +470,9 @@ def run(args):
                 robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
                 # BEGIN native identity survives fixed-installation augmentation.
                 native_geometry_materials=scene.native_geometry_materials,
+                # BEGIN fixed installation cannot drop the bound hand/owner permission.
+                robot_owner_permissions=scene.robot_owner_permissions,
+                # END all installation checks remain separately active.
                 # END both geometry checkers retain identical material bindings.
                 numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
                 numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
@@ -461,6 +491,9 @@ def run(args):
             robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
             # BEGIN robot occupancy evidence preserves object-contact identity.
             native_geometry_materials=scene.native_geometry_materials,
+            # BEGIN occupied-volume evidence does not change contact policy.
+            robot_owner_permissions=scene.robot_owner_permissions,
+            # END keep identical robot/owner pairs through every scene rebuild.
             # END occupancy does not grant or remove contact permissions.
             robot_coverage=coverage, numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
             numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
@@ -520,10 +553,12 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    # BEGIN finite material bindings are required recorded-test inputs.
-    for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "finger-targets", "contact-bindings", "output"):
+    # BEGIN grasp permission comes from arrival/close, with local contacts separately explicit.
+    for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "finger-targets", "output"):
         parser.add_argument("--"+name, type=Path, required=True)
-    # END callers can explicitly declare an empty permission list.
+    parser.add_argument("--contact-bindings", type=Path,
+                        help="Explicit finite material contact policy for a task without pose-gated grasp contact")
+    # END omitted local bindings grant no local contact allowance.
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)
     # BEGIN same-skill continuation consumes an explicit prior execution ledger.

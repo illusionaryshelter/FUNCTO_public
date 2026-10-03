@@ -162,6 +162,12 @@ def validate_result_only_goal_ids(binding, trajectory, values):
         indexes = identities.get(value[0], [])
         if identity in selected:
             raise ValueError("Result-only goal identities must be unique and belong to this original binding")
+        # BEGIN a contact-activation arrival always remains an online gate.
+        if any(row.get("kind") == "grasp_contact_activation"
+               and row.get("arrival_goal_id") == identity
+               for row in binding["problem"].get("conditions", ())):
+            raise ValueError("A gripper contact-activation arrival cannot be result-only")
+        # END terminal progress or an old completion cannot waive this check.
         # A continuation keeps the full immutable policy even after verified
         # original goals have been removed from its remaining requirement list.
         if identity in binding.get("completed_goal_ids", []):

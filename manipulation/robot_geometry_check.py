@@ -261,9 +261,23 @@ class RobotGeometryChecker:
                                            "vertices": vertices, "local_pose": local_pose, "source": record["source"]})
         if len(self._scene_shapes) * (len(self._geometries)+len(self._scene_shapes)) > 100000:
             raise ValueError("Independent scene pair inventory exceeds the bounded CPU query budget")
+        # BEGIN native authorization is bound to explicit names, never inferred materials.
+        from .planning_scene import RobotOwnerContactPermission
+        self._robot_owner_permissions = tuple(RobotOwnerContactPermission(**row)
+            for row in scene_binding.get("robot_owner_permissions", ()))
+        identities = [rule.rule_id for rule in self._robot_owner_permissions]
+        if (len(set(identities)) != len(identities)
+                or set(identities) & {row["rule_id"] for row in scene_binding["contacts"]}):
+            raise ValueError("Robot-owner and material permission IDs must be unique")
+        for rule in self._robot_owner_permissions:
+            if (rule.target_owner not in self._scene_owners
+                    or not set(rule.native_geometry_names) <= self._geometries.keys()):
+                raise ValueError("Robot-owner permission requires bound owner and native robot geometry names")
+        # END no MuJoCo/native physical contact policy is changed here.
 
     def query_scene(self, robot_state, *, tool_pose, progress, finger_positions, state_kind,
-                    owner_poses=None, condition_evidence=None):
+                    owner_poses=None, condition_evidence=None,
+                    active_robot_owner_permissions=frozenset(), robot_owner_permission_progress=None):
         """Query every robot/scene and moving-owner/other-owner solid pair.
 
         Nominal attached motion is an explicit conditional hypothesis. Actual
@@ -278,6 +292,27 @@ class RobotGeometryChecker:
             raise ValueError("Independent scene query requires actual/nominal scope and bound progress")
         if not hasattr(self, "_scene_binding"):
             raise ValueError("Independent scene query has no bound scene model")
+        # BEGIN actual permission is an executor-owned arrival latch, never a clock inference.
+        active = active_robot_owner_permissions
+        known = {rule.rule_id for rule in self._robot_owner_permissions}
+        if active is None:
+            if state_kind != "nominal":
+                raise ValueError("Actual robot-owner permission requires an explicit active set")
+            active = known
+        elif (not isinstance(active, (set, frozenset))
+                or any(not isinstance(identity, str) for identity in active) or not active <= known):
+            raise ValueError("Active robot-owner permissions must name only rules in the bound scene")
+        # Nominal checks share the planner's conditional law. Actual checks
+        # require both the declared interval and this execution's fresh latch.
+        permission_progress = progress if robot_owner_permission_progress is None else robot_owner_permission_progress
+        if not np.isfinite(permission_progress) or permission_progress < 0:
+            raise ValueError("Robot-owner permission requires finite nonnegative progress")
+        if state_kind == "actual" and permission_progress != progress:
+            raise ValueError("Actual permission must use the actual bound progress")
+        permitted_rules = [rule for rule in self._robot_owner_permissions
+            if rule.interval[0] <= permission_progress <= rule.interval[1]
+            and (state_kind == "nominal" or rule.rule_id in active)]
+        # END ordinary collision evidence below is still queried and archived.
         owner_poses, condition_evidence = owner_poses or {}, condition_evidence or {}
         binding = self._scene_binding
         gaps, unresolved, violations, rows = deepcopy(self._scene_gaps), [], [], []
@@ -424,6 +459,17 @@ class RobotGeometryChecker:
                 row["contacts"] = [{"position": np.asarray(contact.pos).tolist(), "normal": np.asarray(contact.normal).tolist(),
                                     "penetration_depth": float(contact.penetration_depth)} for contact in result.getContacts()]
                 row["contact_report_truncated"] = result.numContacts() >= request.num_max_contacts
+                # BEGIN authorized whole-pair contact does not consume a local patch allowance.
+                permissions = [rule for rule in permitted_rules
+                    if first["owner"] == "robot" and first["name"] in rule.native_geometry_names
+                    and second["owner"] == rule.target_owner]
+                if permissions:
+                    row["permission"] = permissions[0].rule_id
+                    row["permission_scope"] = "explicit_robot_owner_pair"
+                    row["permission_authorization"] = ("conditional_nominal_arrival" if state_kind == "nominal"
+                                                        else "current_execution_arrival_latch")
+                    continue
+                # END signed distance, witnesses and physical contacts remain raw evidence.
                 # BEGIN resolve a Coal numerical boundary using complete solid intersections.
                 # A sub-tolerance positive gap can be reported by GJK as zero
                 # distance/contact. Infeasibility of the complete convex
@@ -523,6 +569,10 @@ class RobotGeometryChecker:
         return {"passed": not violations and not gaps, "violations": violations, "query_gaps": gaps,
                 "unresolved_assumptions": unresolved, "pairs": rows, "state_kind": state_kind,
                 "required_contact_checks": required_checks,
+                # BEGIN expose authorization separately from geometry relation and task effects.
+                "active_robot_owner_permissions": sorted(rule.rule_id for rule in permitted_rules),
+                "robot_owner_permission_progress": float(permission_progress),
+                # END a permission does not establish actual contact or Holding.
                 "progress": float(progress), "observed_scene_checked": not gaps and not uncertain_owners and not unmodelled_geometries,
                 "supplied_scene_models_checked": not gaps,
                 "complete_scene_geometry": all(owner["geometry_complete"] for owner, _ in self._scene_owners.values()),

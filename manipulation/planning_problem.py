@@ -1483,6 +1483,34 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             "effect_requirement": "stable_grasp_from_current_synchronized_evidence"})
         events.append(PlanningEvent("__stable_holding__", skill_id, 1., int(frames[-1]), "effect", source))
         # END no effect association is inferred from its name or clock value.
+        # BEGIN each original close requires arrival before its contact permission.
+        # Keep the terminal owner-relative task result at index zero. These
+        # additional point goals instead compare measured robot FK with the
+        # frozen perception-bound command target; they neither claim a fresh
+        # owner observation nor impose a maintained pose during closure.
+        commands = grounded["gripper_events"]
+        for index, command in enumerate(commands):
+            if command["command"] != "close":
+                continue
+            begin = frame_progress[int(command["frame_index"])]
+            end = next((frame_progress[int(later["frame_index"])]
+                        for later in commands[index+1:] if later["command"] == "open"), 1.)
+            activation = {"skill_id": skill_id, "event_id": command["event_id"],
+                          "occurrence": command.get("occurrence", 0), "kind": "close"}
+            arrival_source = {**source, "kind": "frozen_perception_grasp_arrival",
+                "carrier_id": carrier, "binding_source": deepcopy(grasp_goal["source"]),
+                "activation_event": deepcopy(activation),
+                "semantics": "Robot FK arrival at the frozen perception-bound interaction target before close; not a current owner observation or Holding evidence"}
+            arrival_id = ["pose_events", len(pose_events)]
+            pose_events.append(PoseEventRequirement(begin, np.eye(4), grounded["goal_pose"],
+                grasp_goal["position_tolerance_m"], grasp_goal["rotation_tolerance_rad"],
+                arrival_source, actual_relation=None))
+            conditions.append({"kind": "grasp_contact_activation",
+                "condition_id": f"{skill_id}:grasp_contact:{command['event_id']}:{activation['occurrence']}",
+                "carrier_id": carrier, "arrival_goal_id": arrival_id,
+                "activation_event": activation, "interval": [begin, end],
+                "source": deepcopy(arrival_source)})
+        # END source close identity/progress and the complete skill clock stay intact.
     elif program["skill_kind"] == "manipulation":
         objects, eef = grounded["object_poses"], grounded["eef_poses"]
         attachment = _pose_array(scene["holding"]["T_carrier_eef"], "actual attachment")

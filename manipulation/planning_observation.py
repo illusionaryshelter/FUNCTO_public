@@ -594,7 +594,10 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                           known_solids=None, current_robot=None,
                           max_mapping_bytes=256*1024**2,
                           # BEGIN owner precision is independent of whole-scene extent.
-                          native_geometry_materials=None, owner_voxel_size_m=None):
+                          native_geometry_materials=None, owner_voxel_size_m=None,
+                          # BEGIN explicit pose-arrival robot/owner pair permissions.
+                          robot_owner_permissions=()):
+                          # END mapping preserves the caller's bound policy.
                           # END no owner sample is omitted by the refinement.
     """Fuse a current snapshot into a partial, explicitly partitioned scene.
 
@@ -755,7 +758,10 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                            robot_geometry_source=robot_geometry_source, contacts=contacts,
                            # BEGIN preserve the independently calibrated native material identities.
                            gripper=gripper, has_gripper=has_gripper,
-                           native_geometry_materials=native_geometry_materials)
+                           native_geometry_materials=native_geometry_materials,
+                           # BEGIN retain identical pair permissions through observation binding.
+                           robot_owner_permissions=robot_owner_permissions)
+                           # END RGB-D mapping does not activate actual contact permission.
                            # END the mapping does not itself create a contact permission.
     result.observation_report = {"source": "current calibrated RGB-D and explicit current physical-solid evidence", "partitions": statistics,
                                  "known_free_voxels": free_count, "additional_known_occupied_voxels": occupied_count,

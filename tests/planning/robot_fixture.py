@@ -1161,6 +1161,75 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, collisi
     return manifest
 
 
+# BEGIN bind the complete calibrated hand for pose-gated grasp contact.
+def bind_fixture_gripper_geometry(fixture, robot_cfg, sphere_indices_by_link, finger_joint_names):
+    """Map the finger assembly's exact native solids to their planner spheres.
+
+    The nearest common ancestor of the named finger joints owns the palm and
+    both finger branches. Reject any additional movable joint below that root
+    so an arm or another mechanism cannot acquire hand contact permission.
+    Only the isolated robot model is read; no task/object state is available.
+    The caller has already validated the complete fixture collision contract.
+    """
+    kinematics = robot_cfg["robot_cfg"]["kinematics"]
+    links = kinematics["collision_link_names"]
+    indices = [int(index) for link in links for index in sphere_indices_by_link[link]]
+    if (set(sphere_indices_by_link) != set(links)
+            or len(indices) != fixture["sphere_count"]
+            or sorted(indices) != list(range(len(indices)))
+            or any(len(sphere_indices_by_link[link]) != len(kinematics["collision_spheres"][link]) for link in links)):
+        raise ValueError("Hand binding needs the exact complete runtime sphere partition")
+    names = tuple(finger_joint_names)
+    if len(names) < 2 or len(set(names)) != len(names) or set(names) != set(fixture["finger_joint_names"]):
+        raise ValueError("Hand assembly requires every distinct calibrated finger joint")
+    model = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
+    joints = {int(model.joint(name).id) for name in names}
+
+    def ancestors(body):
+        result = []
+        while body:
+            result.append(body)
+            body = int(model.body_parentid[body])
+        return result
+
+    chains = [ancestors(int(model.jnt_bodyid[joint])) for joint in sorted(joints)]
+    roots = [body for body in chains[0] if all(body in chain for chain in chains[1:])]
+    if not roots:
+        raise ValueError("Named finger joints have no isolated common hand assembly")
+    root = roots[0]
+    bodies = {body for body in range(1, model.nbody) if root in ancestors(body)}
+    if {joint for joint in range(model.njnt) if model.jnt_bodyid[joint] in bodies} != joints:
+        raise ValueError("Selected hand subtree contains an unbound movable robot joint")
+    expected = {model.geom(geom).name for geom in range(model.ngeom)
+                if model.geom_bodyid[geom] in bodies
+                and (model.geom_contype[geom] or model.geom_conaffinity[geom])}
+    offsets = {link: 0 for link in links}
+    selected, geometries = [], []
+    for record in fixture["collision_geometries"]:
+        link, count = record["link"], record["sphere_count"]
+        start = offsets[link]
+        offsets[link] += count
+        if record["geom"] not in expected:
+            continue
+        geom = model.geom(record["geom"]).id
+        with np.load(record["certificate_path"], allow_pickle=False) as saved:
+            balls = kinematics["collision_spheres"][link][start:start+count]
+            if (model.body(model.geom_bodyid[geom]).name != link
+                    or count != len(saved["sphere_radii"])
+                    or not np.array_equal([ball["center"] for ball in balls], saved["sphere_centers_body"])
+                    or not np.array_equal([ball["radius"] for ball in balls], saved["sphere_radii"])):
+                raise ValueError(f"Hand solid differs from its verified sphere cover: {record['geom']}")
+        selected.extend(int(index) for index in sphere_indices_by_link[link][start:start+count])
+        geometries.append(record["geom"])
+    if (not expected or set(geometries) != expected or len(geometries) != len(expected)
+            or any(offsets[link] != len(sphere_indices_by_link[link]) for link in links)):
+        raise ValueError("Every native hand collision solid requires its exact complete sphere cover")
+    return {"root_body": model.body(root).name, "native_geometry_names": geometries,
+            "sphere_indices": selected, "finger_joint_names": list(names),
+            "source": "Isolated calibrated robot: common finger ancestor and complete native collision solids, with exact runtime sphere-cover indices"}
+# END permission changes software checks only, never native contact physics.
+
+
 # BEGIN bind exact native material geometry to the runtime sphere ordering.
 def bind_fixture_contact_materials(fixture, robot_cfg, sphere_indices_by_link,
                                   feedback, material_faces):

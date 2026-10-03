@@ -475,7 +475,10 @@ class PlanningBuilderTest(unittest.TestCase):
         skill["program"]["demo"]["timestamps"] = np.array([2., 2.02, 2.03, 2.5, 2.7, 3.])
         request = compile_inputs(skill)
         self.assertEqual(len(request.phases), 1)
-        self.assertEqual(len(request.pose_events), 1)
+        # BEGIN the close arrival reuses the task goal without a pregrasp pose.
+        self.assertEqual(len(request.pose_events), 2)
+        self.assertEqual(request.pose_events[1].progress, .5)
+        # END the separate terminal goal remains at its original index zero.
         self.assertEqual(request.stop_progress.tolist(), [])
         self.assertFalse(any(event.requires_evidence for event in request.events))
         # BEGIN independent effect assessment keeps its exact event key.
@@ -492,6 +495,77 @@ class PlanningBuilderTest(unittest.TestCase):
         p, q = request.sample_reference(torch.tensor([[.02, .03]], dtype=torch.float64))
         p = p+3.
         self.assertEqual(request.evaluate(p, q, torch.tensor([[.02, .03]])).sum().item(), 0.)
+
+    # BEGIN close arrival and permission refer to the same unchanged source event.
+    def test_grasp_close_arrival_uses_original_goal_allowed_set_and_activation_tick(self):
+        from manipulation.planning import _ProgressMap, _bind_event_clock
+
+        skill = grasp_input()
+        request = compile_inputs(skill)
+        terminal, arrival = request.pose_events
+        close = next(event for event in request.events if event.kind == "close")
+        condition = next(row for row in request.conditions if row["kind"] == "grasp_contact_activation")
+        self.assertEqual(terminal.progress, 1.)
+        self.assertEqual(terminal.actual_relation["target_owner_id"], "carrier")
+        self.assertEqual((close.event_id, close.source_frame, close.occurrence), ("close", 20, 0))
+        self.assertEqual(arrival.progress, close.progress)
+        self.assertIsNone(arrival.actual_relation)
+        self.assertEqual(arrival.source["kind"], "frozen_perception_grasp_arrival")
+        self.assertEqual(arrival.source["binding_source"], skill["scene"]["grasp_goal"]["source"])
+        self.assertEqual(arrival.position_tolerance_m, terminal.position_tolerance_m)
+        self.assertEqual(arrival.rotation_tolerance_rad, terminal.rotation_tolerance_rad)
+        np.testing.assert_array_equal(arrival.target, terminal.target)
+        self.assertEqual(condition["arrival_goal_id"], ["pose_events", 1])
+        self.assertEqual(condition["activation_event"],
+                         {"skill_id": "grasp", "event_id": "close", "occurrence": 0, "kind": "close"})
+        self.assertEqual(condition["interval"], [close.progress, 1.])
+        self.assertEqual(request.pose_relations, ())
+
+        # Exact point-goal arithmetic distinguishes a bad close arrival from
+        # a valid terminal pose; free intervening motion acquires no new hold.
+        progress = torch.tensor([[close.progress, .8, 1.]], dtype=torch.float64)
+        poses = np.repeat(terminal.target[None], 3, axis=0)
+        poses[0, 0, 3] += 2*terminal.position_tolerance_m
+        poses[1, 0, 3] += .3
+        position, quaternion = components(poses[None])
+        values = request.evaluate(position, quaternion, progress)
+        self.assertGreater(values[0, 0].item(), 0.)
+        self.assertEqual(values[0, 1:].sum().item(), 0.)
+        clock = _bind_event_clock(request,
+            _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), .013, .002)
+        activated = clock.event_clock[("grasp", "close", 0)]["activation_time_s"]
+        self.assertEqual(activated, .008)
+        self.assertAlmostEqual(clock.anchor_parameters([arrival.progress])[0, 0]*.013, activated)
+    # END arrival is an online command gate, not observed owner-relative success.
+
+    # BEGIN opening bounds a permission and a later close owns a fresh arrival.
+    def test_grasp_contact_conditions_preserve_each_close_until_the_next_open(self):
+        skill = grasp_input()
+        demo = skill["program"]["demo"]
+        demo["protected_start_frame"] = 11
+        demo["gripper_events"] = [
+            {"event_id": "open", "frame_index": 11, "command": "open"},
+            {"event_id": "close-a", "frame_index": 14, "command": "close", "occurrence": 2},
+            {"event_id": "hold", "frame_index": 17, "command": "hold"},
+            {"event_id": "reopen", "frame_index": 20, "command": "open"},
+            {"event_id": "close-b", "frame_index": 23, "command": "close"},
+        ]
+        request = compile_inputs(skill)
+        conditions = [row for row in request.conditions if row["kind"] == "grasp_contact_activation"]
+        self.assertEqual(len(conditions), 2)
+        self.assertEqual(len(request.pose_events), 3)
+        self.assertEqual(len({row["condition_id"] for row in conditions}), 2)
+        np.testing.assert_allclose([row["interval"] for row in conditions], [[.2, .6], [.8, 1.]])
+        self.assertEqual([row["arrival_goal_id"] for row in conditions], [["pose_events", 1], ["pose_events", 2]])
+        self.assertEqual([row["activation_event"]["event_id"] for row in conditions], ["close-a", "close-b"])
+        self.assertEqual([row["activation_event"]["occurrence"] for row in conditions], [2, 0])
+        for event in demo["gripper_events"]:
+            bound = next(row for row in request.events if row.event_id == event["event_id"])
+            self.assertEqual(bound.source_frame, event["frame_index"])
+            self.assertEqual(bound.source["original_event"], event)
+        np.testing.assert_allclose(request.source_progress, np.linspace(0., 1., 6))
+        np.testing.assert_array_equal(request.source_timestamps, demo["timestamps"])
+    # END no renamed operation, invented frame or truncated skill map is created.
 
     def test_only_one_current_skill_and_actual_holding_are_accepted(self):
         with self.assertRaisesRegex(ValueError, "exactly one"):

@@ -590,6 +590,56 @@ class ContactRule:
             raise ValueError("Numerical contact tolerances must be separately declared finite values")
 
 
+# BEGIN pose-arrival permission identifies a complete explicit robot/owner pair.
+@dataclass
+class RobotOwnerContactPermission:
+    """Software collision permission after a particular arrival and close.
+
+    Native names and sphere indices are the same selected robot solids in the
+    independent and planning models. This record supplies no material contact,
+    attachment, Holding evidence, or simulator collision-filter changes.
+    Actual authorization additionally requires the executor's current arrival
+    latch; a nominal rollout only uses the declared conditional interval.
+    """
+
+    rule_id: str
+    target_owner: str
+    native_geometry_names: tuple
+    sphere_indices: tuple
+    interval: tuple
+    arrival_goal_id: tuple
+    activation_event: dict
+    source: str
+
+    def __post_init__(self):
+        for name in ("rule_id", "target_owner", "source"):
+            _text(getattr(self, name), name)
+        if isinstance(self.native_geometry_names, str):
+            raise ValueError("Native geometry names require an explicit sequence")
+        self.native_geometry_names = tuple(self.native_geometry_names)
+        if (not self.native_geometry_names
+                or len(set(self.native_geometry_names)) != len(self.native_geometry_names)):
+            raise ValueError("Robot-owner permission requires unique native geometry names")
+        for name in self.native_geometry_names:
+            _text(name, "native geometry name")
+        self.sphere_indices = tuple(self.sphere_indices)
+        if (not self.sphere_indices or len(set(self.sphere_indices)) != len(self.sphere_indices)
+                or any(type(index) is not int or index < 0 for index in self.sphere_indices)):
+            raise ValueError("Robot-owner permission requires unique explicit robot sphere indices")
+        self.interval = _valid_interval(self.interval)
+        self.arrival_goal_id = tuple(self.arrival_goal_id)
+        if (len(self.arrival_goal_id) != 2 or self.arrival_goal_id[0] != "pose_events"
+                or type(self.arrival_goal_id[1]) is not int or self.arrival_goal_id[1] < 0):
+            raise ValueError("Robot-owner permission requires a named pose-event arrival goal")
+        event = self.activation_event
+        if (not isinstance(event, dict) or set(event) != {"skill_id", "event_id", "occurrence", "kind"}
+                or event["kind"] != "close"):
+            raise ValueError("Robot-owner permission requires an exact close activation event")
+        event_occurrence_key(event)
+        self.activation_event = deepcopy(event)
+# END whole-pair permission is distinct from finite material ContactRule.
+
+
 class PrismaticGripper:
     """Bind native finger coordinates to a supported controller and geometry.
 
@@ -852,11 +902,14 @@ def _validate_contact_and_gripper_inputs(owner_materials, robot_materials, conta
 class PlanningScene:
     """One scene contract for optimizer rollout, search and final checks.
 
+    # BEGIN distinguish local material rules from pose-gated grasp pairs.
     ``robot_sphere_materials`` assigns a specific native material solid or
-    None to *every* robot sphere. A permission still names its finite contact
-    face: side/back overlaps of that same solid remain checked outside the
-    face's thin region. Palm and adjacent finger bodies keep their separate
-    unmodified proxies. Geometry calibration and coverage belong to the model.
+    None to *every* robot sphere. ``contacts`` names finite contact faces:
+    side/back overlaps stay checked outside those thin local regions.
+    ``robot_owner_permissions`` separately names complete robot/owner pairs
+    conditional on a bound arrival and close; no material face implies one.
+    Geometry calibration and coverage belong to the model in both cases.
+    # END contact scope never changes the calibrated physical geometry.
     Missing gripper information is rejected rather than assuming open fingers.
     A robot without a gripper must explicitly pass ``has_gripper=False``.
     """
@@ -865,7 +918,7 @@ class PlanningScene:
                  robot_sphere_materials, robot_geometry_source,
                  contacts=(), gripper=None, has_gripper=True, robot_coverage=None,
                  numerical_position_tolerance_m=1e-4, numerical_rotation_tolerance_rad=1e-3,
-                 native_geometry_materials=None):
+                 native_geometry_materials=None, robot_owner_permissions=()):
         self.background = background
         # BEGIN independent solids need explicit material identity, not sphere-index guesses.
         self.native_geometry_materials = dict(native_geometry_materials or {})
@@ -947,6 +1000,19 @@ class PlanningScene:
             self.robot_sphere_materials, contacts, gripper, has_gripper)
         self.gripper = gripper
         # END shared CPU-only hand/material validation.
+        # BEGIN bind explicit robot/owner pairs without inferring a hand from materials.
+        self.robot_owner_permissions = tuple(robot_owner_permissions)
+        if any(not isinstance(rule, RobotOwnerContactPermission) for rule in self.robot_owner_permissions):
+            raise TypeError("Robot-owner permissions require RobotOwnerContactPermission records")
+        permission_ids = [rule.rule_id for rule in self.robot_owner_permissions]
+        if (len(set(permission_ids)) != len(permission_ids)
+                or set(permission_ids) & {rule.rule_id for rule in self.contacts}):
+            raise ValueError("Robot-owner and material permission IDs must be unique")
+        for rule in self.robot_owner_permissions:
+            if (rule.target_owner not in ids
+                    or max(rule.sphere_indices) >= len(self.robot_sphere_materials)):
+                raise ValueError("Robot-owner permission must match an explicit owner and robot sphere layout")
+        # END the source adapter owns exact native-name to sphere correspondence.
         # BEGIN own the complete finite target inventory once per binding.
         contacted = {rule.target_owner for rule in self.contacts}
         self._contact_cells = {owner.owner_id: ContactCellGeometry(query_geometry(owner.query))
@@ -955,6 +1021,9 @@ class PlanningScene:
         self._fixed_release_poses = {}
         anchors = [x for owner in self.owners for relation in owner.attachments for x in relation.interval]
         anchors.extend(x for rule in self.contacts for x in rule.interval)
+        # BEGIN pair policy shares the same sampled progress boundaries.
+        anchors.extend(x for rule in self.robot_owner_permissions for x in rule.interval)
+        # END actual activation still requires measured arrival evidence.
         if gripper is not None:
             anchors.extend(float(event["progress"]) for event in gripper.commands)
         self.required_progress_anchors = tuple(sorted(set(anchors)))
@@ -1017,6 +1086,21 @@ class PlanningScene:
         conditions = {row["condition_id"]: row for row in condition_rows}
         if len(conditions) != len(condition_rows):
             raise ValueError("Problem attachment/release condition IDs must be unique")
+        # BEGIN every nominal pair permission is tied to the same required arrival.
+        activations = [row for row in problem.conditions if row.get("kind") == "grasp_contact_activation"]
+        matched = set()
+        for rule in self.robot_owner_permissions:
+            candidates = [index for index, row in enumerate(activations)
+                if row.get("carrier_id") == rule.target_owner
+                and tuple(row.get("arrival_goal_id", ())) == rule.arrival_goal_id
+                and row.get("activation_event") == rule.activation_event
+                and tuple(row.get("interval", ())) == rule.interval]
+            if len(candidates) != 1 or candidates[0] in matched:
+                raise ValueError("Robot-owner permission must match exactly one problem arrival/close condition")
+            matched.add(candidates[0])
+        if matched != set(range(len(activations))):
+            raise ValueError("Every arrival/close condition requires its exact robot-owner permission")
+        # END progress alone cannot introduce a permission outside the bound problem.
         initial_poses, used_attachments = {}, set()
 
         def matrix(position, quaternion):
@@ -1192,6 +1276,9 @@ class PlanningScene:
             owner.attachments = deepcopy(owner.attachments)
             owner.local_spheres = (None if owner.local_spheres is None else owner.local_spheres.copy())
         result.contacts = deepcopy(self.contacts)
+        # BEGIN candidate copies cannot mutate another candidate's pair policy.
+        result.robot_owner_permissions = deepcopy(self.robot_owner_permissions)
+        # END native geometry remains shared read-only.
         # BEGIN immutable target cells/tree are shared; query diagnostics are private.
         result._contact_cells = {name: copy(value) for name, value in self._contact_cells.items()}
         for value in result._contact_cells.values():
@@ -1552,7 +1639,8 @@ class PlanningScene:
         # END the target-cell query checks every possible material overlap.
 
     def components(self, robot_spheres, position, quaternion, progress,
-                   joint_position=None, joint_names=None, *, trajectory_time=None):
+                   joint_position=None, joint_names=None, *, trajectory_time=None,
+                   robot_owner_permission_progress=None):
         """Return nonnegative [B,H] terms; no term can cancel a violation.
 
         Required event anchors must be included by the caller. On a mode
@@ -1567,6 +1655,11 @@ class PlanningScene:
                 or quaternion.shape != (*progress.shape, 4)):
             raise ValueError("Scene needs aligned FK spheres, tool pose and progress [B,H]")
         costs = {}
+        # BEGIN a same-state old material mode does not revoke an arrived pair permission.
+        permission_progress = progress if robot_owner_permission_progress is None else robot_owner_permission_progress
+        if permission_progress.shape != progress.shape:
+            raise ValueError("Robot-owner permission progress must align with the queried states")
+        # END ordinary scene/attachment rules continue to consume their original progress.
         coordinates = half = None
         spheres = robot_spheres
         if self.gripper is not None:
@@ -1716,15 +1809,27 @@ class PlanningScene:
                     enabled = values.new_ones(values.shape[-1])
                     enabled[list(owner.robot_excluded_spheres)] = 0
                     values = values * enabled
+                # BEGIN nominal arrival permits only the selected robot/owner pairs.
+                if actor == "robot":
+                    for rule in self.robot_owner_permissions:
+                        if rule.target_owner != owner.owner_id:
+                            continue
+                        selected = torch.zeros(values.shape[-1], dtype=torch.bool, device=values.device)
+                        selected[list(rule.sphere_indices)] = True
+                        permitted = _interval(permission_progress, rule.interval).unsqueeze(-1) & selected
+                        values = torch.where(permitted, torch.zeros_like(values), values)
+                # END background, other owners, robot self pairs and raw queries are unchanged.
                 collision_terms(values, f"collision/{actor}/{owner.owner_id}", actor)
                 # END the observed background and unknown-space queries are unchanged.
         return costs
 
     def evaluate(self, robot_spheres, position, quaternion, progress,
-                 joint_position=None, joint_names=None, *, trajectory_time=None):
+                 joint_position=None, joint_names=None, *, trajectory_time=None,
+                 robot_owner_permission_progress=None):
         terms = self.components(robot_spheres, position, quaternion, progress,
                                 joint_position=joint_position, joint_names=joint_names,
-                                trajectory_time=trajectory_time)
+                                trajectory_time=trajectory_time,
+                                robot_owner_permission_progress=robot_owner_permission_progress)
         # BEGIN allowed observation/model uncertainty stays diagnostic.
         # A missing release anchor is different: the requested pose query
         # cannot be formed and must still fail this candidate.
@@ -1822,6 +1927,9 @@ class PlanningScene:
                 "background": {"owner_ids": sorted(self.background.owner_ids), "source": self.background.source,
                                "geometry": geometry(self.background)},
                 "owners": owners, "contacts": plain([asdict(rule) for rule in self.contacts]),
+                # BEGIN keep the exact conditional pair policy in every formal archive.
+                "robot_owner_permissions": plain([asdict(rule) for rule in self.robot_owner_permissions]),
+                # END execution must bind this snapshot before receiving actual latches.
                 "contact_query_models": {identity: {"complete_cells": len(value.centres),
                     "query_gaps": list(value.gaps), "cell_half_diagonal_m": value.cell_half_diagonal_m,
                     "maximum_candidate_pairs": value.max_candidate_pairs,
@@ -1860,6 +1968,9 @@ class PlanningScene:
             # END no owner-wide or background-wide exemption is implied.
             "conditional_attachments": {owner.owner_id: [relation.condition_id for relation in owner.attachments]
                                         for owner in self.owners if owner.attachments},
+            # BEGIN permission metadata is not contact or task-success evidence.
+            "robot_owner_permissions": [asdict(rule) for rule in self.robot_owner_permissions],
+            # END retain exact scope for diagnostics.
             "release_requires_evidence": {
                 owner.owner_id: [relation.release_condition_id for relation in owner.attachments
                                  if relation.release_condition_id is not None]
