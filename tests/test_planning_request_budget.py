@@ -44,6 +44,15 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         self.assertEqual(third.diagnostics["failure"], "cumulative_planning_budget_exhausted")
         self.assertGreaterEqual(third.request_ledger["consumed_planning"]["planning_seconds"],
                                 second.request_ledger["consumed_planning"]["planning_seconds"])
+        # BEGIN a carried computation ledger is not actual-world continuation.
+        self.assertEqual(first.request_ledger["binding_records"][-1]["mode"], "initial")
+        for result in (second, third):
+            self.assertEqual(result.request_ledger["binding_records"][-1]["mode"], "planning_retry")
+            self.assertFalse(result.request_ledger["requires_continuation"])
+        self.assertEqual(second.request_ledger["binding_records"][:-1], saved["binding_records"])
+        self.assertEqual(third.request_ledger["binding_records"][:-1],
+                         second.request_ledger["binding_records"])
+        # END exhausted retries append their own mode without rewriting history.
 
     def test_rejected_budget_change_retains_prior_work_and_source_evidence(self):
         with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("initialization failed")) as native:
@@ -68,6 +77,10 @@ class PlanningRequestBudgetTest(unittest.TestCase):
     def test_rejected_execution_record_still_accounts_against_supplied_request(self):
         with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("initialization failed")) as native:
             first = plan_trajectory(self.problem, self.scene, {}, budget=self.budget)
+            # BEGIN a requested actual continuation keeps its distinct mode.
+            continuation_attempt = plan_trajectory(self.problem, self.scene, {}, request_ledger=first.request_ledger,
+                continuation={"failure_reason": "missing actual continuation evidence"})
+            # END rejection still reports which binding path was requested.
             rejected = plan_trajectory(self.problem, self.scene, {}, request_ledger=first.request_ledger,
                 continuation={"failure_reason": "missing actual continuation evidence"},
                 rebind={"kind": "remaining", "source": "explicit Executor continuation"})
@@ -77,6 +90,11 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         self.assertEqual(rejected.request_ledger["request_id"], first.request_ledger["request_id"])
         self.assertGreater(rejected.request_ledger["consumed_planning"]["binding_attempts"],
                            first.request_ledger["consumed_planning"]["binding_attempts"])
+        # BEGIN an explicit rebind keeps its own mode despite rejection.
+        self.assertFalse(continuation_attempt.success)
+        self.assertEqual(continuation_attempt.request_ledger["binding_records"][-1]["mode"], "continuation")
+        self.assertEqual(rejected.request_ledger["binding_records"][-1]["mode"], "remaining")
+        # END this reporting fix does not reclassify explicit executor decisions.
 
 
 if __name__ == "__main__":

@@ -115,19 +115,35 @@ def _segment(q0, dq0, goal, start, end, timestep, names, limits):
     accelerations = np.maximum(np.abs(limits["acceleration"][0]), np.abs(limits["acceleration"][1]))
     required = max(float(np.max(np.abs(goal - q0) / speeds)),
                    float(np.max(np.abs(dq0) / accelerations)))
-    first = max(1, int(math.ceil(required / timestep)))
+    # BEGIN admit the exact absolute endpoints later used by the saved spline.
+    # Adding a relative duration to a nonzero start can change its binary64
+    # width, so a locally admissible cubic need not remain admissible after
+    # translation. Native endpoints come from the original integer tick
+    # products; both admission and final construction use those same values.
+    first, _ = _activation(start + required, timestep)
+    # The lower-bound sum itself may round. Check represented differences
+    # directly so this pruning cannot omit the earliest admissible tick.
+    while first > 0 and (first-1)*timestep > start and (first-1)*timestep-start >= required:
+        first -= 1
+    while first*timestep <= start or first*timestep-start < required:
+        first += 1
     available = end - start
-    last = int(math.floor(available / timestep))
-    if last > 100_000:
+    if int(math.floor(available / timestep)) > 100_000:
         raise ValueError("Finger reference search exceeds the bounded native control horizon")
-    candidates = [step * timestep for step in range(first, last + 1)]
-    if available >= required and (not candidates or candidates[-1] != available):
-        candidates.append(available)
-    for duration in candidates:
-        ramp = CubicHermiteSpline([0., duration], np.stack((q0, goal)),
+    last, last_time = _activation(end, timestep)
+    if last_time > end:
+        last -= 1
+    candidates = [step*timestep for step in range(first, last+1)]
+    # A non-grid original deadline is still an eligible exact endpoint. It
+    # is never reconstructed as start+(end-start), nor extended to a tick.
+    if available >= required and (not candidates or candidates[-1] != end):
+        candidates.append(end)
+    for finish in candidates:
+        ramp = CubicHermiteSpline([start, finish], np.stack((q0, goal)),
                                   np.stack((dq0, np.zeros_like(dq0))), axis=0)
         if _extrema(ramp, names, limits)["bounds_satisfied"]:
-            return start + duration
+            return finish
+    # END strict physical bounds and the original event/deadline are unchanged.
     raise ValueError(f"No C1 finger command satisfies the declared q/dq/ddq bounds before {end} s")
 
 

@@ -142,6 +142,11 @@ def test_native_contact_is_permitted_locally_and_actual_state_remains_distinct(t
     assert not rejected["passed"] and rejected["violations"]
     held = backend.abort_hold(actual, np.asarray([.01, -.01]), expected_sim_time=actual["sim_time"],
         stop_velocity=np.asarray([.01, .01, .01]), max_steps=50)
+    # BEGIN account for every completed native step, including the separate hold.
+    # Record before checking the stop verdict: a rejected stop still consumes
+    # its actual physics steps, while mj_forward queries do not advance time.
+    record_property("native_physics_steps", 400+held["physical_steps"])
+    # END the executed hold count, not its maximum budget, enters the ledger.
     assert held["native_ctrl_written"] and held["physical_steps"] > 0
     assert held["physical_stop_confirmed"]
     assert all(abs(value) <= .01 for value in held["samples"][-1]["dq"])
@@ -197,6 +202,11 @@ def test_native_arm_stop_keeps_the_original_finger_position_fault_visible(record
     initial = backend.proprioception()
     result = backend.abort_hold(initial, np.array([.04, -.04]), expected_sim_time=initial["sim_time"],
         stop_velocity=np.array([.01, .001, .001]), max_steps=250)
+    # BEGIN retain the exact completed native stop count independently of success.
+    # This fixture has no preceding trajectory steps; setup mj_forward calls
+    # only refresh derived state and must not inflate physical consumption.
+    record_property("native_physics_steps", result["physical_steps"])
+    # END the existing isolated_native_stop_steps diagnostic remains unchanged.
     assert initial["q"][1] > backend.joint_ranges[1, 1]
     assert initial["dq"][0] == .4
     assert result["prepared"] and result["native_ctrl_written"]

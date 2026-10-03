@@ -4089,9 +4089,15 @@ def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0", cont
                 diagnostics["wall_time_overrun_s"] = ledger["consumed_planning"]["planning_seconds"]-ledger["planning_budget"]["planning_seconds"]
                 diagnostics["planning_budget_exhausted"] = True
                 diagnostics["budget_exhausted_after_qualification"] = outcome.success
+            # BEGIN distinguish planning-only retries from actual-world continuation.
+            # A previous work ledger carries cumulative computation, but does
+            # not by itself supply executed state, events or a physical clock.
+            # Append the accurate mode without relabelling historical records.
             ledger["binding_records"].append({
                 "candidate_id": None if outcome.execution_binding is None else outcome.execution_binding.get("candidate_id"),
-                "mode": "initial" if previous is None else "continuation" if rebind is None else
+                "mode": "initial" if previous is None else
+                        "planning_retry" if continuation is None and rebind is None else
+                        "continuation" if rebind is None else
                         rebind.get("kind") if isinstance(rebind, dict) else "invalid_rebind",
                 "source": deepcopy(rebind.get("source")) if isinstance(rebind, dict) else None,
                 "request_time_origin_s": (None if continuation is not None and prior is None else
@@ -4099,6 +4105,7 @@ def plan_trajectory(problem, scene, robot, *, budget=None, device="cuda:0", cont
                 "accepted": outcome.success, "failed_stage": diagnostics.get("failed_stage"),
                 "failure": diagnostics.get("failure"), "reason": diagnostics.get("reason"),
                 "consumed_planning": deepcopy(ledger["consumed_planning"])})
+            # END the mode describes this attempt, not all earlier request work.
             outcome.request_ledger = deepcopy(ledger)
             if outcome.execution_binding is not None:
                 outcome.execution_binding["consumed_planning"] = deepcopy(ledger["consumed_planning"])
