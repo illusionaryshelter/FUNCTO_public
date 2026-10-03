@@ -626,6 +626,11 @@ class TrajectoryExecutor:
         No goal from the later curve is sent to an actuator. Physical tracking
         and actual finger intervals require an explicit ``ExecutionLimits``;
         rejection sends bounded device hold and records its measured result.
+        # BEGIN one physical allowance includes every attempted native step.
+        ``max_physics_steps`` bounds normal playback and both hold paths
+        together. Failed or uncertain attempts remain charged; confirmed
+        native advancement is recorded separately and owns physical time.
+        # END a hold is not an additional allowance outside the request.
         """
         # BEGIN a rejected new binding cannot expose an earlier trial report.
         self.last_execution_report = None
@@ -850,6 +855,92 @@ class TrajectoryExecutor:
             evaluated_events=[], stopped_events=[], reached_events=[],
             completed_goal_ids=deepcopy(binding.get("completed_goal_ids", [])),
             goal_evidence=deepcopy(binding.get("goal_evidence", [])))
+        # BEGIN one local allowance covers normal commands and both hold paths.
+        normal_accounting = {"charged_steps": 0, "physical_steps": 0,
+                             "step_accounting_exact": True}
+        report["normal_step_accounting"] = normal_accounting
+        report["last_confirmed_curve_time_s"] = 0.
+
+        def step_accounting():
+            """Separate conservative budget charges from confirmed movement."""
+            phases = [normal_accounting, *(report[key] for key in ("dependency_hold", "abort_hold")
+                                           if report[key] is not None)]
+            charged = sum(row["charged_steps"] for row in phases)
+            return {"charged_steps": charged,
+                    "physical_steps": sum(row["physical_steps"] for row in phases),
+                    "step_accounting_exact": all(row["step_accounting_exact"] for row in phases),
+                    "execution_step_limit": max_physics_steps,
+                    "remaining_charged_steps": max(0, max_physics_steps-charged),
+                    "scope": "This execute invocation; normal playback and both hold paths"}
+
+        def run_hold(key, feedback, *, expected_sim_time):
+            """Allocate only the same invocation's unspent native attempts.
+
+            Reserve the complete supplied hold allowance until its owned
+            result is available. If the hold itself unexpectedly raises or
+            loses its report, no unknown work becomes a free retry.
+            """
+            allowance = min(max_hold_steps, step_accounting()["remaining_charged_steps"])
+            report[key] = {"prepared": None, "native_ctrl_written": None,
+                "physical_stop_confirmed": False, "physical_steps": 0,
+                "charged_steps": allowance, "step_accounting_exact": allowance == 0,
+                "samples": [], "controls": [],
+                "reason": "Hold result unavailable; its allotted attempts remain conservatively charged"}
+            outcome = backend.abort_hold(feedback, target_positions,
+                expected_sim_time=expected_sim_time,
+                stop_velocity=np.r_[execution_limits.stop_arm_velocity, execution_limits.stop_finger_velocity],
+                max_steps=allowance)
+            if (not isinstance(outcome, dict)
+                    or type(outcome.get("charged_steps")) is not int
+                    or type(outcome.get("physical_steps")) is not int
+                    or type(outcome.get("step_accounting_exact")) is not bool
+                    or not 0 <= outcome["physical_steps"] <= outcome["charged_steps"] <= allowance):
+                raise ValueError("Hold result must retain bounded charged and confirmed native steps")
+            report[key] = outcome
+
+        def normal_step(curve_time):
+            """Charge before integration and retain its result before capture.
+
+            The backend publishes accounting at the native integration
+            boundary, before forward refresh. A later refresh/record error
+            cannot erase that completed step or replace the primary error.
+            """
+            if step_accounting()["remaining_charged_steps"] <= 0:
+                raise ExecutionGuardError("The total native physics-step budget is exhausted")
+            previous = backend.last_step_accounting
+            previous_attempt = 0 if previous is None else previous["attempt_index"]
+            normal_accounting["charged_steps"] += 1
+            primary = None
+            try:
+                backend.step()
+            except Exception as error:
+                primary = error
+            try:
+                outcome = backend.last_step_accounting
+                if (not isinstance(outcome, dict)
+                        or type(outcome.get("attempt_index")) is not int
+                        or outcome["attempt_index"] != previous_attempt+1
+                        or type(outcome.get("charged_steps")) is not int or outcome["charged_steps"] != 1
+                        or type(outcome.get("physical_steps")) is not int or outcome["physical_steps"] not in (0, 1)
+                        or type(outcome.get("step_accounting_exact")) is not bool):
+                    raise ValueError("Backend must publish accounting for this exact native step attempt")
+            except Exception as error:
+                outcome = {"charged_steps": 1, "physical_steps": 0, "step_accounting_exact": False,
+                           "reason": f"{type(error).__name__}: {error}"}
+                if primary is None:
+                    primary = error
+                else:
+                    report.setdefault("cleanup_errors", []).append({
+                        "stage": "normal_step_accounting", "error": outcome["reason"]})
+            normal_accounting["physical_steps"] += outcome["physical_steps"]
+            normal_accounting["step_accounting_exact"] &= outcome["step_accounting_exact"]
+            report["executed_steps"] = normal_accounting["physical_steps"]
+            report["last_normal_step_accounting"] = deepcopy(outcome)
+            if outcome["physical_steps"]:
+                report["last_confirmed_curve_time_s"] = float(curve_time)
+            if primary is not None:
+                raise primary
+        # END post-step telemetry never owns budget accounting or completed time.
         # BEGIN every functional pose goal keeps its original identity and clock.
         pose_goals = binding["problem"].get("pose_events", [])
         pose_goal_ids = binding.get("goal_identities", {}).get("pose_events", [])
@@ -1661,10 +1752,9 @@ class TrajectoryExecutor:
                     "feedback_id": feedback["feedback_id"], "physical_elapsed_s": float(elapsed)})
                 if evidence["value"] != "T":
                     report["status"] = "effect_rejected" if evidence["value"] == "F" else "stopped_for_evidence"
-                    report["dependency_hold"] = backend.abort_hold(feedback, target_positions,
-                        expected_sim_time=sim_start+elapsed,
-                        stop_velocity=np.r_[execution_limits.stop_arm_velocity, execution_limits.stop_finger_velocity],
-                        max_steps=max_hold_steps)
+                    # BEGIN dependency stopping spends only the shared remainder.
+                    run_hold("dependency_hold", feedback, expected_sim_time=sim_start+elapsed)
+                    # END an exhausted allowance never grants an extra stop step.
                     return False
                 report["verified_events"].append(deepcopy(event))
                 # Only actual dependency evaluation activates this event;
@@ -1728,6 +1818,10 @@ class TrajectoryExecutor:
             for index in range(count):
                 if not active:
                     break
+                # BEGIN exhausted total capacity forbids even a new control write.
+                if step_accounting()["remaining_charged_steps"] <= 0:
+                    raise ExecutionGuardError("The total native physics-step budget is exhausted")
+                # END hold attempts and normal playback use the same allowance.
                 elapsed = index * backend.timestep
                 # Re-read once at each step boundary. The same snapshot gates
                 # any due event; a failed gate cannot mutate a finger goal.
@@ -1784,9 +1878,10 @@ class TrajectoryExecutor:
                 for name in control_terms:
                     control_terms[name].append(_finite_array(control[name], (narm,), name))
                 # END no term is reconstructed from post-step telemetry.
-                backend.step()
+                # BEGIN native completion is counted before any post-step capture.
+                normal_step(min(next_time, stop))
                 current = record(next_time, q, dq, ddq, progress)
-                report["executed_steps"] = index + 1
+                # END failed record/FK cannot hide a completed physical step.
                 samples.append(current)
                 # Preserve the completed physical sample, including independent
                 # evaluator contacts, before rejecting its measured feedback.
@@ -1816,18 +1911,53 @@ class TrajectoryExecutor:
             # BEGIN send bounded hold control and preserve separate feedback.
             # The last applied finger goal remains in force. No rejected
             # event, source reset or artificial zero velocity is introduced.
-            failure_feedback = (report["feedback_failure"]["actual_feedback"]
-                                if report["feedback_failure"] is not None else backend.proprioception())
-            report["abort_hold"] = backend.abort_hold(failure_feedback, target_positions,
-                expected_sim_time=sim_start+report["executed_steps"]*backend.timestep,
-                stop_velocity=np.r_[execution_limits.stop_arm_velocity, execution_limits.stop_finger_velocity],
-                max_steps=max_hold_steps)
+            # BEGIN cleanup failures retain the original execution exception.
+            try:
+                failure_feedback = (report["feedback_failure"]["actual_feedback"]
+                                    if report["feedback_failure"] is not None else backend.proprioception())
+                expected_steps = step_accounting()["physical_steps"]
+                run_hold("abort_hold", failure_feedback,
+                         expected_sim_time=sim_start+expected_steps*backend.timestep)
+            except Exception as hold_error:
+                report.setdefault("cleanup_errors", []).append({
+                    "stage": "abort_hold", "error": f"{type(hold_error).__name__}: {hold_error}"})
+            # END missing fresh feedback never becomes a fabricated hold origin.
             # END physical stop confirmation is distinct from loop exit.
             raise
         finally:
+            # BEGIN publish budget facts independently of final telemetry capture.
+            accounting = step_accounting()
+            report["physics_step_accounting"] = accounting
+            finalization_error = None
+            try:
+                final_feedback = deepcopy(backend.proprioception())
+            except Exception as error:
+                final_feedback = None
+                finalization_error = error
+                report.setdefault("cleanup_errors", []).append({
+                    "stage": "final_feedback", "error": f"{type(error).__name__}: {error}"})
+                if execution_error is None:
+                    report["status"] = "execution_error"
+                    report["error"] = f"{type(error).__name__}: {error}"
+            # END unavailable actual feedback cannot suppress the step ledger.
             actual_q = np.asarray([row["q"] for row in samples])
             command_q = np.asarray([row["command_q"] for row in samples])
-            final_elapsed = float(backend.sim_time - sim_start)
+            # BEGIN an unreadable actual clock cannot erase charged native work.
+            try:
+                final_elapsed = float(backend.sim_time - sim_start)
+                if not np.isfinite(final_elapsed) or final_elapsed < 0:
+                    raise ValueError("Final native clock is nonfinite or precedes this execution")
+            except Exception as error:
+                final_elapsed = None
+                accounting["step_accounting_exact"] = False
+                report.setdefault("cleanup_errors", []).append({
+                    "stage": "final_clock", "error": f"{type(error).__name__}: {error}"})
+                if finalization_error is None:
+                    finalization_error = error
+                if execution_error is None:
+                    report["status"] = "execution_error"
+                    report["error"] = f"{type(finalization_error).__name__}: {finalization_error}"
+            # END unknown elapsed time is never replaced by count*timestep.
             applied_ids = {event_occurrence_key(event) for event in report["events"]}
             consumed_ids = applied_ids | {event_occurrence_key(event)
                 for event in report["verified_events"] if event["kind"] not in ("open", "close", "hold")}
@@ -1838,8 +1968,8 @@ class TrajectoryExecutor:
             barrier_command_reached = stop == 0 or (report["executed_steps"] > 0 and samples[-1]["curve_time"] >= stop-1e-12)
             report.update(elapsed_wall_s=time.monotonic()-started, elapsed_sim_s=final_elapsed,
                 actual_sim_stop_s=final_elapsed, last_command_sample_s=samples[-1]["curve_time"] if controls else None,
-                remaining_to_barrier_s=max(0., stop-final_elapsed),
-                physical_clock_overrun_s=max(0., final_elapsed-stop),
+                remaining_to_barrier_s=None if final_elapsed is None else max(0., stop-final_elapsed),
+                physical_clock_overrun_s=None if final_elapsed is None else max(0., final_elapsed-stop),
                 barrier_command_reached=barrier_command_reached,
                 barrier_crossed=any(samples[-1]["curve_time"] > event["time"]
                                     for event in report["verified_events"]),
@@ -1889,7 +2019,8 @@ class TrajectoryExecutor:
                         report["timing_checks"].append({"skill_id": event["skill_id"],
                             "event_id": event["event_id"], "occurrence": event["occurrence"],
                             "check_target": constraint["check_target"], "constraint_index": index,
-                            "time_s": request_origin+final_elapsed, "value": "U", "source": constraint["source"],
+                            "time_s": None if final_elapsed is None else request_origin+final_elapsed,
+                            "value": "U", "source": constraint["source"],
                             "reason": "Execution ended without an applicable actual witness"})
             report["timing_result"] = (None if not timing_values else "F" if "F" in timing_values
                 else "T" if all(value == "T" for value in timing_values) else "U")
@@ -1939,9 +2070,13 @@ class TrajectoryExecutor:
                     for key in ("position_bounds", "maximum_speed")},
                 "physics_budget": physics_budget,
                 "device_timestep_s": float(backend.timestep),
-                "elapsed_physical_s": final_elapsed, "last_curve_time_s": samples[-1]["curve_time"],
+                # BEGIN confirmed command time survives a failed post-step capture.
+                "elapsed_physical_s": final_elapsed,
+                "last_curve_time_s": report["last_confirmed_curve_time_s"],
+                # END missing a state sample never rolls back the commanded curve.
                 "request_time_origin_s": float(binding.get("request_time_origin_s", 0.)),
-                "cumulative_elapsed_physical_s": float(binding.get("request_time_origin_s", 0.))+final_elapsed,
+                "cumulative_elapsed_physical_s": (None if final_elapsed is None else
+                    float(binding.get("request_time_origin_s", 0.))+final_elapsed),
                 "applied_events": deepcopy(report["events"]),
                 "verified_events": deepcopy(report["verified_events"]),
                 "evaluated_events": deepcopy(report["evaluated_events"]),
@@ -1953,22 +2088,23 @@ class TrajectoryExecutor:
                 "direction_evidence": deepcopy(report["direction_evidence"]),
                 "superseded_events": deepcopy(report["superseded_gripper_events"]),
                 "remaining_events": deepcopy(report["unconsumed_events"]),
-                "effects": effects, "actual_feedback": deepcopy(backend.proprioception()),
+                # BEGIN absent final feedback remains explicitly unavailable.
+                "effects": effects, "actual_feedback": final_feedback,
+                # END no earlier sample is relabelled as the current robot state.
                 "object_changes": deepcopy(report["object_changes"]),
-                "requires_rebind": (report["status"] != "curve_finished"
+                "requires_rebind": (final_feedback is None or not accounting["step_accounting_exact"]
+                    or report["status"] != "curve_finished"
                     or report["timing_result"] not in (None, "T")
                     or report["direction_result"] not in (None, "T")
                     or report["execution_pose_goal_result"] not in (None, "T")),
                 "reason": "Remaining obligations require current actual/scene binding; applied events and original hard clock cannot be reset",
-                "consumed_physics_steps": report["executed_steps"] + sum(
-                    0 if report[key] is None else report[key]["physical_steps"]
-                    for key in ("abort_hold", "dependency_hold")),
-                "cumulative_physics_steps": prior_physics_steps+report["executed_steps"]+sum(
-                    0 if report[key] is None else report[key]["physical_steps"]
-                    for key in ("abort_hold", "dependency_hold")),
-                "remaining_physics_steps": max(0, physics_budget-prior_physics_steps-report["executed_steps"]-sum(
-                    0 if report[key] is None else report[key]["physical_steps"]
-                    for key in ("abort_hold", "dependency_hold")))}
+                # BEGIN budget charges and confirmed time have distinct contracts.
+                "consumed_physics_steps": accounting["charged_steps"],
+                "confirmed_physics_steps": accounting["physical_steps"],
+                "step_accounting_exact": accounting["step_accounting_exact"],
+                "cumulative_physics_steps": prior_physics_steps+accounting["charged_steps"],
+                "remaining_physics_steps": max(0, physics_budget-prior_physics_steps-accounting["charged_steps"])}
+                # END an uncertain attempt is never a free retry or invented time.
             # END finishing command playback never asserts Holding or release.
             # BEGIN each evidence sink is independent of the primary verdict.
             persistence_errors = []
@@ -2034,7 +2170,10 @@ class TrajectoryExecutor:
                 control_elapsed=np.arange(len(controls))*backend.timestep,
                 control_sim_time=sim_start+np.arange(len(controls))*backend.timestep,
                 gripper_command=np.asarray([row["gripper_command"] for row in samples])))
-            if report["status"] in ("stopped_for_evidence", "curve_finished", "feedback_rejected", "execution_error", "effect_rejected"):
+            # BEGIN feedback artifacts require a captured current sample.
+            if final_feedback is not None and report["status"] in (
+                    "stopped_for_evidence", "curve_finished", "feedback_rejected", "execution_error", "effect_rejected"):
+            # END an unavailable sample remains absent, while both ledgers persist.
                 # This is a robot-only observation. A later bridge still needs
                 # a current scene observation and independently verified
                 # holding evidence before constructing an attached-object model.
@@ -2052,8 +2191,13 @@ class TrajectoryExecutor:
                                   barrier_feedback_path=str(feedback_path) if completed and trajectory.next_verification is not None else None)
             persist("execution-report.json", lambda: (output/"execution-report.json").write_text(
                 json.dumps(_feedback_json(report), indent=2, allow_nan=False)+"\n"))
-            if persistence_errors and execution_error is None:
-                raise persistence_errors[0]
+            # BEGIN final capture errors precede later persistence errors.
+            if execution_error is None:
+                if finalization_error is not None:
+                    raise finalization_error
+                if persistence_errors:
+                    raise persistence_errors[0]
+            # END cleanup cannot replace a primary execution exception.
             # END failed persistence never reports success or hides an execution error.
         return report
 

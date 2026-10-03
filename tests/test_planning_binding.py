@@ -165,6 +165,9 @@ class PlanningBindingTest(unittest.TestCase):
         return {"candidate_id": "candidate", "original_binding": original,
                 "physics_budget": 1000, "cumulative_physics_steps": 100+local_steps,
                 "remaining_physics_steps": 900-local_steps, "consumed_physics_steps": local_steps,
+                # BEGIN successful synthetic native steps have an explicit exact clock.
+                "confirmed_physics_steps": local_steps, "step_accounting_exact": True,
+                # END charges alone cannot advance a continuation's original time.
                 "device_timestep_s": timestep,
                 "actual_feedback": {"joint_names": ["q"], "q": [0.], "dq": [0.]},
                 "elapsed_physical_s": elapsed,
@@ -190,6 +193,23 @@ class PlanningBindingTest(unittest.TestCase):
             np.interp(times+.25, [0., .5, 1.], [0., .8, 1.]), atol=1e-15)
         self.assertEqual(mapping.event_clock[("current", "close", 0)]["activation_time_s"], .65)
         self.assertEqual(mapping.event_clock[("current", "close", 0)]["request_intent_time_s"], .9)
+
+    # BEGIN a paid but stationary attempt never advances the physical clock.
+    def test_continuation_separates_charges_from_exact_confirmed_steps(self):
+        request = self.problem((PlanningEvent("close", "current", .9, 1, "close", "task"),))
+        retained = self.continuation(request, elapsed=0.)
+        retained.update(consumed_physics_steps=1, cumulative_physics_steps=101, remaining_physics_steps=899)
+        _, prior = _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, retained)
+        self.assertEqual(prior["elapsed"], 0.)
+        self.assertEqual(prior["elapsed_device_steps"], 0)
+        self.assertEqual(prior["consumed_physics_steps"], 101)
+        self.assertEqual(prior["remaining_physics_steps"], 899)
+        for key, value in (("step_accounting_exact", False), ("step_accounting_exact", None),
+                           ("confirmed_physics_steps", None), ("confirmed_physics_steps", 2)):
+            changed = deepcopy(retained); changed[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ContinuationBindingError):
+                _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, changed)
+    # END an unknown count cannot masquerade as an exact zero-step continuation.
 
     def test_continuation_never_replays_applied_events_or_guesses_past_effects(self):
         events = (PlanningEvent("earlier", "current", .1, 1, "close", "task"),

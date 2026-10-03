@@ -54,6 +54,9 @@ def continuation(request, *, elapsed=.4, curve_time=.4, applied=(), completed=()
     return {"candidate_id": "previous", "original_binding": original,
         "physics_budget": 1000, "cumulative_physics_steps": round(elapsed/.01),
         "remaining_physics_steps": 1000-round(elapsed/.01), "consumed_physics_steps": round(elapsed/.01),
+        # BEGIN this timed-evidence fixture declares its confirmed native steps.
+        "confirmed_physics_steps": round(elapsed/.01), "step_accounting_exact": True,
+        # END physical event windows never use attempted-work charges as time.
         "device_timestep_s": .01, "elapsed_physical_s": elapsed, "last_curve_time_s": curve_time,
         "actual_feedback": {"joint_names": ["q"], "q": [0.], "dq": [0.], "timestamp_s": elapsed},
         "remaining_events": [row for row in rows if event_occurrence_key(row) not in applied],

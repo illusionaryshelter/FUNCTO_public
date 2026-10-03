@@ -109,6 +109,10 @@ class RobosuiteExecutionBackend:
         self._dt = float(model.opt.timestep)
         if not np.isfinite(self._dt) or self._dt <= 0:
             raise ValueError("Native physics timestep must be finite and positive")
+        # BEGIN each native attempt publishes its own boundary accounting.
+        self._step_attempts = 0
+        self._last_step_accounting = None
+        # END later feedback failures cannot erase an already completed step.
         # END physical finger targets through the existing unscaled GRIP.
 
         def indexes(start, stop):
@@ -303,12 +307,76 @@ class RobosuiteExecutionBackend:
         # END count only the arm controller's clipped torque coordinates.
     # END no derivative-free fallback or mutation of physical q/dq/qacc.
 
+    # BEGIN account at the native integration boundary, before derived feedback.
+    @property
+    def last_step_accounting(self):
+        """Return the latest attempt's facts independently of later sampling."""
+        return deepcopy(self._last_step_accounting)
+
     def step(self):
-        """Integrate exactly one native step and refresh derived feedback."""
-        self._sim.step()
+        """Integrate one native step and retain its count even if refresh fails.
+
+        One entered attempt is conservatively charged. A normal native return
+        confirms its one completed step; an exceptional return can still be
+        resolved by the native clock. A stationary exceptional clock confirms
+        zero completed steps without refunding the attempted work. An unreadable
+        or discontinuous clock leaves only a lower bound on completed steps.
+        No accounting or derived-feedback error replaces a native exception.
+        """
+        self._step_attempts += 1
+        report = {"attempt_index": self._step_attempts, "charged_steps": 1,
+                  "physical_steps": 0, "step_accounting_exact": True,
+                  "native_step_attempted": False, "native_step_returned": False,
+                  "before_sim_time": None, "after_sim_time": None,
+                  "clock_advance_confirmed": False, "clock_error": None}
+        self._last_step_accounting = report
+        try:
+            before = float(self.native_data.time)
+            report["before_sim_time"] = before
+            if not np.isfinite(before):
+                raise ValueError("Native integration requires a finite initial clock")
+        except Exception as error:
+            report["clock_error"] = f"{type(error).__name__}: {error}"
+            raise
+        try:
+            report["native_step_attempted"] = True
+            self._sim.step()
+            report["native_step_returned"] = True
+        except Exception as error:
+            report["native_error"] = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            # Read accounting before mj_forward or proprioception. Both may
+            # fail after integration and must not make that step disappear.
+            try:
+                after = float(self.native_data.time)
+                report["after_sim_time"] = after
+                finite = bool(np.isfinite(after))
+                advanced = finite and abs(after-(before+self.timestep)) <= 1e-8
+                stationary = finite and after == before
+                report["clock_advance_confirmed"] = bool(advanced)
+                if not finite:
+                    report["clock_error"] = "Native clock became nonfinite during integration"
+                elif not advanced and (report["native_step_returned"] or not stationary):
+                    report["clock_error"] = "Native clock does not agree with the completed integration boundary"
+            except Exception as error:
+                advanced = stationary = False
+                report["clock_error"] = f"{type(error).__name__}: {error}"
+            report["physical_steps"] = int(report["native_step_returned"] or advanced)
+            # A completed native call is known work, but a contradictory clock
+            # cannot authorize an exact continuation time. Keep that completed
+            # step as a lower bound while explicitly marking the inconsistency.
+            report["step_accounting_exact"] = bool(advanced or (stationary and not report["native_step_returned"]))
         # mj_step leaves derived positions at its integration stage. Forward
-        # refreshes native robot feedback and evaluator contacts without a step.
-        mujoco.mj_forward(self.native_model, self.native_data)
+        # refreshes feedback without another integration. Its failure preserves
+        # the completed native boundary record and remains the original error.
+        try:
+            mujoco.mj_forward(self.native_model, self.native_data)
+        except Exception as error:
+            report["feedback_refresh_error"] = f"{type(error).__name__}: {error}"
+            raise
+        return self.last_step_accounting
+    # END native counts do not depend on a successful post-step sample.
 
 
     def _prepare_reference_fk(self):
@@ -358,11 +426,18 @@ class RobosuiteExecutionBackend:
         """
         # BEGIN fault stopping preserves position faults separately from speed convergence.
         result = {"prepared": False, "native_ctrl_written": False, "physical_steps": 0,
+                  "charged_steps": 0, "step_accounting_exact": True, "step_accounting": [],
                   "physical_stop_confirmed": False, "samples": [], "controls": [],
                   "joint_position_bounds_satisfied": None, "joint_position_violation_samples": [],
                   "physical_stop_scope": "Measured named stop velocities; does not clear the original execution fault or certify restored joint position bounds"}
         # END a stopped actuator does not imply that its physical fault disappeared.
         try:
+            # BEGIN an exhausted shared budget permits observation, not motion.
+            # Read current named feedback for a zero-step stop assessment;
+            # an earlier failed sample cannot stand in for fresh measured dq.
+            if type(max_steps) is int and max_steps == 0:
+                feedback = self.proprioception()
+            # END neither a controller write nor an integration is needed here.
             if (tuple(feedback.get("joint_names", ())) != self.joint_names
                     or tuple(feedback.get("arm_joint_names", ())) != self.arm_joint_names
                     or tuple(feedback.get("finger_joint_names", ())) != self.finger_joint_names
@@ -375,9 +450,9 @@ class RobosuiteExecutionBackend:
                     or feedback.get("feedback_id") != f"{self._trial_id}@native_time={current_time:.17g}"):
                 raise ValueError("Cannot hold from stale or discontinuous native feedback time")
             q = _finite_array(feedback["q"], (len(self.joint_names),), "Hold feedback positions")
-            _finite_array(feedback["dq"], q.shape, "Hold feedback velocities")
+            measured_entry_dq = _finite_array(feedback["dq"], q.shape, "Hold feedback velocities")
             limits = _finite_array(stop_velocity, q.shape, "Named physical stop velocities")
-            if np.any(limits < 0) or type(max_steps) is not int or not 1 <= max_steps <= 10000:
+            if np.any(limits < 0) or type(max_steps) is not int or not 0 <= max_steps <= 10000:
                 raise ValueError("Physical hold requires finite nonnegative criteria and a bounded step count")
             ranges = self.joint_ranges
             # BEGIN only arm coordinates become new hold targets.
@@ -398,7 +473,18 @@ class RobosuiteExecutionBackend:
                             "upper": float(ranges[j, 1])} for j in outside]})
                 return outside
 
-            if np.any(retain_position_faults(q, phase="entry", sim_time=current_time) < narm):
+            outside = retain_position_faults(q, phase="entry", sim_time=current_time)
+            # BEGIN zero remaining steps never synthesize a hold or a stop.
+            if max_steps == 0:
+                result["samples"].append(feedback)
+                result["stop_velocity"] = limits.tolist()
+                result["physical_stop_confirmed"] = bool(np.all(np.abs(measured_entry_dq) <= limits))
+                result["reason"] = ("No hold steps allocated; current named stop velocities are satisfied"
+                    if result["physical_stop_confirmed"] else
+                    "No hold steps allocated; current named stop velocities are not satisfied")
+                return result
+            # END any finite position fault remains independent of this velocity verdict.
+            if np.any(outside < narm):
                 raise ValueError("Out-of-range actual arm coordinates cannot become a new hold goal")
             goal = q[:narm].copy()
             # END the normal executor still rejects every arm and finger limit violation.
@@ -425,9 +511,37 @@ class RobosuiteExecutionBackend:
                     **{key: value.tolist() if isinstance(value, np.ndarray) else value
                        for key, value in control.items()}})
                 # END each row precedes exactly its following native hold step.
-                self.step()
+                # BEGIN charge before attempting integration and retain its
+                # boundary facts before any possibly failing sample capture.
+                previous_attempt = self._step_attempts
+                result["charged_steps"] += 1
+                result["joint_position_bounds_satisfied"] = None
+                step_error = None
+                try:
+                    self.step()
+                except Exception as error:
+                    step_error = error
+                try:
+                    accounting = self.last_step_accounting
+                    if accounting is None or accounting["attempt_index"] != previous_attempt+1:
+                        # A wrapper failed before reaching the native boundary.
+                        # Keep the conservative charge and the original error;
+                        # absent new evidence cannot establish zero motion.
+                        result["step_accounting_exact"] = False
+                        result["step_accounting_error"] = "No current native step accounting was published"
+                    else:
+                        result["step_accounting"].append(accounting)
+                        result["physical_steps"] += accounting["physical_steps"]
+                        result["step_accounting_exact"] &= accounting["step_accounting_exact"]
+                except Exception as error:
+                    result["step_accounting_exact"] = False
+                    result["step_accounting_error"] = f"{type(error).__name__}: {error}"
+                if step_error is not None:
+                    raise step_error
+                if result.get("step_accounting_error") is not None:
+                    raise RuntimeError(result["step_accounting_error"])
                 actual = self.proprioception()
-                result["physical_steps"] = index+1
+                # END failed forward/proprioception cannot reduce consumed work.
                 result["samples"].append(actual)
                 # BEGIN report the latest position evidence even when velocity is invalid.
                 # Unknown new q must not inherit an earlier in-range verdict.

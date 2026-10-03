@@ -371,15 +371,29 @@ def run(args, *, observation_callback=None):
                 hold_steps = sum(0 if execution.get(key) is None else
                                  execution[key]["physical_steps"]
                                  for key in ("abort_hold", "dependency_hold"))
-                actual_steps = execution["executed_steps"] + hold_steps
-                report.update(execution_tested=execution["executed_steps"] > 0,
-                    actual_physics_tested=actual_steps > 0,
+                # BEGIN preserve confirmed advancement separately from budget charges.
+                # An uncertain native clock leaves confirmed steps as a lower
+                # bound. Do not turn that bound, or a charged attempt, into an
+                # exact actual count or an assertion that no physics occurred.
+                accounting = execution["physics_step_accounting"]
+                confirmed_steps = accounting["physical_steps"]
+                exact_steps = accounting["step_accounting_exact"]
+                normal_exact = execution["normal_step_accounting"]["step_accounting_exact"]
+                report.update(execution_tested=(True if execution["executed_steps"] else
+                                               False if normal_exact else None),
+                    actual_physics_tested=(True if confirmed_steps else False if exact_steps else None),
                     trajectory_executed_steps=execution["executed_steps"],
-                    hold_physics_steps=hold_steps, actual_physics_steps=actual_steps,
+                    hold_physics_steps=hold_steps,
+                    actual_physics_steps=confirmed_steps if exact_steps else None,
+                    confirmed_physics_steps=confirmed_steps,
+                    charged_physics_steps=accounting["charged_steps"],
+                    step_accounting_exact=exact_steps,
+                    physics_step_accounting=deepcopy(accounting),
                     # Separate backend holds do not call the evaluator hook.
                     evaluator_excluded_hold_physics_steps=hold_steps,
                     robot_feedback_path=execution.get("robot_feedback_path"),
                     barrier_feedback_path=execution.get("barrier_feedback_path"))
+                # END the executor owns the shared limit and every stop charge.
                 # BEGIN retain bounded first-failure evidence without its full binding.
                 report["execution_persistence_errors"] = execution.get("persistence_errors", [])
                 preflight = execution.get("geometry_preflight", {})

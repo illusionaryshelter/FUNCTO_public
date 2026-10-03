@@ -19,15 +19,32 @@ import run_recorded_simulation as runner
 
 @pytest.mark.parametrize("cleanup_failure", [False, True])
 @pytest.mark.parametrize("archive_write_failure", [False, True])
+# BEGIN summary counts distinguish confirmed motion, charged attempts and unknown clocks.
+@pytest.mark.parametrize("normal_steps,hold_steps,normal_charge,hold_charge,normal_exact,hold_exact", [
+    (0, 1, 0, 1, True, True),
+    (0, 0, 1, 0, True, True),  # A charged attempt provably did not advance time.
+    (0, 0, 1, 0, False, True),  # No confirmed step does not prove no motion.
+    (2, 1, 2, 2, True, False),  # One uncertain hold follows known native motion.
+])
 def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
-        tmp_path, cleanup_failure, archive_write_failure):
+        tmp_path, cleanup_failure, archive_write_failure,
+        normal_steps, hold_steps, normal_charge, hold_charge, normal_exact, hold_exact):
     simulation, curve, targets = _fixture()
     initial = _initial_feedback(simulation)
     primary = RuntimeError("original independent geometry rejection")
+    confirmed, charged = normal_steps+hold_steps, normal_charge+hold_charge
+    accounting_exact = normal_exact and hold_exact
+    accounting = {"physical_steps": confirmed, "charged_steps": charged,
+        "step_accounting_exact": accounting_exact, "execution_step_limit": 30000,
+        "remaining_charged_steps": 30000-charged, "scope": "this execute invocation"}
     shared_report = {
-        "status": "feedback_rejected", "executed_steps": 0, "barrier_command_reached": False,
+        "status": "feedback_rejected", "executed_steps": normal_steps, "barrier_command_reached": False,
         "elapsed_sim_s": .002,
-        "abort_hold": {"physical_steps": 1}, "dependency_hold": None,
+        "abort_hold": {"physical_steps": hold_steps, "charged_steps": hold_charge,
+            "step_accounting_exact": hold_exact}, "dependency_hold": None,
+        "normal_step_accounting": {"physical_steps": normal_steps, "charged_steps": normal_charge,
+            "step_accounting_exact": normal_exact, "attempts": []},
+        "physics_step_accounting": accounting,
         "robot_feedback_path": "actual_failure_feedback", "barrier_feedback_path": None,
         "geometry_preflight": {"passed": np.bool_(True), "checked_interval_s": [0., .0075],
             "reference_collision_checked": True, "continuous_collision_certified": False,
@@ -139,11 +156,15 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
     assert evaluator.finalized and videos.closed
     report = json.loads((args.output/"simulation-report.json").read_text())
     assert report["error"] == "RuntimeError: original independent geometry rejection"
-    assert report["trajectory_executed_steps"] == 0
-    assert report["hold_physics_steps"] == report["actual_physics_steps"] == 1
-    assert report["evaluator_excluded_hold_physics_steps"] == 1
-    assert report["execution_tested"] is False
-    assert report["actual_physics_tested"] is True
+    assert report["trajectory_executed_steps"] == normal_steps
+    assert report["hold_physics_steps"] == report["evaluator_excluded_hold_physics_steps"] == hold_steps
+    assert report["confirmed_physics_steps"] == confirmed
+    assert report["charged_physics_steps"] == charged
+    assert report["step_accounting_exact"] is accounting_exact
+    assert report["physics_step_accounting"] == accounting
+    assert report["actual_physics_steps"] == (confirmed if accounting_exact else None)
+    assert report["execution_tested"] is (True if normal_steps else False if normal_exact else None)
+    assert report["actual_physics_tested"] is (True if confirmed else False if accounting_exact else None)
     assert report["robot_feedback_path"] == "actual_failure_feedback"
     assert report["source_candidate_id"] == result.execution_binding["candidate_id"]
     assert report["execution_candidate_id"] != report["source_candidate_id"]
@@ -165,6 +186,7 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
     else:
         assert report["video_final_elapsed_s"] == .002
     assert simulation.sim_time == 1.3  # No native integration occurs in these doubles.
+# END failed writes and cleanup cannot collapse uncertain accounting into an exact count.
 
 
 # BEGIN generic upstream NumPy booleans survive the executor and every sink.

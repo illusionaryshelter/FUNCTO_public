@@ -8,7 +8,7 @@ physics, or provide evidence of actual tracking/contact performance.
 # BEGIN focused regression coverage for the mandatory q/dq/ddq contract.
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import numpy as np
 
@@ -53,6 +53,12 @@ def _backend():
     backend._joint_ids = np.array([2, 0, 3, 1])
     backend._actuator_names = ("shoulder_motor", "elbow_motor", "left_servo", "right_servo")
     backend._dt = .002
+    # BEGIN the mock retains the production native-boundary accounting path.
+    backend._step_attempts = 0
+    backend._last_step_accounting = None
+    backend._sim = SimpleNamespace(step=lambda: setattr(
+        backend.native_data, "time", backend.native_data.time+backend.timestep))
+    # END only the native integration itself is replaced by a scripted clock.
     backend._trial_id = "algebra-only-control-fixture"
     backend._feedback_source = "declared synthetic feedback; not physical measurements"
     backend.native_data = SimpleNamespace(qpos=np.array([-.2, -.01, .1, .01]),
@@ -120,6 +126,13 @@ class AnalyticReferenceTests(unittest.TestCase):
 
 
 class TrajectoryTorqueTests(unittest.TestCase):
+    # BEGIN no native model is constructed or forwarded by these mock tests.
+    def setUp(self):
+        forward = patch("manipulation.robosuite_execution.mujoco.mj_forward")
+        self.forward = forward.start()
+        self.addCleanup(forward.stop)
+    # END production step accounting still runs around the mock native call.
+
     def test_coupled_torque_components_and_native_indices_are_distinct(self):
         backend = _backend()
         q, dq, ddq = np.array([.15, -.25]), np.array([-.1, .2]), np.array([.8, -.5])
@@ -217,7 +230,7 @@ class TrajectoryTorqueTests(unittest.TestCase):
             backend.native_data.time += backend.timestep
 
         backend.proprioception = feedback
-        backend.step = mocked_step
+        backend._sim.step = mocked_step
         original_time = backend.sim_time
         with patch.object(backend, "apply_control", wraps=backend.apply_control) as applied:
             result = backend.abort_hold(feedback(), np.array([.01, -.01]), expected_sim_time=original_time,
@@ -274,7 +287,7 @@ class TrajectoryTorqueTests(unittest.TestCase):
                         backend.native_data.qpos[finger_index] = .04
 
                 backend.proprioception = lambda: _hold_feedback(backend)
-                backend.step = scripted_step
+                backend._sim.step = scripted_step
                 with patch.object(backend, "apply_control", wraps=backend.apply_control) as applied:
                     result = backend.abort_hold(backend.proprioception(), finger_ctrl,
                         expected_sim_time=original_time,
@@ -346,7 +359,7 @@ class TrajectoryTorqueTests(unittest.TestCase):
             backend.native_data.qvel[:] = 0.
 
         backend.proprioception = lambda: _hold_feedback(backend)
-        backend.step = scripted_step
+        backend._sim.step = scripted_step
         with patch.object(backend, "apply_control", wraps=backend.apply_control) as applied:
             result = backend.abort_hold(backend.proprioception(), backend.finger_control,
                 expected_sim_time=original_time,
@@ -375,7 +388,7 @@ class TrajectoryTorqueTests(unittest.TestCase):
                     backend.native_data.qvel[:] = 0.
 
                 backend.proprioception = lambda: _hold_feedback(backend)
-                backend.step = scripted_step
+                backend._sim.step = scripted_step
                 with patch.object(backend, "apply_control", wraps=backend.apply_control) as applied:
                     result = backend.abort_hold(backend.proprioception(), backend.finger_control,
                         expected_sim_time=original_time,
@@ -400,7 +413,7 @@ class TrajectoryTorqueTests(unittest.TestCase):
             backend.native_data.qvel[backend._qvel_ids[2]] = np.nan
 
         backend.proprioception = lambda: _hold_feedback(backend)
-        backend.step = scripted_step
+        backend._sim.step = scripted_step
         with patch.object(backend, "apply_control", wraps=backend.apply_control) as applied:
             result = backend.abort_hold(backend.proprioception(), backend.finger_control,
                 expected_sim_time=original_time,
@@ -426,7 +439,7 @@ class TrajectoryTorqueTests(unittest.TestCase):
                     backend.native_data.qvel[:] = 0.
 
                 backend.proprioception = lambda: _hold_feedback(backend)
-                backend.step = scripted_step
+                backend._sim.step = scripted_step
                 with patch.object(backend, "apply_control", wraps=backend.apply_control) as applied:
                     result = backend.abort_hold(backend.proprioception(), backend.finger_control,
                         expected_sim_time=original_time,
@@ -436,8 +449,158 @@ class TrajectoryTorqueTests(unittest.TestCase):
                 self.assertEqual(applied.call_count, 1)
                 self.assertFalse(result["physical_stop_confirmed"])
                 self.assertIn("clock", result["reason"].lower())
+                self.assertEqual(result["charged_steps"], 1)
+                self.assertFalse(result["step_accounting_exact"])
     # END invalid fresh telemetry neither inherits old truth nor sends another control.
     # END tests distinguish stopped velocities, position validity and applied controls.
+
+    # BEGIN completed integration survives every later feedback failure.
+    def test_forward_failure_preserves_one_confirmed_and_charged_native_step(self):
+        backend = _backend()
+        primary = RuntimeError("derived feedback failed after integration")
+        self.forward.side_effect = primary
+        with self.assertRaises(RuntimeError) as raised:
+            backend.step()
+        self.assertIs(raised.exception, primary)
+        accounting = backend.last_step_accounting
+        self.assertEqual(accounting["physical_steps"], 1)
+        self.assertEqual(accounting["charged_steps"], 1)
+        self.assertTrue(accounting["step_accounting_exact"])
+        self.assertTrue(accounting["native_step_returned"])
+        self.assertTrue(accounting["clock_advance_confirmed"])
+        self.assertEqual(accounting["attempt_index"], 1)
+        accounting["physical_steps"] = 99
+        self.assertEqual(backend.last_step_accounting["physical_steps"], 1)
+
+    def test_native_exception_accounts_advanced_stationary_and_unknown_clocks(self):
+        for after, confirmed, exact in ((3.002, 1, True), (3., 0, True),
+                                         (3.003, 0, False), (np.nan, 0, False)):
+            with self.subTest(after=after):
+                backend = _backend()
+                primary = RuntimeError("native integration failed")
+                def native_step():
+                    backend.native_data.time = after
+                    raise primary
+                backend._sim.step = native_step
+                with self.assertRaises(RuntimeError) as raised:
+                    backend.step()
+                self.assertIs(raised.exception, primary)
+                accounting = backend.last_step_accounting
+                self.assertEqual(accounting["physical_steps"], confirmed)
+                self.assertEqual(accounting["charged_steps"], 1)
+                self.assertEqual(accounting["step_accounting_exact"], exact)
+                self.assertFalse(accounting["native_step_returned"])
+        self.forward.assert_not_called()
+
+    def test_unreadable_post_exception_clock_does_not_replace_native_error(self):
+        backend = _backend()
+        primary = RuntimeError("original native error")
+        class UnreadableClock:
+            def __float__(self):
+                raise ValueError("clock read also failed")
+        def native_step():
+            backend.native_data.time = UnreadableClock()
+            raise primary
+        backend._sim.step = native_step
+        with self.assertRaises(RuntimeError) as raised:
+            backend.step()
+        self.assertIs(raised.exception, primary)
+        accounting = backend.last_step_accounting
+        self.assertEqual(accounting["charged_steps"], 1)
+        self.assertEqual(accounting["physical_steps"], 0)
+        self.assertFalse(accounting["step_accounting_exact"])
+        self.assertIn("clock read also failed", accounting["clock_error"])
+
+    def test_hold_counts_native_step_before_forward_or_proprioception_failure(self):
+        for failure in ("forward", "proprioception"):
+            with self.subTest(failure=failure):
+                backend = _backend()
+                initial = _hold_feedback(backend)
+                primary = RuntimeError(f"{failure} failed after integration")
+                self.forward.side_effect = primary if failure == "forward" else None
+                backend.proprioception = lambda: (_ for _ in ()).throw(primary)
+                result = backend.abort_hold(initial, backend.finger_control,
+                    expected_sim_time=3., stop_velocity=np.array([.01, .01, .001, .001]), max_steps=3)
+                self.assertEqual(result["physical_steps"], 1)
+                self.assertEqual(result["charged_steps"], 1)
+                self.assertTrue(result["step_accounting_exact"])
+                self.assertFalse(result["physical_stop_confirmed"])
+                self.assertIsNone(result["joint_position_bounds_satisfied"])
+                self.assertEqual(result["samples"], [])
+                self.assertIn(str(primary), result["reason"])
+                self.assertEqual(backend._step_attempts, 1)
+
+    def test_hold_native_failure_charges_attempt_without_free_retry(self):
+        for after, confirmed, exact in ((3., 0, True), (3.002, 1, True), (3.003, 0, False)):
+            with self.subTest(after=after):
+                backend = _backend()
+                initial = _hold_feedback(backend)
+                def native_step():
+                    backend.native_data.time = after
+                    raise RuntimeError("native hold failure")
+                backend._sim.step = native_step
+                backend.proprioception = lambda: _hold_feedback(backend)
+                result = backend.abort_hold(initial, backend.finger_control,
+                    expected_sim_time=3., stop_velocity=np.array([.01, .01, .001, .001]), max_steps=3)
+                self.assertEqual(result["physical_steps"], confirmed)
+                self.assertEqual(result["charged_steps"], 1)
+                self.assertEqual(result["step_accounting_exact"], exact)
+                self.assertEqual(backend._step_attempts, 1)
+                self.assertFalse(result["physical_stop_confirmed"])
+                self.assertIn("native hold failure", result["reason"])
+
+    def test_hold_accounting_read_failure_does_not_replace_native_failure(self):
+        backend = _backend()
+        initial = _hold_feedback(backend)
+        backend._sim.step = lambda: (_ for _ in ()).throw(RuntimeError("primary native failure"))
+        with patch.object(RobosuiteExecutionBackend, "last_step_accounting", new_callable=PropertyMock,
+                          side_effect=ValueError("secondary accounting failure")):
+            result = backend.abort_hold(initial, backend.finger_control,
+                expected_sim_time=3., stop_velocity=np.array([.01, .01, .001, .001]), max_steps=3)
+        self.assertIn("primary native failure", result["reason"])
+        self.assertIn("secondary accounting failure", result["step_accounting_error"])
+        self.assertEqual(result["charged_steps"], 1)
+        self.assertFalse(result["step_accounting_exact"])
+
+    def test_zero_hold_budget_observes_current_stop_without_control_or_step(self):
+        for stopped in (False, True):
+            with self.subTest(stopped=stopped):
+                backend = _backend()
+                # The supplied sample deliberately says the opposite. The
+                # zero-budget verdict must read current named feedback.
+                stale = _hold_feedback(backend)
+                stale["dq"][:] = 0. if not stopped else .1
+                backend.native_data.qvel[:] = 0. if stopped else .2
+                backend.proprioception = lambda: _hold_feedback(backend)
+                before = backend.native_data.ctrl.copy()
+                with patch.object(backend, "apply_control") as applied, patch.object(backend, "step") as step:
+                    result = backend.abort_hold(stale, backend.finger_control,
+                        expected_sim_time=3., stop_velocity=np.array([.01, .01, .001, .001]), max_steps=0)
+                applied.assert_not_called()
+                step.assert_not_called()
+                np.testing.assert_array_equal(backend.native_data.ctrl, before)
+                self.assertFalse(result["prepared"])
+                self.assertFalse(result["native_ctrl_written"])
+                self.assertEqual(result["physical_steps"], 0)
+                self.assertEqual(result["charged_steps"], 0)
+                self.assertTrue(result["step_accounting_exact"])
+                self.assertEqual(result["physical_stop_confirmed"], stopped)
+                self.assertEqual(len(result["samples"]), 1)
+
+    def test_zero_hold_budget_feedback_failure_cannot_claim_a_stop(self):
+        backend = _backend()
+        initial = _hold_feedback(backend)
+        backend.proprioception = lambda: (_ for _ in ()).throw(RuntimeError("no current feedback"))
+        with patch.object(backend, "apply_control") as applied, patch.object(backend, "step") as step:
+            result = backend.abort_hold(initial, backend.finger_control,
+                expected_sim_time=3., stop_velocity=np.array([.01, .01, .001, .001]), max_steps=0)
+        applied.assert_not_called()
+        step.assert_not_called()
+        self.assertEqual((result["physical_steps"], result["charged_steps"]), (0, 0))
+        self.assertFalse(result["physical_stop_confirmed"])
+        self.assertIsNone(result["joint_position_bounds_satisfied"])
+        self.assertIn("no current feedback", result["reason"])
+    # END no mock sample or successful serializer determines consumed physics.
 
 
 if __name__ == "__main__":

@@ -1223,17 +1223,29 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
     if physics_remaining == 0:
         raise ContinuationBindingError("The current skill's cumulative physics-step budget is exhausted")
     local_steps = continuation.get("consumed_physics_steps")
+    # BEGIN physical time uses confirmed steps; attempts consume budget only.
+    confirmed_steps = continuation.get("confirmed_physics_steps")
+    accounting_exact = continuation.get("step_accounting_exact")
+    # END no legacy charge-as-time interpretation is accepted implicitly.
     timestep = continuation.get("device_timestep_s")
     if (type(local_steps) is not int or local_steps < 0
+            # BEGIN uncertain clock records cannot bind a new physical suffix.
+            or type(confirmed_steps) is not int or not 0 <= confirmed_steps <= local_steps
+            or accounting_exact is not True
+            # END a known zero-step failed attempt may still carry one charge.
             or not isinstance(timestep, (float, int)) or not np.isfinite(timestep) or timestep <= 0
             or physics_consumed != original.get("consumed_physics_steps", 0)+local_steps):
-        raise ContinuationBindingError("Continuation requires cumulative steps and the unchanged native device timestep")
+        raise ContinuationBindingError("Continuation requires cumulative charges, exact confirmed steps and the unchanged native device timestep")
     remaining_solves = request_budget.maximum_trajectory_solves-consumed["trajectory_solves"]
     if remaining_solves <= 0:
         raise ContinuationBindingError("The current skill's cumulative trajectory-solve budget is exhausted")
     remaining = replace(request_budget, maximum_trajectory_solves=remaining_solves,
                         search_seconds=max(0., request_budget.search_seconds-consumed["search_seconds"]))
     feedback = continuation.get("actual_feedback", {})
+    # BEGIN failed final capture cannot be replaced by stale or absent feedback.
+    if not isinstance(feedback, dict):
+        raise ContinuationBindingError("Continuation needs captured synchronized actual feedback")
+    # END the failed attempt's conservative charge remains in the request.
     names = list(feedback.get("joint_names", ()))
     if not names or len(set(names)) != len(names) or not set(problem.joint_names) <= set(names):
         raise ContinuationBindingError("Continuation needs synchronized named actual q/dq feedback")
@@ -1253,7 +1265,9 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
             raise ContinuationBindingError("Continuation hand model is not bound to the current actual fingers")
     curve = original.get("curve", {})
     duration, actual_elapsed = curve.get("duration"), continuation.get("elapsed_physical_s")
-    elapsed = local_steps*float(timestep)
+    # BEGIN advance the original clock only by verified native integration.
+    elapsed = confirmed_steps*float(timestep)
+    # END budget reservations never synthesize physical elapsed time.
     if (not isinstance(actual_elapsed, (int, float)) or not np.isfinite(actual_elapsed)
             or abs(actual_elapsed-elapsed) > 1e-8):
         raise ContinuationBindingError("Actual elapsed physics time differs from its native device step ledger")
@@ -1472,7 +1486,9 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
         if item.init:
             setattr(problem, item.name, getattr(rebound, item.name))
     return remaining, {"original_duration": float(duration), "elapsed": float(elapsed),
-        "actual_elapsed": float(actual_elapsed), "elapsed_device_steps": local_steps,
+        # BEGIN event-clock origins count only confirmed physical advancement.
+        "actual_elapsed": float(actual_elapsed), "elapsed_device_steps": confirmed_steps,
+        # END accumulated planning/execution budgets retain their separate charges.
         "device_timestep_s": float(timestep),
         "u": original_map.u.copy(), "s": original_map.s.copy(),
         "events": {identity: deepcopy(old_occurrences[identity]) for identity in pending_ids},

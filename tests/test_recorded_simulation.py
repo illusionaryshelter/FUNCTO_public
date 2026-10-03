@@ -51,6 +51,10 @@ def _fixture():
     simulation._actuator_names = tuple(f"native_actuator_{index}" for index in range(9))
     simulation._base_id = simulation._site_id = 0
     simulation._dt = .002
+    # BEGIN this mock clock uses the same explicit native-attempt accounting.
+    simulation._step_attempts = 0
+    simulation._last_step_accounting = None
+    # END no fixture count is inferred from successful telemetry capture.
     simulation._trial_id = str(uuid4())
     simulation._feedback_source = "explicit mocked robot feedback; no physical integration"
     simulation._description = {"scope": "mocked integration clock only"}
@@ -548,7 +552,11 @@ class RecordedControlTests(unittest.TestCase):
                              [("open-original", .002), ("close-original", .004)])
             self.assertEqual([row["event_id"] for row in report["unapplied_gripper_events"]], ["hold-later"])
             self.assertEqual(curve.events, original_events)
-            np.testing.assert_allclose(simulation.arm_goals[-2], curve.sample(.0075)[0], atol=0., rtol=0.)
+            # BEGIN the four-step total leaves no separate hold control/step.
+            np.testing.assert_allclose(simulation.arm_goals[-1], curve.sample(.0075)[0], atol=0., rtol=0.)
+            self.assertFalse(report["dependency_hold"]["native_ctrl_written"])
+            self.assertEqual(report["dependency_hold"]["physical_steps"], 0)
+            # END the command at the barrier remains the last applied goal.
             with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
                 self.assertEqual(saved["command_q"].shape, (5, 9))
                 self.assertEqual(saved["actual_q"].shape, (5, 9))
@@ -576,7 +584,7 @@ class RecordedControlTests(unittest.TestCase):
             self.assertEqual(actual["tool_link"], initial["tool_link"])
             self.assertEqual(actual["tool_transform"], initial["tool_transform"])
             self.assertTrue(actual["feedback_id"].startswith(simulation._trial_id+"@"))
-            self.assertAlmostEqual(actual["timestamp_s"], 1.310)
+            self.assertAlmostEqual(actual["timestamp_s"], 1.308)
             self.assertFalse(actual["evidence_passed"])
             self.assertNotIn("object_pose", actual)
             self.assertNotIn("contact", actual)
@@ -604,7 +612,9 @@ class RecordedControlTests(unittest.TestCase):
             output = Path(temporary)/"trial"
             report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=initial, execution_limits=_limits(simulation, curve),
-                output=output, max_physics_steps=4)
+                # BEGIN raw hold telemetry needs one explicitly allotted step.
+                output=output, max_physics_steps=5)
+                # END the four command samples and one stop share that total.
             with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
                 np.testing.assert_array_equal(saved["actual_qacc"], expected_acceleration[:5])
                 np.testing.assert_array_equal(saved["actual_actuator_force"], expected_force[:5])
@@ -857,16 +867,107 @@ class DependencyExecutionTests(unittest.TestCase):
                     execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial")
         self.assertEqual(simulation.arm_goals, [])
 
-    def test_hold_cost_is_cumulative_even_when_the_task_step_budget_is_spent(self):
+    # BEGIN exhaustion never grants an extra native hold attempt.
+    def test_normal_and_hold_share_one_total_step_budget(self):
         simulation, curve, targets = _fixture()
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial", max_physics_steps=4)
-        self.assertTrue(report["dependency_hold"]["native_ctrl_written"])
+        self.assertFalse(report["dependency_hold"]["native_ctrl_written"])
+        self.assertEqual(report["dependency_hold"]["charged_steps"], 0)
+        self.assertEqual(report["dependency_hold"]["physical_steps"], 0)
         self.assertEqual(report["continuation"]["physics_budget"], 4)
-        self.assertEqual(report["continuation"]["cumulative_physics_steps"], 5)
+        self.assertEqual(report["continuation"]["consumed_physics_steps"], 4)
+        self.assertEqual(report["continuation"]["confirmed_physics_steps"], 4)
+        self.assertTrue(report["continuation"]["step_accounting_exact"])
+        self.assertEqual(report["continuation"]["cumulative_physics_steps"], 4)
         self.assertEqual(report["continuation"]["remaining_physics_steps"], 0)
+        self.assertEqual(simulation._step_attempts, 4)
+        self.assertEqual(len(simulation.arm_goals), 4)
+    # END budget accounting does not change the original dependency outcome.
+
+    # BEGIN stop work and failed captures retain the same finite allowance.
+    def test_abort_hold_receives_only_the_one_remaining_attempt(self):
+        simulation, curve, targets = _fixture()
+        values = _limit_values(simulation, curve)
+        values["stop_arm_velocity"] = [.0001]*7
+        executor = _executor(simulation)
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            with self.assertRaises(ExecutionGuardError):
+                _execute_bound(executor, _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                    initial_feedback=_initial_feedback(simulation), execution_limits=ExecutionLimits.from_mapping(values),
+                    output=Path(temporary)/"trial", max_physics_steps=5, max_hold_steps=250)
+        report = executor.last_execution_report
+        self.assertEqual(report["executed_steps"], 4)
+        self.assertEqual(report["abort_hold"]["charged_steps"], 1)
+        self.assertFalse(report["abort_hold"]["physical_stop_confirmed"])
+        self.assertEqual(report["physics_step_accounting"]["charged_steps"], 5)
+        self.assertEqual(report["continuation"]["remaining_physics_steps"], 0)
+        self.assertEqual(simulation._step_attempts, 5)
+
+    def test_post_step_capture_errors_preserve_primary_and_native_accounting(self):
+        for failure in ("forward", "record", "feedback", "clock"):
+            with self.subTest(failure=failure):
+                simulation, curve, targets = _fixture()
+                initial = _initial_feedback(simulation)
+                executor = _executor(simulation)
+                primary = RuntimeError("primary "+failure)
+                original_feedback = simulation.proprioception
+
+                def feedback():
+                    if simulation._step_attempts:
+                        raise primary
+                    return original_feedback()
+
+                def forward(*args):
+                    if failure == "forward" and simulation._step_attempts == 1:
+                        raise primary
+
+                def reference_pose(q):
+                    if simulation._step_attempts:
+                        raise primary
+                    return np.eye(4)
+
+                class UnreadableClock:
+                    def __float__(self):
+                        raise ValueError("native clock unavailable")
+
+                def native_failure():
+                    simulation.native_data.time = UnreadableClock()
+                    raise primary
+
+                if failure == "feedback":
+                    simulation.proprioception = feedback
+                elif failure == "record":
+                    simulation.reference_tool_pose = reference_pose
+                elif failure == "clock":
+                    simulation._sim.step = native_failure
+                with TemporaryDirectory() as temporary, patch(
+                        "manipulation.robosuite_execution.mujoco.mj_forward", side_effect=forward):
+                    output = Path(temporary)/"trial"
+                    with self.assertRaises(RuntimeError) as caught:
+                        _execute_bound(executor, _result(curve), finger_targets=FixedFingerTargets.from_mapping(targets),
+                            initial_feedback=initial, execution_limits=_limits(simulation, curve),
+                            output=output, max_physics_steps=4)
+                    self.assertIs(caught.exception, primary)
+                    retained = json.loads((output/"continuation.json").read_text())
+                    report = json.loads((output/"execution-report.json").read_text())
+                    self.assertEqual(report["normal_step_accounting"]["charged_steps"], 1)
+                    self.assertEqual(report["executed_steps"], 0 if failure == "clock" else 1)
+                    expected_charge = 2 if failure in ("forward", "record") else 1
+                    self.assertEqual(retained["consumed_physics_steps"], expected_charge)
+                    self.assertEqual(retained["confirmed_physics_steps"], 0 if failure == "clock" else expected_charge)
+                    self.assertEqual(retained["remaining_physics_steps"], 4-expected_charge)
+                    self.assertEqual(retained["step_accounting_exact"], failure != "clock")
+                    if failure in ("feedback", "clock"):
+                        self.assertIsNone(retained["actual_feedback"])
+                        self.assertFalse((output/"failure-feedback.json").exists())
+                    if failure == "clock":
+                        self.assertIsNone(retained["elapsed_physical_s"])
+                    with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
+                        self.assertEqual(len(saved["actual_q"]), 1)
+    # END missing captured samples never refund real or uncertain native work.
 
     def test_remaining_device_inputs_keep_last_applied_interval_and_original_targets(self):
         from manipulation.execution import continuation_execution_inputs
