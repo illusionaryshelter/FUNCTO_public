@@ -1290,12 +1290,14 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                     transform_robot_spheres=lambda value: value,
                     evaluate=Mock(side_effect=lambda p, *args, **kwargs: p.square().sum(-1)),
                     optimizer_preferences=Mock(side_effect=lambda p, *args, **kwargs: p[..., 0]*0))
-                scene = SimpleNamespace(gripper=None, robot_coverage=object(),
+                # BEGIN the synthetic scene explicitly declares no owner contact permissions.
+                scene = SimpleNamespace(gripper=None, robot_coverage=object(), robot_owner_permissions=(),
                     required_progress_anchors=(0., 1.),
                     evaluate=Mock(side_effect=lambda spheres, p, *args, **kwargs: p.square().sum(-1)),
                     robot_coverage_guidance=Mock(side_effect=lambda poses, progress: poses.square().sum(-1)),
                     optimizer_preferences=lambda progress, *args: torch.zeros_like(progress))
                 scene.clone_for_rollout = Mock(return_value=scene)
+                # END the mock follows the same required scene contract as production.
                 transition = self.transition()
                 transition.joint_names = ("first_joint", "second_joint")
                 transition.robot_model.tool_frames = ["tool"]

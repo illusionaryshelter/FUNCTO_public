@@ -276,8 +276,12 @@ def run(args):
         report["robot_collision_contract_validated"] = True
         # END verify the physical policy and separation certificates before GPU use.
         sphere_count = sum(len(rows) for rows in robot["robot_cfg"]["kinematics"]["collision_spheres"].values())
-        if not 1 <= sphere_count <= 512 or sphere_count != len(fixture["sphere_materials"]):
-            raise ValueError("Actual native robot geometry/materials must agree within the 512-sphere local budget")
+        # BEGIN admit the same finite refined-cover capacity as fixture and planner.
+        # Full native geometry/material ownership remains exact. The existing
+        # scene and whole-device memory checks still guard the actual rollout.
+        if not 1 <= sphere_count <= 640 or sphere_count != len(fixture["sphere_materials"]):
+            raise ValueError("Actual native robot geometry/materials must agree within the 640-sphere local budget")
+        # END added capacity never changes a collision residual or permission.
         robot["robot_cfg"]["kinematics"]["lock_joints"] = {
             name: measured[name] for name in feedback["finger_joint_names"]}
         # BEGIN read native command timing/ranges from the selected robot model.
@@ -514,8 +518,11 @@ def run(args):
             "path": "entrance-scene.npz", "sphere_count": len(entrance_fk["robot_spheres"]),
             "scope": "Measured native q0; the formally bound planner performs the only entrance verdict"}
         # END no uncertainty envelope is labelled as the current hand state.
+        # BEGIN bind refined device geometry to an explicit unchanged-work budget.
+        # A supplied request ledger must declare this same model capacity;
+        # historical work is retained by the existing exact-ledger validation.
         budget = PlanningBudget(knots=args.knots, interpolation_buffer_size=args.interpolation_buffer_size,
-                                max_robot_spheres=512, ik_seeds=args.ik_seeds,
+                                max_robot_spheres=640, ik_seeds=args.ik_seeds,
                                 trajectory_seeds=args.trajectory_seeds,
                                 ik_iterations=80, trajectory_iterations=100,
                                 max_validation_points=args.max_validation_points,
@@ -526,6 +533,7 @@ def run(args):
                                 # flags cannot reset or enlarge it implicitly.
                                 maximum_trajectory_solves=args.maximum_trajectory_solves,
                                 planning_seconds=args.planning_seconds, search_seconds=3.)
+        # END geometry capacity does not replenish planning time or solve counts.
         # END reviewed input revisions remain caller-owned.
         report["planning_called"] = True
         result = plan_and_record(problem, scene, robot, args.output/"planning", budget=budget,

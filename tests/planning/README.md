@@ -33,6 +33,7 @@ checked independently. It preserves all required source anchors.
 | `check_recorded_robot_binding.py` | CPU comparison of an explicitly mapped recorded robot and planning URDF, including collision-sphere coverage counterexamples |
 | `visualize_recorded_task.py` | Local HTML and PNG presentation of those input audits and task-space references; does not run joint planning or simulation |
 | `robot_fixture.py`, `prepare_recorded_task.py` | Explicit native robot geometry, named proprioception, FK checks and current planning-problem preparation |
+| `refine_robot_fixture.py` | CPU refinement of explicitly selected complete native convex-cell covers, preserving source geometry and pair policy and revalidating every serialized sphere |
 | `check_recorded_robot_geometry.py` | Independent Pinocchio FK and Coal convex/analytic-solid pair distances for complete named recorded states; CPU only |
 | `probe_finger_control.py` | Bounded native asset control diagnostic with actual q/dq, actuator/generalized forces, contact identities and explicit convergence thresholds |
 | `probe_mounted_execution.py` | Complete mounted-scene control measurement or explicitly supervised diagnostic reference through the production backend/executor; preserves measured entrance velocity |
@@ -42,6 +43,7 @@ checked independently. It preserves all required source anchors.
 | `probe_recorded_robot_mask.py` | One calibrated recorded RGB-D view with the complete known robot assembly, fixed-mount coverage checks and actual OpenGL device metadata |
 | `recorded_observation.py`, `recorded_owner_geometry.py`, `detect_recorded_owners.py` | Current robot/owner masks and explicitly bound offline carrier geometry; no current object truth enters planning |
 | `run_recorded_skill.py`, `recorded_task_planning.py` | Current bounded joint planning, unchanged skill constraints and classified diagnostic curve export |
+| `audit_recorded_collision.py` | CPU replay of a candidate's saved scene-query inputs against independent robot and scene solids, retaining rule sides and uncertain nominal hand geometry without execution authorization |
 | `recorded_simulation.py`, `robot_validation_fixture.py`, `recorded_skill_evaluation.py`, `run_recorded_simulation.py` | Recording/model adapters to the production executor and mandatory independent validator, with separate task evaluation and calibrated videos |
 | `visualize_current_recorded_task.py` | Current references, classified joint curves, actual robot feedback and physical outcomes; retains historical incomplete attempts |
 | `visualize_recorded_failure.py` | Frozen reference, commanded FK and actual TCP, plus joint position/velocity/acceleration and native limits on their recorded clocks |
@@ -198,18 +200,34 @@ against the complete known robot and preserves all unmatched projections as
 unknown boundaries; its output alone cannot establish free-space coverage.
 <!-- END shared actual-hand execution contract and independent geometry diagnostics. -->
 
-The native simulator accepts a classified saved curve and an explicit evaluation
-mode. A rejected candidate may be run only as an isolated diagnostic; its physics
-outcome never changes planner acceptance. The restored full scene is used for
+<!-- BEGIN formal archive authorization is required before native simulation. -->
+The native simulator requires a formally accepted saved curve and its complete
+execution binding. Rejected candidates remain available to the independent CPU
+diagnostic; a diagnostic pass does not authorize execution. The restored full scene is used for
 simulator setup and independent evaluation. Planning consumes named robot
 feedback and RGB-D observations. After setup, execution applies the recorded
 controller configuration through actuator commands and native physics steps.
 It stops at the first evidence barrier, clamps the final command to that barrier,
 and reports any sub-step physical clock overrun separately. It never infers that
 issuing a close command establishes a grasp.
+<!-- END input restoration and independent evaluation do not bypass acceptance. -->
 
 Current visualization takes explicit run and trial directories. It keeps solver
 acceptance, validation completion and measured physics outcome separate; an
 input reference or an unexecuted candidate cannot become a successful trial.
 MP4 playback uses a constant frame rate, while saved capture times preserve
 the exact native simulation times, including the final barrier state.
+
+<!-- BEGIN complete candidate diagnostics remain separate from execution permission. -->
+Each retained planning candidate also has a `candidate-XX-scene.json` record.
+It owns that candidate's full observed scene, target, curve, nominal hand and
+actual verification query inputs, including adjacent rule modes. Failed or
+unfinished exports retain their diagnostic classification; absent evidence is
+reported explicitly. `audit_recorded_collision.py` accepts this snapshot and
+the same robot fixture. Its separate finite query budget and streamed solid
+evidence do not change planner acceptance or the executor's preflight budget.
+Raw negative distances can belong to permitted contacts or native excluded
+pairs, so read the pair policy and violations as well as its distance. Native
+query states are retained, while independent solid/rule arithmetic is binary64;
+this is not a bit-identical reproduction of the cuRobo ESDF collision cost.
+<!-- END rejected candidates never acquire an execution binding from diagnosis. -->

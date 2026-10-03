@@ -177,7 +177,7 @@ class CuroboSphereQuery:
     # BEGIN bound complete validation for the admitted robot geometry capacity.
     # Three million sphere queries fit the existing 64-MiB buffer at 20 bytes
     # per sphere plus scalar weights. This also admits 1536 validation times
-    # at all three mode sides for the existing 512-sphere robot limit. The
+    # at all three mode sides for the bounded 640-sphere robot capacity. The
     # planner separately bounds every rollout's retained/live allocations;
     # cumulative cache bytes and semantic slots remain checked below.
     def __init__(self, scene_collision, *, owner_ids, source,

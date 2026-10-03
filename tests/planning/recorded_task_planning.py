@@ -237,6 +237,56 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
         default=_json_value, indent=2, allow_nan=False)+"\n")
 
 
+# BEGIN rejected curves retain the exact scene and query scope without authorization.
+def scene_query_snapshot(args, kwargs):
+    """Copy one real scene evaluation, including repeated one-sided mode probes.
+
+    ``PlanningScene.evaluate`` receives the expanded progress values after the
+    planner has selected the before/after laws. Retaining these inputs avoids
+    recreating float32 neighbours in float64 or guessing physical time by
+    inverting progress. This observer never repeats the geometry query.
+    """
+    spheres, position, quaternion, progress, joint_position, joint_names = args
+    del spheres, position, quaternion  # The independent checker computes its own FK.
+    times = kwargs["trajectory_time"]
+    permission = kwargs.get("robot_owner_permission_progress", progress)
+    return {"time_s": _cpu_array(times), "progress": _cpu_array(progress),
+            "robot_owner_permission_progress": _cpu_array(permission),
+            "joint_names": list(joint_names), "joint_position": _cpu_array(joint_position),
+            "time_dtype": str(times.dtype), "progress_dtype": str(progress.dtype),
+            "query_order": "actual scene.evaluate order; same-state mode probes and duplicates retained"}
+
+
+def save_collision_snapshot(path, planner, curve, *, curve_path, validation_status, query_capture):
+    """Archive this candidate's owned inputs for independent CPU diagnostics.
+
+    Reuse the production scene serializer, including observed target geometry,
+    background, pair permissions and the already bound nominal finger curve.
+    The full polynomial and event clock identify the saved curve exactly.
+    Neither this file nor a later independent pass grants execution authority.
+    An unfinished export has no completed validation report: the planner may
+    still hold ``last_validation`` from an entirely different native seed.
+    """
+    from manipulation.execution_binding import curve_snapshot, plain
+
+    if validation_status not in {"completed", "not_completed"}:
+        raise ValueError("Collision snapshots require an explicit export validation status")
+    validation = plain(planner.last_validation) if validation_status == "completed" else None
+    document = {"classification": "diagnostic_collision_snapshot_not_executable",
+        "curve_path": Path(curve_path).name, "curve": curve_snapshot(curve),
+        "problem": plain(planner.problem),
+        "scene": plain(planner._verification_scene.to_execution_binding()),
+        "formal_clock": plain(planner.formal_clock),
+        "validation_status": validation_status, "validation": validation,
+        "scene_query_capture": plain(query_capture),
+        "scope": "same candidate, verification scene and actual sampled query inputs; independent solid audit pending"}
+    # Render first, so unsupported values cannot leave a plausible partial JSON
+    # record. The caller records a failed write explicitly beside this curve.
+    rendered = json.dumps(document, indent=2, allow_nan=False)+"\n"
+    Path(path).write_text(rendered)
+# END diagnostics preserve scene identity without creating an execution binding.
+
+
 def plan_and_record(problem, scene, robot, output, *, budget, provenance, execution_limits,
                     continuation=None, rebind=None, request_ledger=None):
     """Call ``plan_trajectory`` once and preserve its measured outcome.
@@ -263,7 +313,11 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
               "phase_count": problem.phase_count,
               "required_source_anchors": len(problem.anchors),
               "candidates": [], "native_results": [], "effective_configurations": [],
-              "optimizer_inputs": []}
+              "optimizer_inputs": [],
+              # BEGIN expose missing scene evidence even when construction fails.
+              "initialization": {"status": "not_started"},
+              "collision_snapshot_scope": "each retained candidate; unselected native seeds remain native-result diagnostics"}
+              # END a run without an initialized planner cannot claim a snapshot.
     original = planning._CuroboPlanner.select_candidate
     original_export = planning._CuroboPlanner.export
     original_curve_init = planning.JointTrajectory.__post_init__
@@ -272,6 +326,9 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
     # BEGIN retain an owned CPU copy before the native planner is released.
     selected_joint_limits = None
     # END no live solver reference is retained by the recording adapter.
+    # BEGIN query copies belong to one selection round and the exact curve object.
+    export_query_captures = {}
+    # END no prior seed's successful validation fills a failed candidate record.
 
     def record_stage(stage):
         try:
@@ -285,6 +342,10 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
         def measured(planner, *args, **kwargs):
             stage = {"stage": name, "state": "started",
                      "elapsed_seconds": time.monotonic()-started}
+            # BEGIN report initialization failure before any candidate can exist.
+            if name == "_initialize":
+                report["initialization"] = {"status": "started"}
+            # END stage failures are evidence gaps, not empty successful scenes.
             record_stage(stage)
             # BEGIN copy the exact optimizer input before native buffer reuse.
             if name == "optimize":
@@ -302,7 +363,20 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
                     entry["error"] = f"{type(error).__name__}: {error}"
                 report["optimizer_inputs"].append(entry)
             # END copy the exact optimizer input before native buffer reuse.
-            result = method(planner, *args, **kwargs)
+            # BEGIN preserve a failed construction stage without changing its exception.
+            try:
+                result = method(planner, *args, **kwargs)
+            except Exception as error:
+                stage.update(state="failed", elapsed_seconds=time.monotonic()-started,
+                             error=f"{type(error).__name__}: {error}")
+                if name == "_initialize":
+                    report["initialization"] = {"status": "failed", "error": stage["error"],
+                        "collision_snapshot_unavailable": "No fully initialized candidate verification scene"}
+                record_stage(stage)
+                raise
+            if name == "_initialize":
+                report["initialization"] = {"status": "completed"}
+            # END archive recording never turns a construction failure into a plan.
             # BEGIN persist the measured entrance before potentially long IK.
             # This copies the production verdict once; interrupted later work
             # must not erase its evidence or cause a second geometry query.
@@ -347,6 +421,21 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
         entry = {"path": path.name, "classification": classification,
                  "attempt": deepcopy(attempt), "validation_status": validation_status,
                  "curve_saved": False, "native_result": native_trace}
+        # BEGIN each saved curve names its own full observed scene and exact modes.
+        snapshot_path = path.with_name(path.stem+"-scene.json")
+        snapshot = {"path": snapshot_path.name, "saved": False}
+        entry["collision_snapshot"] = snapshot
+        capture = export_query_captures.get(id(curve))
+        query_capture = ({"status": "not_recorded", "calls": [],
+                          "errors": ["No observation belongs to this exact exported curve"]}
+                         if capture is None or capture[0] is not curve else capture[1])
+        try:
+            save_collision_snapshot(snapshot_path, planner, curve, curve_path=path,
+                validation_status=validation_status, query_capture=query_capture)
+            snapshot.update(saved=True, query_capture_status=query_capture["status"])
+        except Exception as error:
+            snapshot["error"] = f"{type(error).__name__}: {error}"
+        # END snapshot failure is explicit and cannot change planner acceptance.
         try:
             # BEGIN retain the exact verifier that produced this candidate.
             selected_joint_limits = verification_joint_limits(planner)
@@ -385,17 +474,37 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
         # Preserve that same object if validation cannot finish; do not retry
         # validation with weaker settings or return it as a successful plan.
         constructed = []
+        # BEGIN observe the expanded scene query once, before reusable buffers change.
+        query_capture = {"status": "not_recorded", "calls": [], "errors": []}
+        original_evaluate = planner._verification_scene.evaluate
+
+        def capture_evaluate(*args, **kwargs):
+            try:
+                query_capture["calls"].append(scene_query_snapshot(args, kwargs))
+            except Exception as error:
+                query_capture["errors"].append(f"{type(error).__name__}: {error}")
+            query_capture["status"] = "error" if query_capture["errors"] else "completed"
+            return original_evaluate(*args, **kwargs)
+        # END recorded inputs do not replace the original evaluator or its result.
 
         def capture(curve):
             original_curve_init(curve)
             constructed.append(curve)
 
         try:
-            with patch.object(planning.JointTrajectory, "__post_init__", new=capture):
-                return original_export(planner, native_result)
+            # BEGIN the recorder is scoped to this export's private verification scene.
+            with patch.object(planning.JointTrajectory, "__post_init__", new=capture), \
+                    patch.object(planner._verification_scene, "evaluate", new=capture_evaluate):
+                exported = original_export(planner, native_result)
+            export_query_captures[id(exported[0])] = (exported[0], query_capture)
+            return exported
+            # END other candidate scenes and the optimizer remain unmodified.
         except ValueError as error:
             if len(constructed) == 1:
                 try:
+                    # BEGIN unfinished validation retains only its own observed query inputs.
+                    export_query_captures[id(constructed[0])] = (constructed[0], query_capture)
+                    # END save_collision_snapshot deliberately omits stale last_validation.
                     preserve_candidate(planner, constructed[0],
                         {"accepted": False, "native_success": bool(native_result.success.all()),
                          "export_error": str(error)}, validation_status="not_completed")
@@ -407,6 +516,9 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
     def observed(planner, native_result):
         # BEGIN retain every native seed before production gathers a candidate.
         nonlocal native_trace
+        # BEGIN bound retained query memory to the existing native seed count.
+        export_query_captures.clear()
+        # END snapshots from a previous optimization round are already on disk.
         path = output/f"native-result-{len(report['native_results']):02d}.npz"
         native_trace = path.name
         entry = {"path": path.name, "saved": False,

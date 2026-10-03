@@ -888,10 +888,14 @@ def validate_fixture_collision_contract(fixture, robot_config):
                     raise ValueError("A serialized sphere lost its required complete-cell enclosure allowance")
                 minimum_allowance = min(minimum_allowance, allowance)
             offsets[row["link"]] += count
+    # BEGIN reload the bounded refined cover without weakening its certificate.
+    # More cells still require complete native-solid ownership, fresh partition
+    # reconstruction and outward-rounded coverage for every serialized sphere.
     if (any(offsets[name] != len(kinematics["collision_spheres"][name]) for name in links)
             or sum(offsets.values()) != fixture["sphere_count"]
-            or not 1 <= fixture["sphere_count"] <= 480):
+            or not 1 <= fixture["sphere_count"] <= 640):
         raise ValueError("Fixture sphere count or complete collision ownership changed")
+    # END only the storage capacity changes; collision geometry remains complete.
     # BEGIN share contact declarations while re-deriving both native contracts.
     expected = _collision_query_contract(robot, kinematics, mechanical_contact_pairs=mechanical_contact_pairs)
     source_expected = _collision_query_contract(source, kinematics, mechanical_contact_pairs=mechanical_contact_pairs)
@@ -1085,8 +1089,12 @@ def export_fixture(*, scene_path, catalog_path, episode_path, root_body, collisi
     if max_position > 1e-9 or max_rotation > 1e-9:
         raise ValueError(f"Serialized URDF differs from native FK: {max_position} m, {max_rotation} rad")
     sphere_count = sum(map(len, covers.values()))
-    if sphere_count > 480:
-        raise ValueError("Local fixture exceeds the explicitly bounded 480-sphere budget")
+    # BEGIN retain a finite device-model capacity for complete cover refinement.
+    # The planner independently checks actual workspace bytes before allocating
+    # GPU rollouts; no sphere is shrunk or removed to meet this export capacity.
+    if sphere_count > 640:
+        raise ValueError("Local fixture exceeds the explicitly bounded 640-sphere budget")
+    # END physical geometry, native pair policy and all coverage checks are unchanged.
     config = {"robot_cfg": {"load_dynamics": False, "kinematics": {
         "format_version": 2.0, "urdf_path": str(urdf_path), "asset_root_path": str(output),
         "base_link": root_body, "tool_frames": [tcp_site], "use_global_cumul": True,

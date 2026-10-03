@@ -111,7 +111,12 @@ class PlanningBudget:
         if (not 1 <= self.trajectory_seeds <= 2 or not self.trajectory_seeds <= self.ik_seeds <= 8
                 or not 6 <= self.knots <= 24 or not 1 <= self.interpolation_steps <= 8
                 or not 1 <= self.ik_iterations <= 200 or not 1 <= self.trajectory_iterations <= 300
-                or not 1 <= self.max_robot_spheres <= 512
+                # BEGIN admit bounded complete-volume robot cover refinement.
+                # This is storage capacity, not a collision clearance or an
+                # acceptance tolerance. Scene/native memory preflight remains
+                # mandatory for every actual sphere count and query horizon.
+                or not 1 <= self.max_robot_spheres <= 640
+                # END geometric coverage and cumulative work limits are unchanged.
                 or not 1 <= self.max_robot_dof <= 16
                 or not 1 <= self.max_robot_links <= 64
                 or not 32 <= self.max_validation_points <= 8192
