@@ -311,6 +311,10 @@ class RobotStateValidator:
                 "numerics": dict(self.checker.numerics),
                 "fk_model_translation_tolerance_m": self.fk_translation_tolerance_m,
                 "fk_model_rotation_tolerance_rad": self.fk_rotation_tolerance_rad,
+                # BEGIN FK tolerances compare known models, not Cartesian sensors.
+                "fk_tolerance_scope": "Consistency of known robot models/calibration at the same measured joints; even a 1e-8 tolerance is not physical Cartesian sensing accuracy",
+                "robot_pose_scope": "Fixed calibrated base and TCP FK estimates from measured joint positions; no independent Cartesian observation",
+                # END physical tracking and task tolerances keep their own meaning.
                 "scope": "robot self/installation solids, model FK and joint position/velocity limits only",
                 "observed_scene_checked": False, "unknown_space_checked": False,
                 "continuous_collision_certified": False,
@@ -325,8 +329,12 @@ class RobotStateValidator:
         """Gate full actual q, after the executor validates identity and time.
 
         Clock freshness and physical tracking use the execution layer's own
-        guard. This independently checks model-frame identity, raw native joint
-        limits, robot solid separation and measured TCP versus Pinocchio FK.
+        # BEGIN independent models do not manufacture independent measurements.
+        guard. This independently checks model-frame identity, joint limits,
+        robot solid separation and backend FK versus Pinocchio FK at the same
+        measured q. Fixed-base/TCP consistency tolerances, including 1e-8 values,
+        are numerical/model requirements, not sensor-accuracy certificates.
+        # END original physical tracking limits remain owned by ExecutionLimits.
         No actuator command is read by this function.
         """
         _name(stage, "validation stage")
@@ -342,7 +350,9 @@ class RobotStateValidator:
         if not np.array_equal(tool_transform, self.T_frame_tcp):
             raise ValueError("Actual feedback changed the independently bound link-from-TCP transform")
         base = _rigid_pose(feedback["base_pose"], "feedback base_pose")
-        measured_tool = _rigid_pose(feedback["tool_pose"], "feedback tool_pose")
+        # BEGIN the supplied Cartesian pose is the backend's robot-model estimate.
+        estimated_tool = _rigid_pose(feedback["tool_pose"], "feedback TCP FK estimate")
+        # END neither validator reads hidden current object truth here.
         velocities = np.asarray(feedback["dq"])
         if velocities.shape != (len(self.joint_names),) or velocities.dtype.kind not in "iuf" or not np.isfinite(velocities).all():
             raise ValueError("Independent validation requires one finite actual velocity per named joint")
@@ -350,7 +360,7 @@ class RobotStateValidator:
                                     T_reference_base=self.T_reference_base, pairs=self.pairs, frames=[self.tool_frame])
         expected_tool = np.asarray(result["frame_poses"][self.tool_frame]) @ self.T_frame_tcp
         base_error = self._pose_difference(base, self.T_reference_base)
-        tool_error = self._pose_difference(measured_tool, expected_tool)
+        tool_error = self._pose_difference(estimated_tool, expected_tool)
         violations = []
         for name, error in (("base", base_error), ("tcp", tool_error)):
             for metric, maximum in (("translation_m", self.fk_translation_tolerance_m),
@@ -381,6 +391,9 @@ class RobotStateValidator:
                 "mechanical_contacts": mechanical_contacts,
                 "min_required_clearance_m": min(required) if required else None,
                 "base_model_error": base_error, "tcp_model_error": tool_error,
+                # BEGIN disclose what the small residual actually establishes.
+                "fk_error_scope": "Agreement of calibrated robot models at measured joints, not independent Cartesian sensing or physical accuracy",
+                # END a zero model residual cannot fill a missing object observation.
                 "actual_joint_positions": result["joint_positions"],
                 "scope": "supplied robot solids at this actual state; no between-state or scene certificate"}
         # BEGIN current scene geometry consumes actual q and current explicit evidence.

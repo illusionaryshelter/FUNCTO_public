@@ -468,6 +468,19 @@ def make_finger_reference(source, case, candidate, initial_q, initial_dq, dt, ti
         timestamp_s=timestamp)
 
 
+# BEGIN native diagnostics belong only to this offline device probe.
+def native_robot_diagnostics(backend):
+    """Read simulator dynamics separately from runtime robot feedback.
+
+    These copied arrays retain the backend's explicit named joint/actuator
+    order. They are saved for offline review, never passed to control or the
+    runtime guard as observations from a real acceleration/force sensor.
+    """
+    return {"qacc": backend.native_data.qacc[backend._qvel_ids].copy(),
+            "actuator_force": backend.native_data.actuator_force[backend._actuator_ids].copy()}
+# END no diagnostic fields are restored to backend.proprioception().
+
+
 def bench_case(backend, curve, case, fingers, limits, protection, materials, ledger, output):
     """Run one frozen case and always retain its separately bounded hold."""
     ledger.reserve_case()
@@ -482,7 +495,11 @@ def bench_case(backend, curve, case, fingers, limits, protection, materials, led
     primary = None
     physical_before = ledger.describe()
     initial = backend.proprioception()
-    states.append({"phase": "initial", "feedback": initial, "gap": material_gaps(materials, initial["q"][narm:])})
+    # BEGIN the offline native diagnostic sample is separate from online q/dq.
+    states.append({"phase": "initial", "feedback": initial,
+                   "native_diagnostics": native_robot_diagnostics(backend),
+                   "gap": material_gaps(materials, initial["q"][narm:])})
+    # END guards below receive only the runtime feedback record.
     initial_contacts, overflow = native_self_contacts(backend, MAX_CONTACT_ROWS_PER_SAMPLE)
     contacts.append(initial_contacts, state_index=0, sim_time=initial["sim_time"], phase="initial", overflow=overflow)
     native_step, native_apply = backend.step, backend.apply_control
@@ -516,8 +533,11 @@ def bench_case(backend, curve, case, fingers, limits, protection, materials, led
             return
         try:
             actual = backend.proprioception()
+            # BEGIN record simulator-only quantities outside runtime feedback.
             states.append({"phase": phase, "feedback": actual,
+                           "native_diagnostics": native_robot_diagnostics(backend),
                            "gap": material_gaps(materials, actual["q"][narm:])})
+            # END the diagnostic arrays do not affect a command or guard value.
             contact_rows, overflow = native_self_contacts(backend, MAX_CONTACT_ROWS_PER_SAMPLE)
             contacts.append(contact_rows, state_index=len(states)-1, sim_time=after, phase=phase, overflow=overflow)
             if phase == "hold":
@@ -594,7 +614,9 @@ def bench_case(backend, curve, case, fingers, limits, protection, materials, led
     hold_confirmed = final_ledger["confirmed_physics_steps"]-before_hold["confirmed_physics_steps"]
     actual_q = np.asarray([row["feedback"]["q"] for row in states])
     actual_dq = np.asarray([row["feedback"]["dq"] for row in states])
-    force = np.asarray([row["feedback"]["actuator_force"] for row in states])
+    # BEGIN explicit offline native dynamics replace unavailable robot sensors.
+    force = np.asarray([row["native_diagnostics"]["actuator_force"] for row in states])
+    # END only the final diagnostic summary consumes this array.
     actual_control = np.asarray([row["feedback"]["actuator_ctrl"]["values"] for row in states])
     finger_error = actual_q[:, narm:]-actual_control[:, narm:]
     control_array = np.asarray([row["actuator_ctrl"] for row in controls])
@@ -610,7 +632,11 @@ def bench_case(backend, curve, case, fingers, limits, protection, materials, led
         "finger_min_upper_margin_m": (ranges[narm:, 1]-actual_q[:, narm:]).min(axis=0),
         "finger_max_signed_upper_error_m": (actual_q[:, narm:]-ranges[narm:, 1]).max(axis=0),
         "finger_max_absolute_speed": np.abs(actual_dq[:, narm:]).max(axis=0),
-        "finger_final_velocity": actual_dq[-1, narm:], "maximum_absolute_actuator_force": np.abs(force).max(axis=0),
+        # BEGIN distinguish native diagnostic forces from real robot feedback.
+        "finger_final_velocity": actual_dq[-1, narm:],
+        "maximum_absolute_diagnostic_actuator_force": np.abs(force).max(axis=0),
+        "native_diagnostics_source": "Offline simulator qacc and actuator_force in explicit backend joint/actuator order; never runtime sensor or control-guard input",
+        # END the native force maximum is not a contact or safety acceptance rule.
         "finger_actual_minus_control_min_m": finger_error.min(axis=0),
         "finger_actual_minus_control_max_m": finger_error.max(axis=0),
         "arm_torque_saturated": any(bool(np.any(row["arm_torque_saturated"])) for row in controls),
@@ -622,7 +648,11 @@ def bench_case(backend, curve, case, fingers, limits, protection, materials, led
             and hold.get("physical_stop_confirmed") is True and not hold_faults and not capture_errors
             and not contacts.active and not contacts.overflow and not contacts.nonfinite
             and final_ledger["exact_clock_accounting"] and confirmed == len(states)-1)}
-    arrays = {key: np.asarray([row["feedback"][key] for row in states]) for key in ("q", "dq", "qacc", "actuator_force", "tool_pose")}
+    # BEGIN archive runtime feedback and offline native diagnostics separately.
+    arrays = {key: np.asarray([row["feedback"][key] for row in states]) for key in ("q", "dq", "tool_pose")}
+    arrays.update({f"diagnostic_{key}": np.asarray([row["native_diagnostics"][key] for row in states])
+                   for key in ("qacc", "actuator_force")})
+    # END no unavailable native sensor field is expected in proprioception.
     arrays.update(actual_phase=np.asarray([row["phase"] for row in states]),
         sim_time=np.asarray([row["feedback"]["sim_time"] for row in states]),
         measured_pad_gap=np.asarray([row["gap"] for row in states]),

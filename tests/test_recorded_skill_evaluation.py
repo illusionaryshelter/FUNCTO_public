@@ -85,16 +85,25 @@ def _history(*, mapped=True, goal_progress=1., duration=.4, until=None, error=No
     return evaluator, result
 
 
+# BEGIN explicit collection completeness is independent of physical completion.
+def _complete_collection():
+    return {"completed": True, "first_error": None, "disabled": False}
+
+
 def _completed(evaluator):
     return {"status": "curve_finished", "executed_steps": len(evaluator._samples)-1,
-            "barrier_command_reached": True, "history": [], "completed_goal_ids": []}
+            "barrier_command_reached": True, "history": [], "completed_goal_ids": [],
+            "normal_step_accounting": {"step_accounting_exact": True},
+            "independent_evidence_sink": {"completed": True}}
+
+# END CPU histories declare their own successful acquisition boundary.
 
 
 def test_nonidentity_observed_frame_moves_with_native_body_and_preserves_original_goal(tmp_path):
     evaluator, result = _history(moving=True)
     before = deepcopy(result.execution_binding)
     execution = _completed(evaluator)
-    report = evaluator.finalize(tmp_path, execution_report=execution)
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=execution)
     goal = report["functional_goal_evidence"][0]
     assert goal["identity"] == ["pose_events", 7]
     assert goal["value"] == "T" and report["physics_success"] is True
@@ -113,7 +122,7 @@ def test_nonidentity_observed_frame_moves_with_native_body_and_preserves_origina
 
 def test_stable_grasp_cannot_override_original_functional_accuracy_failure(tmp_path):
     evaluator, _ = _history(error=lambda time: [.002, 0., 0.])
-    report = evaluator.finalize(tmp_path, execution_report=_completed(evaluator))
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     assert report["stable_grasp_at_stop"] is True
     assert report["effect_evidence"][0]["value"] == "T"
     goal = report["functional_goal_evidence"][0]
@@ -123,9 +132,49 @@ def test_stable_grasp_cannot_override_original_functional_accuracy_failure(tmp_p
     assert report["physics_outcome"] == "failed" and report["physics_success"] is False
 
 
+# BEGIN incomplete GT histories cannot inherit a successful retained prefix.
+@pytest.mark.parametrize("failure", ["collection", "callback", "inexact_clock", "missing_suffix",
+                                    "missing_initial", "missing_interior", "empty"])
+def test_incomplete_collection_is_unknown_and_names_missing_sample_ranges(tmp_path, failure):
+    evaluator, _ = _history()
+    execution = _completed(evaluator)
+    collection = _complete_collection()
+    expected_missing = []
+    if failure == "collection":
+        collection.update(completed=False, disabled=True,
+            first_error={"type": "ValueError", "message": "capture failed", "phase": "after_step",
+                         "curve_time": .4, "sim_time": 10.4})
+    elif failure == "callback":
+        execution["independent_evidence_sink"]["completed"] = False
+    elif failure == "inexact_clock":
+        execution["normal_step_accounting"]["step_accounting_exact"] = False
+    else:
+        missing = ({"missing_suffix": list(range(181, 201)), "missing_initial": [0],
+                    "missing_interior": [23, 24], "empty": list(range(201))})[failure]
+        expected_missing = [[missing[0], missing[-1]]]
+        keep = [index for index in range(201) if index not in missing]
+        evaluator._samples = [evaluator._samples[index] for index in keep]
+        evaluator._contacts = [evaluator._contacts[index] for index in keep]
+        evaluator._offsets = [0]*(len(keep)+1)
+        evaluator._goals._owner_pose_samples = [evaluator._goals._owner_pose_samples[index] for index in keep]
+    report = evaluator.finalize(tmp_path, execution_report=execution, collection_report=collection)
+    assert report["physics_success"] is None and report["physics_outcome"] == "incomplete_evidence"
+    assert not report["completed_current_curve"]
+    coverage = report["evidence_coverage"]
+    assert coverage["complete"] is False and coverage["expected_sample_count"] == 201
+    assert coverage["missing_normal_sample_index_ranges"] == expected_missing
+    assert report["evidence_collection"]["first_error"] == collection["first_error"]
+    if failure == "empty":
+        assert not (tmp_path/"physics-evidence.npz").exists()
+    else:
+        with np.load(tmp_path/"physics-evidence.npz", allow_pickle=False) as archive:
+            assert len(archive["sim_time"]) == len(evaluator._samples)
+# END retained actual samples are saved without interpolating missing evidence.
+
+
 def test_missing_explicit_owner_mapping_keeps_goal_and_whole_result_unknown(tmp_path):
     evaluator, _ = _history(mapped=False)
-    report = evaluator.finalize(tmp_path, execution_report=_completed(evaluator))
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     assert report["stable_grasp_at_stop"] is True
     assert report["functional_goal_evidence"][0]["value"] == "U"
     assert report["effect_evidence"][0]["value"] == "U"
@@ -134,11 +183,11 @@ def test_missing_explicit_owner_mapping_keeps_goal_and_whole_result_unknown(tmp_
 
 def test_early_hold_cannot_supply_unobserved_future_goal_or_stability_window(tmp_path):
     evaluator, _ = _history(until=.2)
-    execution = {"status": "feedback_rejected", "executed_steps": 100,
+    execution = {**_completed(evaluator), "status": "feedback_rejected", "executed_steps": 100,
         "barrier_command_reached": False, "history": [], "elapsed_sim_s": .5,
         "abort_hold": {"physical_steps": 150, "physical_stop_confirmed": True},
         "continuation": {"actual_feedback": {"sim_time": 10.5, "tool_pose": evaluator._samples[-1][2].tolist()}}}
-    report = evaluator.finalize(tmp_path, execution_report=execution)
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=execution)
     assert report["functional_goal_evidence"][0]["query_count"] == 0
     assert report["functional_goal_evidence"][0]["value"] == "U"
     assert report["effect_evidence"][0]["value"] == "U"
@@ -148,7 +197,7 @@ def test_early_hold_cannot_supply_unobserved_future_goal_or_stability_window(tmp
 
 def test_first_goal_time_failure_is_not_repaired_by_a_later_perfect_pose(tmp_path):
     evaluator, _ = _history(goal_progress=.5, error=lambda time: [.002 if time == .2 else 0., 0., 0.])
-    report = evaluator.finalize(tmp_path, execution_report=_completed(evaluator))
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     goal = report["functional_goal_evidence"][0]
     assert goal["sample_elapsed_s"] == .2 and goal["query_count"] == 1
     assert goal["value"] == "F"
@@ -166,7 +215,7 @@ def test_later_stable_contact_cannot_repair_the_original_effect_checkpoint(tmp_p
         replacement = list(row)
         replacement[5] = np.array([row[1] >= .3, row[1] >= .3])
         evaluator._samples[index] = tuple(replacement)
-    report = evaluator.finalize(tmp_path, execution_report=_completed(evaluator))
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     assert report["functional_goal_evidence"][0]["sample_elapsed_s"] == .4
     assert report["functional_goal_evidence"][0]["value"] == "T"
     assert report["effect_evidence"][0]["sample_elapsed_s"] == .4
@@ -184,7 +233,7 @@ def test_grasp_lost_after_original_effect_success_fails_the_final_stop_predicate
         replacement = list(row)
         replacement[5] = np.array([row[1] < .7, row[1] < .7])
         evaluator._samples[index] = tuple(replacement)
-    report = evaluator.finalize(tmp_path, execution_report=_completed(evaluator))
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     assert report["effect_evidence"][0]["sample_elapsed_s"] == .4
     assert report["effect_evidence"][0]["value"] == "T"
     assert report["stable_grasp_at_stop"] is False
@@ -195,7 +244,7 @@ def test_grasp_lost_after_original_effect_success_fails_the_final_stop_predicate
 def test_one_ulp_future_goal_uses_next_native_tick(tmp_path):
     evaluator, _ = _history(duration=np.nextafter(.4, np.inf), goal_progress=.5,
         error=lambda time: [.002 if time >= .202 else 0., 0., 0.])
-    report = evaluator.finalize(tmp_path, execution_report=_completed(evaluator))
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     goal = report["functional_goal_evidence"][0]
     assert goal["scheduled_curve_time_s"] > .2
     assert goal["device_due_time_s"] == goal["sample_elapsed_s"] == .202
@@ -207,7 +256,7 @@ def test_incomplete_arrival_window_retains_unknown_instead_of_premature_failure(
     result.execution_binding["timing_events"] = [{"timing": [{"check_target": "arrival",
         "window_s": [.1, .4], "time_basis": "request_physical", "origin_time_s": 0.,
         "goal_id": ["pose_events", 7], "source": "Original explicit arrival window"}]}]
-    report = evaluator.finalize(tmp_path, execution_report={"status": "feedback_rejected",
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report={**_completed(evaluator), "status": "feedback_rejected",
         "executed_steps": 100, "barrier_command_reached": False, "history": []})
     goal = report["functional_goal_evidence"][0]
     assert goal["measurement"]["value"] == "F" and goal["value"] == "U"
@@ -228,7 +277,7 @@ def test_owner_binding_rejects_native_identity_or_nonrigid_source_frame(corrupti
 def test_unimplemented_original_process_cannot_inherit_overall_grasp_success(tmp_path):
     evaluator, result = _history()
     result.execution_binding["problem"]["interiors"] = [{"source": "Original independently scoped interior requirement"}]
-    report = evaluator.finalize(tmp_path, execution_report=_completed(evaluator))
+    report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     assert report["functional_goal_evidence"][0]["value"] == report["effect_evidence"][0]["value"] == "T"
     assert report["process_evidence"][0]["value"] == "U"
     assert report["physics_outcome"] == "unverified" and report["physics_success"] is None
@@ -241,6 +290,10 @@ def test_native_contact_probe_only_appends_offline_truth_and_returns_no_runtime_
     pose = np.eye(4)
     goal = PoseEventRequirement(1., pose, pose, .001, .01, "Explicit original synthetic goal")
     record = {"elapsed": .2, "curve_time": .2, "feedback": {"tool_pose": pose,
+        # BEGIN explicit synthetic robot-pose estimator provenance.
+        "tool_pose_source": "Synthetic FK of named measured joints",
+        "tool_pose_is_independent_observation": False,
+        # END no live native body/site pose is a runtime observation here.
         "source": "Synthetic named proprioceptive TCP", "timestamp_s": 1.2, "feedback_id": "synthetic-1.2"}}
     data = SimpleNamespace(time=1.2, ncon=1, contact=[SimpleNamespace(
         geom1=2, geom2=4, exclude=0, efc_address=0)])
@@ -252,5 +305,6 @@ def test_native_contact_probe_only_appends_offline_truth_and_returns_no_runtime_
     assert returned is None
     assert rows[0]["value"] == "T" and rows[0]["normal_force_n"] == 2.5
     assert "effects" not in record and "completed_goal_ids" not in record
-    assert set(record["feedback"]) == {"tool_pose", "source", "timestamp_s", "feedback_id"}
+    assert set(record["feedback"]) == {"tool_pose", "source", "timestamp_s", "feedback_id",
+                                       "tool_pose_source", "tool_pose_is_independent_observation"}
 # END these tests establish grading semantics, not physical grasp performance.

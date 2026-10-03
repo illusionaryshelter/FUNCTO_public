@@ -1116,7 +1116,11 @@ def _verified_completed_goals(continuation, original, all_goals, *, elapsed,
                             pose = _pose_array(item["pose"], "Measured TCP pose").tolist()
                             if "tool_pose" in measured_feedback and measured_feedback["tool_pose"] != pose:
                                 raise ValueError("Actual TCP measurements disagree")
-                            measured_feedback.update(tool_pose=pose, source=item["source"])
+                            # BEGIN continuation preserves the original TCP estimate provenance.
+                            measured_feedback.update(tool_pose=pose, source=item["source"],
+                                tool_pose_source=item["pose_source"],
+                                tool_pose_is_independent_observation=item["independent_observation"])
+                            # END replay cannot relabel model FK as an independent observation.
                         elif item["kind"] in ("current_owner_pose", "current_verified_attachment"):
                             policy = original["execution_limits"]["observation_policy"]
                             # BEGIN current-state freshness matches the executor's observation policy.

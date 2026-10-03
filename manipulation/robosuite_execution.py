@@ -123,11 +123,13 @@ class RobosuiteExecutionBackend:
 
         # BEGIN native mass/bias compensation is part of the trajectory law.
         bounds = model.actuator_ctrlrange[self._arm_actuators]
+        # BEGIN joint-space control has no site pose or Jacobian observation.
         self._arm_controller = JointPositionController(self._sim, indexes(0, narm),
-            actuator_range=(bounds[:, 0], bounds[:, 1]), ref_name=tcp_site,
+            actuator_range=(bounds[:, 0], bounds[:, 1]), ref_name=None,
             input_type="absolute", kp=float(arm_kp), kd=float(arm_kd), damping_ratio=1,
             policy_freq=1/self._dt, lite_physics=False, interpolator=None,
             use_torque_compensation=True)
+        # END ref_name=None disables the mature controller's unused site reads.
         # END derivative feedforward uses this same compensated controller.
         bounds = model.actuator_ctrlrange[self._finger_actuators]
         # BEGIN resume raw native command state without binary action memory.
@@ -145,9 +147,9 @@ class RobosuiteExecutionBackend:
         if not np.array_equal(self._grip_controller.run_controller(), restored_ctrl):
             raise ValueError("Unscaled GRIP must reproduce restored native position controls exactly")
         # END resume raw native command state without binary action memory.
-        # BEGIN isolated robot FK for physical TCP tracking checks.
+        # BEGIN model FK uses measured arm q, never a live TCP observation.
         self._prepare_reference_fk()
-        # END isolated robot FK for physical TCP tracking checks.
+        # END the same calibrated model supplies reference and measured-q FK.
         self._description = {
             "backend": "robosuite native MuJoCo trajectory-state and gripper controllers",
             "source": source, "trial_id": self._trial_id,
@@ -155,12 +157,21 @@ class RobosuiteExecutionBackend:
             "finger_joint_names": list(self.finger_joint_names),
             "base_link": base_link, "reference_frame": self.reference_frame,
             "tool_link": self.tool_link, "tool_transform": self.tool_transform.tolist(),
+            # BEGIN disclose model-derived poses separately from encoder feedback.
+            "base_pose_source": "known_fixed_robot_model_calibration",
+            "tool_pose_source": "forward_kinematics_from_measured_arm_q",
+            "tool_pose_is_independent_observation": False,
+            "proprioception_live_fields": ["named_joint_q", "named_joint_dq", "named_actuator_ctrl", "time"],
+            # END no independent TCP, acceleration or force sensor is claimed.
             "actuator_names": list(self.actuator_names), "native_timestep_s": self.timestep,
             "actuator_ctrlrange": model.actuator_ctrlrange[self._actuator_ids].tolist(),
             "actuator_forcelimited": model.actuator_forcelimited[self._actuator_ids].astype(bool).tolist(),
             "actuator_forcerange": model.actuator_forcerange[self._actuator_ids].tolist(),
             # BEGIN bind the complete trajectory-control contract by joint name.
             "arm_controller": "robosuite JointPositionController plus same-curve dq/ddq feedforward, native torque actuators",
+            # BEGIN model terms are not measured object/contact forces.
+            "arm_dynamics_source": "Known fixed robot model M(q) and bias C(q,dq)+g at measured robot q/dq; no target-pose or contact-force feedback",
+            # END no change to the controller gains or torque equation.
             "arm_kp": float(arm_kp), "arm_kd": float(arm_kd),
             "effective_arm_kp": self._arm_controller.kp.tolist(),
             "effective_arm_kd": self._arm_controller.kd.tolist(),
@@ -202,14 +213,17 @@ class RobosuiteExecutionBackend:
 
     @property
     def reference_frame(self):
-        # Native site_xpos/site_xmat and body xpos/xmat are in MuJoCo world.
+        # BEGIN the known robot installation defines the fixed model gauge.
+        # Scratch FK uses this calibration; it is not a live body-pose sensor.
         return "world"
+        # END the gauge does not disclose a task object's current pose.
 
     @property
     def tool_link(self):
-        # The observed tool frame is this exact native site. No runner may
-        # relabel another frame or attach a second, unapplied TCP transform.
+        # BEGIN the named model site identifies the estimated TCP frame.
+        # No runner may relabel it or attach an unapplied TCP transform.
         return self.native_model.site(self._site_id).name
+        # END its current pose is computed from measured joint positions.
 
     @property
     def tool_transform(self):
@@ -379,6 +393,7 @@ class RobosuiteExecutionBackend:
     # END native counts do not depend on a successful post-step sample.
 
 
+    # BEGIN fixed device calibration and scratch FK share no live pose arrays.
     def _prepare_reference_fk(self):
         """Require a fixed, controlled TCP chain before creating scratch data.
 
@@ -400,12 +415,24 @@ class RobosuiteExecutionBackend:
         arm_ids = set(self._joint_ids[:len(self.arm_joint_names)].tolist())
         if not chain <= arm_ids or any(model.body_mocapid[index] >= 0 for index in ancestors):
             raise ValueError("TCP reference needs a fixed base and only the explicitly controlled arm joints")
+        base_ancestors, body = {0}, self._base_id
+        while body:
+            base_ancestors.add(body)
+            body = int(model.body_parentid[body])
+        if any(int(owner) in base_ancestors for owner in model.jnt_bodyid):
+            raise ValueError("Robot base calibration requires a fixed base with no joint-driven ancestors")
         self._reference_data = mujoco.MjData(model)
         self._reference_data.qpos[self._qpos_ids] = self.native_data.qpos[self._qpos_ids]
+        # Base ancestors are static model transforms. Kinematics reads the
+        # scratch state only; no live object/body/site pose supplies this cache.
+        mujoco.mj_kinematics(model, self._reference_data)
+        self._calibrated_base_pose = np.eye(4)
+        self._calibrated_base_pose[:3, :3] = self._reference_data.xmat[self._base_id].reshape(3, 3)
+        self._calibrated_base_pose[:3, 3] = self._reference_data.xpos[self._base_id]
 
 
     def reference_tool_pose(self, arm_q):
-        """Compute exact TCP FK of a sampled arm cubic without stepping it."""
+        """Compute model TCP FK of explicit arm q without observing or stepping."""
         values = _finite_array(arm_q, (len(self.arm_joint_names),), "Reference arm positions")
         self._reference_data.qpos[self._qpos_ids[:len(values)]] = values
         mujoco.mj_kinematics(self.native_model, self._reference_data)
@@ -413,6 +440,7 @@ class RobosuiteExecutionBackend:
         pose[:3, :3] = self._reference_data.site_xmat[self._site_id].reshape(3, 3)
         pose[:3, 3] = self._reference_data.site_xpos[self._site_id]
         return pose
+    # END reference q and measured q use the same known device model.
 
 
     # BEGIN bounded physical hold with actual feedback confirmation.
@@ -574,37 +602,35 @@ class RobosuiteExecutionBackend:
     # END physical hold result preserves unconfirmed and failed stops.
 
 
+    # BEGIN runtime robot feedback excludes simulator pose/dynamics oracles.
     def proprioception(self):
-        """Return only explicitly named robot feedback and its native TCP."""
-        base = np.eye(4)
-        base[:3, :3] = self.native_data.xmat[self._base_id].reshape(3, 3)
-        base[:3, 3] = self.native_data.xpos[self._base_id]
-        tool = np.eye(4)
-        tool[:3, :3] = self.native_data.site_xmat[self._site_id].reshape(3, 3)
-        tool[:3, 3] = self.native_data.site_xpos[self._site_id]
-        # BEGIN named actual state and separately named native command state.
+        """Read encoders/commands/time and estimate TCP with calibrated FK.
+
+        The tool pose is a model estimate from this sample's measured arm q,
+        not an independent TCP observation. Acceleration and actuator force
+        are not available sensors in this binding and are not exported.
+        """
         timestamp = float(self.native_data.time)
+        q = self.native_data.qpos[self._qpos_ids].copy()
+        tool = self.reference_tool_pose(q[:len(self.arm_joint_names)])
         return {"joint_names": self.joint_names,
                 "reference_frame": self.reference_frame, "tool_link": self.tool_link,
                 "tool_transform": self.tool_transform,
                 "arm_joint_names": self.arm_joint_names, "finger_joint_names": self.finger_joint_names,
                 "trial_id": self._trial_id, "feedback_id": f"{self._trial_id}@native_time={timestamp:.17g}",
                 "source": self._feedback_source, "timestamp_s": timestamp,
-                "q": self.native_data.qpos[self._qpos_ids].copy(),
+                "q": q,
                 "dq": self.native_data.qvel[self._qvel_ids].copy(),
-                # BEGIN preserve native dynamics in their independent named orders.
-                # qacc is the acceleration from the refreshed native forward
-                # state, not a finite difference of logged velocities. Force
-                # belongs to actuators; position-servo ctrl is not a force.
-                "qacc": self.native_data.qacc[self._qvel_ids].copy(),
                 "actuator_names": self.actuator_names,
-                "actuator_force": self.native_data.actuator_force[self._actuator_ids].copy(),
-                # END raw dynamics remain separate from commands and limits.
-                "base_pose": base, "tool_pose": tool, "sim_time": timestamp,
+                "base_pose": self._calibrated_base_pose.copy(), "tool_pose": tool, "sim_time": timestamp,
+                "base_pose_source": "known_fixed_robot_model_calibration",
+                "tool_pose_source": "forward_kinematics_from_measured_arm_q",
+                "tool_pose_is_independent_observation": False,
                 "actuator_ctrl": {"joint_names": self.joint_names,
                     "actuator_names": self._actuator_names,
                     "values": self.native_data.ctrl[self._actuator_ids].tolist(),
                     "sim_time": timestamp, "timestamp_s": timestamp,
                     "semantics": "native actuator command state; never measured joint position"}}
+    # END no live body/site, qacc or actuator-force read enters proprioception.
 
 # END native robosuite execution backend without recording dependencies.

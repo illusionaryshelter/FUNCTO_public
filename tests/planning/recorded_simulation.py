@@ -147,8 +147,11 @@ def restore_recorded_simulation(*, scene_path, catalog_path, episode_path, frame
     mujoco.mj_forward(model, data)
     if not np.isclose(data.time, recorded_time, atol=1e-10, rtol=0):
         raise ValueError("Restored integration time does not match the selected recorded frame")
-    source = (f"Named native robot feedback and actuator controls from {Path(scene_path).resolve()}; "
+    # BEGIN distinguish encoder-equivalent state and known robot FK from GT poses.
+    source = (f"Named robot encoder-equivalent q/dq and actuator commands from {Path(scene_path).resolve()}; "
+              "tool/base poses use known robot FK and the fixed calibrated base; "
               f"restored {Path(episode_path).resolve()} frame {frame_index}")
+    # END the setup recording is not a runtime object-pose observation channel.
     backend = RobosuiteExecutionBackend(sim, base_link=base_link, tcp_site=tcp_site,
         arm_joint_names=arm_joint_names, finger_joint_names=finger_joint_names,
         arm_kp=arm_kp, arm_kd=arm_kd, velocity_limits=velocity_limits, source=source)

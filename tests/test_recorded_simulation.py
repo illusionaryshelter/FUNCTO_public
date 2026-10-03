@@ -82,6 +82,20 @@ def _fixture():
     # BEGIN explicitly synthetic physical limits and FK for control-contract tests.
     simulation._velocity_limits = dict(zip(simulation.joint_names, [1.]*7+[.2, .2]))
     simulation.reference_tool_pose = lambda arm_q: np.eye(4)
+    # BEGIN static calibration and an explicit scripted estimate replace live site GT.
+    simulation._calibrated_base_pose = np.eye(4)
+    simulation.scripted_tcp_estimate_offset = np.zeros(3)
+    native_proprioception = simulation.proprioception
+
+    def scripted_proprioception():
+        feedback = native_proprioception()
+        # Only contract tests inject this declared estimate error; native body
+        # and site arrays never provide the mock's online TCP pose.
+        feedback["tool_pose"][:3, 3] += simulation.scripted_tcp_estimate_offset
+        return feedback
+
+    simulation.proprioception = scripted_proprioception
+    # END the fixture's optional estimate error is not physical sensor evidence.
     # END explicitly synthetic physical limits and FK for control-contract tests.
 
     def step():
@@ -589,35 +603,23 @@ class RecordedControlTests(unittest.TestCase):
             self.assertNotIn("object_pose", actual)
             self.assertNotIn("contact", actual)
 
-    # BEGIN raw dynamics and clipped command evidence remain independently timed.
-    def test_native_dynamics_and_requested_applied_torque_are_recorded_without_differencing(self):
+    # BEGIN privileged dynamics do not enter online state or command archives.
+    def test_online_execution_ignores_native_dynamics_and_keeps_command_torque_evidence(self):
         simulation, curve, value = _fixture()
+        simulation.native_data.qacc[:] = np.nan
+        simulation.native_data.actuator_force[:] = np.inf
         initial = _initial_feedback(simulation)
-        expected_acceleration = [simulation.native_data.qacc.copy()]
-        expected_force = [simulation.native_data.actuator_force.copy()]
-        advance = simulation._sim.step
-
-        def step():
-            advance()
-            # q/dq deliberately stay constant while the mock exposes distinct
-            # native telemetry. Differentiating dq or copying ctrl would fail.
-            simulation.native_data.qacc += .25
-            simulation.native_data.actuator_force += 2.
-            expected_acceleration.append(simulation.native_data.qacc.copy())
-            expected_force.append(simulation.native_data.actuator_force.copy())
-
-        simulation._sim.step = step
         simulation._arm_controller.run_controller = lambda: np.full(7, 5.*len(simulation.arm_goals))
         with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
             output = Path(temporary)/"trial"
             report = _execute_bound(_executor(simulation), _result(curve), finger_targets=FixedFingerTargets.from_mapping(value),
                 initial_feedback=initial, execution_limits=_limits(simulation, curve),
-                # BEGIN raw hold telemetry needs one explicitly allotted step.
                 output=output, max_physics_steps=5)
-                # END the four command samples and one stop share that total.
             with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
-                np.testing.assert_array_equal(saved["actual_qacc"], expected_acceleration[:5])
-                np.testing.assert_array_equal(saved["actual_actuator_force"], expected_force[:5])
+                self.assertNotIn("actual_qacc", saved)
+                self.assertNotIn("actual_actuator_force", saved)
+                self.assertTrue(np.all(saved["tool_pose_source"] == "forward_kinematics_from_measured_arm_q"))
+                self.assertFalse(saved["tool_pose_is_independent_observation"].any())
                 self.assertEqual(len(saved["elapsed"]), 5)
                 self.assertEqual(report["dependency_hold"]["physical_steps"], 1)
                 np.testing.assert_array_equal(saved["actuator_names"], simulation.actuator_names)
@@ -627,13 +629,14 @@ class RecordedControlTests(unittest.TestCase):
                 np.testing.assert_allclose(saved["applied_arm_torque"][:, 0], [5.01, 10., 10., 10.], atol=1e-9, rtol=0.)
                 np.testing.assert_array_equal(saved["applied_arm_torque"], saved["actuator_ctrl"][:, :7])
                 np.testing.assert_array_equal(saved["arm_torque_saturated"][:, 0], [False, True, True, True])
-                # END native force sentinels above remain independent of these controller demands.
+                # END requested/applied controls remain distinct from measured force.
                 np.testing.assert_allclose(np.diff(saved["control_elapsed"]), simulation.timestep, atol=1e-15)
             self.assertEqual(report["arm_control_saturated_coordinates"], 21)
             final = json.loads(Path(report["barrier_feedback_path"]).read_text())
-            np.testing.assert_array_equal(final["qacc"], expected_acceleration[-1])
-            np.testing.assert_array_equal(final["actuator_force"], expected_force[-1])
-    # END telemetry does not claim physical dynamics from the mocked clock.
+            self.assertNotIn("qacc", final)
+            self.assertNotIn("actuator_force", final)
+            self.assertFalse(final["tool_pose_is_independent_observation"])
+    # END independent evaluation owns privileged dynamic evidence separately.
 
     # BEGIN device quantization must preserve distinct original actions.
     def test_distinct_commands_cannot_disappear_in_one_activation_tick(self):
@@ -1004,9 +1007,110 @@ class DependencyExecutionTests(unittest.TestCase):
         np.testing.assert_array_equal(simulation.native_data.qvel, initial_dq)
 
 
+# BEGIN independent evidence failures cannot select online execution outcomes.
+class IndependentEvidenceSinkTests(unittest.TestCase):
+    def test_first_initial_or_post_step_sink_failure_disables_only_collection(self):
+        reports, recorded_controls = [], []
+        for fail_at in (None, 0, 1):
+            simulation, curve, targets = _fixture()
+            curve.events[2].update(kind="effect", requires_evidence=None, stop=False)
+            _bind_fingers(simulation, curve, targets)
+            calls = []
+
+            def collect(model, data, sample):
+                calls.append(sample["elapsed"])
+                if fail_at is not None and len(calls)-1 == fail_at:
+                    raise RuntimeError("scripted independent sink failure")
+                # A returned verdict and mutations of the detached sample
+                # are deliberately inadmissible as online execution input.
+                sample["q"][:] = np.nan
+                sample["feedback"]["q"][:] = np.nan
+                return {"value": "F"}
+
+            with self.subTest(fail_at=fail_at), TemporaryDirectory() as temporary, patch(
+                    "manipulation.robosuite_execution.mujoco.mj_forward"):
+                output = Path(temporary)/"trial"
+                report = _execute_bound(_executor(simulation), _result(curve),
+                    finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
+                    execution_limits=_limits(simulation, curve), output=output, step_callback=collect)
+                with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
+                    recorded_controls.append(saved["actuator_ctrl"].copy())
+                    self.assertTrue(np.isfinite(saved["actual_q"]).all())
+                reports.append(report)
+                self.assertEqual(report["status"], "curve_finished")
+                self.assertEqual(report["executed_steps"], 6)
+                self.assertIsNone(report["feedback_failure"])
+                sink = report["independent_evidence_sink"]
+                self.assertTrue(sink["configured"])
+                self.assertEqual(sink["disabled"], fail_at is not None)
+                self.assertEqual(sink["completed"], fail_at is None)
+                expected_calls = 7 if fail_at is None else fail_at+1
+                self.assertEqual(sink["attempted_callbacks"], expected_calls)
+                self.assertEqual(len(calls), expected_calls)
+                self.assertEqual(sink["successful_callbacks"], 7 if fail_at is None else fail_at)
+                if fail_at is None:
+                    self.assertIsNone(sink["first_error"])
+                    np.testing.assert_allclose(calls, np.arange(7)*simulation.timestep, atol=1e-15)
+                else:
+                    failure = sink["first_error"]
+                    self.assertEqual(failure["type"], "RuntimeError")
+                    self.assertEqual(failure["message"], "scripted independent sink failure")
+                    self.assertEqual(failure["phase"], "initial_state" if fail_at == 0 else "after_step")
+                    self.assertAlmostEqual(failure["sim_time"], 1.3+fail_at*simulation.timestep)
+        for report, controls in zip(reports[1:], recorded_controls[1:]):
+            self.assertEqual(report["physics_step_accounting"], reports[0]["physics_step_accounting"])
+            self.assertEqual(report["events"], reports[0]["events"])
+            np.testing.assert_array_equal(controls, recorded_controls[0])
+
+    def test_sink_failure_at_rejected_step_preserves_primary_guard_failure(self):
+        simulation, curve, targets = _fixture()
+        checker = _GeometryChecker(simulation.joint_names, rejected_stage="after_step")
+        calls = []
+
+        def collect(model, data, sample):
+            calls.append(sample["elapsed"])
+            if sample["elapsed"] > 0:
+                raise RuntimeError("independent sink unavailable")
+
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            output = Path(temporary)/"trial"
+            with self.assertRaises(ExecutionGuardError) as caught:
+                _execute_bound(TrajectoryExecutor(simulation, geometry_checker=checker), _result(curve),
+                    finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
+                    execution_limits=_limits(simulation, curve), output=output, step_callback=collect)
+            report = json.loads((output/"execution-report.json").read_text())
+        self.assertEqual(report["error"], f"ExecutionGuardError: {caught.exception}")
+        self.assertEqual(report["feedback_failure"]["point"], "after_step")
+        self.assertEqual(report["status"], "feedback_rejected")
+        self.assertEqual(report["normal_step_accounting"]["physical_steps"], 1)
+        self.assertEqual(report["events"], [])
+        self.assertEqual(len(calls), 2)
+        sink = report["independent_evidence_sink"]
+        self.assertFalse(sink["completed"])
+        self.assertEqual(sink["successful_callbacks"], 1)
+        self.assertEqual(sink["first_error"]["phase"], "after_step")
+
+    def test_preflight_rejection_still_emits_exactly_one_initial_sample(self):
+        simulation, curve, targets = _fixture()
+        checker = _GeometryChecker(simulation.joint_names, preflight_passed=False)
+        calls = []
+        executor = TrajectoryExecutor(simulation, geometry_checker=checker)
+        with TemporaryDirectory() as temporary:
+            with self.assertRaises(ExecutionGuardError):
+                _execute_bound(executor, _result(curve),
+                    finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
+                    execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial",
+                    step_callback=lambda model, data, sample: calls.append(sample["elapsed"]))
+        self.assertEqual(calls, [0.])
+        sink = executor.last_execution_report["independent_evidence_sink"]
+        self.assertTrue(sink["completed"])
+        self.assertEqual(sink["successful_callbacks"], 1)
+# END evaluator collection coverage is separate from task and physics success.
+
+
 class ExecutionGuardTests(unittest.TestCase):
     # BEGIN reject malformed telemetry without adding physical spike thresholds.
-    def test_native_dynamics_require_finite_values_and_exact_actuator_order(self):
+    def test_online_joint_feedback_requires_finite_values_and_exact_actuator_order(self):
         backend, curve, _ = _fixture()
         executor = _executor(backend)
         limits = _limits(backend, curve)
@@ -1014,7 +1118,7 @@ class ExecutionGuardTests(unittest.TestCase):
             finger_joint_names=backend.finger_joint_names, native_joint_ranges=backend.joint_ranges,
             named_velocity_limits=backend.velocity_limits)
         q, dq, _, _ = curve.sample(0.)
-        for field in ("actuator_names", "qacc", "actuator_force"):
+        for field in ("actuator_names", "q", "dq"):
             with self.subTest(field=field):
                 feedback = backend.proprioception()
                 if field == "actuator_names":
@@ -1108,7 +1212,7 @@ class ExecutionGuardTests(unittest.TestCase):
             ("actual_finger_velocity", lambda data: data.qvel.__setitem__(7, .08)),
             ("native_joint_position", lambda data: data.qpos.__setitem__(0, 2.1)),
             ("hardware_joint_velocity", lambda data: data.qvel.__setitem__(0, 1.1)),
-            ("tcp_tracking", lambda data: data.site_xpos.__setitem__((0, 0), .01)),
+            ("tcp_tracking", lambda data: simulation.scripted_tcp_estimate_offset.__setitem__(0, .01)),
             ("feedback_clock", lambda data: setattr(data, "time", data.time+.002)),
             ("nonfinite_feedback", lambda data: data.qvel.__setitem__(0, np.nan)),
         )
@@ -1136,7 +1240,7 @@ class ExecutionGuardTests(unittest.TestCase):
                 self.assertEqual(report["feedback_failure"]["point"], "after_step")
                 self.assertIn(kind, [item["kind"] for item in report["feedback_failure"]["violations"]])
                 self.assertEqual(report["events"], [])
-                self.assertEqual(len(observed), 1)
+                self.assertEqual(len(observed), 2)
                 if kind in ("feedback_clock", "native_joint_position", "nonfinite_feedback"):
                     self.assertFalse(report["abort_hold"]["prepared"])
                 np.testing.assert_array_equal(simulation.native_data.ctrl[7:], curve.finger_trajectory.sample(.002)[0])
@@ -1219,7 +1323,7 @@ class ExecutionGuardTests(unittest.TestCase):
             self.assertAlmostEqual(continuation["elapsed_physical_s"], 3*simulation.timestep)
             np.testing.assert_array_equal(continuation["actual_feedback"]["q"], hold_entry["q"])
             np.testing.assert_array_equal(continuation["actual_feedback"]["dq"], np.zeros(9))
-            self.assertEqual(len(physical_samples), 1)
+            self.assertEqual(len(physical_samples), 2)
             self.assertIsNotNone(executor.last_execution_report["feedback_failure"])
             with np.load(output/"physical-trajectory.npz") as saved:
                 # The original failed sample remains the curve endpoint;
@@ -1341,8 +1445,9 @@ class GeometryExecutionTests(unittest.TestCase):
             report = json.loads((output/"execution-report.json").read_text())
             self.assertEqual(report["executed_steps"], 1)
             self.assertEqual(report["feedback_failure"]["point"], "after_step")
-            self.assertEqual(len(observed), 1)
-            self.assertFalse(observed[0]["passed"])
+            self.assertEqual(len(observed), 2)
+            self.assertIsNone(observed[0])
+            self.assertFalse(observed[1]["passed"])
             with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
                 np.testing.assert_array_equal(saved["geometry_checked"], [True, True])
                 np.testing.assert_array_equal(saved["geometry_passed"], [True, False])
@@ -1404,23 +1509,28 @@ class GeometryExecutionTests(unittest.TestCase):
 
 # BEGIN concrete native backend binding, independent of recorded datasets.
 class RobosuiteBackendTests(unittest.TestCase):
-    # BEGIN telemetry cannot confuse native actuator columns with joint columns.
-    def test_native_dynamics_use_named_indices_and_independent_copies(self):
+    # BEGIN online feedback reads named joint state and calibrated model FK only.
+    def test_online_feedback_ignores_privileged_dynamics_and_live_pose_arrays(self):
         backend, _, _ = _fixture()
         backend._qvel_ids = np.array([6, 5, 4, 3, 2, 1, 0, 8, 7])
         backend._actuator_ids = np.array([3, 4, 5, 6, 0, 1, 2, 8, 7])
-        acceleration = backend.native_data.qacc[backend._qvel_ids].copy()
-        force = backend.native_data.actuator_force[backend._actuator_ids].copy()
+        velocity = backend.native_data.qvel[backend._qvel_ids].copy()
+        controls = backend.native_data.ctrl[backend._actuator_ids].copy()
+        for field in ("qacc", "actuator_force", "xmat", "xpos", "site_xmat", "site_xpos"):
+            getattr(backend.native_data, field)[:] = np.nan
         feedback = backend.proprioception()
         self.assertEqual(feedback["actuator_names"], backend.actuator_names)
-        np.testing.assert_array_equal(feedback["qacc"], acceleration)
-        np.testing.assert_array_equal(feedback["actuator_force"], force)
-        backend.native_data.qacc[:] = 100.
-        backend.native_data.actuator_force[:] = -100.
-        np.testing.assert_array_equal(feedback["qacc"], acceleration)
-        np.testing.assert_array_equal(feedback["actuator_force"], force)
+        self.assertNotIn("qacc", feedback)
+        self.assertNotIn("actuator_force", feedback)
+        self.assertFalse(feedback["tool_pose_is_independent_observation"])
+        np.testing.assert_array_equal(feedback["base_pose"], np.eye(4))
+        np.testing.assert_array_equal(feedback["tool_pose"], np.eye(4))
+        backend.native_data.qvel[:] = 100.
+        backend.native_data.ctrl[:] = -100.
+        np.testing.assert_array_equal(feedback["dq"], velocity)
+        np.testing.assert_array_equal(feedback["actuator_ctrl"]["values"], controls)
         self.assertEqual(backend.sim_time, 1.3)
-    # END feedback sampling neither aliases native arrays nor advances physics.
+    # END privileged NaNs cannot change online feedback or advance the mock clock.
 
     @staticmethod
     def _simulator(*, arm_attributes='gaintype="fixed" dyntype="none" gear="1"'):
@@ -1841,7 +1951,7 @@ class ActualPoseGoalTests(unittest.TestCase):
 
     def test_two_mm_actual_miss_fails_one_mm_goal_inside_five_mm_tracking_band(self):
         fixture = self.fixture()
-        fixture[0].native_data.site_xpos[0, 0] = .002
+        fixture[0].scripted_tcp_estimate_offset[0] = .002
         def observer(feedback, curve_time):
             return {"source": "An untrusted pose-completion label cannot replace measurement",
                 "timestamp_s": feedback["timestamp_s"], "completed_goal_ids": [["pose_events", 7]]}
@@ -1858,12 +1968,12 @@ class ActualPoseGoalTests(unittest.TestCase):
     def test_within_original_tolerance_completes_once_with_original_identity(self):
         fixture = self.fixture()
         simulation = fixture[0]
-        simulation.native_data.site_xpos[0, 0] = .0005
+        simulation.scripted_tcp_estimate_offset[0] = .0005
         def after_step(model, data, row):
             # The once-goal has already been measured at .006 s. A later
             # departure inside the engineering band adds no invented hold goal.
             if row["elapsed"] >= .008:
-                simulation.native_data.site_xpos[0, 0] = .003
+                simulation.scripted_tcp_estimate_offset[0] = .003
         report = self.run_trial(fixture, step_callback=after_step)
         self.assertEqual(report["status"], "curve_finished")
         self.assertEqual(report["pose_goal_result"], "T")
@@ -1905,7 +2015,7 @@ class ActualPoseGoalTests(unittest.TestCase):
         curve.progress_s = np.asarray([0., .5, .5, 1.])
         from manipulation.execution_binding import curve_snapshot
         result.execution_binding["curve"] = curve_snapshot(curve)
-        simulation.native_data.site_xpos[0, 0] = .0005
+        simulation.scripted_tcp_estimate_offset[0] = .0005
         report = self.run_trial(fixture)
         proof = report["goal_evidence"][-1]
         self.assertAlmostEqual(proof["scheduled_curve_time_s"], .0048)
@@ -1949,13 +2059,20 @@ class ActualPoseGoalTests(unittest.TestCase):
         requirement = PoseEventRequirement(.5, tool_from_function, tool_from_function, .001, .01,
             "Explicit synthetic held material", actual_relation={"function_owner_id": "held",
                 "T_owner_function": np.eye(4), "attachment_condition_id": "actual_holding"})
-        feedback = {"tool_pose": np.eye(4), "timestamp_s": 2., "source": "Actual named robot feedback", "feedback_id": "robot:2"}
+        # BEGIN the direct helper fixture declares its model-estimate provenance.
+        feedback = {"tool_pose": np.eye(4), "timestamp_s": 2., "source": "Actual named robot feedback", "feedback_id": "robot:2",
+            "tool_pose_source": "forward_kinematics_from_measured_arm_q", "tool_pose_is_independent_observation": False}
+        # END a verified attachment does not supply independent TCP sensing.
         self.assertEqual(_actual_pose_goal(requirement, feedback, None)["value"], "U")
         observed = {"timestamp_s": 2., "source": "Actual synchronized holding observation",
                     "scene_condition_evidence": {"actual_holding": True}}
         proof = _actual_pose_goal(requirement, feedback, observed)
         self.assertEqual(proof["value"], "T")
         np.testing.assert_array_equal(proof["actual_function_pose"], tool_from_function)
+        # BEGIN the original estimate provenance survives functional composition.
+        self.assertEqual(proof["measurement_sources"][0]["pose_source"], "forward_kinematics_from_measured_arm_q")
+        self.assertFalse(proof["measurement_sources"][0]["independent_observation"])
+        # END the material transform changes the pose, not its source class.
 
     def test_upstream_nonpose_completion_keeps_acquisition_clock_when_delivery_is_delayed(self):
         simulation, curve, targets = _fixture()
@@ -2391,8 +2508,8 @@ class TrajectoryDeviceBindingTests(unittest.TestCase):
                 terms = [saved[name] for name in ("arm_position_feedback_torque", "arm_velocity_feedback_torque",
                     "arm_velocity_feedforward_torque", "arm_acceleration_feedforward_torque", "arm_bias_torque")]
                 np.testing.assert_allclose(saved["requested_arm_torque"], sum(terms), rtol=0., atol=1e-15)
-                np.testing.assert_array_equal(saved["actual_qacc"][0], initial["qacc"])
-                self.assertFalse(np.array_equal(saved["actual_qacc"][0, :7], saved["arm_curve_ddq"][0]))
+                self.assertNotIn("actual_qacc", saved)
+                self.assertNotIn("actual_actuator_force", saved)
         self.assertEqual(report["status"], "curve_finished")
         np.testing.assert_array_equal(simulation.native_data.qvel, initial["dq"])
 
@@ -2405,7 +2522,7 @@ class TrajectoryDeviceBindingTests(unittest.TestCase):
             from manipulation.execution_binding import curve_snapshot
             source.execution_binding["curve"] = curve_snapshot(curve)
             if kind == "measured_miss":
-                simulation.native_data.site_xpos[0, 0] = .002
+                simulation.scripted_tcp_estimate_offset[0] = .002
             result = self.bind(simulation, source, targets, limits, [["pose_events", 7]])
             with self.subTest(kind=kind), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
                 report = _executor(simulation).execute(result, finger_targets=FixedFingerTargets.from_mapping(targets),

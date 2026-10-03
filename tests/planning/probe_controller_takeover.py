@@ -72,7 +72,21 @@ def run(args):
         count = int(np.ceil(args.seconds/backend.timestep))
         if count > 100:
             raise ValueError("Takeover comparison exceeds 100 native steps")
+        # BEGIN simulator-only diagnostic data stays outside online feedback.
+        # This offline controller experiment records native dynamics for later
+        # comparison. Neither these arrays nor their differences enter control
+        # targets, the independent robot guard, or an execution observation.
+        model, data = backend.native_model, backend.native_data
+        dof_ids = np.asarray([int(model.joint(name).dofadr[0]) for name in backend.joint_names])
+        actuator_ids = np.asarray([model.actuator(name).id for name in backend.actuator_names])
+
+        def native_diagnostics():
+            return {"qacc": data.qacc[dof_ids].copy(),
+                    "actuator_force": data.actuator_force[actuator_ids].copy()}
+
         actual, controls, geometry = [initial], [], []
+        diagnostics = [native_diagnostics()]
+        # END the production proprioception contract contains no dynamics GT.
         for index in range(count):
             # BEGIN decompose the actual unified controller demand.
             if mode == "hold":
@@ -100,11 +114,19 @@ def run(args):
             backend.step()
             state = backend.proprioception()
             actual.append(state)
+            # BEGIN capture offline diagnostic truth without augmenting feedback.
+            diagnostics.append(native_diagnostics())
+            # END the following guard consumes only the declared robot state.
             check = validator.check_state(state, stage=mode, trajectory_time=(index+1)*backend.timestep)
             geometry.append(check["passed"])
             if not check["passed"]:
                 raise RuntimeError("Independent actual robot geometry rejected takeover trial")
-        arrays = {key: np.asarray([row[key] for row in actual]) for key in ("q", "dq", "qacc", "actuator_force")}
+        # BEGIN label the distinct sensor and simulator-diagnostic sources.
+        arrays = {key: np.asarray([row[key] for row in actual]) for key in ("q", "dq")}
+        arrays.update({key: np.asarray([row[key] for row in diagnostics])
+                       for key in ("qacc", "actuator_force")})
+        report["native_diagnostics_source"] = "Offline native qacc/actuator_force; absent from online feedback and control/guard inputs"
+        # END numerical archive alignment does not make GT a device sensor.
         arrays.update({key: np.asarray([row[key] for row in controls]) for key in controls[0]})
         np.savez_compressed(args.output/f"{mode}.npz", **arrays,
             elapsed=np.arange(count+1)*backend.timestep, control_elapsed=np.arange(count)*backend.timestep,

@@ -126,9 +126,13 @@ class _FunctionalGoalEvaluator:
                  for key, value in row.items()} for row in self._owners.values()]
 
     def _measure(self, identity, index, times, tools):
+        # BEGIN shared pure metrics retain the evaluator-only GT provenance.
         feedback = {"tool_pose": tools[index], "source": "Independent evaluator native TCP pose",
+            "tool_pose_source": "Independent evaluator-only native GT site pose; not a runtime sensor",
+            "tool_pose_is_independent_observation": False,
             "timestamp_s": float(times[index]),
             "feedback_id": f"{self._binding['candidate_id']}@native_evaluator_time={times[index]:.17g}"}
+        # END no runtime encoder/FK observation is claimed for this local value.
         # This local dictionary is only an argument to the shared pure metric
         # calculation. It is never supplied to an executor or an observer hook.
         observation = {"scene_owner_poses": self._owner_pose_samples[index],
@@ -391,20 +395,72 @@ class NativeSkillPhysicsEvaluator:
         if not np.isfinite(tool).all() or not np.isfinite(target).all() or not np.isfinite(fingers).all():
             raise ValueError("Actual grasp evidence became non-finite")
         reference = None if self._reference is None else _body_pose(data, self._reference)
+        # BEGIN finish all native reads before committing a synchronized sample.
+        sample = (now, float(record["elapsed"]), tool, target, fingers, touch,
+                  reference, data.qpos[self._target_qpos].copy(), data.qvel[self._target_qvel].copy())
+        if (not np.isfinite(sample[0]) or not np.isfinite(sample[1])
+                or not np.isfinite(sample[7]).all() or not np.isfinite(sample[8]).all()
+                or (reference is not None and not np.isfinite(reference).all())):
+            raise ValueError("Actual evaluator timestamps or carrier state became non-finite")
         self._goals.observe(data)
-        self._samples.append((now, float(record["elapsed"]), tool, target, fingers, touch,
-                              reference, data.qpos[self._target_qpos].copy(), data.qvel[self._target_qvel].copy()))
+        self._samples.append(sample)
+        # END an incomplete native read cannot append a partial evidence row.
         self._contacts.append(contacts)
         self._offsets.append(self._offsets[-1]+len(contacts))
 
-    def finalize(self, output, *, execution_report):
+    def finalize(self, output, *, execution_report, collection_report):
         """Save the evidence and grade only a completed physical prefix."""
-        if not self._samples:
-            raise ValueError("A skill trial needs at least its observed initial native state")
         output = Path(output)
         output.mkdir(parents=True, exist_ok=True)
+        # BEGIN a retained prefix cannot masquerade as complete GT evidence.
+        capture_state = deepcopy(collection_report)
+        expected = None if execution_report is None else execution_report["executed_steps"]+1
         times = np.asarray([row[0] for row in self._samples])
         elapsed = np.asarray([row[1] for row in self._samples])
+        timestep = float(self._model.opt.timestep)
+        reasons = []
+        if not capture_state["completed"]:
+            reasons.append("Evaluator collection did not complete without failure")
+        if execution_report is None:
+            reasons.append("No execution report establishes the sampled physical interval")
+        else:
+            if not execution_report["independent_evidence_sink"]["completed"]:
+                reasons.append("Executor evidence callback did not cover every normal sample")
+            if not execution_report["normal_step_accounting"]["step_accounting_exact"]:
+                reasons.append("Normal physical step accounting is not exact")
+        if len(self._samples) != expected:
+            reasons.append("Retained sample count differs from initial state plus executed normal steps")
+        if (not len(times) or not np.isfinite(times).all() or not np.isfinite(elapsed).all()
+                or not np.isclose(elapsed[0], 0., atol=1e-8, rtol=0)
+                or not np.allclose(np.diff(times), timestep, atol=1e-8, rtol=0)
+                or not np.allclose(elapsed, np.arange(len(elapsed))*timestep, atol=1e-8, rtol=0)):
+            reasons.append("Evidence does not cover the initial state and consecutive normal ticks")
+        # Use retained timestamps, so a missing initial/interior state is not
+        # mislabeled as a missing suffix. Never interpolate evidence rows.
+        observed_ticks = elapsed[np.isfinite(elapsed)]/timestep
+        rounded = np.rint(observed_ticks)
+        observed_ticks = rounded[np.isclose(observed_ticks, rounded, atol=1e-5, rtol=0)].astype(np.int64)
+        absent = (np.empty(0, dtype=np.int64) if expected is None else
+                  np.setdiff1d(np.arange(expected), observed_ticks))
+        runs = np.split(absent, np.flatnonzero(np.diff(absent) != 1)+1) if len(absent) else []
+        missing_ranges = [[int(row[0]), int(row[-1])] for row in runs]
+        coverage = {"complete": not reasons, "reasons": reasons,
+            "expected_sample_count": expected, "retained_sample_count": len(self._samples),
+            "normal_sample_index_convention": "0 is initial state; 1..executed_steps are normal steps; holds excluded",
+            "missing_normal_sample_index_ranges": missing_ranges,
+            "missing_normal_elapsed_intervals_s": [[a*timestep, b*timestep] for a, b in missing_ranges],
+            "retained_elapsed_interval_s": None if not len(elapsed) else [float(elapsed[0]), float(elapsed[-1])]}
+        if not self._samples:
+            report = {"evaluation_kind": self._skill_kind, "physics_outcome": "incomplete_evidence",
+                "physics_success": None, "sample_count": 0, "native_contact_rows": 0,
+                "evidence_collection": capture_state, "evidence_coverage": coverage,
+                "executor_evidence_sink": None if execution_report is None else
+                    deepcopy(execution_report["independent_evidence_sink"]),
+                "candidate_id": self._planning_result.execution_binding["candidate_id"],
+                "completed_physical_prefix": False, "completed_current_curve": False}
+            (output/"evaluation-report.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
+            return report
+        # END missing states are reported without fabricated samples or frames.
         tools = np.asarray([row[2] for row in self._samples])
         targets = np.asarray([row[3] for row in self._samples])
         fingers = np.asarray([row[4] for row in self._samples])
@@ -427,7 +483,7 @@ class NativeSkillPhysicsEvaluator:
             and absence_duration >= self.settings["release_absence_s"]-1e-9)
         # BEGIN a component grasp predicate cannot replace the full original contract.
         trajectory = self._planning_result.trajectory
-        full_curve_completed = bool(completed and execution_report["status"] == "curve_finished"
+        full_curve_completed = bool(coverage["complete"] and completed and execution_report["status"] == "curve_finished"
             and elapsed[-1] >= pose_goal_schedule(trajectory, float(trajectory.progress_s[-1]),
                                                 self._model.opt.timestep)[1]
             and elapsed[-1] >= trajectory.duration)
@@ -503,7 +559,10 @@ class NativeSkillPhysicsEvaluator:
                 "source": "Original independent grasp evaluator final stable-window requirement",
                 "scope": "Separate from the original functional/effect checkpoint; both must hold"})
         values = [row["value"] for row in goal_evidence + effect_evidence + process_evidence + terminal_evidence]
-        if not full_curve_completed:
+        # BEGIN collection failure leaves the physical verdict unknown.
+        if not coverage["complete"]:
+            passed, outcome = None, "incomplete_evidence"
+        elif not full_curve_completed:
             passed, outcome = None, "not_evaluated"
         elif "F" in values:
             passed, outcome = False, "failed"
@@ -511,11 +570,15 @@ class NativeSkillPhysicsEvaluator:
             passed, outcome = None, "unverified"
         else:
             passed, outcome = True, "passed"
+        # END partial component observations never authorize overall success.
         # END unknown or out-of-scope predicates never become an overall success/failure.
         target_q = np.asarray([row[7] for row in self._samples])
         target_dq = np.asarray([row[8] for row in self._samples])
         report = {"evaluation_kind": self._skill_kind, "physics_outcome": outcome,
             "physics_success": passed, "completed_physical_prefix": completed,
+            "evidence_collection": capture_state, "evidence_coverage": coverage,
+            "executor_evidence_sink": None if execution_report is None else
+                deepcopy(execution_report["independent_evidence_sink"]),
             "completed_current_curve": full_curve_completed,
             "candidate_id": binding["candidate_id"],
             "functional_goal_evidence": goal_evidence, "effect_evidence": effect_evidence,

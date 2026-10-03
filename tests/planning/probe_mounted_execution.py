@@ -253,7 +253,7 @@ def run(args):
             feedback = backend.proprioception()
             # BEGIN retain the complete same-time reference for diagnostics.
             q, dq, ddq, _ = curve.sample(min(elapsed, duration))
-            # END measured acceleration remains a separate native channel.
+            # END simulator diagnostic acceleration is not an online sensor.
             reference_fingers = (finger_reference.sample(min(elapsed, duration)) if finger_reference is not None
                                  else (np.full(len(backend.finger_joint_names), np.nan),
                                        np.full(len(backend.finger_joint_names), np.nan)))
@@ -262,9 +262,11 @@ def run(args):
             # reject nonfinite feedback; terminal evidence must not disappear.
             samples.append({"time": elapsed, "q": feedback["q"], "dq": feedback["dq"],
                             "reference_q": q, "reference_dq": dq, "reference_ddq": ddq,
-                            # BEGIN native acceleration is not a reference derivative.
-                            "qacc": feedback["qacc"],
-                            # END retain both acceleration channels independently.
+                            # BEGIN this offline diagnostic owns simulator truth.
+                            # Production feedback deliberately contains no qacc;
+                            # this array is not an online control or guard input.
+                            "qacc": data.qacc[dof_ids].copy(),
+                            # END retain native diagnostics outside proprioception.
                             "tcp": feedback["tool_pose"],
                             "reference_finger_q": reference_fingers[0], "reference_finger_dq": reference_fingers[1],
                             "reference_tcp": tcp, "ctrl": backend.actuator_control.copy(),

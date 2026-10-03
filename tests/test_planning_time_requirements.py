@@ -75,6 +75,9 @@ def continuation(request, *, elapsed=.4, curve_time=.4, applied=(), completed=()
             "actual_function_pose": np.eye(4).tolist(), "actual_target_pose": np.eye(4).tolist(),
             "position_error_m": 0., "rotation_error_rad": 0., "measurement_sources": [{
                 "kind": "actual_robot_tcp", "source": "actual TCP", "pose": np.eye(4).tolist(),
+                # BEGIN preserve the explicit FK-estimate source through continuation.
+                "pose_source": "forward_kinematics_from_measured_arm_q", "independent_observation": False,
+                # END the scripted identity pose is not independent sensing.
                 "feedback_id": "task-feedback-"+str(value[1]),
                 "timestamp_s": request.pose_events[value[1]].progress}]}
             for value in completed],
@@ -95,6 +98,10 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
             "wrong candidate": lambda row: row["goal_evidence"][0].update(candidate_id="different"),
             "not verified": lambda row: row["goal_evidence"][0].update(completion_verified=False),
             "missing measurement source": lambda row: row["goal_evidence"][0].update(measurement_sources=[]),
+            # BEGIN continuation cannot silently fill in missing pose provenance.
+            "missing FK source": lambda row: row["goal_evidence"][0]["measurement_sources"][0].pop("pose_source"),
+            "missing observation flag": lambda row: row["goal_evidence"][0]["measurement_sources"][0].pop("independent_observation"),
+            # END absence rejects the saved proof without a compatibility path.
             "late acquisition": lambda row: row["goal_evidence"][0].update(
                 timestamp_s=.25, physical_elapsed_s=.25, evaluated_curve_time_s=.25),
             "inconsistent timestamp": lambda row: row["goal_evidence"][0].update(timestamp_s=.3),

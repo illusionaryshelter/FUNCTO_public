@@ -60,9 +60,12 @@ def _native_pair_policies(model, geometry_names):
 def build_robot_validator(fixture, *, reference_frame, T_reference_base, tool_frame, T_frame_tcp):
     """Build the mandatory CPU gate from the same complete source robot model.
 
-    Calibration identity is explicit. The current recording backend returns
-    MuJoCo's world-frame native TCP site with identity link-from-TCP transform;
-    a caller cannot relabel that site or silently apply another offset.
+    # BEGIN the robot pose channel is calibrated FK, not a native pose sensor.
+    Calibration identity is explicit. The recording backend estimates the
+    world-frame TCP from measured robot joints and the known fixed model, with
+    an identity link-from-TCP transform. This independent model checks that FK
+    convention; a caller cannot relabel the frame or silently add an offset.
+    # END matching models do not establish independent physical TCP accuracy.
     """
     robot_config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
     validated = validate_fixture_collision_contract(fixture, robot_config)

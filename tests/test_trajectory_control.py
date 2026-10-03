@@ -1,8 +1,8 @@
 """CPU algebra checks for analytic references and native control adaptation.
 
 The controller fixture exposes the documented robosuite mass/bias equation
-with a coupled two-joint matrix.  It does not create a MuJoCo model, integrate
-physics, or provide evidence of actual tracking/contact performance.
+with a coupled two-joint matrix. A separate tiny model checks zero-step FK.
+No test integrates physics or proves actual tracking/contact performance.
 """
 
 # BEGIN focused regression coverage for the mandatory q/dq/ddq contract.
@@ -11,6 +11,9 @@ import unittest
 from unittest.mock import PropertyMock, patch
 
 import numpy as np
+# BEGIN the boundary regression uses only MuJoCo model FK, with zero steps.
+import mujoco
+# END no renderer or physics rollout is imported by this regression.
 
 from manipulation.planning import JointTrajectory
 from manipulation.robosuite_execution import RobosuiteExecutionBackend
@@ -132,6 +135,40 @@ class TrajectoryTorqueTests(unittest.TestCase):
         self.forward = forward.start()
         self.addCleanup(forward.stop)
     # END production step accounting still runs around the mock native call.
+
+    # BEGIN the installed joint controller works without live site observations.
+    def test_installed_joint_controller_without_reference_preserves_torque(self):
+        from robosuite.controllers.parts.generic.joint_pos import JointPositionController
+
+        backend = _backend()
+        # This simulator double has no site pose or Jacobian interface. The
+        # model terms are explicit algebra, and forward performs no native work.
+        backend.native_data.qM = np.zeros(10)
+        backend.native_data.qfrc_bias = np.array([-.2, 0., .7, 0.])
+        sim = SimpleNamespace(data=backend.native_data, forward=lambda: None,
+            model=SimpleNamespace(nv=4, _model=object(),
+                joint_id2name=lambda index: ("elbow", "right_finger", "shoulder", "left_finger")[index]))
+        full_mass = np.eye(4)
+        full_mass[np.ix_([2, 0], [2, 0])] = [[2., .5], [.5, 1.5]]
+
+        def unpack_mass(model, destination, packed):
+            destination[:] = full_mass
+
+        with patch("mujoco.mj_fullM", side_effect=unpack_mass):
+            backend._arm_controller = JointPositionController(sim,
+                {"joints": [2, 0], "qpos": [2, 0], "qvel": [2, 0]},
+                actuator_range=(np.full(2, -100.), np.full(2, 100.)), ref_name=None,
+                input_type="absolute", kp=[10., 20.], kd=[3., 4.], lite_physics=False,
+                interpolator=None, use_torque_compensation=True)
+            output = backend.apply_control(np.array([.15, -.25]), np.array([-.1, .2]),
+                np.array([.8, -.5]), np.array([.025, -.03]))
+        self.assertEqual(backend._arm_controller.num_ref_sites, 0)
+        self.assertEqual(backend._arm_controller.initial_ref_pos.shape, (0, 3))
+        np.testing.assert_allclose(output["requested_arm_torque"], [1.35, 1.2], rtol=0., atol=1e-14)
+        np.testing.assert_allclose(output["arm_bias_torque"], [.7, -.2], rtol=0., atol=1e-14)
+        np.testing.assert_allclose(output["arm_acceleration_feedforward_torque"], [1.35, -.35], rtol=0., atol=1e-14)
+        self.assertEqual(backend.native_data.time, 3.)
+    # END the unchanged coupled law consumes model terms and encoder q/dq only.
 
     def test_coupled_torque_components_and_native_indices_are_distinct(self):
         backend = _backend()
@@ -601,6 +638,66 @@ class TrajectoryTorqueTests(unittest.TestCase):
         self.assertIsNone(result["joint_position_bounds_satisfied"])
         self.assertIn("no current feedback", result["reason"])
     # END no mock sample or successful serializer determines consumed physics.
+
+
+# BEGIN tiny zero-step FK verifies the runtime observation boundary.
+class ProprioceptionBoundaryTests(unittest.TestCase):
+    def test_only_encoders_commands_and_clock_feed_calibrated_pose_estimates(self):
+        backend = _backend()
+        backend.native_model = mujoco.MjModel.from_xml_string("""
+            <mujoco><worldbody><body name="base" pos="0.5 -0.2 1" euler="0 0 90">
+              <body name="upper"><joint name="shoulder" axis="0 0 1"/>
+                <geom type="sphere" size="0.01" mass="0.1"/>
+                <body name="lower" pos="0.3 0 0"><joint name="elbow" axis="0 0 1"/>
+                  <geom type="sphere" size="0.01" mass="0.1"/><site name="tcp" pos="0.2 0 0"/>
+                  <body name="left"><joint name="left_finger" type="slide" axis="0 1 0"/>
+                    <geom type="sphere" size="0.01" mass="0.1"/></body>
+                  <body name="right"><joint name="right_finger" type="slide" axis="0 1 0"/>
+                    <geom type="sphere" size="0.01" mass="0.1"/></body>
+                </body>
+              </body>
+            </body></worldbody></mujoco>""")
+        model = backend.native_model
+        backend._base_id, backend._site_id = model.body("base").id, model.site("tcp").id
+        backend._joint_ids = np.array([model.joint(name).id for name in backend.joint_names])
+        backend._qpos_ids = model.jnt_qposadr[backend._joint_ids].copy()
+        backend._qvel_ids = model.jnt_dofadr[backend._joint_ids].copy()
+
+        class EncoderOnlyData(SimpleNamespace):
+            def __getattribute__(self, name):
+                if name in {"xpos", "xmat", "site_xpos", "site_xmat", "qacc", "actuator_force"}:
+                    raise AssertionError(f"Unavailable runtime observation: {name}")
+                return super().__getattribute__(name)
+
+        backend.native_data = EncoderOnlyData(qpos=np.array([0., 0., .01, -.01]),
+            qvel=np.array([.2, -.3, .001, -.001]), ctrl=np.array([7., -.01, 8., .01]), time=3.)
+        # These guards fail the test if setup or sampling integrates, renders,
+        # or refreshes full dynamics; only separate-data kinematics is allowed.
+        with patch("mujoco.mj_step", side_effect=AssertionError("No physics steps")), \
+                patch("mujoco.mj_forward", side_effect=AssertionError("FK only")):
+            backend._prepare_reference_fk()
+            first = backend.proprioception()
+            np.testing.assert_allclose(first["base_pose"][:3, 3], [.5, -.2, 1.], rtol=0., atol=1e-14)
+            np.testing.assert_allclose(first["tool_pose"][:3, 3], [.5, .3, 1.], rtol=0., atol=1e-14)
+            backend.native_data.qpos[backend._qpos_ids[0]] = np.pi/2
+            second = backend.proprioception()
+            np.testing.assert_allclose(second["tool_pose"][:3, 3], [0., -.2, 1.], rtol=0., atol=1e-14)
+            np.testing.assert_array_equal(second["base_pose"], first["base_pose"])
+            np.testing.assert_array_equal(second["q"], backend.native_data.qpos)
+            np.testing.assert_array_equal(second["dq"], backend.native_data.qvel)
+            self.assertNotIn("qacc", second)
+            self.assertNotIn("actuator_force", second)
+            self.assertFalse(second["tool_pose_is_independent_observation"])
+            self.assertEqual(second["tool_pose_source"], "forward_kinematics_from_measured_arm_q")
+            self.assertEqual(second["base_pose_source"], "known_fixed_robot_model_calibration")
+            self.assertFalse(np.shares_memory(second["base_pose"], backend._calibrated_base_pose))
+            self.assertEqual(second["sim_time"], 3.)
+            np.testing.assert_array_equal(second["actuator_ctrl"]["values"], [8., 7., .01, -.01])
+            # A joint-driven declared base cannot become a frozen calibration.
+            backend._base_id = model.body("upper").id
+            with self.assertRaisesRegex(ValueError, "fixed base with no joint-driven ancestors"):
+                backend._prepare_reference_fk()
+# END no simulator pose, acceleration or force can masquerade as a sensor.
 
 
 if __name__ == "__main__":

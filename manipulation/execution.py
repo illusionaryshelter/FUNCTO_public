@@ -77,15 +77,21 @@ def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condit
 def _actual_pose_goal(requirement, feedback, observation):
     """Measure one original functional allowed set from applicable actual poses.
 
-    A declared fixed tool/world goal can use the measured TCP and its fixed
-    calibration. An owner-relative target instead needs the current owner's
+    # BEGIN robot FK estimates are not independent Cartesian measurements.
+    A declared fixed tool/world goal can use the robot TCP estimate from
+    measured joints and the bound robot model/calibration. This does not
+    certify physical Cartesian accuracy or replace a current owner observation.
+    # END the original functional tolerances remain unchanged.
+    An owner-relative target instead needs the current owner's
     observation. A carried material frame needs either its observed owner pose
     or a currently verified holding relation. Neither a frozen owner model nor
     a candidate attachment supplies a missing runtime measurement.
     """
-    measured = {"value": "U", "source": "Executor independently compares actual functional poses with the original task allowed set",
+    # BEGIN provenance separates joint-derived estimates from owner observations.
+    measured = {"value": "U", "source": "Executor compares applicable current robot FK estimates and supplied owner observations with the original task allowed set",
         "actual_function_pose": None, "actual_target_pose": None,
         "position_error_m": None, "rotation_error_rad": None, "measurement_sources": []}
+    # END this comparison does not claim independent Cartesian sensing.
     relation = requirement.actual_relation
     poses = {} if observation is None else observation.get("scene_owner_poses", {})
     conditions = {} if observation is None else observation.get("scene_condition_evidence", {})
@@ -101,9 +107,13 @@ def _actual_pose_goal(requirement, feedback, observation):
         return pose
 
     def actual_tool():
-        pose = _pose_array(feedback["tool_pose"], "Actual feedback TCP pose")
+        # BEGIN retain the estimator provenance alongside the actual joint clock.
+        pose = _pose_array(feedback["tool_pose"], "Robot TCP estimate from measured joints")
         measured["measurement_sources"].append({"kind": "actual_robot_tcp", "source": feedback["source"],
+            "pose_source": feedback["tool_pose_source"],
+            "independent_observation": feedback["tool_pose_is_independent_observation"],
             "timestamp_s": float(feedback["timestamp_s"]), "feedback_id": feedback["feedback_id"], "pose": pose.tolist()})
+        # END FK agreement alone never supplies a Cartesian sensor measurement.
         return pose
 
     if relation is not None and "function_owner_id" in relation:
@@ -523,7 +533,7 @@ class TrajectoryExecutor:
         def add(kind, name, measured, **allowed):
             failures.append({"kind": kind, "name": name, "measured": measured, **allowed})
 
-        # BEGIN actuator force has its own named native order.
+        # BEGIN actuator command identity retains its own named native order.
         for field, expected in (("joint_names", backend.joint_names),
                                 ("arm_joint_names", backend.arm_joint_names),
                                 ("finger_joint_names", backend.finger_joint_names),
@@ -548,10 +558,10 @@ class TrajectoryExecutor:
         if feedback.get("feedback_id") != expected_id:
             add("feedback_identity", "feedback_id", feedback.get("feedback_id"), expected=expected_id)
         actual = {}
-        # BEGIN require finite native telemetry without inventing acceleration
-        # or force-spike thresholds. Hardware/tracking guards remain separate.
-        for field, names in (("q", backend.joint_names), ("dq", backend.joint_names),
-                             ("qacc", backend.joint_names), ("actuator_force", backend.actuator_names)):
+        # BEGIN online supervision consumes only available named proprioception.
+        # Native qacc and actuator_force belong to independent evaluation;
+        # missing or invalid simulator diagnostics cannot stop robot execution.
+        for field, names in (("q", backend.joint_names), ("dq", backend.joint_names)):
             value = np.asarray(feedback.get(field), dtype=float)
             if value.shape != (len(names),):
                 add("feedback_shape", field, list(value.shape), expected=[len(names)])
@@ -559,7 +569,7 @@ class TrajectoryExecutor:
             actual[field] = value
             for index in np.flatnonzero(~np.isfinite(value)):
                 add("nonfinite_feedback", f"{field}:{names[index]}", float(value[index]))
-        # END retain raw measurements; finite telemetry is not spike acceptance.
+        # END physical position, speed and tracking limits remain unchanged.
         pose = np.asarray(feedback.get("tool_pose"), dtype=float)
         if (pose.shape != (4, 4) or not np.isfinite(pose).all()
                 or not np.allclose(pose[3], [0., 0., 0., 1.], atol=1e-9, rtol=0)
@@ -612,8 +622,14 @@ class TrajectoryExecutor:
                 start_velocity_tolerance=2e-6, max_hold_steps=250):
         """Follow the exact bound curve within its authorized execution scope.
 
-        ``step_callback(model, data, record)`` is an evaluator/camera hook after
-        each physical step. Its output is never fed to the planner here. The
+        # BEGIN independent evidence collection has no control authority.
+        ``step_callback(model, data, record)`` is an independent evaluator/camera
+        sink for the initial state and each completed normal execution step.
+        Its first exception is recorded and disables that sink; it cannot reject
+        execution, trigger a hold, or mask an online guard failure. Its return
+        value is never consumed. Holds have their own physical accounting.
+        # END only the separately declared online observer supplies semantics.
+        The
         ``observation_callback(feedback, curve_time)`` supplies current allowed
         scene/effect evidence. Only a true declared prerequisite can extend
         the authorized prefix, after independent checks of the same suffix.
@@ -826,16 +842,21 @@ class TrajectoryExecutor:
             "finger_reference_actual_tracking_certified": False,
             "command_record_semantics": "sample zero uses curve q(0) and restored finger ctrl; each later command_q combines the arm goal sampled at min(step end, barrier) with the finger goal applied during that step",
             "arm_curve_dq_semantics": "arm cubic derivative at curve_time, recorded independently of actual velocity",
-            # BEGIN analytic reference acceleration is distinct from measured qacc.
+            # BEGIN analytic reference acceleration is a command quantity.
             "arm_curve_ddq_semantics": "Same Hermite query as reference q/dq at curve_time; right internal-knot acceleration and last-piece left acceleration at the endpoint",
             # END reference acceleration jumps do not add a C2 requirement.
             "finger_reference_semantics": "reference_finger_q/dq are the archived C1 nominal command at curve_time, not actual feedback; absent references are NaN and explicitly unprovided; physical contact can prevent target attainment without proving a tracking failure or Holding",
             "actuator_control_semantics": "one native torque/position ctrl row per executed attempt, timestamped at step start; actual q/dq are separately recorded after each completed step",
-            # BEGIN preserve the two clocks and meanings needed for dynamics review.
-            "actual_dynamics_semantics": "actual_qacc and actual_actuator_force use the initial refreshed native state and every completed post-step mj_forward state at elapsed/sim_time; qacc is native forward acceleration, not differentiated dq; force is native actuator output, not mixed-unit ctrl",
+            # BEGIN online archives contain robot observations and issued commands.
+            "robot_pose_semantics": "base_pose is known fixed robot calibration; tool_pose/actual_tool_pose are model FK estimates from measured joint q, not independent Cartesian observations or certified physical accuracy",
             "arm_torque_semantics": "requested_arm_torque and applied_arm_torque are pre-step controller demand and clipped arm ctrl in arm_actuator_names order at control_elapsed/control_sim_time; adjacent-row increments may be computed from these original arrays",
-            "actuator_spike_assessment": "Raw native force and command arrays retained; no force/acceleration spike threshold or all-actuator pass is inferred",
-            # END command clipping and dynamics remain distinct evidence.
+            "actuator_spike_assessment": "Issued command arrays retained; native acceleration/force diagnostics belong only to independent evaluation and confer no online acceptance",
+            # END simulator-only dynamics are absent from online feedback/archives.
+            # BEGIN evidence sinks report loss without creating a robot failure.
+            "independent_evidence_sink": {"configured": step_callback is not None,
+                "completed": False, "disabled": False, "first_error": None,
+                "successful_callbacks": 0, "attempted_callbacks": 0},
+            # END completeness is finalized against the actual normal-step ledger.
             "events": [], "superseded_gripper_events": [],
             "pending_verifications": [deepcopy(event) for event in trajectory.events if event["requires_evidence"] is not None],
             "unconsumed_events": deepcopy(trajectory.events)}
@@ -846,7 +867,7 @@ class TrajectoryExecutor:
         report.update(execution_limits=execution_limits.describe(),
             named_hardware_velocity_limits=deepcopy(backend.velocity_limits),
             native_joint_position_ranges=limit_binding["joint_ranges"].tolist(),
-            execution_guard_scope="Actual robot tracking and independently queried bound robot/scene geometry; effect evidence remains separate",
+            execution_guard_scope="Measured joint tracking, robot FK estimates and independently queried bound robot/scene geometry; FK consistency is a model check, and current owner/effect observations remain separate",
             geometry_checker=deepcopy(self._geometry_description), geometry_preflight=None,
             geometry_check_counts={"initial_state": 0, "before_step": 0, "command_event": 0, "after_step": 0},
             last_geometry_check=None,
@@ -957,9 +978,11 @@ class TrajectoryExecutor:
                 trajectory, requirement.progress, backend.timestep)
         pose_goal_queries, evaluated_result_goals = set(), set()
         report["pose_goal_checks"] = []
+        # BEGIN retain the distinction between FK estimates and physical accuracy.
         report["pose_goal_scope"] = (
-            "Original functional allowed sets evaluated from actual TCP and explicitly required current owner/holding observations; "
+            "Original functional allowed sets evaluated from robot TCP FK estimates and explicitly required current owner/holding observations; "
             "scheduled first-arrival native sample or declared actual-arrival window. Explicit result-only goals record T/F/U without an online dependency; reference tracking and effect observations remain separate.")
+        # END unchanged task tolerances do not become a Cartesian sensor claim.
         # END a source-progress crossing selects evaluation but cannot prove attainment.
         # BEGIN direction obligations retain original scope identities and actual evidence.
         report["completed_direction_ids"] = deepcopy(binding.get("completed_direction_ids", []))
@@ -1547,9 +1570,10 @@ class TrajectoryExecutor:
                     "reference_finger_q": reference_fingers[0].copy(),
                     "reference_finger_dq": reference_fingers[1].copy(),
                     "q": feedback["q"], "dq": feedback["dq"], "tool_pose": feedback["tool_pose"],
-                    # BEGIN synchronized native dynamics, including failed samples.
-                    "qacc": feedback["qacc"], "actuator_force": feedback["actuator_force"],
-                    # END these are measured telemetry rather than curve derivatives.
+                    # BEGIN estimator provenance accompanies the recorded robot pose.
+                    "tool_pose_source": feedback["tool_pose_source"],
+                    "tool_pose_is_independent_observation": feedback["tool_pose_is_independent_observation"],
+                    # END native acceleration and force are independent evaluator data.
                     "reference_tool_pose": backend.reference_tool_pose(desired_arm_q),
                     "feedback": deepcopy(feedback), "finger_state": deepcopy(finger_state),
                     "geometry_check": None,
@@ -1791,12 +1815,34 @@ class TrajectoryExecutor:
             return True
         # END unknown or false evidence causes a physical hold, never success.
 
+        # BEGIN an independent evaluator cannot become an execution dependency.
+        def emit_independent_evidence(sample, phase):
+            sink = report["independent_evidence_sink"]
+            if not sink["configured"] or sink["disabled"]:
+                return
+            sink["attempted_callbacks"] += 1
+            try:
+                # Keep evaluator mutations of its record out of subsequent
+                # online event/goal consumption. Native model/data are exposed
+                # exclusively as read-only evaluator inputs by this contract.
+                step_callback(backend.native_model, backend.native_data, deepcopy(sample))
+            except Exception as error:
+                sink["disabled"] = True
+                sink["first_error"] = {"type": type(error).__name__, "message": str(error),
+                    "phase": phase, "curve_time": sample["curve_time"], "sim_time": sample["sim_time"]}
+            else:
+                sink["successful_callbacks"] += 1
+        # END return values and failures cannot grant or deny robot commands.
+
         q, dq, ddq, progress = trajectory.sample(0.)
         samples.append(record(0., q, dq, ddq, progress))
         # BEGIN persistence failures must not replace a measured execution error.
         execution_error = None
         # END retain the primary exception separately from diagnostic sinks.
         try:
+            # BEGIN retain one initial sample even when preflight later rejects.
+            emit_independent_evidence(samples[-1], "initial_state")
+            # END the runner must not separately duplicate this initial exposure.
             # Preflight checks the declared model/reference contract without
             # stepping or preparing an actuator goal. Formal planning success
             # does not bypass this independent current-scene acceptance gate.
@@ -1889,16 +1935,9 @@ class TrajectoryExecutor:
                     guard(current["feedback"], curve_time=min(next_time, stop),
                           physical_elapsed=next_time, point="after_step", sample=current)
                 finally:
-                    if step_callback is not None:
-                        try:
-                            step_callback(backend.native_model, backend.native_data, current)
-                        except Exception as observer_error:
-                            if report["feedback_failure"] is None:
-                                raise
-                            # Nonfinite feedback can also invalidate evaluator
-                            # input. Retain the primary measured guard failure
-                            # and its physical sample rather than masking it.
-                            report["failed_sample_observer_error"] = f"{type(observer_error).__name__}: {observer_error}"
+                    # BEGIN post-step evaluation cannot mask or create a guard failure.
+                    emit_independent_evidence(current, "after_step")
+                    # END the first sink failure disables only further collection.
                 consume_ordinary_events(current["feedback"], next_time)
                 active = release_dependencies(current["feedback"], next_time)
             if active:
@@ -1928,6 +1967,13 @@ class TrajectoryExecutor:
             # BEGIN publish budget facts independently of final telemetry capture.
             accounting = step_accounting()
             report["physics_step_accounting"] = accounting
+            # BEGIN a missing post-step sample leaves independent evidence incomplete.
+            sink = report["independent_evidence_sink"]
+            normal = report["normal_step_accounting"]
+            sink["completed"] = bool(sink["configured"] and not sink["disabled"]
+                and normal["step_accounting_exact"]
+                and sink["successful_callbacks"] == 1+normal["physical_steps"])
+            # END this is collection coverage, never task or physical success.
             finalization_error = None
             try:
                 final_feedback = deepcopy(backend.proprioception())
@@ -2140,11 +2186,12 @@ class TrajectoryExecutor:
                 reference_finger_q=np.asarray([row["reference_finger_q"] for row in samples]),
                 reference_finger_dq=np.asarray([row["reference_finger_dq"] for row in samples]),
                 actual_q=actual_q, actual_dq=np.asarray([row["dq"] for row in samples]),
-                # BEGIN keep every actual dynamics sample aligned with elapsed/sim_time.
-                actual_qacc=np.asarray([row["qacc"] for row in samples]),
-                actual_actuator_force=np.asarray([row["actuator_force"] for row in samples]),
-                # END no filtering or finite-difference reconstruction of native outputs.
+                # BEGIN record robot FK provenance, without native dynamics diagnostics.
                 actual_tool_pose=np.asarray([row["tool_pose"] for row in samples]),
+                tool_pose_source=np.asarray([row["tool_pose_source"] for row in samples]),
+                tool_pose_is_independent_observation=np.asarray(
+                    [row["tool_pose_is_independent_observation"] for row in samples], dtype=bool),
+                # END actual joint sampling and Cartesian estimation stay distinct.
                 reference_tool_pose=np.asarray([row["reference_tool_pose"] for row in samples]),
                 actual_finger_position_bounds=np.asarray([row["finger_state"]["position_bounds"] for row in samples]),
                 actual_finger_maximum_speed=np.asarray([row["finger_state"]["maximum_speed"] for row in samples]),

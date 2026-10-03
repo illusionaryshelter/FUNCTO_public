@@ -48,6 +48,11 @@ class _Backend:
         self.hold_steps = 2
         self.finger_speed = 0.
         self.native_failure = False
+        # BEGIN offline diagnostics use a distinct, deliberately permuted order.
+        self._qvel_ids = self._actuator_ids = np.array([2, 0, 1])
+        self.native_data = SimpleNamespace(qacc=np.array([20., 30., 10.]),
+            actuator_force=np.array([50., 60., 40.]))
+        # END these values never appear in the mock runtime feedback.
 
     @property
     def finger_control(self):
@@ -66,7 +71,11 @@ class _Backend:
                 "trial_id": self.trial_id, "source": self.feedback_source,
                 "feedback_id": self.feedback_id, "sim_time": self.sim_time,
                 "timestamp_s": self.sim_time, "q": self.q.copy(), "dq": self.dq.copy(),
-                "qacc": np.zeros(3), "actuator_force": np.zeros(3), "tool_pose": np.eye(4),
+                # BEGIN model TCP is distinct from native dynamics diagnostics.
+                "tool_pose": np.eye(4),
+                "tool_pose_source": "forward_kinematics_from_measured_arm_q",
+                "tool_pose_is_independent_observation": False,
+                # END runtime feedback has neither qacc nor actuator_force.
                 "actuator_ctrl": {"values": self.control.copy()}}
 
     def apply_control(self, q, dq, ddq, finger_q):
@@ -228,7 +237,17 @@ class CommandDomainTests(unittest.TestCase):
             return result, ledger, arrays
 
     def test_success_records_normal_and_hold_with_same_time_control(self):
-        result, ledger, arrays = self._run_mock_case(_Backend())
+        # BEGIN unavailable sensor fields must stay outside online feedback.
+        backend = _Backend()
+        self.assertNotIn("qacc", backend.proprioception())
+        self.assertNotIn("actuator_force", backend.proprioception())
+        result, ledger, arrays = self._run_mock_case(backend)
+        np.testing.assert_array_equal(arrays["diagnostic_qacc"], np.tile([10., 20., 30.], (9, 1)))
+        np.testing.assert_array_equal(arrays["diagnostic_actuator_force"], np.tile([40., 50., 60.], (9, 1)))
+        self.assertNotIn("qacc", arrays)
+        self.assertNotIn("actuator_force", arrays)
+        np.testing.assert_array_equal(result["maximum_absolute_diagnostic_actuator_force"], [40., 50., 60.])
+        # END offline diagnostic records preserve their named order separately.
         self.assertTrue(result["bench_feasible"])
         self.assertEqual((result["normal_steps"], result["hold_confirmed_physics_steps"]), (6, 2))
         self.assertEqual((ledger.charged, ledger.confirmed), (8, 8))

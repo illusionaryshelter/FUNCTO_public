@@ -191,6 +191,28 @@ def run(args, *, observation_callback=None):
         "planner_inputs_changed": False, "execution_tested": False}
     simulation = evaluator = videos = execution = executor = None
     caught = None
+    # BEGIN optional evidence sinks cannot become physical execution gates.
+    report["evidence_collection"] = {name: {
+        "configured": configured, "initialized": False, "completed": False,
+        "disabled": False, "first_error": None,
+        "attempted_callbacks": 0, "successful_callbacks": 0}
+        for name, configured in (("evaluator", True), ("video", not args.no_video))}
+
+    def evidence_failure(name, error, phase, record=None):
+        state = report["evidence_collection"][name]
+        state.update(disabled=True, completed=False)
+        if state["first_error"] is None:
+            # Evidence diagnostics must not raise while handling their own
+            # failure, including an unreadable/non-finite simulator clock.
+            try:
+                sim_time = float(simulation.sim_time)
+                sim_time = sim_time if np.isfinite(sim_time) else None
+            except Exception:
+                sim_time = None
+            state["first_error"] = {"type": type(error).__name__, "message": str(error),
+                "phase": phase, "curve_time": None if record is None else record["elapsed"],
+                "sim_time": sim_time}
+    # END no evidence error replaces the executor's primary physical error.
     try:
         manifest, fixture, feedback = _read(args.manifest), _read(args.robot_fixture), _read(args.feedback)
         root = Path(manifest["workspace_root"])
@@ -245,12 +267,6 @@ def run(args, *, observation_callback=None):
         # END reporting cannot observe a different second copy of the archive.
         if {event["skill_id"] for event in curve.events} != {args.segment}:
             raise ValueError("The exported candidate must contain only the selected skill instance")
-        evidence = _read(args.evaluator_evidence)
-        source_segment = _one(evidence["segments"], "segment_id", segment["source_library_segment"])
-        if source_segment["interaction"] != program["skill_kind"]:
-            raise ValueError("The evaluator's explicit source identity must match the compiled skill kind")
-        actor = {key: deepcopy(evidence["actor"][key]) for key in
-                 ("entity_name", "eef_site_name", "contact_geom_groups")}
         # BEGIN restore native context before constructing the production executor.
         simulation, restore_report = restore_recorded_simulation(scene_path=fixture["source_scene_xml"],
             catalog_path=fixture["catalog_path"], episode_path=fixture["episode_path"],
@@ -296,34 +312,67 @@ def run(args, *, observation_callback=None):
                 "finger_targets": str(args.finger_targets.resolve()),
                 "program": str((root/segment["program_path"]).resolve()),
                 "evaluator_evidence": str(args.evaluator_evidence.resolve())})
-        catalog = _read(fixture["catalog_path"])
-        reference_role = program["demo"]["roles"].get("reference")
-        reference_name = None
-        if reference_role is not None and reference_role["body_id"] is not None:
-            reference_name = _one(catalog["bodies"], "id", reference_role["body_id"])["name"]
-        evaluator = NativeSkillPhysicsEvaluator(simulation.native_model, catalog=catalog,
-            actor=actor, target_body_name=source_segment["carrier_body_name"],
-            finger_joint_names=fixture["finger_joint_names"], tcp_site=fixture["tcp_site"],
-            program=program, reference_body_name=reference_name,
-            planning_result=planning_result, evaluation_owner_bindings=evidence["evaluation_owner_bindings"],
-            binding_source={"path": str(args.evaluator_evidence.resolve()),
-                "source_segment_id": segment["source_library_segment"],
-                "fields_used": ["actor identity and contact-group names", "carrier_body_name",
-                    "reference body identity and declared source function requirements",
-                    "evaluation_owner_bindings: explicit observed owner IDs and native body names"],
-                "original_contact_outcome_or_object_trajectory_used": False})
-        evaluator.observe(simulation.native_model, simulation.native_data, {"elapsed": 0.})
+        # BEGIN evaluator metadata and native identity failures are evidence-only.
+        try:
+            evidence = _read(args.evaluator_evidence)
+            source_segment = _one(evidence["segments"], "segment_id", segment["source_library_segment"])
+            if source_segment["interaction"] != program["skill_kind"]:
+                raise ValueError("The evaluator's explicit source identity must match the compiled skill kind")
+            actor = {key: deepcopy(evidence["actor"][key]) for key in
+                     ("entity_name", "eef_site_name", "contact_geom_groups")}
+            catalog = _read(fixture["catalog_path"])
+            reference_role = program["demo"]["roles"].get("reference")
+            reference_name = None
+            if reference_role is not None and reference_role["body_id"] is not None:
+                reference_name = _one(catalog["bodies"], "id", reference_role["body_id"])["name"]
+            evaluator = NativeSkillPhysicsEvaluator(simulation.native_model, catalog=catalog,
+                actor=actor, target_body_name=source_segment["carrier_body_name"],
+                finger_joint_names=fixture["finger_joint_names"], tcp_site=fixture["tcp_site"],
+                program=program, reference_body_name=reference_name,
+                planning_result=planning_result, evaluation_owner_bindings=evidence["evaluation_owner_bindings"],
+                binding_source={"path": str(args.evaluator_evidence.resolve()),
+                    "source_segment_id": segment["source_library_segment"],
+                    "fields_used": ["actor identity and contact-group names", "carrier_body_name",
+                        "reference body identity and declared source function requirements",
+                        "evaluation_owner_bindings: explicit observed owner IDs and native body names"],
+                    "original_contact_outcome_or_object_trajectory_used": False})
+            report["evidence_collection"]["evaluator"]["initialized"] = True
+        except Exception as error:
+            evidence_failure("evaluator", error, "initialize")
+        # END failed GT evidence setup never prevents physical execution.
         if not args.no_video:
-            views = [_one(segment["snapshot"]["views"], "id", name) for name in args.views]
-            videos = _TrialVideos(simulation, views=views, workspace_root=root,
-                                  output=output, fps=environment["control_freq_hz"])
-            report["videos"] = videos.records
-            videos.capture(0.)
+            # BEGIN camera initialization has the same independent boundary.
+            try:
+                views = [_one(segment["snapshot"]["views"], "id", name) for name in args.views]
+                videos = _TrialVideos(simulation, views=views, workspace_root=root,
+                                      output=output, fps=environment["control_freq_hz"])
+                report["videos"] = videos.records
+                report["evidence_collection"]["video"]["initialized"] = True
+            except Exception as error:
+                evidence_failure("video", error, "initialize")
+            # END missing camera records are reported, never synthesized.
 
         def observe(model, data, record):
-            evaluator.observe(model, data, record)
-            if videos is not None:
-                videos.capture(record["elapsed"])
+            # BEGIN executor supplies the initial state and each normal step once.
+            # Stop only the failed sink; its peer can retain independent evidence.
+            phase = "initial_state" if record["elapsed"] == 0. else "after_step"
+            state = report["evidence_collection"]["evaluator"]
+            if evaluator is not None and not state["disabled"]:
+                state["attempted_callbacks"] += 1
+                try:
+                    evaluator.observe(model, data, record)
+                    state["successful_callbacks"] += 1
+                except Exception as error:
+                    evidence_failure("evaluator", error, phase, record)
+            state = report["evidence_collection"]["video"]
+            if videos is not None and not state["disabled"]:
+                state["attempted_callbacks"] += 1
+                try:
+                    videos.capture(record["elapsed"])
+                    state["successful_callbacks"] += 1
+                except Exception as error:
+                    evidence_failure("video", error, phase, record)
+            # END no evaluator return value or exception feeds runtime control.
 
         # BEGIN mandatory independent robot verification before native commands.
         validator = build_robot_validator(fixture,
@@ -396,6 +445,9 @@ def run(args, *, observation_callback=None):
                 # END the executor owns the shared limit and every stop charge.
                 # BEGIN retain bounded first-failure evidence without its full binding.
                 report["execution_persistence_errors"] = execution.get("persistence_errors", [])
+                # BEGIN expose the executor's independent callback completeness.
+                report["independent_evidence_sink"] = deepcopy(execution["independent_evidence_sink"])
+                # END this diagnostic is separate from physical guard status.
                 preflight = execution.get("geometry_preflight", {})
                 report["geometry_preflight_summary"] = {key: preflight[key] for key in (
                     "passed", "checked_interval_s", "reference_collision_checked",
@@ -419,30 +471,68 @@ def run(args, *, observation_callback=None):
                 caught = caught or error
                 report.update(status="error", execution_report_error=f"{type(error).__name__}: {error}")
         # END diagnostic extraction cannot skip evaluator or camera cleanup.
+        # BEGIN grade only complete evaluator capture, independently of execution.
+        collection = report["evidence_collection"]["evaluator"]
+        collection["completed"] = bool(collection["initialized"] and not collection["disabled"]
+            and execution is not None and execution["independent_evidence_sink"]["completed"])
+        assessment = None
         if evaluator is not None:
             try:
-                assessment = evaluator.finalize(output, execution_report=execution)
+                assessment = evaluator.finalize(output, execution_report=execution,
+                    collection_report=collection)
                 report.update(physics_outcome=assessment["physics_outcome"], physics_success=assessment["physics_success"])
+                report["evaluation_coverage"] = assessment["evidence_coverage"]
             except Exception as error:
-                caught = caught or error
-                report.update(status="error", evaluation_error=f"{type(error).__name__}: {error}")
+                evidence_failure("evaluator", error, "finalize")
+                report["evaluation_error"] = f"{type(error).__name__}: {error}"
+                assessment = None
+        if assessment is None:
+            report.update(physics_outcome="incomplete_evidence", physics_success=None)
+            # A missing/failed evaluator still leaves an explicit unknown grade.
+            # Do not fabricate native samples or replace a physical first error.
+            expected = None if execution is None else execution["executed_steps"]+1
+            retained = collection["successful_callbacks"]
+            missing = ([retained, expected-1]
+                if expected is not None and retained < expected else None)
+            assessment = {"physics_outcome": "incomplete_evidence", "physics_success": None,
+                "evidence_collection": deepcopy(collection),
+                "evidence_coverage": {"complete": False,
+                    "expected_sample_count": expected, "retained_sample_count": retained,
+                    "missing_normal_sample_index_ranges": [] if missing is None else [missing],
+                    "reason": "Evaluator unavailable or finalization failed; retained artifacts are incomplete"}}
+            report["evaluation_coverage"] = assessment["evidence_coverage"]
+            try:
+                (output/"evaluation-report.json").write_text(json.dumps(
+                    _feedback_json(assessment), indent=2, allow_nan=False)+"\n")
+            except Exception as error:
+                evidence_failure("evaluator", error, "write_incomplete_report")
+                report["evaluation_report_write_error"] = f"{type(error).__name__}: {error}"
+        # END GT collection/finalization failures cannot change physical status.
         if videos is not None:
             # BEGIN capture the actual final hold state even after a guard rejection.
             # This is a video frame only: no missing evaluator/online-observer
             # samples are synthesized for the separate hold interval.
-            if execution is not None:
+            if execution is not None and not report["evidence_collection"]["video"]["disabled"]:
                 try:
                     videos.capture(execution["elapsed_sim_s"], final=True)
                     report["video_final_elapsed_s"] = execution["elapsed_sim_s"]
                 except Exception as error:
-                    caught = caught or error
-                    report.update(status="error", video_final_capture_error=f"{type(error).__name__}: {error}")
+                    evidence_failure("video", error, "final_capture")
+                    report["video_final_capture_error"] = f"{type(error).__name__}: {error}"
             # END failed final capture must still release every writer/context.
             try:
                 videos.close()
             except Exception as error:
-                caught = caught or error
-                report.update(status="error", video_error=f"{type(error).__name__}: {error}")
+                evidence_failure("video", error, "close")
+                report["video_error"] = f"{type(error).__name__}: {error}"
+        # BEGIN video gaps remain separate from the GT evaluator's verdict.
+        video_state = report["evidence_collection"]["video"]
+        video_state["completed"] = bool(video_state["initialized"] and not video_state["disabled"]
+            and execution is not None and execution["independent_evidence_sink"]["completed"])
+        report["evidence_complete"] = bool(report["evaluation_coverage"]["complete"]
+            and all(not state["configured"] or state["completed"]
+                    for state in report["evidence_collection"].values()))
+        # END incomplete recording never invents frames or changes a hold.
         report.update(elapsed_seconds=time.monotonic()-started,
                       peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024)
         # BEGIN even the final summary write must preserve a prior execution error.

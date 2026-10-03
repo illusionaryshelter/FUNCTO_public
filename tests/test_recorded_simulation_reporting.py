@@ -17,46 +17,8 @@ from manipulation.execution import ExecutionGuardError, FixedFingerTargets, _fee
 import run_recorded_simulation as runner
 
 
-@pytest.mark.parametrize("cleanup_failure", [False, True])
-@pytest.mark.parametrize("archive_write_failure", [False, True])
-# BEGIN summary counts distinguish confirmed motion, charged attempts and unknown clocks.
-@pytest.mark.parametrize("normal_steps,hold_steps,normal_charge,hold_charge,normal_exact,hold_exact", [
-    (0, 1, 0, 1, True, True),
-    (0, 0, 1, 0, True, True),  # A charged attempt provably did not advance time.
-    (0, 0, 1, 0, False, True),  # No confirmed step does not prove no motion.
-    (2, 1, 2, 2, True, False),  # One uncertain hold follows known native motion.
-])
-def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
-        tmp_path, cleanup_failure, archive_write_failure,
-        normal_steps, hold_steps, normal_charge, hold_charge, normal_exact, hold_exact):
-    simulation, curve, targets = _fixture()
-    initial = _initial_feedback(simulation)
-    primary = RuntimeError("original independent geometry rejection")
-    confirmed, charged = normal_steps+hold_steps, normal_charge+hold_charge
-    accounting_exact = normal_exact and hold_exact
-    accounting = {"physical_steps": confirmed, "charged_steps": charged,
-        "step_accounting_exact": accounting_exact, "execution_step_limit": 30000,
-        "remaining_charged_steps": 30000-charged, "scope": "this execute invocation"}
-    shared_report = {
-        "status": "feedback_rejected", "executed_steps": normal_steps, "barrier_command_reached": False,
-        "elapsed_sim_s": .002,
-        "abort_hold": {"physical_steps": hold_steps, "charged_steps": hold_charge,
-            "step_accounting_exact": hold_exact}, "dependency_hold": None,
-        "normal_step_accounting": {"physical_steps": normal_steps, "charged_steps": normal_charge,
-            "step_accounting_exact": normal_exact, "attempts": []},
-        "physics_step_accounting": accounting,
-        "robot_feedback_path": "actual_failure_feedback", "barrier_feedback_path": None,
-        "geometry_preflight": {"passed": np.bool_(True), "checked_interval_s": [0., .0075],
-            "reference_collision_checked": True, "continuous_collision_certified": False,
-            "observed_scene_checked": True, "unknown_space_checked": False,
-            "nominal_scene": {"states": "must not be duplicated into the small summary"}},
-        "feedback_failure": {"point": "after_step", "curve_time_s": .002,
-            "physical_elapsed_s": .002, "actual_feedback": initial,
-            "violations": [{"kind": "arm_position_tracking", "name": "arm_0",
-                "measured": np.float64(.11), "expected": .10002, "maximum_error": .001}]},
-        "continuation": {"actual_feedback": initial},
-        "large_geometry_diagnostic": "x"*(16*1024**2+1)}
-
+# BEGIN shared explicit trial metadata for evidence-isolation CPU doubles.
+def _runner_inputs(tmp_path, simulation, curve, targets, initial):
     def save(name, value):
         path = tmp_path/name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,11 +56,61 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
     result = _result(curve)
     result.diagnostics["archive_classification"] = "planner_accepted"
 
+    return args, result
+# END no native scene, integration or renderer is constructed by this fixture.
+
+
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+@pytest.mark.parametrize("archive_write_failure", [False, True])
+# BEGIN summary counts distinguish confirmed motion, charged attempts and unknown clocks.
+@pytest.mark.parametrize("normal_steps,hold_steps,normal_charge,hold_charge,normal_exact,hold_exact", [
+    (0, 1, 0, 1, True, True),
+    (0, 0, 1, 0, True, True),  # A charged attempt provably did not advance time.
+    (0, 0, 1, 0, False, True),  # No confirmed step does not prove no motion.
+    (2, 1, 2, 2, True, False),  # One uncertain hold follows known native motion.
+])
+def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
+        tmp_path, cleanup_failure, archive_write_failure,
+        normal_steps, hold_steps, normal_charge, hold_charge, normal_exact, hold_exact):
+    simulation, curve, targets = _fixture()
+    initial = _initial_feedback(simulation)
+    primary = RuntimeError("original independent geometry rejection")
+    confirmed, charged = normal_steps+hold_steps, normal_charge+hold_charge
+    accounting_exact = normal_exact and hold_exact
+    accounting = {"physical_steps": confirmed, "charged_steps": charged,
+        "step_accounting_exact": accounting_exact, "execution_step_limit": 30000,
+        "remaining_charged_steps": 30000-charged, "scope": "this execute invocation"}
+    shared_report = {
+        "status": "feedback_rejected", "executed_steps": normal_steps, "barrier_command_reached": False,
+        "elapsed_sim_s": .002,
+        "abort_hold": {"physical_steps": hold_steps, "charged_steps": hold_charge,
+            "step_accounting_exact": hold_exact}, "dependency_hold": None,
+        "normal_step_accounting": {"physical_steps": normal_steps, "charged_steps": normal_charge,
+            "step_accounting_exact": normal_exact, "attempts": []},
+        "physics_step_accounting": accounting,
+        "independent_evidence_sink": {"configured": True, "completed": True, "disabled": False,
+            "first_error": None, "attempted_callbacks": normal_steps+1, "successful_callbacks": normal_steps+1},
+        "robot_feedback_path": "actual_failure_feedback", "barrier_feedback_path": None,
+        "geometry_preflight": {"passed": np.bool_(True), "checked_interval_s": [0., .0075],
+            "reference_collision_checked": True, "continuous_collision_certified": False,
+            "observed_scene_checked": True, "unknown_space_checked": False,
+            "nominal_scene": {"states": "must not be duplicated into the small summary"}},
+        "feedback_failure": {"point": "after_step", "curve_time_s": .002,
+            "physical_elapsed_s": .002, "actual_feedback": initial,
+            "violations": [{"kind": "arm_position_tracking", "name": "arm_0",
+                "measured": np.float64(.11), "expected": .10002, "maximum_error": .001}]},
+        "continuation": {"actual_feedback": initial},
+        "large_geometry_diagnostic": "x"*(16*1024**2+1)}
+
+    args, result = _runner_inputs(tmp_path, simulation, curve, targets, initial)
+
     class Executor:
         last_execution_report = None
 
         def execute(self, *args, **kwargs):
             self.last_execution_report = shared_report
+            for index in range(normal_steps+1):
+                kwargs["step_callback"](simulation.native_model, simulation.native_data, {"elapsed": index*.002})
             path = kwargs["output"]/"execution-report.json"
             path.parent.mkdir()
             if archive_write_failure:
@@ -113,12 +125,13 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
         def observe(self, *args):
             pass
 
-        def finalize(self, output, *, execution_report):
+        def finalize(self, output, *, execution_report, collection_report):
             self.finalized = True
             assert execution_report is shared_report
             if cleanup_failure:
                 raise ValueError("independent evaluator cleanup failure")
-            return {"physics_outcome": "not_evaluated", "physics_success": None}
+            return {"physics_outcome": "not_evaluated", "physics_success": None,
+                "evidence_coverage": {"complete": normal_exact}}
 
     class Videos:
         records = []
@@ -187,6 +200,160 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
         assert report["video_final_elapsed_s"] == .002
     assert simulation.sim_time == 1.3  # No native integration occurs in these doubles.
 # END failed writes and cleanup cannot collapse uncertain accounting into an exact count.
+
+
+# BEGIN independent evidence failures never alter a physical execution verdict.
+@pytest.mark.parametrize("physical_failure", [False, True])
+@pytest.mark.parametrize("failure_stage", ["evaluator_metadata", "evaluator_init", "evaluator_initial",
+    "evaluator_step", "evaluator_finalize", "video_init", "video_initial", "video_step",
+    "video_final", "video_close"])
+def test_evidence_failures_do_not_stop_execution_or_replace_physical_error(
+        tmp_path, physical_failure, failure_stage):
+    simulation, curve, targets = _fixture()
+    initial = _initial_feedback(simulation)
+    args, result = _runner_inputs(tmp_path, simulation, curve, targets, initial)
+    primary = ExecutionGuardError("physical guard owns this stop")
+    evidence_error = ValueError("independent acquisition failed")
+    held = int(physical_failure)
+    execution = {"status": "feedback_rejected" if physical_failure else "curve_finished",
+        "executed_steps": 2, "barrier_command_reached": not physical_failure,
+        "elapsed_sim_s": .004+held*.002,
+        "abort_hold": None if not held else {"physical_steps": held}, "dependency_hold": None,
+        "normal_step_accounting": {"physical_steps": 2, "charged_steps": 2, "step_accounting_exact": True},
+        "physics_step_accounting": {"physical_steps": 2+held, "charged_steps": 2+held,
+            "step_accounting_exact": True},
+        "independent_evidence_sink": {"configured": True, "completed": True, "disabled": False,
+            "first_error": None, "attempted_callbacks": 3, "successful_callbacks": 3},
+        "robot_feedback_path": "named_robot_feedback", "barrier_feedback_path": None,
+        "continuation": {"actual_feedback": initial}}
+    calls, observations, captures = [], [], []
+
+    class Executor:
+        last_execution_report = None
+
+        def execute(self, *unused, **kwargs):
+            calls.append("execute")
+            self.last_execution_report = execution
+            for index in range(3):
+                calls.append(index)
+                kwargs["step_callback"](simulation.native_model, simulation.native_data, {"elapsed": index*.002})
+            if physical_failure:
+                raise primary
+            return execution
+
+    class Evaluator:
+        def observe(self, model, data, record):
+            observations.append(record["elapsed"])
+            if ((failure_stage == "evaluator_initial" and record["elapsed"] == 0.)
+                    or (failure_stage == "evaluator_step" and record["elapsed"] == .002)):
+                raise evidence_error
+
+        def finalize(self, output, *, execution_report, collection_report):
+            assert execution_report is execution
+            if failure_stage == "evaluator_finalize":
+                raise evidence_error
+            complete = collection_report["completed"]
+            return {"physics_outcome": ("incomplete_evidence" if not complete else
+                                        "not_evaluated" if physical_failure else "passed"),
+                "physics_success": True if complete and not physical_failure else None,
+                "evidence_coverage": {"complete": complete}}
+
+    class Videos:
+        records = []
+        closed = False
+
+        def capture(self, elapsed, *, final=False):
+            captures.append((elapsed, final))
+            if ((failure_stage == "video_initial" and elapsed == 0.)
+                    or (failure_stage == "video_step" and elapsed == .002)
+                    or (failure_stage == "video_final" and final)):
+                raise evidence_error
+
+        def close(self):
+            self.closed = True
+            if failure_stage == "video_close":
+                raise evidence_error
+
+    videos = Videos()
+    if failure_stage == "evaluator_metadata":
+        args.evaluator_evidence.write_text("invalid independent evaluator JSON")
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(runner, "load_saved_trajectory", return_value=result))
+        stack.enter_context(patch.object(runner, "restore_recorded_simulation", return_value=(simulation, {})))
+        stack.enter_context(patch.object(runner, "build_robot_validator", return_value=object()))
+        stack.enter_context(patch.object(runner, "TrajectoryExecutor", return_value=Executor()))
+        stack.enter_context(patch.object(runner, "NativeSkillPhysicsEvaluator", return_value=Evaluator(),
+            side_effect=evidence_error if failure_stage == "evaluator_init" else None))
+        stack.enter_context(patch.object(runner, "_TrialVideos", return_value=videos,
+            side_effect=evidence_error if failure_stage == "video_init" else None))
+        if physical_failure:
+            with pytest.raises(ExecutionGuardError) as raised:
+                runner.run(args)
+            assert raised.value is primary
+        else:
+            runner.run(args)
+    report = json.loads((args.output/"simulation-report.json").read_text())
+    assert calls == ["execute", 0, 1, 2]
+    assert report["status"] == ("error" if physical_failure else "completed")
+    assert report["trajectory_executed_steps"] == 2
+    assert report["hold_physics_steps"] == held
+    assert report["charged_physics_steps"] == 2+held
+    assert report["evidence_complete"] is False
+    if physical_failure:
+        assert report["error"] == f"ExecutionGuardError: {primary}"
+    failed_sink = "evaluator" if failure_stage.startswith("evaluator") else "video"
+    state = report["evidence_collection"][failed_sink]
+    assert state["disabled"] and not state["completed"] and state["first_error"] is not None
+    if failed_sink == "evaluator":
+        assert report["physics_success"] is None
+        assert report["physics_outcome"] == "incomplete_evidence"
+        assert len(captures) == 4 and videos.closed
+        if failure_stage in ("evaluator_metadata", "evaluator_init"):
+            assert observations == []
+            assessment = json.loads((args.output/"evaluation-report.json").read_text())
+            assert assessment["evidence_coverage"]["missing_normal_sample_index_ranges"] == [[0, 2]]
+        elif failure_stage == "evaluator_initial":
+            assert observations == [0.]
+        elif failure_stage == "evaluator_step":
+            assert observations == [0., .002]
+    else:
+        # Video is an optional witness; complete native predicates remain
+        # independently gradable, just as in an explicit --no-video run.
+        assert report["physics_success"] is (None if physical_failure else True)
+        assert observations == [0., .002, .004]
+        if failure_stage == "video_init":
+            assert captures == []
+        elif failure_stage == "video_initial":
+            assert captures == [(0., False)] and videos.closed
+        elif failure_stage == "video_step":
+            assert captures == [(0., False), (.002, False)] and videos.closed
+    assert simulation.sim_time == 1.3
+# END all execution and acquisition are CPU doubles; no native step is issued.
+
+
+# BEGIN a partly failed camera tick retains only frames actually written.
+def test_partial_video_tick_does_not_invent_peer_frames_or_timestamps():
+    video = runner._TrialVideos.__new__(runner._TrialVideos)
+    video._counter, video._stride, video._last_elapsed = 0, 1, None
+    video._simulation = SimpleNamespace(native_data=SimpleNamespace(time=3.4))
+    video._cv2 = SimpleNamespace(cvtColor=lambda rgb, conversion: rgb, COLOR_RGB2BGR=1)
+    written = []
+
+    def failed_camera(data):
+        raise ValueError("second camera capture failed")
+
+    video._entries = [{"camera": SimpleNamespace(capture=capture),
+        "writer": SimpleNamespace(write=lambda frame, index=index: written.append(index)),
+        "times": [], "record": {"frame_count": 0}}
+        for index, capture in enumerate((lambda data: {"rgb": np.zeros((1, 1, 3))}, failed_camera))]
+    with pytest.raises(ValueError, match="second camera capture failed"):
+        video.capture(.1)
+    assert written == [0]
+    assert video._entries[0]["record"]["frame_count"] == 1
+    assert video._entries[0]["times"] == [[.1, 3.4]]
+    assert video._entries[1]["record"]["frame_count"] == 0
+    assert video._entries[1]["times"] == []
+# END no renderer, codec or synthetic replacement frame is used.
 
 
 # BEGIN generic upstream NumPy booleans survive the executor and every sink.

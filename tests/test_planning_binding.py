@@ -261,6 +261,9 @@ class PlanningBindingTest(unittest.TestCase):
             "requirement": plain(problem.pose_events[0]), "actual_function_pose": np.eye(4).tolist(),
             "actual_target_pose": np.eye(4).tolist(), "position_error_m": 0., "rotation_error_rad": 0.,
             "measurement_sources": [{"kind": "actual_robot_tcp", "source": "synchronized actual TCP",
+                # BEGIN continuation retains the online model-estimate provenance.
+                "pose_source": "forward_kinematics_from_measured_arm_q", "independent_observation": False,
+                # END this fixture supplies no independently sensed TCP pose.
                 "feedback_id": "measured-at-first-native-tick", "timestamp_s": .063,
                 "pose": np.eye(4).tolist()}]}]
         # END the nonuniform source map reaches s=.1 at t=.0625, then measures t=.063.
