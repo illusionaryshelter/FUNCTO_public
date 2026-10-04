@@ -515,6 +515,11 @@ class RobotGeometryChecker:
         boundary = max(self.numerics["gjk_tolerance"], self.numerics["epa_tolerance"])
         # BEGIN exact local TSDF components replace expanded ESDF sample cubes.
         for actor_body in actors:
+            # BEGIN reuse only this actor's unchanging native world transform.
+            # A TSDF actor expands into new component rows with different local
+            # frames; those rows must still construct their individual poses.
+            actor_transform = None
+            # END the lazy value never survives this one scene query.
             for first, second in _scene_component_pairs(
                     actor_body, targets, decisions, boundary, rows, self._request, checked, stopped_pairs):
                 row_count = len(rows)
@@ -543,7 +548,16 @@ class RobotGeometryChecker:
                                          "native_pair_evidence": deepcopy(native[0]),
                                          "scope": "same explicitly bound native installation solid/pair"})
                         continue
-                    transforms = [coal.Transform3s(row["pose"][:3, :3], row["pose"][:3, 3]) for row in (first, second)]
+                    # BEGIN unchanged actors recur across many TSDF components.
+                    if first is actor_body and actor_transform is not None:
+                        first_transform = actor_transform
+                    else:
+                        first_transform = coal.Transform3s(first["pose"][:3, :3], first["pose"][:3, 3])
+                        if first is actor_body:
+                            actor_transform = first_transform
+                    transforms = [first_transform,
+                        coal.Transform3s(second["pose"][:3, :3], second["pose"][:3, 3])]
+                    # END distance/contact requests and results remain fresh.
                     distance = coal.DistanceResult()
                     coal.distance(first["shape"], transforms[0], second["shape"], transforms[1], self._request, distance)
                     value = float(distance.min_distance)

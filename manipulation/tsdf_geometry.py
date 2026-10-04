@@ -362,6 +362,7 @@ class ObservedTsdfGeometry:
             raise ValueError("TSDF component vertices and CSR offsets must describe complete bounded convex pieces")
         return vertices, offsets
 
+    # BEGIN select exact component IDs before deciding whether vertices are needed.
     def iter_components(self, bounds=None, *, surface=True, negative=True):
         """Yield ``(kind, index, vertices)`` for every requested AABB candidate.
 
@@ -370,6 +371,13 @@ class ObservedTsdfGeometry:
         the vertices. A zero-valued tetrahedron is intentionally a complete
         convex surface component, allowing a caller to catch containment.
         """
+        # BEGIN share candidate identity without preparing unused vertices.
+        for kind, index in self._iter_component_ids(bounds, surface=surface, negative=negative):
+            yield kind, index, self._component_vertices(kind, index)
+        # END public component coordinates and enumeration stay unchanged.
+
+    def _iter_component_ids(self, bounds=None, *, surface=True, negative=True):
+        """Select the original ordered IDs before any component is materialized."""
         if self._tree is None or not (surface or negative):
             return
         if bounds is None:
@@ -392,14 +400,25 @@ class ObservedTsdfGeometry:
         for index in candidates:
             if index < surfaces:
                 if surface:
-                    yield "surface", int(index), self.surface_vertices[self.surface_offsets[index]:self.surface_offsets[index + 1]]
+                    yield "surface", int(index)
             elif index < surfaces + negatives:
                 if negative:
-                    local = index - surfaces
-                    yield "negative", int(local), self.negative_vertices[self.negative_offsets[local]:self.negative_offsets[local + 1]]
+                    yield "negative", int(index - surfaces)
             elif negative:
-                local = index - surfaces - negatives
-                yield "negative_cell", int(local), self._lower[index] + _CORNERS * self.voxel_size
+                yield "negative_cell", int(index - surfaces - negatives)
+
+    def _component_vertices(self, kind, index):
+        """Materialize one selected component with the original arithmetic."""
+        # BEGIN only a raw-component consumer or a cache miss needs vertices.
+        if kind == "surface":
+            return self.surface_vertices[self.surface_offsets[index]:self.surface_offsets[index + 1]]
+        if kind == "negative":
+            return self.negative_vertices[self.negative_offsets[index]:self.negative_offsets[index + 1]]
+        # The private ID iterator supplies only the three validated kinds.
+        offset = self._counts[0] + self._counts[1] + index
+        return self._lower[offset] + _CORNERS * self.voxel_size
+        # END cache hits avoid both array slicing and eight-corner allocation.
+    # END both public raw components and native cache misses use the same vertices.
 
     # BEGIN reuse only snapshot-local Coal geometry, never query decisions.
     def iter_collision_components(self, bounds=None):
@@ -412,10 +431,11 @@ class ObservedTsdfGeometry:
         LRU eviction drops only this cache's reference; a yielded row keeps its
         own shape and arrays alive until the ongoing query has consumed them.
         """
-        for kind, index, vertices in self.iter_components(bounds):
+        for kind, index in self._iter_component_ids(bounds):
             key = (kind, index)
             component = self._collision_cache.get(key)
             if component is None:
+                vertices = self._component_vertices(kind, index)
                 shape, local = coal_component(vertices)
                 points = (vertices - local[:3, 3]) @ local[:3, :3]
                 local.setflags(write=False)

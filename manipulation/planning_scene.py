@@ -1444,6 +1444,18 @@ class PlanningScene:
                     ("body_fine", selection.body_fine),
                     ("influence_aabb_grid_m", selection.influence_aabb),
                     ("index_lower", selection.index_lower), ("index_upper", selection.index_upper))}}
+        # BEGIN reuse only byte-identical source states within this fixed binding.
+        # All fields retain their dtype/shape for this call. In particular time
+        # controls the nominal fingers, progress controls material/attachment
+        # laws, and permission progress may differ at an arrival. Owner poses
+        # and every archived layer field are part of the identity as well.
+        # Keeping raw bytes avoids rounding, including signed-zero merging.
+        state_fields = [positions, times, progress_values, permission_values]
+        state_fields.extend(value for pose in owner_values.values() for value in pose)
+        state_fields.extend(value for selection in selected_values.values()
+                            for name, value in selection.items() if name != "body_ids")
+        state_residuals = {}
+        # END no result survives a call, model binding, gripper or candidate change.
         residuals, unmodelled, worst = [], set(), None
         # The final exporter passes the same small accumulator across native
         # chunks. Retain one witness for the whole export, not one full scene
@@ -1461,6 +1473,17 @@ class PlanningScene:
                           -float("inf") if clearance is None else -clearance), prior)
         for index, (row, time_s, phase, permission) in enumerate(zip(
                 positions, times, progress_values, permission_values)):
+            # BEGIN preserve first-occurrence query and exception order.
+            # Nominal scene queries have no release-history or budget mutation;
+            # Pinocchio refreshes its scratch data at every independent query.
+            # Retain only a scalar per unique state, never a trajectory-sized
+            # inventory of scene reports. A duplicate cannot add an unmodelled
+            # name or beat its first report under the strict worst-rank test.
+            state_key = tuple(value[index].tobytes() for value in state_fields)
+            if state_key in state_residuals:
+                residuals.append(state_residuals[state_key])
+                continue
+            # END logical residual order/count still includes every valid state.
             owner_poses = {}
             for identity, (p, q) in owner_values.items():
                 pose = np.eye(4)
@@ -1476,6 +1499,9 @@ class PlanningScene:
                 progress=phase, nominal_owner_poses=owner_poses, layer_selection=layers,
                 robot_owner_permission_progress=permission)
             residuals.append(report["residual"])
+            # BEGIN only a successfully completed query can be reused.
+            state_residuals[state_key] = report["residual"]
+            # END errors propagate at the original first occurrence.
             unmodelled.update(report["unmodelled_geometry_names"])
             if diagnostics is not None:
                 scene = report["scene"]
@@ -1767,13 +1793,25 @@ class PlanningScene:
             + sum(len(self.robot_collision_bodies) if actor == "robot" else 1
                   for actor in actors for target, query in targets.items()
                   if actor != target and isinstance(query, LayeredVoxelQuery))*128)
+        # BEGIN admit the worst case of no duplicate source state.
+        # Keys copy the raw CPU payload once. Reserve tuple/bytes headers,
+        # dictionary growth and scalar residuals for every logical state;
+        # source_input_bytes already bounds the numeric payload per field.
+        # Owners/layers excluded by the query only make this an overestimate.
+        source_dedup_bytes = 0
+        if self.robot_validator is not None and self._source_scene_checker is not None:
+            layer_pairs = sum(actor != target and isinstance(query, LayeredVoxelQuery)
+                              for actor in actors for target, query in targets.items())
+            fields = 4 + 2*len(self.owners) + 4*layer_pairs
+            source_dedup_bytes = source_input_bytes + batch*horizon*(512 + 64*fields)
+        # END accounting does not assume that three-mode probes will coincide.
         contact_bytes = (sum(value.workspace_bytes() for value in self._contact_cells.values())
                          + (batch*horizon*len(self.robot_sphere_materials)*64 if self._contact_cells else 0))
         contact_bytes += batch*horizon*sum((len(rule._feature_edge_normals)+10)*32 for rule in self.contacts)
         # END CPU neighbor lists separately obey a two-million-pair admission cap.
         return {"retained": int(retained_bytes),
                 "live": int(query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes+contact_bytes+layer_bytes+layer_scratch
-                            +source_input_bytes+source_query_bytes),
+                            +source_input_bytes+source_query_bytes+source_dedup_bytes),
                 "shared_cpu": int(shared_cpu_bytes)}
         # END source scene snapshots are not multiplied by the rollout count.
         # END include checkpointed hand-pair scratch and its retained input.

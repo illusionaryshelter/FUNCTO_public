@@ -174,6 +174,43 @@ def test_cache_eviction_preserves_live_rows_and_reconstructs_evicted_geometry(mo
         np.testing.assert_array_equal(row[4], np.zeros((1, 3)))
 
 
+# BEGIN a warm negative-cell cache must skip the otherwise repeated eight corners.
+def test_warm_cache_skips_vertices_and_eviction_rebuilds_exact_negative_cell(monkeypatch):
+    target = ObservedTsdfGeometry(component_record([[[0., 0., 0.]]], cells=(0, 1)))
+    target._collision_cache_capacity = 2
+    vertices = target._component_vertices
+    prepared = []
+
+    def tracked(kind, index):
+        prepared.append((kind, index))
+        return vertices(kind, index)
+
+    monkeypatch.setattr(target, "_component_vertices", tracked)
+
+    def select(point):
+        # Interior points select exactly one negative cell; the separate
+        # zero-dimensional surface is used only to force normal LRU eviction.
+        return next(target.iter_collision_components((point, point)))
+
+    first = select(np.array([40.25, .25, .25]))
+    second = select(np.array([40.75, .25, .25]))
+    warm = select(np.array([40.25, .25, .25]))
+    assert prepared == [("negative_cell", 0), ("negative_cell", 1)]
+    assert first[:2] == warm[:2] == ("negative_cell", 0)
+    assert all(before is after for before, after in zip(first[2:], warm[2:]))
+
+    select(np.zeros(3))
+    assert list(target._collision_cache) == [("negative_cell", 0), ("surface", 0)]
+    rebuilt = select(np.array([40.75, .25, .25]))
+    assert prepared == [("negative_cell", 0), ("negative_cell", 1),
+                        ("surface", 0), ("negative_cell", 1)]
+    assert rebuilt[:2] == second[:2]
+    assert rebuilt[2] is not second[2]
+    np.testing.assert_array_equal(rebuilt[3], second[3])
+    np.testing.assert_array_equal(rebuilt[4], second[4])
+# END eviction changes residency only; it retains the original corner arithmetic.
+
+
 def test_cache_identity_separates_snapshots_and_component_kinds(geometry):
     first = {row[:2]: row[2:] for row in geometry.iter_collision_components()}
     for index in range(4):
