@@ -113,7 +113,10 @@ class RobotGeometryChecker:
     """
 
     def __init__(self, urdf_path, *, base_frame, geometries):
-        required = ("buildModelFromUrdf", "forwardKinematics", "updateFramePlacements", "neutral")
+        # BEGIN native distance batches use this installed robotics API.
+        required = ("buildModelFromUrdf", "forwardKinematics", "updateFramePlacements", "neutral",
+                    "GeometryModel", "GeometryData", "GeometryObject", "CollisionPair", "SE3", "computeDistances")
+        # END missing native APIs fail before any state is evaluated.
         if any(not callable(getattr(pin, name, None)) for name in required):
             raise ImportError("Robot Pinocchio API is required from the installed 'pin' distribution; "
                               "the imported 'pinocchio' module is not that robotics package")
@@ -203,6 +206,25 @@ class RobotGeometryChecker:
                          "epa_tolerance": float(self._request.epa_tolerance),
                          "enable_signed_distance": True,
                          "tolerance_is_error_bound": False}
+        # BEGIN retain one pair schema in bounded native blocks, with cold solvers.
+        # Scene TSDF components keep their ordered permission/early-stop loop.
+        # This workspace is used only by query(), whose explicit native pairs
+        # all require raw evidence regardless of their acceptance policy.
+        self._native_distance_batches = None
+        # Reserve before any lazy query allocation. Each unordered native pair
+        # can occur once. A block has at most 256 unique geometries; its dense
+        # Pinocchio pair map therefore cannot grow quadratically with the full
+        # robot inventory. At default EPA=64, 64 KiB/pair covers the working and
+        # pristine distance solvers, GeometryData's other functors/results,
+        # the working EPA's 68 vertices/132 faces, and allocation overhead.
+        count = len(self._geometries)
+        pair_count = count * (count-1) // 2
+        block_geometries = min(count, 256)
+        name_bytes = sum(len(name.encode("utf-8")) for name in self._geometries)
+        self.native_query_storage_nbytes = (
+            pair_count * (32768 + 512 * int(self._request.epa_max_iterations))
+            + ((pair_count+127)//128) * (4096 + block_geometries*4096 + 8*block_geometries**2 + 2*name_bytes))
+        # END no old distance, permission or solver history is reused as evidence.
 
     def _frame_id(self, name):
         _name(name, "frame")
@@ -327,9 +349,9 @@ class RobotGeometryChecker:
                     or not set(rule.native_geometry_names) <= self._geometries.keys()):
                 raise ValueError("Robot-owner permission requires bound owner and native robot geometry names")
         # END no MuJoCo/native physical contact policy is changed here.
-        # BEGIN account once for the owned scene record and decoded geometry.
+        # BEGIN account once for the owned scene, decoded shapes and native cache.
         from .tsdf_geometry import ObservedTsdfGeometry
-        self.scene_storage_nbytes = _owned_record_bytes(self._scene_binding) + sum(
+        self.scene_storage_nbytes = self.native_query_storage_nbytes + _owned_record_bytes(self._scene_binding) + sum(
             row["shape"].storage_nbytes if isinstance(row["shape"], ObservedTsdfGeometry)
             else (0 if row["vertices"] is None else np.asarray(row["vertices"]).nbytes * 4)
             for row in self._scene_shapes)
@@ -337,9 +359,11 @@ class RobotGeometryChecker:
         # and a streamed component summary), plus one failure witness. The
         # per-pair reserve covers 64 Coal contacts and each finite rule result;
         # search candidates and native LP/BVH scratch reuse scene-sized memory.
+        # The independent fixed native-pair cache is already reserved above;
+        # it is not duplicated as scene-sized scratch on every scene query.
         pair_bound = len(self._scene_shapes) * (len(self._geometries) + len(self._scene_shapes))
         self.scene_query_workspace_nbytes = (pair_bound * (131072 + 4096 * len(scene_binding["contacts"]))
-                                            + 2 * self.scene_storage_nbytes)
+                                            + 2 * (self.scene_storage_nbytes - self.native_query_storage_nbytes))
         # END planning clones share this immutable scene allocation.
 
     def query_scene(self, robot_state, *, tool_pose, progress, finger_positions, state_kind,
@@ -977,17 +1001,21 @@ class RobotGeometryChecker:
         poses = {name: world_base @ self._data.oMf[index].homogeneous
                  for name, index in frame_ids.items()}
         geometry_poses = {name: poses[frame] @ local for name, (frame, _, _, local) in self._geometries.items()}
-        transforms = {name: coal.Transform3s(pose[:3, :3], pose[:3, 3])
-                      for name, pose in geometry_poses.items()}
+        # BEGIN run independent native pairs in C++, retaining their exact order.
+        # FK and the two matrix multiplications above deliberately stay in their
+        # original NumPy/Pinocchio order; only prepared rigid matrices are copied
+        # into the many-pair distance workspace below.
+        distances = self._native_pair_distances(pair_list, geometry_poses)
+        # END finite input validation precedes all native distance work.
         rows = []
         boundary = max(self.numerics["gjk_tolerance"], self.numerics["epa_tolerance"])
-        for pair in pair_list:
-            # A fresh result is essential: Coal updates an accumulated minimum.
-            result = coal.DistanceResult()
-            coal.distance(self._geometries[pair.first][1], transforms[pair.first],
-                          self._geometries[pair.second][1], transforms[pair.second],
-                          self._request, result)
+        # BEGIN inspect every original pair's fresh result, including exclusions.
+        for pair, result in zip(pair_list, distances):
+            # Pinocchio clears each DistanceResult before its native query.
+            # _native_pair_distances additionally resets the entire solver;
+            # default GJK direction alone does not reset its support hint.
             distance = float(result.min_distance)
+            # END report construction and nonfinite rejection retain their order.
             first = np.asarray(result.getNearestPoint1(), dtype=float)
             second = np.asarray(result.getNearestPoint2(), dtype=float)
             normal = np.asarray(result.normal, dtype=float)
@@ -1007,6 +1035,66 @@ class RobotGeometryChecker:
                 "geometry_poses": {name: pose.tolist() for name, pose in geometry_poses.items()},
                 "geometry_sources": {name: value[2] for name, value in self._geometries.items()},
                 "numerics": dict(self.numerics), "pairs": rows}
+
+    # BEGIN bounded native many-pair queries with explicitly pristine history.
+    def _native_pair_distances(self, pairs, poses):
+        """Yield original-order results without retaining warm solver state.
+
+        Pinocchio's geometry model has a dense geometry-to-pair map. Limiting
+        each workspace to 128 pairs (at most 256 geometries) bounds that map to
+        256 by 256 integer entries even for a large, sparse pair list. Every block
+        of the most recent complete pair schema is retained, so larger fixed
+        schemas do not rebuild blocks on every state. Changing pair order
+        releases the old schema before allocating its replacement.
+        All shape allocations finish before functors retain GeometryObject
+        addresses. The geometry model outlives both the working and pristine
+        functor vectors.
+
+        A batch may perform later independent distance work before Python checks
+        an earlier result. Every nonfinite result still rejects the whole call;
+        native exceptions propagate with Pinocchio's pair context and no partial
+        report is returned. This interface never owns scene contact permissions.
+        """
+        identities = tuple((pair.first, pair.second) for pair in pairs)
+        schema = self._native_distance_batches
+        if schema is None or schema[0] != identities:
+            # Drop both old references before construction, including when the
+            # new schema is empty or construction raises. No stale or partially
+            # configured workspace can serve the following query.
+            self._native_distance_batches = None
+            schema = None
+            blocks = []
+            for start in range(0, len(identities), 128):
+                block_pairs = identities[start:start+128]
+                names = tuple(dict.fromkeys(name for pair in block_pairs for name in pair))
+                columns = {name: index for index, name in enumerate(names)}
+                model = pin.GeometryModel()
+                for name in names:
+                    model.addGeometryObject(pin.GeometryObject(
+                        name, 0, pin.SE3.Identity(), self._geometries[name][1]))
+                for first, second in block_pairs:
+                    model.addCollisionPair(pin.CollisionPair(columns[first], columns[second]))
+                data = pin.GeometryData(model)
+                for index in range(len(block_pairs)):
+                    data.distanceRequests[index] = self._request
+                # Value-copy the never-evaluated solver vector. Restoring this
+                # vector resets GJK/EPA/support hints, including the history
+                # that Coal retains even with gjk_initial_guess=DefaultGuess.
+                pristine = data.distance_functors.copy()
+                blocks.append((names, model, data, pristine))
+            schema = (identities, tuple(blocks))
+            self._native_distance_batches = schema
+        for names, model, data, pristine in schema[1]:
+            data.distance_functors = pristine
+            for index, name in enumerate(names):
+                pose = poses[name]
+                data.oMg[index] = pin.SE3(pose[:3, :3], pose[:3, 3])
+            # Returned minimum index is intentionally ignored: all pairs and
+            # their signed distances/witnesses/normals remain separately read.
+            pin.computeDistances(model, data)
+            for index in range(len(model.collisionPairs)):
+                yield data.distanceResults[index]
+    # END native scene-component distance/contact evaluation stays independent.
 # END independent named robot FK and native-solid numerical diagnostics.
 
 # BEGIN independent full-solid scene geometry and local material permissions.

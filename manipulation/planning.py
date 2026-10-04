@@ -698,7 +698,7 @@ def _validation_storage_admission(problem, scene, robot_metadata, budget):
 
 
 def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
-    """Estimate the independent scene queries and all native anchor FK buffers.
+    """Return scene bytes, anchor-FK bytes and trajectory graph admission.
 
     The main native rollout retains its original control horizon. Each trajectory
     manager evaluates the required anchors with a separate native FK model,
@@ -725,7 +725,8 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     # query buffers persist across rollouts. Installed gradient_opt_core
     # executes evaluate_action then backward(retain_graph=False) before another
     # initial/exploration rollout; metrics consume its detached best action.
-    # CUDA graphs are explicitly disabled in both native solver factories.
+    # The solver factories keep CPU metrics outside capture. Eligible owned
+    # optimizer cores additionally retain two private graph pools below.
     # The final two anchor-shaped reserves also cover the simultaneous OMPL
     # chart-scene stack: at most anchor_capacity one-state scene clones, whose
     # aggregate sphere buffers fit one such reserve. Scalar slots are counted
@@ -736,6 +737,7 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
                    for copies, batch, length, guidance in allocation_shapes]
     scene_bytes = (sum(copies*value["retained"] for copies, value in allocations)
                    + max(value["live"] for _, value in allocations)
+                   + max(value["shared_grids"] for _, value in allocations)
                    + max(value["shared_cpu"] for _, value in allocations))
     # END geometry/query sets and the unchanged hard memory budget are preserved.
     # END all live optimization scratch remains under the unchanged hard budget.
@@ -744,6 +746,19 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
         raise ValueError("Independent scene query workspaces exceed the declared local allocation budget: "
                          f"required {int(scene_bytes)} bytes, allowed {budget.max_scene_workspace_bytes} bytes")
         # END reporting a shortfall does not alter the allocation contract.
+    # BEGIN choose capture scope before allocation, preserving eager admission.
+    # Each trajectory entry/inner executor retains a private pool in addition
+    # to the ordinary live scratch used by warmup and metrics. A finite contact
+    # scene needs CPU cost geometry. A scene whose two graph pools exceed the
+    # declared capacity retains the unchanged native eager optimizer as well;
+    # neither case changes required queries, arithmetic or iteration counts.
+    graph_live = max(value["live"] for (_, value), (_, _, _, guidance)
+                     in zip(allocations, allocation_shapes) if guidance)
+    graph_scene_bytes = scene_bytes+2*graph_live
+    trajectory_graph = not scene.contacts and graph_scene_bytes <= budget.max_scene_workspace_bytes
+    if trajectory_graph:
+        scene_bytes = graph_scene_bytes
+    # END no independent captured pool is treated as reusable eager scratch.
     dof, links, spheres = (len(robot_metadata["active_joint_names"]),
                            robot_metadata["links"], robot_metadata["spheres"])
     # Installed KinematicsFusedFunction.create_buffers uses float32 and this
@@ -766,7 +781,7 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     bytes_per_state = 4*(22+8*spheres+8*dof+12*links)+self_bytes_per_state
     # END anchor collision buffers share the existing finite admission limit.
     anchor_fk_bytes = 22*budget.trajectory_seeds*anchor_capacity*bytes_per_state
-    return int(scene_bytes), int(anchor_fk_bytes)
+    return int(scene_bytes), int(anchor_fk_bytes), trajectory_graph
 
 
 def _require_planning_memory(torch, device, scene_bytes, anchor_fk_bytes):
@@ -2103,6 +2118,23 @@ def _projection_tolerance(problem):
 # END project more tightly than every existing mechanism acceptance band.
 
 
+# BEGIN combine completed OMPL term flags before the single host decision.
+def _ompl_terms_accepted(terms):
+    """Keep every existing FP comparison and synchronize one boolean only.
+
+    OMPL constructs all term tensors before acceptance. They share the state
+    device; collecting their finite/nonpositive flags changes no floating
+    operation, sum, tolerance, or report value. Boolean AND is exact, unlike
+    reassociating a floating-point reduction. The empty collection keeps
+    Python ``all``'s identity, although production also supplies scene/task
+    terms. Only the final scalar crosses the device/host boundary.
+    """
+    import torch
+    flags = [torch.isfinite(term).all() & (term <= 0).all() for term in terms.values()]
+    return bool(torch.stack(flags).all().item()) if flags else True
+# END no floating-point term is recomputed, combined, or rounded here.
+
+
 def _ompl_stage(start, goal, lower, upper, valid, equality, *, tolerance,
                 step, seconds, sample_limit, query_parameters=()):
     """Run native directed RRTConnect in (q,u=t/T), retaining checked edge samples.
@@ -2587,15 +2619,18 @@ class _RobotCoverageFK:
         import torch
         from scipy.spatial.transform import Rotation
         from .planning_problem import quaternion_multiply
+        from .optimizer_device_checks import constant_tensor
         names, full = self.scene.full_robot_positions(joint_position, joint_names, trajectory_time)
         columns = [names.index(name) for name in self.fk.joint_names]
-        q = full[..., columns].contiguous()
+        # BEGIN retain integer indices and pose constants in optimizer captures.
+        q = full[..., constant_tensor(columns, full, dtype=torch.long)].contiguous()
         state = self.fk.compute_kinematics(self.JointState.from_position(q, joint_names=self.fk.joint_names))
         p = self._layout.apply(state.tool_poses.position)
         r = self._quaternion.apply(q, state.tool_poses.quaternion.detach(), state.tool_jacobians[..., 3:, :].detach())
-        base = torch.as_tensor(self.problem.base_pose, dtype=q.dtype, device=q.device)
-        base_quaternion = torch.as_tensor(Rotation.from_matrix(self.problem.base_pose[:3, :3]).as_quat()[[3, 0, 1, 2]],
-                                          dtype=q.dtype, device=q.device)
+        base = constant_tensor(self.problem.base_pose, q)
+        base_quaternion = constant_tensor(
+            Rotation.from_matrix(self.problem.base_pose[:3, :3]).as_quat()[[3, 0, 1, 2]], q)
+        # END FK, matrix products and quaternion arithmetic remain unchanged.
         p = p@base[:3, :3].T+base[:3, 3]
         r = quaternion_multiply(base_quaternion, r)
         return {name: (p[..., index, :], r[..., index, :]) for index, name in enumerate(self.fk.tool_frames)}
@@ -2612,6 +2647,7 @@ def _timed_native_state(state, problem, scene, joint_names, trajectory_time, *, 
     if hand is None or hand.controller not in {"timed_reference", "binary"}:
         return state
     import torch
+    from .optimizer_device_checks import constant_tensor
     q = state.joint_state.position
     tool = state.tool_poses
     index = tool.tool_frames.index(problem.tool_link)
@@ -2632,12 +2668,14 @@ def _timed_native_state(state, problem, scene, joint_names, trajectory_time, *, 
         for sphere_index, translation in zip(hand.sphere_indices, hand.sphere_joint_translation):
             moving[sphere_index] = bool(np.any(translation != 0))
         uncertain = ((trajectory_time > 0)[..., None]
-                     & torch.as_tensor(moving, device=spheres.device)[None, None])
-        padding = torch.as_tensor(sphere_padding, dtype=spheres.dtype, device=spheres.device)
+                     & constant_tensor(moving, spheres, dtype=torch.bool)[None, None])
+        padding = constant_tensor(sphere_padding, spheres)
         radius = torch.where(uncertain, -1.-padding.abs(), spheres[..., 3])
         spheres = torch.cat((spheres[..., :3], radius[..., None]), -1)
     # END command completion is never treated as actual finger penetration.
-    base = torch.as_tensor(problem.base_pose, dtype=q.dtype, device=q.device)
+    # BEGIN model pose conversion is cached without changing its input or dtype.
+    base = constant_tensor(problem.base_pose, q)
+    # END the original inverse rotation still evaluates in the same order.
     spheres = torch.cat(((spheres[..., :3]-base[:3, 3])@base[:3, :3], spheres[..., 3:4]), -1)
     result = copy(state)
     result.cuda_robot_model_state = copy(state.cuda_robot_model_state)
@@ -2667,6 +2705,7 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     side; an action during that plateau never regains an expired old mode.
     """
     import torch
+    from .optimizer_device_checks import constant_tensor
     # BEGIN the same mode expansion owns both proxy guidance and source acceptance.
     # This is a call-site mode, not a configurable collision fallback. Formal
     # metrics/search/export explicitly choose source geometry; only optimizer
@@ -2690,11 +2729,13 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     right = torch.zeros_like(progress, dtype=torch.bool)
     for anchor in anchors:
         parameters = progress_map.anchor_parameters([anchor])[:, 0]
-        matching = progress == progress.new_tensor(anchor)
+        # BEGIN preserve exact native-dtype anchor constants during replay.
+        matching = progress == constant_tensor(anchor, progress)
         if anchor > problem.start_progress:
-            left |= matching & (normalized_time <= normalized_time.new_tensor(parameters[0]))
+            left |= matching & (normalized_time <= constant_tensor(parameters[0], normalized_time))
         if anchor < problem.phase_count:
-            right |= matching & (normalized_time >= normalized_time.new_tensor(parameters[-1]))
+            right |= matching & (normalized_time >= constant_tensor(parameters[-1], normalized_time))
+        # END only constant storage changes, including each original FP32 cast.
     lower = torch.where(left, torch.nextafter(progress, torch.full_like(progress, -float("inf"))), progress)
     upper = torch.where(right, torch.nextafter(progress, torch.full_like(progress, float("inf"))), progress)
     # BEGIN an arrival authorizes its explicit pair before same-state mode probes.
@@ -2703,7 +2744,7 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     # state. Earlier actual samples and all interval-end probes stay unchanged.
     permission_lower = lower
     for rule in scene.robot_owner_permissions:
-        arrival = progress.new_tensor(rule.interval[0])
+        arrival = constant_tensor(rule.interval[0], progress)
         permission_lower = torch.where((progress == arrival) & (lower < arrival), progress, permission_lower)
     # END equality is in the native query dtype; no tolerance advances arrival.
     repeated = lambda value: torch.cat((value, value, value), dim=1)
@@ -3201,7 +3242,8 @@ class _CuroboPlanner:
                 joint = int(checker.model.parents[joint])
         # END source identity is established before allocating GPU solvers.
         self.validation_storage = _validation_storage_admission(problem, scene, self.robot_metadata, budget)
-        self.scene_workspace_bytes, self.anchor_fk_workspace_bytes = _planning_workspace_bytes(
+        (self.scene_workspace_bytes, self.anchor_fk_workspace_bytes,
+         self._trajectory_optimizer_graph_admitted) = _planning_workspace_bytes(
             scene, self.robot_metadata, budget, self.anchor_capacity)
         # END preserve all required source points within the total query budget.
         import torch
@@ -3469,8 +3511,12 @@ class _CuroboPlanner:
         self.physical_domain = CubicJointDomain(bounds[0], bounds[1],
             self.start.position, self.start.velocity, self.formal_clock["knot_dt"],
             self.trajopt.action_horizon)
-        for solver, domain in ((self.ik, self.position_domain), (self.trajopt, self.physical_domain)):
-            bind_solver_components(solver, domain)
+        # BEGIN solver metrics remain eager; only admitted CUDA cores capture.
+        cuda = self.device_cfg.device.type == "cuda"
+        bind_solver_components(self.ik, self.position_domain, use_optimizer_graph=cuda)
+        bind_solver_components(self.trajopt, self.physical_domain,
+            use_optimizer_graph=cuda and self._trajectory_optimizer_graph_admitted)
+        # END native fixed-iteration/kernel requirements remain explicit errors.
         # END the installed cuRobo library needs no physical-domain/cache patch.
     # END limits are the model's full physical q interval, never a seed box.
 
@@ -3692,7 +3738,7 @@ class _CuroboPlanner:
         progress_map = self.progress_map
         parameters = np.unique(np.asarray(refinement_parameters, float))
         capacity = _anchor_capacity(progress_map, self.anchors, self.budget, parameters)
-        scene_bytes, anchor_fk_bytes = _planning_workspace_bytes(
+        scene_bytes, anchor_fk_bytes, trajectory_graph = _planning_workspace_bytes(
             self.scene, self.robot_metadata, self.budget, capacity)
         self.trajopt.destroy()
         self.trajopt = None
@@ -3704,6 +3750,7 @@ class _CuroboPlanner:
         self.refinement_parameters = parameters
         self.anchor_capacity = capacity
         self.scene_workspace_bytes, self.anchor_fk_workspace_bytes = scene_bytes, anchor_fk_bytes
+        self._trajectory_optimizer_graph_admitted = trajectory_graph
         manager_type = _process_manager_type(self.problem, self.scene, progress_map, self.anchors,
                                              self.budget, parameters,
                                              clock=self.formal_clock, seed_parameter=self.seed_parameter,
@@ -3853,8 +3900,9 @@ class _CuroboPlanner:
                 if coverage:
                     terms["robot_query_incomplete"] = progress.new_tensor([[float(any(
                         not row["attempt_allowed"] for row in coverage))]])
-                accepted = all(bool(torch.isfinite(term).all()) and bool((term <= 0).all())
-                               for term in terms.values())
+                # BEGIN all existing tensors precede one exact boolean host read.
+                accepted = _ompl_terms_accepted(terms)
+                # END rejected-state diagnostics retain their original order/values.
                 if not accepted and len(invalid_states) < 3:
                     invalid_states.append({"u": float(values[-1]), "progress": float(progress.item()),
                         "terms": {name: float(term.max().item()) for name, term in terms.items()}})

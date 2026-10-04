@@ -15,6 +15,7 @@ import torch
 # BEGIN compact archival records retain exact native selections.
 from .collision_records import encode_array
 # END codec storage does not alter any layer-selection arithmetic.
+from .optimizer_device_checks import require_tensor
 
 
 def _measured_spheres(spheres, margin):
@@ -29,10 +30,12 @@ def _measured_spheres(spheres, margin):
         return spheres
     radius = spheres[..., 3:4]
     target = radius.detach().to(torch.float64)+margin
-    target = torch.nextafter(target, target.new_tensor(torch.inf))
+    # BEGIN device-created scalars avoid repeated host transfers in capture.
+    target = torch.nextafter(target, torch.full((), torch.inf, dtype=target.dtype, device=target.device))
     rounded = target.to(radius.dtype)
     rounded = torch.where(rounded.to(torch.float64) < target,
-        torch.nextafter(rounded, rounded.new_tensor(torch.inf)), rounded)
+        torch.nextafter(rounded, torch.full((), torch.inf, dtype=rounded.dtype, device=rounded.device)), rounded)
+    # END infinity is exact; radius arithmetic and its rounding are unchanged.
     return torch.cat((spheres[..., :3], rounded+(radius-radius.detach())), dim=-1)
 
 
@@ -127,12 +130,44 @@ class FineRegion:
             prefix = prefix.cumsum(axis=axis, dtype=np.int32)
         self._prefix = torch.from_numpy(prefix)
         self._device_prefix = {}
+        # BEGIN stable immutable layer constants shared with captured queries.
+        self._device_constants = {}
+        self._device_groups = {}
+        # END no input state or layer decision is cached here.
         self.shape = shape
-        self.pose, self.size, self.support, self.margin = pose, size, support, margin
+        # BEGIN own the immutable pose that supplies cached device constants.
+        self.pose = pose.copy()
+        self.pose.setflags(write=False)
+        self.size, self.support, self.margin = size, support, margin
+        # END caller-owned ndarray mutations cannot change this bound region.
 
     @property
     def storage_bytes(self):
-        return self._prefix.numel()*self._prefix.element_size()
+        # BEGIN include one device's int shape, FP64 shape/pose and infinities.
+        return self._prefix.numel()*self._prefix.element_size() + (3+3+7+2)*8
+        # END each planner binds this region to its admitted single GPU.
+
+    # BEGIN immutable tensors retain their original dtype and exact conversion.
+    def _constants(self, device):
+        if device not in self._device_constants:
+            self._device_constants[device] = (
+                torch.tensor(self.shape, dtype=torch.int64, device=device),
+                torch.tensor(self.shape, dtype=torch.float64, device=device),
+                torch.tensor(self.pose, dtype=torch.float64, device=device),
+                torch.tensor(-torch.inf, dtype=torch.float64, device=device),
+                torch.tensor(torch.inf, dtype=torch.float64, device=device))
+        return self._device_constants[device]
+    # END warmup creates constants before graph replay can use their addresses.
+
+    # BEGIN Python advanced-index lists otherwise create a host index per call.
+    def _group_indices(self, device, groups):
+        partition = tuple(tuple(group["sphere_indices"]) for group in groups)
+        key = (device, partition)
+        if key not in self._device_groups:
+            self._device_groups[key] = tuple(torch.tensor(indices, device=device, dtype=torch.int64)
+                                              for indices in partition)
+        return self._device_groups[key]
+    # END the scene's fixed partitions preserve all sphere and reduction orders.
 
     def _box_count(self, lower, upper):
         """Count unsupported inclusive sample boxes using eight prefix corners."""
@@ -140,7 +175,7 @@ class FineRegion:
         if key not in self._device_prefix:
             self._device_prefix[key] = self._prefix.to(lower.device)
         prefix = self._device_prefix[key]
-        shape = torch.tensor(self.shape, device=lower.device)
+        shape = self._constants(lower.device)[0]
         lo = torch.maximum(torch.zeros_like(lower), torch.minimum(lower, shape))
         hi = torch.maximum(torch.zeros_like(upper), torch.minimum(upper+1, shape))
         count = torch.zeros(lower.shape[:-1], dtype=torch.int32, device=lower.device)
@@ -160,11 +195,15 @@ class FineRegion:
         """
         if envelope.shape[-2:] != (2, 3) or envelope.dtype != torch.float64:
             raise ValueError("Source-support envelopes require float64 [...,2,3] grid-local bounds")
+        # BEGIN keep unsafe integer indexing out of a deferred-failure block.
         low, high = envelope[..., 0, :], envelope[..., 1, :]
-        if not bool(torch.isfinite(envelope).all()) or bool((low > high).any()):
-            raise ValueError("Source-support envelopes must be finite ordered boxes")
-        shape = low.new_tensor(self.shape)
-        negative, positive = low.new_tensor(-torch.inf), low.new_tensor(torch.inf)
+        valid = require_tensor(torch.isfinite(envelope).all() & ~(low > high).any(),
+                               "Source-support envelopes must be finite ordered boxes")
+        if valid is not None:
+            envelope = torch.where(valid, envelope, torch.zeros_like(envelope))
+            low, high = envelope[..., 0, :], envelope[..., 1, :]
+        _, shape, _, negative, positive = self._constants(low.device)
+        # END all valid FP64 bounds enter the identical outward-rounded formula.
         # Integer shape and half-integer offsets are represented exactly.
         lo_coordinate = torch.nextafter(torch.nextafter(low/self.size, negative)+(shape-1)/2, negative)
         hi_coordinate = torch.nextafter(torch.nextafter(high/self.size, positive)+(shape-1)/2, positive)
@@ -197,8 +236,12 @@ class FineRegion:
         if spheres.ndim != 4 or spheres.shape[-1] != 4:
             raise ValueError("Layer selection requires [B,H,S,4] complete body spheres")
         groups = validate_body_groups(groups, spheres.shape[-2])
-        if not bool(torch.isfinite(spheres).all()) or bool((spheres[..., 3] < 0).any()):
-            raise ValueError("Layer selection cannot omit invalid or disabled body-cover spheres")
+        # BEGIN record dynamic faults on-device inside an optimizer graph.
+        valid = require_tensor(torch.isfinite(spheres).all() & ~(spheres[..., 3] < 0).any(),
+                               "Layer selection cannot omit invalid or disabled body-cover spheres")
+        if valid is not None:
+            spheres = torch.where(valid, spheres, torch.zeros_like(spheres))
+        # END a failed block cannot export this placeholder selection.
         # Selection is a discrete, shared model choice; collision gradients
         # continue through the original spheres in the selected native field.
         # The Mapper produces axis-aligned grids in each owner's local frame.
@@ -207,14 +250,13 @@ class FineRegion:
         # Outward rounding at every +/- operation encloses exact arithmetic
         # on those stored sphere values, including strict ROI-edge cases.
         detached = _measured_spheres(spheres.detach(), self.margin).to(dtype=torch.float64)
-        pose = detached.new_tensor(self.pose)
+        _, _, pose, toward_low, toward_high = self._constants(detached.device)
         local = detached[..., :3]-pose[:3]
-        toward_low, toward_high = local.new_tensor(-torch.inf), local.new_tensor(torch.inf)
         local_low = torch.nextafter(local, toward_low)
         local_high = torch.nextafter(local, toward_high)
         lower, upper = [], []
-        for group in groups:
-            idx = group["sphere_indices"]
+        indices = self._group_indices(detached.device, groups)
+        for idx in indices:
             radius = detached[..., idx, 3:4]
             low = torch.nextafter(local_low[..., idx, :]-radius, toward_low).amin(-2)
             high = torch.nextafter(local_high[..., idx, :]+radius, toward_high).amax(-2)
@@ -224,8 +266,8 @@ class FineRegion:
         envelope = torch.stack((low, high), -2)
         chosen, lo, hi = self._envelope_support(envelope)
         per_sphere = torch.empty(spheres.shape[:-1], dtype=torch.bool, device=spheres.device)
-        for i, group in enumerate(groups):
-            per_sphere[..., group["sphere_indices"]] = chosen[..., i, None]
+        for i, idx in enumerate(indices):
+            per_sphere[..., idx] = chosen[..., i, None]
         return LayerSelection(per_sphere, chosen, envelope, lo, hi,
                               tuple(group["body_id"] for group in groups))
 

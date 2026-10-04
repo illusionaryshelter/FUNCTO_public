@@ -231,6 +231,12 @@ def native_differential(current, operation, monkeypatch):
     # release witnesses, three-mode expansion and layer choices stay native.
     with monkeypatch.context() as context:
         context.setattr(current, "check_world_geometry", MethodType(singleton_reference, current))
+        # BEGIN the oracle also retains the original separate device copies.
+        # Comparing two packed callers would miss a common field/dtype error;
+        # this control executes the pre-optimization transfer expression.
+        context.setattr("manipulation.tensor_cpu_snapshot.masked_cpu_snapshot",
+            lambda fields, valid: tuple(value.detach()[valid].cpu().numpy() for value in fields))
+        # END complete native report comparison now spans both optimizations.
         expected_diagnostics, expected_layers, expected_components = {}, {}, {}
         expected = operation(current, expected_diagnostics, expected_layers, expected_components)
     torch.testing.assert_close(actual, expected, rtol=0., atol=0.)

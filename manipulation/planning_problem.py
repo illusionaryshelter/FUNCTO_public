@@ -20,8 +20,10 @@ from .motion import MotionModel, _inverse, _pose_array, _poses_array
 
 
 def _tensor(value, like):
-    import torch
-    return torch.as_tensor(value, dtype=like.dtype, device=like.device)
+    # BEGIN only optimizer scopes retain host constants for graph replay.
+    from .optimizer_device_checks import constant_tensor
+    return constant_tensor(value, like)
+    # END tensor inputs and all numeric conversions retain their original path.
 
 
 def quaternion_conjugate(q):
@@ -566,9 +568,16 @@ class MechanismRequirement:
         # Rollout and exact-event queries can be concatenated out of order.
         # Physical time orders motion even when progress is on a plateau.
         # Progress is sufficient only for a local seed query with no clock.
-        if trajectory_time is not None and (trajectory_time.shape != progress.shape
-                or not bool(torch.isfinite(trajectory_time).all())):
-            raise ValueError("Coordinate history needs finite physical times aligned with its queries")
+        # BEGIN finite-time validation stays on-device inside optimizer blocks.
+        if trajectory_time is not None:
+            from .optimizer_device_checks import require_tensor
+            message = "Coordinate history needs finite physical times aligned with its queries"
+            if trajectory_time.shape != progress.shape:
+                raise ValueError(message)
+            valid = require_tensor(torch.isfinite(trajectory_time).all(), message)
+            if valid is not None:
+                trajectory_time = torch.where(valid, trajectory_time, torch.zeros_like(trajectory_time))
+        # END valid times retain the original stable sort and cumsum order.
         order = torch.argsort(progress if trajectory_time is None else trajectory_time, dim=-1, stable=True)
         sorted_angle = torch.gather(angle, -1, order)
         sorted_progress = torch.gather(progress, -1, order)
@@ -1129,7 +1138,11 @@ class PlanningProblem:
                 raise ValueError("Actuator coupling requires named robot joint positions")
             for index, coupling in enumerate(self.couplings):
                 columns = [tuple(joint_names).index(name) for name in coupling.joint_names]
-                error = joint_position[..., columns] @ _tensor(coupling.matrix.T, joint_position)-_tensor(coupling.target, joint_position)
+                # BEGIN cache only the original integer advanced-index array.
+                from .optimizer_device_checks import constant_tensor
+                column_index = constant_tensor(columns, joint_position, dtype=torch.int64)
+                error = joint_position[..., column_index] @ _tensor(coupling.matrix.T, joint_position)-_tensor(coupling.target, joint_position)
+                # END the matrix multiplication and residual order are unchanged.
                 result[f"coupling:{index}"] = torch.relu(error.abs()-self.numerical.joint).sum(-1)
         for event in self.events:
             if event.stop:
@@ -1155,7 +1168,11 @@ class PlanningProblem:
         for requirement in self.pose_relations:
             exact = np.isfinite(requirement.pose_bounds).all(axis=1) & (requirement.pose_bounds[:, 0] == requirement.pose_bounds[:, 1])
             if exact.any():
-                error = requirement.error(position, quaternion, progress)[..., exact]
+                # BEGIN expand a static host mask before graph capture.
+                from .optimizer_device_checks import constant_tensor
+                exact_columns = constant_tensor(np.flatnonzero(exact), position, dtype=torch.long)
+                error = requirement.error(position, quaternion, progress)[..., exact_columns]
+                # END selected coordinates keep the original ascending mask order.
                 preference = (error-_tensor(requirement.pose_bounds[exact, 0], position)).square().sum(-1)
                 mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
                 result = result+torch.where(mask, preference, 0.)
@@ -1357,7 +1374,11 @@ class PlanningProblem:
                 continue
             exact = np.isfinite(requirement.pose_bounds[:, 0]) & (requirement.pose_bounds[:, 0] == requirement.pose_bounds[:, 1])
             if exact.any():
-                error = requirement.error(position, quaternion, progress)[..., exact]-_tensor(requirement.pose_bounds[exact, 0], position)
+                # BEGIN static equality masks need no device nonzero operation.
+                from .optimizer_device_checks import constant_tensor
+                exact_columns = constant_tensor(np.flatnonzero(exact), position, dtype=torch.long)
+                error = requirement.error(position, quaternion, progress)[..., exact_columns]-_tensor(requirement.pose_bounds[exact, 0], position)
+                # END all residual rows and subsequent reductions retain their order.
                 mask = ((progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7))[..., None]
                 pieces.append(torch.where(mask, error, 0.) if selected is None else error)
         for index, requirement in enumerate(self.mechanisms):
@@ -1372,7 +1393,11 @@ class PlanningProblem:
             if joint_position is None or joint_names is None:
                 raise ValueError("Projection needs named joints for actuator coupling")
             columns = [tuple(joint_names).index(name) for name in coupling.joint_names]
-            pieces.append(joint_position[..., columns] @ _tensor(coupling.matrix.T, joint_position)-_tensor(coupling.target, joint_position))
+            # BEGIN projection keeps the exact column order on either device.
+            from .optimizer_device_checks import constant_tensor
+            index = constant_tensor(columns, joint_position, dtype=torch.int64)
+            pieces.append(joint_position[..., index] @ _tensor(coupling.matrix.T, joint_position)-_tensor(coupling.target, joint_position))
+            # END no coupling rows are reordered or combined.
         return torch.cat(pieces, -1) if pieces else position[..., :0]
     # END projection selects equations without inactive zero rows or invented poses.
 # END one current skill with separate goals, process relations and references.

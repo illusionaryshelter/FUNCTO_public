@@ -236,6 +236,9 @@ class FingerTrajectory:
     timestamp_s: float
     _curve: CubicHermiteSpline = field(init=False, repr=False)
     _bounds_report: dict = field(init=False, repr=False)
+    # BEGIN keep immutable polynomial tensors at stable capture addresses.
+    _torch_cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
+    # END this runtime cache is excluded from the archived reference schema.
 
     def __post_init__(self):
         if isinstance(self.joint_names, str):
@@ -410,21 +413,41 @@ class FingerTrajectory:
     def sample_torch(self, times):
         """Evaluate the same saved polynomial without native FK or new timing."""
         import torch
+        from .optimizer_device_checks import require_tensor
 
         # Query tensors already belong to the planner's bounded device. This
         # module never creates a CUDA context or chooses a device itself.
-        if (not isinstance(times, torch.Tensor) or not times.is_floating_point()
-                or not bool(torch.isfinite(times).all()) or bool((times < 0.).any())
-                or bool((times > self.duration).any())):
-            raise ValueError("Finger reference queries must stay inside the original finite trajectory duration")
-        knots = torch.as_tensor(self.times.copy(), dtype=times.dtype, device=times.device)
-        coefficients = torch.as_tensor(self._curve.c.copy(), dtype=times.dtype, device=times.device)
+        # BEGIN preserve polynomial operations while removing per-call H2D copies.
+        message = "Finger reference queries must stay inside the original finite trajectory duration"
+        if not isinstance(times, torch.Tensor) or not times.is_floating_point():
+            raise ValueError(message)
+        valid = require_tensor(torch.isfinite(times).all() & ~(times < 0.).any()
+                               & ~(times > self.duration).any(), message)
+        if valid is not None:
+            # Deferred errors must never feed invalid search/index arithmetic;
+            # zero is an admitted time in every validated reference. The block
+            # reports this fault before any optimizer result can be returned.
+            times = torch.where(valid, times, torch.zeros_like(times))
+        key = (times.device, times.dtype)
+        if key not in self._torch_cache:
+            self._torch_cache[key] = (
+                torch.as_tensor(self.times.copy(), dtype=times.dtype, device=times.device),
+                torch.as_tensor(self._curve.c.copy(), dtype=times.dtype, device=times.device))
+        knots, coefficients = self._torch_cache[key]
+        # END each dtype keeps the exact original conversion and operation order.
         indices = torch.searchsorted(knots, times.contiguous(), right=True).clamp(1, len(self.times) - 1) - 1
         offset = (times - knots[indices])[..., None]
         selected = coefficients[:, indices, :]
         q = ((selected[0] * offset + selected[1]) * offset + selected[2]) * offset + selected[3]
         dq = (3 * selected[0] * offset + 2 * selected[1]) * offset + selected[2]
         return q, dq
+
+    # BEGIN budget the planner's float32 and float64 immutable device copies.
+    @property
+    def torch_storage_bytes(self):
+        """Reserve both planning dtypes before lazy polynomial tensor creation."""
+        return (self.times.size + self._curve.c.size) * (4 + 8)
+    # END ordinary CPU serialization does not allocate these device copies.
 
     def describe(self):
         """Serialize owned values; a loader must not generate another curve."""

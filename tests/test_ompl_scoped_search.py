@@ -22,8 +22,41 @@ from manipulation.motion import MotionModel
 from manipulation.planning_problem import (MotionPhase, PlanningProblem,
     CoordinateEventRequirement, MechanismRequirement, PoseEventRequirement, PoseProcessRequirement,
     SupportRequirement)
+from manipulation.planning_scene import PlanningScene
 from tests.test_manipulation_planning_scene import (Attachment, CollisionOwner,
                                                     SphereQuery, pose_path, scene)
+
+
+# BEGIN bind the Cartesian fixture's declared exact sphere geometry explicitly.
+class CartesianSphereScene(PlanningScene):
+    """Source evaluator for this test's analytic sphere bodies only.
+
+    The Cartesian robot and each obstacle are the spheres themselves, not
+    covering approximations to unbound mesh/URDF solids. Reuse their existing
+    distance evaluator and all task/attachment/unknown-space terms. This
+    explicit test adapter cannot be selected by a production scene, and does
+    not return an unconditional free-space result for the source interface.
+    """
+    def __init__(self, source):
+        if (source.gripper is not None or source.contacts or source.robot_validator is not None
+                or any(type(query) is not SphereQuery
+                       for query in (source.background, *(owner.query for owner in source.owners)))):
+            raise ValueError("Cartesian OMPL fixture requires its declared exact sphere bodies")
+        self.__dict__.update(source.__dict__)
+
+    def evaluate_source(self, *args, valid=None, diagnostics=None, components_out=None, **kwargs):
+        if diagnostics is not None:
+            raise ValueError("Cartesian OMPL fixture does not supply production solid reports")
+        terms = self.components(*args, **kwargs)
+        if valid is not None:
+            terms = {name: torch.where(valid, value, torch.zeros_like(value))
+                     for name, value in terms.items()}
+        if components_out is not None:
+            components_out.update(terms)
+        known = [value for name, value in terms.items()
+                 if not name.startswith("unknown/") or name.startswith("unknown/release_anchor/")]
+        return torch.stack(known).sum(0) if known else torch.zeros_like(args[3])
+# END cloned search scenes retain the same analytic source evaluator and history.
 
 
 def cartesian_planner(problem, world=None):
@@ -33,7 +66,9 @@ def cartesian_planner(problem, world=None):
     planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
     planner.budget = PlanningBudget(search_seconds=3., validation_joint_step=.08)
     planner.joint_names = problem.joint_names
-    planner.scene = scene() if world is None else world
+    # BEGIN the synthetic robot supplies its own explicit source-world model.
+    planner.scene = CartesianSphereScene(scene() if world is None else world)
+    # END real planning scenes still require their bound Pinocchio/Coal checker.
     # BEGIN this one-body Cartesian fixture has no source self-collision pair.
     planner.scene.check_robot_self_collision = lambda q, names, times, **kwargs: torch.zeros_like(times)
     # END OMPL still checks every configured task and observed obstacle.

@@ -40,6 +40,7 @@ from .contact_geometry import make_contact_geometry, query_geometry
 # BEGIN all geometry consumers share one complete-body layer selection.
 from .voxel_layers import LayeredVoxelQuery, validate_body_groups
 # END a layer decision is not recomputed from collision costs.
+from .optimizer_device_checks import constant_tensor
 
 
 def _array(value, shape, label):
@@ -56,7 +57,9 @@ def _text(value, label):
 
 
 def _tensor(value, reference):
-    return torch.as_tensor(value, dtype=reference.dtype, device=reference.device)
+    # BEGIN graph-scoped constants use exactly the same as_tensor conversion.
+    return constant_tensor(value, reference)
+    # END eager queries keep their ordinary device-following tensor creation.
 
 
 def _interval(progress, interval):
@@ -147,7 +150,9 @@ def _self_pair_sum(spheres, pair_indices):
     total = spheres.new_zeros(spheres.shape[:2])
     if not len(pair_indices):
         return total
-    pairs = torch.as_tensor(pair_indices, dtype=torch.long, device=spheres.device)
+    # BEGIN keep the original integer pair order without repeated host copies.
+    pairs = constant_tensor(pair_indices, spheres, dtype=torch.long)
+    # END pair chunking and floating-point reduction order remain unchanged.
     step = _self_pair_chunk_size(math.prod(spheres.shape[:2]), len(pairs))
     gradients = torch.is_grad_enabled() and spheres.requires_grad
     for begin in range(0, len(pairs), step):
@@ -321,6 +326,9 @@ class ObservedSpace:
         distance = distance_transform_edt(np.pad(mask, 1), sampling=voxel_size)[1:-1, 1:-1, 1:-1]
         distance = np.maximum(distance - math.sqrt(3) * voxel_size, 0)
         self._distance = torch.from_numpy(distance.astype(np.float32))[None, None]
+        # BEGIN retain immutable observation grids before CUDA graph capture.
+        self._device_distance = {}
+        # END rollout clones share these request-owned, read-only tensors.
         self._shape_xyz = np.array(mask.shape[::-1], float)
         # BEGIN retain exact observation masks for the execution binding.
         self._known = mask.copy()
@@ -357,9 +365,14 @@ class ObservedSpace:
         centre = spheres[..., :3]
         coordinates = (centre - _tensor(self.origin, centre)) / self.voxel_size
         grid = 2 * coordinates / _tensor(self._shape_xyz - 1, centre) - 1
-        values = F.grid_sample(self._distance.to(device=centre.device, dtype=centre.dtype),
+        # BEGIN the same converted grid must outlive every captured query.
+        key = (centre.device, centre.dtype)
+        if key not in self._device_distance:
+            self._device_distance[key] = self._distance.to(device=centre.device, dtype=centre.dtype)
+        values = F.grid_sample(self._device_distance[key],
                                grid.reshape(1, 1, 1, -1, 3), mode="bilinear",
                                padding_mode="zeros", align_corners=True)
+        # END interpolation, input dtype and reduction order are unchanged.
         clearance = values.reshape(spheres.shape[:-1])
         radius = spheres[..., 3]
         return torch.where(radius > 0, torch.relu(radius - clearance), torch.zeros_like(radius))
@@ -823,7 +836,9 @@ class PrismaticGripper:
             if joint_position is None or joint_names is None:
                 raise ValueError("Tracking fingers require actual named solver joints")
             indices = [tuple(joint_names).index(name) for name in self.joint_names]
-            coordinates = joint_position[..., indices]
+            # BEGIN keep named-column indices at stable device addresses.
+            coordinates = joint_position[..., constant_tensor(indices, joint_position, dtype=torch.long)]
+            # END only index storage changes, never its order or selected values.
             # Tracking means a single executable command, not optimizer-selected width.
             violations = violations + torch.relu((upper - lower).abs() - tolerance).sum(-1)
             violations = violations + torch.relu((coordinates - middle).abs() - tolerance).sum(-1)
@@ -851,7 +866,9 @@ class PrismaticGripper:
         radii = local[:, 3] + torch.linalg.vector_norm(displacement, dim=-1)
         transformed = torch.cat((_world_points(centres, position, quaternion), radii[..., None]), -1)
         result = robot_spheres.clone()
-        result[..., list(self.sphere_indices), :] = transformed
+        # BEGIN preserve the original advanced-index update under graph capture.
+        result[..., constant_tensor(list(self.sphere_indices), result, dtype=torch.long), :] = transformed
+        # END no sphere values or replacement order are changed.
         return result
 
 
@@ -957,6 +974,9 @@ class PlanningScene:
         # BEGIN immutable, bounded optimization guidance for the solid oracle.
         self._coverage_geometry = (None if robot_coverage is None else robot_coverage.guidance_geometry())
         self._coverage_samples = ()
+        # BEGIN immutable native-volume guidance grids are shared by scene copies.
+        self._device_coverage_grids = {}
+        # END no per-candidate poses or coverage results enter this cache.
         if robot_coverage is not None:
             # These identical model samples are immutable across every native
             # objective and checkpoint recomputation; select them only once.
@@ -1406,12 +1426,16 @@ class PlanningScene:
                              valid=None, diagnostics=None):
         """Return source-world 0/1 residuals for the complete valid state batch.
 
-        Only the numeric layer arrays are copied once to CPU. Each Coal call
+        All numeric inputs share one masked byte copy to CPU. Each Coal call
         receives a singleton record, so checking H states never decodes an
         H-state base64 payload H times. Diagnostics retain one worst state;
         complete per-pair reports are not accumulated over the trajectory.
+        Fields come from one native state batch on a common device: owner
+        poses and layer choices are produced by this scene's ``components``
+        call with that same batch, before this explicit CPU boundary.
         """
         from .collision_records import encode_array
+        from .tensor_cpu_snapshot import masked_cpu_snapshot
 
         if self.robot_validator is None or self._source_scene_checker is None:
             raise ValueError("Source world acceptance requires the frozen planning scene")
@@ -1425,25 +1449,31 @@ class PlanningScene:
             valid = torch.ones_like(trajectory_time, dtype=torch.bool)
         if valid.shape != trajectory_time.shape or valid.dtype != torch.bool:
             raise ValueError("Source world validity must be an aligned native-state boolean mask")
-        positions = joint_position.detach()[valid].cpu().numpy()
-        times = trajectory_time.detach()[valid].cpu().numpy()
-        progress_values = progress.detach()[valid].cpu().numpy()
-        permission_values = robot_owner_permission_progress.detach()[valid].cpu().numpy()
         # Apply valid before any CPU coordinate or owner-pose query. Native
         # dense-buffer padding is not another physical robot configuration.
         # Fixed native aliases already bind one immutable source pose. A
         # float32 optimizer copy cannot replace that double-precision pose;
         # all moving, attached and released owners use this candidate's pose.
-        owner_values = {identity: (p.detach()[valid].cpu().numpy(), q.detach()[valid].cpu().numpy())
+        # BEGIN pack original fields as bytes; never promote or recompute them.
+        owner_fields = [(identity, p, q)
                         for identity, (p, q) in geometry_query["nominal_owner_poses"].items()
-                        if identity not in self._self_collision_owner_ids}
+                        if identity not in self._self_collision_owner_ids]
+        layer_fields = [(key, selection, (
+            ("body_fine", selection.body_fine),
+            ("influence_aabb_grid_m", selection.influence_aabb),
+            ("index_lower", selection.index_lower), ("index_upper", selection.index_upper)))
+            for key, selection in geometry_query["layer_selection"].items()]
+        fields = [joint_position, trajectory_time, progress, robot_owner_permission_progress]
+        fields.extend(value for _, p, q in owner_fields for value in (p, q))
+        fields.extend(value for _, _, layer in layer_fields for _, value in layer)
+        snapshots = iter(masked_cpu_snapshot(fields, valid))
+        positions, times, progress_values, permission_values = (next(snapshots) for _ in range(4))
+        owner_values = {identity: (next(snapshots), next(snapshots)) for identity, _, _ in owner_fields}
         selected_values = {}
-        for key, selection in geometry_query["layer_selection"].items():
+        for key, selection, layer in layer_fields:
             selected_values[key] = {"body_ids": list(selection.body_ids),
-                **{name: value.detach()[valid].cpu().numpy() for name, value in (
-                    ("body_fine", selection.body_fine),
-                    ("influence_aabb_grid_m", selection.influence_aabb),
-                    ("index_lower", selection.index_lower), ("index_upper", selection.index_upper))}}
+                                   **{name: next(snapshots) for name, _ in layer}}
+        # END one mask gather and one transfer preserve all source query bytes.
         # BEGIN reuse only byte-identical source states within this fixed binding.
         # All fields retain their dtype/shape for this call. In particular time
         # controls the nominal fingers, progress controls material/attachment
@@ -1576,8 +1606,14 @@ class PlanningScene:
             raise ValueError("Native solid guidance requires every actual named body pose")
         solids = self._coverage_geometry["solids"]
         planes = [_tensor(row["baseline_halfspaces_world"], progress) for row in solids]
-        distance_grid = self._free_distance.to(device=progress.device, dtype=progress.dtype)
-        mask_grid = self._free_mask.to(device=progress.device, dtype=progress.dtype)
+        # BEGIN fixed grid transfers happen at warmup, outside captured replay.
+        key = (progress.device, progress.dtype)
+        if key not in self._device_coverage_grids:
+            self._device_coverage_grids[key] = (
+                self._free_distance.to(device=progress.device, dtype=progress.dtype),
+                self._free_mask.to(device=progress.device, dtype=progress.dtype))
+        distance_grid, mask_grid = self._device_coverage_grids[key]
+        # END values and the original grid_sample kernels are preserved exactly.
         origin = _tensor(self.coverage.origin, progress)
         shape = _tensor(self.coverage._shape_xyz, progress)
 
@@ -1717,6 +1753,18 @@ class PlanningScene:
         # Count scalar slots per state as well. This also bounds a stack of
         # one-state OMPL scenes by one equivalent multi-state allocation.
         retained_bytes = batch*horizon*(count*20 + slots*8)
+        # BEGIN fixed group indices have one int64 entry per selected sphere.
+        retained_bytes += sum(size*8 for actor, size in actors.items()
+                              for target, query in targets.items()
+                              if actor != target and isinstance(query, LayeredVoxelQuery))
+        # END graph capture does not rebuild Python-list indices on the device.
+        # BEGIN admit stable finger-polynomial tensors before lazy GPU creation.
+        if self.gripper is not None:
+            finger_models = {id(model): model for model in
+                             (self.gripper.finger_trajectory, self.gripper.nominal_finger_trajectory)
+                             if model is not None}
+            retained_bytes += sum(model.torch_storage_bytes for model in finger_models.values())
+        # END reserve both native planning dtypes without scaling by samples.
         # Native CollisionBuffer owns distance + four-gradient floats (20B).
         # The current graph additionally owns the gradient snapshot (16B),
         # output clone (4B), return_loss backward product (16B), and its scalar
@@ -1726,12 +1774,19 @@ class PlanningScene:
         # BEGIN count only actors that still execute whole-sphere coverage.
         # Native robot-volume coverage replaces that one query in components;
         # moving payloads keep their original unknown-space checks. Retain the
-        # conservative shared-grid allowance and the separate native guidance
-        # storage below. No collision term or allowed volume changes here.
+        # separately counted immutable grids and native guidance scratch
+        # below. No collision term or allowed volume changes here.
         coverage_spheres = sum(size for actor, size in actors.items()
                                if actor != "robot" or self.robot_coverage is None)
-        coverage_bytes = (batch * horizon * coverage_spheres * 128
-                          + (1 + len(actors)) * self.coverage._distance.numel() * 4)
+        coverage_bytes = batch * horizon * coverage_spheres * 128
+        # BEGIN grid sources and lazy device copies remain live across stages.
+        # All rollout clones share these immutable caches. Count each CPU
+        # source plus its single planning-device FP32 copy once, independently
+        # of whether the current stage requests native coverage gradients.
+        shared_grid_bytes = 2*self.coverage._distance.numel()*4
+        if self.robot_coverage is not None:
+            shared_grid_bytes += 2*(self._free_distance.numel()+self._free_mask.numel())*4
+        # END public extra-device/dtype queries are outside this planner budget.
         # END disabled robot sphere queries cannot consume per-state scratch.
         # BEGIN include checkpointed hand-pair scratch and its retained input.
         pair_bytes = 0
@@ -1771,12 +1826,15 @@ class PlanningScene:
             native_coverage_bytes = (plane_elements*8 + chain_bytes
                 + states*(32*32*8 + frames*(32+12*joints)*4)
                 + sum(plane_counts)*24)
-            native_coverage_bytes += self._free_distance.numel()*8
         # BEGIN finite contact witnesses never allocate the raw Cartesian product.
         # BEGIN account once for shared native contact/source-world geometry.
         shared_cpu_bytes = layer_bytes+sum(layer.storage_bytes
             for value in self._contact_cells.values()
             for layer in (value.layers.values() if hasattr(value, "layers") else (value,)))
+        # BEGIN native self-distance batches own separate resettable solvers.
+        if self.robot_validator is not None:
+            shared_cpu_bytes += self.robot_validator.checker.native_query_storage_nbytes
+        # END the source-scene checker's own cache is included in its scene size.
         source_query_bytes = 0
         if self._source_scene_checker is not None:
             shared_cpu_bytes += self._source_scene_checker.scene_storage_nbytes
@@ -1799,11 +1857,18 @@ class PlanningScene:
         # source_input_bytes already bounds the numeric payload per field.
         # Owners/layers excluded by the query only make this an overestimate.
         source_dedup_bytes = 0
+        source_transfer_bytes = 0
         if self.robot_validator is not None and self._source_scene_checker is not None:
             layer_pairs = sum(actor != target and isinstance(query, LayeredVoxelQuery)
                               for actor in actors for target, query in targets.items())
             fields = 4 + 2*len(self.owners) + 4*layer_pairs
             source_dedup_bytes = source_input_bytes + batch*horizon*(512 + 64*fields)
+            # BEGIN pack raw fields once before the single selected-state copy.
+            # This is additional to the original GPU/CPU field payload above;
+            # one full packed table and one int64 index per state can coexist
+            # while the filtered bytes and original field owners are live.
+            source_transfer_bytes = source_input_bytes + batch*horizon*9
+            # END no assumed duplicate/padded-state ratio reduces admission.
         # END accounting does not assume that three-mode probes will coincide.
         contact_bytes = (sum(value.workspace_bytes() for value in self._contact_cells.values())
                          + (batch*horizon*len(self.robot_sphere_materials)*64 if self._contact_cells else 0))
@@ -1811,8 +1876,8 @@ class PlanningScene:
         # END CPU neighbor lists separately obey a two-million-pair admission cap.
         return {"retained": int(retained_bytes),
                 "live": int(query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes+contact_bytes+layer_bytes+layer_scratch
-                            +source_input_bytes+source_query_bytes+source_dedup_bytes),
-                "shared_cpu": int(shared_cpu_bytes)}
+                            +source_input_bytes+source_query_bytes+source_dedup_bytes+source_transfer_bytes),
+                "shared_cpu": int(shared_cpu_bytes), "shared_grids": int(shared_grid_bytes)}
         # END source scene snapshots are not multiplied by the rollout count.
         # END include checkpointed hand-pair scratch and its retained input.
 
@@ -1837,6 +1902,9 @@ class PlanningScene:
         indices = [tuple(joint_names).index(name) for name in hand.joint_names]
         lower, upper = hand.joint_bounds(progress)
         command = (lower + upper) / 2
+        # BEGIN graph-scoped integer columns retain the native joint order.
+        indices = constant_tensor(indices, joint_position, dtype=torch.long)
+        # END CPU projection continues to use the original as_tensor conversion.
         return ((joint_position[..., indices] - command)
                 @ _tensor(hand._drive_basis.T, joint_position))
 
@@ -1981,9 +2049,15 @@ class PlanningScene:
             values = owner.query(local, key=("robot", owner.owner_id))
             if owner.robot_excluded_spheres:
                 enabled = values.new_ones(values.shape[-1])
-                enabled[list(owner.robot_excluded_spheres)] = 0
+                # BEGIN index_fill uses a device kernel, without a scalar H2D copy.
+                enabled.index_fill_(0, constant_tensor(list(owner.robot_excluded_spheres),
+                    spheres, dtype=torch.long), 0)
+                # END writing zero leaves every subsequent floating operation intact.
                 values = values * enabled
-            total = total + torch.where(uncertain, values[..., known_indices].sum(-1), values.sum(-1))
+            # BEGIN constant indices do not reorder either original sum.
+            known = constant_tensor(known_indices, values, dtype=torch.long)
+            total = total + torch.where(uncertain, values[..., known].sum(-1), values.sum(-1))
+            # END only the integer index allocation is retained across replay.
         return total
     # END no sphere self term is added to a hard scene constraint below.
 
@@ -2065,11 +2139,15 @@ class PlanningScene:
                 # END the known/unknown partition below still applies to owners.
         def collision_terms(values, key, actor):
             if actor == "robot" and uncertain_indices:
-                unresolved = values[..., uncertain_indices].sum(-1) * uncertain_hand
+                # BEGIN graph-safe original known/unknown column partitions.
+                uncertain_columns = constant_tensor(uncertain_indices, values, dtype=torch.long)
+                known_columns = constant_tensor(known_indices, values, dtype=torch.long)
+                unresolved = values[..., uncertain_columns].sum(-1) * uncertain_hand
                 costs["unknown/" + key] = unresolved
                 # BEGIN preserve known per-sphere values before any reduction.
                 # No tolerance or clamp may hide a true positive component.
-                known = values[..., known_indices].sum(-1)
+                known = values[..., known_columns].sum(-1)
+                # END each original floating reduction sees the same ordered slice.
                 costs[key] = torch.where(uncertain_hand, known, values.sum(-1))
                 # END initial measured fingers retain their full query values.
             else:
@@ -2197,7 +2275,12 @@ class PlanningScene:
                 # END other materials/owners retain their original full query.
                 if actor == "robot" and owner.robot_excluded_spheres:
                     enabled = values.new_ones(values.shape[-1])
-                    enabled[list(owner.robot_excluded_spheres)] = 0
+                    # BEGIN integer mask indices are model constants.
+                    # BEGIN preserve the mask while avoiding indexed scalar H2D allocation.
+                    enabled.index_fill_(0, constant_tensor(list(owner.robot_excluded_spheres),
+                        spheres, dtype=torch.long), 0)
+                    # END no floating arithmetic is reordered by this mask fill.
+                    # END enabled values retain the same masked sphere policy.
                     values = values * enabled
                 # BEGIN nominal arrival permits only the selected robot/owner pairs.
                 if actor == "robot":
@@ -2205,7 +2288,12 @@ class PlanningScene:
                         if rule.target_owner != owner.owner_id:
                             continue
                         selected = torch.zeros(values.shape[-1], dtype=torch.bool, device=values.device)
-                        selected[list(rule.sphere_indices)] = True
+                        # BEGIN retain the original permission mask indices.
+                        # BEGIN capture-safe write of the original boolean permission mask.
+                        selected.index_fill_(0, constant_tensor(list(rule.sphere_indices),
+                            spheres, dtype=torch.long), True)
+                        # END selected sphere order and policy values are unchanged.
+                        # END permission predicates and geometry are unchanged.
                         permitted = _interval(permission_progress, rule.interval).unsqueeze(-1) & selected
                         values = torch.where(permitted, torch.zeros_like(values), values)
                 # END background, other owners, robot self pairs and raw queries are unchanged.
@@ -2294,7 +2382,10 @@ class PlanningScene:
             raise ValueError("Tracking command shape must match progress and native fingers")
         indices = [tuple(joint_names).index(name) for name in hand.joint_names]
         command = (lower+upper)/2  # Same single-command contract as hand.state().
+        # BEGIN use the same ordered integer columns without host transfer in replay.
+        indices = constant_tensor(indices, joint_position, dtype=torch.long)
         return ((joint_position[..., indices]-command)**2).sum(-1)
+        # END the preference's square and sum are not fused or rearranged.
     # END optimize toward an actual tracking command inside its numerical band.
 
     # BEGIN exact bounded scene inputs for independent execution review.

@@ -6,9 +6,11 @@ import unittest
 import numpy as np
 from scipy.interpolate import BSpline, PPoly
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from manipulation.physical_joint_domain import (CubicJointDomain, JointPositionDomain,
                                                 JointDomainInitializationError)
+from manipulation.optimizer_device_checks import DeviceChecks
 
 
 class PhysicalJointDomainTest(unittest.TestCase):
@@ -80,6 +82,38 @@ class PhysicalJointDomainTest(unittest.TestCase):
         step = domain.limit_step(base, torch.tensor([[[5., -5.]]]), scales)
         self.assertTrue(bool(domain.feasible(base[:, None]+scales*step[:, None]).all()))
         self.assertGreater(float(step[0, 0, 0]), 0.)
+
+    # BEGIN enforce device-only arithmetic without needing a CUDA allocation.
+    def test_tensor_step_map_never_extracts_a_python_scalar(self):
+        class RejectScalarRead(TorchDispatchMode):
+            def __torch_dispatch__(self, operation, types, args=(), kwargs=None):
+                if operation is torch.ops.aten._local_scalar_dense.default:
+                    raise AssertionError("A tensor step read a host scalar")
+                return operation(*args, **(kwargs or {}))
+
+        domain = self.domain(q=.2, dq=.1)
+        base = torch.full((2, 8, 1), .2)
+        direction = torch.tensor([4., float("nan")]).reshape(2, 1, 1).expand_as(base)
+        scales = torch.tensor([0., .1, .5, 1.]).reshape(1, 4, 1, 1)
+        with RejectScalarRead():
+            limited = domain.limit_step_tensor(base, direction, scales)
+        self.assertTrue(bool(domain.feasible(base[:, None]+scales*limited[:, None]).all()))
+        self.assertTrue(torch.equal(limited[1], torch.zeros_like(limited[1])))
+
+    def test_public_validation_stays_strict_and_scoped_faults_keep_error_type(self):
+        domain = self.domain()
+        bad = torch.full((1, 8, 1), 3.)
+        with self.assertRaises(JointDomainInitializationError):
+            domain.validate(bad)
+        checks = DeviceChecks("cpu")
+        with checks.scope():
+            predicate = domain.validate(bad)
+        self.assertEqual(predicate.dtype, torch.bool)
+        with self.assertRaises(JointDomainInitializationError):
+            checks.raise_if_failed()
+        checks.reset()
+        checks.raise_if_failed()
+    # END no GPU context is initialized by this regression suite.
 
 
 if __name__ == '__main__':

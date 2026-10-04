@@ -1,6 +1,7 @@
 """Exercise FUNCTO composition using native CPU L-BFGS and goal allocation."""
 
 # BEGIN regression coverage for the behavior moved out of third-party source.
+from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -105,6 +106,146 @@ class NativeComponentTest(unittest.TestCase):
         manager = owned.core.goal_registry_manager
         bind_solver_components(owned, domain)
         self.assertIs(owned.core.goal_registry_manager, manager)
+
+    # BEGIN exercise capture lifecycle and fail-closed behavior on CPU tensors.
+    def test_deferred_bad_iteration_only_constructs_legal_search_points(self):
+        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        seed = torch.full((1, 1, 2), .4)
+        core._prepare_solve(seed)
+        checks = core._device_checks
+        with checks.scope():
+            points, _ = core._line_search_strategy._prepare_search_points(
+                torch.zeros_like(seed), torch.ones_like(seed), core._line_search_context)
+        domain.validate(points.reshape(1, 3, 1, 2))
+        with self.assertRaises(JointDomainInitializationError):
+            checks.raise_if_failed()
+
+    def test_capture_warmup_restores_history_and_clears_only_warmup_faults(self):
+        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        records = core._capture_state()
+
+        class MutatingExecutor:
+            is_initialized = False
+
+            def warmup(self, *args):
+                self._graph_input = tuple(value.clone() for value in args)
+                for _, _, tensor, _ in records:
+                    tensor.fill_(1)
+                domain.validate(torch.zeros((1, 1, 2)))
+                self.is_initialized = True
+
+            def __call__(self, value):
+                for _, _, tensor, saved in records:
+                    assert torch.equal(tensor, saved), "Warmup changed native closure state"
+                return value
+
+            def reset(self):
+                self.is_initialized = False
+
+        executor = MutatingExecutor()
+        core._executors["_opt_step"] = executor
+        core.use_cuda_graph = True
+        value = core._create_initial_iteration_state(torch.full((1, 1, 2), .4))
+        with patch("torch.cuda.memory_allocated", return_value=0):
+            result = core._dispatch("_opt_iters", value)
+        self.assertTrue(torch.equal(result.action, value.action))
+        # The native executor's action-pointer shortcut misses this changed
+        # field. The owned dispatch must copy it even though action aliases.
+        changed = replace(result, step_direction=torch.full_like(result.step_direction, .25))
+        replayed = core._dispatch("_opt_iters", changed)
+        self.assertTrue(torch.equal(replayed.step_direction, changed.step_direction))
+        self.assertTrue(executor.is_initialized)
+        core.bind_domain(domain)
+        self.assertFalse(executor.is_initialized)
+
+    def test_step_replays_keep_faults_until_one_original_block_check(self):
+        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+
+        class FaultingExecutor:
+            is_initialized = False
+            calls = 0
+
+            def warmup(self, value):
+                self._graph_input = (value.clone(),)
+                self.is_initialized = True
+
+            def __call__(self, value):
+                self.calls += 1
+                # The later legal replay must not clear an earlier fault.
+                domain.validate(torch.full_like(value.action, 0. if self.calls == 1 else .4))
+                return value
+
+            def reset(self):
+                self.is_initialized = False
+
+        executor = FaultingExecutor()
+        core._executors["_opt_step"] = executor
+        core.use_cuda_graph = True
+        value = core._create_initial_iteration_state(torch.full((1, 1, 2), .4))
+        with patch("torch.cuda.memory_allocated", return_value=0), \
+                patch.object(core._device_checks, "raise_if_failed",
+                             wraps=core._device_checks.raise_if_failed) as host_check:
+            with self.assertRaises(JointDomainInitializationError):
+                core._dispatch("_opt_iters", value)
+            self.assertEqual(executor.calls, core.config.inner_iters)
+            self.assertEqual(host_check.call_count, 1)
+            core._dispatch("_opt_iters", value)
+            self.assertEqual(executor.calls, 2*core.config.inner_iters)
+            self.assertEqual(host_check.call_count, 2)
+
+    def test_explicit_graph_request_rejects_cpu_without_changing_backend(self):
+        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        original = optimizer._core
+        with self.assertRaisesRegex(ValueError, "native CUDA L-BFGS"):
+            bind_solver_components(solver, domain, use_optimizer_graph=True)
+        self.assertIs(optimizer._core, original)
+
+    def test_native_shift_keeps_buffers_and_shape_reset_invalidates_graph(self):
+        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
+        solver, optimizer, rollouts = self.make_solver(domain, 4)
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        cached = core._create_initial_iteration_state(torch.full((1, 4, 2), .4))
+        core._iteration_state = cached
+        history = optimizer._qn.s
+
+        class CapturedExecutor:
+            is_initialized = True
+
+            def reset(self):
+                self.is_initialized = False
+
+        executor = CapturedExecutor()
+        core._executors["_opt_step"] = executor
+        core.use_cuda_graph = True
+        optimizer.shift(0)
+        self.assertTrue(executor.is_initialized)
+        optimizer.shift(1)
+        # The installed shift helper copies into its inputs before returning
+        # the same tensors; its tuple assignment does not replace storage.
+        self.assertTrue(executor.is_initialized)
+        self.assertIs(optimizer._qn.s, history)
+        self.assertIs(core._iteration_state, cached)
+
+        resets = []
+        for index, rollout in enumerate(rollouts):
+            rollout.reset_shape = lambda index=index: resets.append(index)
+        executor.is_initialized = True
+        core.reset_shape()
+        self.assertFalse(executor.is_initialized)
+        self.assertEqual(resets, list(range(len(rollouts))))
+        self.assertIs(core._iteration_state, cached)
+    # END production CUDA capture itself is checked by a separate bounded probe.
 
     def goal(self, count, value):
         return GoalToolPose(tool_frames=["tool"],

@@ -13,6 +13,10 @@ import torch
 from scipy.interpolate import BSpline, CubicHermiteSpline, PPoly
 from scipy.optimize import linprog
 
+# BEGIN a graph scope records errors without changing any domain arithmetic.
+from .optimizer_device_checks import require_tensor
+# END public calls outside an optimizer graph still raise synchronously.
+
 
 class JointDomainInitializationError(ValueError):
     """A bounded initializer construction failed for the unchanged actual."""
@@ -52,9 +56,23 @@ class JointPositionDomain:
         values = action.to(torch.float64)
         return (torch.isfinite(values) & (values >= self.lower) & (values <= self.upper)).all(dim=(-1, -2))
 
-    def validate(self, action: torch.Tensor) -> None:
-        if not bool(self.feasible(action).all()):
-            raise JointDomainInitializationError("An optimizer action left the physical joint domain")
+    # BEGIN keep host validation separate from the unchanged tensor step map.
+    def validate(self, action: torch.Tensor) -> torch.Tensor | None:
+        """Raise outside a graph; return a recorded predicate inside its scope.
+
+        Graph callers must use the predicate to isolate invalid actions before
+        a rollout. Recording an error alone would still let a captured kernel
+        consume that action before the enclosing block reports the failure.
+        """
+        return require_tensor(self.feasible(action).all(),
+            "An optimizer action left the physical joint domain",
+            error_type=JointDomainInitializationError)
+
+    @staticmethod
+    def validate_scales(scales: torch.Tensor) -> None:
+        """Validate the fixed native line-search multipliers outside capture."""
+        require_tensor(torch.isfinite(scales).all() & (scales >= 0).all(),
+            "A domain-restricted line search needs finite nonnegative scales")
 
     def limit_step(self, base: torch.Tensor, step: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """Shorten one direction before constructing any native trial action.
@@ -65,8 +83,21 @@ class JointPositionDomain:
         handles rounding at a physical boundary without widening that domain.
         """
         self.validate(base)
-        if not bool(torch.isfinite(scales).all() & (scales >= 0).all()):
-            raise ValueError("A domain-restricted line search needs finite nonnegative scales")
+        self.validate_scales(scales)
+        limited = self.limit_step_tensor(base, step, scales)
+        self.validate(base[:, None]+scales*limited[:, None])
+        return limited
+
+    def limit_step_tensor(self, base: torch.Tensor, step: torch.Tensor,
+                          scales: torch.Tensor) -> torch.Tensor:
+        """Apply the original step map to an already validated base/scales.
+
+        Every operation, bracket, dtype and reduction below is retained from
+        the strict wrapper's original implementation. This is deliberately
+        ordinary Torch, with no new tracing, compilation, fusion or reduction
+        rewrite. The optimizer separately records/checks the resulting trial
+        predicate before calling either native rollout.
+        """
         finite = torch.isfinite(step).all(dim=(-1, -2), keepdim=True)
         step = torch.where(finite, step, torch.zeros_like(step))
         maximum = scales.max()
@@ -90,8 +121,8 @@ class JointPositionDomain:
         trials = base[:, None]+scales*limited[:, None]
         passed = self.feasible(trials).all(dim=1)[:, None, None]
         limited = torch.where(passed, limited, torch.zeros_like(limited))
-        self.validate(base[:, None]+scales*limited[:, None])
         return limited
+    # END no initial/control coordinate or physical bound is projected/clipped.
 
 
 class CubicJointDomain(JointPositionDomain):

@@ -53,17 +53,22 @@ def run(args):
     # Only these declared counts enter the allocation expression. Their
     # placeholders are never submitted to any geometric query or optimizer.
     allocation_scene = copy(scene)
-    allocation_scene.owners = tuple(SimpleNamespace(moving=False) for _ in range(args.static_owners))
-    allocation_scene.gripper = SimpleNamespace(self_collision_pairs=range(args.hand_pairs))
+    # BEGIN declare every field consumed by current allocation accounting.
+    allocation_scene.owners = tuple(SimpleNamespace(moving=False, owner_id=f"static-{index}", query=None)
+                                    for index in range(args.static_owners))
+    allocation_scene.gripper = SimpleNamespace(self_collision_pairs=range(args.hand_pairs),
+        finger_trajectory=None, nominal_finger_trajectory=None)
+    # END these metadata placeholders still never enter geometric evaluation.
     budget = PlanningBudget(**audit["unchanged_budget"])
-    scene_bytes, fk_bytes = _planning_workspace_bytes(allocation_scene, audit["robot_metadata"],
-                                                    budget, audit["reserved_anchor_capacity"])
+    scene_bytes, fk_bytes, trajectory_graph = _planning_workspace_bytes(
+        allocation_scene, audit["robot_metadata"], budget, audit["reserved_anchor_capacity"])
     report = {"scope": __doc__, "fixture": str(args.fixture.resolve()),
         "feedback": str(args.feedback.resolve()), "observed_free": str(args.observed_free.resolve()),
         "gpu_used": not args.cpu_only, "coverage_queries": 0,
         "solid_plane_counts": counts, "solid_sample_counts": [len(p) for p in scene._coverage_samples],
         "grid_shape": list(coverage.known_free.shape), "static_owner_count": args.static_owners,
         "hand_pair_count": args.hand_pairs, "scene_workspace_bytes": scene_bytes,
+        "trajectory_optimizer_graph_admitted": trajectory_graph,
         "scene_workspace_mib": scene_bytes/1024**2, "anchor_fk_bytes": fk_bytes,
         "scene_limit_bytes": budget.max_scene_workspace_bytes, "methods": {}}
     if not args.cpu_only:
