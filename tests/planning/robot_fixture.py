@@ -22,6 +22,7 @@ from mpmath.ctx_iv import MPIntervalContext
 import mujoco
 import numpy as np
 from scipy.cluster.vq import kmeans2
+from scipy.optimize import minimize
 from scipy.spatial import ConvexHull, HalfspaceIntersection
 from scipy.spatial.transform import Rotation
 from scipy.stats import qmc
@@ -96,6 +97,77 @@ def _cover_cells(vertices, *, count=None, box_halfsize=None, subdivisions=None):
     return cells, sites
 
 
+# BEGIN fit complete convex cells against the native mesh rather than ball size.
+def _fit_cell_sphere_center(vertices, planes):
+    """Minimize the maximum outward native support-plane excess of a ball.
+
+    The convex program is min t subject to ||c-v|| <= r for EVERY cell vertex
+    and n.c+d+r <= t for EVERY normalized native hull plane. A smaller radius
+    alone need not reduce false collisions: moving a center inward can admit
+    a larger ball whose exterior follows the native solid more closely.
+
+    Trimesh supplies only a feasible initial center, never an optimality or
+    coverage certificate. SciPy solves a unit-scaled five-variable problem;
+    explicit norm/plane constraints and objective checks accompany its status.
+    The caller recomputes coverage after float32 serialization. This directional
+    plane-excess objective is NOT a Euclidean Hausdorff error bound.
+    """
+    vertices, planes = np.asarray(vertices, float), np.asarray(planes, float)
+    if (vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 4
+            or planes.ndim != 2 or planes.shape[1] != 4 or not len(planes)
+            or not np.isfinite(vertices).all() or not np.isfinite(planes).all()):
+        raise ValueError("Native sphere fit requires finite convex vertices and planes")
+    lengths = np.linalg.norm(planes[:, :3], axis=1)
+    if np.any(lengths <= 0):
+        raise ValueError("Native sphere fit requires nonzero support-plane normals")
+    planes = planes / lengths[:, None]
+    origin = vertices.mean(0)
+    scale = float(np.linalg.norm(np.ptp(vertices, axis=0)))
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Native sphere fit requires a nondegenerate convex cell")
+    points = (vertices-origin)/scale
+    normals = planes[:, :3]
+    constants = (normals @ origin+planes[:, 3])/scale
+    initial_center, _ = trimesh.nsphere.minimum_nsphere(vertices)
+    initial_center = (initial_center-origin)/scale
+    initial_radius = float(np.linalg.norm(points-initial_center, axis=1).max())
+    initial_excess = float((normals @ initial_center+constants+initial_radius).max())
+    initial = np.r_[initial_center, initial_radius, initial_excess]
+
+    def constraints(value):
+        return np.r_[value[3]-np.linalg.norm(points-value[:3], axis=1),
+                     value[4]-normals @ value[:3]-constants-value[3]]
+
+    def jacobian(value):
+        delta = points-value[:3]
+        distance = np.linalg.norm(delta, axis=1)
+        if np.any(distance <= 1e-12):
+            raise ValueError("Native sphere fit encountered an undefined norm gradient")
+        return np.vstack((
+            np.column_stack((delta/distance[:, None], np.ones(len(points)), np.zeros(len(points)))),
+            np.column_stack((-normals, -np.ones(len(normals)), np.ones(len(normals))))))
+
+    fitted = minimize(lambda value: value[4], initial,
+        jac=lambda value: np.array([0., 0., 0., 0., 1.]), method="SLSQP",
+        constraints=[{"type": "ineq", "fun": constraints, "jac": jacobian}],
+        options={"maxiter": 200, "ftol": 1e-11, "disp": False})
+    if not fitted.success or not np.isfinite(fitted.x).all():
+        raise ValueError(f"Native support-plane sphere fit failed: {fitted.message}")
+    residual = float(constraints(fitted.x).min())
+    # Recompute the actual covering radius; r/t returned by an optimizer never
+    # establish either containment or objective improvement on their own.
+    covering_radius = float(np.linalg.norm(points-fitted.x[:3], axis=1).max())
+    measured_excess = float((normals @ fitted.x[:3]+constants+covering_radius).max())
+    if residual < -1e-7 or measured_excess > initial_excess+1e-7:
+        raise ValueError("Native sphere fit failed its independent feasibility/objective check")
+    return fitted.x[:3]*scale+origin, {
+        "constraint_violation_m": max(0., -residual)*scale,
+        "initial_support_plane_excess_m": initial_excess*scale,
+        "fitted_support_plane_excess_m": measured_excess*scale,
+    }
+# END no pose, obstacle, task name or fallback participates in fitting.
+
+
 def _geom_cover(model, geom_id, specification, destination):
     geometry = _collision_geometry(model, geom_id, "native_collision_proxy")
     # BEGIN preserve the native geom transform and reproducible partition input.
@@ -108,10 +180,20 @@ def _geom_cover(model, geom_id, specification, destination):
         count=specification.get("cells"),
         box_halfsize=model.geom_size[geom_id] if is_box else None,
         subdivisions=specification.get("subdivisions"))
-    spheres, proof_vertices, offsets, margins = [], [], [0], []
+    # BEGIN transform original native hull planes metrically before cell fits.
+    planes = geometry["halfspaces"]
+    normals_body = np.linalg.solve(local[:3, :3].T, planes[:, :3].T).T
+    normal_lengths = np.linalg.norm(normals_body, axis=1)
+    offsets_body = planes[:, 3]-normals_body @ local[:3, 3]
+    body_planes = np.column_stack((normals_body, offsets_body))/normal_lengths[:, None]
+    spheres, proof_vertices, offsets, margins, fitting = [], [], [0], [], []
+    # END original transforms, including native matrix scale, remain explicit.
     for cell in cells:
         body_vertices = cell @ local[:3, :3].T + local[:3, 3]
-        center, _ = trimesh.nsphere.minimum_nsphere(body_vertices)
+        # BEGIN replace minimum-radius acceptance with a checked mesh fit.
+        center, fit = _fit_cell_sphere_center(body_vertices, body_planes)
+        fitting.append(fit)
+        # END coverage below remains independent of the optimizer's radius.
         # cuRobo consumes float32. Recompute and round the radius outward AFTER
         # rounding the serialized center, retaining a 1 micrometre allowance.
         center = np.asarray(center, dtype=np.float32).astype(float)
@@ -123,11 +205,7 @@ def _geom_cover(model, geom_id, specification, destination):
         margins.append(radius - distances.max())
     centers = np.asarray([sphere["center"] for sphere in spheres])
     radii = np.asarray([sphere["radius"] for sphere in spheres])
-    planes = geometry["halfspaces"]
     # BEGIN evaluate metric body-space support planes under the native matrix.
-    normals_body = np.linalg.solve(local[:3, :3].T, planes[:, :3].T).T
-    normal_lengths = np.linalg.norm(normals_body, axis=1)
-    offsets_body = planes[:, 3]-normals_body @ local[:3, 3]
     excess = (centers @ normals_body.T + offsets_body) / normal_lengths + radii[:, None]
     # END evaluate metric body-space support planes under the native matrix.
     np.savez_compressed(destination, native_vertices=geometry["vertices"],
@@ -144,6 +222,15 @@ def _geom_cover(model, geom_id, specification, destination):
               # END record the exact current partition input for independent reload.
               "minimum_cell_enclosure_margin_m": float(min(margins)),
               "maximum_support_plane_excess_m": float(excess.max()),
+              # BEGIN record independent fit checks without a sampled-coverage claim.
+              "sphere_fit_method": "minimum_maximum_native_support_plane_excess",
+              "sphere_fit_maximum_constraint_violation_m": max(
+                  row["constraint_violation_m"] for row in fitting),
+              "sphere_fit_maximum_objective_increase_m": max(
+                  row["fitted_support_plane_excess_m"]-row["initial_support_plane_excess_m"]
+                  for row in fitting),
+              "support_plane_excess_scope": "Directional hull-plane statistic, not a Euclidean Hausdorff bound",
+              # END final serialized containment is proved by all cell vertices.
               "source_contype": int(model.geom_contype[geom_id]),
               "source_conaffinity": int(model.geom_conaffinity[geom_id]),
               "scope": "collision proxy only; not RGB-D occupied-solid evidence"}
