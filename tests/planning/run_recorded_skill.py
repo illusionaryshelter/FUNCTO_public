@@ -253,7 +253,7 @@ def run(args):
         if not torch.cuda.is_available():
             raise RuntimeError("This explicit local planner test requires CUDA access")
         # BEGIN expose the production scene budget without raising Torch limits.
-        if args.torch_memory_mib not in (2048, 4096) or args.scene_workspace_mib not in (1024, 2048, 3072):
+        if args.torch_memory_mib not in (2048, 4096) or args.scene_workspace_mib not in (1024, 2048, 3072, 6144):
             raise ValueError("Use only the explicitly bounded local Torch and scene allocations")
         # END process-tree and device-growth guards remain separate run limits.
         torch.set_num_threads(2)
@@ -578,8 +578,10 @@ if __name__ == "__main__":
     parser.add_argument("--maximum-trajectory-solves", type=int, default=2)
     parser.add_argument("--planning-seconds", type=float, default=120.)
     # END the production PlanningBudget and ledger checks validate these inputs.
-    # BEGIN explicit larger scene storage shares the production three-GiB cap.
-    parser.add_argument("--scene-workspace-mib", type=int, choices=(1024, 2048, 3072), default=1024)
+    # BEGIN explicit larger scene storage shares the production six-GiB cap.
+    # BEGIN explicit shared CPU cache capacity remains separate from Torch's cap.
+    parser.add_argument("--scene-workspace-mib", type=int, choices=(1024, 2048, 3072, 6144), default=1024)
+    # END the default allocation request and all geometric checks remain unchanged.
     # END the default allocation remains unchanged.
     parser.add_argument("--torch-memory-mib", type=int, choices=(2048, 4096), default=2048)
     # BEGIN opt-in host profiling covers preparation, planning and persistence.

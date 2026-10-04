@@ -107,6 +107,18 @@ def test_empty_inventory_has_no_filter_or_collision_candidates():
     assert list(empty.iter_collision_components()) == []
 
 
+# BEGIN budget large inventories without allocating their native shapes.
+@pytest.mark.parametrize("count,expected_capacity", ((16385, 16385), (262145, 262144)))
+def test_snapshot_cache_reserve_covers_inventory_up_to_the_finite_cap(count, expected_capacity):
+    record = component_record((), cells=np.arange(count, dtype=np.int64))
+    record["shape_xyz"] = [count + 1, 2, 2]
+    target = ObservedTsdfGeometry(record)
+    assert target._collision_cache_capacity == expected_capacity
+    assert target.storage_nbytes >= expected_capacity * 4096
+    assert not target._collision_cache  # Pre-admission reserves are not eager Coal allocations.
+# END oversized inventories keep bounded residency and the normal eviction path.
+
+
 def test_cache_reuses_only_local_geometry_and_keeps_reserved_storage_constant(geometry, monkeypatch):
     calls = []
 

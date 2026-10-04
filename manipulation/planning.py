@@ -141,13 +141,13 @@ class PlanningBudget:
         # END bound optional samples without capping a skill's source knots.
         # BEGIN admit explicit TSDF scene storage within bounded local resources.
         # The default remains one GiB. This bound includes shared CPU TSDF
-        # records/BVHs as well as query tensors, so a two-GiB ceiling can reject
-        # a request whose actual device usage remains small. Three GiB still
-        # leaves the separate two-GiB native reserve below the six-GiB local
-        # device target. Actual-device/anchor checks and external process
-        # memory guards remain mandatory; this bound is not a total-RSS cap.
-        if type(self.max_scene_workspace_bytes) is not int or not 0 <= self.max_scene_workspace_bytes <= 3*1024**3:
-            raise ValueError("Scene workspaces must remain within the local three-GiB allocation budget")
+        # records/BVHs and bounded native-component caches as well as query
+        # tensors. The explicit six-GiB allowance accommodates those shared
+        # CPU allocations; it is not a device-usage or total-RSS cap. The
+        # separate native reserve, actual-device/anchor admission and external
+        # process guards remain mandatory. Default callers still request 1 GiB.
+        if type(self.max_scene_workspace_bytes) is not int or not 0 <= self.max_scene_workspace_bytes <= 6*1024**3:
+            raise ValueError("Scene workspaces must remain within the local six-GiB allocation budget")
         # END no query geometry, sample count or collision threshold changes.
         for name in ("interpolation_dt", "maximum_trajectory_dt", "constraint_weight", "validation_joint_step",
                      "validation_spatial_step_m", "planning_seconds"):

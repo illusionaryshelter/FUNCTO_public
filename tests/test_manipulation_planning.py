@@ -2024,10 +2024,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
     def test_scene_budget_and_removed_legacy_parameter_remain_strict(self):
         # BEGIN explicit TSDF storage capacity does not weaken workspace admission.
         self.assertEqual(PlanningBudget().max_scene_workspace_bytes, 1024**3)
-        self.assertEqual(PlanningBudget(max_scene_workspace_bytes=3*1024**3).max_scene_workspace_bytes,
-                         3*1024**3)
-        with self.assertRaisesRegex(ValueError, "three-GiB allocation budget"):
-            PlanningBudget(max_scene_workspace_bytes=3*1024**3+1)
+        self.assertEqual(PlanningBudget(max_scene_workspace_bytes=6*1024**3).max_scene_workspace_bytes,
+                         6*1024**3)
+        with self.assertRaisesRegex(ValueError, "six-GiB allocation budget"):
+            PlanningBudget(max_scene_workspace_bytes=6*1024**3+1)
         # END requests above the local ceiling still fail before allocations.
         scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
                                 {"retained": 1024**3, "live": 0, "shared_cpu": 0})

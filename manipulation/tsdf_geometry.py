@@ -343,7 +343,10 @@ class ObservedTsdfGeometry:
         # which reads storage_nbytes only once. A component has at most eight
         # vertices; 4 KiB covers its small native hull/BVH, arrays and Python
         # bookkeeping conservatively. Current world poses/results stay outside.
-        self._collision_cache_capacity = min(16384, sum(self._counts))
+        # The finite cap admits complete medium-sized snapshots when callers
+        # explicitly supply the larger scene-memory budget. Larger inventories
+        # still use the same bounded eviction path and exact reconstruction.
+        self._collision_cache_capacity = min(262144, sum(self._counts))
         self._collision_cache = OrderedDict()
         self.storage_nbytes += self._collision_cache_capacity * 4096
         # END cache residency is bounded independently of trajectory length.
