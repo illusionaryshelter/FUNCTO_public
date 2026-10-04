@@ -1,327 +1,415 @@
-我建议把方案收敛成：
+- 这批信息已经足够让我把问题进一步收敛成 **3 个已证实问题 + 1 个高优先级待确认问题**。现在看起来，不是 skill 本身在“泛化后失效”，而是规划链里几种不同近似的边界条件叠加后，把本来有可行空间的问题变成了拒绝。
 
-> **演示提供抓持目标和运动初始解；cuRobo 负责求解与时间处理；需要时 OMPL 提供另一条路径初始解；Pinocchio＋Coal 负责一致的几何验证。全部使用固定的后端配置，不按 skill 调权重、距离或接入点。**
+  ## 一、已经能确认：自碰撞存在“软优化、硬验证”的语义错配
 
-这里有真实可调用的接口，不需要另写一个新的轨迹优化算法。
+  你的自碰撞例子现在非常清楚。
 
-------
+  优化阶段对同一个球对看到的是
 
-## 1. 先划清“不调参”的含义
+  \[ D=9.669724\times 10^{-6}\ {\rm m}^2 \]
 
-**可以做到：新增 `grasp_mug`、`grasp_bowl` 等技能时，不修改后端参数、不新增动作名称分支。**
+  以及
 
-不能诚实地承诺：数值系统完全没有容差、采样分辨率、规划预算和机器人速度限制。它们是机器人与求解器配置，不是技能模板。
+  \[ z_{\rm opt} = \frac12\cdot2500\cdot D \approx0.01209. \]
 
-两者应当严格分离：
+  其中：
 
-| 固定在机器人／后端配置中        | 随技能调用传入的数据                 |
-| ------------------------------- | ------------------------------------ |
-| 机器人模型、TCP、关节顺序与限位 | 当前机器人状态                       |
-| 夹爪几何、开口范围、控制接口    | 演示来源的目标交互位姿               |
-| 碰撞模型与验证精度              | 当前场景与对象绑定                   |
-| 求解器默认配置、计算预算        | 演示运动参考                         |
-| 执行与停止条件                  | 已有的接触／开合事件、明确的过程要求 |
+  - \(D=R^2-d^2\)：最大球对平方差；
+  - \(R=r_i+r_j\)：球半径和；
+  - \(d\)：球心距离；
+  - \(z_{\rm opt}\)：优化阶段看到的自碰撞代价。
 
-cuRoboV2 的 `MotionPlannerCfg.create()` 文档也明确建议：一般集成代码传入机器人、场景和容量配置，其余任务 YAML 保留默认设置。**可以冻结一份后端配置使用，而不是见一个技能调一遍。** 默认值是否覆盖某次请求，由求解结果决定；失败不是自动修改参数的理由。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.motion_planner.html)
+  这对 L-BFGS 来说只是一个**有限的小代价**，完全可能为了改善更重的场景/任务项而接受它。
 
-我们的要求可以落实为：
+  但验证时，同一个 \(D>0\) 被映射为
 
-```
-同一 robot profile
-同一 planner profile
-同一后端代码
+  \[ C=1+\min(z,1) \]
 
-新增 skill → 只新增 SkillRecord 中的数据
-```
+  所以哪怕只重叠
 
-这和 TaskFlux 已确定的“不按动作名字新增 generator”一致。   
+  \[ p\approx0.0797\text{ mm}, \]
 
-------
+  都会从
 
-## 2. 一个具体发现：前面把 cuRobo 的接口说得太笼统了
+  \[ D=0\quad\Rightarrow\quad C=0 \]
 
-**“目标”“参考轨迹”“优化初始解”不能放进同一个参数。**
+  直接跳到
 
-我核对到，当前 cuRoboV2 的 `TrajectoryOptimizer.solve_pose()` 有独立入口：
+  \[ D>0\quad\Rightarrow\quad C>1. \]
 
-```
-goal_tool_poses   # 要到达的工具位姿current_state    # 当前关节状态seed_config      # 用于生成初始轨迹的关节配置seed_traj        # 已有的轨迹初始解goal_state       # 显式目标关节状态
-```
+  也就是说这里有一个真正的**离散语义跳变**：
 
-这些都是实际源码中的参数。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/solver/solver_trajopt.py)
+  > 优化器认为“这是一个小代价，可以权衡”；
+  > validator 认为“只要符号变正，就是硬失败”。
 
-而且发现了两处值得特别注意的实现细节。
+  而且你已经证明这不是实际 source collision：
 
-**第一，不能只看 `GoalToolPose` 的类型说明，就认为整条 Cartesian 参考已经接通。** 文档称它支持 `horizon > 1` 的逐时刻目标，但我检查的公开 `main` 调用链中，`ToolPoseCost.forward()` 对目标执行 `squeeze(1)`，下层又要求目标是四维张量，并按静态目标索引。多时刻目标在这条路径上存在明显的不一致。**我没有检查我们本机版本，不能说这就是我们当前卡住的原因，但不能再给我们一段“整条轨迹直接塞进去”的伪可用代码。**[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.types.html)
+  \[ d_{\rm Coal}=+8.347276\text{ mm}. \]
 
-**第二，`seed_traj` 的实际输入需要包含种子维度。** 当前 `SeedManager` 明确检查：
+  更关键的是，这次甚至没有 self-collision padding。误差完全来自球覆盖：
 
-```
-[batch, num_seeds, action_horizon, dof]
-```
+  \[ 6.836178+3.465190-10.221683 = 0.079685\text{ mm}. \]
 
-而不是只传一个 `[时间点数, 关节数]` 数组。这里 `action_horizon` 来自求解器，不是视频帧数。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/solver/manager_seed.py)
+  所以这里我现在会明确判断：
 
-所以，现在最明确、能对接已有实现的入口是：
+  **这个拒绝不是调大优化权重就能从根本上修好的。**
 
-> **静态交互目标走 `goal_tool_poses`；演示转换得到的关节路径走 `seed_traj`。**
+  调大权重只会逼 CuRobo 更认真地满足一个本身存在保守误报的代理约束。
 
-不先要求完成一个新的、持续追踪演示的代价函数。
+  这里更合理的职责划分应该是：
 
-------
+  - 球：继续用于 GPU 优化梯度和 broad phase；
+  - 当最终验证出现 \(D>0\) 时：
+    - 再用 source geometry + Coal 做 narrow phase；
+    - Coal 也碰撞 → 真正拒绝；
+    - Coal 满足安全间隙 → 不因为球代理单独拒绝。
 
-## 3. 我建议的具体 runtime：固定目标，多种初始解，同一个验证出口
+  这和你目前已有的 Pinocchio/Coal 链非常契合，甚至不需要重新设计 skill。
 
-以下处理的是我们现在给出的这种请求：
+  当然，这只解决**最终误拒**。如果球误报已经严重到阻止优化器进入某个可行区域，那还得改善球拟合。但你这个具体 pair 只有约 \(0.08\) mm overlap，而 source geometry 有 8 mm 以上间隙，我会优先把它当成 narrow-phase 问题，而不是先重做整个机器人球模型。
 
-> **参考运动＋目标交互位姿＋机器人模型＋当前场景。**
+  ------
 
-演示参考可以帮助求解，但不是“所有中间帧都必须经过”的硬性路径。SkillRecord 已明确要求保持的过程约束仍然要检查，不能默默删除。
+  # 二、环境问题的主要矛盾已经不是机器人球，而是 15 mm 粗图
 
-### 第一步：编译一个运动请求，不让求解器看到技能名称
+  这个结果更重要。
 
-建议后端实际收到的是：
+  两个 OMPL 目标里：
 
-```
-MotionRequest
-    current_joint_state
-    goal_tool_pose
-    reference_tool_path
-    scene_snapshot
-    gripper_state_before_interaction
-    interaction_events
-    explicit_path_requirements
-```
+  \[ d_{\rm link6,coarse} = -6.005,\ -6.191\text{ mm} \]
 
-`grasp_mug`、`grasp_bowl` 不进入规划算法的判断条件。它们只影响 Executor 已经实例化出来的对象、目标和事件数据。
+  这是 **source collision geometry 对 coarse occupancy 本身就相交**。
 
-这一接口正对应文档中 Executor 的职责：把技能内容实例化为候选末端运动、开合时序和过程要求，再交给共享后端。   
+  所以哪怕完全删除机器人 sphere approximation，两个 OMPL 目标仍然非法。
 
-### 第二步：检查目标本身，而不是先要求整条参考可执行
+  但与此同时，对 simulator 原始桌面：
 
-先求目标交互位姿的 IK 候选，检查关节限位、机器人自身碰撞和当前阶段不允许的环境碰撞。
+  \[ d_{\rm link6,table} = +0.642,\ +0.337\text{ mm}. \]
 
-这里要特别注意：
+  候选 01 环境最大点也是：
 
-**用于到达的夹爪状态，与抓持完成后的夹爪状态不是同一个东西。**
+  \[ d_{\rm link6,coarse}=-5.133\text{ mm}, \]
 
-对于我们讨论的抓取，应当用演示／夹爪适配已经给出的到达前开口状态检查运动，再执行闭合事件。不能拿“已经闭合并接触物体”的几何状态，去要求整个接近过程完全无接触。
+  而
 
-如果终点都不合法，应返回具体原因，而不是继续在 reference weight 或 approach distance 上寻找答案。
+  \[ d_{\rm link6,table}=+0.898\text{ mm}. \]
 
-### 第三步：把演示转成一个关节空间初始解
+  因此现在可以非常明确地区分：
 
-这里不再要求它是“已经可执行的演示后缀”。这里的演示就是FUNCTO原先生成的参考轨迹。
+  > 这不是 link6 真撞上桌子了；
+  > 是 link6 撞上了 **15 mm 离散地图所表示出来的桌子**。
 
-处理方式可以固定为：
+  这对于 15 mm voxel 并不令人意外。
 
-```
-迁移后的 Cartesian 参考
-    ↓
-按求解器所需数量重采样
-    ↓
-由终端 IK 配置向前回溯，使用邻近解作 IK seed
-    ↓
-得到关节路径初始解
-    ↓
-把边界配置设置为真实当前状态、已验证终端状态
-```
+  如果一个 occupied voxel 被看成完整边长
 
-这里的“向前回溯”指从演示末端向更早的采样求解。
+  \[ h=15\text{ mm} \]
 
-**这条初始解允许暂时碰撞，也允许不平滑。** 因为它只是优化器的起点，不能直接执行。若某条演示无法产生基本可用的关节初始解，丢弃的是这个初始解，不是宣布这个 skill 永远无法执行。
+  的立方体，仅半个 voxel 就已经是
 
-关键区别是：
+  \[ \frac h2=7.5\text{ mm}. \]
 
-> 我们不再先花力气证明每一个演示 pose 都能严格跟踪，再开始规划。
+  沿三维对角线，半对角线甚至达到
 
-当前机器人起点与演示起点不同，可能使这个初始解质量变差，但这不构成循环依赖：真实起点始终由 `current_state` 提供。
+  \[ \frac{\sqrt3}{2}h \approx12.99\text{ mm}. \]
 
-cuRobo 自己的图规划支路也是把几何路径插值到 `action_horizon`，然后作为 `seed_traj` 交给轨迹优化；并不把插值路径直接当作最终执行命令。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/motion/motion_planner.py)
+  这里 \(h\) 是 voxel 边长。
 
-### 第四步：先尝试演示初始解，失败再使用路径搜索初始解
+  我不是说你的实现一定产生上述精确误差界——这取决于 voxel 怎么从 RGB-D/ESDF 填充——但 **“真实桌面还有约 0.3–0.9 mm，15 mm occupancy 已经侵入实体约 5–6 mm”这个数量级本身非常合理。**
 
-固定流程即可：
+  所以这里实际上暴露出了一个重要事实：
 
-```
-演示初始解 → cuRobo 轨迹优化
-                    │
-               验证通过？
-                /       \
-              是         否
-              ↓          ↓
-            候选     cuRobo 图规划／OMPL
-                           ↓
-                    路径初始解
-                           ↓
-                    同一个轨迹优化器
-                           ↓
-                        同一个验证器
-```
+  > 当前规划允许机器人姿态进入“对真实几何仍安全，但 clearance 已经远小于 coarse-map 分辨能力”的区域。
 
-**这不是按 skill 分支，而是按求解结果分支。**
+  这也是为什么你觉得：
 
-cuRoboV2 原生 `MotionPlanner` 已经采用了“IK＋轨迹优化，必要时图规划提供 seed”的流程；我们不需要重新实现这一套搜索逻辑。OMPL 可以在既定共享后端里承担额外的路径搜索，不需要每次都把两套完整规划串行跑一遍。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/motion/motion_planner.py)
+  > “场景空间余量明明很大。”
 
-也不需要引入新的参考权重来控制这套流程。可以固定采用：
+  全局确实可能很大。
 
-> 优先接受通过验证的演示初始解结果；没有结果时，接受同一目标、同一明确约束下的其他合法规划结果。
+  但**这两个具体关节状态的 link6 与桌面实际上只剩亚毫米 clearance**。
 
-**代价必须说清楚：演示作为初始解，不保证输出完整保留演示形状。** 这是该接口的确定含义，不是等待解决的研究问题。若某段运动已经被 SkillRecord 标为必须保持，就按要求验证；不能仅因为终点到了就放行。
+  这两个概念要分开：
 
-我们已经接受执行可能失败，那么就不需要再把“自动证明所有未表述的过程语义”设成发出第一条命令的前提。
+  \[ \exists\ \text{高余量可行轨迹} \]
 
-------
+  并不等于
 
-## 4. cuRobo、OMPL、Pinocchio、Coal 各自只做自己的事
+  \[ \text{当前 seed/goal configuration 本身也高余量}. \]
 
-我不建议再加 MoveIt、Drake 或另一个优化框架。我们现有组合可以这样分工：
+  现在你的证据反而说明：
 
-| 组件          | 固定职责                                                     |
-| ------------- | ------------------------------------------------------------ |
-| **cuRoboV2**  | IK、轨迹优化、已有图规划、时间处理，产生关节轨迹候选         |
-| **OMPL**      | 必要时搜索从当前关节状态到目标关节状态的几何路径，提供替代初始解 |
-| **Pinocchio** | 统一正运动学、TCP 与关节顺序转换，更新机器人碰撞几何位置     |
-| **Coal**      | 场景和机器人几何的碰撞／距离查询，服务 OMPL 和最终验证       |
+  **泛化以后得到的某些 full-body configuration 过于贴近桌面。**
 
-Pinocchio 有直接更新几何位姿及计算碰撞的接口，Coal 提供碰撞与距离运算；OMPL 则要求使用方提供状态／运动有效性检查。它们本来就是可以这样组合的组件，不需要它们先理解 `grasp_mug`。[Gepetto Web](https://gepettoweb.laas.fr/doc/stack-of-tasks/pinocchio/master/doxygen-html/md_doc_b_examples_c_collisions.html?utm_source=chatgpt.com)
+  这并不否定 interaction pose 是正确的。
 
-最容易让集成“什么都规划不出来”的，反而是下面这些接口不一致：
+  ------
 
-| 需要核对的项目                             | 可能导致的结果               |
-| ------------------------------------------ | ---------------------------- |
-| 世界坐标系与机器人基座坐标系不一致         | IK 目标被放错位置            |
-| TCP 实际是法兰，目标却按夹爪中心定义       | 到达姿态系统性错误           |
-| 四元数 `wxyz`／`xyzw` 混用                 | 姿态错误或大量 IK 失败       |
-| 关节排序、mimic joints、夹爪锁定状态不一致 | 两个库看到不同的机器人       |
-| cuRobo 球近似与 Coal 网格不一致            | 一方认为可行，另一方全部拒绝 |
-| 抓持目标接触被当成禁止碰撞                 | 目标配置天然不可达           |
-| 把参考点数当成优化器 action horizon        | 张量尺寸或轨迹表示错误       |
+  # 三、我现在非常怀疑 ProcessCostManager 存在“约束追赶”现象
 
-这些是**需要逐项检查的候选原因，不是我对我们本机故障的诊断**。但应先把它们记录出来，而不是在没有错误归因的情况下调规划参数。
+  你这个时间关系非常值得注意。
 
-### 接触不能靠“关掉手指全部碰撞”解决
+  候选 00 的环境最大违例在：
 
-预期接触应按**接触部件—目标对象—执行阶段**处理，其他碰撞仍要检查。Pinocchio 的碰撞对可以单独激活／停用，能够承载这种统一策略。[Gepetto Web](https://gepettoweb.laas.fr/doc/stack-of-tasks/pinocchio/devel/doxygen-html/structpinocchio_1_1GeometryData.html?utm_source=chatgpt.com)
+  \[ t=13.300000\text{ s}. \]
 
-cuRobo 的公开 `plan_grasp()` 会使用固定接近偏移，并可以禁用指定 link 的碰撞。因此，它并不适合未经适配直接作为我们这里的统一 grasp 实现。尤其不能为了让规划成功，永久取消手指对所有障碍的检测。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.motion_planner.html)
+  于是 refine 加了 16 个点：
 
-------
+  \[ 13.266667 \sim 13.337500\text{ s}. \]
 
-## 5. 真正需要接上的 cuRobo 调用，长这样
+  重新优化之后，候选 01 的最大环境违例跑到了：
 
-下面展示的是**现有 API 的核心接线参考代码**，不是声称已经在我们本机运行过的完整后端，并且只保留了核心调用，仅供参考。前提是 `planner` 已按我们的机器人和场景创建，`q_goal` 是已核验的目标 IK，`seed_bank` 是已转换的关节初始解。
+  \[ t=13.434559\text{ s}. \]
 
-```
-import torch
+  已经跑出了新增检查窗口约
 
-from curobo.types import GoalToolPose, JointState
+  \[ 13.434559-13.337500 = 0.097059\text{ s}. \]
 
+  而这一次：
 
-def solve_from_demo_seeds(
-    planner,
-    q_current: torch.Tensor,       # [1, dof]
-    q_goal: torch.Tensor,          # [1, dof]
-    goal_position: torch.Tensor,  # [3]，规划基座坐标系
-    goal_quaternion: torch.Tensor,# [4]，wxyz
-    seed_bank: torch.Tensor,       # [1, seeds, action_horizon, dof]
-):
-    solver = planner.trajopt_solver
+  - 控制点确实重新优化；
+  - 最大变化达到 \(0.545822\) rad；
+  - 新增点只进入 ProcessCostManager；
+  - 项目场景检查本身仍是离散的；
+  - 最终 validator 又比优化时密得多。
 
-    if len(planner.tool_frames) != 1:
-        raise ValueError("此适配函数要求一个已配置的 TCP。")
+  所以目前很像这种行为：
 
-    expected_tail = (solver.action_horizon, solver.action_dim)
-    if seed_bank.ndim != 4 or tuple(seed_bank.shape[-2:]) != expected_tail:
-        raise ValueError(
-            f"seed_bank 应为 [1, seeds, {expected_tail[0]}, "
-            f"{expected_tail[1]}]，实际为 {tuple(seed_bank.shape)}"
-        )
+  ```
+  candidate 00:
+  
+  ----------X----------------
+           13.30
+            ↑
+         collision
+  
+  加入检查点：
+  
+  -------||||||||------------
+  
+  
+  candidate 01:
+  
+  -------||||||||-----X------
+                      ↑
+                   13.4346
+  ```
 
-    current = JointState.from_position(
-        q_current, joint_names=planner.joint_names
-    )
-    terminal = JointState.from_position(
-        q_goal, joint_names=planner.joint_names
-    )
+  也就是优化器把违例从被加强约束的区域**推到了旁边没有同等检查密度的位置**。
 
-    goal = GoalToolPose(
-        tool_frames=planner.tool_frames,
-        position=goal_position.reshape(1, 1, 1, 1, 3),
-        quaternion=goal_quaternion.reshape(1, 1, 1, 1, 4),
-    )
+  注意我现在还不能断言就是这样，因为 00→01 连几何路径也改变了，而不只是时间平移。
 
-    # 使用固定 solver profile 的种子数量，不随 skill 名称修改。
-    count = solver.config.num_seeds
-    terminal_seeds = q_goal[:, None, :].expand(
-        -1, count, -1
-    ).contiguous()
+  但这是非常值得验证的。
 
-    result = solver.solve_pose(
-        goal_tool_poses=goal,
-        current_state=current,
-        goal_state=terminal,
-        seed_config=terminal_seeds,
-        seed_traj=seed_bank,
-    )
+  如果成立，它实际上比“interpolation_dt 是否太大”更具体：
 
-    # 此处仅返回候选；不能在这里直接认定“抓持成功”或下发硬件。
-    return result
-```
+  > **最终密集验证使用的约束集合，比 TrajOpt 真正优化的 ProcessCostManager 场景约束集合更强。**
 
-`solve_pose()` 和 `seed_traj` 路径在源码中真实存在；上面的四维种子布局按 `SeedManager` 的实际检查写，而不是只照抄上层 docstring。[GitHub](https://raw.githubusercontent.com/NVlabs/curobo/main/curobo/_src/solver/solver_trajopt.py)
+  于是你永远可能遇到：
 
-**还需要写的是适配代码，不是新的算法：**
+  \[ \text{optimizer passes its sampled problem} \]
 
-- 把当前关节状态、目标 TCP、场景转换到同一约定。
-- 把演示 IK 路径或 OMPL 路径重采样成种子。
-- 读取返回轨迹，统一验证并交给控制器。
+  但
 
-不能直接把离线视频中的 `[N,4,4]` 位姿数组填进 `seed_traj`；那是 Cartesian 轨迹，不是关节初始解。
+  \[ \text{dense validator rejects another point}. \]
 
-------
+  refine 再把这个点加入以后，又可能出现下一个点。
 
-## 6. 什么时候允许开始执行？
+  这就会退化成一种 constraint whack-a-mole。
 
-这里应该采用**可检查的放行条件**，而不是“对技能语义有足够信心”这种无法落地的条件。
+  你前面提出的：
 
-对返回候选，检查：
+  > 按完整机器人几何空间位移界增加检查时刻
 
-**实际起点正确；终端 TCP 满足演示抓持目标；关节与运动限制满足；整段路径没有禁止碰撞；已明确声明的过程要求通过；夹爪事件可执行。**
+  如果目前主要用于**最终验证**，那我现在认为它真正应该发挥价值的地方，可能恰恰是：
 
-碰撞不能只检查优化器的稀疏节点。OMPL 文档明确指出，离散运动检查过粗会漏掉节点之间的碰撞；检查精度属于共享验证配置。[Open Motion Planning Library](https://ompl.kavrakilab.org/stateValidation.html?utm_source=chatgpt.com)
+  > **也用于决定优化阶段 ProcessCostManager 必须检查哪些时间。**
 
-通过后，后端输出：
+  不一定每轮都用 2 万多个点，那显然太贵。
 
-```
-CANDIDATE_READY
-    timed_joint_trajectory
-    gripper_events
-    validation_report
-    scene_version
-```
+  但可以自适应地把“无法由现有采样证明安全”的 segment 加入 optimizer constraint set。
 
-Executor 执行；执行中目标移动、跟踪失效或控制异常则中断／回报。终端由观测确认是否真的建立抓持，不把规划成功直接写成 `Holding = TRUE`。这正是 TaskFlux 文档要求的“候选与实际后果分开”。   
+  这和单纯在失败以后围绕最大点加固定 16 个时间，本质上不同。
 
-如果失败，报告也应当具体：
+  ------
 
-```
-INVALID_START
-NO_VALID_GOAL_IK
-NO_PATH_WITHIN_BUDGET
-COLLISION_VALIDATION_FAILED
-EXPLICIT_CONSTRAINT_VIOLATION
-EXECUTION_FAILED
-```
+  # 四、粗细地图切换现在也出现了一个明显的非光滑边界
 
-**“有限预算内没找到路径”不是“这个技能理论上不成立”，也不是“现在必须增加一种新表示”。** TaskFlux 已要求区分这些情况。
+  这个虽然还不是主因，但我认为会影响优化稳定性。
 
+  候选 01 的 link7 只因为超出 fine 支撑：
 
+  \[ x\approx0.131\text{ mm}, \qquad y\approx0.695\text{ mm}, \]
 
+  整条 link 就从：
 
+  \[ 2\text{ mm fine map} \]
 
-源码核查发现三个关键问题：
+  切换成：
 
-- 当前编译器把演示后缀默认锁为逐帧位姿约束；取消硬锁时，必须同时保留真正的目标消费。
-- 固定cuRobo的dt仍不够：现有OMPL分支会改变progress，进而移动夹爪事件。
-- 接触候选即使获准尝试，仍可能被下游旧筛选条件再次拒绝；独立场景验证和执行交接也尚未贯通。
+  \[ 15\text{ mm coarse map}. \]
+
+  而你又说：
+
+  - 以“整个 link 的全部覆盖球”是否被 fine map 支撑作为选择条件；
+  - 两张图不叠加；
+  - 不是按 collision cost 选择。
+
+  这个规则本身逻辑是干净的，但对于梯度优化存在一个问题：
+
+  \[ M(q)= \begin{cases} M_{\rm fine},&q\in\Omega_{\rm fine}\\ M_{\rm coarse},&q\notin\Omega_{\rm fine} \end{cases} \]
+
+  其中：
+
+  - \(q\)：机器人配置；
+  - \(M(q)\)：当前选择的地图；
+  - \(\Omega_{\rm fine}\)：整个 link 被 fine map 完整支撑的配置集合。
+
+  在边界上，地图查询函数可能出现离散跳变。
+
+  L-BFGS 得到的是当前地图内部的梯度，但并不知道：
+
+  > 再移动 0.2 mm，整个 link 会换成另一张 resolution 相差 7.5 倍的地图。
+
+  这不是 cuRobo 梯度本身的问题，而是你外部 map selector 引入的非光滑性。
+
+  对于候选 01 的 **link6 主失败**它不是根因，因为 link6 本来就在 coarse。
+
+  但它很可能是后续泛化中的一个稳定性问题。
+
+  ------
+
+  # 现在我最想继续确认 4 件事
+
+  ### ① 候选 00 与 01 的“环境最大值”和“自碰撞最大值”分别是多少？
+
+  最好给我：
+
+  |               | candidate 00 | candidate 01 |
+  | ------------- | ------------ | ------------ |
+  | env max       | ?            | 0.222158104  |
+  | env max time  | 13.300000    | 13.434559    |
+  | self max      | ?            | 1.006044     |
+  | self max time | ?            | 6.614063     |
+
+  特别想知道：
+
+  **01 是否真的降低了原来的环境问题，只是把最大值转移了？**
+
+  如果：
+
+  \[ C_{\rm env}^{00}>C_{\rm env}^{01} \]
+
+  说明 refine 有效果，只是没有形成全轨迹覆盖。
+
+  如果反而：
+
+  \[ C_{\rm env}^{01}\ge C_{\rm env}^{00}, \]
+
+  那重新优化本身还有更大的问题。
+
+  ------
+
+  ### ② ProcessCostManager 原本到底在哪些时间检查环境？
+
+  这现在是我最关心的信息之一。
+
+  比如是：
+
+  - 16 个 B-spline control times？
+  - 641 个导出点中的子集？
+  - 固定 \(N\) 个 progress samples？
+  - 每个 phase 分配固定个数？
+  - 根据 task events 插入？
+
+  另外新增的 16 个时间加入后：
+
+  > 原来的 grid 保留不变，只增加这 16 个？
+
+  还是会整体重新生成？
+
+  我想计算：
+
+  \[ \Delta t_{\max} = \max_k(t_{k+1}-t_k) \]
+
+  尤其是 \(13.3\sim13.45\) s 附近。
+
+  ------
+
+  ### ③ OMPL 的两个“目标配置”究竟是硬编码的完整 \(q\)，还是一个 goal manifold？
+
+  这个问题现在优先级非常高。
+
+  也就是 OMPL 实际要求：
+
+  \[ q=q_{\rm goal} \]
+
+  还是：
+
+  \[ FK(q)=X_{\rm task}, \qquad q\in Q_{\rm valid} \]
+
+  然后允许自己在冗余自由度里寻找不同的 \(q\)？
+
+  如果目标就是失败候选里拿出的两个完整关节配置，而这两个配置的 link6 恰好只有
+
+  \[ 0.337\sim0.642\text{ mm} \]
+
+  真实桌面 clearance，那么 OMPL 在入口：
+
+  ```
+  goal invalid
+  → motion_checks = 0
+  ```
+
+  其实非常自然。
+
+  而且这样会出现一个架构上的限制：
+
+  > **OMPL 被允许换路径，却没有被允许换 endpoint posture。**
+
+  如果交互任务实际上允许不同 elbow posture，那么“空间明明够但 OMPL 连搜索都没开始”就有非常直接的解释。
+
+  这一点现在我不会猜，希望你确认。
+
+  ------
+
+  ### ④ 15 mm coarse occupancy 到底怎么构造？
+
+  我想知道从 RGB-D 到这个占据体的具体规则：
+
+  - TSDF 后按什么阈值得到 occupancy？
+  - 一个 voxel 只要被 surface 穿过就把整个 cell 填满？
+  - Coal 看到的是完整 \(15^3\) mm cube？
+  - ESDF 距离是到 voxel center、voxel surface，还是 reconstructed zero level set？
+  - coarse/fine 两层是否来自同一 TSDF 后重新采样，还是独立积分？
+
+  这会决定我们能不能给 coarse map 建一个明确的保守误差界
+
+  \[ \epsilon_{\rm coarse}. \]
+
+  一旦这个界能建立，就可以把 multiresolution 规则从“ROI 里用 fine”升级成更有意义的：
+
+  \[ d_{\rm coarse}>\epsilon_{\rm coarse}+g_{\rm safe} \Rightarrow \text{coarse 已足够证明安全}, \]
+
+  否则：
+
+  \[ \text{必须进入 fine / exact refinement}. \]
+
+  其中：
+
+  - \(d_{\rm coarse}\)：粗图查询距离；
+  - \(\epsilon_{\rm coarse}\)：粗图几何表示误差上界；
+  - \(g_{\rm safe}\)：真正需要的安全间隙。
+
+  这比“整个 link 是否完全位于一个预设 fine ROI”更接近你现在真正遇到的问题。
+
+  ------
+
+  目前我的排序已经比较明确：
+
+  **P1：优化场景约束的采样集合与最终密集验证不一致。**
+  **P2：15 mm coarse occupancy 无法支持亚毫米级 table clearance，却被 OMPL hard gate 当作最终合法性。**
+  **P3：球代理 positive 被 validation binary conversion 直接升级为硬拒绝，而 source geometry 实际安全。**
+  **P4：fine/coarse 硬切换给梯度优化引入非光滑边界。**
+
+  这四个全都是**通用 planner/backend 问题**，目前没有一个要求你给 `grasp_mug` 单独调参数。
