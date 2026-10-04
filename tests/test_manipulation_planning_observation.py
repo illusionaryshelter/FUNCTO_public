@@ -471,24 +471,34 @@ class NativeVoxelLayoutTest(unittest.TestCase):
         assert storage.features.data_ptr() == field.data_ptr()
         return voxel, SimpleNamespace(data=SimpleNamespace(voxels=storage))
 
-    def test_truncated_native_dimensions_are_rejected_without_repair(self):
+    # BEGIN regression for native #699 rounding and unchanged input storage.
+    def test_near_integer_dimensions_use_native_rounding_without_metadata_repair(self):
         cases = [((3, 2, 2), .0015, (2, 2, 2)),
                  ((2, 3, 2), .0015, (2, 2, 2)),
                  ((2, 2, 3), .0015, (2, 2, 2)),
-                 ((49, 2, 2), .015, (48, 2, 2))]
+                 ((49, 2, 2), .015, (48, 2, 2)),
+                 ((120, 120, 100), .01, (119, 119, 100))]
         for shape, size, truncated in cases:
             with self.subTest(shape=shape, size=size):
                 voxel, native = self.native_fixture(shape, size)
                 field = voxel.feature_tensor.clone()
                 params = native.data.voxels.params.clone()
                 self.assertEqual(tuple(params[0, 0, :3].to(torch.int32).tolist()), truncated)
-                with self.assertRaisesRegex(ValueError, "Unsupported native ESDF grid layout") as raised:
-                    _require_native_voxel_layout(voxel, native)
-                self.assertIn(f"field_shape_xyz={shape}", str(raised.exception))
-                self.assertIn(f"native_truncated_shape_xyz={truncated}", str(raised.exception))
-                self.assertIn("native_params_xyz=", str(raised.exception))
+                _require_native_voxel_layout(voxel, native)
                 torch.testing.assert_close(voxel.feature_tensor, field, rtol=0., atol=0.)
                 torch.testing.assert_close(native.data.voxels.params, params, rtol=0., atol=0.)
+
+    def test_native_roundf_ties_and_inconsistent_layouts(self):
+        voxel, native = self.native_fixture((3, 2, 2), .0015)
+        # The guard must match Warp roundf rather than ties-to-even torch.round.
+        native.data.voxels.params[0, 0, 0] = 2.5
+        _require_native_voxel_layout(voxel, native)
+        for value in (2.499, 3.5, 0., -1., float("nan"), float("inf")):
+            with self.subTest(value=value):
+                native.data.voxels.params[0, 0, 0] = value
+                with self.assertRaises(ValueError):
+                    _require_native_voxel_layout(voxel, native)
+    # END the guard validates actual indexing, not a historical truncation rule.
 
     def test_correct_native_integer_layout_allows_positive_roundoff(self):
         # Unequal XYZ dimensions include the current two owner-grid sizes and
@@ -508,6 +518,9 @@ class NativeVoxelLayoutTest(unittest.TestCase):
         from curobo.perception import MapperCfg
         from curobo.types import DeviceCfg
         voxel, native = self.native_fixture((3, 2, 2), .0015)
+        # BEGIN an actually inconsistent rounded layout must still fail closed.
+        native.data.voxels.params[0, 0, 0] = 2.0
+        # END a tiny float32 error near 3 is now handled by the repaired kernel.
         cfg = MapperCfg(extent_meters_xyz=(.06, .06, .06), voxel_size=.015,
             extent_esdf_meters_xyz=(.06, .06, .06), esdf_voxel_size=.015,
             image_height=96, image_width=96, device="cuda:0")
@@ -522,7 +535,7 @@ class NativeVoxelLayoutTest(unittest.TestCase):
             mapper.return_value.get_stats.return_value = {
                 "allocation_failures": 0, "num_allocated": 0, "active_blocks": 0, "free_count": 0}
             mapper.return_value.compute_esdf.return_value = voxel
-            with self.assertRaisesRegex(ValueError, "native_truncated_shape_xyz=\\(2, 2, 2\\)"):
+            with self.assertRaisesRegex(ValueError, "native_rounded_shape_xyz=\\(2, 2, 2\\)"):
                 build_scene_from_rgbd({"current": view()}, {}, mapper_cfg=cfg, depth_error_m=.001,
                     reference_frame="world", robot_sphere_materials=(None,),
                     robot_geometry_source="Explicit CPU robot fixture", has_gripper=False,

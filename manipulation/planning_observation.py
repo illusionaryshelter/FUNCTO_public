@@ -484,27 +484,30 @@ def _require_mapping_memory(estimated_bytes, device):
 def _require_native_voxel_layout(voxel, native):
     """Admit the same XYZ field for native queries and independent geometry.
 
-    The installed VoxelData stores float32 ``dims / voxel_size`` parameters;
-    both Warp SDF entry points truncate them to integers. Floating division
-    can put an integer grid size just below its exact value, changing native
-    cell centres and flattening strides. Compare those actual parameters to
-    the completed mapper tensor before publishing either consumer. This is
-    an admission check, never a repair of native discretization or field data.
+    VoxelData stores float32 ``dims / voxel_size`` parameters. The two native
+    SDF entry points now recover these integral sizes with wp.round, fixing
+    cuRobo #699. Compare that actual kernel layout with the completed mapper
+    tensor before publishing either consumer. This is an admission check;
+    it never rewrites metadata or repairs an inconsistent field.
     """
     storage = native.data.voxels
     layer = storage.get_idx(voxel.name)
     values = storage.params[0, layer, :3].detach().cpu()
     field_shape = tuple(int(value) for value in voxel.feature_tensor.shape)
-    if len(field_shape) != 3 or not bool(torch.isfinite(values).all()):
-        raise ValueError("Completed native ESDF needs a dense XYZ field and finite grid params")
-    # Python int, like the installed wp.int32 conversion, truncates rather
-    # than rounds. A value just above an integer may still index correctly.
-    native_shape = tuple(int(value) for value in values.tolist())
+    # BEGIN match the corrected Warp kernel's positive roundf conversion.
+    if (len(field_shape) != 3 or not bool(torch.isfinite(values).all())
+            or bool((values <= 0).any())):
+        raise ValueError("Completed native ESDF needs a dense XYZ field and finite positive grid params")
+    # Warp uses C roundf (half away from zero); Python/torch round instead use
+    # ties to even. These are positive float32 grid counts, so floor(x + 0.5)
+    # on each promoted scalar reproduces the native conversion, including ties.
+    native_shape = tuple(math.floor(float(value)+.5) for value in values.tolist())
+    # END no legacy truncation or metadata-writing fallback remains.
     declared_shape = tuple(int(round(float(value)/float(voxel.voxel_size))) for value in voxel.dims)
     if native_shape != field_shape or declared_shape != field_shape:
         raise ValueError(
             f"Unsupported native ESDF grid layout for {voxel.name}: "
-            f"field_shape_xyz={field_shape}, native_truncated_shape_xyz={native_shape}, "
+            f"field_shape_xyz={field_shape}, native_rounded_shape_xyz={native_shape}, "
             f"native_params_xyz={values.tolist()}, declared_shape_xyz={declared_shape}, "
             f"dims_m={list(voxel.dims)}, voxel_size_m={float(voxel.voxel_size)}")
 # END no rounding repair, reshape or alternate field enters either consumer.
