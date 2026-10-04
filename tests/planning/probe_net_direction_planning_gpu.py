@@ -35,7 +35,9 @@ def run(output):
     torch.cuda.set_per_process_memory_fraction(min(2*1024**3/torch.cuda.get_device_properties(0).total_memory, 1.))
     torch.cuda.reset_peak_memory_stats()
     output.mkdir(parents=True, exist_ok=False)
-    backend, _, targets, _, robot = build_native(output)
+    # BEGIN preserve the exact source model returned by the shared native fixture.
+    backend, validator, targets, _, robot = build_native(output)
+    # END direction variants use the same robot solids and complete pair policy.
     initial = backend.proprioception()
     reference = PosePath(np.array([0., 1.]), np.stack((initial["tool_pose"], initial["tool_pose"])),
                          "explicit unchanged actual pose; no excursion reference")
@@ -56,7 +58,9 @@ def run(output):
         problem = replace(original, mechanisms=(mechanism,))
         scene = build_scene(DeviceCfg("cuda:0"), robot, backend, targets, problem)
         start = time.monotonic()
-        result = plan_trajectory(problem, scene, robot, budget=budget)
+        # BEGIN every independent planning request supplies its source validator.
+        result = plan_trajectory(problem, scene, robot, robot_validator=validator, budget=budget)
+        # END an empty direction requirement does not bypass geometry validation.
         row = {"case": name, "success": result.success, "elapsed_s": time.monotonic()-start,
                "diagnostics": result.diagnostics, "request_ledger": result.request_ledger,
                "execution_binding": result.execution_binding}

@@ -9,6 +9,7 @@ independent Coal, actuator, or physical contact certification.
 
 # BEGIN bounded native goal/reference integration with formal result evidence.
 import argparse
+from copy import deepcopy
 from dataclasses import asdict
 import gc
 import json
@@ -39,14 +40,18 @@ class EmptyBackground:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--fixture", type=Path, required=True,
+                        help="Verified native robot manifest supplying source solids and pair policy")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     import torch
     from curobo.kinematics import Kinematics, KinematicsCfg
+    from curobo.types import DeviceCfg
     from manipulation.execution_binding import plain
     from manipulation.planning import PlanningBudget, plan_trajectory
     from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath, PoseEventRequirement
     from manipulation.planning_scene import ObservedSpace, PlanningScene
+    from probe_robot_fixture import load_probe_fixture, fixed_probe_hand
 
     torch.set_num_threads(1)
     if not torch.cuda.is_available():
@@ -54,24 +59,29 @@ def main():
     total = torch.cuda.get_device_properties(0).total_memory
     torch.cuda.set_per_process_memory_fraction(min(2*1024**3/total, 1.))
     torch.cuda.reset_peak_memory_stats()
-    robot = "franka.yml"
-    kinematics = Kinematics(KinematicsCfg.from_robot_yaml_file(robot))
+    # BEGIN every variant uses the same explicitly supplied source robot.
+    fixture, robot, validator = load_probe_fixture(args.fixture, reference_frame="synthetic_base")
+    full_positions = np.asarray(robot["robot_cfg"]["kinematics"]["cspace"]["default_joint_position"])
+    device = DeviceCfg("cuda:0")
+    kinematics = Kinematics(KinematicsCfg.from_robot_yaml_file(deepcopy(robot), device_cfg=device))
     actual = kinematics.default_joint_state
     state = kinematics.compute_kinematics(actual)
     base = np.eye(4)
     base[:3, 3] = state.tool_poses.position[0, 0, 0].detach().cpu().numpy()
     wxyz = state.tool_poses.quaternion[0, 0, 0].detach().cpu().numpy()
     base[:3, :3] = Rotation.from_quat(wxyz[[1, 2, 3, 0]]).as_matrix()
+    base = base @ validator.T_frame_tcp
     joint_names = tuple(kinematics.joint_names)
     start_q = actual.position.detach().cpu().numpy().reshape(-1)
-    tool_link, sphere_count = kinematics.tool_frames[0], kinematics.total_spheres
+    tool_link, sphere_count = fixture["tool_link"], kinematics.total_spheres
+    # END actual source names and TCP transforms replace built-in robot assumptions.
     del state, actual, kinematics
     gc.collect()
     # BEGIN explicit integration budget; task precision and device policy stay fixed.
     # The archived 1 s / 256-query run exhausted its finite OMPL connection
     # budget for the changed goal. This probe grants bounded additional search
     # work; it does not change production defaults or relax an acceptance gate.
-    budget = PlanningBudget(max_validation_points=512, max_refinement_points=32,
+    budget = PlanningBudget(max_validation_points=512, max_refinement_points=32, max_robot_spheres=sphere_count,
                             search_seconds=3., maximum_trajectory_solves=3)
     # END keep the complete budget in every probe report.
     rows = []
@@ -88,20 +98,24 @@ def main():
         source = f"Synthetic reference variant: {name}"
         path = PosePath(np.array([0., .5, 1.]), np.stack((base, middle, reference_end)), source)
         problem = PlanningProblem(joint_names, start_q, np.zeros_like(start_q), tool_link,
-            "synthetic_base", np.eye(4), np.eye(4), (MotionPhase(name, path),),
+            "synthetic_base", np.eye(4), validator.T_frame_tcp, (MotionPhase(name, path),),
             pose_events=(PoseEventRequirement(1., np.eye(4), goal, 1e-4, 1e-3,
                 "Explicit synthetic terminal reach goal"),),
             source_timestamps=np.array([0., 1., 2.]), source_progress=np.array([0., .5, 1.]))
-        scene = PlanningScene(reference_frame="synthetic_base", background=EmptyBackground(), owners=(),
+        # BEGIN nominal fixed geometry is explicit and source installations stay present.
+        hand, owners, hand_report = fixed_probe_hand(fixture, robot, problem, device=device,
+                                                    full_current_positions=full_positions)
+        scene = PlanningScene(reference_frame="synthetic_base", background=EmptyBackground(), owners=owners,
             coverage=ObservedSpace(np.ones((20, 20, 20), bool), origin=[-2., -2., -2.], voxel_size=.2,
                                    reference_frame="synthetic_base", observation_ids=("declared-synthetic-empty-box",)),
-            robot_sphere_materials=(None,)*sphere_count, has_gripper=False,
-            robot_geometry_source="Native franka.yml robot geometry; explicit empty synthetic fixture")
+            robot_sphere_materials=(None,)*sphere_count, gripper=hand,
+            robot_geometry_source=fixture["robot_geometry_source"])
         started = time.monotonic()
-        result = plan_trajectory(problem, scene, robot, budget=budget)
+        result = plan_trajectory(problem, scene, robot, robot_validator=validator, budget=budget)
+        # END native spheres guide optimization; verified source solids gate acceptance.
         row = {"case": name, "success": result.success, "elapsed_s": time.monotonic()-started,
                "goal": goal.tolist(), "reference": path.poses.tolist(), "diagnostics": result.diagnostics,
-               "execution_binding": result.execution_binding}
+               "execution_binding": result.execution_binding, "fixed_hand_hypothesis": hand_report}
         (args.output/f"{name}.json").write_text(json.dumps(plain(row), indent=2, allow_nan=False)+"\n")
         rows.append({"case": name, "success": result.success, "elapsed_s": row["elapsed_s"]})
         del result, scene, problem

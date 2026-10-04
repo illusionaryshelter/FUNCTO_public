@@ -13,6 +13,7 @@ solve, dynamics claim, execution, or local reachability proof is performed.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -127,14 +128,15 @@ def verify_original_scene(problem, scene, budget, args, report):
         require_equal("measured_dq0", problem.start_dq, saved["actual_dq"][columns], checks)
 
 
-def check_states(problem, scene, robot, budget, args, report, arrays, save):
+# BEGIN reuse the runner's source model for construction and diagnostic queries.
+def check_states(problem, scene, robot, robot_validator, budget, args, report, arrays, save):
     """Evaluate one immutable arm state at each actual existing anchor time."""
     from manipulation.planning import _CuroboPlanner, _timed_native_state
-    from robot_validation_fixture import build_robot_validator
+    from curobo._src.cost.cost_self_collision import SelfCollisionCost
 
     targets = archived_targets(problem, args, report, arrays)
     verify_original_scene(problem, scene, budget, args, report)
-    planner = _CuroboPlanner(problem, scene, robot, budget, "cuda:0")
+    planner = _CuroboPlanner(problem, scene, robot, budget, "cuda:0", robot_validator=robot_validator)
     try:
         torch, names = planner.torch, list(planner.joint_names)
         checked_scene = planner._verification_scene
@@ -152,14 +154,19 @@ def check_states(problem, scene, robot, budget, args, report, arrays, save):
         if checked_scene.robot_coverage is None:
             raise ValueError("The current exact native-solid unknown-space oracle is required")
         cspace = planner._verification_native.get_cost("cspace")
-        native_self = planner._verification_native.get_cost("self_collision")
-        if cspace is None or not cspace.enabled or native_self is None or not native_self.enabled:
-            raise ValueError("Current native bounds and self constraints must remain enabled")
+        # BEGIN sphere overlap remains an optimizer diagnostic, not acceptance.
+        optimizer_self = planner.trajopt.optimizer_rollouts[0].constraint_manager.get_cost("self_collision")
+        if cspace is None or not cspace.enabled or optimizer_self is None or not optimizer_self.enabled:
+            raise ValueError("Current native joint bounds and optimizer self guidance must remain enabled")
+        # A separate instance owns the one-state diagnostic buffers and keeps
+        # the already normalized optimizer configuration unchanged.
+        native_self = SelfCollisionCost(deepcopy(optimizer_self.config))
+        # END source solids below supply the actual self/installation verdict.
         limits = cspace.config.joint_limits
         columns = [limits.joint_names.index(name) for name in names]
         bounds = cpu(limits.position)[:, columns]
-        validator = build_robot_validator(read_json(args.robot_fixture), reference_frame=problem.reference_frame,
-            T_reference_base=problem.base_pose, tool_frame=problem.tool_link, T_frame_tcp=problem.tool_transform)
+        validator = robot_validator
+        # END one source/pair binding serves both planning and archived-state queries.
         report.update(formal_clock=planner.formal_clock.copy(), budget=asdict(budget),
             numerical_tolerances=asdict(problem.numerical), joint_names=names,
             position_limits={"lower": bounds[0].tolist(), "upper": bounds[1].tolist()},
@@ -217,19 +224,21 @@ def check_states(problem, scene, robot, budget, args, report, arrays, save):
                                         if row["policy"] == "required" and row["relation"] != "separated"]
                         known_scene = {key: value for key, value in scene_terms.items() if not key.startswith("unknown/")}
                         other_unknown = {key: value for key, value in scene_terms.items() if key.startswith("unknown/")}
-                        gates = {"native_position_bounds": bool(not excess.any()), "native_sphere_self": sphere_self <= 0,
+                        # BEGIN source-solid acceptance replaces the obsolete sphere gate.
+                        gates = {"native_position_bounds": bool(not excess.any()),
                             "known_scene_and_hand": all(value <= 0 for value in known_scene.values()),
                             "other_scene_evidence": all(value <= 0 for value in other_unknown.values()),
                             "nominal_source_pose": bool(pose_passed),
                             "cpu_native_solid_self_and_installation": not physical_bad,
                             "cpu_full_joint_position_bounds": not physical["joint_limit_violations"]}
+                        # END the proxy value is retained only as optimizer evidence.
                         state_row = {"archive_row": target_row["archive_rows"][candidate], "time_index": time_index,
                             "u": float(u), "progress": float(progress), "time_s": elapsed,
                             "native_time_s": float(t.item()), "joint_position": q.tolist(),
                             "full_joint_names": list(full_names), "full_joint_position": cpu(full_q)[0, 0].tolist(),
                             "actual_tool_pose": pose.tolist(), "position_error_m": position_error,
                             "rotation_error_rad": rotation_error, "position_limit_excess": excess.tolist(),
-                            "native_sphere_self_value": sphere_self, "scene_terms": scene_terms,
+                            "sphere_proxy_self_guidance": sphere_self, "scene_terms": scene_terms,
                             "cpu_geometry": physical, "cpu_required_pair_failures": physical_bad,
                             "static_prerequisite_gates": gates, "exact_robot_unknown_checked": False,
                             "passed_all_tested_static_conditions": False}
@@ -284,13 +293,14 @@ def run(args):
         raise RuntimeError("This archived-state diagnostic must not call IK, optimization or path search")
 
     # BEGIN bind the current preparation callback without enabling a new solve.
-    def capture(problem, scene, robot, output, *, budget, provenance, execution_limits, continuation):
-        if continuation is not None:
+    def capture(problem, scene, robot, output, *, robot_validator, budget, provenance, execution_limits,
+                continuation=None, rebind=None, request_ledger=None):
+        if continuation is not None or rebind is not None or request_ledger is not None:
             raise ValueError("Static archived-state checks do not create a continuation binding")
         if report.get("planning_boundary_intercepted"):
             raise ValueError("The runner reached its planning boundary more than once")
         report["planning_boundary_intercepted"] = True
-        check_states(problem, scene, robot, budget, args, report, arrays, save)
+        check_states(problem, scene, robot, robot_validator, budget, args, report, arrays, save)
         return SimpleNamespace(success=False, diagnostics={"initial_state": None})
 
     runner_args = SimpleNamespace(**vars(args))

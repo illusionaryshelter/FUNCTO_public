@@ -218,7 +218,9 @@ def run(output, *, cpu_check=False):
             trajectory_iterations=200, maximum_trajectory_dt=.1, maximum_trajectory_solves=2,
             search_seconds=0., max_robot_spheres=64, max_validation_points=256)
         report["budget"] = asdict(budget)
-        result = plan_trajectory(problem, scene, robot, budget=budget)
+        # BEGIN the exact three-box source model gates planning and execution.
+        result = plan_trajectory(problem, scene, robot, robot_validator=validator, budget=budget)
+        # END sphere covers remain optimizer geometry, not a source-model substitute.
         report["planning"] = {"success": result.success, "diagnostics": result.diagnostics}
         if result.request_ledger is not None:
             (output/"request-ledger.json").write_text(json.dumps(result.request_ledger, indent=2, allow_nan=False)+"\n")

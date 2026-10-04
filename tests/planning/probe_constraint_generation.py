@@ -581,7 +581,8 @@ def self_forward_probe(planner, rollout, actions, witness_joint, arrays, report,
 # END isolate native self forward repeatability and its actual timed inputs.
 
 
-def replay(problem, scene, robot, budget, args, report, save, arrays):
+# BEGIN archived objective replay retains the exact runner source-solid model.
+def replay(problem, scene, robot, robot_validator, budget, args, report, save, arrays):
     """Initialize once, bind the installed native goal lifecycle, then replay."""
     import torch
     from manipulation.planning import _CuroboPlanner
@@ -618,7 +619,8 @@ def replay(problem, scene, robot, budget, args, report, save, arrays):
         require_equal("measured_dq0", problem.start_dq, saved["actual_dq"][columns], checks)
     save("archive_scene_checked")
 
-    planner = _CuroboPlanner(problem, scene, robot, budget, "cuda:0")
+    planner = _CuroboPlanner(problem, scene, robot, budget, "cuda:0", robot_validator=robot_validator)
+    # END a diagnostic replay does not bypass the planner's required source binding.
     try:
         names = list(planner.joint_names)
         arrays["joint_names"] = np.asarray(names)
@@ -730,13 +732,14 @@ def run(args):
         raise RuntimeError("This diagnostic must not call IK, optimizer solve, or path search")
 
     # BEGIN archived replay accepts the current runner boundary explicitly.
-    def capture(problem, scene, robot, output, *, budget, provenance, execution_limits, continuation):
-        if continuation is not None:
+    def capture(problem, scene, robot, output, *, robot_validator, budget, provenance, execution_limits,
+                continuation=None, rebind=None, request_ledger=None):
+        if continuation is not None or rebind is not None or request_ledger is not None:
             raise ValueError("Archived objective replay does not create a continuation binding")
         if report.get("planning_boundary_intercepted"):
             raise ValueError("The recorded runner reached its planning boundary more than once")
         report["planning_boundary_intercepted"] = True
-        replay(problem, scene, robot, budget, args, report, save, arrays)
+        replay(problem, scene, robot, robot_validator, budget, args, report, save, arrays)
         return SimpleNamespace(success=False, diagnostics={"initial_state": None})
 
     runner_args = SimpleNamespace(**vars(args))

@@ -22,6 +22,9 @@ class PlanningPrecisionTests(unittest.TestCase):
                          torch.backends.cudnn.allow_tf32)
         self.cuda_initialized = torch.cuda.is_initialized()
         self.addCleanup(self.restore_original)
+        # BEGIN mocked initialization still receives an explicit source-model binding.
+        self.robot_validator = object()
+        # END this lifecycle sentinel is never used as a physical geometry oracle.
 
     def restore_original(self):
         torch.backends.cuda.matmul.allow_tf32 = self.original[0]
@@ -39,7 +42,8 @@ class PlanningPrecisionTests(unittest.TestCase):
                 torch.backends.cudnn.allow_tf32 = not enabled
 
                 # BEGIN the request initializer now binds an optional continuation.
-                def initialize(planner, *_args, continuation=None):
+                def initialize(planner, *_args, robot_validator, continuation=None):
+                    self.assertIs(robot_validator, self.robot_validator)
                     self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
                     # Both actual solver destructors must still run within the
                     # request precision scope, including any native cleanup.
@@ -49,7 +53,7 @@ class PlanningPrecisionTests(unittest.TestCase):
 
                 with patch.object(_CuroboPlanner, "_initialize", autospec=True,
                                   side_effect=initialize):
-                    planner = _CuroboPlanner(None, None, None, None, "cpu")
+                    planner = _CuroboPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
                 planner.close()
                 self.assertEqual(self.flags(), (enabled, not enabled))
                 torch.backends.cuda.matmul.allow_tf32 = not enabled
@@ -60,7 +64,7 @@ class PlanningPrecisionTests(unittest.TestCase):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
 
-        def failing_initialize(*_args, continuation=None):
+        def failing_initialize(*_args, robot_validator, continuation=None):
             # Reproduce seed_ik_solver's import-time assignments before a
             # subsequent initialization failure can reach the normal reset.
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -69,14 +73,14 @@ class PlanningPrecisionTests(unittest.TestCase):
 
         with patch.object(_CuroboPlanner, "_initialize", side_effect=failing_initialize):
             with self.assertRaisesRegex(ValueError, "native initialization failed"):
-                _CuroboPlanner(None, None, None, None, "cpu")
+                _CuroboPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
         self.assertEqual(self.flags(), (False, False))
 
     def test_native_destroy_failure_still_restores_precision(self):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = False
         with patch.object(_CuroboPlanner, "_initialize"):
-            planner = _CuroboPlanner(None, None, None, None, "cpu")
+            planner = _CuroboPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
         planner.ik = SimpleNamespace(destroy=Mock(side_effect=RuntimeError("destroy failed")))
         with self.assertRaisesRegex(RuntimeError, "destroy failed"):
             planner.close()
@@ -85,10 +89,13 @@ class PlanningPrecisionTests(unittest.TestCase):
     def test_diagnostic_failure_closes_the_real_request_scope(self):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = False
-        scene = SimpleNamespace(describe=Mock(side_effect=ValueError("description failed")))
+        # BEGIN scene binding is mocked along with all native initialization.
+        scene = SimpleNamespace(describe=Mock(side_effect=ValueError("description failed")),
+                                bind_robot_validator=Mock())
+        # END this test isolates precision cleanup after the later diagnostic error.
         scene.clone_for_rollout = lambda: deepcopy(scene)
 
-        def initialize(planner, *_args, continuation=None):
+        def initialize(planner, *_args, robot_validator, continuation=None):
             from manipulation.planning import PlanningBudget
             planner.budget = PlanningBudget()
             planner.scene_workspace_bytes = 0
@@ -98,7 +105,8 @@ class PlanningPrecisionTests(unittest.TestCase):
 
         with patch.object(_CuroboPlanner, "_initialize", autospec=True, side_effect=initialize):
             # BEGIN failed requests retain accounting and restore caller precision.
-            result = plan_trajectory(SimpleNamespace(events=()), scene, None, device="cpu")
+            result = plan_trajectory(SimpleNamespace(events=()), scene, None,
+                                     robot_validator=self.robot_validator, device="cpu")
             self.assertFalse(result.success)
             self.assertEqual(result.diagnostics["reason"], "description failed")
             self.assertEqual(result.request_ledger["consumed_planning"]["initializations"], 1)

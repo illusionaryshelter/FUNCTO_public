@@ -74,7 +74,9 @@ class RobotStateValidator:
         if (self.joint_names != self.arm_joint_names + self.finger_joint_names
                 or len(self.joint_names) != len(set(self.joint_names))
                 or set(self.joint_names) != set(checker.joint_names)
-                or not self.arm_joint_names or not self.finger_joint_names):
+                # BEGIN a generic robot may have no independently actuated hand.
+                or not self.arm_joint_names):
+                # END the complete named model is still mandatory.
             raise ValueError("The explicit arm/finger order must cover the complete native model")
         self.reference_frame = _name(reference_frame, "reference frame")
         self.tool_frame = _name(tool_frame, "tool frame")
@@ -103,6 +105,139 @@ class RobotStateValidator:
         for pair in self.pairs:
             _name(pair.source, "native pair policy source")
 
+    # BEGIN one native-solid acceptance policy at planning and execution states.
+    def _planning_positions(self, joint_positions, joint_names, *, time_s, gripper):
+        """Complete only declared coordinates; identify unknown descendants.
+
+        Pinocchio requires the complete tree coordinates even when an actuator
+        has no future geometry model. Interior placeholders affect only that
+        actuator's descendants, which are explicitly excluded from acceptance.
+        """
+        names, values = tuple(joint_names), np.asarray(joint_positions)
+        if (len(names) != len(set(names)) or not set(names) <= set(self.joint_names)
+                or values.shape != (len(names),) or values.dtype.kind not in "iuf"
+                or not np.isfinite(values).all()):
+            raise ValueError("Planning self checks require unique named finite robot coordinates")
+        if not np.isscalar(time_s) or not np.isfinite(time_s) or time_s < 0:
+            raise ValueError("Planning self checks require finite nonnegative physical time")
+        named = dict(zip(names, values.astype(float)))
+        unmodelled = ()
+        if gripper is None:
+            if set(names) != set(self.joint_names):
+                raise ValueError("A planning robot without a gripper must supply every native joint")
+        else:
+            if tuple(gripper.joint_names) != self.finger_joint_names:
+                raise ValueError("Planning gripper and native model must share the exact finger partition")
+            if gripper.controller == "position_tracking":
+                if set(names) != set(self.joint_names):
+                    raise ValueError("Position-tracking fingers must be active planning coordinates")
+            else:
+                if set(names) != set(self.arm_joint_names):
+                    raise ValueError("Independently controlled fingers must not duplicate active arm coordinates")
+                if time_s == 0:
+                    fingers = gripper.current_positions
+                elif gripper.nominal_finger_trajectory is not None:
+                    model = gripper.nominal_finger_trajectory
+                    if tuple(model.joint_names) != self.finger_joint_names:
+                        raise ValueError("Nominal finger geometry changed native joint identity")
+                    # BEGIN the native endpoint has one explicit typed representation.
+                    # Its float32 value can lie just beyond the binary64 model
+                    # duration. Exact equality to that dtype's endpoint names
+                    # the same terminal instant; no epsilon admits other times
+                    # and no command or new clock replaces the nominal curve.
+                    time_dtype = np.asarray(time_s).dtype
+                    sample_time = float(time_s)
+                    if time_dtype.kind == "f" and time_s == np.asarray(model.duration, dtype=time_dtype):
+                        sample_time = float(model.duration)
+                    fingers, _ = model.sample(sample_time)
+                    # END all nonendpoint queries retain their original physical time.
+                else:
+                    fingers = [sum(self.checker.joint_limits[name])/2 for name in self.finger_joint_names]
+                    unmodelled = self.checker.geometry_depending_on(self.finger_joint_names)
+                fingers = np.asarray(fingers)
+                if (fingers.shape != (len(self.finger_joint_names),) or fingers.dtype.kind not in "iuf"
+                        or not np.isfinite(fingers).all()):
+                    raise ValueError("Planning finger geometry must supply every finite named coordinate")
+                named.update(zip(self.finger_joint_names, fingers.astype(float)))
+        return np.asarray([named[name] for name in self.joint_names]), unmodelled
+
+    def validate_planning_binding(self, problem, gripper):
+        """Bind model identity and measured entrance before allocating solvers.
+
+        Collision feasibility remains the entrance gate's responsibility. This
+        checks the source model, calibration and coordinate partition without
+        reconstructing geometry or replacing the supplied measured entrance.
+        """
+        if (problem.reference_frame != self.reference_frame or problem.tool_link != self.tool_frame
+                or not np.array_equal(problem.base_pose, self.T_reference_base)
+                or not np.array_equal(problem.tool_transform, self.T_frame_tcp)):
+            raise ValueError("Planning and native self geometry must share reference, base and TCP identity")
+        self._planning_positions(problem.start_q, problem.joint_names, time_s=0., gripper=gripper)
+        if gripper is not None:
+            if not np.array_equal(gripper.joint_limits,
+                                  [self.checker.joint_limits[name] for name in self.finger_joint_names]):
+                raise ValueError("Planning fingers must use the source model's mechanical limits")
+            if gripper.controller == "position_tracking":
+                named = dict(zip(problem.joint_names, problem.start_q))
+                if not np.array_equal([named[name] for name in self.finger_joint_names], gripper.current_positions):
+                    raise ValueError("Planning fingers must preserve the same measured entrance")
+
+    def check_planning_self(self, joint_positions, joint_names, *, time_s, gripper):
+        """Check all known required native pairs at this one physical instant.
+
+        A positive sphere proxy cost is not consumed here, and a zero sphere
+        cost cannot bypass these solid queries. ``passed`` covers only known
+        geometry; an unmodelled future hand is reported explicitly. Scalar
+        joint limits still apply even when mechanical contact is permitted.
+        """
+        positions, unmodelled = self._planning_positions(
+            joint_positions, joint_names, time_s=time_s, gripper=gripper)
+        unknown = set(unmodelled)
+        pairs = tuple(pair for pair in self.pairs if pair.policy == "required"
+                      and pair.first not in unknown and pair.second not in unknown)
+        result = self.checker.query(joint_names=self.joint_names, joint_positions=positions,
+            T_reference_base=self.T_reference_base, pairs=pairs)
+        violations = [row for row in result["pairs"] if row["relation"] != "separated"]
+        minimum = min(result["pairs"], key=lambda row: row["signed_distance_m"], default=None)
+        # BEGIN admit only the active tensor's exact representation of a limit.
+        # For example float32(.1) lies above the source binary64 upper limit
+        # .1, while naming that same endpoint in the native planner. Keep the
+        # original q for Coal FK and preserve the source-limit discrepancy as
+        # evidence; neither an epsilon nor clipping admits a neighbouring q.
+        # Independently sampled nominal fingers are absent from active_values
+        # and therefore retain the source model's original hard limit check.
+        limits = dict(result["joint_limit_violations"])
+        rounded_limits = []
+        active = np.asarray(joint_positions)
+        if active.dtype.kind == "f":
+            active_values = dict(zip(joint_names, active))
+            for name, row in tuple(limits.items()):
+                boundary = "lower" if row["position"] < row["lower"] else "upper"
+                if (name in active_values
+                        and active_values[name] == np.asarray(row[boundary], dtype=active.dtype)):
+                    rounded_limits.append({"joint_name": name, "input_dtype": str(active.dtype),
+                                           "represented_boundary": boundary, **row})
+                    del limits[name]
+        # END the execution gate and nonendpoint planning states remain strict.
+        passed = not violations and not limits
+        return {"passed": passed, "residual": float(not passed), "queried_pairs": len(pairs),
+                "minimum_required_clearance_m": None if minimum is None else minimum["signed_distance_m"],
+                "unmodelled_geometry_names": list(unmodelled), "violations": violations,
+                "minimum_pair": minimum, "joint_limit_violations": limits,
+                "rounded_limit_representations": rounded_limits,
+                "joint_names": result["joint_names"], "joint_positions": result["joint_positions"]}
+
+    def planning_binding_record(self):
+        """Freeze the same source geometry, complete pair policy and numerics."""
+        record = self.describe()
+        # Scene binding is a separate execution epoch, not robot model identity.
+        record.pop("scene_bound")
+        record.pop("object_contact_permission_checked")
+        record["model"] = self.checker.model_record()
+        record["scope"] = "complete source robot/installation solids and required/excluded/mechanical pair policy"
+        return record
+    # END planning never changes the execution gate's complete actual-state policy.
+
     # BEGIN bind independent scene validation to the exact accepted input snapshot.
     def bind_scene(self, binding, progress_at_time, nominal_fingers=None):
         """Bind f(t)->progress and optional nominal f(t)->(named finger q,dq).
@@ -115,6 +250,15 @@ class RobotStateValidator:
             raise ValueError("Independent scene and clock must share the bound reference frame")
         if nominal_fingers is not None and not callable(nominal_fingers):
             raise TypeError("Nominal finger geometry must be an explicit time sampler")
+        # BEGIN execution must retain the source solids that qualified a plan.
+        # A standalone scene diagnostic has no planned model to compare. A
+        # formal planning scene carries the complete model and pair policy;
+        # matching joint names or TCP calibration alone cannot substitute a
+        # smaller solid or a more permissive mechanical-contact declaration.
+        planned_robot = binding.get("robot_self_collision")
+        if planned_robot is not None and planned_robot != self.planning_binding_record():
+            raise ValueError("Execution source robot geometry and pair policy differ from the planned binding")
+        # END reject before changing the active execution scene or its clock.
         hand = binding.get("gripper")
         if hand is not None and tuple(hand["joint_names"]) != self.finger_joint_names:
             raise ValueError("Scene material translations and independent actual fingers must share the same named order")

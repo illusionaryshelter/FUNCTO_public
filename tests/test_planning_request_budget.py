@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from manipulation.planning import PlanningBudget, plan_trajectory
 
@@ -18,16 +18,25 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         # operation. The entry needs only the explicitly empty event ledger.
         self.problem = SimpleNamespace(events=())
         # The admission owns a scene copy even when native initialization fails.
-        self.scene = SimpleNamespace(clone_for_rollout=lambda: SimpleNamespace())
+        self.bind_robot_validator = Mock()
+        self.scene = SimpleNamespace(clone_for_rollout=lambda: SimpleNamespace(
+            bind_robot_validator=self.bind_robot_validator))
         self.budget = PlanningBudget(maximum_trajectory_solves=2)
+        # BEGIN native construction is mocked; this sentinel tests argument identity.
+        self.robot_validator = object()
+        # END these accounting tests never claim physical geometry validation.
 
     def test_failed_native_initializations_share_a_finite_request_budget(self):
         with patch("manipulation.planning._CuroboPlanner", side_effect=TypeError("declared native API failure")) as native:
-            first = plan_trajectory(self.problem, self.scene, {}, budget=self.budget)
+            first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=self.budget)
             saved = deepcopy(first.request_ledger)
-            second = plan_trajectory(self.problem, self.scene, {}, request_ledger=first.request_ledger)
-            third = plan_trajectory(self.problem, self.scene, {}, request_ledger=second.request_ledger)
+            second = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, request_ledger=first.request_ledger)
+            third = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, request_ledger=second.request_ledger)
         self.assertEqual(native.call_count, 2)
+        # BEGIN every admitted retry carries the same caller-owned source model.
+        self.assertTrue(all(call.kwargs["robot_validator"] is self.robot_validator for call in native.call_args_list))
+        self.assertTrue(all(call.args[0] is self.robot_validator for call in self.bind_robot_validator.call_args_list))
+        # END exhausted work does not replace the validator or reach construction.
         self.assertEqual(first.request_ledger, saved)
         self.assertEqual(first.diagnostics["failed_stage"], "initialization")
         self.assertEqual(first.diagnostics["error_type"], "TypeError")
@@ -56,11 +65,11 @@ class PlanningRequestBudgetTest(unittest.TestCase):
 
     def test_rejected_budget_change_retains_prior_work_and_source_evidence(self):
         with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("initialization failed")) as native:
-            first = plan_trajectory(self.problem, self.scene, {}, budget=self.budget)
+            first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=self.budget)
             first.request_ledger["effects"]["already_observed"] = {
                 "value": "T", "source": "earlier actual feedback", "timestamp_s": 3.}
             saved = deepcopy(first.request_ledger)
-            rejected = plan_trajectory(self.problem, self.scene, {}, request_ledger=first.request_ledger,
+            rejected = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, request_ledger=first.request_ledger,
                 budget=replace(self.budget, maximum_trajectory_solves=3))
         self.assertEqual(native.call_count, 1)
         self.assertFalse(rejected.success)
@@ -76,12 +85,12 @@ class PlanningRequestBudgetTest(unittest.TestCase):
 
     def test_rejected_execution_record_still_accounts_against_supplied_request(self):
         with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("initialization failed")) as native:
-            first = plan_trajectory(self.problem, self.scene, {}, budget=self.budget)
+            first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=self.budget)
             # BEGIN a requested actual continuation keeps its distinct mode.
-            continuation_attempt = plan_trajectory(self.problem, self.scene, {}, request_ledger=first.request_ledger,
+            continuation_attempt = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, request_ledger=first.request_ledger,
                 continuation={"failure_reason": "missing actual continuation evidence"})
             # END rejection still reports which binding path was requested.
-            rejected = plan_trajectory(self.problem, self.scene, {}, request_ledger=first.request_ledger,
+            rejected = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, request_ledger=first.request_ledger,
                 continuation={"failure_reason": "missing actual continuation evidence"},
                 rebind={"kind": "remaining", "source": "explicit Executor continuation"})
         self.assertEqual(native.call_count, 1)

@@ -742,8 +742,11 @@ class PrismaticGripper:
         # END reject duplicate declarations before batched summation.
         # BEGIN own each bound occurrence so later retry input cannot alter this scene.
         self.commands = tuple(deepcopy(commands))
-        if not self.commands:
-            raise ValueError("Gripper geometry must be bound to explicit controller events")
+        # BEGIN arm-only planning still binds measured fingers without issuing a command.
+        # An explicitly empty event list is valid. validate_problem below
+        # requires an exact match whenever an actual hand action is requested;
+        # optional nominal geometry never invents an actuator event.
+        # END source geometry and command occurrence identity remain separate.
         for event in self.commands:
             _text(event.get("event_id"), "gripper event ID")
             _text(event.get("skill_id"), "gripper skill instance ID")
@@ -924,6 +927,10 @@ class PlanningScene:
                  native_geometry_materials=None, robot_owner_permissions=(),
                  robot_collision_bodies=()):
         self.background = background
+        # BEGIN one source-solid authority is bound before a planning request.
+        self.robot_validator = None
+        self._self_collision_owner_ids = frozenset()
+        # END standalone scene queries do not implicitly supply robot evidence.
         # BEGIN independent solids need explicit material identity, not sphere-index guesses.
         self.native_geometry_materials = dict(native_geometry_materials or {})
         # END identity is serialized with the exact scene binding.
@@ -1276,6 +1283,101 @@ class PlanningScene:
             if actual_rows != required_rows:
                 raise ValueError("Tracking gripper and problem must share the same native A q=b coupling")
     # END bind one collision scene to the exact generated skill problem.
+
+    # BEGIN source-solid acceptance shared by entrance, native metrics and search.
+    def bind_robot_validator(self, validator, problem):
+        """Bind complete named solids and identify their static scene aliases.
+
+        An alias is an explicitly declared fixed installation already present
+        in the robot's complete pair policy. Its scene proxy still checks a
+        moving payload; robot/installation acceptance belongs to Coal alone.
+        The owner proxy may be an outward approximation of an analytic solid,
+        so identity and pose are checked without substituting that proxy shape.
+        """
+        from .robot_validation import RobotStateValidator
+
+        if not isinstance(validator, RobotStateValidator):
+            raise TypeError("Planning requires an explicit source RobotStateValidator")
+        if self.robot_validator is not None and self.robot_validator is not validator:
+            raise ValueError("A planning scene cannot change its source robot model")
+        validator.validate_planning_binding(problem, self.gripper)
+        if self.reference_frame != validator.reference_frame:
+            raise ValueError("Scene and source robot must share the calibrated reference frame")
+        aliases = [owner for owner in self.owners if owner.native_geometry_names]
+        checked = set()
+        if aliases:
+            checker = validator.checker
+            fixed = set(checker.geometry_names) - set(checker.geometry_depending_on(validator.joint_names))
+            positions, _ = validator._planning_positions(
+                problem.start_q, problem.joint_names, time_s=0., gripper=self.gripper)
+            state = checker.query(joint_names=validator.joint_names, joint_positions=positions,
+                                  T_reference_base=validator.T_reference_base, pairs=())
+            used = set()
+            for owner in aliases:
+                geometry = query_geometry(owner.query)
+                names = owner.native_geometry_names
+                if (len(names) != 1 or names[0] not in fixed or names[0] in used
+                        or geometry.get("query_gaps") or len(geometry["solids"]) != 1
+                        or owner.moving or owner.attachments or not owner.geometry_complete):
+                    raise ValueError("Installation aliases require one distinct complete fixed source solid")
+                path = owner.pose_path
+                if (path.motion_model is not None
+                        or not np.array_equal(path.poses, np.broadcast_to(path.poses[0], path.poses.shape))):
+                    raise ValueError("A source installation alias requires a constant scene pose")
+                record = geometry["solids"][0]
+                pose7 = np.asarray(record["pose"], float)
+                local = np.eye(4)
+                local[:3, :3] = Rotation.from_quat(pose7[[4, 5, 6, 3]]).as_matrix()
+                local[:3, 3] = pose7[:3]
+                if (owner.source != checker.geometry_sources[names[0]]
+                        or not np.allclose(path.poses[0] @ path.attachment @ local, state["geometry_poses"][names[0]],
+                                           atol=1e-8, rtol=0)):
+                    raise ValueError("Installation alias must preserve its source identity and fixed pose")
+                checked.add(owner.owner_id)
+                used.add(names[0])
+        self.robot_validator = validator
+        self._self_collision_owner_ids = frozenset(checked)
+
+    def check_robot_self_collision(self, joint_position, joint_names, trajectory_time,
+                                   *, valid=None, diagnostics=None):
+        """Query every known required solid pair for the actual native states.
+
+        The valid mask is applied before copying coordinates to the CPU, so
+        native interpolation padding cannot invent collision states. These
+        discrete 0/1 constraints are used only for acceptance, never backward.
+        Diagnostics retain one worst state rather than all state/pair products.
+        """
+        if self.robot_validator is None:
+            raise ValueError("Source robot self-collision validation is not bound")
+        if (joint_position.ndim != 3 or joint_position.shape[-1] != len(joint_names)
+                or trajectory_time.shape != joint_position.shape[:2]):
+            raise ValueError("Source self checks require aligned [B,H,J] coordinates and [B,H] time")
+        if valid is None:
+            valid = torch.ones_like(trajectory_time, dtype=torch.bool)
+        if valid.shape != trajectory_time.shape or valid.dtype != torch.bool:
+            raise ValueError("Source self validity must be a boolean mask of the native states")
+        positions = joint_position.detach()[valid].cpu().numpy()
+        times = trajectory_time.detach()[valid].cpu().numpy()
+        residuals, unmodelled, worst = [], set(), None
+        for row, time_s in zip(positions, times):
+            report = self.robot_validator.check_planning_self(
+                row, joint_names, time_s=time_s, gripper=self.gripper)
+            residuals.append(report["residual"])
+            unmodelled.update(report["unmodelled_geometry_names"])
+            if diagnostics is not None:
+                clearance = report["minimum_required_clearance_m"]
+                rank = (report["residual"], -float("inf") if clearance is None else -clearance)
+                if worst is None or rank > worst[0]:
+                    worst = (rank, {**report, "trajectory_time_s": float(time_s),
+                        "planning_joint_names": list(joint_names), "planning_joint_positions": row.tolist()})
+        result = torch.zeros_like(trajectory_time)
+        result[valid] = result.new_tensor(residuals)
+        if diagnostics is not None:
+            diagnostics.update(checked_states=len(positions),
+                unmodelled_geometry_names=sorted(unmodelled),
+                worst_state=None if worst is None else worst[1])
+        return result
+    # END source-solid state queries never inherit a sphere-proxy acceptance gate.
 
     def clone_for_rollout(self):
         # BEGIN isolate candidate policy and relationships without GPU copies.
@@ -1667,6 +1769,48 @@ class PlanningScene:
                 (active & ~certain).to(progress.dtype))
         # END the target-cell query checks every possible material overlap.
 
+    # BEGIN sphere self/installation costs are optimizer guidance only.
+    def robot_self_collision_guidance(self, robot_spheres, position, quaternion, progress,
+                                     joint_position, joint_names, *, trajectory_time):
+        """Retain differentiable hand and installation proxies without vetoes.
+
+        Unknown future fingers contribute no presumed physical self overlap.
+        Their rigid palm and every other known body retain guidance. Complete
+        source solids are checked separately at acceptance states, including
+        states with zero proxy penetration.
+        """
+        spheres = robot_spheres
+        hand = self.gripper
+        uncertain = torch.zeros_like(progress, dtype=torch.bool)
+        unknown_indices = set()
+        total = torch.zeros_like(progress)
+        if hand is not None:
+            coordinates, half, _ = hand.state(
+                progress, joint_position, joint_names, trajectory_time=trajectory_time)
+            spheres = hand.spheres(spheres, position, quaternion, coordinates, half)
+            if hand.controller in {"binary", "timed_reference"} and hand.nominal_finger_trajectory is None:
+                uncertain = trajectory_time > 0
+                unknown_indices = {index for index, mapping in zip(hand.sphere_indices, hand.sphere_joint_translation)
+                                   if np.any(mapping != 0)}
+            if hand.self_collision_pairs:
+                all_pairs = _self_pair_sum(spheres, hand._self_pair_indices)
+                known_pairs = [pair for pair in hand.self_collision_pairs if not set(pair) & unknown_indices]
+                known = _self_pair_sum(spheres, np.asarray(known_pairs, dtype=np.int64).reshape(-1, 2))
+                total = torch.where(uncertain, known, all_pairs)
+        known_indices = [index for index in range(spheres.shape[-2]) if index not in unknown_indices]
+        for owner in self.owners:
+            if owner.owner_id not in self._self_collision_owner_ids:
+                continue
+            local = _local_spheres(spheres, *owner.predicted_pose(progress))
+            values = owner.query(local, key=("robot", owner.owner_id))
+            if owner.robot_excluded_spheres:
+                enabled = values.new_ones(values.shape[-1])
+                enabled[list(owner.robot_excluded_spheres)] = 0
+                values = values * enabled
+            total = total + torch.where(uncertain, values[..., known_indices].sum(-1), values.sum(-1))
+        return total
+    # END no sphere self term is added to a hard scene constraint below.
+
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time=None,
                    robot_owner_permission_progress=None, layer_selection_out=None):
@@ -1714,10 +1858,9 @@ class PlanningScene:
             coordinates, half, costs["gripper/controller"] = self.gripper.state(
                 progress, joint_position, joint_names, trajectory_time=trajectory_time)
             spheres = self.gripper.spheres(spheres, position, quaternion, coordinates, half)
-            # BEGIN retain every declared pair without a per-pair Python graph.
-            if self.gripper.self_collision_pairs:
-                costs["gripper/self"] = _self_pair_sum(spheres, self.gripper._self_pair_indices)
-            # END retain every declared pair without a per-pair Python graph.
+            # BEGIN source solids own self acceptance; hand spheres guide only.
+            # robot_self_collision_guidance retains their optimizer gradients.
+            # END controller constraints and all ordinary owner queries remain.
         # BEGIN an unmodelled future width does not establish a physical collision.
         uncertain_hand = torch.zeros_like(progress, dtype=torch.bool)
         uncertain_indices = []
@@ -1732,21 +1875,9 @@ class PlanningScene:
                 known_indices = [index for index in range(spheres.shape[-2])
                                  if index not in uncertain_set]
                 # END the same robot partition applies to every scene owner.
-                if hand.self_collision_pairs:
-                    affected = [pair for pair in hand.self_collision_pairs if set(pair) & uncertain_set]
-                    unresolved = _self_pair_sum(spheres, np.asarray(affected, dtype=np.int64).reshape(-1, 2)) if affected else torch.zeros_like(progress)
-                    costs["unknown/gripper/self"] = unresolved * uncertain_hand
-                    # BEGIN known pairs are independent nonnegative evidence.
-                    # Subtracting differently rounded all/unknown reductions
-                    # can invent a positive violation or erase a small real
-                    # one. Sum the unaffected pairs themselves; measured
-                    # entrance states still retain every declared pair.
-                    known_pairs = [pair for pair in hand.self_collision_pairs
-                                   if not set(pair) & uncertain_set]
-                    known = _self_pair_sum(spheres, np.asarray(known_pairs, dtype=np.int64).reshape(-1, 2))
-                    costs["gripper/self"] = torch.where(
-                        uncertain_hand, known, costs["gripper/self"])
-                    # END unknown pair values remain separately diagnostic.
+                # BEGIN unknown self geometry is reported by the source query.
+                # Sphere overlap is not evidence about an unknown future width.
+                # END the known/unknown partition below still applies to owners.
         def collision_terms(values, key, actor):
             if actor == "robot" and uncertain_indices:
                 unresolved = values[..., uncertain_indices].sum(-1) * uncertain_hand
@@ -1845,6 +1976,10 @@ class PlanningScene:
                 # BEGIN retain native welded/masked installation pairs without deleting geometry.
                 # Applying the mask to per-sphere costs leaves the same owner
                 # active for all other robot links and for a carried payload.
+                # BEGIN the complete native installation pair policy owns robot acceptance.
+                if actor == "robot" and owner.owner_id in self._self_collision_owner_ids:
+                    continue
+                # END moving payloads still query this same installation owner.
                 values = field_query(owner.query, local, (actor, owner.owner_id), selected)
                 if policies:
                     cells = self._contact_cells[owner.owner_id]
@@ -1979,6 +2114,10 @@ class PlanningScene:
                 {"times": hand.finger_trajectory.times, "position": hand.finger_trajectory.position,
                  "velocity": hand.finger_trajectory.velocity})})
         return {"reference_frame": self.reference_frame, "robot_geometry_source": self.robot_geometry_source,
+                # BEGIN freeze source geometry and policy with every formal request.
+                "robot_self_collision": (None if self.robot_validator is None else
+                                         self.robot_validator.planning_binding_record()),
+                # END paths or sphere inventories alone cannot bind the source model.
                 "robot_collision_bodies": deepcopy(self.robot_collision_bodies),
                 "native_geometry_materials": deepcopy(self.native_geometry_materials),
                 "robot_sphere_materials": list(self.robot_sphere_materials), "gripper": gripper,
@@ -2008,6 +2147,13 @@ class PlanningScene:
         """Static scope/evidence for results; never report candidate Holding as verified."""
         return {
             "reference_frame": self.reference_frame,
+            # BEGIN identify the single source-solid self-collision authority.
+            "robot_self_collision": (None if self.robot_validator is None else {
+                "name": self.robot_validator.name, "source": self.robot_validator.source,
+                "installation_owner_ids": sorted(self._self_collision_owner_ids),
+                "acceptance": "all known required source-solid pairs at each validation state",
+                "sphere_proxy": "optimizer guidance only"}),
+            # END unknown future geometry is recorded by each state query.
             "observation_ids": self.coverage.observation_ids,
             "observation_build": deepcopy(self.observation_report),
             "current_occupied_evidence": deepcopy(self.coverage.occupancy_evidence),

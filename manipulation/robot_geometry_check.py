@@ -120,6 +120,12 @@ class RobotGeometryChecker:
         self.urdf_path = str(Path(urdf_path).resolve())
         self.base_frame = _name(base_frame, "base_frame")
         tree = ET.parse(self.urdf_path).getroot()
+        # BEGIN retain the consumed source model in the planning binding.
+        # A filesystem path alone cannot identify the kinematic tree or the
+        # supplied collision solids after the source files have changed.
+        self._model_urdf = ET.tostring(tree, encoding="unicode")
+        self._geometry_model = []
+        # END serialized identity contains no independently reconstructed model.
         links = [node.attrib["name"] for node in tree.findall("link")]
         joints = tree.findall("joint")
         joint_names = [node.attrib["name"] for node in joints]
@@ -177,6 +183,15 @@ class RobotGeometryChecker:
                 raise ValueError("Geometry must be an explicit native convex solid or analytic primitive")
             self._geometries[name] = (_name(record.frame, "geometry frame"), shape,
                                       _name(record.source, "geometry source"), local_pose)
+            # BEGIN preserve the exact inputs used to construct each Coal shape.
+            identity = {"name": name, "frame": record.frame, "source": record.source}
+            if isinstance(record, NativeSolid):
+                identity.update(kind="convex", vertices_frame=self._solid_vertices[name].tolist())
+            else:
+                identity.update(kind=record.shape_kind, dimensions=list(dimensions),
+                                T_frame_geometry=local_pose.tolist())
+            self._geometry_model.append(identity)
+            # END individual components remain distinct in the frozen binding.
         if not self._geometries:
             raise ValueError("At least one explicitly sourced native solid is required")
         self._request = coal.DistanceRequest()
@@ -206,6 +221,13 @@ class RobotGeometryChecker:
     def geometry_sources(self):
         return {name: value[2] for name, value in self._geometries.items()}
     # END expose immutable geometry identities for a complete acceptance policy.
+
+    # BEGIN provide source geometry without exposing mutable Coal objects.
+    def model_record(self):
+        """Serialize the consumed URDF and every explicit native solid input."""
+        from copy import deepcopy
+        return {"urdf_xml": self._model_urdf, "geometries": deepcopy(self._geometry_model)}
+    # END callers receive owned JSON-compatible evidence, not shared buffers.
 
     # BEGIN identify exactly which solids depend on unmodelled actuator coordinates.
     def geometry_depending_on(self, joint_names):

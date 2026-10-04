@@ -305,3 +305,226 @@ def test_prefix_preflight_uses_actual_feedback_time_separately_from_authorized_s
     assert result["checked_interval_s"] == [.4, 1.]
     assert result["actual_state"]["trajectory_time"] == .5
 # END native device tick alignment does not relabel the actual contact-rule time.
+
+
+# BEGIN shared planning solid policy needs no sphere proxy or GPU state.
+def planning_hand(*, controller="binary", current=-.08, nominal=None):
+    """Minimal physical hand contract; its command deliberately predicts contact."""
+    return SimpleNamespace(controller=controller, joint_names=NAMES[1:],
+        current_positions=np.array([current]), joint_limits=np.array([[-.1, 0.]]),
+        nominal_finger_trajectory=nominal,
+        finger_trajectory=SimpleNamespace(sample=lambda time: (np.array([0.]), np.array([0.]))))
+
+
+def planning_problem(names=NAMES[:1], positions=(.03,)):
+    return SimpleNamespace(joint_names=names, start_q=np.asarray(positions),
+        reference_frame="world", base_pose=np.eye(4), tool_link="tool", tool_transform=np.eye(4))
+
+
+@pytest.mark.parametrize("finger,passed,relation", [
+    (-.08, True, "separated"), (0., False, "penetrating"),
+    (-.01000025, False, "numerical_boundary"),
+])
+def test_planning_self_queries_native_solids_without_any_sphere_cost(model, finger, passed, relation):
+    gate = validator(model)
+    result = gate.check_planning_self([finger, .03], NAMES[::-1], time_s=.2,
+                                     gripper=planning_hand(controller="position_tracking"))
+    assert result["passed"] is passed
+    assert result["residual"] == float(not passed)
+    assert result["queried_pairs"] == 1
+    assert result["minimum_pair"]["relation"] == relation
+    assert result["joint_names"] == list(NAMES)
+    assert result["joint_positions"] == [.03, finger]
+    assert len(result["violations"]) == int(not passed)
+    assert result["unmodelled_geometry_names"] == []
+
+
+@pytest.mark.parametrize("policy", ["excluded", "mechanical_contact"])
+def test_planning_native_pair_permissions_keep_joint_limits(model, policy):
+    gate = validator(model, [PairQuery("first", "second", policy, "explicit source policy")])
+    accepted = gate.check_planning_self([.03, 0.], NAMES, time_s=.2, gripper=None)
+    assert accepted["passed"] and accepted["queried_pairs"] == 0
+    assert accepted["minimum_pair"] is None and accepted["minimum_required_clearance_m"] is None
+    rejected = gate.check_planning_self([.11, 0.], NAMES, time_s=.2, gripper=None)
+    assert not rejected["passed"] and rejected["residual"] == 1.
+    assert rejected["violations"] == []
+    assert set(rejected["joint_limit_violations"]) == {"left_slide"}
+
+
+@pytest.mark.parametrize("index,boundary", [(0, "upper"), (1, "lower")])
+def test_planning_source_limits_admit_only_exact_active_dtype_endpoints(model, index, boundary):
+    # Mechanical contact removes collision as a confounder; the independent
+    # scalar joint domain must still reject each adjacent unrepresentable q.
+    gate = validator(model, [PairQuery("first", "second", "mechanical_contact", "explicit source permission")])
+    q = np.array([.03, -.08], dtype=np.float32)
+    q[index] = np.float32(.1 if boundary == "upper" else -.1)
+    accepted = gate.check_planning_self(q, NAMES, time_s=.2, gripper=None)
+    assert accepted["passed"] and accepted["joint_limit_violations"] == {}
+    assert accepted["joint_positions"] == q.astype(float).tolist()
+    evidence = accepted["rounded_limit_representations"]
+    assert len(evidence) == 1 and evidence[0]["joint_name"] == NAMES[index]
+    assert evidence[0]["represented_boundary"] == boundary
+    assert evidence[0]["position"] == float(q[index])
+    assert evidence[0]["position"] != evidence[0][boundary]
+    adjacent = q.copy()
+    adjacent[index] = np.nextafter(q[index], np.float32(np.inf if boundary == "upper" else -np.inf))
+    for values in (adjacent, q.astype(np.float64)):
+        rejected = gate.check_planning_self(values, NAMES, time_s=.2, gripper=None)
+        assert not rejected["passed"] and rejected["rounded_limit_representations"] == []
+        assert set(rejected["joint_limit_violations"]) == {NAMES[index]}
+    actual = feedback(arm=float(q[0]), finger=float(q[1]))
+    assert any(row["kind"] == "independent_joint_position"
+               for row in gate.check_state(actual, stage="actual", trajectory_time=.2)["violations"])
+
+
+def test_planning_active_dtype_cannot_relax_independent_nominal_finger_limits(model):
+    gate = validator(model, [PairQuery("first", "second", "mechanical_contact", "explicit source permission")])
+    nominal = SimpleNamespace(joint_names=NAMES[1:], duration=1.,
+        sample=lambda time: (np.array([float(np.float32(-.1))]), np.array([0.])))
+    result = gate.check_planning_self(np.array([.03], dtype=np.float32), NAMES[:1], time_s=.2,
+        gripper=planning_hand(controller="timed_reference", nominal=nominal))
+    assert not result["passed"] and result["rounded_limit_representations"] == []
+    assert set(result["joint_limit_violations"]) == {"right_slide"}
+
+
+@pytest.mark.parametrize("controller", ["binary", "timed_reference"])
+def test_planning_unknown_future_fingers_never_use_the_control_command(model, controller):
+    gate = validator(model)
+    hand = planning_hand(controller=controller)
+    actual = gate.check_planning_self([.03], NAMES[:1], time_s=0., gripper=hand)
+    assert actual["passed"] and actual["queried_pairs"] == 1
+    assert actual["joint_positions"] == [.03, -.08]
+    future = gate.check_planning_self([.03], NAMES[:1], time_s=.2, gripper=hand)
+    assert future["passed"] and future["queried_pairs"] == 0
+    assert future["unmodelled_geometry_names"] == ["second"]
+    nominal = SimpleNamespace(joint_names=NAMES[1:], duration=1.,
+        sample=lambda time: (np.array([-.08+.08*time]), np.array([.08])))
+    hand.nominal_finger_trajectory = nominal
+    middle = gate.check_planning_self([.03], NAMES[:1], time_s=.5, gripper=hand)
+    assert middle["passed"] and middle["joint_positions"] == [.03, -.04]
+    finish = gate.check_planning_self([.03], NAMES[:1], time_s=1., gripper=hand)
+    assert not finish["passed"] and finish["queried_pairs"] == 1
+    assert finish["unmodelled_geometry_names"] == []
+
+
+def test_planning_nominal_finger_endpoint_preserves_exact_native_time_representation(model):
+    from scipy.interpolate import CubicHermiteSpline
+    from manipulation.gripper_trajectory import FingerTrajectory
+
+    duration = 9*float(np.float32(.2))
+    nominal = SimpleNamespace(joint_names=NAMES[1:], duration=duration,
+        _curve=CubicHermiteSpline([0., duration], [[-.08], [-.04]], [[0.], [0.]]))
+    # Use the production sampler's strict physical domain and polynomial;
+    # actuator event generation is independent of this representation check.
+    nominal.sample = lambda time: FingerTrajectory.sample(nominal, time)
+    hand = planning_hand(controller="timed_reference", nominal=nominal)
+    gate = validator(model)
+    endpoint = np.float32(duration)
+    assert float(endpoint) > duration
+    result = gate.check_planning_self([.03], NAMES[:1], time_s=endpoint, gripper=hand)
+    final_position = float(nominal.sample(duration)[0][0])
+    assert result["passed"] and result["joint_positions"] == [.03, final_position]
+    interior = gate.check_planning_self([.03], NAMES[:1], time_s=1, gripper=hand)
+    assert interior["joint_positions"][1] == float(nominal.sample(1.)[0][0])
+    assert interior["joint_positions"][1] != final_position
+    for beyond in (np.nextafter(endpoint, np.float32(np.inf)), float(endpoint),
+                   np.nextafter(duration, np.inf)):
+        with pytest.raises(ValueError, match="original trajectory duration"):
+            gate.check_planning_self([.03], NAMES[:1], time_s=beyond, gripper=hand)
+
+
+def test_planning_unknown_finger_keeps_arm_against_fixed_installation(model):
+    from itertools import combinations
+    fixed_pose = np.eye(4)
+    fixed_pose[:3, 3] = [.03, .2, 0.]
+    second_pose = np.eye(4)
+    second_pose[1, 3] = .4
+    checker = RobotGeometryChecker(model.urdf_path, base_frame="base", geometries=[
+        NativePrimitive("first", "left", "box", (.04, .04, .04), np.eye(4), "moving arm solid"),
+        NativePrimitive("second", "right", "box", (.04, .04, .04), second_pose, "moving finger solid"),
+        NativePrimitive("mount", "base", "box", (.01, .01, .01), fixed_pose, "fixed installation")])
+    pairs = [PairQuery(a, b, "required", "native enabled pair")
+             for a, b in combinations(checker.geometry_names, 2)]
+    result = validator(checker, pairs).check_planning_self([.03], NAMES[:1], time_s=1., gripper=planning_hand())
+    assert not result["passed"] and result["queried_pairs"] == 1
+    assert result["unmodelled_geometry_names"] == ["second"]
+    assert [(row["first"], row["second"]) for row in result["violations"]] == [("first", "mount")]
+
+
+def test_planning_robot_without_hand_requires_complete_native_coordinates(model):
+    gate = RobotStateValidator(model, joint_names=NAMES, arm_joint_names=NAMES, finger_joint_names=(),
+        pairs=[PairQuery("first", "second", "required", "native enabled pair")],
+        named_velocity_limits={name: 1. for name in NAMES}, reference_frame="world",
+        T_reference_base=np.eye(4), tool_frame="tool", T_frame_tcp=np.eye(4),
+        fk_translation_tolerance_m=1e-8, fk_rotation_tolerance_rad=1e-8, source="robot without hand")
+    gate.validate_planning_binding(planning_problem(NAMES, [.03, -.08]), None)
+    assert gate.check_planning_self([.03, -.08], NAMES, time_s=.2, gripper=None)["passed"]
+    with pytest.raises(ValueError, match="every native joint"):
+        gate.check_planning_self([.03], NAMES[:1], time_s=.2, gripper=None)
+
+
+def test_planning_binding_preserves_calibration_joint_partition_and_measured_fingers(model):
+    gate, problem, hand = validator(model), planning_problem(), planning_hand()
+    gate.validate_planning_binding(problem, hand)
+    for field in ("base_pose", "tool_transform"):
+        wrong = deepcopy(problem)
+        getattr(wrong, field)[0, 3] = .01
+        with pytest.raises(ValueError, match="identity"):
+            gate.validate_planning_binding(wrong, hand)
+    wrong = deepcopy(hand)
+    wrong.joint_limits[0, 0] = -.2
+    with pytest.raises(ValueError, match="mechanical limits"):
+        gate.validate_planning_binding(problem, wrong)
+    hand.controller = "position_tracking"
+    with pytest.raises(ValueError, match="active planning coordinates"):
+        gate.validate_planning_binding(problem, hand)
+    active = planning_problem(NAMES, [.03, -.08])
+    gate.validate_planning_binding(active, hand)
+    active.start_q[1] = -.04
+    with pytest.raises(ValueError, match="measured entrance"):
+        gate.validate_planning_binding(active, hand)
+
+
+def test_planning_binding_records_owned_source_geometry_and_complete_policy(model):
+    import json
+    gate = validator(model)
+    record = gate.planning_binding_record()
+    assert json.loads(json.dumps(record, allow_nan=False)) == record
+    assert record["pair_order"][0]["policy"] == "required"
+    assert "left_slide" in record["model"]["urdf_xml"]
+    assert record["model"]["geometries"][0]["dimensions"] == [.04, .04, .04]
+    assert record["numerics"] == model.numerics
+    record["model"]["geometries"][0]["dimensions"][0] = 10.
+    assert gate.planning_binding_record()["model"]["geometries"][0]["dimensions"][0] == .04
+# END every planning decision uses the same native solid and mechanical policy.
+
+
+# BEGIN execution checks the exact robot model saved with accepted planning inputs.
+@pytest.mark.parametrize("changed", ["geometry", "pair_policy"])
+def test_execution_scene_rejects_different_planned_source_solids_or_pair_policy(model, changed):
+    from test_independent_scene_validation import binding
+    gate, scene = validator(model), binding()
+    scene["robot_self_collision"] = gate.planning_binding_record()
+    if changed == "geometry":
+        scene["robot_self_collision"]["model"]["geometries"][0]["dimensions"][0] = .08
+    else:
+        scene["robot_self_collision"]["pair_order"][0]["policy"] = "mechanical_contact"
+    with pytest.raises(ValueError, match="source robot geometry and pair policy"):
+        gate.bind_scene(scene, progress_at_time=lambda time: time)
+    assert not hasattr(gate, "_scene_binding")
+
+
+def test_execution_scene_rebinding_preserves_frozen_robot_identity_after_first_bind(model):
+    from test_independent_scene_validation import binding
+    gate, scene = validator(model), binding()
+    identity = gate.planning_binding_record()
+    scene["robot_self_collision"] = identity
+    for _ in range(2):
+        gate.bind_scene(scene, progress_at_time=lambda time: time)
+        assert gate.describe()["scene_bound"] is True
+        assert gate.planning_binding_record() == identity
+    standalone = binding()
+    standalone["robot_self_collision"] = None
+    gate.bind_scene(standalone, progress_at_time=lambda time: time)
+    assert gate._scene_binding["robot_self_collision"] is None
+# END source equality is independent of mutable execution-scene bookkeeping.

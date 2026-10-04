@@ -34,6 +34,9 @@ def cartesian_planner(problem, world=None):
     planner.budget = PlanningBudget(search_seconds=3., validation_joint_step=.08)
     planner.joint_names = problem.joint_names
     planner.scene = scene() if world is None else world
+    # BEGIN this one-body Cartesian fixture has no source self-collision pair.
+    planner.scene.check_robot_self_collision = lambda q, names, times, **kwargs: torch.zeros_like(times)
+    # END OMPL still checks every configured task and observed obstacle.
     planner.anchors = np.unique(np.r_[problem.anchors, planner.scene.required_progress_anchors])
     planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.tensor(value, dtype=torch.float64))
     planner.start = SimpleNamespace(position=torch.tensor(problem.start_q[None], dtype=torch.float64))
@@ -80,6 +83,28 @@ class ScopedOmplSearchTest(unittest.TestCase):
     def search(self, planner, curve):
         return planner.ompl_seed(torch.zeros((1, 1, 8, len(planner.joint_names)), dtype=torch.float64),
                                 SimpleNamespace(duration=1., _curve=curve))
+
+    # BEGIN OMPL requires source separation even when every proxy/scene term is zero.
+    def test_source_self_collision_rejects_an_otherwise_free_boundary(self):
+        planner = cartesian_planner(problem())
+        planner.budget = replace(planner.budget, ik_seeds=2, trajectory_seeds=1)
+        calls = []
+
+        def source_check(q, names, times, **kwargs):
+            calls.append((q.clone(), times.clone()))
+            return (times == 1.).to(times)
+
+        planner.scene.check_robot_self_collision = source_check
+        seed, report = self.search(planner, lambda t: np.zeros(3))
+        self.assertIsNone(seed)
+        self.assertEqual(len(report["branches"]), 2)
+        for branch in report["branches"]:
+            self.assertEqual(branch["failure"], "boundary_candidate_not_feasible")
+            terms = branch["first_invalid_states"][0]["terms"]
+            self.assertEqual(terms["scene"], 0.)
+            self.assertEqual(terms["source_self_collision"], 1.)
+        self.assertTrue(any(bool((times == 1.).any()) for _, times in calls))
+    # END all proposals still pass the same actual-time solid check.
 
     def test_native_goal_projection_preserves_free_direction_and_fixed_time(self):
         # Two bands, one free tangent, one duplicate equation. A projected

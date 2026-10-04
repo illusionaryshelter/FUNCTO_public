@@ -951,15 +951,28 @@ cuRobo optimization.
 The optimizer retains cuRobo's native trajectory regularization. Independent
 native and exported-curve constraints still determine acceptance. Before IK,
 the planner checks measured active-joint position/velocity against effective
-native limits, native self collision and scene components at actual entrance
+native limits, source-solid self collision and scene components at actual entrance
 FK. A failed necessary condition returns `initial_state_infeasible` with its
 individual residuals and no trajectory. This check does not invent unmeasured
 acceleration, jerk, torque or locked-joint velocity. A conservative binary-hand
 violation describes that controller model's feasibility, rather than proving
-current physical contact. An independently commanded hand uses its measured
-entrance and synchronous finger reference instead of the union of its entire
-mechanical travel.
+current physical contact. An independently commanded hand uses measured
+entrance coordinates and, when supplied, its separately declared nominal
+geometry trajectory. A command alone does not establish future finger geometry.
 <!-- END retain native smoothness and reject an infeasible fixed entrance. -->
+
+<!-- BEGIN one source-solid self-collision authority throughout planning. -->
+Every request supplies a `RobotStateValidator` containing the complete source
+solids and explicit required/excluded/mechanical-contact pair policy. Entrance,
+IK and trajectory feasibility, OMPL states and final curve samples query all
+known required pairs with Pinocchio FK and Coal. Native sphere self costs,
+hand self proxies and duplicate robot/installation proxies guide optimization;
+they do not independently veto a source-separated state. Environment and
+payload constraints, native joint limits and terminal convergence stay required.
+The accepted binding contains the consumed URDF, geometry and pair policy;
+execution rejects a different robot validator. Checks remain discrete and do
+not establish continuous collision freedom or the positions of unknown fingers.
+<!-- END optimizer guidance and sampled source acceptance have separate roles. -->
 
 | Module | Responsibility |
 |---|---|
@@ -968,6 +981,7 @@ mechanical travel.
 | `planning_observation` | Convert calibrated current RGB-D and explicit pixel masks into owner-separated native Mapper fields and conservative coverage |
 | `planning` | Bound native work, solve the complete window, refine failing samples and export the verified cubic joint curve |
 | `robot_coverage` | Check newly entered native robot volume against frozen initial model occupancy and original depth-proven free cells |
+| `robot_validation` / `robot_geometry_check` | Bind source geometry and pair policy; perform Pinocchio/Coal self checks in planning and full measured-state checks in execution |
 | `gripper_trajectory` | Preserve a named C1 finger command reference on the formal arm clock, separately from measured finger motion |
 | `execution` / `robosuite_execution` | Gate original events and measured full robot state, then send the saved references through native controllers |
 
@@ -988,11 +1002,12 @@ problem = build_planning_problem(
 )
 result = plan_trajectory(
     problem, collision_scene, robot_config,
+    robot_validator=source_robot_validator,  # Same named source robot and calibration.
     budget=PlanningBudget(knots=12, interpolation_buffer_size=768),
 )
 if result.success:
     curve = result.trajectory
-    q, dq, progress = curve.sample(controller_sample_times)
+    q, dq, ddq, progress = curve.sample(controller_sample_times)
     # Execution requires actual evidence before crossing this boundary.
     permitted_end_time = curve.executable_until
     next_evidence = curve.next_verification

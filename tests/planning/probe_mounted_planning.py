@@ -28,8 +28,8 @@ from manipulation.execution import ExecutionLimits
 from manipulation.planning import PlanningBudget
 from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath, PoseEventRequirement
 from recorded_task_planning import _json_value, plan_and_record
-from robot_fixture import create_fixed_installation_owners
 from robot_validation_fixture import build_robot_validator
+from probe_robot_fixture import fixed_probe_hand
 
 
 class DeclaredEmptyBackground:
@@ -160,10 +160,10 @@ def run(args):
         robot = yaml.safe_load(config_path.read_text())
         kin = robot["robot_cfg"]["kinematics"]
         sphere_count = sum(len(rows) for rows in kin["collision_spheres"].values())
-        if (not 1 <= sphere_count <= 480 or sphere_count != fixture["sphere_count"]
+        if (not 1 <= sphere_count <= 640 or sphere_count != fixture["sphere_count"]
                 or len(fixture["sphere_materials"]) != sphere_count
                 or tuple(kin["cspace"]["joint_names"]) != full_names):
-            raise ValueError("This control experiment requires the complete source robot within its 480-sphere budget")
+            raise ValueError("This control experiment requires the complete source robot within its 640-sphere budget")
         kin["lock_joints"] = {name: float(actual_q[full_names.index(name)]) for name in finger_names}
         # The source cspace includes all joints; cuRobo removes explicitly
         # locked coordinates itself. Keep its named defaults/weights aligned.
@@ -196,17 +196,23 @@ def run(args):
         torch.cuda.reset_peak_memory_stats(0)
         report["gpu_used"] = True
         report["resource_limits"] = {"torch_allocator_bytes": allocator_bytes, "cpu_threads": 2,
-                                     "max_robot_spheres": 480, "initial_free_device_bytes": free}
+                                     "max_robot_spheres": sphere_count, "initial_free_device_bytes": free}
         device = DeviceCfg("cuda:0")
         native = Kinematics(KinematicsCfg.from_robot_yaml_file(deepcopy(robot), device_cfg=device))
         if tuple(native.joint_names) != arm_names or native.total_spheres != sphere_count:
             raise ValueError("Loaded native arm order or sphere count differs from the verified input")
-        parameters = native.config.kinematics_config
-        indices_by_link = {link: [int(index) for index in
-            parameters.get_sphere_index_from_link_name(link).cpu().tolist()]
-            for link in kin["collision_link_names"]}
-        owners, owner_report = create_fixed_installation_owners(fixture, device_cfg=device,
-            T_output_base=problem.base_pose, sphere_indices_by_link=indices_by_link)
+        # BEGIN measured coordinates define a declared constant future geometry hypothesis.
+        # The actual source control tick is metadata for that hypothesis. No
+        # command event, actuator-tracking claim or execution band is invented.
+        import mujoco
+        source_model = mujoco.MjModel.from_xml_path(fixture["source_scene_xml"])
+        control_timestep = float(source_model.opt.timestep)
+        del source_model
+        hand, owners, hand_report = fixed_probe_hand(fixture, robot, problem, device=device,
+            full_current_positions=actual_q, control_timestep_s=control_timestep)
+        owner_report = hand_report["fixed_installation_owners"]
+        report["fixed_hand_hypothesis"] = hand_report
+        # END independently measured q/dq remain the separate execution contract.
         # The box is specified by this synthetic experiment, not inferred from
         # an RGB-D image or filled around a failed candidate. Its finite border
         # still uses the production whole-sphere unknown-space constraint.
@@ -216,7 +222,7 @@ def run(args):
             reference_frame=problem.reference_frame)
         scene = PlanningScene(background=DeclaredEmptyBackground(), owners=owners, coverage=coverage,
             reference_frame=problem.reference_frame, robot_sphere_materials=(None,) * sphere_count,
-            robot_geometry_source=fixture["robot_geometry_source"], has_gripper=False)
+            robot_geometry_source=fixture["robot_geometry_source"], gripper=hand)
         scene.observation_report = {"scope": scope, "synthetic_known_box_origin_m": origin.tolist(),
                                     "synthetic_known_box_shape_zyx": [81, 81, 81], "voxel_size_m": .05}
         with torch.no_grad():
@@ -226,12 +232,13 @@ def run(args):
             position, quaternion = problem.transform_tool_pose(
                 state.tool_poses.position[:, :, tool_index], state.tool_poses.quaternion[:, :, tool_index])
             terms = scene.components(problem.transform_robot_spheres(state.robot_spheres), position, quaternion,
-                device.to_device([[0.]]), device.to_device(problem.start_q)[None, None], arm_names)
+                device.to_device([[0.]]), device.to_device(problem.start_q)[None, None], arm_names,
+                trajectory_time=device.to_device([[0.]]))
             report["initial_scene_components"] = {name: float(value.max().cpu()) for name, value in terms.items()}
         report.update(fixed_installation_owners=owner_report, scene=scene.describe())
         # Queries own their buffers; this temporary FK model is no longer
         # needed once its actual sphere ownership has been bound to the owners.
-        del native, state, parameters, position, quaternion, terms
+        del native, state, position, quaternion, terms
         # This newly constructed short-reach problem owns its own duration;
         # a 0.05-s native step keeps the resulting physical probe bounded. No
         # saved skill timing or solver feasibility tolerance is changed.
@@ -241,21 +248,24 @@ def run(args):
         # require 321 validation samples (each interval is subdivided twice),
         # END no extra spline interval or physical retiming is introduced.
         # plus the original anchors. Exceeding this budget still rejects.
-        # The production estimator accounts for every independent scene copy:
-        # 416 robot spheres, three mounts and the finite coverage grid require
-        # about 447 MiB here, within both 512 MiB and the 2-GiB allocator cap.
+        # The production estimator checks this exact source sphere inventory,
+        # its installations and finite coverage against the same workspace
+        # allowance and two-GiB allocator cap before constructing rollouts.
         budget = PlanningBudget(knots=16, ik_seeds=2, trajectory_seeds=1,
             ik_iterations=80, trajectory_iterations=100, maximum_trajectory_dt=.05,
             interpolation_buffer_size=256, max_validation_points=384, max_refinement_points=16,
-            maximum_trajectory_solves=1, search_seconds=0., max_robot_spheres=480,
+            maximum_trajectory_solves=1, search_seconds=0., max_robot_spheres=sphere_count,
             max_scene_workspace_bytes=512 * 1024**2)
         report["planning_called"] = True
-        result = plan_and_record(problem, scene, robot, output / "planning", budget=budget,
+        # BEGIN reuse the same source validator that checked measured entrance.
+        result = plan_and_record(problem, scene, robot, output / "planning",
+            robot_validator=validator, budget=budget,
             provenance={"scope": scope, "fixture": str(args.fixture.resolve()),
                         "feedback": str(args.feedback.resolve()), "entry_frame": feedback["entry_frame"],
                         "goal_source": "Pinocchio FK of measured arm q plus explicit CLI delta",
                         "arm_delta": delta.tolist(), "rigid_finger_parameters": kin["lock_joints"],
                         "fixed_installation_owners": owner_report}, execution_limits=limits.describe())
+        # END planning retains the complete native solid-pair policy.
         report.update(status="completed", planning_success=bool(result.success),
                       accepted_trajectory=(str(output / "planning" / "trajectory.npz")
                                            if result.success and result.trajectory is not None else None))

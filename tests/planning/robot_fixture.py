@@ -731,6 +731,11 @@ def create_fixed_installation_owners(fixture, *, device_cfg, T_output_base, sphe
     for record in records:
         prepared = fixed_installation_proxy(record)
         owner_id = f"robot_installation/{record['geom']}"
+        # BEGIN scene aliases name the same compiled geom as the Coal adapter.
+        # The fixture's descriptive installation source remains in its record;
+        # this explicit identity binds the proxy to one physical native solid.
+        native_source = f"{fixture['robot_mjcf_path']}::geom[{record['geom']}]"
+        # END an outward proxy remains an approximation of this exact source.
         if prepared["kind"] == "cuboid":
             world = SceneCfg(cuboid=[Cuboid(**prepared["arguments"])])
             cache = {"cuboid": 1}
@@ -739,19 +744,21 @@ def create_fixed_installation_owners(fixture, *, device_cfg, T_output_base, sphe
             cache = {"mesh": 1}
         native = SceneCollision.from_config(SceneCollisionCfg(
             device_cfg=device_cfg, scene_model=world, cache=cache))
-        query = CuroboSphereQuery(native, owner_ids=(owner_id,), source=record["source"])
+        # BEGIN preserve exact native source identity through the scene owner.
+        query = CuroboSphereQuery(native, owner_ids=(owner_id,), source=native_source)
         pose = base @ _pose_array(record["T_base_geom"], "native fixed primitive base transform")
         excluded = tuple(int(index) for link in record["robot_excluded_links"]
                          for index in sphere_indices_by_link[link])
         owners.append(CollisionOwner(
-            owner_id, query, PosePath(np.array([0., 1.]), np.stack((pose, pose)), record["source"]),
-            record["source"], geometry_complete=True, moving=False,
+            owner_id, query, PosePath(np.array([0., 1.]), np.stack((pose, pose)), native_source),
+            native_source, geometry_complete=True, moving=False,
             robot_excluded_spheres=excluded,
             robot_exclusion_source=record["policy_source"] if excluded else None,
             robot_exclusion_geometry_source=fixture["robot_geometry_source"] if excluded else None,
             # BEGIN exact native identity for the independent installation pair policy.
             native_geometry_names=(record["geom"],)))
             # END the owner remains present for payload/world queries.
+        # END source-string binding does not alter geometry or native masks.
         reports.append({"owner_id": owner_id, "native_geom": record["geom"],
                         "native_shape_kind": record["shape_kind"], "native_dimensions": record["dimensions"],
                         "T_output_geom": pose.tolist(), "approximation": prepared["approximation"],

@@ -117,14 +117,20 @@ def observed_scene(args):
 
     captured = {}
 
-    def capture(problem, scene, robot, output, *, budget, provenance, execution_limits, continuation):
+    # BEGIN retain every explicit current runner argument without a permissive sink.
+    def capture(problem, scene, robot, output, *, robot_validator, budget, provenance, execution_limits,
+                continuation=None, rebind=None, request_ledger=None):
+        if continuation is not None or rebind is not None or request_ledger is not None:
+            raise ValueError("Prepared grasp diagnostics do not create or continue a planning request")
         if captured:
             raise ValueError("The recorded runner must reach its preparation boundary exactly once")
-        captured.update(problem=problem, scene=scene, robot=robot, budget=budget, provenance=provenance,
+        captured.update(problem=problem, scene=scene, robot=robot, robot_validator=robot_validator,
+                        budget=budget, provenance=provenance,
                         execution_limits=execution_limits)
         # BEGIN preparation metadata satisfies the runner without claiming a solve.
         return SimpleNamespace(success=False, diagnostics={"initial_state": None})
         # END the captured scene remains the diagnostic's actual output.
+    # END the preparation boundary preserves the required physical source model.
 
     runner_args = SimpleNamespace(**vars(args))
     runner_args.output = args.output/"scene-build"

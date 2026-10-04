@@ -13,7 +13,8 @@ from unittest.mock import patch
 import probe_process_planner as experiment
 
 
-def run(output):
+# BEGIN the gradient wrapper preserves the required source-fixture boundary.
+def run(output, *, fixture_path):
     import torch
     from manipulation import planning
     from curobo._src.optim.gradient.line_search_strategy import LineSearchStrategy
@@ -79,12 +80,15 @@ def run(output):
     # Imported probe helpers can be called again in the same process. Restore
     # the exact prior method even if the experiment or observer raises.
     with patch.object(planning._CuroboPlanner, "optimize", new=measured):
-        experiment.run(output, False)
+        experiment.run(output, False, fixture_path=fixture_path)
     # END scoped diagnostic instrumentation.
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    run(parser.parse_args().output)
+    parser.add_argument("--fixture", type=Path, required=True)
+    args = parser.parse_args()
+    run(args.output, fixture_path=args.fixture)
+# END instrumentation never supplies a substitute robot model.
 # END independent finite-difference and line-search scale experiment.

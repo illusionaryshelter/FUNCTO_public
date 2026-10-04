@@ -71,6 +71,8 @@ grading; result-only execution scope alone does not imply diagnostic grading.
 | `probe_ompl_constraints.py` | CPU OMPL projection and connection contracts |
 | `probe_scalar_progress_clock.py`, `diagnose_moving_gripper_capacity.py`, `probe_collision_suffix_capacity.py` | CPU representation and interpolation diagnostics |
 | `probe_fk_gradient.py`, `probe_process_gradient.py` | Native FK and full-process derivative checks |
+| `probe_anchor_self_collision_gpu.py`, `probe_source_self_collision_gpu.py` | Exact two-box source fixtures: preserved native gradients, added-time collisions, proxy false positives and complete public planning |
+| `probe_robot_fixture.py` | Shared explicit source-fixture loading and constant nominal hand geometry for synthetic robot checks; no fabricated hand events |
 | `probe_scene_query_gpu.py`, `probe_observation_scene_gpu.py`, `probe_known_solid_fk_gpu.py` | Native collision queries, observed-space mapping and current robot evidence |
 | `probe_planning_gpu.py`, `probe_process_planner.py`, `probe_robot_collision.py`, `probe_required_excursion.py`, `probe_robot_projected_seed.py` | Explicit trajectory generation and projected-seed checks |
 | `probe_moving_gripper_gpu.py`, `probe_native_contact_permission.py`, `probe_on_endpoint_family.py` | Gripper commands, local contact and permitted support freedom |
@@ -80,8 +82,22 @@ For example, the existing full-robot collision check is run explicitly with:
 
 ```bash
 python tests/planning/probe_robot_collision.py \
+  --fixture /path/to/verified-robot-fixture/manifest.json \
   --knots 12 --output runs/planning/robot-collision
 ```
+
+<!-- BEGIN synthetic robot planning also requires explicit source geometry. -->
+Full-robot planning probes require `--fixture`, including the process/gradient,
+required-excursion, moving-gripper, material-contact and occupied-solid checks.
+The fixture supplies named joints, tool frame, complete source solids and pair
+policy. They do not infer filled collision solids from the bundled Franka mesh
+surfaces. Fixed-hand experiments declare constant nominal finger geometry as a
+synthetic assumption and preserve the request's actual event list, which can be
+empty. This assumption does not assert that physical fingers follow a command.
+The moving-hand probe keeps active source finger coordinates and their signed
+mechanical ranges. Native self spheres remain optimizer guidance; all required
+source self pairs enter entrance, search, metrics and final acceptance.
+<!-- END standalone FK diagnostics do not become source-model certificates. -->
 
 All script-to-script imports stay local to this directory. Run the scripts by
 file path; they are not a second production planning package. Historical JSON,

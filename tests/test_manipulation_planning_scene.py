@@ -111,6 +111,9 @@ class BatchedHandCollisionTest(unittest.TestCase):
 class SphereQuery:
     def __init__(self, owner_ids=(), center=(8., 0., 0.), radius=.1):
         self.owner_ids = frozenset(owner_ids)
+        # BEGIN formal source bindings need explicit test geometry provenance.
+        self.source = "explicit analytic test sphere field"
+        # END this fixture remains a test-only query implementation.
         self.center, self.radius = center, radius
         self.calls = {}
 
@@ -212,6 +215,89 @@ class FixedInstallationPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "complete robot sphere model"):
             scene((self.mount(robot_excluded_spheres=(1,)),))
 # END mounting geometry remains an obstacle rather than becoming observed free volume.
+
+
+# BEGIN source installation pairs replace only their duplicate robot proxy gate.
+def source_installation_scene(tmp_path):
+    """One movable box and one fixed box with intentionally larger sphere covers."""
+    from manipulation.robot_geometry_check import NativePrimitive, PairQuery, RobotGeometryChecker
+    from manipulation.robot_validation import RobotStateValidator
+    path = tmp_path / "slide.urdf"
+    path.write_text('''<robot name="source_boxes"><link name="base"/><link name="slider"/>
+      <joint name="slide" type="prismatic"><parent link="base"/><child link="slider"/>
+      <axis xyz="1 0 0"/><limit lower="-1" upper="1" effort="10" velocity="1"/></joint></robot>''')
+    checker = RobotGeometryChecker(path, base_frame="base", geometries=[
+        NativePrimitive("mount", "base", "box", (.04,)*3, np.eye(4), "native fixed installation"),
+        NativePrimitive("moving", "slider", "box", (.04,)*3, np.eye(4), "native moving box")])
+    validator = RobotStateValidator(checker, joint_names=("slide",), arm_joint_names=("slide",), finger_joint_names=(),
+        pairs=(PairQuery("mount", "moving", "required", "explicit independent bodies"),),
+        named_velocity_limits={"slide": 1.}, reference_frame="world", T_reference_base=np.eye(4),
+        tool_frame="slider", T_frame_tcp=np.eye(4), fk_translation_tolerance_m=1e-8,
+        fk_rotation_tolerance_rad=1e-8, source="explicit source boxes")
+    query = SphereQuery(("mount",), center=(0., 0., 0.), radius=.1)
+    query.independent_geometry = {"solids": [{"name": "mount_proxy", "kind": "cuboid",
+        "dimensions": [.04]*3, "pose": [0., 0., 0., 1., 0., 0., 0.],
+        "source": "native fixed installation"}], "query_gaps": []}
+    mount = CollisionOwner("mount", query, pose_path(), "native fixed installation", True,
+                           native_geometry_names=("mount",))
+    payload = CollisionOwner("payload", SphereQuery(("payload",)), pose_path(), "current payload",
+        geometry_complete=True, moving=True, local_spheres=[[0., 0., 0., .1]])
+    current = scene((mount, payload))
+    problem = SimpleNamespace(reference_frame="world", tool_link="slider", base_pose=np.eye(4),
+        tool_transform=np.eye(4), start_q=np.array([.15]), joint_names=("slide",))
+    current.bind_robot_validator(validator, problem)
+    return current, validator, problem
+
+
+def test_source_acceptance_survives_proxy_overlap_and_keeps_payload_collision(tmp_path):
+    current, validator, _ = source_installation_scene(tmp_path)
+    args = inputs((0.,), sphere_rows=[[[.15, 0., 0., .1]]], dtype=torch.float32)
+    q = torch.tensor([[[.15]]], dtype=torch.float32, requires_grad=True)
+    times = torch.zeros((1, 1))
+    terms = current.components(*args, q, ("slide",), trajectory_time=times)
+    assert "collision/robot/mount" not in terms
+    assert terms["collision/payload/mount"].item() > 0
+    args[0].requires_grad_()
+    guidance = current.robot_self_collision_guidance(*args, q, ("slide",), trajectory_time=times)
+    assert guidance.item() > 0
+    assert torch.autograd.grad(guidance.sum(), args[0])[0][..., 0].item() == -1
+    evidence = {}
+    assert current.check_robot_self_collision(q, ("slide",), times, diagnostics=evidence).item() == 0
+    assert evidence["checked_states"] == 1
+    assert evidence["worst_state"]["planning_joint_positions"] == q.detach()[0, 0].tolist()
+    assert evidence["worst_state"]["minimum_pair"]["relation"] == "separated"
+    assert current.clone_for_rollout().robot_validator is validator
+    binding = current.to_execution_binding()["robot_self_collision"]
+    assert binding["pair_order"][0]["policy"] == "required"
+    assert len(binding["model"]["geometries"]) == 2
+
+
+def test_source_queries_reject_solid_collision_and_ignore_only_invalid_padding(tmp_path):
+    current, _, _ = source_installation_scene(tmp_path)
+    q = torch.tensor([[[.15], [.02], [float("nan")]]])
+    times = torch.tensor([[0., .5, float("nan")]])
+    valid = torch.tensor([[True, True, False]])
+    report = {}
+    result = current.check_robot_self_collision(q, ("slide",), times, valid=valid, diagnostics=report)
+    assert result.tolist() == [[0., 1., 0.]]
+    assert report["checked_states"] == 2
+    assert report["worst_state"]["violations"][0]["relation"] == "penetrating"
+    # Even a misleading zero sphere overlap never bypasses the source query.
+    assert report["worst_state"]["planning_joint_positions"] == q[0, 1].tolist()
+
+
+def test_source_installation_alias_rejects_different_pose_or_movable_solid(tmp_path):
+    import pytest
+    current, validator, problem = source_installation_scene(tmp_path)
+    mount = current.owners[0]
+    mount.pose_path = pose_path(position=(.1, 0., 0.))
+    with pytest.raises(ValueError, match="source identity and fixed pose"):
+        current.bind_robot_validator(validator, problem)
+    mount.pose_path = pose_path()
+    mount.native_geometry_names = ("moving",)
+    with pytest.raises(ValueError, match="fixed source solid"):
+        current.bind_robot_validator(validator, problem)
+# END no owner name pattern or sphere overlap can infer a source-solid exemption.
 
 
 def contact_rule(**changes):
@@ -916,6 +1002,24 @@ class PlanningSceneTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "current native feedback"):
             world.validate_problem(problem)
 
+    # BEGIN an arm-only request must not invent a hold action to bind the hand.
+    def test_arm_only_request_binds_measured_hand_with_explicit_empty_commands(self):
+        hand = PrismaticGripper(controller="binary", control_timestep_s=.002,
+            joint_names=("finger",), current_positions=[.04], joint_limits=[[0., .04]],
+            joint_bounds=None, coupling_matrix=np.empty((0, 1)), coupling_offset=[],
+            sphere_indices=(0,), local_spheres=[[0., 0., 0., .005]],
+            sphere_joint_translation=[[[1.], [0.], [0.]]], self_collision_pairs=(),
+            commands=(), source="explicit measured hand; no requested hand action")
+        world = scene(gripper=hand, has_gripper=True)
+        problem = PlanningProblem(("arm",), np.zeros(1), np.zeros(1), "tool", "world",
+            np.eye(4), np.eye(4), (MotionPhase("arm reach", pose_path()),))
+        world.validate_problem(problem)
+        self.assertEqual(hand.commands, ())
+        problem.events = (PlanningEvent("close", "skill", 0., 0, "close", "explicit new action"),)
+        with self.assertRaisesRegex(ValueError, "skill/event/occurrence/command/progress"):
+            world.validate_problem(problem)
+    # END real hand actions still require their exact scene command identities.
+
     def test_tracking_drive_projection_cannot_omit_problem_coupling(self):
         hand = PrismaticGripper(
             controller="position_tracking", control_timestep_s=.002, joint_names=("left", "right"),
@@ -1115,7 +1219,7 @@ def test_future_unknown_spheres_cannot_create_roundoff_or_erase_known_penetratio
 
 
 def test_future_unknown_self_pairs_do_not_erase_small_known_pair_or_its_gradient():
-    """A fixed palm pair stays hard even while another pair uses unknown width."""
+    """Known palm guidance survives unknown fingers without becoming a veto."""
     hand = PrismaticGripper(
         controller="binary", control_timestep_s=.002, joint_names=("finger",),
         current_positions=[.04], joint_limits=[[0., .04]], joint_bounds=None,
@@ -1130,13 +1234,15 @@ def test_future_unknown_self_pairs_do_not_erase_small_known_pair_or_its_gradient
     args = inputs((0., .5), sphere_rows=[rows, rows], dtype=torch.float32)
     args[0].requires_grad_()
     times = torch.tensor([[0., .5]], dtype=torch.float32)
+    # BEGIN proxy gradients belong solely to optimizer guidance.
     terms = current.components(*args, trajectory_time=times)
-    assert terms["gripper/self"][0, 0].item() > .1
-    assert terms["unknown/gripper/self"][0, 0].item() == 0.
-    assert terms["gripper/self"][0, 1].item() == 2**-30
-    assert terms["unknown/gripper/self"][0, 1].item() > .2
-    assert current.evaluate(*args, trajectory_time=times)[0, 1].item() == 2**-30
-    gradient = torch.autograd.grad(terms["gripper/self"][0, 1], args[0])[0]
+    assert "gripper/self" not in terms and "unknown/gripper/self" not in terms
+    guidance = current.robot_self_collision_guidance(*args, None, None, trajectory_time=times)
+    assert guidance[0, 0].item() > .1
+    assert guidance[0, 1].item() == 2**-30
+    assert current.evaluate(*args, trajectory_time=times)[0, 1].item() == 0.
+    gradient = torch.autograd.grad(guidance[0, 1], args[0])[0]
+    # END native source geometry supplies the independent hard self verdict.
     assert gradient[0, 1, 2, 0].item() == -1.
     assert gradient[0, 1, 3].count_nonzero().item() == 0
 # END no tolerance, clipping, or unknown reduction can alter known components.

@@ -1,12 +1,13 @@
 """Bounded full-robot avoidance with the production planner and native queries.
 
-All geometry here is explicitly synthetic. The Panda fingers are mechanically
-locked by its supplied robot configuration, so this experiment tests a rigid
-tool and makes no claim about actuated closing or observed real-world safety.
+The obstacle is explicitly synthetic. The supplied source robot retains all
+native solids and installation policy. A declared constant nominal finger
+model tests rigid-tool planning without claiming actual actuator tracking.
 """
 
 # BEGIN synthetic robot collision-generation integration experiment.
 import argparse
+from copy import deepcopy
 import json
 from pathlib import Path
 import resource
@@ -24,7 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # END project-local imports.
 
 
-def run(output, knots=8):
+def run(output, knots=8, *, fixture_path):
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     report = {"scope": "synthetic known world, full arm, rigid locked tool",
@@ -39,12 +40,17 @@ def run(output, knots=8):
         from manipulation.planning_problem import (PlanningProblem, MotionPhase, PosePath,
             NumericalTolerance, PoseEventRequirement, PoseProcessRequirement)
         from manipulation import planning
+        from probe_robot_fixture import load_probe_fixture, fixed_probe_hand
 
         torch.set_num_threads(2)
         torch.cuda.set_per_process_memory_fraction(2*1024**3/torch.cuda.get_device_properties(0).total_memory)
         torch.cuda.reset_peak_memory_stats()
         config = DeviceCfg("cuda:0")
-        kinematics = Kinematics(KinematicsCfg.from_robot_yaml_file("franka.yml"))
+        # BEGIN the complete source model replaces the built-in sphere-only robot.
+        fixture, robot, validator = load_probe_fixture(fixture_path, reference_frame="robot_base")
+        full_positions = np.asarray(robot["robot_cfg"]["kinematics"]["cspace"]["default_joint_position"])
+        kinematics = Kinematics(KinematicsCfg.from_robot_yaml_file(deepcopy(robot), device_cfg=config))
+        # END no native source pair is inferred from a synthetic obstacle placement.
         initial = kinematics.default_joint_position.reshape(-1).clone()
         middle, entrance, finish = initial.clone(), initial.clone(), initial.clone()
         middle[0] += .75
@@ -84,17 +90,14 @@ def run(output, knots=8):
                                        source="fully specified synthetic cuboid")
         coverage = ObservedSpace(np.ones((81, 81, 81), bool), origin=[-2., -2., -2.], voxel_size=.05,
                                  observation_ids=("explicit synthetic known-space grid",), reference_frame="robot_base")
-        scene = PlanningScene(background=background, owners=(), coverage=coverage, reference_frame="robot_base",
-                              robot_sphere_materials=(None,)*kinematics.total_spheres,
-                              robot_geometry_source="supplied Franka spheres with mechanically locked fingers",
-                              has_gripper=False)
         poses = np.repeat(np.eye(4)[None], 3, axis=0)
         poses[:, :3, 3] = p[[0, 2, 3]]
         poses[:, :3, :3] = Rotation.from_quat(r[[0, 2, 3]][:, [1, 2, 3, 0]]).as_matrix()
+        poses = poses @ validator.T_frame_tcp
         # BEGIN the fixture independently requires its short collision suffix.
         suffix = PosePath(np.array([0., 1.]), poses[1:], "declared synthetic local relation")
         problem = PlanningProblem(tuple(kinematics.joint_names), initial.cpu().numpy(), np.zeros(len(initial)),
-                                  "panda_hand", "robot_base", np.eye(4), np.eye(4),
+                                  fixture["tool_link"], "robot_base", np.eye(4), validator.T_frame_tcp,
                                   (MotionPhase("approach_reference", PosePath(np.array([0., 1.]), poses[:2], "synthetic reference")),
                                    MotionPhase("suffix_reference", suffix)),
                                   numerical=NumericalTolerance(position_m=.001, rotation_rad=.005),
@@ -104,7 +107,16 @@ def run(output, knots=8):
                                       "Explicit fixture requirement for the local suffix after obstacle avoidance"),),
                                   source_timestamps=np.array([0., 2., 3.]), source_progress=np.array([0., 1., 2.]))
         # END source phase boundaries themselves impose no robot waypoints.
+        # BEGIN the hand hypothesis and physical installation survive scene construction.
+        hand, owners, hand_report = fixed_probe_hand(fixture, robot, problem, device=config,
+                                                    full_current_positions=full_positions)
+        scene = PlanningScene(background=background, owners=owners, coverage=coverage, reference_frame="robot_base",
+            robot_sphere_materials=(None,)*kinematics.total_spheres,
+            robot_geometry_source=fixture["robot_geometry_source"], gripper=hand)
+        report["fixed_hand_hypothesis"] = hand_report
+        # END complete source robot policy is independent of sphere guidance.
         budget = planning.PlanningBudget(ik_seeds=4, trajectory_seeds=2, ik_iterations=80,
+                                         max_robot_spheres=kinematics.total_spheres,
                                          knots=knots, interpolation_buffer_size=768,
                                          trajectory_iterations=150, maximum_trajectory_solves=3, search_seconds=3.)
         report["knots"] = knots
@@ -131,7 +143,7 @@ def run(output, knots=8):
         # The same imported helper may be reused after a native or diagnostic
         # exception; neither path may leave its observer on the shared class.
         with patch.object(planning._CuroboPlanner, "optimize", new=measured):
-            result = planning.plan_trajectory(problem, scene, "franka.yml", budget=budget)
+            result = planning.plan_trajectory(problem, scene, robot, robot_validator=validator, budget=budget)
         # END scoped collision diagnostics.
         report.update(status="completed", success=result.success, diagnostics=result.diagnostics)
         if result.trajectory is not None:
@@ -155,7 +167,9 @@ def run(output, knots=8):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--fixture", type=Path, required=True,
+                        help="Verified native robot manifest supplying source solids and pair policy")
     parser.add_argument("--knots", type=int, default=8)
     args = parser.parse_args()
-    run(args.output, args.knots)
+    run(args.output, args.knots, fixture_path=args.fixture)
 # END synthetic robot collision-generation integration experiment.

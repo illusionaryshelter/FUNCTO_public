@@ -4,7 +4,7 @@
 from copy import deepcopy
 from dataclasses import asdict, replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import unittest
 
 import numpy as np
@@ -88,6 +88,10 @@ def continuation(request, *, elapsed=.4, curve_time=.4, applied=(), completed=()
 
 
 class PhysicalTimeRequirementsTest(unittest.TestCase):
+    # BEGIN timing regressions replace native construction before geometry use.
+    # This identity-only argument keeps the public physical-model contract explicit.
+    robot_validator = object()
+    # END physical source validation is exercised by separate geometry regressions.
     # BEGIN a continuation cannot convert labels or altered measurements into task completion.
     def test_pose_completion_rechecks_original_allowance_clock_and_candidate(self):
         goal = PoseEventRequirement(.2, np.eye(4), np.eye(4), .001, .01, "original narrow task goal")
@@ -291,7 +295,7 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
         event = PlanningEvent("close", "s", .2, 1, "close", "task")
         request = problem((event,))
         history = continuation(request, elapsed=1.2, curve_time=.4)
-        scene = SimpleNamespace(gripper=None, required_progress_anchors=())
+        scene = SimpleNamespace(gripper=None, required_progress_anchors=(), bind_robot_validator=Mock())
         with self.assertRaisesRegex(ContinuationBindingError, "clock is exhausted"):
             _prepare_continuation(deepcopy(request), scene, None, history)
         budget, prior = _prepare_continuation(request, scene, None, history,
@@ -497,11 +501,11 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
         request = problem((PlanningEvent("old", "s", .1, 1, "close", "source"),
                            PlanningEvent("future", "s", .8, 2, "open", "source")))
         history = continuation(request, applied={("s", "old", 0)})
-        scene = SimpleNamespace(gripper=None, required_progress_anchors=())
+        scene = SimpleNamespace(gripper=None, required_progress_anchors=(), bind_robot_validator=Mock())
         scene.clone_for_rollout = lambda: deepcopy(scene)
         before = plain(request)
         with patch("manipulation.planning._CuroboPlanner", side_effect=ValueError("native initialization gap")):
-            result = plan_trajectory(request, scene, {}, continuation=history)
+            result = plan_trajectory(request, scene, {}, robot_validator=self.robot_validator, continuation=history)
         self.assertFalse(result.success)
         self.assertIn("native initialization gap", result.diagnostics["reason"])
         self.assertEqual(plain(request), before)
@@ -518,10 +522,10 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
         actual["request_ledger"] = deepcopy(actual["original_binding"]["request_ledger"])
         for key in ("completed_goal_ids", "goal_evidence"):
             actual["request_ledger"][key] = deepcopy(actual[key])
-        scene = SimpleNamespace(gripper=None, required_progress_anchors=())
+        scene = SimpleNamespace(gripper=None, required_progress_anchors=(), bind_robot_validator=Mock())
         scene.clone_for_rollout = lambda: deepcopy(scene)
         with patch("manipulation.planning._CuroboPlanner") as native:
-            failed = plan_trajectory(request, scene, {}, continuation=actual)
+            failed = plan_trajectory(request, scene, {}, robot_validator=self.robot_validator, continuation=actual)
             self.assertFalse(failed.success)
             self.assertIn("actual allowed-set T evidence", failed.diagnostics["reason"])
             self.assertEqual(failed.request_ledger["completed_goal_ids"], [])
@@ -529,7 +533,7 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
             self.assertTrue(failed.request_ledger["requires_continuation"])
             self.assertEqual(failed.request_ledger["consumed_planning"]["binding_attempts"], 2)
             self.assertIn("continuation_facts_pending_validation", failed.diagnostics)
-            retried = plan_trajectory(request, scene, {}, request_ledger=failed.request_ledger)
+            retried = plan_trajectory(request, scene, {}, robot_validator=self.robot_validator, request_ledger=failed.request_ledger)
             self.assertFalse(retried.success)
             self.assertIn("actual continuation facts", retried.diagnostics["reason"])
             native.assert_not_called()
@@ -550,7 +554,8 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
 
     def test_failed_first_initialization_does_not_mutate_callers_hand_or_problem(self):
         request = problem((PlanningEvent("future", "s", .8, 2, "open", "source"),))
-        scene = SimpleNamespace(gripper=SimpleNamespace(clock=None, commands=["original"]), required_progress_anchors=())
+        scene = SimpleNamespace(gripper=SimpleNamespace(clock=None, commands=["original"]),
+                                required_progress_anchors=(), bind_robot_validator=Mock())
         scene.clone_for_rollout = lambda: deepcopy(scene)
         before = plain(request)
         def partially_initialize(private_problem, private_scene, *args, **kwargs):
@@ -559,7 +564,7 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
             private_scene.gripper.commands.clear()
             raise ValueError("native allocation failed after clock binding")
         with patch("manipulation.planning._CuroboPlanner", side_effect=partially_initialize):
-            result = plan_trajectory(request, scene, {})
+            result = plan_trajectory(request, scene, {}, robot_validator=self.robot_validator)
         self.assertFalse(result.success)
         self.assertIn("native allocation failed", result.diagnostics["reason"])
         self.assertEqual(plain(request), before)
@@ -588,12 +593,12 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
         def expensive_binding(*args, **kwargs):
             clock["time"] = 2.
             return {"candidate_id": "too-late"}
-        scene = SimpleNamespace(describe=lambda: {})
+        scene = SimpleNamespace(describe=lambda: {}, bind_robot_validator=Mock())
         scene.clone_for_rollout = lambda: deepcopy(scene)
         with patch("manipulation.planning.time.monotonic", side_effect=lambda: clock["time"]), \
                 patch("manipulation.planning._CuroboPlanner", return_value=planner), \
                 patch("manipulation.execution_binding.bind_candidate", side_effect=expensive_binding):
-            result = plan_trajectory(problem(), scene, {},
+            result = plan_trajectory(problem(), scene, {}, robot_validator=self.robot_validator,
                                      budget=PlanningBudget(maximum_trajectory_solves=1, planning_seconds=1.))
         self.assertFalse(result.success)
         self.assertIsNone(result.execution_binding)

@@ -1,9 +1,9 @@
-"""Bounded native Franka trajectory with one declared local material permission.
+"""Bounded source-backed robot trajectory with one declared local material permission.
 
-All original Franka collision spheres and native self-collision rules remain.
-Two additional spheres model a small synthetic rigid pad on panda_hand; only
+All original source solids, collision spheres and self-collision rules remain.
+Two additional spheres model a small synthetic rigid pad on the source TCP; only
 its dedicated contact-feature sphere receives a material identity. This pad
-is declared experiment geometry, not a claim about an actual Franka tool.
+is declared experiment geometry, not a claim about an actual robot tool.
 The owner, patch and observation volume are fully specified synthetic inputs.
 
 One complete V2 solve must pass with the finite material permission. The same
@@ -11,9 +11,10 @@ exported curve is then rejected without that permission, with a noncontact
 palm obstruction owned by the same object, and with another explicit owner.
 These are paired curve checks, not separate claims of global infeasibility.
 No physical grasp, measured contact or actual Holding is supplied or inferred.
-The native fingers stay mechanically locked; no moving-gripper claim is made.
+Future finger geometry is an explicit constant hypothesis; no actuator tracking is certified.
 Run serially: two IK seeds, two trajectory seeds, N=8, 512 interpolation slots,
 no search, at most two complete solves, and a 2 GiB Torch allocator ceiling.
+The source plus added pad and native padding must fit the 640-sphere admission limit.
 """
 
 # BEGIN native finite-material permission and paired export counterexamples.
@@ -42,26 +43,76 @@ def pose_vector(matrix):
     return [*matrix[:3, 3].tolist(), *q.tolist()]
 
 
-def run(output):
+# BEGIN one declared synthetic pad extends both source solids and native proxies.
+def contact_pad_fixture(fixture, robot, validator):
+    """Preserve every source solid/pair and append one exact TCP-frame box.
+
+    This experiment requires an existing TCP frame with no original spheres,
+    allowing new proxy indices to follow the source inventory unchanged. The
+    pad is separated from all original solids by the complete new pair list.
+    Its two spheres are optimizer/scene proxies, never a replacement solid.
+    """
+    from manipulation.robot_geometry_check import NativePrimitive, NativeSolid, PairQuery, RobotGeometryChecker
+    from manipulation.robot_validation import RobotStateValidator
+
+    robot = deepcopy(robot)
+    kin = robot["robot_cfg"]["kinematics"]
+    tool = fixture["tool_link"]
+    if tool in kin["collision_link_names"] or tool in kin["collision_spheres"]:
+        raise ValueError("This added-pad experiment requires a source TCP frame without original spheres")
+    additions = [{"center": [0., 0., .22], "radius": .005},
+                 {"center": [0., 0., .226], "radius": .006}]
+    tcp = validator.T_frame_tcp
+    kin["collision_link_names"].append(tool)
+    kin["collision_spheres"][tool] = [{"center": (tcp[:3, :3] @ row["center"]+tcp[:3, 3]).tolist(),
+                                       "radius": row["radius"]} for row in additions]
+    kin["self_collision_buffer"][tool] = 0.
+    originals = []
+    for row in validator.checker.model_record()["geometries"]:
+        if row["kind"] == "convex":
+            originals.append(NativeSolid(row["name"], row["frame"], np.asarray(row["vertices_frame"]), row["source"]))
+        else:
+            originals.append(NativePrimitive(row["name"], row["frame"], row["kind"], tuple(row["dimensions"]),
+                                             np.asarray(row["T_frame_geometry"]), row["source"]))
+    pad_name = "declared_synthetic_contact_pad"
+    local = np.eye(4)
+    local[:3, 3] = [0., 0., .221]
+    source = "explicit synthetic TCP pad: exact 4 by 4 by 10 mm filled box"
+    pad = NativePrimitive(pad_name, tool, "box", (.004, .004, .01), tcp @ local, source)
+    checker = RobotGeometryChecker(validator.checker.urdf_path, base_frame=validator.checker.base_frame,
+                                   geometries=[*originals, pad])
+    pairs = (*validator.pairs, *(PairQuery(name, pad_name, "required", source)
+                                for name in validator.checker.geometry_names))
+    extended = RobotStateValidator(checker, joint_names=validator.joint_names,
+        arm_joint_names=validator.arm_joint_names, finger_joint_names=validator.finger_joint_names,
+        pairs=pairs, named_velocity_limits=validator.velocity_limits, reference_frame=validator.reference_frame,
+        T_reference_base=validator.T_reference_base, tool_frame=validator.tool_frame, T_frame_tcp=tcp,
+        fk_translation_tolerance_m=validator.fk_translation_tolerance_m,
+        fk_rotation_tolerance_rad=validator.fk_rotation_tolerance_rad,
+        source=f"{validator.source}; {source}")
+    return robot, extended, additions, pad_name
+# END original source geometry and physical pair permissions are unchanged.
+
+
+def run(output, *, fixture_path):
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     report = {"status": "running", "success": False,
-              "scope": "complete native Franka plus explicitly declared synthetic rigid contact pad",
+              "scope": "complete source robot plus explicitly declared synthetic rigid contact pad",
               "production_environment_validation": False, "physical_contact_validation": False,
               "moving_gripper_validation": False, "actual_holding_evidence": False}
     try:
         import torch
-        from curobo.content import get_robot_configs_path
         from curobo.kinematics import Kinematics, KinematicsCfg
         from curobo.types import DeviceCfg, JointState
-        from curobo._src.util.config_io import load_yaml, join_path
         from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
         from curobo._src.geom.types import Cuboid, SceneCfg
-        from manipulation.planning import PlanningBudget, plan_trajectory
+        from manipulation.planning import PlanningBudget, plan_trajectory, _ProgressMap
         from manipulation.planning_problem import (MotionPhase, NumericalTolerance,
             PlanningProblem, PosePath, PoseProcessRequirement)
         from manipulation.planning_scene import (
             CollisionOwner, ContactRule, CuroboSphereQuery, ObservedSpace, PlanningScene, _local_spheres)
+        from probe_robot_fixture import load_probe_fixture, fixed_probe_hand
 
         if not torch.cuda.is_available():
             raise RuntimeError("This experiment requires explicitly authorized CUDA access")
@@ -69,29 +120,26 @@ def run(output):
         torch.cuda.set_per_process_memory_fraction(2*1024**3/torch.cuda.get_device_properties(0).total_memory)
         torch.cuda.reset_peak_memory_stats()
         device = DeviceCfg("cuda:0")
-        robot = deepcopy(load_yaml(join_path(get_robot_configs_path(), "franka.yml")))
+        # BEGIN explicit source fixture plus declared pad; the robot tree is unchanged.
+        fixture, source_robot, source_validator = load_probe_fixture(fixture_path, reference_frame="robot_base")
+        original_geometry = deepcopy(source_robot["robot_cfg"]["kinematics"]["collision_spheres"])
+        robot, validator, additions, pad_name = contact_pad_fixture(fixture, source_robot, source_validator)
         kinematic_input = robot["robot_cfg"]["kinematics"]
-        original_geometry = deepcopy(kinematic_input["collision_spheres"])
-        original_hand_count = len(original_geometry["panda_hand"])
-        additions = [{"center": [0., 0., .22], "radius": .005},
-                     {"center": [0., 0., .226], "radius": .006}]
-        kinematic_input["collision_spheres"]["panda_hand"].extend(deepcopy(additions))
-        # Keep the complete original model verbatim. The extra noncontact
-        # backing sphere remains unmodified even against the permitted owner.
         for link, original in original_geometry.items():
-            if kinematic_input["collision_spheres"][link][:len(original)] != original:
-                raise AssertionError("The experiment must not remove or alter original Franka spheres")
+            if kinematic_input["collision_spheres"][link] != original:
+                raise AssertionError("The experiment must preserve every original source sphere")
         kinematics = Kinematics(KinematicsCfg.from_robot_yaml_file(deepcopy(robot), device_cfg=device))
         names = tuple(kinematics.joint_names)
-        if len(names) != 7 or kinematic_input["lock_joints"] != {
-                "panda_finger_joint1": .04, "panda_finger_joint2": .04}:
-            raise AssertionError("This rigid-tool experiment must retain the explicit native locked fingers")
+        if names != tuple(fixture["arm_joint_names"]):
+            raise AssertionError("This fixed-finger hypothesis leaves only source arm joints active")
         initial = kinematics.default_joint_position.reshape(-1).clone()
-        hand_indices = kinematics.config.kinematics_config.get_sphere_index_from_link_name("panda_hand").cpu().tolist()
-        if len(hand_indices) != original_hand_count+2:
-            raise AssertionError("Native sphere ownership must preserve the declared contact-pad additions")
-        contact_index, backing_index = map(int, hand_indices[-2:])
-        palm_index = int(hand_indices[0])
+        tool_index = kinematics.tool_frames.index(fixture["tool_link"])
+        parameters = kinematics.config.kinematics_config
+        pad_indices = parameters.get_sphere_index_from_link_name(fixture["tool_link"]).cpu().tolist()
+        if len(pad_indices) != 2 or pad_indices != list(range(fixture["sphere_count"], fixture["sphere_count"]+2)):
+            raise AssertionError("The declared pad must follow all unchanged source sphere indices")
+        contact_index, backing_index = map(int, pad_indices)
+        # END source installations and all original robot bodies retain their identities.
 
         def fk(coordinates):
             value = torch.as_tensor(coordinates, dtype=torch.float32, device=device.device)
@@ -99,16 +147,21 @@ def run(output):
                 value[None].contiguous(), joint_names=list(names)))
 
         state = fk(initial[None])
-        position = state.tool_poses.position[0, 0, 0].detach().cpu().numpy().astype(float)
-        quaternion = state.tool_poses.quaternion[0, 0, 0].detach().cpu().numpy().astype(float)
+        position = state.tool_poses.position[0, 0, tool_index].detach().cpu().numpy().astype(float)
+        quaternion = state.tool_poses.quaternion[0, 0, tool_index].detach().cpu().numpy().astype(float)
         tool_pose = np.eye(4)
         tool_pose[:3, 3] = position
         tool_pose[:3, :3] = Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_matrix()
+        tool_pose = tool_pose @ validator.T_frame_tcp
+        position = tool_pose[:3, 3].copy()
         original_spheres = state.robot_spheres[0, 0].detach().cpu().numpy().astype(float)
         local_added = ((original_spheres[[contact_index, backing_index], :3]-position)
                        @ tool_pose[:3, :3])
         np.testing.assert_allclose(local_added, [row["center"] for row in additions], atol=2e-6, rtol=0)
 
+        rigid_indices = [int(index) for link in original_geometry if link not in fixture["finger_link_names"]
+            for index in parameters.get_sphere_index_from_link_name(link).cpu().tolist()]
+        palm_index = min(rigid_indices, key=lambda index: np.linalg.norm(original_spheres[index, :3]-position))
         # The declared contact polygon is the small pad's bottom face. Its
         # outer sphere extends 1 mm past the plane; the separate backing
         # sphere covers noncontact tool volume. This limited proxy error is
@@ -157,11 +210,31 @@ def run(output):
         coverage = ObservedSpace(np.ones((81, 81, 81), bool), origin=[-2., -2., -2.], voxel_size=.05,
                                  observation_ids=("explicit synthetic known-space grid",), reference_frame="robot_base")
 
+        # BEGIN the static contact fixture states its true pose process separately.
+        contact_reference = PosePath(np.array([0., 1.]), np.stack((tool_pose, tool_pose)),
+                                     "synthetic static contact reference")
+        problem = PlanningProblem(
+            names, initial.detach().cpu().numpy(), np.zeros(len(names)), fixture["tool_link"], "robot_base", np.eye(4), validator.T_frame_tcp,
+            (MotionPhase("contact_reference", contact_reference),),
+            numerical=NumericalTolerance(position_m=1e-5, rotation_rad=1e-4),
+            pose_relations=(PoseProcessRequirement(0., 1., contact_reference, np.zeros((6, 2)),
+                "Explicit fixture keeps one constant tool pose while independently changing contact permissions"),),
+            source_timestamps=np.array([0., 1.]), source_progress=np.array([0., 1.]))
+        # END permission and required contact remain independent scene relations.
+        full_current = np.asarray(kinematic_input["cspace"]["default_joint_position"], float)
+        for name, value in zip(names, initial.cpu().numpy()):
+            full_current[fixture["joint_names"].index(name)] = float(value)
+        hand, installations, hand_report = fixed_probe_hand(
+            fixture, robot, problem, device=device, full_current_positions=full_current)
+        report["nominal_hand_hypothesis"] = hand_report
+
         def scene(owners, permissions):
-            return PlanningScene(background=background, owners=owners, contacts=permissions, coverage=coverage,
+            return PlanningScene(background=background, owners=(*installations, *owners), contacts=permissions, coverage=coverage,
                                  reference_frame="robot_base", robot_sphere_materials=materials,
-                                 robot_geometry_source="unchanged complete Franka model plus two declared rigid pad spheres",
-                                 has_gripper=False)
+                                 # BEGIN preserve the installation filters' exact source identity.
+                                 robot_geometry_source=fixture["robot_geometry_source"],
+                                 # END the complete validator record separately identifies the added pad.
+                                 gripper=deepcopy(hand), native_geometry_materials={pad_name: "synthetic_pad_bottom"})
 
         scenes = {"permitted": scene((base_owner,), (rule,)),
                   "permission_removed": scene((base_owner,), ()),
@@ -187,22 +260,14 @@ def run(output):
             "modeling_allowance_m": rule.modeling_allowance_m,
             "geometry_error_m": rule.geometry_error_m, "minimum_thickness_m": rule.minimum_thickness_m}
 
-        # BEGIN the static contact fixture states its true pose process separately.
-        contact_reference = PosePath(np.array([0., 1.]), np.stack((tool_pose, tool_pose)),
-                                     "synthetic static contact reference")
-        problem = PlanningProblem(
-            names, initial.detach().cpu().numpy(), np.zeros(len(names)), "panda_hand", "robot_base", np.eye(4), np.eye(4),
-            (MotionPhase("contact_reference", contact_reference),),
-            numerical=NumericalTolerance(position_m=1e-5, rotation_rad=1e-4),
-            pose_relations=(PoseProcessRequirement(0., 1., contact_reference, np.zeros((6, 2)),
-                "Explicit fixture keeps one constant tool pose while independently changing contact permissions"),),
-            source_timestamps=np.array([0., 1.]), source_progress=np.array([0., 1.]))
-        # END permission and required contact remain independent scene relations.
         budget = PlanningBudget(ik_seeds=2, trajectory_seeds=2, knots=8, ik_iterations=80,
                                 trajectory_iterations=150, interpolation_buffer_size=512,
+                                # BEGIN include both added pad spheres and native disabled slots.
+                                max_robot_spheres=kinematics.total_spheres,
+                                # END allocator and solver workspace limits remain unchanged.
                                 maximum_trajectory_solves=2, search_seconds=0.)
         report["budget"] = asdict(budget)
-        result = plan_trajectory(problem, scenes["permitted"], robot, budget=budget)
+        result = plan_trajectory(problem, scenes["permitted"], robot, budget=budget, robot_validator=validator)
         report["diagnostics"] = result.diagnostics
         if not result.success or result.trajectory is None:
             raise AssertionError("Complete native optimization and exported validation must accept the permitted fixture")
@@ -215,9 +280,16 @@ def run(output):
         progress = device.to_device(s)[None]
         report["paired_export_checks"] = {}
         for label, world in scenes.items():
-            terms = world.components(native.robot_spheres, native.tool_poses.position[:, :, 0],
-                                     native.tool_poses.quaternion[:, :, 0], progress,
-                                     joint_position=device.to_device(q)[None], joint_names=names)
+            # Each paired scene uses the exported clock and the same constant
+            # nominal fingers; binding cannot turn that hypothesis into feedback.
+            world.gripper.bind_clock(curve.duration, _ProgressMap(curve.progress_u, curve.progress_s))
+            world.validate_problem(problem)
+            world.bind_robot_validator(validator, problem)
+            tool_p, tool_r = problem.transform_tool_pose(native.tool_poses.position[:, :, tool_index],
+                                                         native.tool_poses.quaternion[:, :, tool_index])
+            terms = world.components(problem.transform_robot_spheres(native.robot_spheres), tool_p, tool_r, progress,
+                                     joint_position=device.to_device(q)[None], joint_names=names,
+                                     trajectory_time=device.to_device(times)[None])
             total = torch.stack(tuple(terms.values())).sum(0)
             maxima = {name: float(value.max().detach().cpu()) for name, value in terms.items()}
             report["paired_export_checks"][label] = {"maximum_by_component": maxima,
@@ -248,5 +320,7 @@ def run(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    run(parser.parse_args().output)
+    parser.add_argument("--fixture", type=Path, required=True)
+    options = parser.parse_args()
+    run(options.output, fixture_path=options.fixture)
 # END native contact-permission integration experiment.

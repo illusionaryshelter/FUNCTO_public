@@ -275,7 +275,8 @@ def save_collision_snapshot(path, planner, curve, *, curve_path, validation_stat
 # END diagnostics preserve scene identity without creating an execution binding.
 
 
-def plan_and_record(problem, scene, robot, output, *, budget, provenance, execution_limits,
+# BEGIN recorded planning carries the required source-solid validator unchanged.
+def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, provenance, execution_limits,
                     continuation=None, rebind=None, request_ledger=None):
     """Call ``plan_trajectory`` once and preserve its measured outcome.
 
@@ -539,8 +540,9 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
                                                  new=stage_observer(method, name)))
             # END the observer does not repeat or bypass any entrance check.
             # BEGIN continuation consumes the original ledger and request budget.
-            result = planning.plan_trajectory(problem, scene, robot, budget=budget,
+            result = planning.plan_trajectory(problem, scene, robot, robot_validator=robot_validator, budget=budget,
                 continuation=continuation, rebind=rebind, request_ledger=request_ledger)
+            # END recording never substitutes the robot's physical pair policy.
             # END a new actual binding is never an implicit budget reset.
         report.update(status="completed", success=result.success,
                       diagnostics=result.diagnostics)

@@ -20,6 +20,10 @@ def test_failed_result_archives_ledger_and_passes_previous_work_to_next_attempt(
     problem = SimpleNamespace(events=(PlanningEvent("close", "skill", .5, 3, "close", "explicit test event"),),
                               phase_count=1, anchors=np.array([0., .5, 1.]))
     budget = PlanningBudget()
+    # BEGIN this recorder test intercepts planning before any geometry query.
+    # Object identity proves the supplied source binding survives both attempts.
+    robot_validator = object()
+    # END no test geometry is claimed by this handoff-only sentinel.
     first = {"request_id": "same-explicit-request", "consumed_planning": {"initializations": 1},
              "history": [{"value": "F", "source": "unchanged failed attempt fact"}]}
     second = {**deepcopy(first), "consumed_planning": {"initializations": 2}}
@@ -28,13 +32,16 @@ def test_failed_result_archives_ledger_and_passes_previous_work_to_next_attempt(
     with patch("manipulation.planning.plan_trajectory", side_effect=outputs) as plan, \
             patch("torch.cuda.max_memory_allocated", return_value=0), \
             patch("torch.cuda.max_memory_reserved", return_value=0):
-        result = plan_and_record(problem, None, {}, tmp_path/"first", budget=budget,
+        result = plan_and_record(problem, None, {}, tmp_path/"first", robot_validator=robot_validator, budget=budget,
                                 provenance={"scope": "CPU handoff regression; no native solve"}, execution_limits={})
         saved = json.loads((tmp_path/"first"/"request-ledger.json").read_text())
         assert saved == first and not result.success
-        plan_and_record(problem, None, {}, tmp_path/"second", budget=budget,
+        plan_and_record(problem, None, {}, tmp_path/"second", robot_validator=robot_validator, budget=budget,
                         provenance={"scope": "same CPU request"}, execution_limits={}, request_ledger=saved)
     assert plan.call_args_list[1].kwargs["request_ledger"] == first
+    # BEGIN recording forwards the explicit physical source model unchanged.
+    assert all(call.kwargs["robot_validator"] is robot_validator for call in plan.call_args_list)
+    # END retries never reconstruct a substitute collision policy.
     assert json.loads((tmp_path/"second"/"request-ledger.json").read_text()) == second
     report = json.loads((tmp_path/"second"/"planning-report.json").read_text())
     assert not report["success"] and Path(report["request_ledger_path"]).name == "request-ledger.json"
