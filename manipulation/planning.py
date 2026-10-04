@@ -750,7 +750,16 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     # optimizer/trajectory storage retain the separate two-GiB allowance in
     # the device-memory preflight below. The scene budget is specifically for
     # dedicated geometry queries, not a claim about all planner allocations.
-    bytes_per_state = 4*(22+8*spheres+8*dof+12*links)
+    # BEGIN reserve the independent self-collision buffers at exact anchors.
+    # SelfCollisionCost stores one float output, four float gradients and one
+    # uint8 sparse flag per sphere, plus two int16 indices/one float per block.
+    # Its smallest native block covers 2048 pairs; all unordered sphere pairs
+    # bound the blocks without constructing a dense pair matrix. Production
+    # costs do not request the optional per-pair diagnostic distance tensor.
+    self_blocks = (spheres*(spheres-1)//2+2047)//2048
+    self_bytes_per_state = 4+17*spheres+8*self_blocks
+    bytes_per_state = 4*(22+8*spheres+8*dof+12*links)+self_bytes_per_state
+    # END anchor collision buffers share the existing finite admission limit.
     anchor_fk_bytes = 22*budget.trajectory_seeds*anchor_capacity*bytes_per_state
     return int(scene_bytes), int(anchor_fk_bytes)
 
@@ -2724,6 +2733,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
     from curobo.types import JointState
     from curobo._src.rollout.cost_manager.cost_manager_robot import RobotCostManager
     from curobo._src.rollout.cost_manager.cost_manager_robot_cfg import RobotCostManagerCfg
+    # BEGIN exact-anchor collision checks use the same native implementation.
+    from curobo._src.cost.cost_self_collision import SelfCollisionCost
+    from curobo._src.state.state_robot import RobotState
+    # END no separate collision formula or policy is introduced.
     orientation_vjp = _orientation_vjp_type()
     native_layout = _native_gradient_layout_type()
 
@@ -2770,6 +2783,14 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # A separate native FK instance owns the anchor buffers.  Reusing
             # the main rollout FK would overwrite values needed by backward.
             self._anchor_fk = Kinematics(transition_model.robot_model.config, compute_jacobian=True)
+            # BEGIN every added task/refinement time also checks self collision.
+            # The main cost owns mutable CUDA forward/backward buffers. A
+            # separate instance preserves both graphs, while copying its
+            # already-normalized config avoids dividing the weight twice.
+            native_self = self.get_cost("self_collision")
+            self._anchor_self_collision = (None if native_self is None else
+                SelfCollisionCost(deepcopy(native_self.config)))
+            # END ordinary reference IK creates no additional check buffers.
 
         def set_dense_counts(self, counts):
             self._dense_counts = counts.reshape(-1).long()
@@ -2817,8 +2838,25 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             anchor_u = self._anchor_u.expand(batch, -1)
             anchor_s = self._anchor_s.expand(batch, -1)
             anchor_q, anchor_dq = _hermite_at_parameters(q, dq, state.joint_state.dt, counts, anchor_u)
-            anchor_state = self._anchor_fk.compute_kinematics(
-                JointState.from_position(anchor_q.contiguous(), joint_names=list(self._joint_names)))
+            # BEGIN retain the actual anchor state for native self collision.
+            anchor_joints = JointState.from_position(anchor_q.contiguous(), joint_names=list(self._joint_names))
+            anchor_state = self._anchor_fk.compute_kinematics(anchor_joints)
+            native_self = self.get_cost("self_collision")
+            if native_self is not None and native_self.enabled:
+                anchor_native = _timed_native_state(
+                    RobotState(joint_state=anchor_joints, cuda_robot_model_state=anchor_state),
+                    problem, self._scene, self._joint_names, anchor_u*clock["duration"],
+                    sphere_padding=_native_collision_padding(self))
+                self._anchor_self_collision.setup_batch_tensors(batch, anchor_u.shape[1])
+                anchor_collision = self._anchor_self_collision.forward(
+                    native_layout.apply(anchor_native.robot_spheres).contiguous())
+                # These values already contain the native optimizer/metrics
+                # weight and binary policy. Do not square or multiply them
+                # by the separate task/scene constraint weight below.
+                folded_collision = torch.cat((q.new_zeros((batch, horizon-1, 1)),
+                    anchor_collision.sum(1, keepdim=True)), dim=1)
+                collection.add(folded_collision, "anchor_self_collision")
+            # END anchor failures and gradients enter native candidate checks.
             anchor_quaternion = orientation_vjp.apply(anchor_q, anchor_state.tool_poses.quaternion.detach(),
                                                       anchor_state.tool_jacobians[..., 3:, :].detach())
             anchor_position = native_layout.apply(anchor_state.tool_poses.position)[:, :, self._tool_index]
@@ -3703,16 +3741,22 @@ class _CuroboPlanner:
                         "terms": {name: float(term.max().item()) for name, term in terms.items()}})
                 return accepted
 
+        # BEGIN a two-attempt boundary budget includes a non-reference posture.
         def proposals(begin, parameter):
-            yield np.r_[candidate_trajectory._curve(parameter*candidate_trajectory.duration), parameter]
+            yield "candidate_curve", np.r_[candidate_trajectory._curve(parameter*candidate_trajectory.duration), parameter]
+            # Reference hints must not consume every small attempt budget.
+            # This proposal still uses the same allowed-set projection and
+            # complete state/edge validity checks as every other member.
+            yield "joint_box_random", np.r_[rng.uniform(lower, upper), parameter]
             for controls in source_controls:
-                yield np.r_[[np.interp(parameter, control_u, controls[:, column])
-                             for column in range(len(self.joint_names))], parameter]
-            yield np.r_[begin[:-1], parameter]
+                yield "reference_controls", np.r_[[np.interp(parameter, control_u, controls[:, column])
+                                                   for column in range(len(self.joint_names))], parameter]
+            yield "previous_boundary", np.r_[begin[:-1], parameter]
             # Sampling the actual joint box permits different support tangents,
             # yaw and redundant IK branches. There is no reference corridor.
             while True:
-                yield np.r_[rng.uniform(lower, upper), parameter]
+                yield "joint_box_random", np.r_[rng.uniform(lower, upper), parameter]
+        # END proposal ordering changes neither attempts nor time/query limits.
 
         # An explicit stack permits bounded backtracking without recursive
         # depth or copying all prior path samples into every branch frame.
@@ -3731,7 +3775,9 @@ class _CuroboPlanner:
                     continue
                 frame["attempts"] += 1
                 begin, scene = frame["start"], frame["scene"]
-                goal = next(frame["proposals"])
+                # BEGIN retain the initializer identity through projection.
+                proposal_source, goal = next(frame["proposals"])
+                # END the source labels a proposal, not a validity certificate.
                 goal_s = float(anchor_progress.get(hi, np.interp(hi, self.progress_map.u, self.progress_map.s)))
                 middle_s = float(np.interp((lo+hi)/2, self.progress_map.u, self.progress_map.s))
                 active = self.problem.projection_requirements(middle_s)
@@ -3741,8 +3787,11 @@ class _CuroboPlanner:
                 process_count = len(boundary_equations(goal, False))
                 goal = _project_allowed_boundary(goal, equations(scene, boundary_active, goal_ids),
                     process_count, tolerance, np.r_[lower, lo], np.r_[upper, hi], deadline=deadline)
+                # BEGIN rejected projections retain their proposal source too.
                 evidence = {"chart": stage, "time_interval": [float(lo), float(hi)],
-                            "goals": list(goal_ids), "attempt": frame["attempts"]}
+                            "goals": list(goal_ids), "attempt": frame["attempts"],
+                            "proposal_source": proposal_source}
+                # END provenance does not alter projection or validity results.
                 if goal is None:
                     report["branches"].append({**evidence, "failure": "allowed_boundary_projection_failed"})
                     continue

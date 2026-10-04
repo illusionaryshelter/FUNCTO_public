@@ -140,6 +140,49 @@ class ScopedOmplSearchTest(unittest.TestCase):
         np.testing.assert_allclose(boundary[:2], [.2, .15], atol=1e-12)
         self.assertLessEqual(abs(boundary[2]), .001)
 
+    # BEGIN a small boundary budget must reach an independently sampled posture.
+    def test_two_attempts_sample_a_new_posture_without_bypassing_projection_or_collision(self):
+        for block_random in (False, True):
+            with self.subTest(block_random=block_random):
+                # The first obstacle blocks only the curve endpoint. The
+                # larger alternative also blocks the projected random goal,
+                # while leaving the measured start free in both cases.
+                center, radius = ((.565, -.5, 0.), .57) if block_random else ((.4, 0., 0.), .08)
+                world = scene(background=SphereQuery(("background",), center=center, radius=radius))
+                support = replace(self.support_goal(), progress=1.)
+                planner = cartesian_planner(problem(supports=(support,)), world)
+                planner.budget = replace(planner.budget, ik_seeds=2, trajectory_seeds=1)
+                sampled = np.random.default_rng(planner.budget.random_seed).uniform(-2., 2., 3)
+                self.assertGreater(abs(sampled[2]), support.gap_tolerance)
+
+                seed, report = self.search(planner, lambda t: np.array([.4*t, 0., .3]))
+                first, second = report["branches"]
+                self.assertEqual([first["proposal_source"], second["proposal_source"]],
+                                 ["candidate_curve", "joint_box_random"])
+                self.assertEqual([first["attempt"], second["attempt"]], [1, 2])
+                self.assertEqual(first["failure"], "boundary_candidate_not_feasible")
+                self.assertEqual(first["boundary"], "goal")
+                self.assertGreater(first["first_invalid_states"][0]["terms"]["scene"], 0.)
+                boundary = np.asarray(second["boundary_state"])
+                # Native projection changes the unsupported height and the
+                # out-of-polygon y, preserving the unconstrained x and time.
+                self.assertAlmostEqual(boundary[0], sampled[0])
+                self.assertLessEqual(abs(boundary[1]), 1.+planner.problem.numerical.position_m)
+                self.assertLessEqual(abs(boundary[2]), support.gap_tolerance)
+                self.assertEqual(boundary[-1], 1.)
+                self.assertLessEqual(report["state_queries"], planner.budget.max_validation_points)
+                if block_random:
+                    self.assertIsNone(seed)
+                    self.assertEqual(second["failure"], "boundary_candidate_not_feasible")
+                    self.assertEqual(second["boundary"], "goal")
+                    self.assertGreater(second["first_invalid_states"][0]["terms"]["scene"], 0.)
+                else:
+                    self.assertIsNotNone(seed, report)
+                    self.assertTrue(report["success"])
+                    self.assertGreater(second["motion_checks"], 0)
+                    self.assertGreater(second["validity_checks"], 2)
+    # END both sampled outcomes use the installed projection and validity path.
+
     def test_failed_suffix_revisits_a_different_member_of_previous_allowed_set(self):
         planner = cartesian_planner(problem(supports=(self.support_goal(),)))
         def connector(start, goal, *args, **kwargs):

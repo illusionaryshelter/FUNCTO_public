@@ -7,6 +7,9 @@ IK, GPU execution, collision geometry or physical grasp certification.
 
 # BEGIN independent calculus, exact-anchor and execution-boundary regressions.
 from copy import deepcopy
+# BEGIN exact-anchor native self-collision fixtures keep GPU resources isolated.
+from contextlib import contextmanager, ExitStack, nullcontext
+# END the installed native cost remains active in CPU integration tests.
 # BEGIN preserve the complete event payload in the shared test clock.
 from dataclasses import asdict
 # END the exported occurrence must match its frozen source metadata.
@@ -1199,6 +1202,182 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         result.initialize_from_config(config, transition)
         return result
 
+    # BEGIN required/refinement anchors share native self-collision semantics.
+    @contextmanager
+    def anchor_self_collision_fixture(self, mode, *, required=(), refinement=(), hand=None, padding=0.):
+        """Keep native cost/buffer behavior; replace GPU FK and its pair kernel.
+
+        The analytic robot has a sphere at x=q[0] and a fixed sphere at zero.
+        Endpoint states are separated; a cubic interpolation can collide at
+        an exact anchor. Two batches exercise the native gradient layout.
+        """
+        from curobo._src.cost.cost_self_collision import SelfCollisionCost
+        from curobo._src.rollout.cost_manager.cost_manager_robot import RobotCostManager
+        from curobo._src.state.state_robot import RobotState
+        from curobo.types import JointState
+
+        def kinematics(joints):
+            q = joints.position
+            p = torch.cat((q, torch.zeros_like(q[..., :1])), -1)
+            r = q.new_zeros((*q.shape[:2], 1, 4)); r[..., 0] = 1.
+            moving = torch.cat((q[..., :1], torch.zeros_like(q), torch.full_like(q[..., :1], .2)), -1)
+            fixed = torch.cat((torch.zeros_like(p), torch.full_like(q[..., :1], .2)), -1)
+            return SimpleNamespace(tool_poses=SimpleNamespace(position=p.unsqueeze(-2), quaternion=r,
+                tool_frames=["tool"]), tool_jacobians=q.new_zeros((*q.shape[:2], 1, 6, 2)),
+                robot_spheres=torch.stack((moving, fixed), -2))
+
+        def pair_kernel(spheres, output, gradient, pair_distance, sparse, weight, sphere_padding,
+                        pairs, *unused):
+            # Independent Euclidean sphere-pair oracle. Returning the supplied
+            # output tensor preserves the native reusable-buffer contract.
+            radius = spheres[..., 3] + sphere_padding
+            first, second = pairs[:, 0].long(), pairs[:, 1].long()
+            squared_distance = (spheres[..., first, :3]-spheres[..., second, :3]).square().sum(-1)
+            squared_overlap = (radius[..., first]+radius[..., second]).square()-squared_distance
+            active = (radius[..., first] >= 0) & (radius[..., second] >= 0)
+            value = .5*weight*torch.where(active, squared_overlap.clamp_min(0), 0.).amax(-1, keepdim=True)
+            output.copy_(value)
+            return output
+
+        forwarded = []
+        original_forward = SelfCollisionCost.forward
+
+        def native_forward(cost, spheres):
+            value = original_forward(cost, spheres)
+            forwarded.append({"cost": cost, "spheres": spheres.detach().clone(),
+                "distance_buffer": cost._out_distance.data_ptr(), "gradient_buffer": cost._out_grad.data_ptr(),
+                "value": value.detach().clone()})
+            return value
+
+        q = torch.tensor([[[-1., 0.], [1., 0.]], [[-1.1, 0.], [.9, 0.]]], requires_grad=True)
+        joints = JointState.from_position(q, joint_names=["first_joint", "second_joint"])
+        joints.velocity = torch.zeros_like(q)
+        joints.dt = torch.ones(2)
+        state = RobotState(joint_state=joints, cuda_robot_model_state=kinematics(joints))
+        problem = SimpleNamespace(tool_link="tool", start_progress=0., phase_count=1., base_pose=np.eye(4),
+            mechanisms=(), stop_progress=(), transform_tool_pose=lambda p, r: (p, r),
+            transform_robot_spheres=lambda value: value,
+            evaluate=lambda p, *args, **kwargs: p[..., 0]*0,
+            optimizer_preferences=lambda p, *args, **kwargs: p[..., 0]*0)
+        scene = SimpleNamespace(gripper=hand, robot_coverage=None, robot_owner_permissions=(),
+            required_progress_anchors=(), evaluate=lambda spheres, p, *args, **kwargs: p[..., 0]*0,
+            optimizer_preferences=lambda progress, *args: progress*0)
+        scene.clone_for_rollout = lambda: scene
+        transition = self.transition()
+        transition.joint_names = ("first_joint", "second_joint")
+        transition.robot_model.tool_frames = ["tool"]
+        transition.robot_model.config = object()
+        transition.robot_model.get_self_collision_config = lambda: SimpleNamespace(num_spheres=2,
+            sphere_padding=torch.tensor(padding), collision_pairs=torch.tensor([[0, 1]], dtype=torch.int16),
+            num_blocks_per_batch=1, max_threads_per_block=32)
+        with ExitStack() as stack:
+            stack.enter_context(patch("curobo.kinematics.Kinematics",
+                return_value=SimpleNamespace(compute_kinematics=kinematics)))
+            stack.enter_context(patch("manipulation.planning._orientation_vjp_type",
+                return_value=SimpleNamespace(apply=lambda q, r, jacobian: r)))
+            stack.enter_context(patch.object(RobotCostManager, "_stream_context", side_effect=lambda _: nullcontext()))
+            stack.enter_context(patch("curobo._src.rollout.cost_manager.cost_manager_robot.synchronize_cuda_streams"))
+            stack.enter_context(patch("curobo._src.cost.cost_self_collision.SelfCollisionDistance.apply",
+                side_effect=pair_kernel))
+            stack.enter_context(patch.object(SelfCollisionCost, "forward", autospec=True, side_effect=native_forward))
+            config_type = _process_manager_type(problem, scene,
+                _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), required,
+                PlanningBudget(constraint_weight=777.), refinement_parameters=refinement,
+                clock={"duration": 2.}, seed_parameter=torch.tensor([[.3]]))
+            config = config_type.create({"process_mode": mode, "self_collision_cfg": {
+                "weight": 8., "convert_to_binary": mode.endswith("metrics")}}, device_cfg=self.device_cfg)
+            manager = self.manager(config, transition)
+            yield SimpleNamespace(manager=manager, state=state, q=q, forwarded=forwarded, config=config)
+
+    def test_required_and_refinement_self_collision_anchors_retain_native_values_and_gradient(self):
+        for mode in ("trajectory_optimizer", "trajectory_metrics"):
+            for source in ("required", "refinement"):
+                with self.subTest(mode=mode, source=source):
+                    # u=.55 is inside the endpoint spheres' overlap region but
+                    # off its symmetric maximum, so its gradient must be nonzero.
+                    sites = {source: (.55,)}
+                    with self.anchor_self_collision_fixture(mode, **sites) as fixture:
+                        costs = fixture.manager.compute_costs(fixture.state)
+                        self.assertIn("anchor_self_collision", costs.names)
+                        self.assertEqual(len(fixture.forwarded), 2)
+                        main, anchor = fixture.forwarded
+                        self.assertIsNot(main["cost"], anchor["cost"])
+                        self.assertNotEqual(main["distance_buffer"], anchor["distance_buffer"])
+                        self.assertNotEqual(main["gradient_buffer"], anchor["gradient_buffer"])
+                        self.assertEqual(main["cost"]._weight.item(), 2.)
+                        self.assertEqual(anchor["cost"]._weight.item(), 2.)
+                        self.assertEqual(fixture.config.self_collision_cfg.weight.item(), 8.)
+                        self.assertTrue(bool((main["value"] == 0).all()))
+                        self.assertTrue(bool((anchor["value"] > 0).all()))
+                        main_cost = costs.values[costs.names.index("self_collision")]
+                        anchor_cost = costs.values[costs.names.index("anchor_self_collision")]
+                        torch.testing.assert_close(main_cost, main["value"], rtol=0., atol=0.)
+                        self.assertEqual(anchor_cost.shape, main_cost.shape)
+                        torch.testing.assert_close(anchor_cost.sum(1), anchor["value"].sum(1), rtol=0., atol=0.)
+                        # The native weight/binary operation is authoritative:
+                        # no project constraint weight or second square applies.
+                        center = anchor["spheres"][..., 0, 0]
+                        expected = (.4**2-center.square()).clamp_min(0)
+                        if mode.endswith("metrics"):
+                            expected = torch.where(expected > 0, expected.clamp_max(1)+1, expected)
+                        torch.testing.assert_close(anchor_cost.sum(1).squeeze(-1), expected.sum(1))
+                        sum(value.sum() for value in costs.values).backward()
+                        self.assertTrue(bool(torch.isfinite(fixture.q.grad).all()))
+                        self.assertGreater(fixture.q.grad.abs().max().item(), 0.)
+
+    def test_disabled_self_collision_and_reference_ik_do_not_add_anchor_checks(self):
+        for mode in ("trajectory_optimizer", "trajectory_metrics", "seed_optimizer", "seed_metrics"):
+            with self.subTest(mode=mode):
+                with self.anchor_self_collision_fixture(mode, required=(.55,), refinement=(.65,)) as fixture:
+                    if mode.startswith("trajectory_"):
+                        fixture.manager.disable_cost_component("self_collision")
+                    costs = fixture.manager.compute_costs(fixture.state)
+                    self.assertNotIn("anchor_self_collision", costs.names)
+                    self.assertEqual(len(fixture.forwarded), 1 if mode.startswith("seed_") else 0)
+
+    def test_anchor_self_collision_uses_timed_hand_geometry_and_native_padding(self):
+        for controller in ("timed_reference", "binary"):
+            for nominal in (False, True):
+                with self.subTest(controller=controller, nominal=nominal):
+                    times = []
+
+                    def hand_state(progress, q, names, *, trajectory_time):
+                        times.append(trajectory_time.detach().clone())
+                        return (.1*trajectory_time)[..., None], torch.zeros_like(trajectory_time), None
+
+                    def hand_spheres(spheres, position, quaternion, fingers, half):
+                        # One translating finger sphere has an independent
+                        # physical-time command. Arm geometry stays untouched.
+                        finger = torch.cat((fingers, torch.zeros_like(spheres[..., 1, 1:3]),
+                                            spheres[..., 1, 3:4]), -1)
+                        return torch.stack((spheres[..., 0, :], finger), -2)
+
+                    hand = SimpleNamespace(controller=controller, state=hand_state, spheres=hand_spheres,
+                        nominal_finger_trajectory=object() if nominal else None,
+                        sphere_indices=(1,), sphere_joint_translation=[[[1.], [0.], [0.]]])
+                    with self.anchor_self_collision_fixture("trajectory_metrics", required=(.55,),
+                            refinement=(.65,), hand=hand, padding=.3) as fixture:
+                        original = fixture.state.robot_spheres.detach().clone()
+                        costs = fixture.manager.compute_costs(fixture.state)
+                        self.assertEqual(len(times), 2)
+                        torch.testing.assert_close(times[0], torch.tensor([[0., 2.], [0., 2.]]))
+                        torch.testing.assert_close(times[1], torch.tensor([[1.1, 1.3], [1.1, 1.3]]))
+                        main, anchor = fixture.forwarded
+                        torch.testing.assert_close(anchor["spheres"][..., 1, 0], .1*times[1])
+                        self.assertAlmostEqual(anchor["cost"].config.self_collision_kin_config.sphere_padding.item(), .3)
+                        torch.testing.assert_close(fixture.state.robot_spheres, original, rtol=0., atol=0.)
+                        anchor_cost = costs.values[costs.names.index("anchor_self_collision")]
+                        if nominal:
+                            torch.testing.assert_close(anchor["spheres"][..., 1, 3], torch.full((2, 2), .2))
+                            self.assertTrue(bool((anchor_cost[:, -1] > 0).all()))
+                        else:
+                            # Missing future physical finger geometry remains
+                            # disabled even after the native radius padding.
+                            torch.testing.assert_close(anchor["spheres"][..., 1, 3], torch.full((2, 2), -1.3))
+                            self.assertTrue(bool((anchor_cost == 0).all()))
+                            self.assertTrue(bool((main["spheres"][:, 0, 1, 3] > 0).all()))
+    # END anchors augment native self collision without changing its physical semantics.
+
     def test_repeated_managers_and_verifier_each_normalize_self_weight_once(self):
         template = self.configuration()
         managers = []
@@ -1509,9 +1688,38 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                                 {"retained": 0, "live": 0, "shared_cpu": 0})
         budget = PlanningBudget(max_validation_points=8192)
         before_cuda = torch.cuda.is_initialized()
+        # BEGIN the anchor admission bound includes native self-cost buffers.
+        # Construct actual native tensors on meta: this checks shapes/dtypes
+        # without allocating their multi-GiB represented storage or running
+        # CUDA. Use the smallest installed block capacity to verify the
+        # conservative all-pairs bound used before native model construction.
+        from curobo._src.cost.cost_self_collision import SelfCollisionCost
+        from curobo._src.robot.types.self_collision_params import SelfCollisionKinematicsCfg
+        collision_layout = SelfCollisionKinematicsCfg()
+        block_capacity = min(
+            collision_layout._num_checks_per_thread_small_collision_pairs
+            * collision_layout._max_threads_per_block_small_collision_pairs,
+            collision_layout._num_checks_per_thread_large_collision_pairs
+            * collision_layout._max_threads_per_block_large_collision_pairs)
+        pair_count = native.num_spheres*(native.num_spheres-1)//2
+        self_cost = SelfCollisionCost.__new__(SelfCollisionCost)
+        self_cost.config = SimpleNamespace(store_pair_distance=False,
+            self_collision_kin_config=SimpleNamespace(num_spheres=native.num_spheres,
+                num_blocks_per_batch=(pair_count+block_capacity-1)//block_capacity))
+        self_cost.device_cfg = SimpleNamespace(device="meta", dtype=torch.float32)
+        self_cost._batch_size, self_cost._horizon = None, None
+        # END the isolated setup executes the installed native allocator.
         for count in (322, 386, 8192):
             buffers = scope["create_buffers"](44, count, native)
             expected = sum(value.numel()*value.element_size() for value in buffers.values())
+            # BEGIN include every anchor-count-dependent native collision array.
+            self_cost.setup_batch_tensors(44, count)
+            expected += sum(value.numel()*value.element_size() for name, value in vars(self_cost).items()
+                            if isinstance(value, torch.Tensor) and name != "_pair_distance")
+            # Disabling optional pair diagnostics leaves one fixed scratch
+            # scalar, covered by the existing fixed native memory reserve.
+            self.assertEqual(self_cost._pair_distance.numel(), 1)
+            # END no real GPU allocation is needed to validate the admission bound.
             _, actual = _planning_workspace_bytes(scene, metadata, budget, count)
             self.assertEqual(actual, expected)
         self.assertGreater(actual, 6*1024**3)
