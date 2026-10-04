@@ -531,7 +531,7 @@ class NativeVoxelLayoutTest(unittest.TestCase):
                 patch("curobo.types.Pose.from_matrix", return_value=SimpleNamespace()), \
                 patch("curobo._src.geom.collision.collision_scene.SceneCollision.from_config", return_value=native) as create, \
                 patch("manipulation.planning_observation.CuroboSphereQuery") as query, \
-                patch("manipulation.planning_observation._independent_voxel_geometry") as export:
+                patch("manipulation.tsdf_geometry.build_tsdf_geometry") as export:
             mapper.return_value.get_stats.return_value = {
                 "allocation_failures": 0, "num_allocated": 0, "active_blocks": 0, "free_count": 0}
             mapper.return_value.compute_esdf.return_value = voxel

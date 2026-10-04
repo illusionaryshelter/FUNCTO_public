@@ -266,10 +266,12 @@ def test_required_contact_cannot_borrow_material_feature_from_another_body(check
     assert any(gap["reason"] == "required_contact_layer_selection_unbound" for gap in result["query_gaps"])
 
 
-def test_margin_finite_cell_query_does_not_drop_originally_disjoint_leaves():
+def test_margin_tsdf_piece_query_does_not_drop_originally_disjoint_geometry():
     from test_robot_geometry_check import corners
     actor = corners(.05)
-    occupied = {"voxel_boxes": np.array([[0., 0., -.151, .2]]), "pose": np.eye(4)}
+    # BEGIN one full negative centre-cell is an exact convex TSDF component.
+    occupied = {"tsdf_component": corners(.1)+[0., 0., -.151]}
+    # END the measured band must be checked even when original solids are apart.
     wide = (np.array([[1., 0., 0.]]), np.array([.06]))
     raw = _overlap_within_region(actor, occupied, wide)
     assert raw["intersection_empty"]

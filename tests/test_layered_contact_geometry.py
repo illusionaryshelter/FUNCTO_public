@@ -6,9 +6,11 @@ from itertools import product
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from manipulation.contact_geometry import ContactCellGeometry, LayeredContactCellGeometry
+from manipulation.tsdf_geometry import tsdf_geometry_from_samples
 
 
 def box(name, centre, dimensions):
@@ -86,7 +88,8 @@ class LayeredContactTests(unittest.TestCase):
         torch.testing.assert_close(cost, torch.tensor([[[.01, 0.]]], dtype=torch.float64))
         self.assertTrue(enabled.all())
 
-    def test_required_contact_cannot_borrow_occupancy_from_the_other_layer(self):
+    # BEGIN required contact follows actual surfaces in the selected layer.
+    def test_required_contact_cannot_borrow_surfaces_from_the_other_layer(self):
         occupied = geometry([box("occupied", [0., 0., 0.], [.002]*3)])
         empty = geometry()
         mask = torch.tensor([[[False]], [[True]]])
@@ -96,11 +99,11 @@ class LayeredContactTests(unittest.TestCase):
                 residual = cells.required_contact(policy((2, 1)), mask)
                 torch.testing.assert_close(residual.flatten(), torch.tensor(expected, dtype=torch.float64))
                 # Each native solver receives only its own state's activity;
-                # occupied material is verified by the existing complete LP.
+                # all six real box faces lie within this finite material region.
                 for name, layer in cells.layers.items():
                     report = cells.last_required_report["layers"][name]
                     self.assertEqual(report["active_states"], 1)
-                    self.assertEqual(report["candidate_cells"], len(layer.centres))
+                    self.assertEqual(report["candidate_components"], len(layer.surface_components))
 
     def test_required_contact_preserves_selected_highs_dual_gradient(self):
         occupied = geometry([box("occupied", [0., 0., 0.], [.002]*3)])
@@ -109,11 +112,29 @@ class LayeredContactTests(unittest.TestCase):
         rule = policy((2, 1))
         rule["bounds"].requires_grad_(True)
         residual = cells.required_contact(rule, torch.tensor([[[False]], [[True]]]))
-        torch.testing.assert_close(residual.flatten(), torch.tensor([0., .0025], dtype=torch.float64))
+        # The fine box's nearest actual face is x=.01 and the material's
+        # upper x bound is .005. Only the material region is relaxed: the
+        # complete target face remains fixed, giving .005 slack and -1 slope.
+        torch.testing.assert_close(residual.flatten(), torch.tensor([0., .005], dtype=torch.float64))
         residual.sum().backward()
         expected = torch.zeros_like(rule["bounds"])
-        expected[1, 0, 0] = -.5
+        expected[1, 0, 0] = -1.
         torch.testing.assert_close(rule["bounds"].grad, expected)
+
+    def test_negative_tsdf_layer_cannot_borrow_another_layers_zero_surface(self):
+        occupied = tsdf_geometry_from_samples(-np.ones((2, 2, 2)),
+            np.ones((2, 2, 2), dtype=bool), origin=[0., 0., 0.], voxel_size=.01,
+            name="negative", source="observed negative test TSDF")
+        zero = tsdf_geometry_from_samples(np.zeros((1, 1, 1)),
+            np.ones((1, 1, 1), dtype=bool), origin=[0., 0., 0.], voxel_size=.01,
+            name="surface", source="observed zero test TSDF")
+        mask = torch.tensor([[[False]], [[True]]])
+        for coarse, fine, expected in ((occupied, zero, [1., 0.]), (zero, occupied, [0., 1.])):
+            with self.subTest(expected=expected):
+                cells = LayeredContactCellGeometry(layered(coarse, fine))
+                residual = cells.required_contact(policy((2, 1)), mask)
+                torch.testing.assert_close(residual.flatten(), torch.tensor(expected, dtype=torch.float64))
+    # END negative volume and another layer's zero set cannot supply contact.
 
     def test_mixed_policy_layers_are_rejected_even_for_inactive_states(self):
         cells = LayeredContactCellGeometry(layered(geometry(), geometry()))
@@ -202,4 +223,4 @@ class LayeredContactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-# END finite permission and required occupancy use the same selected native layer.
+# END finite permission and required surfaces use the same selected native layer.

@@ -254,6 +254,7 @@ class RobotGeometryChecker:
         self._scene_binding = deepcopy(scene_binding)
         self._scene_owners = {}
         self._scene_shapes = []
+        self._has_observed_tsdf = False
         self._scene_gaps = []
         self._scene_native_aliases = {}
         self._scene_release_predictions = {}
@@ -304,6 +305,7 @@ class RobotGeometryChecker:
             # BEGIN retain each complete occupied inventory without taking a union.
             for layer, layer_geometry in layers.items():
                 for record in layer_geometry["solids"]:
+                    self._has_observed_tsdf |= record["kind"] == "tsdf"
                     shape, vertices, local_pose = _scene_shape(record)
                     if shape is None:
                         continue  # A validated positive-only field has no occupied solid.
@@ -325,9 +327,23 @@ class RobotGeometryChecker:
                     or not set(rule.native_geometry_names) <= self._geometries.keys()):
                 raise ValueError("Robot-owner permission requires bound owner and native robot geometry names")
         # END no MuJoCo/native physical contact policy is changed here.
+        # BEGIN account once for the owned scene record and decoded geometry.
+        from .tsdf_geometry import ObservedTsdfGeometry
+        self.scene_storage_nbytes = _owned_record_bytes(self._scene_binding) + sum(
+            row["shape"].storage_nbytes if isinstance(row["shape"], ObservedTsdfGeometry)
+            else (0 if row["vertices"] is None else np.asarray(row["vertices"]).nbytes * 4)
+            for row in self._scene_shapes)
+        # A state keeps at most two rows per physical pair (surface distance
+        # and a streamed component summary), plus one failure witness. The
+        # per-pair reserve covers 64 Coal contacts and each finite rule result;
+        # search candidates and native LP/BVH scratch reuse scene-sized memory.
+        pair_bound = len(self._scene_shapes) * (len(self._geometries) + len(self._scene_shapes))
+        self.scene_query_workspace_nbytes = (pair_bound * (131072 + 4096 * len(scene_binding["contacts"]))
+                                            + 2 * self.scene_storage_nbytes)
+        # END planning clones share this immutable scene allocation.
 
     def query_scene(self, robot_state, *, tool_pose, progress, finger_positions, state_kind,
-                    owner_poses=None, condition_evidence=None,
+                    owner_poses=None, nominal_owner_poses=None, condition_evidence=None,
                     active_robot_owner_permissions=frozenset(), robot_owner_permission_progress=None,
                     layer_selection=None, layer_selection_index=(0, 0), select_layers=False):
         """Query every robot/scene and moving-owner/other-owner solid pair.
@@ -370,6 +386,13 @@ class RobotGeometryChecker:
             and (state_kind == "nominal" or rule.rule_id in active)]
         # END ordinary collision evidence below is still queried and archived.
         owner_poses, condition_evidence = owner_poses or {}, condition_evidence or {}
+        # BEGIN consume this candidate's owner poses without claiming observations.
+        nominal_owner_poses = nominal_owner_poses or {}
+        if nominal_owner_poses and (state_kind != "nominal" or owner_poses):
+            raise ValueError("Candidate owner poses require nominal scope without current observations")
+        if not set(nominal_owner_poses) <= self._scene_owners.keys():
+            raise ValueError("Candidate owner poses must name bound scene owners")
+        # END attachment and release assumptions below remain explicit.
         binding = self._scene_binding
         gaps, unresolved, violations, rows = deepcopy(self._scene_gaps), [], [], []
         poses = {"background": np.eye(4)}
@@ -411,12 +434,18 @@ class RobotGeometryChecker:
                 if released:
                     index, relation = released[-1]
                     prediction = self._scene_release_predictions.get((identity, index))
+                    # BEGIN the planner supplies release FK for this exact candidate.
+                    if identity in nominal_owner_poses:
+                        prediction = {"pose": _rigid_pose(nominal_owner_poses[identity]),
+                                      "release_progress": relation["interval"][1]}
+                    # END no shared release cache is mutated during batch validation.
                     if prediction is None:
                         gaps.append({"owner": identity, "reason": "same_candidate_release_fk_unbound"})
                         continue
                     poses[identity] = prediction["pose"].copy()
                     unresolved.append({"owner": identity, "kind": "predicted_release_pose",
-                                       "time_s": prediction["time_s"], "condition_id": relation["release_condition_id"]})
+                                       **{key: prediction[key] for key in ("time_s", "release_progress") if key in prediction},
+                                       "condition_id": relation["release_condition_id"]})
                     if state_kind == "actual":
                         uncertain_owners.add(identity)
                 else:
@@ -429,6 +458,10 @@ class RobotGeometryChecker:
                     if owner["moving"] and state_kind == "actual":
                         uncertain_owners.add(identity)
                         unresolved.append({"owner": identity, "kind": "current_motion_prediction_unobserved"})
+            # BEGIN match the same owner motion used by this candidate's costs.
+            if identity in nominal_owner_poses:
+                poses[identity] = _rigid_pose(nominal_owner_poses[identity], "candidate owner pose")
+            # END supplied predictions never erase conditional effect evidence.
         actors = []
         materials = binding["native_geometry_materials"]
         unmodelled_geometries = set(robot_state.get("unmodelled_geometry_names", ()))
@@ -478,151 +511,165 @@ class RobotGeometryChecker:
         decisions, selection_checks, selection_snapshot = self._consume_layer_selection(
             layer_selection, layer_selection_index, actors, poses, gaps, unmodelled_geometries)
         # END a query gap cannot silently switch either the layer or the body.
-        checked = set()
+        checked, stopped_pairs, component_summaries = set(), set(), {}
         boundary = max(self.numerics["gjk_tolerance"], self.numerics["epa_tolerance"])
-        for first in actors:
-            for second in targets:
-                if first["owner"] == second["owner"]:
-                    continue
-                # BEGIN exactly one archived target layer applies to this complete body.
-                selected = decisions.get((first["owner"], first["name"], second["owner"]))
-                if second["owner"] in self._scene_layers:
-                    if selected is None or second["layer"] != selected["layer"]:
+        # BEGIN exact local TSDF components replace expanded ESDF sample cubes.
+        for actor_body in actors:
+            for first, second in _scene_component_pairs(
+                    actor_body, targets, decisions, boundary, rows, self._request, checked, stopped_pairs):
+                row_count = len(rows)
+                issue_counts = tuple(len(items) for items in (violations, gaps, unresolved))
+                try:
+            # END each component retains its original owner, body and layer identity.
+                    if first["owner"] == second["owner"]:
                         continue
-                # END unselected coarse/fine solids never enter distance or permission queries.
-                identity = tuple(sorted(((first["owner"], first["name"]), (second["owner"], second["name"]))))
-                if identity in checked:
-                    continue
-                checked.add(identity)
-                if first["owner"] == "robot" and "native_alias" in second:
-                    alias = second["native_alias"]
-                    if first["name"] == alias:
-                        continue  # Explicitly the identical native solid, not another owner.
-                    native = [pair for pair in robot_state["pairs"] if
-                              {pair["first"], pair["second"]} == {first["name"], alias}]
-                    if len(native) != 1:
-                        gaps.append({"owner": second["owner"], "reason": "native_installation_pair_not_queried"})
-                    else:
-                        rows.append({"actor": "robot", "actor_geometry": first["name"],
-                                     "target_owner": second["owner"], "target_geometry": alias,
-                                     "native_pair_evidence": deepcopy(native[0]),
-                                     "scope": "same explicitly bound native installation solid/pair"})
-                    continue
-                transforms = [coal.Transform3s(row["pose"][:3, :3], row["pose"][:3, 3]) for row in (first, second)]
-                distance = coal.DistanceResult()
-                coal.distance(first["shape"], transforms[0], second["shape"], transforms[1], self._request, distance)
-                value = float(distance.min_distance)
-                if not np.isfinite(value):
-                    raise RuntimeError("Independent scene distance returned nonfinite evidence")
-                row = {"actor": first["owner"], "actor_geometry": first["name"],
-                       "target_owner": second["owner"], "target_geometry": second["name"],
-                       "actor_source": first["source"], "target_source": second["source"],
-                       "signed_distance_m": value, "witness_first": np.asarray(distance.getNearestPoint1()).tolist(),
-                       "witness_second": np.asarray(distance.getNearestPoint2()).tolist(),
-                       "normal_first_to_second": np.asarray(distance.normal).tolist(),
-                       "relation": "separated" if value > boundary else "penetrating" if value < -boundary else "numerical_boundary",
-                       "permission": None, "contact_region_checks": []}
-                # BEGIN retain geometric separation separately from sensor margin rejection.
-                margin = 0. if selected is None else selected["measurement_allowance_m"]
-                if selected is not None:
-                    row.update(layer=selected["layer"], body_id=selected["body_id"],
-                               measurement_allowance_m=margin,
-                               measurement_margin_violated=value <= margin,
-                               measurement_adjusted_distance_m=value-margin)
-                rows.append(row)
-                if value > max(boundary, margin):
-                    continue
-                # END the measured margin never becomes material modeling allowance.
-                request, result = coal.CollisionRequest(), coal.CollisionResult()
-                request.enable_contact, request.num_max_contacts = True, 64
-                coal.collide(first["shape"], transforms[0], second["shape"], transforms[1], request, result)
-                row["contacts"] = [{"position": np.asarray(contact.pos).tolist(), "normal": np.asarray(contact.normal).tolist(),
-                                    "penetration_depth": float(contact.penetration_depth)} for contact in result.getContacts()]
-                row["contact_report_truncated"] = result.numContacts() >= request.num_max_contacts
-                # BEGIN authorized whole-pair contact does not consume a local patch allowance.
-                permissions = [rule for rule in permitted_rules
-                    if first["owner"] == "robot" and first["name"] in rule.native_geometry_names
-                    and second["owner"] == rule.target_owner]
-                if permissions:
-                    row["permission"] = permissions[0].rule_id
-                    row["permission_scope"] = "explicit_robot_owner_pair"
-                    row["permission_authorization"] = ("conditional_nominal_arrival" if state_kind == "nominal"
-                                                        else "current_execution_arrival_latch")
-                    continue
-                # END signed distance, witnesses and physical contacts remain raw evidence.
-                # BEGIN resolve a Coal numerical boundary using complete solid intersections.
-                # A sub-tolerance positive gap can be reported by GJK as zero
-                # distance/contact. Infeasibility of the complete convex
-                # intersection is a finished separation query, not missing
-                # contact evidence. Preserve Coal's raw values unchanged.
-                if abs(value) <= boundary:
-                    overlap = _overlap_within_region(_world_vertices(first["vertices"], first["pose"]),
-                        _world_vertices(second["vertices"], second["pose"]), (np.zeros((1, 3)), np.zeros(1)))
-                    row["boundary_intersection_check"] = overlap
-                    if overlap.get("completed") and overlap.get("intersection_empty"):
-                        row["relation"] = "numerical_boundary_with_proven_empty_intersection"
-                        if margin == 0.:
+                    # BEGIN exactly one archived target layer applies to this complete body.
+                    selected = decisions.get((first["owner"], first["name"], second["owner"]))
+                    if second["owner"] in self._scene_layers:
+                        if selected is None or second["layer"] != selected["layer"]:
                             continue
-                # END no contact allowance is used to establish disjoint geometry.
-                # BEGIN unordered physical pairs may have either directed
-                # material permission. Enumeration order must not choose law.
-                possible_rules = [(actor, target, rule) for actor, target in ((first, second), (second, first))
-                                  for rule in binding["contacts"] if rule["actor"] == actor["owner"]
-                                  and rule["target_owner"] == target["owner"]
-                                  and rule["interval"][0] <= progress <= rule["interval"][1]]
-                unbound_material = any(actor["material"] is None for actor, _, _ in possible_rules)
-                candidates = [(actor, target, rule) for actor, target, rule in possible_rules
-                              if rule["material_id"] == actor["material"]]
-                incomplete = False
-                for actor, target, rule in candidates:
-                    actor_pose = tool_pose if actor["owner"] == "robot" else poses[actor["owner"]]
-                    region, reason = _feature_region(rule, actor_pose, poses[target["owner"]], finger_positions)
-                    evidence = {"rule_id": rule["rule_id"], "actor": actor["owner"], "target_owner": target["owner"], "reason": reason}
-                    if reason == "finite_material_patch_region_query_incomplete":
-                        incomplete = True
-                    if region is not None and value >= -rule["modeling_allowance_m"]-rule["numerical_position_tolerance_m"]:
-                        evidence.update(_overlap_within_region(_world_vertices(actor["vertices"], actor["pose"]),
-                                                               _world_vertices(target["vertices"], target["pose"]), region))
-                        # BEGIN measurement uncertainty needs complete finite-region evidence.
-                        # A separated original solid has an empty intersection,
-                        # which cannot authorize its nonempty measurement band.
-                        if margin > 0 and evidence.get("contained"):
-                            raw = {key: value for key, value in evidence.items()
-                                   if key not in {"rule_id", "actor", "target_owner", "reason"}}
-                            evidence = {key: value for key, value in evidence.items()
-                                        if key in {"rule_id", "actor", "target_owner", "reason"}}
-                            evidence["raw_solid_overlap"] = raw
-                            evidence.update(_overlap_within_region(
-                                _world_vertices(actor["vertices"], actor["pose"]),
-                                _world_vertices(target["vertices"], target["pose"]), region,
-                                first_margin_m=margin if actor is first else 0.,
-                                second_margin_m=margin if target is first else 0.))
-                            evidence["measurement_allowance_m"] = margin
-                            evidence["margin_geometry"] = "support_plane_outer_polytope_of_native_solid_plus_ball"
-                        # END no unchanged modeling allowance authorizes unqueried expanded overlap.
-                        if evidence.get("intersection_empty") and value < -boundary:
-                            evidence.update(completed=False, contained=False,
-                                reason="penetrating_distance_disagrees_with_empty_solid_intersection")
-                        incomplete |= not evidence["completed"]
-                        if evidence.get("contained"):
-                            row["permission"] = rule["rule_id"]
-                    row["contact_region_checks"].append(evidence)
-                    if row["permission"]:
-                        break
-                # END both directions still require their exact material, patch and interval.
-                if row["permission"] is None:
-                    issue = {"kind": ("independent_scene_measurement_margin" if value > boundary and margin > 0
-                                      else "independent_scene_collision"), "pair_index": len(rows)-1,
-                             "actor": first["owner"], "target_owner": second["owner"], "evidence": deepcopy(row)}
-                    if unbound_material:
-                        gaps.append({**issue, "reason": "contact_material_native_geometry_binding_missing"})
-                    elif incomplete:
-                        gaps.append({**issue, "reason": "local_contact_region_query_incomplete"})
-                    elif first["owner"] in uncertain_owners or second["owner"] in uncertain_owners:
-                        unresolved.append({**issue, "kind": "conditional_scene_collision",
-                                           "scope": "predicted owner geometry; not confirmed actual collision"})
-                    else:
-                        violations.append(issue)
+                    # END unselected coarse/fine solids never enter distance or permission queries.
+                    if first["owner"] == "robot" and "native_alias" in second:
+                        alias = second["native_alias"]
+                        if first["name"] == alias:
+                            continue  # Explicitly the identical native solid, not another owner.
+                        native = [pair for pair in robot_state["pairs"] if
+                                  {pair["first"], pair["second"]} == {first["name"], alias}]
+                        if len(native) != 1:
+                            gaps.append({"owner": second["owner"], "reason": "native_installation_pair_not_queried"})
+                        else:
+                            rows.append({"actor": "robot", "actor_geometry": first["name"],
+                                         "target_owner": second["owner"], "target_geometry": alias,
+                                         "native_pair_evidence": deepcopy(native[0]),
+                                         "scope": "same explicitly bound native installation solid/pair"})
+                        continue
+                    transforms = [coal.Transform3s(row["pose"][:3, :3], row["pose"][:3, 3]) for row in (first, second)]
+                    distance = coal.DistanceResult()
+                    coal.distance(first["shape"], transforms[0], second["shape"], transforms[1], self._request, distance)
+                    value = float(distance.min_distance)
+                    if not np.isfinite(value):
+                        raise RuntimeError("Independent scene distance returned nonfinite evidence")
+                    row = {"actor": first["owner"], "actor_geometry": first["name"],
+                           "target_owner": second["owner"], "target_geometry": second["name"],
+                           "actor_source": first["source"], "target_source": second["source"],
+                           "signed_distance_m": value, "witness_first": np.asarray(distance.getNearestPoint1()).tolist(),
+                           "witness_second": np.asarray(distance.getNearestPoint2()).tolist(),
+                           "normal_first_to_second": np.asarray(distance.normal).tolist(),
+                           "relation": "separated" if value > boundary else "penetrating" if value < -boundary else "numerical_boundary",
+                           "permission": None, "contact_region_checks": []}
+                    # BEGIN retain the exact local field piece used for this result.
+                    for label, item in (("actor", first), ("target", second)):
+                        if "tsdf_component_id" in item:
+                            row[label+"_tsdf_component"] = list(item["tsdf_component_id"])
+                    # END a component penetration is not a global union penetration depth.
+                    # BEGIN retain geometric separation separately from sensor margin rejection.
+                    margin = 0. if selected is None else selected["measurement_allowance_m"]
+                    if selected is not None:
+                        row.update(layer=selected["layer"], body_id=selected["body_id"],
+                                   measurement_allowance_m=margin,
+                                   measurement_margin_violated=value <= margin,
+                                   measurement_adjusted_distance_m=value-margin)
+                    rows.append(row)
+                    if value > max(boundary, margin):
+                        continue
+                    # END the measured margin never becomes material modeling allowance.
+                    request, result = coal.CollisionRequest(), coal.CollisionResult()
+                    request.enable_contact, request.num_max_contacts = True, 64
+                    coal.collide(first["shape"], transforms[0], second["shape"], transforms[1], request, result)
+                    row["contacts"] = [{"position": np.asarray(contact.pos).tolist(), "normal": np.asarray(contact.normal).tolist(),
+                                        "penetration_depth": float(contact.penetration_depth)} for contact in result.getContacts()]
+                    row["contact_report_truncated"] = result.numContacts() >= request.num_max_contacts
+                    # BEGIN authorized whole-pair contact does not consume a local patch allowance.
+                    permissions = [rule for rule in permitted_rules
+                        if first["owner"] == "robot" and first["name"] in rule.native_geometry_names
+                        and second["owner"] == rule.target_owner]
+                    if permissions:
+                        row["permission"] = permissions[0].rule_id
+                        row["permission_scope"] = "explicit_robot_owner_pair"
+                        row["permission_authorization"] = ("conditional_nominal_arrival" if state_kind == "nominal"
+                                                            else "current_execution_arrival_latch")
+                        continue
+                    # END signed distance, witnesses and physical contacts remain raw evidence.
+                    # BEGIN resolve a Coal numerical boundary using complete solid intersections.
+                    # A sub-tolerance positive gap can be reported by GJK as zero
+                    # distance/contact. Infeasibility of the complete convex
+                    # intersection is a finished separation query, not missing
+                    # contact evidence. Preserve Coal's raw values unchanged.
+                    if abs(value) <= boundary:
+                        overlap = _overlap_within_region(_world_vertices(first["vertices"], first["pose"]),
+                            _world_vertices(second["vertices"], second["pose"]), (np.zeros((1, 3)), np.zeros(1)))
+                        row["boundary_intersection_check"] = overlap
+                        if overlap.get("completed") and overlap.get("intersection_empty"):
+                            row["relation"] = "numerical_boundary_with_proven_empty_intersection"
+                            if margin == 0.:
+                                continue
+                    # END no contact allowance is used to establish disjoint geometry.
+                    # BEGIN unordered physical pairs may have either directed
+                    # material permission. Enumeration order must not choose law.
+                    possible_rules = [(actor, target, rule) for actor, target in ((first, second), (second, first))
+                                      for rule in binding["contacts"] if rule["actor"] == actor["owner"]
+                                      and rule["target_owner"] == target["owner"]
+                                      and rule["interval"][0] <= progress <= rule["interval"][1]]
+                    unbound_material = any(actor["material"] is None for actor, _, _ in possible_rules)
+                    candidates = [(actor, target, rule) for actor, target, rule in possible_rules
+                                  if rule["material_id"] == actor["material"]]
+                    incomplete = False
+                    for actor, target, rule in candidates:
+                        actor_pose = tool_pose if actor["owner"] == "robot" else poses[actor["owner"]]
+                        region, reason = _feature_region(rule, actor_pose, poses[target["owner"]], finger_positions)
+                        evidence = {"rule_id": rule["rule_id"], "actor": actor["owner"], "target_owner": target["owner"], "reason": reason}
+                        if reason == "finite_material_patch_region_query_incomplete":
+                            incomplete = True
+                        if region is not None and value >= -rule["modeling_allowance_m"]-rule["numerical_position_tolerance_m"]:
+                            evidence.update(_overlap_within_region(_world_vertices(actor["vertices"], actor["pose"]),
+                                                                   _world_vertices(target["vertices"], target["pose"]), region))
+                            # BEGIN measurement uncertainty needs complete finite-region evidence.
+                            # A separated original solid has an empty intersection,
+                            # which cannot authorize its nonempty measurement band.
+                            if margin > 0 and evidence.get("contained"):
+                                raw = {key: value for key, value in evidence.items()
+                                       if key not in {"rule_id", "actor", "target_owner", "reason"}}
+                                evidence = {key: value for key, value in evidence.items()
+                                            if key in {"rule_id", "actor", "target_owner", "reason"}}
+                                evidence["raw_solid_overlap"] = raw
+                                evidence.update(_overlap_within_region(
+                                    _world_vertices(actor["vertices"], actor["pose"]),
+                                    _world_vertices(target["vertices"], target["pose"]), region,
+                                    first_margin_m=margin if actor is first else 0.,
+                                    second_margin_m=margin if target is first else 0.))
+                                evidence["measurement_allowance_m"] = margin
+                                evidence["margin_geometry"] = "support_plane_outer_polytope_of_native_solid_plus_ball"
+                            # END no unchanged modeling allowance authorizes unqueried expanded overlap.
+                            if evidence.get("intersection_empty") and value < -boundary:
+                                evidence.update(completed=False, contained=False,
+                                    reason="penetrating_distance_disagrees_with_empty_solid_intersection")
+                            incomplete |= not evidence["completed"]
+                            if evidence.get("contained"):
+                                row["permission"] = rule["rule_id"]
+                        row["contact_region_checks"].append(evidence)
+                        if row["permission"]:
+                            break
+                    # END both directions still require their exact material, patch and interval.
+                    if row["permission"] is None:
+                        issue = {"kind": ("independent_scene_measurement_margin" if value > boundary and margin > 0
+                                          else "independent_scene_collision"), "pair_index": len(rows)-1,
+                                 "actor": first["owner"], "target_owner": second["owner"], "evidence": deepcopy(row)}
+                        if unbound_material:
+                            gaps.append({**issue, "reason": "contact_material_native_geometry_binding_missing"})
+                        elif incomplete:
+                            gaps.append({**issue, "reason": "local_contact_region_query_incomplete"})
+                        elif first["owner"] in uncertain_owners or second["owner"] in uncertain_owners:
+                            unresolved.append({**issue, "kind": "conditional_scene_collision",
+                                               "scope": "predicted owner geometry; not confirmed actual collision"})
+                        else:
+                            violations.append(issue)
+                finally:
+                    # BEGIN stream complete component checks into bounded pair evidence.
+                    if "tsdf_component_id" in first or "tsdf_component_id" in second:
+                        _summarize_component_result(first, second, rows, row_count,
+                            (violations, gaps, unresolved), issue_counts,
+                            component_summaries, stopped_pairs)
+                    # END a failed pair can stop; an accepted pair checks every candidate.
         # Required contact additionally needs actual supplied target occupancy
         # in the finite region; an abstract patch can contain unobserved air.
         required_checks = []
@@ -700,9 +747,10 @@ class RobotGeometryChecker:
                 # END a permission does not establish actual contact or Holding.
                 "progress": float(progress), "observed_scene_checked": not gaps and not uncertain_owners and not unmodelled_geometries,
                 "supplied_scene_models_checked": not gaps,
-                "complete_scene_geometry": all(owner["geometry_complete"] for owner, _ in self._scene_owners.values()),
+                "complete_scene_geometry": (not self._has_observed_tsdf
+                    and all(owner["geometry_complete"] for owner, _ in self._scene_owners.values())),
                 "continuous_collision_certified": False, "unknown_space_certified": False,
-                "scope": "independent filled native solids at this state and complete local overlap regions where adapted"}
+                "scope": "source solids and observed TSDF zero/negative components at this state; complete adapted contact intersections"}
     # END raw geometry evidence is retained independently of every task permission.
 
     # BEGIN explicit new-state selection and independent saved-envelope consumption.
@@ -966,19 +1014,174 @@ def _box_vertices(dimensions):
 
 
 def _world_vertices(vertices, pose):
+    # BEGIN preserve a component's affine dimension and observed-field identity.
+    from .tsdf_geometry import ObservedTsdfGeometry
+    if isinstance(vertices, ObservedTsdfGeometry):
+        return {"tsdf": vertices, "pose": pose}
     if isinstance(vertices, dict):
-        return {"voxel_boxes": vertices["voxel_boxes"], "pose": pose}
+        return {"tsdf_component": np.asarray(vertices["tsdf_component"]) @ pose[:3, :3].T + pose[:3, 3]}
+    # END a triangle/line/point is not promoted to a filled bounding box.
     return None if vertices is None else np.asarray(vertices) @ pose[:3, :3].T + pose[:3, 3]
+
+
+# BEGIN bounded broad phase over the unchanged local TSDF components.
+def _owned_record_bytes(value):
+    """Conservatively count the supported in-memory record without encoding it."""
+    from sys import getsizeof
+    size = getsizeof(value)
+    if isinstance(value, dict):
+        size += sum(_owned_record_bytes(key)+_owned_record_bytes(item) for key, item in value.items())
+    elif isinstance(value, (list, tuple)):
+        size += sum(_owned_record_bytes(item) for item in value)
+    elif isinstance(value, np.ndarray):
+        size += value.nbytes
+    return size
+
+
+def _body_pair_key(first, second):
+    return tuple(sorted(((first["owner"], first["name"]), (second["owner"], second["name"]))))
+
+
+def _summarize_component_result(first, second, rows, previous_count, issues, issue_counts, summaries, stopped):
+    """Retain one decisive witness and complete counts, without storing all pieces.
+
+    A rejected physical pair needs no second witness. An accepted pair still
+    visits every possible intersection and proves each permission. Replacing
+    its representative row does not change any earlier pair's stable index.
+    """
+    if len(rows) == previous_count:
+        return
+    key = _body_pair_key(first, second)
+    current = rows[-1]
+    # Conditional collisions remain allowed unresolved hypotheses. They must
+    # not stop a later component from exposing a mandatory query gap.
+    failed = any(len(items) > count for items, count in zip(issues[:2], issue_counts[:2]))
+    if key not in summaries:
+        index, tested, permitted = len(rows)-1, 0, 0
+        summaries[key] = {"index": index, "conditional_index": None, "conditional_count": 0}
+    else:
+        index = summaries[key]["index"]
+        previous = rows[index]
+        counts = previous["component_summary"]
+        tested, permitted = counts["tested"], counts["permitted"]
+        rows.pop()
+        if failed or current["signed_distance_m"] < previous["signed_distance_m"]:
+            rows[index] = current
+    rows[index]["component_summary"] = {
+        "tested": tested+1, "permitted": permitted+int(current.get("permission") is not None),
+        "stopped_after_pair_failure": failed,
+        "scope": "complete candidate enumeration unless a decisive pair failure already rejects the state"}
+    for items, count in zip(issues, issue_counts):
+        for issue in items[count:]:
+            if "pair_index" in issue:
+                issue["pair_index"] = index
+    unresolved, start = issues[2], issue_counts[2]
+    summary = summaries[key]
+    if len(unresolved) > start:
+        summary["conditional_count"] += len(unresolved)-start
+        if summary["conditional_index"] is None:
+            summary["conditional_index"] = start
+            del unresolved[start+1:]
+        else:
+            del unresolved[start:]
+        unresolved[summary["conditional_index"]]["component_issue_count"] = summary["conditional_count"]
+    if failed:
+        stopped.add(key)
+
+
+def _transform_bounds(bounds, pose):
+    """Transform all eight AABB corners; the result is an enclosing AABB."""
+    lower, upper = bounds
+    corners = _box_vertices(np.asarray(upper)-lower)+(np.asarray(upper)+lower)/2
+    points = _world_vertices(corners, pose)
+    return points.min(axis=0), points.max(axis=0)
+
+
+def _component_rows(row, world_bounds, margin):
+    """Yield every field component that can meet the other complete body.
+
+    The expansion is only a broad-phase search radius. Coal still receives the
+    original component vertices and contact permission uses the same original
+    finite material region. Source body and selected target layer names survive
+    component expansion so neither filtering nor permission becomes per-mesh.
+    """
+    from .tsdf_geometry import ObservedTsdfGeometry, coal_component
+    geometry = row["shape"]
+    if not isinstance(geometry, ObservedTsdfGeometry):
+        yield row
+        return
+    local_bounds = None if world_bounds is None else _transform_bounds(
+        (world_bounds[0]-margin, world_bounds[1]+margin), np.linalg.inv(row["pose"]))
+    for kind, index, vertices in geometry.iter_components(local_bounds):
+        shape, local = coal_component(vertices)
+        # Coal uses a translated frame for points/segments. Undo that frame
+        # for the complete-overlap LP vertices before applying it exactly once.
+        points = (vertices-local[:3, 3]) @ local[:3, :3]
+        yield {**row, "shape": shape, "pose": row["pose"] @ local,
+               "vertices": {"tsdf_component": points}, "tsdf_component_id": (kind, index)}
+
+
+def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, request,
+                           visited=None, stopped=None):
+    """Query a surface distance and all potentially intersecting signed pieces.
+
+    A positive triangle distance cannot reject the negative-volume containment
+    check. The BVH row is therefore diagnostic; acceptance below uses every
+    candidate zero/negative component, including lower-dimensional samples.
+    """
+    from .tsdf_geometry import ObservedTsdfGeometry
+    visited = set() if visited is None else visited
+    stopped = set() if stopped is None else stopped
+    for target in targets:
+        if actor["owner"] == target["owner"]:
+            continue
+        selected = decisions.get((actor["owner"], actor["name"], target["owner"]))
+        if target["layer"] is not None and (selected is None or target["layer"] != selected["layer"]):
+            continue
+        key = _body_pair_key(actor, target)
+        if key in visited:
+            continue
+        visited.add(key)
+        margin = max(boundary, 0. if selected is None else selected["measurement_allowance_m"])
+        a_tsdf = isinstance(actor["shape"], ObservedTsdfGeometry)
+        b_tsdf = isinstance(target["shape"], ObservedTsdfGeometry)
+        if not a_tsdf and b_tsdf and target["shape"].surface_shape is not None:
+            result = coal.DistanceResult()
+            transforms = [coal.Transform3s(row["pose"][:3, :3], row["pose"][:3, 3])
+                          for row in (actor, target)]
+            coal.distance(actor["shape"], transforms[0], target["shape"].surface_shape,
+                          transforms[1], request, result)
+            value = float(result.min_distance)
+            if not np.isfinite(value):
+                raise RuntimeError("Observed TSDF surface distance returned nonfinite evidence")
+            evidence_rows.append({"actor": actor["owner"], "actor_geometry": actor["name"],
+                "target_owner": target["owner"], "target_geometry": target["name"],
+                "layer": target["layer"], "signed_distance_m": value,
+                "distance_scope": "observed_zero_surface_only",
+                "witness_first": np.asarray(result.getNearestPoint1()).tolist(),
+                "witness_second": np.asarray(result.getNearestPoint2()).tolist(),
+                "diagnostic_only": True, "scope": "observed zero-set triangles; signed pieces checked separately"})
+        target_bounds = _solid_axis_bounds(target["vertices"], target["shape"], target["pose"])
+        for first in _component_rows(actor, target_bounds, margin):
+            if key in stopped:
+                break
+            first_bounds = _solid_axis_bounds(first["vertices"], first["shape"], first["pose"])
+            for second in _component_rows(target, first_bounds, margin):
+                if key in stopped:
+                    break
+                yield first, second
+# END unknown regions never acquire a fabricated boundary or filled cell.
 
 
 # BEGIN exact body support bounds in the selected field's own grid axes.
 def _solid_axis_bounds(vertices, shape, pose):
-    """Bound complete convex vertices, filled voxel cells or analytic curves."""
+    """Bound complete source solids or observed TSDF pieces in supplied axes."""
+    from .tsdf_geometry import ObservedTsdfGeometry
+    if isinstance(vertices, ObservedTsdfGeometry):
+        return _transform_bounds(vertices.bounds, pose)
     if isinstance(vertices, dict):
-        boxes = vertices["voxel_boxes"]
-        centres = boxes[:, :3] @ pose[:3, :3].T+pose[:3, 3]
-        extent = boxes[:, 3:4]/2*np.abs(pose[:3, :3]).sum(axis=1)
-        return np.min(centres-extent, axis=0), np.max(centres+extent, axis=0)
+        points = _world_vertices(vertices, pose)["tsdf_component"]
+        return points.min(axis=0), points.max(axis=0)
     if vertices is not None:
         points = _world_vertices(vertices, pose)
         return points.min(axis=0), points.max(axis=0)
@@ -997,38 +1200,14 @@ def _scene_shape(record):
     """Build one explicitly described filled volume, with no mesh-hull fallback."""
     kind = record["kind"]
     vertices = None
-    if kind == "voxel":
-        shape_xyz = np.asarray(record["shape_xyz"], dtype=int)
-        size = float(record["voxel_size"])
-        indices = np.asarray(record["occupied_flat_indices"], dtype=np.int64)
-        if (shape_xyz.shape != (3,) or np.any(shape_xyz <= 0) or np.prod(shape_xyz) > 8_000_000
-                or not np.isfinite(size) or size <= 0 or indices.ndim != 1 or len(indices) > 250_000
-                or len(np.unique(indices)) != len(indices) or np.any(indices < 0) or np.any(indices >= np.prod(shape_xyz))):
-            raise ValueError("Independent voxel solids require their complete bounded occupied-cell inventory")
-        dtype = np.dtype(record["field_dtype"])
-        if dtype.kind != "f" or dtype.itemsize not in (2, 4, 8):
-            raise ValueError("Independent field samples require a supported finite floating dtype")
-        field = np.frombuffer(bytes.fromhex(record["field_bytes_hex"]), dtype=dtype)
-        if (field.size != np.prod(shape_xyz) or not np.isfinite(field).all()
-                # BEGIN independently verify the completed native ESDF convention.
-                or record["occupancy_rule"] != "ESDF_sample_nonpositive"
-                or not np.array_equal(indices, np.flatnonzero(field <= 0))):
-                # END preserve every negative interior and signed-zero boundary cell.
-            raise ValueError("Occupied-cell inventory changed from the exact original field")
-        # BEGIN an empty union is legitimate only after exact complete-field validation.
-        if not len(indices):
+    # BEGIN explicit observed-field geometry keeps components and sign evidence.
+    if kind == "tsdf":
+        from .tsdf_geometry import ObservedTsdfGeometry
+        shape = ObservedTsdfGeometry(record)
+        if shape.bounds is None:
             return None, None, _pose7(record["pose"])
-        # END positive-only or unknown-sentinel fields never create Coal obstacles.
-        ijk = np.column_stack(np.unravel_index(indices, tuple(shape_xyz)))
-        # OctoMap's lattice is anchored at zero. Build in positive grid-cell
-        # coordinates, then apply the native lower grid corner exactly once.
-        shape = coal.makeOctree((ijk + .5)*size, size)
-        boxes = np.asarray(shape.toBoxes(), float)[:, :4]
-        vertices = {"voxel_boxes": boxes}
-        local = _pose7(record["pose"])
-        shift = np.eye(4)
-        shift[:3, 3] = -shape_xyz*size/2
-        return shape, vertices, local @ shift
+        return shape, shape, _pose7(record["pose"])
+    # END no whole-environment convex hull or ESDF cube is constructed.
     if kind == "mesh":
         vertices = np.asarray(record["vertices"], float)
         shape = _convex_solid(vertices)
@@ -1121,35 +1300,32 @@ def _solid_intersects_region(vertices, region):
     options = {"primal_feasibility_tolerance": 1e-9, "dual_feasibility_tolerance": 1e-9}
     if vertices is None:
         return {"completed": False, "reason": "required_curved_target_needs_complete_region_adapter"}
-    if isinstance(vertices, dict):
-        # An axis-aligned outer bound of the complete finite region safely
-        # rejects disjoint occupied leaves before any per-leaf allocation.
+    # BEGIN required contact needs the actual zero set, never unknown-facing caps.
+    if isinstance(vertices, dict) and "tsdf" in vertices:
+        from .contact_geometry import convex_component_intersects_region
+        geometry, pose = vertices["tsdf"], vertices["pose"]
         lower, upper = np.empty(3), np.empty(3)
-        for index, axis in enumerate(np.eye(3)):
+        for column, axis in enumerate(np.eye(3)):
             for sign in (-1., 1.):
-                result = linprog(sign*axis, A_ub=region[0], b_ub=region[1],
-                                 bounds=[(None, None)]*3, method="highs", options=options)
-                if not result.success:
-                    return {"completed": result.status == 2, "intersects": False,
-                            "reason": "required_region_empty" if result.status == 2 else "required_region_bounds_incomplete"}
-                if sign == 1.:
-                    lower[index] = result.x[index]
-                else:
-                    upper[index] = result.x[index]
-        boxes, pose = vertices["voxel_boxes"], vertices["pose"]
-        centres = boxes[:, :3] @ pose[:3, :3].T+pose[:3, 3]
-        extent = boxes[:, 3:4]/2*np.abs(pose[:3, :3]).sum(axis=1)
-        selected = np.flatnonzero(np.all(centres+extent >= lower, axis=1)
-                                  & np.all(centres-extent <= upper, axis=1))
-        if len(selected) > 4096:
-            return {"completed": False, "reason": "required_target_leaf_query_budget", "candidate_leaves": len(selected)}
-        for count, index in enumerate(selected, start=1):
-            cell = _world_vertices(_box_vertices([boxes[index, 3]]*3)+boxes[index, :3], pose)
-            result = _solid_intersects_region(cell, region)
+                bound = linprog(sign*axis, A_ub=region[0], b_ub=region[1],
+                    bounds=[(None, None)]*3, method="highs", options=options)
+                if not bound.success:
+                    return {"completed": bound.status == 2, "intersects": False,
+                            "reason": "required_region_empty" if bound.status == 2 else "required_region_bounds_incomplete"}
+                (lower if sign == 1. else upper)[column] = bound.x[column]
+        local_bounds = _transform_bounds((lower, upper), np.linalg.inv(pose))
+        count = 0
+        for _, _, points in geometry.iter_components(local_bounds, surface=True, negative=False):
+            count += 1
+            result = convex_component_intersects_region(_world_vertices(points, pose), region)
             if not result["completed"] or result["intersects"]:
-                return {**result, "leaf_queries": count, "candidate_leaves": len(selected)}
-        return {"completed": True, "intersects": False, "leaf_queries": len(selected),
-                "method": "complete_target_region_feasibility"}
+                return {**result, "component_queries": count, "geometry_scope": "observed_tsdf_zero_set"}
+        return {"completed": True, "intersects": False, "component_queries": count,
+                "geometry_scope": "observed_tsdf_zero_set"}
+    if isinstance(vertices, dict) and "tsdf_component" in vertices:
+        from .contact_geometry import convex_component_intersects_region
+        return convex_component_intersects_region(vertices["tsdf_component"], region)
+    # END negative pieces remain collision evidence without inventing contact surfaces.
     planes = ConvexHull(vertices).equations
     result = linprog(np.zeros(3), A_ub=np.concatenate((region[0], planes[:, :3])),
                      b_ub=np.r_[region[1], -planes[:, 3]], bounds=[(None, None)]*3,
@@ -1176,50 +1352,27 @@ def _overlap_within_region(first_vertices, second_vertices, region, *, first_mar
     from scipy.spatial import ConvexHull
     if first_vertices is None or second_vertices is None:
         return {"completed": False, "reason": "curved_contact_requires_complete_local_region_adapter"}
-    if isinstance(first_vertices, dict) or isinstance(second_vertices, dict):
-        def bounds(vertices, margin):
-            if isinstance(vertices, dict):
-                boxes, pose = vertices["voxel_boxes"], vertices["pose"]
-                local_lo, local_hi = np.min(boxes[:, :3]-boxes[:, 3:4]/2, axis=0), np.max(boxes[:, :3]+boxes[:, 3:4]/2, axis=0)
-                corners = _box_vertices(local_hi-local_lo)+(local_hi+local_lo)/2
-                points = _world_vertices(corners, pose)
-            else:
-                points = vertices
-            return points.min(axis=0)-margin, points.max(axis=0)+margin
-        def components(vertices, other_bounds, margin):
-            if not isinstance(vertices, dict):
-                return [vertices]
-            boxes, pose = vertices["voxel_boxes"], vertices["pose"]
-            centres = boxes[:, :3] @ pose[:3, :3].T + pose[:3, 3]
-            extent = boxes[:, 3:4]/2 * np.abs(pose[:3, :3]).sum(axis=1)
-            selected = np.flatnonzero(np.all(centres+extent+margin >= other_bounds[0], axis=1)
-                                      & np.all(centres-extent-margin <= other_bounds[1], axis=1))
-            if len(selected) > 512:
-                return None
-            return [_world_vertices(_box_vertices([boxes[i, 3]]*3)+boxes[i, :3], pose) for i in selected]
-        first = components(first_vertices, bounds(second_vertices, second_margin_m), first_margin_m)
-        second = components(second_vertices, bounds(first_vertices, first_margin_m), second_margin_m)
-        if first is None or second is None or len(first)*len(second) > 512:
-            return {"completed": False, "reason": "complete_contact_leaf_query_budget"}
-        evidence, intersecting = [], 0
-        for a in first:
-            for b in second:
-                check = _overlap_within_region(a, b, region,
-                    first_margin_m=first_margin_m, second_margin_m=second_margin_m)
-                # HiGHS infeasibility here proves these two complete convex
-                # leaves have no volume intersection. Keep that raw status.
-                if check.get("completed") and check.get("intersection_empty"):
-                    continue
-                evidence.append(check)
-                intersecting += 1
-                if not check.get("completed") or not check.get("contained"):
-                    return {**check, "leaf_queries": len(evidence), "scope": "all potentially overlapping occupied leaves"}
-        if not intersecting:
-            return {"completed": True, "contained": True, "intersection_empty": True,
-                    "leaf_queries": len(first)*len(second), "method": "complete_occupied_leaf_intersections",
-                    "numerical_certificate": False}
-        return {"completed": True, "contained": True, "leaf_queries": len(evidence),
-                "method": "complete_occupied_leaf_intersections", "numerical_certificate": False}
+    # BEGIN lower-dimensional TSDF pieces use complete barycentric support LPs.
+    first_component = isinstance(first_vertices, dict)
+    second_component = isinstance(second_vertices, dict)
+    if first_component or second_component:
+        from .contact_geometry import (convex_component_overlap_within_region,
+                                       component_component_overlap_within_region)
+        if first_component and second_component:
+            return component_component_overlap_within_region(
+                first_vertices["tsdf_component"], second_vertices["tsdf_component"], region,
+                first_margin_m=first_margin_m, second_margin_m=second_margin_m)
+        solid = second_vertices if first_component else first_vertices
+        component = first_vertices["tsdf_component"] if first_component else second_vertices["tsdf_component"]
+        solid_margin = second_margin_m if first_component else first_margin_m
+        component_margin = first_margin_m if first_component else second_margin_m
+        if component_margin:
+            return component_component_overlap_within_region(
+                solid, component, region, first_margin_m=solid_margin, second_margin_m=component_margin)
+        planes = ConvexHull(solid).equations
+        return convex_component_overlap_within_region(
+            (planes[:, :3], -planes[:, 3]), component, region, actor_margin=solid_margin)
+    # END all component vertices participate; contact witness limits are irrelevant.
     # BEGIN each shifted plane contains the native solid plus an isotropic ball.
     # Their intersection is a conservative outer polytope, including at sharp
     # corners. Proving its entire target overlap lies inside the unchanged

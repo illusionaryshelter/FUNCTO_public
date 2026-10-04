@@ -516,51 +516,6 @@ def _require_native_voxel_layout(voxel, native):
 # END no rounding repair, reshape or alternate field enters either consumer.
 
 
-# BEGIN independent finite occupied-cell model from the original mapped field.
-def _independent_voxel_geometry(voxel, source):
-    """Own every field sample and its occupied cells before native buffers move.
-
-    Coal uses the filled union of nonpositive ESDF sample cells. This is a second
-    numerical representation of the same observed field, not a free-space
-    proof or an inferred hidden back surface. Its half-cell diagonal is exposed
-    as model discretization; it is never silently added to contact permission.
-    """
-    field = voxel.feature_tensor.detach().cpu().numpy()
-    shape = tuple(int(round(float(value)/float(voxel.voxel_size))) for value in voxel.dims)
-    if len(shape) != 3 or min(shape) < 1 or math.prod(shape) != field.size or field.size > 8_000_000:
-        raise ValueError("Independent occupied field requires the complete bounded native grid")
-    flat = np.ascontiguousarray(field.reshape(-1))
-    if not np.isfinite(flat).all():
-        raise ValueError("Independent field samples must be finite, including the native unknown sentinel")
-    # BEGIN match the completed native ESDF's negative-inside sign convention.
-    # Installed data_voxel.compute_local_sdf returns the field without a sign
-    # flip; collision penetration is radius - sdf. After compute_esdf's full-
-    # grid write, missing sites have +1e4, whereas +/-0 is a surface seed. Keep
-    # the closed surface as well as every negative interior cell. Positive
-    # samples are not objects, and do not by themselves prove observed free
-    # space: that remains the independent raw-ray coverage contract.
-    occupied = np.flatnonzero(flat <= 0)
-    field_summary = {"shape_xyz": list(shape), "total_cells": int(flat.size),
-        "negative_cells": int(np.count_nonzero(flat < 0)), "zero_cells": int(np.count_nonzero(flat == 0)),
-        "positive_cells": int(np.count_nonzero(flat > 0)), "occupied_cells": int(len(occupied)),
-        "occupancy_rule": "ESDF_sample_nonpositive", "occupied_cell_limit": 250_000}
-    # END zero has no epsilon band, and positive native unknown sentinels stay out.
-    if len(occupied) > 250_000:
-        return {"solids": [], "query_gaps": ["Independent occupied-cell inventory exceeds 250000 cells"],
-                "field_summary": field_summary}
-    # BEGIN an empty occupied union still owns and exposes its complete field.
-    return {"solids": [{
-        "name": voxel.name, "kind": "voxel", "pose": list(voxel.pose), "source": source,
-        "voxel_size": float(voxel.voxel_size), "shape_xyz": list(shape),
-        "field_dtype": flat.dtype.str, "field_bytes_hex": flat.tobytes().hex(),
-        "occupied_flat_indices": occupied.tolist(), "occupancy_rule": "ESDF_sample_nonpositive",
-        "geometry_scope": "filled occupied sample cells of the observed field; unknown cells remain unknown",
-        "cell_half_diagonal_m": math.sqrt(3)*float(voxel.voxel_size)/2}], "query_gaps": [],
-        "field_summary": field_summary}
-    # END validators may omit an empty solid only after checking every sample.
-# END neither sparsification nor a contact witness may discard occupied cells.
-
-
 # BEGIN independently bounded owner resolution on the same current RGB-D input.
 def _owner_mapper_config(config, views, masks, owner_id, pose, voxel_size, depth_error_m):
     """Enclose every labelled depth sample in a finite owner-local grid.
@@ -782,9 +737,15 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
         key = (identity, layer)
         queries[key] = CuroboSphereQuery(native, owner_ids=(partition_id,),
                                              source=f"current_rgbd:{','.join(normalized)}")
-        # BEGIN retain an independent filled-cell model of this same owner partition.
-        queries[key].independent_geometry = _independent_voxel_geometry(voxel, queries[key].source)
-        # END no GPU query or robot-sphere residual is used by independent checking.
+        # BEGIN preserve observed TSDF geometry independently of ESDF optimizer costs.
+        # The Mapper is still alive here: export its weighted distance samples,
+        # not the ESDF seeds expanded into occupied cubes. The adapter uses one
+        # affine tetrahedral field for both its zero set and observed negative
+        # region, with physical sample-centre coordinates and no unknown fill.
+        from .tsdf_geometry import build_tsdf_geometry
+        queries[key].independent_geometry = build_tsdf_geometry(
+            mapper, name=partition_id, source=queries[key].source)
+        # END native sphere costs retain their original differentiable ESDF.
         # BEGIN export the actual fine sign source before releasing its Mapper.
         if layer == "fine":
             from .native_voxel_sources import export_source_bits
@@ -818,7 +779,6 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                                     # BEGIN record the finite field actually queried.
                                     "grid_center_local_m": config.grid_center.cpu().tolist(),
                                     "extent_esdf_meters_xyz": list(config.extent_esdf_meters_xyz),
-                                    "occupied_cell_half_diagonal_m": math.sqrt(3)*config.esdf_voxel_size/2,
                                     # BEGIN disclose counts even when a finite inventory refuses admission.
                                     "independent_field": queries[key].independent_geometry["field_summary"],
                                     # END a resource refusal cannot masquerade as an empty observed target.

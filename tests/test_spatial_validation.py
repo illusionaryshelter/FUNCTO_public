@@ -85,17 +85,19 @@ def test_large_full_history_tensors_are_rejected_using_metadata_before_allocatio
                                       PlanningBudget(max_validation_points=65536))
 
 
-def test_analytic_solids_use_explicit_metric_step_and_voxels_only_tighten_it():
+# BEGIN observed TSDF sample spacing tightens the explicit metric validation bound.
+def test_analytic_solids_use_explicit_metric_step_and_tsdf_only_tightens_it():
     problem = cartesian_problem((MotionPhase("free", constant_path()),))
     planner, _ = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                np.zeros((2, 3)), np.zeros((2, 3)), 1.)
     params, scene = planner._verification_fk.config.kinematics_config, planner._verification_scene
     scene.background = NS(independent_geometry={"solids": [{"kind": "cuboid"}]})
     assert _export_motion_inputs(params, scene, problem, spatial_step_m=.001)[1] == .001
-    scene.background.independent_geometry["solids"] = [{"kind": "voxel", "voxel_size": .0015}]
+    scene.background.independent_geometry["solids"] = [{"kind": "tsdf", "voxel_size": .0015}]
     assert _export_motion_inputs(params, scene, problem, spatial_step_m=.001)[1] == .00075
     with pytest.raises(ValueError, match="finite positive"):
         _export_motion_inputs(params, scene, problem, spatial_step_m=0.)
+# END the removed occupied-voxel model does not supply formal scene resolution.
 
 
 def test_out_of_range_cubic_cannot_use_a_smaller_declared_reach_bound():
@@ -245,11 +247,13 @@ def test_export_geometry_chunks_preserve_full_process_history_and_actual_mode_re
     planner._verification_fk.compute_kinematics = lambda state: (horizon.append(state.position.shape[1]) or fk(state))
     coverage_calls = []
     scene.check_robot_coverage = lambda q, names, t, **kw: (coverage_calls.append((len(t[0]), kw.get("entrance", False))) or [])
-    def evaluate(spheres, p, r, progress, q, names, *, layer_selection_out, **kwargs):
+    # BEGIN these chunk records originate from the source-world acceptance call.
+    def evaluate_source(spheres, p, r, progress, q, names, *, layer_selection_out, **kwargs):
         layer_selection_out["robot/background"] = {"body_ids": ["body"],
             "body_fine": encode_array((progress > .5).unsqueeze(-1).detach().cpu())}
         return torch.zeros_like(progress)
-    scene.evaluate = evaluate
+    scene.evaluate_source = evaluate_source
+    # END exact/left/right mode expansion still owns the archived selection shape.
     original = problem.residuals
     problem.residuals = Mock(side_effect=original)
     curve, count = planner.export(result)
@@ -293,11 +297,13 @@ def test_release_history_is_frozen_before_every_geometry_chunk():
     # is shared only for this CPU oracle.
     def clone_with_evaluate():
         value = clone()
-        def evaluate(spheres, p, r, progress, q, names, **kwargs):
+        # BEGIN source geometry consumes each clone's candidate release history.
+        def evaluate_source(spheres, p, r, progress, q, names, **kwargs):
             saved = value._fixed_release_poses[(payload.owner_id, 0)][0]
             checked.append(saved.clone())
             return torch.zeros_like(progress)
-        value.evaluate = evaluate
+        value.evaluate_source = evaluate_source
+        # END the original scene never receives a candidate release cache.
         return value
     scene.clone_for_rollout = clone_with_evaluate
     planner.anchors = np.array([0., .4, 1.])

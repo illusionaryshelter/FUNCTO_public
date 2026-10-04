@@ -564,8 +564,10 @@ def _export_motion_inputs(params, scene, problem, *, spatial_step_m):
         for voxel in getattr(model, "voxel", ()) or ():
             resolutions.append(float(voxel.voxel_size))
         for solid in getattr(query, "independent_geometry", {}).get("solids", ()):
-            if solid["kind"] == "voxel":
+            # BEGIN source TSDF spacing also bounds formal geometric sampling.
+            if solid["kind"] == "tsdf":
                 resolutions.append(float(solid["voxel_size"]))
+            # END the removed occupied-ESDF voxel record is not an alternate model.
     if scene.background is not None:
         collect(scene.background)
     for owner in scene.owners:
@@ -2651,7 +2653,8 @@ def _native_collision_padding(manager):
 # BEGIN scene switches share q/t while querying distinct adjacent modes.
 def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion,
                              progress, joint_position, joint_names, *, trajectory_time,
-                             normalized_time, layer_selection_out=None):
+                             normalized_time, layer_selection_out=None, source_geometry=False,
+                             valid=None, diagnostics=None, source_components_out=None):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2661,13 +2664,21 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     side; an action during that plateau never regains an expired old mode.
     """
     import torch
+    # BEGIN the same mode expansion owns both proxy guidance and source acceptance.
+    # This is a call-site mode, not a configurable collision fallback. Formal
+    # metrics/search/export explicitly choose source geometry; only optimizer
+    # objectives retain the differentiable sphere/ESDF evaluation.
+    evaluate = scene.evaluate_source if source_geometry else scene.evaluate
+    source_arguments = ({"valid": valid, "diagnostics": diagnostics,
+                         "components_out": source_components_out} if source_geometry else {})
+    # END actual arrival permissions are preserved identically in both modes.
     anchors = [float(value) for value in scene.required_progress_anchors
                if problem.start_progress <= value <= problem.phase_count]
     if not anchors:
         selected = {} if layer_selection_out is not None else None
-        result = scene.evaluate(spheres, position, quaternion, progress, joint_position,
-                              joint_names, trajectory_time=trajectory_time,
-                              **({"layer_selection_out": selected} if selected is not None else {}))
+        result = evaluate(spheres, position, quaternion, progress, joint_position,
+                          joint_names, trajectory_time=trajectory_time, **source_arguments,
+                          **({"layer_selection_out": selected} if selected is not None else {}))
         if layer_selection_out is not None:
             layer_selection_out.update(_layer_query_record(trajectory_time, progress, progress,
                 joint_position, joint_names, selected, ("exact",)))
@@ -2696,16 +2707,26 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     selected = {} if layer_selection_out is not None else None
     expanded_progress = torch.cat((progress, lower, upper), dim=1)
     permission_progress = torch.cat((progress, permission_lower, upper), dim=1)
-    terms = scene.evaluate(repeated(spheres), repeated(position), repeated(quaternion),
+    # BEGIN padding masks and diagnostics follow exact/left/right state identity.
+    expanded_components = {} if source_components_out is not None else None
+    if source_geometry:
+        source_arguments.update(valid=None if valid is None else repeated(valid),
+                                components_out=expanded_components)
+    terms = evaluate(repeated(spheres), repeated(position), repeated(quaternion),
         expanded_progress, repeated(joint_position), joint_names,
         # BEGIN pair authorization and other discontinuous laws retain separate scope.
         trajectory_time=repeated(trajectory_time),
         robot_owner_permission_progress=permission_progress,
+        **source_arguments,
         **({"layer_selection_out": selected} if selected is not None else {}))
         # END q, physical time and the command clock are unchanged.
     if layer_selection_out is not None:
         layer_selection_out.update(_layer_query_record(repeated(trajectory_time), expanded_progress,
             permission_progress, repeated(joint_position), joint_names, selected, ("exact", "left", "right")))
+    if source_components_out is not None:
+        source_components_out.update({name: torch.stack(value.split(progress.shape[1], dim=1)).amax(0)
+                                      for name, value in expanded_components.items()})
+    # END source world checks never see native dense-buffer padding as a state.
     return torch.stack(terms.split(progress.shape[1], dim=1)).amax(0)
 
 
@@ -2896,13 +2917,17 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             process_value = problem.evaluate(position, quaternion, progress, q, self._joint_names,
                 joint_velocity=dq, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear,
                 tool_angular_velocity=tool_angular)
+            # BEGIN only real native states enter source world/self acceptance.
+            valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
+            source_valid = (ordered(torch.cat((valid, torch.ones_like(anchor_u, dtype=torch.bool)), 1))
+                            if self._process_mode == "trajectory_metrics" else None)
             scene_value = _scene_boundary_evaluate(self._scene, problem, progress_map,
                 spheres, position, quaternion, progress, q, self._joint_names,
-                trajectory_time=trajectory_time, normalized_time=ordered(all_u))
-            valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
+                trajectory_time=trajectory_time, normalized_time=ordered(all_u),
+                source_geometry=self._process_mode == "trajectory_metrics", valid=source_valid)
+            # END optimizer world gradients continue through the original ESDF.
             # BEGIN all hard self checks use the same source geometry and exact query times.
             if self._process_mode == "trajectory_metrics":
-                source_valid = ordered(torch.cat((valid, torch.ones_like(anchor_u, dtype=torch.bool)), 1))
                 source_self = self._scene.check_robot_self_collision(
                     q, self._joint_names, trajectory_time, valid=source_valid).gather(1, inverse)
                 folded_self = torch.cat((q.new_zeros((batch, horizon-1)),
@@ -3135,6 +3160,12 @@ class _CuroboPlanner:
             hand.bind_clock(initial_clock["duration"], self.progress_map)
         self.finger_trajectory = None if hand is None else hand.finger_trajectory
         # END every private scene receives the same already frozen hand clock.
+        # BEGIN build source world shapes once from the finalized request inputs.
+        # Continuation filtering and hand-clock binding precede this snapshot.
+        # Native managers/search children share its immutable geometry while
+        # supplying their own owner/release poses for every source query.
+        scene.bind_source_scene()
+        # END execution keeps its own independently bound checker and arrival latches.
         self.anchor_capacity = _anchor_capacity(self.progress_map, anchors, budget)
         robot_dict, self.robot_metadata = _bounded_robot_configuration(robot, problem, scene, budget)
         # BEGIN native and source FK must consume the same complete robot description.
@@ -3510,20 +3541,20 @@ class _CuroboPlanner:
             # END both geometric interpretations retain their original numeric precision.
             progress = q.new_full(q.shape[:2], self.problem.start_progress)
             unresolved_scene = {}
-            for name, value in self._verification_scene.components(
-                    self.problem.transform_robot_spheres(state.robot_spheres),
-                    position, quaternion, progress, q, self.joint_names,
-                    trajectory_time=torch.zeros_like(progress)).items():
+            # BEGIN the entrance uses the same source world law as every candidate.
+            source_world_evidence, scene_components = {}, {}
+            _scene_boundary_evaluate(self._verification_scene, self.problem, self.progress_map,
+                self.problem.transform_robot_spheres(state.robot_spheres), position,
+                quaternion, progress, q, self.joint_names,
+                trajectory_time=torch.zeros_like(progress), normalized_time=torch.zeros_like(progress),
+                source_geometry=True, diagnostics=source_world_evidence,
+                source_components_out=scene_components)
+            for name, value in scene_components.items():
                 if name.startswith("unknown/") and not name.startswith("unknown/release_anchor/"):
                     unresolved_scene[name] = float(value.max().item())
                 else:
                     components[f"scene:{name}"] = value
-            if self._verification_scene.required_progress_anchors:
-                components["scene:mode_boundary"] = _scene_boundary_evaluate(
-                    self._verification_scene, self.problem, self.progress_map,
-                    self.problem.transform_robot_spheres(state.robot_spheres), position,
-                    quaternion, progress, q, self.joint_names,
-                    trajectory_time=torch.zeros_like(progress), normalized_time=torch.zeros_like(progress))
+            # END individual terms retain the worst same-state material mode.
             residuals = {name: float(value.max().item()) for name, value in components.items()}
             coverage = self._verification_scene.check_robot_coverage(
                 q, self.joint_names, torch.zeros_like(progress), entrance=True)
@@ -3543,12 +3574,13 @@ class _CuroboPlanner:
             "joint_names": list(self.joint_names), "joint_bounds": joint_bounds,
             "robot_coverage": coverage, "unresolved_scene": unresolved_scene,
             "source_self_collision": source_self_evidence,
+            "source_world_collision": source_world_evidence,
             "source_native_fk": model_fk,
             "scope": {
                 "kind": "necessary_conditions_at_fixed_measured_entrance",
                 "progress": self.problem.start_progress, "active_joint_position_velocity": "native_effective_limits",
                 "source_self_collision_checked": True,
-                "scene": "actual native FK with the declared conservative scene and gripper model",
+                "scene": "source robot geometry against the same selected observed/native owner geometry",
                 "not_checked": ["acceleration", "jerk", "torque", "unprovided_locked_joint_velocity",
                                 "future_trajectory_feasibility", "physical_task_success"],
             },
@@ -3805,7 +3837,7 @@ class _CuroboPlanner:
                     "scene": _scene_boundary_evaluate(scene, self.problem, self.progress_map,
                         self.problem.transform_robot_spheres(state.robot_spheres), p, r, progress,
                         js.position, self.joint_names, trajectory_time=clock_time,
-                        normalized_time=values_t[..., -1])}
+                        normalized_time=values_t[..., -1], source_geometry=True)}
                 # BEGIN OMPL shares the metrics source-solid self-collision contract.
                 native = self._verification_native.compute_costs(
                     self._RobotState(joint_state=js, cuda_robot_model_state=state))
@@ -4202,6 +4234,9 @@ class _CuroboPlanner:
         # BEGIN retain bounded source-solid witnesses for every exported validation chunk.
         source_self_reports = []
         # END complete per-pair arrays never accumulate across the trajectory.
+        # BEGIN world diagnostics retain one worst source state for the complete curve.
+        source_world_report = {}
+        # END every state is checked even when its proxy cost vanishes.
         coverage_count, coverage_passed, coverage_failed = 0, True, []
         coverage_unknown = np.zeros(len(queries))
         needs_twist = any(direction.kind == "local_rate" for mechanism in self.problem.mechanisms
@@ -4262,7 +4297,8 @@ class _CuroboPlanner:
                     p, r, s_t[:, selected], q_t[:, selected], self.joint_names,
                     trajectory_time=time_t[:, selected],
                     normalized_time=self.device_cfg.to_device((queries[selected]/times[-1])[None]),
-                    layer_selection_out=layer_record)}
+                    layer_selection_out=layer_record, source_geometry=True,
+                    diagnostics=source_world_report)}
                 layer_record["sample_start"] = begin
                 layer_record["sample_count"] = end-begin
                 layer_queries.append(layer_record)
@@ -4328,6 +4364,7 @@ class _CuroboPlanner:
                 "spatial_resolution": spatial_report, "scene_layer_queries": layer_queries,
                 "source_self_collision": {"checked_states": sum(
                     report["checked_states"] for report in source_self_reports), "chunks": source_self_reports},
+                "source_world_collision": source_world_report,
                 "coordinate_direction_resolution": {"query_count": len(queries),
                     "maximum_physical_time_gap_s": float(np.max(np.diff(queries))),
                     "local_rate": "instantaneous native geometric Jacobian times actual cubic joint velocity",

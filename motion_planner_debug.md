@@ -1,6 +1,6 @@
 我们现在这个新证据把问题又缩小了一层，而且方向非常明确：
 
-> **当前 `Coal + 占据体素` 这条所谓“实体检查”并不是一个真正独立于 ESDF 表示的环境几何检查。机器人几何换成了来源实体，但环境几何仍是由 ESDF 的零/负值格经过“整格立方体化”得到的第二层代理。**
+> **此次诊断中的旧 `Coal + 占据体素` 路径并不是一个真正独立于 ESDF 表示的环境几何检查。机器人几何换成了来源实体，但当时的环境几何仍是由 ESDF 的零/负值格经过“整格立方体化”得到的第二层代理。**
 
 所以 `−0.03042025 mm` **不能解释成“2 mm fine map 也确认真实碰撞”**。更准确的解释是：
 
@@ -8,13 +8,13 @@
 
 这和真实桌面仍有约 \(+0.642\) mm 间隙完全可以同时成立。
 
-这些数字与体素表示造成额外占据厚度的假设相容，尚不能分离各项误差来源。表示对照及导出坐标检查的实测结果见[专项报告](../sim-version-plans/2026-10-04-tsdf-surface-review.md)；下文的环境表示迁移属于架构建议，尚未接入正式规划。
+这些数字与体素表示造成额外占据厚度的假设相容，尚不能分离各项误差来源。前四节保留这次表示对照的分析；它们描述的 ESDF 填充格路径已从生产验收中移除。已批准的 TSDF 零集合与同源负区重建，以及规划和执行的来源几何验收，均已接入当前代码，具体职责见第 5、6 节。表示对照、导出坐标检查和迁移后的最终验证结果统一记录在[专项报告](../sim-version-plans/2026-10-04-tsdf-surface-review.md)；代码接入本身不代表验证已通过。
 
 ------
 
 ## 1. 先看体素表示的数量级关系
 
-我们当前 Coal 环境代理实际上相当于：
+此次诊断所针对的旧 Coal 环境代理实际上相当于：
 
 \[ \mathcal O_h = \bigcup_{k:\phi_k\le0} \left( c_k+ [-h/2,h/2]^3 \right) \]
 
@@ -121,7 +121,7 @@ cuRoboV2 官方现在已经把两者语义写得非常清楚：
 
 本地 `builder_esdf.py` 的两种方法均使用 `abs(tsdf) <= 0.9*h` 或 `tsdf < -(truncation_distance-1.1*h)` 作为 seed 条件，其中 `h` 是 TSDF 格距。当前截断距离为 `2*h`，这两条条件合起来包含全部有效负 TSDF 样本及正侧表面带。因此 seed 不能一概解释为连续表面上的采样点。
 
-所以我们正式路径的几何链实际上是：
+所以此次诊断所针对的旧正式路径，其环境几何链实际上是：
 
 ```
 RGB-D
@@ -147,7 +147,7 @@ Coal collision geometry
 
 存在一定程度的循环论证。
 
-因为 Coal 的环境仍然源自同一个已经经过 gather 的 ESDF。
+因为这条旧 Coal 路径的环境仍然源自同一个已经经过 gather 的 ESDF。当前生产路径已按第 5 节改为从观测 TSDF 样本重建几何；上述循环依赖分析解释的是被移除路径的问题。
 
 ------
 
@@ -250,7 +250,7 @@ scatter ESDF zero centers:
 
 这适合用 Coal 的三角网格 BVH（包围体层次树，保留三角形并加速距离和相交查询）做环境表示对照，但仍来自同一份观测 TSDF，不是独立重建的环境真值。
 
-另有一项已确认的本地导出坐标差异：`builder_coord.voxel_to_world` 将 TSDF 样本放在 `index+0.5`，而 `builder_mesh.generate_mesh_kernel` 将相同样本值放在 `index`。在 `refine_iterations=0` 时，每轴补回半个 TSDF 格距可恢复样本中心坐标。FUNCTO 的 [`extract_tsdf_surface(mapper)`](manipulation/mapper_surface.py) 固定使用零 refinement，返回修正后的 CPU 顶点和原三角索引；它不改第三方库、不补洞、不做凸包，也不增加碰撞余量。该函数是表面导出修正，**正式规划尚未使用它替换验收判据**。
+另有一项已确认的本地导出坐标差异：`builder_coord.voxel_to_world` 将 TSDF 样本放在 `index+0.5`，而 `builder_mesh.generate_mesh_kernel` 将相同样本值放在 `index`。在 `refine_iterations=0` 时，每轴补回半个 TSDF 格距可恢复样本中心坐标。FUNCTO 的 [`extract_tsdf_surface(mapper)`](manipulation/mapper_surface.py) 固定使用零 refinement，返回修正后的 CPU 顶点和原三角索引；它不改第三方库、不补洞、不做凸包，也不增加碰撞余量。该函数保留为**诊断用的公开 marching-cubes 导出坐标修正**。当前生产验收使用第 5 节的 `export_blocks()` 样本重建；不会把这里补回半格的三角表面直接作为唯一验收判据。
 
 这些顶点位于 Mapper 融合观测所用的坐标系，已含 `grid_center`；被分区目标物体（owner）的局部地图在查询时只应用一次该物体位姿。三角表面可能开放，正距离不能证明机器人处于障碍外部，也不能证明未知空间没有障碍。
 
@@ -276,11 +276,11 @@ scatter ESDF zero centers:
 
 ------
 
-# 5. 因此我现在建议把架构明确成“三种几何表示，三种职责”
+# 5. 已批准并接入的架构：“三种几何表示，三种职责”
 
-这是碰撞环境表示与验收职责的架构建议，不涉及 skill 参数。当前 OMPL 状态验收、轨迹优化候选验收和稠密轨迹验收仍保留 sphere/ESDF 的硬拒绝；Coal 检查通过不会自动覆盖这些拒绝。要改变最终判据，需要先明确完整占据、表面距离、接触权限和未知空间各自的职责，再经架构决定统一修改相关入口。
+这次修改统一了碰撞环境表示与验收职责，不涉及 skill 参数。当前代码由 sphere/ESDF 提供优化代价与梯度，由机器人来源实体及同一观测 TSDF 重建的完整有限分量作碰撞和接触验收。验收必须查询所需来源几何对，不以代理球代价是否为零决定是否查询，也不再让 sphere/ESDF 代价单独否决已通过来源几何检查的状态。
 
-现有“未知可尝试”政策应保持：不可见区域缺少几何证据，不应因表面导出而被宣称已证自由，也不能在这次修正中静默改为一律禁止尝试。地图层选择的有效支撑要求与未知空间政策分别处理。
+现有“未知可尝试”（`allow_attempt`）政策保持：不可见区域缺少几何证据，既不被宣称已证自由，也不因本次重建而一律禁止尝试。已观测的负 TSDF 分量仍属于碰撞证据；缺少必需来源几何适配、查询未完成等程序性缺口仍显式拒绝，不能冒充不可见区域。地图层选择的有效支撑要求与未知空间政策继续分别处理。
 
 ## 第一层：CuRobo sphere + ESDF
 
@@ -297,52 +297,55 @@ gather ESDF
 - L-BFGS 梯度；
 - 快速 cost；
 - 远离障碍物；
-- broad phase。
+- 优化查询自身的空间筛选；它不决定来源几何验收是否执行。
 
 `gather` 为了提高 recall 而故意保守，这是官方设计，不必因为现在的问题就全面改成 scatter。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.perception.html?utm_source=chatgpt.com)
 
 ------
 
-## 第二层：source robot geometry + TSDF mesh + Coal
+## 第二层：来源机器人实体 + 同源 TSDF 零集合和负区 + Coal
 
-用于诊断时，proxy 判断危险后可比较另一种环境表示：
+生产几何由 [`planning_observation.py`](manipulation/planning_observation.py) 绑定到每个地图快照；[`tsdf_geometry.build_tsdf_geometry()`](manipulation/tsdf_geometry.py) 调用 `mapper.tsdf.export_blocks()`，读取观测块中的加权 TSDF 累积值与权重，并按样本中心坐标还原有效样本。它不消费 ESDF 的正负号，也不调用公开 marching-cubes 表面导出作为验收几何。
 
 ```
-sphere / ESDF says collision
+同一 Mapper 观测快照
           ↓
-source robot collision geometry
+export_blocks() → 有效 TSDF 样本值、权重和样本中心坐标
+          ↓
+相邻样本中心构成的单元，按固定六四面体划分
+          ↓
+每个完整已观测四面体的仿射 TSDF
+          ↓
+零集合 + 同一仿射函数的负区有限分量
           ×
-extract_tsdf_surface(mapper)
+机器人来源碰撞实体 / 已绑定物体来源实体
           ↓
-Coal 三角表面距离/相交查询
+Coal 距离、相交及完整接触区域检查
 ```
 
-直接用途是分析 sphere/ESDF 与三角表面查询的分歧。若要参与 OMPL 状态、轨迹优化候选及稠密轨迹的最终验收，仍须满足统一的占据、包含关系、接触与未知空间合同；**开放 BVH 表面的正距离不能单独放行状态或轨迹**。
+这里“仿射 TSDF”指一个四面体内由其四个顶点样本确定的一次函数，包含常数项；“零集合”是该函数等于零的点集，“负区”是同一个函数为负的部分及其零边界。固定六四面体划分保证相邻单元共享面的划分一致；每个四面体只有在四个样本均被观测到时才重建。八个角都严格为负的完整单元可以压缩保存为整数索引，其几何仍只占相邻样本中心之间的范围。孤立的非正样本保留为单点，不扩成半格邻域；四个样本全零的四面体保留整个零值区域。未观测空间不补洞、不外推为负区，也不通过整个场景的凸包填满。
 
-当前 `robot_geometry_check._scene_shape()` 对 `record['kind'] == 'mesh'` 的分支将顶点构造成填充凸包，面向来源凸实体。TSDF 网格可能非凸且开放，不能直接送入这个入口；诊断应保留其 faces 构建 BVH。BVH 的表面相交和距离也不能替代完整实体的包含关系检查。
+[`ObservedTsdfGeometry`](manipulation/tsdf_geometry.py) 保留这些有限分量的并集。每个分量本身是点、线段、零截面多边形或凸负区，Coal 按其实际维数进行查询；完整并集可以非凸，也不要求形成封闭的障碍外表面。`robot_geometry_check._scene_shape()` 中原有 `kind='mesh'` 仍服务于明确的来源凸实体，观测 TSDF 使用独立的 `kind='tsdf'` 记录，不把开放三角网格整体凸包化。负区检查能发现实体落在已观测负区内部的情形，所以只有开放表面距离为正不再足以放行。
 
-Coal 本身就是为 GJK/EPA collision 和 distance narrow phase 设计的，也支持安全 margin 和距离下界。[GitHub](https://github.com/coal-library/coal?utm_source=chatgpt.com)
+有限接触由 [`contact_geometry.py`](manipulation/contact_geometry.py) 和 [`RobotGeometryChecker.query_scene()`](manipulation/robot_geometry_check.py) 按同一目标几何检查。“允许接触”要求来源实体与目标分量的**完整交集**处于声明的材料面、目标接触片及间隙约束内，不能用少数见证点代替全交集。“必须接触”要求目标已观测零集合或显式来源实体表面与该有限区域相交，并满足原有方向等约束；负区在未知边界形成的截断面不能建立接触。测量余量继续沿用已有合同，不通过本次表示迁移增加另一套安全余量。
 
-可以借鉴 self-collision 中将优化梯度与来源实体验收分开的职责：
+[`PlanningScene.bind_source_scene()`](manipulation/planning_scene.py) 为每次规划绑定一次来源几何，`source_components()` / `evaluate_source()` 保留任务约束和未知空间政策，并调用完整来源检查。以下四个入口已使用该路径：
 
-```
-sphere provides optimization gradient
-source geometry provides acceptance decision
-```
+- 起始状态检查：`planning.py` 的 `initial_state_diagnostics()`。
+- OMPL 状态有效性检查：`ompl_seed()` 内的状态与边检查。
+- 优化候选验收：`_process_manager_type()` 生成的轨迹指标处理器，供 `select_candidate()` 使用。
+- 导出稠密轨迹验收：`export()` 对实际导出轨迹及约束切换状态进行检查。
 
-但 self-collision 使用的是来源完整实体；world side 若从：
+[`RobotStateValidator.check_planning_world()`](manipulation/robot_validation.py) 将规划状态交给同一 `RobotGeometryChecker.query_scene()` 几何合同。执行前检查和执行时实际状态检查消费相同的序列化 TSDF 分量、来源实体和接触规则；规划工作区与执行工作区分开，规划候选不会重绑定执行状态。这里统一的是几何与权限语义，仍不能声称离散检查之间已获得连续无碰撞证明。
 
-```
-ESDF-derived cubes
-```
-
-改为：
+因此职责保持为：
 
 ```
-TSDF zero-level mesh
+sphere / ESDF → 优化代价与梯度
+来源实体 × TSDF 零集合及同源负区 → 完整状态的碰撞与接触验收
 ```
 
-还会失去原占据立方体明确的体积含义。因此这不是可直接等价替换的实现修改。
+这次迁移保留了原分析中“单独用零表面替换占据体积会丢失包含关系”的结论，并通过**同一仿射重建的负区**补足已观测内部的几何语义。公开 `extract_mesh()` 与坐标修正后的 `extract_tsdf_surface()` 继续用于表示对照；它们不承担生产环境的唯一验收职责。当前接入的验证结果与尚存限制见[专项报告](../sim-version-plans/2026-10-04-tsdf-surface-review.md)。
 
 ------
 
@@ -374,19 +377,19 @@ MuJoCo table / object collision geometry
 
 > **所有模块必须使用同一种几何表示。**
 
-在明确上述验收合同后，可以保留以下同层表示对照关系；图中的 Coal 项首先是表面查询证据：
+当前实现保留以下同层关系：PlanningScene 用既定规则为每个实体选择地图层，来源验收消费同一份层选择记录和观测快照；执行检查也验证该选择记录。图中的 Coal 项包含同源零集合与负区，不只是表面距离：
 
 ```
 MapSelector(q, link)
         ↓
     chooses FINE
         ↓
-┌──────────────────────────┐
-│ same fine mapper snapshot│
-├──────────────────────────┤
-│ ESDF → CuRobo gradient   │
-│ TSDF mesh → Coal evidence│
-└──────────────────────────┘
+┌─────────────────────────────┐
+│ same fine mapper snapshot   │
+├─────────────────────────────┤
+│ ESDF → CuRobo gradient      │
+│ TSDF zero + negative → Coal │
+└─────────────────────────────┘
 ```
 
 或者：
@@ -396,12 +399,12 @@ MapSelector(q, link)
         ↓
     chooses COARSE
         ↓
-┌──────────────────────────┐
-│same coarse mapper snapshot│
-├───────────────────────────┤
-│ ESDF → CuRobo gradient    │
-│ TSDF mesh → Coal evidence │
-└───────────────────────────┘
+┌─────────────────────────────┐
+│ same coarse mapper snapshot │
+├─────────────────────────────┤
+│ ESDF → CuRobo gradient      │
+│ TSDF zero + negative → Coal │
+└─────────────────────────────┘
 ```
 
 也就是：
@@ -496,9 +499,9 @@ fine/scatter
 
 # 9. 不把 `field <= 0` 填充格称为独立环境真值
 
-当前实现已将它定义为同一观测场的填充格近似。需要纠正的是对这种表示精度和独立性的解释；生产替换仍需前述架构决定。
+该表示属于同一观测场的填充格近似，不是独立环境真值。当前生产代码已移除由 `ESDF<=0` 构造完整格子的验收分支；本节保留其几何局限，解释为什么不能仅改阈值符号来完成迁移。
 
-条件符号符合当前负内正外的 ESDF 定义；不能简单改为 `field < 0`，否则会丢掉零值 seed 对应的障碍表示。它的局限是：
+旧条件符号符合负内正外的 ESDF 定义；如果只改为 `field < 0`，就会丢掉零值 seed 对应的障碍表示。旧填充格路径的局限是：
 
 `compute_esdf()` 的目标是产生距离场供规划器查询。
 
@@ -534,7 +537,7 @@ occupied = field <= 0
 
 \[ d_{\rm simulator\ table} \approx+0.642\text{ mm}. \]
 
-TSDF 零等值面的原始导出、坐标修正及与原桌面的比较见专项报告。各表示的距离应分别保留，不能把 mesh 分离直接转为生产规划放行。
+TSDF 零等值面的原始导出、坐标修正及与原桌面的比较见专项报告。各表示的距离分别保留；生产规划按第 5 节同时检查来源实体、同源零集合和负区及接触权限，不把诊断 mesh 的分离直接转为放行。
 
 ------
 
@@ -585,7 +588,7 @@ rotated mug = 0.2 mm
 
 现在增加这个证据以后，我会改成：
 
-**P0：明确 `ESDF<=0 → full cubes` 的占据近似语义，并区分它与 TSDF 表面、完整实体及环境真值。**
+**P0：明确 `ESDF<=0 → full cubes` 的占据近似语义，并区分它与 TSDF 表面、完整实体及环境真值；生产验收现已移除这条填充格分支。**
 
 **P1：正式 planning 使用 `gather`，它官方定义上就会 dilate ESDF seed band；必须与 scatter 诊断分开。**
 
@@ -597,9 +600,9 @@ rotated mug = 0.2 mm
 
 所以我现在**不会建议我们扩大 fine ROI、改 skill、增加 OMPL 时间或继续加 refine points**。
 
-用于区分表示的关键检查是：
+原先用于区分表示的关键诊断是：
 
 > **在完全相同的 Mapper TSDF snapshot 上调用公开 `extract_mesh()`，同时保留原始输出与 FUNCTO `extract_tsdf_surface(mapper)` 的坐标修正语义，让 link6 来源 collision geometry 对保留三角拓扑的 mesh 做 Coal 表面距离和相交查询。**
 
-这项检查绕开 `gather/scatter` 的 ESDF seed 差异，但仍需检查导出坐标与重建误差，不能仅凭正距离确认完整环境无碰撞。官方 API 和源码支持提取这种观测表面。[GitHub](https://github.com/NVlabs/curobo/blob/main/curobo/_src/perception/mapper/integrator_esdf.py) 已有实测结果统一保留在专项报告，不以重复测试替代架构决定。
+这项诊断绕开 `gather/scatter` 的 ESDF seed 差异，但仍需检查导出坐标与重建误差，不能仅凭正距离确认完整环境无碰撞。官方 API 和源码支持提取这种观测表面。[GitHub](https://github.com/NVlabs/curobo/blob/main/curobo/_src/perception/mapper/integrator_esdf.py) 它的实测结果与当前 `export_blocks()` 同源零集合和负区路径的最终验证结果统一保留在[专项报告](../sim-version-plans/2026-10-04-tsdf-surface-review.md)。架构与代码已按第 5 节接入，不以重复诊断或坐标修正表面单独代替生产验收。
 

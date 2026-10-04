@@ -35,7 +35,7 @@ from .planning_problem import event_occurrence_key
 # END source names alone do not identify an explicitly repeated operation.
 from .motion import _inverse, _pose_array
 # BEGIN material permission uses complete finite target intersections.
-from .contact_geometry import ContactCellGeometry, query_geometry
+from .contact_geometry import make_contact_geometry, query_geometry
 # END the ordinary collision query still owns all other pairs.
 # BEGIN all geometry consumers share one complete-body layer selection.
 from .voxel_layers import LayeredVoxelQuery, validate_body_groups
@@ -930,6 +930,7 @@ class PlanningScene:
         # BEGIN one source-solid authority is bound before a planning request.
         self.robot_validator = None
         self._self_collision_owner_ids = frozenset()
+        self._source_scene_checker = None
         # END standalone scene queries do not implicitly supply robot evidence.
         # BEGIN independent solids need explicit material identity, not sphere-index guesses.
         self.native_geometry_materials = dict(native_geometry_materials or {})
@@ -1040,7 +1041,7 @@ class PlanningScene:
                 from .contact_geometry import LayeredContactCellGeometry
                 self._contact_cells[owner.owner_id] = LayeredContactCellGeometry(query_geometry(owner.query))
             else:
-                self._contact_cells[owner.owner_id] = ContactCellGeometry(query_geometry(owner.query))
+                self._contact_cells[owner.owner_id] = make_contact_geometry(query_geometry(owner.query))
         # END unsupported inventories remain explicit permission-query gaps.
         self._fixed_release_poses = {}
         anchors = [x for owner in self.owners for relation in owner.attachments for x in relation.interval]
@@ -1338,6 +1339,26 @@ class PlanningScene:
         self.robot_validator = validator
         self._self_collision_owner_ids = frozenset(checked)
 
+    # BEGIN freeze world geometry after continuation policy and hand clocks are bound.
+    def bind_source_scene(self):
+        """Build one immutable source scene for this complete planning request.
+
+        ``to_execution_binding`` serializes inputs only: it neither binds a
+        checker nor calls this method. The snapshot can therefore include the
+        source robot identity without recursive binding. Rollout clones share
+        these read-only scene shapes; candidate owner/release poses are query
+        inputs, never changes to the saved scene or the execution validator.
+        """
+        if self.robot_validator is None:
+            raise ValueError("Source world geometry needs the already validated robot binding")
+        checker = copy(self.robot_validator.checker)
+        # Geometry and the Pinocchio model are immutable. Its FK workspace is
+        # local so planning does not overwrite the execution checker's data.
+        checker._data = checker.model.createData()
+        checker.bind_scene(self.to_execution_binding())
+        self._source_scene_checker = checker
+    # END one scene construction serves optimizer metrics, search and final validation.
+
     def check_robot_self_collision(self, joint_position, joint_names, trajectory_time,
                                    *, valid=None, diagnostics=None):
         """Query every known required solid pair for the actual native states.
@@ -1378,6 +1399,104 @@ class PlanningScene:
                 worst_state=None if worst is None else worst[1])
         return result
     # END source-solid state queries never inherit a sphere-proxy acceptance gate.
+
+    # BEGIN every formal world state consumes the original native layer and owner poses.
+    def check_world_geometry(self, joint_position, joint_names, trajectory_time, progress,
+                             *, geometry_query, robot_owner_permission_progress,
+                             valid=None, diagnostics=None):
+        """Return source-world 0/1 residuals for the complete valid state batch.
+
+        Only the numeric layer arrays are copied once to CPU. Each Coal call
+        receives a singleton record, so checking H states never decodes an
+        H-state base64 payload H times. Diagnostics retain one worst state;
+        complete per-pair reports are not accumulated over the trajectory.
+        """
+        from .collision_records import encode_array
+
+        if self.robot_validator is None or self._source_scene_checker is None:
+            raise ValueError("Source world acceptance requires the frozen planning scene")
+        if (joint_position is None or joint_position.ndim != 3
+                or joint_position.shape[-1] != len(joint_names)
+                or trajectory_time is None or trajectory_time.shape != joint_position.shape[:2]
+                or progress.shape != trajectory_time.shape
+                or robot_owner_permission_progress.shape != trajectory_time.shape):
+            raise ValueError("Source world states need aligned named coordinates, times and progress")
+        if valid is None:
+            valid = torch.ones_like(trajectory_time, dtype=torch.bool)
+        if valid.shape != trajectory_time.shape or valid.dtype != torch.bool:
+            raise ValueError("Source world validity must be an aligned native-state boolean mask")
+        positions = joint_position.detach()[valid].cpu().numpy()
+        times = trajectory_time.detach()[valid].cpu().numpy()
+        progress_values = progress.detach()[valid].cpu().numpy()
+        permission_values = robot_owner_permission_progress.detach()[valid].cpu().numpy()
+        # Apply valid before any CPU coordinate or owner-pose query. Native
+        # dense-buffer padding is not another physical robot configuration.
+        # Fixed native aliases already bind one immutable source pose. A
+        # float32 optimizer copy cannot replace that double-precision pose;
+        # all moving, attached and released owners use this candidate's pose.
+        owner_values = {identity: (p.detach()[valid].cpu().numpy(), q.detach()[valid].cpu().numpy())
+                        for identity, (p, q) in geometry_query["nominal_owner_poses"].items()
+                        if identity not in self._self_collision_owner_ids}
+        selected_values = {}
+        for key, selection in geometry_query["layer_selection"].items():
+            selected_values[key] = {"body_ids": list(selection.body_ids),
+                **{name: value.detach()[valid].cpu().numpy() for name, value in (
+                    ("body_fine", selection.body_fine),
+                    ("influence_aabb_grid_m", selection.influence_aabb),
+                    ("index_lower", selection.index_lower), ("index_upper", selection.index_upper))}}
+        residuals, unmodelled, worst = [], set(), None
+        # The final exporter passes the same small accumulator across native
+        # chunks. Retain one witness for the whole export, not one full scene
+        # pair inventory per chunk or one report per sampled robot state.
+        previous_count = 0
+        previous_failed = 0
+        if diagnostics is not None:
+            previous_count = diagnostics.get("checked_states", 0)
+            previous_failed = diagnostics.get("failed_states", 0)
+            unmodelled.update(diagnostics.get("unmodelled_geometry_names", ()))
+            prior = diagnostics.get("worst_state")
+            if prior is not None:
+                clearance = prior["minimum_scene_clearance_m"]
+                worst = ((prior["residual"], len(prior["scene"]["query_gaps"]),
+                          -float("inf") if clearance is None else -clearance), prior)
+        for index, (row, time_s, phase, permission) in enumerate(zip(
+                positions, times, progress_values, permission_values)):
+            owner_poses = {}
+            for identity, (p, q) in owner_values.items():
+                pose = np.eye(4)
+                pose[:3, :3] = Rotation.from_quat(q[index, [1, 2, 3, 0]]).as_matrix()
+                pose[:3, 3] = p[index]
+                owner_poses[identity] = pose
+            layers = {key: {"body_ids": value["body_ids"],
+                **{name: encode_array(array[index:index+1][None])
+                   for name, array in value.items() if name != "body_ids"}}
+                for key, value in selected_values.items()}
+            report = self.robot_validator.check_planning_world(row, joint_names,
+                time_s=time_s, gripper=self.gripper, scene_checker=self._source_scene_checker,
+                progress=phase, nominal_owner_poses=owner_poses, layer_selection=layers,
+                robot_owner_permission_progress=permission)
+            residuals.append(report["residual"])
+            unmodelled.update(report["unmodelled_geometry_names"])
+            if diagnostics is not None:
+                scene = report["scene"]
+                distances = [pair["signed_distance_m"] for pair in scene["pairs"]
+                             if "signed_distance_m" in pair]
+                minimum = min(distances, default=None)
+                rank = (report["residual"], len(scene["query_gaps"]),
+                        -float("inf") if minimum is None else -minimum)
+                if worst is None or rank > worst[0]:
+                    worst = (rank, {**report, "trajectory_time_s": float(time_s),
+                        "minimum_scene_clearance_m": minimum,
+                        "planning_joint_names": list(joint_names), "planning_joint_positions": row.tolist()})
+        result = torch.zeros_like(trajectory_time)
+        result[valid] = result.new_tensor(residuals)
+        if diagnostics is not None:
+            diagnostics.update(checked_states=previous_count+len(positions),
+                failed_states=previous_failed+sum(value > 0 for value in residuals),
+                unmodelled_geometry_names=sorted(unmodelled),
+                worst_state=None if worst is None else worst[1])
+        return result
+    # END missing required geometry remains a source query failure, not unknown free space.
 
     def clone_for_rollout(self):
         # BEGIN isolate candidate policy and relationships without GPU copies.
@@ -1628,16 +1747,35 @@ class PlanningScene:
                 + sum(plane_counts)*24)
             native_coverage_bytes += self._free_distance.numel()*8
         # BEGIN finite contact witnesses never allocate the raw Cartesian product.
-        shared_cpu_bytes = layer_bytes+sum(layer.centres.nbytes+layer.halves.nbytes+layer.rotations.nbytes
+        # BEGIN account once for shared native contact/source-world geometry.
+        shared_cpu_bytes = layer_bytes+sum(layer.storage_bytes
             for value in self._contact_cells.values()
             for layer in (value.layers.values() if hasattr(value, "layers") else (value,)))
-        contact_bytes = (sum(value.pair_chunk*1600 for value in self._contact_cells.values())
+        source_query_bytes = 0
+        if self._source_scene_checker is not None:
+            shared_cpu_bytes += self._source_scene_checker.scene_storage_nbytes
+            # The checker reduces TSDF pieces while traversing them. Reserve
+            # its bounded one-state evidence and contact scratch once; it is
+            # reused serially across all B*H accepted/failed state queries.
+            source_query_bytes = self._source_scene_checker.scene_query_workspace_nbytes
+        # Per-state source inputs contain only q/time, owner rigid poses and
+        # selected body envelopes. Pair results are reduced one state at a
+        # time; no B*H*robot*scene report inventory is retained.
+        source_input_bytes = batch*horizon*(
+            (0 if self.robot_validator is None else len(self.robot_validator.joint_names))*8
+            + 64 + len(self.owners)*128
+            + sum(len(self.robot_collision_bodies) if actor == "robot" else 1
+                  for actor in actors for target, query in targets.items()
+                  if actor != target and isinstance(query, LayeredVoxelQuery))*128)
+        contact_bytes = (sum(value.workspace_bytes() for value in self._contact_cells.values())
                          + (batch*horizon*len(self.robot_sphere_materials)*64 if self._contact_cells else 0))
         contact_bytes += batch*horizon*sum((len(rule._feature_edge_normals)+10)*32 for rule in self.contacts)
         # END CPU neighbor lists separately obey a two-million-pair admission cap.
         return {"retained": int(retained_bytes),
-                "live": int(query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes+contact_bytes+layer_bytes+layer_scratch),
+                "live": int(query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes+contact_bytes+layer_bytes+layer_scratch
+                            +source_input_bytes+source_query_bytes),
                 "shared_cpu": int(shared_cpu_bytes)}
+        # END source scene snapshots are not multiplied by the rollout count.
         # END include checkpointed hand-pair scratch and its retained input.
 
     def estimated_workspace_bytes(self, batch, horizon, *, robot_coverage_guidance=True):
@@ -1813,7 +1951,8 @@ class PlanningScene:
 
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time=None,
-                   robot_owner_permission_progress=None, layer_selection_out=None):
+                   robot_owner_permission_progress=None, layer_selection_out=None,
+                   geometry_query_out=None):
         """Return nonnegative [B,H] terms; no term can cancel a violation.
 
         Required event anchors must be included by the caller. On a mode
@@ -1828,6 +1967,12 @@ class PlanningScene:
                 or quaternion.shape != (*progress.shape, 4)):
             raise ValueError("Scene needs aligned FK spheres, tool pose and progress [B,H]")
         costs = {}
+        # BEGIN source acceptance consumes these same owner and selector inputs.
+        if geometry_query_out is not None:
+            if not isinstance(geometry_query_out, dict):
+                raise TypeError("Source geometry query output must be a dictionary")
+            geometry_query_out["layer_selection"] = {}
+        # END no independent source FK is allowed to choose another map layer.
         # BEGIN only final validation asks to archive these actual decisions.
         if layer_selection_out is not None and not isinstance(layer_selection_out, dict):
             raise TypeError("Layer selection output must be an explicit per-query dictionary")
@@ -1841,6 +1986,8 @@ class PlanningScene:
             selected = query.region.select(queried_spheres, groups)
             if layer_selection_out is not None:
                 layer_selection_out[f"{actor}/{target}"] = selected.record()
+            if geometry_query_out is not None:
+                geometry_query_out["layer_selection"][f"{actor}/{target}"] = selected
             return selected
 
         def field_query(query, queried_spheres, key, selected):
@@ -1907,6 +2054,10 @@ class PlanningScene:
                 releases.append(released)
             release_states[owner.owner_id] = releases
             poses[owner.owner_id] = owner.pose(position, quaternion, progress, releases)
+        # BEGIN keep each batch member's own attachment/release prediction.
+        if geometry_query_out is not None:
+            geometry_query_out["nominal_owner_poses"] = poses
+        # END these predictions do not mutate the bound source checker.
         actors = {"robot": (spheres, (position, quaternion))}
         for owner in self.owners:
             if owner.moving:
@@ -1947,8 +2098,14 @@ class PlanningScene:
             if actor != "robot" or self.robot_coverage is None:
                 costs[f"unknown/space/{actor}"] = self.coverage.violation(actor_spheres).amax(-1)
             background_selection = layer_selection(self.background, actor, "background", actor_spheres)
-            collision_terms(field_query(self.background, actor_spheres, (actor, "background"), background_selection),
-                            f"collision/{actor}/background", actor)
+            # BEGIN source acceptance needs the shared selection, not a proxy query.
+            # Avoid native ESDF buffers and material sphere-query limits on
+            # this path. The source checker evaluates every collision and
+            # required finite contact using the same poses and selected field.
+            if geometry_query_out is None:
+                collision_terms(field_query(self.background, actor_spheres, (actor, "background"), background_selection),
+                                f"collision/{actor}/background", actor)
+            # END optimizer calls keep their original differentiable values.
             for owner in self.owners:
                 if actor == owner.owner_id:
                     continue
@@ -1957,6 +2114,10 @@ class PlanningScene:
                 selected = layer_selection(owner.query, actor, owner.owner_id, local)
                 layer_args = {} if selected is None else {"fine_mask": selected.sphere_fine}
                 # END all spheres of a native body have one selected target layer.
+                # BEGIN one source authority owns collision and finite contact acceptance.
+                if geometry_query_out is not None:
+                    continue
+                # END the geometry inputs above are still captured for every actor/target.
                 # BEGIN local permission is evaluated per complete target cell.
                 policies = []
                 for rule in self.contacts:
@@ -2013,6 +2174,50 @@ class PlanningScene:
                 collision_terms(values, f"collision/{actor}/{owner.owner_id}", actor)
                 # END the observed background and unknown-space queries are unchanged.
         return costs
+
+    # BEGIN source world geometry owns collision and finite contact acceptance.
+    def source_components(self, robot_spheres, position, quaternion, progress,
+                          joint_position, joint_names, *, trajectory_time,
+                          robot_owner_permission_progress=None,
+                          layer_selection_out=None, valid=None, diagnostics=None):
+        """Keep task laws and use source geometry for collision and contact.
+
+        Ordinary ESDF and finite-material sphere queries retain their original
+        optimizer implementation in ``components``. Requesting its geometry
+        inputs skips those proxy queries. Required surface contact and material
+        orientation are checked by the source scene; controller limits,
+        attachment consistency and unknown-space policy remain separate terms.
+        Missing required source queries are hard failures.
+        """
+        query = {}
+        result = self.components(robot_spheres, position, quaternion, progress,
+            joint_position, joint_names, trajectory_time=trajectory_time,
+            robot_owner_permission_progress=robot_owner_permission_progress,
+            layer_selection_out=layer_selection_out, geometry_query_out=query)
+        permission = progress if robot_owner_permission_progress is None else robot_owner_permission_progress
+        result["source_world_collision"] = self.check_world_geometry(
+            joint_position, joint_names, trajectory_time, progress, geometry_query=query,
+            robot_owner_permission_progress=permission, valid=valid, diagnostics=diagnostics)
+        if valid is not None:
+            result = {name: torch.where(valid, value, torch.zeros_like(value)) for name, value in result.items()}
+        return result
+
+    def evaluate_source(self, robot_spheres, position, quaternion, progress,
+                        joint_position, joint_names, *, trajectory_time,
+                        robot_owner_permission_progress=None,
+                        layer_selection_out=None, valid=None, diagnostics=None,
+                        components_out=None):
+        """Evaluate formal source geometry without changing unknown-space law."""
+        terms = self.source_components(robot_spheres, position, quaternion, progress,
+            joint_position, joint_names, trajectory_time=trajectory_time,
+            robot_owner_permission_progress=robot_owner_permission_progress,
+            layer_selection_out=layer_selection_out, valid=valid, diagnostics=diagnostics)
+        if components_out is not None:
+            components_out.update(terms)
+        known = [value for key, value in terms.items()
+                 if not key.startswith("unknown/") or key.startswith("unknown/release_anchor/")]
+        return torch.stack(known).sum(0) if known else torch.zeros_like(progress)
+    # END only the explicitly selected source model owns formal world acceptance.
 
     def evaluate(self, robot_spheres, position, quaternion, progress,
                  joint_position=None, joint_names=None, *, trajectory_time=None,
@@ -2127,11 +2332,13 @@ class PlanningScene:
                 # BEGIN keep the exact conditional pair policy in every formal archive.
                 "robot_owner_permissions": plain([asdict(rule) for rule in self.robot_owner_permissions]),
                 # END execution must bind this snapshot before receiving actual latches.
-                "contact_query_models": {identity: {"complete_cells": (value.layer_cell_counts if hasattr(value, "layers") else len(value.centres)),
+                # BEGIN records distinguish observed TSDF material from explicit native boxes.
+                "contact_query_models": {identity: {"complete_components": (value.layer_cell_counts if hasattr(value, "layers") else len(value.centres)),
                     "query_gaps": list(value.gaps), "cell_half_diagonal_m": value.cell_half_diagonal_m,
                     "maximum_candidate_pairs": value.max_candidate_pairs,
-                    "scope": "complete filled-cell union for material pairs; ESDF remains the ordinary nonmaterial representation"}
+                    "scope": "observed TSDF zero surface and negative known components, or explicitly supplied native solids"}
                     for identity, value in self._contact_cells.items()},
+                # END ESDF values supply optimizer guidance, never source material volume.
                 "coverage": {"origin": self.coverage.origin.tolist(), "voxel_size": self.coverage.voxel_size,
                              "shape_zyx": list(self.coverage._known.shape),
                              "known_packbits": np.packbits(self.coverage._known).tolist(),
@@ -2154,13 +2361,20 @@ class PlanningScene:
                 "acceptance": "all known required source-solid pairs at each validation state",
                 "sphere_proxy": "optimizer guidance only"}),
             # END unknown future geometry is recorded by each state query.
+            # BEGIN state acceptance shares the source world geometry with execution.
+            "world_collision_acceptance": {
+                "source_scene_bound": self._source_scene_checker is not None,
+                "geometry": "source robot solids against observed TSDF zero surfaces and negative known material",
+                "scope": "all valid native states, required finite contact, selected layers and conditional owner poses",
+                "sphere_esdf_proxy": "optimizer guidance only"},
+            # END observation coverage deficits remain diagnostic uncertainty.
             "observation_ids": self.coverage.observation_ids,
             "observation_build": deepcopy(self.observation_report),
             "current_occupied_evidence": deepcopy(self.coverage.occupancy_evidence),
             "occupied_owner_ids": tuple(sorted(self._occupied_owner_ids)),
             "background_owner_ids": tuple(sorted(self.background.owner_ids)),
             "owner_geometry_complete": {owner.owner_id: owner.geometry_complete for owner in self.owners},
-            "contact_queries": {identity: {"complete_cells": (value.layer_cell_counts if hasattr(value, "layers") else len(value.centres)), "query_gaps": list(value.gaps),
+            "contact_queries": {identity: {"complete_components": (value.layer_cell_counts if hasattr(value, "layers") else len(value.centres)), "query_gaps": list(value.gaps),
                 "last_report": deepcopy(value.last_report), "required_report": deepcopy(value.last_required_report)}
                 for identity, value in self._contact_cells.items()},
             # BEGIN report exact installation exclusions alongside ordinary owner geometry.

@@ -1,7 +1,7 @@
 """Finite contact intersections over the already bound target solid model.
 
 The ordinary scene query remains responsible for every nonmaterial pair.
-These helpers localize material permission to complete occupied cells or
+These helpers localize material permission to observed TSDF components or
 explicit cuboids; no task identity or live object truth enters this adapter.
 """
 
@@ -11,9 +11,174 @@ import math
 
 import numpy as np
 from scipy.optimize import linprog
-from scipy.spatial import cKDTree
+from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.transform import Rotation
 import torch
+
+
+# BEGIN complete finite-component contact proofs, including points and surfaces.
+_LP_OPTIONS = {"primal_feasibility_tolerance": 1e-9, "dual_feasibility_tolerance": 1e-9}
+
+
+def convex_component_intersects_region(vertices, region):
+    """Test the entire convex component against ``A @ x <= b``.
+
+    Barycentric coordinates represent its complete convex hull, including a
+    single observed point, an edge, or a zero-level polygon. No 3D hull or
+    sampled contact witness substitutes for these lower-dimensional sets.
+    """
+    vertices = np.asarray(vertices, dtype=float)
+    normals, bounds = map(np.asarray, region)
+    result = linprog(np.zeros(len(vertices)), A_ub=normals @ vertices.T,
+        b_ub=bounds, A_eq=np.ones((1, len(vertices))), b_eq=[1.],
+        bounds=(0., None), method="highs", options=_LP_OPTIONS)
+    if result.status == 2:
+        return {"completed": True, "intersects": False, "numerical_certificate": False}
+    if not result.success:
+        return {"completed": False, "reason": "component_region_query_incomplete",
+                "solver_status": int(result.status)}
+    return {"completed": True, "intersects": True,
+            "witness": (result.x @ vertices).tolist(), "numerical_certificate": False}
+
+
+def _component_intersection_support(vertices, region, *, A_ub=None, b_ub=None,
+                                    A_eq=None, b_eq=None, variable_bounds=(0., None)):
+    """Maximize every region plane over one complete barycentric feasible set."""
+    normals, bounds = map(np.asarray, region)
+    maximum = -np.inf
+    # A zero objective also distinguishes an empty intersection when the
+    # caller asks only for intersection, without any region inequalities.
+    queries = list(zip(normals, bounds)) or [(np.zeros(3), 0.)]
+    for axis, bound in queries:
+        objective = vertices @ axis
+        result = linprog(-objective, A_ub=A_ub, b_ub=b_ub,
+            A_eq=A_eq, b_eq=b_eq, bounds=variable_bounds, method="highs", options=_LP_OPTIONS)
+        if result.status == 2:
+            return {"completed": True, "contained": True, "intersection_empty": True,
+                    "numerical_certificate": False, "method": "complete_component_intersection_support"}
+        if not result.success:
+            return {"completed": False, "contained": False,
+                    "reason": "component_intersection_support_incomplete", "solver_status": int(result.status)}
+        point = result.x @ vertices
+        excess = float(axis @ point-bound)
+        # BEGIN an explicit identical constraint is already a support bound.
+        # At a clipping plane, reconstructing a barycentric point may put it
+        # one floating-point step outside that same plane. An exactly equal
+        # input row proves the upper bound directly; this needs no tolerance
+        # and does not enlarge the permitted region or waive a real gap.
+        if A_ub is not None:
+            identical = np.all(np.asarray(A_ub) == objective, axis=1)
+            if np.any(identical):
+                excess = min(excess, float(np.min(np.asarray(b_ub)[identical])-bound))
+        # END only an actual input inequality can override point round-off.
+        maximum = max(maximum, excess)
+        if excess > 0.:
+            return {"completed": True, "contained": False, "intersection_empty": False,
+                    "outside_witness": point.tolist(), "maximum_constraint_excess_m": excess,
+                    "numerical_certificate": False, "method": "complete_component_intersection_support"}
+    return {"completed": True, "contained": True, "intersection_empty": False,
+            "maximum_constraint_excess_m": maximum, "numerical_certificate": False,
+            "method": "complete_component_intersection_support"}
+
+
+def convex_component_overlap_within_region(actor_halfspaces, component_vertices, region, actor_margin=0.):
+    """Prove containment of a source convex solid's entire component overlap.
+
+    ``actor_halfspaces`` and ``region`` are ``(A, b)`` for ``A @ x <= b``.
+    The existing measured-body allowance shifts source support planes only;
+    it does not enlarge the material permission or fill a TSDF surface.
+    """
+    vertices = np.asarray(component_vertices, dtype=float)
+    normals, bounds = map(np.asarray, actor_halfspaces)
+    shifted = bounds + float(actor_margin)*np.linalg.norm(normals, axis=1)
+    return _component_intersection_support(vertices, region,
+        A_ub=normals @ vertices.T, b_ub=shifted,
+        A_eq=np.ones((1, len(vertices))), b_eq=np.ones(1))
+
+
+def _component_support_planes(vertices):
+    """Finite supporting planes for a convex component of any affine rank.
+
+    Zero-thickness directions remain equalities represented by two planes.
+    Shifting every normalized plane by a measured radius contains the whole
+    component plus that radius ball, as for the existing native-solid model.
+    """
+    vertices = np.asarray(vertices, float)
+    origin = vertices[0]
+    _, singular, axes = np.linalg.svd(vertices-origin, full_matrices=True)
+    # Coordinates result from finite-precision rigid transforms. Classification
+    # uses their representable spatial precision, not a contact allowance.
+    tolerance = np.finfo(float).eps*max(vertices.shape)*max(1., float(np.abs(vertices).max()))
+    rank = int(np.count_nonzero(singular > tolerance))
+    if rank == 3:
+        planes = ConvexHull(vertices).equations
+        return planes[:, :3], -planes[:, 3], rank
+    if rank == 2:
+        basis = axes[:2].T
+        polygon = ConvexHull((vertices-origin) @ basis)
+        normals = polygon.equations[:, :2] @ basis.T
+        bounds = normals @ origin-polygon.equations[:, 2]
+    else:
+        normals = np.empty((0, 3))
+        bounds = np.empty(0)
+        if rank == 1:
+            coordinate = (vertices-origin) @ axes[0]
+            normals = np.array([axes[0], -axes[0]])
+            bounds = np.array([coordinate.max()+axes[0] @ origin,
+                               -coordinate.min()-axes[0] @ origin])
+    fixed = axes[rank:]
+    normals = np.concatenate((normals, fixed, -fixed))
+    bounds = np.r_[bounds, fixed @ origin, -fixed @ origin]
+    return normals, bounds, rank
+
+
+def component_component_overlap_within_region(first_vertices, second_vertices, region,
+                                              *, first_margin_m=0., second_margin_m=0.):
+    """Prove the full intersection of two finite components by two simplexes.
+
+    Neither component needs nonzero volume. Measured component bands use the
+    same conservative supporting-plane outer polytope as native solid bands;
+    proving containment of that full outer intersection covers the real band.
+    """
+    first, second = np.asarray(first_vertices, float), np.asarray(second_vertices, float)
+    if first_margin_m or second_margin_m:
+        first_a, first_b, _ = _component_support_planes(first)
+        second_a, second_b, _ = _component_support_planes(second)
+        evidence = _component_intersection_support(np.eye(3), region,
+            A_ub=np.concatenate((first_a, second_a)),
+            b_ub=np.r_[first_b+first_margin_m*np.linalg.norm(first_a, axis=1),
+                       second_b+second_margin_m*np.linalg.norm(second_a, axis=1)],
+            variable_bounds=(None, None))
+        evidence["margin_geometry"] = "component_support_plane_outer_polytope"
+        return evidence
+    n, m = len(first), len(second)
+    equalities = np.zeros((5, n+m))
+    equalities[0, :n], equalities[1, n:] = 1., 1.
+    equalities[2:, :n], equalities[2:, n:] = first.T, -second.T
+    # Objective and returned point use the first component; the equality
+    # constraints require exactly the same point in the second component.
+    objective_vertices = np.concatenate((first, np.zeros_like(second)), axis=0)
+    return _component_intersection_support(objective_vertices, region,
+        A_eq=equalities, b_eq=np.array([1., 1., 0., 0., 0.]))
+
+
+def _component_region_slack(vertices, normals, bounds):
+    """Differentiable required-contact slack on an unchanged finite component."""
+    vertices = np.asarray(vertices, float)
+    matrix = normals.detach().cpu().numpy()
+    rhs = bounds.detach().cpu().numpy()
+    result = linprog(np.r_[np.zeros(len(vertices)), 1.],
+        A_ub=np.c_[matrix @ vertices.T, -np.ones(len(matrix))], b_ub=rhs,
+        A_eq=np.r_[np.ones(len(vertices)), 0.][None], b_eq=[1.],
+        bounds=[(0., None)]*(len(vertices)+1), method="highs", options=_LP_OPTIONS)
+    if not result.success:
+        raise ValueError(f"Required component contact did not complete: {result.message}")
+    point = result.x[:-1] @ vertices
+    dual = np.asarray(result.ineqlin.marginals)
+    return (bounds.new_tensor(result.fun)
+            + ((normals-normals.detach())*normals.new_tensor(-dual[:, None]*point)).sum()
+            + ((bounds-bounds.detach())*bounds.new_tensor(dual)).sum())
+# END each permission covers the complete intersection, never a witness subset.
 
 
 def region_slack(normals, bounds):
@@ -78,6 +243,66 @@ def query_geometry(query):
     return {"solids": solids, "query_gaps": gaps}
 
 
+# BEGIN required contact consumes actual target surfaces, never negative caps.
+_BOX_SIGNS = np.array([[x, y, z] for x in (-1., 1.) for y in (-1., 1.) for z in (-1., 1.)])
+
+
+def _bind_required_surfaces(target, surfaces):
+    target.surface_components = tuple(surfaces)
+    target.surface_centres = np.asarray([points.mean(0) for points in surfaces], float).reshape(-1, 3)
+    target.surface_radii = np.asarray([
+        np.linalg.norm(points-centre, axis=1).max() for points, centre in zip(surfaces, target.surface_centres)])
+    target.surface_tree = cKDTree(target.surface_centres)
+    target.maximum_surface_radius = float(target.surface_radii.max(initial=0.))
+
+
+def _required_surface_contact(target, policy):
+    """Existential LP contact on all candidate zero surfaces or native faces."""
+    active = policy["active"].reshape(-1)
+    shape = policy["active"].shape
+    selected = torch.nonzero(active, as_tuple=False).flatten()
+    points = policy["feature_points"].reshape(len(active), -1, 3)
+    centre = points.mean(-2)
+    radius = torch.linalg.vector_norm(points-centre[:, None], dim=-1).amax(-1)+policy["allowance"]
+    output = radius*0
+    if not len(selected):
+        return output.reshape(shape)
+    if not len(target.surface_centres):
+        target.last_required_report = {"active_states": len(selected), "candidate_components": 0,
+            "target_surface_inventory_empty": True, "negative_components_do_not_establish_contact": True}
+        return output.index_fill(0, selected, 1.).reshape(shape)
+    rows = selected.detach().cpu().numpy()
+    centres = centre[selected].detach().cpu().numpy()
+    radii = np.nextafter(radius[selected].detach().cpu().numpy()+target.maximum_surface_radius, np.inf)
+    lengths = target.surface_tree.query_ball_point(centres, radii, return_length=True, workers=1)
+    if int(lengths.sum()) > 4096:
+        raise ValueError(f"Required surface contact needs {int(lengths.sum())} component LPs, budget 4096")
+    neighbors = target.surface_tree.query_ball_point(centres, radii, workers=1)
+    normals = policy["normals"].reshape(len(active), -1, 3)
+    bounds = policy["bounds"].reshape(len(active), -1)
+    values = []
+    for local_index, state_index in enumerate(rows):
+        candidates = neighbors[local_index]
+        if len(candidates):
+            slack = [_component_region_slack(target.surface_components[index],
+                normals[state_index], bounds[state_index]) for index in candidates]
+            values.append(torch.stack(slack).amin())
+        else:
+            _, nearest = target.surface_tree.query(centres[local_index], workers=1)
+            # The complete bounding-ball search excluded every possible
+            # intersection. This positive bound supplies a useful approach
+            # gradient without pretending the nearest surface is contact.
+            distance = torch.linalg.vector_norm(centre[state_index]-centre.new_tensor(target.surface_centres[nearest]))
+            values.append(torch.relu(distance-target.maximum_surface_radius-radius[state_index]))
+    output = output.index_copy(0, selected, torch.stack(values))
+    target.last_required_report = {"active_states": len(selected), "candidate_components": int(lengths.sum()),
+        "maximum_component_lps": 4096, "target_surface_inventory_empty": False,
+        "negative_components_do_not_establish_contact": True,
+        "scope": "some actual target zero surface or native face intersects the finite material/patch/gap region"}
+    return output.reshape(shape)
+# END an observed negative volume may block motion without witnessing contact.
+
+
 class ContactCellGeometry:
     """A complete finite box union with a bounded exact spatial broad phase.
 
@@ -85,8 +310,8 @@ class ContactCellGeometry:
     the enclosing cell ball. Candidate count is obtained BEFORE allocating
     neighbor lists. At most two million candidates and 32768 live pairs enter
     a query; exceeding either supported model/query budget raises explicitly.
-    The box union is the declared observed field representation, not a claim
-    about hidden geometry or the continuous ESDF interpolation surface.
+    These boxes are explicitly supplied native solids. Mapper observations
+    use ObservedContactGeometry and never enter an ESDF-to-box conversion.
     """
 
     max_cells = 250_000
@@ -110,27 +335,8 @@ class ContactCellGeometry:
                     raise ValueError("Contact target cuboids need positive native dimensions")
                 local = np.zeros((1, 3))
                 half = dimensions[None]/2
-            elif record["kind"] == "voxel":
-                shape = np.asarray(record["shape_xyz"], int)
-                size = float(record["voxel_size"])
-                indices = np.asarray(record["occupied_flat_indices"], np.int64)
-                dtype = np.dtype(record["field_dtype"])
-                if (shape.shape != (3,) or np.any(shape <= 0) or np.prod(shape) > 8_000_000
-                        or not np.isfinite(size) or size <= 0 or indices.ndim != 1
-                        or len(indices) > self.max_cells or dtype.kind != "f" or dtype.itemsize not in (2, 4, 8)):
-                    raise ValueError("Contact target voxels need a complete bounded field inventory")
-                field = np.frombuffer(bytes.fromhex(record["field_bytes_hex"]), dtype=dtype)
-                if (field.size != np.prod(shape) or not np.isfinite(field).all()
-                        # BEGIN negative interiors and exact zero surfaces follow native ESDF.
-                        or record["occupancy_rule"] != "ESDF_sample_nonpositive"
-                        or not np.array_equal(indices, np.flatnonzero(field <= 0))):
-                        # END positive samples, including unknown sentinels, grant no solid.
-                    raise ValueError("Contact occupied cells differ from the original bound field")
-                local = (np.column_stack(np.unravel_index(indices, tuple(shape)))+.5-shape/2)*size
-                half = np.full((len(indices), 3), size/2)
-                self.cell_half_diagonal_m = max(self.cell_half_diagonal_m, math.sqrt(3)*size/2)
             else:
-                self.gaps.append(f"{record['name']}: finite contact intersections require complete box cells")
+                self.gaps.append(f"{record['name']}: finite native contact requires an explicit supported solid")
                 continue
             centres.append(local @ rotation.T+pose[:3])
             halves.append(half)
@@ -144,77 +350,29 @@ class ContactCellGeometry:
         self.maximum_cell_radius = float(np.linalg.norm(self.halves, axis=1).max(initial=0.))
         self.last_report = None
         self.last_required_report = None
+        surfaces = []
+        for centre, half, rotation in zip(self.centres, self.halves, self.rotations):
+            vertices = (_BOX_SIGNS*half) @ rotation.T+centre
+            surfaces.extend(vertices[_BOX_SIGNS[:, axis] == sign]
+                            for axis in range(3) for sign in (-1., 1.))
+        _bind_required_surfaces(self, surfaces)
 
     @property
     def complete(self):
         return not self.gaps
 
     def workspace_bytes(self):
-        # GPU cell tensors are only gathered for one live pair chunk. CPU
-        # KD-tree/list storage has its separately disclosed candidate bound.
-        return int(self.pair_chunk*1600 + self.centres.nbytes+self.halves.nbytes+self.rotations.nbytes)
+        return int(self.pair_chunk*1600)
+
+    @property
+    def storage_bytes(self):
+        return int(self.centres.nbytes+self.halves.nbytes+self.rotations.nbytes
+                   + self.surface_centres.nbytes+self.surface_radii.nbytes
+                   + sum(vertices.nbytes for vertices in self.surface_components))
 
     def required_contact(self, policy):
-        """Require some COMPLETE target cell in the finite material region.
-
-        The material extrusion's enclosing ball gives a complete candidate
-        set. Every surviving cell contributes all six native halfspaces to a
-        HiGHS intersection solve. A feasible abstract patch without occupied
-        target material therefore cannot satisfy required contact. This is
-        geometric/model contact, still independent of measured contact force.
-        """
-        active = policy["active"].reshape(-1)
-        shape = policy["active"].shape
-        selected = torch.nonzero(active, as_tuple=False).flatten()
-        points = policy["feature_points"].reshape(len(active), -1, 3)
-        centre = points.mean(-2)
-        radius = torch.linalg.vector_norm(points-centre[:, None], dim=-1).amax(-1)+policy["allowance"]
-        output = radius*0
-        if not len(selected):
-            return output.reshape(shape)
-        if not len(self.centres):
-            self.last_required_report = {"active_states": len(selected), "candidate_cells": 0,
-                                         "target_inventory_empty": True}
-            return output.index_fill(0, selected, 1.).reshape(shape)
-        rows = selected.detach().cpu().numpy()
-        centres = centre[selected].detach().cpu().numpy()
-        radii = np.nextafter(radius[selected].detach().cpu().numpy()+self.maximum_cell_radius, np.inf)
-        lengths = self.tree.query_ball_point(centres, radii, return_length=True, workers=1)
-        pairs = int(np.sum(lengths))
-        if pairs > 4096:
-            raise ValueError(f"Required complete target contact needs {pairs} cell LPs, budget 4096")
-        neighbors = self.tree.query_ball_point(centres, radii, workers=1)
-        missing = np.flatnonzero(lengths == 0)
-        if len(missing):
-            _, nearest = self.tree.query(centres[missing], workers=1)
-            indices = selected[torch.as_tensor(missing, device=selected.device)]
-            # This strictly positive distance bound is valid because the
-            # complete enclosing-ball search found no possible intersection.
-            distance = torch.linalg.vector_norm(centre[indices]-centre.new_tensor(self.centres[nearest]), dim=-1)
-            value = torch.relu(distance-self.maximum_cell_radius-radius[indices])
-            output = output.index_copy(0, indices, value)
-        if pairs:
-            state_rows = np.repeat(rows, lengths)
-            cell_rows = np.concatenate(neighbors).astype(np.int64)
-            states = torch.as_tensor(state_rows, device=active.device)
-            rotation = centre.new_tensor(self.rotations[cell_rows])
-            half = centre.new_tensor(self.halves[cell_rows])
-            cell_centre = centre.new_tensor(self.centres[cell_rows])
-            axes = rotation.transpose(-1, -2)
-            box_normals = torch.cat((axes, -axes), dim=-2)
-            box_bounds = torch.cat(((axes*cell_centre[:, None]).sum(-1)+half,
-                                    (-axes*cell_centre[:, None]).sum(-1)+half), dim=-1)
-            region_normals = policy["normals"].reshape(len(active), -1, 3)[states]
-            region_bounds = policy["bounds"].reshape(len(active), -1)[states]
-            slack = region_slack(torch.cat((region_normals, box_normals), dim=-2),
-                                 torch.cat((region_bounds, box_bounds), dim=-1))
-            minima = torch.full_like(output, torch.inf).scatter_reduce(0, states, slack, reduce="amin", include_self=True)
-            covered = selected[torch.as_tensor(np.flatnonzero(lengths > 0), device=selected.device)]
-            output = output.index_copy(0, covered, minima[covered])
-        self.last_required_report = {"active_states": len(selected), "candidate_cells": pairs,
-            "maximum_cell_lps": 4096, "target_inventory_empty": False,
-            "scope": "at least one complete target cell intersects the finite material/patch/gap region"}
-        return output.reshape(shape)
+        """Require a supplied native box face, not merely interior occupancy."""
+        return _required_surface_contact(self, policy)
 
     def query(self, spheres, policies):
         """Return complete-cell collision for the enabled material spheres.
@@ -327,11 +485,251 @@ class ContactCellGeometry:
 # END no sampled contact point can authorize an unexamined overlap.
 
 
+# BEGIN observed zero surfaces and negative affine pieces share contact inventory.
+class ObservedContactGeometry:
+    """Finite TSDF components for contact guidance and required surface contact.
+
+    The component union is kept nonconvex. Every component is independently
+    convex by construction; its support and point distance can therefore use
+    its complete vertex set. Sphere costs guide optimization only. Source
+    solid acceptance uses the complete-intersection LP helpers above.
+    """
+
+    max_cells = 250_000
+    max_candidate_pairs = 2_000_000
+    max_candidate_plane_products = 32_000_000
+    pair_chunk = 4096
+    cell_half_diagonal_m = 0.
+
+    def __init__(self, geometry):
+        from .tsdf_geometry import ObservedTsdfGeometry
+
+        self.gaps = list(geometry.get("query_gaps", ()))
+        components, negative, surfaces = [], [], []
+        for record in geometry["solids"]:
+            pose = np.asarray(record["pose"], float)
+            if (pose.shape != (7,) or not np.isfinite(pose).all()
+                    or not np.isclose(np.linalg.norm(pose[3:]), 1., atol=1e-6)):
+                raise ValueError("Observed contact components need a finite normalized native pose")
+            rotation = Rotation.from_quat(pose[[4, 5, 6, 3]]).as_matrix()
+            if record["kind"] == "tsdf":
+                for kind, _, points in ObservedTsdfGeometry(record).iter_components():
+                    vertices = np.asarray(points, float) @ rotation.T+pose[:3]
+                    components.append(vertices)
+                    negative.append(kind != "surface")
+                    if kind == "surface":
+                        surfaces.append(vertices)
+                    if len(components) > self.max_cells:
+                        raise ValueError("Complete contact target exceeds its 250000-component model budget")
+            elif record["kind"] == "cuboid":
+                dimensions = np.asarray(record["dimensions"], float)
+                if dimensions.shape != (3,) or not np.isfinite(dimensions).all() or np.any(dimensions <= 0):
+                    raise ValueError("Native contact cuboids require positive finite dimensions")
+                vertices = (_BOX_SIGNS*dimensions/2) @ rotation.T+pose[:3]
+                components.append(vertices)
+                negative.append(True)
+                surfaces.extend(vertices[_BOX_SIGNS[:, axis] == sign]
+                                for axis in range(3) for sign in (-1., 1.))
+            else:
+                self.gaps.append(f"{record['name']}: unsupported observed contact component {record['kind']}")
+        if len(components) > self.max_cells:
+            raise ValueError("Complete contact target exceeds its 250000-component model budget")
+        self.vertices = tuple(components)
+        self.negative = np.asarray(negative, bool)
+        self.centres = np.asarray([points.mean(0) for points in components], float).reshape(-1, 3)
+        self.radii = np.asarray([np.linalg.norm(points-centre, axis=1).max()
+                                for points, centre in zip(components, self.centres)])
+        self.tree = cKDTree(self.centres)
+        self.maximum_cell_radius = float(self.radii.max(initial=0.))
+        self._distance_models = {}
+        _bind_required_surfaces(self, surfaces)
+        self.last_report = None
+        self.last_required_report = None
+
+    @property
+    def complete(self):
+        return not self.gaps
+
+    @property
+    def storage_bytes(self):
+        # Surface views refer to the owned component arrays. Native box faces
+        # are separate, small arrays and are included conservatively here.
+        model_bytes = sum(value.nbytes for model in self._distance_models.values()
+                          for value in model.values() if isinstance(value, np.ndarray))
+        return int(self.centres.nbytes+self.radii.nbytes+self.negative.nbytes
+            + self.surface_centres.nbytes+self.surface_radii.nbytes
+            + sum(points.nbytes for points in self.vertices)
+            + sum(points.nbytes for points in self.surface_components)+model_bytes)
+
+    def workspace_bytes(self):
+        # At most twelve hull triangles per eight-vertex component are live
+        # per pair, plus the bounded component/region support products.
+        return int(self.pair_chunk*4096)
+
+    def required_contact(self, policy):
+        return _required_surface_contact(self, policy)
+
+    def _distance_model(self, index):
+        """Cache only queried component hulls; never hull the whole inventory."""
+        model = self._distance_models.get(index)
+        if model is not None:
+            return model
+        points = self.vertices[index]
+        normals, bounds, rank = _component_support_planes(points)
+        model = {"rank": rank, "normals": normals, "bounds": bounds}
+        if rank == 0:
+            model["point"] = points[0]
+        elif rank == 1:
+            direction = normals[0]
+            coordinate = points @ direction
+            model["endpoints"] = points[[coordinate.argmin(), coordinate.argmax()]]
+        elif rank == 2:
+            basis = np.linalg.svd(points-points[0], full_matrices=True)[2][:2].T
+            order = ConvexHull((points-points[0]) @ basis).vertices
+            faces = np.array([[order[0], order[i], order[i+1]] for i in range(1, len(order)-1)])
+            model["triangles"] = points[faces]
+        else:
+            model["triangles"] = points[ConvexHull(points).simplices]
+        self._distance_models[index] = model
+        return model
+
+    def _closest_points(self, indices, points):
+        """Use maintained triangle distance code and exact convex inside planes."""
+        from trimesh.triangles import closest_point
+
+        nearest = np.empty_like(points)
+        signs = np.ones(len(points))
+        order = np.argsort(indices, kind="stable")
+        boundaries = np.r_[0, np.flatnonzero(np.diff(indices[order]))+1, len(order)]
+        for begin, end in zip(boundaries[:-1], boundaries[1:]):
+            rows = order[begin:end]
+            index = int(indices[rows[0]])
+            model = self._distance_model(index)
+            current = points[rows]
+            if model["rank"] == 0:
+                nearest[rows] = model["point"]
+            elif model["rank"] == 1:
+                first, second = model["endpoints"]
+                edge = second-first
+                parameter = np.clip((current-first) @ edge/(edge @ edge), 0., 1.)
+                nearest[rows] = first+parameter[:, None]*edge
+            else:
+                triangles = model["triangles"]
+                witnesses = closest_point(np.tile(triangles, (len(rows), 1, 1)),
+                    np.repeat(current, len(triangles), axis=0)).reshape(len(rows), len(triangles), 3)
+                squared = np.square(witnesses-current[:, None]).sum(-1)
+                nearest[rows] = witnesses[np.arange(len(rows)), squared.argmin(axis=1)]
+                if model["rank"] == 3:
+                    values = current @ model["normals"].T-model["bounds"]
+                    inside = values.max(axis=1) <= 0.
+                    if self.negative[index]:
+                        face = values[inside].argmax(axis=1)
+                        signed = values[inside, face]
+                        nearest[rows[inside]] = current[inside]-signed[:, None]*model["normals"][face]
+                        signs[rows[inside]] = -1.
+                    else:
+                        # An all-zero affine tetrahedron is itself zero-level
+                        # evidence. Its interior distance to that set is zero.
+                        nearest[rows[inside]] = current[inside]
+        return nearest, signs
+
+    def query(self, spheres, policies):
+        """Differentiable sphere guidance over every possible target component."""
+        if not self.complete:
+            raise ValueError("A partial target inventory cannot grant contact permission")
+        policies = tuple(policies)
+        states, count = math.prod(spheres.shape[:-2]), spheres.shape[-2]
+        flat = spheres.reshape(states*count, 4)
+        enabled = torch.zeros((states, count), dtype=torch.bool, device=spheres.device)
+        for policy in policies:
+            enabled[:, list(policy["sphere_indices"])] |= policy["active"].reshape(-1, 1)
+        chosen = torch.nonzero(enabled.reshape(-1), as_tuple=False).flatten()
+        supplied = flat[chosen].detach().cpu().numpy().astype(float, copy=False)
+        if len(supplied) and (not np.isfinite(supplied).all() or np.any(supplied[:, 3] <= 0)):
+            raise ValueError("Finite contact queries need positive finite material spheres")
+        radii = np.nextafter(supplied[:, 3]+self.maximum_cell_radius, np.inf)
+        lengths = self.tree.query_ball_point(supplied[:, :3], radii, return_length=True, workers=1)
+        candidates = int(np.sum(lengths))
+        plane_count = max((policy["normals"].shape[-2] for policy in policies), default=1)
+        if candidates > self.max_candidate_pairs:
+            raise ValueError(f"Complete contact component query needs {candidates} candidate pairs, budget {self.max_candidate_pairs}")
+        if candidates*plane_count*len(policies) > self.max_candidate_plane_products:
+            raise ValueError("Complete component/region queries exceed the 32000000-product budget")
+        neighbors = self.tree.query_ball_point(supplied[:, :3], radii, workers=1)
+        ball_indices = np.repeat(np.arange(len(supplied)), lengths)
+        component_indices = np.concatenate(neighbors).astype(np.int64) if candidates else np.empty(0, np.int64)
+        best_values = np.zeros(len(supplied))
+        best_components = np.full(len(supplied), -1, np.int64)
+        best_allowances = np.zeros(len(supplied))
+        best_points = np.zeros((len(supplied), 3))
+        best_signs = np.ones(len(supplied))
+        selected_flat = chosen.detach().cpu().numpy()
+        live_chunk = min(self.pair_chunk, max(1, 131072//plane_count))
+        permitted_pairs = 0
+        for begin in range(0, candidates, live_chunk):
+            ib = ball_indices[begin:begin+live_chunk]
+            ic = component_indices[begin:begin+live_chunk]
+            balls = supplied[ib]
+            nearest, signs = self._closest_points(ic, balls[:, :3])
+            sdf = signs*np.linalg.norm(balls[:, :3]-nearest, axis=1)
+            allowance = np.zeros(len(ib))
+            padded = np.asarray([np.pad(self.vertices[index], ((0, 8-len(self.vertices[index])), (0, 0)),
+                                         mode="edge") for index in ic])
+            states_index = selected_flat[ib]//count
+            for policy in policies:
+                active = (policy["active"].reshape(-1).detach().cpu().numpy()[states_index]
+                    & policy["normal_valid"].reshape(-1).detach().cpu().numpy()[states_index]
+                    & np.isin(selected_flat[ib] % count, policy["sphere_indices"]))
+                normals = policy["normals"].detach().cpu().numpy().reshape(states, -1, 3)[states_index]
+                bounds = policy["bounds"].detach().cpu().numpy().reshape(states, -1)[states_index]
+                sphere_support = np.einsum("nki,ni->nk", normals, balls[:, :3])+balls[:, 3:4]*np.linalg.norm(normals, axis=-1)
+                component_support = np.einsum("nki,nvi->nkv", normals, padded).max(-1)
+                inside = (np.minimum(sphere_support, component_support) <= bounds).all(-1)
+                allowance = np.maximum(allowance, (active & inside)*float(policy["allowance"]))
+            cost = np.maximum(balls[:, 3]-sdf-allowance, 0.)
+            permitted_pairs += int(np.count_nonzero(allowance))
+            order = np.lexsort((np.arange(len(ib)), -cost, ib))
+            ordered = ib[order]
+            winners = order[np.r_[True, ordered[1:] != ordered[:-1]]]
+            winners = winners[cost[winners] > best_values[ib[winners]]]
+            selected = ib[winners]
+            best_values[selected] = cost[winners]
+            best_components[selected] = ic[winners]
+            best_allowances[selected] = allowance[winners]
+            best_points[selected] = nearest[winners]
+            best_signs[selected] = signs[winners]
+        output = flat[:, 3]*0
+        hit = np.flatnonzero(best_components >= 0)
+        if len(hit):
+            selected = torch.as_tensor(hit, device=spheres.device)
+            balls = flat[chosen[selected]]
+            # The nearest point is the minimizer of the same complete convex
+            # distance. Its detached coordinates give the envelope derivative;
+            # no differentiation through hull topology or an LP is required.
+            sdf = spheres.new_tensor(best_signs[hit])*torch.linalg.vector_norm(
+                balls[:, :3]-spheres.new_tensor(best_points[hit]), dim=-1)
+            value = torch.relu(balls[:, 3]-sdf-spheres.new_tensor(best_allowances[hit]))
+            output = output.index_copy(0, chosen[selected], value)
+        self.last_report = {"complete_components": len(self.vertices), "enabled_spheres": len(supplied),
+            "candidate_pairs": candidates, "raw_pair_product": len(supplied)*len(self.vertices),
+            "maximum_live_pairs": min(candidates, live_chunk), "permitted_pairs": permitted_pairs,
+            "scope": "optimization sphere guidance over complete TSDF surface and negative components"}
+        return output.reshape(spheres.shape[:-1]), enabled.reshape(spheres.shape[:-1])
+
+
+def make_contact_geometry(geometry):
+    """Select the two actual data contracts; no ESDF occupancy fallback."""
+    if any(record["kind"] == "tsdf" for record in geometry["solids"]):
+        return ObservedContactGeometry(geometry)
+    return ContactCellGeometry(geometry)
+# END the same observed components support contact guidance and source proofs.
+
+
 # BEGIN explicit body-selected coarse/fine contact geometry.
 class LayeredContactCellGeometry:
     """Apply finite contact checks to the caller's already selected layer.
 
-    The two native inventories remain separate complete box unions. The
+    The two inventories remain separate complete component unions. The
     PlanningScene supplies one boolean choice per body sphere and state;
     this adapter neither inspects region metadata nor chooses a layer from
     its cost. A contact rule must name spheres with one common choice in
@@ -344,7 +742,7 @@ class LayeredContactCellGeometry:
         # Retain the complete original record, including selection metadata,
         # for independent checking. Only the two inventories feed contact.
         self.geometry = deepcopy(geometry)
-        self.layers = {name: ContactCellGeometry(self.geometry["layers"][name])
+        self.layers = {name: make_contact_geometry(self.geometry["layers"][name])
                        for name in ("coarse", "fine")}
         self.last_report = None
         self.last_required_report = None
@@ -393,6 +791,10 @@ class LayeredContactCellGeometry:
 
     def workspace_bytes(self):
         return sum(layer.workspace_bytes() for layer in self.layers.values())
+
+    @property
+    def storage_bytes(self):
+        return sum(layer.storage_bytes for layer in self.layers.values())
 
     @staticmethod
     def _validate_mask(fine_mask):
@@ -446,7 +848,7 @@ class LayeredContactCellGeometry:
                 torch.where(fine_mask, results["fine"][1], results["coarse"][1]))
 
     def required_contact(self, policy, fine_mask):
-        """Require occupancy in the same layer as the entire contact rule."""
+        """Require an actual target surface in the contact rule's same layer."""
         self._validate_mask(fine_mask)
         if not self.complete:
             raise ValueError("A partial target-cell inventory cannot establish required layered contact")
@@ -461,6 +863,6 @@ class LayeredContactCellGeometry:
         self.last_required_report = {
             "layers": {name: deepcopy(layer.last_required_report) for name, layer in self.layers.items()},
             "layer_cell_counts": self.layer_cell_counts,
-            "scope": "at least one complete target cell in the caller-selected layer intersects the finite region"}
+            "scope": "an actual target zero surface or native face in the caller-selected layer intersects the finite region"}
         return torch.where(choice, results["fine"], results["coarse"])
 # END coarse/fine selection never depends on collision cost or contact residual.

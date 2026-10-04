@@ -1,15 +1,14 @@
 """Complete finite contact intersections, gradients and admission bounds."""
 
 # BEGIN partial contact does not require whole-pad or whole-sphere containment.
-from types import SimpleNamespace
 from dataclasses import replace
 import unittest
 
 import numpy as np
 import torch
 
-from manipulation.contact_geometry import ContactCellGeometry, region_slack
-from manipulation.planning_observation import _independent_voxel_geometry
+from manipulation.contact_geometry import ContactCellGeometry, make_contact_geometry, region_slack
+from manipulation.tsdf_geometry import tsdf_geometry_from_samples
 from test_manipulation_planning_scene import BoxQuery, contact_rule, inputs, pose_path, scene
 from manipulation.planning_scene import CollisionOwner
 
@@ -90,24 +89,23 @@ class CompleteContactTests(unittest.TestCase):
             world.evaluate(*args)
         self.assertEqual(calls, [True])
 
-    def test_voxel_inventory_and_empty_union_are_explicit(self):
-        # BEGIN native ESDF is negative inside and positive outside.
-        field = torch.full((2, 2, 2), 1., dtype=torch.float32)
+    # BEGIN observed TSDF evidence retains its actual spatial dimension.
+    def test_isolated_observed_point_and_empty_union_are_explicit(self):
+        field = np.zeros((2, 2, 2))
         field[0, 1, 1] = -.01
-        # END this fixture no longer reverses the installed kernel convention.
-        voxel = SimpleNamespace(feature_tensor=field, dims=[.02]*3, voxel_size=.01,
-                                pose=[0., 0., 0., 1., 0., 0., 0.], name="observed")
-        geometry = _independent_voxel_geometry(voxel, "explicit observed field")
-        cells = ContactCellGeometry(geometry)
+        observed = np.zeros_like(field, dtype=bool)
+        observed[0, 1, 1] = True
+        geometry = tsdf_geometry_from_samples(field, observed,
+            origin=[-.005]*3, voxel_size=.01, name="observed", source="explicit observed TSDF")
+        cells = make_contact_geometry(geometry)
         np.testing.assert_allclose(cells.centres, [[-.005, .005, .005]])
-        self.assertAlmostEqual(cells.cell_half_diagonal_m, np.sqrt(3)*.005)
-        geometry["solids"][0]["occupied_flat_indices"] = []
-        with self.assertRaisesRegex(ValueError, "original bound field"):
-            ContactCellGeometry(geometry)
+        self.assertEqual(cells.radii.tolist(), [0.])
+        self.assertEqual(len(cells.surface_components), 0)
         empty = ContactCellGeometry({"solids": [], "query_gaps": []})
         output, enabled = empty.query(torch.zeros((1, 1, 1, 4), dtype=torch.float64), [])
         self.assertEqual(output.item(), 0.)
         self.assertFalse(enabled.item())
+    # END no negative sample becomes an ESDF-threshold occupied cube.
 
     def test_required_overlap_slack_has_the_dual_gradient(self):
         normals = torch.tensor([[[1., 0., 0.], [-1., 0., 0.]]], dtype=torch.float64)

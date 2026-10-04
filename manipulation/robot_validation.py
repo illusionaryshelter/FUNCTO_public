@@ -227,6 +227,48 @@ class RobotStateValidator:
                 "rounded_limit_representations": rounded_limits,
                 "joint_names": result["joint_names"], "joint_positions": result["joint_positions"]}
 
+    # BEGIN planning world queries reuse the execution geometry and hand contract.
+    def check_planning_world(self, joint_positions, joint_names, *, time_s, gripper,
+                             scene_checker, progress, nominal_owner_poses,
+                             layer_selection, robot_owner_permission_progress):
+        """Check one nominal state against this request's owned source scene.
+
+        The caller has already selected each map layer using the actual native
+        sphere inputs. Its one-state record and candidate owner poses travel
+        unchanged to the same scene query used by execution. The separate
+        checker owns this planning binding; the execution checker's scene and
+        release history are never rebound by an optimizer or search branch.
+        """
+        if not isinstance(scene_checker, RobotGeometryChecker):
+            raise TypeError("Planning world acceptance needs a bound source scene checker")
+        positions, unmodelled = self._planning_positions(
+            joint_positions, joint_names, time_s=time_s, gripper=gripper)
+        unknown = set(unmodelled)
+        # Self acceptance already checks every required robot pair. Scene
+        # aliases additionally retain their exact native pair evidence,
+        # including excluded and mechanical pairs, without querying unrelated
+        # robot pairs twice for every world state.
+        aliases = set(scene_checker._scene_native_aliases.values())
+        pairs = tuple(pair for pair in self.pairs
+                      if (pair.first in aliases or pair.second in aliases)
+                      and pair.first not in unknown and pair.second not in unknown)
+        robot = scene_checker.query(joint_names=self.joint_names, joint_positions=positions,
+            T_reference_base=self.T_reference_base, pairs=pairs, frames=[self.tool_frame])
+        robot["unmodelled_geometry_names"] = unmodelled
+        tool_pose = np.asarray(robot["frame_poses"][self.tool_frame]) @ self.T_frame_tcp
+        fingers = (None if unmodelled else
+                   positions[[self.joint_names.index(name) for name in self.finger_joint_names]])
+        scene = scene_checker.query_scene(robot, tool_pose=tool_pose,
+            progress=float(progress), finger_positions=fingers, state_kind="nominal",
+            nominal_owner_poses=nominal_owner_poses,
+            active_robot_owner_permissions=None,
+            robot_owner_permission_progress=float(robot_owner_permission_progress),
+            layer_selection=layer_selection, layer_selection_index=(0, 0))
+        return {"residual": float(not scene["passed"]), "scene": scene,
+                "unmodelled_geometry_names": list(unmodelled),
+                "joint_names": list(self.joint_names), "joint_positions": positions.tolist()}
+    # END a zero proxy cost never bypasses source world collision or query gaps.
+
     def planning_binding_record(self):
         """Freeze the same source geometry, complete pair policy and numerics."""
         record = self.describe()

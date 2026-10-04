@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from manipulation.planning_observation import _independent_voxel_geometry
+from manipulation.tsdf_geometry import tsdf_geometry_from_samples
 from manipulation.planning_scene import ContactRule
 from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChecker
 from test_robot_geometry_check import URDF
@@ -148,61 +148,52 @@ def test_unknown_conditional_attachment_is_not_an_automatic_holding_gate(checker
     assert not actual["passed"] and actual["violations"][0]["kind"] == "independent_scene_collision"
 
 
-def test_voxel_adapter_retains_complete_field_and_detects_filled_occupancy(checker):
-    # BEGIN native ESDF is negative inside and positive outside.
-    field = torch.full((8, 8, 8), 1., dtype=torch.float32)
-    field[4, 4, 4] = -.01
-    # END the known occupied cell matches the installed native query.
-    voxel = SimpleNamespace(feature_tensor=field, dims=[.08]*3, voxel_size=.01,
-                            pose=[0., 0., 0., 1., 0., 0., 0.], name="observed_cells")
-    geometry = _independent_voxel_geometry(voxel, "observed depth field")
+# BEGIN observed negative volume and a zero set have distinct obligations.
+def test_tsdf_negative_volume_detects_contained_source_without_a_zero_surface(checker):
+    geometry = tsdf_geometry_from_samples(-np.ones((2, 2, 2)), np.ones((2, 2, 2), bool),
+        origin=[-.1, -.1, -.05], voxel_size=.2, name="observed_material", source="observed negative samples")
     model = binding()
     model["owners"][0]["geometry"] = geometry
-    row = geometry["solids"][0]
-    restored = np.frombuffer(bytes.fromhex(row["field_bytes_hex"]), dtype=row["field_dtype"])
-    np.testing.assert_array_equal(restored, field.numpy().reshape(-1))
     result = query(checker, model)
     assert not result["passed"] and result["violations"]
-    # Changing the occupied inventory without changing its original field is
-    # rejected before any independent geometry result can be produced.
-    modified = deepcopy(model)
-    modified["owners"][0]["geometry"]["solids"][0]["occupied_flat_indices"] = [0]
-    with pytest.raises(ValueError, match="inventory changed"):
-        query(checker, modified)
+    assert geometry["field_summary"]["surface_components"] == 0
+    assert any(row.get("target_tsdf_component", [None])[0] == "negative_cell" for row in result["pairs"])
 
 
-# BEGIN native field signs, zero surfaces and positive sentinels reach both consumers.
-@pytest.mark.parametrize("sample, occupied", [(-.01, True), (0., True), (-0., True), (.01, False), (10000., False)])
-def test_completed_native_esdf_sign_reaches_contact_and_coal(checker, sample, occupied):
-    from manipulation.contact_geometry import ContactCellGeometry
-    # In the installed completed native ESDF, missing sites are +1e4,
-    # negative values are interiors, and both signs of zero are surfaces.
-    # The test cell lies strictly inside the independent robot's native box.
-    field = torch.full((8, 8, 8), 10000., dtype=torch.float32)
-    field[4, 4, 4] = sample
-    voxel = SimpleNamespace(feature_tensor=field, dims=[.08]*3, voxel_size=.01,
-                            pose=[0., 0., 0., 1., 0., 0., 0.], name="completed_native_field")
-    geometry = _independent_voxel_geometry(voxel, "completed native ESDF contract")
-    cells = ContactCellGeometry(geometry)
-    assert cells.complete and len(cells.centres) == int(occupied)
-    assert geometry["field_summary"]["occupied_cells"] == int(occupied)
-    assert geometry["field_summary"]["positive_cells"] == 512-int(occupied)
+@pytest.mark.parametrize("sample, observed, occupied", [(-.01, True, True), (0., True, True),
+    (-0., True, True), (.01, True, False), (-.01, False, False)])
+def test_isolated_tsdf_evidence_is_a_point_without_an_invented_voxel(checker, sample, observed, occupied):
+    values = np.full((1, 1, 1), sample)
+    geometry = tsdf_geometry_from_samples(values, np.full(values.shape, observed),
+        origin=[.005, .005, .005], voxel_size=.01, name="isolated_sample", source="explicit observed sample")
     model = binding()
     model["owners"][0]["geometry"] = geometry
     result = query(checker, model)
     assert result["passed"] is not occupied
-    row = geometry["solids"][0]
-    assert row["occupancy_rule"] == "ESDF_sample_nonpositive"
-    # Byte equality includes an empty union, -0 and all unknown sentinels.
-    assert bytes.fromhex(row["field_bytes_hex"]) == field.numpy().tobytes()
+    assert geometry["field_summary"]["observed_samples"] == int(observed)
+    # A point just outside the box stays outside; its old full sample cube
+    # would have overlapped the box's lower z=-0.001 face.
     if occupied:
-        np.testing.assert_allclose(cells.centres, [[.005, .005, .005]])
-    row["occupancy_rule"] = "ESDF_sample_strictly_positive"
-    with pytest.raises(ValueError, match="original bound field"):
-        ContactCellGeometry(geometry)
-    with pytest.raises(ValueError, match="inventory changed"):
-        query(checker, model)
-# END positive field values never supply target material or observed-free evidence.
+        separated = tsdf_geometry_from_samples(values, np.full(values.shape, observed),
+            origin=[.005, .005, -.002], voxel_size=.01, name="isolated_sample", source="explicit observed sample")
+        model["owners"][0]["geometry"] = separated
+        assert query(checker, model)["passed"]
+# END unknown values neither fill space nor supply a required target surface.
+
+
+# BEGIN raw-distance reports retain their numeric schema without claiming a solid sign.
+def test_separated_tsdf_surface_reports_distance_and_partial_observation(checker):
+    values = np.broadcast_to([.05, -.05], (2, 2, 2))
+    model = binding()
+    model["owners"][0]["geometry"] = tsdf_geometry_from_samples(values, np.ones(values.shape, bool),
+        origin=[-.05, -.05, .15], voxel_size=.1, name="observed_plane", source="observed plane samples")
+    result = query(checker, model)
+    assert result["passed"] and not result["complete_scene_geometry"]
+    row = result["pairs"][0]
+    assert row["signed_distance_m"] > .1
+    assert row["diagnostic_only"] and row["distance_scope"] == "observed_zero_surface_only"
+# END containment is checked independently by the signed field components.
+
 # END counterexamples preserve actual physical violations and allowed uncertainty.
 
 # BEGIN owner predictions preserve multi-phase time and actual observation scope.
@@ -387,22 +378,46 @@ def test_moving_owner_pair_permission_is_independent_of_owner_order(checker):
     assert any(row["reason"] == "required_material_native_geometry_binding_missing" for row in incomplete["query_gaps"])
 
 
-def test_all_intersecting_voxel_leaves_must_fit_the_local_material_feature(checker):
-    # BEGIN preserve the two physical occupied cells with native ESDF signs.
-    field = torch.full((20, 20, 20), 1., dtype=torch.float32)
-    field[9, 9, 9] = field[14, 9, 9] = -.01
-    # END positive surrounding cells must never become contact target material.
-    voxel = SimpleNamespace(feature_tensor=field, dims=[.2]*3, voxel_size=.01,
-                            pose=[0., 0., 0., 1., 0., 0., 0.], name="observed_cells")
+def test_all_intersecting_tsdf_components_must_fit_the_local_material_feature(checker):
+    values = np.ones((7, 1, 1))
+    observed = np.zeros(values.shape, bool)
+    values[0, 0, 0] = values[5, 0, 0] = -.01
+    observed[0, 0, 0] = observed[5, 0, 0] = True
     model = binding([rule()])
-    model["owners"][0]["geometry"] = _independent_voxel_geometry(voxel, "two disjoint observed occupied cells")
+    model["owners"][0]["geometry"] = tsdf_geometry_from_samples(values, observed,
+        origin=[-.005, -.005, -.0005], voxel_size=.01,
+        name="observed_points", source="two disjoint observed negative samples")
     accepted = query(checker, model)
     assert accepted["passed"]
-    check = accepted["pairs"][0]["contact_region_checks"][0]
-    assert check["method"] == "complete_occupied_leaf_intersections" and check["leaf_queries"] == 2
+    assert accepted["pairs"][0]["component_summary"]["permitted"] == 2
     model["contacts"] = [rule(feature_points=[[-.015, -.015, -.001], [.015, -.015, -.001],
         [.015, .015, -.001], [-.015, .015, -.001]])]
     rejected = query(checker, model)
     assert not rejected["passed"] and rejected["violations"]
-    assert rejected["pairs"][0]["contact_region_checks"][0]["contained"] is False
+    assert any(check.get("contained") is False for row in rejected["pairs"] for check in row["contact_region_checks"])
 # END no first witness or iteration order can suppress a second illegal contact.
+
+
+# BEGIN allowed conditional collisions cannot hide a later mandatory query gap.
+def test_conditional_component_collisions_continue_until_a_hard_query_failure(checker):
+    cylinder = RobotGeometryChecker(checker.urdf_path, base_frame="base", geometries=[
+        NativePrimitive("pad", "base", "cylinder", (.05, .1), rigid(.049), "native curved pad")])
+    model = binding([rule()])
+    owner = model["owners"][0]
+    owner["moving"] = True
+    owner["attachments"] = [{"interval": [0., 1.], "position_tool_owner": [0., 0., 0.],
+        "quaternion_tool_owner": [1., 0., 0., 0.], "condition_id": "candidate_attachment",
+        "release_condition_id": None}]
+    owner["geometry"] = tsdf_geometry_from_samples(-np.ones((3, 1, 1)), np.ones((3, 1, 1), bool),
+        origin=[0., 0., .049], voxel_size=.02475, name="observed_points", source="three observed negative points")
+    result = query(cylinder, model)
+    # The first two deep overlaps remain conditional. The last shallow one
+    # attempts finite permission, which needs a complete curved-region adapter.
+    # An early stop after either allowed hypothesis would incorrectly pass.
+    assert not result["passed"]
+    assert any(item["reason"] == "local_contact_region_query_incomplete" for item in result["query_gaps"])
+    conditional = [item for item in result["unresolved_assumptions"] if item["kind"] == "conditional_scene_collision"]
+    assert len(conditional) == 1 and conditional[0]["component_issue_count"] == 2
+    summary = result["pairs"][0]["component_summary"]
+    assert summary["tested"] == 3 and summary["stopped_after_pair_failure"]
+# END one report slot summarizes all evaluated pieces without changing acceptance.

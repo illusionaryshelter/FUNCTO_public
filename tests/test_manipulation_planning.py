@@ -173,8 +173,10 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     # END no omitted FK metadata can silently bypass geometric sampling.
     planner._verification_scene = SimpleNamespace(
         gripper=None, owners=(), required_progress_anchors=(),
-        background=SimpleNamespace(independent_geometry={"solids": [{"kind": "voxel", "voxel_size": 1.}]}),
-        evaluate=lambda spheres, p, r, s, q, names, **kwargs: torch.zeros_like(s),
+        background=SimpleNamespace(independent_geometry={"solids": [{"kind": "tsdf", "voxel_size": 1.}]}),
+        # BEGIN exporter fixtures explicitly supply the source-world acceptance API.
+        evaluate_source=lambda spheres, p, r, s, q, names, **kwargs: torch.zeros_like(s),
+        # END source geometry numerics remain the dedicated integration tests' responsibility.
         check_robot_self_collision=separated_source_self,
         check_robot_coverage=lambda *args, **kwargs: [])
     # BEGIN give the real exporter explicit, finite native acceleration bounds.
@@ -305,7 +307,9 @@ class PlannerCalculusTests(unittest.TestCase):
         world.required_progress_anchors = ()
         world.robot_coverage = SimpleNamespace(baseline_joint_names=planner.joint_names,
             baseline_joint_positions=baseline, check_state=check_state)
-        world.evaluate = planner._verification_scene.evaluate
+        # BEGIN this volume-policy fixture keeps its separate zero source-world result.
+        world.evaluate_source = planner._verification_scene.evaluate_source
+        # END the real coverage implementation still evaluates every exported state.
         world.check_robot_self_collision = separated_source_self
         planner._verification_scene = world
         curve, count = planner.export(native)
@@ -1273,6 +1277,9 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             optimizer_preferences=lambda p, *args, **kwargs: p[..., 0]*0)
         scene = SimpleNamespace(gripper=hand, robot_coverage=None, robot_owner_permissions=(),
             required_progress_anchors=(), evaluate=lambda spheres, p, *args, **kwargs: p[..., 0]*0,
+            # BEGIN native metrics query an explicit source-world fixture independently of self.
+            evaluate_source=Mock(side_effect=lambda spheres, p, *args, **kwargs: p[..., 0]*0),
+            # END optimizer guidance retains its existing differentiable scene callback.
             check_robot_self_collision=Mock(side_effect=separated_source_self),
             robot_self_collision_guidance=lambda spheres, p, *args, **kwargs: p[..., 0]*0,
             optimizer_preferences=lambda progress, *args: progress*0)
@@ -1414,6 +1421,12 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                                                                    [0., 1., 1.1, 2., 2.]]))
             torch.testing.assert_close(query.kwargs["valid"], torch.tensor([[True, True, True, False, False],
                                                                             [True, True, True, True, False]]))
+            # BEGIN world and self receive the identical original native states and padding mask.
+            world_query = fixture.scene.evaluate_source.call_args
+            torch.testing.assert_close(world_query.args[4], query.args[0])
+            torch.testing.assert_close(world_query.kwargs["trajectory_time"], query.args[2])
+            torch.testing.assert_close(world_query.kwargs["valid"], query.kwargs["valid"])
+            # END padding cannot become source-world evidence through the scene callback.
 
     def test_seed_source_metrics_use_the_bound_physical_time_without_proxy_collision(self):
         with self.anchor_self_collision_fixture("seed_metrics", required=(.55,)) as fixture:
@@ -1587,6 +1600,9 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                     robot_self_collision_guidance=lambda spheres, p, *args, **kwargs: p.square().sum(-1),
                     # END source metrics never consume this differentiable proxy value.
                     evaluate=Mock(side_effect=lambda spheres, p, *args, **kwargs: p.square().sum(-1)),
+                    # BEGIN an explicitly separated source world contributes no proxy gradient.
+                    evaluate_source=Mock(side_effect=lambda spheres, p, r, progress, *args, **kwargs: torch.zeros_like(progress)),
+                    # END process constraints remain independently differentiable in metrics.
                     robot_coverage_guidance=Mock(side_effect=lambda poses, progress: poses.square().sum(-1)),
                     optimizer_preferences=lambda progress, *args: torch.zeros_like(progress))
                 scene.clone_for_rollout = Mock(return_value=scene)
@@ -1620,6 +1636,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                         torch.testing.assert_close(q.grad, 2*q.detach(), rtol=0., atol=0.)
                         problem.evaluate.assert_not_called()
                         scene.evaluate.assert_not_called()
+                        scene.evaluate_source.assert_not_called()
                         scene.robot_coverage_guidance.assert_not_called()
                         anchor_fk.assert_not_called()
                         coverage_fk.assert_not_called()
@@ -1627,10 +1644,13 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                         self.assertIn("skill_process", collection.names)
                         self.assertIn("process_scene", collection.names)
                         problem.evaluate.assert_called_once()
-                        scene.evaluate.assert_called_once()
                         anchor_fk.assert_called_once()
                         self.assertTrue(bool((q.grad > 2*q.detach()).all()))
                         if mode == "trajectory_optimizer":
+                            # BEGIN only the optimizer consumes differentiable proxy collision.
+                            scene.evaluate.assert_called_once()
+                            scene.evaluate_source.assert_not_called()
+                            # END source metrics have a separate explicit callback below.
                             # The source fixture has E(q)=S(q)=||q||².
                             # Original scene guidance is (E+S)², including
                             # its cross term; separate squares would halve it.
@@ -1643,6 +1663,10 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                             coverage_fk.assert_called_once()
                             scene.robot_coverage_guidance.assert_called_once()
                         else:
+                            # BEGIN trajectory acceptance queries source geometry exactly once.
+                            scene.evaluate.assert_not_called()
+                            scene.evaluate_source.assert_called_once()
+                            # END reference seed modes above query neither scene callback.
                             coverage_fk.assert_not_called()
                             scene.robot_coverage_guidance.assert_not_called()
 
@@ -1727,8 +1751,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
     def test_clock_validation_lower_bound_refuses_512_before_native_and_admits_1536(self):
         problem = cartesian_problem((MotionPhase("free", constant_path()),))
         problem.source_timestamps = np.array([0., 16.])
-        scene = SimpleNamespace(bind_robot_validator=Mock(), validate_problem=Mock(), required_progress_anchors=(), gripper=None,
+        # BEGIN the accepted clock path freezes source geometry before native metadata allocation.
+        scene = SimpleNamespace(bind_robot_validator=Mock(), bind_source_scene=Mock(), validate_problem=Mock(), required_progress_anchors=(), gripper=None,
                                 reference_frame=problem.reference_frame)
+        # END the rejected 512-sample case still exits before this source freeze.
         before_cuda = torch.cuda.is_initialized()
         for capacity in (512, 1536):
             with self.subTest(capacity=capacity):
@@ -1745,10 +1771,12 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                         self.assertIn("interpolation_dt_s=0.02500000037252903", str(error.exception))
                         self.assertIn("native_samples=641", str(error.exception))
                         robot.assert_not_called()
+                        scene.bind_source_scene.assert_not_called()
                     else:
                         with self.assertRaisesRegex(RuntimeError, "metadata boundary reached"):
                             _CuroboPlanner(problem, scene, object(), budget, "cuda:0", robot_validator=object())
                         robot.assert_called_once()
+                        scene.bind_source_scene.assert_called_once()
                     manager.assert_not_called()
                 self.assertEqual(budget.max_validation_points, capacity)
                 self.assertEqual(budget.maximum_trajectory_dt, .2)
@@ -1787,8 +1815,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                     hand = (SimpleNamespace(controller="binary", joint_names=("finger",), current_positions=(.1,),
                         control_timestep_s=.01, bind_clock=Mock(), finger_trajectory=None) if has_hand else None)
                     problem = cartesian_problem((MotionPhase("free", constant_path()),))
-                    scene = SimpleNamespace(bind_robot_validator=Mock(), validate_problem=Mock(),
+                    # BEGIN geometry binding is explicit even in the CPU source-identity fixture.
+                    scene = SimpleNamespace(bind_robot_validator=Mock(), bind_source_scene=Mock(), validate_problem=Mock(),
                         required_progress_anchors=(), gripper=hand, reference_frame=problem.reference_frame)
+                    # END XML, joint-lock and ancestor checks below retain their original assertions.
                     robot = {"robot_cfg": {"kinematics": {"urdf_path": str(path), "base_link": "base", **changes}}}
                     planner = _CuroboPlanner.__new__(_CuroboPlanner)
                     with patch("torch.cuda._lazy_init", side_effect=AssertionError("source preflight must stay CPU-only")), \
@@ -2008,6 +2038,11 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         world = PlanningScene.__new__(PlanningScene)
         world.required_progress_anchors = (0., 1.)
         world.robot_sphere_materials = (None,)*416
+        # BEGIN this admission fixture declares the absence of a frozen source allocation.
+        world.robot_validator = None
+        world._source_scene_checker = None
+        world.robot_collision_bodies = ()
+        # END actual source snapshots are accounted by the same method when bound.
         world.background = None
         world.owners = tuple(SimpleNamespace(moving=False, owner_id=f"fixed-{i}", query=None) for i in range(4))
         world.coverage = SimpleNamespace(_distance=SimpleNamespace(numel=lambda: 503840))
@@ -2020,8 +2055,18 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                                                 for n in planes]}
         world._free_distance = world.coverage._distance
         world.contacts = tuple(SimpleNamespace(_feature_edge_normals=np.zeros((4, 3))) for _ in range(2))
-        cells = SimpleNamespace(pair_chunk=32768, centres=np.empty((0, 3)), halves=np.empty((0, 3)),
-                                rotations=np.empty((0, 3, 3)))
+        # BEGIN metadata implements the contact model's explicit storage/workspace interface.
+        class ContactStorage(SimpleNamespace):
+            @property
+            def storage_bytes(self):
+                return self.centres.nbytes+self.halves.nbytes+self.rotations.nbytes
+
+            def workspace_bytes(self):
+                return self.pair_chunk*1600
+
+        cells = ContactStorage(pair_chunk=32768, centres=np.empty((0, 3)), halves=np.empty((0, 3)),
+                               rotations=np.empty((0, 3, 3)))
+        # END changing only complete component inventory still changes shared bytes exactly once.
         world._contact_cells = {"target": cells}
         budget = PlanningBudget(ik_seeds=2, trajectory_seeds=1, knots=16, interpolation_steps=4,
             interpolation_buffer_size=768, max_refinement_points=16, max_validation_points=512)
@@ -2052,6 +2097,12 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         large_work = replace(expanded, max_validation_points=32768)
         self.assertEqual(complete_bytes, _planning_workspace_bytes(world, metadata, large_work, 20)[0])
         self.assertLess(complete_bytes, expanded.max_scene_workspace_bytes)
+        # BEGIN shared source storage and one serial query workspace are each counted once.
+        world._source_scene_checker = SimpleNamespace(scene_storage_nbytes=131072,
+                                                       scene_query_workspace_nbytes=98304)
+        self.assertEqual(_planning_workspace_bytes(world, metadata, expanded, 20)[0]-complete_bytes,
+                         131072+98304)
+        # END rollout counts multiply neither the immutable source scene nor its live CPU query.
         query = CuroboSphereQuery(SimpleNamespace(get_sphere_distance_raw=lambda *args, **kwargs: None),
                                  owner_ids=("fixture",), source="complete validation allocation metadata")
         native_spheres = 3*256*metadata["spheres"]
@@ -2543,7 +2594,7 @@ class InitialStatePreflightTests(unittest.TestCase):
 
     @staticmethod
     def fixture(*, position=(.1, -.3, .5), velocity=(.7, -1.7, 2.4),
-                native_collision=0., scene_name="robot/background", scene_value=0.):
+                native_collision=0., scene_name="source_world_collision", scene_value=0.):
         base = np.eye(4)
         base[:3, :3] = Rotation.from_euler("z", .8).as_matrix()
         base[:3, 3] = [.8, -.6, .2]
@@ -2558,6 +2609,9 @@ class InitialStatePreflightTests(unittest.TestCase):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.problem, planner.joint_names = problem, problem.joint_names
+        # BEGIN entrance source checks receive the same explicit progress/time mapping.
+        planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+        # END this fixture has no material or attachment mode switches.
         planner.budget = PlanningBudget()
         planner.torch, planner.JointState = torch, SimpleNamespace
         planner._RobotState = SimpleNamespace
@@ -2602,10 +2656,17 @@ class InitialStatePreflightTests(unittest.TestCase):
                 "translation_m": float(np.linalg.norm(actual[:3, 3]-expected[:3, 3])),
                 "rotation_rad": float(Rotation.from_matrix(expected[:3, :3].T @ actual[:3, :3]).magnitude())})
         # END this diagnostic compares identical q without relaxing any gate.
+        # BEGIN source acceptance exposes per-term entrance evidence through its own API.
+        def evaluate_source(spheres, position, quaternion, progress, joints, names, *, components_out, **kwargs):
+            value = torch.full_like(progress, scene_value)
+            components_out[scene_name] = value
+            return value
+
         planner._verification_scene = SimpleNamespace(gripper=None, required_progress_anchors=(), check_robot_coverage=Mock(return_value=[]),
             check_robot_self_collision=Mock(side_effect=lambda q, names, times, **kwargs:
                 torch.full_like(times, native_collision)),
-            components=Mock(return_value={scene_name: torch.tensor([[scene_value]], dtype=torch.float64)}))
+            evaluate_source=Mock(side_effect=evaluate_source))
+        # END no proxy component callback can stand in for the source entrance verdict.
         planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes, planner.anchor_capacity = 64, 32, 4
         planner.reference_seeds = Mock(side_effect=AssertionError("an infeasible fixed entrance must stop before IK"))
         planner.optimize, planner.ompl_seed, planner.close = Mock(), Mock(), Mock()
@@ -2631,7 +2692,9 @@ class InitialStatePreflightTests(unittest.TestCase):
         source.assert_called_once()
         torch.testing.assert_close(source.call_args.args[0], planner.start.position[:, None])
         torch.testing.assert_close(source.call_args.args[2], torch.zeros((1, 1), dtype=torch.float64))
-        spheres, position, quaternion, progress, joints, names = planner._verification_scene.components.call_args.args
+        # BEGIN inspect the actual source-world call with the unchanged native entrance FK.
+        spheres, position, quaternion, progress, joints, names = planner._verification_scene.evaluate_source.call_args.args
+        # END named limits and absent derivative assertions above retain their independent scope.
         expected_position = (planner.problem.base_pose[:3, :3]
                              @ (planner.problem.start_q+planner.problem.tool_transform[:3, 3])
                              + planner.problem.base_pose[:3, 3])
@@ -2652,8 +2715,10 @@ class InitialStatePreflightTests(unittest.TestCase):
             ("native:position", {"position": (.21, -.3, .5)}, .01),
             ("native:velocity", {"velocity": (.7, -2.3, 2.4)}, .3),
             ("source_self_collision", {"native_collision": 1.}, 1.),
-            ("scene:robot/background", {"scene_name": "robot/background", "scene_value": 4.5}, 4.5),
-            ("scene:unknown_space", {"scene_name": "unknown_space", "scene_value": np.nan}, np.nan),
+            # BEGIN source world collision is binary; nonfinite source evidence still rejects.
+            ("scene:source_world_collision", {"scene_value": 1.}, 1.),
+            ("scene:source_world_collision", {"scene_value": np.nan}, np.nan),
+            # END neither an unknown-space proxy nor its magnitude owns acceptance.
         )
         scene = SimpleNamespace(bind_robot_validator=Mock(), describe=lambda: {"scope": "analytic entrance fixture"})
         scene.clone_for_rollout = lambda: deepcopy(scene)
