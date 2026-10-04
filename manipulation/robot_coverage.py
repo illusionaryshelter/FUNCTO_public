@@ -118,10 +118,14 @@ class RobotCoverage:
                  max_working_bytes=_MAX_WORKING_BYTES):
         if not isinstance(checker, RobotGeometryChecker):
             raise TypeError("Coverage requires the existing complete named native FK checker")
-        if (type(max_queries) is not int or not 0 < max_queries <= 100_000
+        # BEGIN bounded spatial validation may visit more than 100k states
+        # across candidates. This is cumulative work, not one allocation;
+        # each Boolean query retains the unchanged two-GiB memory admission.
+        if (type(max_queries) is not int or not 0 < max_queries <= 1_000_000
                 or type(max_working_bytes) is not int
                 or not 0 < max_working_bytes <= _MAX_WORKING_BYTES):
             raise ValueError("Coverage needs finite state-query and at-most-2-GiB CPU budgets")
+        # END every query still consumes the caller's finite request budget.
         self._checker = checker
         self.reference_frame = _name(reference_frame, "coverage reference frame")
         self.initialization_source = _name(initialization_source, "valid initial-model assumption source")

@@ -13,18 +13,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 from audit_recorded_collision import (MAX_QUERIES, captured_queries, nominal_hand,
                                      query_state, unordered_witnesses)
 from manipulation.execution_binding import curve_snapshot
+from manipulation.collision_records import encode_array
 from test_recorded_collision_snapshot import candidate
 
 
 def snapshot(curve):
     lower = float(np.nextafter(np.float32(.5), np.float32(-np.inf)))
-    return {"classification": "diagnostic_collision_snapshot_not_executable",
+    saved = {"classification": "diagnostic_collision_snapshot_not_executable",
         "curve": curve_snapshot(curve), "formal_clock": {"duration": curve.duration},
         "scene_query_capture": {"status": "completed", "errors": [], "calls": [{
             "time_s": [[.5, .5, .5]], "progress": [[.5, lower, .5]],
             "robot_owner_permission_progress": [[.5, .5, .5]],
             "joint_position": [[[.125], [.125], [.125]]], "joint_names": ["arm"],
             "time_dtype": "torch.float32", "progress_dtype": "torch.float32"}]}}
+    encode_call(saved["scene_query_capture"]["calls"][0])
+    return saved
+
+
+def encode_call(call):
+    """Match the production snapshot numeric-array contract, with no list fallback."""
+    for key in ("time_s", "progress", "robot_owner_permission_progress", "joint_position"):
+        call[key] = encode_array(np.asarray(call[key], dtype=np.float32))
 
 
 def test_deduplication_keeps_different_modes_and_original_float_values():
@@ -47,6 +56,7 @@ def test_complete_query_budget_counts_duplicate_calls_before_deduplication():
     count = MAX_QUERIES+1
     call.update(time_s=[[.5]*count], progress=[[.5]*count],
         robot_owner_permission_progress=[[.5]*count], joint_position=[[[.125]]*count])
+    encode_call(call)
     with pytest.raises(ValueError, match="explicit 4608 budget"):
         captured_queries(saved, curve)
 
@@ -96,7 +106,10 @@ def test_nominal_hand_collisions_are_not_established_wrist_background_collisions
         T_reference_base=np.eye(4), T_frame_tcp=np.eye(4), pairs=(), tool_frame="tcp",
         checker=SimpleNamespace(query=query, query_scene=scene_query))
     state = {"time_s": time_s, "time_dtype": "torch.float32", "progress": .4999999701976776,
-             "permission_progress": .5, "q": np.array([.125])}
+             "permission_progress": .5, "q": np.array([.125]),
+             # BEGIN an explicitly single-layer captured state has no choices.
+             "layer_selection": {}}
+             # END direct fixtures match the production capture contract.
     result = query_state(validator, {"contacts": []}, state, ("arm",),
                          lambda time, dtype: (np.array([.02, -.03]), np.zeros(2)), {"finger"})
     assert len(result["established_model_violations"]) == 2-conditional_count
@@ -127,9 +140,10 @@ def test_original_float32_endpoint_may_round_above_the_binary64_curve_duration()
     assert endpoint > curve.duration
     call.update(time_s=[[endpoint]], progress=[[1.]], robot_owner_permission_progress=[[1.]],
                 joint_position=[[[0.]]])
+    encode_call(call)
     states, _, _ = captured_queries(saved, curve)
     assert states[0]["time_s"] == endpoint
-    call["time_s"][0][0] = float(np.nextafter(np.float32(.1), np.float32(np.inf)))
+    call["time_s"] = encode_array(np.array([[np.nextafter(np.float32(.1), np.float32(np.inf))]], np.float32))
     with pytest.raises(ValueError, match="original-clock"):
         captured_queries(saved, curve)
 # END diagnostics cannot promote hypothetical hand geometry or change source status.

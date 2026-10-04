@@ -20,6 +20,7 @@ from scipy.interpolate import CubicHermiteSpline
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from manipulation.execution_binding import curve_snapshot
+from manipulation.collision_records import decode_array, slice_layer_selection
 from manipulation.gripper_trajectory import FingerTrajectory
 
 
@@ -39,7 +40,7 @@ def read_json(path):
 def captured_queries(snapshot, curve):
     """Validate and exactly deduplicate captured states, retaining every index.
 
-    The original float32 values have already been copied into JSON numbers.
+    The original float32 values are retained in compact typed array records.
     They are promoted exactly to binary64 for Coal, never regenerated from a
     nearby cubic sample. Native dtype remains part of identity because it also
     controls the separately sampled nominal hand polynomial. Coal's scene
@@ -59,9 +60,9 @@ def captured_queries(snapshot, curve):
         names = tuple(call["joint_names"])
         if len(set(names)) != len(names) or set(names) != set(curve.joint_names):
             raise ValueError("Captured coordinates must name every archived active joint exactly once")
-        times, progress, permission = (np.asarray(call[key], float) for key in
+        times, progress, permission = (decode_array(call[key]).astype(float) for key in
             ("time_s", "progress", "robot_owner_permission_progress"))
-        q = np.asarray(call["joint_position"], float)
+        q = decode_array(call["joint_position"]).astype(float)
         if call["time_dtype"] not in ("torch.float32", "torch.float64"):
             raise ValueError("Captured hand queries require their supported original floating dtype")
         # The production tensor comparison converts duration to this same
@@ -82,13 +83,18 @@ def captured_queries(snapshot, curve):
         columns = [names.index(name) for name in curve.joint_names]
         for index in range(times.size):
             coordinates = q[0, index, columns].copy()
+            # BEGIN preserve the scene's emitted complete-body layer decision.
+            selected = slice_layer_selection(call.get("layer_selection", {}), index=(0, index))
+            # END slicing changes storage only, never the choice or its bounds.
             key = (float(times[0, index]), float(progress[0, index]), float(permission[0, index]),
                    call["time_dtype"], call["progress_dtype"], *coordinates.tolist())
             if key not in identities:
                 identities[key] = len(unique)
                 unique.append({"time_s": key[0], "progress": key[1], "permission_progress": key[2],
                     "time_dtype": key[3], "progress_dtype": key[4], "q": coordinates,
-                    "first_capture": {"call": call_index, "index": index}})
+                    "first_capture": {"call": call_index, "index": index}, "layer_selection": selected})
+            elif unique[identities[key]]["layer_selection"] != selected:
+                raise ValueError("Identical captured query states disagree on their shared layer selection")
             indices.append(identities[key])
         mapping.append({"call": call_index, "shape": list(times.shape), "unique_state_indices": indices})
     return unique, mapping, total
@@ -189,7 +195,10 @@ def query_state(validator, scene_binding, state, active_names, sampler, uncertai
     scene = validator.checker.query_scene(robot, tool_pose=tool_pose, progress=state["progress"],
         finger_positions=np.asarray([positions[name] for name in validator.finger_joint_names]),
         state_kind="nominal", active_robot_owner_permissions=None,
-        robot_owner_permission_progress=state["permission_progress"])
+        robot_owner_permission_progress=state["permission_progress"],
+        # BEGIN independent geometry consumes the original scene selection.
+        layer_selection=state["layer_selection"], layer_selection_index=(0, 0))
+        # END no CPU re-selection may replace the captured native decision.
     issues = [{"kind": "independent_robot_collision", "evidence": pair}
               for pair in robot["pairs"] if pair["policy"] == "required" and pair["relation"] != "separated"]
     issues += [{"kind": "independent_joint_position", "name": name, **row}

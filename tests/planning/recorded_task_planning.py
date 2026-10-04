@@ -238,25 +238,6 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
 
 
 # BEGIN rejected curves retain the exact scene and query scope without authorization.
-def scene_query_snapshot(args, kwargs):
-    """Copy one real scene evaluation, including repeated one-sided mode probes.
-
-    ``PlanningScene.evaluate`` receives the expanded progress values after the
-    planner has selected the before/after laws. Retaining these inputs avoids
-    recreating float32 neighbours in float64 or guessing physical time by
-    inverting progress. This observer never repeats the geometry query.
-    """
-    spheres, position, quaternion, progress, joint_position, joint_names = args
-    del spheres, position, quaternion  # The independent checker computes its own FK.
-    times = kwargs["trajectory_time"]
-    permission = kwargs.get("robot_owner_permission_progress", progress)
-    return {"time_s": _cpu_array(times), "progress": _cpu_array(progress),
-            "robot_owner_permission_progress": _cpu_array(permission),
-            "joint_names": list(joint_names), "joint_position": _cpu_array(joint_position),
-            "time_dtype": str(times.dtype), "progress_dtype": str(progress.dtype),
-            "query_order": "actual scene.evaluate order; same-state mode probes and duplicates retained"}
-
-
 def save_collision_snapshot(path, planner, curve, *, curve_path, validation_status, query_capture):
     """Archive this candidate's owned inputs for independent CPU diagnostics.
 
@@ -271,7 +252,14 @@ def save_collision_snapshot(path, planner, curve, *, curve_path, validation_stat
 
     if validation_status not in {"completed", "not_completed"}:
         raise ValueError("Collision snapshots require an explicit export validation status")
-    validation = plain(planner.last_validation) if validation_status == "completed" else None
+    # BEGIN one authoritative copy of potentially large query records per file.
+    # The scoped observer already owns the exact production records, including
+    # partial failed exports. Validation keeps metrics, bounds and violations;
+    # scene_query_capture keeps the actual query arrays and layer decisions.
+    validation = (plain({key: value for key, value in planner.last_validation.items()
+                         if key != "scene_layer_queries"})
+                  if validation_status == "completed" else None)
+    # END no query payload is duplicated inside the validation dictionary.
     document = {"classification": "diagnostic_collision_snapshot_not_executable",
         "curve_path": Path(curve_path).name, "curve": curve_snapshot(curve),
         "problem": plain(planner.problem),
@@ -474,18 +462,21 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
         # Preserve that same object if validation cannot finish; do not retry
         # validation with weaker settings or return it as a successful plan.
         constructed = []
-        # BEGIN observe the expanded scene query once, before reusable buffers change.
+        # BEGIN copy production's own expanded query record after each chunk.
         query_capture = {"status": "not_recorded", "calls": [], "errors": []}
-        original_evaluate = planner._verification_scene.evaluate
+        original_boundary_query = planning._scene_boundary_evaluate
 
-        def capture_evaluate(*args, **kwargs):
+        def capture_boundary(*args, **kwargs):
+            if "layer_selection_out" not in kwargs:
+                kwargs["layer_selection_out"] = {}
+            value = original_boundary_query(*args, **kwargs)
             try:
-                query_capture["calls"].append(scene_query_snapshot(args, kwargs))
+                query_capture["calls"].append(deepcopy(kwargs["layer_selection_out"]))
             except Exception as error:
                 query_capture["errors"].append(f"{type(error).__name__}: {error}")
             query_capture["status"] = "error" if query_capture["errors"] else "completed"
-            return original_evaluate(*args, **kwargs)
-        # END recorded inputs do not replace the original evaluator or its result.
+            return value
+        # END a release-history scene clone keeps its own bound evaluate method.
 
         def capture(curve):
             original_curve_init(curve)
@@ -494,7 +485,7 @@ def plan_and_record(problem, scene, robot, output, *, budget, provenance, execut
         try:
             # BEGIN the recorder is scoped to this export's private verification scene.
             with patch.object(planning.JointTrajectory, "__post_init__", new=capture), \
-                    patch.object(planner._verification_scene, "evaluate", new=capture_evaluate):
+                    patch.object(planning, "_scene_boundary_evaluate", new=capture_boundary):
                 exported = original_export(planner, native_result)
             export_query_captures[id(exported[0])] = (exported[0], query_capture)
             return exported

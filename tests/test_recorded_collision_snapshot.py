@@ -12,8 +12,9 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
-from recorded_task_planning import save_collision_snapshot, scene_query_snapshot
-from manipulation.planning import JointTrajectory
+from recorded_task_planning import save_collision_snapshot
+from manipulation.planning import JointTrajectory, _layer_query_record
+from manipulation.collision_records import decode_array, encode_array
 
 
 def candidate():
@@ -47,9 +48,9 @@ def candidate():
 
 def test_rejected_snapshot_owns_complete_scene_clock_curve_and_query_scope(tmp_path):
     planner, curve, scene = candidate()
-    captured = {"status": "completed", "calls": [{"time_s": [[.5, .5, .5]],
-        "progress": [[.5, .4999999701976776, .5000000596046448]],
-        "robot_owner_permission_progress": [[.5, .5, .5000000596046448]]}], "errors": []}
+    captured = {"status": "completed", "calls": [{"time_s": encode_array(np.array([[.5, .5, .5]], np.float32)),
+        "progress": encode_array(np.array([[.5, .4999999701976776, .5000000596046448]], np.float32)),
+        "robot_owner_permission_progress": encode_array(np.array([[.5, .5, .5000000596046448]], np.float32))}], "errors": []}
     target = tmp_path/"candidate-00-scene.json"
     save_collision_snapshot(target, planner, curve, curve_path="candidate-00.npz",
                             validation_status="completed", query_capture=captured)
@@ -57,7 +58,7 @@ def test_rejected_snapshot_owns_complete_scene_clock_curve_and_query_scope(tmp_p
     # this candidate's target, nominal fingers or completed query evidence.
     scene["owners"][0]["owner_id"] = "different_candidate_target"
     planner.last_validation["u"][1] = .125
-    captured["calls"][0]["progress"][0][1] = 0.
+    captured["calls"][0]["progress"] = encode_array(np.zeros((1, 3), np.float32))
     document = json.loads(target.read_text())
     assert document["classification"] == "diagnostic_collision_snapshot_not_executable"
     assert "execution_binding" not in document
@@ -70,7 +71,7 @@ def test_rejected_snapshot_owns_complete_scene_clock_curve_and_query_scope(tmp_p
     assert document["curve"]["events"][0]["activation_time_s"] == .5
     assert document["validation"]["u"] == [0., .25, .5, .75, 1.]
     assert document["validation"]["violations"][2] == .01
-    assert document["scene_query_capture"]["calls"][0]["progress"][0][1] < .5
+    assert decode_array(document["scene_query_capture"]["calls"][0]["progress"])[0][1] < .5
     np.testing.assert_array_equal(document["curve"]["coefficients"], curve._curve.c)
     assert curve.residuals == {"scene": .01}
 
@@ -96,17 +97,18 @@ def test_scene_capture_keeps_native_float32_sides_and_arrival_permission():
     permission = progress.clone()
     permission[:, 1] = middle
     positions = torch.zeros((1, 3, 1), dtype=torch.float32)
-    saved = scene_query_snapshot((None, None, None, progress, positions, ("arm",)),
-        {"trajectory_time": times, "robot_owner_permission_progress": permission})
+    # BEGIN the diagnostic copies the actual production query record.
+    saved = _layer_query_record(times, progress, permission, positions, ("arm",), {}, ("exact", "left", "right"))
+    # END no observer reconstructs a second set of mode probes.
     progress.fill_(0.)
     permission.fill_(0.)
     positions.fill_(99.)
     assert saved["progress_dtype"] == "torch.float32"
-    assert saved["progress"][0, 1] == np.nextafter(np.float32(.5), np.float32(-np.inf))
-    assert saved["progress"][0, 2] == np.nextafter(np.float32(.5), np.float32(np.inf))
-    assert saved["robot_owner_permission_progress"][0, 1] == .5
-    np.testing.assert_array_equal(saved["time_s"], [[.5, .5, .5]])
-    np.testing.assert_array_equal(saved["joint_position"], np.zeros((1, 3, 1)))
+    assert decode_array(saved["progress"])[0][1] == np.nextafter(np.float32(.5), np.float32(-np.inf))
+    assert decode_array(saved["progress"])[0][2] == np.nextafter(np.float32(.5), np.float32(np.inf))
+    assert decode_array(saved["robot_owner_permission_progress"])[0][1] == .5
+    np.testing.assert_array_equal(decode_array(saved["time_s"]), [[.5, .5, .5]])
+    np.testing.assert_array_equal(decode_array(saved["joint_position"]), np.zeros((1, 3, 1)))
 
 
 def test_snapshot_failure_does_not_leave_a_complete_looking_file(tmp_path):

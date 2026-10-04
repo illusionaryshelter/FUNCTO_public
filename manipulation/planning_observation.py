@@ -28,6 +28,9 @@ from .planning_scene import (
     CollisionOwner, CuroboSphereQuery, ObservedSpace, PlanningScene, _text,
     _validate_contact_and_gripper_inputs,
 )
+# BEGIN body-wide replacement by a separately observed fine field.
+from .voxel_layers import LayeredVoxelQuery, validate_body_groups
+# END both native and independent consumers retain the same layer inventory.
 
 
 def _views(views, reference_frame, depth_range_m):
@@ -591,6 +594,37 @@ def _owner_mapper_config(config, views, masks, owner_id, pose, voxel_size, depth
 # END refined owner fields remain partial collision geometry.
 
 
+# BEGIN explicit small-region allocation before any native mapping work.
+def _fine_mapper_config(config, request):
+    """Freeze a caller-evidenced small region in this partition's local frame.
+
+    The request is generic metric geometry, not an object/task heuristic.
+    Sensor allowance is supplied with its measurement evidence. Numerical
+    support is separately computed from this Mapper's truncation and samples.
+    """
+    center = np.asarray(request["center_m"], float)
+    extent = np.asarray(request["extent_m"], float)
+    size = float(request["voxel_size_m"])
+    margin = float(request["measurement_allowance_m"])
+    if (center.shape != (3,) or extent.shape != (3,)
+            or not np.isfinite(center).all() or not np.isfinite(extent).all()
+            or np.any(extent <= 0) or not np.isfinite([size, margin]).all()
+            or not 0 < size < config.esdf_voxel_size or margin < 0):
+        raise ValueError("Fine ROI requires finite local bounds, smaller spacing and a measured allowance")
+    _text(request["measurement_evidence"], "fine measurement evidence")
+    _text(request["source"], "fine region bounds source")
+    # Python integer products cannot wrap an oversized array into a small
+    # admitted count. Check before constructing native block-pool metadata.
+    shape = tuple(math.ceil(float(value)/size) for value in extent)
+    if min(shape) < 3 or math.prod(shape) > 1_000_000:
+        raise ValueError("Each complete fine ROI must fit the one-million-sample bound")
+    return replace(config, grid_center=torch.as_tensor(center, dtype=torch.float32),
+        extent_meters_xyz=tuple(extent), extent_esdf_meters_xyz=tuple(extent),
+        voxel_size=size, esdf_voxel_size=size, truncation_distance=2*size,
+        max_visible_blocks_per_integration=None)
+# END no allocation is reduced after seeing collision values.
+
+
 def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                           reference_frame, robot_sphere_materials, robot_geometry_source,
                           gripper=None, has_gripper=True, contacts=(),
@@ -599,7 +633,8 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                           # BEGIN owner precision is independent of whole-scene extent.
                           native_geometry_materials=None, owner_voxel_size_m=None,
                           # BEGIN explicit pose-arrival robot/owner pair permissions.
-                          robot_owner_permissions=()):
+                          robot_owner_permissions=(),
+                          fine_regions=None, robot_collision_bodies=()):
                           # END mapping preserves the caller's bound policy.
                           # END no owner sample is omitted by the refinement.
     """Fuse a current snapshot into a partial, explicitly partitioned scene.
@@ -654,6 +689,13 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
     if not robot_sphere_materials:
         raise ValueError("The actual robot sphere model and material identities are required")
     _text(robot_geometry_source, "robot sphere model source")
+    # BEGIN multi-resolution selection needs every physical body's full cover.
+    fine_regions = {} if fine_regions is None else dict(fine_regions)
+    if not set(fine_regions) <= {None, *frames}:
+        raise ValueError("Fine regions must name existing owner partitions, or None for background")
+    if fine_regions:
+        robot_collision_bodies = validate_body_groups(robot_collision_bodies, len(robot_sphere_materials))
+    # END material identities cannot substitute for body ownership.
     contacts = _validate_contact_and_gripper_inputs(
         dict.fromkeys(frames), robot_sphere_materials, contacts, gripper, has_gripper)
     torch_device = torch.device(mapper_cfg.device)
@@ -678,7 +720,12 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
             extent_meters_xyz=tuple(np.abs(inverse[:3, :3])@world_extent),
             extent_esdf_meters_xyz=tuple(np.abs(inverse[:3, :3])@esdf_extent),
             max_visible_blocks_per_integration=None)
-    estimates = {identity: _mapper_memory_bound(config) for identity, config in configs.items()}
+    # BEGIN each layer gets its own Mapper, with all allocations admitted together.
+    jobs = {(identity, "coarse"): config for identity, config in configs.items()}
+    jobs.update({(identity, "fine"): _fine_mapper_config(configs[identity], request)
+                 for identity, request in fine_regions.items()})
+    estimates = {key: _mapper_memory_bound(config) for key, config in jobs.items()}
+    # END a fine field is reconstructed from the same pixels, never upsampled.
     if sum(estimates.values()) > max_mapping_bytes:
         raise ValueError(f"Native RGB-D mapper buffers exceed the declared budget: {sum(estimates.values())} bytes")
     shape_xyz = tuple(math.ceil(x/mapper_cfg.esdf_voxel_size) for x in mapper_cfg.extent_esdf_meters_xyz)
@@ -700,8 +747,8 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
     # END native mapping and occupied-solid evidence cannot widen F.
     _require_mapping_memory(sum(estimates.values()), mapper_cfg.device)
     config_device = DeviceCfg(device=mapper_cfg.device)
-    queries, statistics = {}, {}
-    for identity, config in configs.items():
+    queries, statistics, regions = {}, {}, {}
+    for (identity, layer), config in jobs.items():
         # A fresh mapper per partition preserves ownership at every observed
         # surface. Queries retain their native field tensors; summing every
         # partition's budget also covers delayed native scratch cleanup. No
@@ -732,12 +779,38 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
         # BEGIN validate native indexing before a query or solid can be published.
         _require_native_voxel_layout(voxel, native)
         # END a mismatched complete field remains unsupported, not executable.
-        queries[identity] = CuroboSphereQuery(native, owner_ids=(partition_id,),
+        key = (identity, layer)
+        queries[key] = CuroboSphereQuery(native, owner_ids=(partition_id,),
                                              source=f"current_rgbd:{','.join(normalized)}")
         # BEGIN retain an independent filled-cell model of this same owner partition.
-        queries[identity].independent_geometry = _independent_voxel_geometry(voxel, queries[identity].source)
+        queries[key].independent_geometry = _independent_voxel_geometry(voxel, queries[key].source)
         # END no GPU query or robot-sphere residual is used by independent checking.
-        statistics[partition_id] = {"allocated_blocks": stats["num_allocated"],
+        # BEGIN export the actual fine sign source before releasing its Mapper.
+        if layer == "fine":
+            from .native_voxel_sources import export_source_bits
+            shape = tuple(voxel.feature_tensor.shape)
+            bits = export_source_bits(mapper, config, voxel)
+            # Raw depth retains robot/other-owner occlusion. Only its observed
+            # free prefix can support a background sign; no masked hole is free.
+            local_views = {name: {**view, "T_output_camera": inverse@view["T_output_camera"]}
+                           for name, view in normalized.items()}
+            fine_origin = np.asarray(voxel.pose[:3])-(np.asarray(shape)-1)*voxel.voxel_size/2
+            free = _known_free_voxels(local_views, origin=fine_origin, shape=shape[::-1],
+                voxel_size=voxel.voxel_size, depth_error_m=depth_error_m).transpose(2, 1, 0)
+            request = fine_regions[identity]
+            # Truncation, a full grid diagonal and one interpolation step
+            # are numerical map support, never the sensor-error margin.
+            support = math.ceil((config.truncation_distance+math.sqrt(3)*config.voxel_size
+                                  +config.esdf_voxel_size)/config.esdf_voxel_size)*config.esdf_voxel_size
+            regions[identity] = {"pose": list(voxel.pose), "shape_xyz": list(shape),
+                "voxel_size_m": float(voxel.voxel_size), "numerical_support_m": support,
+                "measurement_allowance_m": float(request["measurement_allowance_m"]),
+                "measurement_evidence": request["measurement_evidence"], "source": request["source"],
+                "observation_ids": list(normalized), "source_bits_hex": bits.tobytes().hex(),
+                "raw_free_packbits_hex": np.packbits(free).tobytes().hex(),
+                "distance_scope": "local source-supported distance; no global nearest-surface certificate"}
+        # END positive ESDF values never become observation evidence.
+        statistics.setdefault(partition_id, {})[layer] = {"allocated_blocks": stats["num_allocated"],
                                     "max_blocks": config.max_blocks,
                                     "tsdf_voxel_size_m": float(config.voxel_size),
                                     "esdf_voxel_size_m": float(config.esdf_voxel_size),
@@ -747,11 +820,16 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                                     "extent_esdf_meters_xyz": list(config.extent_esdf_meters_xyz),
                                     "occupied_cell_half_diagonal_m": math.sqrt(3)*config.esdf_voxel_size/2,
                                     # BEGIN disclose counts even when a finite inventory refuses admission.
-                                    "independent_field": queries[identity].independent_geometry["field_summary"],
+                                    "independent_field": queries[key].independent_geometry["field_summary"],
                                     # END a resource refusal cannot masquerade as an empty observed target.
                                     # END voxel resolution is not a sensor-error certificate.
-                                    "estimated_buffers_bytes": estimates[identity]}
+                                    "estimated_buffers_bytes": estimates[key]}
         del mapper, observation
+    # BEGIN publish one selector-backed query per physical owner partition.
+    queries = {identity: (LayeredVoxelQuery(queries[identity, "coarse"], queries[identity, "fine"], regions[identity])
+                         if identity in regions else queries[identity, "coarse"])
+               for identity in configs}
+    # END coarse and fine costs are never fused as separate obstacles.
     owners = [CollisionOwner(identity, queries[identity],
                               PosePath(np.array([0., 1.]), np.repeat(pose[None], 2, axis=0), source),
                               source, geometry_complete=False)
@@ -763,7 +841,8 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                            gripper=gripper, has_gripper=has_gripper,
                            native_geometry_materials=native_geometry_materials,
                            # BEGIN retain identical pair permissions through observation binding.
-                           robot_owner_permissions=robot_owner_permissions)
+                           robot_owner_permissions=robot_owner_permissions,
+                           robot_collision_bodies=robot_collision_bodies)
                            # END RGB-D mapping does not activate actual contact permission.
                            # END the mapping does not itself create a contact permission.
     result.observation_report = {"source": "current calibrated RGB-D and explicit current physical-solid evidence", "partitions": statistics,

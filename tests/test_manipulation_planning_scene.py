@@ -290,7 +290,10 @@ class PlanningSceneTest(unittest.TestCase):
         world.robot_coverage = SimpleNamespace(required_link_names=("body",), baseline_joint_names=("q",))
         world._coverage_geometry = {"solids": [{"baseline_halfspaces_world": np.zeros((32, 4))}]}
         world._free_distance = world.coverage._distance
-        world.owners = (SimpleNamespace(owner_id="payload", moving=True, local_spheres=np.zeros((1, 4))),)
+        # BEGIN storage admission now reads the real per-owner field count.
+        world.owners = (SimpleNamespace(owner_id="payload", moving=True, local_spheres=np.zeros((1, 4)),
+                                       query=SphereQuery(("payload",))),)
+        # END a complete owner fixture includes its collision query.
         batch, horizon = 2, 10
         before = world.estimated_workspace_bytes(batch, horizon)
         world.robot_sphere_materials = (None,)*17

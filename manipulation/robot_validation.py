@@ -141,7 +141,13 @@ class RobotStateValidator:
             condition_evidence=feedback.get("scene_condition_evidence"),
             # BEGIN only actual execution carries arrival-latched authorization.
             active_robot_owner_permissions=(None if state_kind == "nominal" else active_robot_owner_permissions),
-            robot_owner_permission_progress=permission_progress)
+            robot_owner_permission_progress=permission_progress,
+            # BEGIN an additional nominal/actual state owns one shared selection.
+            # These CPU preflight or measured states have no captured native
+            # query to replay. Select once from their complete bound covers;
+            # query_scene archives that decision before any distance query.
+            select_layers=True)
+            # END diagnostic native-query replay supplies its original record.
             # END nominal geometry remains explicitly conditional on the bound arrival.
 
     # BEGIN release anchors come from the same executable cubic and bound clock.

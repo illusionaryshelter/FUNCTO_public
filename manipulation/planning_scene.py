@@ -37,6 +37,9 @@ from .motion import _inverse, _pose_array
 # BEGIN material permission uses complete finite target intersections.
 from .contact_geometry import ContactCellGeometry, query_geometry
 # END the ordinary collision query still owns all other pairs.
+# BEGIN all geometry consumers share one complete-body layer selection.
+from .voxel_layers import LayeredVoxelQuery, validate_body_groups
+# END a layer decision is not recomputed from collision costs.
 
 
 def _array(value, shape, label):
@@ -918,7 +921,8 @@ class PlanningScene:
                  robot_sphere_materials, robot_geometry_source,
                  contacts=(), gripper=None, has_gripper=True, robot_coverage=None,
                  numerical_position_tolerance_m=1e-4, numerical_rotation_tolerance_rad=1e-3,
-                 native_geometry_materials=None, robot_owner_permissions=()):
+                 native_geometry_materials=None, robot_owner_permissions=(),
+                 robot_collision_bodies=()):
         self.background = background
         # BEGIN independent solids need explicit material identity, not sphere-index guesses.
         self.native_geometry_materials = dict(native_geometry_materials or {})
@@ -967,6 +971,12 @@ class PlanningScene:
         if not self.robot_sphere_materials:
             raise ValueError("The actual robot sphere model and material identities are required")
         self.robot_geometry_source = _text(robot_geometry_source, "robot sphere model source")
+        # BEGIN bind physical ownership independently of contact materials.
+        layered = isinstance(background, LayeredVoxelQuery) or any(
+            isinstance(owner.query, LayeredVoxelQuery) for owner in self.owners)
+        self.robot_collision_bodies = (validate_body_groups(robot_collision_bodies, len(self.robot_sphere_materials))
+            if layered or robot_collision_bodies else ())
+        # END a partial sphere grouping cannot authorize a fine-field query.
         # BEGIN bind installation masks to this exact robot sphere layout.
         for owner in self.owners:
             if owner.robot_excluded_spheres and (
@@ -1015,8 +1025,15 @@ class PlanningScene:
         # END the source adapter owns exact native-name to sphere correspondence.
         # BEGIN own the complete finite target inventory once per binding.
         contacted = {rule.target_owner for rule in self.contacts}
-        self._contact_cells = {owner.owner_id: ContactCellGeometry(query_geometry(owner.query))
-                               for owner in self.owners if owner.owner_id in contacted}
+        self._contact_cells = {}
+        for owner in self.owners:
+            if owner.owner_id not in contacted:
+                continue
+            if isinstance(owner.query, LayeredVoxelQuery):
+                from .contact_geometry import LayeredContactCellGeometry
+                self._contact_cells[owner.owner_id] = LayeredContactCellGeometry(query_geometry(owner.query))
+            else:
+                self._contact_cells[owner.owner_id] = ContactCellGeometry(query_geometry(owner.query))
         # END unsupported inventories remain explicit permission-query gaps.
         self._fixed_release_poses = {}
         anchors = [x for owner in self.owners for relation in owner.attachments for x in relation.interval]
@@ -1437,8 +1454,19 @@ class PlanningScene:
             raise ValueError("Coverage guidance horizon must fit the original scene horizon")
         actors = {"robot": len(self.robot_sphere_materials)}
         actors.update({owner.owner_id: len(owner.local_spheres) for owner in self.owners if owner.moving})
-        count = sum(size * (1 + len(self.owners) - int(actor != "robot")) for actor, size in actors.items())
-        slots = sum(1+len(self.owners)-int(actor != "robot") for actor in actors)
+        # BEGIN reserve both native field buffers wherever one is selected.
+        targets = {"background": self.background, **{owner.owner_id: owner.query for owner in self.owners}}
+        count = sum(size*(2 if isinstance(query, LayeredVoxelQuery) else 1)
+                    for actor, size in actors.items() for target, query in targets.items() if actor != target)
+        slots = sum(2 if isinstance(query, LayeredVoxelQuery) else 1
+                    for actor in actors for target, query in targets.items() if actor != target)
+        layer_bytes = sum(query.region.storage_bytes for query in targets.values() if isinstance(query, LayeredVoxelQuery))
+        # Source-prefix arrays are immutable and shared across rollout clones;
+        # selection scratch includes whole-body bounds and per-sphere masks.
+        layer_scratch = batch*horizon*sum(size*256+len(self.robot_collision_bodies)*320
+            for actor, size in actors.items() for target, query in targets.items()
+            if actor != target and isinstance(query, LayeredVoxelQuery))
+        # END admission accounts for the unselected native query's allocation.
         # Count scalar slots per state as well. This also bounds a stack of
         # one-state OMPL scenes by one equivalent multi-state allocation.
         retained_bytes = batch*horizon*(count*20 + slots*8)
@@ -1498,14 +1526,15 @@ class PlanningScene:
                 + sum(plane_counts)*24)
             native_coverage_bytes += self._free_distance.numel()*8
         # BEGIN finite contact witnesses never allocate the raw Cartesian product.
-        shared_cpu_bytes = sum(value.centres.nbytes+value.halves.nbytes+value.rotations.nbytes
-                               for value in self._contact_cells.values())
+        shared_cpu_bytes = layer_bytes+sum(layer.centres.nbytes+layer.halves.nbytes+layer.rotations.nbytes
+            for value in self._contact_cells.values()
+            for layer in (value.layers.values() if hasattr(value, "layers") else (value,)))
         contact_bytes = (sum(value.pair_chunk*1600 for value in self._contact_cells.values())
                          + (batch*horizon*len(self.robot_sphere_materials)*64 if self._contact_cells else 0))
         contact_bytes += batch*horizon*sum((len(rule._feature_edge_normals)+10)*32 for rule in self.contacts)
         # END CPU neighbor lists separately obey a two-million-pair admission cap.
         return {"retained": int(retained_bytes),
-                "live": int(query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes+contact_bytes),
+                "live": int(query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes+contact_bytes+layer_bytes+layer_scratch),
                 "shared_cpu": int(shared_cpu_bytes)}
         # END include checkpointed hand-pair scratch and its retained input.
 
@@ -1640,7 +1669,7 @@ class PlanningScene:
 
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time=None,
-                   robot_owner_permission_progress=None):
+                   robot_owner_permission_progress=None, layer_selection_out=None):
         """Return nonnegative [B,H] terms; no term can cancel a violation.
 
         Required event anchors must be included by the caller. On a mode
@@ -1655,6 +1684,25 @@ class PlanningScene:
                 or quaternion.shape != (*progress.shape, 4)):
             raise ValueError("Scene needs aligned FK spheres, tool pose and progress [B,H]")
         costs = {}
+        # BEGIN only final validation asks to archive these actual decisions.
+        if layer_selection_out is not None and not isinstance(layer_selection_out, dict):
+            raise TypeError("Layer selection output must be an explicit per-query dictionary")
+
+        def layer_selection(query, actor, target, queried_spheres):
+            if not isinstance(query, LayeredVoxelQuery):
+                return None
+            groups = (self.robot_collision_bodies if actor == "robot" else
+                ({"body_id": actor, "sphere_indices": list(range(queried_spheres.shape[-2])),
+                  "geometry_names": [actor]},))
+            selected = query.region.select(queried_spheres, groups)
+            if layer_selection_out is not None:
+                layer_selection_out[f"{actor}/{target}"] = selected.record()
+            return selected
+
+        def field_query(query, queried_spheres, key, selected):
+            return (query(queried_spheres, key=key, selection=selected) if selected is not None
+                    else query(queried_spheres, key=key))
+        # END the native, material and exported solid queries share this value.
         # BEGIN a same-state old material mode does not revoke an arrived pair permission.
         permission_progress = progress if robot_owner_permission_progress is None else robot_owner_permission_progress
         if permission_progress.shape != progress.shape:
@@ -1767,11 +1815,17 @@ class PlanningScene:
             # check_robot_coverage at entrance, search and final acceptance.
             if actor != "robot" or self.robot_coverage is None:
                 costs[f"unknown/space/{actor}"] = self.coverage.violation(actor_spheres).amax(-1)
-            collision_terms(self.background(actor_spheres, key=(actor, "background")),
+            background_selection = layer_selection(self.background, actor, "background", actor_spheres)
+            collision_terms(field_query(self.background, actor_spheres, (actor, "background"), background_selection),
                             f"collision/{actor}/background", actor)
             for owner in self.owners:
                 if actor == owner.owner_id:
                     continue
+                # BEGIN choose before native cost or any material permission query.
+                local = _local_spheres(actor_spheres, *poses[owner.owner_id])
+                selected = layer_selection(owner.query, actor, owner.owner_id, local)
+                layer_args = {} if selected is None else {"fine_mask": selected.sphere_fine}
+                # END all spheres of a native body have one selected target layer.
                 # BEGIN local permission is evaluated per complete target cell.
                 policies = []
                 for rule in self.contacts:
@@ -1784,19 +1838,21 @@ class PlanningScene:
                     if rule.required:
                         unresolved = uncertain_hand if actor == "robot" and rule.feature_joint_translation is not None else torch.zeros_like(progress, dtype=torch.bool)
                         cells = self._contact_cells[owner.owner_id]
-                        residual = residual+(cells.required_contact(policy) if cells.complete else policy["active"].to(progress.dtype))
+                        residual = residual+(cells.required_contact(policy, **layer_args) if cells.complete else policy["active"].to(progress.dtype))
                         costs[f"contact/{rule.rule_id}"] = residual * ~unresolved
                         costs[f"unknown/contact/{rule.rule_id}"] = torch.maximum(uncertain, unresolved.to(progress.dtype))
                     policies.append(policy)
-                local = _local_spheres(actor_spheres, *poses[owner.owner_id])
                 # BEGIN retain native welded/masked installation pairs without deleting geometry.
                 # Applying the mask to per-sphere costs leaves the same owner
                 # active for all other robot links and for a carried payload.
-                values = owner.query(local, key=(actor, owner.owner_id))
+                values = field_query(owner.query, local, (actor, owner.owner_id), selected)
                 if policies:
                     cells = self._contact_cells[owner.owner_id]
                     if cells.complete:
-                        finite_values, enabled = cells.query(local, policies)
+                        # BEGIN preserve measured sensor allowance in material queries too.
+                        contact_spheres = local if selected is None else owner.query.inflated_spheres(local)
+                        finite_values, enabled = cells.query(contact_spheres, policies, **layer_args)
+                        # END the material's declared allowance itself is unchanged.
                         values = torch.where(enabled, finite_values, values)
                     else:
                         # A missing complete model cannot grant an exemption.
@@ -1825,11 +1881,12 @@ class PlanningScene:
 
     def evaluate(self, robot_spheres, position, quaternion, progress,
                  joint_position=None, joint_names=None, *, trajectory_time=None,
-                 robot_owner_permission_progress=None):
+                 robot_owner_permission_progress=None, layer_selection_out=None):
         terms = self.components(robot_spheres, position, quaternion, progress,
                                 joint_position=joint_position, joint_names=joint_names,
                                 trajectory_time=trajectory_time,
-                                robot_owner_permission_progress=robot_owner_permission_progress)
+                                robot_owner_permission_progress=robot_owner_permission_progress,
+                                layer_selection_out=layer_selection_out)
         # BEGIN allowed observation/model uncertainty stays diagnostic.
         # A missing release anchor is different: the requested pose query
         # cannot be formed and must still fail this candidate.
@@ -1922,6 +1979,7 @@ class PlanningScene:
                 {"times": hand.finger_trajectory.times, "position": hand.finger_trajectory.position,
                  "velocity": hand.finger_trajectory.velocity})})
         return {"reference_frame": self.reference_frame, "robot_geometry_source": self.robot_geometry_source,
+                "robot_collision_bodies": deepcopy(self.robot_collision_bodies),
                 "native_geometry_materials": deepcopy(self.native_geometry_materials),
                 "robot_sphere_materials": list(self.robot_sphere_materials), "gripper": gripper,
                 "background": {"owner_ids": sorted(self.background.owner_ids), "source": self.background.source,
@@ -1930,7 +1988,7 @@ class PlanningScene:
                 # BEGIN keep the exact conditional pair policy in every formal archive.
                 "robot_owner_permissions": plain([asdict(rule) for rule in self.robot_owner_permissions]),
                 # END execution must bind this snapshot before receiving actual latches.
-                "contact_query_models": {identity: {"complete_cells": len(value.centres),
+                "contact_query_models": {identity: {"complete_cells": (value.layer_cell_counts if hasattr(value, "layers") else len(value.centres)),
                     "query_gaps": list(value.gaps), "cell_half_diagonal_m": value.cell_half_diagonal_m,
                     "maximum_candidate_pairs": value.max_candidate_pairs,
                     "scope": "complete filled-cell union for material pairs; ESDF remains the ordinary nonmaterial representation"}
@@ -1956,7 +2014,7 @@ class PlanningScene:
             "occupied_owner_ids": tuple(sorted(self._occupied_owner_ids)),
             "background_owner_ids": tuple(sorted(self.background.owner_ids)),
             "owner_geometry_complete": {owner.owner_id: owner.geometry_complete for owner in self.owners},
-            "contact_queries": {identity: {"complete_cells": len(value.centres), "query_gaps": list(value.gaps),
+            "contact_queries": {identity: {"complete_cells": (value.layer_cell_counts if hasattr(value, "layers") else len(value.centres)), "query_gaps": list(value.gaps),
                 "last_report": deepcopy(value.last_report), "required_report": deepcopy(value.last_required_report)}
                 for identity, value in self._contact_cells.items()},
             # BEGIN report exact installation exclusions alongside ordinary owner geometry.

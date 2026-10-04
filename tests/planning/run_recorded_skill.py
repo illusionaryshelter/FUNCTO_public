@@ -413,6 +413,27 @@ def run(args):
                            grid_center=torch.tensor(args.center), truncation_distance=2*args.voxel_size,
                            image_height=height, image_width=width, depth_minimum_distance=.05,
                            depth_maximum_distance=5., device="cuda:0")
+        # BEGIN bind the complete native covers and explicit request-local fine ROIs.
+        # Each fixed link may own several geoms. Its entire sphere group and
+        # every corresponding solid use one map; material labels are unrelated.
+        body_geometries = {}
+        for row in fixture["collision_geometries"]:
+            body_geometries.setdefault(row["link"], []).append(row["geom"])
+        collision_bodies = [{"body_id": link, "frame": link, "sphere_indices": indices,
+                             "geometry_names": body_geometries[link],
+                             "local_spheres": [[*sphere["center"], sphere["radius"]]
+                                 for sphere in robot["robot_cfg"]["kinematics"]["collision_spheres"][link]],
+                             "source": fixture["robot_geometry_source"]}
+            for link, indices in entrance_fk["sphere_indices_by_link"].items()]
+        fine_regions = {}
+        if args.fine_regions is not None:
+            requests = json.loads(args.fine_regions.read_text())
+            for row in requests:
+                identity = row["owner_id"]
+                if identity in fine_regions:
+                    raise ValueError("Only one bounded fine ROI is admitted per physical owner partition")
+                fine_regions[identity] = {key: value for key, value in row.items() if key != "owner_id"}
+        # END no simulator obstacle pose or task-specific crop enters the mapper.
         scene = build_scene_from_rgbd(
             observations, {carrier_id: {
                 "T_output_owner": owner_pose,
@@ -426,6 +447,7 @@ def run(args):
             robot_owner_permissions=pair_permissions,
             # END a current measured arrival is still required by execution.
             owner_voxel_size_m=args.owner_voxel_size,
+            fine_regions=fine_regions, robot_collision_bodies=collision_bodies,
             max_mapping_bytes=1024**3)
             # END the RGB-D partition remains partial.
         report["observation_build"] = scene.observation_report
@@ -445,6 +467,7 @@ def run(args):
                 background=scene.background, owners=(owner,), coverage=scene.coverage,
                 reference_frame=scene.reference_frame,
                 robot_sphere_materials=scene.robot_sphere_materials,
+                robot_collision_bodies=scene.robot_collision_bodies,
                 # BEGIN preserve contact contracts when substituting explicit owner geometry.
                 robot_geometry_source=scene.robot_geometry_source, gripper=hand,
                 contacts=scene.contacts, native_geometry_materials=scene.native_geometry_materials,
@@ -471,6 +494,7 @@ def run(args):
             scene = PlanningScene(
                 background=scene.background, owners=(*scene.owners, *fixed_owners), coverage=scene.coverage,
                 reference_frame=scene.reference_frame, robot_sphere_materials=scene.robot_sphere_materials,
+                robot_collision_bodies=scene.robot_collision_bodies,
                 robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
                 # BEGIN native identity survives fixed-installation augmentation.
                 native_geometry_materials=scene.native_geometry_materials,
@@ -492,6 +516,7 @@ def run(args):
         observed_report = scene.observation_report
         scene = PlanningScene(background=scene.background, owners=scene.owners, coverage=scene.coverage,
             reference_frame=scene.reference_frame, robot_sphere_materials=scene.robot_sphere_materials,
+            robot_collision_bodies=scene.robot_collision_bodies,
             robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
             # BEGIN robot occupancy evidence preserves object-contact identity.
             native_geometry_materials=scene.native_geometry_materials,
@@ -585,6 +610,10 @@ if __name__ == "__main__":
     parser.add_argument("--voxel-size", type=float, required=True)
     # BEGIN current owner precision is declared before a planning result exists.
     parser.add_argument("--owner-voxel-size", type=float, required=True)
+    # BEGIN freeze reviewed local bounds, resolution and measurement evidence.
+    parser.add_argument("--fine-regions", type=Path,
+                        help="JSON array of owner_id (null for background), local bounds and measured-allowance evidence")
+    # END the same generic ROI input is accepted for any observed partition.
     # END the mapper retains every current labelled sample in the refined field.
     parser.add_argument("--depth-error", type=float, required=True)
     parser.add_argument("--robot-depth-tolerance", type=float, required=True)

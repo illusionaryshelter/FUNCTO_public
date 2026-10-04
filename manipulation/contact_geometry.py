@@ -325,3 +325,142 @@ class ContactCellGeometry:
             "scope": "complete finite target-cell union; conservative whole sphere/cell intersection permission"}
         return output.reshape(spheres.shape[:-1]), enabled.reshape(spheres.shape[:-1])
 # END no sampled contact point can authorize an unexamined overlap.
+
+
+# BEGIN explicit body-selected coarse/fine contact geometry.
+class LayeredContactCellGeometry:
+    """Apply finite contact checks to the caller's already selected layer.
+
+    The two native inventories remain separate complete box unions. The
+    PlanningScene supplies one boolean choice per body sphere and state;
+    this adapter neither inspects region metadata nor chooses a layer from
+    its cost. A contact rule must name spheres with one common choice in
+    each state so its finite material region has exactly one target model.
+    """
+
+    def __init__(self, geometry):
+        if set(geometry.get("layers", ())) != {"coarse", "fine"}:
+            raise ValueError("Layered contact geometry needs exactly coarse and fine layers")
+        # Retain the complete original record, including selection metadata,
+        # for independent checking. Only the two inventories feed contact.
+        self.geometry = deepcopy(geometry)
+        self.layers = {name: ContactCellGeometry(self.geometry["layers"][name])
+                       for name in ("coarse", "fine")}
+        self.last_report = None
+        self.last_required_report = None
+
+    def __copy__(self):
+        """Share immutable inventories but isolate rollout diagnostics."""
+        from copy import copy
+
+        result = type(self).__new__(type(self))
+        result.__dict__ = self.__dict__.copy()
+        result.layers = {name: copy(layer) for name, layer in self.layers.items()}
+        result.last_report = None
+        result.last_required_report = None
+        for layer in result.layers.values():
+            layer.last_report = None
+            layer.last_required_report = None
+        return result
+
+    @property
+    def gaps(self):
+        return [f"{name}: {gap}" for name, layer in self.layers.items() for gap in layer.gaps]
+
+    @property
+    def complete(self):
+        return all(layer.complete for layer in self.layers.values())
+
+    @property
+    def pair_chunk(self):
+        # Disclose both child allocations conservatively. Each child still
+        # enforces its own unchanged per-query admission and live-pair caps.
+        return sum(layer.pair_chunk for layer in self.layers.values())
+
+    @property
+    def max_candidate_pairs(self):
+        return sum(layer.max_candidate_pairs for layer in self.layers.values())
+
+    @property
+    def cell_half_diagonal_m(self):
+        # This maximum describes representation error only; it never selects
+        # or combines contact geometry across the two independent layers.
+        return max(layer.cell_half_diagonal_m for layer in self.layers.values())
+
+    @property
+    def layer_cell_counts(self):
+        return {name: len(layer.centres) for name, layer in self.layers.items()}
+
+    def workspace_bytes(self):
+        return sum(layer.workspace_bytes() for layer in self.layers.values())
+
+    @staticmethod
+    def _validate_mask(fine_mask):
+        if not isinstance(fine_mask, torch.Tensor) or fine_mask.dtype != torch.bool or fine_mask.ndim != 3:
+            raise ValueError("Layered contact needs a boolean fine_mask with shape [B,H,S]")
+
+    @staticmethod
+    def _policy_layer(policy, fine_mask):
+        """Validate rule membership before evaluating either native layer."""
+        active = policy["active"]
+        if (not isinstance(active, torch.Tensor) or active.dtype != torch.bool
+                or active.shape != fine_mask.shape[:2] or active.device != fine_mask.device):
+            raise ValueError("Layered contact policy active flags must match fine_mask states and device")
+        indices = tuple(policy["sphere_indices"])
+        if not indices or any(not isinstance(index, (int, np.integer)) or isinstance(index, bool)
+                              or index < 0 or index >= fine_mask.shape[-1] for index in indices):
+            raise ValueError("Layered contact policy needs valid nonempty sphere_indices")
+        choices = fine_mask[..., list(indices)]
+        # Check every state, including inactive ones: activity cannot repair
+        # a rule whose members have no single geometric target inventory.
+        if not bool((choices == choices[..., :1]).all()):
+            raise ValueError("Layered contact policy sphere_indices select mixed coarse/fine layers")
+        return choices[..., 0]
+
+    @staticmethod
+    def _masked_policy(policy, selected):
+        # Keep halfspaces and feature tensors attached to their original
+        # autograd graph; only per-state activity changes for the child call.
+        return dict(policy, active=policy["active"] & selected)
+
+    def query(self, spheres, policies, fine_mask):
+        """Select exact native costs with the supplied [B,H,S] body mask."""
+        self._validate_mask(fine_mask)
+        if spheres.ndim != 4 or spheres.shape[-1] != 4 or spheres.shape[:-1] != fine_mask.shape:
+            raise ValueError("Layered contact spheres must have shape [B,H,S,4] matching fine_mask")
+        if spheres.device != fine_mask.device:
+            raise ValueError("Layered contact spheres and fine_mask must use the same device")
+        if not self.complete:
+            raise ValueError("A partial target-cell inventory cannot grant layered contact permission")
+        policies = tuple(policies)
+        selections = [self._policy_layer(policy, fine_mask) for policy in policies]
+        results = {}
+        for name, selected_fine in (("coarse", False), ("fine", True)):
+            masked = [self._masked_policy(policy, choice if selected_fine else ~choice)
+                      for policy, choice in zip(policies, selections)]
+            results[name] = self.layers[name].query(spheres, masked)
+        self.last_report = {"layers": {name: deepcopy(layer.last_report) for name, layer in self.layers.items()},
+            "layer_cell_counts": self.layer_cell_counts,
+            "scope": "complete finite target cells in the caller-selected layer for each body"}
+        return (torch.where(fine_mask, results["fine"][0], results["coarse"][0]),
+                torch.where(fine_mask, results["fine"][1], results["coarse"][1]))
+
+    def required_contact(self, policy, fine_mask):
+        """Require occupancy in the same layer as the entire contact rule."""
+        self._validate_mask(fine_mask)
+        if not self.complete:
+            raise ValueError("A partial target-cell inventory cannot establish required layered contact")
+        choice = self._policy_layer(policy, fine_mask)
+        results = {}
+        for name, selected in (("coarse", ~choice), ("fine", choice)):
+            layer = self.layers[name]
+            # The native inactive path returns zero before writing a report.
+            # Clear that report so a previous solve cannot appear current.
+            layer.last_required_report = None
+            results[name] = layer.required_contact(self._masked_policy(policy, selected))
+        self.last_required_report = {
+            "layers": {name: deepcopy(layer.last_required_report) for name, layer in self.layers.items()},
+            "layer_cell_counts": self.layer_cell_counts,
+            "scope": "at least one complete target cell in the caller-selected layer intersects the finite region"}
+        return torch.where(choice, results["fine"], results["coarse"])
+# END coarse/fine selection never depends on collision cost or contact residual.

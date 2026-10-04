@@ -116,6 +116,7 @@ def export_fixture(problem, progress_map, position, velocity, dt):
             quaternion = q.new_zeros((*q.shape[:2], 1, 4))
             quaternion[..., 0] = 1.
             spheres = q.new_zeros((*q.shape[:2], 1, 4))
+            spheres[..., :3] = q[:, :, None]
             spheres[..., 3] = .001
             return SimpleNamespace(
                 tool_poses=SimpleNamespace(tool_frames=[problem.tool_link],
@@ -127,7 +128,9 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
     planner.problem = problem
-    planner.budget = PlanningBudget()
+    # The Cartesian test coordinates span metres; declare their metric sampling
+    # resolution explicitly while individual spatial tests select finer values.
+    planner.budget = PlanningBudget(validation_spatial_step_m=.5)
     # BEGIN the mock uses the same exact occurrence clock as the native exporter.
     clock = {(event.skill_id, event.event_id, event.occurrence): {"event": asdict(event), "time": float(progress_map.anchor_parameters([event.progress])[0, 0]*(position.shape[1]-1)*dt),
         "hold_until": float(progress_map.anchor_parameters([event.progress])[-1, 0]*(position.shape[1]-1)*dt)} for event in problem.events}
@@ -145,8 +148,19 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     planner.finger_trajectory = None
     planner.start = SimpleNamespace(position=position[:, 0], velocity=velocity[:, 0])
     planner._verification_fk = CartesianKinematics()
+    # BEGIN the analytic Cartesian fixture declares its complete native tree.
+    fixed = torch.eye(4, dtype=torch.float64)[:3].repeat(4, 1, 1)
+    planner._verification_fk.config = SimpleNamespace(kinematics_config=SimpleNamespace(
+        fixed_transforms=fixed, link_map=torch.tensor([0, 0, 1, 2]),
+        joint_map=torch.tensor([-1, 0, 1, 2]), joint_map_type=torch.tensor([-1, 0, 1, 2]),
+        joint_offset_map=torch.tensor([1., 0.]*4), joint_names=list(problem.joint_names),
+        joint_limits=SimpleNamespace(position=torch.tensor([[-1e6]*3, [1e6]*3])),
+        link_name_to_idx_map={"base": 0, "x": 1, "y": 2, problem.tool_link: 3},
+        link_spheres=torch.tensor([[[0., 0., 0., .001]]]), link_sphere_idx_map=torch.tensor([3])))
+    # END no omitted FK metadata can silently bypass geometric sampling.
     planner._verification_scene = SimpleNamespace(
-        gripper=None, required_progress_anchors=(),
+        gripper=None, owners=(), required_progress_anchors=(),
+        background=SimpleNamespace(independent_geometry={"solids": [{"kind": "voxel", "voxel_size": 1.}]}),
         evaluate=lambda spheres, p, r, s, q, names, **kwargs: torch.zeros_like(s),
         check_robot_coverage=lambda *args, **kwargs: [])
     # BEGIN give the real exporter explicit, finite native acceleration bounds.
@@ -272,6 +286,8 @@ class PlannerCalculusTests(unittest.TestCase):
 
         world = PlanningScene.__new__(PlanningScene)
         world.gripper = None
+        world.owners = ()
+        world.background = planner._verification_scene.background
         world.required_progress_anchors = ()
         world.robot_coverage = SimpleNamespace(baseline_joint_names=planner.joint_names,
             baseline_joint_positions=baseline, check_state=check_state)
@@ -1630,7 +1646,8 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         world = PlanningScene.__new__(PlanningScene)
         world.required_progress_anchors = (0., 1.)
         world.robot_sphere_materials = (None,)*416
-        world.owners = tuple(SimpleNamespace(moving=False) for _ in range(4))
+        world.background = None
+        world.owners = tuple(SimpleNamespace(moving=False, owner_id=f"fixed-{i}", query=None) for i in range(4))
         world.coverage = SimpleNamespace(_distance=SimpleNamespace(numel=lambda: 503840))
         world.gripper = SimpleNamespace(self_collision_pairs=range(28672))
         world.robot_coverage = SimpleNamespace(required_link_names=range(13), baseline_joint_names=range(9))
@@ -1669,18 +1686,21 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         cells.rotations = np.broadcast_to(0., (45655, 3, 3))
         expanded = replace(budget, max_validation_points=1536, max_scene_workspace_bytes=2*1024**3)
         complete_bytes, _ = _planning_workspace_bytes(world, metadata, expanded, 20)
-        self.assertEqual(complete_bytes, 1380440104)
+        # BEGIN total validation work does not enlarge live geometry batches.
+        large_work = replace(expanded, max_validation_points=32768)
+        self.assertEqual(complete_bytes, _planning_workspace_bytes(world, metadata, large_work, 20)[0])
         self.assertLess(complete_bytes, expanded.max_scene_workspace_bytes)
         query = CuroboSphereQuery(SimpleNamespace(get_sphere_distance_raw=lambda *args, **kwargs: None),
                                  owner_ids=("fixture",), source="complete validation allocation metadata")
-        native_spheres = 3*expanded.max_validation_points*metadata["spheres"]
+        native_spheres = 3*256*metadata["spheres"]
         self.assertLessEqual(native_spheres, query.max_query_spheres)
         self.assertLessEqual(native_spheres*20+8, query.max_cache_bytes)
         # BEGIN complete refined coverage still fits without dropping samples.
-        maximum_robot_query = 3*expanded.max_validation_points*expanded.max_robot_spheres
+        maximum_robot_query = 3*256*expanded.max_robot_spheres
         self.assertLessEqual(maximum_robot_query, query.max_query_spheres)
         self.assertLessEqual(query.max_query_spheres*20+8, query.max_cache_bytes)
         self.assertGreater(3*3072*metadata["spheres"], query.max_query_spheres)
+        # END all 32768 finite queries are retained across bounded chunks.
         # END both the sphere bound and byte bound remain finite and enforced.
         # END additional samples are admitted intact, never thinned to fit cache.
         self.assertEqual(torch.cuda.is_initialized(), cuda_before)
@@ -2121,6 +2141,9 @@ class ExportedCurveContractTests(unittest.TestCase):
         problem = cartesian_problem((MotionPhase("free", constant_path()),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                          np.zeros((2, 3)), np.array([[1e9, 0., 0.], [-1e9, 0., 0.]]), 1.)
+        # Keep this intentionally huge excursion in its declared domain so
+        # this test reaches the separate finite-work rejection it exercises.
+        planner._verification_fk.config.kinematics_config.joint_limits.position *= 1e6
         with patch("manipulation.planning.np.linspace", wraps=np.linspace) as allocations:
             with self.assertRaisesRegex(ValueError, "finite sample budget"):
                 planner.export(result)
