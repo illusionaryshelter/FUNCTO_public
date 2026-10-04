@@ -1105,20 +1105,20 @@ def _component_rows(row, world_bounds, margin):
     finite material region. Source body and selected target layer names survive
     component expansion so neither filtering nor permission becomes per-mesh.
     """
-    from .tsdf_geometry import ObservedTsdfGeometry, coal_component
+    from .tsdf_geometry import ObservedTsdfGeometry
     geometry = row["shape"]
     if not isinstance(geometry, ObservedTsdfGeometry):
         yield row
         return
     local_bounds = None if world_bounds is None else _transform_bounds(
         (world_bounds[0]-margin, world_bounds[1]+margin), np.linalg.inv(row["pose"]))
-    for kind, index, vertices in geometry.iter_components(local_bounds):
-        shape, local = coal_component(vertices)
-        # Coal uses a translated frame for points/segments. Undo that frame
-        # for the complete-overlap LP vertices before applying it exactly once.
-        points = (vertices-local[:3, 3]) @ local[:3, :3]
+    # BEGIN reuse fixed component geometry while recomputing the current pose.
+    # Cached points already use the point/segment primitive's local frame;
+    # applying row.pose @ local once preserves complete-overlap witnesses.
+    for kind, index, shape, local, points in geometry.iter_collision_components(local_bounds):
         yield {**row, "shape": shape, "pose": row["pose"] @ local,
                "vertices": {"tsdf_component": points}, "tsdf_component_id": (kind, index)}
+    # END the selected owner/layer and all query-specific fields remain intact.
 
 
 def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, request,

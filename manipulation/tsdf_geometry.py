@@ -6,6 +6,7 @@ negative convex piece therefore describe the same geometry. Unknown samples
 never acquire a value or an occupied neighbourhood.
 """
 
+from collections import OrderedDict
 from itertools import combinations
 import math
 
@@ -336,6 +337,16 @@ class ObservedTsdfGeometry:
         self.storage_nbytes = sum(array.nbytes for array in arrays) + triangle_count * 512
         if self._tree is not None:
             self.storage_nbytes += self._tree.indices.nbytes + self._tree.size * 128
+        # BEGIN bounded reuse of fixed local collision geometry.
+        # Each snapshot owns its cache: kind/index cannot alias another map,
+        # owner or layer. Reserve its full capacity before scene admission,
+        # which reads storage_nbytes only once. A component has at most eight
+        # vertices; 4 KiB covers its small native hull/BVH, arrays and Python
+        # bookkeeping conservatively. Current world poses/results stay outside.
+        self._collision_cache_capacity = min(16384, sum(self._counts))
+        self._collision_cache = OrderedDict()
+        self.storage_nbytes += self._collision_cache_capacity * 4096
+        # END cache residency is bounded independently of trajectory length.
 
     @staticmethod
     def _decode_components(record, kind, maximum_vertices):
@@ -366,8 +377,14 @@ class ObservedTsdfGeometry:
                 raise ValueError("TSDF candidate bounds require finite ordered XYZ corners")
             centre = (lower + upper) / 2
             radius = float(np.linalg.norm(upper - lower) / 2) + self._radius
-            candidates = self._tree.query_ball_point(centre, radius, return_sorted=True)
-            candidates = [i for i in candidates if np.all(self._upper[i] >= lower) and np.all(self._lower[i] <= upper)]
+            # BEGIN batch the same closed AABB comparisons in candidate order.
+            # Integer indexing also handles an empty KD-tree result. The tree
+            # search, its radius and inclusive face/edge/point tests are unchanged.
+            candidates = np.asarray(self._tree.query_ball_point(centre, radius, return_sorted=True), dtype=np.intp)
+            intersects = (np.all(self._upper[candidates] >= lower, axis=1)
+                          & np.all(self._lower[candidates] <= upper, axis=1))
+            candidates = candidates[intersects]
+            # END boolean selection retains the original sorted component IDs.
         surfaces, negatives, _ = self._counts
         for index in candidates:
             if index < surfaces:
@@ -380,4 +397,32 @@ class ObservedTsdfGeometry:
             elif negative:
                 local = index - surfaces - negatives
                 yield "negative_cell", int(local), self._lower[index] + _CORNERS * self.voxel_size
+
+    # BEGIN reuse only snapshot-local Coal geometry, never query decisions.
+    def iter_collision_components(self, bounds=None):
+        """Yield candidate IDs, native shapes, local poses and native-frame points.
+
+        Coal's distance/collision calls read these shapes. Point/segment
+        primitives use translated/rotated coordinates, so their original
+        vertices must undergo the same local conversion used before caching.
+        Callers still compose the owner's current world pose for every query.
+        LRU eviction drops only this cache's reference; a yielded row keeps its
+        own shape and arrays alive until the ongoing query has consumed them.
+        """
+        for kind, index, vertices in self.iter_components(bounds):
+            key = (kind, index)
+            component = self._collision_cache.get(key)
+            if component is None:
+                shape, local = coal_component(vertices)
+                points = (vertices - local[:3, 3]) @ local[:3, :3]
+                local.setflags(write=False)
+                points.setflags(write=False)
+                component = (shape, local, points)
+                self._collision_cache[key] = component
+                if len(self._collision_cache) > self._collision_cache_capacity:
+                    self._collision_cache.popitem(last=False)
+            else:
+                self._collision_cache.move_to_end(key)
+            yield kind, index, *component
+    # END no world pose, distance/contact result or permission enters the cache.
 # END one observed reconstruction supplies both zero distances and negative material.
