@@ -3425,6 +3425,9 @@ class _CuroboPlanner:
 
     # BEGIN constrain the actual cubic throughout native initialization/updates.
     def _bind_physical_domains(self):
+        # BEGIN FUNCTO owns the optimizer/goal extensions on its solver instances.
+        from .curobo_solver_components import bind_solver_components
+
         limits = self._verification_native.get_cost("cspace").config.joint_limits
         columns = [limits.joint_names.index(name) for name in self.joint_names]
         bounds = limits.position[:, columns]
@@ -3433,11 +3436,8 @@ class _CuroboPlanner:
             self.start.position, self.start.velocity, self.formal_clock["knot_dt"],
             self.trajopt.action_horizon)
         for solver, domain in ((self.ik, self.position_domain), (self.trajopt, self.physical_domain)):
-            for optimizer in solver.core.optimizers:
-                if not hasattr(optimizer._core, "set_action_domain"):
-                    raise RuntimeError("The active cuRobo source lacks the physical action-domain hook; "
-                                       "run with the reviewed local curobo source on PYTHONPATH")
-                optimizer._core.set_action_domain(domain)
+            bind_solver_components(solver, domain)
+        # END the installed cuRobo library needs no physical-domain/cache patch.
     # END limits are the model's full physical q interval, never a seed box.
 
     # BEGIN reject an immutable infeasible entrance before running native IK.

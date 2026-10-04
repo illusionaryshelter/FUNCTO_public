@@ -1,0 +1,149 @@
+"""Exercise FUNCTO composition using native CPU L-BFGS and goal allocation."""
+
+# BEGIN regression coverage for the behavior moved out of third-party source.
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import torch
+from curobo._src.optim.components.gradient_opt_core import GradientOptCore
+from curobo._src.optim.gradient.lbfgs import LBFGSOpt, LBFGSOptCfg
+from curobo._src.solver.manager_goal import GoalManager
+from curobo._src.solver.solve_mode import SolveMode
+from curobo._src.solver.solve_state import SolveState
+from curobo._src.types.device_cfg import DeviceCfg
+from curobo.types import GoalToolPose, JointState
+
+from manipulation.curobo_solver_components import (
+    LayoutGoalManager, PhysicalGradientCore, bind_solver_components,
+)
+from manipulation.physical_joint_domain import (
+    CubicJointDomain, JointDomainInitializationError, JointPositionDomain,
+)
+
+
+class AnalyticRollout:
+    """A differentiable objective beyond the limits; inspect actual evaluations."""
+
+    def __init__(self, domain, horizon, offset=0.):
+        self.domain, self.action_horizon = domain, horizon
+        self.action_dim = domain.lower.numel()
+        self.action_bound_lows = domain.lower.float()
+        self.action_bound_highs = domain.upper.float()
+        self.evaluations = []
+        self.offset = offset
+
+    def update_batch_size(self, batch_size):
+        self.batch_size = batch_size
+
+    def evaluate_action(self, action, use_cuda_graph=False):
+        # This observes tensors at the rollout boundary, independently of
+        # which search strategy produced them. Violations abort before cost.
+        self.domain.validate(action)
+        self.evaluations.append(action.detach().clone())
+        costs = ((action-4.)**2).sum(dim=(-1, -2))+self.offset
+        return SimpleNamespace(costs_and_constraints=SimpleNamespace(
+            get_sum_cost_and_constraint=lambda sum_horizon: costs))
+
+
+class NativeComponentTest(unittest.TestCase):
+    device = DeviceCfg("cpu")
+
+    def make_solver(self, domain, horizon, offset=0.):
+        rollouts = [AnalyticRollout(domain, horizon, offset) for _ in range(2)]
+        optimizer = LBFGSOpt(LBFGSOptCfg(
+            device_cfg=self.device, num_iters=4, inner_iters=2, history=2,
+            line_search_scale=[0., .2, 1.], step_scale=.98,
+            use_cuda_kernel_step_direction=False, use_cuda_kernel_line_search=False,
+        ), rollouts)
+        solver = SimpleNamespace(core=SimpleNamespace(
+            device_cfg=self.device, config=SimpleNamespace(use_cuda_graph=False),
+            optimizers=[optimizer], goal_registry_manager=GoalManager(self.device)))
+        return solver, optimizer, rollouts
+
+    def test_both_rollouts_obey_domains_through_native_resize_and_reinitialize(self):
+        lower, upper = torch.tensor([.1, -.8]), torch.tensor([1., .9])
+        domains = [(JointPositionDomain(lower, upper), 1),
+            (CubicJointDomain(lower, upper, torch.tensor([.4, .2]),
+                             torch.tensor([.05, -.05]), .2, 8), 8)]
+        for domain, horizon in domains:
+            with self.subTest(horizon=horizon):
+                solver, optimizer, rollouts = self.make_solver(domain, horizon)
+                bind_solver_components(solver, domain)
+                with patch("curobo._src.runtime.cuda_event_timers", False):
+                    for count in (2, 1, 2):
+                        optimizer.update_num_problems(count)
+                        seeds = torch.tensor([.4, .2]).repeat(count, horizon, 1)
+                        optimizer.reinitialize(seeds)
+                        result = optimizer.optimize(seeds)
+                        domain.validate(result)
+                        self.assertGreater(float((result-seeds).abs().sum()), 0.)
+                        self.assertEqual(tuple(result.shape), (count, horizon, 2))
+                self.assertTrue(all(len(rollout.evaluations) >= 3 for rollout in rollouts))
+
+    def test_initial_best_is_legal_even_when_native_cost_sentinel_is_smaller(self):
+        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1, offset=1e20)
+        bind_solver_components(solver, domain)
+        seed = torch.full((1, 1, 2), .4)
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+            result = optimizer.optimize(seed)
+        torch.testing.assert_close(result, seed)
+
+    def test_illegal_seed_never_reaches_either_rollout_and_binding_is_local(self):
+        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
+        owned, optimizer, rollouts = self.make_solver(domain, 1)
+        ordinary, native, _ = self.make_solver(domain, 1)
+        bind_solver_components(owned, domain)
+        self.assertIsInstance(optimizer._core, PhysicalGradientCore)
+        self.assertIs(type(native._core), GradientOptCore)
+        self.assertIs(type(ordinary.core.goal_registry_manager), GoalManager)
+        with self.assertRaises(JointDomainInitializationError):
+            optimizer.reinitialize(torch.zeros((1, 1, 2)))
+        self.assertTrue(all(not rollout.evaluations for rollout in rollouts))
+        manager = owned.core.goal_registry_manager
+        bind_solver_components(owned, domain)
+        self.assertIs(owned.core.goal_registry_manager, manager)
+
+    def goal(self, count, value):
+        return GoalToolPose(tool_frames=["tool"],
+            position=torch.full((1, 1, 1, count, 3), float(value)),
+            quaternion=torch.tensor([1., 0., 0., 0.]).repeat(1, 1, 1, count, 1))
+
+    def state(self, seeds, goals=1):
+        return SolveState(SolveMode.SINGLE, batch_size=1, num_envs=1,
+            num_seeds=seeds, num_trajopt_seeds=seeds, num_goalset=goals, tool_frames=["tool"])
+
+    def test_goal_seed_indices_reallocate_for_2_1_2_and_reuse_same_layout(self):
+        manager = LayoutGoalManager(self.device)
+        current = JointState.from_position(torch.zeros((1, 2)))
+        previous = None
+        for seeds in (2, 1, 2):
+            state = self.state(seeds)
+            buffer, changed = manager.update_goal_buffer(
+                state, self.goal(1, seeds), current_js=current)
+            self.assertTrue(changed)
+            self.assertIsNot(buffer, previous)
+            self.assertEqual(manager.solve_state, state)
+            self.assertEqual(buffer.idxs_link_pose.numel(), seeds)
+            self.assertEqual(buffer.idxs_current_js.numel(), seeds)
+            reused, changed = manager.update_goal_buffer(state, self.goal(1, seeds+1))
+            self.assertFalse(changed)
+            self.assertIs(reused, buffer)
+            self.assertTrue(bool((reused.link_goal_poses.position == seeds+1).all()))
+            previous = buffer
+
+    def test_smaller_goalset_still_uses_native_padding(self):
+        manager = LayoutGoalManager(self.device)
+        buffer, _ = manager.update_goal_buffer(self.state(2, 3), self.goal(3, 1.))
+        reused, changed = manager.update_goal_buffer(self.state(2, 1), self.goal(1, 2.))
+        self.assertFalse(changed)
+        self.assertIs(reused, buffer)
+        self.assertEqual(reused.link_goal_poses.position.shape[-2], 3)
+        self.assertTrue(bool((reused.link_goal_poses.position == 2.).all()))
+
+
+if __name__ == "__main__":
+    unittest.main()
+# END no physical robot, scene substitution, or CUDA allocation is needed here.

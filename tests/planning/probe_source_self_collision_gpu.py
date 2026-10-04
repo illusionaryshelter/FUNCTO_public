@@ -7,7 +7,9 @@ Run serially under the existing external RAM/device monitor.
 
 # BEGIN complete public API regression with explicit source-solid evidence.
 import argparse
-from dataclasses import asdict
+# BEGIN native seed-layout transitions share this bounded source model.
+from dataclasses import asdict, replace
+# END no additional robot or environment fixture is introduced.
 import gc
 import json
 from pathlib import Path
@@ -72,6 +74,38 @@ def run(output):
             del planner, scene
             gc.collect()
             torch.cuda.empty_cache()
+
+        # BEGIN repeated actual native solves exercise FUNCTO's goal components.
+        problem = problem_at(-.3, -.28)
+        scene = _source_scene(robot, problem)
+        planner = _CuroboPlanner(problem, scene, robot,
+            replace(budget, trajectory_seeds=2, maximum_trajectory_solves=3), "cuda:0",
+            robot_validator=scene.robot_validator)
+        try:
+            seeds, _ = planner.reference_seeds()
+            transitions = []
+            for count in (2, 1, 2):
+                native = planner.optimize(seeds[:, :count].clone())
+                manager = planner.trajopt.core.goal_registry_manager
+                # Check the actual result and native start/pose index buffers,
+                # not just FUNCTO's requested count. Each returned cubic must
+                # retain its mechanical position bounds even if a task rejects it.
+                planner.physical_domain.validate(native.solution)
+                if (native.num_seeds != count or native.solution.shape[1] != count
+                        or manager.solve_state.num_seeds != count
+                        or manager.goal_buffer.idxs_link_pose.numel() != count
+                        or manager.goal_buffer.idxs_current_js.numel() != count):
+                    raise AssertionError("Native result/goal indices retained a stale seed layout")
+                transitions.append({"num_seeds": count,
+                    "native_success": native.success.detach().cpu().tolist()})
+            report["cases"].append({"case": "native_seed_layout_2_1_2", "passed": True,
+                "transitions": transitions})
+        finally:
+            planner.close()
+        del planner, scene, seeds, native, manager
+        gc.collect()
+        torch.cuda.empty_cache()
+        # END task acceptance is checked independently by the public request below.
 
         # A short reach on the other side of the fixed box exercises the full
         # public request, native success formula and final cubic acceptance.
