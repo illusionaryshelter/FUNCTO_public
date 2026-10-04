@@ -1869,7 +1869,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         metadata = self.robot_metadata()
         native = SimpleNamespace(num_pose_links=1, num_spheres=512, num_dof=16, num_links=64)
         scene = SimpleNamespace(required_progress_anchors=(), contacts=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
-                                {"retained": 0, "live": 0, "shared_cpu": 0, "shared_grids": 0})
+                                {"retained": 0, "live": 0, "shared_cpu": 0, "shared_grids": 0, "graph_live": 0})
         budget = PlanningBudget(max_validation_points=8192)
         before_cuda = torch.cuda.is_initialized()
         # BEGIN the anchor admission bound includes native self-cost buffers.
@@ -1932,7 +1932,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planner.anchors = np.array([0., 1., 2.])
         planner.problem = object()
         planner.scene = SimpleNamespace(required_progress_anchors=(), contacts=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
-                                        {"retained": batch*horizon, "live": 0, "shared_cpu": 0, "shared_grids": 0})
+                                        {"retained": batch*horizon, "live": 0, "shared_cpu": 0, "shared_grids": 0, "graph_live": 0})
         planner.robot_metadata = self.robot_metadata()
         planner.progress_map = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
         planner.seed_parameter, planner.formal_clock, planner.robot_dict = object(), {}, {}
@@ -2031,7 +2031,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             PlanningBudget(max_scene_workspace_bytes=6*1024**3+1)
         # END requests above the local ceiling still fail before allocations.
         scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
-                                {"retained": 1024**3, "live": 0, "shared_cpu": 0, "shared_grids": 0})
+                                {"retained": 1024**3, "live": 0, "shared_cpu": 0, "shared_grids": 0, "graph_live": 0})
         with self.assertRaisesRegex(ValueError, "scene query workspaces"):
             _planning_workspace_bytes(scene, self.robot_metadata(), PlanningBudget(), 322)
         with self.assertRaises(TypeError):
@@ -2041,17 +2041,20 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
 
     # BEGIN a large finite scene must fit by lifetime, without dropping queries.
     def test_graph_admission_preserves_eager_budget_and_counts_shared_grids_once(self):
-        # Distinct guidance/metrics peaks verify that private CUDA graph pools
-        # reserve guidance scratch only. The host/device immutable grid pair
-        # is shared across both graph pools and all independently live scenes.
+        # BEGIN graph pools exclude CPU source validation, even in guidance rows.
+        # Distinct full-live/captured peaks catch accidentally duplicating CPU
+        # query/packing/dedup scratch in the two CUDA pools. Immutable grids
+        # remain shared across both graph pools and all independent scenes.
         estimator = Mock(side_effect=lambda batch, horizon, *, robot_coverage_horizon:
             {"retained": 5, "live": 100 if robot_coverage_horizon else 150,
-             "shared_cpu": 17, "shared_grids": 23})
+             "shared_cpu": 17, "shared_grids": 23,
+             "graph_live": 60 if robot_coverage_horizon else 90})
         scene = SimpleNamespace(required_progress_anchors=(), contacts=(),
                                 estimated_workspace_allocation=estimator)
         metadata = self.robot_metadata()
         eager_bytes = 13*5+150+17+23
-        graph_bytes = eager_bytes+2*100
+        graph_bytes = eager_bytes+2*60
+        # END the ordinary eager bound still includes the complete 150-byte peak.
         for capacity, expected_bytes, expected_graph in (
                 (eager_bytes, eager_bytes, False),
                 (graph_bytes-1, eager_bytes, False),

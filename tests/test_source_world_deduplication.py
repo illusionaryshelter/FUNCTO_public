@@ -377,6 +377,11 @@ def test_source_reservation_bounds_real_unique_key_storage_as_horizon_grows(scen
         with monkeypatch.context() as context:
             context.setattr(current, "_source_scene_checker", None)
             original = current.estimated_workspace_allocation(1, count, robot_coverage_horizon=0)
+        # BEGIN binding source acceptance adds no CUDA optimizer graph scratch.
+        assert admitted["graph_live"] == original["graph_live"]
+        assert current.estimated_workspace_bytes(1, count, robot_coverage_guidance=False) == sum(
+            admitted[name] for name in ("retained", "live", "shared_cpu", "shared_grids"))
+        # END the full ordinary bound below still includes native queries and keys.
         # Unbinding removes both the pre-existing one-state native scratch
         # and the new keys. Subtract only that known old scratch to isolate
         # the resource increment; no key-size formula is reproduced here.

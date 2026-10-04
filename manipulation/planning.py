@@ -752,8 +752,10 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     # scene needs CPU cost geometry. A scene whose two graph pools exceed the
     # declared capacity retains the unchanged native eager optimizer as well;
     # neither case changes required queries, arithmetic or iteration counts.
-    graph_live = max(value["live"] for (_, value), (_, _, _, guidance)
+    # BEGIN CPU source validation has no allocations inside either graph pool.
+    graph_live = max(value["graph_live"] for (_, value), (_, _, _, guidance)
                      in zip(allocations, allocation_shapes) if guidance)
+    # END the ordinary live bound above still reserves all validation scratch.
     graph_scene_bytes = scene_bytes+2*graph_live
     trajectory_graph = not scene.contacts and graph_scene_bytes <= budget.max_scene_workspace_bytes
     if trajectory_graph:

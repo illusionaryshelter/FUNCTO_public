@@ -1874,17 +1874,29 @@ class PlanningScene:
                          + (batch*horizon*len(self.robot_sphere_materials)*64 if self._contact_cells else 0))
         contact_bytes += batch*horizon*sum((len(rule._feature_edge_normals)+10)*32 for rule in self.contacts)
         # END CPU neighbor lists separately obey a two-million-pair admission cap.
-        return {"retained": int(retained_bytes),
-                "live": int(query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes+contact_bytes+layer_bytes+layer_scratch
-                            +source_input_bytes+source_query_bytes+source_dedup_bytes+source_transfer_bytes),
-                "shared_cpu": int(shared_cpu_bytes), "shared_grids": int(shared_grid_bytes)}
+        # BEGIN distinguish capture scratch from source validation outside CUDA.
+        # Source queries, CPU-state deduplication and packed CPU transfers run
+        # only in metrics/acceptance, never in the optimizer's captured cost.
+        # Keep the complete ordinary live bound, while graph_live is an explicit
+        # NONADDITIVE subset for the two additional graph pools. Original q/time,
+        # owner poses and layer inputs remain conservatively counted in both.
+        graph_live_bytes = (query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes
+                            +contact_bytes+layer_bytes+layer_scratch+source_input_bytes)
+        live_bytes = graph_live_bytes+source_query_bytes+source_dedup_bytes+source_transfer_bytes
+        return {"retained": int(retained_bytes), "live": int(live_bytes),
+                "shared_cpu": int(shared_cpu_bytes), "shared_grids": int(shared_grid_bytes),
+                "graph_live": int(graph_live_bytes)}
+        # END CPU validation remains fully admitted once at its ordinary boundary.
         # END source scene snapshots are not multiplied by the rollout count.
         # END include checkpointed hand-pair scratch and its retained input.
 
     def estimated_workspace_bytes(self, batch, horizon, *, robot_coverage_guidance=True):
         """Bound one complete query, including its persistent native buffers."""
-        return sum(self.estimated_workspace_allocation(batch, horizon,
-            robot_coverage_horizon=horizon if robot_coverage_guidance else 0).values())
+        # BEGIN graph_live is a subset, not a fifth independent allocation.
+        allocation = self.estimated_workspace_allocation(batch, horizon,
+            robot_coverage_horizon=horizon if robot_coverage_guidance else 0)
+        return sum(allocation[name] for name in ("retained", "live", "shared_cpu", "shared_grids"))
+        # END the ordinary single-query estimate is numerically unchanged.
     # END callers sum caches across rollouts but only one sequential live graph.
 
     def project_residual(self, progress, joint_position, joint_names):
