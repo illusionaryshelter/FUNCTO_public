@@ -1,415 +1,613 @@
-- 这批信息已经足够让我把问题进一步收敛成 **3 个已证实问题 + 1 个高优先级待确认问题**。现在看起来，不是 skill 本身在“泛化后失效”，而是规划链里几种不同近似的边界条件叠加后，把本来有可行空间的问题变成了拒绝。
+我们现在这个新证据把问题又缩小了一层，而且方向非常明确：
 
-  ## 一、已经能确认：自碰撞存在“软优化、硬验证”的语义错配
+> **当前 `Coal + 占据体素` 这条所谓“实体检查”并不是一个真正独立于 ESDF 表示的环境几何检查。机器人几何换成了来源实体，但环境几何仍是由 ESDF 的零/负值格经过“整格立方体化”得到的第二层代理。**
 
-  你的自碰撞例子现在非常清楚。
+所以 `−0.03042025 mm` **不能解释成“2 mm fine map 也确认真实碰撞”**。更准确的解释是：
 
-  优化阶段对同一个球对看到的是
+> 在 `scatter` 生成的 ESDF 零值 seed 上，把每个 2 mm cell 变成完整立方体后，link6 与这个“加厚后的离散表面”发生了 0.03 mm 的相交。
 
-  \[ D=9.669724\times 10^{-6}\ {\rm m}^2 \]
+这和真实桌面仍有约 \(+0.642\) mm 间隙完全可以同时成立。
 
-  以及
+而且我们的数字现在非常漂亮地支持这个解释。
 
-  \[ z_{\rm opt} = \frac12\cdot2500\cdot D \approx0.01209. \]
+------
 
-  其中：
+## 1. 先看一个很有说服力的数量级关系
 
-  - \(D=R^2-d^2\)：最大球对平方差；
-  - \(R=r_i+r_j\)：球半径和；
-  - \(d\)：球心距离；
-  - \(z_{\rm opt}\)：优化阶段看到的自碰撞代价。
+我们当前 Coal 环境代理实际上相当于：
 
-  这对 L-BFGS 来说只是一个**有限的小代价**，完全可能为了改善更重的场景/任务项而接受它。
+\[ \mathcal O_h = \bigcup_{k:\phi_k\le0} \left( c_k+ [-h/2,h/2]^3 \right) \]
 
-  但验证时，同一个 \(D>0\) 被映射为
+其中：
 
-  \[ C=1+\min(z,1) \]
+- \(\mathcal O_h\)：Coal 最终看到的环境占据集合；
+- \(\phi_k\)：第 \(k\) 个 ESDF cell 的值；
+- \(c_k\)：该 cell 中心；
+- \(h\)：voxel 边长；
+- 每个被选择的 cell 都被扩展成完整立方体。
 
-  所以哪怕只重叠
+对一个单位表面法向量
 
-  \[ p\approx0.0797\text{ mm}, \]
+\[ n=(n_x,n_y,n_z), \]
 
-  都会从
+轴对齐 voxel 在该法向上的“半厚度”是
 
-  \[ D=0\quad\Rightarrow\quad C=0 \]
+\[ \rho_h(n) = \frac{h}{2} \left( |n_x|+|n_y|+|n_z| \right). \]
 
-  直接跳到
+如果桌面基本和 grid 对齐，
 
-  \[ D>0\quad\Rightarrow\quad C>1. \]
+\[ n\approx(0,0,1), \]
 
-  也就是说这里有一个真正的**离散语义跳变**：
+那么就是近似
 
-  > 优化器认为“这是一个小代价，可以权衡”；
-  > validator 认为“只要符号变正，就是硬失败”。
+\[ \rho_h\approx\frac h2. \]
 
-  而且你已经证明这不是实际 source collision：
+于是：
 
-  \[ d_{\rm Coal}=+8.347276\text{ mm}. \]
+### 15 mm coarse
 
-  更关键的是，这次甚至没有 self-collision padding。误差完全来自球覆盖：
+\[ \frac{h}{2}=7.5\text{ mm}. \]
 
-  \[ 6.836178+3.465190-10.221683 = 0.079685\text{ mm}. \]
+我们的真实桌面距离约：
 
-  所以这里我现在会明确判断：
+\[ d_{\rm truth}=+0.642\text{ mm}, \]
 
-  **这个拒绝不是调大优化权重就能从根本上修好的。**
+而 Coal coarse：
 
-  调大权重只会逼 CuRobo 更认真地满足一个本身存在保守误报的代理约束。
+\[ d_{\rm coarse}=-6.0051\text{ mm}. \]
 
-  这里更合理的职责划分应该是：
+两者差：
 
-  - 球：继续用于 GPU 优化梯度和 broad phase；
-  - 当最终验证出现 \(D>0\) 时：
-    - 再用 source geometry + Coal 做 narrow phase；
-    - Coal 也碰撞 → 真正拒绝；
-    - Coal 满足安全间隙 → 不因为球代理单独拒绝。
+\[ 0.642-(-6.0051) = 6.6471\text{ mm}. \]
 
-  这和你目前已有的 Pinocchio/Coal 链非常契合，甚至不需要重新设计 skill。
+这就在 **7.5 mm 半 voxel** 的尺度以内。
 
-  当然，这只解决**最终误拒**。如果球误报已经严重到阻止优化器进入某个可行区域，那还得改善球拟合。但你这个具体 pair 只有约 \(0.08\) mm overlap，而 source geometry 有 8 mm 以上间隙，我会优先把它当成 narrow-phase 问题，而不是先重做整个机器人球模型。
+### 2 mm fine/scatter
 
-  ------
+\[ \frac h2=1\text{ mm}. \]
 
-  # 二、环境问题的主要矛盾已经不是机器人球，而是 15 mm 粗图
+Coal 得到：
 
-  这个结果更重要。
+\[ d_{\rm fine}=-0.03042\text{ mm}. \]
 
-  两个 OMPL 目标里：
+相对真实桌面的差：
 
-  \[ d_{\rm link6,coarse} = -6.005,\ -6.191\text{ mm} \]
+\[ 0.642-(-0.03042) = 0.67242\text{ mm}, \]
 
-  这是 **source collision geometry 对 coarse occupancy 本身就相交**。
+同样在 **1 mm 半 voxel** 的尺度以内。
 
-  所以哪怕完全删除机器人 sphere approximation，两个 OMPL 目标仍然非法。
+这不是证明，但已经是非常强的诊断证据：
 
-  但与此同时，对 simulator 原始桌面：
+> **15 mm → 2 mm 后，误差从约 6.65 mm 缩小到约 0.67 mm，几乎按 voxel 几何厚度同步缩小。**
 
-  \[ d_{\rm link6,table} = +0.642,\ +0.337\text{ mm}. \]
+所以我现在不会再把 link6 的主要问题描述成“ESDF 本身错误”。
 
-  候选 01 环境最大点也是：
+更准确的是：
 
-  \[ d_{\rm link6,coarse}=-5.133\text{ mm}, \]
+> **ESDF → `field<=0` → full voxel cubes 这个转换把一个距离场的零等值面变成了有有限厚度的实体层。**
 
-  而
+------
 
-  \[ d_{\rm link6,table}=+0.898\text{ mm}. \]
+# 2. 而 `gather` 又会在这之前进一步加厚 surface seed
 
-  因此现在可以非常明确地区分：
+这次我们特别指出：
 
-  > 这不是 link6 真撞上桌子了；
-  > 是 link6 撞上了 **15 mm 离散地图所表示出来的桌子**。
+> 正式规划：`gather`
+> 扩大 fine 诊断：`scatter`
 
-  这对于 15 mm voxel 并不令人意外。
+这个区别非常重要。
 
-  如果一个 occupied voxel 被看成完整边长
+cuRoboV2 官方现在已经把两者语义写得非常清楚：
 
-  \[ h=15\text{ mm} \]
+### `scatter`
 
-  的立方体，仅半个 voxel 就已经是
+一个 TSDF surface voxel 只映射到包含其中心的那个 ESDF cell，因此形成：
 
-  \[ \frac h2=7.5\text{ mm}. \]
+> exactly one ESDF voxel thick
 
-  沿三维对角线，半对角线甚至达到
+并且官方直接说：
 
-  \[ \frac{\sqrt3}{2}h \approx12.99\text{ mm}. \]
+> **scatter faithfully matches the TSDF surface geometry**
 
-  这里 \(h\) 是 voxel 边长。
+### `gather`
 
-  我不是说你的实现一定产生上述精确误差界——这取决于 voxel 怎么从 RGB-D/ESDF 填充——但 **“真实桌面还有约 0.3–0.9 mm，15 mm occupancy 已经侵入实体约 5–6 mm”这个数量级本身非常合理。**
+每个 ESDF cell 不仅检查中心，还检查 6 个 face-center，因此可能捕获邻居 cell 中的 surface voxel，形成：
 
-  所以这里实际上暴露出了一个重要事实：
+> **dilated seed band (~1.5 voxels thick)**
 
-  > 当前规划允许机器人姿态进入“对真实几何仍安全，但 clearance 已经远小于 coarse-map 分辨能力”的区域。
+官方明确说，这是为了得到更高 collision recall，但代价是**不再精确匹配 TSDF surface**。[nvlabs.github.io](https://nvlabs.github.io/curobo/latest/api/curobo.perception.html?utm_source=chatgpt.com)
 
-  这也是为什么你觉得：
+这几乎就是我们现在现象的官方解释。
 
-  > “场景空间余量明明很大。”
+所以我们正式路径的几何链实际上是：
 
-  全局确实可能很大。
+```
+RGB-D
+ ↓
+TSDF surface
+ ↓
+gather
+ ↓
+约 1.5 voxel 厚的 ESDF seed band
+ ↓
+field <= 0
+ ↓
+每个 seed 又变成完整 voxel cube
+ ↓
+Coal collision geometry
+```
 
-  但**这两个具体关节状态的 link6 与桌面实际上只剩亚毫米 clearance**。
+这里实际上发生了**两次空间加厚**。
 
-  这两个概念要分开：
+因此：
 
-  \[ \exists\ \text{高余量可行轨迹} \]
+> 用这条 Coal 路径去证明“CuRobo 的 ESDF 是否误报”
 
-  并不等于
+存在一定程度的循环论证。
 
-  \[ \text{当前 seed/goal configuration 本身也高余量}. \]
+因为 Coal 的环境仍然源自同一个已经经过 gather 的 ESDF。
 
-  现在你的证据反而说明：
+------
 
-  **泛化以后得到的某些 full-body configuration 过于贴近桌面。**
+# 3. `scatter` 下 32782 个 cell 全部恰好等于 0，这个现象尤其关键
 
-  这并不否定 interaction pose 是正确的。
+我们说：
 
-  ------
+> 负值格 = 0
+> 所有 32782 个选中格都是 ESDF zero cell
 
-  # 三、我现在非常怀疑 ProcessCostManager 存在“约束追赶”现象
+这意味着在这次诊断里：
 
-  你这个时间关系非常值得注意。
+```
+occupied = field <= 0
+```
 
-  候选 00 的环境最大违例在：
+实际上等价于：
 
-  \[ t=13.300000\text{ s}. \]
+```
+occupied = field == 0
+```
 
-  于是 refine 加了 16 个点：
+也就是说 Coal 看到的根本不是“障碍物内部 voxel volume”。
 
-  \[ 13.266667 \sim 13.337500\text{ s}. \]
+它看到的是：
 
-  重新优化之后，候选 01 的最大环境违例跑到了：
+> **ESDF surface seed cells 的立方体并集。**
 
-  \[ t=13.434559\text{ s}. \]
+示意：
 
-  已经跑出了新增检查窗口约
+```
+真实连续 surface:
 
-  \[ 13.434559-13.337500 = 0.097059\text{ s}. \]
+────────────────────────────
 
-  而这一次：
 
-  - 控制点确实重新优化；
-  - 最大变化达到 \(0.545822\) rad；
-  - 新增点只进入 ProcessCostManager；
-  - 项目场景检查本身仍是离散的；
-  - 最终 validator 又比优化时密得多。
+scatter ESDF zero centers:
 
-  所以目前很像这种行为：
+   •   •   •   •   •   •
 
-  ```
-  candidate 00:
-  
-  ----------X----------------
-           13.30
-            ↑
-         collision
-  
-  加入检查点：
-  
-  -------||||||||------------
-  
-  
-  candidate 01:
-  
-  -------||||||||-----X------
-                      ↑
-                   13.4346
-  ```
 
-  也就是优化器把违例从被加强约束的区域**推到了旁边没有同等检查密度的位置**。
+变成完整 2 mm cubes:
 
-  注意我现在还不能断言就是这样，因为 00→01 连几何路径也改变了，而不只是时间平移。
+┌───┬───┬───┬───┬───┬───┐
+│   │   │   │   │   │   │
+└───┴───┴───┴───┴───┴───┘
+────────────────────────────
+        ↑
+   形成有限厚度 shell
+```
 
-  但这是非常值得验证的。
+所以：
 
-  如果成立，它实际上比“interpolation_dt 是否太大”更具体：
+\[ d_{\rm Coal}<0 \]
 
-  > **最终密集验证使用的约束集合，比 TrajOpt 真正优化的 ProcessCostManager 场景约束集合更强。**
+只能说明：
 
-  于是你永远可能遇到：
+> robot source geometry 与这个 **voxelized shell** 相交。
 
-  \[ \text{optimizer passes its sampled problem} \]
+不能推出：
 
-  但
+\[ d_{\rm TSDF\ surface}<0. \]
 
-  \[ \text{dense validator rejects another point}. \]
+更不能推出：
 
-  refine 再把这个点加入以后，又可能出现下一个点。
+\[ d_{\rm physical\ table}<0. \]
 
-  这就会退化成一种 constraint whack-a-mole。
+这一点现在应该成为我们报告里的明确证据边界。
 
-  你前面提出的：
+------
 
-  > 按完整机器人几何空间位移界增加检查时刻
+# 4. 官方 API 实际上已经给我们准备了更合适的两种导出方式
 
-  如果目前主要用于**最终验证**，那我现在认为它真正应该发挥价值的地方，可能恰恰是：
+我们发现的这两个接口非常重要，而且不是“我们重新发明一套检查方法”。
 
-  > **也用于决定优化阶段 ProcessCostManager 必须检查哪些时间。**
+## A. `extract_mesh()`
 
-  不一定每轮都用 2 万多个点，那显然太贵。
+当前 V2 的 `Mapper.extract_mesh()` 直接调用 TSDF integrator，通过 marching cubes 提取：
 
-  但可以自适应地把“无法由现有采样证明安全”的 segment 加入 optimizer constraint set。
+\[ \text{TSDF}=0 \]
 
-  这和单纯在失败以后围绕最大点加固定 16 个时间，本质上不同。
+的三角等值面。
 
-  ------
+源码明确写的是：
 
-  # 四、粗细地图切换现在也出现了一个明显的非光滑边界
+- `level=0.0`
+- GPU marching cubes
+- 从 `_tsdf_integrator.extract_mesh(...)` 导出
 
-  这个虽然还不是主因，但我认为会影响优化稳定性。
+它**不经过 ESDF gather/scatter seeding**。[GitHub](https://github.com/NVlabs/curobo/blob/main/curobo/_src/perception/mapper/integrator_esdf.py)
 
-  候选 01 的 link7 只因为超出 fine 支撑：
+官方 volumetric mapping 文档也把两件事明确分开：
 
-  \[ x\approx0.131\text{ mm}, \qquad y\approx0.695\text{ mm}, \]
+- TSDF → mesh
+- TSDF → ESDF → \(O(1)\) trilinear collision distance query
 
-  整条 link 就从：
+也就是说官方架构本身没有把“ESDF 零格”当 mesh 使用。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.examples.getting_started.volumetric_mapping.html?utm_source=chatgpt.com)
 
-  \[ 2\text{ mm fine map} \]
+这非常适合我们的 Coal 独立验证。
 
-  切换成：
+------
 
-  \[ 15\text{ mm coarse map}. \]
+## B. `extract_occupied_voxels()`
 
-  而你又说：
+这个接口也不是从 `compute_esdf()` 的 `feature_tensor<=0` 提取。
 
-  - 以“整个 link 的全部覆盖球”是否被 fine map 支撑作为选择条件；
-  - 两张图不叠加；
-  - 不是按 collision cost 选择。
+它直接从 **TSDF integrator** 提取 occupied/surface voxels：
 
-  这个规则本身逻辑是干净的，但对于梯度优化存在一个问题：
+- `surface_only=True` 时提取 near-surface voxels；
+- `sdf_threshold` 默认是底层 TSDF voxel size；
+- 返回 voxel/subvoxel sample center。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.perception.html?utm_source=chatgpt.com)
 
-  \[ M(q)= \begin{cases} M_{\rm fine},&q\in\Omega_{\rm fine}\\ M_{\rm coarse},&q\notin\Omega_{\rm fine} \end{cases} \]
+因此它同样绕开 `gather/scatter`。
 
-  其中：
+但我会强调：
 
-  - \(q\)：机器人配置；
-  - \(M(q)\)：当前选择的地图；
-  - \(\Omega_{\rm fine}\)：整个 link 被 fine map 完整支撑的配置集合。
+> **如果我们把 `extract_occupied_voxels()` 得到的中心再次变成完整边长 \(h\) 的立方体，那么半 voxel 的几何膨胀依然存在。**
 
-  在边界上，地图查询函数可能出现离散跳变。
+所以它比我们现在的 ESDF threshold 方法语义更正确，但如果目标是做高精度 narrow-phase distance，**mesh 更合适。**
 
-  L-BFGS 得到的是当前地图内部的梯度，但并不知道：
+------
 
-  > 再移动 0.2 mm，整个 link 会换成另一张 resolution 相差 7.5 倍的地图。
+# 5. 因此我现在建议把架构明确成“三种几何表示，三种职责”
 
-  这不是 cuRobo 梯度本身的问题，而是你外部 map selector 引入的非光滑性。
+这不是给 skill 加东西，而是修 collision backend。
 
-  对于候选 01 的 **link6 主失败**它不是根因，因为 link6 本来就在 coarse。
+## 第一层：CuRobo sphere + ESDF
 
-  但它很可能是后续泛化中的一个稳定性问题。
+保留现在的：
 
-  ------
+```
+robot spheres
+      ×
+gather ESDF
+```
 
-  # 现在我最想继续确认 4 件事
+用于：
 
-  ### ① 候选 00 与 01 的“环境最大值”和“自碰撞最大值”分别是多少？
+- L-BFGS 梯度；
+- 快速 cost；
+- 远离障碍物；
+- broad phase。
 
-  最好给我：
+`gather` 为了提高 recall 而故意保守，这是官方设计，不必因为现在的问题就全面改成 scatter。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.perception.html?utm_source=chatgpt.com)
 
-  |               | candidate 00 | candidate 01 |
-  | ------------- | ------------ | ------------ |
-  | env max       | ?            | 0.222158104  |
-  | env max time  | 13.300000    | 13.434559    |
-  | self max      | ?            | 1.006044     |
-  | self max time | ?            | 6.614063     |
+------
 
-  特别想知道：
+## 第二层：source robot geometry + TSDF mesh + Coal
 
-  **01 是否真的降低了原来的环境问题，只是把最大值转移了？**
+当 proxy 判断危险时：
 
-  如果：
+```
+sphere / ESDF says collision
+          ↓
+source robot collision geometry
+          ×
+Mapper.extract_mesh()
+          ↓
+Coal narrow phase
+```
 
-  \[ C_{\rm env}^{00}>C_{\rm env}^{01} \]
+用于：
 
-  说明 refine 有效果，只是没有形成全轨迹覆盖。
+- OMPL state validity 的最终裁决；
+- TrajOpt candidate 最终裁决；
+- dense trajectory validation；
+- proxy false-positive 消歧。
 
-  如果反而：
+Coal 本身就是为 GJK/EPA collision 和 distance narrow phase 设计的，也支持安全 margin 和距离下界。[GitHub](https://github.com/coal-library/coal?utm_source=chatgpt.com)
 
-  \[ C_{\rm env}^{01}\ge C_{\rm env}^{00}, \]
+这跟我们已经对 self-collision 做的事情是一模一样的哲学：
 
-  那重新优化本身还有更大的问题。
+```
+sphere provides optimization gradient
+source geometry provides acceptance decision
+```
 
-  ------
+只是 world side 也要从：
 
-  ### ② ProcessCostManager 原本到底在哪些时间检查环境？
+```
+ESDF-derived cubes
+```
 
-  这现在是我最关心的信息之一。
+换成：
 
-  比如是：
+```
+TSDF zero-level mesh
+```
 
-  - 16 个 B-spline control times？
-  - 641 个导出点中的子集？
-  - 固定 \(N\) 个 progress samples？
-  - 每个 phase 分配固定个数？
-  - 根据 task events 插入？
+------
 
-  另外新增的 16 个时间加入后：
+## 第三层：simulator native geometry
 
-  > 原来的 grid 保留不变，只增加这 16 个？
+只在仿真开发阶段作为 oracle：
 
-  还是会整体重新生成？
+```
+MuJoCo table / object collision geometry
+```
 
-  我想计算：
+用于回答：
 
-  \[ \Delta t_{\max} = \max_k(t_{k+1}-t_k) \]
+> Mapper 和 narrow phase 相对“真实仿真世界”误差多少？
 
-  尤其是 \(13.3\sim13.45\) s 附近。
+它不应该成为最终真机算法的一部分。
 
-  ------
+------
 
-  ### ③ OMPL 的两个“目标配置”究竟是硬编码的完整 \(q\)，还是一个 goal manifold？
+# 6. 这样仍然可以满足我们之前强调的“同一地图选择规则”
 
-  这个问题现在优先级非常高。
+这个要求不需要放弃。
 
-  也就是 OMPL 实际要求：
+应该统一的是：
 
-  \[ q=q_{\rm goal} \]
+> **选哪个 map layer / 哪个 observation snapshot**
 
-  还是：
+而不是强制：
 
-  \[ FK(q)=X_{\rm task}, \qquad q\in Q_{\rm valid} \]
+> **所有模块必须使用同一种几何表示。**
 
-  然后允许自己在冗余自由度里寻找不同的 \(q\)？
+例如：
 
-  如果目标就是失败候选里拿出的两个完整关节配置，而这两个配置的 link6 恰好只有
+```
+MapSelector(q, link)
+        ↓
+    chooses FINE
+        ↓
+┌──────────────────────────┐
+│ same fine mapper snapshot│
+├──────────────────────────┤
+│ ESDF → CuRobo gradient   │
+│ TSDF mesh → Coal verdict │
+└──────────────────────────┘
+```
 
-  \[ 0.337\sim0.642\text{ mm} \]
+或者：
 
-  真实桌面 clearance，那么 OMPL 在入口：
+```
+MapSelector(q, link)
+        ↓
+    chooses COARSE
+        ↓
+┌──────────────────────────┐
+│same coarse mapper snapshot│
+├───────────────────────────┤
+│ ESDF → CuRobo gradient    │
+│ TSDF mesh → Coal verdict  │
+└───────────────────────────┘
+```
 
-  ```
-  goal invalid
-  → motion_checks = 0
-  ```
+也就是：
 
-  其实非常自然。
+\[ \text{map identity一致} \]
 
-  而且这样会出现一个架构上的限制：
+但
 
-  > **OMPL 被允许换路径，却没有被允许换 endpoint posture。**
+\[ \text{representation可以不同}. \]
 
-  如果交互任务实际上允许不同 elbow posture，那么“空间明明够但 OMPL 连搜索都没开始”就有非常直接的解释。
+这反而更标准。
 
-  这一点现在我不会猜，希望你确认。
+------
 
-  ------
+# 7. 我们现在最值得做的不是继续规划，而是一个非常小的表示对照实验
 
-  ### ④ 15 mm coarse occupancy 到底怎么构造？
+固定：
 
-  我想知道从 RGB-D 到这个占据体的具体规则：
+- 当前 RGB-D；
+- 当前 TSDF；
+- 同一个 link6 \(q\)；
+- 同一个 13.378 s OMPL boundary；
+- 同一来源机器人 collision geometry。
 
-  - TSDF 后按什么阈值得到 occupancy？
-  - 一个 voxel 只要被 surface 穿过就把整个 cell 填满？
-  - Coal 看到的是完整 \(15^3\) mm cube？
-  - ESDF 距离是到 voxel center、voxel surface，还是 reconstructed zero level set？
-  - coarse/fine 两层是否来自同一 TSDF 后重新采样，还是独立积分？
+然后只换环境表示。
 
-  这会决定我们能不能给 coarse map 建一个明确的保守误差界
+建议直接得到这张表：
 
-  \[ \epsilon_{\rm coarse}. \]
+| 环境表示                               | seed                  | Coal link6 distance |
+| -------------------------------------- | --------------------- | ------------------- |
+| Simulator 原桌面                       | —                     | **+0.642 mm**       |
+| TSDF `extract_mesh()`                  | 不涉及 gather/scatter | **?**               |
+| TSDF `extract_occupied_voxels()`→cubes | 不涉及 gather/scatter | **?**               |
+| 2 mm ESDF→`field<=0` cubes             | scatter               | **−0.030 mm**       |
+| 2 mm ESDF→`field<=0` cubes             | gather                | **?**               |
+| 15 mm ESDF→`field<=0` cubes            | gather                | **−6.005 mm**       |
 
-  一旦这个界能建立，就可以把 multiresolution 规则从“ROI 里用 fine”升级成更有意义的：
+这一次实验的信息量非常高。
 
-  \[ d_{\rm coarse}>\epsilon_{\rm coarse}+g_{\rm safe} \Rightarrow \text{coarse 已足够证明安全}, \]
+### 如果得到：
 
-  否则：
+\[ d_{\rm mesh}\approx +0.6\text{ mm} \]
 
-  \[ \text{必须进入 fine / exact refinement}. \]
+那么问题几乎确定：
 
-  其中：
+> **我们的 `field<=0 → cubes` 路径正在制造 collision geometry inflation。**
 
-  - \(d_{\rm coarse}\)：粗图查询距离；
-  - \(\epsilon_{\rm coarse}\)：粗图几何表示误差上界；
-  - \(g_{\rm safe}\)：真正需要的安全间隙。
+### 如果：
 
-  这比“整个 link 是否完全位于一个预设 fine ROI”更接近你现在真正遇到的问题。
+\[ d_{\rm mesh}<0 \]
 
-  ------
+那才说明：
 
-  目前我的排序已经比较明确：
+> TSDF 重建出来的 zero surface 本身已经侵入 link6。
 
-  **P1：优化场景约束的采样集合与最终密集验证不一致。**
-  **P2：15 mm coarse occupancy 无法支持亚毫米级 table clearance，却被 OMPL hard gate 当作最终合法性。**
-  **P3：球代理 positive 被 validation binary conversion 直接升级为硬拒绝，而 source geometry 实际安全。**
-  **P4：fine/coarse 硬切换给梯度优化引入非光滑边界。**
+这时才继续查 RGB-D integration / TSDF。
 
-  这四个全都是**通用 planner/backend 问题**，目前没有一个要求你给 `grasp_mug` 单独调参数。
+这个实验不会涉及任何 skill 参数。
+
+------
+
+# 8. 特别建议再做 gather/scatter 的 apples-to-apples 比较
+
+我们这次正式与诊断现在不能直接比，就是因为同时变化了：
+
+- extent；
+- resolution；
+- seeding method。
+
+固定：
+
+\[ h=2\text{ mm} \]
+
+且 extent 完全相同，分别：
+
+```
+fine/gather
+fine/scatter
+```
+
+然后比较：
+
+1. zero cell 数量；
+2. negative cell 数量；
+3. `field<=0` cube 的 AABB；
+4. Coal link6 distance；
+5. CuRobo 原始 sphere→ESDF cost。
+
+官方已经告诉我们预期：
+
+\[ \text{gather seed band} > \text{scatter seed band} \]
+
+因为 gather 本来就会 over-seed。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.perception.html?utm_source=chatgpt.com)
+
+如果实测：
+
+```
+scatter: −0.03 mm
+gather : −1.x mm
+```
+
+就不会再奇怪。
+
+------
+
+# 9. 我会停止使用 `field <= 0` 作为“实体 occupied geometry”的定义
+
+这可能是当前最值得直接修改的一项。
+
+不是因为条件符号一定错——我们已经验证了具体数据——而是因为**语义不对**：
+
+`compute_esdf()` 的目标是产生距离场供规划器查询。
+
+官方教程直接称它为：
+
+> dense Euclidean Signed Distance Field，供 robot collision spheres 做 \(O(1)\) trilinear distance query。[NV Labs](https://nvlabs.github.io/curobo/latest/api/curobo.examples.getting_started.volumetric_mapping.html?utm_source=chatgpt.com)
+
+而不是：
+
+> 对数组做 threshold，然后把每个 cell 填满成为几何真值。
+
+因此：
+
+```
+occupied = field <= 0
+```
+
+更适合 debug 可视化/离散占据近似，而不适合成为我们所谓的“independent exact environment validator”。
+
+------
+
+# 10. 当前 link6 的真实状态应该重新表述
+
+在现在的证据下，不应该再说：
+
+> link6 与 2 mm fine map 也相交。
+
+更准确的是：
+
+> link6 与由 2 mm scatter ESDF 的零值 cell 转换得到的填充 voxel shell 相交 0.0304 mm。
+
+同时：
+
+\[ d_{\rm simulator\ table} \approx+0.642\text{ mm}. \]
+
+而 TSDF zero-level mesh 距离目前：
+
+\[ d_{\rm TSDFmesh}=?. \]
+
+**现在真正缺的就是这个问号。**
+
+它会决定接下来走哪条路。
+
+------
+
+# 11. 另外，我们这个 0.642 mm 本身仍然值得警惕，但这是另一件事
+
+即使最后：
+
+\[ d_{\rm TSDFmesh}=+0.5\sim0.7\text{ mm}, \]
+
+也只说明：
+
+> 这个 configuration 几何上没有碰撞。
+
+并不等于：
+
+> 真机上应该允许 0.6 mm clearance。
+
+最终硬判据应该是：
+
+\[ d_{\rm narrow} \ge m_{\rm safe}, \]
+
+其中：
+
+- \(d_{\rm narrow}\)：source robot geometry 对 TSDF mesh 的最小距离；
+- \(m_{\rm safe}\)：统一的系统安全裕量，由 RGB-D、标定、机器人状态误差等决定。
+
+这个 \(m_{\rm safe}\) 应该是**backend/system-level** 参数，不应该是：
+
+```
+grasp_mug = 0.4 mm
+grasp_bowl = 0.9 mm
+rotated mug = 0.2 mm
+```
+
+这样才不会进入我们最担心的 per-skill/per-generalization 调参地狱。
+
+------
+
+## 我现在对我们的问题排序已经发生了变化
+
+之前：
+
+1. coarse map 太粗；
+2. sphere protrusion；
+3. map selector。
+
+现在增加这个证据以后，我会改成：
+
+**P0：`ESDF<=0 → full cubes` 作为 Coal world geometry 的语义错误/过保守转换。**
+
+**P1：正式 planning 使用 `gather`，它官方定义上就会 dilate ESDF seed band；必须与 scatter 诊断分开。**
+
+**P2：robot sphere protrusion，已经确认在 link7 / palm 和 self-collision 上产生 false positive。**
+
+**P3：15 mm coarse 仍然不适合裁决亚毫米 clearance，但其 −6 mm 的很大一部分现在很可能可以由 full-voxel shell inflation 解释。**
+
+**P4：最后才是这个特定 IK posture 的真实 clearance 是否过小。**
+
+所以我现在**不会建议我们扩大 fine ROI、改 skill、增加 OMPL 时间或继续加 refine points**。
+
+下一步最有决定性的结果只有一个：
+
+> **在完全相同的 Mapper TSDF snapshot 上调用 `extract_mesh(level=0)`，让 link6 来源 collision geometry 对这个 mesh 做 Coal distance。**
+
+如果这个值接近 simulator 的 \(+0.642\) mm，我们基本就找到了当前环境误拒链条里最核心的表示错误。官方 API 和源码都支持这种检查，而且它天然绕开 `gather/scatter` 的 ESDF seed 差异。[GitHub](https://github.com/NVlabs/curobo/blob/main/curobo/_src/perception/mapper/integrator_esdf.py)
+
