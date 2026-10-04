@@ -139,13 +139,16 @@ class PlanningBudget:
                 or not 0 <= self.max_refinement_points <= self.max_validation_points):
             raise ValueError("Refinement points must fit the finite validation-point budget")
         # END bound optional samples without capping a skill's source knots.
-        # BEGIN allow complete observed robots within the existing 12-GiB GPU.
-        # The default stays one GiB. Larger explicit requests still pass the
-        # actual-device check with separate anchor-FK and two-GiB native
-        # allowances; current observation fields already consume free memory.
-        if type(self.max_scene_workspace_bytes) is not int or not 0 <= self.max_scene_workspace_bytes <= 2*1024**3:
-            raise ValueError("Scene workspaces must remain within the local two-GiB allocation budget")
-        # END allow complete observed robots within the existing 12-GiB GPU.
+        # BEGIN admit explicit TSDF scene storage within bounded local resources.
+        # The default remains one GiB. This bound includes shared CPU TSDF
+        # records/BVHs as well as query tensors, so a two-GiB ceiling can reject
+        # a request whose actual device usage remains small. Three GiB still
+        # leaves the separate two-GiB native reserve below the six-GiB local
+        # device target. Actual-device/anchor checks and external process
+        # memory guards remain mandatory; this bound is not a total-RSS cap.
+        if type(self.max_scene_workspace_bytes) is not int or not 0 <= self.max_scene_workspace_bytes <= 3*1024**3:
+            raise ValueError("Scene workspaces must remain within the local three-GiB allocation budget")
+        # END no query geometry, sample count or collision threshold changes.
         for name in ("interpolation_dt", "maximum_trajectory_dt", "constraint_weight", "validation_joint_step",
                      "validation_spatial_step_m", "planning_seconds"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
