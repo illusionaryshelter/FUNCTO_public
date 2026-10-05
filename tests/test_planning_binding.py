@@ -94,8 +94,9 @@ class PlanningBindingTest(unittest.TestCase):
     def test_nonfinite_single_ik_seed_does_not_hide_a_valid_success(self):
         candidates = np.array([[np.nan, 0.], [1., 2.], [3., 4.]])
         selected = rank_ik_candidates(candidates,
-            [{"task_satisfied": flag, "source_valid": flag} for flag in [True, True, False]],
-            np.array([[0., 0.]]), count=1, joint_tolerance=1e-6)
+            [{"task_satisfied": flag, "source_valid": flag, "native_pose_ik_success": flag}
+             for flag in [True, True, False]],
+            np.array([[0., 0.]]), count=1, joint_tolerance=1e-6, query_kind="reference")
         np.testing.assert_array_equal(selected, [1])
 
     def test_both_trajectory_phases_disable_duplicate_native_pose_objective(self):
@@ -103,14 +104,17 @@ class PlanningBindingTest(unittest.TestCase):
         planner.problem = self.problem()
         planner.problem.pose_events = (PoseEventRequirement(1., np.eye(4), np.eye(4), .001, .02, "goal"),)
         planner.physical_domain = SimpleNamespace(validate=Mock())
+        native = SimpleNamespace(solution=torch.zeros((1, 1, 4, 1)))
         planner.trajopt = SimpleNamespace(disable_tool_pose_tracking=Mock(),
-            enable_tool_pose_tracking=Mock(), solve_pose=Mock(return_value="native result"))
+            enable_tool_pose_tracking=Mock(), solve_pose=Mock(return_value=native),
+            core=SimpleNamespace(optimizers=[SimpleNamespace(_core=SimpleNamespace(
+                solve_diagnostics=[{"exhausted": False, "effective_updates": 0}]))]))
         planner.torch, planner.budget, planner.start = torch, PlanningBudget(), object()
         metadata = object()
         planner._goal = Mock(return_value=metadata)
         for phase in ("feasibility", "quality"):
             planner.phase = phase
-            self.assertEqual(planner.optimize(torch.zeros((1, 1, 4, 1))), "native result")
+            self.assertIs(planner.optimize(torch.zeros((1, 1, 4, 1))), native)
             self.assertIs(planner.trajopt.solve_pose.call_args.kwargs["goal_tool_poses"], metadata)
         self.assertEqual(planner.trajopt.disable_tool_pose_tracking.call_count, 2)
         planner.trajopt.enable_tool_pose_tracking.assert_not_called()

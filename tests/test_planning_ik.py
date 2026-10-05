@@ -1,42 +1,68 @@
-"""CPU counterexamples for IK priorities without native solver allocation."""
+"""CPU counterexamples for IK policies without native solver allocation."""
 
-# BEGIN feasibility, missing evidence and finite diversity are independent contracts.
+# BEGIN qualification, whole-chain continuity and explicit recovery are separate contracts.
+from itertools import product
+
 import numpy as np
 import pytest
 
-from manipulation.planning_ik import rank_ik_candidates
+from manipulation.planning_ik import rank_ik_candidates, select_ik_chains
 
 
 def report(**changes):
-    return {"task_satisfied": True, "source_valid": True,
-            "environment_clearance_m": .001, "self_clearance_m": .002,
-            "joint_limit_margin_fraction": .2, **changes}
+    return {"task_satisfied": True, "source_valid": True, "native_pose_ik_success": True,
+            "candidate_source": "native_ik", "environment_clearance_m": .001,
+            "self_clearance_m": .002, "joint_limit_margin_fraction": .2, **changes}
 
 
-def select(values, reports, *, count=1, tolerance=1e-5):
+def select(values, reports, *, count=1, tolerance=1e-5, query_kind="reference"):
     values = np.asarray(values, float)
     return rank_ik_candidates(values, reports, np.zeros((1, values.shape[1])),
-                              count=count, joint_tolerance=tolerance).tolist()
+                              count=count, joint_tolerance=tolerance, query_kind=query_kind).tolist()
 
 
-def test_environment_clearance_precedes_large_continuity_advantage():
-    assert select([[.001], [2.]], [report(environment_clearance_m=.00005), report()]) == [1]
+def chains(values, reports=None, *, count=2, times=None, velocity=None, tolerance=1e-5):
+    pools = [np.asarray(pool, float) for pool in values]
+    joints = pools[0].shape[1]
+    if reports is None:
+        reports = [[report() for _ in pool] for pool in pools]
+    return select_ik_chains(pools, reports, np.zeros((1, joints)),
+        np.arange(1, len(pools)+1, dtype=float) if times is None else times,
+        np.array([[-1.]*joints, [1.]*joints]) if velocity is None else velocity,
+        count=count, joint_tolerance=tolerance)
+
+
+def test_extra_clearance_cannot_buy_a_large_continuity_loss():
+    assert select([[.001], [2.]], [report(environment_clearance_m=.00005), report()]) == [0]
 
 
 @pytest.mark.parametrize("first,second", [
     (report(task_satisfied=False, environment_clearance_m=100.), report(source_valid=False)),
     (report(source_valid=False, environment_clearance_m=100.), report()),
-    (report(self_clearance_m=.0001, joint_limit_margin_fraction=.9), report()),
-    (report(joint_limit_margin_fraction=.01), report()),
+    (report(native_pose_ik_success=False, environment_clearance_m=100.), report()),
 ])
-def test_higher_priority_cannot_be_bought_with_lower_priority_quality(first, second):
+def test_same_query_qualification_precedes_any_continuity_or_clearance_advantage(first, second):
     assert select([[0.], [2.]], [first, second]) == [1]
+
+
+def test_functional_allowed_set_does_not_require_nominal_center_ik_success():
+    reports = [report(native_pose_ik_success=False), report()]
+    assert select([[.1], [2.]], reports, query_kind="reference") == [1]
+    assert select([[.1], [2.]], reports, query_kind="functional") == [0]
+
+
+@pytest.mark.parametrize("first", [
+    report(self_clearance_m=.0001, joint_limit_margin_fraction=.9),
+    report(joint_limit_margin_fraction=.01),
+])
+def test_quality_breaks_only_equal_continuity_ties(first):
+    assert select([[-1.], [1.]], [first, report()]) == [1]
 
 
 @pytest.mark.parametrize("missing", [None, float("nan"), float("inf"), -float("inf")])
 def test_unknown_distance_never_masquerades_as_infinite_clearance(missing):
-    assert select([[0.], [2.]], [report(environment_clearance_m=missing),
-                                report(environment_clearance_m=-.01)]) == [1]
+    assert select([[-1.], [1.]], [report(environment_clearance_m=missing),
+                                 report(environment_clearance_m=-.01)]) == [1]
 
 
 def test_duplicate_representative_retains_the_better_evidence_before_deduplication():
@@ -46,21 +72,115 @@ def test_duplicate_representative_retains_the_better_evidence_before_deduplicati
     assert select(values, reports, count=1) == [1]
 
 
-def test_nearest_previous_branch_breaks_only_equal_quality_ties():
+def test_nearest_previous_state_precedes_extra_clearance():
     values = np.array([[1.], [1.5]])
-    selected = rank_ik_candidates(values, [report(), report()], [[0.], [1.6]],
-                                  count=2, joint_tolerance=1e-5)
+    selected = rank_ik_candidates(values, [report(environment_clearance_m=100.), report()],
+                                  [[0.], [1.6]], count=2, joint_tolerance=1e-5,
+                                  query_kind="reference")
     assert selected.tolist() == [1, 0]
 
 
 def test_all_broken_values_produce_no_candidate_instead_of_a_fabricated_state():
     assert select([[float("nan")], [float("inf")]], [report(), report()], count=2) == []
+    assert chains([[[float("nan")]], [[.1]]]) == []
 
 
 def test_validity_must_be_explicit_not_a_missing_default():
     with pytest.raises(ValueError, match="explicit booleans"):
-        select([[0.]], [{"task_satisfied": True}])
-# END selection offers finite initializers, never whole-trajectory feasibility.
+        select([[0.]], [{"task_satisfied": True, "source_valid": True}])
+    with pytest.raises(ValueError, match="explicit candidate_source"):
+        chains([[[.1]]], [[{key: value for key, value in report().items()
+                           if key != "candidate_source"}]])
+    with pytest.raises(ValueError, match="cannot claim native"):
+        chains([[[.1]]], [[report(candidate_source="carried_previous")]])
+
+
+def test_complete_chain_looks_past_the_nearest_first_query_and_keeps_two_histories():
+    selected = chains([[[0.], [4.]], [[5.]]])
+    assert [row["candidate_indices"] for row in selected] == [[1, 0], [0, 0]]
+    assert selected[0]["selection_cost"]["normalized_velocity_energy"] == pytest.approx(8.5)
+    assert selected[1]["selection_cost"]["normalized_velocity_energy"] == pytest.approx(12.5)
+    assert all(row["reference_success"] and not row["recovery_queries"] for row in selected)
+
+
+def test_chain_success_cannot_be_replaced_by_a_stationary_failed_reference():
+    selected = chains([[[.5], [0.]], [[1.], [0.]]],
+        [[report(), report(native_pose_ik_success=False, environment_clearance_m=100.)]]*2)
+    assert len(selected) == 1
+    assert selected[0]["candidate_indices"] == [0, 0]
+    assert selected[0]["reference_success"]
+
+
+def test_task_and_source_screening_are_independent_of_reference_pose_success():
+    selected = chains([[[.1], [.5]]],
+        [[report(source_valid=False), report(native_pose_ik_success=False)]])
+    assert selected[0]["candidate_indices"] == [1]
+    assert selected[0]["recovery_queries"] == [{"query_index": 0, "candidate_index": 1,
+        "candidate_source": "native_ik", "reasons": ["reference_pose_ik_not_successful"]}]
+
+
+def test_failed_and_carried_queries_keep_their_explicit_recovery_sources():
+    selected = chains([[[.1], [.9]], [[.1]]],
+        [[report(native_pose_ik_success=False), report(native_pose_ik_success=False)],
+         [report(native_pose_ik_success=False, candidate_source="carried_previous", source_valid=False)]])
+    assert not selected[0]["reference_success"]
+    assert selected[0]["candidate_indices"] == [0, 0]
+    recovery = selected[0]["recovery_queries"]
+    assert [row["candidate_source"] for row in recovery] == ["native_ik", "carried_previous"]
+    assert recovery[1]["reasons"] == ["static_source_requirements_not_satisfied",
+        "reference_pose_ik_not_successful", "reference_query_has_no_finite_native_candidate"]
+
+
+def test_velocity_bounds_scale_named_joints_before_comparing_postures():
+    selected = chains([[[1., 0.], [0., .5]]], velocity=[[-10., -1.], [5., 1.]])
+    assert selected[0]["candidate_indices"] == [0]
+    assert selected[0]["selection_cost"]["normalized_velocity_energy"] == pytest.approx(.005)
+
+
+def test_nonuniform_physical_clock_uses_velocity_integral_not_query_count():
+    selected = chains([[[1.]], [[2.]]], times=[.1, 2.])
+    expected = (.1*(1/.1)**2+1.9*(1/1.9)**2)/2
+    assert selected[0]["selection_cost"]["normalized_velocity_energy"] == pytest.approx(expected)
+
+
+def test_tiny_extra_clearance_does_not_change_the_smoother_complete_chain():
+    selected = chains([[[.1], [1.]], [[.2], [1.1]]],
+        [[report(), report(self_clearance_m=.002000551)]]*2)
+    assert selected[0]["candidate_indices"] == [0, 0]
+
+
+def test_numerical_duplicates_do_not_manufacture_distinct_whole_chains():
+    selected = chains([[[.1], [.100002]], [[.2], [.200002]]])
+    assert len(selected) == 1
+    selected = chains([[[.1], [.10004]], [[.2], [.20004]]])
+    assert len(selected) == 2
+
+
+def test_bounded_dynamic_program_matches_independent_exhaustive_small_graph():
+    rng = np.random.default_rng(20261005)
+    pools = rng.normal(size=(4, 3, 2))
+    times = np.array([.3, .7, 1.4, 2.])
+    bounds = np.array([[-2., -3.], [1., 2.]])
+    scale = np.array([2., 3.])
+    expected = []
+    for path in product(range(3), repeat=4):
+        postures = np.stack([pools[query, index] for query, index in enumerate(path)])
+        changes = np.diff(np.r_[np.zeros((1, 2)), postures], axis=0)
+        intervals = np.diff(np.r_[0., times])
+        energy = np.sum(changes**2/scale**2/intervals[:, None])/(times[-1]*2)
+        expected.append((float(energy), path))
+    expected.sort()
+    actual = chains(pools, times=times, velocity=bounds, count=3)
+    assert [tuple(row["candidate_indices"]) for row in actual] == [path for _, path in expected[:3]]
+    np.testing.assert_allclose([row["selection_cost"]["normalized_velocity_energy"] for row in actual],
+                               [energy for energy, _ in expected[:3]], rtol=1e-14)
+
+
+@pytest.mark.parametrize("times", [[0., 1.], [1., 1.], [2., 1.], [1., float("nan")]])
+def test_invalid_clock_is_rejected_instead_of_retimed(times):
+    with pytest.raises(ValueError, match="increasing physical times"):
+        chains([[[.1]], [[.2]]], times=times)
+# END these candidates are initialization evidence, never a checked continuous trajectory.
 
 
 # BEGIN production IK integration consumes explicit fake static-query contracts on CPU.
@@ -132,13 +252,26 @@ def test_actual_task_and_source_checks_rank_reference_ik_without_hardening_its_p
     planner, calls = _static_planner(monkeypatch)
     selected, reports = planner._rank_ik_candidates(
         [[.1, 0., 0.], [.7, 0., 0.]], [True, False], [[0., 0., 0.]], .4)
-    assert selected.tolist() == [1, 0]
+    assert selected.tolist() == [0, 1]
     assert all(row["task_satisfied"] and row["source_valid"] for row in reports)
     assert not reports[1]["native_pose_ik_success"]
     assert "stop:test" not in reports[1]["task_residuals"]
     assert "stop_dynamics" in reports[1]["not_checked"]
     assert calls["source"] == [(.8, .4), (.8, .4)]
     assert len(calls["self"]) == len(calls["coverage"]) == 2
+
+
+def test_functional_static_pool_keeps_allowed_pose_when_nominal_center_ik_failed(monkeypatch):
+    from types import SimpleNamespace
+
+    planner, _ = _static_planner(monkeypatch)
+    planner.problem.pose_events = [SimpleNamespace(progress=.4)]
+    selected, reports = planner._rank_ik_candidates(
+        [[.7, 0., 0.], [.1, 0., 0.]], [True, False], [[0., 0., 0.]], .4,
+        (("pose_events", 0),))
+    assert selected.tolist() == [1, 0]
+    assert reports[1]["task_satisfied"] and reports[1]["source_valid"]
+    assert not reports[1]["native_pose_ik_success"]
 
 
 def test_static_source_self_rejection_cannot_be_overruled_by_environment_clearance(monkeypatch):
@@ -195,6 +328,9 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     planner.seed_parameter = torch.zeros((1, 1), dtype=torch.float64)
     planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float64))
     planner.start = SimpleNamespace(position=torch.zeros((1, 3), dtype=torch.float64))
+    from manipulation.physical_joint_domain import CubicJointDomain
+    planner.physical_domain = CubicJointDomain(torch.full((3,), -2.), torch.full((3,), 2.),
+        planner.start.position, torch.zeros((1, 3)), 3./10., 6)
     planner._functional_goal = lambda target: target
     queries = []
 

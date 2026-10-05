@@ -17,6 +17,10 @@ from scipy.optimize import linprog
 from .optimizer_device_checks import require_tensor
 # END public calls outside an optimizer graph still raise synchronously.
 
+# BEGIN CPU QPs share the exact cubic representation used by the tensor domain.
+from .physical_joint_qp import CubicAffineMap, fit_cubic_reference, recover_position_step
+# END no CPU solver is called by a captured tensor limiter.
+
 
 class JointDomainInitializationError(ValueError):
     """A bounded initializer construction failed for the unchanged actual."""
@@ -55,6 +59,12 @@ class JointPositionDomain:
     def feasible(self, action: torch.Tensor) -> torch.Tensor:
         values = action.to(torch.float64)
         return (torch.isfinite(values) & (values >= self.lower) & (values <= self.upper)).all(dim=(-1, -2))
+
+    # BEGIN graph-external recovery for single-state IK position boundaries.
+    def recovery_step(self, base, gradient, step_limits, scales):
+        """Return a legal descent direction; the caller must verify cost decrease."""
+        return recover_position_step(self, base, gradient, step_limits, scales)
+    # END independent coordinates are not frozen when another hits its bound.
 
     # BEGIN keep host validation separate from the unchanged tensor step map.
     def validate(self, action: torch.Tensor) -> torch.Tensor | None:
@@ -143,6 +153,33 @@ class CubicJointDomain(JointPositionDomain):
         self.prefix = q[None]+q.new_tensor([-1., 0., 1., 2.])[:, None]*dq[None]*knot_dt
         self._anchor = None
         self._start_q = q
+        # BEGIN one native affine representation for seed sampling and CPU QPs.
+        self._curve_map = CubicAffineMap(self.prefix, knots, knot_dt)
+        # END its fixed coefficients and clock never change during a solve.
+
+    # BEGIN reference values and cubic coefficients have distinct public APIs.
+    def evaluate(self, actions, progress, derivative=0):
+        """Sample normalized progress, returning NumPy values in physical units.
+
+        Actions end in [free controls, joints]; output ends in [queries,
+        joints]. Derivatives 1..3 use seconds from the immutable knot clock.
+        """
+        return self._curve_map.evaluate(actions, progress, derivative)
+
+    def fit_reference(self, progress, joint_targets, prior_controls=None, velocity_bounds=None):
+        """Fit soft samples on this clock, optionally enforcing model velocity.
+
+        Returns [controls,joints] or None with a construction report. Velocity
+        bounds apply only to this initializer, not to the optimizer domain or
+        its recovery directions for trajectories with existing violations.
+        """
+        return fit_cubic_reference(self, self._curve_map, progress, joint_targets,
+                                   prior_controls, velocity_bounds)
+
+    def recovery_step(self, base, gradient, step_limits, scales):
+        """Find a curve-feasible direction without boxing its free coefficients."""
+        return recover_position_step(self, base, gradient, step_limits, scales, self._curve_map)
+    # END references are soft observations, never new trajectory task equalities.
 
     def coefficients(self, action: torch.Tensor) -> torch.Tensor:
         if action.shape[-2:] != (self.knots, len(self.lower)):
@@ -197,14 +234,10 @@ class CubicJointDomain(JointPositionDomain):
         constant = self._start_q.to(dtype=dtype, device=device).expand(1, self.knots, -1).clone()
         if bool(self.feasible(constant).all()):
             return constant
-        knot_vector = np.arange(-3., self.knots+8.)
-        matrix = np.zeros((self.knots+7, self.knots))
-        matrix[4:4+self.knots] = np.eye(self.knots)
-        matrix[-3:, -1] = 1.
-        basis = BSpline(knot_vector, matrix, 3)
-        prefix = np.zeros((self.knots+7, len(self.lower)))
-        prefix[:4] = self.prefix.cpu().numpy()
-        fixed = BSpline(knot_vector, prefix, 3)
+        # BEGIN share exactly one coefficient map with fitting and recovery.
+        knot_vector, matrix = self._curve_map.knot_vector, self._curve_map.matrix
+        basis, prefix, fixed = self._curve_map.basis, self._curve_map.prefix, self._curve_map.fixed
+        # END the old initializer keeps its existing LP and acceptance rules.
         lower, upper = self.lower.cpu().numpy(), self.upper.cpu().numpy()
         controls = np.empty((self.knots, len(lower)))
         for joint in range(len(lower)):

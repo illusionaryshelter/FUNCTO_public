@@ -107,6 +107,160 @@ class NativeComponentTest(unittest.TestCase):
         bind_solver_components(owned, domain)
         self.assertIs(owned.core.goal_registry_manager, manager)
 
+    # BEGIN actual displacement, per-row history and recovery acceptance contracts.
+    def test_zero_displacement_preserves_history_and_references_current_gradient(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        core, history = optimizer._core, optimizer._qn
+        state = core._create_initial_iteration_state(torch.full((1, 1, 2), .4))
+        state.exploration_gradient.fill_(2.)
+        history.set_reference(state.exploration_action.reshape_as(history.x_0),
+                              state.exploration_gradient.reshape_as(history.grad_0))
+        history.s.fill_(.5)
+        history.y.fill_(1.)
+        history.rho.fill_(1.)
+        before = {name: getattr(history, name).clone() for name in ("s", "y", "rho", "alpha")}
+        direction = core._guarded_step_direction(state)
+        for name, value in before.items():
+            torch.testing.assert_close(getattr(history, name), value, rtol=0, atol=0)
+        torch.testing.assert_close(direction, -optimizer.config.initial_step_scale*state.exploration_gradient)
+        torch.testing.assert_close(history.x_0, state.exploration_action.reshape_as(history.x_0))
+        torch.testing.assert_close(history.grad_0, state.exploration_gradient.reshape_as(history.grad_0))
+        self.assertEqual(core.solve_diagnostics[0]["history_skips"], 1)
+
+    def test_negative_curvature_resets_only_affected_row_and_rebinds_reference(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        optimizer.update_num_problems(2)
+        core, history = optimizer._core, optimizer._qn
+        state = core._create_initial_iteration_state(torch.full((2, 1, 2), .4))
+        state.exploration_gradient.copy_(torch.tensor([[[1., 1.]], [[3., 3.]]]))
+        history.x_0.fill_(.2)
+        history.grad_0.fill_(2.)
+        direction = core._guarded_step_direction(state)
+        self.assertTrue(torch.equal(history.s[:, 0], torch.zeros_like(history.s[:, 0])))
+        self.assertTrue(torch.any(history.s[:, 1] != 0))
+        torch.testing.assert_close(direction[0], -optimizer.config.initial_step_scale*state.exploration_gradient[0])
+        torch.testing.assert_close(history.x_0, state.exploration_action.reshape_as(history.x_0))
+        torch.testing.assert_close(history.grad_0, state.exploration_gradient.reshape_as(history.grad_0))
+        self.assertEqual([row["history_resets"] for row in core.solve_diagnostics], [1, 0])
+
+    def test_retired_seed_keeps_history_references_when_a_peer_is_evaluated(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        optimizer.update_num_problems(2)
+        core, history = optimizer._core, optimizer._qn
+        state = core._create_initial_iteration_state(torch.full((2, 1, 2), .4))
+        state.exploration_gradient.fill_(3.)
+        history.x_0.fill_(.2)
+        history.grad_0.fill_(2.)
+        core._exhausted[0] = True
+        core._last_curvature[0] = .25
+        before = {name: getattr(history, name).clone()
+                  for name in ("s", "y", "rho", "alpha", "x_0", "grad_0")}
+        direction = core._guarded_step_direction(state)
+        for name, value in before.items():
+            actual = getattr(history, name)
+            index = (slice(None), 0) if actual.ndim == 4 else 0
+            torch.testing.assert_close(actual[index], value[index], rtol=0, atol=0)
+        torch.testing.assert_close(direction[0], torch.zeros_like(direction[0]))
+        self.assertEqual(core.solve_diagnostics[0]["last_curvature"], .25)
+
+    def test_legal_recovery_without_armijo_descent_is_rejected_and_seed_stops(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        seed = torch.ones((1, 1, 2))
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+        core = optimizer._core
+        state = core._iteration_state
+        core._stalled_steps.fill_(core.config.inner_iters)
+        # A move into the position domain increases this objective. A legal
+        # QP proposal alone must not be accepted as optimization progress.
+        with patch.object(domain, "recovery_step", return_value=(-torch.full_like(seed, .1),
+                {"success": True, "reason": "test_inward_but_ascending"})):
+            core._recover_stalled(state)
+        torch.testing.assert_close(state.exploration_action, seed)
+        torch.testing.assert_close(optimizer._qn.x_0, seed.reshape_as(optimizer._qn.x_0))
+        self.assertTrue(core.solve_diagnostics[0]["exhausted"])
+        self.assertEqual(core.solve_diagnostics[0]["recovery_accepted"], 0)
+        self.assertTrue(core._all_exhausted)
+
+    def test_all_stalled_seeds_stop_before_fixed_iteration_budget(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        optimizer.config.num_iters = 100
+        seed = torch.ones((1, 1, 2))
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+            result = optimizer.optimize(seed)
+        torch.testing.assert_close(result, seed)
+        report = optimizer._core.solve_diagnostics[0]
+        self.assertEqual(report["iterations"], optimizer.config.inner_iters)
+        self.assertEqual(report["recovery_attempts"], 1)
+        self.assertTrue(report["exhausted"])
+
+    def test_recovery_recomputes_main_gradient_and_backtracks_oversized_descent(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        seed = torch.zeros((1, 1, 2))
+
+        def objective(target, weight):
+            def evaluate(action, use_cuda_graph=False):
+                domain.validate(action)
+                costs = weight*((action-target)**2).sum(dim=(-1, -2))
+                return SimpleNamespace(costs_and_constraints=SimpleNamespace(
+                    get_sum_cost_and_constraint=lambda sum_horizon: costs))
+            return evaluate
+
+        # Opposing initial/main gradients expose stale-reference use. The
+        # main minimizer is so near that all original trial scales overshoot.
+        with patch.object(rollouts[0], "evaluate_action", new=objective(.01, 10000.)), \
+                patch.object(rollouts[1], "evaluate_action", new=objective(-.1, 1.)), \
+                patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+            core = optimizer._core
+            state = core._iteration_state
+            self.assertTrue(bool((state.exploration_gradient > 0).all()))
+            core._stalled_steps.fill_(core.config.inner_iters)
+            with patch.object(domain, "recovery_step", wraps=domain.recovery_step) as recovery:
+                core._recover_stalled(state)
+            self.assertTrue(bool((recovery.call_args.args[1] < 0).all()))
+        report = core.solve_diagnostics[0]["recoveries"][0]
+        self.assertTrue(report["accepted"])
+        self.assertGreater(report["line_search_evaluations"], 1)
+        self.assertLess(report["cost_after"], report["cost_before"])
+        self.assertTrue(bool((state.exploration_action > 0).all()))
+        torch.testing.assert_close(state.best_action, state.exploration_action)
+        torch.testing.assert_close(state.best_cost, state.exploration_cost)
+        torch.testing.assert_close(optimizer._qn.grad_0,
+                                  state.exploration_gradient.reshape_as(optimizer._qn.grad_0))
+
+    def test_boundary_recovery_moves_free_coordinate_and_keeps_retired_peer_fixed(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        optimizer.update_num_problems(2)
+        optimizer.config.num_iters = 12
+        seed = torch.tensor([[[1., 1.]], [[1., .2]]])
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+            result = optimizer.optimize(seed)
+        domain.validate(result)
+        torch.testing.assert_close(result[0], seed[0])
+        self.assertGreater(float(result[1, 0, 1]), float(seed[1, 0, 1]))
+        reports = optimizer._core.solve_diagnostics
+        self.assertEqual(reports[0]["iterations"], optimizer.config.inner_iters)
+        self.assertGreater(reports[1]["iterations"], reports[0]["iterations"])
+        self.assertGreater(reports[1]["recovery_accepted"], 0)
+    # END recovered motion must decrease the same objective and preserve peers.
+
     # BEGIN exercise capture lifecycle and fail-closed behavior on CPU tensors.
     def test_deferred_bad_iteration_only_constructs_legal_search_points(self):
         domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))

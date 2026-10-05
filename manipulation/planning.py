@@ -3302,6 +3302,7 @@ class _CuroboPlanner:
         self.phase = "feasibility"
         self.witnesses = AttemptWitnesses()
         self.goal_ik_candidates = {}
+        self.last_optimizer_diagnostics = []
         # END neither solver rebuilds nor candidate selection reset this state.
 
         def configuration(name, mode):
@@ -3691,97 +3692,135 @@ class _CuroboPlanner:
                                  position=position[:, :, None, None].contiguous(),
                                  quaternion=quaternion[:, :, None, None].contiguous())
 
-    def reference_seeds(self):
-        """Return source-ranked native IK chains within the fixed seed budget.
+    # BEGIN whole-chain selection and native-basis soft reference fitting.
+    def _seed_velocity_bounds(self):
+        """Read existing physical speed bounds in the action's named joint order."""
+        limits = self._verification_native.get_cost("cspace").config.joint_limits
+        columns = [limits.joint_names.index(name) for name in self.joint_names]
+        return limits.velocity.detach().cpu().numpy()[:, columns]
 
-        Nominal poses may be infeasible even when their allowed functional
-        family contains a solution. If any nominal control pose has no native
-        successful IK candidate, or both complete chains coincide numerically,
-        use the primary chain and a measured-state initializer instead. Every
-        initializer still requires the complete-process optimizer and checks.
-        Reference poses remain initializer hints, never extra task targets.
-        Static point screening ranks the existing outputs by modeled source
-        clearance before continuity; actual functional events have their own
-        bounded proposal pool even away from the reference control grid.
-        Neither point screening nor a goal hint certifies the complete path.
+    def reference_seeds(self):
+        """Build bounded initializers from explicit reference-query evidence.
+
+        All admitted IK outputs survive until the finite whole-chain selection.
+        A failed nominal query remains an initialization recovery, never a new
+        task failure or a successful pose solution. Samples are fitted in the
+        actual native cubic representation before becoming optimizer actions.
         """
+        from .planning_ik import select_ik_chains
         torch, count = self.torch, self.budget.trajectory_seeds
-        # BEGIN bounded distinct IK chains and measured-state initialization.
+        velocity_bounds = self._seed_velocity_bounds()
         previous = self.start.position[:, None].clone()
-        sequence = []
-        success_counts = []
-        finite_reference_samples = 0
-        self.reference_ik_distinct_counts = []
-        # Control points are initialization, not a promise of exact reference
-        # interpolation.  With four leading fixed cubic controls, free action
-        # j has Greville time (j+3)/(N+4).  The first free action is not q0;
-        # native boundary controls already enforce the measured start state.
-        # All internal boundaries remain variables in full TrajOpt.
         control_u = (np.arange(self.trajopt.action_horizon)+3.)/(self.trajopt.action_horizon+4.)
-        for u in control_u:
+        pools, evidence, success_counts = [], [], []
+        self.reference_ik_queries, self.reference_ik_distinct_counts = [], []
+        for query_index, u in enumerate(control_u):
             progress = float(np.interp(u, self.progress_map.u, self.progress_map.s))
             self.seed_parameter.fill_(float(u))
             result = self.ik.solve_pose(self._goal(progress), current_state=self.start,
                                        seed_config=previous, return_seeds=self.budget.ik_seeds)
-            candidates = self.ik.get_active_js(result.js_solution).position
-            # BEGIN source clearance precedes continuity for every retained IK posture.
-            ranked, reports = self._rank_ik_candidates(
-                candidates[0].detach().cpu().numpy(), result.success[0].detach().cpu().numpy(),
+            values = self.ik.get_active_js(result.js_solution).position[0].detach().cpu().numpy()
+            flags = result.success[0].detach().cpu().numpy()
+            success_counts.append(int((flags & np.isfinite(values).all(-1)).sum()))
+            ranked, reports = self._rank_ik_candidates(values, flags,
                 previous[0].detach().cpu().numpy(), float(u))
-            valid = [index for index in ranked
-                     if reports[index]["task_satisfied"] and reports[index]["source_valid"]]
-            selected = np.asarray(valid if valid else ranked, dtype=int)[:count]
-            distinct_count = len(valid)
-            if 0 < len(selected) < count:
-                selected = np.resize(selected, count)
-            # END identical candidates may fill a temporary chain but are not counted twice.
-            # BEGIN an entirely broken IK query only loses this reference sample.
-            if len(selected):
-                finite_reference_samples += 1
-                previous = candidates[:, selected].clone()
+            self.reference_ik_distinct_counts.append(sum(
+                reports[index]["native_pose_ik_success"] and reports[index]["task_satisfied"]
+                and reports[index]["source_valid"] for index in ranked))
+            if not len(ranked):
+                # A previous posture must be screened at THIS physical time:
+                # hand commands, permissions and task modes may have changed.
+                values = previous[0].detach().cpu().numpy()
+                ranked, reports = self._rank_ik_candidates(values, np.zeros(len(values), bool),
+                    values, float(u))
+                for report in reports:
+                    report.update(candidate_source="measured_start" if query_index == 0 else "carried_previous",
+                                  reference_recovery_reason="no_finite_native_ik_output")
+            if not len(ranked):
+                raise JointDomainInitializationError("No finite reference recovery state survived static screening")
+            pools.append(values)
+            evidence.append(reports)
+            # Preserve every distinct admitted candidate as the next native
+            # warm-start pool; trajectory_seeds does not truncate this pool.
+            previous = self.device_cfg.to_device(values[ranked][None]).contiguous()
+            self.reference_ik_queries.append({"u": float(u),
+                "time_s": float(u*self.formal_clock["duration"]),
+                "candidates": [{"joint_position": row.tolist(), "report": report}
+                               for row, report in zip(values, reports)]})
+        chains = select_ik_chains(pools, evidence, self.start.position.detach().cpu().numpy(),
+            control_u*self.formal_clock["duration"], velocity_bounds, count=count,
+            joint_tolerance=self.problem.numerical.joint)
+        if not chains:
+            raise JointDomainInitializationError("No finite whole reference chain was constructed")
+        self.reference_ik_chains = chains
+        # Keep the existing independent measured-state alternative when no
+        # complete successful reference chain or no distinct second chain exists.
+        retained = chains[:count] if chains[0]["reference_success"] else chains[:1]
+        targets = [np.asarray(chain["joint_positions"]) for chain in retained]
+        self.initial_seed_strategies = ["reference_ik" if chain["reference_success"]
+                                       else "reference_ik_recovery" for chain in retained]
+        if len(retained) > 1:
+            self.initial_seed_strategies[1] = "reference_ik_alternative"
+        while len(targets) < count:
+            targets.append(np.broadcast_to(self.start.position[0].detach().cpu().numpy(),
+                                            (self.trajopt.action_horizon, len(self.joint_names))).copy())
+            self.initial_seed_strategies.append("measured_state_constant")
+        controls, self.reference_seed_fits = [], []
+        for branch, target in enumerate(targets):
+            if self.initial_seed_strategies[branch] == "measured_state_constant":
+                value = self.trajopt._trajectory_seed_generator.generate_constant_seeds(self.start.position, 1)
+                control = self.physical_domain.initialize(value).reshape(self.trajopt.action_horizon, -1)
+                fit = {"success": True, "source": "measured_state_constant_free_controls"}
             else:
-                previous = previous[:, :1].expand(1, count, -1).clone()
-            # END actual and remaining finite chains stay intact.
-            sequence.append(previous)
-            success_counts.append(int((result.success & torch.isfinite(candidates).all(dim=-1)).sum().item()))
-            self.reference_ik_distinct_counts.append(distinct_count)
-        seeds = torch.stack(sequence, dim=2)
-        self.initial_seed_strategies = ["reference_ik" if finite_reference_samples else "measured_state_constant"]
-        if count == 2:
-            distinct_chains = bool(torch.any((seeds[:, 0]-seeds[:, 1]).abs() > self.problem.numerical.joint))
-            if all(success_counts) and distinct_chains:
-                self.initial_seed_strategies.append("reference_ik_alternative")
-            else:
-                # Only free controls are constant. The original measured q0
-                # and dq0 still enter the native fixed boundary via self.start.
-                constant = self.trajopt._trajectory_seed_generator.generate_constant_seeds(
-                    self.start.position, 1)
-                seeds = torch.cat((seeds[:, :1], constant), dim=1)
-                self.initial_seed_strategies.append("measured_state_constant")
-        # BEGIN real goals receive bounded hints even off the reference control grid.
+                control, fit = self.physical_domain.fit_reference(control_u,
+                    self.device_cfg.to_device(target), velocity_bounds=velocity_bounds)
+                if control is None:
+                    # Optional reference fitting cannot prove a task impossible.
+                    # Keep its failure evidence and use the existing measured
+                    # initializer, whose dynamics still require Phase A checks.
+                    value = self.trajopt._trajectory_seed_generator.generate_constant_seeds(self.start.position, 1)
+                    control = self.physical_domain.initialize(value).reshape(self.trajopt.action_horizon, -1)
+                    self.initial_seed_strategies[branch] = "measured_state_after_reference_fit_failure"
+                    targets[branch] = self.physical_domain.evaluate(control, control_u)
+                    fit = {**fit, "initializer_after_failure": "measured_state_constant",
+                           "initializer_scope": "Position legal; dynamic/task constraints require optimization"}
+            controls.append(control)
+            self.reference_seed_fits.append(fit)
+        seeds = torch.stack(controls)[None]
         pool = self._build_goal_ik_candidates(seeds)
-        self.goal_ik_control_hints = []
-        for parameter, entry in sorted(pool.items()):
-            candidates = [row for row in entry["candidates"]
-                          if row["report"]["task_satisfied"] and row["report"]["source_valid"]]
-            if not candidates or parameter == 0.:
-                continue
-            control = int(np.argmin(np.abs(control_u-parameter)))
-            for branch in range(count):
+        self.goal_ik_fit_hints = []
+        for branch in range(count):
+            samples, postures = list(control_u), list(targets[branch])
+            for parameter, entry in sorted(pool.items()):
+                candidates = [row for row in entry["candidates"]
+                              if row["report"]["task_satisfied"] and row["report"]["source_valid"]]
+                if not candidates or parameter == 0.:
+                    continue
                 rank = min(branch, len(candidates)-1)
-                seeds[0, branch, control] = self.device_cfg.to_device(candidates[rank]["joint_position"])
-                self.goal_ik_control_hints.append({"event_u": parameter, "control_index": control,
-                    "branch": branch, "rank": rank,
-                    "scope": "Free-control initialization hint, not exact event interpolation"})
-        # A later event can replace an earlier hint at the same free control.
-        # Every original goal still enters optimization and full validation.
-        for branch in {row["branch"] for row in self.goal_ik_control_hints}:
+                samples.append(float(parameter))
+                postures.append(candidates[rank]["joint_position"])
+                self.goal_ik_fit_hints.append({"event_u": float(parameter), "branch": branch,
+                    "rank": rank, "scope": "Soft observation at the exact event time; no interpolation equality"})
+            if len(samples) == len(control_u):
+                continue
+            control, fit = self.physical_domain.fit_reference(np.asarray(samples),
+                self.device_cfg.to_device(np.asarray(postures)), prior_controls=seeds[0, branch],
+                velocity_bounds=velocity_bounds)
+            self.reference_seed_fits[branch]["functional_hint_fit"] = fit
+            for hint in self.goal_ik_fit_hints:
+                if hint["branch"] == branch:
+                    hint["applied"] = control is not None
+            if control is None:
+                # A numerical failure to fit optional hints must not erase the
+                # preceding initializer or remove the actual hard event goals.
+                self.initial_seed_strategies[branch] += "+functional_hint_fit_failed"
+                continue
+            seeds[0, branch] = control
             self.initial_seed_strategies[branch] += "+ranked_functional_ik"
-        # END fixed boundary controls, measured q0/dq0 and the physical clock are untouched.
-        seeds = self.physical_domain.initialize(seeds)
+        self.physical_domain.validate(seeds)
         self.seed_strategies = list(self.initial_seed_strategies)
         return seeds.contiguous(), success_counts
-        # END bounded distinct IK chains and measured-state initialization.
+    # END q0/dq0, native clock, hard task checks and admitted seed count are fixed.
 
     def refine_validation(self, refinement_parameters, *, phase=None):
         """Rebuild only validation workspaces in the already frozen binding.
@@ -3886,7 +3925,6 @@ class _CuroboPlanner:
         work = {"state_queries": 0}
         rng = np.random.default_rng(self.budget.random_seed)
         source_controls = initial_seed[0].detach().cpu().numpy()
-        control_u = (np.arange(self.trajopt.action_horizon)+3.)/(self.trajopt.action_horizon+4.)
         invalid_states = []
 
         def goals_at_time(parameter):
@@ -3993,9 +4031,11 @@ class _CuroboPlanner:
             # This proposal still uses the same allowed-set projection and
             # complete state/edge validity checks as every other member.
             yield "joint_box_random", np.r_[rng.uniform(lower, upper), parameter]
+            # BEGIN proposal states come from the represented cubic, not coefficients.
             for controls in source_controls:
-                yield "reference_controls", np.r_[[np.interp(parameter, control_u, controls[:, column])
-                                                   for column in range(len(self.joint_names))], parameter]
+                yield "reference_curve", np.r_[self.physical_domain.evaluate(
+                    controls, np.asarray([parameter]))[0], parameter]
+            # END the original scene/projection checks still qualify each proposal.
             yield "previous_boundary", np.r_[begin[:-1], parameter]
             # Sampling the actual joint box permits different support tangents,
             # yaw and redundant IK branches. There is no reference corridor.
@@ -4103,10 +4143,17 @@ class _CuroboPlanner:
                             or self.problem.verification_issues(full_progress)):
                         evidence["failure"] = "complete_path_process_or_history_rejected"
                         continue
-                controls = np.stack([np.interp(control_u, whole_path[:, -1], whole_path[:, column])
-                    for column in range(len(self.joint_names))], axis=-1)
-                report.update(success=True, samples=len(whole_path), state_queries=work["state_queries"])
-                return self.physical_domain.initialize(self.device_cfg.to_device(controls[None, None])), report
+                # BEGIN OMPL point samples also require the native representation map.
+                controls, fit = self.physical_domain.fit_reference(whole_path[:, -1],
+                    self.device_cfg.to_device(whole_path[:, :-1]), prior_controls=initial_seed[0, 0],
+                    velocity_bounds=self._seed_velocity_bounds())
+                if controls is None:
+                    evidence.update(failure="native_cubic_fit_failed", fit=fit)
+                    continue
+                report.update(success=True, samples=len(whole_path), state_queries=work["state_queries"],
+                              cubic_fit=fit)
+                return controls[None, None].contiguous(), report
+                # END fitted curves still need full trajectory optimization/verification.
         except TimeoutError:
             report["budget_exhausted"] = True
         report["state_queries"] = work["state_queries"]
@@ -4159,7 +4206,8 @@ class _CuroboPlanner:
         upper = self.trajopt.transition_model.action_bound_highs.detach().cpu().numpy().reshape(-1)
         reports = []
         for index, row in enumerate(values):
-            report = {"native_pose_ik_success": bool(flags[index]), "task_satisfied": False,
+            report = {"native_pose_ik_success": bool(flags[index]), "candidate_source": "native_ik",
+                "task_satisfied": False,
                 "source_valid": False, "environment_clearance_m": None,
                 "self_clearance_m": None, "joint_limit_margin_fraction": None,
                 "progress": phase, "u": float(u), "time_s": float(u*self.formal_clock["duration"]),
@@ -4235,8 +4283,11 @@ class _CuroboPlanner:
                 unmodelled_geometry_names=sorted(set(world["unmodelled_geometry_names"])
                                                 |set(own["unmodelled_geometry_names"])),
                 full_robot_coverage_certified=bool(coverage) and all(item["passed"] for item in coverage))
+        # BEGIN nominal reference success and actual goal satisfaction stay distinct.
         selected = rank_ik_candidates(values, reports, prior, count=self.budget.ik_seeds,
-                                       joint_tolerance=self.problem.numerical.joint)
+            joint_tolerance=self.problem.numerical.joint,
+            query_kind="functional" if goal_ids else "reference")
+        # END a functional allowed set never acquires an extra centre-pose equality.
         return selected, reports
 
     def _build_goal_ik_candidates(self, reference_seeds):
@@ -4251,7 +4302,6 @@ class _CuroboPlanner:
         """
         self.goal_ik_candidates = {}
         controls = reference_seeds[0].detach().cpu().numpy()
-        control_u = (np.arange(self.trajopt.action_horizon)+3.)/(self.trajopt.action_horizon+4.)
         targets = sorted(enumerate(self.problem.pose_events), key=lambda item: (item[1].progress, item[0]))
         for _, target in targets:
             if target.progress < self.problem.start_progress:
@@ -4259,8 +4309,9 @@ class _CuroboPlanner:
             u = float(self.progress_map.anchor_parameters([target.progress])[0, 0])
             if u in self.goal_ik_candidates:
                 continue
-            previous = np.asarray([[np.interp(u, control_u, branch[:, column])
-                                    for column in range(len(self.joint_names))] for branch in controls])
+            # BEGIN native IK warm starts use actual curve states at the event time.
+            previous = self.physical_domain.evaluate(controls, np.asarray([u]))[:, 0]
+            # END interpolation of free coefficients would omit the fixed boundaries.
             self.seed_parameter.fill_(u)
             result = self.ik.solve_pose(self._functional_goal(target), current_state=self.start,
                 seed_config=self.device_cfg.to_device(previous[None]).contiguous(),
@@ -4291,13 +4342,30 @@ class _CuroboPlanner:
         self.trajopt.disable_tool_pose_tracking()
         goal = self._goal(self.problem.phase_count)
         # END IK retains its own native pose tracking for proposal generation.
-        return self.trajopt.solve_pose(
+        # BEGIN result provenance uses the full unsorted native seed layout.
+        # Returning every seed makes native get_topk_seeds return the original
+        # layout; per-seed history and input/output displacement remain aligned.
+        initial = seed.detach().clone()
+        result = self.trajopt.solve_pose(
             goal_tool_poses=goal, current_state=self.start,
             seed_traj=seed, num_seeds=seed.shape[1], return_seeds=seed.shape[1],
             dt=self.torch.full((1, seed.shape[1]), self.budget.maximum_trajectory_dt,
                                dtype=seed.dtype, device=seed.device),
             use_implicit_goal=False, goal_state=None,
             finetune_attempts=0, finetune_dt_scale=1.)
+        if result.solution.shape != initial.shape:
+            raise ValueError("Native trajectory solving changed the admitted seed layout")
+        core_reports = [optimizer._core.solve_diagnostics for optimizer in self.trajopt.core.optimizers]
+        self.last_optimizer_diagnostics = []
+        for index in range(seed.shape[1]):
+            displacement = (result.solution[0, index]-initial[0, index]).abs()
+            unchanged = bool((displacement == 0).all().item())
+            self.last_optimizer_diagnostics.append({"seed_index": index,
+                "unchanged_from_seed": unchanged,
+                "maximum_control_update": float(displacement.max().item()),
+                "cores": [rows[index] for rows in core_reports]})
+        return result
+        # END unchanged output is separate from movement of native exploration states.
     # END intermediate and terminal goals share the same typed requirement owner.
 
     def native_diagnostics(self, result, seed_index=None):
@@ -4390,7 +4458,8 @@ class _CuroboPlanner:
             candidate = _trajectory_candidate(result, index)
             report = {"seed_index": index, "native_success": native_success,
                 "native_metrics": native_metrics, "native_seed_cost": float(result.seed_cost[0, index].item()),
-                "seed_provenance": self.seed_strategies[index], "phase": self.phase}
+                "seed_provenance": self.seed_strategies[index], "phase": self.phase,
+                "optimizer": deepcopy(self.last_optimizer_diagnostics[index])}
             validation = None
             try:
                 if native_success:
@@ -4944,9 +5013,12 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         diagnostics.update(reference_ik_success_counts=ik_success,
             ik_exit_early=bool(planner.ik.config.exit_early),
             reference_ik_distinct_counts=planner.reference_ik_distinct_counts,
-            initial_seed_strategies=planner.initial_seed_strategies)
+            initial_seed_strategies=planner.initial_seed_strategies,
+            reference_ik_queries=deepcopy(planner.reference_ik_queries),
+            reference_ik_chains=deepcopy(planner.reference_ik_chains),
+            reference_seed_fits=deepcopy(planner.reference_seed_fits))
         diagnostics["functional_ik_candidates"] = deepcopy(getattr(planner, "goal_ik_candidates", {}))
-        diagnostics["functional_ik_control_hints"] = deepcopy(getattr(planner, "goal_ik_control_hints", []))
+        diagnostics["functional_ik_fit_hints"] = deepcopy(planner.goal_ik_fit_hints)
         reference_seeds, searched = seeds, False
         for iteration in range(budget.maximum_trajectory_solves):
             check("trajectory_solves")
@@ -5026,10 +5098,14 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             if best_attempt is not None:
                 attempt["quality_decision"] = "retained_feasible_candidate_after_rejection"
                 break
+            # BEGIN do not add new queries to the identical rejected curve.
+            stagnant = attempt["optimizer"]["unchanged_from_seed"]
+            if stagnant:
+                attempt["stop_reason"] = "optimizer_returned_unchanged_infeasible_curve"
             if iteration+1 >= budget.maximum_trajectory_solves:
                 break
             stage = "validation_refinement"
-            additional = planner.refinement_samples()
+            additional = None if stagnant else planner.refinement_samples()
             check()
             if native_success and additional is not None:
                 seeds = native_result.solution.detach().clone()
@@ -5054,6 +5130,11 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 if path_seed is not None:
                     seeds, planner.seed_strategies = path_seed, ["ompl"]
                     # BEGIN OMPL changes the initializer, never the active witness set.
+                    if stagnant:
+                        # The new curve must inherit ALL retained failures.
+                        # Capacity exhaustion here concerns a new initializer,
+                        # not repeated expansion of the original blocked one.
+                        additional = planner.refinement_samples()
                     if additional is not None:
                         planner.refine_validation(additional)
                     # END every later optimization sees all admitted failure times.
@@ -5068,12 +5149,14 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 check()
                 continue
             break
+            # END every failure remains recorded even when no new solve is useful.
         if best_attempt is not None:
             diagnostics.update(best_attempt)
             diagnostics["returned_candidate"] = deepcopy(best_attempt)
             return outcome
-        diagnostics["failure"] = ("exported_curve_constraint_violation" if diagnostics["native_success"]
-                                  else "complete_process_optimization_not_feasible")
+        diagnostics["failure"] = ("optimization_stagnated" if diagnostics["attempts"][-1]["optimizer"]["unchanged_from_seed"]
+            else "exported_curve_constraint_violation" if diagnostics["native_success"]
+            else "complete_process_optimization_not_feasible")
         return outcome
     except Exception as error:
         # BEGIN optional work exhaustion cannot erase a previously bound feasible curve.
