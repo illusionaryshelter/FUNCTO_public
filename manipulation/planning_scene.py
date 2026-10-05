@@ -1901,12 +1901,22 @@ class PlanningScene:
             return None, report
         result = self.clone_for_rollout()
         result.background = replacement
-        result._source_scene_checker = None
+        # BEGIN retain source geometry when only optimizer overlap boxes change.
+        # A reused map keeps both native fields and the complete fine-region
+        # source record. guidance_boxes affect soft weights, never source
+        # layer selection, owner geometry or contact permissions. The clone
+        # can therefore keep the same checker, immutable shapes and bounded
+        # component cache. Its new optimization history remains scene-owned.
+        if report.get("mapping_reused") is not True:
+            result._source_scene_checker = None
+        # END a real remap still requires a new source-geometry binding.
         if result.observation_report is not None:
             result.observation_report["partitions"]["observed_background"]["fine"] = deepcopy(report["mapping"])
             result.observation_report.setdefault("background_refinements", []).append(deepcopy(report))
-        if result.robot_validator is not None:
+        # BEGIN an originally unbound scene still needs its first checker.
+        if result.robot_validator is not None and result._source_scene_checker is None:
             result.bind_source_scene()
+        # END unchanged source inputs do not rebuild every TSDF owner/layer.
         return result, report
     # END unchanged sensor evidence, physical clock and contact policy survive.
 

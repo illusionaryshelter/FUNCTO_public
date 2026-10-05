@@ -4020,9 +4020,12 @@ class _CuroboPlanner:
             "validation_storage": deepcopy(storage)}
         self.validation_storage = storage
         # END ordinary geometry/shape/runtime errors are never resource refusals.
-        # The factory has already rebuilt the independent source checker from
-        # the new observed fine field. Rebuild all trajectory rollouts/captures
-        # before using it, and retain the exact frozen hand/trajectory clock.
+        # BEGIN source geometry and guidance have separate replacement scopes.
+        # The factory rebinds the source checker only for a new observed field;
+        # changed guidance boxes retain the existing immutable source shapes.
+        # Either replacement changes rollout inputs, so rebuild all trajectory
+        # rollouts/captures while retaining the frozen hand/trajectory clock.
+        # END a reused field does not imply unchanged optimization guidance.
         self.scene = replacement
         self._verification_scene = replacement.clone_for_rollout()
         self.refine_validation(self.refinement_parameters)

@@ -3,17 +3,24 @@
 # BEGIN witnesses retain the native curve/clock through a solver rebuild.
 from types import SimpleNamespace
 from unittest.mock import Mock
+from copy import deepcopy
+import math
 
 import numpy as np
 import pytest
 import torch
 
 from manipulation.physical_joint_domain import CubicJointDomain
+from manipulation.planning_observation import _FrozenBackgroundRefinement
+from manipulation.planning_scene import ObservedSpace, PlanningScene
 from manipulation.planning import (
     PlanningBudget, ResourceLimitError, _CuroboPlanner,
     _planning_workspace_bytes, _require_planning_memory,
 )
 from manipulation.voxel_layers import LayeredVoxelQuery
+from test_source_world_acceptance import ProxyQuery, observed_plane, owner, scene_factory, states
+from test_source_world_deduplication import assert_report_bytes_equal
+from test_voxel_layers import NativeStub, region
 
 
 # BEGIN CPU fixtures expose each preflight boundary without touching CUDA.
@@ -127,6 +134,237 @@ def test_refused_refinement_retains_scene_and_solver():
     assert result["updated"] is False
     assert planner.scene is original
     planner.refine_validation.assert_not_called()
+
+
+# BEGIN exercise the real no-growth refiner through both scene/planner boundaries.
+@pytest.mark.parametrize("supported", (False, True))
+def test_contained_native_grid_witnesses_do_not_rebuild_scene_or_solver(admission, monkeypatch, supported):
+    planner, _, _, _, _ = planner_fixture()
+    shape = (81, 43, 45)
+    bits = np.full(shape, 3 if supported else 1, np.uint8)
+    if supported:
+        # An interior unknown plane bounds an already certified cuboid. The
+        # body stays in its overlap transition, so it still proposes witnesses
+        # even though neither the physical grid nor this cuboid can grow.
+        bits[40] = 1
+    record = region()
+    record.update(shape_xyz=list(shape), voxel_size_m=float(np.float32(.002)),
+        numerical_support_m=.01, measurement_allowance_m=.0001,
+        source_bits_hex=bits.tobytes().hex(),
+        raw_free_packbits_hex=np.packbits(np.zeros(shape, bool)).tobytes().hex())
+    background = LayeredVoxelQuery(NativeStub(10., 2.), NativeStub(1., 3.), record)
+    background.mapping_report = {}
+    bodies = ({"body_id": "body", "sphere_indices": [0], "geometry_names": ["native"]},)
+    if supported:
+        initial = torch.tensor([[[[-.02, 0., 0., .01]]]], dtype=torch.float32)
+        selected = background.region.select(initial, bodies)
+        background.region.prepare_guidance_boxes(selected.influence_aabb.numpy().reshape(-1, 2, 3))
+        weight = background.region.guidance_weights(initial, bodies)[1].item()
+        assert 0 < weight < 1
+    views = {"camera": {"image": np.zeros((3, 3, 3), np.uint8), "depth": np.ones((3, 3)),
+                        "K": np.eye(3), "T_output_camera": np.eye(4)}}
+    source = _FrozenBackgroundRefinement(views, {"camera": {None: np.ones((3, 3), bool)}},
+        SimpleNamespace(device="cuda:0"), {"voxel_size_m": .002, "measurement_allowance_m": .0001,
+            "measurement_evidence": "explicit calibration", "source": "original RGB-D"}, .0001)
+    background.refinement_source = source
+    scene = PlanningScene(background=background, owners=(),
+        coverage=ObservedSpace(np.ones((5, 5, 5), bool), origin=[-1.]*3, voxel_size=.5,
+            observation_ids=["camera"], reference_frame="world"), reference_frame="world",
+        robot_sphere_materials=(None,), robot_geometry_source="complete synthetic native cover",
+        robot_collision_bodies=bodies, has_gripper=False)
+    # These identities make an accidental source rebind observable. Actual
+    # source queries are unnecessary for gathering the original coarse costs.
+    scene.robot_validator = object()
+    scene._source_scene_checker = object()
+    planner.scene = scene
+    planner.physical_domain = CubicJointDomain(torch.tensor([-2.]), torch.tensor([2.]),
+        torch.tensor([[-.02]]), torch.tensor([[.0005]]), .1, 4)
+    seed = planner.physical_domain.initialize(torch.full((1, 1, 4, 1), -.0195))
+    planner._charge_candidate_queries = Mock()
+    planner.optimize = Mock()
+    fk = Mock(wraps=planner._verification_fk.compute_kinematics)
+    planner._verification_fk.compute_kinematics = fk
+    witnesses = Mock(wraps=scene.background_refinement_witnesses)
+    monkeypatch.setattr(scene, "background_refinement_witnesses", witnesses)
+    refine = Mock(wraps=source.refine)
+    monkeypatch.setattr(source, "refine", refine)
+    forbidden = []
+    for name in ("_fine_mapper_config", "_map_partition", "_require_mapping_memory"):
+        guard = Mock(side_effect=AssertionError("Contained witnesses must not allocate another map"))
+        monkeypatch.setattr("manipulation.planning_observation."+name, guard)
+        forbidden.append(guard)
+    bind = Mock(side_effect=AssertionError("An unchanged source scene must not be rebound"))
+    monkeypatch.setattr(PlanningScene, "bind_source_scene", bind)
+    original = (planner.scene, planner._verification_scene, planner.trajopt, scene._source_scene_checker)
+    original_boxes = background.region.guidance_boxes.copy()
+    cuda_before = torch.cuda.is_initialized()
+    for _ in range(2):
+        result = planner.refine_background_for_seed(seed)
+        assert result["updated"] is False and result["mapping_reused"] is True
+        assert result["status"] == ("unchanged_source_supported_cuboids" if supported
+                                    else "observation_support_unavailable")
+        assert result["active_witnesses"] == result["sampled_times"] > 0
+        assert result["shape_xyz"] == list(shape) and result["center_m"] == [0., 0., 0.]
+        assert result["estimated_mapping_bytes"] == 0
+        assert (planner.scene, planner._verification_scene, planner.trajopt,
+                scene._source_scene_checker) == original
+    # The real cubic/FK/witness pass still runs for each request; only the
+    # unnecessary map, source-scene and solver replacement are absent.
+    assert fk.call_count == witnesses.call_count == refine.call_count == 2
+    assert all(call.kwargs["include_satisfied"] is True for call in witnesses.call_args_list)
+    assert all(not call.args and not call.kwargs for call in planner._check_validation_work.call_args_list)
+    assert planner._check_validation_work.call_count == 4
+    assert scene.background is background
+    np.testing.assert_array_equal(background.region.guidance_boxes, original_boxes)
+    for unused in (*forbidden, bind, admission.storage, admission.workspace, admission.gpu,
+                   planner.refine_validation, planner._charge_candidate_queries,
+                   planner.optimize, planner.trajopt.destroy):
+        unused.assert_not_called()
+    assert torch.cuda.is_initialized() == cuda_before
+# END actual float32 spacing cannot create an otherwise unnecessary rebuild.
+
+
+# BEGIN a changed optimizer cuboid is not a changed source-geometry snapshot.
+def real_guidance_refinement_scene(scene_factory):
+    shape = (81, 43, 45)
+    bits = np.full(shape, 3, np.uint8)
+    bits[40] = 1
+    record = region()
+    record.update(shape_xyz=list(shape), voxel_size_m=float(np.float32(.002)),
+        numerical_support_m=.01, measurement_allowance_m=.0001,
+        source_bits_hex=bits.tobytes().hex(),
+        raw_free_packbits_hex=np.packbits(np.zeros(shape, bool)).tobytes().hex())
+    background = LayeredVoxelQuery(ProxyQuery("background", observed_plane(), bias=1.),
+        ProxyQuery("background", observed_plane(), bias=.1), record)
+    background.region.prepare_guidance_boxes(np.array([[[-.04, -.01, -.01], [-.02, .01, .01]]]))
+    background.mapping_report = {"source": "same original mapped RGB-D", "shape_xyz": list(shape)}
+    views = {"camera": {"image": np.zeros((3, 3, 3), np.uint8), "depth": np.ones((3, 3)),
+                        "K": np.eye(3), "T_output_camera": np.eye(4)}}
+    background.refinement_source = _FrozenBackgroundRefinement(views,
+        {"camera": {None: np.ones((3, 3), bool)}}, SimpleNamespace(device="cuda:0"),
+        {"voxel_size_m": .002, "measurement_allowance_m": .0001,
+         "measurement_evidence": "explicit calibration", "source": "original RGB-D"}, .0001)
+    bodies = ({"body_id": "tool", "sphere_indices": [0], "geometry_names": ["tool_box"]},)
+    current = scene_factory(background, bodies=bodies,
+        owners=(owner(ProxyQuery("target", observed_plane())),))
+    current.observation_report = {"partitions": {"observed_background": {
+        "fine": deepcopy(background.mapping_report)}}}
+    current.bind_source_scene()
+    return current
+
+
+def test_guidance_only_refinement_preserves_native_shapes_cache_and_complete_reports(scene_factory, monkeypatch):
+    current = real_guidance_refinement_scene(scene_factory)
+    old_binding = current.to_execution_binding()
+    old_boxes = current.background.region.guidance_boxes.copy()
+    checker = current._source_scene_checker
+    # Exercise both a coarse-selected collision and a fine-selected separation
+    # before changing only the smooth guidance weights on the right component.
+    query = states([[.005, .03]], [[.25, .75]])
+    old_evidence = {"capture_components": True}
+    old_residual = current.evaluate_source(*query, trajectory_time=query[3], diagnostics=old_evidence)
+    assert old_residual.tolist() == [[1., 0.]]
+    shapes = tuple(row["shape"] for row in checker._scene_shapes)
+    caches = tuple(shape._collision_cache for shape in shapes)
+    entries = tuple(tuple(cache.items()) for cache in caches)
+    assert any(entries)
+    witness_query = states([[.03]])
+    witnesses = current.background_refinement_witnesses(*witness_query,
+        trajectory_time=witness_query[3], include_satisfied=True)
+    assert len(witnesses) == 1 and witnesses[0]["guidance_weight"] == 0.
+    previous_cost = current.background.background_guidance(witness_query[0], key="before",
+        groups=current.robot_collision_bodies)
+    bind = Mock(side_effect=AssertionError("Unchanged source inputs must keep their existing checker"))
+    mapper = Mock(side_effect=AssertionError("An existing supported component needs no new Mapper"))
+    monkeypatch.setattr(PlanningScene, "bind_source_scene", bind)
+    monkeypatch.setattr("manipulation.planning_observation._map_partition", mapper)
+    replacement, report = current.refine_background(witnesses)
+    assert replacement is not None and report["mapping_reused"] is True
+    assert replacement._source_scene_checker is checker
+    assert len(replacement.background.region.guidance_boxes) == 2
+    np.testing.assert_array_equal(current.background.region.guidance_boxes, old_boxes)
+    assert replacement.background.region.guidance_weights(witness_query[0], current.robot_collision_bodies)[1].item() > 0
+    assert replacement.background.background_guidance(witness_query[0], key="after",
+        groups=current.robot_collision_bodies).item() < previous_cost.item()
+    new_binding = replacement.to_execution_binding()
+    # Optimization history is exported from the new scene, while every field
+    # actually consumed by source geometry/permissions remains identical.
+    old_log, new_log = old_binding.pop("observation_report"), new_binding.pop("observation_report")
+    assert_report_bytes_equal(new_binding, old_binding)
+    assert "background_refinements" not in old_log
+    assert new_log["background_refinements"] == [report]
+    assert new_log["partitions"] == old_log["partitions"]
+    assert current.observation_report == old_log
+    new_evidence = {"capture_components": True}
+    new_residual = replacement.evaluate_source(*query, trajectory_time=query[3], diagnostics=new_evidence)
+    torch.testing.assert_close(new_residual, old_residual, rtol=0., atol=0.)
+    assert_report_bytes_equal(new_evidence, old_evidence)
+    for row, shape, cache, saved in zip(checker._scene_shapes, shapes, caches, entries):
+        assert row["shape"] is shape and shape._collision_cache is cache
+        assert all(cache[key] is value for key, value in saved)
+    bind.assert_not_called()
+    mapper.assert_not_called()
+
+
+@pytest.mark.parametrize("remap", (False, True))
+def test_refinement_binds_a_new_checker_for_new_map_or_unbound_scene(scene_factory, monkeypatch, remap):
+    current = real_guidance_refinement_scene(scene_factory)
+    old_checker = current._source_scene_checker
+    original_shape = current.background.region.shape
+    if remap:
+        padding = current.background.region.support+6*current.background.region.size
+        old_top = original_shape[2]*current.background.region.size/2
+        envelope = [[.02, -.005, old_top-padding-.006], [.04, .005, old_top-padding+.004]]
+        witnesses = [{"body_id": "tool", "positive_spheres": 1, "coarse_cost": 1.,
+                      "envelope_world_m": envelope}]
+
+        def mapped(*args):
+            # Only the CUDA Mapper boundary is replaced. The real refiner
+            # decides expansion/shape and the real source checker binds the
+            # resulting finite TSDF and changed source-support grid.
+            request = args[-1]
+            shape = tuple(math.ceil(value/request["voxel_size_m"]) for value in request["extent_m"])
+            native_pose = np.asarray(request["center_m"], dtype=np.float32).astype(float)
+            record = deepcopy(current.background.region.record)
+            record.update(shape_xyz=list(shape), pose=[*native_pose, 1., 0., 0., 0.],
+                source_bits_hex=np.full(shape, 3, np.uint8).tobytes().hex(),
+                raw_free_packbits_hex=np.packbits(np.zeros(shape, bool)).tobytes().hex())
+            return ProxyQuery("background", observed_plane(), bias=.1), {"shape_xyz": list(shape)}, record
+
+        monkeypatch.setattr("manipulation.planning_observation._fine_mapper_config",
+                            Mock(return_value=SimpleNamespace(device="cuda:0")))
+        monkeypatch.setattr("manipulation.planning_observation._mapper_memory_bound", lambda _: 1000)
+        monkeypatch.setattr("manipulation.planning_observation._require_mapping_memory", Mock())
+        mapper = Mock(side_effect=mapped)
+    else:
+        current._source_scene_checker = None
+        query = states([[.03]])
+        witnesses = current.background_refinement_witnesses(*query, trajectory_time=query[3])
+        mapper = Mock(side_effect=AssertionError("Guidance-only first binding still needs no Mapper"))
+    monkeypatch.setattr("manipulation.planning_observation._map_partition", mapper)
+    original_bind = PlanningScene.bind_source_scene
+    rebound = []
+
+    def bind(scene):
+        rebound.append(scene)
+        original_bind(scene)
+
+    monkeypatch.setattr(PlanningScene, "bind_source_scene", bind)
+    replacement, report = current.refine_background(witnesses)
+    assert replacement is not None and report["mapping_reused"] is (not remap)
+    assert rebound == [replacement]
+    assert replacement._source_scene_checker is not None and replacement._source_scene_checker is not old_checker
+    if remap:
+        mapper.assert_called_once()
+        assert replacement.background.region.shape[2] > original_shape[2]
+        assert replacement._source_scene_checker._scene_layers["background"]["region"].shape == replacement.background.region.shape
+        assert all(new["shape"] is not old["shape"] for new, old in
+                   zip(replacement._source_scene_checker._scene_shapes, old_checker._scene_shapes))
+        assert current._source_scene_checker is old_checker
+    else:
+        mapper.assert_not_called()
+        assert current._source_scene_checker is None
+# END a real geometry change and a first binding still create their own checker.
 
 
 def test_builder_api_error_is_not_silently_treated_as_no_refinement():
