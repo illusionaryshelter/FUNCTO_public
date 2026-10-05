@@ -370,8 +370,10 @@ def save_collision_snapshot(path, planner, curve, *, curve_path, validation_stat
     """
     from manipulation.execution_binding import curve_snapshot, plain
 
-    if validation_status not in {"completed", "not_completed"}:
+    # BEGIN native rejection deliberately omits independent export validation.
+    if validation_status not in {"completed", "not_completed", "skipped_native_rejection"}:
         raise ValueError("Collision snapshots require an explicit export validation status")
+    # END skipped validation cannot inherit another seed's last_validation.
     # BEGIN one authoritative copy of potentially large query records per file.
     # The scoped observer already owns the exact production records, including
     # partial failed exports. Validation keeps metrics, bounds and violations;
@@ -729,7 +731,10 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
         report["native_results"].append(entry)
         # END retain every native seed before production gathers a candidate.
         selected, curve, attempt = original(planner, native_result)
-        preserve_candidate(planner, curve, attempt, validation_status="completed")
+        # BEGIN archive the production selection's actual independent-check status.
+        preserve_candidate(planner, curve, attempt,
+                           validation_status=attempt["independent_validation"])
+        # END a cheap native-rejected curve has no completed validation report.
         return selected, curve, attempt
 
     try:

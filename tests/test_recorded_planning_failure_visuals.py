@@ -12,7 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
 from manipulation.collision_records import encode_array
 from recorded_planning_failure_visuals import (candidate_document,
-    captured_query_summary, failure_witnesses, native_metric_rows, validation_summary)
+    captured_query_summary, failure_witnesses, native_failure_evidence, native_metric_rows, validation_summary)
 
 
 def test_recorded_mode_inputs_are_counted_once_without_becoming_verdicts():
@@ -91,3 +91,28 @@ def test_explicit_document_binding_rejects_another_native_seed(tmp_path):
         candidate_document(tmp_path, record, "export_validation_path", document["schema"])
     assert candidate_document(tmp_path, {}, "export_validation_path", document["schema"]) == (None, None)
 # END none of these checks runs geometry, GPU work or physical simulation.
+
+# BEGIN native rejection has evidence even though independent validation is absent.
+def test_native_witnesses_bind_seed_and_do_not_duplicate_material_modes():
+    evidence = {"actor_geometry": "arm", "target_geometry": "observed_object",
+        "signed_distance_m": .00005, "witness_first": [0., 0., 0.],
+        "witness_second": [.00005, 0., 0.]}
+    row = {"component": "source_world_collision", "time_s": .5,
+        "geometry_witnesses": [{"trajectory_time_s": .5,
+            "planning_joint_names": ["j"], "planning_joint_positions": [.25],
+            "violations": [{"kind": "margin_not_satisfied", "evidence": evidence}]}]}
+    seed = {"seed_index": 0, "metrics": {"rollout": {"source_trace": {
+        "status": "recorded", "component_failures": [row, deepcopy(row)]}}}}
+    other = deepcopy(seed)
+    other["seed_index"] = 1
+    other["metrics"]["rollout"]["source_trace"]["component_failures"][0]["time_s"] = 99.
+    components, witnesses = native_failure_evidence({"seeds": [seed, other]}, 0)
+    assert components[0]["failed_mode_samples"] == 2
+    assert components[0]["time_range_s"] == [.5, .5]
+    assert len(witnesses) == 1
+    assert witnesses[0]["scope"] == "native_rollout"
+    assert witnesses[0]["joint_position"] == [.25]
+    assert witnesses[0]["signed_distance_m"] == .00005
+    assert witnesses[0]["evidence_origin"] == "native_source_trace_not_independent_validation"
+    assert failure_witnesses(None) == []
+# END positive distance inside the required margin remains a recorded failure.

@@ -236,6 +236,51 @@ def failure_witnesses(partial):
     return witnesses
 
 
+# BEGIN display native failures even when independent export was never started.
+def native_failure_evidence(document, seed_index):
+    """Summarize bound native samples and copy original rejected pair points.
+
+    Component counts include material modes and are not distinct geometry
+    calls. Spatial witnesses are deduplicated for display only; their complete
+    raw rows remain in the linked native metrics file. No geometry is queried.
+    """
+    components, witnesses, seen = {}, [], set()
+    if document is None:
+        return [], []
+    for seed in document["seeds"]:
+        if seed["seed_index"] != seed_index:
+            continue
+        for scope in ("rollout", "interpolated"):
+            trace = seed["metrics"].get(scope, {}).get("source_trace", {})
+            if trace.get("status") != "recorded":
+                continue
+            for row in trace["component_failures"]:
+                key = (scope, row["component"])
+                summary = components.setdefault(key, {"scope": scope,
+                    "component": row["component"], "failed_mode_samples": 0,
+                    "time_range_s": [row["time_s"], row["time_s"]]})
+                summary["failed_mode_samples"] += 1
+                summary["time_range_s"][0] = min(summary["time_range_s"][0], row["time_s"])
+                summary["time_range_s"][1] = max(summary["time_range_s"][1], row["time_s"])
+                for state in row.get("geometry_witnesses", []):
+                    partial = {"source_world_collision": {"worst_state": {
+                        "trajectory_time_s": state["trajectory_time_s"],
+                        "scene": {"violations": state["violations"]}}}}
+                    for witness in failure_witnesses(partial):
+                        identity = json.dumps([scope, witness["time_s"], witness["geometry_names"],
+                                               witness["points_world"]], sort_keys=True)
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        witnesses.append({**witness, "scope": "native_"+scope,
+                            "evidence_origin": "native_source_trace_not_independent_validation",
+                            "joint_names": state["planning_joint_names"],
+                            "joint_position": state["planning_joint_positions"],
+                            "native_component": row["component"]})
+    return list(components.values()), witnesses
+# END only the selected seed's bound failing samples supply native evidence.
+
+
 def _pose7(values):
     pose = np.eye(4)
     values = np.asarray(values, dtype=float)
@@ -389,14 +434,17 @@ def _metric_table(rows):
     return "".join(body)
 
 
-def _timeline(axis, duration, captured, partial):
+def _timeline(axis, duration, captured, partial, *, validation_status):
     """Keep query recording and completed verification on separate rows."""
     for row in (0, 1):
         axis.broken_barh([(0, duration)], (row-.25, .5), facecolors=UNKNOWN_COLOR, alpha=.35)
     samples = np.asarray(captured["sample_times"], float)
     if len(samples):
         axis.plot(samples, np.zeros(len(samples)), "|", color=PATH_COLOR, markersize=10)
-    label = "原分批验收：未归档 / 未知"
+    # BEGIN omitted validation is a known lifecycle decision, not lost evidence.
+    label = ("独立验收：原生拒绝后未启动" if validation_status == "skipped_native_rejection"
+             else "原分批验收：未归档 / 未知")
+    # END no sampled native verdict implies complete export validation.
     if partial is not None:
         label = f"原分批验收：{partial['checked_points']} / {partial['planned_points']} 采样"
         interval = partial["checked_time_interval_s"]
@@ -517,7 +565,10 @@ def static_summary(path, report, rows, captured, partial, metric_rows, curve,
     failing = [r for r in metric_rows if r["status"] == "正约束项"]
     lines = ["规划诊断 / 非物理执行", f"候选：{report['candidate_id']}",
              f"规划成功：{report.get('planning_success')}",
-             "最终验收："+("未完成" if curve["metadata"]["validation_status"] == "not_completed" else "已完成"),
+             # BEGIN use the producer's exact validation lifecycle.
+             "独立验收："+{"not_completed": "未完成", "completed": "已完成",
+                 "skipped_native_rejection": "原生检查拒绝，未启动"}[curve["metadata"]["validation_status"]],
+             # END native checks cannot imply completed independent acceptance.
              ""]
     exception = None if partial is None else partial.get("exception")
     error = curve["attempt"].get("export_error")
@@ -548,7 +599,8 @@ def static_summary(path, report, rows, captured, partial, metric_rows, curve,
     else:
         axis.text(.5, .5, "观测图像未提供", ha="center", transform=axis.transAxes)
     axis = figure.add_subplot(grid[2, :])
-    _timeline(axis, float(curve["times"][-1]), captured, partial)
+    _timeline(axis, float(curve["times"][-1]), captured, partial,
+              validation_status=curve["metadata"]["validation_status"])
     figure.suptitle("规划失败证据：计算耗时、验证范围与候选现象", fontsize=19)
     figure.savefig(path, dpi=135); plt.close(figure)
 
@@ -561,11 +613,17 @@ def static_witnesses(path, witnesses, curve, meshes, states, clouds):
     shown = witnesses[:4]
     figure = plt.figure(figsize=(14, 6*int(np.ceil(len(shown)/2))), layout="constrained")
     for index, witness in enumerate(shown):
-        axis = figure.add_subplot(int(np.ceil(len(shown)/2)), 2, index+1, projection="3d")
+        # BEGIN keep original witness markers readable in a transparent close-up.
+        axis = figure.add_subplot(int(np.ceil(len(shown)/2)), 2, index+1,
+                                  projection="3d", computed_zorder=False)
         state = next(state for state in states if state["time_s"] == witness["time_s"])
         _static_scene(axis, curve, meshes, state, clouds)
+        for collection in axis.collections:
+            if isinstance(collection, Poly3DCollection):
+                collection.set_alpha(.1)
         points = np.asarray(witness["points_world"])
-        axis.plot(*points.T, "o-", color=FAILED_COLOR, linewidth=3, markersize=6)
+        axis.plot(*points.T, "o-", color=FAILED_COLOR, linewidth=3, markersize=7, zorder=20)
+        # END contextual bodies cannot cover the exact archived red points.
         center = points.mean(0)
         span = max(.06, float(np.linalg.norm(points[1]-points[0]))*1.5)
         axis.set(xlim=(center[0]-span, center[0]+span), ylim=(center[1]-span, center[1]+span),
@@ -640,7 +698,23 @@ def render_failure_diagnostics(run, segment, manifest, output, run_index, stage_
         partial_path, partial_document = candidate_document(run["directory"], record,
             "export_validation_path", "functo.export_validation_progress.1")
         partial = validation_summary(partial_document, float(curve["times"][-1]))
-        witnesses = failure_witnesses(partial)
+        # BEGIN native rejection still has original source-component evidence.
+        components, native_witnesses = native_failure_evidence(
+            metric_document, record["attempt"].get("seed_index"))
+        all_witnesses = failure_witnesses(partial) + native_witnesses
+        # Keep CPU display work bounded; the full evidence and raw native rows
+        # remain saved. Show the earliest and the closest recorded pair first.
+        witnesses = []
+        if all_witnesses:
+            ordered = [min(all_witnesses, key=lambda item: item["time_s"]),
+                       min(all_witnesses, key=lambda item: item["signed_distance_m"]),
+                       *all_witnesses]
+            for witness in ordered:
+                if witness not in witnesses:
+                    witnesses.append(witness)
+                if len(witnesses) == 4:
+                    break
+        # END graphics are a labelled subset, not a substitute for validation.
         display_times = np.unique(np.r_[curve["times"][0], np.linspace(0, curve["times"][-1], 5),
             [] if captured.get("time_range_s") is None else captured["time_range_s"][-1],
             [witness["time_s"] for witness in witnesses],
@@ -667,7 +741,16 @@ def render_failure_diagnostics(run, segment, manifest, output, run_index, stage_
         body.append("<p><b>原生求解标记：</b>"+_plain(record["attempt"].get("native_success"))+"；"
                     "<b>导出结果：</b>"+_plain(record["attempt"].get("export_error", "见原候选报告"))+"。</p>")
         body.append(_metric_table(metrics))
-        body.append(_partial_table(partial, witnesses))
+        # BEGIN display native component names/times without calling them export checks.
+        if record["validation_status"] == "skipped_native_rejection":
+            body.append("<p><b>独立验收未启动：</b>原生约束检查已经拒绝该候选。</p>")
+        else:
+            body.append(_partial_table(partial, witnesses))
+        if components:
+            body.append("<p>原生失败分量（次数包含材料模式；时间范围不表示连续碰撞）：</p><pre>"+
+                        _plain(json.dumps(components, ensure_ascii=False, indent=2))+"</pre>")
+        body.append(f"<p>空间见证展示 {len(witnesses)} / {len(all_witnesses)} 条；完整见证保存在证据 JSON。</p>")
+        # END no skipped export is described as a missing or completed audit.
         witness_path = output / (prefix+"_witnesses.png")
         if witnesses:
             static_witnesses(witness_path, witnesses, curve, meshes, states, clouds)
@@ -683,7 +766,8 @@ def render_failure_diagnostics(run, segment, manifest, output, run_index, stage_
                    "native_metrics_path": str(metric_path) if metric_document is not None else None,
                    "native_metric_rows": metrics,
                    "partial_validation_path": None if partial_path is None else str(partial_path),
-                   "partial_validation": partial, "original_failure_witnesses": witnesses,
+                   "partial_validation": partial, "original_failure_witnesses": all_witnesses,
+                   "displayed_failure_witnesses": witnesses, "native_failure_components": components,
                    "source_display_counts": source_counts, "observation_display_counts": observation_counts,
                    "display_times_s": display_times.tolist(), "unknown_future_finger_geometry_hidden": True,
                    "geometry_evaluations_performed": 0, "gpu_used": False, "physics_steps": 0,

@@ -72,7 +72,10 @@ def test_failed_atomic_progress_write_retains_last_complete_document(tmp_path):
 @pytest.mark.parametrize("diagnostic_write_fails", [False, True])
 def test_native_metrics_are_saved_before_failed_export_without_repeating_metrics(tmp_path, diagnostic_write_fails):
     problem = SimpleNamespace(events=(), phase_count=1, anchors=np.array([0., 1.]))
-    native = PlannerCandidateSelectionTests.native_candidates(flags=(False, False))
+    # BEGIN only native-accepted seeds reach independent export validation.
+    native = PlannerCandidateSelectionTests.native_candidates(
+        flags=(True, True), native_violations=(0., 0.))
+    # END this fixture tests interrupted export, not the native rejection path.
     planner, _ = PlannerCandidateSelectionTests.selection_fixture((.1, .2))
     del planner.export  # Exercise the recorder's class wrapper, not a fixture mock.
     planner.trajopt = SimpleNamespace(config=SimpleNamespace(
@@ -90,8 +93,8 @@ def test_native_metrics_are_saved_before_failed_export_without_repeating_metrics
         if not diagnostic_write_fails:
             saved = json.loads((output/"native-result-00-metrics.json").read_text())
             assert saved["seeds"][0]["seed_index"] == 0
-            assert saved["seeds"][0]["metrics"]["success"] is False
-            assert saved["seeds"][0]["positive_constraint_names"]["rollout"] == ["cspace"]
+            assert saved["seeds"][0]["metrics"]["success"] is True
+            assert saved["seeds"][0]["positive_constraint_names"]["rollout"] == []
         self._export_progress_observer(batch(end=2, witness="actual first batch", clearance=-.01))
         raise exhausted
 

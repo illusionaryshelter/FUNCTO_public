@@ -76,17 +76,20 @@ def test_rejected_snapshot_owns_complete_scene_clock_curve_and_query_scope(tmp_p
     assert curve.residuals == {"scene": .01}
 
 
-def test_unfinished_export_never_copies_a_previous_candidates_validation(tmp_path):
+# BEGIN neither interrupted nor deliberately skipped exports own old validation.
+@pytest.mark.parametrize("validation_status", ["not_completed", "skipped_native_rejection"])
+def test_unfinished_export_never_copies_a_previous_candidates_validation(tmp_path, validation_status):
     planner, curve, _ = candidate()
     planner.last_validation = {"u": [0., 1.], "violations": [0., 0.], "candidate": "previous_seed"}
     target = tmp_path/"candidate-scene.json"
     save_collision_snapshot(target, planner, curve, curve_path="candidate.npz",
-        validation_status="not_completed", query_capture={"status": "not_recorded", "calls": [], "errors": []})
+        validation_status=validation_status, query_capture={"status": "not_recorded", "calls": [], "errors": []})
     document = json.loads(target.read_text())
     assert document["validation"] is None
-    assert document["validation_status"] == "not_completed"
+    assert document["validation_status"] == validation_status
     assert document["scene_query_capture"]["status"] == "not_recorded"
     assert "previous_seed" not in target.read_text()
+# END stale seed evidence must not be attached to this diagnostic curve.
 
 
 def test_scene_capture_keeps_native_float32_sides_and_arrival_permission():

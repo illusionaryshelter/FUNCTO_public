@@ -78,8 +78,10 @@ def load_curve(path, expected_classification):
     if (classification not in CLASSIFICATIONS or classification != expected_classification
             or metadata["classification"] != classification):
         raise ValueError("Curve arrays, metadata and planning report disagree on classification")
-    if metadata["validation_status"] not in {"completed", "not_completed"}:
+    # BEGIN native-rejected curves were retained without independent validation.
+    if metadata["validation_status"] not in {"completed", "not_completed", "skipped_native_rejection"}:
         raise ValueError("Every current curve must declare whether final verification completed")
+    # END only completed verification can authorize an accepted archive.
     if classification == "planner_accepted" and metadata["validation_status"] != "completed":
         raise ValueError("A curve without completed verification cannot be planner_accepted")
     times, position, velocity = (np.asarray(curve[key], float)
@@ -512,9 +514,13 @@ def render(manifest, audit, runs, unmatched, output, *, defer_untested=False, st
                 body.append("<p>本次运行未生成可展示的关节曲线。</p>")
             for curve in run["curves"]:
                 label, _ = CLASSIFICATIONS[curve["classification"]]
-                validation = ("最终验证未完成；仅保留原生曲线，没有最终约束判定"
-                              if curve["metadata"]["validation_status"] == "not_completed"
-                              else "最终验证已完成；是否通过以规划分类为准")
+                # BEGIN distinguish interrupted validation from deliberately skipped work.
+                validation = {
+                    "not_completed": "最终验证未完成；仅保留原生曲线，没有最终约束判定",
+                    "skipped_native_rejection": "原生约束检查拒绝；未启动独立曲线验收；仅供诊断",
+                    "completed": "最终验证已完成；是否通过以规划分类为准",
+                }[curve["metadata"]["validation_status"]]
+                # END native sampling never becomes full-curve acceptance.
                 body.append(f'<h4>{escape(curve["path"].name)} · {label}</h4>'
                             f'<p><b>{validation}</b></p>'
                             +link(curve["path"], output, "原始 q / dq / 时间数组")
