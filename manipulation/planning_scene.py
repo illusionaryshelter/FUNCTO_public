@@ -922,6 +922,97 @@ def _validate_contact_and_gripper_inputs(owner_materials, robot_materials, conta
 # END CPU-only hand/contact validation.
 
 
+# BEGIN one frozen candidate shares exact ordinary reports with its dense check.
+_SOURCE_WORLD_REUSE_BYTES = 32 * 1024 * 1024
+
+
+def _source_world_binding_key(scene):
+    """Name the frozen native binding and the hand values it actually consumes.
+
+    Ordinary and dense rollouts own different copies of the hand. Their
+    identity therefore comes from its typed measured entrance and nominal
+    polynomial, rather than the Python identity of those copies. Command
+    references are not future physical geometry in the source validator.
+    """
+    def typed(value):
+        value = np.asarray(value)
+        return value.dtype.str, value.shape, value.tobytes()
+
+    hand = scene.gripper
+    nominal = None if hand is None else hand.nominal_finger_trajectory
+    hand_key = None if hand is None else (
+        hand.controller, tuple(hand.joint_names), typed(hand.current_positions),
+        None if nominal is None else (type(nominal), tuple(nominal.joint_names),
+            typed(nominal.duration), typed(nominal.times), typed(nominal.position),
+            typed(nominal.velocity)))
+    return (id(scene.robot_validator), id(scene._source_scene_checker),
+            tuple(sorted(scene._self_collision_owner_ids)), hand_key)
+
+
+class _SourceWorldStateReuse:
+    """Bound complete reports from one ordinary call until its dense call ends.
+
+    This is a candidate-local store, not a history of trajectory checks. Only
+    the ordinary scene inserts entries. Dense states absent from the store
+    execute the original query and use only the existing call-local cache.
+    Every stored/replayed report is owned independently of public diagnostics.
+    """
+
+    def __init__(self, ordinary, dense):
+        from .robot_geometry_check import _owned_record_bytes
+
+        self._scenes = (ordinary, dense)
+        self._binding = _source_world_binding_key(ordinary)
+        if self._binding != _source_world_binding_key(dense):
+            raise ValueError("Source state reuse requires the same frozen scene and nominal hand binding")
+        self._candidate = object()
+        self._reports = {}
+        # The conservative count deliberately charges repeated references
+        # repeatedly. 512 bytes per entry below bound dictionary growth and
+        # container headers; the fixed reserve also includes this coordinator.
+        self.storage_nbytes = _owned_record_bytes(self._binding) + 4096
+        self.capacity_nbytes = _SOURCE_WORLD_REUSE_BYTES
+        self.stored_states = self.reused_states = self.capacity_misses = 0
+        if self.storage_nbytes > self.capacity_nbytes:
+            self.close()
+
+    def binding_for(self, scene):
+        """A changed binding invalidates both ends before another lookup."""
+        if self._scenes and _source_world_binding_key(scene) == self._binding:
+            return self._binding
+        self.close()
+        return None
+
+    def lookup(self, scene, key):
+        if self._scenes and scene is self._scenes[1] and key in self._reports:
+            self.reused_states += 1
+            return deepcopy(self._reports[key])
+        return None
+
+    def record(self, scene, key, report):
+        from .robot_geometry_check import _owned_record_bytes
+
+        if not self._scenes or scene is not self._scenes[0] or key in self._reports:
+            return
+        size = _owned_record_bytes(key) + _owned_record_bytes(report) + 512
+        if self.storage_nbytes + size > self.capacity_nbytes:
+            self.capacity_misses += 1
+            return
+        self._reports[key] = deepcopy(report)
+        self.storage_nbytes += size
+        self.stored_states += 1
+
+    def close(self):
+        for scene in self._scenes:
+            if getattr(scene, "_source_world_reuse", None) is self:
+                scene._source_world_reuse = None
+        self._reports.clear()
+        self._scenes = ()
+        self._binding = self._candidate = None
+        self.storage_nbytes = 0
+# END no stored result survives the paired ordinary/dense candidate lifecycle.
+
+
 class PlanningScene:
     """One scene contract for optimizer rollout, search and final checks.
 
@@ -948,6 +1039,9 @@ class PlanningScene:
         self.robot_validator = None
         self._self_collision_owner_ids = frozenset()
         self._source_scene_checker = None
+        # BEGIN candidate report reuse is attached only by native postprocessing.
+        self._source_world_reuse = None
+        # END optimizer, search and standalone checks have no cross-call store.
         # END standalone scene queries do not implicitly supply robot evidence.
         # BEGIN independent solids need explicit material identity, not sphere-index guesses.
         self.native_geometry_materials = dict(native_geometry_materials or {})
@@ -1369,6 +1463,9 @@ class PlanningScene:
         these read-only scene shapes; candidate owner/release poses are query
         inputs, never changes to the saved scene or the execution validator.
         """
+        # BEGIN a new source-map/policy epoch cannot inherit candidate verdicts.
+        self.end_source_world_reuse()
+        # END the other rollout end is detached as well.
         if self.robot_validator is None:
             raise ValueError("Source world geometry needs the already validated robot binding")
         checker = copy(self.robot_validator.checker)
@@ -1378,6 +1475,33 @@ class PlanningScene:
         checker.bind_scene(self.to_execution_binding())
         self._source_scene_checker = checker
     # END one scene construction serves optimizer metrics, search and final validation.
+
+    # BEGIN native postprocessing owns an explicit ordinary-to-dense lifetime.
+    def begin_source_world_reuse(self, dense_scene):
+        """Share reports with this candidate's dense scene until explicit end.
+
+        The caller begins immediately before ordinary metrics and ends in a
+        finally block after dense metrics, including interpolation/query errors.
+        Starting another candidate first detaches both ends of the old store.
+        """
+        if dense_scene is self:
+            raise ValueError("Ordinary and dense source checks need distinct rollout scenes")
+        PlanningScene.end_source_world_reuse(self)
+        PlanningScene.end_source_world_reuse(dense_scene)
+        if (self.robot_validator is None or self._source_scene_checker is None
+                or dense_scene.robot_validator is None or dense_scene._source_scene_checker is None):
+            raise ValueError("Source state reuse requires two bound native scene copies")
+        session = _SourceWorldStateReuse(self, dense_scene)
+        if session._scenes:
+            self._source_world_reuse = dense_scene._source_world_reuse = session
+        return session
+
+    def end_source_world_reuse(self):
+        """Release both scene references and reports; repeated cleanup is safe."""
+        session = getattr(self, "_source_world_reuse", None)
+        if session is not None:
+            session.close()
+    # END source reuse never changes native interpolation or acceptance inputs.
 
     def check_robot_self_collision(self, joint_position, joint_names, trajectory_time,
                                    *, valid=None, diagnostics=None):
@@ -1485,16 +1609,30 @@ class PlanningScene:
         state_fields.extend(value for selection in selected_values.values()
                             for name, value in selection.items() if name != "body_ids")
         state_residuals = {}
+        # BEGIN a cross-call identity includes the fixed schema as well as bytes.
+        # Unlike the call-local key, a shared key cannot infer dtype, shape,
+        # names or body order from the enclosing call. Batch identity denotes
+        # the original native seed, while the session denotes its frozen curve.
+        reuse = getattr(self, "_source_world_reuse", None)
+        reuse_binding = None if reuse is None else reuse.binding_for(self)
+        reuse_schema = None if reuse_binding is None else (
+            reuse._candidate, reuse_binding, tuple(joint_names), tuple(owner_values),
+            tuple((name, tuple(value["body_ids"])) for name, value in selected_values.items()),
+            tuple((value.dtype.str, value.shape[1:]) for value in state_fields))
+        # END numerically close states and differently typed fields cannot match.
         # BEGIN diagnostic references preserve batch/mode identity across deduplication.
         # q/time alone is not an identity: another seed can have a different
         # released owner pose or selected field at the same robot configuration.
         capture_failures = diagnostics is not None and diagnostics.get("capture_components")
         query_indices = None
-        if capture_failures:
+        if capture_failures or reuse_schema is not None:
             try:
                 query_indices = valid.nonzero().detach().cpu().numpy()
             except Exception as error:
+                if not capture_failures:
+                    raise
                 capture_failures = False
+                reuse_schema = None
                 diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
         failure_references = {}
 
@@ -1507,7 +1645,7 @@ class PlanningScene:
             except Exception as error:
                 diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
         # END only already-evaluated, byte-identical state keys share a witness.
-        # END no result survives a call, model binding, gripper or candidate change.
+        # END call-local references never survive into another diagnostic report.
         residuals, unmodelled, worst = [], set(), None
         # BEGIN IK ranking consumes all queried modes, never only the worst witness.
         clearance = (deepcopy(diagnostics.get("unpermitted_clearance"))
@@ -1537,35 +1675,48 @@ class PlanningScene:
             # BEGIN preserve first-occurrence query and exception order.
             # Nominal scene queries have no release-history or budget mutation;
             # Pinocchio refreshes its scratch data at every independent query.
-            # Retain only a scalar per unique state, never a trajectory-sized
-            # inventory of scene reports. A duplicate cannot add an unmodelled
-            # name or beat its first report under the strict worst-rank test.
+            # Retain a residual and logical distance count per unique state.
+            # A duplicate cannot add an unmodelled name or beat its first
+            # report under the strict worst-rank test. It still represents
+            # the same already measured distances at this logical query.
             state_key = tuple(value[index].tobytes() for value in state_fields)
             if state_key in state_residuals:
-                residuals.append(state_residuals[state_key])
+                residual, measured_count = state_residuals[state_key]
+                residuals.append(residual)
+                if diagnostics is not None:
+                    clearance["measured_count"] += measured_count
                 # BEGIN repeated logical modes retain their own precise witness reference.
                 if state_key in failure_references:
                     reference_failure(index, failure_references[state_key])
                 # END this branch still performs no additional geometry query.
                 continue
             # END logical residual order/count still includes every valid state.
-            owner_poses = {}
-            for identity, (p, q) in owner_values.items():
-                pose = np.eye(4)
-                pose[:3, :3] = Rotation.from_quat(q[index, [1, 2, 3, 0]]).as_matrix()
-                pose[:3, 3] = p[index]
-                owner_poses[identity] = pose
-            layers = {key: {"body_ids": value["body_ids"],
-                **{name: encode_array(array[index:index+1][None])
-                   for name, array in value.items() if name != "body_ids"}}
-                for key, value in selected_values.items()}
-            report = self.robot_validator.check_planning_world(row, joint_names,
-                time_s=time_s, gripper=self.gripper, scene_checker=self._source_scene_checker,
-                progress=phase, nominal_owner_poses=owner_poses, layer_selection=layers,
-                robot_owner_permission_progress=permission)
+            # BEGIN only this candidate's exact ordinary state may supply a report.
+            shared_key = (None if reuse_schema is None else
+                          (reuse_schema, int(query_indices[index, 0]), state_key))
+            report = None if shared_key is None else reuse.lookup(self, shared_key)
+            if report is None:
+                owner_poses = {}
+                for identity, (p, q) in owner_values.items():
+                    pose = np.eye(4)
+                    pose[:3, :3] = Rotation.from_quat(q[index, [1, 2, 3, 0]]).as_matrix()
+                    pose[:3, 3] = p[index]
+                    owner_poses[identity] = pose
+                layers = {key: {"body_ids": value["body_ids"],
+                    **{name: encode_array(array[index:index+1][None])
+                       for name, array in value.items() if name != "body_ids"}}
+                    for key, value in selected_values.items()}
+                report = self.robot_validator.check_planning_world(row, joint_names,
+                    time_s=time_s, gripper=self.gripper, scene_checker=self._source_scene_checker,
+                    progress=phase, nominal_owner_poses=owner_poses, layer_selection=layers,
+                    robot_owner_permission_progress=permission)
+                if shared_key is not None:
+                    reuse.record(self, shared_key, report)
+            # END hits enter the same complete diagnostic reduction as real queries.
             residuals.append(report["residual"])
             # BEGIN only a successfully completed query can be reused.
-            state_residuals[state_key] = report["residual"]
+            measured_count = (report.get("scene", {}).get("unpermitted_clearance") or {}).get("measured_count", 0)
+            state_residuals[state_key] = report["residual"], measured_count
             # END errors propagate at the original first occurrence.
             unmodelled.update(report["unmodelled_geometry_names"])
             if diagnostics is not None:
@@ -1634,6 +1785,9 @@ class PlanningScene:
         # robot oracle is likewise shared so its cumulative request budget
         # cannot be restarted by making another candidate.
         result = copy(self)
+        # BEGIN a new rollout is never another end of an in-flight candidate.
+        result._source_world_reuse = None
+        # END only begin_source_world_reuse explicitly attaches the dense peer.
         result.background = self.background.clone_for_rollout()
         result.owners = tuple(copy(owner) for owner in self.owners)
         for owner in result.owners:
@@ -2015,6 +2169,12 @@ class PlanningScene:
             # its bounded one-state evidence and contact scratch once; it is
             # reused serially across all B*H accepted/failed state queries.
             source_query_bytes = self._source_scene_checker.scene_query_workspace_nbytes
+            # BEGIN admit one bounded ordinary-report store across both metrics.
+            # The planner takes the maximum sequential live allocation, rather
+            # than summing it over rollout copies. Dense-only reports are never
+            # retained, and this CPU store cannot enter graph_live below.
+            source_query_bytes += _SOURCE_WORLD_REUSE_BYTES
+            # END the candidate store has one fixed internal 32 MiB capacity.
         # Per-state source inputs contain only q/time, owner rigid poses and
         # selected body envelopes. Pair results are reduced one state at a
         # time; no B*H*robot*scene report inventory is retained.

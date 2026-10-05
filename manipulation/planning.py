@@ -3162,6 +3162,45 @@ def _trajectory_candidate(result, index):
 # END exact native candidate extraction before independent verification.
 
 
+# BEGIN one frozen candidate owns ordinary-to-dense source report reuse.
+def _bind_candidate_source_world_reuse(optimizer):
+    """Bind exact-report reuse to native metrics calls, including error cleanup.
+
+    A native solve can evaluate several candidates. Starting at each ordinary
+    metrics call, rather than at solve entry, prevents results from a previous
+    curve being retained. The dense wrapper includes interpolation itself so
+    failures before dense cost evaluation also release both scene references.
+    """
+    from functools import wraps
+    ordinary = optimizer.metrics_rollout
+    dense = optimizer.additional_metrics_rollouts["interpolated_rollout"]
+    ordinary_scene = ordinary.metrics_constraint_manager._scene
+    dense_scene = dense.metrics_constraint_manager._scene
+    ordinary_metrics = ordinary.compute_metrics_from_action
+    dense_metrics = optimizer._interpolate_and_compute_metrics
+
+    @wraps(ordinary_metrics)
+    def evaluate_ordinary(*args, **kwargs):
+        ordinary_scene.begin_source_world_reuse(dense_scene)
+        try:
+            return ordinary_metrics(*args, **kwargs)
+        except BaseException:
+            ordinary_scene.end_source_world_reuse()
+            raise
+
+    @wraps(dense_metrics)
+    def evaluate_dense(*args, **kwargs):
+        try:
+            return dense_metrics(*args, **kwargs)
+        finally:
+            ordinary_scene.end_source_world_reuse()
+
+    ordinary.compute_metrics_from_action = evaluate_ordinary
+    optimizer._interpolate_and_compute_metrics = evaluate_dense
+    return ordinary_scene.end_source_world_reuse
+# END cleanup is idempotent for dense completion, solve errors and observation.
+
+
 class _CuroboPlanner:
     """One request's native solvers and independent verification workspaces."""
 
@@ -3413,6 +3452,18 @@ class _CuroboPlanner:
         }
 
         class ProcessTrajectoryOptimizer(TrajectoryOptimizer):
+            # BEGIN install sessions on each construction, including grid rebuilds.
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.end_source_world_reuse = _bind_candidate_source_world_reuse(self)
+
+            def solve_pose(self, *args, **kwargs):
+                try:
+                    return super().solve_pose(*args, **kwargs)
+                finally:
+                    self.end_source_world_reuse()
+            # END an error between ordinary metrics and interpolation cannot leak.
+
             def get_interpolated_trajectory(self, js_optimized):
                 # BEGIN preserve raw controls and boundary derivatives on one clock.
                 from curobo._src.curobolib.cuda_ops.trajectory import get_bspline_interpolation
@@ -4549,14 +4600,19 @@ class _CuroboPlanner:
         self._charge_candidate_queries(count*(self.trajopt.horizon+self.formal_clock["valid_count"]
                                               +2*(len(self.anchors)+len(self.refinement_parameters))))
         with self.torch.no_grad():
-            metrics = self.trajopt.metrics_rollout.compute_metrics_from_action(actions)
-            joint = metrics.state.joint_state
-            joint.joint_names = self.trajopt.joint_names
-            joint.knot = metrics.actions
-            joint.knot_dt = joint.dt*self.trajopt.interpolation_steps
-            interpolated, trajectory, last = self.trajopt._interpolate_and_compute_metrics(joint)
-            result = self.trajopt._get_result(actions, metrics, interpolated, trajectory, last, count, count)
-            return self.trajopt._get_best_result(result, count)
+            # BEGIN observations have the same bounded candidate lifecycle as solve.
+            try:
+                metrics = self.trajopt.metrics_rollout.compute_metrics_from_action(actions)
+                joint = metrics.state.joint_state
+                joint.joint_names = self.trajopt.joint_names
+                joint.knot = metrics.actions
+                joint.knot_dt = joint.dt*self.trajopt.interpolation_steps
+                interpolated, trajectory, last = self.trajopt._interpolate_and_compute_metrics(joint)
+                result = self.trajopt._get_result(actions, metrics, interpolated, trajectory, last, count, count)
+                return self.trajopt._get_best_result(result, count)
+            finally:
+                self.trajopt.end_source_world_reuse()
+            # END sorting a result never extends the source report session.
 
     def _observe_actions(self, actions, origin, initial, seen):
         """Validate new block states without replacing the optimizer's state."""

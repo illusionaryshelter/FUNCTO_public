@@ -157,6 +157,7 @@ class FeasibleObservationTests(unittest.TestCase):
             horizon=49, interpolation_steps=4, joint_names=["a", "b", "c"],
             metrics_rollout=SimpleNamespace(compute_metrics_from_action=Mock(return_value=metrics)),
             _interpolate_and_compute_metrics=Mock(return_value=("metrics", "trajectory", "last")),
+            end_source_world_reuse=Mock(),
             _get_result=Mock(return_value=output), _get_best_result=Mock(return_value=output))
         planner = SimpleNamespace(trajopt=trajopt, torch=torch, formal_clock={"valid_count": 385},
             anchors=[0., 1.], refinement_parameters=np.array([.4]), _charge_candidate_queries=Mock())
@@ -164,9 +165,61 @@ class FeasibleObservationTests(unittest.TestCase):
         self.assertIs(result, output)
         trajopt._get_result.assert_called_once_with(actions, metrics, "metrics", "trajectory", "last", 2, 2)
         trajopt._get_best_result.assert_called_once_with(output, 2)
+        trajopt.end_source_world_reuse.assert_called_once_with()
         self.assertIs(joint.knot, actions)
         torch.testing.assert_close(joint.knot_dt, torch.full((2, 1), .8))
         planner._charge_candidate_queries.assert_called_once_with(2*(49+385+6))
+
+    # BEGIN candidate sessions follow actual native calls and all error exits.
+    def test_source_reuse_session_begins_per_candidate_and_closes_on_errors(self):
+        from manipulation.planning import _bind_candidate_source_world_reuse
+
+        for failure in (None, "ordinary", "dense"):
+            with self.subTest(failure=failure):
+                events = []
+                active = [False]
+                dense_scene = object()
+
+                def begin(scene):
+                    self.assertIs(scene, dense_scene)
+                    events.append("begin")
+                    active[0] = True
+
+                def end():
+                    events.append("end")
+                    active[0] = False
+
+                def evaluate(kind):
+                    self.assertTrue(active[0])
+                    events.append(kind)
+                    if failure == kind:
+                        raise RuntimeError(kind)
+                    return kind
+
+                ordinary_scene = SimpleNamespace(begin_source_world_reuse=begin,
+                                                  end_source_world_reuse=end)
+                rollout = SimpleNamespace(metrics_constraint_manager=SimpleNamespace(_scene=ordinary_scene),
+                    compute_metrics_from_action=lambda _: evaluate("ordinary"))
+                optimizer = SimpleNamespace(metrics_rollout=rollout,
+                    additional_metrics_rollouts={"interpolated_rollout": SimpleNamespace(
+                        metrics_constraint_manager=SimpleNamespace(_scene=dense_scene))},
+                    _interpolate_and_compute_metrics=lambda _: evaluate("dense"))
+                cleanup = _bind_candidate_source_world_reuse(optimizer)
+                if failure is None:
+                    for _ in range(2):
+                        self.assertEqual(rollout.compute_metrics_from_action("actions"), "ordinary")
+                        self.assertEqual(optimizer._interpolate_and_compute_metrics("joint"), "dense")
+                        self.assertFalse(active[0])
+                    self.assertEqual(events, ["begin", "ordinary", "dense", "end"]*2)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, failure):
+                        rollout.compute_metrics_from_action("actions")
+                        optimizer._interpolate_and_compute_metrics("joint")
+                    self.assertFalse(active[0])
+                    self.assertEqual(events[-1], "end")
+                cleanup()
+                self.assertFalse(active[0])
+    # END no interpolation failure can leave a candidate report cache active.
 
     def test_pose_gate_checks_exact_event_parameter_and_original_tolerance(self):
         from manipulation.planning import _ProgressMap

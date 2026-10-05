@@ -376,13 +376,16 @@ class RobotGeometryChecker:
         # BEGIN avoid reserving a second and third copy of persistent TSDF rows.
         # iter_collision_components yields references to immutable cached Coal
         # shapes/vertices, including inside contact-region checks. A cache miss
-        # creates one bounded component; the per-pair reserve above covers the
-        # few live yielded/evicted components. KD candidates, source arrays and
+        # creates one bounded component; the batch reserve below additionally
+        # covers its borrowed/evicted entries. KD candidates, source arrays and
         # native LP/BVH work retain the existing doubled non-cache allowance.
         component_cache_bytes = sum(row["shape"].collision_cache_storage_nbytes
             for row in self._scene_shapes if isinstance(row["shape"], ObservedTsdfGeometry))
         self.scene_query_workspace_nbytes = (pair_bound * (131072 + 4096 * len(scene_binding["contacts"]))
-            + 2 * (self.scene_storage_nbytes - self.native_query_storage_nbytes - component_cache_bytes))
+            + 2 * (self.scene_storage_nbytes - self.native_query_storage_nbytes - component_cache_bytes)
+            # BEGIN one live batch: shape reserve plus references/pose scratch.
+            + (4096 * (4096 + 1024) if component_cache_bytes else 0))
+            # END the reserve is per query, never multiplied by map components.
         # END full cache capacity remains charged in scene_storage_nbytes once.
         # END planning clones share this immutable scene allocation.
 
@@ -582,6 +585,9 @@ class RobotGeometryChecker:
                     self._scene_surface_distance_cache):
             # END component identities still remain on the individual rows.
                 row_count = len(rows)
+                # BEGIN a separated native prefix represents actual Coal calls.
+                measured_count = second.get("_component_count", 1)
+                # END near/contact components always retain their individual row.
                 issue_counts = tuple(len(items) for items in (violations, gaps, unresolved))
                 try:
             # END each component retains its original owner, body and layer identity.
@@ -622,8 +628,12 @@ class RobotGeometryChecker:
                     transforms = [first_transform,
                         coal.Transform3s(second["pose"][:3, :3], second["pose"][:3, 3])]
                     # END distance/contact requests and results remain fresh.
-                    distance = coal.DistanceResult()
-                    coal.distance(first["shape"], transforms[0], second["shape"], transforms[1], self._request, distance)
+                    # BEGIN TSDF prefixes already used the same native leaf call.
+                    distance = second.get("_prequeried_distance")
+                    if distance is None:
+                        distance = coal.DistanceResult()
+                        coal.distance(first["shape"], transforms[0], second["shape"], transforms[1], self._request, distance)
+                    # END ordinary analytic pairs still require their single query.
                     value = float(distance.min_distance)
                     if not np.isfinite(value):
                         raise RuntimeError("Independent scene distance returned nonfinite evidence")
@@ -638,12 +648,13 @@ class RobotGeometryChecker:
                     summary = component_summaries.get(pair_key)
                     if (summary is not None and value > max(boundary, margin)
                             and value >= rows[summary["index"]]["signed_distance_m"]):
-                        rows[summary["index"]]["component_summary"]["tested"] += 1
+                        rows[summary["index"]]["component_summary"]["tested"] += measured_count
                         # BEGIN a permitted nearest piece cannot hide an unpermitted next piece.
                         if (first["owner"] == "robot"
                                 and (first["name"], second["owner"]) not in permitted_robot_pairs):
                             _record_unpermitted_clearance(clearance, value, margin,
-                                first["name"], second["owner"], second["name"], "queried_source_component")
+                                first["name"], second["owner"], second["name"], "queried_source_component",
+                                measured_count=measured_count)
                         # END preserve scalar evidence even when detail allocation is omitted.
                         continue
                     # END the finally summary sees no appended row in this case.
@@ -781,13 +792,13 @@ class RobotGeometryChecker:
                             _record_unpermitted_clearance(clearance, current["signed_distance_m"],
                                 current.get("measurement_allowance_m", 0.),
                                 current["actor_geometry"], current["target_owner"], current["target_geometry"],
-                                "queried_source_component")
+                                "queried_source_component", measured_count=measured_count)
                     # END neither the saved witness nor its distance participates in acceptance.
                     # BEGIN stream complete component checks into bounded pair evidence.
                     if "tsdf_component_id" in first or "tsdf_component_id" in second:
                         _summarize_component_result(pair_key, rows, row_count,
                             (violations, gaps, unresolved), issue_counts,
-                            component_summaries, stopped_pairs)
+                            component_summaries, stopped_pairs, measured_count=measured_count)
                     # END a failed pair can stop; an accepted pair checks every candidate.
         # Required contact additionally needs actual supplied target occupancy
         # in the finite region; an abstract patch can contain unobserved air.
@@ -1282,7 +1293,7 @@ def _owned_record_bytes(value):
 
 # BEGIN bounded scalar clearance records survive per-pair contact summarization.
 def _record_unpermitted_clearance(summary, distance, margin, actor_geometry,
-                                 target_owner, target_geometry, distance_scope):
+                                 target_owner, target_geometry, distance_scope, *, measured_count=1):
     """Accumulate one already queried, unpermitted robot/environment distance.
 
     The caller owns policy and complete-solid checks. No additional Coal query
@@ -1292,7 +1303,9 @@ def _record_unpermitted_clearance(summary, distance, margin, actor_geometry,
     finiteness and margin validity were already checked at the query boundary;
     losing a minimum update allocates no new witness record or NumPy array.
     """
-    summary["measured_count"] += 1
+    # BEGIN a pure separated prefix has one minimum and many measured leaves.
+    summary["measured_count"] += measured_count
+    # END its fixed pair/margin preserves both raw and adjusted minima.
     raw_minimum = (summary["minimum_recorded_distance_m"] is None
                    or distance < summary["minimum_recorded_distance_m"])
     adjusted = distance-margin
@@ -1316,7 +1329,8 @@ def _body_pair_key(first, second):
 
 
 # BEGIN the component enumerator supplies the stable whole-body pair key once.
-def _summarize_component_result(key, rows, previous_count, issues, issue_counts, summaries, stopped):
+def _summarize_component_result(key, rows, previous_count, issues, issue_counts, summaries, stopped,
+                                *, measured_count=1):
     """Retain one decisive witness and complete counts, without storing all pieces.
 
     A rejected physical pair needs no second witness. An accepted pair still
@@ -1341,7 +1355,7 @@ def _summarize_component_result(key, rows, previous_count, issues, issue_counts,
         if failed or current["signed_distance_m"] < previous["signed_distance_m"]:
             rows[index] = current
     rows[index]["component_summary"] = {
-        "tested": tested+1, "permitted": permitted+int(current.get("permission") is not None),
+        "tested": tested+measured_count, "permitted": permitted+int(current.get("permission") is not None),
         "stopped_after_pair_failure": failed,
         "scope": "complete candidate enumeration unless a decisive pair failure already rejects the state"}
     for items, count in zip(issues, issue_counts):
@@ -1460,13 +1474,68 @@ def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, r
             if key in stopped:
                 break
             first_bounds = _solid_axis_bounds(first["vertices"], first["shape"], first["pose"])
-            for second in _component_rows(target, first_bounds, margin):
+            # BEGIN query TSDF leaves in bounded, order-preserving native runs.
+            for second in _target_component_runs(first, target, first_bounds, margin, request):
                 if key in stopped:
                     break
                 # BEGIN one identity per body pair, independent of piece count.
                 yield first, second, key
+                # The next generator step performs distances, so stop before
+                # requesting it when Python has rejected this physical pair.
+                if key in stopped:
+                    break
                 # END callers reuse the exact same key for streamed evidence.
+            # END Python still decides whether any near/contact item may continue.
 # END unknown regions never acquire a fabricated boundary or filled cell.
+
+
+# BEGIN separated-prefix reduction retains original Coal results and ordering.
+def _target_component_runs(first, target, world_bounds, margin, request):
+    """Yield a first-minimum representative or an individual near component.
+
+    Only strictly separated consecutive leaves are reduced. Their selected
+    layer, body identity and measurement allowance are identical, so a minimum
+    and exact count preserve the existing report. Native scanning stops before
+    any later leaf whenever contact/permission handling could reject this pair.
+    """
+    from .tsdf_geometry import ObservedTsdfGeometry
+    geometry = target["shape"]
+    if not isinstance(geometry, ObservedTsdfGeometry):
+        yield target
+        return
+    try:
+        from ._coal_scene_batch import scan_separated_prefix
+    except ImportError as error:
+        raise RuntimeError("Build the project Coal adapter with PYTHONNOUSERSITE=1 "
+                           "python tests/planning/build_coal_scene_batch.py") from error
+    local_bounds = None if world_bounds is None else _transform_bounds(
+        (world_bounds[0]-margin, world_bounds[1]+margin), np.linalg.inv(target["pose"]))
+    transform = coal.Transform3s(first["pose"][:3, :3], first["pose"][:3, 3])
+    for batch, poses in geometry.iter_collision_batches(local_bounds, target["pose"]):
+        shapes = [component[2] for component in batch]
+        start = 0
+        while start < len(batch):
+            count, minimum, result, near, near_result = scan_separated_prefix(
+                first["shape"], transform, shapes[start:], poses[start:], request, margin)
+            # Both outputs carry unmodified native points/normal. Constructing
+            # dictionaries only for these representatives avoids per-leaf Python
+            # report work while the measured component count remains complete.
+            for index, distance, measured in ((minimum, result, count), (near, near_result, 1)):
+                if index < 0:
+                    continue
+                absolute = start+index
+                kind, identity, shape, _, points = batch[absolute]
+                yield {**target, "shape": shape, "pose": poses[absolute],
+                       "vertices": {"tsdf_component": points}, "tsdf_component_id": (kind, identity),
+                       "_prequeried_distance": distance, "_component_count": measured}
+            if near < 0:
+                break
+            start += near+1
+        # Release this chunk before requesting/preparing the next one. A for
+        # loop alone retains its previous item while next(iterator) constructs
+        # the successor, which would otherwise keep two batches of shapes live.
+        del batch, poses, shapes
+# END abandoning this generator prevents all later native leaf distance calls.
 
 
 # BEGIN exact body support bounds in the selected field's own grid axes.

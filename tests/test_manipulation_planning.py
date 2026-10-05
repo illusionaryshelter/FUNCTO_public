@@ -2381,8 +2381,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         # BEGIN shared source storage and one serial query workspace are each counted once.
         world._source_scene_checker = SimpleNamespace(scene_storage_nbytes=131072,
                                                        scene_query_workspace_nbytes=98304)
+        # BEGIN the bounded ordinary/dense report store is live once per candidate.
         self.assertEqual(_planning_workspace_bytes(world, metadata, expanded, 20)[0]-complete_bytes,
-                         131072+98304)
+                         131072+98304+32*1024**2)
+        # END it is neither a per-rollout nor a captured-graph allocation.
         # END rollout counts multiply neither the immutable source scene nor its live CPU query.
         query = CuroboSphereQuery(SimpleNamespace(get_sphere_distance_raw=lambda *args, **kwargs: None),
                                  owner_ids=("fixture",), source="complete validation allocation metadata")

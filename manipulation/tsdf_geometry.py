@@ -456,4 +456,39 @@ class ObservedTsdfGeometry:
                 self._collision_cache.move_to_end(key)
             yield kind, index, *component
     # END no world pose, distance/contact result or permission enters the cache.
+
+    # BEGIN bounded batches borrow the same immutable component cache entries.
+    def iter_collision_batches(self, bounds, world_pose, batch_size=4096):
+        """Yield ordered components and their original NumPy world transforms.
+
+        Every matrix product remains the previous individual ``pose @ local``
+        operation. Preparing a later component may fail, but that exception is
+        deferred until the consumer asks beyond the prepared prefix: an earlier
+        decisive collision must retain its original stop and exception order.
+        A batch holds at most ``batch_size`` cache references, including entries
+        evicted while this batch is prepared; it never pins the whole map.
+        """
+        if type(batch_size) is not int or not 1 <= batch_size <= 4096:
+            raise ValueError("Collision batches require between 1 and 4096 components")
+        components = iter(self.iter_collision_components(bounds))
+        while True:
+            batch, poses, error = [], [], None
+            for _ in range(batch_size):
+                try:
+                    component = next(components)
+                    pose = world_pose @ component[3]
+                except StopIteration:
+                    break
+                except Exception as caught:
+                    error = caught
+                    break
+                batch.append(component)
+                poses.append(pose)
+            if batch:
+                yield batch, np.asarray(poses, dtype=np.float64)
+            if error is not None:
+                raise error
+            if len(batch) < batch_size:
+                return
+    # END batches contain geometry only; query results stay local to the caller.
 # END one observed reconstruction supplies both zero distances and negative material.

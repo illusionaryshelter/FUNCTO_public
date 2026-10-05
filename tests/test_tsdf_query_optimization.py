@@ -389,3 +389,40 @@ def test_surface_cache_does_not_reuse_stateful_or_nonfinite_calls(geometry, monk
         assert not cache
     assert len(calls) == 2
 # END later queries must repeat the real native call and retain its failures.
+
+
+# BEGIN preparing a batch must preserve the original decisive-failure boundary.
+@pytest.mark.parametrize("stop_after_first", (False, True))
+def test_component_batch_defers_later_materialization_error_until_consumed(monkeypatch, stop_after_first):
+    from manipulation.robot_geometry_check import _scene_component_pairs
+
+    field = ObservedTsdfGeometry(component_record((), [
+        np.array([[0., 0., 0.]]), np.array([[.01, 0., 0.]])]))
+    actor = {"owner": "robot", "name": "body", "shape": coal.Box(.1, .1, .1),
+        "vertices": None, "pose": np.eye(4), "source": "complete native box"}
+    target = {"owner": "target", "name": "points", "shape": field, "vertices": field,
+        "pose": np.eye(4), "source": "observed points", "layer": None}
+    materialize = tsdf_geometry.coal_component
+    calls = []
+
+    def fail_second(points):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("later component preparation failed")
+        return materialize(points)
+
+    monkeypatch.setattr(tsdf_geometry, "coal_component", fail_second)
+    stopped = set()
+    pairs = _scene_component_pairs(actor, [target], {}, 1e-6, [], coal.DistanceRequest(),
+                                   set(), stopped, {})
+    first, second, key = next(pairs)
+    assert first is actor
+    assert second["tsdf_component_id"] == ("negative", 0)
+    assert second["_prequeried_distance"].min_distance <= 1e-6
+    if stop_after_first:
+        stopped.add(key)
+        assert list(pairs) == []
+    else:
+        with pytest.raises(RuntimeError, match="later component preparation failed"):
+            next(pairs)
+# END contact permission decides whether the later component is ever consumed.
