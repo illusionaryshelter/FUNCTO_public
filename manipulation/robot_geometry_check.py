@@ -373,8 +373,17 @@ class RobotGeometryChecker:
         # one distance and two XYZ witnesses; 4 KiB also covers Python storage.
         self.scene_storage_nbytes += pair_bound * 4096
         # END no trajectory-length history or extra geometry is retained.
+        # BEGIN avoid reserving a second and third copy of persistent TSDF rows.
+        # iter_collision_components yields references to immutable cached Coal
+        # shapes/vertices, including inside contact-region checks. A cache miss
+        # creates one bounded component; the per-pair reserve above covers the
+        # few live yielded/evicted components. KD candidates, source arrays and
+        # native LP/BVH work retain the existing doubled non-cache allowance.
+        component_cache_bytes = sum(row["shape"].collision_cache_storage_nbytes
+            for row in self._scene_shapes if isinstance(row["shape"], ObservedTsdfGeometry))
         self.scene_query_workspace_nbytes = (pair_bound * (131072 + 4096 * len(scene_binding["contacts"]))
-                                            + 2 * (self.scene_storage_nbytes - self.native_query_storage_nbytes))
+            + 2 * (self.scene_storage_nbytes - self.native_query_storage_nbytes - component_cache_bytes))
+        # END full cache capacity remains charged in scene_storage_nbytes once.
         # END planning clones share this immutable scene allocation.
 
     def query_scene(self, robot_state, *, tool_pose, progress, finger_positions, state_kind,

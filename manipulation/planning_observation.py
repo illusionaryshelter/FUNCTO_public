@@ -29,7 +29,7 @@ from .planning_scene import (
     _validate_contact_and_gripper_inputs,
 )
 # BEGIN body-wide replacement by a separately observed fine field.
-from .voxel_layers import LayeredVoxelQuery, validate_body_groups
+from .voxel_layers import MAX_FINE_CELLS, LayeredVoxelQuery, validate_body_groups
 # END both native and independent consumers retain the same layer inventory.
 
 
@@ -571,13 +571,254 @@ def _fine_mapper_config(config, request):
     # Python integer products cannot wrap an oversized array into a small
     # admitted count. Check before constructing native block-pool metadata.
     shape = tuple(math.ceil(float(value)/size) for value in extent)
-    if min(shape) < 3 or math.prod(shape) > 1_000_000:
-        raise ValueError("Each complete fine ROI must fit the one-million-sample bound")
+    if min(shape) < 3 or math.prod(shape) > MAX_FINE_CELLS:
+        raise ValueError("Each complete fine ROI must fit the four-million-sample bound")
     return replace(config, grid_center=torch.as_tensor(center, dtype=torch.float32),
         extent_meters_xyz=tuple(extent), extent_esdf_meters_xyz=tuple(extent),
         voxel_size=size, esdf_voxel_size=size, truncation_distance=2*size,
         max_visible_blocks_per_integration=None)
 # END no allocation is reduced after seeing collision values.
+
+
+# BEGIN one immutable mapped partition, shared by initial build and refinement.
+def _map_partition(normalized, masks, identity, config, inverse, depth_error_m, request=None):
+    """Reconstruct one field from original partitioned observations, sequentially."""
+    from curobo.perception import Mapper
+    from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
+    from curobo._src.geom.types import SceneCfg
+    from curobo.types import CameraObservation, DeviceCfg, Pose
+    config_device = DeviceCfg(device=config.device)
+    region = None
+    # A fresh mapper per partition preserves ownership at every observed
+    # surface. Queries retain their native field tensors; summing every
+    # partition's budget also covers delayed native scratch cleanup. No
+    # clear_region or AABB subtraction is used.
+    mapper = Mapper(config)
+    for name, view in normalized.items():
+        depth = np.where(masks[name][identity], view["depth"], 0.).astype(np.float32)
+        observation = CameraObservation(
+            name=name, depth_image=config_device.to_device(depth)[None],
+            rgb_image=torch.as_tensor(np.asarray(view["image"]).copy(), dtype=torch.uint8,
+                                      device=config_device.device)[None],
+            intrinsics=config_device.to_device(view["K"])[None],
+            pose=Pose.from_matrix(config_device.to_device(inverse@view["T_output_camera"])[None]),
+            resolution=list(depth.shape), depth_to_meter=1.)
+        mapper.integrate(camera_observation=observation)
+    stats = mapper.get_stats(scan_pool=True)
+    # Native stats omit the optional holes key when no blocks exist.
+    # Use the invariant itself, which also covers an empty background.
+    if (stats["allocation_failures"] != 0
+            or stats["num_allocated"] != stats["active_blocks"]+stats["free_count"]):
+        raise RuntimeError("Native observation mapping lost geometry through block-pool allocation failure")
+    voxel = mapper.compute_esdf()
+    partition_id = "observed_background" if identity is None else identity
+    voxel.name = partition_id
+    native = SceneCollision.from_config(SceneCollisionCfg(
+        device_cfg=config_device, scene_model=SceneCfg(voxel=[voxel]), cache={"voxel": 1}))
+    # BEGIN validate native indexing before a query or solid can be published.
+    _require_native_voxel_layout(voxel, native)
+    # END a mismatched complete field remains unsupported, not executable.
+    query = CuroboSphereQuery(native, owner_ids=(partition_id,),
+                                         source=f"current_rgbd:{','.join(normalized)}")
+    # BEGIN preserve observed TSDF geometry independently of ESDF optimizer costs.
+    # The Mapper is still alive here: export its weighted distance samples,
+    # not the ESDF seeds expanded into occupied cubes. The adapter uses one
+    # affine tetrahedral field for both its zero set and observed negative
+    # region, with physical sample-centre coordinates and no unknown fill.
+    from .tsdf_geometry import build_tsdf_geometry
+    query.independent_geometry = build_tsdf_geometry(
+        mapper, name=partition_id, source=query.source)
+    # END native sphere costs retain their original differentiable ESDF.
+    # BEGIN export the actual fine sign source before releasing its Mapper.
+    if request is not None:
+        from .native_voxel_sources import export_source_bits
+        shape = tuple(voxel.feature_tensor.shape)
+        bits = export_source_bits(mapper, config, voxel)
+        # Raw depth retains robot/other-owner occlusion. Only its observed
+        # free prefix can support a background sign; no masked hole is free.
+        local_views = {name: {**view, "T_output_camera": inverse@view["T_output_camera"]}
+                       for name, view in normalized.items()}
+        fine_origin = np.asarray(voxel.pose[:3])-(np.asarray(shape)-1)*voxel.voxel_size/2
+        free = _known_free_voxels(local_views, origin=fine_origin, shape=shape[::-1],
+            voxel_size=voxel.voxel_size, depth_error_m=depth_error_m).transpose(2, 1, 0)
+        # Truncation, a full grid diagonal and one interpolation step
+        # are numerical map support, never the sensor-error margin.
+        support = math.ceil((config.truncation_distance+math.sqrt(3)*config.voxel_size
+                              +config.esdf_voxel_size)/config.esdf_voxel_size)*config.esdf_voxel_size
+        region = {"pose": list(voxel.pose), "shape_xyz": list(shape),
+            "voxel_size_m": float(voxel.voxel_size), "numerical_support_m": support,
+            "measurement_allowance_m": float(request["measurement_allowance_m"]),
+            "measurement_evidence": request["measurement_evidence"], "source": request["source"],
+            "observation_ids": list(normalized), "source_bits_hex": bits.tobytes().hex(),
+            "raw_free_packbits_hex": np.packbits(free).tobytes().hex(),
+            "distance_scope": "local source-supported distance; no global nearest-surface certificate"}
+    # END positive ESDF values never become observation evidence.
+    statistics = {"allocated_blocks": stats["num_allocated"],
+                                "max_blocks": config.max_blocks,
+                                "tsdf_voxel_size_m": float(config.voxel_size),
+                                "esdf_voxel_size_m": float(config.esdf_voxel_size),
+                                "truncation_distance_m": float(config.truncation_distance),
+                                # BEGIN record the finite field actually queried.
+                                "grid_center_local_m": config.grid_center.cpu().tolist(),
+                                "extent_esdf_meters_xyz": list(config.extent_esdf_meters_xyz),
+                                # BEGIN disclose counts even when a finite inventory refuses admission.
+                                "independent_field": query.independent_geometry["field_summary"],
+                                # END a resource refusal cannot masquerade as an empty observed target.
+                                # END voxel resolution is not a sensor-error certificate.
+                                "estimated_buffers_bytes": _mapper_memory_bound(config)}
+    del mapper, observation
+    return query, statistics, region
+# END no different mapping formula exists for a refined field.
+
+
+# BEGIN request-owned original observations for finite background remapping.
+class _FrozenBackgroundRefinement:
+    """Retain read-only sensor inputs, never a previous solver or fine field."""
+
+    def __init__(self, normalized, masks, config, request, depth_error_m):
+        self.views, self.masks = {}, {}
+        for name, view in normalized.items():
+            self.views[name] = {}
+            for key in ("image", "depth", "K", "T_output_camera"):
+                value = np.asarray(view[key]).copy()
+                value.setflags(write=False)
+                self.views[name][key] = value
+            mask = masks[name][None].copy()
+            mask.setflags(write=False)
+            self.masks[name] = {None: mask}
+        self.config = deepcopy(config)
+        self.request = deepcopy(request)
+        self.depth_error_m = float(depth_error_m)
+
+    @property
+    def storage_bytes(self):
+        """Count the one shared immutable CPU observation snapshot."""
+        return sum(value.nbytes for view in self.views.values() for value in view.values())+sum(
+            value[None].nbytes for value in self.masks.values())
+
+    def refine(self, current, witnesses):
+        """Build one enlarged local map without changing frozen evidence.
+
+        The old ROI is retained to prevent repeated movement/shrinkage. All
+        positive complete-body witnesses enter the requested union; capacity
+        refusal is explicit rather than dropping an inconvenient body.
+        """
+        report = {"status": "unavailable", "active_witnesses": len(witnesses),
+                  "max_fine_cells": MAX_FINE_CELLS, "max_mapping_bytes": 1024**3}
+        if not witnesses:
+            report["status"] = "no_active_witnesses"
+            return None, report
+        if len(witnesses) > 32768:
+            raise ValueError("Background refinement witnesses exceed the finite sample inventory")
+        envelopes = np.asarray([row["envelope_world_m"] for row in witnesses], dtype=float)
+        if (envelopes.shape != (len(witnesses), 2, 3) or not np.isfinite(envelopes).all()
+                or np.any(envelopes[:, 0] > envelopes[:, 1])):
+            raise ValueError("Refinement requires finite ordered complete-body envelopes")
+        report.update(active_positive_spheres=sum(int(row["positive_spheres"]) for row in witnesses),
+                      active_bodies=sorted({row["body_id"] for row in witnesses}),
+                      coarse_cost=sum(float(row["coarse_cost"]) for row in witnesses))
+        # BEGIN distinguish native geometry from the Mapper's Python size input.
+        # Mapper rounds its spacing and center to float32, but computes shape
+        # as ceil(Python extent/Python spacing). Re-ceiling N*native_spacing
+        # with the original Python spacing can spuriously turn N into N+1.
+        size = float(self.request["voxel_size_m"])
+        native_size = current.region.size
+        padding = current.region.support+6*native_size
+        previous_shape = tuple(current.region.shape)
+        previous_half = np.asarray(previous_shape)*native_size/2
+        previous_lower = current.region.pose[:3]-previous_half
+        previous_upper = current.region.pose[:3]+previous_half
+        lower = np.minimum(envelopes[:, 0].min(0)-padding, previous_lower)
+        upper = np.maximum(envelopes[:, 1].max(0)+padding, previous_upper)
+        expanded = (lower < previous_lower) | (upper > previous_upper)
+        same_bounds = not expanded.any()
+        center = current.region.pose[:3].copy()
+        shape = list(previous_shape)
+        if not same_bounds:
+            # Decide coverage using the actual center the native Mapper will
+            # store. Unchanged axes keep their exact old center and integer
+            # shape; changed axes cover both sides after center quantization.
+            center[expanded] = ((lower[expanded]+upper[expanded])/2).astype(np.float32)
+            for axis in np.flatnonzero(expanded):
+                span = 2*max(center[axis]-lower[axis], upper[axis]-center[axis])
+                count = max(previous_shape[axis], math.ceil(span/native_size))
+                # Division can round down at an integer. Check the published
+                # physical bounds directly and add one cell only if needed.
+                half = count*native_size/2
+                if center[axis]-half > lower[axis] or center[axis]+half < upper[axis]:
+                    count += 1
+                shape[axis] = count
+        # The integer shape owns admission. Encoding the Mapper's extent one
+        # binary64 step inward avoids a second ceil caused by multiplication
+        # roundoff; published geometry is still exactly N*native_spacing.
+        cells = math.prod(shape)
+        report["requested_cells"] = cells
+        if cells > MAX_FINE_CELLS:
+            report["status"] = "local_cell_budget_refused"
+            return None, report
+        extent = np.nextafter(np.asarray(shape, dtype=float)*size, 0.)
+        actual_extent = np.asarray(shape)*native_size
+        if (tuple(math.ceil(float(value)/size) for value in extent) != tuple(shape)
+                or np.any(center-actual_extent/2 > lower)
+                or np.any(center+actual_extent/2 < upper)):
+            raise RuntimeError("Refined native grid must retain its exact shape and contain every requested bound")
+        # END neither approximate equality nor nominal spacing can hide growth.
+        request = {**self.request, "center_m": center.tolist(), "extent_m": extent.tolist(),
+                   "source": "planner active complete-body background collision witnesses; same frozen RGB-D"}
+        report.update(center_m=center.tolist(), extent_m=extent.tolist(), voxel_size_m=size,
+                      shape_xyz=shape, actual_voxel_size_m=native_size,
+                      actual_extent_m=actual_extent.tolist())
+        if same_bounds:
+            # Existing observation fields remain immutable. A new witness can
+            # require another supported overlap box without needing any new
+            # Mapper allocation or changing a previously captured selector.
+            fine, region = current.fine.clone_for_rollout(), current.region.record
+            mapping = deepcopy(current.mapping_report)
+            report.update(mapping_reused=True, estimated_mapping_bytes=0)
+        else:
+            # BEGIN only a real physical expansion needs a Mapper admission.
+            config = _fine_mapper_config(self.config, request)
+            estimate = _mapper_memory_bound(config)
+            report["estimated_mapping_bytes"] = estimate
+            if estimate > 1024**3:
+                report["status"] = "mapping_byte_budget_refused"
+                return None, report
+            # END unchanged fields never allocate or reserve remapping buffers.
+            try:
+                _require_mapping_memory(estimate, config.device)
+            except ValueError as error:
+                # This admission check allocates nothing. Its explicit live
+                # resource refusal retains the still-valid original scene;
+                # Mapper/runtime exceptions below remain actual failures.
+                report.update(status="live_mapping_memory_refused", reason=str(error))
+                return None, report
+            fine, mapping, region = _map_partition(self.views, self.masks, None, config,
+                                                   np.eye(4), self.depth_error_m, request)
+            report["mapping_reused"] = False
+        replacement = LayeredVoxelQuery(current.coarse.clone_for_rollout(), fine, region)
+        # Re-prove old boxes in the new field before adding new witnesses. A
+        # body already at weight one is absent from the unresolved witness
+        # list; omitting these boxes would withdraw its existing fine guide.
+        previous_boxes = current.region.guidance_boxes+current.region.pose[:3]
+        # High-cost new witnesses retain deterministic tie order. The source
+        # predicate is checked again for every old and new envelope.
+        ordered = np.argsort([-float(row["coarse_cost"]) for row in witnesses], kind="stable")
+        support_report = replacement.region.prepare_guidance_boxes(
+            np.concatenate((previous_boxes, envelopes[ordered])))
+        support_report["previous_cuboid_envelopes"] = len(previous_boxes)
+        report.update(mapping=mapping, support=support_report)
+        if not support_report["cuboids"]:
+            report["status"] = "observation_support_unavailable"
+            return None, report
+        if same_bounds and np.array_equal(replacement.region.guidance_boxes, current.region.guidance_boxes):
+            report["status"] = ("cuboid_budget_refused" if support_report["cuboid_capacity_reached"]
+                and support_report["supported_uncovered_envelopes"] else "unchanged_source_supported_cuboids")
+            return None, report
+        replacement.refinement_source = self
+        replacement.mapping_report = deepcopy(mapping)
+        report["status"] = "refined"
+        return replacement, report
+# END only the newly mapped fine layer is allocated between solver lifetimes.
 
 
 def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
@@ -612,10 +853,7 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
     outer collision model or change geometry_complete. An owner supplying
     occupied evidence is unknown until its collision geometry is complete.
     """
-    from curobo.perception import Mapper, MapperCfg
-    from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
-    from curobo._src.geom.types import SceneCfg
-    from curobo.types import CameraObservation, DeviceCfg, Pose
+    from curobo.perception import MapperCfg
 
     if not isinstance(mapper_cfg, MapperCfg):
         raise TypeError("Provide the installed cuRobo MapperCfg directly")
@@ -701,95 +939,26 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
                              occupancy_evidence=evidence, known_free=known_free)
     # END native mapping and occupied-solid evidence cannot widen F.
     _require_mapping_memory(sum(estimates.values()), mapper_cfg.device)
-    config_device = DeviceCfg(device=mapper_cfg.device)
     queries, statistics, regions = {}, {}, {}
     for (identity, layer), config in jobs.items():
-        # A fresh mapper per partition preserves ownership at every observed
-        # surface. Queries retain their native field tensors; summing every
-        # partition's budget also covers delayed native scratch cleanup. No
-        # clear_region or AABB subtraction is used.
-        mapper = Mapper(config)
         inverse = np.eye(4) if identity is None else _inverse(frames[identity][0])
-        for name, view in normalized.items():
-            depth = np.where(masks[name][identity], view["depth"], 0.).astype(np.float32)
-            observation = CameraObservation(
-                name=name, depth_image=config_device.to_device(depth)[None],
-                rgb_image=torch.as_tensor(np.asarray(view["image"]).copy(), dtype=torch.uint8,
-                                          device=config_device.device)[None],
-                intrinsics=config_device.to_device(view["K"])[None],
-                pose=Pose.from_matrix(config_device.to_device(inverse@view["T_output_camera"])[None]),
-                resolution=list(depth.shape), depth_to_meter=1.)
-            mapper.integrate(camera_observation=observation)
-        stats = mapper.get_stats(scan_pool=True)
-        # Native stats omit the optional holes key when no blocks exist.
-        # Use the invariant itself, which also covers an empty background.
-        if (stats["allocation_failures"] != 0
-                or stats["num_allocated"] != stats["active_blocks"]+stats["free_count"]):
-            raise RuntimeError("Native observation mapping lost geometry through block-pool allocation failure")
-        voxel = mapper.compute_esdf()
-        partition_id = "observed_background" if identity is None else identity
-        voxel.name = partition_id
-        native = SceneCollision.from_config(SceneCollisionCfg(
-            device_cfg=config_device, scene_model=SceneCfg(voxel=[voxel]), cache={"voxel": 1}))
-        # BEGIN validate native indexing before a query or solid can be published.
-        _require_native_voxel_layout(voxel, native)
-        # END a mismatched complete field remains unsupported, not executable.
-        key = (identity, layer)
-        queries[key] = CuroboSphereQuery(native, owner_ids=(partition_id,),
-                                             source=f"current_rgbd:{','.join(normalized)}")
-        # BEGIN preserve observed TSDF geometry independently of ESDF optimizer costs.
-        # The Mapper is still alive here: export its weighted distance samples,
-        # not the ESDF seeds expanded into occupied cubes. The adapter uses one
-        # affine tetrahedral field for both its zero set and observed negative
-        # region, with physical sample-centre coordinates and no unknown fill.
-        from .tsdf_geometry import build_tsdf_geometry
-        queries[key].independent_geometry = build_tsdf_geometry(
-            mapper, name=partition_id, source=queries[key].source)
-        # END native sphere costs retain their original differentiable ESDF.
-        # BEGIN export the actual fine sign source before releasing its Mapper.
-        if layer == "fine":
-            from .native_voxel_sources import export_source_bits
-            shape = tuple(voxel.feature_tensor.shape)
-            bits = export_source_bits(mapper, config, voxel)
-            # Raw depth retains robot/other-owner occlusion. Only its observed
-            # free prefix can support a background sign; no masked hole is free.
-            local_views = {name: {**view, "T_output_camera": inverse@view["T_output_camera"]}
-                           for name, view in normalized.items()}
-            fine_origin = np.asarray(voxel.pose[:3])-(np.asarray(shape)-1)*voxel.voxel_size/2
-            free = _known_free_voxels(local_views, origin=fine_origin, shape=shape[::-1],
-                voxel_size=voxel.voxel_size, depth_error_m=depth_error_m).transpose(2, 1, 0)
-            request = fine_regions[identity]
-            # Truncation, a full grid diagonal and one interpolation step
-            # are numerical map support, never the sensor-error margin.
-            support = math.ceil((config.truncation_distance+math.sqrt(3)*config.voxel_size
-                                  +config.esdf_voxel_size)/config.esdf_voxel_size)*config.esdf_voxel_size
-            regions[identity] = {"pose": list(voxel.pose), "shape_xyz": list(shape),
-                "voxel_size_m": float(voxel.voxel_size), "numerical_support_m": support,
-                "measurement_allowance_m": float(request["measurement_allowance_m"]),
-                "measurement_evidence": request["measurement_evidence"], "source": request["source"],
-                "observation_ids": list(normalized), "source_bits_hex": bits.tobytes().hex(),
-                "raw_free_packbits_hex": np.packbits(free).tobytes().hex(),
-                "distance_scope": "local source-supported distance; no global nearest-surface certificate"}
-        # END positive ESDF values never become observation evidence.
-        statistics.setdefault(partition_id, {})[layer] = {"allocated_blocks": stats["num_allocated"],
-                                    "max_blocks": config.max_blocks,
-                                    "tsdf_voxel_size_m": float(config.voxel_size),
-                                    "esdf_voxel_size_m": float(config.esdf_voxel_size),
-                                    "truncation_distance_m": float(config.truncation_distance),
-                                    # BEGIN record the finite field actually queried.
-                                    "grid_center_local_m": config.grid_center.cpu().tolist(),
-                                    "extent_esdf_meters_xyz": list(config.extent_esdf_meters_xyz),
-                                    # BEGIN disclose counts even when a finite inventory refuses admission.
-                                    "independent_field": queries[key].independent_geometry["field_summary"],
-                                    # END a resource refusal cannot masquerade as an empty observed target.
-                                    # END voxel resolution is not a sensor-error certificate.
-                                    "estimated_buffers_bytes": estimates[key]}
-        del mapper, observation
+        query, report, region = _map_partition(normalized, masks, identity, config, inverse,
+            depth_error_m, fine_regions[identity] if layer == "fine" else None)
+        queries[identity, layer] = query
+        statistics.setdefault("observed_background" if identity is None else identity, {})[layer] = report
+        if region is not None:
+            regions[identity] = region
     # BEGIN publish one selector-backed query per physical owner partition.
     queries = {identity: (LayeredVoxelQuery(queries[identity, "coarse"], queries[identity, "fine"], regions[identity])
                          if identity in regions else queries[identity, "coarse"])
                for identity in configs}
     # END coarse and fine costs are never fused as separate obstacles.
+    # BEGIN snapshot remapping follows the background through scene copies.
+    if None in fine_regions:
+        queries[None].refinement_source = _FrozenBackgroundRefinement(
+            normalized, masks, configs[None], fine_regions[None], depth_error_m)
+        queries[None].mapping_report = deepcopy(statistics["observed_background"]["fine"])
+    # END owner substitutions and installation additions preserve this query.
     owners = [CollisionOwner(identity, queries[identity],
                               PosePath(np.array([0., 1.]), np.repeat(pose[None], 2, axis=0), source),
                               source, geometry_complete=False)

@@ -949,8 +949,8 @@ class NativeCubicClockTests(unittest.TestCase):
             goals.append(goal)
             requested_parameters.append(float(planner.seed_parameter.item()))
             supplied_seed_shapes.append(tuple(kwargs["seed_config"].shape))
-            # Finite solutions of failed pose IK may initialize the optimizer,
-            # but their zero success count must remain visible to its caller.
+            # Finite failed poses remain diagnostic evidence; neither this
+            # query's seed nor the next native warm start may use them.
             first = measured_q+goal
             second = first+1.
             return SimpleNamespace(js_solution=SimpleNamespace(position=torch.stack((first, second), dim=1)),
@@ -973,24 +973,20 @@ class NativeCubicClockTests(unittest.TestCase):
         seeds, success_counts = planner.reference_seeds()
         np.testing.assert_array_equal(requested_parameters,
             ((np.arange(horizon)+3.)/(horizon+4.)).astype(np.float32).astype(float))
-        helper.assert_called_once()
+        self.assertEqual(helper.call_count, 2)
         self.assertIs(helper.call_args.args[0], measured_q)
         self.assertEqual(helper.call_args.args[1], 1)
         self.assertEqual(tuple(seeds.shape), (1, 2, horizon, 3))
         self.assertTrue(seeds.is_contiguous())
         self.assertEqual(success_counts, [0]*horizon)
-        self.assertEqual(supplied_seed_shapes, [(1, 1, 3)]+[(1, 2, 3)]*(horizon-1))
-        # BEGIN recovery provenance belongs to selected samples, not fitted coefficients.
-        reference = np.asarray(planner.reference_ik_chains[0]["joint_positions"])
-        for index, goal in enumerate(goals):
-            proposals = np.concatenate((measured_q.numpy()+goal, measured_q.numpy()+goal+1.), axis=0)
-            self.assertLessEqual(np.abs(proposals-reference[index]).max(axis=-1).min(), 1e-14)
-        self.assertFalse(planner.reference_ik_chains[0]["reference_success"])
-        self.assertEqual(len(planner.reference_ik_chains[0]["recovery_queries"]), horizon)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_recovery", "measured_state_constant"])
-        rebuilt = planner.physical_domain.evaluate(seeds[0, 0], (np.arange(horizon)+3.)/(horizon+4.))
-        np.testing.assert_allclose(rebuilt, reference, atol=1e-5)
-        # END the measured-state alternative below remains exact and independent.
+        self.assertEqual(supplied_seed_shapes, [(1, 1, 3)]*horizon)
+        # BEGIN all-failed references preserve evidence without a fabricated anchor chain.
+        self.assertEqual(planner.reference_ik_chains, [])
+        self.assertTrue(all(row["reference_status"] == "FAILED_REFERENCE"
+                            for row in planner.reference_ik_queries))
+        self.assertEqual(planner.initial_seed_strategies, ["measured_state_constant"]*2)
+        np.testing.assert_array_equal(seeds[0, 0].numpy(), np.broadcast_to(measured_q.numpy(), (horizon, 3)))
+        # END the independent measured-state initializer retains the original entrance.
         np.testing.assert_array_equal(seeds[0, 1].numpy(), np.broadcast_to(measured_q.numpy(), (horizon, 3)))
         torch.testing.assert_close(measured_q, position_before, rtol=0, atol=0)
         torch.testing.assert_close(measured_dq, velocity_before, rtol=0, atol=0)
@@ -1005,11 +1001,11 @@ class NativeCubicClockTests(unittest.TestCase):
         seeds, failures = planner.reference_seeds()
         self.assertTrue(bool(torch.isfinite(seeds).all()))
         self.assertEqual(failures, [0]*horizon)
-        self.assertEqual([row["candidate_source"] for row in planner.reference_ik_chains[0]["recovery_queries"]],
-                         ["measured_start"]+["carried_previous"]*(horizon-1))
-        # Empty queries are checked a second time at their actual current u;
-        # the previous query's geometry/task report is never silently reused.
-        self.assertEqual(planner._rank_ik_candidates.call_count, 3*horizon)
+        self.assertEqual(planner.reference_ik_chains, [])
+        self.assertTrue(all(row["warm_start_from_query"] is None for row in planner.reference_ik_queries))
+        # Each raw query is screened once. Reused warm starts only initialize
+        # IK and never masquerade as successful states at a different time.
+        self.assertEqual(planner._rank_ik_candidates.call_count, 2*horizon)
     # END native constant-seed initialization contract after failed pose IK.
 
 
@@ -1090,9 +1086,9 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         constant.assert_not_called()
         self.assertEqual(tuple(warm_starts[0].shape), (1, 1, 3))
         for index in range(1, 6):
-            self.assertEqual(tuple(warm_starts[index].shape), (1, 4, 3))
+            self.assertEqual(tuple(warm_starts[index].shape), (1, 3, 3))
             self.assertEqual({tuple(row) for row in warm_starts[index].numpy()[0]},
-                             {tuple(row) for row in pools[index-1]})
+                             {tuple(row) for row in pools[index-1][flags[index-1]]})
         torch.testing.assert_close(planner.start.position, measured_q, rtol=0, atol=0)
         torch.testing.assert_close(planner.start.velocity, measured_dq, rtol=0, atol=0)
         self.assertTrue(seeds.is_contiguous())
@@ -1123,21 +1119,21 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         self.assertEqual(planner.initial_seed_strategies, ["reference_ik", "reference_ik_alternative"])
         constant.assert_not_called()
 
-    def test_one_failed_control_pose_keeps_its_diagnostic_and_uses_measured_state_second(self):
+    def test_one_failed_control_pose_keeps_its_diagnostic_and_successful_alternative_chain(self):
         _, _, pools, flags = self.two_tracks()
         flags[2] = np.zeros(4, dtype=bool)
         planner, constant, _ = self.planner_for(pools, flags)
         seeds, success = planner.reference_seeds()
         self.assertEqual(success, [3, 3, 0, 3, 3, 3])
         self.assertEqual(planner.reference_ik_distinct_counts, [3, 3, 0, 3, 3, 3])
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_recovery", "measured_state_constant"])
+        self.assertEqual(planner.initial_seed_strategies,
+                         ["reference_ik_with_fallback", "reference_ik_with_fallback_alternative"])
         self.assertEqual([row["query_index"] for row in planner.reference_ik_chains[0]["recovery_queries"]], [2])
         self.assertTrue(bool(torch.isfinite(seeds).all()))
         self.assertGreater(float(seeds[0, 0].abs().max()), 0.)
-        np.testing.assert_array_equal(seeds.numpy()[0, 1], np.zeros((6, 3)))
-        constant.assert_called_once()
-        self.assertIs(constant.call_args.args[0], planner.start.position)
-        self.assertEqual(constant.call_args.args[1], 1)
+        self.assertEqual(len(planner.reference_ik_chains), 2)
+        self.assertTrue(all(chain["candidate_indices"][2] is None for chain in planner.reference_ik_chains))
+        constant.assert_not_called()
 
     def test_numerically_duplicate_native_results_do_not_claim_a_second_reference_trace(self):
         tolerance = 1e-5

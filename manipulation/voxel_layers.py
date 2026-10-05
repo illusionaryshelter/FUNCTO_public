@@ -17,6 +17,12 @@ from .collision_records import encode_array
 # END codec storage does not alter any layer-selection arithmetic.
 from .optimizer_device_checks import require_tensor
 
+# BEGIN finite local refinement capacity, independently admitted by Mapper bytes.
+# Four million float32 samples need 16 MB; the padded int32 prefix is counted
+# from its actual shape. Mapping scratch has a separate one-GiB admission.
+MAX_FINE_CELLS = 4_000_000
+# END this is a local inventory bound, never permission to refine the workspace.
+
 
 def _measured_spheres(spheres, margin):
     """Round r+measured allowance outward in the native query's actual dtype.
@@ -108,7 +114,7 @@ class FineRegion:
         size = float(record["voxel_size_m"])
         support = float(record["numerical_support_m"])
         margin = float(record["measurement_allowance_m"])
-        if (min(shape) < 3 or math.prod(shape) > 1_000_000
+        if (min(shape) < 3 or math.prod(shape) > MAX_FINE_CELLS
                 or pose.shape != (7,) or not np.isfinite(pose).all()
                 or not np.array_equal(pose[3:], [1., 0., 0., 0.])
                 or not np.isfinite([size, support, margin]).all()
@@ -123,7 +129,7 @@ class FineRegion:
         if np.any(((bits & 4) != 0) & ((bits & 2) == 0)):
             raise ValueError("A negative sign cannot exist without an observed TSDF sample")
         valid = ((bits & 1) != 0) & (((bits & 2) != 0) | free) & ~(free & ((bits & 4) != 0))
-        # At most one million cells keeps every exact prefix count in int32.
+        # The finite cell bound keeps every exact prefix count in int32.
         invalid = (~valid).reshape(tuple(shape)).astype(np.int32)
         prefix = np.pad(invalid, ((1, 0),)*3)
         for axis in range(3):
@@ -140,11 +146,15 @@ class FineRegion:
         self.pose.setflags(write=False)
         self.size, self.support, self.margin = size, support, margin
         # END caller-owned ndarray mutations cannot change this bound region.
+        # BEGIN fixed, source-certified optimizer overlap regions.
+        self.guidance_boxes = np.empty((0, 2, 3), dtype=np.float64)
+        self._device_guidance_boxes = {}
+        # END source acceptance continues to use select(), independently.
 
     @property
     def storage_bytes(self):
         # BEGIN include one device's int shape, FP64 shape/pose and infinities.
-        return self._prefix.numel()*self._prefix.element_size() + (3+3+7+2)*8
+        return self._prefix.numel()*self._prefix.element_size() + (3+3+7+2)*8 + self.guidance_boxes.nbytes
         # END each planner binds this region to its admitted single GPU.
 
     # BEGIN immutable tensors retain their original dtype and exact conversion.
@@ -271,6 +281,144 @@ class FineRegion:
         return LayerSelection(per_sphere, chosen, envelope, lo, hi,
                               tuple(group["body_id"] for group in groups))
 
+    # BEGIN smooth guidance uses boxes proved entirely supported before solving.
+    def prepare_guidance_boxes(self, envelopes_world, *, maximum_boxes=16):
+        """Grow bounded supported witness boxes using exact prefix counts.
+
+        No distance value establishes validity. A missing sign/site anywhere
+        in a witness's complete interpolation box prevents its admission.
+        Greedy face expansion is deterministic and uses only the frozen map.
+        The resulting metric boxes include guards for interpolation stencils
+        and the numerical support band. They remain fixed for the whole solve.
+        """
+        envelopes = np.asarray(envelopes_world, dtype=np.float64)
+        if (envelopes.ndim != 3 or envelopes.shape[1:] != (2, 3)
+                or len(envelopes) > 32768+16 or not np.isfinite(envelopes).all()
+                or np.any(envelopes[:, 0] > envelopes[:, 1])
+                or type(maximum_boxes) is not int or not 0 < maximum_boxes <= 16):
+            raise ValueError("Guidance witnesses need bounded finite complete-body envelopes")
+        local = envelopes-self.pose[:3]
+        selected, lower, upper = self._envelope_support(torch.from_numpy(local))
+        prefix = self._prefix.numpy()
+        shape = np.asarray(self.shape)
+        def supported(lo, hi):
+            count = 0
+            for x in (0, 1):
+                for y in (0, 1):
+                    for z in (0, 1):
+                        corner = tuple(int(hi[i]+1 if side else lo[i])
+                                       for i, side in enumerate((x, y, z)))
+                        count += (-1)**(3-x-y-z)*int(prefix[corner])
+            return count == 0
+        boxes = []
+        # BEGIN capacity counts distinct final cuboids, never repeated witnesses.
+        box_keys = set()
+        duplicate_boxes = 0
+        # END different witnesses still run the same supported face expansion.
+        origin = -(shape-1)*self.size/2
+        # Native query coordinates are float32. This inward numerical guard
+        # makes positive double-precision clearance imply the strict selector
+        # predicate even where rounded grid faces coincide with sample centres.
+        guard = 32*np.finfo(np.float32).eps*(1.+float(np.abs(self.pose[:3]).max())
+                                              +float((shape*self.size).max()))
+        allowed = np.stack((-shape*self.size/2+self.support+guard,
+                            shape*self.size/2-self.support-guard))
+        for index in np.flatnonzero(selected.numpy()):
+            # BEGIN an already-covered witness can still grow a different box.
+            # Its narrower starting stencil can admit a different first face
+            # expansion. Only equal final coordinates establish redundancy.
+            # END no containment shortcut discards another supported cuboid.
+            if len(boxes) == maximum_boxes:
+                break
+            lo, hi = lower[index].numpy().copy(), upper[index].numpy().copy()
+            for axis in range(3):
+                left, right = 0, int(lo[axis])
+                while left < right:
+                    middle = (left+right)//2
+                    trial = lo.copy(); trial[axis] = middle
+                    if supported(trial, hi): right = middle
+                    else: left = middle+1
+                lo[axis] = left
+                left, right = int(hi[axis]), int(shape[axis]-1)
+                while left < right:
+                    middle = (left+right+1)//2
+                    trial = hi.copy(); trial[axis] = middle
+                    if supported(lo, trial): left = middle
+                    else: right = middle-1
+                hi[axis] = left
+            # BEGIN invert the selector's one-sample interpolation padding once.
+            # _envelope_support uses floor(low_coordinate)-1 and
+            # ceil(high_coordinate)+1. Thus a metric envelope strictly above
+            # sample lo+1 and below sample hi-1 stays within these supported
+            # indices. The existing inward guard preserves those strict
+            # inequalities after native float32 sphere arithmetic; an extra
+            # sample of erosion would discard already-proved witness space.
+            box = np.stack((np.maximum(origin+(lo+1)*self.size+guard, allowed[0]),
+                            np.minimum(origin+(hi-1)*self.size-guard, allowed[1])))
+            # END source validity and the numerical support band are unchanged.
+            if np.all(box[0] < box[1]):
+                # BEGIN deduplicate only identical results after full expansion.
+                # A boundary witness may not fit its own inward-guarded box.
+                # Repeating that result must not consume another finite slot;
+                # every different final cuboid remains eligible for admission.
+                key = tuple(box.ravel())
+                if key in box_keys:
+                    duplicate_boxes += 1
+                    continue
+                box_keys.add(key)
+                boxes.append(box)
+                # END no witness coordinates are rounded or epsilon-merged.
+        self.guidance_boxes = np.asarray(boxes, dtype=np.float64).reshape(-1, 2, 3)
+        self.guidance_boxes.setflags(write=False)
+        self._device_guidance_boxes = {}
+        covered = np.zeros(len(local), dtype=bool)
+        for box in boxes:
+            covered |= np.all(local[:, 0] > box[0], axis=-1) & np.all(local[:, 1] < box[1], axis=-1)
+        return {"witnesses": len(envelopes), "source_supported_witnesses": int(selected.sum()),
+                "unsupported_witnesses": int((~selected).sum()), "cuboids": len(boxes),
+                "duplicate_cuboid_candidates": duplicate_boxes,
+                "supported_uncovered_envelopes": int((selected.numpy() & ~covered).sum()),
+                "cuboid_capacity_reached": len(boxes) == maximum_boxes,
+                "overlap_m": 4*self.size,
+                "cuboids_grid_m": self.guidance_boxes.tolist()}
+
+    def guidance_weights(self, spheres, groups):
+        """Return one differentiable weight per complete body and sphere.
+
+        Smoothstep has zero value and derivative at the source-safe boundary.
+        Its derivative is retained: dropping it would give the gradient of a
+        different objective in the overlap band. Maximum over fixed boxes is
+        continuous and piecewise differentiable, without stateful hysteresis.
+        """
+        groups = validate_body_groups(groups, spheres.shape[-2])
+        expanded = _measured_spheres(spheres, self.margin).to(torch.float64)
+        device = spheres.device
+        if device not in self._device_guidance_boxes:
+            self._device_guidance_boxes[device] = torch.tensor(
+                self.guidance_boxes.copy(), device=device, dtype=torch.float64)
+        boxes = self._device_guidance_boxes[device]
+        pose = self._constants(device)[2]
+        centers = expanded[..., :3]-pose[:3]
+        weights = []
+        indices = self._group_indices(device, groups)
+        for idx in indices:
+            low = (centers[..., idx, :]-expanded[..., idx, 3:4]).amin(-2)
+            high = (centers[..., idx, :]+expanded[..., idx, 3:4]).amax(-2)
+            if len(self.guidance_boxes):
+                clearance = torch.minimum(low[..., None, :]-boxes[:, 0],
+                                           boxes[:, 1]-high[..., None, :]).amin(-1)
+                phase = (clearance/(4*self.size)).clamp(0., 1.)
+                weight = (phase.square()*(3.-2.*phase)).amax(-1)
+            else:
+                weight = low.sum(-1)*0.
+            weights.append(weight.to(spheres.dtype))
+        body_weights = torch.stack(weights, -1)
+        sphere_weights = torch.empty(spheres.shape[:-1], dtype=spheres.dtype, device=device)
+        for index, idx in enumerate(indices):
+            sphere_weights[..., idx] = body_weights[..., index, None]
+        return sphere_weights, body_weights
+    # END fixed supported boxes affect only differentiable collision guidance.
+
 
 class LayeredVoxelQuery:
     """Two native fields, one externally frozen complete-body choice per state."""
@@ -284,6 +432,8 @@ class LayeredVoxelQuery:
         self.source = coarse.source+"; source-supported local fine region"
         self.independent_geometry = {"layers": {"coarse": query_geometry(coarse), "fine": query_geometry(fine)},
                                      "fine_region": deepcopy(region)}
+        self.refinement_source = None
+        self.mapping_report = None
 
     def clone_for_rollout(self):
         result = copy(self)
@@ -303,3 +453,12 @@ class LayeredVoxelQuery:
         coarse = self.coarse(expanded, key=key)
         fine = self.fine(expanded, key=key)
         return torch.where(selection.sphere_fine, fine, coarse)
+
+    # BEGIN background optimizer blending never changes source layer evidence.
+    def background_guidance(self, spheres, *, key, groups):
+        expanded = self.inflated_spheres(spheres)
+        coarse = self.coarse(expanded, key=key)
+        fine = self.fine(expanded, key=key)
+        weights, _ = self.region.guidance_weights(spheres, groups)
+        return coarse+weights*(fine-coarse)
+    # END both native values and the overlap-weight derivative remain in graph.

@@ -82,7 +82,7 @@ def test_nearest_previous_state_precedes_extra_clearance():
 
 def test_all_broken_values_produce_no_candidate_instead_of_a_fabricated_state():
     assert select([[float("nan")], [float("inf")]], [report(), report()], count=2) == []
-    assert chains([[[float("nan")]], [[.1]]]) == []
+    assert chains([[[float("nan")]], [[float("inf")]]]) == []
 
 
 def test_validity_must_be_explicit_not_a_missing_default():
@@ -114,21 +114,16 @@ def test_chain_success_cannot_be_replaced_by_a_stationary_failed_reference():
 def test_task_and_source_screening_are_independent_of_reference_pose_success():
     selected = chains([[[.1], [.5]]],
         [[report(source_valid=False), report(native_pose_ik_success=False)]])
-    assert selected[0]["candidate_indices"] == [1]
-    assert selected[0]["recovery_queries"] == [{"query_index": 0, "candidate_index": 1,
-        "candidate_source": "native_ik", "reasons": ["reference_pose_ik_not_successful"]}]
+    # Neither a colliding pose solution nor a pose-failed safe state is a
+    # successful reference anchor; both remain available as caller evidence.
+    assert selected == []
 
 
-def test_failed_and_carried_queries_keep_their_explicit_recovery_sources():
+def test_failed_and_carried_queries_cannot_supply_reference_anchors():
     selected = chains([[[.1], [.9]], [[.1]]],
         [[report(native_pose_ik_success=False), report(native_pose_ik_success=False)],
          [report(native_pose_ik_success=False, candidate_source="carried_previous", source_valid=False)]])
-    assert not selected[0]["reference_success"]
-    assert selected[0]["candidate_indices"] == [0, 0]
-    recovery = selected[0]["recovery_queries"]
-    assert [row["candidate_source"] for row in recovery] == ["native_ik", "carried_previous"]
-    assert recovery[1]["reasons"] == ["static_source_requirements_not_satisfied",
-        "reference_pose_ik_not_successful", "reference_query_has_no_finite_native_candidate"]
+    assert selected == []
 
 
 def test_velocity_bounds_scale_named_joints_before_comparing_postures():

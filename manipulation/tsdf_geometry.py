@@ -343,13 +343,21 @@ class ObservedTsdfGeometry:
         # which reads storage_nbytes only once. A component has at most eight
         # vertices; 4 KiB covers its small native hull/BVH, arrays and Python
         # bookkeeping conservatively. Current world poses/results stay outside.
-        # The finite cap admits complete medium-sized snapshots when callers
-        # explicitly supply the larger scene-memory budget. Larger inventories
-        # still use the same bounded eviction path and exact reconstruction.
+        # BEGIN retain the established reuse capacity and identify its ownership.
+        # Cache rows hold fixed component geometry and are borrowed by queries;
+        # their full reserve belongs to scene storage, never query scratch.
         self._collision_cache_capacity = min(262144, sum(self._counts))
         self._collision_cache = OrderedDict()
-        self.storage_nbytes += self._collision_cache_capacity * 4096
+        self.storage_nbytes += self.collision_cache_storage_nbytes
+        # END admission reserves the persistent cache exactly once.
         # END cache residency is bounded independently of trajectory length.
+
+    # BEGIN expose the persistent portion already included in storage_nbytes.
+    @property
+    def collision_cache_storage_nbytes(self):
+        """Full fixed-component LRU reserve, independent of current occupancy."""
+        return self._collision_cache_capacity * 4096
+    # END a query borrows cached shapes without cloning this reserve.
 
     @staticmethod
     def _decode_components(record, kind, maximum_vertices):

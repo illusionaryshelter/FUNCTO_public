@@ -89,7 +89,7 @@ def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance,
 
 def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s,
                      velocity_limits, *, count, joint_tolerance):
-    """Choose up to ``count`` distinct complete chains from finite query pools.
+    """Connect qualified reference anchors and interpolate missing seed samples.
 
     Inputs retain the caller's candidate indices. ``previous`` is the measured
     start of shape ``[1,D]`` at t=0; strictly increasing ``query_times_s`` are
@@ -98,12 +98,15 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     query is introduced. Each report requires an explicit ``candidate_source``;
     only ``native_ik`` may report native pose success.
 
-    At each query, retain the best available task/source/reference-success
-    tier and remove numerical duplicates. A failed nominal query is therefore
-    an explicit recovery layer, while a successful candidate cannot lose to
-    a failed one with more clearance or a shorter connection. These are only
-    initializer policies: a tier failing actual task/source checks remains
-    unqualified, and every emitted chain still needs whole-curve optimization.
+    Only native pose solutions passing both static task and source checks can
+    be anchors. Failed queries do not become graph vertices or joint targets.
+    The graph connects successive SOLVED queries using their actual time gap;
+    missing samples are interpolated between the measured start and selected
+    anchors, with constant continuation after the last anchor. Those samples
+    are explicitly FALLBACK_SEED, not solutions to their requested tool pose.
+    With no qualified anchor, return no reference chain: the caller owns its
+    independent measured-state initializer. Every emitted chain still needs
+    whole-curve optimization and validation.
 
     Dynamic programming retains at most ``count`` paths at each last candidate.
     Edges integrate squared joint velocity divided by the square of the
@@ -130,8 +133,9 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     if np.any(scales <= 0):
         raise ValueError("IK chain velocity scales must be positive")
 
+    # BEGIN failed nominal IK never participates in graph edges or interpolation anchors.
     layers = []
-    for values, rows in zip(pools, reports):
+    for query, (values, rows) in enumerate(zip(pools, reports)):
         if values.ndim != 2 or values.shape[1] != start.shape[1]:
             raise ValueError("Every IK query pool must use the same named joint layout")
         _validate_reports(rows, len(values))
@@ -141,20 +145,21 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                 raise ValueError("IK chain candidates require an explicit candidate_source")
             if source != "native_ik" and row["native_pose_ik_success"]:
                 raise ValueError("A recovery source cannot claim native pose IK success")
-        finite = np.flatnonzero(np.isfinite(values).all(axis=-1))
-        if not len(finite):
-            # The caller may offer a separately screened carried/measured
-            # state; this policy must never manufacture one or its evidence.
-            return []
-        best_tier = min(_tier(rows[index], "reference") for index in finite)
+        qualified = [int(index) for index in np.flatnonzero(np.isfinite(values).all(axis=-1))
+                     if rows[index]["candidate_source"] == "native_ik"
+                     and all(rows[index][name] for name in
+                             ("task_satisfied", "source_valid", "native_pose_ik_success"))]
         retained = []
-        for index in sorted((int(index) for index in finite
-                             if _tier(rows[index], "reference") == best_tier),
+        for index in sorted(qualified,
                             key=lambda index: (*_quality(rows[index]), index)):
             if retained and np.any(np.max(np.abs(values[retained]-values[index]), axis=-1) <= joint_tolerance):
                 continue
             retained.append(index)
-        layers.append(retained)
+        if retained:
+            layers.append((query, retained))
+    if not layers:
+        return []
+    # END all discarded native results remain in the caller's original query reports.
 
     # State tuples contain the additive rank and original candidate-index
     # sequence. Keeping K predecessors per terminal node suffices for K best
@@ -162,14 +167,14 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     states = {None: [((0., 0, 0., 0, 0., 0, 0.), ())]}
     previous_time = 0.
     normalizer = times[-1]*start.shape[1]
-    for query, indices in enumerate(layers):
+    for layer, (query, indices) in enumerate(layers):
         dt = float(times[query]-previous_time)
         next_states = {}
         for index in indices:
             quality = _quality(reports[query][index])
             options = []
             for preceding_index, paths in states.items():
-                preceding = start[0] if query == 0 else pools[query-1][preceding_index]
+                preceding = start[0] if layer == 0 else pools[layers[layer-1][0]][preceding_index]
                 with np.errstate(over="ignore", invalid="ignore"):
                     scaled_velocity = (pools[query][index]-preceding)/(scales*dt)
                     edge = float(dt*np.dot(scaled_velocity, scaled_velocity)/normalizer)
@@ -185,26 +190,26 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 
     result = []
     for cost, path in sorted(item for paths in states.values() for item in paths):
-        positions = np.stack([pools[query][index] for query, index in enumerate(path)])
+        # BEGIN gap samples derive only from measured q0 and successful native anchors.
+        anchor_queries = [query for query, _ in layers]
+        anchors = np.stack([pools[query][index] for query, index in zip(anchor_queries, path)])
+        anchor_times = np.r_[0., times[anchor_queries]]
+        anchor_positions = np.concatenate((start, anchors))
+        positions = np.column_stack([np.interp(times, anchor_times, anchor_positions[:, joint])
+                                     for joint in range(start.shape[1])])
         if any(np.max(np.abs(np.asarray(prior["joint_positions"])-positions)) <= joint_tolerance
                for prior in result):
             continue
-        recovery = []
-        for query, index in enumerate(path):
-            report = reports[query][index]
-            reasons = []
-            if not report["task_satisfied"]:
-                reasons.append("static_task_requirements_not_satisfied")
-            if not report["source_valid"]:
-                reasons.append("static_source_requirements_not_satisfied")
-            if not report["native_pose_ik_success"]:
-                reasons.append("reference_pose_ik_not_successful")
-            if report["candidate_source"] != "native_ik":
-                reasons.append("reference_query_has_no_finite_native_candidate")
-            if reasons:
-                recovery.append({"query_index": query, "candidate_index": int(index),
-                    "candidate_source": report["candidate_source"], "reasons": reasons})
-        result.append({"candidate_indices": list(path), "joint_positions": positions.tolist(),
+        indices = [None]*len(pools)
+        for query, index in zip(anchor_queries, path):
+            indices[query] = int(index)
+        recovery = [{"query_index": query, "candidate_index": None,
+                     "candidate_source": "interpolated_success_anchors",
+                     "reasons": ["reference_query_has_no_qualified_native_candidate"]}
+                    for query, index in enumerate(indices) if index is None]
+        result.append({"candidate_indices": indices, "joint_positions": positions.tolist(),
+            "anchor_query_indices": anchor_queries,
+            "query_statuses": ["FALLBACK_SEED" if index is None else "SOLVED" for index in indices],
             "selection_cost": {"normalized_velocity_energy": float(cost[0]),
                 "environment_clearance_missing_count": int(cost[1]),
                 "environment_clearance_sum_m": float(-cost[2]),
@@ -213,6 +218,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                 "joint_margin_missing_count": int(cost[5]),
                 "joint_margin_sum": float(-cost[6])},
             "recovery_queries": recovery, "reference_success": not recovery})
+        # END interpolated joint samples initialize a curve; they never claim pose convergence.
         if len(result) == count:
             break
     return result

@@ -701,7 +701,8 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
         return metrics
     # END the recorder never repeats native evaluation or mutates its result.
 
-    def observed(planner, native_result):
+    # BEGIN recording preserves seed/block selection options and result identity.
+    def observed(planner, native_result, **selection_options):
         # BEGIN retain every native seed before production gathers a candidate.
         nonlocal native_trace, native_metrics_document, current_native_seed
         # BEGIN bound retained query memory to the existing native seed count.
@@ -730,12 +731,17 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
             entry["error"] = f"{type(error).__name__}: {error}"
         report["native_results"].append(entry)
         # END retain every native seed before production gathers a candidate.
-        selected, curve, attempt = original(planner, native_result)
+        # The same selector now observes initial seeds and optimizer blocks.
+        # Forward its candidate subset, first-feasible policy and origin as
+        # supplied; the recorder has no authority to broaden that selection.
+        selection = original(planner, native_result, **selection_options)
+        _, curve, attempt = selection
         # BEGIN archive the production selection's actual independent-check status.
         preserve_candidate(planner, curve, attempt,
                            validation_status=attempt["independent_validation"])
         # END a cheap native-rejected curve has no completed validation report.
-        return selected, curve, attempt
+        return selection
+    # END selector exceptions propagate without substitution or a second call.
 
     try:
         with ExitStack() as stack:

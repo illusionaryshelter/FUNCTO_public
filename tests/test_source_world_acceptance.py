@@ -17,7 +17,7 @@ from manipulation.planning_scene import (
 )
 from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChecker
 from manipulation.robot_validation import RobotStateValidator
-from manipulation.tsdf_geometry import tsdf_geometry_from_samples
+from manipulation.tsdf_geometry import ObservedTsdfGeometry, tsdf_geometry_from_samples
 from manipulation.voxel_layers import LayeredVoxelQuery
 
 
@@ -142,6 +142,39 @@ def test_zero_proxy_still_queries_tsdf_surface_and_negative_material(scene_facto
     assert source_terms(current, args, diagnostics=evidence)["source_world_collision"].item() == 1.
     assert evidence["checked_states"] == evidence["failed_states"] == 1
     assert evidence["worst_state"]["scene"]["violations"]
+
+
+# BEGIN persistent component reuse must not multiply per-query admission.
+def test_source_scene_cache_reserve_is_counted_once_and_queries_are_unchanged(scene_factory, monkeypatch):
+    first = scene_factory(ProxyQuery("background", observed_plane()))
+    first_checker = first._source_scene_checker
+    original_reserve = ObservedTsdfGeometry.collision_cache_storage_nbytes.fget
+    extra_reserve = 64 * 1024 * 1024
+    # Simulate a larger conservative cache reservation without altering source
+    # samples, component identity, geometry queries or the pair inventory.
+    monkeypatch.setattr(ObservedTsdfGeometry, "collision_cache_storage_nbytes",
+        property(lambda shape: original_reserve(shape) + extra_reserve))
+    larger = scene_factory(ProxyQuery("background", observed_plane()))
+    larger_checker = larger._source_scene_checker
+    assert larger_checker.scene_storage_nbytes - first_checker.scene_storage_nbytes == extra_reserve
+    assert larger_checker.scene_query_workspace_nbytes == first_checker.scene_query_workspace_nbytes
+    admitted = (larger_checker.scene_storage_nbytes, larger_checker.scene_query_workspace_nbytes)
+    args = states([[.2, 0.]])  # Source-clear state followed by true material intersection.
+    cold_evidence, warm_evidence, original_evidence = {}, {}, {}
+    cold = source_terms(larger, args, diagnostics=cold_evidence)
+    warm = source_terms(larger, args, diagnostics=warm_evidence)
+    original = source_terms(first, args, diagnostics=original_evidence)
+    assert cold["source_world_collision"].tolist() == [[0., 1.]]
+    assert cold.keys() == warm.keys() == original.keys()
+    for name in cold:
+        torch.testing.assert_close(cold[name], warm[name], rtol=0., atol=0.)
+        torch.testing.assert_close(cold[name], original[name], rtol=0., atol=0.)
+    assert cold_evidence["worst_state"]["scene"] == warm_evidence["worst_state"]["scene"]
+    assert cold_evidence["worst_state"]["scene"] == original_evidence["worst_state"]["scene"]
+    assert any(row["shape"]._collision_cache for row in larger_checker._scene_shapes
+               if isinstance(row["shape"], ObservedTsdfGeometry))
+    assert (larger_checker.scene_storage_nbytes, larger_checker.scene_query_workspace_nbytes) == admitted
+# END cache occupancy cannot change a source verdict or its admitted workspace.
 
 
 def test_missing_required_geometry_is_not_allowed_unknown_space(scene_factory):

@@ -600,6 +600,17 @@ class PlanningResult:
 
 
 # BEGIN size required evidence and native anchor buffers from the actual request.
+class ResourceLimitError(ValueError):
+    """An explicit byte-cap refusal, distinct from malformed inputs or APIs."""
+
+    def __init__(self, resource, required_bytes, limit_bytes, *, description="Resource capacity exceeded"):
+        self.resource = str(resource)
+        self.required_bytes = int(required_bytes)
+        self.limit_bytes = int(limit_bytes)
+        super().__init__(f"{description} ({self.resource}): required {self.required_bytes} bytes, "
+                         f"allowed {self.limit_bytes} bytes")
+
+
 def _anchor_capacity(progress_map, anchors, budget, refinement_parameters=()):
     """Keep every required clock anchor; bound only additional refinement.
 
@@ -742,8 +753,8 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     # END all live optimization scratch remains under the unchanged hard budget.
     if scene_bytes > budget.max_scene_workspace_bytes:
         # BEGIN report the actual bound so a refused trial is reproducible.
-        raise ValueError("Independent scene query workspaces exceed the declared local allocation budget: "
-                         f"required {int(scene_bytes)} bytes, allowed {budget.max_scene_workspace_bytes} bytes")
+        raise ResourceLimitError("scene_workspace", scene_bytes, budget.max_scene_workspace_bytes,
+            description="Independent scene query workspaces exceed the declared local allocation budget")
         # END reporting a shortfall does not alter the allocation contract.
     # BEGIN choose capture scope before allocation, preserving eager admission.
     # Each trajectory entry/inner executor retains a private pool in addition
@@ -798,9 +809,17 @@ def _require_planning_memory(torch, device, scene_bytes, anchor_fk_bytes):
     free_bytes, _ = torch.cuda.mem_get_info(device)
     reusable_torch_bytes = max(0, torch.cuda.memory_reserved(device)-torch.cuda.memory_allocated(device))
     other_native_bytes = 2*1024**3
-    if (free_bytes < other_native_bytes
-            or free_bytes+reusable_torch_bytes < other_native_bytes+scene_bytes+anchor_fk_bytes):
-        raise ValueError("Available GPU memory does not cover the bounded planner, anchor FK and scene workspaces")
+    # BEGIN expose only explicit capacity comparisons as resource refusals.
+    description = "Available GPU memory does not cover the bounded planner, anchor FK and scene workspaces"
+    if free_bytes < other_native_bytes:
+        raise ResourceLimitError("gpu_native_reserve", other_native_bytes, free_bytes,
+                                 description=description)
+    required_bytes = other_native_bytes+scene_bytes+anchor_fk_bytes
+    available_bytes = free_bytes+reusable_torch_bytes
+    if available_bytes < required_bytes:
+        raise ResourceLimitError("gpu_planner_workspace", required_bytes, available_bytes,
+                                 description=description)
+    # END CUDA API errors retain their original exception identity.
 # END size required evidence and native anchor buffers from the actual request.
 
 
@@ -3702,15 +3721,17 @@ class _CuroboPlanner:
     def reference_seeds(self):
         """Build bounded initializers from explicit reference-query evidence.
 
-        All admitted IK outputs survive until the finite whole-chain selection.
-        A failed nominal query remains an initialization recovery, never a new
-        task failure or a successful pose solution. Samples are fitted in the
-        actual native cubic representation before becoming optimizer actions.
+        Native outputs retain their diagnostics, but only successful pose IK
+        passing static task/source checks enters the next warm start or the
+        anchor graph. Failed queries are filled from successful anchors and
+        measured q0, never from a failed native posture. Samples are fitted in
+        the actual native cubic representation before becoming optimizer actions.
         """
         from .planning_ik import select_ik_chains
         torch, count = self.torch, self.budget.trajectory_seeds
         velocity_bounds = self._seed_velocity_bounds()
         previous = self.start.position[:, None].clone()
+        warm_start_query = None
         control_u = (np.arange(self.trajopt.action_horizon)+3.)/(self.trajopt.action_horizon+4.)
         pools, evidence, success_counts = [], [], []
         self.reference_ik_queries, self.reference_ik_distinct_counts = [], []
@@ -3724,47 +3745,62 @@ class _CuroboPlanner:
             success_counts.append(int((flags & np.isfinite(values).all(-1)).sum()))
             ranked, reports = self._rank_ik_candidates(values, flags,
                 previous[0].detach().cpu().numpy(), float(u))
-            self.reference_ik_distinct_counts.append(sum(
-                reports[index]["native_pose_ik_success"] and reports[index]["task_satisfied"]
-                and reports[index]["source_valid"] for index in ranked))
-            if not len(ranked):
-                # A previous posture must be screened at THIS physical time:
-                # hand commands, permissions and task modes may have changed.
-                values = previous[0].detach().cpu().numpy()
-                ranked, reports = self._rank_ik_candidates(values, np.zeros(len(values), bool),
-                    values, float(u))
-                for report in reports:
-                    report.update(candidate_source="measured_start" if query_index == 0 else "carried_previous",
-                                  reference_recovery_reason="no_finite_native_ik_output")
-            if not len(ranked):
-                raise JointDomainInitializationError("No finite reference recovery state survived static screening")
+            # BEGIN failed reference poses remain evidence, never future warm starts.
+            qualified = [int(index) for index in ranked if all(reports[index][name] for name in
+                ("native_pose_ik_success", "task_satisfied", "source_valid"))]
+            self.reference_ik_distinct_counts.append(len(qualified))
+            for index, report in enumerate(reports):
+                report["reference_status"] = ("SOLVED" if np.isfinite(values[index]).all()
+                    and all(report[name] for name in
+                            ("native_pose_ik_success", "task_satisfied", "source_valid"))
+                    else "FAILED_REFERENCE")
+            # Native result errors describe convergence to the nominal pose;
+            # static task and geometry evidence above remain independent.
+            for attribute, name in (("position_error", "nominal_position_error_m"),
+                                    ("rotation_error", "nominal_rotation_error_rad")):
+                measurement = getattr(result, attribute, None)
+                if measurement is not None:
+                    errors = measurement[0].detach().cpu().numpy().reshape(-1)
+                    if errors.shape != (len(reports),):
+                        raise ValueError("Native IK convergence errors must align with returned candidates")
+                    for report, error in zip(reports, errors):
+                        report[name] = float(error) if np.isfinite(error) else None
             pools.append(values)
             evidence.append(reports)
-            # Preserve every distinct admitted candidate as the next native
-            # warm-start pool; trajectory_seeds does not truncate this pool.
-            previous = self.device_cfg.to_device(values[ranked][None]).contiguous()
             self.reference_ik_queries.append({"u": float(u),
                 "time_s": float(u*self.formal_clock["duration"]),
-                "candidates": [{"joint_position": row.tolist(), "report": report}
+                "reference_status": "SOLVED" if qualified else "FAILED_REFERENCE",
+                "seed_status": "SOLVED" if qualified else "FALLBACK_SEED",
+                "qualified_candidate_indices": qualified,
+                "warm_start_from_query": warm_start_query,
+                "candidates": [{"joint_position": [float(value) if np.isfinite(value) else None
+                                                    for value in row], "report": report}
                                for row, report in zip(values, reports)]})
+            if qualified:
+                # Static checks apply at this query only. Carrying this pool
+                # supplies numerical IK initializers, not acceptance evidence
+                # for later task modes, permissions, or physical times.
+                previous = self.device_cfg.to_device(values[qualified][None]).contiguous()
+                warm_start_query = query_index
+            # END an empty/failed query leaves the most recent successful pool intact.
         chains = select_ik_chains(pools, evidence, self.start.position.detach().cpu().numpy(),
             control_u*self.formal_clock["duration"], velocity_bounds, count=count,
             joint_tolerance=self.problem.numerical.joint)
-        if not chains:
-            raise JointDomainInitializationError("No finite whole reference chain was constructed")
         self.reference_ik_chains = chains
-        # Keep the existing independent measured-state alternative when no
-        # complete successful reference chain or no distinct second chain exists.
-        retained = chains[:count] if chains[0]["reference_success"] else chains[:1]
+        # BEGIN failure gaps do not erase distinct successful anchor branches.
+        # Every returned chain contains at least one qualified native anchor;
+        # interpolation fills its missing samples without using failed IK.
+        retained = chains[:count]
         targets = [np.asarray(chain["joint_positions"]) for chain in retained]
         self.initial_seed_strategies = ["reference_ik" if chain["reference_success"]
-                                       else "reference_ik_recovery" for chain in retained]
+                                       else "reference_ik_with_fallback" for chain in retained]
         if len(retained) > 1:
-            self.initial_seed_strategies[1] = "reference_ik_alternative"
+            self.initial_seed_strategies[1] += "_alternative"
         while len(targets) < count:
             targets.append(np.broadcast_to(self.start.position[0].detach().cpu().numpy(),
                                             (self.trajopt.action_horizon, len(self.joint_names))).copy())
             self.initial_seed_strategies.append("measured_state_constant")
+        # END all-failed references use only the independent measured-state strategy.
         controls, self.reference_seed_fits = [], []
         for branch, target in enumerate(targets):
             if self.initial_seed_strategies[branch] == "measured_state_constant":
@@ -3821,6 +3857,132 @@ class _CuroboPlanner:
         self.seed_strategies = list(self.initial_seed_strategies)
         return seeds.contiguous(), success_counts
     # END q0/dq0, native clock, hard task checks and admitted seed count are fixed.
+
+    # BEGIN source-supported spatial refinement precedes each frozen solve.
+    def refine_background_for_seed(self, seed):
+        """Rebuild local background guidance from this initializer's witnesses.
+
+        A witness is a complete body's positive coarse proxy query at a real
+        physical time. Sample the same native regular grid and exact anchors
+        used by trajectory costs. These extra FK/proxy queries propose map
+        resolution only; they neither certify the curve nor consume a source
+        geometry acceptance pass. The request's wall deadline still applies.
+        Every later solve starts here, including a changed OMPL initializer.
+        """
+        from .voxel_layers import LayeredVoxelQuery
+
+        background = self.scene.background
+        if (not isinstance(background, LayeredVoxelQuery)
+                or getattr(background, "refinement_source", None) is None):
+            return {"updated": False, "reason": "no_observed_background_refinement_source"}
+        self.physical_domain.validate(seed)
+        anchors = self.progress_map.anchor_parameters(self.anchors)[:, 0]
+        parameters = np.unique(np.r_[np.linspace(0., 1., self.trajopt.horizon),
+                                     anchors, self.refinement_parameters])
+        # CPU cubic evaluation uses the actual free controls and fixed q0/dq0;
+        # interpolating those free controls themselves would be another curve.
+        controls = seed[0].detach().cpu().numpy()
+        q = self.physical_domain.evaluate(controls, parameters)
+        progress = np.interp(parameters, self.progress_map.u, self.progress_map.s)
+        times = parameters*self.formal_clock["duration"]
+        check = getattr(self, "_check_validation_work", None)
+
+        def collect(scene):
+            rows = []
+            with self.torch.no_grad():
+                for begin in range(0, len(parameters), _VALIDATION_CHUNK_SIZE):
+                    if check is not None:
+                        check()
+                    end = min(begin+_VALIDATION_CHUNK_SIZE, len(parameters))
+                    joints = self.device_cfg.to_device(q[:, begin:end]).contiguous()
+                    state = self._verification_fk.compute_kinematics(self.JointState.from_position(
+                        joints, joint_names=list(self.joint_names)))
+                    tool = state.tool_poses
+                    index = tool.tool_frames.index(self.problem.tool_link)
+                    position, quaternion = self.problem.transform_tool_pose(
+                        tool.position[:, :, index], tool.quaternion[:, :, index])
+                    spheres = self.problem.transform_robot_spheres(state.robot_spheres)
+                    s = self.device_cfg.to_device(progress[None, begin:end]).expand(len(controls), -1)
+                    t = self.device_cfg.to_device(times[None, begin:end]).expand(len(controls), -1)
+                    rows.extend(scene.background_refinement_witnesses(
+                        spheres, position, quaternion, s, joints, self.joint_names,
+                        trajectory_time=t, include_satisfied=True))
+            return rows
+
+        def summarize(rows):
+            # Costs sum sphere penalties at the sampled body/time queries;
+            # they are neither signed distances nor source collision verdicts.
+            bodies = {}
+            for row in rows:
+                body = bodies.setdefault(row["body_id"], {"queries": 0, "positive_spheres": 0,
+                    "source_supported_queries": 0, "full_fine_weight_queries": 0,
+                    "coarse_cost_sum": 0., "guidance_cost_sum": 0.,
+                    "fine_cost_sum_on_supported_queries": 0.})
+                body["queries"] += 1
+                body["positive_spheres"] += row["positive_spheres"]
+                body["source_supported_queries"] += int(row["fine_supported"])
+                body["full_fine_weight_queries"] += int(row["guidance_weight"] == 1.)
+                body["coarse_cost_sum"] += row["coarse_cost"]
+                body["guidance_cost_sum"] += row["guidance_cost"]
+                if row["fine_supported"]:
+                    body["fine_cost_sum_on_supported_queries"] += row["fine_cost"]
+            return {"body_queries": len(rows), "bodies": bodies,
+                    "largest_coarse_query": None if not rows else max(rows, key=lambda row: row["coarse_cost"]),
+                    "scope": "Same cubic and times; proxy penalties only, not geometry acceptance"}
+
+        before = collect(self.scene)
+        witnesses = [row for row in before if row["guidance_weight"] < 1.]
+        if check is not None:
+            check()
+        replacement, report = self.scene.refine_background(witnesses)
+        report = {**report, "sampled_times": len(parameters), "sampled_seeds": len(controls),
+                  "updated": replacement is not None, "before": summarize(before)}
+        if replacement is None:
+            return report
+        # BEGIN admit the complete replacement while the working scene survives.
+        # Mapping's own capacity check does not include source-solid snapshots,
+        # dense query scratch, candidate records or planner FK. None of those
+        # limits may be discovered only after replacing the old scene/solver.
+        # Live GPU admission is deliberately conservative: the old solver is
+        # still allocated and its storage is not promised as already reusable.
+        refusal = None
+        try:
+            storage = _validation_storage_admission(self.problem, replacement, self.robot_metadata, self.budget)
+            capacity = _anchor_capacity(self.progress_map, self.anchors, self.budget, self.refinement_parameters)
+            scene_bytes, anchor_bytes, graph = _planning_workspace_bytes(
+                replacement, self.robot_metadata, self.budget, capacity)
+            _require_planning_memory(self.torch, self.device_cfg.device, scene_bytes, anchor_bytes)
+        except ResourceLimitError as error:
+            refusal = {"resource": error.resource, "required_bytes": error.required_bytes,
+                       "limit_bytes": error.limit_bytes, "reason": str(error)}
+        if refusal is not None:
+            # Leave the exception scope before collection: its traceback would
+            # otherwise keep the refused scene alive through the preflight frame.
+            del replacement
+            gc.collect()
+            report.update(status="resource_refused", updated=False, resource_refusal=refusal)
+            if check is not None:
+                check()
+            return report
+        report["planner_admission"] = {"scene_workspace_bytes": scene_bytes,
+            "anchor_fk_workspace_bytes": anchor_bytes, "trajectory_graph": graph,
+            "validation_storage": deepcopy(storage)}
+        self.validation_storage = storage
+        # END ordinary geometry/shape/runtime errors are never resource refusals.
+        # The factory has already rebuilt the independent source checker from
+        # the new observed fine field. Rebuild all trajectory rollouts/captures
+        # before using it, and retain the exact frozen hand/trajectory clock.
+        self.scene = replacement
+        self._verification_scene = replacement.clone_for_rollout()
+        self.refine_validation(self.refinement_parameters)
+        report["after"] = summarize(collect(replacement))
+        # IK seed metrics use only native pose/domain and robot self geometry;
+        # they do not query background fields. Static IK screening and OMPL use
+        # this new verification scene, so the unchanged IK core needs no rebuild.
+        if check is not None:
+            check()
+        return report
+    # END no map or blend-region mutation occurs inside an optimizer block.
 
     def refine_validation(self, refinement_parameters, *, phase=None):
         """Rebuild only validation workspaces in the already frozen binding.
@@ -4333,6 +4495,116 @@ class _CuroboPlanner:
         return self.goal_ik_candidates
     # END static candidates cannot manufacture release history or trajectory feasibility.
 
+    # BEGIN independently qualify bounded seed and exploration observations.
+    def _functional_candidate_mask(self, actions):
+        """Screen exact pose-event anchors; this is never a feasibility verdict.
+
+        Use the native sampled cubic and the same Hermite anchor evaluation as
+        ProcessCostManager. Source solids, all other process requirements and
+        continuous derivative bounds remain mandatory in metrics/export.
+        """
+        goals = [goal for goal in self.problem.pose_events
+                 if goal.progress >= self.problem.start_progress]
+        count = actions.shape[0]
+        if not goals:
+            return np.ones(count, dtype=bool)
+        self._charge_candidate_queries(count*(self.trajopt.horizon+len(goals)))
+        with self.torch.no_grad():
+            state = self.trajopt.metrics_rollout.compute_state_from_action(actions)
+            joint = state.joint_state
+            # BEGIN keep each point goal paired with its own first arrival.
+            # A combined anchor query sorts and deduplicates goals and expands
+            # pauses into two endpoints. Its columns cannot be indexed in the
+            # original goal order. Like _first_event_query, a pose event owns
+            # only its earliest arrival, not a maintained pose over a pause.
+            # One query per goal also matches the FK work charged above.
+            parameters = np.asarray([self.progress_map.anchor_parameters([goal.progress])[0, 0]
+                                     for goal in goals])
+            # END repeated progress values still retain every separate goal.
+            u = self.device_cfg.to_device(parameters)[None].expand(count, -1)
+            counts = self.torch.full((count,), joint.position.shape[1], device=actions.device,
+                                     dtype=self.torch.long)
+            q, _ = _hermite_at_parameters(joint.position, joint.velocity, joint.dt, counts, u)
+            kinematics = self._verification_fk.compute_kinematics(self.JointState.from_position(
+                q.contiguous(), joint_names=list(self.joint_names)))
+            tools = kinematics.tool_poses
+            index = tools.tool_frames.index(self.problem.tool_link)
+            position = self._native_layout.apply(tools.position)[:, :, index]
+            quaternion = tools.quaternion[:, :, index]
+            position, quaternion = self.problem.transform_tool_pose(position, quaternion)
+            eligible = self.torch.ones(count, dtype=self.torch.bool, device=actions.device)
+            for column, goal in enumerate(goals):
+                p, r = goal.errors(position[:, column], quaternion[:, column])
+                eligible &= (self.torch.isfinite(p) & self.torch.isfinite(r)
+                             & (p <= goal.position_tolerance_m) & (r <= goal.rotation_tolerance_rad))
+        return eligible.detach().cpu().numpy()
+
+    def _observed_native_result(self, actions):
+        """Reuse native postprocessing on its unchanged complete seed layout."""
+        count = actions.shape[0]
+        if self.trajopt.solve_state.batch_size != 1 or self.trajopt.solve_state.num_seeds != count:
+            raise ValueError("Observed actions changed the active native seed layout")
+        # Extra source metrics are real validation work, even when no candidate
+        # survives to export. The native oracle also retains its own work limit.
+        self._charge_candidate_queries(count*(self.trajopt.horizon+self.formal_clock["valid_count"]
+                                              +2*(len(self.anchors)+len(self.refinement_parameters))))
+        with self.torch.no_grad():
+            metrics = self.trajopt.metrics_rollout.compute_metrics_from_action(actions)
+            joint = metrics.state.joint_state
+            joint.joint_names = self.trajopt.joint_names
+            joint.knot = metrics.actions
+            joint.knot_dt = joint.dt*self.trajopt.interpolation_steps
+            interpolated, trajectory, last = self.trajopt._interpolate_and_compute_metrics(joint)
+            result = self.trajopt._get_result(actions, metrics, interpolated, trajectory, last, count, count)
+            return self.trajopt._get_best_result(result, count)
+
+    def _observe_actions(self, actions, origin, initial, seen):
+        """Validate new block states without replacing the optimizer's state."""
+        controls = actions.detach().cpu().numpy()
+        fresh = np.asarray([not any(np.array_equal(value, old) for old in seen[index])
+                            for index, value in enumerate(controls)])
+        if not fresh.any():
+            return
+        for index in np.flatnonzero(fresh):
+            seen[index].append(controls[index].copy())
+        eligible = self._functional_candidate_mask(actions) & fresh
+        summary = {**deepcopy(origin), "eligible_seed_indices": np.flatnonzero(eligible).tolist(),
+                   "accepted": False, "selection_policy": "first_complete_feasible_candidate",
+                   "scope": "pose-event screen followed by complete native/export validation"}
+        self.candidate_observations.append(summary)
+        if not eligible.any():
+            return
+        self._check_validation_work("validation_passes")
+        result = self._observed_native_result(actions)
+        previous = self.last_optimizer_diagnostics
+        try:
+            self._observing_candidate = True
+            self.last_optimizer_diagnostics = self._optimizer_reports(result.solution, initial)
+            _, trajectory, attempt = self.select_candidate(result,
+                candidate_indices=np.flatnonzero(eligible), first_feasible=True, origin=origin)
+            summary.update(accepted=attempt["accepted"], residuals=deepcopy(attempt["residuals"]),
+                           selected_seed_index=attempt["selected_seed_index"],
+                           validation_points=attempt["validation_points"])
+            if attempt["accepted"]:
+                # Capture this validation before any later native metrics or
+                # export can replace the planner's mutable diagnostic pointer.
+                self._candidate_qualified(trajectory, self.last_validation, attempt)
+        finally:
+            self._observing_candidate = False
+            self.last_optimizer_diagnostics = previous
+
+    def _optimizer_reports(self, solution, initial):
+        core_reports = [optimizer._core.solve_diagnostics for optimizer in self.trajopt.core.optimizers]
+        reports = []
+        for index in range(solution.shape[1]):
+            displacement = (solution[0, index]-initial[0, index]).abs()
+            reports.append({"seed_index": index,
+                "unchanged_from_seed": bool((displacement == 0).all().item()),
+                "maximum_control_update": float(displacement.max().item()),
+                "cores": [rows[index] for rows in core_reports]})
+        return reports
+    # END functional screening cannot itself authorize execution.
+
     def optimize(self, seed):
         self.physical_domain.validate(seed)
         # BEGIN functional-frame goals have one owner and their original tolerances.
@@ -4346,24 +4618,31 @@ class _CuroboPlanner:
         # Returning every seed makes native get_topk_seeds return the original
         # layout; per-seed history and input/output displacement remain aligned.
         initial = seed.detach().clone()
-        result = self.trajopt.solve_pose(
-            goal_tool_poses=goal, current_state=self.start,
-            seed_traj=seed, num_seeds=seed.shape[1], return_seeds=seed.shape[1],
-            dt=self.torch.full((1, seed.shape[1]), self.budget.maximum_trajectory_dt,
-                               dtype=seed.dtype, device=seed.device),
-            use_implicit_goal=False, goal_state=None,
-            finetune_attempts=0, finetune_dt_scale=1.)
+        # BEGIN solve-local observers have no references in captured closures.
+        cores = [optimizer._core for optimizer in self.trajopt.core.optimizers]
+        observing = callable(getattr(self, "_candidate_qualified", None))
+        seen = [[] for _ in range(seed.shape[1])]
+        # Keep only small verdicts. Complete validation evidence is serialized
+        # once into the bound archive, never retained for every explored curve.
+        self._observed_verdicts = []
+        if observing:
+            for core in cores:
+                core.candidate_observer = lambda actions, origin: self._observe_actions(actions, origin, initial, seen)
+        try:
+            result = self.trajopt.solve_pose(
+                goal_tool_poses=goal, current_state=self.start,
+                seed_traj=seed, num_seeds=seed.shape[1], return_seeds=seed.shape[1],
+                dt=self.torch.full((1, seed.shape[1]), self.budget.maximum_trajectory_dt,
+                                   dtype=seed.dtype, device=seed.device),
+                use_implicit_goal=False, goal_state=None,
+                finetune_attempts=0, finetune_dt_scale=1.)
+        finally:
+            for core in cores:
+                core.candidate_observer = None
+        # END partial solves cannot retain stale callbacks into another request.
         if result.solution.shape != initial.shape:
             raise ValueError("Native trajectory solving changed the admitted seed layout")
-        core_reports = [optimizer._core.solve_diagnostics for optimizer in self.trajopt.core.optimizers]
-        self.last_optimizer_diagnostics = []
-        for index in range(seed.shape[1]):
-            displacement = (result.solution[0, index]-initial[0, index]).abs()
-            unchanged = bool((displacement == 0).all().item())
-            self.last_optimizer_diagnostics.append({"seed_index": index,
-                "unchanged_from_seed": unchanged,
-                "maximum_control_update": float(displacement.max().item()),
-                "cores": [rows[index] for rows in core_reports]})
+        self.last_optimizer_diagnostics = self._optimizer_reports(result.solution, initial)
         return result
         # END unchanged output is separate from movement of native exploration states.
     # END intermediate and terminal goals share the same typed requirement owner.
@@ -4440,7 +4719,7 @@ class _CuroboPlanner:
             acceleration_bounds=limits.acceleration.detach().cpu().numpy(),
             jerk_bounds=limits.jerk.detach().cpu().numpy())
 
-    def select_candidate(self, result):
+    def select_candidate(self, result, *, candidate_indices=None, first_feasible=False, origin=None):
         """Keep failure evidence from every visited seed and accept only checked curves.
 
         The first feasible Phase A curve returns immediately so another seed
@@ -4451,7 +4730,9 @@ class _CuroboPlanner:
         if result.batch_size != 1 or not 1 <= result.num_seeds <= self.budget.trajectory_seeds:
             raise ValueError("Native results exceed the declared single-batch candidate budget")
         reports, selected, selected_key = [], None, None
-        for index in range(result.num_seeds):
+        indices = range(result.num_seeds) if candidate_indices is None else candidate_indices
+        for index in indices:
+            index = int(index)
             native_metrics = self.native_diagnostics(result, seed_index=index)
             self.witnesses.add_native(native_metrics, duration=self.formal_clock["duration"])
             native_success = native_metrics["success"]
@@ -4460,9 +4741,24 @@ class _CuroboPlanner:
                 "native_metrics": native_metrics, "native_seed_cost": float(result.seed_cost[0, index].item()),
                 "seed_provenance": self.seed_strategies[index], "phase": self.phase,
                 "optimizer": deepcopy(self.last_optimizer_diagnostics[index])}
+            if origin is not None:
+                report["candidate_origin"] = deepcopy(origin)
             validation = None
+            # BEGIN final scalar-best output may already have been fully checked.
+            # Its exact controls, scene and clock are unchanged within a solve.
+            # Reuse a small verdict; execution still uses the existing bound
+            # archive, never reconstructed or incomplete validation evidence.
+            prior_verdict = None
+            if origin is None:
+                controls = candidate.solution[0, 0].detach().cpu().numpy()
+                prior_verdict = next((row for row in getattr(self, "_observed_verdicts", ())
+                    if np.array_equal(controls, row["controls"])), None)
+            # END no native cost or approximate control comparison identifies a curve.
             try:
-                if native_success:
+                if native_success and prior_verdict is not None:
+                    trajectory, points = self._native_curve(candidate), 0
+                    trajectory.residuals = deepcopy(prior_verdict["residuals"])
+                elif native_success:
                     trajectory, points = self.export(candidate)
                     validation = self.last_validation
                     self.witnesses.add_validation(validation)
@@ -4483,17 +4779,31 @@ class _CuroboPlanner:
             report.update(accepted=accepted, validation_points=points,
                 independent_validation="completed" if native_success else "skipped_native_rejection",
                 residuals=trajectory.residuals, continuation_violation=severity)
+            if native_success and prior_verdict is not None:
+                report.update(independent_validation="completed_prior_observation",
+                    previously_considered=True, original_validation_points=prior_verdict["validation_points"],
+                    candidate_origin=deepcopy(prior_verdict["candidate_origin"]),
+                    measurements=deepcopy(prior_verdict["measurements"]),
+                    numerical_tolerances=deepcopy(prior_verdict["numerical_tolerances"]))
             if validation is not None:
                 report.update(measurements=validation["measurements"],
                               numerical_tolerances=validation["numerical_tolerances"])
             if accepted:
-                report["quality"] = self.candidate_quality(trajectory, validation)
+                report["quality"] = (deepcopy(prior_verdict["quality"]) if prior_verdict is not None
+                                     else self.candidate_quality(trajectory, validation))
+            if origin is not None and validation is not None:
+                verdict = {name: deepcopy(report[name]) for name in (
+                    "residuals", "validation_points", "candidate_origin", "measurements", "numerical_tolerances")}
+                if accepted:
+                    verdict["quality"] = deepcopy(report["quality"])
+                verdict["controls"] = candidate.solution[0, 0].detach().cpu().numpy().copy()
+                self._observed_verdicts.append(verdict)
             reports.append(report)
             key = (0, report["quality"]["score"], index) if accepted else (1, severity, index)
             if selected_key is None or key < selected_key:
                 selected_key = key
                 selected = candidate, trajectory, validation, report
-            if accepted and self.phase == "feasibility":
+            if accepted and (first_feasible or self.phase == "feasibility"):
                 break
         if selected is None:
             errors = "; ".join(f"seed {item['seed_index']}: {item['export_error']}" for item in reports)
@@ -4962,12 +5272,18 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         def tracked_export(*args, **kwargs):
             check("validation_passes")
             consumed["validation_passes"] += 1
+            observation = bool(getattr(planner, "_observing_candidate", False))
+            if observation:
+                work = diagnostics.setdefault("candidate_observation_work", {})
+                work["export_passes"] = work.get("export_passes", 0)+1
             queries = budget.max_validation_points
             try:
                 exported = original_export(*args, **kwargs)
                 queries = int(exported[1])
             finally:
                 consumed["validation_queries"] += queries
+                if observation:
+                    work["export_queries"] = work.get("export_queries", 0)+queries
             # BEGIN preserve an original environment/API exception during charging.
             check()
             return exported
@@ -5019,8 +5335,88 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             reference_seed_fits=deepcopy(planner.reference_seed_fits))
         diagnostics["functional_ik_candidates"] = deepcopy(getattr(planner, "goal_ik_candidates", {}))
         diagnostics["functional_ik_fit_hints"] = deepcopy(planner.goal_ik_fit_hints)
+        # BEGIN seed, block and final candidates share one complete binding boundary.
+        def qualify_candidate(trajectory, validation, attempt):
+            nonlocal best_attempt
+            if not attempt["accepted"] or validation is None:
+                raise ValueError("Only a completely validated candidate may enter execution binding")
+            if best_attempt is not None and attempt["quality"]["score"] >= best_attempt["quality"]["score"]:
+                attempt["quality_decision"] = "retained_better_or_equal_feasible_candidate"
+                return False
+            diagnostics.update(executable_until=trajectory.executable_until,
+                               next_verification=trajectory.next_verification)
+            binding = bind_candidate(trajectory, problem=problem, scene=scene,
+                validation=deepcopy(validation), native_report=attempt)
+            for event in problem.events:
+                if event.timing and not any(event_occurrence_key(row) == event_occurrence_key(event)
+                                            for row in ledger["timing_events"]):
+                    ledger["timing_events"].append(plain(event))
+            retry_goal_ids = set() if prior is None else set(prior["retry_goal_ids"])
+            retry_direction_ids = set() if prior is None else set(prior["retry_direction_ids"])
+            binding.update(planning_budget=deepcopy(request_budget),
+                request_events=deepcopy(ledger["original_events"]),
+                consumed_events=[] if prior is None else prior["consumed_events"],
+                goal_identities=({name: list(range(len(getattr(problem, name))))
+                    for name in ("pose_events", "coordinate_events", "supports")}
+                    if prior is None else prior["goal_identities"]),
+                completed_goal_ids=[deepcopy(value) for value in
+                                    (ledger["completed_goal_ids"] if prior is None else prior["completed_goal_ids"])
+                                    if tuple(value) not in retry_goal_ids],
+                goal_evidence=deepcopy(ledger["goal_evidence"]),
+                direction_identities=([[(index, column) for column in range(len(mechanism.directions))]
+                    for index, mechanism in enumerate(getattr(problem, "mechanisms", ()))]
+                    if prior is None else deepcopy(prior["direction_identities"])),
+                completed_direction_ids=[deepcopy(value) for value in
+                    (ledger["completed_direction_ids"] if prior is None else prior["completed_direction_ids"])
+                    if tuple(value) not in retry_direction_ids],
+                retry_direction_ids=sorted(retry_direction_ids),
+                direction_evidence=deepcopy(ledger["direction_evidence"]),
+                history=deepcopy(ledger["history"]), effect_history=deepcopy(ledger["effect_history"]),
+                timing_events=deepcopy(ledger["timing_events"]), timing_checks=deepcopy(ledger["timing_checks"]),
+                request_time_origin_s=0. if prior is None else prior["request_time_origin_s"],
+                request_time_origin_step=0 if prior is None else prior["request_time_origin_step"])
+            if prior is not None:
+                binding.update({name: deepcopy(prior[name]) for name in (
+                    "physics_budget", "consumed_physics_steps", "remaining_physics_steps",
+                    "device_policy", "active_finger_interval")})
+            # All work required to qualify and bind this candidate must
+            # finish within budget. Cleanup after that fact is recorded,
+            # but cannot erase an already available qualified candidate.
+            check()
+            diagnostics["qualified_candidate_elapsed_seconds"] = time.monotonic()-started
+            outcome.success, outcome.trajectory, outcome.execution_binding = True, trajectory, binding
+            # BEGIN preserve the qualified curve before rebuilding the sole solver.
+            best_attempt = deepcopy(attempt)
+            diagnostics["best_feasible_quality"] = deepcopy(attempt["quality"])
+            return True
+
+        def charge_candidate_queries(count):
+            check("validation_queries")
+            consumed["validation_queries"] += int(count)
+            work = diagnostics.setdefault("candidate_observation_work", {})
+            work["screen_and_native_queries"] = work.get("screen_and_native_queries", 0)+int(count)
+            check()
+
+        planner._candidate_qualified = qualify_candidate
+        planner._charge_candidate_queries = charge_candidate_queries
+        planner.candidate_observations = diagnostics.setdefault("candidate_observations", [])
+        planner._observed_verdicts = []
+        # END observations use the original request ledger and explicit validation.
         reference_seeds, searched = seeds, False
+        background_already_refined = False
         for iteration in range(budget.maximum_trajectory_solves):
+            # BEGIN map refinement is fixed before the next native solve/observer.
+            refine_background = getattr(planner, "refine_background_for_seed", None)
+            if callable(refine_background) and not background_already_refined:
+                stage = "background_refinement"
+                report = (refine_background(seeds) if best_attempt is None else
+                          {"updated": False, "reason": "preserve_qualified_candidate_scene"})
+                diagnostics.setdefault("background_refinements", []).append(report)
+                scene = planner.scene
+                diagnostics["scene"] = scene.describe()
+                check()
+            background_already_refined = False
+            # END each later binding names the scene actually used for validation.
             check("trajectory_solves")
             consumed["trajectory_solves"] += 1
             stage = "trajectory_optimization_and_verification"
@@ -5030,56 +5426,13 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             diagnostics["attempts"].append(attempt)
             diagnostics.update(attempt)
             if attempt["accepted"]:
-                # BEGIN cross-phase selection uses the same phase-independent score.
-                if best_attempt is not None and attempt["quality"]["score"] >= best_attempt["quality"]["score"]:
-                    attempt["quality_decision"] = "retained_better_or_equal_feasible_candidate"
+                if attempt.get("previously_considered"):
+                    if best_attempt is None:
+                        raise RuntimeError("A qualified observation lost its execution archive")
+                    attempt["quality_decision"] = "retained_previously_bound_observation"
                     break
-                # END a smaller native weighted sum cannot override this comparison.
-                diagnostics.update(executable_until=trajectory.executable_until,
-                                   next_verification=trajectory.next_verification)
-                binding = bind_candidate(trajectory, problem=problem, scene=scene,
-                    validation=planner.last_validation, native_report=attempt)
-                for event in problem.events:
-                    if event.timing and not any(event_occurrence_key(row) == event_occurrence_key(event)
-                                                for row in ledger["timing_events"]):
-                        ledger["timing_events"].append(plain(event))
-                retry_goal_ids = set() if prior is None else set(prior["retry_goal_ids"])
-                retry_direction_ids = set() if prior is None else set(prior["retry_direction_ids"])
-                binding.update(planning_budget=deepcopy(request_budget),
-                    request_events=deepcopy(ledger["original_events"]),
-                    consumed_events=[] if prior is None else prior["consumed_events"],
-                    goal_identities=({name: list(range(len(getattr(problem, name))))
-                        for name in ("pose_events", "coordinate_events", "supports")}
-                        if prior is None else prior["goal_identities"]),
-                    completed_goal_ids=[deepcopy(value) for value in
-                                        (ledger["completed_goal_ids"] if prior is None else prior["completed_goal_ids"])
-                                        if tuple(value) not in retry_goal_ids],
-                    goal_evidence=deepcopy(ledger["goal_evidence"]),
-                    direction_identities=([[(index, column) for column in range(len(mechanism.directions))]
-                        for index, mechanism in enumerate(getattr(problem, "mechanisms", ()))]
-                        if prior is None else deepcopy(prior["direction_identities"])),
-                    completed_direction_ids=[deepcopy(value) for value in
-                        (ledger["completed_direction_ids"] if prior is None else prior["completed_direction_ids"])
-                        if tuple(value) not in retry_direction_ids],
-                    retry_direction_ids=sorted(retry_direction_ids),
-                    direction_evidence=deepcopy(ledger["direction_evidence"]),
-                    history=deepcopy(ledger["history"]), effect_history=deepcopy(ledger["effect_history"]),
-                    timing_events=deepcopy(ledger["timing_events"]), timing_checks=deepcopy(ledger["timing_checks"]),
-                    request_time_origin_s=0. if prior is None else prior["request_time_origin_s"],
-                    request_time_origin_step=0 if prior is None else prior["request_time_origin_step"])
-                if prior is not None:
-                    binding.update({name: deepcopy(prior[name]) for name in (
-                        "physics_budget", "consumed_physics_steps", "remaining_physics_steps",
-                        "device_policy", "active_finger_interval")})
-                # All work required to qualify and bind this candidate must
-                # finish within budget. Cleanup after that fact is recorded,
-                # but cannot erase an already available qualified candidate.
-                check()
-                diagnostics["qualified_candidate_elapsed_seconds"] = time.monotonic()-started
-                outcome.success, outcome.trajectory, outcome.execution_binding = True, trajectory, binding
-                # BEGIN preserve the qualified curve before rebuilding the sole solver.
-                best_attempt = deepcopy(attempt)
-                diagnostics["best_feasible_quality"] = deepcopy(attempt["quality"])
+                if not qualify_candidate(trajectory, planner.last_validation, attempt):
+                    break
                 if planner.phase == "quality" or iteration+1 >= budget.maximum_trajectory_solves:
                     break
                 stage = "quality_phase_initialization"
@@ -5104,6 +5457,24 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 attempt["stop_reason"] = "optimizer_returned_unchanged_infeasible_curve"
             if iteration+1 >= budget.maximum_trajectory_solves:
                 break
+            # BEGIN the optimized failure can expose witnesses absent from its seed.
+            # A map change is useful work even when every failure time is already
+            # sampled. Rebuild only between solves, keeping the original clock.
+            if callable(refine_background):
+                stage = "rejected_candidate_background_refinement"
+                refinement_seed = native_result.solution.detach().clone()
+                report = refine_background(refinement_seed)
+                diagnostics.setdefault("background_refinements", []).append({**report, "phase": "rejected_candidate"})
+                scene = planner.scene
+                diagnostics["scene"] = scene.describe()
+                check()
+                if report["updated"]:
+                    seeds = refinement_seed
+                    planner.seed_strategies = [attempt["seed_provenance"]]
+                    background_already_refined = True
+                    attempt["next_action"] = "optimize_refined_background"
+                    continue
+            # END unchanged or refused maps follow the existing validation/search route.
             stage = "validation_refinement"
             additional = None if stagnant else planner.refinement_samples()
             check()

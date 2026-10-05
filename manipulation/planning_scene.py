@@ -1664,6 +1664,98 @@ class PlanningScene:
         return result
         # END private rule/anchor edits cannot contaminate parent or siblings.
 
+    # BEGIN planner-level refinement reads actual timed complete-body queries.
+    @torch.no_grad()
+    def background_refinement_witnesses(self, robot_spheres, position, quaternion, progress,
+                                       joint_position=None, joint_names=(), *, trajectory_time,
+                                       include_satisfied=False):
+        """Return positive coarse witnesses lacking full supported fine weight.
+
+        Inputs are the same world-frame native FK values as ``components``.
+        The same measured/commanded gripper replacement is applied before
+        grouping complete physical bodies. Unknown future finger widths do
+        not become asserted collision witnesses, matching ordinary guidance.
+        """
+        query = self.background
+        if not isinstance(query, LayeredVoxelQuery) or query.refinement_source is None:
+            return []
+        if (robot_spheres.ndim != 4 or robot_spheres.shape[:2] != progress.shape
+                or trajectory_time.shape != progress.shape):
+            raise ValueError("Background witnesses need aligned native spheres, progress and physical times")
+        spheres = robot_spheres
+        if self.gripper is not None:
+            coordinates, half, _ = self.gripper.state(progress, joint_position, joint_names,
+                                                     trajectory_time=trajectory_time)
+            spheres = self.gripper.spheres(spheres, position, quaternion, coordinates, half)
+        selected = query.region.select(spheres, self.robot_collision_bodies)
+        expanded = query.inflated_spheres(spheres)
+        values = query.coarse(expanded, key=("robot", "refinement_witness"))
+        fine_values = query.fine(expanded, key=("robot", "refinement_witness"))
+        hand = self.gripper
+        if (hand is not None and hand.controller in {"binary", "timed_reference"}
+                and hand.nominal_finger_trajectory is None):
+            uncertain = [index for index, mapping in zip(hand.sphere_indices, hand.sphere_joint_translation)
+                         if np.any(mapping != 0)]
+            if uncertain:
+                values = values.clone()
+                fine_values = fine_values.clone()
+                values[..., uncertain] = torch.where(trajectory_time[..., None] > 0,
+                                                       0., values[..., uncertain])
+                fine_values[..., uncertain] = torch.where(trajectory_time[..., None] > 0,
+                                                            0., fine_values[..., uncertain])
+        _, weights = query.region.guidance_weights(spheres, self.robot_collision_bodies)
+        envelopes = selected.influence_aabb+torch.as_tensor(query.region.pose[:3].copy(),
+                                                            device=spheres.device, dtype=torch.float64)
+        times = trajectory_time.detach().cpu().numpy()
+        bounds = envelopes.cpu().numpy()
+        fine = selected.body_fine.cpu().numpy()
+        body_weights = weights.cpu().numpy()
+        costs = values.cpu().numpy()
+        fine_costs = fine_values.cpu().numpy()
+        witnesses = []
+        for column, body in enumerate(self.robot_collision_bodies):
+            part = costs[..., body["sphere_indices"]]
+            sums, counts = part.sum(-1), (part > 0).sum(-1)
+            fine_sums = fine_costs[..., body["sphere_indices"]].sum(-1)
+            active = counts > 0
+            if not include_satisfied:
+                active &= body_weights[..., column] < 1.
+            for batch, sample in np.argwhere(active):
+                witnesses.append({"body_id": body["body_id"], "batch_index": int(batch),
+                    "time_s": float(times[batch, sample]), "coarse_cost": float(sums[batch, sample]),
+                    "fine_cost": float(fine_sums[batch, sample]),
+                    "guidance_cost": float(sums[batch, sample]+body_weights[batch, sample, column]
+                                           *(fine_sums[batch, sample]-sums[batch, sample])),
+                    "positive_spheres": int(counts[batch, sample]),
+                    "envelope_world_m": bounds[batch, sample, column].tolist(),
+                    "fine_supported": bool(fine[batch, sample, column]),
+                    "guidance_weight": float(body_weights[batch, sample, column])})
+        return witnesses
+
+    def refine_background(self, witnesses):
+        """Return a new source-bound scene; never mutate a captured rollout.
+
+        A refusal returns ``(None, report)`` and leaves this scene intact.
+        Mapping/runtime errors propagate rather than masquerading as missing
+        observation support. The planner replaces its solvers separately.
+        """
+        query = self.background
+        if not isinstance(query, LayeredVoxelQuery) or query.refinement_source is None:
+            return None, {"status": "background_refinement_unavailable", "active_witnesses": len(witnesses)}
+        replacement, report = query.refinement_source.refine(query, witnesses)
+        if replacement is None:
+            return None, report
+        result = self.clone_for_rollout()
+        result.background = replacement
+        result._source_scene_checker = None
+        if result.observation_report is not None:
+            result.observation_report["partitions"]["observed_background"]["fine"] = deepcopy(report["mapping"])
+            result.observation_report.setdefault("background_refinements", []).append(deepcopy(report))
+        if result.robot_validator is not None:
+            result.bind_source_scene()
+        return result, report
+    # END unchanged sensor evidence, physical clock and contact policy survive.
+
     # BEGIN native solid guidance plus a mandatory independent volume verdict.
     def robot_coverage_guidance(self, robot_link_poses, progress):
         """Guide native body samples toward F or V0; this is not a certificate.
@@ -1821,6 +1913,11 @@ class PlanningScene:
         layer_scratch = batch*horizon*sum(size*256+len(self.robot_collision_bodies)*320
             for actor, size in actors.items() for target, query in targets.items()
             if actor != target and isinstance(query, LayeredVoxelQuery))
+        # BEGIN account for differentiable complete-body/cuboid overlap scratch.
+        if isinstance(self.background, LayeredVoxelQuery) and self.background.refinement_source is not None:
+            layer_scratch += batch*horizon*(len(self.robot_sphere_materials)*16
+                +len(self.robot_collision_bodies)*16*10*8)
+        # END the finite sixteen-box maximum is reserved before capture.
         # END admission accounts for the unselected native query's allocation.
         # Count scalar slots per state as well. This also bounds a stack of
         # one-state OMPL scenes by one equivalent multi-state allocation.
@@ -1903,6 +2000,10 @@ class PlanningScene:
         shared_cpu_bytes = layer_bytes+sum(layer.storage_bytes
             for value in self._contact_cells.values()
             for layer in (value.layers.values() if hasattr(value, "layers") else (value,)))
+        # BEGIN the remapping snapshot is shared, immutable CPU sensor storage.
+        if isinstance(self.background, LayeredVoxelQuery) and self.background.refinement_source is not None:
+            shared_cpu_bytes += self.background.refinement_source.storage_bytes
+        # END clones do not reserve a second set of RGB-D pixels.
         # BEGIN native self-distance batches own separate resettable solvers.
         if self.robot_validator is not None:
             shared_cpu_bytes += self.robot_validator.checker.native_query_storage_nbytes
@@ -2303,8 +2404,16 @@ class PlanningScene:
             # this path. The source checker evaluates every collision and
             # required finite contact using the same poses and selected field.
             if geometry_query_out is None:
-                collision_terms(field_query(self.background, actor_spheres, (actor, "background"), background_selection),
-                                f"collision/{actor}/background", actor)
+                # BEGIN optimizer robot/background uses fixed source-safe overlap.
+                if (actor == "robot" and isinstance(self.background, LayeredVoxelQuery)
+                        and self.background.refinement_source is not None):
+                    background_values = self.background.background_guidance(actor_spheres,
+                        key=(actor, "background"), groups=self.robot_collision_bodies)
+                else:
+                    background_values = field_query(self.background, actor_spheres,
+                                                     (actor, "background"), background_selection)
+                collision_terms(background_values, f"collision/{actor}/background", actor)
+                # END source/contact paths still consume their original selector.
             # END optimizer calls keep their original differentiable values.
             for owner in self.owners:
                 if actor == owner.owner_id:

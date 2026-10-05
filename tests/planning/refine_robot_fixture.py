@@ -14,12 +14,44 @@ import resource
 import time
 
 import mujoco
+import numpy as np
 import yaml
 
 from robot_fixture import (
     _collision_query_contract, _effective_ignored_pairs, _geom_cover,
     validate_fixture_collision_contract,
 )
+
+
+# BEGIN refinement compares the actual float32 sphere representation, not stale metadata.
+def _checked_support_excess(previous, refined, native_planes, transform):
+    """Reject a larger maximum directional hull-plane excess after refitting.
+
+    Both covers use the same original convex solid and its full native affine
+    geometry transform. The statistic is measured from serialized ball centers
+    and radii; it is not a Euclidean Hausdorff bound or a coverage certificate.
+    Complete-cell coverage is checked separately by the fixture consumer.
+    """
+    planes, transform = np.asarray(native_planes, float), np.asarray(transform, float)
+    normals = np.linalg.solve(transform[:3, :3].T, planes[:, :3].T).T
+    lengths = np.linalg.norm(normals, axis=1)
+    offsets = planes[:, 3]-normals @ transform[:3, 3]
+
+    def measure(spheres):
+        centers = np.asarray([row["center"] for row in spheres], float)
+        radii = np.asarray([row["radius"] for row in spheres], float)
+        excess = (centers @ normals.T+offsets)/lengths+radii[:, None]
+        if not np.isfinite(excess).all():
+            raise ValueError("Serialized sphere fit has nonfinite support-plane excess")
+        return float(excess.max())
+
+    before, after = measure(previous), measure(refined)
+    roundoff = 64*np.finfo(float).eps*max(1., abs(before), abs(after))
+    if after > before+roundoff:
+        raise ValueError("Refinement worsened serialized support-plane excess: "
+                         f"{before:.12g} m -> {after:.12g} m")
+    return before, after
+# END a low fitting objective cannot hide worse serialized geometry.
 
 
 def refine(fixture_path, specification_path, output):
@@ -54,14 +86,19 @@ def refine(fixture_path, specification_path, output):
         if sum(other["link"] == row["link"] for other in rows.values()) != 1:
             raise ValueError("Selected refinement requires one native geometry per link")
         previous = deepcopy(row)
-        spheres, generated, _ = _geom_cover(
+        spheres, generated, geometry = _geom_cover(
             model, model.geom(name).id, spec, (output/(name+".npz")).resolve())
+        # BEGIN compare exact same native solid before publishing any replacement.
+        before, after = _checked_support_excess(kinematics["collision_spheres"][row["link"]],
+            spheres, geometry["halfspaces"], generated["T_body_geom"])
+        # END coverage and query-pair checks below are still independently mandatory.
         row.update(generated)
         kinematics["collision_spheres"][row["link"]] = spheres
         changes.append({"geometry": name, "before_spheres": previous["sphere_count"],
                         "after_spheres": row["sphere_count"],
-                        "before_support_excess_m": previous["maximum_support_plane_excess_m"],
-                        "after_support_excess_m": row["maximum_support_plane_excess_m"]})
+                        "before_support_excess_m": before,
+                        "after_support_excess_m": after,
+                        "serialized_support_excess_not_worsened": True})
     contract = _collision_query_contract(
         model, kinematics, mechanical_contact_pairs=fixture["mechanical_contact_pairs"])
     if contract["effective_query_pairs"] != fixture["effective_query_pairs"]:

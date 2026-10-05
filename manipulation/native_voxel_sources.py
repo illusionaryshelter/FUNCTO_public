@@ -11,6 +11,7 @@ import torch
 import warp as wp
 
 from curobo._src.perception.mapper.kernel.warp_types import BlockSparseTSDFWarp
+from .voxel_layers import MAX_FINE_CELLS
 
 
 def _source_kernel(lookup):
@@ -40,8 +41,10 @@ def export_source_bits(mapper, config, voxel):
     if config.enable_static:
         raise ValueError("Snapshot source validity does not admit static map history")
     shape = tuple(voxel.feature_tensor.shape)
-    if len(shape) != 3 or math.prod(shape) > 1_000_000:
+    # BEGIN share the byte-admitted local inventory bound with its consumers.
+    if len(shape) != 3 or math.prod(shape) > MAX_FINE_CELLS:
         raise ValueError("Fine source export requires a bounded complete XYZ grid")
+    # END a larger inventory never skips mapping's independent memory check.
     device = voxel.feature_tensor.device
     bits = torch.empty(math.prod(shape), dtype=torch.uint8, device=device)
     center = torch.as_tensor(voxel.pose[:3], dtype=torch.float32, device=device)

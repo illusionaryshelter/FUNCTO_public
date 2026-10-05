@@ -114,8 +114,15 @@ def test_snapshot_cache_reserve_covers_inventory_up_to_the_finite_cap(count, exp
     record["shape_xyz"] = [count + 1, 2, 2]
     target = ObservedTsdfGeometry(record)
     assert target._collision_cache_capacity == expected_capacity
+    assert target.collision_cache_storage_nbytes == expected_capacity * 4096
     assert target.storage_nbytes >= expected_capacity * 4096
     assert not target._collision_cache  # Pre-admission reserves are not eager Coal allocations.
+    # BEGIN exceeding cache capacity cannot remove later observed components.
+    np.testing.assert_array_equal(target.negative_cell_flat_indices, np.arange(count))
+    last_point = np.array([40.+(count-.5)*.5, .25, .25])
+    last = next(target.iter_components((last_point, last_point)))
+    assert last[:2] == ("negative_cell", count-1)
+    # END the whole source inventory remains addressable beyond resident reuse.
 # END oversized inventories keep bounded residency and the normal eviction path.
 
 
@@ -208,6 +215,17 @@ def test_warm_cache_skips_vertices_and_eviction_rebuilds_exact_negative_cell(mon
     assert rebuilt[2] is not second[2]
     np.testing.assert_array_equal(rebuilt[3], second[3])
     np.testing.assert_array_equal(rebuilt[4], second[4])
+    # BEGIN eviction preserves actual signed distances, contacts and witnesses.
+    # Check both an intersecting body and a separated body using fresh native
+    # requests. Equal vertices alone would not test the reconstructed Coal
+    # shape or its local placement consumed by the source collision checker.
+    for centre in ([40.75, .25, .25], [42., .25, .25]):
+        expected = native_evidence(second[2], second[3], np.asarray(centre))
+        actual = native_evidence(rebuilt[2], rebuilt[3], np.asarray(centre))
+        np.testing.assert_allclose(actual[0], expected[0], rtol=0., atol=1e-12)
+        assert actual[1] == expected[1]
+        np.testing.assert_allclose(actual[2], expected[2], rtol=0., atol=1e-12)
+    # END cache residency does not enter the scene's geometric verdict.
 # END eviction changes residency only; it retains the original corner arithmetic.
 
 

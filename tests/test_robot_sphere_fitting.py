@@ -12,6 +12,7 @@ import trimesh
 
 sys.path.insert(0, str(Path(__file__).parent / "planning"))
 from robot_fixture import _fit_cell_sphere_center
+from refine_robot_fixture import _checked_support_excess
 
 
 @pytest.mark.parametrize("scale", [1e-3, 1., 1e3])
@@ -52,4 +53,20 @@ def test_invalid_native_plane_cannot_select_an_unchecked_fit():
     cell = np.asarray(list(product((-1., 1.), repeat=3)))
     with pytest.raises(ValueError, match="nonzero support-plane normals"):
         _fit_cell_sphere_center(cell, np.zeros((1, 4)))
+
+
+def test_refinement_rejects_serialized_radius_growth_under_native_affine_transform():
+    """A translated stretched cube provides an analytic directional oracle."""
+    native = np.asarray(list(product((-1., 1.), repeat=3)))
+    transform = np.diag([2., 3., 4., 1.])
+    transform[:3, 3] = [.1, -.2, .3]
+    center = transform[:3, 3].tolist()
+    previous = [{"center": center, "radius": 6.}]
+    refined = [{"center": center, "radius": 5.5}]
+    before, after = _checked_support_excess(previous, refined, ConvexHull(native).equations, transform)
+    assert (before, after) == pytest.approx((4., 3.5))
+    # A misleading old metadata value cannot excuse worsening actual balls:
+    # this API accepts only serialized balls and the original solid planes.
+    with pytest.raises(ValueError, match="worsened serialized"):
+        _checked_support_excess(refined, previous, ConvexHull(native).equations, transform)
 # END no saved task pose, collision exclusion, or scene-specific fit appears here.

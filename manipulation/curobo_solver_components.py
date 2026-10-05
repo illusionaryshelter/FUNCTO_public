@@ -81,6 +81,11 @@ class PhysicalGradientCore(GradientOptCore):
         kwargs["step_direction_fn"] = self._guarded_step_direction
         self._all_exhausted = False
         self._recovery_reports = []
+        # BEGIN optional trajectory observations stay outside native capture.
+        # The observer owns validation, not optimization or best-cost tracking.
+        # IK cores leave this unset and keep their existing lifecycle.
+        self.candidate_observer = None
+        # END an observer never changes the exploration or L-BFGS state.
         # END no third-party optimizer or process-wide callback is replaced.
         super().__init__(*args, **kwargs)
         # BEGIN scope graph checks independently of the CPU metrics rollout.
@@ -359,8 +364,18 @@ class PhysicalGradientCore(GradientOptCore):
     def reinitialize(self, action, mask=None, clear_optimizer_state=True, reset_num_iters=False):
         self._prepare_solve(action)
         self._reset_progress()
-        return super().reinitialize(action, mask=mask,
+        result = super().reinitialize(action, mask=mask,
             clear_optimizer_state=clear_optimizer_state, reset_num_iters=reset_num_iters)
+        # BEGIN native reinitialize bypasses the graph dispatch initializer.
+        self._observe_candidate(self._iteration_state, "initial_seed")
+        return result
+        # END the seed has its actual goal and physical clock before observation.
+
+    def _observe_candidate(self, state, kind):
+        """Publish one complete batch after native evaluation, outside graphs."""
+        if self.candidate_observer is not None:
+            self.candidate_observer(state.exploration_action.detach().clone(), {
+                "kind": kind, "iterations": self._iterations.detach().cpu().tolist()})
 
     def optimize(self, seed_action):
         self._prepare_solve(seed_action)
@@ -413,7 +428,12 @@ class PhysicalGradientCore(GradientOptCore):
             return args[0]
         if not self.use_cuda_graph:
             result = super()._dispatch(method_name, *args)
-            return self._recover_stalled(result) if method_name == "_opt_iters" else result
+            if method_name == "_opt_iters":
+                result = self._recover_stalled(result)
+                self._observe_candidate(result, "optimization_block")
+            elif method_name == "_prepare_initial_iteration_state":
+                self._observe_candidate(result, "initial_seed")
+            return result
         # One fault boundary surrounds the original inner-iteration block.
         # Its native loop calls our _opt_step and records each replayed state;
         # the scalar mask is neither reset nor read between those steps.
@@ -434,6 +454,10 @@ class PhysicalGradientCore(GradientOptCore):
                                ("current_iteration", "current_iteration"),
                                ("converged", "converged")):
             getattr(self._best, target).copy_(getattr(result, source))
+        # BEGIN geometry validation never executes during warmup or graph replay.
+        if method_name in {"_opt_iters", "_prepare_initial_iteration_state"}:
+            self._observe_candidate(result, "optimization_block" if method_name == "_opt_iters" else "initial_seed")
+        # END only requested native states enter candidate observation.
         return result
 
     def _replay_graph(self, method_name, *args):
