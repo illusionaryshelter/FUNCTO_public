@@ -1485,6 +1485,28 @@ class PlanningScene:
         state_fields.extend(value for selection in selected_values.values()
                             for name, value in selection.items() if name != "body_ids")
         state_residuals = {}
+        # BEGIN diagnostic references preserve batch/mode identity across deduplication.
+        # q/time alone is not an identity: another seed can have a different
+        # released owner pose or selected field at the same robot configuration.
+        capture_failures = diagnostics is not None and diagnostics.get("capture_components")
+        query_indices = None
+        if capture_failures:
+            try:
+                query_indices = valid.nonzero().detach().cpu().numpy()
+            except Exception as error:
+                capture_failures = False
+                diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
+        failure_references = {}
+
+        def reference_failure(index, witness_index):
+            try:
+                batch, column = query_indices[index]
+                diagnostics.setdefault("failure_witness_references", []).append({
+                    "batch_index": int(batch), "expanded_query_index": int(column),
+                    "witness_index": witness_index})
+            except Exception as error:
+                diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
+        # END only already-evaluated, byte-identical state keys share a witness.
         # END no result survives a call, model binding, gripper or candidate change.
         residuals, unmodelled, worst = [], set(), None
         # The final exporter passes the same small accumulator across native
@@ -1512,6 +1534,10 @@ class PlanningScene:
             state_key = tuple(value[index].tobytes() for value in state_fields)
             if state_key in state_residuals:
                 residuals.append(state_residuals[state_key])
+                # BEGIN repeated logical modes retain their own precise witness reference.
+                if state_key in failure_references:
+                    reference_failure(index, failure_references[state_key])
+                # END this branch still performs no additional geometry query.
                 continue
             # END logical residual order/count still includes every valid state.
             owner_poses = {}
@@ -1535,6 +1561,26 @@ class PlanningScene:
             unmodelled.update(report["unmodelled_geometry_names"])
             if diagnostics is not None:
                 scene = report["scene"]
+                # BEGIN native failures keep only failing query evidence, not all pairs.
+                # The existing per-call state cache deduplicates exact q/time/
+                # owner/layer inputs. Other modes may reference this same unique
+                # failure by their original batch/mode index and full state key.
+                if capture_failures and report["residual"] > 0:
+                    try:
+                        witnesses = diagnostics.setdefault("failure_witnesses", [])
+                        witnesses.append({
+                            "trajectory_time_s": float(time_s), "progress": float(phase),
+                            "permission_progress": float(permission),
+                            "planning_joint_names": list(joint_names),
+                            "planning_joint_positions": row.tolist(),
+                            "violations": deepcopy(scene["violations"]),
+                            "query_gaps": deepcopy(scene["query_gaps"]),
+                            "unmodelled_geometry_names": list(report["unmodelled_geometry_names"])})
+                        failure_references[state_key] = len(witnesses)-1
+                        reference_failure(index, len(witnesses)-1)
+                    except Exception as error:
+                        diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
+                # END passing pair inventories remain bounded to the existing worst state.
                 distances = [pair["signed_distance_m"] for pair in scene["pairs"]
                              if "signed_distance_m" in pair]
                 minimum = min(distances, default=None)

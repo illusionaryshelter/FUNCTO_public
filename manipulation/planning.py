@@ -2723,6 +2723,16 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
         result = evaluate(spheres, position, quaternion, progress, joint_position,
                           joint_names, trajectory_time=trajectory_time, **source_arguments,
                           **({"layer_selection_out": selected} if selected is not None else {}))
+        # BEGIN retain pre-reduction state identity only for native diagnostic calls.
+        if source_geometry and diagnostics is not None and diagnostics.get("capture_components"):
+            from .planning_diagnostics import scene_component_failures
+            try:
+                diagnostics["component_failures"] = scene_component_failures(
+                    source_components_out, trajectory_time, progress, progress, joint_position,
+                    position, quaternion, modes=("exact",))
+            except Exception as error:
+                diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
+        # END diagnostic conversion cannot alter the evaluated residual.
         if layer_selection_out is not None:
             layer_selection_out.update(_layer_query_record(trajectory_time, progress, progress,
                 joint_position, joint_names, selected, ("exact",)))
@@ -2766,6 +2776,17 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
         **source_arguments,
         **({"layer_selection_out": selected} if selected is not None else {}))
         # END q, physical time and the command clock are unchanged.
+    # BEGIN preserve each original mode before taking its maximum.
+    if source_geometry and diagnostics is not None and diagnostics.get("capture_components"):
+        from .planning_diagnostics import scene_component_failures
+        try:
+            diagnostics["component_failures"] = scene_component_failures(
+                expanded_components, repeated(trajectory_time), expanded_progress, permission_progress,
+                repeated(joint_position), repeated(position), repeated(quaternion),
+                modes=("exact", "left", "right"))
+        except Exception as error:
+            diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
+    # END no extra geometry query or acceptance calculation is performed.
     if layer_selection_out is not None:
         layer_selection_out.update(_layer_query_record(repeated(trajectory_time), expanded_progress,
             permission_progress, repeated(joint_position), joint_names, selected, ("exact", "left", "right")))
@@ -2967,10 +2988,36 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
             source_valid = (ordered(torch.cat((valid, torch.ones_like(anchor_u, dtype=torch.bool)), 1))
                             if self._process_mode == "trajectory_metrics" else None)
+            # BEGIN native acceptance keeps component identity before anchor folding.
+            scene_diagnostics = ({"capture_components": True}
+                                 if self._process_mode == "trajectory_metrics" else None)
+            scene_components = {} if scene_diagnostics is not None else None
+            # END optimizer costs do not allocate diagnostic state snapshots.
             scene_value = _scene_boundary_evaluate(self._scene, problem, progress_map,
                 spheres, position, quaternion, progress, q, self._joint_names,
                 trajectory_time=trajectory_time, normalized_time=ordered(all_u),
-                source_geometry=self._process_mode == "trajectory_metrics", valid=source_valid)
+                source_geometry=self._process_mode == "trajectory_metrics", valid=source_valid,
+                diagnostics=scene_diagnostics, source_components_out=scene_components)
+            # BEGIN copy only this metrics call; later calls replace all prior evidence.
+            if scene_diagnostics is not None:
+                try:
+                    if "component_capture_error" in scene_diagnostics:
+                        raise ValueError(scene_diagnostics["component_capture_error"])
+                    original = state.joint_state
+                    captured = [value.detach().cpu().numpy().copy()
+                                for value in (original.position, original.velocity, order)]
+                    for row in scene_diagnostics["component_failures"]:
+                        column = int(captured[2][row["batch_index"], row["ordered_query_index"]])
+                        row.update(sample_kind="regular" if column < horizon else "anchor",
+                                   sample_index=column if column < horizon else column-horizon)
+                    scene_diagnostics.pop("capture_components")
+                    self.last_source_diagnostics = {
+                        "input_position": captured[0], "input_velocity": captured[1],
+                        "component_failures": scene_diagnostics.pop("component_failures"),
+                        "world_geometry": scene_diagnostics}
+                except Exception as error:
+                    self.last_source_diagnostics = {"error": f"{type(error).__name__}: {error}"}
+            # END evidence failures remain separate from every numerical residual.
             # END optimizer world gradients continue through the original ESDF.
             # BEGIN all hard self checks use the same source geometry and exact query times.
             if self._process_mode == "trajectory_metrics":
@@ -4131,6 +4178,28 @@ class _CuroboPlanner:
                 "convergence": {name: maximum(value)
                                 for name, value in zip(metrics.convergence.names, metrics.convergence.values)},
             }
+            # BEGIN preserve native violation columns and match pre-fold scene evidence.
+            # The last cost column can contain extra anchors. Its index alone
+            # is not a physical failure time; source_trace keeps that identity.
+            if seed_index is not None:
+                try:
+                    samples = []
+                    for name, value in zip(constraints.names, constraints.values):
+                        array = value[seed_index].detach().cpu().numpy()
+                        for index in np.argwhere((array > 0) | ~np.isfinite(array)):
+                            samples.append({"constraint": name, "index": index.tolist(),
+                                            "value": float(array[tuple(index)])})
+                    report[label]["violating_constraint_samples"] = samples
+                    from .planning_diagnostics import bind_trace_to_native_seed
+                    rollout = (self.trajopt.metrics_rollout if label == "rollout" else
+                               self.trajopt.additional_metrics_rollouts["interpolated_rollout"])
+                    state = result.js_solution if label == "rollout" else result.interpolated_trajectory
+                    report[label]["source_trace"] = bind_trace_to_native_seed(
+                        getattr(rollout.metrics_constraint_manager, "last_source_diagnostics", None),
+                        state, seed_index, self.joint_names)
+                except Exception as error:
+                    report[label]["source_trace"] = {"status": "error", "error": f"{type(error).__name__}: {error}"}
+            # END a trace failure never changes native acceptance or selection.
         return report
 
     # BEGIN all-candidate hard verification and continuation selection.

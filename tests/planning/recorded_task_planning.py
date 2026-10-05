@@ -697,7 +697,7 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
         except Exception as error:
             report["observer_errors"].append(f"Native metrics record: {type(error).__name__}: {error}")
         return metrics
-    # END no extra GPU reduction, scalar read or native result mutation occurs.
+    # END the recorder never repeats native evaluation or mutates its result.
 
     def observed(planner, native_result):
         # BEGIN retain every native seed before production gathers a candidate.

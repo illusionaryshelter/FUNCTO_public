@@ -267,7 +267,7 @@ def _primitive(kind, dimensions):
     return np.asarray(mesh.vertices), np.asarray(mesh.faces)
 
 
-def robot_display(snapshot, curve, feedback, display_times):
+def robot_display(snapshot, curve, feedback, display_times, *, joint_positions=None):
     """Build CPU-only FK poses from the exact archived URDF and solid vertices.
 
     It is intentionally not a replay of the GPU FK. Saved native endpoint
@@ -284,6 +284,13 @@ def robot_display(snapshot, curve, feedback, display_times):
     baseline = dict(zip(feedback["joint_names"], feedback["start_q"]))
     base = np.asarray(source["T_reference_base"], float)
     curve_poly = CubicHermiteSpline(curve["times"], curve["position"], curve["velocity"], axis=0)
+    # BEGIN failure poses may use the exact original native q instead of resampling.
+    if joint_positions is not None:
+        joint_positions = np.asarray(joint_positions)
+        if (joint_positions.shape != (len(display_times), len(curve["names"]))
+                or not np.isfinite(joint_positions).all()):
+            raise ValueError("Explicit display states must align with the named curve and times")
+    # END CPU FK remains contextual display, never a new collision verdict.
     hand = snapshot["scene"]["gripper"]
     nominal = None if hand is None else hand["nominal_model"]
     nominal_poly = (None if nominal is None else CubicHermiteSpline(
@@ -310,9 +317,12 @@ def robot_display(snapshot, curve, feedback, display_times):
                        "vertices": vertices, "faces": faces, "local": local,
                        "unknown_after_entrance": item["frame"] in unknown_frames})
     states = []
-    for time_s in display_times:
+    for display_index, time_s in enumerate(display_times):
         positions = dict(baseline)
-        positions.update(zip(curve["names"], curve_poly(time_s)))
+        # BEGIN keep supplied native states byte-for-byte before CPU FK conversion.
+        values = curve_poly(time_s) if joint_positions is None else joint_positions[display_index]
+        positions.update(zip(curve["names"], values))
+        # END the optional source is explicit at this display-only call site.
         if nominal_poly is not None:
             positions.update(zip(finger_names, nominal_poly(time_s)))
         robot.update_cfg(positions)
