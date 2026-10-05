@@ -57,10 +57,14 @@ def build():
     with tempfile.NamedTemporaryFile(prefix="_coal_scene_batch-build-", suffix=".tmp",
                                      dir=output.parent, delete=False) as temporary:
         temporary_path = Path(temporary.name)
+    # BEGIN interval support certificates require real directed IEEE rounding.
+    # Disable reassociation/FMA and tell the compiler that arithmetic observes
+    # the saved rounding mode. Existing Coal itself remains the installed lib.
     command = [*compiler, "-std=c++17", "-O3", "-DNDEBUG", "-shared", "-fPIC",
-               "-fno-fast-math", "-ffp-contract=off", "-Wall", "-Wextra",
+               "-frounding-math", "-fno-fast-math", "-ffp-contract=off", "-Wall", "-Wextra",
                *[f"-I{path}" for path in includes], *eigen_flags, str(source),
                *map(str, libraries), f"-Wl,-rpath,{prefix / 'lib'}", "-o", str(temporary_path)]
+    # END building never substitutes an approximate epsilon for this contract.
     try:
         # One compiler process: no build pool, package manager, or parallel jobs.
         subprocess.run(command, check=True)

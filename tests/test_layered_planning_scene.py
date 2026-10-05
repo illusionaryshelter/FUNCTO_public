@@ -41,8 +41,8 @@ class TestLayeredPlanningScene(unittest.TestCase):
         self.assertIsNot(scene.background.coarse, cloned.background.coarse)
         self.assertIs(scene.background.region, cloned.background.region)
         estimate = scene.estimated_workspace_allocation(1, 2, robot_coverage_horizon=0)
-        self.assertGreaterEqual(estimate["shared_cpu"], scene.background.region.storage_bytes)
-        self.assertGreaterEqual(estimate["retained"], 2*3*2*20)
+        self.assertGreaterEqual(estimate["cpu_shared"], scene.background.region.storage_bytes)
+        self.assertGreaterEqual(estimate["gpu_retained"], 2*3*2*20)
 
     def test_missing_whole_body_binding_is_rejected(self):
         scene = self.make_scene()

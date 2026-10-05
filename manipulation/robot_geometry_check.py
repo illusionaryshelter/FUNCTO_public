@@ -17,6 +17,8 @@ import coal
 import numpy as np
 import pinocchio as pin
 
+from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES, require_host_memory
+
 
 def _name(value, label):
     if not isinstance(value, str) or not value.strip():
@@ -268,11 +270,33 @@ class RobotGeometryChecker:
     # END an unknown finger never removes a rigid palm or unrelated arm link.
 
     # BEGIN independent scene/target/payload query using the formal model snapshot.
-    def bind_scene(self, scene_binding):
+    def bind_scene(self, scene_binding, *, previous_checker=None,
+                   max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
         """Build once from the owned finite scene snapshot, without GPU queries."""
         from copy import deepcopy
         from manipulation.planning_problem import PosePath
         from manipulation.motion import MotionModel
+        # BEGIN unchanged source records share geometry, never query or policy state.
+        from .tsdf_geometry import ObservedTsdfGeometry
+        previous_shapes, previous_records = {}, {}
+        if previous_checker is not None:
+            for row in previous_checker._scene_shapes:
+                if isinstance(row["shape"], ObservedTsdfGeometry):
+                    previous_shapes[(row["owner"], row["layer"], row["name"])] = row
+            for partition in [previous_checker._scene_binding["background"],
+                              *previous_checker._scene_binding["owners"]]:
+                owner = partition.get("owner_id", "background")
+                geometry = partition["geometry"]
+                layers = geometry["layers"] if "layers" in geometry else {None: geometry}
+                for layer, values in layers.items():
+                    for record in values["solids"]:
+                        previous_records[(owner, layer, record["name"])] = record
+        # The existing scene stays alive during replacement. Its pending shapes
+        # are counted once by identity even if several rollout clones share it.
+        require_host_memory(_owned_record_bytes(scene_binding),
+            pending_existing_bytes=ObservedTsdfGeometry.pending_storage_total_nbytes(),
+            max_rss_bytes=max_host_rss_bytes)
+        # END compare complete records at binding, not names or dataset identities.
         self._scene_binding = deepcopy(scene_binding)
         self._scene_owners = {}
         self._scene_shapes = []
@@ -285,6 +309,10 @@ class RobotGeometryChecker:
         # geometry, pose, contact permission or signed-piece verdict is shared
         # between different scene snapshots by this cache.
         self._scene_surface_distance_cache = {}
+        # BEGIN the next state may requery a previous component at its new pose.
+        # A new checker epoch has its own hints even when source maps are shared.
+        self._scene_component_hints = {}
+        # END old distances and permission verdicts are never stored in hints.
         # END entry count is bounded by the admitted finite shape-pair inventory.
         # BEGIN keep both observed resolutions and their shared body identities.
         self._scene_layers = {}
@@ -334,7 +362,16 @@ class RobotGeometryChecker:
             for layer, layer_geometry in layers.items():
                 for record in layer_geometry["solids"]:
                     self._has_observed_tsdf |= record["kind"] == "tsdf"
-                    shape, vertices, local_pose = _scene_shape(record)
+                    # BEGIN a real fine-map replacement keeps identical other layers.
+                    identity = (owner_id, layer, record["name"])
+                    previous = previous_shapes.get(identity)
+                    if previous is not None and previous_records[identity] == record:
+                        shape, vertices, local_pose = (previous["shape"], previous["vertices"],
+                                                       previous["local_pose"])
+                    else:
+                        shape, vertices, local_pose = _scene_shape(
+                            record, max_host_rss_bytes=max_host_rss_bytes)
+                    # END different source payloads cannot alias a former shape/tree.
                     if shape is None:
                         continue  # A validated positive-only field has no occupied solid.
                     self._scene_shapes.append({"owner": owner_id, "name": record["name"], "shape": shape,
@@ -377,8 +414,9 @@ class RobotGeometryChecker:
         # iter_collision_components yields references to immutable cached Coal
         # shapes/vertices, including inside contact-region checks. A cache miss
         # creates one bounded component; the batch reserve below additionally
-        # covers its borrowed/evicted entries. KD candidates, source arrays and
-        # native LP/BVH work retain the existing doubled non-cache allowance.
+        # covers references and original world transforms. Spatial-tree search,
+        # source candidates and native LP/BVH work fit the doubled non-cache
+        # allowance; persistent source shapes are not duplicated per query.
         component_cache_bytes = sum(row["shape"].collision_cache_storage_nbytes
             for row in self._scene_shapes if isinstance(row["shape"], ObservedTsdfGeometry))
         self.scene_query_workspace_nbytes = (pair_bound * (131072 + 4096 * len(scene_binding["contacts"]))
@@ -571,6 +609,9 @@ class RobotGeometryChecker:
             layer_selection, layer_selection_index, actors, poses, gaps, unmodelled_geometries)
         # END a query gap cannot silently switch either the layer or the body.
         checked, stopped_pairs, component_summaries = set(), set(), {}
+        # BEGIN separate actual distance work from components covered by bounds.
+        component_searches = {}
+        # END one aggregate per physical body/target/layer bounds report storage.
         boundary = max(self.numerics["gjk_tolerance"], self.numerics["epa_tolerance"])
         # BEGIN exact local TSDF components replace expanded ESDF sample cubes.
         for actor_body in actors:
@@ -582,7 +623,8 @@ class RobotGeometryChecker:
             # BEGIN carry the unchanged physical-pair identity through its pieces.
             for first, second, pair_key in _scene_component_pairs(
                     actor_body, targets, decisions, boundary, rows, self._request, checked, stopped_pairs,
-                    self._scene_surface_distance_cache):
+                    self._scene_surface_distance_cache, hints=self._scene_component_hints,
+                    statistics=component_searches):
             # END component identities still remain on the individual rows.
                 row_count = len(rows)
                 # BEGIN a separated native prefix represents actual Coal calls.
@@ -928,6 +970,7 @@ class RobotGeometryChecker:
                 "unresolved_assumptions": unresolved, "pairs": rows, "state_kind": state_kind,
                 "required_contact_checks": required_checks,
                 "unpermitted_clearance": clearance,
+                "component_searches": list(component_searches.values()),
                 "layer_selection_checks": selection_checks,
                 "layer_selection": selection_snapshot,
                 # BEGIN expose authorization separately from geometry relation and task effects.
@@ -1357,7 +1400,7 @@ def _summarize_component_result(key, rows, previous_count, issues, issue_counts,
     rows[index]["component_summary"] = {
         "tested": tested+measured_count, "permitted": permitted+int(current.get("permission") is not None),
         "stopped_after_pair_failure": failed,
-        "scope": "complete candidate enumeration unless a decisive pair failure already rejects the state"}
+        "scope": "candidate components covered by exact queries or conservative bounds unless a decisive pair failure already rejects the state"}
     for items, count in zip(issues, issue_counts):
         for issue in items[count:]:
             if "pair_index" in issue:
@@ -1410,7 +1453,7 @@ def _component_rows(row, world_bounds, margin):
 
 
 def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, request,
-                           visited, stopped, surface_cache):
+                           visited, stopped, surface_cache, *, hints, statistics):
     """Query a surface distance and all potentially intersecting signed pieces.
 
     A positive triangle distance cannot reject the negative-volume containment
@@ -1475,7 +1518,8 @@ def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, r
                 break
             first_bounds = _solid_axis_bounds(first["vertices"], first["shape"], first["pose"])
             # BEGIN query TSDF leaves in bounded, order-preserving native runs.
-            for second in _target_component_runs(first, target, first_bounds, margin, request):
+            for second in _target_component_runs(first, target, first_bounds, margin, request,
+                                                 hints=hints, statistics=statistics):
                 if key in stopped:
                     break
                 # BEGIN one identity per body pair, independent of piece count.
@@ -1489,53 +1533,47 @@ def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, r
 # END unknown regions never acquire a fabricated boundary or filled cell.
 
 
-# BEGIN separated-prefix reduction retains original Coal results and ordering.
-def _target_component_runs(first, target, world_bounds, margin, request):
-    """Yield a first-minimum representative or an individual near component.
+# BEGIN spatial search retains original leaf results and source-order consumption.
+def _target_component_runs(first, target, world_bounds, margin, request, *, hints, statistics):
+    """Yield measured separated-prefix minima and every required near component.
 
-    Only strictly separated consecutive leaves are reduced. Their selected
-    layer, body identity and measurement allowance are identical, so a minimum
-    and exact count preserve the existing report. Native scanning stops before
-    any later leaf whenever contact/permission handling could reject this pair.
+    Static spatial nodes may exclude leaves using conservative geometric bounds.
+    Remaining raw results retain the original source order and contact policy;
+    counts explicitly distinguish actual queries from node-covered components.
     """
     from .tsdf_geometry import ObservedTsdfGeometry
+    from .tsdf_spatial_query import iter_component_distances
     geometry = target["shape"]
     if not isinstance(geometry, ObservedTsdfGeometry):
         yield target
         return
-    try:
-        from ._coal_scene_batch import scan_separated_prefix
-    except ImportError as error:
-        raise RuntimeError("Build the project Coal adapter with PYTHONNOUSERSITE=1 "
-                           "python tests/planning/build_coal_scene_batch.py") from error
     local_bounds = None if world_bounds is None else _transform_bounds(
         (world_bounds[0]-margin, world_bounds[1]+margin), np.linalg.inv(target["pose"]))
-    transform = coal.Transform3s(first["pose"][:3, :3], first["pose"][:3, 3])
-    for batch, poses in geometry.iter_collision_batches(local_bounds, target["pose"]):
-        shapes = [component[2] for component in batch]
-        start = 0
-        while start < len(batch):
-            count, minimum, result, near, near_result = scan_separated_prefix(
-                first["shape"], transform, shapes[start:], poses[start:], request, margin)
-            # Both outputs carry unmodified native points/normal. Constructing
-            # dictionaries only for these representatives avoids per-leaf Python
-            # report work while the measured component count remains complete.
-            for index, distance, measured in ((minimum, result, count), (near, near_result, 1)):
-                if index < 0:
-                    continue
-                absolute = start+index
-                kind, identity, shape, _, points = batch[absolute]
-                yield {**target, "shape": shape, "pose": poses[absolute],
-                       "vertices": {"tsdf_component": points}, "tsdf_component_id": (kind, identity),
-                       "_prequeried_distance": distance, "_component_count": measured}
-            if near < 0:
-                break
-            start += near+1
-        # Release this chunk before requesting/preparing the next one. A for
-        # loop alone retains its previous item while next(iterator) constructs
-        # the successor, which would otherwise keep two batches of shapes live.
-        del batch, poses, shapes
-# END abandoning this generator prevents all later native leaf distance calls.
+    identity = (first["owner"], first["name"], target["owner"], target["name"], target["layer"])
+    saved = hints.get(identity)
+    previous = saved[1] if saved is not None and saved[0] is geometry else -1
+    work = statistics.setdefault(identity, {
+        "actor": first["owner"], "actor_geometry": first["name"],
+        "target_owner": target["owner"], "target_geometry": target["name"], "layer": target["layer"],
+        "candidate_count": 0, "bound_pruned_count": 0, "exact_leaf_query_count": 0,
+        "seed_query_count": 0, "prior_hint_query_count": 0, "node_bound_count": 0,
+        "retained_pass_count": 0,
+        "query_count": 0, "completed_queries": 0, "completed": False,
+        "workspace_nbytes_upper": 0,
+        "scope": "physical component work; a seed can be queried before its source-order evidence is consumed"})
+    best, best_id = float("inf"), None
+    for flat, component, pose, distance, measured in iter_component_distances(
+            geometry, first["shape"], first["pose"], target["pose"], local_bounds, margin, request,
+            previous_component=previous, statistics=work):
+        value = float(distance.min_distance)
+        if value < best or (value == best and (best_id is None or flat < best_id)):
+            best, best_id = value, flat
+            hints[identity] = (geometry, flat)
+        kind, component_id, shape, _, points = component
+        yield {**target, "shape": shape, "pose": pose,
+               "vertices": {"tsdf_component": points}, "tsdf_component_id": (kind, component_id),
+               "_prequeried_distance": distance, "_component_count": measured}
+# END a next-state hint is only an ID; no old distance or permission survives.
 
 
 # BEGIN exact body support bounds in the selected field's own grid axes.
@@ -1561,14 +1599,14 @@ def _solid_axis_bounds(vertices, shape, pose):
 # END no corner tessellation substitutes for a cylinder's circular support.
 
 
-def _scene_shape(record):
+def _scene_shape(record, *, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
     """Build one explicitly described filled volume, with no mesh-hull fallback."""
     kind = record["kind"]
     vertices = None
     # BEGIN explicit observed-field geometry keeps components and sign evidence.
     if kind == "tsdf":
         from .tsdf_geometry import ObservedTsdfGeometry
-        shape = ObservedTsdfGeometry(record)
+        shape = ObservedTsdfGeometry(record, max_host_rss_bytes=max_host_rss_bytes)
         if shape.bounds is None:
             return None, None, _pose7(record["pose"])
         return shape, shape, _pose7(record["pose"])

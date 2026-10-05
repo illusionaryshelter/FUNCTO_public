@@ -72,6 +72,7 @@ def export(args):
     import torch
     from curobo.kinematics import Kinematics, KinematicsCfg
     from curobo.types import DeviceCfg
+    from manipulation.planning import _PlanningWorkspace, _require_planning_host_memory, _require_planning_memory
 
     prepared = observed_scene(source_args)
     # The producer imports this public module AFTER hand calibration. Its
@@ -83,13 +84,21 @@ def export(args):
     problem, scene = prepared['problem'], prepared['scene']
     if scene.contacts or any(owner.moving for owner in scene.owners):
         raise ValueError('This frozen grasp review requires static owners and no contact permissions')
+    # BEGIN source geometry is host-admitted before the native FK allocation.
+    allocation = scene.estimated_workspace_allocation(8, 1, robot_coverage_horizon=1)
+    workspace = _PlanningWorkspace(allocation['cpu_shared'], allocation['cpu_live'],
+        sum(allocation[name] for name in ('gpu_retained', 'gpu_live', 'gpu_shared')), 0, 0, False)
+    if workspace.gpu_bytes > 1024**3:
+        raise ValueError('Static queries exceed the existing 1 GiB GPU workspace budget')
+    budget = prepared['budget']
+    _require_planning_host_memory(workspace, max_host_rss_bytes=budget.max_host_rss_bytes)
     device = DeviceCfg('cuda:0')
+    _require_planning_memory(torch, device.device, workspace, max_device_used_bytes=budget.max_device_used_bytes)
+    # END CPU shape residency never enters the GPU workspace comparison.
     native = Kinematics(KinematicsCfg.from_robot_yaml_file(prepared['robot'], device_cfg=device))
     names = tuple(native.joint_names)
     if names != tuple(original['joint_names']) or native.total_spheres > 480:
         raise ValueError('Native geometry and active joint order changed')
-    if scene.estimated_workspace_bytes(8, 1) > 1024**3:
-        raise ValueError('Static queries exceed the existing 1 GiB workspace budget')
     with np.load(args.probe_report.parent/'native-collision-model.npz', allow_pickle=False) as model:
         sphere_links = model['source_sphere_links'].copy()
         native_pairs = model['collision_pairs'].copy()

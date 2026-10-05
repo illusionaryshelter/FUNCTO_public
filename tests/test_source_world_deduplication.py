@@ -204,7 +204,7 @@ def test_first_original_error_is_preserved_without_partial_diagnostic_commit():
     args[0][0, 2, 0] = -1.
     kwargs["geometry_query"]["nominal_owner_poses"]["second"][1][1, 0] = 0.
     current, calls = recording_scene(report)
-    diagnostics = {"checked_states": 9, "failed_states": 2, "unrelated": "retained"}
+    diagnostics = {"checked_states": 9, "failed_states": 2, "unrelated": "gpu_retained"}
     before = deepcopy(diagnostics)
     with pytest.raises(ValueError, match="^first invalid joint state$"):
         current.check_world_geometry(*args, **kwargs, diagnostics=diagnostics)
@@ -240,7 +240,7 @@ def native_differential(current, operation, monkeypatch):
         expected_diagnostics, expected_layers, expected_components = {}, {}, {}
         expected = operation(current, expected_diagnostics, expected_layers, expected_components)
     torch.testing.assert_close(actual, expected, rtol=0., atol=0.)
-    assert actual_diagnostics == expected_diagnostics
+    assert_business_report_bytes_equal(actual_diagnostics, expected_diagnostics)
     assert actual_layers == expected_layers
     assert actual_components.keys() == expected_components.keys()
     for name in actual_components:
@@ -248,8 +248,12 @@ def native_differential(current, operation, monkeypatch):
     assert 0 < len(actual_records) < len(records)
     # Compare complete distance/contact/permission/query-gap evidence for
     # every logical reference row, not only the chosen worst report.
-    assert all(item in actual_records for item in records)
-    assert all(item in records for item in actual_records)
+    # BEGIN current-state hints change physical work, never logical evidence.
+    actual_business = [business_report(item) for item in actual_records]
+    expected_business = [business_report(item) for item in records]
+    assert all(item in actual_business for item in expected_business)
+    assert all(item in expected_business for item in actual_business)
+    # END the full geometry, permissions and original query rows remain exact.
     return actual, actual_diagnostics, actual_layers
 
 
@@ -378,16 +382,16 @@ def test_source_reservation_bounds_real_unique_key_storage_as_horizon_grows(scen
             context.setattr(current, "_source_scene_checker", None)
             original = current.estimated_workspace_allocation(1, count, robot_coverage_horizon=0)
         # BEGIN binding source acceptance adds no CUDA optimizer graph scratch.
-        assert admitted["graph_live"] == original["graph_live"]
+        assert admitted["gpu_graph_live"] == original["gpu_graph_live"]
         assert current.estimated_workspace_bytes(1, count, robot_coverage_guidance=False) == sum(
-            admitted[name] for name in ("retained", "live", "shared_cpu", "shared_grids"))
+            admitted[name] for name in ("gpu_retained", "gpu_live", "cpu_shared", "gpu_shared", "cpu_live"))
         # END the full ordinary bound below still includes native queries and keys.
         # Unbinding removes both the pre-existing one-state native scratch
         # and the new keys. Subtract only that known old scratch to isolate
         # the resource increment; no key-size formula is reproduced here.
         # The separate ordinary/dense report allowance must not conceal a
         # regression in the original call-local key and scalar inventory.
-        reserved = admitted["live"]-original["live"]-checker.scene_query_workspace_nbytes-32*1024**2
+        reserved = admitted["cpu_live"]-original["cpu_live"]-checker.scene_query_workspace_nbytes-32*1024**2
         previous_profile = sys.getprofile()
         try:
             sys.setprofile(capture_dictionary)
@@ -465,6 +469,34 @@ def assert_report_bytes_equal(actual, expected):
         assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
     else:
         assert actual == expected
+
+
+# BEGIN exclude only explicitly documented physical-work fields from geometry comparisons.
+def business_report(value, parent=None):
+    """Retain all evidence except six physical tree-search counters.
+
+    A warm query can visit fewer components than a cold query. Cache-replay
+    tests continue to use the strict helper above because they must reproduce
+    the stored counters too; independent native queries use this projection.
+    """
+    if isinstance(value, dict):
+        result = {}
+        for name, item in value.items():
+            if parent == "component_searches" and name in {
+                    "bound_pruned_count", "exact_leaf_query_count", "seed_query_count",
+                    "prior_hint_query_count", "node_bound_count", "retained_pass_count"}:
+                assert type(item) is int and item >= 0
+            else:
+                result[name] = business_report(item, name)
+        return result
+    if isinstance(value, (list, tuple)):
+        return type(value)(business_report(item, parent) for item in value)
+    return value
+
+
+def assert_business_report_bytes_equal(actual, expected):
+    assert_report_bytes_equal(business_report(actual), business_report(expected))
+# END distances, witness coordinates, normal bytes and permission results remain unmodified.
 
 
 def test_paired_reuse_replays_full_diagnostics_and_only_queries_new_dense_states():
@@ -619,10 +651,10 @@ def test_paired_store_is_reserved_once_outside_cuda_graphs(scene_factory, monkey
         before_ordinary = current.estimated_workspace_allocation(1, 3, robot_coverage_horizon=0)
         before_dense = current.estimated_workspace_allocation(1, 641, robot_coverage_horizon=0)
     for actual, before in ((ordinary, before_ordinary), (dense, before_dense)):
-        assert actual["live"]-before["live"] == 32*1024**2
-        assert {name: value for name, value in actual.items() if name != "live"} == {
-            name: value for name, value in before.items() if name != "live"}
-    assert max(ordinary["live"], dense["live"])-max(before_ordinary["live"], before_dense["live"]) == 32*1024**2
+        assert actual["cpu_live"]-before["cpu_live"] == 32*1024**2
+        assert {name: value for name, value in actual.items() if name != "cpu_live"} == {
+            name: value for name, value in before.items() if name != "cpu_live"}
+    assert max(ordinary["cpu_live"], dense["cpu_live"])-max(before_ordinary["cpu_live"], before_dense["cpu_live"]) == 32*1024**2
 
 
 def native_paired_trial(ordinary, *, reuse):
@@ -665,7 +697,7 @@ def test_actual_tsdf_ordinary_dense_reports_and_new_failures_are_exact(scene_fac
     assert baseline["native_queries"] == 8 and reused["native_queries"] == 5
     assert reused["reused_states"] == reused["stored_states"] == 3
     assert_report_bytes_equal(reused["values"], baseline["values"])
-    assert_report_bytes_equal(reused["diagnostics"], baseline["diagnostics"])
+    assert_business_report_bytes_equal(reused["diagnostics"], baseline["diagnostics"])
     assert reused["values"] == [[[0., 1., 0.]], [[0., 1., 1., 1., 0.]]]
     assert [row["trajectory_time_s"] for row in reused["diagnostics"][1]["failure_witnesses"]] == [.25, .5, .75]
 

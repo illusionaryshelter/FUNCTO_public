@@ -20,6 +20,8 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 import math
 
+from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES
+
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial.transform import Rotation
@@ -1039,6 +1041,9 @@ class PlanningScene:
         self.robot_validator = None
         self._self_collision_owner_ids = frozenset()
         self._source_scene_checker = None
+        # BEGIN source geometry inherits the request's explicit physical RAM cap.
+        self._max_host_rss_bytes = DEFAULT_MAX_HOST_RSS_BYTES
+        # END standalone scenes retain the conservative local default.
         # BEGIN candidate report reuse is attached only by native postprocessing.
         self._source_world_reuse = None
         # END optimizer, search and standalone checks have no cross-call store.
@@ -1454,7 +1459,7 @@ class PlanningScene:
         self._self_collision_owner_ids = frozenset(checked)
 
     # BEGIN freeze world geometry after continuation policy and hand clocks are bound.
-    def bind_source_scene(self):
+    def bind_source_scene(self, *, max_host_rss_bytes=None, previous_checker=None):
         """Build one immutable source scene for this complete planning request.
 
         ``to_execution_binding`` serializes inputs only: it neither binds a
@@ -1468,12 +1473,18 @@ class PlanningScene:
         # END the other rollout end is detached as well.
         if self.robot_validator is None:
             raise ValueError("Source world geometry needs the already validated robot binding")
+        # BEGIN keep unchanged map objects through a real source-scene replacement.
+        previous = self._source_scene_checker if previous_checker is None else previous_checker
+        host_limit = self._max_host_rss_bytes if max_host_rss_bytes is None else max_host_rss_bytes
+        # END both old and new live maps remain covered by construction admission.
         checker = copy(self.robot_validator.checker)
         # Geometry and the Pinocchio model are immutable. Its FK workspace is
         # local so planning does not overwrite the execution checker's data.
         checker._data = checker.model.createData()
-        checker.bind_scene(self.to_execution_binding())
+        checker.bind_scene(self.to_execution_binding(), previous_checker=previous,
+                           max_host_rss_bytes=host_limit)
         self._source_scene_checker = checker
+        self._max_host_rss_bytes = host_limit
     # END one scene construction serves optimizer metrics, search and final validation.
 
     # BEGIN native postprocessing owns an explicit ordinary-to-dense lifetime.
@@ -1915,7 +1926,7 @@ class PlanningScene:
             result.observation_report.setdefault("background_refinements", []).append(deepcopy(report))
         # BEGIN an originally unbound scene still needs its first checker.
         if result.robot_validator is not None and result._source_scene_checker is None:
-            result.bind_source_scene()
+            result.bind_source_scene(previous_checker=self._source_scene_checker)
         # END unchanged source inputs do not rebuild every TSDF owner/layer.
         return result, report
     # END unchanged sensor evidence, physical clock and contact policy survive.
@@ -2049,7 +2060,7 @@ class PlanningScene:
 
     # BEGIN distinguish retained native buffers from one live query/backward.
     def estimated_workspace_allocation(self, batch, horizon, *, robot_coverage_horizon):
-        """Return retained, live and shared-CPU bytes for one scene rollout.
+        """Return separate CPU/GPU storage and live work for one scene rollout.
 
         Native buffers persist per semantic key at the latest shape. Graph
         snapshots and checkpoint scratch live through one forward/backward;
@@ -2112,13 +2123,14 @@ class PlanningScene:
         coverage_spheres = sum(size for actor, size in actors.items()
                                if actor != "robot" or self.robot_coverage is None)
         coverage_bytes = batch * horizon * coverage_spheres * 128
-        # BEGIN grid sources and lazy device copies remain live across stages.
-        # All rollout clones share these immutable caches. Count each CPU
-        # source plus its single planning-device FP32 copy once, independently
-        # of whether the current stage requests native coverage gradients.
-        shared_grid_bytes = 2*self.coverage._distance.numel()*4
+        # BEGIN host grid sources never consume the device workspace budget.
+        # Every source has one immutable CPU array and one lazy planning-GPU
+        # copy. Layer prefix/constant caches are likewise shared by all rollout
+        # clones; they do not become a new allocation in each graph pool.
+        host_grid_bytes = self.coverage._distance.numel()*4
         if self.robot_coverage is not None:
-            shared_grid_bytes += 2*(self._free_distance.numel()+self._free_mask.numel())*4
+            host_grid_bytes += (self._free_distance.numel()+self._free_mask.numel())*4
+        shared_gpu_bytes = host_grid_bytes+layer_bytes
         # END public extra-device/dtype queries are outside this planner budget.
         # END disabled robot sphere queries cannot consume per-state scratch.
         # BEGIN include checkpointed hand-pair scratch and its retained input.
@@ -2161,7 +2173,7 @@ class PlanningScene:
                 + sum(plane_counts)*24)
         # BEGIN finite contact witnesses never allocate the raw Cartesian product.
         # BEGIN account once for shared native contact/source-world geometry.
-        shared_cpu_bytes = layer_bytes+sum(layer.storage_bytes
+        shared_cpu_bytes = host_grid_bytes+layer_bytes+sum(layer.storage_bytes
             for value in self._contact_cells.values()
             for layer in (value.layers.values() if hasattr(value, "layers") else (value,)))
         # BEGIN the remapping snapshot is shared, immutable CPU sensor storage.
@@ -2213,9 +2225,11 @@ class PlanningScene:
             source_transfer_bytes = source_input_bytes + batch*horizon*9
             # END no assumed duplicate/padded-state ratio reduces admission.
         # END accounting does not assume that three-mode probes will coincide.
-        contact_bytes = (sum(value.workspace_bytes() for value in self._contact_cells.values())
-                         + (batch*horizon*len(self.robot_sphere_materials)*64 if self._contact_cells else 0))
-        contact_bytes += batch*horizon*sum((len(rule._feature_edge_normals)+10)*32 for rule in self.contacts)
+        contact_cpu_bytes = sum(value.workspace_bytes() for value in self._contact_cells.values())
+        contact_tensor_bytes = (batch*horizon*len(self.robot_sphere_materials)*64
+                                if self._contact_cells else 0)
+        contact_tensor_bytes += batch*horizon*sum((len(rule._feature_edge_normals)+10)*32
+                                                 for rule in self.contacts)
         # END CPU neighbor lists separately obey a two-million-pair admission cap.
         # BEGIN distinguish capture scratch from source validation outside CUDA.
         # Source queries, CPU-state deduplication and packed CPU transfers run
@@ -2224,22 +2238,29 @@ class PlanningScene:
         # NONADDITIVE subset for the two additional graph pools. Original q/time,
         # owner poses and layer inputs remain conservatively counted in both.
         graph_live_bytes = (query_bytes+coverage_bytes+pair_bytes+native_coverage_bytes
-                            +contact_bytes+layer_bytes+layer_scratch+source_input_bytes)
-        live_bytes = graph_live_bytes+source_query_bytes+source_dedup_bytes+source_transfer_bytes
-        return {"retained": int(retained_bytes), "live": int(live_bytes),
-                "shared_cpu": int(shared_cpu_bytes), "shared_grids": int(shared_grid_bytes),
-                "graph_live": int(graph_live_bytes)}
-        # END CPU validation remains fully admitted once at its ordinary boundary.
+                            +contact_tensor_bytes+layer_scratch+source_input_bytes)
+        gpu_live_bytes = graph_live_bytes+source_transfer_bytes
+        # The host pack and its unpacked fields can coexist. Afterwards the
+        # fields coexist with byte-exact dictionary keys. The existing key
+        # allowance owns one payload; a second payload bounds either overlap.
+        host_snapshot_bytes = source_input_bytes if source_transfer_bytes else 0
+        cpu_live_bytes = (contact_cpu_bytes+contact_tensor_bytes+source_query_bytes
+                          +source_dedup_bytes+host_snapshot_bytes)
+        return {"gpu_retained": int(retained_bytes), "gpu_live": int(gpu_live_bytes),
+                "cpu_shared": int(shared_cpu_bytes), "gpu_shared": int(shared_gpu_bytes),
+                "cpu_live": int(cpu_live_bytes), "gpu_graph_live": int(graph_live_bytes)}
+        # END CPU query geometry, snapshots and reports never enter a CUDA pool.
         # END source scene snapshots are not multiplied by the rollout count.
         # END include checkpointed hand-pair scratch and its retained input.
 
     def estimated_workspace_bytes(self, batch, horizon, *, robot_coverage_guidance=True):
         """Bound one complete query, including its persistent native buffers."""
-        # BEGIN graph_live is a subset, not a fifth independent allocation.
+        # BEGIN graph scratch is a subset, not another ordinary allocation.
         allocation = self.estimated_workspace_allocation(batch, horizon,
             robot_coverage_horizon=horizon if robot_coverage_guidance else 0)
-        return sum(allocation[name] for name in ("retained", "live", "shared_cpu", "shared_grids"))
-        # END the ordinary single-query estimate is numerically unchanged.
+        return sum(allocation[name] for name in
+                   ("gpu_retained", "gpu_live", "cpu_shared", "gpu_shared", "cpu_live"))
+        # END the total remains diagnostic; device admission reads GPU fields.
     # END callers sum caches across rollouts but only one sequential live graph.
 
     def project_residual(self, progress, joint_position, joint_names):

@@ -44,17 +44,14 @@ def geometry():
 
 
 def original_components(target, bounds=None, *, surface=True, negative=True):
-    """Preserve the pre-optimization Python AABB filter as a differential oracle."""
-    if target._tree is None or not (surface or negative):
+    """Independently scan every original box; never use the new tree's answer."""
+    if not len(target._lower) or not (surface or negative):
         return
     if bounds is None:
-        candidates = range(len(target._centres))
+        candidates = range(len(target._lower))
     else:
         lower, upper = np.asarray(bounds, dtype=np.float64)
-        centre = (lower + upper) / 2
-        radius = float(np.linalg.norm(upper - lower) / 2) + target._radius
-        candidates = target._tree.query_ball_point(centre, radius, return_sorted=True)
-        candidates = [index for index in candidates
+        candidates = [index for index in range(len(target._lower))
                       if np.all(target._upper[index] >= lower)
                       and np.all(target._lower[index] <= upper)]
     surfaces, negatives, _ = target._counts
@@ -107,23 +104,32 @@ def test_empty_inventory_has_no_filter_or_collision_candidates():
     assert list(empty.iter_collision_components()) == []
 
 
-# BEGIN budget large inventories without allocating their native shapes.
-@pytest.mark.parametrize("count,expected_capacity", ((16385, 16385), (262145, 262144)))
-def test_snapshot_cache_reserve_covers_inventory_up_to_the_finite_cap(count, expected_capacity):
+# BEGIN reserve every unique source component without eager native shapes.
+@pytest.mark.parametrize("count", (7, 37))
+def test_snapshot_cache_reserve_covers_the_complete_inventory(count):
     record = component_record((), cells=np.arange(count, dtype=np.int64))
     record["shape_xyz"] = [count + 1, 2, 2]
     target = ObservedTsdfGeometry(record)
-    assert target._collision_cache_capacity == expected_capacity
-    assert target.collision_cache_storage_nbytes == expected_capacity * 4096
-    assert target.storage_nbytes >= expected_capacity * 4096
+    assert target._collision_cache_capacity == count
+    assert target.collision_cache_storage_nbytes == target.pending_storage_nbytes == count * 4096
+    assert target.storage_nbytes >= count * 4096
     assert not target._collision_cache  # Pre-admission reserves are not eager Coal allocations.
-    # BEGIN exceeding cache capacity cannot remove later observed components.
+    # BEGIN the last source component belongs to the same admitted inventory.
     np.testing.assert_array_equal(target.negative_cell_flat_indices, np.arange(count))
     last_point = np.array([40.+(count-.5)*.5, .25, .25])
     last = next(target.iter_components((last_point, last_point)))
     assert last[:2] == ("negative_cell", count-1)
-    # END the whole source inventory remains addressable beyond resident reuse.
-# END oversized inventories keep bounded residency and the normal eviction path.
+    # END no fixed nearest subset replaces the complete source field.
+
+
+def test_large_inventory_admission_reserves_beyond_the_former_lru_capacity():
+    # Metadata admission is enough to check the capacity boundary. Do not build
+    # hundreds of thousands of shapes or tree nodes merely to test arithmetic.
+    count = 262145
+    record = component_record((), cells=np.arange(count, dtype=np.int64))
+    record["shape_xyz"] = [count+1, 2, 2]
+    assert ObservedTsdfGeometry.initial_allocation_bound(record) > count*4096
+# END only the tiny fixtures above allocate a real spatial tree.
 
 
 def test_cache_reuses_only_local_geometry_and_keeps_reserved_storage_constant(geometry, monkeypatch):
@@ -151,9 +157,8 @@ def test_cache_reuses_only_local_geometry_and_keeps_reserved_storage_constant(ge
         assert shape is not None
 
 
-def test_cache_eviction_preserves_live_rows_and_reconstructs_evicted_geometry(monkeypatch):
+def test_interleaved_states_never_evict_or_reconstruct_source_geometry(monkeypatch):
     target = ObservedTsdfGeometry(component_record([[[x, 0., 0.]] for x in (0., 10., 20.)]))
-    target._collision_cache_capacity = 2
     calls = []
 
     def tracked(vertices):
@@ -167,24 +172,24 @@ def test_cache_eviction_preserves_live_rows_and_reconstructs_evicted_geometry(mo
         return next(target.iter_collision_components((point, point)))
 
     zero, one = select(0), select(1)
-    assert select(0)[2] is zero[2]  # A hit makes zero the most recently used.
+    assert select(0)[2] is zero[2]
     two = select(2)
-    assert list(target._collision_cache) == [("surface", 0), ("surface", 2)]
+    assert list(target._collision_cache) == [("surface", 0), ("surface", 1), ("surface", 2)]
     again = select(1)
-    assert len(calls) == 4 and len(target._collision_cache) == 2
-    assert again[2] is not one[2]
+    assert len(calls) == 3 and len(target._collision_cache) == 3
+    assert target.pending_storage_nbytes == 0
+    assert again[2] is one[2]
     np.testing.assert_array_equal(again[3], one[3])
     np.testing.assert_array_equal(again[4], one[4])
-    # Eviction drops cache ownership; a previously yielded row remains usable.
+    # Both previous and repeated rows borrow the same map-owned native object.
     for row in (zero, one, two, again):
         assert row[2].radius == 0.
         np.testing.assert_array_equal(row[4], np.zeros((1, 3)))
 
 
-# BEGIN a warm negative-cell cache must skip the otherwise repeated eight corners.
-def test_warm_cache_skips_vertices_and_eviction_rebuilds_exact_negative_cell(monkeypatch):
+# BEGIN warm negative cells never repeat their eight-corner construction.
+def test_warm_cells_stay_resident_after_other_components_are_used(monkeypatch):
     target = ObservedTsdfGeometry(component_record([[[0., 0., 0.]]], cells=(0, 1)))
-    target._collision_cache_capacity = 2
     vertices = target._component_vertices
     prepared = []
 
@@ -196,7 +201,7 @@ def test_warm_cache_skips_vertices_and_eviction_rebuilds_exact_negative_cell(mon
 
     def select(point):
         # Interior points select exactly one negative cell; the separate
-        # zero-dimensional surface is used only to force normal LRU eviction.
+        # zero-dimensional surface exercises an intervening different component.
         return next(target.iter_collision_components((point, point)))
 
     first = select(np.array([40.25, .25, .25]))
@@ -207,18 +212,18 @@ def test_warm_cache_skips_vertices_and_eviction_rebuilds_exact_negative_cell(mon
     assert all(before is after for before, after in zip(first[2:], warm[2:]))
 
     select(np.zeros(3))
-    assert list(target._collision_cache) == [("negative_cell", 0), ("surface", 0)]
+    assert list(target._collision_cache) == [("negative_cell", 0), ("negative_cell", 1), ("surface", 0)]
     rebuilt = select(np.array([40.75, .25, .25]))
     assert prepared == [("negative_cell", 0), ("negative_cell", 1),
-                        ("surface", 0), ("negative_cell", 1)]
+                        ("surface", 0)]
     assert rebuilt[:2] == second[:2]
-    assert rebuilt[2] is not second[2]
+    assert rebuilt[2] is second[2]
     np.testing.assert_array_equal(rebuilt[3], second[3])
     np.testing.assert_array_equal(rebuilt[4], second[4])
-    # BEGIN eviction preserves actual signed distances, contacts and witnesses.
+    # BEGIN native reuse preserves actual signed distances, contacts and witnesses.
     # Check both an intersecting body and a separated body using fresh native
     # requests. Equal vertices alone would not test the reconstructed Coal
-    # shape or its local placement consumed by the source collision checker.
+        # shape or its local placement consumed by the source collision checker.
     for centre in ([40.75, .25, .25], [42., .25, .25]):
         expected = native_evidence(second[2], second[3], np.asarray(centre))
         actual = native_evidence(rebuilt[2], rebuilt[3], np.asarray(centre))
@@ -226,7 +231,7 @@ def test_warm_cache_skips_vertices_and_eviction_rebuilds_exact_negative_cell(mon
         assert actual[1] == expected[1]
         np.testing.assert_allclose(actual[2], expected[2], rtol=0., atol=1e-12)
     # END cache residency does not enter the scene's geometric verdict.
-# END eviction changes residency only; it retains the original corner arithmetic.
+# END other state queries cannot invalidate an immutable cell's geometry.
 
 
 def test_cache_identity_separates_snapshots_and_component_kinds(geometry):
@@ -317,7 +322,10 @@ def test_surface_cache_keeps_exact_witnesses_and_invalidates_changed_inputs(geom
     original = coal.distance
 
     def counted(*args):
-        calls.append(1)
+        # Count this test's complete zero-surface query only. Spatial search
+        # also requeries one raw component seed through the same Coal function.
+        if args[2] is target["shape"].surface_shape:
+            calls.append(1)
         return original(*args)
 
     monkeypatch.setattr(coal, "distance", counted)
@@ -325,7 +333,7 @@ def test_surface_cache_keeps_exact_witnesses_and_invalidates_changed_inputs(geom
     def sample(retained):
         rows = []
         pieces = list(_scene_component_pairs(actor, [target], {}, 1e-6, rows,
-            request, set(), set(), retained))
+            request, set(), set(), retained, hints={}, statistics={}))
         assert pieces  # Reusing a surface row never skips signed-piece enumeration.
         assert len(rows) == 1
         return rows[0]
@@ -369,6 +377,8 @@ def test_surface_cache_does_not_reuse_stateful_or_nonfinite_calls(geometry, monk
     original = coal.distance
 
     def altered(*args):
+        if args[2] is not target["shape"].surface_shape:
+            return original(*args)
         calls.append(1)
         result = original(*args)
         if failure == "request_mutated":
@@ -380,7 +390,7 @@ def test_surface_cache_does_not_reuse_stateful_or_nonfinite_calls(geometry, monk
     monkeypatch.setattr(coal, "distance", altered)
     for _ in range(2):
         samples = _scene_component_pairs(actor, [target], {}, 1e-6, [],
-            request, set(), set(), cache)
+            request, set(), set(), cache, hints={}, statistics={})
         if failure == "nonfinite":
             with pytest.raises(RuntimeError, match="nonfinite evidence"):
                 list(samples)
@@ -414,7 +424,7 @@ def test_component_batch_defers_later_materialization_error_until_consumed(monke
     monkeypatch.setattr(tsdf_geometry, "coal_component", fail_second)
     stopped = set()
     pairs = _scene_component_pairs(actor, [target], {}, 1e-6, [], coal.DistanceRequest(),
-                                   set(), stopped, {})
+                                   set(), stopped, {}, hints={}, statistics={})
     first, second, key = next(pairs)
     assert first is actor
     assert second["tsdf_component_id"] == ("negative", 0)

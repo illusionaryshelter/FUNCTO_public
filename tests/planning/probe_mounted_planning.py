@@ -255,7 +255,7 @@ def run(args):
             ik_iterations=80, trajectory_iterations=100, maximum_trajectory_dt=.05,
             interpolation_buffer_size=256, max_validation_points=384, max_refinement_points=16,
             maximum_trajectory_solves=1, search_seconds=0., max_robot_spheres=sphere_count,
-            max_scene_workspace_bytes=512 * 1024**2)
+            max_scene_gpu_workspace_bytes=512 * 1024**2)
         report["planning_called"] = True
         # BEGIN reuse the same source validator that checked measured entrance.
         result = plan_and_record(problem, scene, robot, output / "planning",

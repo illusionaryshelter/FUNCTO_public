@@ -502,7 +502,9 @@ class ObservedContactGeometry:
     cell_half_diagonal_m = 0.
 
     def __init__(self, geometry):
-        from .tsdf_geometry import ObservedTsdfGeometry
+        # BEGIN raw contact vertices do not need a second source collision map.
+        from .tsdf_geometry import iter_source_components
+        # END the shared decoder keeps the same complete component inventory.
 
         self.gaps = list(geometry.get("query_gaps", ()))
         components, negative, surfaces = [], [], []
@@ -513,7 +515,7 @@ class ObservedContactGeometry:
                 raise ValueError("Observed contact components need a finite normalized native pose")
             rotation = Rotation.from_quat(pose[[4, 5, 6, 3]]).as_matrix()
             if record["kind"] == "tsdf":
-                for kind, _, points in ObservedTsdfGeometry(record).iter_components():
+                for kind, _, points in iter_source_components(record):
                     vertices = np.asarray(points, float) @ rotation.T+pose[:3]
                     components.append(vertices)
                     negative.append(kind != "surface")

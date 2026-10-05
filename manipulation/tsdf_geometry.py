@@ -6,15 +6,16 @@ negative convex piece therefore describe the same geometry. Unknown samples
 never acquire a value or an occupied neighbourhood.
 """
 
-from collections import OrderedDict
 from itertools import combinations
 import math
+from weakref import WeakSet
 
 import coal
 import numpy as np
-from scipy.spatial import ConvexHull, cKDTree
+from scipy.spatial import ConvexHull
 
-from .collision_records import MAX_ARRAY_BYTES, decode_array, encode_array
+from .collision_records import MAX_ARRAY_BYTES, _array_layout, decode_array, encode_array
+from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES, require_host_memory
 
 
 # BEGIN reconstruct observed affine TSDF geometry without ESDF threshold solids.
@@ -263,33 +264,125 @@ def coal_component(vertices):
     return coal.ConvexBase.convexHull(native, True, "Qt"), pose
 
 
+# BEGIN raw contact readers share source decoding without collision allocation.
+def _decode_component_arrays(record, kind, maximum_vertices):
+    vertices = decode_array(record[kind+"_vertices"])
+    offsets = decode_array(record[kind+"_offsets"])
+    if (vertices.ndim != 2 or vertices.shape[1] != 3 or vertices.dtype.kind != "f"
+            or not np.isfinite(vertices).all() or offsets.ndim != 1 or offsets.dtype.kind != "i"
+            or not len(offsets) or offsets[0] != 0 or offsets[-1] != len(vertices)
+            or np.any(np.diff(offsets) < 1) or np.any(np.diff(offsets) > maximum_vertices)):
+        raise ValueError("TSDF component vertices and CSR offsets must describe complete bounded convex pieces")
+    return vertices, offsets
+
+
+def _decode_tsdf_source(record):
+    """Validate the one common source definition before any native adaptation."""
+    if record["kind"] != "tsdf":
+        raise ValueError("Observed components need an affine TSDF record")
+    origin = np.asarray(record["origin"], dtype=np.float64)
+    shape = np.asarray(record["shape_xyz"], dtype=np.int64)
+    size = float(record["voxel_size"])
+    if (origin.shape != (3,) or not np.isfinite(origin).all()
+            or shape.shape != (3,) or np.any(shape < 1)
+            or not np.isfinite(size) or size <= 0):
+        raise ValueError("TSDF component records need a finite positive sample-centre lattice")
+    surface_vertices, surface_offsets = _decode_component_arrays(record, "surface", 4)
+    negative_vertices, negative_offsets = _decode_component_arrays(record, "negative", 6)
+    cells = decode_array(record["negative_cell_flat_indices"])
+    if (cells.ndim != 1 or cells.dtype.kind != "i" or np.any(cells < 0)
+            or np.any(cells >= np.prod(shape-1)) or (len(cells) > 1 and np.any(np.diff(cells) <= 0))):
+        raise ValueError("Negative TSDF cells need unique ordered in-range centre-cell indices")
+    return origin, shape, size, surface_vertices, surface_offsets, negative_vertices, negative_offsets, cells
+
+
+def iter_source_components(record):
+    """Yield original ordered vertices to raw consumers without a shape/tree.
+
+    Contact guidance only consumes vertices and constructs its own required
+    contact representation. Reserving a complete unused Coal shape inventory
+    for that reader would misstate its resource needs and rebuild geometry.
+    """
+    origin, shape, size, sv, so, nv, no, cells = _decode_tsdf_source(record)
+    for kind, vertices, offsets in (("surface", sv, so), ("negative", nv, no)):
+        for index in range(len(offsets)-1):
+            yield kind, index, vertices[offsets[index]:offsets[index+1]]
+    for index, flat in enumerate(cells):
+        indices = np.asarray(np.unravel_index(flat, tuple(shape-1)))
+        lower = origin+indices*size
+        yield "negative_cell", index, lower+_CORNERS*size
+# END raw and native consumers use identical validation and vertex arithmetic.
+
+
 class ObservedTsdfGeometry:
-    """Decoded immutable components and a complete AABB candidate index.
+    """Immutable source components, one spatial tree and lifetime-owned shapes.
 
     Bounds and all returned vertices use the Mapper integration frame. The
-    caller applies an owner's current pose once. The KD query is only a
-    conservative candidate search; exact AABB filtering retains every possible
-    component. No fixed number of nearest witnesses or components is selected.
+    caller applies an owner's current pose once. The tree preserves the closed
+    AABB candidate predicate. Shapes are constructed only on first use and stay
+    with this source map; query poses, distances and permissions never do.
     """
 
-    def __init__(self, record):
+    # BEGIN count every still-live map's unmaterialized shapes before allocation.
+    # Weak ownership neither prolongs retired maps nor duplicates the reservation
+    # when several scene snapshots share the same unchanged coarse/owner field.
+    _live_geometries = WeakSet()
+
+    @classmethod
+    def pending_storage_total_nbytes(cls):
+        return sum(value.pending_storage_nbytes for value in cls._live_geometries)
+
+    @property
+    def pending_storage_nbytes(self):
+        """Admitted shapes not yet represented in the process's resident bytes."""
+        return (self._collision_cache_capacity-len(self._collision_cache))*4096
+
+    @staticmethod
+    def initial_allocation_bound(record):
+        """Bound decoding, tree/BVH construction and full future shape residency.
+
+        The codec's existing layout checks run without decoding any payload.
+        Four triangles per zero component cover both tetrahedral and planar
+        sections. Extra source/triangle copies cover the temporary construction
+        lists; the map keeps only the final arrays and native indices afterward.
+        """
+        sizes = {}
+        for name in ("surface_vertices", "surface_offsets", "negative_vertices",
+                     "negative_offsets", "negative_cell_flat_indices"):
+            layout = record[name]
+            if not isinstance(layout, dict) or set(layout) != {"shape", "dtype", "data_base64"}:
+                raise ValueError("TSDF arrays require the complete bounded collision codec")
+            _, sizes[name] = _array_layout(layout["shape"], layout["dtype"])
+        counts = []
+        for name in ("surface_offsets", "negative_offsets", "negative_cell_flat_indices"):
+            shape = record[name]["shape"]
+            if len(shape) != 1 or (name.endswith("offsets") and shape[0] < 1):
+                raise ValueError("TSDF offsets and cell identities require one bounded axis")
+            counts.append(shape[0]-int(name.endswith("offsets")))
+        count = sum(counts)
+        # 256 B per component is the native tree's complete construction reserve,
+        # not just sizeof(node); 64 B covers Python-owned boxes/flags/index scratch.
+        return (3*sum(sizes.values()) + count*(4096+256+64)
+                + counts[0]*(4*512+512) + 8*1024**2)
+    # END full map capacity is reserved before a sparse first query can hide it.
+
+    def __init__(self, record, *, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
         if record["kind"] != "tsdf":
             raise ValueError("ObservedTsdfGeometry needs an affine TSDF record")
-        self.origin = np.asarray(record["origin"], dtype=np.float64)
-        self.shape_xyz = np.asarray(record["shape_xyz"], dtype=np.int64)
-        self.voxel_size = float(record["voxel_size"])
-        if (self.origin.shape != (3,) or not np.isfinite(self.origin).all()
-                or self.shape_xyz.shape != (3,) or np.any(self.shape_xyz < 1)
-                or not np.isfinite(self.voxel_size) or self.voxel_size <= 0):
-            raise ValueError("TSDF component records need a finite positive sample-centre lattice")
-        self.surface_vertices, self.surface_offsets = self._decode_components(record, "surface", 4)
-        self.negative_vertices, self.negative_offsets = self._decode_components(record, "negative", 6)
-        self.negative_cell_flat_indices = decode_array(record["negative_cell_flat_indices"])
+        # BEGIN refuse before decoding arrays or constructing native tree nodes.
+        require_host_memory(self.initial_allocation_bound(record),
+            pending_existing_bytes=self.pending_storage_total_nbytes(),
+            max_rss_bytes=max_host_rss_bytes)
+        try:
+            from ._coal_scene_batch import ComponentAABBTree
+        except ImportError as error:
+            raise RuntimeError("Build the project Coal adapter with PYTHONNOUSERSITE=1 "
+                               "python tests/planning/build_coal_scene_batch.py") from error
+        # END there is one production search implementation, not a legacy fallback.
+        (self.origin, self.shape_xyz, self.voxel_size, self.surface_vertices, self.surface_offsets,
+         self.negative_vertices, self.negative_offsets, self.negative_cell_flat_indices) = _decode_tsdf_source(record)
         cells = self.negative_cell_flat_indices
         cell_shape = self.shape_xyz - 1
-        if (cells.ndim != 1 or cells.dtype.kind != "i" or np.any(cells < 0)
-                or np.any(cells >= np.prod(cell_shape)) or (len(cells) > 1 and np.any(np.diff(cells) <= 0))):
-            raise ValueError("Negative TSDF cells need unique ordered in-range centre-cell indices")
         self._counts = (len(self.surface_offsets) - 1, len(self.negative_offsets) - 1, len(cells))
         lower, upper = [], []
         for vertices, offsets in ((self.surface_vertices, self.surface_offsets),
@@ -304,10 +397,12 @@ class ObservedTsdfGeometry:
             upper.append(cell_lower + self.voxel_size)
         self._lower = np.concatenate(lower) if lower else np.empty((0, 3))
         self._upper = np.concatenate(upper) if upper else np.empty((0, 3))
-        self._centres = (self._lower + self._upper) / 2
-        self._tree = cKDTree(self._centres) if len(self._centres) else None
-        self._radius = float(np.linalg.norm((self._upper - self._lower) / 2, axis=1).max()) if lower else 0.
         self.bounds = (self._lower.min(axis=0), self._upper.max(axis=0)) if lower else None
+        # BEGIN point/segment native frames require their own enclosure proof.
+        # Until such a proof exists these leaves are always visited, while still
+        # participating in the exact original local AABB candidate selection.
+        self._prunable = np.ones(sum(self._counts), dtype=bool)
+        # END ordinary area/volume pieces retain identity local transforms.
 
         # One BVH supplies the positive distance to all two-dimensional zero
         # sections. Lower-dimensional zero evidence has separate exact native
@@ -318,6 +413,7 @@ class ObservedTsdfGeometry:
             rank, basis = _component_rank(points)
             if rank < 2:
                 lower_dimensional.append(index)
+                self._prunable[index] = False
             else:
                 triangles.append(_component_triangles(points, rank, basis))
         self.surface_lower_dimensional_indices = np.asarray(lower_dimensional, dtype=np.int64)
@@ -330,45 +426,45 @@ class ObservedTsdfGeometry:
                 for triangle in batch:
                     self.surface_shape.addTriangle(*triangle)
             self.surface_shape.endModel()
+        # BEGIN classify negative pieces with the same native-shape SVD rule.
+        # Group equal vertex counts and process bounded blocks: NumPy performs
+        # the same per-piece SVD without a Python call for every untouched leaf.
+        sizes = np.diff(self.negative_offsets)
+        for size in range(1, 7):
+            indices = np.flatnonzero(sizes == size)
+            for start in range(0, len(indices), 4096):
+                selected = indices[start:start+4096]
+                if size < 3:
+                    self._prunable[self._counts[0]+selected] = False
+                    continue
+                points = self.negative_vertices[
+                    self.negative_offsets[selected, None]+np.arange(size)]
+                _, singular, _ = np.linalg.svd(points-points[:, :1], full_matrices=False)
+                tolerance = 8*np.finfo(np.float64).eps*np.maximum(1., np.abs(points).max(axis=(1, 2)))
+                self._prunable[self._counts[0]+selected] = (singular > tolerance[:, None]).sum(axis=1) >= 2
+        self._spatial_index = ComponentAABBTree(self._lower, self._upper, self._prunable)
+        # END one native tree serves both raw candidate selection and bound search.
         arrays = (self.origin, self.shape_xyz, self.surface_vertices, self.surface_offsets,
                   self.negative_vertices, self.negative_offsets, self.negative_cell_flat_indices,
-                  self._lower, self._upper, self._centres, self.surface_lower_dimensional_indices)
+                  self._lower, self._upper, self._prunable, self.surface_lower_dimensional_indices)
         # Include native search/BVH storage in the existing scene CPU budget.
         self.storage_nbytes = sum(array.nbytes for array in arrays) + triangle_count * 512
-        if self._tree is not None:
-            self.storage_nbytes += self._tree.indices.nbytes + self._tree.size * 128
-        # BEGIN bounded reuse of fixed local collision geometry.
-        # Each snapshot owns its cache: kind/index cannot alias another map,
-        # owner or layer. Reserve its full capacity before scene admission,
-        # which reads storage_nbytes only once. A component has at most eight
-        # vertices; 4 KiB covers its small native hull/BVH, arrays and Python
-        # bookkeeping conservatively. Current world poses/results stay outside.
-        # BEGIN retain the established reuse capacity and identify its ownership.
-        # Cache rows hold fixed component geometry and are borrowed by queries;
-        # their full reserve belongs to scene storage, never query scratch.
-        self._collision_cache_capacity = min(262144, sum(self._counts))
-        self._collision_cache = OrderedDict()
+        self.storage_nbytes += self._spatial_index.storage_nbytes
+        # BEGIN every source component is built at most once during this map.
+        # Keep the established 4 KiB per-shape allowance, but reserve all unique
+        # IDs rather than an evicting subset. Query batches borrow these objects.
+        self._collision_cache_capacity = sum(self._counts)
+        self._collision_cache = {}
         self.storage_nbytes += self.collision_cache_storage_nbytes
-        # END admission reserves the persistent cache exactly once.
-        # END cache residency is bounded independently of trajectory length.
+        self._live_geometries.add(self)
+        # END map identity, not state count, owns the complete residency bound.
 
     # BEGIN expose the persistent portion already included in storage_nbytes.
     @property
     def collision_cache_storage_nbytes(self):
-        """Full fixed-component LRU reserve, independent of current occupancy."""
+        """Full source-component residency reserve, independent of occupancy."""
         return self._collision_cache_capacity * 4096
     # END a query borrows cached shapes without cloning this reserve.
-
-    @staticmethod
-    def _decode_components(record, kind, maximum_vertices):
-        vertices = decode_array(record[kind + "_vertices"])
-        offsets = decode_array(record[kind + "_offsets"])
-        if (vertices.ndim != 2 or vertices.shape[1] != 3 or vertices.dtype.kind != "f"
-                or not np.isfinite(vertices).all() or offsets.ndim != 1 or offsets.dtype.kind != "i"
-                or not len(offsets) or offsets[0] != 0 or offsets[-1] != len(vertices)
-                or np.any(np.diff(offsets) < 1) or np.any(np.diff(offsets) > maximum_vertices)):
-            raise ValueError("TSDF component vertices and CSR offsets must describe complete bounded convex pieces")
-        return vertices, offsets
 
     # BEGIN select exact component IDs before deciding whether vertices are needed.
     def iter_components(self, bounds=None, *, surface=True, negative=True):
@@ -386,34 +482,35 @@ class ObservedTsdfGeometry:
 
     def _iter_component_ids(self, bounds=None, *, surface=True, negative=True):
         """Select the original ordered IDs before any component is materialized."""
-        if self._tree is None or not (surface or negative):
-            return
+        for index in self.component_indices(bounds, surface=surface, negative=negative):
+            yield self.component_identity(int(index))
+
+    # BEGIN native candidate IDs do not allocate Python tuples for discarded leaves.
+    def component_indices(self, bounds=None, *, surface=True, negative=True):
+        count = sum(self._counts)
         if bounds is None:
-            candidates = range(len(self._centres))
+            candidates = np.arange(count, dtype=np.intp)
         else:
             lower, upper = np.asarray(bounds, dtype=np.float64)
             if lower.shape != (3,) or upper.shape != (3,) or not np.isfinite([lower, upper]).all() or np.any(lower > upper):
                 raise ValueError("TSDF candidate bounds require finite ordered XYZ corners")
-            centre = (lower + upper) / 2
-            radius = float(np.linalg.norm(upper - lower) / 2) + self._radius
-            # BEGIN batch the same closed AABB comparisons in candidate order.
-            # Integer indexing also handles an empty KD-tree result. The tree
-            # search, its radius and inclusive face/edge/point tests are unchanged.
-            candidates = np.asarray(self._tree.query_ball_point(centre, radius, return_sorted=True), dtype=np.intp)
-            intersects = (np.all(self._upper[candidates] >= lower, axis=1)
-                          & np.all(self._lower[candidates] <= upper, axis=1))
-            candidates = candidates[intersects]
-            # END boolean selection retains the original sorted component IDs.
+            candidates = self._spatial_index.overlap_ids(lower, upper)
+        if not surface:
+            candidates = candidates[candidates >= self._counts[0]]
+        if not negative:
+            candidates = candidates[candidates < self._counts[0]]
+        return candidates
+
+    def component_identity(self, flat_index):
+        if type(flat_index) is not int or not 0 <= flat_index < sum(self._counts):
+            raise ValueError("A TSDF component identity must belong to this source map")
         surfaces, negatives, _ = self._counts
-        for index in candidates:
-            if index < surfaces:
-                if surface:
-                    yield "surface", int(index)
-            elif index < surfaces + negatives:
-                if negative:
-                    yield "negative", int(index - surfaces)
-            elif negative:
-                yield "negative_cell", int(index - surfaces - negatives)
+        if flat_index < surfaces:
+            return "surface", flat_index
+        if flat_index < surfaces+negatives:
+            return "negative", flat_index-surfaces
+        return "negative_cell", flat_index-surfaces-negatives
+    # END flat indices preserve the former surface/negative/cell enumeration.
 
     def _component_vertices(self, kind, index):
         """Materialize one selected component with the original arithmetic."""
@@ -436,59 +533,30 @@ class ObservedTsdfGeometry:
         primitives use translated/rotated coordinates, so their original
         vertices must undergo the same local conversion used before caching.
         Callers still compose the owner's current world pose for every query.
-        LRU eviction drops only this cache's reference; a yielded row keeps its
-        own shape and arrays alive until the ongoing query has consumed them.
+        Every cache entry lives until the source map is released. A later state
+        or a new rollout never rebuilds or evicts an already used component.
         """
-        for kind, index in self._iter_component_ids(bounds):
-            key = (kind, index)
-            component = self._collision_cache.get(key)
-            if component is None:
-                vertices = self._component_vertices(kind, index)
-                shape, local = coal_component(vertices)
-                points = (vertices - local[:3, 3]) @ local[:3, :3]
-                local.setflags(write=False)
-                points.setflags(write=False)
-                component = (shape, local, points)
-                self._collision_cache[key] = component
-                if len(self._collision_cache) > self._collision_cache_capacity:
-                    self._collision_cache.popitem(last=False)
-            else:
-                self._collision_cache.move_to_end(key)
-            yield kind, index, *component
+        for flat_index in self.component_indices(bounds):
+            yield self.collision_component(int(flat_index))
+
+    def collision_component(self, flat_index):
+        """Construct a selected native leaf once, preserving original arithmetic."""
+        kind, index = self.component_identity(flat_index)
+        key = (kind, index)
+        component = self._collision_cache.get(key)
+        if component is None:
+            vertices = self._component_vertices(kind, index)
+            shape, local = coal_component(vertices)
+            points = (vertices-local[:3, 3]) @ local[:3, :3]
+            local.setflags(write=False)
+            points.setflags(write=False)
+            component = (shape, local, points)
+            self._collision_cache[key] = component
+        return kind, index, *component
     # END no world pose, distance/contact result or permission enters the cache.
 
-    # BEGIN bounded batches borrow the same immutable component cache entries.
-    def iter_collision_batches(self, bounds, world_pose, batch_size=4096):
-        """Yield ordered components and their original NumPy world transforms.
-
-        Every matrix product remains the previous individual ``pose @ local``
-        operation. Preparing a later component may fail, but that exception is
-        deferred until the consumer asks beyond the prepared prefix: an earlier
-        decisive collision must retain its original stop and exception order.
-        A batch holds at most ``batch_size`` cache references, including entries
-        evicted while this batch is prepared; it never pins the whole map.
-        """
-        if type(batch_size) is not int or not 1 <= batch_size <= 4096:
-            raise ValueError("Collision batches require between 1 and 4096 components")
-        components = iter(self.iter_collision_components(bounds))
-        while True:
-            batch, poses, error = [], [], None
-            for _ in range(batch_size):
-                try:
-                    component = next(components)
-                    pose = world_pose @ component[3]
-                except StopIteration:
-                    break
-                except Exception as caught:
-                    error = caught
-                    break
-                batch.append(component)
-                poses.append(pose)
-            if batch:
-                yield batch, np.asarray(poses, dtype=np.float64)
-            if error is not None:
-                raise error
-            if len(batch) < batch_size:
-                return
-    # END batches contain geometry only; query results stay local to the caller.
+    # BEGIN spatial-query scheduling now owns the only original-order batches.
+    # tsdf_spatial_query.iter_component_distances borrows collision_component
+    # entries and defers preparation errors until their original source order.
+    # END the former unfiltered batch iterator has no remaining callers.
 # END one observed reconstruction supplies both zero distances and negative material.

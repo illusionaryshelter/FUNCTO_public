@@ -24,6 +24,13 @@ from scipy.interpolate import BSpline, CubicHermiteSpline
 from .planning_problem import event_occurrence_key
 from .geometry_motion_bound import SphereBody, build_geometry_motion_bound
 from .collision_records import encode_array
+# BEGIN physical memory ownership is independent of optimizer workspace size.
+from .resource_admission import (
+    ResourceLimitError, require_host_memory,
+    DEFAULT_MAX_HOST_RSS_BYTES, MAX_HOST_RSS_BYTES,
+    DEFAULT_MAX_DEVICE_USED_BYTES, MAX_DEVICE_USED_BYTES, MIN_DEVICE_FREE_BYTES,
+)
+# END source geometry and native CUDA buffers use the same typed refusals.
 
 # BEGIN final validation separates total finite work from live geometry storage.
 _VALIDATION_CHUNK_SIZE = 256
@@ -105,7 +112,11 @@ class PlanningBudget:
     max_robot_spheres: int = 256
     max_robot_dof: int = 16
     max_robot_links: int = 64
-    max_scene_workspace_bytes: int = 1024**3
+    # BEGIN GPU scene workspaces exclude all resident CPU source geometry.
+    max_scene_gpu_workspace_bytes: int = 1024**3
+    max_host_rss_bytes: int = DEFAULT_MAX_HOST_RSS_BYTES
+    max_device_used_bytes: int = DEFAULT_MAX_DEVICE_USED_BYTES
+    # END larger physical limits require an explicit request, never a fallback.
     max_validation_points: int = 4096
     validation_joint_step: float = 0.025
     # BEGIN metric sampling also has meaning for analytic solids without voxels.
@@ -138,16 +149,17 @@ class PlanningBudget:
                 or not 0 <= self.max_refinement_points <= self.max_validation_points):
             raise ValueError("Refinement points must fit the finite validation-point budget")
         # END bound optional samples without capping a skill's source knots.
-        # BEGIN admit explicit TSDF scene storage within bounded local resources.
-        # The default remains one GiB. This bound includes shared CPU TSDF
-        # records/BVHs and bounded native-component caches as well as query
-        # tensors. The explicit six-GiB allowance accommodates those shared
-        # CPU allocations; it is not a device-usage or total-RSS cap. The
-        # separate native reserve, actual-device/anchor admission and external
-        # process guards remain mandatory. Default callers still request 1 GiB.
-        if type(self.max_scene_workspace_bytes) is not int or not 0 <= self.max_scene_workspace_bytes <= 6*1024**3:
-            raise ValueError("Scene workspaces must remain within the local six-GiB allocation budget")
-        # END no query geometry, sample count or collision threshold changes.
+        # BEGIN physical host/device caps are separate from GPU scene capacity.
+        if (type(self.max_scene_gpu_workspace_bytes) is not int
+                or not 0 <= self.max_scene_gpu_workspace_bytes <= 6*1024**3):
+            raise ValueError("GPU scene workspaces must remain within the local six-GiB allocation budget")
+        if (type(self.max_host_rss_bytes) is not int
+                or not 0 < self.max_host_rss_bytes <= MAX_HOST_RSS_BYTES):
+            raise ValueError("Host RSS must remain within the explicit ten-GiB maximum")
+        if (type(self.max_device_used_bytes) is not int
+                or not 0 < self.max_device_used_bytes <= MAX_DEVICE_USED_BYTES):
+            raise ValueError("Device usage must remain within the explicit eight-GiB maximum")
+        # END defaults retain the existing half-host/half-device resource limits.
         for name in ("interpolation_dt", "maximum_trajectory_dt", "constraint_weight", "validation_joint_step",
                      "validation_spatial_step_m", "planning_seconds"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
@@ -600,17 +612,6 @@ class PlanningResult:
 
 
 # BEGIN size required evidence and native anchor buffers from the actual request.
-class ResourceLimitError(ValueError):
-    """An explicit byte-cap refusal, distinct from malformed inputs or APIs."""
-
-    def __init__(self, resource, required_bytes, limit_bytes, *, description="Resource capacity exceeded"):
-        self.resource = str(resource)
-        self.required_bytes = int(required_bytes)
-        self.limit_bytes = int(limit_bytes)
-        super().__init__(f"{description} ({self.resource}): required {self.required_bytes} bytes, "
-                         f"allowed {self.limit_bytes} bytes")
-
-
 def _anchor_capacity(progress_map, anchors, budget, refinement_parameters=()):
     """Keep every required clock anchor; bound only additional refinement.
 
@@ -707,8 +708,35 @@ def _validation_storage_admission(problem, scene, robot_metadata, budget):
         "layered_body_records_per_typed_state": sum(len(row[2]) for row in pairs)}
 
 
+# BEGIN one value carries independent host/device ownership through rebuilds.
+@dataclass(frozen=True)
+class _PlanningWorkspace:
+    """Scene capacity plus one live query, with optional native graph pools."""
+
+    cpu_shared_bytes: int
+    cpu_live_bytes: int
+    gpu_eager_bytes: int
+    gpu_graph_bytes: int
+    anchor_fk_bytes: int
+    trajectory_graph: bool
+
+    @property
+    def cpu_bytes(self):
+        return self.cpu_shared_bytes+self.cpu_live_bytes
+
+    @property
+    def gpu_bytes(self):
+        return self.gpu_eager_bytes+(self.gpu_graph_bytes if self.trajectory_graph else 0)
+
+    @property
+    def total_bytes(self):
+        """Diagnostic scene total; it is never a CUDA allocation request."""
+        return self.cpu_bytes+self.gpu_bytes
+# END graph admission changes only the two separately retained GPU pools.
+
+
 def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
-    """Return scene bytes, anchor-FK bytes and trajectory graph admission.
+    """Return CPU/GPU scene capacity, anchor FK and graph eligibility.
 
     The main native rollout retains its original control horizon. Each trajectory
     manager evaluates the required anchors with a separate native FK model,
@@ -745,16 +773,18 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     allocations = [(copies, scene.estimated_workspace_allocation(batch, scene_factor*length,
                         robot_coverage_horizon=length if guidance else 0))
                    for copies, batch, length, guidance in allocation_shapes]
-    scene_bytes = (sum(copies*value["retained"] for copies, value in allocations)
-                   + max(value["live"] for _, value in allocations)
-                   + max(value["shared_grids"] for _, value in allocations)
-                   + max(value["shared_cpu"] for _, value in allocations))
+    # BEGIN CPU residency cannot consume the GPU scene budget or graph pools.
+    gpu_eager_bytes = (sum(copies*value["gpu_retained"] for copies, value in allocations)
+                       + max(value["gpu_live"] for _, value in allocations)
+                       + max(value["gpu_shared"] for _, value in allocations))
+    cpu_shared_bytes = max(value["cpu_shared"] for _, value in allocations)
+    cpu_live_bytes = max(value["cpu_live"] for _, value in allocations)
     # END geometry/query sets and the unchanged hard memory budget are preserved.
     # END all live optimization scratch remains under the unchanged hard budget.
-    if scene_bytes > budget.max_scene_workspace_bytes:
+    if gpu_eager_bytes > budget.max_scene_gpu_workspace_bytes:
         # BEGIN report the actual bound so a refused trial is reproducible.
-        raise ResourceLimitError("scene_workspace", scene_bytes, budget.max_scene_workspace_bytes,
-            description="Independent scene query workspaces exceed the declared local allocation budget")
+        raise ResourceLimitError("scene_gpu_workspace", gpu_eager_bytes, budget.max_scene_gpu_workspace_bytes,
+            description="Independent GPU scene query workspaces exceed the declared local allocation budget")
         # END reporting a shortfall does not alter the allocation contract.
     # BEGIN choose capture scope before allocation, preserving eager admission.
     # Each trajectory entry/inner executor retains a private pool in addition
@@ -763,13 +793,11 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     # declared capacity retains the unchanged native eager optimizer as well;
     # neither case changes required queries, arithmetic or iteration counts.
     # BEGIN CPU source validation has no allocations inside either graph pool.
-    graph_live = max(value["graph_live"] for (_, value), (_, _, _, guidance)
+    graph_live = max(value["gpu_graph_live"] for (_, value), (_, _, _, guidance)
                      in zip(allocations, allocation_shapes) if guidance)
     # END the ordinary live bound above still reserves all validation scratch.
-    graph_scene_bytes = scene_bytes+2*graph_live
-    trajectory_graph = not scene.contacts and graph_scene_bytes <= budget.max_scene_workspace_bytes
-    if trajectory_graph:
-        scene_bytes = graph_scene_bytes
+    graph_scene_bytes = gpu_eager_bytes+2*graph_live
+    trajectory_graph = not scene.contacts and graph_scene_bytes <= budget.max_scene_gpu_workspace_bytes
     # END no independent captured pool is treated as reusable eager scratch.
     dof, links, spheres = (len(robot_metadata["active_joint_names"]),
                            robot_metadata["links"], robot_metadata["spheres"])
@@ -793,10 +821,21 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     bytes_per_state = 4*(22+8*spheres+8*dof+12*links)+self_bytes_per_state
     # END anchor collision buffers share the existing finite admission limit.
     anchor_fk_bytes = 22*budget.trajectory_seeds*anchor_capacity*bytes_per_state
-    return int(scene_bytes), int(anchor_fk_bytes), trajectory_graph
+    return _PlanningWorkspace(int(cpu_shared_bytes), int(cpu_live_bytes), int(gpu_eager_bytes),
+                              int(2*graph_live), int(anchor_fk_bytes), bool(trajectory_graph))
+    # END current device usage is checked separately before any native allocation.
 
 
-def _require_planning_memory(torch, device, scene_bytes, anchor_fk_bytes):
+def _require_planning_host_memory(workspace, *, max_host_rss_bytes):
+    """Reserve live CPU work and every still-lazy, identity-deduplicated shape."""
+    from .tsdf_geometry import ObservedTsdfGeometry
+
+    require_host_memory(workspace.cpu_live_bytes,
+        pending_existing_bytes=ObservedTsdfGeometry.pending_storage_total_nbytes(),
+        max_rss_bytes=max_host_rss_bytes)
+
+
+def _require_planning_memory(torch, device, workspace, *, max_device_used_bytes):
     """Admit Torch buffers without promising cached memory to native allocators.
 
     CollisionBuffer and native FK buffers use torch.zeros. Unused capacity in
@@ -805,8 +844,14 @@ def _require_planning_memory(torch, device, scene_bytes, anchor_fk_bytes):
     separate two-GiB allowance covers main FK, general pose/sphere transform
     graphs, solver/model and trajectory storage; it must still fit driver-
     reported free memory independently of the geometry-query tensor cache.
+
+    CPU source geometry is already host-admitted and never enters this check.
+    If the extra graph pools do not fit but the eager solver does, retain the
+    existing eager path with the same geometry, samples and optimizer work.
     """
-    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if type(max_device_used_bytes) is not int or not 0 < max_device_used_bytes <= MAX_DEVICE_USED_BYTES:
+        raise ValueError("Device admission requires an explicit limit no larger than eight GiB")
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     reusable_torch_bytes = max(0, torch.cuda.memory_reserved(device)-torch.cuda.memory_allocated(device))
     other_native_bytes = 2*1024**3
     # BEGIN expose only explicit capacity comparisons as resource refusals.
@@ -814,11 +859,35 @@ def _require_planning_memory(torch, device, scene_bytes, anchor_fk_bytes):
     if free_bytes < other_native_bytes:
         raise ResourceLimitError("gpu_native_reserve", other_native_bytes, free_bytes,
                                  description=description)
-    required_bytes = other_native_bytes+scene_bytes+anchor_fk_bytes
-    available_bytes = free_bytes+reusable_torch_bytes
-    if available_bytes < required_bytes:
-        raise ResourceLimitError("gpu_planner_workspace", required_bytes, available_bytes,
-                                 description=description)
+    def refusal(candidate):
+        required_bytes = other_native_bytes+candidate.gpu_bytes+candidate.anchor_fk_bytes
+        available_bytes = free_bytes+reusable_torch_bytes
+        if available_bytes < required_bytes:
+            return ResourceLimitError("gpu_planner_workspace", required_bytes, available_bytes,
+                                      description=description)
+        # Cached Torch pages are already included in device-used. Only their
+        # unused part can satisfy future tensors without increasing that value;
+        # the native reserve cannot borrow those allocator-owned pages.
+        new_bytes = other_native_bytes+max(0, candidate.gpu_bytes+candidate.anchor_fk_bytes-reusable_torch_bytes)
+        projected_used = total_bytes-free_bytes+new_bytes
+        if projected_used > max_device_used_bytes:
+            return ResourceLimitError("gpu_device_used", projected_used, max_device_used_bytes,
+                                      description="Planner allocations exceed the request device-used limit")
+        if new_bytes+MIN_DEVICE_FREE_BYTES > free_bytes:
+            return ResourceLimitError("gpu_free_reserve", new_bytes+MIN_DEVICE_FREE_BYTES, free_bytes,
+                                      description="Device memory must retain two GiB after planner allocations")
+        return None
+
+    error = refusal(workspace)
+    if error is not None and workspace.trajectory_graph:
+        eager = replace(workspace, trajectory_graph=False)
+        eager_error = refusal(eager)
+        if eager_error is None:
+            return eager
+        error = eager_error
+    if error is not None:
+        raise error
+    return workspace
     # END CUDA API errors retain their original exception identity.
 # END size required evidence and native anchor buffers from the actual request.
 
@@ -3283,7 +3352,7 @@ class _CuroboPlanner:
         # Continuation filtering and hand-clock binding precede this snapshot.
         # Native managers/search children share its immutable geometry while
         # supplying their own owner/release poses for every source query.
-        scene.bind_source_scene()
+        scene.bind_source_scene(max_host_rss_bytes=budget.max_host_rss_bytes)
         # END execution keeps its own independently bound checker and arrival latches.
         self.anchor_capacity = _anchor_capacity(self.progress_map, anchors, budget)
         robot_dict, self.robot_metadata = _bounded_robot_configuration(robot, problem, scene, budget)
@@ -3317,9 +3386,8 @@ class _CuroboPlanner:
                 joint = int(checker.model.parents[joint])
         # END source identity is established before allocating GPU solvers.
         self.validation_storage = _validation_storage_admission(problem, scene, self.robot_metadata, budget)
-        (self.scene_workspace_bytes, self.anchor_fk_workspace_bytes,
-         self._trajectory_optimizer_graph_admitted) = _planning_workspace_bytes(
-            scene, self.robot_metadata, budget, self.anchor_capacity)
+        workspace = _planning_workspace_bytes(scene, self.robot_metadata, budget, self.anchor_capacity)
+        _require_planning_host_memory(workspace, max_host_rss_bytes=budget.max_host_rss_bytes)
         # END preserve all required source points within the total query budget.
         import torch
         from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
@@ -3341,8 +3409,12 @@ class _CuroboPlanner:
         self.torch, self.JointState, self.GoalToolPose = torch, JointState, GoalToolPose
         self.device_cfg = DeviceCfg(device)
         # BEGIN include request-sized anchor FK in native allocation admission.
-        _require_planning_memory(torch, self.device_cfg.device,
-                                 self.scene_workspace_bytes, self.anchor_fk_workspace_bytes)
+        workspace = _require_planning_memory(torch, self.device_cfg.device, workspace,
+                                             max_device_used_bytes=budget.max_device_used_bytes)
+        self.scene_workspace_bytes = workspace.total_bytes
+        self.scene_cpu_workspace_bytes, self.scene_gpu_workspace_bytes = workspace.cpu_bytes, workspace.gpu_bytes
+        self.anchor_fk_workspace_bytes = workspace.anchor_fk_bytes
+        self._trajectory_optimizer_graph_admitted = workspace.trajectory_graph
         # END include request-sized anchor FK in native allocation admission.
         self.ik = self.trajopt = None
         self.anchors = anchors
@@ -3985,7 +4057,24 @@ class _CuroboPlanner:
         witnesses = [row for row in before if row["guidance_weight"] < 1.]
         if check is not None:
             check()
-        replacement, report = self.scene.refine_background(witnesses)
+        # BEGIN host construction refusals preserve the still-running scene.
+        # Source-array/tree allocation is admitted inside the builder, before
+        # a replacement exists. Only typed capacity refusals are recoverable;
+        # mapper/API/model errors retain their original exception identity.
+        construction_refusal = None
+        try:
+            replacement, report = self.scene.refine_background(witnesses)
+        except ResourceLimitError as error:
+            construction_refusal = {"resource": error.resource, "required_bytes": error.required_bytes,
+                                    "limit_bytes": error.limit_bytes, "reason": str(error)}
+        if construction_refusal is not None:
+            gc.collect()
+            if check is not None:
+                check()
+            return {"status": "resource_refused", "updated": False,
+                    "resource_refusal": construction_refusal, "sampled_times": len(parameters),
+                    "sampled_seeds": len(controls), "before": summarize(before)}
+        # END failed construction never reaches scene/solver replacement.
         report = {**report, "sampled_times": len(parameters), "sampled_seeds": len(controls),
                   "updated": replacement is not None, "before": summarize(before)}
         if replacement is None:
@@ -4000,9 +4089,10 @@ class _CuroboPlanner:
         try:
             storage = _validation_storage_admission(self.problem, replacement, self.robot_metadata, self.budget)
             capacity = _anchor_capacity(self.progress_map, self.anchors, self.budget, self.refinement_parameters)
-            scene_bytes, anchor_bytes, graph = _planning_workspace_bytes(
-                replacement, self.robot_metadata, self.budget, capacity)
-            _require_planning_memory(self.torch, self.device_cfg.device, scene_bytes, anchor_bytes)
+            workspace = _planning_workspace_bytes(replacement, self.robot_metadata, self.budget, capacity)
+            _require_planning_host_memory(workspace, max_host_rss_bytes=self.budget.max_host_rss_bytes)
+            workspace = _require_planning_memory(self.torch, self.device_cfg.device, workspace,
+                                                 max_device_used_bytes=self.budget.max_device_used_bytes)
         except ResourceLimitError as error:
             refusal = {"resource": error.resource, "required_bytes": error.required_bytes,
                        "limit_bytes": error.limit_bytes, "reason": str(error)}
@@ -4015,8 +4105,9 @@ class _CuroboPlanner:
             if check is not None:
                 check()
             return report
-        report["planner_admission"] = {"scene_workspace_bytes": scene_bytes,
-            "anchor_fk_workspace_bytes": anchor_bytes, "trajectory_graph": graph,
+        report["planner_admission"] = {"scene_workspace_bytes": workspace.total_bytes,
+            "scene_cpu_workspace_bytes": workspace.cpu_bytes, "scene_gpu_workspace_bytes": workspace.gpu_bytes,
+            "anchor_fk_workspace_bytes": workspace.anchor_fk_bytes, "trajectory_graph": workspace.trajectory_graph,
             "validation_storage": deepcopy(storage)}
         self.validation_storage = storage
         # END ordinary geometry/shape/runtime errors are never resource refusals.
@@ -4055,20 +4146,23 @@ class _CuroboPlanner:
             raise ValueError("Unknown trajectory optimization phase")
         # END capacity is admitted before destroying the working solver.
         capacity = _anchor_capacity(progress_map, self.anchors, self.budget, parameters)
-        scene_bytes, anchor_fk_bytes, trajectory_graph = _planning_workspace_bytes(
-            self.scene, self.robot_metadata, self.budget, capacity)
+        workspace = _planning_workspace_bytes(self.scene, self.robot_metadata, self.budget, capacity)
+        _require_planning_host_memory(workspace, max_host_rss_bytes=self.budget.max_host_rss_bytes)
         self.trajopt.destroy()
         self.trajopt = None
         # Native destroy() releases graphs, while optimizer callbacks can keep
         # rollout tensors in a reference cycle. Collect only at this explicit
         # replacement boundary before querying live allocator statistics.
         gc.collect()
-        _require_planning_memory(self.torch, self.device_cfg.device, scene_bytes, anchor_fk_bytes)
+        workspace = _require_planning_memory(self.torch, self.device_cfg.device, workspace,
+                                             max_device_used_bytes=self.budget.max_device_used_bytes)
         self.refinement_parameters = parameters
         self.phase = selected_phase
         self.anchor_capacity = capacity
-        self.scene_workspace_bytes, self.anchor_fk_workspace_bytes = scene_bytes, anchor_fk_bytes
-        self._trajectory_optimizer_graph_admitted = trajectory_graph
+        self.scene_workspace_bytes = workspace.total_bytes
+        self.scene_cpu_workspace_bytes, self.scene_gpu_workspace_bytes = workspace.cpu_bytes, workspace.gpu_bytes
+        self.anchor_fk_workspace_bytes = workspace.anchor_fk_bytes
+        self._trajectory_optimizer_graph_admitted = workspace.trajectory_graph
         manager_type = _process_manager_type(self.problem, self.scene, progress_map, self.anchors,
                                              self.budget, parameters,
                                              clock=self.formal_clock, seed_parameter=self.seed_parameter,
@@ -5307,6 +5401,8 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             native_trajectory_dt=planner.budget.maximum_trajectory_dt,
             progress_parameter_error_bound=_PROGRESS_PARAMETER_ERROR, progress_clock_max_keys=_MAX_PROGRESS_KEYS,
             scene=scene.describe(), scene_workspace_bytes=planner.scene_workspace_bytes,
+            scene_cpu_workspace_bytes=planner.scene_cpu_workspace_bytes,
+            scene_gpu_workspace_bytes=planner.scene_gpu_workspace_bytes,
             anchor_fk_workspace_bytes=planner.anchor_fk_workspace_bytes, exact_anchor_capacity=planner.anchor_capacity,
             validation_storage=deepcopy(getattr(planner, "validation_storage", {})))
         stage = "initial_state_verification"
@@ -5611,7 +5707,8 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 planner.ik.solve_pose = original_ik_solve
             if original_ik_rank is not None:
                 planner._rank_ik_candidates = original_ik_rank
-            for name in ("scene_workspace_bytes", "anchor_fk_workspace_bytes", "anchor_capacity"):
+            for name in ("scene_workspace_bytes", "scene_cpu_workspace_bytes", "scene_gpu_workspace_bytes",
+                         "anchor_fk_workspace_bytes", "anchor_capacity"):
                 diagnostics["exact_anchor_capacity" if name == "anchor_capacity" else name] = getattr(planner, name)
             try:
                 planner.close()

@@ -37,6 +37,7 @@ from manipulation.planning import (
     # BEGIN actual-anchor allocation and projection preflight regressions.
     _anchor_capacity,
     _planning_workspace_bytes,
+    _PlanningWorkspace,
     _projection_tolerance,
     _require_planning_memory,
     # END actual-anchor allocation and projection preflight regressions.
@@ -2083,7 +2084,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         metadata = self.robot_metadata()
         native = SimpleNamespace(num_pose_links=1, num_spheres=512, num_dof=16, num_links=64)
         scene = SimpleNamespace(required_progress_anchors=(), contacts=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
-                                {"retained": 0, "live": 0, "shared_cpu": 0, "shared_grids": 0, "graph_live": 0})
+                                {"gpu_retained": 0, "gpu_live": 0, "cpu_shared": 0, "cpu_live": 0, "gpu_shared": 0, "gpu_graph_live": 0})
         budget = PlanningBudget(max_validation_points=8192)
         before_cuda = torch.cuda.is_initialized()
         # BEGIN the anchor admission bound includes native self-cost buffers.
@@ -2118,24 +2119,29 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             # scalar, covered by the existing fixed native memory reserve.
             self.assertEqual(self_cost._pair_distance.numel(), 1)
             # END no real GPU allocation is needed to validate the admission bound.
-            _, actual, _ = _planning_workspace_bytes(scene, metadata, budget, count)
+            actual = _planning_workspace_bytes(scene, metadata, budget, count).anchor_fk_bytes
             self.assertEqual(actual, expected)
         self.assertGreater(actual, 6*1024**3)
         self.assertEqual(torch.cuda.is_initialized(), before_cuda)
 
     def test_torch_cache_covers_tensors_but_not_the_other_native_reserve(self):
         native_reserve = 2*1024**3
-        cuda = SimpleNamespace(mem_get_info=Mock(return_value=(native_reserve+500, 12*1024**3)),
+        cuda = SimpleNamespace(mem_get_info=Mock(return_value=(6*1024**3, 8*1024**3)),
                                memory_reserved=Mock(return_value=400), memory_allocated=Mock(return_value=101))
         runtime = SimpleNamespace(cuda=cuda)
-        with self.assertRaisesRegex(ValueError, "anchor FK"):
-            _require_planning_memory(runtime, "cuda:0", 200, 600)
+        workspace = _PlanningWorkspace(0, 0, 200, 0, 600, False)
+        # Existing cached pages count in device-used but can satisfy future
+        # tensors. One byte less reuse must fail the actual physical limit.
+        with self.assertRaisesRegex(ValueError, "device-used"):
+            _require_planning_memory(runtime, "cuda:0", workspace,
+                                     max_device_used_bytes=4*1024**3+500)
         cuda.memory_allocated.return_value = 100
-        _require_planning_memory(runtime, "cuda:0", 200, 600)
+        self.assertIs(_require_planning_memory(runtime, "cuda:0", workspace,
+                                               max_device_used_bytes=4*1024**3+500), workspace)
         cuda.mem_get_info.return_value = native_reserve-1, 12*1024**3
         cuda.memory_reserved.return_value = 10*1024**3
         with self.assertRaisesRegex(ValueError, "GPU memory"):
-            _require_planning_memory(runtime, "cuda:0", 200, 600)
+            _require_planning_memory(runtime, "cuda:0", workspace, max_device_used_bytes=8*1024**3)
 
     def test_refinement_rechecks_workspaces_without_retiming(self):
         import gc
@@ -2146,7 +2152,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planner.anchors = np.array([0., 1., 2.])
         planner.problem = object()
         planner.scene = SimpleNamespace(required_progress_anchors=(), contacts=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
-                                        {"retained": batch*horizon, "live": 0, "shared_cpu": 0, "shared_grids": 0, "graph_live": 0})
+                                        {"gpu_retained": batch*horizon, "gpu_live": 0, "cpu_shared": 0, "cpu_live": 0, "gpu_shared": 0, "gpu_graph_live": 0})
         planner.robot_metadata = self.robot_metadata()
         planner.progress_map = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
         planner.seed_parameter, planner.formal_clock, planner.robot_dict = object(), {}, {}
@@ -2199,7 +2205,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             self.assertEqual(planner.anchor_capacity, 4)
             expected = _planning_workspace_bytes(planner.scene, planner.robot_metadata, planner.budget, 4)
             self.assertEqual((planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes,
-                              planner._trajectory_optimizer_graph_admitted), expected)
+                              planner._trajectory_optimizer_graph_admitted),
+                             (expected.total_bytes, expected.anchor_fk_bytes, expected.trajectory_graph))
+            self.assertEqual((planner.scene_cpu_workspace_bytes, planner.scene_gpu_workspace_bytes),
+                             (expected.cpu_bytes, expected.gpu_bytes))
             destroyed.assert_called_once_with()
             collect.assert_called_once_with()
             manager.assert_called_once()
@@ -2260,14 +2269,14 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
 
     def test_scene_budget_and_removed_legacy_parameter_remain_strict(self):
         # BEGIN explicit TSDF storage capacity does not weaken workspace admission.
-        self.assertEqual(PlanningBudget().max_scene_workspace_bytes, 1024**3)
-        self.assertEqual(PlanningBudget(max_scene_workspace_bytes=6*1024**3).max_scene_workspace_bytes,
+        self.assertEqual(PlanningBudget().max_scene_gpu_workspace_bytes, 1024**3)
+        self.assertEqual(PlanningBudget(max_scene_gpu_workspace_bytes=6*1024**3).max_scene_gpu_workspace_bytes,
                          6*1024**3)
         with self.assertRaisesRegex(ValueError, "six-GiB allocation budget"):
-            PlanningBudget(max_scene_workspace_bytes=6*1024**3+1)
+            PlanningBudget(max_scene_gpu_workspace_bytes=6*1024**3+1)
         # END requests above the local ceiling still fail before allocations.
         scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
-                                {"retained": 1024**3, "live": 0, "shared_cpu": 0, "shared_grids": 0, "graph_live": 0})
+                                {"gpu_retained": 1024**3, "gpu_live": 0, "cpu_shared": 0, "cpu_live": 0, "gpu_shared": 0, "gpu_graph_live": 0})
         with self.assertRaisesRegex(ValueError, "scene query workspaces"):
             _planning_workspace_bytes(scene, self.robot_metadata(), PlanningBudget(), 322)
         with self.assertRaises(TypeError):
@@ -2282,13 +2291,13 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         # query/packing/dedup scratch in the two CUDA pools. Immutable grids
         # remain shared across both graph pools and all independent scenes.
         estimator = Mock(side_effect=lambda batch, horizon, *, robot_coverage_horizon:
-            {"retained": 5, "live": 100 if robot_coverage_horizon else 150,
-             "shared_cpu": 17, "shared_grids": 23,
-             "graph_live": 60 if robot_coverage_horizon else 90})
+            {"gpu_retained": 5, "gpu_live": 100 if robot_coverage_horizon else 150,
+             "cpu_shared": 17, "cpu_live": 31, "gpu_shared": 23,
+             "gpu_graph_live": 60 if robot_coverage_horizon else 90})
         scene = SimpleNamespace(required_progress_anchors=(), contacts=(),
                                 estimated_workspace_allocation=estimator)
         metadata = self.robot_metadata()
-        eager_bytes = 13*5+150+17+23
+        eager_bytes = 13*5+150+23
         graph_bytes = eager_bytes+2*60
         # END the ordinary eager bound still includes the complete 150-byte peak.
         for capacity, expected_bytes, expected_graph in (
@@ -2297,17 +2306,18 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                 (graph_bytes, graph_bytes, True)):
             with self.subTest(capacity=capacity):
                 estimator.reset_mock()
-                actual, _, graph = _planning_workspace_bytes(scene, metadata,
-                    PlanningBudget(max_scene_workspace_bytes=capacity), 1)
-                self.assertEqual((actual, graph), (expected_bytes, expected_graph))
+                actual = _planning_workspace_bytes(scene, metadata,
+                    PlanningBudget(max_scene_gpu_workspace_bytes=capacity), 1)
+                self.assertEqual((actual.gpu_bytes, actual.trajectory_graph), (expected_bytes, expected_graph))
+                self.assertEqual(actual.cpu_bytes, 17+31)
                 self.assertEqual(estimator.call_count, 5)
         scene.contacts = (object(),)
-        actual, _, graph = _planning_workspace_bytes(scene, metadata,
-            PlanningBudget(max_scene_workspace_bytes=graph_bytes), 1)
-        self.assertEqual((actual, graph), (eager_bytes, False))
+        actual = _planning_workspace_bytes(scene, metadata,
+            PlanningBudget(max_scene_gpu_workspace_bytes=graph_bytes), 1)
+        self.assertEqual((actual.gpu_bytes, actual.trajectory_graph), (eager_bytes, False))
         with self.assertRaisesRegex(ValueError, "required .* allowed"):
             _planning_workspace_bytes(scene, metadata,
-                PlanningBudget(max_scene_workspace_bytes=eager_bytes-1), 1)
+                PlanningBudget(max_scene_gpu_workspace_bytes=eager_bytes-1), 1)
 
     def test_scene_allocation_keeps_all_caches_and_only_one_sequential_live_graph(self):
         from dataclasses import replace
@@ -2353,37 +2363,41 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             interpolation_buffer_size=768, max_refinement_points=16, max_validation_points=512)
         metadata = {"active_joint_names": range(7), "links": 13, "spheres": 416}
         cuda_before = torch.cuda.is_initialized()
-        empty_bytes, _, _ = _planning_workspace_bytes(world, metadata, budget, 22)
+        empty = _planning_workspace_bytes(world, metadata, budget, 22)
         cells.centres = np.broadcast_to(0., (250000, 3))
         cells.halves = np.broadcast_to(0., (250000, 3))
         cells.rotations = np.broadcast_to(0., (250000, 3, 3))
         with patch.object(world, "estimated_workspace_allocation", wraps=world.estimated_workspace_allocation) as estimate:
-            complete_bytes, _, _ = _planning_workspace_bytes(world, metadata, budget, 22)
-        self.assertEqual(complete_bytes-empty_bytes, 250000*15*8)
-        self.assertLess(complete_bytes, 1024**3)
-        self.assertGreater(complete_bytes, 900*1024**2)
+            complete = _planning_workspace_bytes(world, metadata, budget, 22)
+        self.assertEqual(complete.cpu_bytes-empty.cpu_bytes, 250000*15*8)
+        self.assertEqual(complete.gpu_bytes, empty.gpu_bytes)
+        self.assertEqual(complete.trajectory_graph, empty.trajectory_graph)
+        self.assertLess(complete.gpu_bytes, budget.max_scene_gpu_workspace_bytes)
         self.assertTrue(any(call.args == (4, 3*(81+22))
                             and call.kwargs["robot_coverage_horizon"] == 81+22
                             for call in estimate.call_args_list))
         with self.assertRaisesRegex(ValueError, "required .* allowed"):
-            _planning_workspace_bytes(world, metadata, replace(budget, max_scene_workspace_bytes=900*1024**2), 22)
+            _planning_workspace_bytes(world, metadata,
+                replace(budget, max_scene_gpu_workspace_bytes=complete.gpu_eager_bytes-1), 22)
         # BEGIN complete validation must fit both planner and native-query guards.
         from manipulation.planning_scene import CuroboSphereQuery
         cells.centres = np.broadcast_to(0., (45655, 3))
         cells.halves = np.broadcast_to(0., (45655, 3))
         cells.rotations = np.broadcast_to(0., (45655, 3, 3))
-        expanded = replace(budget, max_validation_points=1536, max_scene_workspace_bytes=2*1024**3)
-        complete_bytes, _, _ = _planning_workspace_bytes(world, metadata, expanded, 20)
+        expanded = replace(budget, max_validation_points=1536, max_scene_gpu_workspace_bytes=2*1024**3)
+        complete = _planning_workspace_bytes(world, metadata, expanded, 20)
         # BEGIN total validation work does not enlarge live geometry batches.
         large_work = replace(expanded, max_validation_points=32768)
-        self.assertEqual(complete_bytes, _planning_workspace_bytes(world, metadata, large_work, 20)[0])
-        self.assertLess(complete_bytes, expanded.max_scene_workspace_bytes)
+        self.assertEqual(complete, _planning_workspace_bytes(world, metadata, large_work, 20))
+        self.assertLess(complete.gpu_bytes, expanded.max_scene_gpu_workspace_bytes)
         # BEGIN shared source storage and one serial query workspace are each counted once.
         world._source_scene_checker = SimpleNamespace(scene_storage_nbytes=131072,
                                                        scene_query_workspace_nbytes=98304)
         # BEGIN the bounded ordinary/dense report store is live once per candidate.
-        self.assertEqual(_planning_workspace_bytes(world, metadata, expanded, 20)[0]-complete_bytes,
+        admitted = _planning_workspace_bytes(world, metadata, expanded, 20)
+        self.assertEqual(admitted.cpu_bytes-complete.cpu_bytes,
                          131072+98304+32*1024**2)
+        self.assertEqual(admitted.gpu_bytes, complete.gpu_bytes)
         # END it is neither a per-rollout nor a captured-graph allocation.
         # END rollout counts multiply neither the immutable source scene nor its live CPU query.
         query = CuroboSphereQuery(SimpleNamespace(get_sphere_distance_raw=lambda *args, **kwargs: None),
@@ -3045,6 +3059,7 @@ class InitialStatePreflightTests(unittest.TestCase):
             evaluate_source=Mock(side_effect=evaluate_source))
         # END no proxy component callback can stand in for the source entrance verdict.
         planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes, planner.anchor_capacity = 64, 32, 4
+        planner.scene_cpu_workspace_bytes, planner.scene_gpu_workspace_bytes = 24, 40
         planner.reference_seeds = Mock(side_effect=AssertionError("an infeasible fixed entrance must stop before IK"))
         planner.optimize, planner.ompl_seed, planner.close = Mock(), Mock(), Mock()
         return planner, cspace, collision
@@ -3159,7 +3174,8 @@ class PlannerRetryContractTests(unittest.TestCase):
             formal_clock={"duration": 1.}, refinement_parameters=np.empty(0),
             optimize_phases=stages,
             # BEGIN explicit allocation diagnostics in the CPU retry fixture.
-            scene_workspace_bytes=64, anchor_fk_workspace_bytes=32, anchor_capacity=4,
+            scene_workspace_bytes=64, scene_cpu_workspace_bytes=24, scene_gpu_workspace_bytes=40,
+            anchor_fk_workspace_bytes=32, anchor_capacity=4,
             # END explicit allocation diagnostics in the CPU retry fixture.
             progress_map=_ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
             ik=SimpleNamespace(config=SimpleNamespace(exit_early=False)),

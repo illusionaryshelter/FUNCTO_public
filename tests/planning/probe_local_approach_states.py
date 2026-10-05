@@ -317,7 +317,7 @@ def run(args):
         for key in ("manifest", "feedback", "robot_fixture", "execution_limits", "finger_targets"):
             if Path(original[f"{key}_path"]).resolve() != getattr(args, key).resolve():
                 raise ValueError(f"Changed original runner input: {key}")
-        if args.scene_workspace_mib != 2048 or args.torch_memory_mib != 4096 or args.trajectory_seeds != 1:
+        if args.scene_gpu_workspace_mib != 2048 or args.torch_memory_mib != 4096 or args.trajectory_seeds != 1:
             raise ValueError("Keep the original 2-GiB scene, 4-GiB Torch and one-seed budget")
         with patch("recorded_task_planning.plan_and_record", new=capture), \
              patch.object(planning._CuroboPlanner, "reference_seeds", new=forbidden), \
@@ -368,7 +368,11 @@ def parse_args():
     for name, default in (("knots", 16), ("interpolation-buffer-size", 768), ("ik-seeds", 2),
                           ("trajectory-seeds", 1), ("max-validation-points", 4096), ("max-refinement-points", 16)):
         parser.add_argument("--"+name, type=int, default=default)
-    parser.add_argument("--scene-workspace-mib", type=int, choices=(2048,), default=2048)
+    parser.add_argument("--scene-gpu-workspace-mib", type=int, choices=(2048,), default=2048)
+    # BEGIN request-level physical limits remain explicit in standalone runs.
+    parser.add_argument("--max-host-rss-mib", type=int, choices=(8192, 10240), default=8192)
+    parser.add_argument("--max-device-used-mib", type=int, choices=(6144, 8192), default=6144)
+    # END defaults preserve the original half-host/half-device limits.
     parser.add_argument("--torch-memory-mib", type=int, choices=(4096,), default=4096)
     return parser.parse_args()
 

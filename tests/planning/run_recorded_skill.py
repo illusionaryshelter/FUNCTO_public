@@ -253,7 +253,7 @@ def run(args):
         if not torch.cuda.is_available():
             raise RuntimeError("This explicit local planner test requires CUDA access")
         # BEGIN expose the production scene budget without raising Torch limits.
-        if args.torch_memory_mib not in (2048, 4096) or args.scene_workspace_mib not in (1024, 2048, 3072, 6144):
+        if args.torch_memory_mib not in (2048, 4096) or args.scene_gpu_workspace_mib not in (1024, 2048, 3072, 6144):
             raise ValueError("Use only the explicitly bounded local Torch and scene allocations")
         # END process-tree and device-growth guards remain separate run limits.
         torch.set_num_threads(2)
@@ -261,7 +261,9 @@ def run(args):
             args.torch_memory_mib*1024**2/torch.cuda.get_device_properties(0).total_memory)
         torch.cuda.reset_peak_memory_stats()
         report["resource_limits"] = {"torch_allocator_bytes": args.torch_memory_mib*1024**2,
-                                     "scene_workspace_bytes": args.scene_workspace_mib*1024**2,
+                                     "scene_gpu_workspace_bytes": args.scene_gpu_workspace_mib*1024**2,
+                                     "max_host_rss_bytes": args.max_host_rss_mib*1024**2,
+                                     "max_device_used_bytes": args.max_device_used_mib*1024**2,
                                      "mapping_bytes": 1024**3}
         device = DeviceCfg("cuda:0")
         hand, hand_report, entrance_fk = position_controlled_hand(
@@ -497,7 +499,9 @@ def run(args):
                                 ik_iterations=80, trajectory_iterations=100,
                                 max_validation_points=args.max_validation_points,
                                 max_refinement_points=args.max_refinement_points,
-                                max_scene_workspace_bytes=args.scene_workspace_mib*1024**2,
+                                max_scene_gpu_workspace_bytes=args.scene_gpu_workspace_mib*1024**2,
+                                max_host_rss_bytes=args.max_host_rss_mib*1024**2,
+                                max_device_used_bytes=args.max_device_used_mib*1024**2,
                                 # BEGIN expose the existing cumulative work contract.
                                 # The supplied ledger must match these values;
                                 # flags cannot reset or enlarge it implicitly.
@@ -578,11 +582,13 @@ if __name__ == "__main__":
     parser.add_argument("--maximum-trajectory-solves", type=int, default=2)
     parser.add_argument("--planning-seconds", type=float, default=120.)
     # END the production PlanningBudget and ledger checks validate these inputs.
-    # BEGIN explicit larger scene storage shares the production six-GiB cap.
-    # BEGIN explicit shared CPU cache capacity remains separate from Torch's cap.
-    parser.add_argument("--scene-workspace-mib", type=int, choices=(1024, 2048, 3072, 6144), default=1024)
-    # END the default allocation request and all geometric checks remain unchanged.
-    # END the default allocation remains unchanged.
+    # BEGIN scene tensor capacity excludes all CPU geometry and its reservations.
+    parser.add_argument("--scene-gpu-workspace-mib", type=int, choices=(1024, 2048, 3072, 6144), default=1024)
+    # END this separate capacity is not the physical device-used limit.
+    # BEGIN request-level physical limits remain explicit in standalone runs.
+    parser.add_argument("--max-host-rss-mib", type=int, choices=(8192, 10240), default=8192)
+    parser.add_argument("--max-device-used-mib", type=int, choices=(6144, 8192), default=6144)
+    # END defaults preserve the original half-host/half-device limits.
     parser.add_argument("--torch-memory-mib", type=int, choices=(2048, 4096), default=2048)
     # BEGIN opt-in host profiling covers preparation, planning and persistence.
     parser.add_argument("--profile-runtime", action="store_true",

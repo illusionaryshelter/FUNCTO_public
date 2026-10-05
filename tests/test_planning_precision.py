@@ -99,6 +99,7 @@ class PlanningPrecisionTests(unittest.TestCase):
             from manipulation.planning import PlanningBudget
             planner.budget = PlanningBudget()
             planner.scene_workspace_bytes = 0
+            planner.scene_cpu_workspace_bytes = planner.scene_gpu_workspace_bytes = 0
             planner.anchor_fk_workspace_bytes = 0
             planner.anchor_capacity = 0
         # END fixtures retain the production initialization contract.

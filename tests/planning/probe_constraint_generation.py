@@ -756,7 +756,7 @@ def run(args):
         for key in ("manifest", "feedback", "robot_fixture", "execution_limits", "finger_targets"):
             if Path(original[f"{key}_path"]).resolve() != getattr(args, key).resolve():
                 raise ValueError(f"Runner path does not match the source archive: {key}")
-        if (args.scene_workspace_mib != 2048 or args.torch_memory_mib != 4096
+        if (args.scene_gpu_workspace_mib != 2048 or args.torch_memory_mib != 4096
                 or args.trajectory_seeds != 1):
             raise ValueError("This replay keeps the original 2-GiB scene, 4-GiB Torch, one-seed budget")
         with patch("recorded_task_planning.plan_and_record", new=capture), \
@@ -814,7 +814,11 @@ def parse_args():
     parser.add_argument("--trajectory-seeds", type=int, default=1)
     parser.add_argument("--max-validation-points", type=int, default=4096)
     parser.add_argument("--max-refinement-points", type=int, default=16)
-    parser.add_argument("--scene-workspace-mib", type=int, choices=(2048,), default=2048)
+    parser.add_argument("--scene-gpu-workspace-mib", type=int, choices=(2048,), default=2048)
+    # BEGIN request-level physical limits remain explicit in standalone runs.
+    parser.add_argument("--max-host-rss-mib", type=int, choices=(8192, 10240), default=8192)
+    parser.add_argument("--max-device-used-mib", type=int, choices=(6144, 8192), default=6144)
+    # END defaults preserve the original half-host/half-device limits.
     parser.add_argument("--torch-memory-mib", type=int, choices=(4096,), default=4096)
     # BEGIN opt-in isolation of the observed native self finite-difference gap.
     parser.add_argument("--self-forward-audit", action="store_true",

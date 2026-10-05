@@ -395,10 +395,10 @@ class PlanningSceneTest(unittest.TestCase):
         # guidance. Removing the native oracle also removes those two caches.
         without_guidance = world.estimated_workspace_bytes(batch, horizon, robot_coverage_guidance=False)
         self.assertGreater(refined_payload, without_guidance)
-        shared = world.estimated_workspace_allocation(batch, horizon, robot_coverage_horizon=0)["shared_grids"]
-        self.assertEqual(shared, 24*world.coverage._distance.numel())
+        shared = world.estimated_workspace_allocation(batch, horizon, robot_coverage_horizon=0)["gpu_shared"]
+        self.assertEqual(shared, 12*world.coverage._distance.numel())
         self.assertEqual(shared, world.estimated_workspace_allocation(
-            batch, horizon, robot_coverage_horizon=horizon)["shared_grids"])
+            batch, horizon, robot_coverage_horizon=horizon)["gpu_shared"])
         native_oracle, world.robot_coverage = world.robot_coverage, None
         ordinary = world.estimated_workspace_bytes(batch, horizon)
         world.robot_coverage = native_oracle

@@ -15,11 +15,11 @@ from manipulation.planning_observation import _FrozenBackgroundRefinement
 from manipulation.planning_scene import ObservedSpace, PlanningScene
 from manipulation.planning import (
     PlanningBudget, ResourceLimitError, _CuroboPlanner,
-    _planning_workspace_bytes, _require_planning_memory,
+    _planning_workspace_bytes, _require_planning_memory, _PlanningWorkspace,
 )
 from manipulation.voxel_layers import LayeredVoxelQuery
 from test_source_world_acceptance import ProxyQuery, observed_plane, owner, scene_factory, states
-from test_source_world_deduplication import assert_report_bytes_equal
+from test_source_world_deduplication import assert_report_bytes_equal, assert_business_report_bytes_equal
 from test_voxel_layers import NativeStub, region
 
 
@@ -27,9 +27,11 @@ from test_voxel_layers import NativeStub, region
 @pytest.fixture(autouse=True)
 def admission(monkeypatch):
     result = SimpleNamespace(storage=Mock(return_value={"encoded_record_bytes_upper": 7}),
-                             workspace=Mock(return_value=(101, 103, False)), gpu=Mock())
+        workspace=Mock(return_value=_PlanningWorkspace(0, 0, 101, 0, 103, False)),
+        host=Mock(), gpu=Mock(side_effect=lambda runtime, device, workspace, **limits: workspace))
     monkeypatch.setattr("manipulation.planning._validation_storage_admission", result.storage)
     monkeypatch.setattr("manipulation.planning._planning_workspace_bytes", result.workspace)
+    monkeypatch.setattr("manipulation.planning._require_planning_host_memory", result.host)
     monkeypatch.setattr("manipulation.planning._require_planning_memory", result.gpu)
     return result
 # END the separately imported capacity functions remain available for pure tests.
@@ -93,7 +95,7 @@ def test_witness_queries_use_actual_cubic_exact_times_and_replace_before_rebuild
     old_scene, old_verification, old_solver = planner.scene, planner._verification_scene, planner.trajopt
     stages = []
 
-    def gpu_check(*args):
+    def gpu_check(runtime, device, workspace, **limits):
         assert planner.scene is old_scene
         assert planner._verification_scene is old_verification
         assert planner.trajopt is old_solver
@@ -101,6 +103,7 @@ def test_witness_queries_use_actual_cubic_exact_times_and_replace_before_rebuild
         admission.storage.assert_called_once_with(planner.problem, replacement, planner.robot_metadata, planner.budget)
         admission.workspace.assert_called_once()
         stages.append("admitted")
+        return workspace
 
     admission.gpu.side_effect = gpu_check
 
@@ -216,7 +219,7 @@ def test_contained_native_grid_witnesses_do_not_rebuild_scene_or_solver(admissio
     assert planner._check_validation_work.call_count == 4
     assert scene.background is background
     np.testing.assert_array_equal(background.region.guidance_boxes, original_boxes)
-    for unused in (*forbidden, bind, admission.storage, admission.workspace, admission.gpu,
+    for unused in (*forbidden, bind, admission.storage, admission.workspace, admission.host, admission.gpu,
                    planner.refine_validation, planner._charge_candidate_queries,
                    planner.optimize, planner.trajopt.destroy):
         unused.assert_not_called()
@@ -298,7 +301,9 @@ def test_guidance_only_refinement_preserves_native_shapes_cache_and_complete_rep
     new_evidence = {"capture_components": True}
     new_residual = replacement.evaluate_source(*query, trajectory_time=query[3], diagnostics=new_evidence)
     torch.testing.assert_close(new_residual, old_residual, rtol=0., atol=0.)
-    assert_report_bytes_equal(new_evidence, old_evidence)
+    # BEGIN unchanged geometry preserves evidence while warm hints reduce work.
+    assert_business_report_bytes_equal(new_evidence, old_evidence)
+    # END native shape/cache identity is checked independently below.
     for row, shape, cache, saved in zip(checker._scene_shapes, shapes, caches, entries):
         assert row["shape"] is shape and shape._collision_cache is cache
         assert all(cache[key] is value for key, value in saved)
@@ -329,7 +334,9 @@ def test_refinement_binds_a_new_checker_for_new_map_or_unbound_scene(scene_facto
             record.update(shape_xyz=list(shape), pose=[*native_pose, 1., 0., 0., 0.],
                 source_bits_hex=np.full(shape, 3, np.uint8).tobytes().hex(),
                 raw_free_packbits_hex=np.packbits(np.zeros(shape, bool)).tobytes().hex())
-            return ProxyQuery("background", observed_plane(), bias=.1), {"shape_xyz": list(shape)}, record
+            changed_geometry = observed_plane()
+            changed_geometry["solids"][0]["pose"][2] = .001
+            return ProxyQuery("background", changed_geometry, bias=.1), {"shape_xyz": list(shape)}, record
 
         monkeypatch.setattr("manipulation.planning_observation._fine_mapper_config",
                             Mock(return_value=SimpleNamespace(device="cuda:0")))
@@ -345,9 +352,9 @@ def test_refinement_binds_a_new_checker_for_new_map_or_unbound_scene(scene_facto
     original_bind = PlanningScene.bind_source_scene
     rebound = []
 
-    def bind(scene):
+    def bind(scene, **kwargs):
         rebound.append(scene)
-        original_bind(scene)
+        original_bind(scene, **kwargs)
 
     monkeypatch.setattr(PlanningScene, "bind_source_scene", bind)
     replacement, report = current.refine_background(witnesses)
@@ -358,8 +365,13 @@ def test_refinement_binds_a_new_checker_for_new_map_or_unbound_scene(scene_facto
         mapper.assert_called_once()
         assert replacement.background.region.shape[2] > original_shape[2]
         assert replacement._source_scene_checker._scene_layers["background"]["region"].shape == replacement.background.region.shape
-        assert all(new["shape"] is not old["shape"] for new, old in
-                   zip(replacement._source_scene_checker._scene_shapes, old_checker._scene_shapes))
+        # Only the changed fine source is rebuilt. The old scene and its
+        # rollout references still share the unchanged coarse/owner maps.
+        for new, old in zip(replacement._source_scene_checker._scene_shapes, old_checker._scene_shapes):
+            if new["owner"] == "background" and new["layer"] == "fine":
+                assert new["shape"] is not old["shape"]
+            else:
+                assert new["shape"] is old["shape"]
         assert current._source_scene_checker is old_checker
     else:
         mapper.assert_not_called()
@@ -375,8 +387,24 @@ def test_builder_api_error_is_not_silently_treated_as_no_refinement():
     planner.refine_validation.assert_not_called()
 
 
+# BEGIN pre-construction host refusal leaves every old planner object usable.
+def test_builder_host_capacity_refusal_preserves_running_scene(admission):
+    planner, seed, _, _, _ = planner_fixture()
+    original = planner.scene, planner._verification_scene, planner.trajopt
+    planner.scene.refine_background.side_effect = ResourceLimitError("host_process_rss", 101, 100)
+    result = planner.refine_background_for_seed(seed)
+    assert result["updated"] is False and result["status"] == "resource_refused"
+    assert result["resource_refusal"]["resource"] == "host_process_rss"
+    assert (planner.scene, planner._verification_scene, planner.trajopt) == original
+    assert result["before"]["body_queries"] > 0
+    for unused in (admission.storage, admission.workspace, admission.host, admission.gpu,
+                   planner.refine_validation, planner.trajopt.destroy):
+        unused.assert_not_called()
+# END only an explicit resource refusal is converted to a retained-scene result.
+
+
 # BEGIN a refused trial cannot invalidate the already running planner.
-@pytest.mark.parametrize("boundary", ["workspace", "gpu"])
+@pytest.mark.parametrize("boundary", ["workspace", "host", "gpu"])
 def test_candidate_capacity_refusal_preserves_all_running_objects(admission, boundary):
     planner, seed, _, replacement, _ = planner_fixture()
     old_scene, old_verification, old_solver = planner.scene, planner._verification_scene, planner.trajopt
@@ -397,7 +425,7 @@ def test_candidate_capacity_refusal_preserves_all_running_objects(admission, bou
     assert torch.cuda.is_initialized() == was_cuda_initialized
 
 
-@pytest.mark.parametrize("boundary", ["storage", "workspace", "gpu"])
+@pytest.mark.parametrize("boundary", ["storage", "workspace", "host", "gpu"])
 def test_plain_preflight_value_error_keeps_its_identity(admission, boundary):
     planner, seed, _, _, _ = planner_fixture()
     old_scene, old_verification, old_solver = planner.scene, planner._verification_scene, planner.trajopt
@@ -415,21 +443,23 @@ def test_plain_preflight_value_error_keeps_its_identity(admission, boundary):
 
 def test_capacity_functions_report_the_exact_failed_byte_comparison():
     scene = SimpleNamespace(required_progress_anchors=(), estimated_workspace_allocation=lambda *args, **kwargs:
-        {"retained": 0, "live": 11, "shared_grids": 0, "shared_cpu": 0, "graph_live": 0})
+        {"gpu_retained": 0, "gpu_live": 11, "gpu_shared": 0, "cpu_shared": 0, "cpu_live": 0, "gpu_graph_live": 0})
     with pytest.raises(ResourceLimitError) as captured:
-        _planning_workspace_bytes(scene, {}, PlanningBudget(max_scene_workspace_bytes=10), 2)
+        _planning_workspace_bytes(scene, {}, PlanningBudget(max_scene_gpu_workspace_bytes=10), 2)
     assert (captured.value.resource, captured.value.required_bytes, captured.value.limit_bytes) == (
-        "scene_workspace", 11, 10)
+        "scene_gpu_workspace", 11, 10)
     reserve = 2*1024**3
     cuda = SimpleNamespace(mem_get_info=Mock(return_value=(reserve-1, 12*1024**3)),
         memory_reserved=Mock(return_value=0), memory_allocated=Mock(return_value=0))
     with pytest.raises(ResourceLimitError) as captured:
-        _require_planning_memory(SimpleNamespace(cuda=cuda), "cpu", 100, 200)
+        _require_planning_memory(SimpleNamespace(cuda=cuda), "cpu",
+            _PlanningWorkspace(0, 0, 100, 0, 200, False), max_device_used_bytes=8*1024**3)
     assert (captured.value.resource, captured.value.required_bytes, captured.value.limit_bytes) == (
         "gpu_native_reserve", reserve, reserve-1)
     cuda.mem_get_info.return_value = reserve+50, 12*1024**3
     with pytest.raises(ResourceLimitError) as captured:
-        _require_planning_memory(SimpleNamespace(cuda=cuda), "cpu", 100, 200)
+        _require_planning_memory(SimpleNamespace(cuda=cuda), "cpu",
+            _PlanningWorkspace(0, 0, 100, 0, 200, False), max_device_used_bytes=8*1024**3)
     assert (captured.value.resource, captured.value.required_bytes, captured.value.limit_bytes) == (
         "gpu_planner_workspace", reserve+300, reserve+50)
 # END shape/runtime failures propagate; byte-cap refusals preserve the old scene.

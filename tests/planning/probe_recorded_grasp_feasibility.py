@@ -293,15 +293,24 @@ def probe(args, prepared, targets, report):
     from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
     from curobo.kinematics import Kinematics
     from curobo.types import DeviceCfg, GoalToolPose, JointState
-    from manipulation.planning import _bounded_robot_configuration, _require_planning_memory
+    from manipulation.planning import (
+        _bounded_robot_configuration, _require_planning_memory,
+        _require_planning_host_memory, _PlanningWorkspace,
+    )
 
     problem, scene, budget = prepared["problem"], prepared["scene"], prepared["budget"]
     robot, metadata = _bounded_robot_configuration(prepared["robot"], problem, scene, budget)
-    required_bytes = scene.estimated_workspace_bytes(args.ik_seeds, 1)
-    if required_bytes > args.scene_workspace_mib*1024**2:
-        raise ValueError("Actual single-state scene queries exceed the declared existing workspace budget")
+    # BEGIN the standalone single-state query has the same CPU/GPU ownership.
+    allocation = scene.estimated_workspace_allocation(args.ik_seeds, 1, robot_coverage_horizon=1)
+    workspace = _PlanningWorkspace(allocation["cpu_shared"], allocation["cpu_live"],
+        sum(allocation[name] for name in ("gpu_retained", "gpu_live", "gpu_shared")), 0, 0, False)
+    if workspace.gpu_bytes > args.scene_gpu_workspace_mib*1024**2:
+        raise ValueError("Actual single-state GPU scene queries exceed the declared workspace budget")
+    _require_planning_host_memory(workspace, max_host_rss_bytes=budget.max_host_rss_bytes)
+    # END source geometry is never passed to the CUDA preflight as device bytes.
     device = DeviceCfg("cuda:0")
-    report["resources"]["estimated_scene_query_bytes"] = required_bytes
+    report["resources"].update(estimated_scene_query_bytes=workspace.total_bytes,
+        estimated_cpu_scene_query_bytes=workspace.cpu_bytes, estimated_gpu_scene_query_bytes=workspace.gpu_bytes)
     report["robot_metadata"] = metadata
     report["target_frame_count"] = len(targets)
     report["maximum_native_ik_calls"] = len(targets)*len(MODES)
@@ -310,7 +319,8 @@ def probe(args, prepared, targets, report):
     for mode, self_collision in MODES:
         solver = kinematics = None
         try:
-            _require_planning_memory(torch, device.device, required_bytes, 0)
+            _require_planning_memory(torch, device.device, workspace,
+                                     max_device_used_bytes=budget.max_device_used_bytes)
             optimizer, metrics = isolated_configs(self_collision)
             config = InverseKinematicsCfg.create(
                 robot=deepcopy(robot), optimizer_configs=[optimizer], metrics_rollout=metrics,
@@ -436,7 +446,7 @@ def run(args):
         "planning_called": False, "trajectory_planning_called": False, "simulation_called": False,
         "completed_native_ik_calls": 0,
         "resources": {"cpu_threads": 2, "torch_allocator_bytes": args.torch_memory_mib*1024**2,
-                      "mapping_bytes": 1024**3, "scene_workspace_ceiling_bytes": args.scene_workspace_mib*1024**2,
+                      "mapping_bytes": 1024**3, "scene_gpu_workspace_ceiling_bytes": args.scene_gpu_workspace_mib*1024**2,
                       "native_free_memory_allowance_bytes": 2*1024**3,
                       "maximum_seeds": args.ik_seeds, "maximum_batch_size": 1, "maximum_goalset": 1},
         "interpretation": ["Pose-only success provides finite kinematic evidence and does not certify execution",
@@ -493,7 +503,11 @@ def parse_args():
     parser.add_argument("--robot-depth-tolerance", type=float, required=True)
     parser.add_argument("--robot-depth-tolerance-source", required=True)
     parser.add_argument("--ik-seeds", type=int, choices=range(1, 9), default=8)
-    parser.add_argument("--scene-workspace-mib", type=int, choices=(1024, 2048), default=1024)
+    parser.add_argument("--scene-gpu-workspace-mib", type=int, choices=(1024, 2048), default=1024)
+    # BEGIN request-level physical limits remain explicit in standalone runs.
+    parser.add_argument("--max-host-rss-mib", type=int, choices=(8192, 10240), default=8192)
+    parser.add_argument("--max-device-used-mib", type=int, choices=(6144, 8192), default=6144)
+    # END defaults preserve the original half-host/half-device limits.
     parser.add_argument("--torch-memory-mib", type=int, choices=(2048, 4096), default=2048)
     args = parser.parse_args()
     if (len(args.target_frame) > 3 or len(set(args.target_frame)) != len(args.target_frame)
