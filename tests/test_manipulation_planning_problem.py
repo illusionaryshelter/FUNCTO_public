@@ -20,6 +20,9 @@ import torch
 from manipulation.goals import SupportSurface
 from manipulation.motion import MotionModel, transfer_motion
 from manipulation.planning_problem import (
+    # BEGIN phase tests retain explicitly declared directional commands.
+    CoordinateDirectionRequirement,
+    # END no direction is inferred from the analytic reference.
     CoordinateEventRequirement,
     MechanismRequirement,
     PoseEventRequirement,
@@ -322,6 +325,107 @@ class PlanningProcessTest(unittest.TestCase):
         self.assertEqual(position.grad[0, 0].abs().sum().item(), 0.)
         self.assertIsNone(request.terminal_pose_target)
 
+    # BEGIN functional tolerance dead zones apply only during feasibility search.
+    def test_feasibility_removes_satisfied_goal_gradient_at_only_the_actual_first_arrival(self):
+        goal = PoseEventRequirement(.6, pose(), pose(), .01, .02, "declared functional accuracy")
+        request = problem([MotionPhase("source", path([pose(), pose()]))], pose_events=(goal,))
+        # The appended exact event comes before the regular plateau samples in
+        # physical time, despite appearing last in the optimization array.
+        progress = torch.tensor([[.6, .6, .8, .6]], dtype=torch.float64)
+        times = torch.tensor([[.7, .8, 1., .6]], dtype=torch.float64)
+        position, quaternion = components(np.array([[pose((.005, 0., 0.), (0., 0., .015))]*4]))
+        position.requires_grad_(); quaternion.requires_grad_()
+        original = request.residuals(position, quaternion, progress, trajectory_time=times)
+        feasibility = request.optimizer_preferences(position, quaternion, progress,
+            trajectory_time=times, phase="feasibility")
+        quality = request.optimizer_preferences(position, quaternion, progress,
+            trajectory_time=times, phase="quality")
+        np.testing.assert_array_equal(feasibility.detach().numpy(), np.zeros((1, 4)))
+        for derivative in torch.autograd.grad(feasibility.sum(), (position, quaternion), retain_graph=True):
+            torch.testing.assert_close(derivative, torch.zeros_like(derivative), rtol=0, atol=0)
+        np.testing.assert_allclose(quality.detach().numpy(), [[0., 0., 0., .25+.75**2]], atol=1e-12)
+        gradients = torch.autograd.grad(quality.sum(), (position, quaternion))
+        for derivative in gradients:
+            self.assertGreater(float(derivative[0, 3].abs().sum()), 0.)
+            torch.testing.assert_close(derivative[0, :3], torch.zeros_like(derivative[0, :3]), rtol=0, atol=0)
+        after = request.residuals(position, quaternion, progress, trajectory_time=times)
+        for name in original:
+            torch.testing.assert_close(original[name], after[name], rtol=0, atol=0)
+
+    def test_feasibility_pose_dead_zone_preserves_position_and_rotation_balls(self):
+        goal = PoseEventRequirement(1., pose(), pose(), .01, .02, "metric norm tolerances")
+        request = problem([MotionPhase("source", path([pose(), pose()]))], pose_events=(goal,))
+        actual = pose((.008, .008, 0.))
+        actual[:3, :3] = Rotation.from_rotvec([.016, .016, 0.]).as_matrix()
+        position, quaternion = components(np.array([[actual]]))
+        progress = torch.ones((1, 1), dtype=torch.float64)
+        # Each component is inside its nominal number, but both original norm
+        # tolerances are exceeded. Per-axis hinge penalties would miss this.
+        self.assertGreater(float(goal.evaluate(position, quaternion)), 0.)
+        value = request.optimizer_preferences(position, quaternion, progress, phase="feasibility")
+        self.assertAlmostEqual(float(value), 2*(np.sqrt(2)*.8-1.)**2, places=12)
+        self.assertAlmostEqual(float(request.optimizer_preferences(
+            position, quaternion, progress, phase="quality")), 2.56, places=12)
+        with self.assertRaisesRegex(ValueError, "Optimization phase"):
+            request.optimizer_preferences(position, quaternion, progress, phase="unknown")
+
+    def test_feasibility_coordinate_hinge_preserves_absolute_and_entry_relative_goals(self):
+        model = MotionModel("prismatic", np.zeros((1, 1)), pose(), np.eye(3), None,
+                            1e-6, 1e-6, {"source": "current slider"})
+        mechanism = MechanismRequirement(0., 1., model, pose(), None, [.1], "actual coordinate origin")
+        progress = torch.tensor([[0., 1.]], dtype=torch.float64)
+        for mode in ("absolute", "entry_delta"):
+            goal = CoordinateEventRequirement(1., mechanism, .3 if mode == "absolute" else .2,
+                .01, "requested coordinate", coordinate_mode=mode,
+                coordinate_origin=None if mode == "absolute" else .1)
+            request = problem([MotionPhase("source", path([pose(), pose()]))],
+                mechanisms=(mechanism,), coordinate_events=(goal,))
+            for relative_error in (.5, 2.):
+                with self.subTest(mode=mode, relative_error=relative_error):
+                    p, q = components(model.poses(np.array([[.1], [.3+.01*relative_error]]))[None])
+                    p.requires_grad_()
+                    before = request.residuals(p, q, progress)
+                    first = request.optimizer_preferences(p, q, progress, phase="feasibility")
+                    second = request.optimizer_preferences(p, q, progress, phase="quality")
+                    self.assertAlmostEqual(float(first.detach().sum()), max(0., relative_error-1.)**2, places=12)
+                    self.assertAlmostEqual(float(second.detach().sum()), relative_error**2, places=12)
+                    derivative = torch.autograd.grad(first.sum(), p)[0]
+                    self.assertEqual(float(derivative.abs().sum()) == 0., relative_error < 1.)
+                    for name, value in request.residuals(p, q, progress).items():
+                        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+    def test_feasibility_keeps_process_equality_direction_coupling_and_stop_semantics(self):
+        reference = path([pose(), pose()])
+        bounds = np.tile([-np.inf, np.inf], (6, 1)); bounds[0] = 0.
+        relation = PoseProcessRequirement(0., 1., reference, bounds, "actual x equality")
+        model = MotionModel("prismatic", np.zeros((1, 1)), pose(), np.eye(3), None,
+                            1e-6, 1e-6, {"source": "current slider"})
+        direction = CoordinateDirectionRequirement(0., 1., 0, "net", 1, .1, .01, "actual positive motion")
+        mechanism = MechanismRequirement(0., 1., model, pose(), None, [0.], "actual slider", (direction,))
+        stop = PlanningEvent("stop", "analytic", 1., 1, "verification", "actual stop", stop=True)
+        coupling = JointCoupling(("joint_a", "joint_b"), np.array([[1., -1.]]), np.array([0.]), "physical coupling")
+        request = problem([MotionPhase("source", reference)], pose_relations=(relation,),
+                          mechanisms=(mechanism,), events=(stop,), couplings=(coupling,))
+        progress = torch.tensor([[0., 1.]], dtype=torch.float64)
+        p, q = components(model.poses(np.array([[0.], [.095]]))[None])
+        p[..., 0] = .5*request.numerical.position_m
+        p.requires_grad_()
+        joints = torch.zeros((1, 2, 3), dtype=torch.float64)
+        velocity = torch.full_like(joints, 2*request.numerical.velocity)
+        times = torch.tensor([[0., 1.]], dtype=torch.float64)
+        before = request.residuals(p, q, progress, joints, request.joint_names, velocity, trajectory_time=times)
+        values = [request.optimizer_preferences(p, q, progress, phase=phase, trajectory_time=times)
+                  for phase in ("feasibility", "quality")]
+        torch.testing.assert_close(*values, rtol=0, atol=0)
+        self.assertGreater(float(values[0].detach().sum()), .24)
+        self.assertGreater(float(torch.autograd.grad(values[0].sum(), p)[0][..., 0].abs().sum()), 0.)
+        after = request.residuals(p, q, progress, joints, request.joint_names, velocity, trajectory_time=times)
+        self.assertGreater(float(after["stop:analytic:stop"].sum()), 0.)
+        self.assertIn("coupling:0", after)
+        for name in before:
+            torch.testing.assert_close(before[name], after[name], rtol=0, atol=0)
+    # END optimizer phases do not modify any original task acceptance set.
+
     def test_mechanism_is_independent_of_reference_and_bounds_the_actual_coordinate(self):
         request = compile_inputs(prismatic_input())
         progress = torch.tensor([[0., .2, .4, 1.2, 2.]], dtype=torch.float64)
@@ -371,6 +475,10 @@ class PlanningProcessTest(unittest.TestCase):
         self.assertLess(request.evaluate(p[:, order], q[:, order], progress[:, order]).max().item(), 1e-10)
         p, q = components(model.poses(np.zeros((101, 1)))[None])
         self.assertGreater(request.evaluate(p, q, progress).max().item(), 6.2)
+        # BEGIN feasibility retains accumulated-turn goals, not just endpoint orientation.
+        for phase in ("feasibility", "quality"):
+            self.assertGreater(float(request.optimizer_preferences(p, q, progress, phase=phase).max()), 1e10)
+        # END the same Cartesian pose cannot erase the original winding requirement.
 
     def test_ambiguous_axis_projection_has_finite_gradients_and_is_rejected(self):
         model = MotionModel("revolute", np.zeros((1, 1)), pose(), np.eye(3), np.array([.2, 0., 0.]),

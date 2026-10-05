@@ -1509,6 +1509,15 @@ class PlanningScene:
         # END only already-evaluated, byte-identical state keys share a witness.
         # END no result survives a call, model binding, gripper or candidate change.
         residuals, unmodelled, worst = [], set(), None
+        # BEGIN IK ranking consumes all queried modes, never only the worst witness.
+        clearance = (deepcopy(diagnostics.get("unpermitted_clearance"))
+                     if diagnostics is not None else None)
+        if diagnostics is not None and clearance is None:
+            clearance = {"minimum_recorded_distance_m": None,
+                "minimum_recorded_adjusted_distance_m": None, "measured_count": 0,
+                "complete_query": True, "distance_complete": True, "limitations": [],
+                "scope": "Recorded unpermitted source distances across every queried state and mode"}
+        # END streamed summaries retain constant storage across verification chunks.
         # The final exporter passes the same small accumulator across native
         # chunks. Retain one witness for the whole export, not one full scene
         # pair inventory per chunk or one report per sampled robot state.
@@ -1520,9 +1529,9 @@ class PlanningScene:
             unmodelled.update(diagnostics.get("unmodelled_geometry_names", ()))
             prior = diagnostics.get("worst_state")
             if prior is not None:
-                clearance = prior["minimum_scene_clearance_m"]
+                prior_clearance = prior["minimum_scene_clearance_m"]
                 worst = ((prior["residual"], len(prior["scene"]["query_gaps"]),
-                          -float("inf") if clearance is None else -clearance), prior)
+                          -float("inf") if prior_clearance is None else -prior_clearance), prior)
         for index, (row, time_s, phase, permission) in enumerate(zip(
                 positions, times, progress_values, permission_values)):
             # BEGIN preserve first-occurrence query and exception order.
@@ -1561,6 +1570,22 @@ class PlanningScene:
             unmodelled.update(report["unmodelled_geometry_names"])
             if diagnostics is not None:
                 scene = report["scene"]
+                # BEGIN permission-aware source summaries include native installations.
+                current = scene.get("unpermitted_clearance")
+                if current is None:
+                    clearance["complete_query"] = clearance["distance_complete"] = False
+                    clearance["limitations"] = sorted(set(clearance["limitations"]) | {"missing_source_distance_summary"})
+                else:
+                    for name in ("minimum_recorded_distance_m", "minimum_recorded_adjusted_distance_m"):
+                        value = current[name]
+                        if value is not None:
+                            old = clearance[name]
+                            clearance[name] = value if old is None else min(old, value)
+                    clearance["measured_count"] += current["measured_count"]
+                    for name in ("complete_query", "distance_complete"):
+                        clearance[name] = clearance[name] and current[name]
+                    clearance["limitations"] = sorted(set(clearance["limitations"]) | set(current["limitations"]))
+                # END permitted contact and unmeasured gaps cannot masquerade as clearance.
                 # BEGIN native failures keep only failing query evidence, not all pairs.
                 # The existing per-call state cache deduplicates exact q/time/
                 # owner/layer inputs. Other modes may reference this same unique
@@ -1596,7 +1621,8 @@ class PlanningScene:
             diagnostics.update(checked_states=previous_count+len(positions),
                 failed_states=previous_failed+sum(value > 0 for value in residuals),
                 unmodelled_geometry_names=sorted(unmodelled),
-                worst_state=None if worst is None else worst[1])
+                worst_state=None if worst is None else worst[1],
+                unpermitted_clearance=clearance)
         return result
     # END missing required geometry remains a source query failure, not unknown free space.
 
@@ -2554,6 +2580,12 @@ class PlanningScene:
                 "geometry": "source robot solids against observed TSDF zero surfaces and negative known material",
                 "scope": "all valid native states, required finite contact, selected layers and conditional owner poses",
                 "sphere_esdf_proxy": "optimizer guidance only"},
+            # BEGIN report the value actually supplied to the project raw query.
+            "optimizer_collision_activation": {
+                "distance_m": 0., "scope": "CuroboSphereQuery raw sphere/ESDF soft activation",
+                "hard_clearance_owner": "source geometry pair policy",
+                "calibration": "positive global width requires backend regression evidence"},
+            # END removed native scene-cost defaults are not effective project settings.
             # END observation coverage deficits remain diagnostic uncertainty.
             "observation_ids": self.coverage.observation_ids,
             "observation_build": deepcopy(self.observation_report),

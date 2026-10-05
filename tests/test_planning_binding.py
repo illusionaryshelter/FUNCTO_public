@@ -1,4 +1,4 @@
-"""CPU checks of source timing, activation and true native terminal goals."""
+"""CPU checks of source timing, activation and functional IK goal proposals."""
 
 # BEGIN frozen binding and target generation contracts independent of CUDA.
 from types import SimpleNamespace
@@ -14,7 +14,8 @@ from manipulation.planning import (PlanningBudget, _CuroboPlanner, _ProgressMap,
     ContinuationBindingError, _bind_event_clock, _initial_timing,
     _prepare_continuation, _continuation_timing, _fixed_spline_grid,
     _ompl_stage, _scene_boundary_evaluate, _timed_native_state,
-    _progress_for_cubic_boundaries, _select_ik_candidates)
+    _progress_for_cubic_boundaries)
+from manipulation.planning_ik import rank_ik_candidates
 from manipulation.planning_problem import (MotionPhase, PlanningEvent, PlanningProblem,
                                           PosePath, PoseEventRequirement)
 
@@ -67,7 +68,8 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertEqual(warped.s[-1], 1.)
         self.assertFalse(np.any(warped.s < .4))
 
-    def test_only_true_terminal_pose_enables_native_target(self):
+    # BEGIN true goals guide IK while every trajectory goal keeps its original owner.
+    def test_functional_ik_goal_uses_actual_target_in_native_link_coordinates(self):
         problem = self.problem()
         target = np.eye(4); target[0, 3] = .8
         function = np.eye(4); function[0, 3] = .1
@@ -78,47 +80,41 @@ class PlanningBindingTest(unittest.TestCase):
         planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float32))
         planner.GoalToolPose = SimpleNamespace
-        self.assertIsNone(planner._terminal_goal())
-        goal.progress = 1.
-        native = planner._terminal_goal()
+        native = planner._functional_goal(goal)
         np.testing.assert_allclose(native.position.numpy().reshape(3), [.7, 0., 0.], atol=1e-7)
         # Changing the reference path cannot move the actual native goal.
         problem.phases[0].reference.poses[:, 0, 3] = -.8
-        torch.testing.assert_close(planner._terminal_goal().position, native.position)
+        torch.testing.assert_close(planner._functional_goal(goal).position, native.position)
         goal.target[0, 3] = .5
-        self.assertAlmostEqual(float(planner._terminal_goal().position.flatten()[0]), .4, places=6)
+        self.assertAlmostEqual(float(planner._functional_goal(goal).position.flatten()[0]), .4, places=6)
         planner.progress_map = _ProgressMap(np.array([0., .8, 1.]), np.array([0., 1., 1.]))
-        self.assertIsNone(planner._terminal_goal())
+        torch.testing.assert_close(planner._functional_goal(goal).position,
+                                   torch.tensor([[[[[.4, 0., 0.]]]]]))
 
     def test_nonfinite_single_ik_seed_does_not_hide_a_valid_success(self):
         candidates = np.array([[np.nan, 0.], [1., 2.], [3., 4.]])
-        selected, distinct = _select_ik_candidates(candidates, [True, True, False],
-            np.array([[0., 0.]]), 1, 1e-6)
+        selected = rank_ik_candidates(candidates,
+            [{"task_satisfied": flag, "source_valid": flag} for flag in [True, True, False]],
+            np.array([[0., 0.]]), count=1, joint_tolerance=1e-6)
         np.testing.assert_array_equal(selected, [1])
-        self.assertEqual(distinct, 1)
 
-    def test_native_terminal_envelope_does_not_shrink_offset_function_goal(self):
-        from scipy.spatial.transform import Rotation
-        problem = self.problem()
-        problem.tool_transform[0, 3] = .1
-        function = np.eye(4); function[0, 3] = .2
-        target = PoseEventRequirement(1., function, np.eye(4), .001, .02, "goal")
-        problem.pose_events = (target,)
+    def test_both_trajectory_phases_disable_duplicate_native_pose_objective(self):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
-        planner.problem = problem
-        bound, rotation_bound = planner._terminal_tolerances()
-        # The true functional point is exactly on target while the permitted
-        # rotation moves both TCP and native link origins through lever arms.
-        rotation = Rotation.from_rotvec([0., 0., .019999])
-        quaternion = torch.as_tensor(rotation.as_quat()[[3, 0, 1, 2]], dtype=torch.float64)[None]
-        tool_position = torch.as_tensor(-rotation.as_matrix()@function[:3, 3], dtype=torch.float64)[None]
-        self.assertEqual(float(target.evaluate(tool_position, quaternion)), 0.)
-        native_position, _ = problem.reference_to_link_pose(tool_position, quaternion)
-        exact_native_target = np.array([-.3, 0., 0.])
-        native_error = np.linalg.norm(native_position.numpy()[0]-exact_native_target)
-        self.assertGreater(native_error, target.position_tolerance_m)
-        self.assertLess(native_error, bound)
-        self.assertEqual(rotation_bound, target.rotation_tolerance_rad+problem.numerical.rotation_rad)
+        planner.problem = self.problem()
+        planner.problem.pose_events = (PoseEventRequirement(1., np.eye(4), np.eye(4), .001, .02, "goal"),)
+        planner.physical_domain = SimpleNamespace(validate=Mock())
+        planner.trajopt = SimpleNamespace(disable_tool_pose_tracking=Mock(),
+            enable_tool_pose_tracking=Mock(), solve_pose=Mock(return_value="native result"))
+        planner.torch, planner.budget, planner.start = torch, PlanningBudget(), object()
+        metadata = object()
+        planner._goal = Mock(return_value=metadata)
+        for phase in ("feasibility", "quality"):
+            planner.phase = phase
+            self.assertEqual(planner.optimize(torch.zeros((1, 1, 4, 1))), "native result")
+            self.assertIs(planner.trajopt.solve_pose.call_args.kwargs["goal_tool_poses"], metadata)
+        self.assertEqual(planner.trajopt.disable_tool_pose_tracking.call_count, 2)
+        planner.trajopt.enable_tool_pose_tracking.assert_not_called()
+    # END full functional tolerances are checked by typed process residuals only.
 
     def test_dependency_boundary_inside_reference_interval_uses_device_tick(self):
         event = PlanningEvent("effect", "current", .37, 1, "verify", "dependency",

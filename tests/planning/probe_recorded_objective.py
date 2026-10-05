@@ -1,8 +1,10 @@
-"""Replay every native objective gradient at archived controls without solving.
+"""Evaluate the current native objective at archived controls without solving.
 
 Called by probe_fixed_pose_clearance after unchanged scene/clock/input checks.
-The installed native goal lifecycle is reused with a single evaluation particle;
-line-search replication and optimizer iterations are unnecessary for a VJP.
+The current planner phase is recorded explicitly: archived controls do not
+restore an obsolete cost configuration. The native goal lifecycle uses one
+evaluation particle; line-search replication and optimizer iterations are
+unnecessary for a VJP.
 """
 
 # BEGIN bounded whole-curve objective evidence; no controls are accepted.
@@ -23,12 +25,10 @@ def replay_objective(planner, source_run, output, report, save):
     with np.load(source/"native-result-00.npz", allow_pickle=False) as saved:
         native = {name: saved[name].copy() for name in saved.files}
     meta = read_json(source/"native-result-00.json")
-    goal_pose = planner._terminal_goal()
-    if goal_pose is None:
-        solver.disable_tool_pose_tracking()
-        goal_pose = planner._goal(planner.problem.phase_count)
-    else:
-        solver.enable_tool_pose_tracking()
+    # BEGIN match production: typed process goals own both trajectory phases.
+    solver.disable_tool_pose_tracking()
+    goal_pose = planner._goal(planner.problem.phase_count)
+    # END native goal metadata supplies storage only.
     state = SolveState(solve_type=SolveMode.SINGLE, num_trajopt_seeds=1, batch_size=1,
         num_envs=1, num_goalset=goal_pose.num_goalset, tool_frames=goal_pose.tool_frames)
     seed_goal = planner.JointState.from_position(seed[..., -1, :].clone())
@@ -39,8 +39,11 @@ def replay_objective(planner, source_run, output, report, save):
     rollout.update_params(goal, num_particles=1)
     actions = planner.device_cfg.to_device(native["solution"]).reshape(1, solver.action_horizon, solver.action_dim)
     arrays = {"joint_names": np.asarray(planner.joint_names), "actions": cpu(actions)}
-    entry = {"scope": "Original whole-curve optimizer, one particle, fixed original clock, no solve",
+    # BEGIN archived variables and the current cost policy are separate identities.
+    entry = {"scope": "Current whole-curve optimizer at archived controls, one particle, fixed clock, no solve",
+        "phase": planner.phase,
         "components": {}, "native_state_identity": {}, "gradient_direction_trials": []}
+    # END this diagnostic never claims to reconstruct a removed historical objective.
     manager = rollout.constraint_manager
     entry["rollout"] = {"process_mode": manager._process_mode, "horizon": rollout.horizon,
         "anchor_u": cpu(manager._anchor_u).tolist(), "anchor_s": cpu(manager._anchor_s).tolist(),

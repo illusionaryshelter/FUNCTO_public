@@ -420,6 +420,18 @@ class RobotGeometryChecker:
             if rule.interval[0] <= permission_progress <= rule.interval[1]
             and (state_kind == "nominal" or rule.rule_id in active)]
         # END ordinary collision evidence below is still queried and archived.
+        # BEGIN retain unpermitted distances before component evidence is reduced.
+        # Whole-pair permissions also apply to separated pieces, whose normal
+        # fast path has no reason to attach a contact-permission field. Native
+        # installation pairs retain their independent required/excluded law.
+        permitted_robot_pairs = {(name, rule.target_owner) for rule in permitted_rules
+                                 for name in rule.native_geometry_names}
+        clearance = {"minimum_recorded_distance_m": None,
+                     "minimum_recorded_adjusted_distance_m": None,
+                     "minimum_pair": None, "minimum_adjusted_pair": None,
+                     "measured_count": 0, "omitted_ambiguous_surface_count": 0,
+                     "omitted_finite_patch_subset_count": 0}
+        # END this diagnostic never changes collision acceptance or enumeration.
         owner_poses, condition_evidence = owner_poses or {}, condition_evidence or {}
         # BEGIN consume this candidate's owner poses without claiming observations.
         nominal_owner_poses = nominal_owner_poses or {}
@@ -585,6 +597,11 @@ class RobotGeometryChecker:
                                          "target_owner": second["owner"], "target_geometry": alias,
                                          "native_pair_evidence": deepcopy(native[0]),
                                          "scope": "same explicitly bound native installation solid/pair"})
+                            # BEGIN native installation distance obeys native pair policy.
+                            if native[0]["policy"] == "required":
+                                _record_unpermitted_clearance(clearance, native[0]["signed_distance_m"], 0.,
+                                    first["name"], second["owner"], alias, "native_required_pair")
+                            # END task contact permissions cannot waive a required native self pair.
                         continue
                     # BEGIN unchanged actors recur across many TSDF components.
                     if first is actor_body and actor_transform is not None:
@@ -613,6 +630,12 @@ class RobotGeometryChecker:
                     if (summary is not None and value > max(boundary, margin)
                             and value >= rows[summary["index"]]["signed_distance_m"]):
                         rows[summary["index"]]["component_summary"]["tested"] += 1
+                        # BEGIN a permitted nearest piece cannot hide an unpermitted next piece.
+                        if (first["owner"] == "robot"
+                                and (first["name"], second["owner"]) not in permitted_robot_pairs):
+                            _record_unpermitted_clearance(clearance, value, margin,
+                                first["name"], second["owner"], second["name"], "queried_source_component")
+                        # END preserve scalar evidence even when detail allocation is omitted.
                         continue
                     # END the finally summary sees no appended row in this case.
                     row = {"actor": first["owner"], "actor_geometry": first["name"],
@@ -729,6 +752,28 @@ class RobotGeometryChecker:
                         else:
                             violations.append(issue)
                 finally:
+                    # BEGIN consume each fresh piece after its exact contact decision.
+                    # This must precede _summarize_component_result: its minimum
+                    # representative may be a permitted contact and would lose
+                    # the nearest unpermitted component of that same body pair.
+                    if len(rows) > row_count:
+                        current = rows[-1]
+                        # A locally permitted overlap does not measure the
+                        # distance to the rest of this complete solid outside
+                        # that finite patch. This remains true for an analytic
+                        # cuboid with no TSDF components or query gaps.
+                        if (current.get("actor") == "robot" and current.get("permission")
+                                and current.get("permission_scope") != "explicit_robot_owner_pair"):
+                            clearance["omitted_finite_patch_subset_count"] += 1
+                        if (current.get("actor") == "robot" and "signed_distance_m" in current
+                                and not current.get("permission")
+                                and (current["actor_geometry"], current["target_owner"])
+                                    not in permitted_robot_pairs):
+                            _record_unpermitted_clearance(clearance, current["signed_distance_m"],
+                                current.get("measurement_allowance_m", 0.),
+                                current["actor_geometry"], current["target_owner"], current["target_geometry"],
+                                "queried_source_component")
+                    # END neither the saved witness nor its distance participates in acceptance.
                     # BEGIN stream complete component checks into bounded pair evidence.
                     if "tsdf_component_id" in first or "tsdf_component_id" in second:
                         _summarize_component_result(pair_key, rows, row_count,
@@ -801,9 +846,68 @@ class RobotGeometryChecker:
                     violations.append(issue)
         if unmodelled_geometries:
             unresolved.append({"kind": "future_finger_geometry_unbound", "geometry_names": sorted(unmodelled_geometries)})
+        # BEGIN surface measurements require separate permission and completeness labels.
+        # The TSDF broad phase enumerates every potentially colliding signed
+        # piece, not every distant component. A zero-surface distance is useful
+        # observed-geometry evidence only alongside that completed containment
+        # check. A finite contact patch cannot classify the surface's nearest
+        # point, so do not call its distance unpermitted in that case.
+        for row in rows:
+            if (row.get("actor") != "robot" or not row.get("diagnostic_only")
+                    or row.get("distance_scope") != "observed_zero_surface_only"
+                    or (row["actor_geometry"], row["target_owner"]) in permitted_robot_pairs):
+                continue
+            # BEGIN an unrelated material cannot borrow another pad's permission.
+            # Match the same directed actor/material identities used by the
+            # actual piece query above. A missing material binding remains
+            # ambiguous, because its contact test would itself be incomplete.
+            local_permission = False
+            for rule in binding["contacts"]:
+                if not rule["interval"][0] <= progress <= rule["interval"][1]:
+                    continue
+                if rule["actor"] == "robot" and rule["target_owner"] == row["target_owner"]:
+                    material = materials.get(row["actor_geometry"])
+                elif rule["actor"] == row["target_owner"] and rule["target_owner"] == "robot":
+                    material = materials.get(row["target_owner"]+"/"+row["target_geometry"])
+                else:
+                    continue
+                if material is None or material == rule["material_id"]:
+                    local_permission = True
+                    break
+            # END owner identity alone never suppresses an arm/environment distance.
+            if local_permission:
+                clearance["omitted_ambiguous_surface_count"] += 1
+                continue
+            selected = decisions.get(("robot", row["actor_geometry"], row["target_owner"]))
+            margin = 0. if selected is None else selected["measurement_allowance_m"]
+            _record_unpermitted_clearance(clearance, row["signed_distance_m"], margin,
+                row["actor_geometry"], row["target_owner"], row["target_geometry"], row["distance_scope"])
+        limitations = []
+        if gaps:
+            limitations.append("required_query_gaps")
+        if stopped_pairs:
+            limitations.append("component_enumeration_stopped_after_rejection")
+        if unmodelled_geometries:
+            limitations.append("unmodelled_robot_geometry")
+        if unresolved:
+            limitations.append("conditional_or_partial_scene_evidence")
+        if self._has_observed_tsdf:
+            limitations.append("observed_tsdf_local_components_not_global_solid_distance")
+        if clearance["omitted_ambiguous_surface_count"]:
+            limitations.append("surface_permission_not_resolved_by_finite_patch")
+        if clearance["omitted_finite_patch_subset_count"]:
+            limitations.append("finite_patch_unpermitted_subset_distance_unmeasured")
+        clearance.update(complete_query=not gaps and not stopped_pairs,
+            distance_complete=not gaps and not stopped_pairs and not unmodelled_geometries
+                and not unresolved and not self._has_observed_tsdf
+                and not clearance["omitted_finite_patch_subset_count"],
+            limitations=limitations,
+            scope="Recorded unpermitted robot/environment distances only; source static checks, coverage and full trajectory acceptance remain separate")
+        # END missing or incomplete measurements never become infinite free clearance.
         return {"passed": not violations and not gaps, "violations": violations, "query_gaps": gaps,
                 "unresolved_assumptions": unresolved, "pairs": rows, "state_kind": state_kind,
                 "required_contact_checks": required_checks,
+                "unpermitted_clearance": clearance,
                 "layer_selection_checks": selection_checks,
                 "layer_selection": selection_snapshot,
                 # BEGIN expose authorization separately from geometry relation and task effects.
@@ -1165,6 +1269,37 @@ def _owned_record_bytes(value):
     elif isinstance(value, np.ndarray):
         size += value.nbytes
     return size
+
+
+# BEGIN bounded scalar clearance records survive per-pair contact summarization.
+def _record_unpermitted_clearance(summary, distance, margin, actor_geometry,
+                                 target_owner, target_geometry, distance_scope):
+    """Accumulate one already queried, unpermitted robot/environment distance.
+
+    The caller owns policy and complete-solid checks. No additional Coal query
+    or numerical allowance is introduced here. Raw and measurement-adjusted
+    minima can have different witnesses and retain separate identities. This
+    record is bounded independently of the number of TSDF components. Distance
+    finiteness and margin validity were already checked at the query boundary;
+    losing a minimum update allocates no new witness record or NumPy array.
+    """
+    summary["measured_count"] += 1
+    raw_minimum = (summary["minimum_recorded_distance_m"] is None
+                   or distance < summary["minimum_recorded_distance_m"])
+    adjusted = distance-margin
+    adjusted_minimum = (summary["minimum_recorded_adjusted_distance_m"] is None
+                        or adjusted < summary["minimum_recorded_adjusted_distance_m"])
+    if not raw_minimum and not adjusted_minimum:
+        return
+    pair = {"actor_geometry": actor_geometry, "target_owner": target_owner,
+            "target_geometry": target_geometry, "distance_scope": distance_scope}
+    if raw_minimum:
+        summary["minimum_recorded_distance_m"] = distance
+        summary["minimum_pair"] = pair
+    if adjusted_minimum:
+        summary["minimum_recorded_adjusted_distance_m"] = adjusted
+        summary["minimum_adjusted_pair"] = pair
+# END stable first-minimum ties preserve source enumeration order.
 
 
 def _body_pair_key(first, second):

@@ -87,15 +87,10 @@ def main():
     paired_optimizers = []
     try:
         planner = _CuroboPlanner(problem, scene, robot, budget, "cuda:0", robot_validator=validator)
-        goal = planner._terminal_goal()
-        if goal is None:
-            # Match the production terminal-plateau behavior exactly. The
-            # explicit event remains in ProcessCostManager at its bound time;
-            # an inert H=1 reference supplies only native goal-buffer layout.
-            planner.trajopt.disable_tool_pose_tracking()
-            goal = planner._goal(problem.phase_count)
-        else:
-            planner.trajopt.enable_tool_pose_tracking()
+        # BEGIN match production: typed process goals own both trajectory phases.
+        planner.trajopt.disable_tool_pose_tracking()
+        goal = planner._goal(planner.problem.phase_count)
+        # END native goal metadata supplies storage only.
         seed = planner.start.position[:, None].expand(1, planner.trajopt.action_horizon, -1).clone()
         planner.physical_domain.validate(seed)
         seed_goal = JointState.from_position(seed[:, -1:, :].clone())

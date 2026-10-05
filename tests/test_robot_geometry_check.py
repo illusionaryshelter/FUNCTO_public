@@ -171,3 +171,154 @@ def test_wrong_base_reflection_and_degenerate_solid_rejected(urdf):
     with pytest.raises(ValueError, match="full-dimensional"):
         checker(urdf, [NativeSolid("plane", "base", np.zeros((4, 3)), "invalid planar surface")])
 # END independent geometry diagnostics without CUDA, physics or scene state.
+
+
+# BEGIN source clearance summaries preserve per-component policy and query scope.
+def _clearance_checker(urdf, *, rotated=False, installation=False):
+    from test_independent_scene_validation import rigid
+    pose = rigid(.049)
+    if rotated:
+        angle = np.pi/4
+        pose[:3, :3] = [[np.cos(angle), -np.sin(angle), 0.],
+                        [np.sin(angle), np.cos(angle), 0.], [0., 0., 1.]]
+    shapes = [NativePrimitive("pad", "base", "box", (.1, .1, .1), pose, "native source pad")]
+    if installation:
+        shapes.append(NativePrimitive("installation", "base", "box", (.1, .1, .1),
+                                      rigid(-.06), "native source installation"))
+    return RobotGeometryChecker(urdf, base_frame="base", geometries=shapes)
+
+
+def test_clearance_keeps_unpermitted_piece_when_the_summary_representative_is_permitted(urdf):
+    from manipulation.tsdf_geometry import tsdf_geometry_from_samples
+    from test_independent_scene_validation import binding, query as scene_query, rule
+    model = binding([rule()])
+    values, observed = -np.ones((2, 2, 1)), np.zeros((2, 2, 1), bool)
+    observed[0, 0, 0] = observed[1, 1, 0] = True
+    model["owners"][0]["geometry"] = tsdf_geometry_from_samples(values, observed,
+        origin=[0., 0., -.0005], voxel_size=.06, name="two_points",
+        source="permitted underside point and separated corner point")
+    result = scene_query(_clearance_checker(urdf, rotated=True), model)
+    assert result["passed"]
+    row, = result["pairs"]
+    assert row["permission"] == "pad_to_target" and row["signed_distance_m"] < 0
+    assert row["component_summary"]["tested"] == 2
+    clearance = result["unpermitted_clearance"]
+    assert clearance["measured_count"] == 1
+    assert clearance["minimum_recorded_distance_m"] == pytest.approx(np.sqrt(2)*.06-.05, abs=2e-6)
+    assert clearance["complete_query"] and not clearance["distance_complete"]
+
+
+@pytest.mark.parametrize("policy,count", [("required", 1), ("excluded", 0), ("mechanical_contact", 0)])
+def test_clearance_includes_only_required_native_installation_pairs(urdf, policy, count):
+    from test_independent_scene_validation import binding
+    model, native = binding(), _clearance_checker(urdf, installation=True)
+    owner = model["owners"][0]
+    owner["native_geometry_names"] = ["installation"]
+    owner["geometry"]["solids"][0].update(dimensions=[.1]*3, pose=[0., 0., -.06, 1., 0., 0., 0.])
+    native.bind_scene(model)
+    state = query(native, joint_positions=[0., 0.], pairs=[
+        PairQuery("pad", "installation", policy, "explicit native source pair policy")])
+    result = native.query_scene(state, tool_pose=np.eye(4), progress=.5, finger_positions=[0., 0.],
+                                state_kind="actual")
+    clearance = result["unpermitted_clearance"]
+    assert clearance["complete_query"] and clearance["distance_complete"]
+    assert clearance["measured_count"] == count
+    if count:
+        assert clearance["minimum_recorded_distance_m"] == pytest.approx(.009, abs=2e-6)
+        assert clearance["minimum_pair"]["distance_scope"] == "native_required_pair"
+    else:
+        assert clearance["minimum_recorded_distance_m"] is None
+
+
+def test_whole_pair_permission_excludes_separated_pairs_without_a_contact_row(urdf):
+    from dataclasses import asdict
+    from test_independent_scene_validation import binding, query as scene_query
+    from manipulation.planning_scene import RobotOwnerContactPermission
+    model = binding()
+    model["owners"][0]["geometry"]["solids"][0]["pose"][2] = -.06
+    model["robot_owner_permissions"] = [asdict(RobotOwnerContactPermission(
+        rule_id="arrival", target_owner="target", native_geometry_names=("pad",),
+        sphere_indices=(0,), interval=(.5, .9), arrival_goal_id=("pose_events", 0),
+        activation_event={"skill_id": "test", "event_id": "close", "occurrence": 0, "kind": "close"},
+        source="explicit arriving pad permission"))]
+    result = scene_query(_clearance_checker(urdf), model, kind="nominal")
+    assert result["passed"] and result["pairs"][0]["permission"] is None
+    assert result["unpermitted_clearance"]["measured_count"] == 0
+    assert result["unpermitted_clearance"]["minimum_recorded_distance_m"] is None
+
+
+def test_early_rejection_and_query_gaps_cannot_claim_complete_clearance(urdf):
+    from manipulation.tsdf_geometry import tsdf_geometry_from_samples
+    from test_independent_scene_validation import binding, query as scene_query
+    model = binding()
+    model["owners"][0]["geometry"] = tsdf_geometry_from_samples(-np.ones((3, 1, 1)),
+        np.ones((3, 1, 1), bool), origin=[0., 0., -.0005], voxel_size=.01,
+        name="inside_points", source="negative source samples")
+    result = scene_query(_clearance_checker(urdf), model)
+    assert not result["passed"]
+    summary = result["unpermitted_clearance"]
+    assert not summary["complete_query"] and not summary["distance_complete"]
+    assert "component_enumeration_stopped_after_rejection" in summary["limitations"]
+    model = binding()
+    model["background"]["geometry"]["query_gaps"] = ["missing required source geometry"]
+    result = scene_query(_clearance_checker(urdf), model)
+    assert not result["unpermitted_clearance"]["complete_query"]
+    assert "required_query_gaps" in result["unpermitted_clearance"]["limitations"]
+
+
+def test_surface_measurement_never_claims_global_distance_or_infers_patch_permission(urdf):
+    import json
+    from manipulation.tsdf_geometry import tsdf_geometry_from_samples
+    from test_independent_scene_validation import binding, query as scene_query, rule
+    values = np.broadcast_to([.05, -.05], (2, 2, 2))
+    model = binding()
+    model["owners"][0]["geometry"] = tsdf_geometry_from_samples(values, np.ones(values.shape, bool),
+        origin=[-.05, -.05, .15], voxel_size=.1, name="plane", source="observed plane samples")
+    result = scene_query(_clearance_checker(urdf), model)
+    summary = result["unpermitted_clearance"]
+    assert result["passed"] and summary["complete_query"] and not summary["distance_complete"]
+    assert summary["minimum_recorded_distance_m"] > .1
+    assert summary["minimum_pair"]["distance_scope"] == "observed_zero_surface_only"
+    json.dumps(summary, allow_nan=False)
+    model["contacts"] = [rule()]
+    result = scene_query(_clearance_checker(urdf), model)
+    summary = result["unpermitted_clearance"]
+    assert result["passed"] and summary["complete_query"]
+    assert summary["minimum_recorded_distance_m"] is None
+    assert summary["omitted_ambiguous_surface_count"] == 1
+
+
+def test_pad_patch_cannot_suppress_an_explicitly_different_arm_material_distance(urdf):
+    from manipulation.tsdf_geometry import tsdf_geometry_from_samples
+    from test_independent_scene_validation import binding, query as scene_query, rigid, rule
+    native = RobotGeometryChecker(urdf, base_frame="base", geometries=[
+        NativePrimitive("pad", "base", "box", (.1, .1, .1), rigid(.049), "native contact pad"),
+        NativePrimitive("arm", "base", "box", (.05, .05, .05), rigid(.049), "native arm body")])
+    model = binding([rule()])
+    model["native_geometry_materials"]["arm"] = "arm_surface"
+    values = np.broadcast_to([.05, -.05], (2, 2, 2))
+    model["owners"][0]["geometry"] = tsdf_geometry_from_samples(values, np.ones(values.shape, bool),
+        origin=[-.05, -.05, .15], voxel_size=.1, name="plane", source="observed plane samples")
+    result = scene_query(native, model)
+    summary = result["unpermitted_clearance"]
+    assert result["passed"] and summary["complete_query"]
+    assert summary["measured_count"] == 1 and summary["omitted_ambiguous_surface_count"] == 1
+    assert summary["minimum_pair"]["actor_geometry"] == "arm"
+    assert summary["minimum_recorded_distance_m"] == pytest.approx(.126, abs=2e-6)
+    # A removed binding is unknown, not evidence that no pad rule can apply.
+    del model["native_geometry_materials"]["arm"]
+    uncertain = scene_query(native, model)["unpermitted_clearance"]
+    assert uncertain["minimum_recorded_distance_m"] is None
+    assert uncertain["omitted_ambiguous_surface_count"] == 2
+
+
+def test_analytic_finite_patch_does_not_measure_clearance_to_the_unpermitted_remainder(urdf):
+    from test_independent_scene_validation import binding, query as scene_query, rule
+    result = scene_query(_clearance_checker(urdf), binding([rule()]))
+    assert result["passed"] and result["complete_scene_geometry"]
+    summary = result["unpermitted_clearance"]
+    assert summary["complete_query"] and not summary["distance_complete"]
+    assert summary["minimum_recorded_distance_m"] is None
+    assert summary["omitted_finite_patch_subset_count"] == 1
+    assert "finite_patch_unpermitted_subset_distance_unmeasured" in summary["limitations"]
+# END none of these statistics bypasses the original source collision verdict.

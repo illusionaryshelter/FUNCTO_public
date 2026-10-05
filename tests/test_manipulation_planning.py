@@ -69,6 +69,34 @@ def separated_source_self(joints, names, times, *, valid=None, diagnostics=None)
 # END real source geometry is covered by the dedicated Coal integration tests.
 
 
+# BEGIN reference-chain tests use the real ranking policy with explicit synthetic evidence.
+def bind_analytic_ik_screening(planner, report_for=None):
+    """Supply static point reports without claiming CPU fixtures perform FK.
+
+    The existing fixtures declare pose success and finite numerical candidates.
+    Equal source margins leave continuity as the final tiebreaker. Tests with
+    unequal clearances pass their own reports through the production CPU rank
+    helper, keeping source screening separate from chain construction.
+    """
+    from manipulation.planning_ik import rank_ik_candidates
+
+    def rank(candidates, success, previous, parameter, goal_ids=()):
+        reports = [{"task_satisfied": bool(flag), "source_valid": bool(np.isfinite(row).all()),
+                    "environment_clearance_m": 1., "self_clearance_m": 1.,
+                    "joint_limit_margin_fraction": .5}
+                   if report_for is None else report_for(row, bool(flag), parameter)
+                   for row, flag in zip(candidates, success)]
+        indices = rank_ik_candidates(candidates, reports, previous, count=planner.budget.ik_seeds,
+                                    joint_tolerance=planner.problem.numerical.joint)
+        return indices, reports
+
+    planner._rank_ik_candidates = Mock(side_effect=rank)
+    planner._build_goal_ik_candidates = Mock(return_value={})
+    planner.device_cfg = SimpleNamespace(to_device=lambda values: torch.as_tensor(
+        values, dtype=planner.start.position.dtype))
+# END these declared evidence fixtures never substitute for the independent source checker.
+
+
 def serial_rotations(angles):
     """Independent three-revolute chain with two rigidly mounted tool frames.
 
@@ -818,6 +846,9 @@ class NativeCubicClockTests(unittest.TestCase):
                                 required_progress_anchors=())
         scene.clone_for_rollout = lambda: scene
         planner.scene = scene
+        # BEGIN this clock-only search fixture declares no functional IK proposals.
+        planner.goal_ik_candidates = {}
+        # END the existing reference/candidate proposals still exercise the paused clock.
         candidate = SimpleNamespace(duration=2., _curve=lambda moment: path[-1, :-1])
         with patch("manipulation.planning._ompl_stage", return_value=(path, {"success": True})) as search:
             seed, report = planner.ompl_seed(torch.zeros((1, 1, 15, 3)), candidate)
@@ -867,6 +898,7 @@ class NativeCubicClockTests(unittest.TestCase):
         planner.trajopt = SimpleNamespace(action_horizon=count)
         planner.ik = SimpleNamespace(solve_pose=solve_pose, get_active_js=lambda state: state)
         planner._goal = lambda progress: progress
+        bind_analytic_ik_screening(planner)
         seeds, success_counts = planner.reference_seeds()
         np.testing.assert_allclose(requested, np.interp(clock, mapping.u, mapping.s), atol=1e-14)
         np.testing.assert_array_equal(requested_parameters, clock.astype(np.float32).astype(float))
@@ -913,6 +945,7 @@ class NativeCubicClockTests(unittest.TestCase):
                                          _trajectory_seed_generator=SimpleNamespace(generate_constant_seeds=helper))
         planner.ik = SimpleNamespace(solve_pose=failed_pose_ik, get_active_js=lambda state: state)
         planner._goal = lambda progress: progress
+        bind_analytic_ik_screening(planner)
         seeds, success_counts = planner.reference_seeds()
         np.testing.assert_array_equal(requested_parameters,
             ((np.arange(horizon)+3.)/(horizon+4.)).astype(np.float32).astype(float))
@@ -923,7 +956,14 @@ class NativeCubicClockTests(unittest.TestCase):
         self.assertTrue(seeds.is_contiguous())
         self.assertEqual(success_counts, [0]*horizon)
         self.assertEqual(supplied_seed_shapes, [(1, 1, 3)]+[(1, 2, 3)]*(horizon-1))
-        np.testing.assert_allclose(seeds[0, 0].numpy(), measured_q.numpy()+np.asarray(goals)[:, None], atol=1e-14)
+        # BEGIN finite rejected-pose initializers need no artificial branch assignment.
+        # Both previous branches enter the final continuity tiebreaker. Equal
+        # distances may change which finite native row is first; either row
+        # remains only a recovery initializer with its failed IK diagnostic.
+        for index, goal in enumerate(goals):
+            proposals = np.concatenate((measured_q.numpy()+goal, measured_q.numpy()+goal+1.), axis=0)
+            self.assertLessEqual(np.abs(proposals-seeds[0, 0, index].numpy()).max(axis=-1).min(), 1e-14)
+        # END the measured-state alternative below remains exact and independent.
         np.testing.assert_array_equal(seeds[0, 1].numpy(), np.broadcast_to(measured_q.numpy(), (horizon, 3)))
         torch.testing.assert_close(measured_q, position_before, rtol=0, atol=0)
         torch.testing.assert_close(measured_dq, velocity_before, rtol=0, atol=0)
@@ -946,7 +986,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
     """Declared IK outputs test selection, never actual native pose feasibility."""
 
     @staticmethod
-    def planner_for(pools, flags, *, seed_count=2, joint_tolerance=1e-5):
+    def planner_for(pools, flags, *, seed_count=2, joint_tolerance=1e-5, report_for=None):
         from curobo.types import DeviceCfg
         from curobo._src.util.trajectory_seed_generator import TrajectorySeedGenerator
 
@@ -979,6 +1019,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner.ik = SimpleNamespace(solve_pose=solve, get_active_js=lambda state: state,
                                      config=SimpleNamespace(exit_early=seed_count == 1))
         planner._goal = lambda progress: progress
+        bind_analytic_ik_screening(planner, report_for)
         return planner, constant, warm_starts
 
     @staticmethod
@@ -996,13 +1037,17 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
             flags.append(success[order])
         return primary, alternative, pools, flags
 
-    def test_first_nearest_and_farthest_successes_continue_despite_result_order_changes(self):
+    def test_equal_quality_keeps_nearest_distinct_successes_despite_result_order_changes(self):
         primary, alternative, pools, flags = self.two_tracks()
         planner, constant, warm_starts = self.planner_for(pools, flags)
         measured_q, measured_dq = planner.start.position.clone(), planner.start.velocity.clone()
         seeds, success = planner.reference_seeds()
-        np.testing.assert_allclose(seeds.numpy()[0, 0], primary, atol=1e-14)
-        np.testing.assert_allclose(seeds.numpy()[0, 1], alternative, atol=1e-14)
+        # Clearance ties now choose nearest previous configurations. No
+        # farthest-branch or Hungarian reassignment objective is introduced.
+        for index, expected in enumerate(primary):
+            actual = seeds.numpy()[0, :, index]
+            actual = actual[np.argsort(actual[:, 0])]
+            np.testing.assert_allclose(actual, np.stack((expected, expected+[.15, 0., 0.])), atol=1e-14)
         self.assertEqual(success, [3]*6)
         self.assertEqual(planner.reference_ik_distinct_counts, [3]*6)
         self.assertEqual(planner.initial_seed_strategies, ["reference_ik", "reference_ik_alternative"])
@@ -1028,8 +1073,13 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
             flags.append(success[order])
         planner, constant, _ = self.planner_for(pools, flags)
         seeds, success = planner.reference_seeds()
-        np.testing.assert_allclose(seeds.numpy()[0, 0], primary, atol=1e-14)
-        np.testing.assert_allclose(seeds.numpy()[0, 1], alternative, atol=1e-14)
+        for index, (first, second) in enumerate(zip(primary, alternative)):
+            # Branch indices are not a promise of a particular joint basin;
+            # retain both declared legal postures, and duplicate only the
+            # sole legal one instead of introducing a rejected second seed.
+            actual = seeds.numpy()[0, :, index]
+            np.testing.assert_allclose(actual[np.argsort(actual[:, 0])],
+                                      np.stack((first, second)), atol=1e-14)
         self.assertEqual(success, [2, 1, 2, 2, 1, 2])
         self.assertEqual(planner.reference_ik_distinct_counts, success)
         self.assertEqual(planner.initial_seed_strategies, ["reference_ik", "reference_ik_alternative"])
@@ -1082,6 +1132,56 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         self.assertEqual(success, [3]*6)
         self.assertEqual(planner.initial_seed_strategies, ["reference_ik"])
         constant.assert_not_called()
+
+    # BEGIN actual source priorities and off-grid functional hints retain the original seed budget.
+    def test_source_clearance_precedes_continuity_without_retaining_a_rejected_branch(self):
+        _, alternative, pools, flags = self.two_tracks()
+
+        def report(row, success, parameter):
+            return {"task_satisfied": success, "source_valid": success,
+                    "environment_clearance_m": .002 if row[0] > 1. else .0001,
+                    "self_clearance_m": 1., "joint_limit_margin_fraction": .5}
+
+        planner, constant, warm_starts = self.planner_for(pools, flags, seed_count=1, report_for=report)
+        seeds, success = planner.reference_seeds()
+        np.testing.assert_allclose(seeds.numpy()[0, 0], alternative, atol=1e-14)
+        self.assertEqual(success, [3]*6)
+        self.assertEqual(len(warm_starts), 6)
+        self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
+        self.assertEqual(planner._rank_ik_candidates.call_count, 6)
+        constant.assert_not_called()
+
+    def test_off_grid_functional_goal_changes_only_nearest_free_control_as_an_initializer(self):
+        _, _, pools, flags = self.two_tracks()
+        ordinary, _, _ = self.planner_for(pools, flags)
+        baseline, _ = ordinary.reference_seeds()
+        planner, _, _ = self.planner_for(pools, flags)
+        original_q, original_dq = planner.start.position.clone(), planner.start.velocity.clone()
+        valid = {"task_satisfied": True, "source_valid": True}
+        rejected = {"task_satisfied": True, "source_valid": False}
+        target_postures = ([.9, .8, .7], [.6, .5, .4])
+        planner._build_goal_ik_candidates.return_value = {
+            0.: {"candidates": [{"joint_position": [99., 99., 99.], "report": valid}]},
+            .47: {"candidates": [
+                {"joint_position": target_postures[0], "report": valid},
+                {"joint_position": [90., 90., 90.], "report": rejected},
+                {"joint_position": target_postures[1], "report": valid}]}}
+        seeds, success = planner.reference_seeds()
+        control_u = (np.arange(6)+3.)/10.
+        nearest = int(np.argmin(np.abs(control_u-.47)))
+        self.assertNotIn(.47, control_u)
+        self.assertEqual(nearest, 2)
+        np.testing.assert_array_equal(seeds.numpy()[0, :, nearest], target_postures)
+        retained = np.arange(6) != nearest
+        torch.testing.assert_close(seeds[:, :, retained], baseline[:, :, retained], rtol=0, atol=0)
+        torch.testing.assert_close(planner.start.position, original_q, rtol=0, atol=0)
+        torch.testing.assert_close(planner.start.velocity, original_dq, rtol=0, atol=0)
+        self.assertEqual(success, [3]*6)
+        self.assertEqual(len(planner.goal_ik_control_hints), 2)
+        self.assertTrue(all(row["event_u"] == .47 and row["control_index"] == nearest
+                            for row in planner.goal_ik_control_hints))
+        self.assertTrue(all(value.endswith("+ranked_functional_ik") for value in planner.seed_strategies))
+    # END a pose proposal at an event does not fix that event's spline state.
 # END native-result diversity and whole-window initializer selection contracts.
 
 
@@ -1937,6 +2037,11 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planner.progress_map = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
         planner.seed_parameter, planner.formal_clock, planner.robot_dict = object(), {}, {}
         planner.refinement_parameters = np.empty(0)
+        # BEGIN replacement preserves the explicit optimization phase.
+        planner.phase = "feasibility"
+        planner._quality_optimizer_config = {"rollout": {"cost_cfg": {"cspace_cfg": {
+            "squared_l2_regularization_weight": [1.]*5}}}}
+        # END this allocation fixture has no second quality solver.
         planner.torch = SimpleNamespace(cuda=SimpleNamespace(
             mem_get_info=Mock(return_value=(12*1024**3, 12*1024**3)),
             memory_reserved=Mock(return_value=0), memory_allocated=Mock(return_value=0)))
@@ -1994,6 +2099,23 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             planner._optimizer_class.assert_not_called()
             self.assertIsNone(planner.trajopt)
         self.assertEqual(planner.torch.cuda.mem_get_info.call_count, 2)
+
+    # BEGIN refinement admission cannot delete old witnesses or destroy a usable solver.
+    def test_refinement_union_exhaustion_happens_before_solver_mutation(self):
+        planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.phase = "feasibility"
+        planner.budget = PlanningBudget(max_refinement_points=1)
+        planner.anchors = np.array([0., 1.])
+        planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+        planner.refinement_parameters = np.array([.2])
+        planner.trajopt = SimpleNamespace(destroy=Mock())
+        original_solver = planner.trajopt
+        with self.assertRaisesRegex(ValueError, "finite refinement-point budget"):
+            planner.refine_validation([.3])
+        self.assertIs(planner.trajopt, original_solver)
+        planner.trajopt.destroy.assert_not_called()
+        np.testing.assert_array_equal(planner.refinement_parameters, [.2])
+    # END a caller cannot replace the old witness with a new one to fit the budget.
 
     def test_close_releases_both_native_cycles_and_remains_idempotent(self):
         import gc
@@ -2270,14 +2392,25 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
 
     @staticmethod
     def selection_fixture(residuals, errors=()):
+        from manipulation.planning_diagnostics import AttemptWitnesses
+
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.torch = torch
         planner.budget = PlanningBudget()
         planner.seed_strategies = ["reference_ik", "reference_ik_alternative"]
+        # BEGIN selection owns one attempt ledger and an explicit phase.
+        planner.phase = "feasibility"
+        planner.witnesses = AttemptWitnesses()
+        planner.formal_clock = {"duration": 1., "valid_count": 9}
+        planner.trajopt = SimpleNamespace(horizon=9)
+        planner.candidate_quality = Mock(side_effect=lambda curve, validation: {
+            "score": float(2-curve.candidate_index)})
+        # END the score is independent of native phase-dependent seed costs.
         exported = []
 
-        def export(candidate):
+        # BEGIN native reconstruction is observable separately from verification.
+        def curve(candidate):
             index = int(candidate.solution[0, 0, 0, 0].item())-1
             if index in errors:
                 raise ValueError(f"candidate {index} exceeds finite sample budget")
@@ -2288,8 +2421,14 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
             np.testing.assert_array_equal(native.position[0, 0, 1:].numpy(),
                                           np.full((expected_count-1, 3), index+1))
             np.testing.assert_allclose(native.dt.numpy(), [[(.07, .11)[index]]], rtol=1e-7)
-            trajectory = SimpleNamespace(residuals={"required_process": residuals[index]},
-                                         candidate_index=index, executable_until=.4, next_verification=None)
+            return SimpleNamespace(residuals={}, candidate_index=index,
+                                   executable_until=.4, next_verification=None)
+
+        def export(candidate):
+            trajectory = curve(candidate)
+            index = trajectory.candidate_index
+            expected_count = (9, 5)[index]
+            trajectory.residuals = {"required_process": residuals[index]}
             planner.last_validation = {
                 "measurements": {"candidate_index": index},
                 "numerical_tolerances": {"position_m": 1e-4},
@@ -2300,6 +2439,8 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
             return trajectory, expected_count
 
         planner.export = Mock(side_effect=export)
+        planner._native_curve = Mock(side_effect=curve)
+        # END a rejected native seed cannot consume an independent export.
         return planner, exported
 
     def test_native_single_seed_gather_preserves_clock_valid_length_and_original_rank(self):
@@ -2373,7 +2514,8 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         result = self.native_candidates(flags=(False, True))
         planner, exported = self.selection_fixture((.01, 0.))
         chosen, trajectory, attempt = planner.select_candidate(result)
-        self.assertEqual(exported, [0, 1])
+        self.assertEqual(exported, [1])
+        self.assertEqual(planner._native_curve.call_count, 1)
         self.assertTrue(bool(chosen.success.all()))
         self.assertEqual(trajectory.candidate_index, 1)
         self.assertEqual(attempt["selected_seed_index"], 1)
@@ -2382,26 +2524,38 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         self.assertEqual(attempt["measurements"]["candidate_index"], 1)
         torch.testing.assert_close(chosen.solution, result.solution[:, 1:2])
 
-    # BEGIN provenance priority applies only after independent hard acceptance.
-    def test_verified_demo_initializer_has_priority_over_lower_native_cost(self):
+    # BEGIN immediate feasibility archival and phase-independent quality ranking.
+    def test_first_feasible_seed_returns_before_spending_another_export_budget(self):
         result = self.native_candidates(flags=(True, True), native_violations=(0., 0.))
         result.seed_cost = torch.tensor([[100., 1.]])
         planner, exported = self.selection_fixture((0., 0.))
         planner.seed_strategies = ["reference_ik", "measured_state_constant"]
         _, trajectory, attempt = planner.select_candidate(result)
-        self.assertEqual(exported, [0, 1])
+        self.assertEqual(exported, [0])
         self.assertEqual(trajectory.candidate_index, 0)
         self.assertEqual(attempt["seed_provenance"], "reference_ik")
         planner, _ = self.selection_fixture((.01, 0.))
         planner.seed_strategies = ["reference_ik", "measured_state_constant"]
         self.assertEqual(planner.select_candidate(result)[1].candidate_index, 1)
-    # END a reference-derived failure never outranks an accepted alternative.
+
+    def test_quality_phase_uses_common_quality_without_provenance_or_native_cost_priority(self):
+        result = self.native_candidates(flags=(True, True), native_violations=(0., 0.))
+        result.seed_cost = torch.tensor([[1., 100.]])
+        planner, exported = self.selection_fixture((0., 0.))
+        planner.phase = "quality"
+        planner.seed_strategies = ["reference_ik", "measured_state_constant"]
+        _, trajectory, attempt = planner.select_candidate(result)
+        self.assertEqual(exported, [0, 1])
+        self.assertEqual(trajectory.candidate_index, 1)
+        self.assertEqual(attempt["quality"]["score"], 1.)
+    # END hard acceptance is required before either phase can select a result.
 
     def test_failed_candidates_use_per_seed_actual_constraints_instead_of_float32_rank(self):
         result = self.native_candidates(flags=(False, False), native_violations=(.02, 0.))
         planner, exported = self.selection_fixture((.004, .009))
         chosen, trajectory, attempt = planner.select_candidate(result)
-        self.assertEqual(exported, [0, 1])
+        self.assertEqual(exported, [])
+        self.assertEqual(planner._native_curve.call_count, 2)
         self.assertFalse(bool(chosen.success.any()))
         self.assertEqual(trajectory.candidate_index, 1)
         self.assertEqual(attempt["selected_seed_index"], 1)
@@ -2411,15 +2565,16 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         self.assertAlmostEqual(candidates[0]["native_metrics"]["rollout"]["constraints"]["cspace"], .02, places=7)
         self.assertEqual(candidates[1]["native_metrics"]["rollout"]["constraints"]["cspace"], 0.)
 
-    def test_selected_validation_is_restored_for_refinement_and_native_failure_stays_failure(self):
+    def test_native_rejection_has_no_borrowed_validation_and_cannot_become_success(self):
         result = self.native_candidates(flags=(False, False), native_violations=(0., 0.))
         planner, _ = self.selection_fixture((0., .03))
         _, trajectory, attempt = planner.select_candidate(result)
         self.assertEqual(trajectory.candidate_index, 0)
         self.assertFalse(attempt["native_success"])
         self.assertFalse(any(item["accepted"] for item in attempt["candidates"]))
-        self.assertEqual(planner.last_validation["measurements"]["candidate_index"], 0)
-        np.testing.assert_array_equal(planner.last_validation["violations"], [0., 0., 0.])
+        self.assertIsNone(planner.last_validation)
+        planner.export.assert_not_called()
+        self.assertEqual(attempt["independent_validation"], "skipped_native_rejection")
 
     def test_one_unexportable_seed_does_not_hide_another_verified_curve(self):
         result = self.native_candidates(flags=(False, True))
@@ -2603,6 +2758,11 @@ class ExportedCurveContractTests(unittest.TestCase):
         self.assertEqual(planner.last_validation["violations"][-1], 1.)
         planner.refinement_parameters = np.empty(0)
         planner.trajopt.horizon = 4
+        # BEGIN the selector normally adds each completed export to this ledger.
+        from manipulation.planning_diagnostics import AttemptWitnesses
+        planner.witnesses = AttemptWitnesses()
+        planner.witnesses.add_validation(planner.last_validation)
+        # END direct-export fixtures must explicitly perform that same handoff.
         # Neither ordinary sample failures nor pose anchors identify this
         # knot's left acceleration. Its analytic witness must drive the same
         # existing bounded refinement path as other curve violations.
@@ -2856,19 +3016,29 @@ class PlannerRetryContractTests(unittest.TestCase):
     """Exercise authorization and finite retry semantics without native GPU work."""
 
     @staticmethod
-    def scripted_planner(native_flags, residuals):
+    def scripted_planner(native_flags, residuals, *, quality_scores=None):
+        from manipulation.planning_diagnostics import AttemptWitnesses
+
         # Distinct solutions and exports reveal accidental candidate leakage
         # across attempts; a graph-search seed is never an accepted curve.
         native = [SimpleNamespace(success=torch.tensor([[flag]]), batch_size=1, num_seeds=1,
                                   solution=torch.full((1, 1, 4, 3), float(index+1)),
                                   seed_cost=torch.tensor([[float(index)]]), metrics=None, interpolated_metrics=None)
                   for index, flag in enumerate(native_flags)]
-        trajectories = [SimpleNamespace(residuals={"required_process": value}, executable_until=.4,
+        trajectories = [SimpleNamespace(residuals={"required_process": value}, candidate_index=index,
+                                         executable_until=.4,
                                          next_verification={"time": .4, "skill_id": "grasp", "event_id": "verify",
                                                             "requires_evidence": "actual Holding observation"})
-                        for value in residuals]
+                        for index, value in enumerate(residuals)]
+        # BEGIN stages share this one planner and one cumulative witness ledger.
+        qualities = list(range(len(trajectories))) if quality_scores is None else quality_scores
+        stages = []
+        # END different explicit scores expose invalid phase-native comparisons.
         planner = SimpleNamespace(
             budget=PlanningBudget(),
+            phase="feasibility", witnesses=AttemptWitnesses(),
+            formal_clock={"duration": 1.}, refinement_parameters=np.empty(0),
+            optimize_phases=stages,
             # BEGIN explicit allocation diagnostics in the CPU retry fixture.
             scene_workspace_bytes=64, anchor_fk_workspace_bytes=32, anchor_capacity=4,
             # END explicit allocation diagnostics in the CPU retry fixture.
@@ -2882,17 +3052,43 @@ class PlannerRetryContractTests(unittest.TestCase):
                 "failed_components": [], "scope": {"kind": "analytic retry fixture"}}),
             # END valid measured entrance for the independent retry fixture.
             reference_seeds=Mock(return_value=(torch.zeros((1, 2, 4, 3)), [2, 2, 2])),
-            optimize=Mock(side_effect=native), close=Mock(), refine_validation=Mock(),
+            close=Mock(),
             refinement_samples=Mock(return_value=None),
             ompl_seed=Mock(return_value=(None, {"success": False})),
         )
         planner.native_diagnostics = MethodType(_CuroboPlanner.native_diagnostics, planner)
         planner.select_candidate = MethodType(_CuroboPlanner.select_candidate, planner)
 
+        # BEGIN fixture transitions are observable and retain all active parameters.
+        def optimize(seed):
+            index = len(stages)
+            stages.append(planner.phase)
+            return native[index]
+
+        def refine(parameters, *, phase=None):
+            planner.refinement_parameters = np.unique(np.r_[planner.refinement_parameters, parameters])
+            if phase is not None:
+                planner.phase = phase
+
+        def curve(result):
+            index = next(index for index, candidate in enumerate(native) if candidate is result)
+            return SimpleNamespace(residuals={}, candidate_index=index, executable_until=.4,
+                                   next_verification=trajectories[index].next_verification)
+
+        planner.optimize = Mock(side_effect=optimize)
+        planner.refine_validation = Mock(side_effect=refine)
+        planner._native_curve = Mock(side_effect=curve)
+        planner.candidate_quality = Mock(side_effect=lambda trajectory, validation: {
+            "score": float(qualities[trajectory.candidate_index])})
+        # END a cheap curve is an initializer and never shares an exported residual.
+
         def export(result):
             index = next(index for index, candidate in enumerate(native) if candidate is result)
-            planner.last_validation = {"measurements": {"position_error_m": residuals[index]},
-                                       "numerical_tolerances": {"position_m": 1e-4}}
+            planner.last_validation = {"measurements": {"position_error_m": residuals[index],
+                                                       "candidate_index": index},
+                                       "numerical_tolerances": {"position_m": 1e-4},
+                                       "u": np.array([0., .5, 1.]),
+                                       "violations": np.array([0., residuals[index], 0.])}
             return trajectories[index], 17
 
         planner.export = Mock(side_effect=export)
@@ -2904,9 +3100,17 @@ class PlannerRetryContractTests(unittest.TestCase):
         # BEGIN the handoff fixture declares its real empty request ledger.
         problem = SimpleNamespace(events=(), pose_events=(), coordinate_events=(), supports=())
         # END accepted planning never depends on an undeclared object sentinel.
+        # BEGIN each binding owns the exact validation that qualified its curve.
+        def bind(trajectory, **kwargs):
+            return {"fixture": "accepted", "candidate_id": f"candidate-{trajectory.candidate_index}",
+                    "validation": deepcopy(kwargs["validation"]),
+                    "native_report": deepcopy(kwargs["native_report"])}
+
         with patch("manipulation.planning._CuroboPlanner", return_value=planner), \
-                patch("manipulation.execution_binding.bind_candidate", return_value={"fixture": "accepted"}):
+                patch("manipulation.execution_binding.bind_candidate", side_effect=bind) as binder:
             result = plan_trajectory(problem, scene, object(), robot_validator=object(), budget=budget)
+        planner.bound_candidates = binder.call_args_list
+        # END replacing a candidate cannot mutate an earlier archived binding.
         planner.close.assert_called_once_with()
         return result
 
@@ -2924,7 +3128,7 @@ class PlannerRetryContractTests(unittest.TestCase):
     def test_exhausted_export_keeps_request_category_and_charges_once(self):
         from manipulation.planning import PlanningWorkExhausted
 
-        planner, _, _ = self.scripted_planner([False], [.1])
+        planner, _, _ = self.scripted_planner([True], [.1])
         planner.export.side_effect = PlanningWorkExhausted("original cumulative wall-time exhausted")
         budget = PlanningBudget(maximum_trajectory_solves=2)
         result = self.run_planner(planner, budget)
@@ -2992,10 +3196,10 @@ class PlannerRetryContractTests(unittest.TestCase):
             self.assertNotEqual(seed.data_ptr(), native[index-1].solution.data_ptr())
         planner.ompl_seed.assert_not_called()
 
-    def test_first_verified_export_stops_retries_and_preserves_its_evidence_barrier(self):
+    def test_last_budgeted_verified_export_preserves_its_evidence_barrier(self):
         planner, _, trajectories = self.scripted_planner([True, True], [.003, 0.])
         planner.refinement_samples.return_value = np.array([.27])
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=3, search_seconds=0.))
+        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2, search_seconds=0.))
         self.assertTrue(result.success)
         self.assertIs(result.trajectory, trajectories[1])
         self.assertEqual(planner.optimize.call_count, 2)
@@ -3011,6 +3215,123 @@ class PlannerRetryContractTests(unittest.TestCase):
         self.assertIn("finite sample budget", result.diagnostics["reason"])
         self.assertEqual(result.request_ledger["consumed_planning"]["validation_passes"], 1)
         planner.close.assert_called_once_with()
+
+    # BEGIN a bound feasible curve survives only ordinary optional-work rejection.
+    def test_quality_improvement_replaces_archive_with_same_request_budget_and_serial_stages(self):
+        planner, native, trajectories = self.scripted_planner([True, True], [0., 0.],
+                                                              quality_scores=[2., 1.])
+        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
+        self.assertTrue(result.success)
+        self.assertIs(result.trajectory, trajectories[1])
+        self.assertEqual(planner.optimize_phases, ["feasibility", "quality"])
+        self.assertEqual([row.kwargs.get("phase") for row in planner.refine_validation.call_args_list], ["quality"])
+        torch.testing.assert_close(planner.optimize.call_args_list[1].args[0], native[0].solution)
+        self.assertEqual(len(planner.bound_candidates), 2)
+        self.assertEqual(result.execution_binding["candidate_id"], "candidate-1")
+        self.assertEqual(result.execution_binding["validation"]["measurements"]["candidate_index"], 1)
+        self.assertEqual(result.diagnostics["returned_candidate"]["quality"]["score"], 1.)
+        work = result.request_ledger["consumed_planning"]
+        self.assertEqual((work["initializations"], work["ik_batches"], work["trajectory_solves"]), (1, 1, 2))
+        self.assertEqual((work["validation_passes"], work["validation_queries"]), (2, 35))
+        self.assertEqual(result.execution_binding["request_ledger"], result.request_ledger)
+        planner.ompl_seed.assert_not_called()
+
+    def test_worse_or_equal_quality_keeps_exact_archived_curve_binding_and_validation(self):
+        for quality in (1., 2.):
+            with self.subTest(candidate_quality=quality):
+                planner, _, trajectories = self.scripted_planner([True, True], [0., 0.],
+                                                                 quality_scores=[1., quality])
+                result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
+                self.assertTrue(result.success)
+                self.assertIs(result.trajectory, trajectories[0])
+                self.assertEqual(len(planner.bound_candidates), 1)
+                self.assertEqual(result.execution_binding["candidate_id"], "candidate-0")
+                self.assertEqual(result.execution_binding["validation"]["measurements"]["candidate_index"], 0)
+                self.assertEqual(planner.last_validation["measurements"]["candidate_index"], 1)
+                self.assertEqual(result.diagnostics["returned_candidate"]["phase"], "feasibility")
+                self.assertEqual(result.diagnostics["attempts"][-1]["quality_decision"],
+                                 "retained_better_or_equal_feasible_candidate")
+                self.assertEqual(result.request_ledger["consumed_planning"]["trajectory_solves"], 2)
+
+    def test_native_or_independent_quality_rejection_cannot_replace_archive(self):
+        for native_success, residual in ((False, 0.), (True, .01), (True, np.nan)):
+            with self.subTest(native_success=native_success, residual=residual):
+                planner, _, trajectories = self.scripted_planner([True, native_success], [0., residual],
+                                                                 quality_scores=[2., 1.])
+                result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
+                self.assertTrue(result.success)
+                self.assertIs(result.trajectory, trajectories[0])
+                self.assertEqual(len(planner.bound_candidates), 1)
+                self.assertEqual(result.execution_binding["candidate_id"], "candidate-0")
+                self.assertEqual(result.execution_binding["validation"]["measurements"]["candidate_index"], 0)
+                self.assertFalse(result.diagnostics["attempts"][-1]["accepted"])
+                work = result.request_ledger["consumed_planning"]
+                self.assertEqual(work["trajectory_solves"], 2)
+                self.assertEqual(work["validation_passes"], 2 if native_success else 1)
+
+    def test_quality_export_budget_exhaustion_keeps_archive_and_charges_partial_pass_once(self):
+        from manipulation.planning import PlanningWorkExhausted
+
+        planner, _, trajectories = self.scripted_planner([True, True], [0., 0.])
+        original = planner.export.side_effect
+
+        def export(candidate):
+            if candidate.solution[0, 0, 0, 0].item() == 2.:
+                raise PlanningWorkExhausted("optional quality exhausted the original request")
+            return original(candidate)
+
+        planner.export.side_effect = export
+        budget = PlanningBudget(maximum_trajectory_solves=2)
+        result = self.run_planner(planner, budget)
+        self.assertTrue(result.success)
+        self.assertIs(result.trajectory, trajectories[0])
+        self.assertEqual(len(planner.bound_candidates), 1)
+        self.assertEqual(result.execution_binding["candidate_id"], "candidate-0")
+        self.assertEqual(result.diagnostics["quality_stop_reason"],
+                         "optional quality exhausted the original request")
+        work = result.request_ledger["consumed_planning"]
+        self.assertEqual((work["trajectory_solves"], work["validation_passes"]), (2, 2))
+        self.assertEqual(work["validation_queries"], 1+17+budget.max_validation_points)
+        self.assertEqual(result.execution_binding["request_ledger"], result.request_ledger)
+
+    def test_quality_runtime_error_is_not_hidden_by_archive_or_simultaneous_timeout(self):
+        planner, _, _ = self.scripted_planner([True, True], [0., 0.])
+        original = planner.export.side_effect
+        now = [0.]
+        budget = PlanningBudget(maximum_trajectory_solves=2)
+
+        def export(candidate):
+            if candidate.solution[0, 0, 0, 0].item() == 2.:
+                now[0] = budget.planning_seconds+1.
+                raise RuntimeError("source geometry API failed before returning")
+            return original(candidate)
+
+        planner.export.side_effect = export
+        with patch("manipulation.planning.time.monotonic", side_effect=lambda: now[0]):
+            result = self.run_planner(planner, budget)
+        self.assertFalse(result.success)
+        self.assertIsNone(result.trajectory)
+        self.assertIsNone(result.execution_binding)
+        self.assertEqual(len(planner.bound_candidates), 1)
+        self.assertEqual(result.diagnostics["failure"], "planning_stage_failed")
+        self.assertEqual(result.diagnostics["error_type"], "RuntimeError")
+        self.assertEqual(result.diagnostics["reason"], "source geometry API failed before returning")
+        work = result.request_ledger["consumed_planning"]
+        self.assertEqual((work["trajectory_solves"], work["validation_passes"]), (2, 2))
+        self.assertEqual(work["validation_queries"], 1+17+budget.max_validation_points)
+        self.assertGreater(work["planning_seconds"], budget.planning_seconds)
+
+    def test_cleanup_failure_cannot_be_hidden_by_best_feasible_archive(self):
+        planner, _, _ = self.scripted_planner([True, True], [0., .01])
+        planner.close.side_effect = OSError("native cleanup failed")
+        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
+        self.assertFalse(result.success)
+        self.assertIsNone(result.trajectory)
+        self.assertIsNone(result.execution_binding)
+        self.assertEqual(result.diagnostics["failure"], "planner_cleanup_failed")
+        self.assertEqual(result.diagnostics["reason"], "native cleanup failed")
+        self.assertEqual(len(planner.bound_candidates), 1)
+    # END the archive preserves qualified motion but cannot mask environment failures.
 
 
 if __name__ == "__main__":

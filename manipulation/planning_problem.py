@@ -1160,10 +1160,21 @@ class PlanningProblem:
                                   point_goal_ids=point_goal_ids, tool_linear_velocity=tool_linear_velocity,
                                   tool_angular_velocity=tool_angular_velocity, direction_mode=direction_mode).values())
 
+    # BEGIN distinguish functional feasibility from optional goal centering.
     def optimizer_preferences(self, position, quaternion, progress, *, trajectory_time=None,
-                              tool_linear_velocity=None, tool_angular_velocity=None):
-        """Retain real equality/goal gradients without attracting free reference axes."""
+                              tool_linear_velocity=None, tool_angular_velocity=None, phase="quality"):
+        """Guide real requirements with stage-specific functional goal errors.
+
+        ``feasibility`` penalizes only the part of a functional pose/coordinate
+        error outside its declared tolerance. ``quality`` additionally prefers
+        the original goal center. Pose errors remain position and SO(3) norms,
+        not independent per-axis bounds. Process equations and directional
+        commands retain their existing semantics in both phases; this choice
+        never changes the independently evaluated acceptance residuals.
+        """
         import torch
+        if phase not in {"feasibility", "quality"}:
+            raise ValueError("Optimization phase must be feasibility or quality")
         result = torch.zeros_like(progress)
         for requirement in self.pose_relations:
             exact = np.isfinite(requirement.pose_bounds).all(axis=1) & (requirement.pose_bounds[:, 0] == requirement.pose_bounds[:, 1])
@@ -1178,6 +1189,9 @@ class PlanningProblem:
                 result = result+torch.where(mask, preference, 0.)
         for requirement in self.pose_events:
             p, r = requirement.errors(position, quaternion)
+            if phase == "feasibility":
+                p = torch.relu(p-requirement.position_tolerance_m)
+                r = torch.relu(r-requirement.rotation_tolerance_rad)
             # BEGIN scale real goal objectives by their declared functional accuracy.
             # Raw metres/radians squared make a precise goal arbitrarily weak
             # beside native smoothness costs. This fixed rule changes numerical
@@ -1188,6 +1202,8 @@ class PlanningProblem:
             # END goal precision is input semantics, never a per-skill weight.
         for requirement in self.coordinate_events:
             error = requirement.error(position, quaternion, progress, trajectory_time=trajectory_time)
+            if phase == "feasibility":
+                error = torch.relu(error-requirement.tolerance)
             # BEGIN use the same relative-accuracy rule for native coordinate goals.
             result = result+torch.where(_first_event_query(progress, requirement.progress, trajectory_time),
                                         (error/requirement.tolerance).square(), 0.)
@@ -1214,6 +1230,7 @@ class PlanningProblem:
                 result = result+(residual/scale).square()
         # END no per-skill weights or extra hard direction constraints are added.
         return result
+    # END functional goal centers cannot compete during the feasibility phase.
 
     def measurements(self, position, quaternion, progress, *, trajectory_time=None):
         """Report source deviations separately from independent physical/goal errors."""
