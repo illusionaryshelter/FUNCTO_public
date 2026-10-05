@@ -232,6 +232,10 @@ def physics_label(run):
 
 def reference_for(segment_id, candidate_id, audit, workspace):
     """Look up an exact historical candidate; never choose a nearby candidate."""
+    # BEGIN a missing independent input audit is an explicitly absent reference.
+    if audit is None:
+        return None
+    # END current candidate evidence never borrows a different run's reference.
     for segment in audit["segments"]:
         if segment["id"] == segment_id:
             for candidate in segment.get("grounding_recompute", []):
@@ -418,7 +422,7 @@ def trial_panel(trial, output):
     return "".join(body)
 
 
-def render(manifest, audit, runs, unmatched, output, *, defer_untested=False):
+def render(manifest, audit, runs, unmatched, output, *, defer_untested=False, stage_reports=None):
     """Render every manifest segment, keeping independent snapshots separate."""
     workspace = Path(manifest["workspace_root"])
     output.mkdir(parents=True, exist_ok=False)
@@ -458,6 +462,10 @@ def render(manifest, audit, runs, unmatched, output, *, defer_untested=False):
         overview.append([segment["id"]+"\n"+segment["name"], "\n".join(planned), "\n".join(physical)])
         # END compact retry summaries.
     body.append("</tbody></table>")
+    # BEGIN add the requested planning diagnostics to only explicitly bound runs.
+    stage_reports = {} if stage_reports is None else stage_reports
+    planning_diagnostics = []
+    # END other physical-trial pages keep their own established evidence scope.
     run_index, errors = 0, []
     for segment in manifest["segments"]:
         body.append(f'<section id="{escape(segment["id"])}"><h2>{escape(segment["id"])} · '
@@ -490,6 +498,16 @@ def render(manifest, audit, runs, unmatched, output, *, defer_untested=False):
             except (OSError, ValueError, KeyError) as error:
                 run["errors"].append(f"RGB-D: {type(error).__name__}: {error}")
             historical = reference_for(segment["id"], report["candidate_id"], audit, workspace)
+            # BEGIN retained native metrics and partial source evidence need no rerun.
+            if run["directory"] in stage_reports:
+                from recorded_planning_failure_visuals import render_failure_diagnostics
+                panel, saved = render_failure_diagnostics(run, segment, manifest, output,
+                    run_index, stage_path=stage_reports[run["directory"]])
+                body.append(panel)
+                planning_diagnostics.extend(saved)
+            if audit is None:
+                body.append("<p>独立的旧输入参考审计未提供；只显示本次保存产物。</p>")
+            # END display failures remain visible rather than generating replacement evidence.
             if not run["curves"]:
                 body.append("<p>本次运行未生成可展示的关节曲线。</p>")
             for curve in run["curves"]:
@@ -555,13 +573,23 @@ overflow-wrap:anywhere;max-height:500px;overflow:auto;font-size:12px}details{mar
             "unmatched_trial_count": len(unmatched), "render_errors": errors,
             "untested_segments_deferred": defer_untested,
             "continuous_execution_tested": False, "gpu_used": False,
-            "browser_interaction_tested": False}
+            "browser_interaction_tested": False,
+            # BEGIN retain the provenance of each explicitly requested failure view.
+            "planning_diagnostics": planning_diagnostics}
+            # END query inputs and completed validation remain separate evidence.
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("manifest", "audit", "output"):
+    for name in ("manifest", "output"):
         parser.add_argument("--"+name, type=Path, required=True)
+    # BEGIN current planning diagnostics do not require an unrelated historical audit.
+    parser.add_argument("--audit", type=Path,
+                        help="Optional independent historical input-reference audit")
+    parser.add_argument("--stage-report", nargs=2, action="append", default=[],
+                        metavar=("RUN_DIRECTORY", "STAGES_JSON"),
+                        help="Add planning failure/scene diagnostics for this exact run")
+    # END the explicit directory binding prevents mixing timings from another run.
     parser.add_argument("--run-dir", type=Path, action="append", required=True)
     parser.add_argument("--trial-dir", type=Path, action="append", default=[])
     parser.add_argument("--defer-untested", action="store_true",
@@ -569,13 +597,21 @@ def main():
     args = parser.parse_args()
     started = time.monotonic()
     configure_font()
-    manifest, audit = read_json(args.manifest), read_json(args.audit)
+    manifest = read_json(args.manifest)
+    audit = None if args.audit is None else read_json(args.audit)
     if not manifest["snapshots_are_independent"]:
         raise ValueError("This report requires explicitly independent segment snapshots")
     runs, unmatched = load_runs(args.run_dir, args.trial_dir, manifest)
+    # BEGIN refuse an unbound or repeated timing report before creating output.
+    stage_reports = {Path(directory).resolve(): Path(path).resolve() for directory, path in args.stage_report}
+    if (len(stage_reports) != len(args.stage_report)
+            or not set(stage_reports) <= {run["directory"] for run in runs}):
+        raise ValueError("Each stage report must name one distinct supplied run directory")
+    # END no filename proximity supplies a timing identity.
     report = render(manifest, audit, runs, unmatched, args.output.resolve(),
-                    defer_untested=args.defer_untested)
-    report.update(manifest_path=str(args.manifest.resolve()), audit_path=str(args.audit.resolve()),
+                    defer_untested=args.defer_untested, stage_reports=stage_reports)
+    report.update(manifest_path=str(args.manifest.resolve()),
+                  audit_path=None if args.audit is None else str(args.audit.resolve()),
                   run_directories=[str(path.resolve()) for path in args.run_dir],
                   trial_directories=[str(path.resolve()) for path in args.trial_dir],
                   elapsed_seconds=time.monotonic()-started,

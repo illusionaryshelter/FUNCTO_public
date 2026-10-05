@@ -2432,6 +2432,20 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         planner, _ = self.selection_fixture((.01, 0.), errors=(0, 1))
         with self.assertRaisesRegex(ValueError, "export|finite sample budget"):
             planner.select_candidate(result)
+
+    # BEGIN global budget failure must keep its identity and stop seed work.
+    def test_export_work_exhaustion_is_not_wrapped_or_retried_as_a_seed_error(self):
+        from manipulation.planning import PlanningWorkExhausted
+
+        result = self.native_candidates(flags=(False, True))
+        planner, _ = self.selection_fixture((.01, 0.))
+        exhausted = PlanningWorkExhausted("original cumulative wall-time exhausted")
+        planner.export.side_effect = exhausted
+        with self.assertRaises(PlanningWorkExhausted) as caught:
+            planner.select_candidate(result)
+        self.assertIs(caught.exception, exhausted)
+        self.assertEqual(planner.export.call_count, 1)
+    # END an admitted alternative never replenishes the request budget.
 # END independent native-result selection and continuation regressions.
 
 
@@ -2509,6 +2523,45 @@ class ContinuousCubicDerivativeTests(unittest.TestCase):
 
 
 class ExportedCurveContractTests(unittest.TestCase):
+    # BEGIN observer failures cannot alter checks or replace the budget error.
+    def test_partial_observer_sees_only_completed_batches_before_budget_failure(self):
+        from manipulation.planning import PlanningWorkExhausted
+
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
+        planner, native = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
+            np.zeros((5, 3)), np.zeros((5, 3)), .25)
+        old_validation = {"candidate": "previous_seed"}
+        planner.last_validation = old_validation
+        snapshots = []
+        planner._export_progress_observer = lambda value: snapshots.append(deepcopy(value))
+        exhausted = PlanningWorkExhausted("original batch-boundary deadline")
+        checks = []
+        def check():
+            checks.append(True)
+            if len(checks) == 2:
+                raise exhausted
+        planner._check_validation_work = check
+        with patch("manipulation.planning._VALIDATION_CHUNK_SIZE", 2), self.assertRaises(PlanningWorkExhausted) as caught:
+            planner.export(native)
+        self.assertIs(caught.exception, exhausted)
+        self.assertEqual([row["checked_points"] for row in snapshots], [0, 2])
+        self.assertEqual(snapshots[-1]["source_self_collision_batch"]["checked_states"], 2)
+        self.assertGreater(snapshots[-1]["planned_points"], 2)
+        self.assertIs(planner.last_validation, old_validation)
+
+    def test_throwing_partial_observer_leaves_complete_export_unchanged(self):
+        problem = cartesian_problem((MotionPhase("free", constant_path()),))
+        planner, native = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
+            np.zeros((5, 3)), np.zeros((5, 3)), .25)
+        expected, expected_count = planner.export(native)
+        planner._export_progress_observer = Mock(side_effect=OSError("diagnostic disk full"))
+        actual, actual_count = planner.export(native)
+        self.assertEqual(actual_count, expected_count)
+        self.assertEqual(actual.residuals, expected.residuals)
+        np.testing.assert_array_equal(actual.position, expected.position)
+        np.testing.assert_array_equal(actual.velocity, expected.velocity)
+        self.assertGreater(planner._export_progress_observer.call_count, 1)
+    # END evidence collection cannot revoke a numerically unchanged candidate.
     # BEGIN exported source checks preserve the exact native query precision and failure time.
     def test_source_collision_uses_native_query_values_and_enters_exported_residuals(self):
         problem = cartesian_problem((MotionPhase("free", constant_path()),))
@@ -2866,6 +2919,25 @@ class PlannerRetryContractTests(unittest.TestCase):
                 self.assertIsNone(result.trajectory)
                 self.assertEqual(planner.optimize.call_count, 1)
                 planner.ompl_seed.assert_not_called()
+
+    # BEGIN error classification and conservative export charging are independent.
+    def test_exhausted_export_keeps_request_category_and_charges_once(self):
+        from manipulation.planning import PlanningWorkExhausted
+
+        planner, _, _ = self.scripted_planner([False], [.1])
+        planner.export.side_effect = PlanningWorkExhausted("original cumulative wall-time exhausted")
+        budget = PlanningBudget(maximum_trajectory_solves=2)
+        result = self.run_planner(planner, budget)
+        self.assertFalse(result.success)
+        self.assertEqual(result.diagnostics["failure"], "cumulative_planning_budget_exhausted")
+        self.assertEqual(result.diagnostics["error_type"], "PlanningWorkExhausted")
+        self.assertEqual(result.diagnostics["reason"], "original cumulative wall-time exhausted")
+        consumed = result.diagnostics["consumed_planning"]
+        self.assertEqual(consumed["validation_passes"], 1)
+        self.assertEqual(consumed["validation_queries"], 1+budget.max_validation_points)
+        self.assertEqual(planner.export.call_count, 1)
+        planner.ompl_seed.assert_not_called()
+    # END no diagnostic or exception handler spends another solve allowance.
 
     # BEGIN diagnose the completed native seed selection, not a static budget guess.
     def test_diagnostics_report_actual_seed_policy_and_native_early_exit_configuration(self):

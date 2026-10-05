@@ -32,6 +32,126 @@ def _json_value(value):
     raise TypeError(f"Unsupported report value: {type(value).__name__}")
 
 
+# BEGIN diagnostic documents keep nonfinite evidence and complete file writes.
+def _diagnostic_value(value):
+    """Convert owned CPU evidence without silently dropping NaN/Inf failures."""
+    if isinstance(value, np.ndarray):
+        return _diagnostic_value(value.tolist())
+    if isinstance(value, np.generic):
+        return _diagnostic_value(value.item())
+    if isinstance(value, dict):
+        return {key: _diagnostic_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_diagnostic_value(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        return "NaN" if np.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+    return value
+
+
+def _write_diagnostic_json(path, document):
+    """Replace a complete JSON document; a failed write keeps the last one."""
+    path = Path(path)
+    rendered = json.dumps(_diagnostic_value(document), default=_json_value,
+                          indent=2, allow_nan=False)+"\n"
+    temporary = path.with_name(path.name+".tmp")
+    try:
+        temporary.write_text(rendered)
+        temporary.replace(path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+class _ExportValidationRecorder:
+    """Own one export's bounded CPU summaries, never an acceptance decision.
+
+    Source-world reports already retain one worst state over all completed
+    chunks. Source-self reports retain one worst state per chunk; this recorder
+    keeps only the overall first worst state, using the production rank. No
+    trajectory-sized inventory of pair reports or native tensor is retained.
+    """
+
+    def __init__(self, path, *, native_result, seed_index, observer_errors):
+        self.path, self.observer_errors = Path(path), observer_errors
+        self.document = {
+            "schema": "functo.export_validation_progress.1",
+            "classification": "partial_validation_diagnostic_not_executable",
+            "native_result": native_result, "seed_index": seed_index,
+            "status": "started", "validation_complete": False,
+            "completed_batches": 0, "planned_points": None, "checked_points": 0,
+            "curve_duration_s": None, "checked_time_interval_s": None,
+            "source_world_collision": {},
+            "source_self_collision": {"checked_states": 0,
+                "unmodelled_geometry_names": [], "worst_state": None},
+            "process_constraints": {"status": "not_archived",
+                "reason": "Full chronological process residuals are archived only after export returns"},
+            "native_joint_constraints": {"status": "not_archived",
+                "reason": "Partial evidence does not add native tensor reductions or host copies"},
+            "exception": None, "budget_exhausted": False,
+            "scope": "Completed finite batches only; checked time endpoints do not certify the continuous interval. "
+                "World checked_states includes exact/left/right modes in original residual order, not unique Coal calls. "
+                "NaN/Infinity are explicit string values. No record authorizes execution.",
+        }
+        self._write()
+
+    def _write(self):
+        try:
+            _write_diagnostic_json(self.path, self.document)
+        except Exception as error:
+            # Keep error storage bounded even if every later disk write fails.
+            message = f"Export progress {self.path.name}: {type(error).__name__}: {error}"
+            if message not in self.observer_errors:
+                self.observer_errors.append(message)
+
+    def observe(self, progress):
+        """Copy this batch before later queries reuse their mutable reports."""
+        try:
+            values = deepcopy(progress)
+            current = values.pop("source_self_collision_batch")
+            if current is not None:
+                self.document["completed_batches"] += 1
+                retained = self.document["source_self_collision"]
+                retained["checked_states"] += current["checked_states"]
+                retained["unmodelled_geometry_names"] = sorted(set(
+                    retained["unmodelled_geometry_names"]) | set(current["unmodelled_geometry_names"]))
+                previous, candidate = retained["worst_state"], current["worst_state"]
+                def rank(witness):
+                    clearance = witness["minimum_required_clearance_m"]
+                    return witness["residual"], -float("inf") if clearance is None else -clearance
+                if candidate is not None and (previous is None or rank(candidate) > rank(previous)):
+                    retained["worst_state"] = candidate
+            self.document.update(values, status="partial")
+            self._write()
+        except Exception as error:
+            message = f"Export progress {self.path.name}: {type(error).__name__}: {error}"
+            if message not in self.observer_errors:
+                self.observer_errors.append(message)
+
+    def finish(self, *, error=None, residuals=None):
+        """Completion means export returned, independently of native success."""
+        from manipulation.planning import PlanningWorkExhausted
+
+        try:
+            if error is None:
+                self.document.update(status="completed", validation_complete=True,
+                    classification="completed_validation_diagnostic_not_executable",
+                    full_validation_residuals=deepcopy(residuals),
+                    process_constraints={"status": "completed"},
+                    native_joint_constraints={"status": "completed_in_full_validation_residuals"})
+            else:
+                self.document.update(status="partial", validation_complete=False,
+                    exception={"type": type(error).__name__, "message": str(error)},
+                    budget_exhausted=isinstance(error, PlanningWorkExhausted))
+            self._write()
+        except Exception as diagnostic_error:
+            message = f"Export finish {self.path.name}: {type(diagnostic_error).__name__}: {diagnostic_error}"
+            if message not in self.observer_errors:
+                self.observer_errors.append(message)
+# END recorder I/O and metadata failures never become planning failures.
+
+
 # BEGIN preserve native representations before candidate gathering/export.
 def _cpu_array(value):
     """Detach an owned CPU copy; recording cannot alias reusable solver buffers."""
@@ -302,13 +422,20 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
               "phase_count": problem.phase_count,
               "required_source_anchors": len(problem.anchors),
               "candidates": [], "native_results": [], "effective_configurations": [],
-              "optimizer_inputs": [],
+              # BEGIN native and partial reports have independent file identities.
+              "optimizer_inputs": [], "export_validations": [], "observer_errors": [],
+              # END failed exports cannot erase metrics recorded before them.
               # BEGIN expose missing scene evidence even when construction fails.
               "initialization": {"status": "not_started"},
               "collision_snapshot_scope": "each retained candidate; unselected native seeds remain native-result diagnostics"}
               # END a run without an initialized planner cannot claim a snapshot.
     original = planning._CuroboPlanner.select_candidate
     original_export = planning._CuroboPlanner.export
+    # BEGIN reuse the production's single per-seed metrics calculation.
+    original_native_diagnostics = planning._CuroboPlanner.native_diagnostics
+    native_metrics_document, current_native_seed = None, None
+    export_progress_records = {}
+    # END no diagnostic invokes a second native metrics pass.
     original_curve_init = planning.JointTrajectory.__post_init__
     native_trace = None
     configuration_index = 0
@@ -410,6 +537,13 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
         entry = {"path": path.name, "classification": classification,
                  "attempt": deepcopy(attempt), "validation_status": validation_status,
                  "curve_saved": False, "native_result": native_trace}
+        # BEGIN link only this exact curve's independently persisted progress.
+        partial = export_progress_records.get(id(curve))
+        if partial is not None and partial[0] is curve:
+            entry["export_validation_path"] = partial[1]
+        if native_trace is not None:
+            entry["native_metrics_path"] = Path(native_trace).stem+"-metrics.json"
+        # END paths identify diagnostic evidence, not execution authority.
         # BEGIN each saved curve names its own full observed scene and exact modes.
         snapshot_path = path.with_name(path.stem+"-scene.json")
         snapshot = {"path": snapshot_path.name, "saved": False}
@@ -463,6 +597,14 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
         # Preserve that same object if validation cannot finish; do not retry
         # validation with weaker settings or return it as a successful plan.
         constructed = []
+        # BEGIN each export owns a fresh partial record, even when it fails early.
+        progress_path = output/f"export-{len(report['export_validations']):02d}-validation.json"
+        progress = _ExportValidationRecorder(progress_path, native_result=native_trace,
+            seed_index=current_native_seed, observer_errors=report["observer_errors"])
+        progress_entry = {"path": progress_path.name, "native_result": native_trace,
+                          "seed_index": current_native_seed, "validation_complete": False}
+        report["export_validations"].append(progress_entry)
+        # END per-batch atomic files survive errors before the final run report.
         # BEGIN copy production's own expanded query record after each chunk.
         query_capture = {"status": "not_recorded", "calls": [], "errors": []}
         original_boundary_query = planning._scene_boundary_evaluate
@@ -482,38 +624,99 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
         def capture(curve):
             original_curve_init(curve)
             constructed.append(curve)
+            export_progress_records[id(curve)] = (curve, progress_path.name)
 
         try:
             # BEGIN the recorder is scoped to this export's private verification scene.
             with patch.object(planning.JointTrajectory, "__post_init__", new=capture), \
-                    patch.object(planning, "_scene_boundary_evaluate", new=capture_boundary):
+                    patch.object(planning, "_scene_boundary_evaluate", new=capture_boundary), \
+                    patch.object(planner, "_export_progress_observer", new=progress.observe, create=True):
                 exported = original_export(planner, native_result)
             export_query_captures[id(exported[0])] = (exported[0], query_capture)
+            progress.finish(residuals=exported[0].residuals)
+            progress_entry["validation_complete"] = True
             return exported
             # END other candidate scenes and the optimizer remain unmodified.
-        except ValueError as error:
-            if len(constructed) == 1:
+        # BEGIN preserve the original error category, including request exhaustion.
+        except BaseException as error:
+            progress.finish(error=error)
+            progress_entry["exception"] = {"type": type(error).__name__, "message": str(error)}
+            # An explicit interrupt retains already persisted CPU progress but
+            # does not initiate another display FK after the stop request.
+            if isinstance(error, Exception) and len(constructed) == 1:
                 try:
                     # BEGIN unfinished validation retains only its own observed query inputs.
                     export_query_captures[id(constructed[0])] = (constructed[0], query_capture)
                     # END save_collision_snapshot deliberately omits stale last_validation.
+                    seed_metrics = (None if native_metrics_document is None else next(
+                        (item["metrics"] for item in native_metrics_document["seeds"]
+                         if item["seed_index"] == current_native_seed), None))
                     preserve_candidate(planner, constructed[0],
-                        {"accepted": False, "native_success": bool(native_result.success.all()),
-                         "export_error": str(error)}, validation_status="not_completed")
+                        {"accepted": False, "seed_index": current_native_seed,
+                         "native_success": None if seed_metrics is None else seed_metrics["success"],
+                         "native_metrics": deepcopy(seed_metrics),
+                         "export_error": str(error), "export_error_type": type(error).__name__},
+                        validation_status="not_completed")
                 except Exception as diagnostic_error:
                     report.setdefault("observer_errors", []).append(
                         f"Rejected curve record: {type(diagnostic_error).__name__}: {diagnostic_error}")
             raise
+        # END partial witnesses never acquire a completed validation status.
+
+    # BEGIN persist the existing native diagnostic before the corresponding export.
+    def observed_native_diagnostics(planner, native_result, seed_index=None):
+        nonlocal current_native_seed
+        metrics = original_native_diagnostics(planner, native_result, seed_index=seed_index)
+        current_native_seed = seed_index
+        try:
+            if native_metrics_document is None or seed_index is None:
+                raise ValueError("Native metrics require their current result and explicit seed identity")
+            entry = {"seed_index": int(seed_index), "metrics": deepcopy(metrics),
+                     "positive_constraint_names": {}, "nonfinite_metric_names": []}
+            for label in ("rollout", "interpolated"):
+                if label not in metrics:
+                    continue
+                entry["positive_constraint_names"][label] = [name for name, value in
+                    metrics[label]["constraints"].items() if np.isfinite(value) and value > 0.]
+                for kind in ("constraints", "convergence"):
+                    entry["nonfinite_metric_names"].extend(f"{label}.{kind}.{name}"
+                        for name, value in metrics[label][kind].items() if not np.isfinite(value))
+            native_metrics_document["seeds"].append(entry)
+            native_metrics_document["acceptance_semantics"] = {
+                "constraints": "Native summed constraints over the full horizon must be <= 0; "
+                    "archived values are per-name maxima, so positive names identify violated nonnegative terms",
+                "constraint_threshold": 0.,
+                "convergence": "Native position/orientation convergence uses only the last timestep and strict <. "
+                    "Archived convergence values are whole-horizon maxima, not final-timestep failure flags",
+                "position_tolerance": float(planner.trajopt.config.position_tolerance),
+                "orientation_tolerance": float(planner.trajopt.config.orientation_tolerance),
+                "success": "rollout feasibility AND enabled terminal convergence AND interpolated feasibility",
+            }
+            metrics_path = output/(Path(native_trace).stem+"-metrics.json")
+            _write_diagnostic_json(metrics_path, native_metrics_document)
+        except Exception as error:
+            report["observer_errors"].append(f"Native metrics record: {type(error).__name__}: {error}")
+        return metrics
+    # END no extra GPU reduction, scalar read or native result mutation occurs.
 
     def observed(planner, native_result):
         # BEGIN retain every native seed before production gathers a candidate.
-        nonlocal native_trace
+        nonlocal native_trace, native_metrics_document, current_native_seed
         # BEGIN bound retained query memory to the existing native seed count.
         export_query_captures.clear()
+        export_progress_records.clear()
         # END snapshots from a previous optimization round are already on disk.
         path = output/f"native-result-{len(report['native_results']):02d}.npz"
         native_trace = path.name
+        current_native_seed = None
+        native_metrics_document = {
+            "schema": "functo.native_candidate_metrics.1",
+            "classification": "native_diagnostic_not_executable",
+            "native_result": path.name, "expected_seeds": int(native_result.num_seeds),
+            "seeds": [], "nonfinite_encoding": "NaN, Infinity and -Infinity are explicit strings",
+        }
         entry = {"path": path.name, "saved": False,
+                 "metrics_path": path.stem+"-metrics.json",
                  "optimizer_input": report["optimizer_inputs"][-1]["path"]
                  if report["optimizer_inputs"] else None,
                  "effective_configuration": report["effective_configurations"][-1]["path"]
@@ -533,6 +736,8 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
         with ExitStack() as stack:
             stack.enter_context(patch.object(planning._CuroboPlanner, "select_candidate", new=observed))
             stack.enter_context(patch.object(planning._CuroboPlanner, "export", new=observed_export))
+            stack.enter_context(patch.object(planning._CuroboPlanner, "native_diagnostics",
+                                             new=observed_native_diagnostics))
             # BEGIN record the entrance at its original evaluation point.
             for name in ("_initialize", "initial_state_diagnostics", "reference_seeds", "optimize"):
                 method = getattr(planning._CuroboPlanner, name)
@@ -567,17 +772,35 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
         return result
     except KeyboardInterrupt:
         report.update(status="interrupted", interruption_reason="Explicit operator interrupt")
-        (output/"exception.txt").write_text(traceback.format_exc())
+        # BEGIN recording an interruption cannot replace the interruption.
+        try:
+            (output/"exception.txt").write_text(traceback.format_exc())
+        except Exception as error:
+            report["observer_errors"].append(f"Exception record: {type(error).__name__}: {error}")
+        # END already persisted per-batch CPU evidence remains authoritative.
         raise
     except Exception as error:
         report.update(status="error", error=f"{type(error).__name__}: {error}")
-        (output/"exception.txt").write_text(traceback.format_exc())
+        # BEGIN preserve the original failure if the diagnostic filesystem fails.
+        try:
+            (output/"exception.txt").write_text(traceback.format_exc())
+        except Exception as diagnostic_error:
+            report["observer_errors"].append(
+                f"Exception record: {type(diagnostic_error).__name__}: {diagnostic_error}")
+        # END this write has no authority to change the planner's exception.
         raise
     finally:
-        report.update(elapsed_seconds=time.monotonic()-started,
-                      peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024,
-                      peak_torch_allocated_bytes=torch.cuda.max_memory_allocated(),
-                      peak_torch_reserved_bytes=torch.cuda.max_memory_reserved())
-        (output/"planning-report.json").write_text(json.dumps(
-            report, default=_json_value, indent=2, allow_nan=False)+"\n")
+        # BEGIN final telemetry cannot mask an exception or revoke a result.
+        report["elapsed_seconds"] = time.monotonic()-started
+        try:
+            report.update(peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024,
+                          peak_torch_allocated_bytes=torch.cuda.max_memory_allocated(),
+                          peak_torch_reserved_bytes=torch.cuda.max_memory_reserved())
+        except Exception as error:
+            report["observer_errors"].append(f"Peak resource record: {type(error).__name__}: {error}")
+        try:
+            _write_diagnostic_json(output/"planning-report.json", report)
+        except Exception as error:
+            report["observer_errors"].append(f"Final planning report: {type(error).__name__}: {error}")
+        # END a missing final report still fails the external execution gate.
 # END current-planner invocation with scoped diagnostic curve recording.

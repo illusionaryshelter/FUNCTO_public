@@ -127,8 +127,13 @@ def nominal_hand(scene, curve):
         raise ValueError("Nominal hand must retain the complete original named polynomial and clock")
     # Only the geometric polynomial fields are needed by the existing sampler;
     # nominal_model deliberately does not pretend to be a command contract.
+    # BEGIN initialize the sampler's per-device/dtype polynomial storage.
+    # The diagnostic polynomial has no command contract, but must own the same
+    # initially empty cache used by FingerTrajectory.sample_torch. Each entry
+    # retains only converted fixed knots/coefficients, never sampled results.
     polynomial = SimpleNamespace(times=times, duration=curve.duration,
-        _curve=CubicHermiteSpline(times, positions, velocities, axis=0))
+        _curve=CubicHermiteSpline(times, positions, velocities, axis=0), _torch_cache={})
+    # END the production sampler retains its original arithmetic and clock.
 
     def sample(time_s, dtype="torch.float64"):
         import torch

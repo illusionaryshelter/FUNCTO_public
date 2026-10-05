@@ -280,6 +280,12 @@ class RobotGeometryChecker:
         self._scene_gaps = []
         self._scene_native_aliases = {}
         self._scene_release_predictions = {}
+        # BEGIN each immutable scene owns one last exact surface result per pair.
+        # Rebinding discards shape identities and every cached witness. No
+        # geometry, pose, contact permission or signed-piece verdict is shared
+        # between different scene snapshots by this cache.
+        self._scene_surface_distance_cache = {}
+        # END entry count is bounded by the admitted finite shape-pair inventory.
         # BEGIN keep both observed resolutions and their shared body identities.
         self._scene_layers = {}
         self._scene_body_groups = tuple(deepcopy(scene_binding.get("robot_collision_bodies", ())))
@@ -362,6 +368,11 @@ class RobotGeometryChecker:
         # The independent fixed native-pair cache is already reserved above;
         # it is not duplicated as scene-sized scratch on every scene query.
         pair_bound = len(self._scene_shapes) * (len(self._geometries) + len(self._scene_shapes))
+        # BEGIN reserve exact surface inputs/results before scene admission.
+        # Each pair retains two pose byte strings, the complete native request,
+        # one distance and two XYZ witnesses; 4 KiB also covers Python storage.
+        self.scene_storage_nbytes += pair_bound * 4096
+        # END no trajectory-length history or extra geometry is retained.
         self.scene_query_workspace_nbytes = (pair_bound * (131072 + 4096 * len(scene_binding["contacts"]))
                                             + 2 * (self.scene_storage_nbytes - self.native_query_storage_nbytes))
         # END planning clones share this immutable scene allocation.
@@ -544,8 +555,11 @@ class RobotGeometryChecker:
             # frames; those rows must still construct their individual poses.
             actor_transform = None
             # END the lazy value never survives this one scene query.
-            for first, second in _scene_component_pairs(
-                    actor_body, targets, decisions, boundary, rows, self._request, checked, stopped_pairs):
+            # BEGIN carry the unchanged physical-pair identity through its pieces.
+            for first, second, pair_key in _scene_component_pairs(
+                    actor_body, targets, decisions, boundary, rows, self._request, checked, stopped_pairs,
+                    self._scene_surface_distance_cache):
+            # END component identities still remain on the individual rows.
                 row_count = len(rows)
                 issue_counts = tuple(len(items) for items in (violations, gaps, unresolved))
                 try:
@@ -587,6 +601,20 @@ class RobotGeometryChecker:
                     value = float(distance.min_distance)
                     if not np.isfinite(value):
                         raise RuntimeError("Independent scene distance returned nonfinite evidence")
+                    # BEGIN omit detail allocation only for a discarded separated piece.
+                    # Coal still checks every selected component. Beyond both
+                    # the numerical boundary and measurement margin, this piece
+                    # cannot create contacts, permissions or unresolved issues.
+                    # The streaming summary retains the first minimum on ties;
+                    # an equal or larger distance only increments its exact
+                    # tested count. No nearest-point array/list is then needed.
+                    margin = 0. if selected is None else selected["measurement_allowance_m"]
+                    summary = component_summaries.get(pair_key)
+                    if (summary is not None and value > max(boundary, margin)
+                            and value >= rows[summary["index"]]["signed_distance_m"]):
+                        rows[summary["index"]]["component_summary"]["tested"] += 1
+                        continue
+                    # END the finally summary sees no appended row in this case.
                     row = {"actor": first["owner"], "actor_geometry": first["name"],
                            "target_owner": second["owner"], "target_geometry": second["name"],
                            "actor_source": first["source"], "target_source": second["source"],
@@ -601,7 +629,6 @@ class RobotGeometryChecker:
                             row[label+"_tsdf_component"] = list(item["tsdf_component_id"])
                     # END a component penetration is not a global union penetration depth.
                     # BEGIN retain geometric separation separately from sensor margin rejection.
-                    margin = 0. if selected is None else selected["measurement_allowance_m"]
                     if selected is not None:
                         row.update(layer=selected["layer"], body_id=selected["body_id"],
                                    measurement_allowance_m=margin,
@@ -704,7 +731,7 @@ class RobotGeometryChecker:
                 finally:
                     # BEGIN stream complete component checks into bounded pair evidence.
                     if "tsdf_component_id" in first or "tsdf_component_id" in second:
-                        _summarize_component_result(first, second, rows, row_count,
+                        _summarize_component_result(pair_key, rows, row_count,
                             (violations, gaps, unresolved), issue_counts,
                             component_summaries, stopped_pairs)
                     # END a failed pair can stop; an accepted pair checks every candidate.
@@ -1144,7 +1171,8 @@ def _body_pair_key(first, second):
     return tuple(sorted(((first["owner"], first["name"]), (second["owner"], second["name"]))))
 
 
-def _summarize_component_result(first, second, rows, previous_count, issues, issue_counts, summaries, stopped):
+# BEGIN the component enumerator supplies the stable whole-body pair key once.
+def _summarize_component_result(key, rows, previous_count, issues, issue_counts, summaries, stopped):
     """Retain one decisive witness and complete counts, without storing all pieces.
 
     A rejected physical pair needs no second witness. An accepted pair still
@@ -1153,7 +1181,6 @@ def _summarize_component_result(first, second, rows, previous_count, issues, iss
     """
     if len(rows) == previous_count:
         return
-    key = _body_pair_key(first, second)
     current = rows[-1]
     # Conditional collisions remain allowed unresolved hypotheses. They must
     # not stop a later component from exposing a mandatory query gap.
@@ -1189,6 +1216,7 @@ def _summarize_component_result(first, second, rows, previous_count, issues, iss
         unresolved[summary["conditional_index"]]["component_issue_count"] = summary["conditional_count"]
     if failed:
         stopped.add(key)
+# END summary ordering, counts and first-minimum witness selection are unchanged.
 
 
 def _transform_bounds(bounds, pose):
@@ -1224,7 +1252,7 @@ def _component_rows(row, world_bounds, margin):
 
 
 def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, request,
-                           visited=None, stopped=None):
+                           visited, stopped, surface_cache):
     """Query a surface distance and all potentially intersecting signed pieces.
 
     A positive triangle distance cannot reject the negative-volume containment
@@ -1232,8 +1260,6 @@ def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, r
     candidate zero/negative component, including lower-dimensional samples.
     """
     from .tsdf_geometry import ObservedTsdfGeometry
-    visited = set() if visited is None else visited
-    stopped = set() if stopped is None else stopped
     for target in targets:
         if actor["owner"] == target["owner"]:
             continue
@@ -1248,20 +1274,42 @@ def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, r
         a_tsdf = isinstance(actor["shape"], ObservedTsdfGeometry)
         b_tsdf = isinstance(target["shape"], ObservedTsdfGeometry)
         if not a_tsdf and b_tsdf and target["shape"].surface_shape is not None:
-            result = coal.DistanceResult()
-            transforms = [coal.Transform3s(row["pose"][:3, :3], row["pose"][:3, 3])
-                          for row in (actor, target)]
-            coal.distance(actor["shape"], transforms[0], target["shape"].surface_shape,
-                          transforms[1], request, result)
-            value = float(result.min_distance)
-            if not np.isfinite(value):
-                raise RuntimeError("Observed TSDF surface distance returned nonfinite evidence")
+            # BEGIN reuse only bit-identical inputs to this diagnostic distance.
+            # The scene owns immutable native shapes. Pose dtype and all bytes
+            # distinguish even signed zero; Coal's serialization includes every
+            # DistanceRequest setting and initial guess. Keep just the latest
+            # entry for each shape pair, never a quantized or historical pose.
+            surface = target["shape"].surface_shape
+            cache_key = (id(actor["shape"]), id(surface))
+            signature = (request.saveToString(), actor["pose"].dtype.str,
+                actor["pose"].tobytes(), target["pose"].dtype.str, target["pose"].tobytes())
+            cached = surface_cache.get(cache_key)
+            if cached is not None and cached[0] == signature:
+                _, value, witness_first, witness_second = cached
+            else:
+                result = coal.DistanceResult()
+                transforms = [coal.Transform3s(row["pose"][:3, :3], row["pose"][:3, 3])
+                              for row in (actor, target)]
+                coal.distance(actor["shape"], transforms[0], surface,
+                              transforms[1], request, result)
+                value = float(result.min_distance)
+                if not np.isfinite(value):
+                    raise RuntimeError("Observed TSDF surface distance returned nonfinite evidence")
+                witness_first = np.asarray(result.getNearestPoint1()).copy()
+                witness_second = np.asarray(result.getNearestPoint2()).copy()
+                # Never memoize a call that changes its native request: a hit
+                # must have neither solver-history nor request side effects.
+                if request.saveToString() == signature[0]:
+                    surface_cache[cache_key] = (signature, value, witness_first, witness_second)
+                else:
+                    surface_cache.pop(cache_key, None)
+            # END fresh report lists prevent callers from mutating cached points.
             evidence_rows.append({"actor": actor["owner"], "actor_geometry": actor["name"],
                 "target_owner": target["owner"], "target_geometry": target["name"],
                 "layer": target["layer"], "signed_distance_m": value,
                 "distance_scope": "observed_zero_surface_only",
-                "witness_first": np.asarray(result.getNearestPoint1()).tolist(),
-                "witness_second": np.asarray(result.getNearestPoint2()).tolist(),
+                "witness_first": witness_first.tolist(),
+                "witness_second": witness_second.tolist(),
                 "diagnostic_only": True, "scope": "observed zero-set triangles; signed pieces checked separately"})
         target_bounds = _solid_axis_bounds(target["vertices"], target["shape"], target["pose"])
         for first in _component_rows(actor, target_bounds, margin):
@@ -1271,7 +1319,9 @@ def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, r
             for second in _component_rows(target, first_bounds, margin):
                 if key in stopped:
                     break
-                yield first, second
+                # BEGIN one identity per body pair, independent of piece count.
+                yield first, second, key
+                # END callers reuse the exact same key for streamed evidence.
 # END unknown regions never acquire a fabricated boundary or filled cell.
 
 

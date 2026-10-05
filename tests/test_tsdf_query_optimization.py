@@ -283,3 +283,91 @@ def test_cached_component_rows_match_fresh_native_queries_after_pose_changes(geo
                 assert found[1] == wanted[1]
                 np.testing.assert_allclose(found[2], wanted[2], rtol=0., atol=1e-12)
 # END candidate membership and all native geometry evidence retain original semantics.
+
+
+# BEGIN surface reuse requires every native input and never shares report arrays.
+@pytest.mark.parametrize("change", ("none", "pose_bit", "signed_zero", "request", "shape"))
+def test_surface_cache_keeps_exact_witnesses_and_invalidates_changed_inputs(geometry, monkeypatch, change):
+    from copy import deepcopy
+    from manipulation.robot_geometry_check import _scene_component_pairs
+
+    actor = {"owner": "robot", "name": "body", "shape": coal.Box(.1, .1, .1),
+        "vertices": None, "pose": world_pose(.13, [-2., .2, .3]), "source": "native solid"}
+    target = {"owner": "target", "name": "map", "shape": geometry, "vertices": geometry,
+        "pose": np.eye(4), "source": "observed field", "layer": None}
+    request, cache, calls = coal.DistanceRequest(), {}, []
+    original = coal.distance
+
+    def counted(*args):
+        calls.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(coal, "distance", counted)
+
+    def sample(retained):
+        rows = []
+        pieces = list(_scene_component_pairs(actor, [target], {}, 1e-6, rows,
+            request, set(), set(), retained))
+        assert pieces  # Reusing a surface row never skips signed-piece enumeration.
+        assert len(rows) == 1
+        return rows[0]
+
+    first = sample(cache)
+    expected = deepcopy(first)
+    first["witness_first"][0] = 12345.
+    assert sample(cache) == expected and len(calls) == 1
+    if change == "pose_bit":
+        actor["pose"][0, 3] = np.nextafter(actor["pose"][0, 3], -np.inf)
+    elif change == "signed_zero":
+        target["pose"][0, 3] = -0.
+    elif change == "request":
+        request.gjk_tolerance *= 2.
+    elif change == "shape":
+        actor["shape"] = coal.Box(.12, .1, .1)
+    before = len(calls)
+    found = sample(cache)
+    assert len(calls)-before == int(change != "none")
+    fresh = sample({})
+    assert list(found) == list(fresh)
+    assert found == fresh
+    # Dictionary equality alone would hide a changed sign bit in floating zero.
+    for name in ("signed_distance_m", "witness_first", "witness_second"):
+        assert np.asarray(found[name], dtype=np.float64).tobytes() == np.asarray(
+            fresh[name], dtype=np.float64).tobytes()
+    assert len(cache) == (2 if change == "shape" else 1)
+# END misses preserve a fresh native query and cached rows expose owned lists only.
+
+
+# BEGIN native request mutation and failed results can never seed reuse.
+@pytest.mark.parametrize("failure", ("request_mutated", "nonfinite"))
+def test_surface_cache_does_not_reuse_stateful_or_nonfinite_calls(geometry, monkeypatch, failure):
+    from manipulation.robot_geometry_check import _scene_component_pairs
+
+    actor = {"owner": "robot", "name": "body", "shape": coal.Box(.1, .1, .1),
+        "vertices": None, "pose": world_pose(.13, [-2., .2, .3]), "source": "native solid"}
+    target = {"owner": "target", "name": "map", "shape": geometry, "vertices": geometry,
+        "pose": np.eye(4), "source": "observed field", "layer": None}
+    request, cache, calls = coal.DistanceRequest(), {}, []
+    original = coal.distance
+
+    def altered(*args):
+        calls.append(1)
+        result = original(*args)
+        if failure == "request_mutated":
+            request.gjk_tolerance *= 2.
+        else:
+            args[-1].min_distance = float("nan")
+        return result
+
+    monkeypatch.setattr(coal, "distance", altered)
+    for _ in range(2):
+        samples = _scene_component_pairs(actor, [target], {}, 1e-6, [],
+            request, set(), set(), cache)
+        if failure == "nonfinite":
+            with pytest.raises(RuntimeError, match="nonfinite evidence"):
+                list(samples)
+        else:
+            list(samples)
+        assert not cache
+    assert len(calls) == 2
+# END later queries must repeat the real native call and retain its failures.

@@ -421,3 +421,48 @@ def test_conditional_component_collisions_continue_until_a_hard_query_failure(ch
     summary = result["pairs"][0]["component_summary"]
     assert summary["tested"] == 3 and summary["stopped_after_pair_failure"]
 # END one report slot summarizes all evaluated pieces without changing acceptance.
+
+
+# BEGIN separated summaries must retain first ties and later decisive failures.
+@pytest.mark.parametrize("interior_point", [False, True])
+def test_separated_tsdf_summary_preserves_ties_and_later_collision(checker, interior_point):
+    cylinder = RobotGeometryChecker(checker.urdf_path, base_frame="base", geometries=[
+        NativePrimitive("pad", "base", "cylinder", (.05, .1), rigid(.049), "native curved pad")])
+    values = -np.ones((3, 3, 1))
+    observed = np.zeros(values.shape, bool)
+    observed[0, 0, 0] = observed[0, 2, 0] = True
+    observed[2, 0, 0] = observed[2, 2, 0] = True
+    if interior_point:
+        observed[0, 1, 0] = True
+    model = binding()
+    model["owners"][0]["geometry"] = tsdf_geometry_from_samples(values, observed,
+        origin=[-.045, -.045, .049], voxel_size=.045,
+        name="observed_points", source="equal-distance corners and optional interior point")
+    result = query(cylinder, model)
+    row, = result["pairs"]
+    assert result["passed"] is (not interior_point)
+    assert row["component_summary"]["tested"] == (2 if interior_point else 4)
+    assert row["component_summary"]["permitted"] == 0
+    assert row["component_summary"]["stopped_after_pair_failure"] is interior_point
+    # The four corners are outside the round solid but inside its AABB.
+    # Equal later minima keep the first corner. An inserted occupied point
+    # inside the cylinder must still replace it and stop this rejected pair.
+    assert row["target_tsdf_component"][1] == (1 if interior_point else 0)
+    assert (row["signed_distance_m"] < 0.) is interior_point
+    assert len(result["violations"]) == int(interior_point)
+# END unused detail omission cannot turn a later intersecting piece into a pass.
+
+
+# BEGIN rebinding resets all exact surface results before new shape identities.
+def test_rebinding_scene_discards_surface_distance_results(checker):
+    values = np.ones((2, 2, 2))
+    values[:, :, 0] = -1.
+    model = binding()
+    model["owners"][0]["geometry"] = tsdf_geometry_from_samples(values,
+        np.ones(values.shape, bool), origin=[1., 1., 1.], voxel_size=.01,
+        name="distant_surface", source="observed surface for binding isolation")
+    assert query(checker, model)["passed"]
+    assert checker._scene_surface_distance_cache
+    checker.bind_scene(model)
+    assert checker._scene_surface_distance_cache == {}
+# END numerically similar replacement scenes still receive fresh native queries.

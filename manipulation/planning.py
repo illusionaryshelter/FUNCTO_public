@@ -4163,6 +4163,14 @@ class _CuroboPlanner:
                       "native_metrics": native_metrics, "native_seed_cost": native_cost}
             try:
                 trajectory, points = self.export(candidate)
+            # BEGIN request exhaustion is not a local candidate rejection.
+            # Preserve this exact exception for the outer request ledger. The
+            # tracked export's finally block has already charged its admitted
+            # work, so neither another seed nor exception wrapping may reset
+            # that budget or replace its original diagnostic category.
+            except PlanningWorkExhausted:
+                raise
+            # END ordinary bounded export errors still retain other seeds.
             except ValueError as error:
                 # A bounded export rejection is local to this seed. Another
                 # already allocated seed can still provide a valid curve.
@@ -4300,6 +4308,36 @@ class _CuroboPlanner:
             callback = getattr(self, "_check_validation_work", None)
             if callback is not None:
                 callback()
+        # BEGIN completed batches may publish existing CPU-only evidence.
+        # This optional recorder hook never observes an unfinished batch or
+        # borrows last_validation from a previous candidate. In particular it
+        # does not reduce/copy native tensor costs or repeat a geometry query.
+        # A recorder owns any copies it retains. Ordinary diagnostic failures
+        # cannot change verification, work checks, or candidate acceptance.
+        progress_observer = getattr(self, "_export_progress_observer", None)
+        def publish_progress(completed_points, source_self=None):
+            if progress_observer is None:
+                return
+            try:
+                progress_observer({
+                    "planned_points": len(queries), "checked_points": completed_points,
+                    "curve_duration_s": trajectory.duration,
+                    "checked_time_interval_s": (None if not completed_points else
+                        [float(queries[0]), float(queries[completed_points-1])]),
+                    "source_world_collision": source_world_report,
+                    "source_self_collision_batch": source_self,
+                    "robot_coverage": {"checked_states": coverage_count,
+                        "passed": coverage_passed,
+                        "attempt_disallowed_states": int(np.count_nonzero(coverage_unknown[:completed_points])),
+                        "failed_witnesses": coverage_failed},
+                    "analytic_acceleration": derivatives,
+                })
+            except Exception:
+                # The experiment recorder reports its own I/O errors. Other
+                # optional observers are equally unable to alter the result.
+                pass
+        publish_progress(0)
+        # END no partial record supplies a planner validation verdict.
         def fk_at(moments, values, rates):
             check_work()
             joint_state = self.JointState(position=values, velocity=rates,
@@ -4389,6 +4427,9 @@ class _CuroboPlanner:
                     coverage_failed.extend({"time_s": float(queries[begin+i]), "result": row}
                         for i, row in enumerate(coverage) if not row["passed"] and len(coverage_failed) < 16)
                     coverage_failed = coverage_failed[:16]
+                # BEGIN checkpoint only after every original batch operation.
+                publish_progress(end, source_report)
+                # END the existing cumulative-budget boundary remains here.
                 check_work()
             # Process constraints may use ordered winding/first-event history.
             # Evaluate them once on the full small TCP/q arrays, never on an
