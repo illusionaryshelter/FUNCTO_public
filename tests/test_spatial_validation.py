@@ -65,15 +65,46 @@ def test_full_record_capacity_counts_typed_modes_bodies_targets_and_moving_actor
         _validation_storage_admission(problem, scene, metadata, PlanningBudget(max_validation_points=65536))
 
 
-@pytest.mark.parametrize("kind", ["support", "interior", "coupling", "retained_phase_outputs"])
+# BEGIN point-support admission counts one complete event, not every query.
+def test_original_size_support_fits_full_validation_capacity_without_thinning():
+    problem = cartesian_problem((MotionPhase("free", constant_path()),))
+    problem.supports = (NS(body_points=np.broadcast_to(0., (312, 3)),
+        contact_points=np.broadcast_to(0., (24, 3)),
+        surface=NS(_hull=NS(equations=np.broadcast_to(0., (64, 3))))),)
+    scene = NS(required_progress_anchors=(), background=None, owners=())
+    report = _validation_storage_admission(problem, scene, {"active_joint_names": problem.joint_names},
+        PlanningBudget(max_validation_points=32768))
+    assert report["physical_states"] == 32768
+    assert report["process_geometry_peak_byte_limit"] == 256*1024**2
+    assert report["process_geometry_peak_bytes_upper"] < report["process_geometry_peak_byte_limit"]
+    # Full scalar/state retention still grows with the declared history even
+    # though the event's body/plane temporary does not multiply by that length.
+    larger = _validation_storage_admission(problem, scene, {"active_joint_names": problem.joint_names},
+        PlanningBudget(max_validation_points=65536))
+    assert larger["process_geometry_peak_bytes_upper"] > report["process_geometry_peak_bytes_upper"]
+
+
+def test_oversized_single_support_pose_still_exceeds_the_same_process_limit():
+    problem = cartesian_problem((MotionPhase("free", constant_path()),))
+    # Broadcast metadata keeps the test tiny; a single complete 5000-by-5000
+    # body/plane evaluation alone would exceed the unchanged 256-MiB bound.
+    problem.supports = (NS(body_points=np.broadcast_to(0., (5000, 3)),
+        contact_points=np.broadcast_to(0., (24, 3)),
+        surface=NS(_hull=NS(equations=np.broadcast_to(0., (5000, 3))))),)
+    scene = NS(required_progress_anchors=(), background=None, owners=())
+    with pytest.raises(ValueError, match="Full-history process tensors"):
+        _validation_storage_admission(problem, scene, {"active_joint_names": problem.joint_names},
+            PlanningBudget(max_validation_points=32, max_refinement_points=0))
+# END a smaller event temporary does not waive geometry or retained-work limits.
+
+
+@pytest.mark.parametrize("kind", ["interior", "coupling", "retained_phase_outputs"])
 def test_large_full_history_tensors_are_rejected_using_metadata_before_allocation(kind):
     problem = cartesian_problem((MotionPhase("free", constant_path()),))
     # Broadcast metadata makes even the counterexample input allocation tiny.
     points = np.broadcast_to(0., (1000, 3))
     planes = np.broadcast_to(0., (1000, 4))
-    if kind == "support":
-        problem.supports = (NS(body_points=points, contact_points=points, surface=NS(_hull=NS(equations=planes))),)
-    elif kind == "interior":
+    if kind == "interior":
         problem.interiors = (NS(body_points=points, halfspaces=planes),)
     elif kind == "coupling":
         problem.couplings = (NS(matrix=np.broadcast_to(0., (8192, 3))),)

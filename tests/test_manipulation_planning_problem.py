@@ -268,6 +268,90 @@ def alternative_placement(skill, goal=None):
 
 # BEGIN current-skill reference/goal/process separation regression coverage.
 class PlanningProcessTest(unittest.TestCase):
+    # BEGIN event-only support regression fixtures retain complete geometry.
+    @staticmethod
+    def _complete_support_event():
+        """Synthetic geometry with the real workload's 312/24/64 dimensions."""
+        rng = np.random.default_rng(5703)
+        body = rng.uniform([-.035, -.027, 0.], [.036, .031, .09], (312, 3))
+        contact = rng.uniform([-.03, -.02, 0.], [.03, .02, 0.], (24, 3))
+        angles = np.arange(64)*2*np.pi/64
+        boundary = np.column_stack((.3*np.cos(angles), .24*np.sin(angles)))
+        axes = Rotation.from_euler("xyz", [.13, -.17, .21]).as_matrix()
+        surface = SupportSurface([.025, -.035, .015], axes[:, :2], axes[:, 2], boundary,
+                                 "Synthetic observed finite support")
+        return SupportRequirement(.6, pose((.01, -.02, .04), (.2, -.1, .3)),
+            body, contact, [0., 0., -1.], surface, 1e-4, 1e-4, .002,
+            "Explicit synthetic support event with complete material geometry")
+
+    def test_support_event_matches_dense_masked_values_and_pose_gradients(self):
+        requirement = self._complete_support_event()
+        request = problem([MotionPhase("ordinary reference", path([pose(), pose()]))], supports=(requirement,))
+        # Each row is a different batch member. Physical-time duplicates must
+        # choose the first storage occurrence of the earliest matching time;
+        # a progress plateau is still one event, and the last row has no event.
+        progress_rows = [[.6, .2, .6, .6, .9, .6], [0., .6, .6, .8, .6, .6],
+                         [.6]*6, [0., .1, .2, .3, .4, .8]]
+        times = torch.tensor([[.7, .2, .6, .6, .9, .8], [0., .7, .3, .8, .3, .6],
+                              [.9, .8, .7, .6, .5, .4], [0., .1, .2, .3, .4, .8]], dtype=torch.float64)
+        rng = np.random.default_rng(2397)
+        poses = np.asarray([pose(p, r) for p, r in zip(
+            rng.uniform(-.2, .4, (24, 3)), rng.uniform(-.4, .4, (24, 3)))]).reshape(4, 6, 4, 4)
+        position, quaternion = components(poses)
+        weights = torch.arange(1., 25., dtype=torch.float64).reshape(4, 6)
+        for clock, expected_indices in ((times, (2, 2, 5, None)), (None, (0, 1, 0, None))):
+            for selected_goals in (None, (("supports", 0),), ()):
+                for progress_dtype in (torch.float32, torch.float64):
+                    with self.subTest(clock=clock is not None, goals=selected_goals, dtype=progress_dtype):
+                        progress = torch.tensor(progress_rows, dtype=progress_dtype)
+                        mask = torch.zeros_like(progress, dtype=torch.bool)
+                        if selected_goals != ():
+                            for row, index in enumerate(expected_indices):
+                                if index is not None:
+                                    mask[row, index] = True
+                        actual_p, actual_q = position.clone().requires_grad_(), quaternion.clone().requires_grad_()
+                        dense_p, dense_q = position.clone().requires_grad_(), quaternion.clone().requires_grad_()
+                        with patch.object(requirement, "evaluate", wraps=requirement.evaluate) as evaluated:
+                            actual = request.residuals(actual_p, actual_q, progress,
+                                trajectory_time=clock, point_goal_ids=selected_goals)["support:0"]
+                        # The production call must expand complete geometry at
+                        # one pose per batch, including absent/unselected rows.
+                        self.assertEqual(evaluated.call_count, 1)
+                        self.assertEqual(evaluated.call_args.args[0].shape, (4, 1, 3))
+                        self.assertEqual(evaluated.call_args.args[1].shape, (4, 1, 4))
+                        expected = torch.where(mask, requirement.evaluate(dense_p, dense_q, request.numerical), 0.)
+                        self.assertEqual(actual.dtype, expected.dtype)
+                        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+                        actual_grad = torch.autograd.grad((actual*weights).sum(), (actual_p, actual_q))
+                        dense_grad = torch.autograd.grad((expected*weights).sum(), (dense_p, dense_q))
+                        for result, oracle in zip(actual_grad, dense_grad):
+                            self.assertTrue(torch.isfinite(result).all())
+                            torch.testing.assert_close(result, oracle, rtol=1e-11, atol=1e-11)
+                            self.assertEqual(result[~mask].abs().sum().item(), 0.)
+                        if mask.any():
+                            self.assertGreater(actual_grad[0][mask].abs().sum().item(), 0.)
+                            self.assertGreater(actual_grad[1][mask].abs().sum().item(), 0.)
+
+    def test_support_preserves_32768_output_states_but_expands_one_complete_pose(self):
+        requirement = self._complete_support_event()
+        request = problem([MotionPhase("ordinary reference", path([pose(), pose()]))], supports=(requirement,))
+        count, event_index = 32768, 16384
+        progress = torch.linspace(0., 1., count, dtype=torch.float64)[None]
+        progress[0, event_index] = requirement.progress
+        position = torch.tensor([.4, .1, .1], dtype=torch.float64).expand(1, count, 3)
+        quaternion = torch.tensor([1., 0., 0., 0.], dtype=torch.float64).expand(1, count, 4)
+        with patch.object(requirement, "evaluate", wraps=requirement.evaluate) as evaluated:
+            actual = request.residuals(position, quaternion, progress)["support:0"]
+        self.assertEqual(evaluated.call_args.args[0].shape, (1, 1, 3))
+        self.assertEqual(actual.shape, (1, count))
+        self.assertEqual(torch.count_nonzero(actual).item(), 1)
+        expected = requirement.evaluate(position[:, event_index:event_index+1],
+                                        quaternion[:, event_index:event_index+1], request.numerical)
+        torch.testing.assert_close(actual[:, event_index:event_index+1], expected, rtol=0., atol=0.)
+        self.assertEqual((len(requirement.body_points), len(requirement.contact_points),
+                          len(requirement.surface._hull.equations)), (312, 24, 64))
+    # END event selection, all material points and full outputs remain intact.
+
     def test_ordinary_reference_never_creates_a_path_or_terminal_obligation(self):
         request = problem([MotionPhase("reference", path([pose(), pose((.2, 0., 0.)), pose()]))])
         progress = torch.tensor([[0., .3, .5, 1.]], dtype=torch.float64)

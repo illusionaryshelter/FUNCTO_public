@@ -1122,8 +1122,21 @@ class PlanningProblem:
                     tool_angular_velocity=tool_angular_velocity, mode=direction_mode).items():
                 result[f"mechanism:{index}:{name}"] = value
         for index, requirement in enumerate(self.supports):
-            result[f"support:{index}"] = torch.where(event_mask("supports", index, requirement),
-                requirement.evaluate(position, quaternion, self.numerical), 0.)
+            # BEGIN evaluate finite support only at its existing unique arrival.
+            # event_mask already selects at most one physical query per batch,
+            # including unsorted query times and duplicate plateau samples.
+            # Gather that pose before expanding the complete body/plane arrays;
+            # the output and its gradients still occupy the original horizon.
+            mask = event_mask("supports", index, requirement)
+            selected = mask.to(torch.int64).argmax(-1, keepdim=True)
+            event_position = position.gather(-2, selected[..., None].expand(*selected.shape, 3))
+            event_quaternion = quaternion.gather(-2, selected[..., None].expand(*selected.shape, 4))
+            value = requirement.evaluate(event_position, event_quaternion, self.numerical)
+            value = torch.where(mask.any(-1, keepdim=True), value, 0.)
+            # A caller may use a different progress dtype; retain the original
+            # support evaluator's pose dtype rather than the clock's dtype.
+            result[f"support:{index}"] = torch.zeros_like(progress, dtype=value.dtype).scatter(-1, selected, value)
+            # END absent or unselected events retain zero residual and gradient.
         for index, requirement in enumerate(self.interiors):
             mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
             result[f"interior:{index}"] = torch.where(mask, requirement.evaluate(position, quaternion, self.numerical), 0.)

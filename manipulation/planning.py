@@ -638,8 +638,9 @@ def _validation_storage_admission(problem, scene, robot_metadata, budget):
     decision owns one bool, six float64 bounds and six int64 stencil indices
     per body/state. Encode each bounded chunk without Python scalar lists.
     The fixed 512-MiB encoded-payload cap leaves room for candidate/capture and
-    JSON copies within the local RAM budget. Full-history support/interior
-    tensors have a separate 256-MiB peak cap inside the native work reserve.
+    JSON copies within the local RAM budget. Process geometry has a separate
+    256-MiB peak cap: support expands one event pose, while interval constraints
+    retain their full history. All scalar outputs still span the full history.
     """
     from .voxel_layers import LayeredVoxelQuery
     total = budget.max_validation_points
@@ -685,10 +686,13 @@ def _validation_storage_admission(problem, scene, robot_metadata, budget):
     process_peak = 8*total*128
     for item in problem.supports:
         body, contact, planes = len(item.body_points), len(item.contact_points), len(item.surface._hull.equations)
-        # Two dense point/plane intermediates plus rotated points, quaternion
-        # cross products, contacts and scalar outputs; eight bytes also covers
-        # the independent float64 CPU tests. No autograd graph is retained.
-        process_peak = max(process_peak, 8*total*(2*body*planes+24*body+16*contact+64))
+        # BEGIN the full-history verifier evaluates one trajectory at a time.
+        # Support residuals gather its unique event pose before expanding all
+        # body/contact points and support planes. Keep that complete one-pose
+        # temporary; process_retained above still includes every output state.
+        # Eight bytes also covers CPU float64; no autograd graph is retained.
+        process_peak = max(process_peak, 8*(2*body*planes+24*body+16*contact+64))
+        # END interval constraints below still evaluate their complete history.
     for item in problem.interiors:
         body, planes = len(item.body_points), len(item.halfspaces)
         process_peak = max(process_peak, 8*total*(2*body*planes+24*body+64))
