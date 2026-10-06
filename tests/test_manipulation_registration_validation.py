@@ -107,6 +107,65 @@ class RegistrationValidationTest(unittest.TestCase):
             np.testing.assert_array_equal(view["owner_mask"], before[name])
     # END no whole-owner completion or mask-based free-space invention.
 
+    # BEGIN complementary cameras preserve unknown rays and every contradiction.
+    def test_one_visible_view_supports_without_upgrading_an_unobserved_view(self):
+        for hidden_name in ("sensor_left", "sensor_right"):
+            for missing in ("occluded", "unlabelled", "invalid_depth"):
+                with self.subTest(hidden_view=hidden_name, missing=missing):
+                    source, views = observations()
+                    hidden = views[hidden_name]
+                    hidden["owner_mask"][:] = False
+                    hidden["depth"][:] = {"occluded": 1., "unlabelled": 2., "invalid_depth": 0.}[missing]
+                    before = deepcopy(views)
+                    result = screen({"observed": pose()}, source, views)
+                    self.assertEqual(result["selected_candidate_id"], "observed")
+                    evidence = result["candidates"]["observed"]["views"]
+                    self.assertEqual(set(evidence), set(views))
+                    hidden_rays = evidence[hidden_name]
+                    self.assertFalse(hidden_rays["summary"]["positive_support_noncollinear"])
+                    self.assertEqual(hidden_rays["summary"]["near_selected_owner_rays"], 0)
+                    self.assertEqual(hidden_rays["summary"]["free_space_conflict_rays"], 0)
+                    self.assertGreater(hidden_rays["summary"]["unknown_rays"], 0)
+                    np.testing.assert_array_equal(hidden_rays["rays"]["labels"], 0)
+                    if missing == "occluded":
+                        self.assertGreater(hidden_rays["summary"]["occluded_rays"], 0)
+                    for view_name, view in views.items():
+                        if view_name != hidden_name:
+                            self.assertTrue(evidence[view_name]["summary"]["positive_support_noncollinear"])
+                        for key in ("depth", "owner_mask"):
+                            np.testing.assert_array_equal(view[key], before[view_name][key])
+
+    def test_empty_mask_view_can_reject_despite_another_views_positive_support(self):
+        for conflict_name in ("sensor_left", "sensor_right"):
+            with self.subTest(conflicting_view=conflict_name):
+                source, views = observations()
+                views[conflict_name]["owner_mask"][:] = False
+                views[conflict_name]["depth"][:] = 2.5
+                result = screen({"contradicted": pose()}, source, views)
+                self.assertEqual(result["status"], "rejected")
+                self.assertIsNone(result["selected_candidate_id"])
+                evidence = result["candidates"]["contradicted"]["views"]
+                self.assertEqual(set(evidence), set(views))
+                self.assertGreater(evidence[conflict_name]["summary"]["free_space_conflict_rays"], 0)
+                for view_name in views:
+                    if view_name != conflict_name:
+                        self.assertTrue(evidence[view_name]["summary"]["positive_support_noncollinear"])
+
+    def test_partial_visibility_never_breaks_ties_or_discards_unresolved_competitors(self):
+        source, views = observations()
+        views["sensor_right"]["owner_mask"][:] = False
+        views["sensor_right"]["depth"][:] = 1.
+        for alternative, expected_status in ((pose(), "ambiguous"), (pose(z=.5), "unresolved")):
+            for candidates in ({"seen": pose(), "other": alternative}, {"other": alternative, "seen": pose()}):
+                with self.subTest(status=expected_status, order=list(candidates)):
+                    result = screen(candidates, source, views)
+                    self.assertEqual(result["status"], expected_status)
+                    self.assertIsNone(result["selected_candidate_id"])
+                    self.assertEqual(result["candidates"]["seen"]["status"], "supported")
+                    self.assertEqual(result["candidates"]["other"]["status"],
+                                     "supported" if expected_status == "ambiguous" else "unresolved")
+    # END neither view order nor missing owner pixels manufacture a unique pose.
+
     def test_geometry_applicability_is_explicit_and_never_bypassed(self):
         result = screen({"apparently_matching": pose()}, same_rigid_geometry=False)
         self.assertEqual(result["status"], "not_applicable")
@@ -115,23 +174,38 @@ class RegistrationValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             screen({"pose": pose()}, same_rigid_geometry="true")
 
-    def test_invalid_depth_empty_masks_and_no_views_do_not_select(self):
-        for mode in ("source_invalid", "source_empty", "current_invalid", "current_empty"):
+    # BEGIN every hypothesis still needs one independently sufficient observation.
+    def test_missing_source_or_support_in_all_views_never_selects(self):
+        for mode in ("source_invalid", "source_empty", "current_invalid", "current_empty",
+                     "all_occluded", "individually_collinear"):
             source, views = observations()
             if mode == "source_invalid":
                 source["depth"][:] = np.nan
             elif mode == "source_empty":
                 source["owner_mask"][:] = False
             elif mode == "current_invalid":
-                views["sensor_right"]["depth"][:] = 0
+                for view in views.values():
+                    view["depth"][:] = 0
             else:
-                views["sensor_right"]["owner_mask"][:] = False
+                for view in views.values():
+                    view["owner_mask"][:] = False
+                    if mode == "all_occluded":
+                        view["depth"][:] = 1.
+                if mode == "individually_collinear":
+                    # Their union spans a plane, but each camera observes only
+                    # one line after mask erosion. Combining insufficient views
+                    # must not manufacture the required per-view support.
+                    views["sensor_left"]["owner_mask"][3:6, :] = True
+                    views["sensor_right"]["owner_mask"][:, 3:6] = True
             with self.subTest(mode=mode):
                 result = screen({"pose": pose()}, source, views)
                 self.assertEqual(result["status"], "unresolved")
                 self.assertIsNone(result["selected_candidate_id"])
+                self.assertFalse(any(row["summary"]["positive_support_noncollinear"]
+                                     for row in result["candidates"]["pose"]["views"].values()))
         with self.assertRaises(ValueError):
             screen({"pose": pose()}, views={})
+    # END empty, invalid, occluded and insufficient evidence all remain unknown.
 
     def test_nonowner_support_and_discontinuities_never_certify(self):
         source, views = observations()
@@ -204,6 +278,10 @@ class RegistrationValidationTest(unittest.TestCase):
 
     def test_grounding_derives_tested_transform_from_actual_grasp_binding(self):
         source, views = observations()
+        # BEGIN exercise partial visibility through the existing public consumer.
+        views["sensor_right"]["owner_mask"][:] = False
+        views["sensor_right"]["depth"][:] = 1.
+        # END the second view remains present for contradictory depth evidence.
         program, scene = compiled("grasp")
         incorrect = deepcopy(scene)
         incorrect["region_transform"] = pose(z=-.5)

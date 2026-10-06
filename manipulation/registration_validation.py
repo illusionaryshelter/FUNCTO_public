@@ -123,6 +123,7 @@ def _ray_evidence(points_output, view, max_error):
         "label_meaning": {"0": "unknown", "1": "owner_depth_support", "2": "free_space_conflict"}}}
 
 
+# BEGIN complementary views retain separate positive and contradictory evidence.
 def screen_registrations(source, views, transforms, *, reference_frame,
                          same_rigid_geometry, geometry_source, max_error=.01):
     """Screen an arbitrary nonempty set of same-owner rigid hypotheses.
@@ -144,12 +145,15 @@ def screen_registrations(source, views, transforms, *, reference_frame,
     Owner IDs identify bindings, not simulator assets. All hypotheses face all
     supplied views under the same gate, independent of candidate names/order.
 
-    A clear conflict rejects a hypothesis. Otherwise this conservative entry
-    requires noncollinear owner-depth support in every supplied view. Inadequate
-    coverage remains unresolved. Select only one supported hypothesis with no
-    unresolved competitors; ties stay ambiguous rather than ranked by length.
+    A clear conflict in any supplied view rejects a hypothesis, even when that
+    view has an empty owner mask. Otherwise noncollinear owner-depth support in
+    at least one view supports it. Occluded, invalid or unlabelled rays in other
+    views remain unknown; they never contribute positive evidence. With no
+    supporting view the hypothesis remains unresolved. Select only one supported
+    hypothesis with no unresolved competitors; ties stay ambiguous, never ranked.
     The result is registration evidence, not task completion or execution safety.
     """
+    # END every view is checked; the owner need not be visible in every camera.
     _name(reference_frame, "reference_frame")
     source_id = _name(source["owner_id"], "source owner_id")
     _name(geometry_source, "geometry_source")
@@ -200,12 +204,17 @@ def screen_registrations(source, views, transforms, *, reference_frame,
         world = _apply(points, transform)
         evidence = {view_name: _ray_evidence(world, view, max_error)
                     for view_name, view in checked.items()}
+        # BEGIN combine actual visibility without dropping any camera's depth.
+        # Conflict has precedence over positive support from another camera.
+        # One camera must independently observe noncollinear owner support;
+        # unknown/occluded rays and several insufficient views cannot supply it.
         if any(row["summary"]["free_space_conflict_rays"] for row in evidence.values()):
             status = "rejected"
-        elif all(row["summary"]["positive_support_noncollinear"] for row in evidence.values()):
+        elif any(row["summary"]["positive_support_noncollinear"] for row in evidence.values()):
             status = "supported"
         else:
             status = "unresolved"
+        # END per-view ray evidence is preserved unchanged in the result below.
         result[status + "_candidate_ids"].append(name)
         result["candidates"][name] = {"status": status, "T_output_source_owner": transform,
                                       "views": evidence}
