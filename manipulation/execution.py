@@ -10,6 +10,7 @@ this production execution boundary.
 # BEGIN production trajectory execution and required physical contracts.
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 import json
@@ -986,6 +987,62 @@ class TrajectoryExecutor:
         permission_ids = [row["rule_id"] for row in permission_rows]
         if len(set(permission_ids)) != len(permission_ids):
             raise ValueError("Robot-owner contact permission identities must be unique")
+        # BEGIN Holding authorization is rebuilt from this entrance, never a prior latch.
+        # The caller supplies verified evidence; execution checks its identity,
+        # clock and frozen attachment geometry without reading native object truth.
+        holding_permissions = {}
+        start_progress = float(trajectory.sample(0.)[3])
+        for rule in permission_rows:
+            condition_id = rule.get("holding_condition_id")
+            if condition_id is None:
+                continue
+            conditions = [row for row in binding["problem"].get("conditions", ())
+                          if row.get("condition_id") == condition_id]
+            owners = [row for row in binding["scene"].get("owners", ())
+                      if row.get("owner_id") == rule["target_owner"]]
+            relations = [row for owner in owners for row in owner.get("attachments", ())
+                         if row.get("condition_id") == condition_id
+                         and tuple(row.get("interval", ())) == tuple(rule["interval"])]
+            if (rule.get("arrival_goal_id") not in ([], ()) or rule.get("activation_event") != {}
+                    or len(conditions) != 1 or len(owners) != 1 or len(relations) != 1):
+                raise ValueError("A Holding permission needs one observed condition and matching owner attachment")
+            condition, relation = conditions[0], relations[0]
+            lower, upper = map(float, rule["interval"])
+            if (condition.get("kind") != "observed_attachment"
+                    or condition.get("carrier_id") != rule["target_owner"]
+                    or condition.get("progress") != lower
+                    or not lower <= start_progress <= upper
+                    or (start_progress == upper and relation["release_condition_id"] is not None)):
+                raise ValueError("A Holding permission must bind the currently active observed attachment")
+            evidence = condition.get("source")
+            provenance = evidence.get("source") if isinstance(evidence, Mapping) else None
+            if (not isinstance(evidence, dict) or evidence.get("verified") is not True
+                    or evidence.get("robot_feedback_id") != initial_feedback["feedback_id"]
+                    or evidence.get("carrier_id") != rule["target_owner"]
+                    or not ((isinstance(provenance, str) and provenance.strip())
+                            or (isinstance(provenance, Mapping) and provenance))):
+                raise ValueError("Holding permission evidence must identify this current robot feedback and owner")
+            timestamp = evidence.get("timestamp_s")
+            if (not isinstance(timestamp, (int, float)) or not np.isfinite(timestamp)
+                    or abs(float(timestamp)-float(initial_feedback["timestamp_s"])) > 1e-9):
+                raise ValueError("Holding permission evidence must use the current robot feedback timestamp")
+            expected = np.linalg.inv(_pose_array(condition.get("T_carrier_eef"), "observed Holding transform"))
+            actual = np.eye(4)
+            actual[:3, 3] = relation["position_tool_owner"]
+            actual[:3, :3] = Rotation.from_quat(np.asarray(relation["quaternion_tool_owner"])[[1, 2, 3, 0]]).as_matrix()
+            if not np.allclose(actual, expected, atol=1e-7, rtol=0):
+                raise ValueError("Holding permission and collision attachment transform disagree")
+            if initial_feedback.get("scene_condition_evidence", {}).get(condition_id) is False:
+                raise ValueError("Current feedback refutes the Holding permission condition")
+            holding_permissions[rule["rule_id"]] = {
+                "rule_id": rule["rule_id"], "condition_id": condition_id,
+                "target_owner": rule["target_owner"], "interval": [lower, upper],
+                "release_condition_id": relation["release_condition_id"],
+                "feedback_id": initial_feedback["feedback_id"],
+                "timestamp_s": float(initial_feedback["timestamp_s"]),
+                "source": deepcopy(evidence)}
+            matched_permission_ids.add(rule["rule_id"])
+        # END false or stale evidence cannot be repaired by a software pair rule.
         for condition in binding["problem"].get("conditions", ()):
             if condition.get("kind") != "grasp_contact_activation":
                 continue
@@ -1011,13 +1068,24 @@ class TrajectoryExecutor:
             contact_gates[identity] = {"condition": deepcopy(condition),
                 "permission": deepcopy(rules[0]), "requirement": requirement}
         if matched_permission_ids != set(permission_ids):
-            raise ValueError("Every robot-owner permission needs its explicit actual-arrival activation")
+            raise ValueError("Every robot-owner permission needs its explicit arrival or current Holding activation")
         # Execution-local state deliberately does not inherit a prior trial's
         # latch or a completed-goal label. A new close needs a new FK witness.
-        active_contact_permissions = frozenset()
+        active_contact_permissions = frozenset(holding_permissions)
         report["grasp_contact_gate_checks"] = []
         report["grasp_contact_permission_changes"] = []
-        report["active_robot_owner_permissions"] = []
+        report["active_robot_owner_permissions"] = sorted(active_contact_permissions)
+        # BEGIN original release progress, rather than open intent, ends Holding permission.
+        report["holding_contact_permission_changes"] = [
+            {**deepcopy(row), "action": "activated", "curve_progress": start_progress}
+            for row in holding_permissions.values()]
+
+        def current_holding_permissions(curve_time):
+            progress = float(trajectory.sample(curve_time)[3])
+            return frozenset(identity for identity, row in holding_permissions.items()
+                if row["interval"][0] <= progress and (progress < row["interval"][1]
+                    or (progress == row["interval"][1] and row["release_condition_id"] is None)))
+        # END this predicate grants no new Holding after the initial binding.
         # END source pair policy and current activation evidence stay distinct.
         # BEGIN retain the distinction between FK estimates and physical accuracy.
         report["pose_goal_scope"] = (
@@ -1655,7 +1723,9 @@ class TrajectoryExecutor:
                 if contact_check["passed"]:
                     # A new close never inherits permissions for another
                     # target or a previous occurrence, even inside this trial.
-                    permissions = frozenset((permission["rule_id"],))
+                    # BEGIN a new grasp latch does not revoke a separate observed attachment.
+                    permissions = current_holding_permissions(curve_time) | {permission["rule_id"]}
+                    # END only the old arrival-based latch is replaced by this close.
                 else:
                     failures.append({"kind": "grasp_contact_arrival_rejected",
                         "name": condition["condition_id"], "evidence": deepcopy(contact_check)})
@@ -1665,6 +1735,19 @@ class TrajectoryExecutor:
         # BEGIN reject measured violations before changing an event's command.
         def guard(feedback, *, curve_time, physical_elapsed, point, event=None, sample=None,
                   contact_event=None, contact_permissions=None):
+            # BEGIN remove expired Holding authorization before this state's geometry query.
+            nonlocal active_contact_permissions
+            holding_now = current_holding_permissions(curve_time)
+            expired = (active_contact_permissions & holding_permissions.keys())-holding_now
+            for identity in sorted(expired):
+                report["holding_contact_permission_changes"].append({
+                    **deepcopy(holding_permissions[identity]), "action": "expired",
+                    "curve_progress": float(trajectory.sample(curve_time)[3]),
+                    "observed_feedback_id": feedback["feedback_id"],
+                    "observed_timestamp_s": float(feedback["timestamp_s"])})
+            active_contact_permissions -= expired
+            report["active_robot_owner_permissions"] = sorted(active_contact_permissions)
+            # END open commands are deliberately absent from this attachment lifetime.
             # BEGIN consume allowed observations without native object truth.
             observation = observation_at(feedback, curve_time, physical_elapsed)
             if observation is not None:
@@ -1747,6 +1830,9 @@ class TrajectoryExecutor:
             # must prove arrival again, even when a goal was completed earlier.
             queried_permissions = (active_contact_permissions if contact_permissions is None
                                    else frozenset(contact_permissions))
+            # BEGIN provisional overrides cannot retain a Holding rule beyond release.
+            queried_permissions = (queried_permissions-holding_permissions.keys()) | holding_now
+            # END explicit F attachment evidence remains a separate geometry violation.
             queried_permissions, contact_check = provisional_contact_permissions(feedback,
                 curve_time=curve_time, physical_elapsed=physical_elapsed, point=point,
                 contact_event=contact_event, permissions=queried_permissions, failures=failures)
@@ -2012,7 +2098,7 @@ class TrajectoryExecutor:
                 next_contact_permissions, contact_check = guard(before,
                     curve_time=min(elapsed, stop), physical_elapsed=elapsed, point="before_step",
                     contact_event=pending_close,
-                    contact_permissions=(frozenset() if due and due[-1]["kind"] == "close"
+                    contact_permissions=(current_holding_permissions(min(elapsed, stop)) if due and due[-1]["kind"] == "close"
                                          and pending_close is None else None))
                 # END a missed gate stops before sampling or writing the close ramp.
                 next_command = command
@@ -2049,7 +2135,7 @@ class TrajectoryExecutor:
                 if due and due[-1]["kind"] in ("open", "close"):
                     previous_permissions = sorted(active_contact_permissions)
                     active_contact_permissions = (next_contact_permissions if pending_close is not None
-                                                  else frozenset())
+                                                  else current_holding_permissions(min(elapsed, stop)))
                     if contact_check is not None:
                         contact_check["control_applied"] = True
                     report["active_robot_owner_permissions"] = sorted(active_contact_permissions)

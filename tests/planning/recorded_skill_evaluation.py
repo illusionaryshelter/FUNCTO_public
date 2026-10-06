@@ -29,10 +29,17 @@ from manipulation.execution import _actual_pose_goal, pose_goal_schedule
 from manipulation.execution_binding import validate_result_only_goal_ids
 # END result-only execution scope alone does not change a goal's grading role.
 from manipulation.motion import _inverse, _pose_array
+# BEGIN support grading reuses the original finite geometry and numerical contract.
+from manipulation.goals import SupportSurface, check_on
+from manipulation.regions import check_region_on
+# END these pure metrics receive evaluator-local actual material poses only.
+# BEGIN reconstruct typed original requirements without extending their public fields.
 from manipulation.planning_problem import (
-    EventTimeConstraint, PoseEventRequirement, PosePath, TimeBindingError,
-    _model_from_diagnostics, resolve_event_window,
+    EventTimeConstraint, NumericalTolerance, PoseEventRequirement,
+    SupportRequirement, TimeBindingError,
+    resolve_event_window,
 )
+# END the independent evaluator consumes the same serialized requirement contract.
 
 
 # BEGIN explicitly diagnostic goals retain measurements without vetoing skill effects.
@@ -149,9 +156,10 @@ def _site_pose(data, index):
 class _FunctionalGoalEvaluator:
     """Bind observed owner frames to native bodies without changing the candidate.
 
-    The initial rigid offset is evaluator-only calibration. Subsequent native
-    motion moves that same frame; a native body origin is never silently used
-    as the original observed material frame. No returned row is runtime input.
+    A material frame needs a declared static body-from-owner transform and
+    its source. A body identity alone supports contact/effect attribution but
+    supplies no material geometry. Initial observed pose errors are never
+    fitted away with native truth. No returned row is runtime input.
     """
 
     def __init__(self, model, catalog, planning_result, owner_bindings):
@@ -166,6 +174,11 @@ class _FunctionalGoalEvaluator:
             raise ValueError("Native truth grading requires an explicit world-frame candidate binding")
         self._requirements = {}
         self._unsupported_goals = []
+        # BEGIN support goals preserve their declared geometry, not a surrogate pose target.
+        self._support_bindings = {}
+        self._support_numerical = (NumericalTolerance(**deepcopy(problem["numerical"]))
+                                   if problem.get("supports") else None)
+        # END numerical body clearance is distinct from the material gap/normal thresholds.
         for collection in ("pose_events", "coordinate_events", "supports"):
             rows = problem.get(collection, [])
             identities = self._binding.get("goal_identities", {}).get(collection, [])
@@ -176,19 +189,30 @@ class _FunctionalGoalEvaluator:
                 identity = (collection, index)
                 if collection == "pose_events":
                     self._requirements[identity] = PoseEventRequirement(**deepcopy(row))
+                # BEGIN reconstruct the same public support object from the formal archive.
+                elif collection == "supports":
+                    supplied = deepcopy(row)
+                    supplied["surface"] = SupportSurface(**supplied["surface"])
+                    requirement = SupportRequirement(**supplied)
+                    self._requirements[identity] = requirement
+                    self._support_bindings[identity] = self._support_binding(requirement, problem)
+                # END only unsupported coordinate predicates retain their previous unknown role.
                 else:
                     self._unsupported_goals.append({"identity": list(identity), "value": "U",
                         "requirement": deepcopy(row),
-                        "reason": "No native coordinate/support predicate with its original frame/coordinate binding is supplied"})
+                        "reason": "No native coordinate predicate with its original frame/coordinate binding is supplied"})
         owners = self._binding["scene"].get("owners", [])
         self._owners = {}
         if not isinstance(owner_bindings, list):
             raise ValueError("evaluation_owner_bindings must be an explicit list")
-        entry_progress = float(problem.get("start_progress", 0.))
+        # BEGIN static material coordinates are distinct from native body identity.
         for row in owner_bindings:
-            if (not isinstance(row, dict) or set(row) != {"owner_id", "native_body_name"}
-                    or any(not isinstance(value, str) or not value.strip() for value in row.values())):
-                raise ValueError("Each evaluator owner binding needs exactly owner_id and native_body_name")
+            if (not isinstance(row, dict) or set(row) not in (
+                    {"owner_id", "native_body_name"},
+                    {"owner_id", "native_body_name", "T_body_owner", "source"})
+                    or any(not isinstance(row[key], str) or not row[key].strip()
+                           for key in ("owner_id", "native_body_name"))):
+                raise ValueError("An evaluator binding needs owner_id/native_body_name and, for material geometry, both T_body_owner and source")
             identity, name = row["owner_id"], row["native_body_name"]
             if identity in self._owners:
                 raise ValueError("Evaluator owner bindings must be unique")
@@ -197,29 +221,75 @@ class _FunctionalGoalEvaluator:
             if (len(selected) != 1 or len(bodies) != 1
                     or model.body(name).id != bodies[0]["id"]):
                 raise ValueError("Evaluator owner/native body identities must match one declared scene/catalog body")
-            owner = selected[0]
-            lower, upper = owner["pose_interval"]
-            if not lower <= entry_progress <= upper or upper <= lower:
-                raise ValueError("An evaluator owner binding requires its current entry pose interval")
-            path = deepcopy(owner["pose_path"])
-            if path["motion_model"] is not None:
-                path["motion_model"] = _model_from_diagnostics(path["motion_model"])
-            entry_pose = PosePath(**path).sample_numpy((entry_progress-lower)/(upper-lower))
+            transform, source = None, None
+            if "T_body_owner" in row:
+                if not isinstance(row["source"], str) or not row["source"].strip():
+                    raise ValueError("An evaluator material transform requires an explicit nonempty static source")
+                transform = _pose_array(row["T_body_owner"], "Declared static evaluator body-from-owner frame")
+                source = row["source"]
             self._owners[identity] = {"owner_id": identity, "native_body_name": name,
                 "native_body_id": int(bodies[0]["id"]),
-                "T_world_owner_entry": _pose_array(entry_pose, "Bound evaluator owner entry pose"),
-                "T_body_owner": None}
+                "T_body_owner": transform, "source": source,
+                "material_frame_status": "declared_static" if transform is not None else "unmapped"}
+        # END missing transforms remain unknown rather than inheriting an estimated pose.
         self._owner_pose_samples = []
+
+    # BEGIN use the existing compiled held metadata without guessing an owner from a name.
+    @staticmethod
+    def _support_binding(requirement, problem):
+        """Resolve one material carrier from the held phases touching this goal.
+
+        Both neighbours can include a shared boundary. Repeated references to
+        the same declared attachment are one fact; two different facts, an
+        incomplete binding or a conflicting transform remain unknown. This
+        identifies a material frame for offline measurement, not actual Holding.
+        """
+        matched = {}
+        for index, phase in enumerate(problem.get("phases", ())):
+            metadata = phase.get("metadata", {})
+            if (metadata.get("mode") != "held"
+                    or not index <= requirement.progress <= index+1):
+                continue
+            try:
+                carrier, condition_id = metadata["carrier_id"], metadata["attachment_condition_id"]
+                if any(not isinstance(value, str) or not value for value in (carrier, condition_id)):
+                    raise ValueError("Held phase lacks explicit carrier/condition identities")
+                span = np.asarray(metadata["attachment_interval"], float)
+                if (span.shape != (2,) or not np.isfinite(span).all()
+                        or not span[0] <= index < index+1 <= span[1]
+                        or not span[0] <= requirement.progress <= span[1]):
+                    raise ValueError("Held attachment interval does not cover its phase and goal")
+                attachment = _pose_array(metadata["attachment"], "Bound support owner-from-tool")
+                conditions = [row for row in problem.get("conditions", ())
+                              if row.get("condition_id") == condition_id]
+                if (len(conditions) != 1 or conditions[0].get("carrier_id") != carrier
+                        or conditions[0].get("kind") not in ("observed_attachment", "candidate_attachment")
+                        or conditions[0].get("progress") != span[0]):
+                    raise ValueError("Support carrier needs the same uniquely declared attachment condition")
+                declared = _pose_array(conditions[0]["T_carrier_eef"], "Declared support attachment")
+                if (not np.allclose(attachment, declared, atol=1e-10, rtol=0)
+                        or not np.allclose(_inverse(attachment), requirement.tool_from_carrier,
+                                           atol=1e-10, rtol=0)):
+                    raise ValueError("Support material transform differs from its declared held carrier")
+            except (KeyError, TypeError, ValueError) as error:
+                return {"reason": f"Original support carrier binding is incomplete or inconsistent: {error}"}
+            matched[(carrier, condition_id)] = {
+                "carrier_id": carrier, "attachment_condition_id": condition_id}
+        if len(matched) != 1:
+            return {"reason": "Original support has no unique held carrier/attachment binding"}
+        return next(iter(matched.values()))
+    # END owner ambiguity cannot be repaired with native identity or TCP proximity.
 
     def observe(self, data):
         """Read and validate native transforms; do not publish observations."""
         poses = {}
         for identity, binding in self._owners.items():
-            body = _pose_array(_body_pose(data, binding["native_body_id"]), "Native evaluator body pose")
+            # BEGIN only an independently declared material frame follows native motion.
             if binding["T_body_owner"] is None:
-                binding["T_body_owner"] = _pose_array(
-                    _inverse(body) @ binding["T_world_owner_entry"], "Evaluator material-frame calibration")
+                continue
+            body = _pose_array(_body_pose(data, binding["native_body_id"]), "Native evaluator body pose")
             poses[identity] = _pose_array(body @ binding["T_body_owner"], "Actual evaluator owner frame")
+            # END entry perception errors cannot become a fitted body-local displacement.
         self._owner_pose_samples.append(poses)
 
     def describe_bindings(self):
@@ -227,6 +297,10 @@ class _FunctionalGoalEvaluator:
                  for key, value in row.items()} for row in self._owners.values()]
 
     def _measure(self, identity, index, times, tools):
+        # BEGIN actual support follows the material body even after the hand retreats.
+        if identity[0] == "supports":
+            return self._measure_support(identity, index)
+        # END no tool-derived attachment is extrapolated into the released phase.
         # BEGIN shared pure metrics retain the evaluator-only GT provenance.
         feedback = {"tool_pose": tools[index], "source": "Independent evaluator native TCP pose",
             "tool_pose_source": "Independent evaluator-only native GT site pose; not a runtime sensor",
@@ -237,10 +311,58 @@ class _FunctionalGoalEvaluator:
         # This local dictionary is only an argument to the shared pure metric
         # calculation. It is never supplied to an executor or an observer hook.
         observation = {"scene_owner_poses": self._owner_pose_samples[index],
-            "timestamp_s": float(times[index]), "source": "Independent evaluator calibrated native owner poses"}
+            "timestamp_s": float(times[index]), "source": "Independent evaluator native poses composed with declared static material frames"}
         measured = _actual_pose_goal(self._requirements[identity], feedback, observation)
         measured["source"] = "Independent evaluator applies the original functional allowed set to native truth"
         return measured
+
+    # BEGIN independent support metrics preserve precisely the compiled allowed set.
+    def _measure_support(self, identity, index):
+        """Evaluate the observed material body against the frozen world patch.
+
+        ``check_region_on`` supplies gap/normal diagnostics and ``check_on``
+        supplies the whole-body footprint. Their convenience ``valid``/absolute
+        minimum-height criteria are not a replacement for SupportRequirement:
+        only its specified face supplies the contact gap, and its original
+        numerical position budget applies to body height and footprint alone.
+        """
+        requirement = self._requirements[identity]
+        binding = self._support_bindings[identity]
+        measured = {"value": "U", "source": "Independent evaluator applies the original finite support allowed set to native carrier motion in its declared static material frame",
+            "actual_carrier_pose": None, "carrier_binding": deepcopy(binding),
+            "surface_scope": "Original frozen world SupportSurface; no native target replacement or online completion"}
+        if "reason" in binding:
+            measured["reason"] = binding["reason"]
+            return measured
+        carrier = binding["carrier_id"]
+        poses = self._owner_pose_samples[index]
+        if carrier not in poses:
+            measured["reason"] = f"No explicit static evaluator material-frame mapping for support carrier {carrier}"
+            return measured
+        pose = poses[carrier]
+        region = check_region_on(pose, requirement.contact_points, requirement.outward_normal,
+            requirement.surface, gap_tolerance=requirement.gap_tolerance,
+            normal_tolerance=requirement.normal_tolerance, margin=requirement.margin)
+        body = check_on(pose, requirement.body_points, requirement.surface)
+        points = requirement.body_points @ pose[:3, :3].T+pose[:3, 3]
+        height = float(np.min((points-requirement.surface.origin) @ requirement.surface.normal))
+        chord = float(np.linalg.norm(pose[:3, :3] @ requirement.outward_normal+requirement.surface.normal))
+        angular_bound = float(2*np.sin(requirement.normal_tolerance/2))
+        numerical = self._support_numerical.position_m
+        violations = {
+            "contact_gap_m": max(0., region["max_abs_gap_m"]-requirement.gap_tolerance),
+            "body_penetration_m": max(0., -height-numerical),
+            "body_boundary_m": max(0., requirement.margin-body["minimum_boundary_clearance_m"]-numerical),
+            "normal_chord": max(0., chord-angular_bound)}
+        measured.update(value="T" if not any(violations.values()) else "F",
+            actual_carrier_pose=pose.tolist(), contact_face=region,
+            body={**body, "minimum_signed_height_m": height}, violations=violations,
+            normal_chord=chord, normal_chord_bound=angular_bound,
+            gap_tolerance_m=requirement.gap_tolerance,
+            normal_tolerance_rad=requirement.normal_tolerance,
+            margin_m=requirement.margin, numerical_position_tolerance_m=numerical)
+        return measured
+    # END gap, angle, finite footprint and whole-body clearance retain their separate roles.
 
     def evaluate(self, times, elapsed, tools, execution_report, *, full_curve_completed):
         """Grade original goal times using trajectory samples, excluding holds."""
@@ -257,10 +379,17 @@ class _FunctionalGoalEvaluator:
                 "progress": requirement.progress,
                 "scheduled_curve_time_s": float(scheduled) if np.isfinite(scheduled) else None,
                 "device_due_time_s": float(due) if np.isfinite(due) else None,
-                "position_tolerance_m": requirement.position_tolerance_m,
-                "rotation_tolerance_rad": requirement.rotation_tolerance_rad,
                 "requirement_source": deepcopy(requirement.source),
                 "scope": "Independent result evidence only; does not update runtime completion or release a dependency"}
+            # BEGIN preserve the original units and shape of each goal's allowed set.
+            if identity[0] == "supports":
+                row.update(gap_tolerance_m=requirement.gap_tolerance,
+                    normal_tolerance_rad=requirement.normal_tolerance, margin_m=requirement.margin,
+                    numerical_position_tolerance_m=self._support_numerical.position_m)
+            else:
+                row.update(position_tolerance_m=requirement.position_tolerance_m,
+                           rotation_tolerance_rad=requirement.rotation_tolerance_rad)
+            # END support goals do not acquire a full-position/yaw target.
             arrivals = [item for event in timing_events for item in event.get("timing", ())
                         if item["check_target"] == "arrival" and tuple(item["goal_id"]) == identity]
             if arrivals:
@@ -305,11 +434,46 @@ class _FunctionalGoalEvaluator:
             evidence.append(row)
         return evidence
 
+    # BEGIN a final support measurement is explicitly separate from original goal grading.
+    def final_support_diagnostics(self, times, elapsed, *, full_curve_completed):
+        """Measure the last retained body sample without inventing a hold window."""
+        return [{"identity": list(identity), "evaluation_role": "diagnostic",
+            "completed_current_curve": bool(full_curve_completed),
+            "sample_index": len(times)-1, "sample_sim_time_s": float(times[-1]),
+            "sample_elapsed_s": float(elapsed[-1]),
+            "measurement": self._measure_support(identity, len(times)-1),
+            "scope": "Last normal-curve sample only; no declared terminal support or stability interval, and no effect on required original goals"}
+            for identity in self._support_bindings]
+    # END later support success never repairs an earlier original goal failure.
+
+    # BEGIN online coverage comes exclusively from the unchanged execution report.
+    def support_runtime_coverage(self, execution_report):
+        """Expose missing typed support observations without adding a dependency."""
+        execution = {} if execution_report is None else execution_report
+        coverage = []
+        for identity in self._support_bindings:
+            rows = [row for row in execution.get("goal_evidence", ())
+                    if tuple(row.get("identity", ())) == identity]
+            completed = (list(identity) in execution.get("completed_goal_ids", ())
+                and any(row.get("value") == "T" and row.get("completion_verified") is True for row in rows))
+            value = "T" if completed else "F" if any(row.get("value") == "F" for row in rows) else "U"
+            coverage.append({"identity": list(identity), "value": value,
+                "reported_observation_count": len(rows),
+                "source": "Unchanged online execution goal evidence only; independent native support measurements are excluded",
+                "reason": ("Online report contains a verified typed support observation" if completed else
+                    "Online report contains a failed support observation" if value == "F" else
+                    "No verified online typed support observation was supplied"),
+                "scope": "Observation coverage only; a support value does not create an undeclared open/release prerequisite"})
+        return coverage
+    # END independent physics T never turns an online U into a completed goal.
+
     def arrays(self):
-        identities = list(self._owners)
+        # BEGIN body-only identities never manufacture missing material poses in archives.
+        identities = [key for key, binding in self._owners.items() if binding["T_body_owner"] is not None]
         poses = np.asarray([[row[key] for key in identities] for row in self._owner_pose_samples])
         return {"evaluation_owner_ids": np.asarray(identities, dtype=str),
                 "evaluation_owner_poses_world": poses.reshape(len(self._owner_pose_samples), len(identities), 4, 4)}
+        # END the declared static mapping and its source remain in the JSON report.
 # END truth measurements have no route back into the runtime request ledger.
 
 
@@ -597,6 +761,11 @@ class NativeSkillPhysicsEvaluator:
             and elapsed[-1] >= trajectory.duration)
         goal_evidence = self._goals.evaluate(times, elapsed, tools, execution_report,
                                              full_curve_completed=full_curve_completed)
+        # BEGIN original point goals and later support diagnostics remain separate.
+        final_support = self._goals.final_support_diagnostics(times, elapsed,
+            full_curve_completed=full_curve_completed)
+        support_runtime = self._goals.support_runtime_coverage(execution_report)
+        # END neither component contributes a new required terminal predicate.
         effect_evidence = []
         binding = self._planning_result.execution_binding
         for condition in binding["problem"].get("conditions", []):
@@ -685,6 +854,10 @@ class NativeSkillPhysicsEvaluator:
             "completed_current_curve": full_curve_completed,
             "candidate_id": binding["candidate_id"],
             "evaluation_owner_bindings": self._goals.describe_bindings(),
+            # BEGIN disclose online coverage without importing evaluator truth into it.
+            "support_runtime_coverage": support_runtime,
+            "final_support_diagnostics": final_support,
+            # END no hidden success role is assigned to a last-sample diagnostic.
             "task_contract": self._task_contract,
             "binding": self.binding, "settings_source": "collect.preprocess.segmentation.DEFAULT_SETTINGS",
             "settings": self.settings, "finger_stability_limits": self._finger_limits.tolist(),

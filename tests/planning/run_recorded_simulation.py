@@ -154,20 +154,47 @@ class _TrialVideos:
         # END every writer, native context and timestamp archive is attempted.
 
 
-# BEGIN allow an upstream observer to supply current scene/effect evidence.
-def run(args, *, observation_callback=None):
-    """Execute one skill with optional upstream current-observation evidence.
+# BEGIN one skill may borrow an already running physical session without reset.
+def run(args, *, simulation=None, initial_feedback=None,
+        observation_callback=None, step_callback=None, on_simulation_ready=None):
+    """Execute one skill from a recorded entrance or an explicit live handoff.
 
     The native physics evaluator remains independent and never authorizes a
     runtime dependency or supplies owner poses. A caller may provide an
     existing proprioceptive or visual observation callback through the same
     contract; the CLI does not create a semantic sensor from simulator truth.
+
+    ``simulation`` and ``initial_feedback`` must be supplied together. A live
+    handoff uses the complete production proprioception record, retaining its
+    trial, feedback identity, measured velocities and original native time;
+    ``args.feedback`` then identifies the caller's saved handoff artifact and
+    is not decoded as a recorded entrance. The caller owns the borrowed
+    backend and its cameras. This function never restores or closes them.
+
+    ``on_simulation_ready(simulation, restore_report)`` may retain a newly
+    restored backend for later skills. It runs once after the recorded
+    entrance and execution binding have been checked, before evaluator setup
+    or execution. Its return value is ignored; an exception prevents control.
+    The hook is incompatible with a borrowed backend and must not mutate or
+    advance the simulator. Executor geometry and control checks remain intact.
+
+    ``step_callback(model, data, record)`` is an independent, read-only capture
+    sink for the initial sample and normal completed steps, not an online
+    effect observer. Its return value is ignored; acquisition failures are
+    reported without replacing physical execution errors. Holds remain in
+    the executor's separate accounting, so the caller may capture the current
+    post-hold state directly after this call returns or raises.
     """
-# END absent observation evidence retains the executor's explicit U outcome.
+# END actual scene/effect observations retain their separate existing contract.
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
+    # BEGIN record session ownership and absolute time separately from each curve.
+    borrowed_simulation = simulation is not None
+    # END a second skill has a new local curve while the native clock continues.
     report = {"status": "preparing", "segment_id": args.segment,
+        "simulation_ownership": "borrowed" if borrowed_simulation else "recorded_trial",
+        "trial_id": None, "native_start_time_s": None, "native_end_time_s": None,
         "trajectory_path": str(args.trajectory.resolve()), "trajectory_classification": None,
         # BEGIN independent position-target input and unverified robot handoff.
         "finger_targets_path": str(args.finger_targets.resolve()),
@@ -192,14 +219,19 @@ def run(args, *, observation_callback=None):
         "physics_evidence_path": str(output/"physics-evidence.npz"),
         "scope": "One actual native-physics skill prefix; no next skill or full-sequence claim",
         "planner_inputs_changed": False, "execution_tested": False}
-    simulation = evaluator = videos = execution = executor = None
+    # BEGIN borrowed simulation ownership survives initialization and cleanup.
+    evaluator = videos = execution = executor = None
+    # END cleanup below closes only the video contexts created by this invocation.
     caught = None
     # BEGIN optional evidence sinks cannot become physical execution gates.
     report["evidence_collection"] = {name: {
         "configured": configured, "initialized": False, "completed": False,
         "disabled": False, "first_error": None,
         "attempted_callbacks": 0, "successful_callbacks": 0}
-        for name, configured in (("evaluator", True), ("video", not args.no_video))}
+        # BEGIN a caller-owned capture sink has independent completeness evidence.
+        for name, configured in (("evaluator", True), ("video", not args.no_video),
+                                 ("capture_callback", step_callback is not None))}
+        # END capture failure cannot disable its peer evaluator or native execution.
 
     def evidence_failure(name, error, phase, record=None):
         state = report["evidence_collection"][name]
@@ -217,33 +249,53 @@ def run(args, *, observation_callback=None):
                 "sim_time": sim_time}
     # END no evidence error replaces the executor's primary physical error.
     try:
-        manifest, fixture, feedback = _read(args.manifest), _read(args.robot_fixture), _read(args.feedback)
+        # BEGIN a live handoff is explicit and cannot silently restore a source frame.
+        if borrowed_simulation != (initial_feedback is not None):
+            raise ValueError("A borrowed simulation and its complete initial_feedback must be supplied together")
+        # BEGIN only the recorded entrance can transfer a restored backend reference.
+        if on_simulation_ready is not None:
+            if borrowed_simulation:
+                raise ValueError("The simulation-ready hook cannot be used with a borrowed simulation")
+            if not callable(on_simulation_ready):
+                raise ValueError("The simulation-ready hook must be callable")
+        # END explicit borrowing never restores or transfers another backend.
+        if step_callback is not None and not callable(step_callback):
+            raise ValueError("An independent step capture callback must be callable")
+        manifest, fixture = _read(args.manifest), _read(args.robot_fixture)
+        # END only the recorded branch reads the old episode entrance schema.
         root = Path(manifest["workspace_root"])
         segment = _one(manifest["segments"], "id", args.segment)
         program = _read(root/segment["program_path"])
         if program["skill_kind"] not in ("grasp", "manipulation"):
             raise ValueError("Only the explicit compiled grasp/manipulation skill contracts can be executed")
         report["skill_kind"] = program["skill_kind"]
-        if feedback["segment_id"] != args.segment or feedback["entry_frame"] != segment["snapshot"]["entry_frame"]:
-            raise ValueError("Named feedback and selected segment must identify the same entrance")
-        if (feedback["joint_names"] != fixture["joint_names"]
-                or feedback["arm_joint_names"] != fixture["arm_joint_names"]
-                or feedback["finger_joint_names"] != fixture["finger_joint_names"]):
+        # BEGIN normalize only recorded metadata; preserve complete live feedback.
+        if borrowed_simulation:
+            if not isinstance(initial_feedback, dict):
+                raise ValueError("Live initial_feedback must be the complete production robot record")
+            initial_feedback = deepcopy(initial_feedback)
+        else:
+            feedback = _read(args.feedback)
+            if feedback["segment_id"] != args.segment or feedback["entry_frame"] != segment["snapshot"]["entry_frame"]:
+                raise ValueError("Named feedback and selected segment must identify the same entrance")
+            initial_feedback = {"joint_names": feedback["joint_names"],
+                "arm_joint_names": feedback["arm_joint_names"], "finger_joint_names": feedback["finger_joint_names"],
+                "q": feedback["start_q"], "dq": feedback["start_dq"],
+                "base_pose": feedback["base_pose"], "tool_pose": feedback["eef_pose"],
+                "sim_time": feedback["sim_time_s"], "timestamp_s": feedback["sim_time_s"],
+                "reference_frame": feedback["reference_frame"], "tool_link": feedback["tool_link"],
+                "tool_transform": feedback["tool_transform"],
+                "feedback_id": str(args.feedback.resolve()), "source": feedback["source"]}
+        if any(tuple(initial_feedback[key]) != tuple(fixture[key])
+               for key in ("joint_names", "arm_joint_names", "finger_joint_names")):
             raise ValueError("The trial fixture and named feedback must have identical robot bindings")
         # BEGIN preserve explicit coordinate identities for the actual handoff.
-        tool_transform = np.asarray(feedback["tool_transform"], dtype=float)
-        if (feedback["tool_link"] != fixture["tool_link"]
-                or feedback["reference_frame"] != segment["snapshot"]["reference_frame"]
+        tool_transform = np.asarray(initial_feedback["tool_transform"], dtype=float)
+        if (initial_feedback["tool_link"] != fixture["tool_link"]
+                or initial_feedback["reference_frame"] != segment["snapshot"]["reference_frame"]
                 or tool_transform.shape != (4, 4) or not np.isfinite(tool_transform).all()):
             raise ValueError("Robot handoff requires the initial feedback's explicit tool and reference-frame binding")
-        initial_feedback = {"joint_names": feedback["joint_names"],
-            "arm_joint_names": feedback["arm_joint_names"], "finger_joint_names": feedback["finger_joint_names"],
-            "q": feedback["start_q"], "dq": feedback["start_dq"],
-            "base_pose": feedback["base_pose"], "tool_pose": feedback["eef_pose"],
-            "sim_time": feedback["sim_time_s"], "timestamp_s": feedback["sim_time_s"],
-            "reference_frame": feedback["reference_frame"], "tool_link": feedback["tool_link"],
-            "tool_transform": tool_transform.tolist(),
-            "feedback_id": str(args.feedback.resolve()), "source": feedback["source"]}
+        # END actual feedback identities and FK provenance are never relabelled.
         finger_targets = FixedFingerTargets.from_mapping(_read(args.finger_targets))
         # BEGIN require physical tracking and actual-hand limits explicitly.
         execution_limits = ExecutionLimits.from_mapping(_read(args.execution_limits))
@@ -270,21 +322,30 @@ def run(args, *, observation_callback=None):
         # END reporting cannot observe a different second copy of the archive.
         if {event["skill_id"] for event in curve.events} != {args.segment}:
             raise ValueError("The exported candidate must contain only the selected skill instance")
-        # BEGIN restore native context before constructing the production executor.
-        simulation, restore_report = restore_recorded_simulation(scene_path=fixture["source_scene_xml"],
-            catalog_path=fixture["catalog_path"], episode_path=fixture["episode_path"],
-            frame_index=feedback["entry_frame"], base_link=fixture["base_link"], tcp_site=fixture["tcp_site"],
-            arm_joint_names=fixture["arm_joint_names"], finger_joint_names=fixture["finger_joint_names"],
-            arm_kp=arm_config["kp"], arm_kd=arm_config["kd"], velocity_limits=fixture["velocity_limits"])
+        # BEGIN restore only a recorded trial; borrowed sessions keep their exact state.
+        restore_report = None
+        if not borrowed_simulation:
+            simulation, restore_report = restore_recorded_simulation(scene_path=fixture["source_scene_xml"],
+                catalog_path=fixture["catalog_path"], episode_path=fixture["episode_path"],
+                frame_index=feedback["entry_frame"], base_link=fixture["base_link"], tcp_site=fixture["tcp_site"],
+                arm_joint_names=fixture["arm_joint_names"], finger_joint_names=fixture["finger_joint_names"],
+                arm_kp=arm_config["kp"], arm_kd=arm_config["kd"], velocity_limits=fixture["velocity_limits"])
         current = simulation.proprioception()
-        differences = {"q": float(np.max(np.abs(current["q"]-np.asarray(feedback["start_q"])))),
-            "dq": float(np.max(np.abs(current["dq"]-np.asarray(feedback["start_dq"])))),
-            "base_pose": float(np.max(np.abs(current["base_pose"]-np.asarray(feedback["base_pose"])))),
-            "tool_pose": float(np.max(np.abs(current["tool_pose"]-np.asarray(feedback["eef_pose"])))),
-            "time": abs(current["sim_time"]-feedback["sim_time_s"])}
+        report.update(trial_id=simulation.trial_id, native_start_time_s=float(current["sim_time"]))
+        if borrowed_simulation and any(initial_feedback.get(key) != current[key]
+                                       for key in ("trial_id", "feedback_id")):
+            raise ValueError("Live feedback must identify the same current native trial and sample")
+        differences = {}
+        for key in ("q", "dq", "base_pose", "tool_pose", "sim_time", "timestamp_s"):
+            measured, expected = np.asarray(current[key]), np.asarray(initial_feedback[key])
+            if (measured.shape != expected.shape or not np.isfinite(measured).all()
+                    or not np.isfinite(expected).all()):
+                raise ValueError(f"Current and initial robot feedback need matching finite {key}")
+            differences[key] = float(np.max(np.abs(measured-expected)))
         if max(differences.values()) > 1e-9:
-            raise ValueError(f"Restored native feedback differs from the selected observed entrance: {differences}")
-        # END restoration is independent of trajectory execution.
+            raise ValueError(f"Current native feedback differs from the selected observed entrance: {differences}")
+        report["initial_feedback_errors"] = differences
+        # END neither live validation nor recorded restoration changes command timing.
         # BEGIN explicitly rebind the unchanged curve to the current device contract.
         source_candidate = planning_result.execution_binding["candidate_id"]
         planning_result = rebind_execution_result(planning_result,
@@ -306,7 +367,7 @@ def run(args, *, observation_callback=None):
             planning_execution_limits_match=True,
             planning_hand_contract="Explicit rebound device policy; physical limits and original finger polynomial are preserved")
         # END no solve, clock change, source archive mutation or truth feedback occurs.
-        report.update(restored_feedback_errors=differences, restore=restore_report,
+        report.update(restore=restore_report,
             original_controller_configuration={"source": str(source_manifest_path),
                 "part": args.controller_part, "configuration": deepcopy(arm_config),
                 "policy_frequency_hz": environment["control_freq_hz"]},
@@ -315,6 +376,13 @@ def run(args, *, observation_callback=None):
                 "finger_targets": str(args.finger_targets.resolve()),
                 "program": str((root/segment["program_path"]).resolve()),
                 "evaluator_evidence": str(args.evaluator_evidence.resolve())})
+        # BEGIN expose the validated recorded entrance without relabelling feedback.
+        # The lifecycle owner can retain this exact backend even if later
+        # execution fails. A hook failure is a primary pre-control error,
+        # unlike failures of the independent evidence sinks below.
+        if on_simulation_ready is not None:
+            on_simulation_ready(simulation, deepcopy(restore_report))
+        # END no restore, native step or archived identity change occurs here.
         # BEGIN evaluator metadata and native identity failures are evidence-only.
         try:
             evidence = _read(args.evaluator_evidence)
@@ -358,6 +426,10 @@ def run(args, *, observation_callback=None):
                 evidence_failure("video", error, "initialize")
             # END missing camera records are reported, never synthesized.
 
+        # BEGIN the caller owns capture resources; only this call's sink state is local.
+        report["evidence_collection"]["capture_callback"]["initialized"] = step_callback is not None
+        # END no camera or simulator handle is transferred into runner ownership.
+
         def observe(model, data, record):
             # BEGIN executor supplies the initial state and each normal step once.
             # Stop only the failed sink; its peer can retain independent evidence.
@@ -379,12 +451,22 @@ def run(args, *, observation_callback=None):
                 except Exception as error:
                     evidence_failure("video", error, phase, record)
             # END no evaluator return value or exception feeds runtime control.
+            # BEGIN capture remains independent of both runtime semantics and peer sinks.
+            state = report["evidence_collection"]["capture_callback"]
+            if step_callback is not None and not state["disabled"]:
+                state["attempted_callbacks"] += 1
+                try:
+                    step_callback(model, data, deepcopy(record))
+                    state["successful_callbacks"] += 1
+                except Exception as error:
+                    evidence_failure("capture_callback", error, phase, record)
+            # END a returned capture value cannot become an execution observation.
 
         # BEGIN mandatory independent robot verification before native commands.
         validator = build_robot_validator(fixture,
-            reference_frame=feedback["reference_frame"],
-            T_reference_base=np.asarray(feedback["base_pose"], dtype=float),
-            tool_frame=feedback["tool_link"], T_frame_tcp=tool_transform)
+            reference_frame=initial_feedback["reference_frame"],
+            T_reference_base=np.asarray(initial_feedback["base_pose"], dtype=float),
+            tool_frame=initial_feedback["tool_link"], T_frame_tcp=tool_transform)
         executor = TrajectoryExecutor(simulation, geometry_checker=validator)
         report["status"] = "executing"
         execution = executor.execute(planning_result,
@@ -535,6 +617,17 @@ def run(args, *, observation_callback=None):
         video_state = report["evidence_collection"]["video"]
         video_state["completed"] = bool(video_state["initialized"] and not video_state["disabled"]
             and execution is not None and execution["independent_evidence_sink"]["completed"])
+        # BEGIN expose incomplete caller capture without closing caller-owned resources.
+        capture_state = report["evidence_collection"]["capture_callback"]
+        capture_state["completed"] = bool(capture_state["initialized"] and not capture_state["disabled"]
+            and execution is not None and execution["independent_evidence_sink"]["completed"])
+        if simulation is not None:
+            try:
+                native_end = float(simulation.sim_time)
+                report["native_end_time_s"] = native_end if np.isfinite(native_end) else None
+            except Exception as error:
+                report["native_end_time_error"] = f"{type(error).__name__}: {error}"
+        # END post-hold native time survives even an earlier execution/recording error.
         report["evidence_complete"] = bool(report["evaluation_coverage"]["complete"]
             and all(not state["configured"] or state["completed"]
                     for state in report["evidence_collection"].values()))

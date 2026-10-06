@@ -524,7 +524,7 @@ class CollisionOwner:
 
 @dataclass
 class ContactRule:
-    """A material feature / owner patch permission, never a link exemption.
+    """A material edge/polygon and owner patch permission, never a link exemption.
 
     The material points form a complete planar convex feature. Permission
     covers only its actual finite intersection with the target patch; a pad
@@ -556,6 +556,9 @@ class ContactRule:
     feature_joint_translation: object = None
     numerical_position_tolerance_m: float = 1e-6
     numerical_angle_tolerance_rad: float = 1e-6
+    # BEGIN a complete native edge is distinct from a fabricated thin polygon.
+    feature_kind: str = "polygon"
+    # END existing polygon declarations retain their exact geometry semantics.
 
     def __post_init__(self):
         for name in ("rule_id", "actor", "target_owner", "material_id", "source"):
@@ -565,20 +568,44 @@ class ContactRule:
             raise ValueError("Contact permission needs explicit material sphere indices")
         self.sphere_indices = tuple(self.sphere_indices)
         points = np.asarray(self.feature_points, float)
-        if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3 or not np.isfinite(points).all():
-            raise ValueError("A contact feature needs its complete planar polygon vertices")
+        # BEGIN the only admitted material dimensions are a full edge or polygon.
+        if self.feature_kind not in {"polygon", "edge"}:
+            raise ValueError("A contact feature must be an explicit polygon or edge")
+        count_valid = (points.shape == (2, 3) if self.feature_kind == "edge" else
+                       points.ndim == 2 and points.shape[1] == 3 and len(points) >= 3)
+        if not count_valid or not np.isfinite(points).all():
+            raise ValueError("A contact feature needs its complete polygon vertices or exactly two edge endpoints")
+        # END a point or a subset of a native face cannot silently become an edge.
         self.feature_points = points.copy()
         self.feature_normal = _array(self.feature_normal, (3,), "material normal")
         if not np.isclose(np.linalg.norm(self.feature_normal), 1., atol=1e-6):
             raise ValueError("Material normal must be unit length")
         if np.max(np.abs((points - points[0]) @ self.feature_normal)) > 1e-8:
             raise ValueError("Material contact vertices must lie in their declared plane")
-        # BEGIN retain all convex feature edges for complete overlap checks.
-        from scipy.spatial import ConvexHull
-        basis = np.linalg.svd(points-points[0], full_matrices=True)[2][:2].T
-        edges = ConvexHull((points-points[0]) @ basis).equations
-        self._feature_edge_normals = edges[:, :2] @ basis.T
-        self._feature_edge_offsets = edges[:, 2]
+        # BEGIN retain the complete finite feature, including a true native edge.
+        if self.feature_kind == "edge":
+            delta = points[1]-points[0]
+            length = np.linalg.norm(delta)
+            if length <= 256*np.finfo(float).eps*max(1., float(np.abs(points).max())):
+                raise ValueError("Material edge endpoints must define a nonzero complete edge")
+            tangent = delta/length
+            if abs(tangent @ self.feature_normal) > 1e-8:
+                raise ValueError("A material edge normal must be perpendicular to its real tangent")
+            lateral = np.cross(self.feature_normal, tangent)
+            lateral /= np.linalg.norm(lateral)
+            self._feature_tangent = tangent
+            # Endpoint bounds and two opposite lateral planes retain the
+            # zero-width edge. Only the existing numerical tolerance shifts
+            # these planes; the physical allowance remains normal-only.
+            self._feature_edge_normals = np.stack((tangent, -tangent, lateral, -lateral))
+            self._feature_edge_offsets = np.array([-length, 0., 0., 0.])
+        else:
+            from scipy.spatial import ConvexHull
+            basis = np.linalg.svd(points-points[0], full_matrices=True)[2][:2].T
+            edges = ConvexHull((points-points[0]) @ basis).equations
+            self._feature_edge_normals = edges[:, :2] @ basis.T
+            self._feature_edge_offsets = edges[:, 2]
+        # END rank-zero features are outside this explicitly bounded extension.
         # END a nearest contact point cannot stand in for this finite polygon.
         self.patch_origin = _array(self.patch_origin, (3,), "patch origin")
         self.patch_axes = _array(self.patch_axes, (3, 3), "patch axes")
@@ -611,13 +638,14 @@ class ContactRule:
 # BEGIN pose-arrival permission identifies a complete explicit robot/owner pair.
 @dataclass
 class RobotOwnerContactPermission:
-    """Software collision permission after a particular arrival and close.
+    """Software collision permission from a named arrival or current Holding.
 
     Native names and sphere indices are the same selected robot solids in the
     independent and planning models. This record supplies no material contact,
     attachment, Holding evidence, or simulator collision-filter changes.
-    Actual authorization additionally requires the executor's current arrival
-    latch; a nominal rollout only uses the declared conditional interval.
+    Actual authorization requires either the executor's current arrival latch
+    or its verified entrance Holding binding. A nominal rollout only uses the
+    declared conditional interval; neither branch creates physical evidence.
     """
 
     rule_id: str
@@ -628,6 +656,9 @@ class RobotOwnerContactPermission:
     arrival_goal_id: tuple
     activation_event: dict
     source: str
+    # BEGIN an observed attachment is a distinct activation, never a fake close.
+    holding_condition_id: str | None = None
+    # END absent Holding identity retains the original arrival/close contract.
 
     def __post_init__(self):
         for name in ("rule_id", "target_owner", "source"):
@@ -646,6 +677,14 @@ class RobotOwnerContactPermission:
             raise ValueError("Robot-owner permission requires unique explicit robot sphere indices")
         self.interval = _valid_interval(self.interval)
         self.arrival_goal_id = tuple(self.arrival_goal_id)
+        # BEGIN Holding permissions explicitly exclude arrival/command fields.
+        if self.holding_condition_id is not None:
+            _text(self.holding_condition_id, "Holding permission condition ID")
+            if self.arrival_goal_id or self.activation_event != {}:
+                raise ValueError("A Holding permission requires empty arrival and activation event fields")
+            self.activation_event = {}
+            return
+        # END the original close branch retains its exact event validation.
         if (len(self.arrival_goal_id) != 2 or self.arrival_goal_id[0] != "pose_events"
                 or type(self.arrival_goal_id[1]) is not int or self.arrival_goal_id[1] < 0):
             raise ValueError("Robot-owner permission requires a named pose-event arrival goal")
@@ -1292,6 +1331,25 @@ class PlanningScene:
         activations = [row for row in problem.conditions if row.get("kind") == "grasp_contact_activation"]
         matched = set()
         for rule in self.robot_owner_permissions:
+            # BEGIN current Holding binds one owner and its complete attachment span.
+            if rule.holding_condition_id is not None:
+                condition = conditions.get(rule.holding_condition_id)
+                relations = [relation for relation in by_id[rule.target_owner].attachments
+                    if relation.condition_id == rule.holding_condition_id
+                    and relation.interval == rule.interval]
+                if (condition is None or condition.get("kind") != "observed_attachment"
+                        or condition.get("carrier_id") != rule.target_owner
+                        or condition.get("progress") != rule.interval[0] or len(relations) != 1):
+                    raise ValueError("A Holding permission requires the same observed owner, condition and attachment interval")
+                relation = relations[0]
+                expected = _inverse(_pose_array(condition.get("T_carrier_eef"), "observed Holding transform"))
+                actual = np.eye(4)
+                actual[:3, 3] = relation.position_tool_owner
+                actual[:3, :3] = Rotation.from_quat(np.asarray(relation.quaternion_tool_owner)[[1, 2, 3, 0]]).as_matrix()
+                if not np.allclose(expected, actual, atol=1e-7, rtol=0):
+                    raise ValueError("Holding permission and collision attachment transform disagree")
+                continue
+            # END the held-phase checks below still verify every attachment use.
             candidates = [index for index, row in enumerate(activations)
                 if row.get("carrier_id") == rule.target_owner
                 and tuple(row.get("arrival_goal_id", ())) == rule.arrival_goal_id
@@ -2476,9 +2534,17 @@ class PlanningScene:
         # it back onto that actual face before evaluating the declared gap;
         # this allows a curved target to touch just part of a larger pad.
         patch_normal = patch_axes[:, 2]
-        cosine = (material_normal*patch_normal).sum(-1)
-        gap_axis = patch_normal-cosine.unsqueeze(-1)*material_normal
-        gap_offset = cosine*material_height-patch_normal@patch_origin
+        # BEGIN gap belongs to the actual feature's affine projection.
+        if rule.feature_kind == "edge":
+            tangent_world = quaternion_rotate(actor_pose[1], _tensor(rule._feature_tangent, progress))
+            tangent = quaternion_rotate(inverse_target, tangent_world)
+            gap_axis = (tangent*patch_normal).sum(-1).unsqueeze(-1)*tangent
+            gap_offset = (origin*(patch_normal-gap_axis)).sum(-1)-patch_normal@patch_origin
+        else:
+            cosine = (material_normal*patch_normal).sum(-1)
+            gap_axis = patch_normal-cosine.unsqueeze(-1)*material_normal
+            gap_offset = cosine*material_height-patch_normal@patch_origin
+        # END an edge never borrows the rest of its supporting plane.
         for sign, limit in ((1., rule.gap_bounds[1]), (-1., -rule.gap_bounds[0])):
             rows.append((sign*gap_axis).unsqueeze(-2))
             bounds.append((limit-sign*gap_offset+tolerance).unsqueeze(-1))
@@ -2782,7 +2848,15 @@ class PlanningScene:
                             spheres, dtype=torch.long), True)
                         # END selected sphere order and policy values are unchanged.
                         # END permission predicates and geometry are unchanged.
-                        permitted = _interval(permission_progress, rule.interval).unsqueeze(-1) & selected
+                        # BEGIN observed Holding expires at its real release boundary.
+                        active = _interval(permission_progress, rule.interval)
+                        if rule.holding_condition_id is not None and any(
+                                relation.condition_id == rule.holding_condition_id
+                                and relation.release_condition_id is not None
+                                for relation in owner.attachments):
+                            active = active & (permission_progress < rule.interval[1])
+                        permitted = active.unsqueeze(-1) & selected
+                        # END continued Holding includes the window end when no release exists.
                         values = torch.where(permitted, torch.zeros_like(values), values)
                 # END background, other owners, robot self pairs and raw queries are unchanged.
                 collision_terms(values, f"collision/{actor}/{owner.owner_id}", actor)

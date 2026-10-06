@@ -2,6 +2,12 @@
 
 # BEGIN a large generated report must not replace the original execution error.
 from contextlib import ExitStack
+# BEGIN live-session tests preserve caller-owned robot feedback by value.
+from copy import deepcopy
+# END mutations inside capture callbacks must not edit execution records.
+# BEGIN recorded fixture creation binds an immutable reference to its named file.
+from dataclasses import replace
+# END production execution never rewrites an archived feedback identity.
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,17 +18,22 @@ import pytest
 
 from test_recorded_simulation import (
     _fixture, _initial_feedback, _limit_values, _result, _executor, _limits, _execute_bound,
+    # BEGIN reuse the existing CPU finger-reference adapter for each new request.
+    _bind_fingers,
+    # END no native physical state is synthesized by the runner tests.
 )
 from manipulation.execution import ExecutionGuardError, FixedFingerTargets, _feedback_json
 import run_recorded_simulation as runner
 
 
 # BEGIN shared explicit trial metadata for evidence-isolation CPU doubles.
-def _runner_inputs(tmp_path, simulation, curve, targets, initial):
+def _runner_inputs(tmp_path, simulation, curve, targets, initial, *, skill_id="declared_skill"):
     def save(name, value):
         path = tmp_path/name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(value))
+        # BEGIN production feedback retains NumPy calibration arrays in memory.
+        path.write_text(json.dumps(_feedback_json(value)))
+        # END disk fixtures use the same explicit conversion as runner reports.
         return path
 
     fixture = {"joint_names": list(simulation.joint_names),
@@ -30,20 +41,20 @@ def _runner_inputs(tmp_path, simulation, curve, targets, initial):
         "tool_link": simulation.tool_link, "base_link": "test_base", "tcp_site": simulation.tool_link,
         "episode_path": str(tmp_path/"recording"/"episode.h5"), "source_scene_xml": "unused_test_scene",
         "catalog_path": str(save("catalog.json", {})), "velocity_limits": simulation.velocity_limits}
-    feedback = {**fixture, "segment_id": "declared_skill", "entry_frame": 0,
+    feedback = {**fixture, "segment_id": skill_id, "entry_frame": 0,
         "reference_frame": "world", "tool_transform": initial["tool_transform"],
         "start_q": initial["q"].tolist(), "start_dq": initial["dq"].tolist(),
         "base_pose": initial["base_pose"].tolist(), "eef_pose": initial["tool_pose"].tolist(),
         "sim_time_s": initial["sim_time"], "source": initial["source"]}
     save("program.json", {"skill_kind": "grasp", "demo": {"roles": {}}})
     manifest = {"workspace_root": str(tmp_path), "source_recording": "recording", "segments": [{
-        "id": "declared_skill", "program_path": "program.json", "source_library_segment": "declared_skill",
+        "id": skill_id, "program_path": "program.json", "source_library_segment": skill_id,
         "snapshot": {"entry_frame": 0, "reference_frame": "world", "views": [{"id": "test_view"}]}}]}
     save("recording/manifest.json", {"environment": {"control_freq_hz": 20, "controller_config": {"body_parts": {
         "test_arm": {"type": "JOINT_POSITION", "input_type": "absolute", "gripper": {"type": "GRIP"},
                      "interpolation": None, "kp": 1., "kd": 1.}}}}})
     evidence = {"actor": {"entity_name": "test_robot", "eef_site_name": simulation.tool_link,
-        "contact_geom_groups": []}, "segments": [{"segment_id": "declared_skill", "interaction": "grasp",
+        "contact_geom_groups": []}, "segments": [{"segment_id": skill_id, "interaction": "grasp",
         "carrier_body_name": "test_owner"}], "evaluation_owner_bindings": []}
     args = SimpleNamespace(output=tmp_path/"trial", trajectory=tmp_path/"formal.npz",
         manifest=save("manifest.json", manifest), robot_fixture=save("fixture.json", fixture),
@@ -53,7 +64,7 @@ def _runner_inputs(tmp_path, simulation, curve, targets, initial):
         # BEGIN the test caller supplies the explicit independent scoring policy.
         result_only_goal_ids=[], diagnostic_goal_ids=[],
         # END no production compatibility default is needed for an old test double.
-        segment="declared_skill", controller_part="test_arm", views=["test_view"], no_video=False,
+        segment=skill_id, controller_part="test_arm", views=["test_view"], no_video=False,
         max_physics_steps=30000, start_position_tolerance=2e-6, start_velocity_tolerance=2e-6)
     result = _result(curve)
     result.diagnostics["archive_classification"] = "planner_accepted"
@@ -481,3 +492,321 @@ def test_video_cleanup_attempts_every_writer_camera_and_timestamp_sink(tmp_path)
     for i in range(2):
         np.testing.assert_array_equal(np.load(tmp_path/f"times-{i}.npy"), [[0., 1.3]])
 # END every assertion concerns reporting or owned cleanup, not physical feasibility.
+
+
+# BEGIN borrowed sessions keep the real executor and only mock native integration.
+class _LiveCaptureEvaluator:
+    """Count actual executor callbacks without reading object or contact truth."""
+
+    def __init__(self):
+        self.samples = []
+
+    def observe(self, model, data, record):
+        self.samples.append((float(data.time), record["elapsed"]))
+
+    def finalize(self, output, *, execution_report, collection_report):
+        return {"physics_outcome": "not_evaluated", "physics_success": None,
+            "evidence_coverage": {"complete": collection_report["completed"]}}
+
+
+def _live_runner_inputs(tmp_path, simulation, curve, targets, *, skill_id):
+    """Bind a distinct request to this backend's current, unmodified state."""
+    initial = simulation.proprioception()
+    for event in curve.events:
+        event["skill_id"] = skill_id
+    curve.events[2].update(kind="effect", requires_evidence=None, stop=False)
+    curve.conditions = ({"condition_id": skill_id+":effect", "effect_requirement": "current actual evidence",
+        "skill_id": skill_id, "event_id": curve.events[2]["event_id"]},)
+    for event in targets["events"]:
+        event["skill_id"] = skill_id
+    _bind_fingers(simulation, curve, targets)
+    args, result = _runner_inputs(tmp_path, simulation, curve, targets, initial, skill_id=skill_id)
+    args.no_video = True
+    # A live handoff does not decode or depend on the historical-entry schema.
+    # Its provenance path may point at a complete production-feedback artifact.
+    args.feedback.write_text(json.dumps(_feedback_json(initial)))
+    return args, result, initial
+
+
+def _patch_live_runner(stack, simulation, result, evaluator):
+    stack.enter_context(patch.object(runner, "load_saved_trajectory", return_value=result))
+    restore = stack.enter_context(patch.object(runner, "restore_recorded_simulation",
+        side_effect=AssertionError("A borrowed session must never restore an episode")))
+    stack.enter_context(patch.object(runner, "build_robot_validator", return_value=object()))
+    executor = _executor(simulation)
+    construct = stack.enter_context(patch.object(runner, "TrajectoryExecutor", return_value=executor))
+    stack.enter_context(patch.object(runner, "NativeSkillPhysicsEvaluator", return_value=evaluator))
+    videos = stack.enter_context(patch.object(runner, "_TrialVideos",
+        side_effect=AssertionError("The no-video runner does not own the caller's camera")))
+    stack.enter_context(patch("manipulation.robosuite_execution.mujoco.mj_forward"))
+    return restore, construct, videos
+
+
+def test_two_skills_borrow_one_backend_without_replacing_feedback_or_resetting_clock(tmp_path):
+    simulation, curve, targets = _fixture()
+    model, data, native_start = simulation.native_model, simulation.native_data, simulation.sim_time
+    q, dq = data.qpos.copy(), data.qvel.copy()
+    closes, captures, reports, feedback_ids = [], [], [], []
+    simulation.close = lambda: closes.append("simulation")
+
+    def capture(model_arg, data_arg, record):
+        assert model_arg is model and data_arg is data
+        captures.append((float(data_arg.time), record["elapsed"], record["feedback"]["feedback_id"]))
+        # Independent sinks cannot mutate the executor's captured sample or
+        # become an observation just by returning a semantic-looking object.
+        record["feedback"]["q"][:] = 99.
+        return {"effects": {"Holding": {"value": "T", "source": "not an observer"}}}
+
+    for index in range(2):
+        args, result, initial = _live_runner_inputs(tmp_path/str(index), simulation, curve, targets,
+            skill_id=f"live_skill_{index}")
+        evaluator = _LiveCaptureEvaluator()
+        saved = deepcopy(initial)
+        feedback_ids.append(initial["feedback_id"])
+        with ExitStack() as stack:
+            restore, construct, videos = _patch_live_runner(stack, simulation, result, evaluator)
+            report = runner.run(args, simulation=simulation, initial_feedback=initial, step_callback=capture)
+        reports.append(report)
+        restore.assert_not_called()
+        videos.assert_not_called()
+        assert construct.call_args.args[0] is simulation
+        assert len(evaluator.samples) == 7
+        assert report["simulation_ownership"] == "borrowed" and report["restore"] is None
+        assert report["trial_id"] == simulation.trial_id
+        assert report["native_start_time_s"] == initial["sim_time"]
+        assert report["native_end_time_s"] == pytest.approx(initial["sim_time"]+.012)
+        assert report["evidence_collection"]["capture_callback"]["completed"]
+        assert report["online_observation_provided"] is False
+        execution = json.loads((args.output/"execution"/"execution-report.json").read_text())
+        assert execution["status"] == "curve_finished" and execution["effect_result"] == "U"
+        assert execution["continuation"]["actual_feedback"]["trial_id"] == simulation.trial_id
+        assert execution["continuation"]["actual_feedback"]["tool_pose_source"] == initial["tool_pose_source"]
+        final = json.loads(Path(execution["robot_feedback_path"]).read_text())
+        assert final["initial_feedback_id"] == initial["feedback_id"]
+        np.testing.assert_array_equal(initial["q"], saved["q"])
+        np.testing.assert_array_equal(initial["dq"], saved["dq"])
+        np.testing.assert_array_equal(final["q"], q)
+    assert feedback_ids[0] != feedback_ids[1]
+    assert reports[0]["native_end_time_s"] == reports[1]["native_start_time_s"]
+    assert simulation.native_model is model and simulation.native_data is data and closes == []
+    assert simulation.sim_time == pytest.approx(native_start+.024)
+    assert len(captures) == 14 and captures[6][0] == captures[7][0]
+    np.testing.assert_array_equal(data.qpos, q)
+    np.testing.assert_array_equal(data.qvel, dq)
+
+
+@pytest.mark.parametrize("field", ["q", "dq", "sim_time", "timestamp_s", "trial_id", "feedback_id"])
+def test_borrowed_backend_rejects_stale_or_foreign_feedback_before_commands(tmp_path, field):
+    simulation, curve, targets = _fixture()
+    args, result, initial = _live_runner_inputs(tmp_path, simulation, curve, targets, skill_id="live_skill")
+    if field in ("q", "dq"):
+        initial[field][0] += .01
+    elif field in ("sim_time", "timestamp_s"):
+        initial[field] += .01
+    else:
+        initial[field] = "different_native_sample"
+    before = deepcopy(simulation.proprioception())
+    controls = simulation.native_data.ctrl.copy()
+    with ExitStack() as stack:
+        restore, construct, videos = _patch_live_runner(stack, simulation, result, _LiveCaptureEvaluator())
+        with pytest.raises(ValueError, match="same current native|differs from the selected"):
+            runner.run(args, simulation=simulation, initial_feedback=initial)
+    restore.assert_not_called()
+    construct.assert_not_called()
+    videos.assert_not_called()
+    assert simulation.sim_time == before["sim_time"]
+    np.testing.assert_array_equal(simulation.native_data.qpos, before["q"])
+    np.testing.assert_array_equal(simulation.native_data.qvel, before["dq"])
+    np.testing.assert_array_equal(simulation.native_data.ctrl, controls)
+
+
+@pytest.mark.parametrize("missing", ["simulation", "initial_feedback"])
+def test_live_handoff_requires_backend_and_complete_feedback_together(tmp_path, missing):
+    simulation, curve, targets = _fixture()
+    args, result, initial = _live_runner_inputs(tmp_path, simulation, curve, targets, skill_id="live_skill")
+    supplied = {"simulation": simulation, "initial_feedback": initial}
+    supplied.pop(missing)
+    with patch.object(runner, "restore_recorded_simulation") as restore:
+        with pytest.raises(ValueError, match="must be supplied together"):
+            runner.run(args, **supplied)
+    restore.assert_not_called()
+    assert simulation.sim_time == initial["sim_time"]
+
+
+@pytest.mark.parametrize("failed_elapsed", [0., .002])
+def test_borrowed_capture_failure_retains_peer_evidence_and_native_final_state(tmp_path, failed_elapsed):
+    simulation, curve, targets = _fixture()
+    args, result, initial = _live_runner_inputs(tmp_path, simulation, curve, targets, skill_id="live_skill")
+    evaluator, captured = _LiveCaptureEvaluator(), []
+
+    def capture(model, data, record):
+        captured.append(record["elapsed"])
+        if record["elapsed"] >= failed_elapsed:
+            raise RuntimeError("external RGB-D capture failed")
+
+    with ExitStack() as stack:
+        _patch_live_runner(stack, simulation, result, evaluator)
+        report = runner.run(args, simulation=simulation, initial_feedback=initial, step_callback=capture)
+    state = report["evidence_collection"]["capture_callback"]
+    assert report["status"] == "completed" and report["trajectory_executed_steps"] == 6
+    assert state["disabled"] and not state["completed"]
+    assert state["first_error"]["message"] == "external RGB-D capture failed"
+    assert state["first_error"]["curve_time"] == failed_elapsed
+    assert len(captured) == 1+int(failed_elapsed/simulation.timestep)
+    assert len(evaluator.samples) == 7 and report["evidence_collection"]["evaluator"]["completed"]
+    assert report["evidence_complete"] is False
+    assert report["native_end_time_s"] == simulation.sim_time == pytest.approx(initial["sim_time"]+.012)
+
+
+def test_borrowed_capture_failure_cannot_replace_a_later_native_error(tmp_path):
+    simulation, curve, targets = _fixture()
+    args, result, initial = _live_runner_inputs(tmp_path, simulation, curve, targets, skill_id="live_skill")
+    primary = RuntimeError("native step failed after advancing its clock")
+    step, closed = simulation._sim.step, []
+    simulation.close = lambda: closed.append(True)
+
+    def failed_step():
+        step()
+        raise primary
+
+    def failed_capture(model, data, record):
+        raise ValueError("independent capture failed first")
+
+    simulation._sim.step = failed_step
+    with ExitStack() as stack:
+        _patch_live_runner(stack, simulation, result, _LiveCaptureEvaluator())
+        with pytest.raises(RuntimeError) as raised:
+            runner.run(args, simulation=simulation, initial_feedback=initial, step_callback=failed_capture)
+    report = json.loads((args.output/"simulation-report.json").read_text())
+    assert raised.value is primary and report["error"] == f"RuntimeError: {primary}"
+    assert report["evidence_collection"]["capture_callback"]["first_error"]["message"] == "independent capture failed first"
+    assert report["native_end_time_s"] == simulation.sim_time > initial["sim_time"]
+    assert report["final_robot_feedback"]["sim_time"] == simulation.sim_time
+    assert closed == []
+# END live-session tests never instantiate a native model, renderer or GPU planner.
+
+
+# BEGIN a validated recorded entrance can be retained for the next live skill.
+def _recorded_ready_inputs(tmp_path, simulation, curve, targets):
+    """Create a new recorded fixture whose original finger identity is a file."""
+    initial = simulation.proprioception()
+    curve.events[2].update(kind="effect", requires_evidence=None, stop=False)
+    curve.conditions = ({"condition_id": "declared_skill:effect",
+        "effect_requirement": "current actual evidence", "skill_id": "declared_skill",
+        "event_id": curve.events[2]["event_id"]},)
+    _bind_fingers(simulation, curve, targets)
+    args, _ = _runner_inputs(tmp_path, simulation, curve, targets, initial)
+    args.no_video = True
+    curve.finger_trajectory = replace(curve.finger_trajectory, feedback_id=str(args.feedback.resolve()))
+    result = _result(curve)
+    result.diagnostics["archive_classification"] = "planner_accepted"
+    return args, result, initial
+
+
+def test_recorded_ready_hook_retains_backend_and_original_identity_for_next_skill(tmp_path):
+    simulation, curve, targets = _fixture()
+    args, result, initial = _recorded_ready_inputs(tmp_path/"recorded", simulation, curve, targets)
+    retained, lifecycle = [], []
+    restore_report = {"source": {"entry_frame": 0}}
+    before_controls = simulation.native_data.ctrl.copy()
+
+    def ready(backend, restored):
+        assert backend is simulation and restored == restore_report
+        assert simulation.sim_time == initial["sim_time"] and simulation.arm_goals == []
+        np.testing.assert_array_equal(simulation.native_data.ctrl, before_controls)
+        retained.append(backend)
+        lifecycle.append("ready")
+        restored["source"]["entry_frame"] = 99  # The diagnostic copy cannot change the runner report.
+
+    def capture(model, data, record):
+        assert retained == [simulation] and lifecycle[0] == "ready"
+        lifecycle.append("sample")
+
+    with ExitStack() as stack:
+        restore, _, _ = _patch_live_runner(stack, simulation, result, _LiveCaptureEvaluator())
+        restore.side_effect = None
+        restore.return_value = simulation, restore_report
+        first = runner.run(args, on_simulation_ready=ready, step_callback=capture)
+    restore.assert_called_once()
+    assert lifecycle.count("ready") == 1 and first["restore"] == restore_report
+    assert restore_report == {"source": {"entry_frame": 0}}
+    first_feedback = json.loads(Path(first["robot_feedback_path"]).read_text())
+    assert first_feedback["initial_feedback_id"] == str(args.feedback.resolve())
+    assert first["simulation_ownership"] == "recorded_trial"
+    assert first["native_end_time_s"] == pytest.approx(initial["sim_time"]+.012)
+
+    second_args, second_result, current = _live_runner_inputs(tmp_path/"live", retained[0], curve, targets,
+        skill_id="next_skill")
+    with ExitStack() as stack:
+        restore, _, _ = _patch_live_runner(stack, simulation, second_result, _LiveCaptureEvaluator())
+        second = runner.run(second_args, simulation=retained[0], initial_feedback=current)
+    restore.assert_not_called()
+    assert second["simulation_ownership"] == "borrowed" and second["restore"] is None
+    assert first["trial_id"] == second["trial_id"] == simulation.trial_id
+    assert first["native_end_time_s"] == second["native_start_time_s"]
+    assert second["native_end_time_s"] == pytest.approx(initial["sim_time"]+.024)
+    second_feedback = json.loads(Path(second["robot_feedback_path"]).read_text())
+    assert second_feedback["initial_feedback_id"] == current["feedback_id"]
+
+
+@pytest.mark.parametrize("field", ["start_q", "start_dq", "sim_time_s"])
+def test_recorded_ready_hook_is_not_called_when_the_entrance_differs(tmp_path, field):
+    simulation, curve, targets = _fixture()
+    args, result, initial = _recorded_ready_inputs(tmp_path, simulation, curve, targets)
+    feedback = json.loads(args.feedback.read_text())
+    if field == "sim_time_s":
+        feedback[field] += .01
+    else:
+        feedback[field][0] += .01
+    args.feedback.write_text(json.dumps(feedback))
+    received = []
+    with ExitStack() as stack:
+        restore, construct, _ = _patch_live_runner(stack, simulation, result, _LiveCaptureEvaluator())
+        restore.side_effect = None
+        restore.return_value = simulation, {}
+        with pytest.raises(ValueError, match="differs from the selected observed entrance"):
+            runner.run(args, on_simulation_ready=lambda *args: received.append(args))
+    restore.assert_called_once()
+    construct.assert_not_called()
+    assert received == [] and simulation.arm_goals == [] and simulation.sim_time == initial["sim_time"]
+
+
+def test_recorded_ready_hook_failure_is_primary_and_prevents_commands(tmp_path):
+    simulation, curve, targets = _fixture()
+    args, result, initial = _recorded_ready_inputs(tmp_path, simulation, curve, targets)
+    primary = RuntimeError("session could not retain the restored backend")
+    before_controls = simulation.native_data.ctrl.copy()
+
+    def fail_ready(backend, restored):
+        raise primary
+
+    with ExitStack() as stack:
+        restore, construct, videos = _patch_live_runner(stack, simulation, result, _LiveCaptureEvaluator())
+        restore.side_effect = None
+        restore.return_value = simulation, {}
+        with pytest.raises(RuntimeError) as raised:
+            runner.run(args, on_simulation_ready=fail_ready)
+    assert raised.value is primary
+    construct.assert_not_called()
+    videos.assert_not_called()
+    assert simulation.arm_goals == [] and simulation.sim_time == initial["sim_time"]
+    np.testing.assert_array_equal(simulation.native_data.ctrl, before_controls)
+    report = json.loads((args.output/"simulation-report.json").read_text())
+    assert report["error"] == f"RuntimeError: {primary}" and report["execution_tested"] is False
+    assert report["native_start_time_s"] == report["native_end_time_s"]
+    assert report["evidence_collection"]["evaluator"]["initialized"] is False
+
+
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_simulation_ready_hook_rejects_invalid_ownership_or_callable_before_restore(tmp_path, borrowed):
+    simulation, curve, targets = _fixture()
+    args, result, initial = _recorded_ready_inputs(tmp_path, simulation, curve, targets)
+    supplied = {"simulation": simulation, "initial_feedback": initial} if borrowed else {}
+    hook = (lambda *args: None) if borrowed else object()
+    message = "cannot be used with a borrowed simulation" if borrowed else "must be callable"
+    with patch.object(runner, "restore_recorded_simulation") as restore:
+        with pytest.raises(ValueError, match=message):
+            runner.run(args, on_simulation_ready=hook, **supplied)
+    restore.assert_not_called()
+    assert simulation.arm_goals == [] and simulation.sim_time == initial["sim_time"]
+# END callback delivery never authorizes geometry or advances the native clock.

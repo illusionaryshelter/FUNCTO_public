@@ -1,8 +1,8 @@
-"""Bind named robot material faces to existing finite contact permissions.
+"""Bind named robot faces or native rigid-owner features to finite permissions.
 
-Only an isolated native robot model and named robot feedback enter calibration.
-Object geometry, task names and simulation object state are not inputs. A face
-declaration identifies material; it does not itself permit any object contact.
+Robot calibration uses only an isolated model and named robot feedback. Rigid
+owners provide complete native polygons or edges in their own frames.
+A feature declaration identifies material; it does not itself permit contact.
 """
 
 # BEGIN explicit native material calibration and permission construction.
@@ -103,6 +103,9 @@ def calibrate_box_material_features(model, *, tcp_site, joint_positions,
             raise ValueError("Named material faces are not affine in the native finger coordinates")
     return {row["material_id"]: {
         "material_id": row["material_id"], "native_geometry": row["native_geometry"],
+        # BEGIN robot calibration always derives a full native planar face.
+        "feature_kind": "polygon",
+        # END callers cannot relabel its dimensionality in a permission.
         "feature_points": zero[index].tolist(), "feature_normal": normals[index].tolist(),
         "feature_joint_translation": mapping[index].tolist(),
         "finger_joint_names": list(names), "native_thickness_m": float(2*model.geom_size[local_faces[index][0], row["face_axis"]]),
@@ -111,20 +114,28 @@ def calibrate_box_material_features(model, *, tcp_site, joint_positions,
 
 
 def build_material_contact_rules(material_binding, declarations):
-    """Combine calibrated robot material with explicit owner-local permissions.
+    """Combine calibrated material with explicit owner-local permissions.
 
     The target patch and every physical allowance come from the caller's
     declared observation/model evidence. They are never inferred from the
     robot material, a collision failure, or a desired grasp outcome.
     """
     result = []
-    feature_fields = ("sphere_indices", "feature_points", "feature_normal", "feature_joint_translation")
+    feature_fields = ("sphere_indices", "feature_kind", "feature_points", "feature_normal", "feature_joint_translation")
     for declaration in declarations:
         row = dict(declaration)
-        material = material_binding["materials"][row["material_id"]]
-        if any(name in row for name in feature_fields) or row.get("actor", "robot") != "robot":
-            raise ValueError("Robot material geometry must come from its native binding")
-        row["actor"] = "robot"
+        # BEGIN select the actor's exact native material without sharing identities.
+        # Rigid-owner features are expressed in that owner's coordinates. Their
+        # sphere indices refer to its own complete cover, never robot indices.
+        actor = row.setdefault("actor", "robot")
+        materials = (material_binding["materials"] if actor == "robot" else
+                     material_binding.get("owner_materials", {}).get(actor, {}))
+        if row["material_id"] not in materials:
+            raise ValueError("Contact material must belong to its explicitly bound actor")
+        material = materials[row["material_id"]]
+        if any(name in row for name in feature_fields):
+            raise ValueError("Material geometry must come from its native binding")
+        # END caller declarations only set the finite target patch and allowance.
         for name in feature_fields:
             row[name] = material[name]
         row["sphere_indices"] = tuple(row["sphere_indices"])

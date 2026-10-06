@@ -479,6 +479,14 @@ class RobotGeometryChecker:
         permitted_rules = [rule for rule in self._robot_owner_permissions
             if rule.interval[0] <= permission_progress <= rule.interval[1]
             and (state_kind == "nominal" or rule.rule_id in active)]
+        # BEGIN Holding permission shares the attachment's exclusive real release end.
+        # Even an erroneous supplied active set cannot extend that frozen contract.
+        permitted_rules = [rule for rule in permitted_rules
+            if rule.holding_condition_id is None or permission_progress < rule.interval[1]
+            or not any(relation["condition_id"] == rule.holding_condition_id
+                and relation["release_condition_id"] is not None
+                for relation in self._scene_owners[rule.target_owner][0]["attachments"])]
+        # END original arrival/close permission intervals keep their existing semantics.
         # END ordinary collision evidence below is still queried and archived.
         # BEGIN retain unpermitted distances before component evidence is reduced.
         # Whole-pair permissions also apply to separated pieces, whose normal
@@ -751,8 +759,14 @@ class RobotGeometryChecker:
                     if permissions:
                         row["permission"] = permissions[0].rule_id
                         row["permission_scope"] = "explicit_robot_owner_pair"
-                        row["permission_authorization"] = ("conditional_nominal_arrival" if state_kind == "nominal"
-                                                            else "current_execution_arrival_latch")
+                        # BEGIN report the actual activation contract, including current Holding.
+                        if permissions[0].holding_condition_id is not None:
+                            row["permission_authorization"] = ("conditional_nominal_holding_attachment"
+                                if state_kind == "nominal" else "current_execution_holding_binding")
+                        else:
+                            row["permission_authorization"] = ("conditional_nominal_arrival" if state_kind == "nominal"
+                                                                else "current_execution_arrival_latch")
+                        # END a Holding permission is never described as a measured arrival.
                         continue
                     # END signed distance, witnesses and physical contacts remain raw evidence.
                     # BEGIN resolve a Coal numerical boundary using complete solid intersections.
@@ -1604,7 +1618,7 @@ def _scene_shape(record, *, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
 
 
 def _feature_region(rule, actor_pose, target_pose, finger_positions):
-    """Express the complete material polygon and allowed patch in world axes.
+    """Express the complete material edge/polygon and target patch in world axes.
 
     These are the same ContactRule data consumed by generation. This CPU
     implementation never reads its sphere masks or differentiable residuals.
@@ -1629,14 +1643,35 @@ def _feature_region(rule, actor_pose, target_pose, finger_positions):
     # intersection below must lie in every supplied material/patch halfspace.
     # SVD supplies a basis for this supplied planar polygon. ConvexHull in 2D
     # produces all its edge inequalities, including a nonrectangular feature.
-    basis = np.linalg.svd(world-world[0], full_matrices=True)[2][:2].T
-    local = (world-world[0]) @ basis
-    edges = ConvexHull(local).equations
     rows, bounds = [], []
-    for edge in edges:
-        axis = basis @ edge[:2]
-        rows.append(axis)
-        bounds.append(float(axis @ world[0] - edge[2] + tolerance))
+    # BEGIN independently reconstruct the true edge's endpoints and lateral equality.
+    kind = rule.get("feature_kind", "polygon")
+    if kind == "edge":
+        if world.shape != (2, 3):
+            raise ValueError("An independent material edge requires exactly its two endpoints")
+        delta = world[1]-world[0]
+        length = np.linalg.norm(delta)
+        if length <= 256*np.finfo(float).eps*max(1., float(np.abs(world).max())):
+            raise ValueError("An independent material edge must have nonzero length")
+        tangent = delta/length
+        if abs(tangent @ normal) > 1e-8:
+            raise ValueError("Independent material edge normal and tangent must be perpendicular")
+        lateral = np.cross(normal, tangent)
+        lateral /= np.linalg.norm(lateral)
+        for axis, extent in ((tangent, length), (-tangent, 0.), (lateral, 0.), (-lateral, 0.)):
+            rows.append(axis)
+            bounds.append(float(axis @ world[0]+extent+tolerance))
+    elif kind == "polygon":
+        basis = np.linalg.svd(world-world[0], full_matrices=True)[2][:2].T
+        local = (world-world[0]) @ basis
+        edges = ConvexHull(local).equations
+        for edge in edges:
+            axis = basis @ edge[:2]
+            rows.append(axis)
+            bounds.append(float(axis @ world[0] - edge[2] + tolerance))
+    else:
+        raise ValueError("Independent contact features support only explicit edges or polygons")
+    # END no lateral physical band broadens the native edge into a side-face patch.
     allowance = float(rule["modeling_allowance_m"])
     for axis in (normal, -normal):
         rows.append(axis)
@@ -1653,10 +1688,16 @@ def _feature_region(rule, actor_pose, target_pose, finger_positions):
         bounds.append(float(axis @ origin + allowance + tolerance))
     # Evaluate gap on the corresponding point projected onto the ACTUAL
     # material plane, rather than on unrelated corners outside the patch.
-    height = float(normal @ world[0])
-    cosine = float(axes[:, 2] @ normal)
-    gap_axis = axes[:, 2]-cosine*normal
-    gap_offset = cosine*height-float(axes[:, 2] @ origin)
+    # BEGIN an edge uses its line projection; polygons keep the existing plane law.
+    if kind == "edge":
+        gap_axis = float(axes[:, 2] @ tangent)*tangent
+        gap_offset = float((axes[:, 2]-gap_axis) @ world[0]-axes[:, 2] @ origin)
+    else:
+        height = float(normal @ world[0])
+        cosine = float(axes[:, 2] @ normal)
+        gap_axis = axes[:, 2]-cosine*normal
+        gap_offset = cosine*height-float(axes[:, 2] @ origin)
+    # END the finite feature guards and complete-solid intersection proof still apply.
     for sign, limit in ((1., rule["gap_bounds"][1]), (-1., -rule["gap_bounds"][0])):
         rows.append(sign*gap_axis)
         bounds.append(float(limit-sign*gap_offset+tolerance))

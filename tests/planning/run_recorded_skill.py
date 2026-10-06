@@ -134,6 +134,113 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
 # END execution semantics stay here; only measured native geometry is shared.
 
 
+# BEGIN explicit snapshot, owner-mask and hand-permission input contracts.
+def require_feedback_identity(feedback):
+    """Keep the capture adapter's identity across planning and execution.
+
+    A file path only names storage and can change when a capture is copied.
+    It cannot replace the ID already carried by current Holding evidence.
+    """
+    identity = feedback.get("feedback_id")
+    if not isinstance(identity, str) or not identity.strip():
+        raise ValueError("The input adapter must supply an explicit current feedback_id")
+    return identity
+
+
+def recorded_owner_observation_inputs(problem, scene_input, views, mask_rows, *, source):
+    """Require each selected physical owner in every current RGB-D view.
+
+    Carrier coordinates come from the compiled problem. A reference object's
+    coordinates come only from its explicit current scene pose. An invisible
+    object still needs an empty boolean mask; a missing mask is not evidence.
+    """
+    from manipulation.motion import _pose_array
+    from recorded_owner_geometry import _problem_binding
+
+    carrier = scene_input["carrier_id"]
+    initial, _ = _problem_binding(problem, carrier)
+    frames = {carrier: {"T_output_owner": initial, "source": source}}
+    if "reference_id" in scene_input or "reference_pose" in scene_input:
+        reference = scene_input.get("reference_id")
+        if (not isinstance(reference, str) or not reference.strip() or reference == carrier
+                or "reference_pose" not in scene_input):
+            raise ValueError("A reference partition requires its distinct reference_id and current reference_pose")
+        frames[reference] = {"T_output_owner": _pose_array(scene_input["reference_pose"],
+                            "current reference-owner pose"), "source": source}
+    view_ids = [view["id"] for view in views]
+    if len(set(view_ids)) != len(view_ids) or not view_ids:
+        raise ValueError("Current RGB-D views require distinct explicit IDs")
+    masks = {}
+    for row in mask_rows:
+        if len(row) != 3:
+            raise ValueError("Each owner mask requires OWNER_ID VIEW_ID MASK_PATH")
+        owner, view, path = row
+        if (owner, view) in masks:
+            raise ValueError("Every current owner/view mask must be supplied exactly once")
+        masks[owner, view] = Path(path)
+    if set(masks) != {(owner, view) for owner in frames for view in view_ids}:
+        raise ValueError("Supply exactly one current owner mask for every explicit owner and view")
+    return frames, masks
+
+
+def build_hand_owner_permissions(problem, hand_binding):
+    """Bind native hand solids to arrival/close or the observed held interval.
+
+    Holding uses the same condition and attachment span as the moving owner;
+    it cannot manufacture a new close command or an arrival pose event.
+    """
+    from manipulation.planning_scene import RobotOwnerContactPermission
+    from recorded_owner_geometry import _problem_binding
+
+    rules = []
+    for row in problem.conditions:
+        kind = row.get("kind")
+        if kind not in {"grasp_contact_activation", "observed_attachment"}:
+            continue
+        common = dict(rule_id=row["condition_id"], target_owner=row["carrier_id"],
+            native_geometry_names=tuple(hand_binding["native_geometry_names"]),
+            sphere_indices=tuple(hand_binding["sphere_indices"]),
+            source=f"{hand_binding['source']}; bound {kind}: {row['condition_id']}")
+        if kind == "grasp_contact_activation":
+            rules.append(RobotOwnerContactPermission(**common, interval=tuple(row["interval"]),
+                arrival_goal_id=tuple(row["arrival_goal_id"]), activation_event=row["activation_event"]))
+        else:
+            _, attachments = _problem_binding(problem, row["carrier_id"])
+            spans = [relation["interval"] for relation in attachments
+                     if relation["condition_id"] == row["condition_id"]]
+            if len(spans) != 1 or spans[0][0] != row["progress"]:
+                raise ValueError("Observed Holding permission needs exactly its compiled attachment span")
+            rules.append(RobotOwnerContactPermission(**common, interval=tuple(spans[0]),
+                arrival_goal_id=(), activation_event={}, holding_condition_id=row["condition_id"]))
+    return tuple(rules)
+
+
+def install_complete_owner(scene, owner, *, contacts):
+    """Replace one observed partition while retaining all other scene owners.
+
+    Owner-actor contact rules become valid only after this complete moving
+    cover and its attachment replace the partial RGB-D query. Reference
+    partitions and the original coverage grid retain their exact identities.
+    """
+    from manipulation.planning_scene import PlanningScene
+    if not owner.geometry_complete or owner.owner_id not in {row.owner_id for row in scene.owners}:
+        raise ValueError("Complete geometry must replace an already observed owner partition")
+    result = PlanningScene(background=scene.background,
+        owners=tuple(owner if row.owner_id == owner.owner_id else row for row in scene.owners),
+        coverage=scene.coverage, reference_frame=scene.reference_frame,
+        robot_sphere_materials=scene.robot_sphere_materials,
+        robot_collision_bodies=scene.robot_collision_bodies,
+        robot_geometry_source=scene.robot_geometry_source, gripper=scene.gripper,
+        has_gripper=scene.gripper is not None, robot_coverage=scene.robot_coverage,
+        contacts=contacts, native_geometry_materials=scene.native_geometry_materials,
+        robot_owner_permissions=scene.robot_owner_permissions,
+        numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
+        numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
+    result.observation_report = scene.observation_report
+    return result
+# END input identities never supply simulated object geometry or contact truth.
+
+
 def run(args):
     from prepare_recorded_task import prepare_candidate
     from recorded_observation import render_robot_mask
@@ -165,7 +272,7 @@ def run(args):
         fixture = json.loads(args.robot_fixture.read_text())
         feedback = json.loads(args.feedback.read_text())
         # BEGIN preserve the same explicit snapshot identity used by execution.
-        feedback["feedback_id"] = str(args.feedback.resolve())
+        require_feedback_identity(feedback)
         finger_targets = FixedFingerTargets.from_mapping(json.loads(args.finger_targets.read_text()))
         report["finger_targets_path"] = str(args.finger_targets.resolve())
         # END targets remain a separate input from measured feedback.
@@ -276,61 +383,71 @@ def run(args):
             position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
             trajectory_factory=reference_factory)
         report["gripper"] = hand_report
-        # BEGIN bind grasp arrival to the exact native hand/observed-owner pair.
+        # BEGIN bind current Holding or arrival to the same native hand solids.
         # Whole-hand grasp contact uses the problem's explicit arrival/close
         # condition. Finite material faces remain a separate optional policy
         # for tasks that explicitly need a particular local contact region.
         from robot_fixture import bind_fixture_contact_materials, bind_fixture_gripper_geometry
         from manipulation.contact_binding import build_material_contact_rules
-        from manipulation.planning_scene import RobotOwnerContactPermission
-        activations = [row for row in problem.conditions if row.get("kind") == "grasp_contact_activation"]
+        from recorded_owner_geometry import bind_box_owner_materials
+        activations = [row for row in problem.conditions
+                       if row.get("kind") in {"grasp_contact_activation", "observed_attachment"}]
         contacts, pair_permissions = (), ()
-        material_binding = {"robot_sphere_materials": [None]*sphere_count, "native_geometry_materials": {}}
+        material_binding = {"robot_sphere_materials": [None]*sphere_count,
+                            "native_geometry_materials": {}, "materials": {}, "owner_materials": {}}
+        prepared = None if args.owner_geometry is None else json.loads(args.owner_geometry.read_text())
+        if prepared is not None:
+            if prepared["owner_id"] != scene_input["carrier_id"]:
+                raise ValueError("Complete geometry must belong to this explicit current carrier")
+            owner_binding = bind_box_owner_materials(prepared)
+            prepared["sphere_materials"] = owner_binding["sphere_materials"]
+            material_binding["owner_materials"][prepared["owner_id"]] = owner_binding["materials"]
+            material_binding["native_geometry_materials"].update(owner_binding["native_geometry_materials"])
+            # BEGIN retain native feature/cone audits independently of permission.
+            # A normal-cone projection never changes the original functional
+            # normal or its gap/angle thresholds in the compiled problem.
+            report["owner_material_geometry"] = owner_binding
+            # END complete local feature evidence survives even without contacts.
+        report["contact_binding"] = {"policies": []}
         if activations:
-            if args.contact_bindings is not None:
+            if (args.contact_bindings is not None
+                    and any(row["kind"] == "grasp_contact_activation" for row in activations)):
                 raise ValueError("Pose-gated grasp uses its bound whole-hand permission, not obsolete finite grasp patches")
             hand_binding = bind_fixture_gripper_geometry(
                 fixture, robot, entrance_fk["sphere_indices_by_link"], feedback["finger_joint_names"])
-            pair_permissions = tuple(RobotOwnerContactPermission(
-                rule_id=row["condition_id"], target_owner=row["carrier_id"],
-                native_geometry_names=tuple(hand_binding["native_geometry_names"]),
-                sphere_indices=tuple(hand_binding["sphere_indices"]), interval=tuple(row["interval"]),
-                arrival_goal_id=tuple(row["arrival_goal_id"]), activation_event=row["activation_event"],
-                source=f"{hand_binding['source']}; frozen perception arrival: {row['condition_id']}")
-                for row in activations)
-            report["contact_binding"] = {"policy": "measured_pose_arrival_before_close",
-                "hand_geometry": hand_binding, "permissions": [asdict(rule) for rule in pair_permissions]}
-        elif args.contact_bindings is not None:
+            pair_permissions = build_hand_owner_permissions(problem, hand_binding)
+            report["contact_binding"].update(hand_geometry=hand_binding,
+                permissions=[asdict(rule) for rule in pair_permissions])
+            report["contact_binding"]["policies"].extend(sorted({row["kind"] for row in activations}))
+        if args.contact_bindings is not None:
             contact_inputs = json.loads(args.contact_bindings.read_text())
             if not isinstance(contact_inputs, dict) or set(contact_inputs) != {"material_faces", "contacts", "source"}:
                 raise ValueError("Contact bindings need explicit material_faces, contacts and source")
             if not isinstance(contact_inputs["source"], str) or not contact_inputs["source"].strip():
                 raise ValueError("Contact bindings require a current evidence source")
-            material_binding = bind_fixture_contact_materials(
-                fixture, robot, entrance_fk["sphere_indices_by_link"], feedback,
-                contact_inputs["material_faces"])
+            if contact_inputs["material_faces"]:
+                robot_binding = bind_fixture_contact_materials(
+                    fixture, robot, entrance_fk["sphere_indices_by_link"], feedback,
+                    contact_inputs["material_faces"])
+                material_binding["robot_sphere_materials"] = robot_binding["robot_sphere_materials"]
+                material_binding["materials"] = robot_binding["materials"]
+                material_binding["native_geometry_materials"].update(robot_binding["native_geometry_materials"])
             contacts = build_material_contact_rules(material_binding, contact_inputs["contacts"])
-            report["contact_binding"] = {"policy": "explicit_finite_material_contacts",
-                "path": str(args.contact_bindings.resolve()), "source": contact_inputs["source"],
-                "materials": material_binding, "rule_ids": [rule.rule_id for rule in contacts]}
-        else:
-            report["contact_binding"] = {"policy": "no_robot_object_contact_permission"}
+            report["contact_binding"]["policies"].append("explicit_finite_material_contacts")
+            report["contact_binding"].update(path=str(args.contact_bindings.resolve()),
+                source=contact_inputs["source"], materials=material_binding,
+                rule_ids=[rule.rule_id for rule in contacts])
         # END permissions affect software collision legality, never native physical contact.
-        carrier_id = scene_input["carrier_id"]
-        carrier_phases = [phase for phase in problem.phases
-                          if phase.metadata.get("carrier_id") == carrier_id]
-        if not carrier_phases:
-            raise ValueError("The selected skill must bind its explicit carrier in the current problem")
-        owner_pose = np.asarray(carrier_phases[0].metadata["owner_initial_pose"])
-        supplied_masks = dict(args.owner_mask)
-        if len(supplied_masks) != len(args.owner_mask) or set(supplied_masks) != {
-                view["id"] for view in segment["snapshot"]["views"]}:
-            raise ValueError("Supply exactly one current carrier owner-mask path for every identified view")
-        report["carrier_observation"] = {
-            "owner_id": carrier_id, "initial_pose": owner_pose.tolist(),
-            "mask_paths": {key: str(Path(path).resolve()) for key, path in supplied_masks.items()},
+        owner_frames, supplied_masks = recorded_owner_observation_inputs(
+            problem, scene_input, segment["snapshot"]["views"], args.owner_mask,
+            source=str(root/candidate["scene_path"]))
+        report["owner_observations"] = {
+            "owners": {identity: {"initial_pose": frame["T_output_owner"].tolist(),
+                "mask_paths": {view["id"]: str(supplied_masks[identity, view["id"]].resolve())
+                               for view in segment["snapshot"]["views"]}}
+                for identity, frame in owner_frames.items()},
             "geometry_path": None if args.owner_geometry is None else str(args.owner_geometry.resolve()),
-            "reference_partition": "All visible non-carrier non-robot geometry remains in observed background"}
+            "background_partition": "Every visible non-owner non-robot surface remains in observed background"}
         observations = {}
         for view in segment["snapshot"]["views"]:
             calibration = json.loads((root/view["calibration_path"]).read_text())
@@ -350,13 +467,13 @@ def run(args):
             np.save(view_output/"robot_mask.npy", rendered["robot_mask"])
             np.save(view_output/"unknown_boundary.npy", rendered["unknown_boundary"])
             (view_output/"robot-mask-report.json").write_text(json.dumps(rendered["report"], indent=2)+"\n")
-            owner_mask = np.load(supplied_masks[view["id"]], allow_pickle=False)
             observations[view["id"]] = {
                 "image": rgb, "depth": depth, "K": np.asarray(calibration["K"]),
                 "T_output_camera": np.asarray(calibration["T_world_camera_cv"]),
                 "reference_frame": problem.reference_frame,
                 "robot_mask": rendered["robot_mask"],
-                "owner_masks": {carrier_id: owner_mask}}
+                "owner_masks": {identity: np.load(supplied_masks[identity, view["id"]], allow_pickle=False)
+                                for identity in owner_frames}}
         # The finite grid is an explicit test resource limit. Space outside it
         # stays unknown; narrowing it never certifies a removed obstacle.
         height, width = next(iter(observations.values()))["depth"].shape
@@ -387,14 +504,15 @@ def run(args):
                 fine_regions[identity] = {key: value for key, value in row.items() if key != "owner_id"}
         # END no simulator obstacle pose or task-specific crop enters the mapper.
         scene = build_scene_from_rgbd(
-            observations, {carrier_id: {
-                "T_output_owner": owner_pose,
-                "source": str(root/candidate["scene_path"])}}, mapper_cfg=config,
+            observations, owner_frames, mapper_cfg=config,
             depth_error_m=args.depth_error, reference_frame=problem.reference_frame,
             robot_sphere_materials=tuple(material_binding["robot_sphere_materials"]),
             robot_geometry_source=fixture["robot_geometry_source"], gripper=hand,
             # BEGIN keep contact identities and finite permissions on the observed scene.
-            contacts=contacts, native_geometry_materials=material_binding["native_geometry_materials"],
+            # RGB-D owners are still partial/static here. Moving-owner rules
+            # enter once their complete cover and attachment are installed.
+            contacts=tuple(rule for rule in contacts if rule.actor == "robot"),
+            native_geometry_materials=material_binding["native_geometry_materials"],
             # BEGIN both independent and planner models retain the exact pair policy.
             robot_owner_permissions=pair_permissions,
             # END a current measured arrival is still required by execution.
@@ -409,27 +527,8 @@ def run(args):
             # conditional attachment still come from this planning problem;
             # no reference, unlabelled surface or unknown volume is removed.
             from recorded_owner_geometry import create_box_owner
-            from manipulation.planning_scene import PlanningScene
-            prepared = json.loads(args.owner_geometry.read_text())
-            if prepared["owner_id"] != carrier_id:
-                raise ValueError("Complete geometry must belong to this explicit current carrier")
             owner = create_box_owner(prepared, device_cfg=device)
-            observed_report = scene.observation_report
-            scene = PlanningScene(
-                background=scene.background, owners=(owner,), coverage=scene.coverage,
-                reference_frame=scene.reference_frame,
-                robot_sphere_materials=scene.robot_sphere_materials,
-                robot_collision_bodies=scene.robot_collision_bodies,
-                # BEGIN preserve contact contracts when substituting explicit owner geometry.
-                robot_geometry_source=scene.robot_geometry_source, gripper=hand,
-                contacts=scene.contacts, native_geometry_materials=scene.native_geometry_materials,
-                # BEGIN replacing owner geometry preserves the declared grasp policy.
-                robot_owner_permissions=scene.robot_owner_permissions,
-                # END the owner identity remains unchanged.
-                numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
-                numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
-                # END the replacement does not relax any robot material permission.
-            scene.observation_report = observed_report
+            scene = install_complete_owner(scene, owner, contacts=contacts)
             report["complete_carrier_geometry"] = prepared["provenance"]
         # BEGIN retain self-filtered installation as complete static collision owners.
         # These primitives use the same calibrated base as FK. They have no
@@ -547,7 +646,7 @@ if __name__ == "__main__":
     for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "finger-targets", "output"):
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--contact-bindings", type=Path,
-                        help="Explicit finite material contact policy for a task without pose-gated grasp contact")
+                        help="Explicit finite robot/owner material contact policy; current Holding permissions remain separate")
     # END omitted local bindings grant no local contact allowance.
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)
@@ -559,8 +658,8 @@ if __name__ == "__main__":
     parser.add_argument("--request-ledger", type=Path,
                         help="Prior request-ledger.json, including failed planning work; execution history also requires --continuation")
     # END missing current facts are binding failures, not replay defaults.
-    parser.add_argument("--owner-mask", nargs=2, action="append", required=True,
-                        metavar=("VIEW_ID", "MASK_PATH"))
+    parser.add_argument("--owner-mask", nargs=3, action="append", required=True,
+                        metavar=("OWNER_ID", "VIEW_ID", "MASK_PATH"))
     parser.add_argument("--owner-geometry", type=Path)
     parser.add_argument("--center", type=float, nargs=3, required=True)
     parser.add_argument("--extent", type=float, nargs=3, required=True)

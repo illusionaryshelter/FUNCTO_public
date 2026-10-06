@@ -16,6 +16,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+from scipy.optimize import nnls
 from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -162,6 +163,144 @@ def prepare_box_owner(problem, owner_id, *, boxes, T_owner_source, geometry_sour
                            "occupied_space_evidence_supplied": False,
                            "contact_permissions_supplied": False,
                            "current_object_state_read": False}}
+
+
+# BEGIN true native polygon/edge features retain their original dimension.
+def _box_material_feature(row, pose, halfsize):
+    """Build native vertices and supporting normals in the owner frame.
+
+    Face/edge axis and signs use this individual box's local axes. The hint
+    already uses owner-local axes, so it must be compared with transformed
+    adjacent normals, never with box-local normals. The cone projection only
+    chooses a supporting material normal; it never edits functional evidence.
+    """
+    common = {"material_id", "native_geometry", "feature_kind", "source"}
+    kind = row["feature_kind"]
+    if kind == "polygon":
+        if set(row) != common | {"face_axis", "face_sign"}:
+            raise ValueError("A polygon material requires one complete native box face")
+        axis, sign = row["face_axis"], row["face_sign"]
+        if (type(axis) is not int or axis not in (0, 1, 2)
+                or type(sign) is not int or sign not in (-1, 1)):
+            raise ValueError("Native face axis and sign must identify one actual box face")
+        tangents = [index for index in range(3) if index != axis]
+        vertices = np.zeros((4, 3))
+        vertices[:, axis] = sign*halfsize[axis]
+        vertices[:, tangents] = np.asarray(list(product((-1., 1.), repeat=2)))*halfsize[tangents]
+        normal = pose[:3, :3] @ (np.eye(3)[axis]*sign)
+        thickness = float(2*halfsize[axis])
+        audit = {"native_face_axis": axis, "native_face_sign": sign,
+                 "native_thickness_source": "Complete box thickness normal to its selected native face"}
+    elif kind == "edge":
+        if set(row) != common | {"edge_axis", "edge_signs", "normal_hint"}:
+            raise ValueError("An edge material requires its native edge and owner-local normal hint")
+        axis, signs = row["edge_axis"], row["edge_signs"]
+        if (type(axis) is not int or axis not in (0, 1, 2)
+                or not isinstance(signs, (list, tuple)) or len(signs) != 2
+                or any(type(sign) is not int or sign not in (-1, 1) for sign in signs)):
+            raise ValueError("Native edge axis and the other two axes' signs must identify one actual box edge")
+        fixed = [index for index in range(3) if index != axis]
+        vertices = np.zeros((2, 3))
+        vertices[:, axis] = [-halfsize[axis], halfsize[axis]]
+        vertices[:, fixed] = np.asarray(signs)*halfsize[fixed]
+        adjacent_box = np.eye(3)[fixed]*np.asarray(signs)[:, None]
+        adjacent = adjacent_box @ pose[:3, :3].T
+        hint = np.asarray(row["normal_hint"], float)
+        if (hint.shape != (3,) or not np.isfinite(hint).all()
+                or not np.isclose(np.linalg.norm(hint), 1., atol=1e-10, rtol=0)):
+            raise ValueError("An edge normal hint must be an explicit owner-local unit vector")
+        coefficients, residual = nnls(adjacent.T, hint)
+        projected = adjacent.T @ coefficients
+        magnitude = float(np.linalg.norm(projected))
+        if magnitude <= np.finfo(float).eps:
+            raise ValueError("The edge normal hint has no nonzero support in its native outward normal cone")
+        normal = projected/magnitude
+        angle = float(np.arctan2(np.linalg.norm(np.cross(hint, normal)), hint @ normal))
+        # An edge has no fabricated thickness. The unchanged whole solid's
+        # thinner incident face provides the existing allowance safety scale.
+        thickness = float(2*np.min(halfsize[fixed]))
+        audit = {"native_edge_axis": axis, "native_fixed_axes": fixed,
+            "native_edge_signs": list(signs), "normal_hint_owner": hint.tolist(),
+            "adjacent_normals_owner": adjacent.tolist(),
+            "normal_cone_nonnegative_coefficients": coefficients.tolist(),
+            "normal_cone_projection_residual": float(residual),
+            "normal_cone_projection_angle_rad": angle,
+            "normal_hint_endpoint_height_difference_m": float(abs(
+                ((vertices[1]-vertices[0]) @ pose[:3, :3].T) @ hint)),
+            "native_thickness_source": "Minimum full box thickness along the two incident face normals; not an edge thickness"}
+    else:
+        raise ValueError("Native box materials support only polygon and edge features")
+    points = vertices @ pose[:3, :3].T+pose[:3, 3]
+    recovered = (points-pose[:3, 3]) @ pose[:3, :3]
+    audit.update(feature_frame="owner_local", native_vertex_frame="box_local",
+        native_vertices_box=vertices.tolist(), T_owner_box=pose.tolist(),
+        native_vertex_roundtrip_max_error_m=float(np.linalg.norm(recovered-vertices, axis=1).max()),
+        support_plane_max_residual_m=float(np.abs((points-points[0]) @ normal).max()))
+    return points, normal, thickness, audit
+# END edge endpoints are never padded into a planar area or assigned a width.
+
+
+# BEGIN native material identities remain separate from finite target patches.
+def bind_box_owner_materials(prepared):
+    """Bind complete native polygons/edges and whole-box sphere identities.
+
+    Each feature is exactly a complete face or edge of one declared cuboid.
+    Functional-region points cannot replace its native vertices. Labels name
+    the complete source solid for the independent checker; ContactRule still
+    limits permission to the true feature/target-patch intersection.
+    """
+    source = prepared.get("provenance", {}).get("geometry_source", {})
+    if (prepared.get("geometry_complete") is not True
+            or source.get("geometry_complete") is not True):
+        raise ValueError("Owner materials require explicitly complete native geometry")
+    owner_id = prepared["owner_id"]
+    if not isinstance(owner_id, str) or not owner_id.strip() or owner_id == "robot":
+        raise ValueError("Owner material binding requires an explicit nonrobot owner ID")
+    boxes = {row["name"]: row for row in prepared["cuboids"]}
+    covers = {row["box_name"]: row for row in prepared["provenance"]["coverage_cells"]}
+    spheres = np.asarray(prepared["local_spheres"], float)
+    if (len(boxes) != len(prepared["cuboids"]) or not boxes or set(boxes) != set(covers)
+            or len(covers) != len(prepared["provenance"]["coverage_cells"])
+            or {row["source_geom_id"] for row in covers.values()} != set(source["enabled_geom_ids"])
+            or spheres.ndim != 2 or spheres.shape[1] != 4 or not len(spheres)
+            or not np.isfinite(spheres).all() or np.any(spheres[:, 3] <= 0)):
+        raise ValueError("Native box materials need every complete source box and sphere cover")
+    groups, owned = {}, []
+    for name, cover in covers.items():
+        span = cover["sphere_range"]
+        if (len(span) != 2 or any(type(value) is not int for value in span)
+                or not 0 <= span[0] < span[1] <= len(spheres)):
+            raise ValueError("Native box material sphere ranges must be explicit and bounded")
+        groups[name] = list(range(*span))
+        owned.extend(groups[name])
+    if sorted(owned) != list(range(len(spheres))):
+        raise ValueError("Native source box ranges must partition the complete owner sphere cover")
+    materials, native, labels = {}, {}, [None]*len(spheres)
+    for row in prepared.get("material_features", []):
+        identity, name = row["material_id"], row["native_geometry"]
+        if (not isinstance(identity, str) or not identity.strip() or identity in materials
+                or name not in boxes or owner_id+"/"+name in native
+                or not isinstance(row["source"], str) or not row["source"].strip()):
+            raise ValueError("Owner materials need distinct identities and explicit native box features")
+        box = boxes[name]
+        pose, halfsize = _box_pose({"position": box["pose"][:3],
+            "quaternion_wxyz": box["pose"][3:], "halfsize": np.asarray(box["dims"])/2})
+        points, normal, thickness, audit = _box_material_feature(row, pose, halfsize)
+        selected = groups[name]
+        balls = spheres[selected]
+        materials[identity] = {"material_id": identity, "native_geometry": name,
+            "feature_kind": row["feature_kind"],
+            "feature_points": points.tolist(), "feature_normal": normal.tolist(),
+            "feature_joint_translation": None, "sphere_indices": selected,
+            "native_thickness_m": thickness, "feature_geometry_audit": audit,
+            "normal_cover_excess_m": float(np.max((balls[:, :3]-points[0]) @ normal+balls[:, 3])),
+            "source": row["source"]}
+        native[owner_id+"/"+name] = identity
+        for index in selected:
+            labels[index] = identity
+    return {"owner_id": owner_id, "materials": materials, "sphere_materials": labels,
+            "native_geometry_materials": native}
+# END a face identity grants no permission by itself.
 
 
 def create_box_owner(prepared, *, device_cfg):
