@@ -36,9 +36,16 @@ class MemoryGuardTest(unittest.TestCase):
         return reclaim, exit_worker
 
     def test_normal_memory_does_not_trigger_reclamation(self):
-        reclaim, exit_worker = self.run_guard([7], [6], False)
+        # BEGIN bounded-worker cleanup starts before the outer 8 GiB cap.
+        reclaim, exit_worker = self.run_guard([5], [6], False)
         reclaim.assert_not_called()
         exit_worker.assert_not_called()
+
+    def test_dead_checkpoint_pages_are_reclaimed_before_outer_limit(self):
+        reclaim, exit_worker = self.run_guard([6.4, 5.2], [6, 7.2], False)
+        reclaim.assert_called_once_with()
+        exit_worker.assert_not_called()
+        # END early cleanup leaves both hard-stop tests below unchanged.
 
     def test_reclaimed_unused_pages_allow_inference_to_continue(self):
         reclaim, exit_worker = self.run_guard([12.4, 9.2], [2.5, 5.7], False)
