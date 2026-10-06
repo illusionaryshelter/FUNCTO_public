@@ -15,6 +15,7 @@
 #include <coal/collision_object.h>
 #include <coal/distance.h>
 #include <coal/math/transform.h>
+#include <coal/shape/convex.h>
 #include <coal/shape/geometric_shapes.h>
 #include <Eigen/QR>
 
@@ -634,6 +635,91 @@ bool feasible_local_point(const coal::CollisionGeometry& geometry, const coal::V
   return true;
 }
 
+// BEGIN actual hull faces improve a feasible proposal without changing geometry.
+bool triangle_convex_point(const coal::CollisionGeometry& geometry,
+                          const coal::Vec3s& wanted, IntervalPoint& point) {
+  const auto* convex = dynamic_cast<const coal::Convex<coal::Triangle>*>(&geometry);
+  if (!convex || !wanted.allFinite() || !convex->points || !convex->polygons
+      || convex->num_points == 0 || convex->num_points > convex->points->size()
+      || convex->num_polygons == 0 || convex->num_polygons > convex->polygons->size())
+    return false;
+
+  // The old nearest-four-vertices proposal can select the opposite small face
+  // when the real witness lies inside a large face. Enumerate the native hull's
+  // actual triangles instead. Eigen chooses barycentric weights only; neither
+  // the projection accuracy nor a face normal/offset participates in the proof.
+  // Scratch remains three vertices and two small fixed matrices, independently
+  // of hull size. All proposal arithmetic uses the caller's rounding mode.
+  std::array<std::size_t, 3> selected{};
+  std::array<double, 3> selected_weights{};
+  double best_squared_distance = kInfinity;
+  bool found = false;
+  for (std::size_t face = 0; face < convex->num_polygons; ++face) {
+    const coal::Triangle& triangle = (*convex->polygons)[face];
+    std::array<std::size_t, 3> indices{};
+    for (int corner = 0; corner < 3; ++corner) {
+      indices[corner] = triangle[corner];
+      if (indices[corner] >= convex->num_points
+          || !(*convex->points)[indices[corner]].allFinite()) return false;
+    }
+    const coal::Vec3s& origin = (*convex->points)[indices[0]];
+    Eigen::Matrix<double, 3, 2> edges;
+    edges.col(0) = (*convex->points)[indices[1]] - origin;
+    edges.col(1) = (*convex->points)[indices[2]] - origin;
+    if (!edges.allFinite()) continue;
+    const coal::Vec3s desired = wanted - origin;
+    if (!desired.allFinite()) continue;
+    const Eigen::Vector2d proposal = edges.completeOrthogonalDecomposition().solve(desired);
+    if (!proposal.allFinite()) continue;
+    std::array<double, 3> weights{
+        std::max(0., 1. - proposal[0] - proposal[1]),
+        std::max(0., proposal[0]), std::max(0., proposal[1])};
+    const double denominator = weights[0] + weights[1] + weights[2];
+    if (!std::isfinite(denominator) || denominator <= 0.) continue;
+    coal::Vec3s candidate = coal::Vec3s::Zero();
+    for (int corner = 0; corner < 3; ++corner)
+      candidate += weights[corner] * (*convex->points)[indices[corner]];
+    candidate /= denominator;
+    const double squared_distance = (candidate - wanted).squaredNorm();
+    if (std::isfinite(squared_distance) && squared_distance < best_squared_distance) {
+      selected = indices;
+      selected_weights = weights;
+      best_squared_distance = squared_distance;
+      found = true;
+    }
+  }
+  if (!found) return false;
+
+  // Certify only the selected proposal. Nonnegative finite binary64 weights
+  // divided by their exact positive sum define a point on this real triangle.
+  // Interval evaluation encloses that point even for a rank-deficient face or
+  // a Coal witness outside the hull; no approximate projected coordinate is
+  // admitted as a feasible point directly.
+  const RoundingGuard rounding;
+  Interval denominator(0.);
+  point = {Interval(0.), Interval(0.), Interval(0.)};
+  for (int corner = 0; corner < 3; ++corner) {
+    denominator += Interval(selected_weights[corner]);
+    for (int axis = 0; axis < 3; ++axis)
+      point[axis] += Interval(selected_weights[corner]) * Interval((*convex->points)[selected[corner]][axis]);
+  }
+  if (!std::isfinite(denominator.upper()) || denominator.lower() <= 0.) return false;
+  for (int axis = 0; axis < 3; ++axis) point[axis] /= denominator;
+  return true;
+}
+
+double feasible_pair_upper(IntervalPoint first, const coal::Transform3s& first_transform,
+                           IntervalPoint second, const coal::Transform3s& second_transform) {
+  const RoundingGuard rounding;
+  first = transformed_point(first, first_transform);
+  second = transformed_point(second, second_transform);
+  IntervalPoint difference;
+  for (int axis = 0; axis < 3; ++axis) difference[axis] = first[axis] - second[axis];
+  const double upper = norm_interval(difference).upper();
+  return std::isfinite(upper) && upper >= 0. ? upper : kInfinity;
+}
+// END one certified triangle proposal is independent of raw Coal evidence.
+
 double certified_distance_upper_bound(const coal::CollisionGeometry& actor,
     const coal::Transform3s& actor_transform, const coal::CollisionGeometry& target,
     const coal::Transform3s& target_transform, const coal::DistanceResult& result) {
@@ -648,13 +734,24 @@ double certified_distance_upper_bound(const coal::CollisionGeometry& actor,
   IntervalPoint first, second;
   if (!feasible_local_point(actor, first_wanted, result.b1, first)
       || !feasible_local_point(target, second_wanted, result.b2, second)) return kInfinity;
-  const RoundingGuard rounding;
-  first = transformed_point(first, actor_transform);
-  second = transformed_point(second, target_transform);
-  IntervalPoint difference;
-  for (int axis = 0; axis < 3; ++axis) difference[axis] = first[axis] - second[axis];
-  const double upper = norm_interval(difference).upper();
-  return std::isfinite(upper) && upper >= 0. ? upper : kInfinity;
+  // BEGIN retain the generic certificate and accept only certified tightening.
+  // A worse/invalid triangle proposal cannot weaken the old upper bound. Each
+  // alternative is a distance between actual points in the original solids,
+  // so the smallest of these upper bounds is still an upper bound. Comparing
+  // mixed endpoint proposals also avoids assuming that two independently
+  // nearer-to-witness points necessarily give a shorter pair distance.
+  double upper = feasible_pair_upper(first, actor_transform, second, target_transform);
+  IntervalPoint triangle_first, triangle_second;
+  const bool first_triangle = triangle_convex_point(actor, first_wanted, triangle_first);
+  const bool second_triangle = triangle_convex_point(target, second_wanted, triangle_second);
+  if (first_triangle)
+    upper = std::min(upper, feasible_pair_upper(triangle_first, actor_transform, second, target_transform));
+  if (second_triangle)
+    upper = std::min(upper, feasible_pair_upper(first, actor_transform, triangle_second, target_transform));
+  if (first_triangle && second_triangle)
+    upper = std::min(upper, feasible_pair_upper(triangle_first, actor_transform, triangle_second, target_transform));
+  return upper;
+  // END no caller observes a changed distance, witness, solver, or contact band.
 }
 // END certificates affect search only; original Coal results remain untouched.
 

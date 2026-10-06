@@ -924,7 +924,7 @@ def _validate_contact_and_gripper_inputs(owner_materials, robot_materials, conta
 # END CPU-only hand/contact validation.
 
 
-# BEGIN one frozen candidate shares exact ordinary reports with its dense check.
+# BEGIN one solve shares exact source inputs without caching native metrics.
 _SOURCE_WORLD_REUSE_BYTES = 32 * 1024 * 1024
 
 
@@ -952,12 +952,13 @@ def _source_world_binding_key(scene):
 
 
 class _SourceWorldStateReuse:
-    """Bound complete reports from one ordinary call until its dense call ends.
+    """Own one solve's bounded state reports and last two complete batches.
 
-    This is a candidate-local store, not a history of trajectory checks. Only
-    the ordinary scene inserts entries. Dense states absent from the store
-    execute the original query and use only the existing call-local cache.
-    Every stored/replayed report is owned independently of public diagnostics.
+    Individual reports belong only to the current ordinary-to-dense candidate.
+    Each scene additionally keeps its last complete source-world batch, so the
+    native final return can reuse an identical observation without retaining
+    one large pair inventory per dense state. The three stores share the same
+    fixed byte allowance and never contain native/process/self metrics.
     """
 
     def __init__(self, ordinary, dense):
@@ -969,21 +970,38 @@ class _SourceWorldStateReuse:
             raise ValueError("Source state reuse requires the same frozen scene and nominal hand binding")
         self._candidate = object()
         self._reports = {}
+        # BEGIN at most one independently owned completed batch per scene.
+        self._batches = {}
+        self._state_nbytes = 0
+        # END replacing a slot releases its entire previous byte charge.
         # The conservative count deliberately charges repeated references
         # repeatedly. 512 bytes per entry below bound dictionary growth and
         # container headers; the fixed reserve also includes this coordinator.
         self.storage_nbytes = _owned_record_bytes(self._binding) + 4096
         self.capacity_nbytes = _SOURCE_WORLD_REUSE_BYTES
         self.stored_states = self.reused_states = self.capacity_misses = 0
+        self.stored_batches = self.reused_batches = self.batch_capacity_misses = 0
         if self.storage_nbytes > self.capacity_nbytes:
             self.close()
 
     def binding_for(self, scene):
         """A changed binding invalidates both ends before another lookup."""
-        if self._scenes and _source_world_binding_key(scene) == self._binding:
+        if (any(scene is peer for peer in self._scenes)
+                and all(_source_world_binding_key(peer) == self._binding for peer in self._scenes)):
             return self._binding
         self.close()
         return None
+
+    # BEGIN candidates reset only their ordinary-to-dense state inventory.
+    def begin_candidate(self):
+        self.finish_candidate()
+        self._candidate = object()
+
+    def finish_candidate(self):
+        self._reports.clear()
+        self.storage_nbytes -= self._state_nbytes
+        self._state_nbytes = 0
+    # END completed batch slots live until this solve closes or replaces them.
 
     def lookup(self, scene, key):
         if self._scenes and scene is self._scenes[1] and key in self._reports:
@@ -1002,17 +1020,56 @@ class _SourceWorldStateReuse:
             return
         self._reports[key] = deepcopy(report)
         self.storage_nbytes += size
+        self._state_nbytes += size
         self.stored_states += 1
+
+    # BEGIN batch equality includes actual source operands, never curve controls.
+    def lookup_batch(self, scene, key):
+        stored = self._batches.get(id(scene))
+        if self._scenes and stored is not None and stored[0] == key:
+            self.reused_batches += 1
+            return stored[1].copy(), deepcopy(stored[2])
+        return None
+
+    def record_batch(self, scene, key, residuals, diagnostics):
+        from .robot_geometry_check import _owned_record_bytes
+
+        if not self._scenes or not any(scene is peer for peer in self._scenes):
+            return
+        slot = id(scene)
+        previous = self._batches.pop(slot, None)
+        if previous is not None:
+            self.storage_nbytes -= previous[3]
+        del previous
+        size = (_owned_record_bytes(key) + _owned_record_bytes(residuals)
+                + _owned_record_bytes(diagnostics) + 512)
+        # BEGIN complete batches take priority over transient per-state reports.
+        # A nearly full ordinary inventory must not prevent saving the much
+        # smaller batch that eliminates a repeated dense check. Releasing it
+        # only loses optional ordinary-to-dense hits; every missing state still
+        # executes its original query under the unchanged shared byte limit.
+        if self.storage_nbytes + size > self.capacity_nbytes and self._state_nbytes:
+            self.finish_candidate()
+        # END two batch slots can never exceed the same admitted total capacity.
+        if self.storage_nbytes + size > self.capacity_nbytes:
+            self.batch_capacity_misses += 1
+            return
+        self._batches[slot] = key, residuals.copy(), deepcopy(diagnostics), size
+        self.storage_nbytes += size
+        self.stored_batches += 1
+    # END no result aliases the caller's mutable residuals or evidence.
 
     def close(self):
         for scene in self._scenes:
             if getattr(scene, "_source_world_reuse", None) is self:
                 scene._source_world_reuse = None
         self._reports.clear()
+        self._batches.clear()
+        self._state_nbytes = 0
         self._scenes = ()
         self._binding = self._candidate = None
         self.storage_nbytes = 0
-# END no stored result survives the paired ordinary/dense candidate lifecycle.
+# END no stored result survives the solve or a frozen-source binding change.
 
 
 class PlanningScene:
@@ -1046,6 +1103,7 @@ class PlanningScene:
         # END standalone scenes retain the conservative local default.
         # BEGIN candidate report reuse is attached only by native postprocessing.
         self._source_world_reuse = None
+        self._last_source_world_execution = None
         # END optimizer, search and standalone checks have no cross-call store.
         # END standalone scene queries do not implicitly supply robot evidence.
         # BEGIN independent solids need explicit material identity, not sphere-index guesses.
@@ -1470,6 +1528,7 @@ class PlanningScene:
         """
         # BEGIN a new source-map/policy epoch cannot inherit candidate verdicts.
         self.end_source_world_reuse()
+        self._last_source_world_execution = None
         # END the other rollout end is detached as well.
         if self.robot_validator is None:
             raise ValueError("Source world geometry needs the already validated robot binding")
@@ -1487,13 +1546,13 @@ class PlanningScene:
         self._max_host_rss_bytes = host_limit
     # END one scene construction serves optimizer metrics, search and final validation.
 
-    # BEGIN native postprocessing owns an explicit ordinary-to-dense lifetime.
+    # BEGIN the native solve owns a session with shorter candidate state segments.
     def begin_source_world_reuse(self, dense_scene):
-        """Share reports with this candidate's dense scene until explicit end.
+        """Attach two frozen scenes to a fresh bounded source-reuse session.
 
-        The caller begins immediately before ordinary metrics and ends in a
-        finally block after dense metrics, including interpolation/query errors.
-        Starting another candidate first detaches both ends of the old store.
+        The native wrapper resets state reports before ordinary metrics and
+        after dense metrics; complete batch slots survive those resets. A
+        solve finalizer, error, or explicit new session detaches both scenes.
         """
         if dense_scene is self:
             raise ValueError("Ordinary and dense source checks need distinct rollout scenes")
@@ -1645,6 +1704,39 @@ class PlanningScene:
                 capture_failures = False
                 reuse_schema = None
                 diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
+        # BEGIN complete-batch reuse records actual work separately from evidence.
+        # The cached worst-state report retains its original component counters.
+        # This fresh record alone describes physical source calls in this call;
+        # native metrics, process constraints and self checks still execute.
+        execution = {"logical_states": len(positions), "physical_state_queries": 0,
+            "reused_state_reports": 0, "call_local_duplicates": 0,
+            "completed_batch_reused": False, "completed": False,
+            "scope": "Entire valid masked source-world batch across all seeds; replayed component evidence keeps its original work counters"}
+        self._last_source_world_execution = execution
+        batch_key = None
+        diagnostic_mode = ("none" if diagnostics is None else "empty" if not diagnostics else
+            "capture_components" if set(diagnostics) == {"capture_components"}
+            and diagnostics["capture_components"] is True else None)
+        if (reuse_schema is not None and diagnostic_mode is not None
+                and all(np.isfinite(value).all() for value in state_fields)):
+            # The valid index list plus original shape is an exact encoding of
+            # the boolean mask. Reuse the existing transfer; copying only the
+            # masked rows without this layout would misbind failure references.
+            batch_key = (reuse_binding, tuple(joint_names), tuple(owner_values),
+                tuple((name, tuple(value["body_ids"])) for name, value in selected_values.items()),
+                tuple(trajectory_time.shape), query_indices.dtype.str, query_indices.shape,
+                query_indices.tobytes(), diagnostic_mode,
+                tuple((value.dtype.str, value.shape, value.tobytes()) for value in state_fields))
+            cached = reuse.lookup_batch(self, batch_key)
+            if cached is not None:
+                saved_residuals, saved_diagnostics = cached
+                result = torch.zeros_like(trajectory_time)
+                result[valid] = result.new_tensor(saved_residuals)
+                if diagnostics is not None:
+                    diagnostics.update(saved_diagnostics)
+                execution.update(completed_batch_reused=True, completed=True)
+                return result
+        # END cumulative export diagnostics never satisfy this fresh-call identity.
         failure_references = {}
 
         def reference_failure(index, witness_index):
@@ -1692,6 +1784,7 @@ class PlanningScene:
             # the same already measured distances at this logical query.
             state_key = tuple(value[index].tobytes() for value in state_fields)
             if state_key in state_residuals:
+                execution["call_local_duplicates"] += 1
                 residual, measured_count = state_residuals[state_key]
                 residuals.append(residual)
                 if diagnostics is not None:
@@ -1717,12 +1810,15 @@ class PlanningScene:
                     **{name: encode_array(array[index:index+1][None])
                        for name, array in value.items() if name != "body_ids"}}
                     for key, value in selected_values.items()}
+                execution["physical_state_queries"] += 1
                 report = self.robot_validator.check_planning_world(row, joint_names,
                     time_s=time_s, gripper=self.gripper, scene_checker=self._source_scene_checker,
                     progress=phase, nominal_owner_poses=owner_poses, layer_selection=layers,
                     robot_owner_permission_progress=permission)
                 if shared_key is not None:
                     reuse.record(self, shared_key, report)
+            else:
+                execution["reused_state_reports"] += 1
             # END hits enter the same complete diagnostic reduction as real queries.
             residuals.append(report["residual"])
             # BEGIN only a successfully completed query can be reused.
@@ -1785,6 +1881,12 @@ class PlanningScene:
                 unmodelled_geometry_names=sorted(unmodelled),
                 worst_state=None if worst is None else worst[1],
                 unpermitted_clearance=clearance)
+        # BEGIN only complete finite source results can replace this scene's slot.
+        execution["completed"] = True
+        if (batch_key is not None and np.isfinite(residuals).all()
+                and (diagnostics is None or "component_capture_error" not in diagnostics)):
+            reuse.record_batch(self, batch_key, np.asarray(residuals, dtype=float), diagnostics)
+        # END exceptions and incomplete diagnostics never become reusable verdicts.
         return result
     # END missing required geometry remains a source query failure, not unknown free space.
 
@@ -1798,6 +1900,7 @@ class PlanningScene:
         result = copy(self)
         # BEGIN a new rollout is never another end of an in-flight candidate.
         result._source_world_reuse = None
+        result._last_source_world_execution = None
         # END only begin_source_world_reuse explicitly attaches the dense peer.
         result.background = self.background.clone_for_rollout()
         result.owners = tuple(copy(owner) for owner in self.owners)
@@ -2191,12 +2294,13 @@ class PlanningScene:
             # its bounded one-state evidence and contact scratch once; it is
             # reused serially across all B*H accepted/failed state queries.
             source_query_bytes = self._source_scene_checker.scene_query_workspace_nbytes
-            # BEGIN admit one bounded ordinary-report store across both metrics.
+            # BEGIN admit one bounded source-result store across both metrics.
             # The planner takes the maximum sequential live allocation, rather
-            # than summing it over rollout copies. Dense-only reports are never
-            # retained, and this CPU store cannot enter graph_live below.
+            # than summing it over rollout copies. Candidate state reports and
+            # the last ordinary/dense complete batches share this allowance;
+            # no per-dense-state inventory or CUDA graph storage is retained.
             source_query_bytes += _SOURCE_WORLD_REUSE_BYTES
-            # END the candidate store has one fixed internal 32 MiB capacity.
+            # END the solve store has one fixed internal 32 MiB capacity.
         # Per-state source inputs contain only q/time, owner rigid poses and
         # selected body envelopes. Pair results are reduced one state at a
         # time; no B*H*robot*scene report inventory is retained.

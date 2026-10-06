@@ -169,7 +169,27 @@ def test_source_scene_cache_reserve_is_counted_once_and_queries_are_unchanged(sc
     for name in cold:
         torch.testing.assert_close(cold[name], warm[name], rtol=0., atol=0.)
         torch.testing.assert_close(cold[name], original[name], rtol=0., atol=0.)
-    assert cold_evidence["worst_state"]["scene"] == warm_evidence["worst_state"]["scene"]
+    # BEGIN warm hints change physical work, never the complete source verdict.
+    # A tighter feasible upper can make the first cached component decisive;
+    # the cold query still prepares a batch before it consumes that evidence.
+    # Compare all other fields, including unknown/new diagnostics, unchanged.
+    comparable = [deepcopy(evidence["worst_state"]["scene"])
+                  for evidence in (cold_evidence, warm_evidence)]
+    for scene in comparable:
+        for search in scene["component_searches"]:
+            execution = search["execution"]
+            assert execution["physical_leaf_query_count"] == (
+                execution["consumed_leaf_query_count"] + execution["unconsumed_leaf_query_count"])
+            assert execution["consumed_leaf_query_count"] == search["exact_leaf_query_count"]
+            for record, fields in ((search, ("exact_leaf_query_count", "prior_hint_query_count", "node_bound_count")),
+                    (execution, ("physical_leaf_query_count", "consumed_leaf_query_count",
+                     "unconsumed_leaf_query_count", "prepared_component_count",
+                     "reused_component_count", "native_batch_count", "worker_count_max"))):
+                for name in fields:
+                    value = record.pop(name)
+                    assert type(value) is int and value >= 0
+    assert comparable[0] == comparable[1]
+    # END the two cold queries below still require the full original report.
     assert cold_evidence["worst_state"]["scene"] == original_evidence["worst_state"]["scene"]
     assert any(row["shape"]._collision_cache for row in larger_checker._scene_shapes
                if isinstance(row["shape"], ObservedTsdfGeometry))

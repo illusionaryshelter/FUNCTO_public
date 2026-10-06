@@ -473,7 +473,7 @@ def assert_report_bytes_equal(actual, expected):
 
 # BEGIN exclude only explicitly documented physical-work fields from geometry comparisons.
 def business_report(value, parent=None):
-    """Retain all evidence except six physical tree-search counters.
+    """Retain all evidence except explicitly named tree/batch work counters.
 
     A warm query can visit fewer components than a cold query. Cache-replay
     tests continue to use the strict helper above because they must reproduce
@@ -486,6 +486,18 @@ def business_report(value, parent=None):
                     "bound_pruned_count", "exact_leaf_query_count", "seed_query_count",
                     "prior_hint_query_count", "node_bound_count", "retained_pass_count"}:
                 assert type(item) is int and item >= 0
+            # BEGIN native worker/cache work is separate from geometric evidence.
+            # Cold prepared queries execute ten leaves in this small rejected
+            # scene, while the next-state hint needs one. All seven fields are
+            # work counts; distances, component IDs, contacts and verdicts stay.
+            elif parent == "component_searches" and name == "execution":
+                result[name] = business_report(item, "component_execution")
+            elif parent == "component_execution" and name in {
+                    "physical_leaf_query_count", "consumed_leaf_query_count",
+                    "unconsumed_leaf_query_count", "prepared_component_count",
+                    "reused_component_count", "native_batch_count", "worker_count_max"}:
+                assert type(item) is int and item >= 0
+            # END a new or non-work field remains part of the strict comparison.
             else:
                 result[name] = business_report(item, name)
         return result
@@ -497,6 +509,248 @@ def business_report(value, parent=None):
 def assert_business_report_bytes_equal(actual, expected):
     assert_report_bytes_equal(business_report(actual), business_report(expected))
 # END distances, witness coordinates, normal bytes and permission results remain unmodified.
+
+
+# BEGIN repeated candidates reuse only complete, byte-identical source batches.
+def test_completed_batch_slots_survive_candidate_reset_with_owned_evidence():
+    from manipulation.robot_geometry_check import _owned_record_bytes
+
+    ordinary, dense, calls = paired_recording_scenes()
+    session = PlanningScene.begin_source_world_reuse(ordinary, dense)
+    inputs = [sequence_inputs([0., 1., 2.], [0., .5, 1.]),
+              sequence_inputs([0., .5, 1., 1.5, 2., 1.], [0., .25, .5, .75, 1., .5])]
+    originals = []
+    session.begin_candidate()
+    for current, (args, kwargs) in zip((ordinary, dense), inputs):
+        diagnostics = {"capture_components": True}
+        residual = current.check_world_geometry(*args, **kwargs, diagnostics=diagnostics)
+        originals.append((residual.clone(), deepcopy(diagnostics)))
+        diagnostics["worst_state"]["scene"]["pairs"][0]["signed_distance_m"] = 999.
+    assert len(calls) == 5 and len(session._batches) == 2
+    session.finish_candidate()
+    assert not session._reports and session._state_nbytes == 0
+    assert _owned_record_bytes((session._binding, session._reports, session._batches)) <= session.storage_nbytes
+    assert session.storage_nbytes <= session.capacity_nbytes
+
+    for _ in range(2):
+        session.begin_candidate()
+        for current, (args, kwargs), (expected, original) in zip((ordinary, dense), inputs, originals):
+            diagnostics = {"capture_components": True}
+            actual = current.check_world_geometry(*args, **kwargs, diagnostics=diagnostics)
+            torch.testing.assert_close(actual, expected, rtol=0., atol=0.)
+            assert_report_bytes_equal(diagnostics, original)
+            assert current._last_source_world_execution["completed_batch_reused"]
+            assert current._last_source_world_execution["physical_state_queries"] == 0
+            diagnostics["worst_state"]["scene"]["pairs"][0]["signed_distance_m"] = 888.
+            actual.fill_(999.)
+        session.finish_candidate()
+    assert len(calls) == 5 and session.reused_batches == 4
+    PlanningScene.end_source_world_reuse(ordinary)
+    assert not session._batches and session.storage_nbytes == 0
+    assert ordinary._source_world_reuse is dense._source_world_reuse is None
+
+
+@pytest.mark.parametrize("changed", (
+    "joints", "time", "progress", "permission", "owner_position", "owner_quaternion",
+    "signed_zero", "body_fine", "aabb", "index_lower", "index_upper",
+    "joint_names", "owner_id", "layer_key", "body_ids", "dtype", "shape",
+))
+def test_completed_batch_requires_every_original_field_and_schema(changed):
+    ordinary, dense, calls = paired_recording_scenes()
+    session = PlanningScene.begin_source_world_reuse(ordinary, dense)
+    args, kwargs = sequence_inputs([.25])
+    ordinary.check_world_geometry(*args, **kwargs)
+    session.finish_candidate()
+    args, kwargs = deepcopy(args), deepcopy(kwargs)
+    args = list(args)
+    query = kwargs["geometry_query"]
+    layer = query["layer_selection"]["robot/second"]
+    owner_position, owner_quaternion = query["nominal_owner_poses"]["second"]
+    fields = {"joints": args[0], "time": args[2], "progress": args[3],
+        "permission": kwargs["robot_owner_permission_progress"],
+        "owner_position": owner_position, "owner_quaternion": owner_quaternion,
+        "body_fine": layer.body_fine, "aabb": layer.influence_aabb,
+        "index_lower": layer.index_lower, "index_upper": layer.index_upper}
+    if changed in fields:
+        field = fields[changed]
+        index = tuple(size-1 for size in field.shape)
+        field[index] = (not bool(field[index]) if field.dtype == torch.bool else
+            field[index]+1 if not field.is_floating_point() else
+            torch.nextafter(field[index], field.new_tensor(float("inf"))))
+    elif changed == "signed_zero":
+        owner_quaternion[0, 0, -1] = -0.
+    elif changed == "joint_names":
+        args[1] = ("renamed_joint", args[1][1])
+    elif changed == "owner_id":
+        query["nominal_owner_poses"]["renamed_owner"] = query["nominal_owner_poses"].pop("second")
+    elif changed == "layer_key":
+        query["layer_selection"]["renamed_layer"] = query["layer_selection"].pop("robot/second")
+    elif changed == "body_ids":
+        layer.body_ids = ("first_body", "renamed_body")
+    elif changed == "dtype":
+        args[2] = args[2].view(torch.int64)
+    else:
+        layer.influence_aabb = layer.influence_aabb.reshape(1, 1, 4, 3)
+    session.begin_candidate()
+    ordinary.check_world_geometry(*args, **kwargs)
+    assert len(calls) == 2 and session.reused_batches == 0
+    assert ordinary._last_source_world_execution["physical_state_queries"] == 1
+    PlanningScene.end_source_world_reuse(ordinary)
+
+
+@pytest.mark.parametrize("changed", ("seed", "column", "logical_shape", "capture_mode"))
+def test_completed_batch_preserves_original_valid_layout_and_diagnostic_mode(changed):
+    ordinary, dense, calls = paired_recording_scenes()
+    session = PlanningScene.begin_source_world_reuse(ordinary, dense)
+    args, kwargs = batch_inputs()
+    kwargs["valid"] = torch.tensor([[True, False, False], [False, False, False]])
+    ordinary.check_world_geometry(*args, **kwargs, diagnostics={})
+    session.finish_candidate()
+    if changed == "seed":
+        kwargs["valid"] = torch.tensor([[False, False, False], [True, False, False]])
+    elif changed == "column":
+        kwargs["valid"] = torch.tensor([[False, True, False], [False, False, False]])
+    elif changed == "logical_shape":
+        # The one masked row remains byte-identical, but its original grid differs.
+        args = [value.reshape(1, 6, *value.shape[2:]) if torch.is_tensor(value) else value for value in args]
+        kwargs["valid"] = kwargs["valid"].reshape(1, 6)
+        kwargs["robot_owner_permission_progress"] = kwargs["robot_owner_permission_progress"].reshape(1, 6)
+        query = kwargs["geometry_query"]
+        query["nominal_owner_poses"] = {name: tuple(value.reshape(1, 6, *value.shape[2:]) for value in pose)
+            for name, pose in query["nominal_owner_poses"].items()}
+        for layer in query["layer_selection"].values():
+            for name in ("body_fine", "influence_aabb", "index_lower", "index_upper"):
+                value = getattr(layer, name)
+                setattr(layer, name, value.reshape(1, 6, *value.shape[2:]))
+    diagnostics = {"capture_components": True} if changed == "capture_mode" else {}
+    session.begin_candidate()
+    ordinary.check_world_geometry(*args, **kwargs, diagnostics=diagnostics)
+    assert len(calls) == 2 and session.reused_batches == 0
+    PlanningScene.end_source_world_reuse(ordinary)
+
+
+@pytest.mark.parametrize("kind", ("nonfinite_input", "nonfinite_output", "capture_error", "accumulator"))
+def test_incomplete_or_accumulated_calls_never_become_completed_batch_evidence(kind):
+    def report_factory(joints, query):
+        report = reusable_report(joints, query)
+        if kind == "nonfinite_output":
+            report["residual"] = float("nan")
+        elif kind == "capture_error":
+            del report["scene"]["violations"]
+        return report
+
+    ordinary, dense, calls = paired_recording_scenes(report_factory)
+    session = PlanningScene.begin_source_world_reuse(ordinary, dense)
+    args, kwargs = sequence_inputs([.25])
+    if kind == "nonfinite_input":
+        args[0][0, 0, 0] = float("nan")
+    for _ in range(2):
+        session.begin_candidate()
+        diagnostics = {"checked_states": 10} if kind == "accumulator" else {"capture_components": True}
+        ordinary.check_world_geometry(*args, **kwargs, diagnostics=diagnostics)
+        session.finish_candidate()
+        if kind == "capture_error":
+            assert "component_capture_error" in diagnostics
+        elif kind == "accumulator":
+            assert diagnostics["checked_states"] == 11
+    assert len(calls) == 2 and not session._batches and session.stored_batches == 0
+    PlanningScene.end_source_world_reuse(ordinary)
+
+
+def test_state_and_two_batch_slots_share_one_fixed_capacity(monkeypatch):
+    from manipulation.robot_geometry_check import _owned_record_bytes
+
+    monkeypatch.setattr("manipulation.planning_scene._SOURCE_WORLD_REUSE_BYTES", 32*1024)
+    ordinary, dense, calls = paired_recording_scenes()
+    session = PlanningScene.begin_source_world_reuse(ordinary, dense)
+    for index in range(3):
+        session.begin_candidate()
+        for current in (ordinary, dense):
+            args, kwargs = sequence_inputs([.1+index, .2+index])
+            current.check_world_geometry(*args, **kwargs, diagnostics={"capture_components": True})
+            assert _owned_record_bytes((session._binding, session._reports, session._batches)) <= session.storage_nbytes
+            assert session.storage_nbytes <= session.capacity_nbytes
+            assert len(session._batches) <= 2
+        session.finish_candidate()
+    assert session.capacity_misses+session.batch_capacity_misses > 0
+    PlanningScene.end_source_world_reuse(ordinary)
+    assert not session._batches and session.storage_nbytes == 0
+
+
+@pytest.mark.parametrize("failure", (None, "ordinary", "dense"))
+def test_native_metrics_wrappers_preserve_every_call_and_release_sessions_on_errors(failure):
+    from manipulation.planning import _bind_candidate_source_world_reuse
+
+    ordinary, dense, calls = paired_recording_scenes()
+    for current in (ordinary, dense):
+        current.begin_source_world_reuse = MethodType(PlanningScene.begin_source_world_reuse, current)
+        current.end_source_world_reuse = MethodType(PlanningScene.end_source_world_reuse, current)
+    ordinary_inputs = sequence_inputs([.1, .2])
+    dense_inputs = sequence_inputs([.1, .15, .2])
+    metrics_calls = []
+    sessions = []
+
+    def evaluate(kind, current, inputs):
+        metrics_calls.append(kind)
+        session = current._source_world_reuse
+        sessions.append(session)
+        args, kwargs = inputs
+        result = current.check_world_geometry(*args, **kwargs, diagnostics={"capture_components": True})
+        if failure == kind:
+            raise RuntimeError(kind)
+        return result
+
+    rollout = SimpleNamespace(metrics_constraint_manager=SimpleNamespace(_scene=ordinary),
+        compute_metrics_from_action=lambda _: evaluate("ordinary", ordinary, ordinary_inputs))
+    optimizer = SimpleNamespace(metrics_rollout=rollout,
+        additional_metrics_rollouts={"interpolated_rollout": SimpleNamespace(
+            metrics_constraint_manager=SimpleNamespace(_scene=dense))},
+        _interpolate_and_compute_metrics=lambda _: evaluate("dense", dense, dense_inputs))
+    cleanup = _bind_candidate_source_world_reuse(optimizer)
+    if failure is None:
+        for _ in range(2):
+            rollout.compute_metrics_from_action("same actions")
+            optimizer._interpolate_and_compute_metrics("same native states")
+            assert not ordinary._source_world_reuse._reports
+        assert metrics_calls == ["ordinary", "dense", "ordinary", "dense"]
+        assert len(calls) == 3 and all(session is sessions[0] for session in sessions)
+        assert sessions[0].reused_batches == 2
+        cleanup()
+    else:
+        with pytest.raises(RuntimeError, match=failure):
+            rollout.compute_metrics_from_action("actions")
+            optimizer._interpolate_and_compute_metrics("states")
+    assert ordinary._source_world_reuse is dense._source_world_reuse is None
+    assert all(not session._batches and not session._reports and session.storage_nbytes == 0 for session in sessions)
+
+
+@pytest.mark.parametrize("active_solve", (False, True))
+@pytest.mark.parametrize("failure", (None, "postprocess"))
+def test_observation_keeps_batches_only_for_its_successful_enclosing_solve(active_solve, failure):
+    from unittest.mock import Mock
+    from manipulation.planning import _CuroboPlanner
+
+    actions = torch.zeros((1, 8, 2))
+    joint = SimpleNamespace(dt=torch.full((1, 1), .2))
+    metrics = SimpleNamespace(state=SimpleNamespace(joint_state=joint), actions=actions)
+    output = object()
+    optimizer = SimpleNamespace(solve_state=SimpleNamespace(batch_size=1, num_seeds=1),
+        horizon=49, interpolation_steps=4, joint_names=["a", "b"],
+        _source_world_solve_active=active_solve,
+        metrics_rollout=SimpleNamespace(compute_metrics_from_action=Mock(return_value=metrics)),
+        _interpolate_and_compute_metrics=Mock(return_value=("metrics", "trajectory", "last")),
+        _get_result=Mock(return_value=output),
+        _get_best_result=Mock(side_effect=RuntimeError("postprocess") if failure else None, return_value=output),
+        end_source_world_reuse=Mock())
+    planner = SimpleNamespace(trajopt=optimizer, torch=torch, formal_clock={"valid_count": 385},
+        anchors=[0., 1.], refinement_parameters=np.empty(0), _charge_candidate_queries=Mock())
+    if failure:
+        with pytest.raises(RuntimeError, match=failure):
+            _CuroboPlanner._observed_native_result(planner, actions)
+    else:
+        assert _CuroboPlanner._observed_native_result(planner, actions) is output
+    assert optimizer.end_source_world_reuse.call_count == int(bool(failure) or not active_solve)
+# END native metrics and export accumulation remain outside this source-only memo.
 
 
 def test_paired_reuse_replays_full_diagnostics_and_only_queries_new_dense_states():
@@ -626,7 +880,12 @@ def test_report_store_obeys_its_admitted_byte_limit_without_changing_results(mon
     monkeypatch.setattr("manipulation.planning_scene._SOURCE_WORLD_REUSE_BYTES", 64*1024)
 
     def large_report(joints, query):
-        return {**reusable_report(joints, query), "native_evidence": "x"*40000}
+        # BEGIN include the store's binding/key/container charge in this fixture.
+        # 40,000 evidence bytes made the complete entry plus base cost 69,652
+        # bytes, legitimately exceeding 64 KiB even after all states were freed.
+        # This payload admits one complete batch but never two state reports.
+        return {**reusable_report(joints, query), "native_evidence": "x"*35000}
+        # END the production 32 MiB limit and conservative accounting are unchanged.
 
     ordinary, dense, calls = paired_recording_scenes(large_report)
     session = PlanningScene.begin_source_world_reuse(ordinary, dense)
@@ -634,11 +893,20 @@ def test_report_store_obeys_its_admitted_byte_limit_without_changing_results(mon
     ordinary_diagnostics, dense_diagnostics = {}, {}
     expected = ordinary.check_world_geometry(*args, **kwargs, diagnostics=ordinary_diagnostics)
     assert session.stored_states == session.capacity_misses == 1
+    # BEGIN the compact complete call takes priority over a full state store.
+    assert not session._reports and session.stored_batches == 1
     assert _owned_record_bytes(session._reports) <= session.storage_nbytes <= 64*1024
+    repeated_diagnostics = {}
+    repeated = ordinary.check_world_geometry(*args, **kwargs, diagnostics=repeated_diagnostics)
+    torch.testing.assert_close(repeated, expected, rtol=0., atol=0.)
+    assert_report_bytes_equal(repeated_diagnostics, ordinary_diagnostics)
+    assert len(calls) == 2 and session.reused_batches == 1
+    assert ordinary._last_source_world_execution["physical_state_queries"] == 0
+    # END capacity pressure may lose state hits, never the complete verdict.
     actual = dense.check_world_geometry(*args, **kwargs, diagnostics=dense_diagnostics)
     torch.testing.assert_close(actual, expected, rtol=0., atol=0.)
     assert_report_bytes_equal(dense_diagnostics, ordinary_diagnostics)
-    assert len(calls) == 3 and session.reused_states == 1
+    assert len(calls) == 4 and session.reused_states == 0
     PlanningScene.end_source_world_reuse(dense)
 
 
@@ -700,6 +968,44 @@ def test_actual_tsdf_ordinary_dense_reports_and_new_failures_are_exact(scene_fac
     assert_business_report_bytes_equal(reused["diagnostics"], baseline["diagnostics"])
     assert reused["values"] == [[[0., 1., 0.]], [[0., 1., 1., 1., 0.]]]
     assert [row["trajectory_time_s"] for row in reused["diagnostics"][1]["failure_witnesses"]] == [.25, .5, .75]
+
+
+# BEGIN a tiny real TSDF exercises complete-call reuse after source-state disposal.
+def test_actual_tsdf_repeated_candidate_skips_all_source_calls_and_keeps_evidence(scene_factory):
+    ordinary = scene_factory(ProxyQuery("background", observed_plane()))
+    dense = ordinary.clone_for_rollout()
+    native = ordinary.robot_validator.check_planning_world
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(float(kwargs["time_s"]))
+        return native(*args, **kwargs)
+
+    ordinary.robot_validator.check_planning_world = counted
+    inputs = (states([[.2, 0., .1]], [[0., .5, 1.]]),
+              states([[.2, .005, 0., .005, .1]], [[0., .25, .5, .75, 1.]]))
+    session = ordinary.begin_source_world_reuse(dense)
+    evidence = []
+    try:
+        for repeat in range(2):
+            session.begin_candidate()
+            current_evidence = []
+            for current, args in zip((ordinary, dense), inputs):
+                diagnostics = {"capture_components": True}
+                result = current.evaluate_source(*args, trajectory_time=args[3], diagnostics=diagnostics)
+                current_evidence.append({"residuals": result.tolist(), "diagnostics": diagnostics})
+                if repeat:
+                    assert current._last_source_world_execution["completed_batch_reused"]
+                    assert current._last_source_world_execution["physical_state_queries"] == 0
+            evidence.append(current_evidence)
+            session.finish_candidate()
+            assert not session._reports and len(calls) == 5
+        assert session.reused_batches == 2
+        assert_report_bytes_equal(evidence[1], evidence[0])
+    finally:
+        ordinary.end_source_world_reuse()
+        ordinary.robot_validator.check_planning_world = native
+# END source-only memoization leaves proxy/process checks in evaluate_source active.
 
 
 def test_actual_dense_failure_trace_preserves_all_twenty_one_new_times(scene_factory):

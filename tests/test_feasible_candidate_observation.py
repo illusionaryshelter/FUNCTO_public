@@ -173,7 +173,7 @@ class FeasibleObservationTests(unittest.TestCase):
         torch.testing.assert_close(joint.knot_dt, torch.full((2, 1), .8))
         planner._charge_candidate_queries.assert_called_once_with(2*(49+385+6))
 
-    # BEGIN candidate sessions follow actual native calls and all error exits.
+    # BEGIN one solve retains batches while each candidate resets state reports.
     def test_source_reuse_session_begins_per_candidate_and_closes_on_errors(self):
         from manipulation.planning import _bind_candidate_source_world_reuse
 
@@ -183,14 +183,27 @@ class FeasibleObservationTests(unittest.TestCase):
                 active = [False]
                 dense_scene = object()
 
+                class Session:
+                    def binding_for(session, scene):
+                        return "same frozen binding"
+
+                    def begin_candidate(session):
+                        events.append("begin")
+                        active[0] = True
+
+                    def finish_candidate(session):
+                        events.append("finish")
+                        active[0] = False
+
                 def begin(scene):
                     self.assertIs(scene, dense_scene)
-                    events.append("begin")
-                    active[0] = True
+                    ordinary_scene._source_world_reuse = Session()
+                    return ordinary_scene._source_world_reuse
 
                 def end():
                     events.append("end")
                     active[0] = False
+                    ordinary_scene._source_world_reuse = None
 
                 def evaluate(kind):
                     self.assertTrue(active[0])
@@ -213,7 +226,7 @@ class FeasibleObservationTests(unittest.TestCase):
                         self.assertEqual(rollout.compute_metrics_from_action("actions"), "ordinary")
                         self.assertEqual(optimizer._interpolate_and_compute_metrics("joint"), "dense")
                         self.assertFalse(active[0])
-                    self.assertEqual(events, ["begin", "ordinary", "dense", "end"]*2)
+                    self.assertEqual(events, ["begin", "ordinary", "dense", "finish"]*2)
                 else:
                     with self.assertRaisesRegex(RuntimeError, failure):
                         rollout.compute_metrics_from_action("actions")
@@ -222,7 +235,7 @@ class FeasibleObservationTests(unittest.TestCase):
                     self.assertEqual(events[-1], "end")
                 cleanup()
                 self.assertFalse(active[0])
-    # END no interpolation failure can leave a candidate report cache active.
+    # END no interpolation failure can retain either state or complete-batch evidence.
 
     def test_pose_gate_checks_exact_event_parameter_and_original_tolerance(self):
         from manipulation.planning import _ProgressMap

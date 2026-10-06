@@ -3254,14 +3254,14 @@ def _trajectory_candidate(result, index):
 # END exact native candidate extraction before independent verification.
 
 
-# BEGIN one frozen candidate owns ordinary-to-dense source report reuse.
+# BEGIN one native solve owns bounded source reuse across repeated observations.
 def _bind_candidate_source_world_reuse(optimizer):
-    """Bind exact-report reuse to native metrics calls, including error cleanup.
+    """Bind candidate state reports and completed batches to native calls.
 
-    A native solve can evaluate several candidates. Starting at each ordinary
-    metrics call, rather than at solve entry, prevents results from a previous
-    curve being retained. The dense wrapper includes interpolation itself so
-    failures before dense cost evaluation also release both scene references.
+    Every ordinary call resets the short state-report segment. Its matching
+    dense call ends that segment, while each scene's last completed source
+    batch survives until solve cleanup. All native metrics still execute;
+    only exact source-world inputs may reuse a completed geometry verdict.
     """
     from functools import wraps
     ordinary = optimizer.metrics_rollout
@@ -3273,7 +3273,10 @@ def _bind_candidate_source_world_reuse(optimizer):
 
     @wraps(ordinary_metrics)
     def evaluate_ordinary(*args, **kwargs):
-        ordinary_scene.begin_source_world_reuse(dense_scene)
+        session = getattr(ordinary_scene, "_source_world_reuse", None)
+        if session is None or session.binding_for(ordinary_scene) is None:
+            session = ordinary_scene.begin_source_world_reuse(dense_scene)
+        session.begin_candidate()
         try:
             return ordinary_metrics(*args, **kwargs)
         except BaseException:
@@ -3284,13 +3287,18 @@ def _bind_candidate_source_world_reuse(optimizer):
     def evaluate_dense(*args, **kwargs):
         try:
             return dense_metrics(*args, **kwargs)
-        finally:
+        except BaseException:
             ordinary_scene.end_source_world_reuse()
+            raise
+        finally:
+            session = getattr(ordinary_scene, "_source_world_reuse", None)
+            if session is not None:
+                session.finish_candidate()
 
     ordinary.compute_metrics_from_action = evaluate_ordinary
     optimizer._interpolate_and_compute_metrics = evaluate_dense
     return ordinary_scene.end_source_world_reuse
-# END cleanup is idempotent for dense completion, solve errors and observation.
+# END every solve/error closes both scene slots; dense success only ends its segment.
 
 
 class _CuroboPlanner:
@@ -3557,13 +3565,25 @@ class _CuroboPlanner:
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.end_source_world_reuse = _bind_candidate_source_world_reuse(self)
+                self._source_world_solve_active = False
 
             def solve_pose(self, *args, **kwargs):
+                # BEGIN a new native call cannot inherit a previous solve's batches.
+                self.end_source_world_reuse()
+                self._source_world_solve_active = True
+                # END observations below share only this call's frozen binding.
                 try:
                     return super().solve_pose(*args, **kwargs)
                 finally:
+                    self._source_world_solve_active = False
                     self.end_source_world_reuse()
             # END an error between ordinary metrics and interpolation cannot leak.
+
+            # BEGIN explicit solver replacement also releases bounded CPU evidence.
+            def destroy(self):
+                self.end_source_world_reuse()
+                return super().destroy()
+            # END a rebuilt objective starts with two empty source batch slots.
 
             def get_interpolated_trajectory(self, js_optimized):
                 # BEGIN preserve raw controls and boundary derivatives on one clock.
@@ -4730,6 +4750,7 @@ class _CuroboPlanner:
                                               +2*(len(self.anchors)+len(self.refinement_parameters))))
         with self.torch.no_grad():
             # BEGIN observations have the same bounded candidate lifecycle as solve.
+            completed = False
             try:
                 metrics = self.trajopt.metrics_rollout.compute_metrics_from_action(actions)
                 joint = metrics.state.joint_state
@@ -4738,10 +4759,14 @@ class _CuroboPlanner:
                 joint.knot_dt = joint.dt*self.trajopt.interpolation_steps
                 interpolated, trajectory, last = self.trajopt._interpolate_and_compute_metrics(joint)
                 result = self.trajopt._get_result(actions, metrics, interpolated, trajectory, last, count, count)
-                return self.trajopt._get_best_result(result, count)
+                result = self.trajopt._get_best_result(result, count)
+                completed = True
+                return result
             finally:
-                self.trajopt.end_source_world_reuse()
-            # END sorting a result never extends the source report session.
+                # Standalone diagnostic callers have no enclosing solve finalizer.
+                if not completed or not getattr(self.trajopt, "_source_world_solve_active", False):
+                    self.trajopt.end_source_world_reuse()
+            # END normal dense completion keeps only the two bounded batch slots.
 
     def _observe_actions(self, actions, origin, initial, seen):
         """Validate new block states without replacing the optimizer's state."""
@@ -4949,6 +4974,12 @@ class _CuroboPlanner:
                     report[label]["source_trace"] = bind_trace_to_native_seed(
                         getattr(rollout.metrics_constraint_manager, "last_source_diagnostics", None),
                         state, seed_index, self.joint_names)
+                    # BEGIN distinguish a replayed report from new source work.
+                    source_scene = getattr(rollout.metrics_constraint_manager, "_scene", None)
+                    execution = getattr(source_scene, "_last_source_world_execution", None)
+                    if execution is not None:
+                        report[label]["source_query_execution"] = deepcopy(execution)
+                    # END geometry evidence itself keeps its original exact fields.
                 except Exception as error:
                     report[label]["source_trace"] = {"status": "error", "error": f"{type(error).__name__}: {error}"}
             # END a trace failure never changes native acceptance or selection.
