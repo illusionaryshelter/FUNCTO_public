@@ -473,13 +473,38 @@ def run(args):
             np.save(view_output/"robot_mask.npy", rendered["robot_mask"])
             np.save(view_output/"unknown_boundary.npy", rendered["unknown_boundary"])
             (view_output/"robot-mask-report.json").write_text(json.dumps(rendered["report"], indent=2)+"\n")
+            # BEGIN resolve semantic over-segmentation using evidenced robot pixels.
+            # Only the existing depth-consistent robot mask owns these pixels.
+            # Its unknown boundary is not subtracted. Raw depth and original
+            # semantic files stay intact; object/object conflicts still reach
+            # the mapper's strict disjointness check without a guessed winner.
+            owner_masks, mask_report = {}, {}
+            for index, identity in enumerate(owner_frames):
+                supplied = np.load(supplied_masks[identity, view["id"]], allow_pickle=False)
+                if supplied.dtype != np.bool_ or supplied.shape != depth.shape:
+                    raise ValueError("Semantic owner masks must be aligned boolean images")
+                overlap = supplied & rendered["robot_mask"]
+                visible = supplied & ~rendered["robot_mask"]
+                resolved_path = view_output / f"owner-{index:03d}-mask.npy"
+                np.save(resolved_path, visible)
+                owner_masks[identity] = visible
+                mask_report[identity] = {
+                    "semantic_mask_path": str(supplied_masks[identity, view["id"]].resolve()),
+                    "collision_mask_path": str(resolved_path.resolve()),
+                    "semantic_pixels": int(supplied.sum()),
+                    "depth_consistent_robot_overlap_pixels": int(overlap.sum()),
+                    "collision_owner_pixels": int(visible.sum())}
+            (view_output/"owner-mask-report.json").write_text(json.dumps({
+                "policy": "Subtract only depth-consistent robot pixels from semantic owner masks; preserve original depth and uncertain robot boundaries",
+                "robot_evidence": str((view_output/"robot-mask-report.json").resolve()),
+                "owners": mask_report}, indent=2)+"\n")
+            # END final collision ownership remains auditable per actual view.
             observations[view["id"]] = {
                 "image": rgb, "depth": depth, "K": np.asarray(calibration["K"]),
                 "T_output_camera": np.asarray(calibration["T_world_camera_cv"]),
                 "reference_frame": problem.reference_frame,
                 "robot_mask": rendered["robot_mask"],
-                "owner_masks": {identity: np.load(supplied_masks[identity, view["id"]], allow_pickle=False)
-                                for identity in owner_frames}}
+                "owner_masks": owner_masks}
         # The finite grid is an explicit test resource limit. Space outside it
         # stays unknown; narrowing it never certifies a removed obstacle.
         height, width = next(iter(observations.values()))["depth"].shape
