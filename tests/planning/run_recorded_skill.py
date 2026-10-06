@@ -378,10 +378,16 @@ def run(args):
                                      "max_device_used_bytes": args.max_device_used_mib*1024**2,
                                      "mapping_bytes": 1024**3}
         device = DeviceCfg("cuda:0")
+        # BEGIN source hand topology from the bound robot fixture, not feedback.
+        # Continuous proprioception measures q/dq and names its joints. Static
+        # collision-link membership belongs to the already validated fixture;
+        # do not require historical feedback files to duplicate this metadata.
         hand, hand_report, entrance_fk = position_controlled_hand(
-            robot, feedback, problem, device=device, execution_limits=execution_limits,
+            robot, {**feedback, "finger_link_names": fixture["finger_link_names"]},
+            problem, device=device, execution_limits=execution_limits,
             position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
             trajectory_factory=reference_factory)
+        # END actual measured positions, velocities and identity are unchanged.
         report["gripper"] = hand_report
         # BEGIN bind current Holding or arrival to the same native hand solids.
         # Whole-hand grasp contact uses the problem's explicit arrival/close
