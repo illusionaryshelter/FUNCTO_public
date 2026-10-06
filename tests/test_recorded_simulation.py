@@ -937,6 +937,7 @@ class DependencyExecutionTests(unittest.TestCase):
                 executor = _executor(simulation)
                 primary = RuntimeError("primary "+failure)
                 original_feedback = simulation.proprioception
+                original_reference_pose = simulation.reference_tool_pose
 
                 def feedback():
                     if simulation._step_attempts:
@@ -948,9 +949,15 @@ class DependencyExecutionTests(unittest.TestCase):
                         raise primary
 
                 def reference_pose(q):
-                    if simulation._step_attempts:
+                    # BEGIN isolate reference-record failure from measured-joint FK.
+                    # This fixture keeps measured q fixed while the desired
+                    # trajectory moves. Fresh feedback and the abort hold must
+                    # retain measured-q FK; only recording desired-q FK fails.
+                    measured_q = simulation.native_data.qpos[:len(simulation.arm_joint_names)]
+                    if simulation._step_attempts and not np.array_equal(q, measured_q):
                         raise primary
-                    return np.eye(4)
+                    return original_reference_pose(q)
+                    # END the fault is selected by its input, never a call count.
 
                 class UnreadableClock:
                     def __float__(self):
@@ -983,6 +990,12 @@ class DependencyExecutionTests(unittest.TestCase):
                     self.assertEqual(retained["confirmed_physics_steps"], 0 if failure == "clock" else expected_charge)
                     self.assertEqual(retained["remaining_physics_steps"], 4-expected_charge)
                     self.assertEqual(retained["step_accounting_exact"], failure != "clock")
+                    # BEGIN a record-only fault still executes exactly one hold step.
+                    if failure == "record":
+                        self.assertEqual(simulation._step_attempts, 2)
+                        self.assertEqual(report["abort_hold"]["charged_steps"], 1)
+                        self.assertEqual(report["abort_hold"]["physical_steps"], 1)
+                    # END one normal step plus one hold retains the original contract.
                     if failure in ("feedback", "clock"):
                         self.assertIsNone(retained["actual_feedback"])
                         self.assertFalse((output/"failure-feedback.json").exists())
