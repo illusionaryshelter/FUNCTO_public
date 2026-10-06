@@ -1160,17 +1160,69 @@ class PlanningProblem:
                                   point_goal_ids=point_goal_ids, tool_linear_velocity=tool_linear_velocity,
                                   tool_angular_velocity=tool_angular_velocity, direction_mode=direction_mode).values())
 
-    # BEGIN distinguish functional feasibility from optional goal centering.
+    # BEGIN exact signed point inequalities for the functional AL objective.
+    @property
+    def functional_constraint_keys(self):
+        """Stable event/component identities for the current request suffix."""
+        return tuple(
+            [f"function_pose:{index}:{component}"
+             for index, requirement in enumerate(self.pose_events)
+             if requirement.progress >= self.start_progress
+             for component in ("position", "rotation")]
+            + [f"function_coordinate:{index}"
+               for index, requirement in enumerate(self.coordinate_events)
+               if requirement.progress >= self.start_progress])
+
+    def functional_inequalities(self, position, quaternion, progress, *, trajectory_time=None):
+        """Return signed event residuals and their single physical query masks.
+
+        For input progress ``[batch, horizon]``, residual values have shape
+        ``[batch]`` and Boolean masks have shape ``[batch, horizon]``. A pose
+        event supplies separate position-norm and rotation-norm inequalities;
+        a coordinate event uses its existing signed/unwrapped history before
+        taking the absolute error. Every value is ``error/original_tolerance-1``.
+
+        The first actual event instant is used even when progress pauses or an
+        exact anchor duplicates a regular sample. A missing required event is
+        NaN, not a falsely feasible zero. Events before a continued request's
+        start are absent from both dictionaries and retain their original IDs.
+        """
+        import torch
+        if position.shape != (*progress.shape, 3) or quaternion.shape != (*progress.shape, 4):
+            raise ValueError("Pose arrays must align with the complete progress horizon")
+        signed, masks = {}, {}
+
+        def add(key, error, tolerance, mask):
+            value = torch.where(mask, error/tolerance-1., 0.).sum(-1)
+            signed[key] = torch.where(mask.any(-1), value, float("nan"))
+            masks[key] = mask
+
+        for index, requirement in enumerate(self.pose_events):
+            if requirement.progress < self.start_progress:
+                continue
+            mask = _first_event_query(progress, requirement.progress, trajectory_time)
+            position_error, rotation_error = requirement.errors(position, quaternion)
+            add(f"function_pose:{index}:position", position_error, requirement.position_tolerance_m, mask)
+            add(f"function_pose:{index}:rotation", rotation_error, requirement.rotation_tolerance_rad, mask)
+        for index, requirement in enumerate(self.coordinate_events):
+            if requirement.progress < self.start_progress:
+                continue
+            mask = _first_event_query(progress, requirement.progress, trajectory_time)
+            error = requirement.error(position, quaternion, progress, trajectory_time=trajectory_time)
+            add(f"function_coordinate:{index}", error, requirement.tolerance, mask)
+        return signed, masks
+    # END these normalized optimizer inequalities do not change hard residuals.
+
+    # BEGIN keep optional goal centering separate from functional feasibility.
     def optimizer_preferences(self, position, quaternion, progress, *, trajectory_time=None,
                               tool_linear_velocity=None, tool_angular_velocity=None, phase="quality"):
-        """Guide real requirements with stage-specific functional goal errors.
+        """Guide process relations and optional quality-stage goal centering.
 
-        ``feasibility`` penalizes only the part of a functional pose/coordinate
-        error outside its declared tolerance. ``quality`` additionally prefers
-        the original goal center. Pose errors remain position and SO(3) norms,
-        not independent per-axis bounds. Process equations and directional
-        commands retain their existing semantics in both phases; this choice
-        never changes the independently evaluated acceptance residuals.
+        Functional feasibility is supplied only by the signed inequality AL
+        terms. ``quality`` additionally prefers the original goal center inside
+        the same enforced tolerance. Process equations and directional commands
+        retain their existing semantics in both phases; this method never
+        changes the independently evaluated acceptance residuals.
         """
         import torch
         if phase not in {"feasibility", "quality"}:
@@ -1187,11 +1239,8 @@ class PlanningProblem:
                 preference = (error-_tensor(requirement.pose_bounds[exact, 0], position)).square().sum(-1)
                 mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
                 result = result+torch.where(mask, preference, 0.)
-        for requirement in self.pose_events:
+        for requirement in self.pose_events if phase == "quality" else ():
             p, r = requirement.errors(position, quaternion)
-            if phase == "feasibility":
-                p = torch.relu(p-requirement.position_tolerance_m)
-                r = torch.relu(r-requirement.rotation_tolerance_rad)
             # BEGIN scale real goal objectives by their declared functional accuracy.
             # Raw metres/radians squared make a precise goal arbitrarily weak
             # beside native smoothness costs. This fixed rule changes numerical
@@ -1200,10 +1249,8 @@ class PlanningProblem:
             preference = (p/requirement.position_tolerance_m).square()+(r/requirement.rotation_tolerance_rad).square()
             result = result+torch.where(_first_event_query(progress, requirement.progress, trajectory_time), preference, 0.)
             # END goal precision is input semantics, never a per-skill weight.
-        for requirement in self.coordinate_events:
+        for requirement in self.coordinate_events if phase == "quality" else ():
             error = requirement.error(position, quaternion, progress, trajectory_time=trajectory_time)
-            if phase == "feasibility":
-                error = torch.relu(error-requirement.tolerance)
             # BEGIN use the same relative-accuracy rule for native coordinate goals.
             result = result+torch.where(_first_event_query(progress, requirement.progress, trajectory_time),
                                         (error/requirement.tolerance).square(), 0.)

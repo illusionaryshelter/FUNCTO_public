@@ -106,7 +106,10 @@ class FeasibleObservationTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(planner.refine_background_for_seed.call_count, 2)
         torch.testing.assert_close(planner.refine_background_for_seed.call_args.args[0], native[0].solution)
-        self.assertEqual(result.diagnostics["attempts"][0]["next_action"], "optimize_refined_background")
+        # BEGIN map changes now share the AL/working-set replacement boundary.
+        self.assertEqual(result.diagnostics["attempts"][0]["next_action"], "optimize_updated_constraints")
+        self.assertTrue(result.diagnostics["attempts"][0]["subproblem_changes"]["background"])
+        # END the same selected curve continues on the rebuilt objective.
         planner.ompl_seed.assert_not_called()
 
     def test_only_work_exhaustion_preserves_an_observed_binding(self):

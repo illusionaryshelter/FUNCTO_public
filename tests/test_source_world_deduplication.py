@@ -703,7 +703,7 @@ def test_actual_tsdf_ordinary_dense_reports_and_new_failures_are_exact(scene_fac
 
 
 def test_actual_dense_failure_trace_preserves_all_twenty_one_new_times(scene_factory):
-    from manipulation.planning_diagnostics import AttemptWitnesses, WitnessCapacityError, bind_trace_to_native_seed
+    from manipulation.planning_diagnostics import AttemptWitnesses, bind_trace_to_native_seed
     permission = RobotOwnerContactPermission(rule_id="distant_target_permission", target_owner="target",
         native_geometry_names=("tool_box",), sphere_indices=(0,), interval=(.4, .6),
         arrival_goal_id=("pose_events", 1),
@@ -748,12 +748,19 @@ def test_actual_dense_failure_trace_preserves_all_twenty_one_new_times(scene_fac
     finally:
         ordinary.end_source_world_reuse()
     ledger = AttemptWitnesses()
-    ledger.add_native({"rollout": {"source_trace": traces[0]},
-                       "interpolated": {"source_trace": traces[1]}}, duration=1.)
+    # BEGIN exchange finite optimizer queries while retaining every exact source failure.
+    ledger.set_current({"rollout": {"source_trace": traces[0]},
+                        "interpolated": {"source_trace": traces[1]}}, duration=1.)
     np.testing.assert_array_equal(ledger.parameters, parameters.numpy())
-    arguments = {"fixed_parameters": [], "existing_parameters": [],
-                 "regular_parameters": ordinary_parameters.numpy()}
-    assert len(ledger.merged_parameters(**arguments, max_points=21)) == 21
-    with pytest.raises(WitnessCapacityError, match="requires 21 points, allowed 16"):
-        ledger.merged_parameters(**arguments, max_points=16)
+    arguments = {"fixed_parameters": [], "regular_parameters": ordinary_parameters.numpy()}
+    first = ledger.select_parameters(**arguments, max_points=16)
+    assert len(first) == 16
+    assert len(ledger.last_selection["pending_parameters"]) == 5
+    second = ledger.select_parameters(**arguments, max_points=16)
+    assert len(second) == 16
+    eligible = set(parameters.numpy())-set(ordinary_parameters.numpy())
+    assert set(first) | set(second) == eligible
+    np.testing.assert_array_equal(ledger.parameters, parameters.numpy())
+    assert ledger.last_selection["slack_certified"] is False
+    # END scheduling changes neither mode attribution nor the permanent validation ledger.
 # END bounded sharing changes physical query count, never logical state evidence.

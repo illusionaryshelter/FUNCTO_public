@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from manipulation.planning_diagnostics import (
-    AttemptWitnesses, WitnessCapacityError, capture_component_failures,
+    AttemptWitnesses, capture_component_failures,
 )
 
 
@@ -19,12 +19,13 @@ def native_trace(*times, normalized=False, label="interpolated"):
         for value in times]}}}
 
 
-def merge(witnesses, *, existing=(), fixed=(), regular=(), maximum=16):
-    return witnesses.merged_parameters(fixed_parameters=fixed, existing_parameters=existing,
-        regular_parameters=regular, max_points=maximum)
+# BEGIN exchange tests distinguish permanent evidence from bounded optimizer work.
+def select(witnesses, *, fixed=(), regular=(), maximum=16):
+    return witnesses.select_parameters(fixed_parameters=fixed, regular_parameters=regular,
+                                       max_points=maximum)
 
 
-def test_different_seed_native_and_completed_export_failures_all_survive():
+def test_only_selected_candidate_controls_queries_while_all_evidence_survives():
     witnesses = AttemptWitnesses()
     first_seed = native_trace(.4, 1., label="rollout")
     first_seed["interpolated"] = native_trace(.6)["interpolated"]
@@ -33,13 +34,17 @@ def test_different_seed_native_and_completed_export_failures_all_survive():
     witnesses.add_native(second_seed, duration=2.)
     witnesses.add_validation({"u": [.1, .2, .8, .9], "violations": [0., .03, .04, 0.]})
     np.testing.assert_array_equal(witnesses.parameters, [.2, .3, .5, .7, .8])
-    active = merge(witnesses, fixed=(.5,), regular=(0., .2, 1.))
-    np.testing.assert_array_equal(active, [.3, .7, .8])
-    # The next attempt moves the failure; neither earlier seed nor the
-    # preceding independently checked curve may lose its refinement time.
+    np.testing.assert_array_equal(witnesses.current_parameters, [])
+    witnesses.set_current(first_seed, duration=2.,
+        validation={"u": [.1, .8], "violations": [0., .04]})
+    np.testing.assert_array_equal(select(witnesses, fixed=(.5,), regular=(0., .2, 1.)), [.3, .8])
+    # Later observer/other-seed evidence cannot overwrite the continuation
+    # selected above. Its full history still belongs to final export checking.
+    witnesses.add_native(native_trace(.2, normalized=True), duration=2.)
     witnesses.add_validation({"u": [.1, .6], "violations": [.02, 0.]})
-    np.testing.assert_array_equal(merge(witnesses, existing=active, fixed=(.5,), regular=(0., .2, 1.)),
-                                  [.1, .3, .7, .8])
+    np.testing.assert_array_equal(witnesses.current_parameters, [.2, .3, .5, .8])
+    np.testing.assert_array_equal(select(witnesses, fixed=(.5,), regular=(0., .2, 1.)), [.3, .8])
+    np.testing.assert_array_equal(witnesses.parameters, [.1, .2, .3, .5, .7, .8])
 
 
 def test_capture_parameters_prevent_float32_endpoint_time_drift():
@@ -47,9 +52,10 @@ def test_capture_parameters_prevent_float32_endpoint_time_drift():
     native_time = float(np.float32(2.4))
     metrics = native_trace(native_time)
     metrics["interpolated"]["source_trace"]["component_failures"][0]["normalized_time"] = 1.
-    witnesses.add_native(metrics, duration=2.4)
+    witnesses.set_current(metrics, duration=2.4)
     np.testing.assert_array_equal(witnesses.parameters, [1.])
-    np.testing.assert_array_equal(merge(witnesses, regular=(0., 1.), maximum=0), [])
+    np.testing.assert_array_equal(select(witnesses, regular=(0., 1.), maximum=0), [])
+    assert witnesses.last_selection["pending_parameters"] == []
 
 
 def test_explicit_native_joint_times_survive_missing_source_trace_without_index_guessing():
@@ -60,36 +66,98 @@ def test_explicit_native_joint_times_survive_missing_source_trace_without_index_
             {"constraint": "process_scene", "index": [9, 0]}]},
         "interpolated": {"source_trace": {"status": "unmatched"},
             "violating_constraint_samples": [{"constraint": "cspace", "normalized_time": .6}]}}
-    witnesses.add_native(metrics, duration=2.)
+    witnesses.set_current(metrics, duration=2.)
     np.testing.assert_array_equal(witnesses.parameters, [.4, .6])
+    np.testing.assert_array_equal(select(witnesses), [.4, .6])
 
 
-def test_capacity_failure_never_discards_a_witness_or_mutates_active_parameters():
+def test_twenty_one_current_failures_rotate_through_sixteen_slots_without_loss():
     witnesses = AttemptWitnesses()
-    witnesses.add_validation({"u": [.2, .4, .6, .8], "violations": [1., 1., 1., 1.]})
-    existing = np.array([.1, .2])
-    before = existing.copy()
-    with pytest.raises(WitnessCapacityError, match="requires 4 points, allowed 3"):
-        merge(witnesses, existing=existing, fixed=(.4,), maximum=3)
-    np.testing.assert_array_equal(existing, before)
-    np.testing.assert_array_equal(witnesses.parameters, [.2, .4, .6, .8])
-    np.testing.assert_array_equal(merge(witnesses, existing=existing, fixed=(.4,), maximum=4),
-                                  [.1, .2, .6, .8])
+    # This is the actual 24 dense times minus their three 81-grid queries;
+    # comparison uses their native float32 values without epsilon merging.
+    dense = np.arange(482, 506, dtype=np.float32)/np.float32(640)
+    regular = np.arange(81, dtype=np.float32)/np.float32(80)
+    metrics = native_trace(*dense, normalized=True)
+    witnesses.set_current(metrics, duration=16.)
+    first = select(witnesses, regular=regular)
+    first_report = witnesses.last_selection
+    assert len(first) == 16 and len(first_report["pending_parameters"]) == 5
+    assert first_report["eligible_count"] == 21
+    # Reselecting the same candidate must not reset fairness or erase history.
+    witnesses.set_current(metrics, duration=16.)
+    second = select(witnesses, regular=regular)
+    assert len(second) == 16
+    assert set(first_report["pending_parameters"]) <= set(second)
+    assert len(set(first) | set(second)) == 21
+    np.testing.assert_array_equal(witnesses.parameters, dense.astype(float))
+    assert witnesses.last_selection["slack_certified"] is False
 
 
-def test_only_exact_duplicate_times_share_a_query_and_existing_queries_are_monotone():
+def test_historical_dense_collisions_do_not_displace_current_fixed_functional_queries():
+    witnesses = AttemptWitnesses()
+    dense = np.arange(482, 506, dtype=np.float32)/np.float32(640)
+    witnesses.add_native(native_trace(*dense, normalized=True), duration=16.)
+    goals = np.asarray([.836125, .95], dtype=np.float32).astype(float)
+    current = native_trace(*goals, normalized=True)
+    for row in current["interpolated"]["source_trace"]["component_failures"]:
+        row["component"] = "skill_process"
+    witnesses.set_current(current, duration=16.)
+    regular = np.arange(81, dtype=np.float32)/np.float32(80)
+    np.testing.assert_array_equal(select(witnesses, fixed=goals, regular=regular), [])
+    assert len(witnesses.parameters) == 26
+    assert witnesses.last_selection["covered_parameters"] == goals.tolist()
+    assert witnesses.last_selection["pending_parameters"] == []
+    # The 21 old off-regular times are still validation obligations; they do
+    # not become currently failing merely because the scheduler remembers them.
+    assert len(set(dense.astype(float))-set(regular.astype(float))) == 21
+
+
+def test_only_exact_duplicate_times_share_query_and_returned_evidence_is_owned():
     witnesses = AttemptWitnesses()
     next_time = float(np.nextafter(np.float32(.5), np.float32(1.)))
-    witnesses.add_native(native_trace(.5, .5, next_time, normalized=True), duration=2.)
+    witnesses.set_current(native_trace(.5, .5, next_time, normalized=True), duration=2.)
     np.testing.assert_array_equal(witnesses.parameters, [.5, next_time])
     # An exact fixed anchor covers .5 but cannot certify the adjacent time.
-    np.testing.assert_array_equal(merge(witnesses, fixed=(.5,), maximum=1), [next_time])
-    # A later supplied regular grid cannot erase previously active anchors.
-    np.testing.assert_array_equal(merge(witnesses, existing=(.25,), fixed=(.5,), regular=(.25,), maximum=2),
-                                  [.25, next_time])
-    snapshot = witnesses.parameters
-    snapshot[:] = 0.
+    np.testing.assert_array_equal(select(witnesses, fixed=(.5,), maximum=1), [next_time])
+    witnesses.parameters[:] = 0.
+    witnesses.current_parameters[:] = 0.
+    report = witnesses.last_selection
+    report["selected_parameters"].clear()
+    report["selection_counts"][0]["count"] = 500
     np.testing.assert_array_equal(witnesses.parameters, [.5, next_time])
+    np.testing.assert_array_equal(witnesses.current_parameters, [.5, next_time])
+    assert witnesses.last_selection["selected_parameters"] == [next_time]
+    assert witnesses.last_selection["selection_counts"][0]["count"] == 1
+
+
+def test_new_candidate_can_retire_queries_without_erasing_history_and_recurrence_returns():
+    witnesses = AttemptWitnesses()
+    witnesses.set_current(native_trace(.2, .4, normalized=True), duration=1.)
+    np.testing.assert_array_equal(select(witnesses), [.2, .4])
+    # A current pass supplies no signed clearance. Removing its optimization
+    # query is scheduling only; the history must still reach independent export.
+    witnesses.set_current({}, duration=1.)
+    assert witnesses.last_selection is None
+    np.testing.assert_array_equal(select(witnesses), [])
+    np.testing.assert_array_equal(witnesses.parameters, [.2, .4])
+    witnesses.set_current(native_trace(.4, normalized=True), duration=1.)
+    np.testing.assert_array_equal(select(witnesses), [.4])
+    assert witnesses.last_selection["selection_counts"] == [{"parameter": .4, "count": 2}]
+
+
+def test_mixed_residual_units_do_not_change_selection_or_hide_zero_capacity_pending():
+    witnesses = AttemptWitnesses()
+    metrics = native_trace(.2, .4, .6, normalized=True)
+    rows = metrics["interpolated"]["source_trace"]["component_failures"]
+    for row, component, value in zip(rows, ("skill_process", "source_world_collision", "cspace"),
+                                   (1e-20, 1., 1e20)):
+        row.update(component=component, raw_residual=value)
+    witnesses.set_current(metrics, duration=1.)
+    np.testing.assert_array_equal(select(witnesses, maximum=0), [])
+    assert witnesses.last_selection["pending_parameters"] == [.2, .4, .6]
+    assert all(row["count"] == 0 for row in witnesses.last_selection["selection_counts"])
+    np.testing.assert_array_equal(select(witnesses, maximum=1), [.2])
+    np.testing.assert_array_equal(select(witnesses, maximum=1), [.4])
 
 
 def test_nonfinite_hard_residuals_keep_their_failure_time_and_bad_time_admission_is_atomic():
@@ -102,6 +170,25 @@ def test_nonfinite_hard_residuals_keep_their_failure_time_and_bad_time_admission
     with pytest.raises(ValueError, match="one hard residual"):
         witnesses.add_validation({"u": [.4, .5], "violations": [1.]})
     np.testing.assert_array_equal(witnesses.parameters, [.1, .2, .3])
+
+
+def test_failed_current_or_selection_update_leaves_history_priority_and_fairness_unchanged():
+    witnesses = AttemptWitnesses()
+    witnesses.set_current(native_trace(.2, .4, normalized=True), duration=1.)
+    np.testing.assert_array_equal(select(witnesses, maximum=1), [.2])
+    previous = witnesses.last_selection
+    with pytest.raises(ValueError, match="one hard residual"):
+        witnesses.set_current(native_trace(.8, normalized=True), duration=1.,
+            validation={"u": [.6, .7], "violations": [1.]})
+    with pytest.raises(ValueError, match="normalized physical times"):
+        select(witnesses, regular=(1.1,), maximum=1)
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        select(witnesses, maximum=True)
+    assert witnesses.last_selection == previous
+    np.testing.assert_array_equal(witnesses.parameters, [.2, .4])
+    np.testing.assert_array_equal(witnesses.current_parameters, [.2, .4])
+    np.testing.assert_array_equal(select(witnesses, maximum=1), [.4])
+# END omitted optimizer queries remain historical validation obligations.
 
 
 def test_raw_process_and_self_capture_retains_real_anchor_time_before_folding():

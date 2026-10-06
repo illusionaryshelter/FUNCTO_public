@@ -9,23 +9,25 @@ from copy import deepcopy
 import numpy as np
 
 
-# BEGIN attempt-wide failure witnesses, independent of candidate ranking.
-class WitnessCapacityError(ValueError):
-    """All known failure times cannot fit the admitted refinement workspace."""
-
-
+# BEGIN permanent failure evidence and bounded current-candidate query scheduling.
 class AttemptWitnesses:
-    """Keep every discovered failure time until this planning attempt ends.
+    """Keep historical failures separate from the next optimizer's queries.
 
     The ledger records normalized physical time, not source progress: a pause
     can map several distinct trajectory times to one progress value. Exact
     repeated times share one query. Nearby but distinct times remain distinct
     because neither a numerical tolerance nor a previous passing query proves
-    the intervening source geometry safe.
+    the intervening source geometry safe. Only the explicitly selected current
+    candidate supplies the bounded optimizer query set. Historical parameters
+    remain mandatory inputs to independent export validation after exchange;
+    this scheduler neither discards evidence nor certifies motion.
     """
 
     def __init__(self):
         self._parameters = set()
+        self._current = set()
+        self._selection_counts = {}
+        self._last_selection = None
 
     @staticmethod
     def _validated_parameters(values, *, source):
@@ -40,14 +42,25 @@ class AttemptWitnesses:
         """Return an owned sorted snapshot; callers cannot erase the ledger."""
         return np.asarray(sorted(self._parameters), dtype=float)
 
-    def add_native(self, native_metrics, *, duration):
-        """Union exact times from each bound native source-constraint trace.
+    @property
+    def current_parameters(self):
+        """Return failures belonging to the explicitly selected candidate."""
+        return np.asarray(sorted(self._current), dtype=float)
+
+    @property
+    def last_selection(self):
+        """Return owned scheduling evidence, not a constraint-slack verdict."""
+        return deepcopy(self._last_selection)
+
+    @classmethod
+    def _native_parameters(cls, native_metrics, *, duration):
+        """Read exact times from bound native source-constraint traces.
 
         Traces can carry the original normalized query parameter or their
         physical ``time_s`` and frozen duration; the latter ratio is used
-        exactly, without clipping or
-        epsilon merging. Unavailable/unmatched observer traces contain no
-        attributed witness and are left to their existing diagnostic report.
+        exactly, without clipping or epsilon merging. Unavailable/unmatched
+        observer traces contain no attributed witness and are left to their
+        existing diagnostic report.
         """
         duration = float(duration)
         if not np.isfinite(duration) or duration <= 0.:
@@ -69,42 +82,83 @@ class AttemptWitnesses:
                 # original hard residual, including nonfinite rejection.
                 parameters.append(float(row["normalized_time"]) if "normalized_time" in row
                                   else float(row["time_s"])/duration)
-        parameters = self._validated_parameters(parameters, source="Native failure witnesses")
-        self._parameters.update(parameters.tolist())
+        return cls._validated_parameters(parameters, source="Native failure witnesses")
 
-    def add_validation(self, validation):
-        """Union every failed time from one completed independent curve check."""
-        parameters = self._validated_parameters(validation["u"], source="Independent validation")
+    @classmethod
+    def _validation_parameters(cls, validation):
+        """Read failed times from a completed independent curve check."""
+        parameters = cls._validated_parameters(validation["u"], source="Independent validation")
         violations = np.asarray(validation["violations"], dtype=float)
         if violations.shape != parameters.shape:
             raise ValueError("Independent validation needs one hard residual per physical query time")
         failed = (violations > 0.) | ~np.isfinite(violations)
-        self._parameters.update(parameters[failed].tolist())
+        return parameters[failed]
 
-    def merged_parameters(self, *, fixed_parameters, existing_parameters, regular_parameters,
-                          max_points):
-        """Admit the complete union before a caller mutates solver workspaces.
+    def add_native(self, native_metrics, *, duration):
+        """Accumulate evidence from any visited seed without changing priority."""
+        parameters = self._native_parameters(native_metrics, duration=duration)
+        self._parameters.update(parameters.tolist())
 
-        Fixed anchors and regular optimizer samples already evaluate those
-        exact times. Only newly witnessed, uncovered times require extra
-        refinement storage. Previously active refinements are retained even
-        if a caller supplies a changed regular grid; the method never removes
-        an active constraint or truncates the union to fit a finite budget.
+    def add_validation(self, validation):
+        """Accumulate completed validation failures without changing priority."""
+        self._parameters.update(self._validation_parameters(validation).tolist())
+
+    def set_current(self, native_metrics, *, validation=None, duration):
+        """Select one continuation candidate's native and independent failures.
+
+        The caller must invoke this only after candidate selection. Observers
+        and unselected seeds use add_native/add_validation instead. Validate
+        both inputs before mutation, so a malformed completed validation cannot
+        partly replace current priority or add unbound native evidence.
+        """
+        native = self._native_parameters(native_metrics, duration=duration)
+        independent = (np.empty(0) if validation is None else
+                       self._validation_parameters(validation))
+        current = set(np.r_[native, independent].tolist())
+        self._parameters.update(current)
+        self._current = current
+        self._last_selection = None
+
+    def select_parameters(self, *, fixed_parameters, regular_parameters, max_points):
+        """Schedule bounded current failures fairly; retain all history.
+
+        Fixed anchors and regular optimizer samples cover only their supplied
+        exact representations. The caller supplies native float32 aliases for
+        fixed anchors when those aliases represent actual existing queries.
+        Among remaining current failures, choose the least frequently selected
+        times first and break ties by time. Boolean collision failures and
+        process errors in different units therefore never compete by magnitude.
+        Pending failures remain explicit even at zero capacity. A changed query
+        set is a gradient-work decision, not evidence of positive signed slack
+        or a claim that an omitted historical failure cannot recur.
         """
         if type(max_points) is not int or max_points < 0:
             raise ValueError("The refinement witness capacity must be a nonnegative integer")
         fixed = self._validated_parameters(fixed_parameters, source="Fixed anchors")
-        existing = self._validated_parameters(existing_parameters, source="Existing refinements")
         regular = self._validated_parameters(regular_parameters, source="Regular optimizer samples")
         covered = set(fixed.tolist()) | set(regular.tolist())
-        merged = set(existing.tolist()) | (self._parameters-covered)
-        if len(merged) > max_points:
-            raise WitnessCapacityError(
-                "The complete failure-witness union exceeds the finite refinement-point budget: "
-                f"requires {len(merged)} points, allowed {max_points}; no failure time was discarded")
-        return np.asarray(sorted(merged), dtype=float)
+        eligible = self._current-covered
+        ordered = sorted(eligible, key=lambda value: (self._selection_counts.get(value, 0), value))
+        selected = set(ordered[:max_points])
+        for parameter in selected:
+            self._selection_counts[parameter] = self._selection_counts.get(parameter, 0)+1
+        self._last_selection = {
+            "scope": "optimizer query scheduling only; all history remains subject to independent validation",
+            "policy": "current candidate failures; least selected count, then exact physical time",
+            "slack_certified": False,
+            "history_count": len(self._parameters),
+            "current_failure_parameters": sorted(self._current),
+            "covered_parameters": sorted(self._current & covered),
+            "eligible_count": len(eligible), "capacity": max_points,
+            "selected_parameters": sorted(selected),
+            "pending_parameters": sorted(eligible-selected),
+            "selection_counts": [{"parameter": value, "count": self._selection_counts.get(value, 0)}
+                                 for value in sorted(eligible)]}
+        return np.asarray(sorted(selected), dtype=float)
+# END finite optimizer batches never delete evidence or relax final acceptance.
 
 
+# BEGIN retain each native hard failure's time before constraint-column folding.
 def capture_component_failures(components, times, progress, joints, position, quaternion, *,
                                normalized_time=None, mode="exact"):
     """Capture process/self residual times before anchor columns are folded.

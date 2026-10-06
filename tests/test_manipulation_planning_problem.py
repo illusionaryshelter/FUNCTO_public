@@ -18,6 +18,9 @@ from scipy.spatial.transform import Rotation
 import torch
 
 from manipulation.goals import SupportSurface
+# BEGIN functional feasibility is evaluated through the standard inequality AL.
+from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
+# END optional quality centering remains separately tested below.
 from manipulation.motion import MotionModel, transfer_motion
 from manipulation.planning_problem import (
     # BEGIN phase tests retain explicitly declared directional commands.
@@ -325,7 +328,7 @@ class PlanningProcessTest(unittest.TestCase):
         self.assertEqual(position.grad[0, 0].abs().sum().item(), 0.)
         self.assertIsNone(request.terminal_pose_target)
 
-    # BEGIN functional tolerance dead zones apply only during feasibility search.
+    # BEGIN AL owns functional feasibility while quality retains goal centering.
     def test_feasibility_removes_satisfied_goal_gradient_at_only_the_actual_first_arrival(self):
         goal = PoseEventRequirement(.6, pose(), pose(), .01, .02, "declared functional accuracy")
         request = problem([MotionPhase("source", path([pose(), pose()]))], pose_events=(goal,))
@@ -336,11 +339,17 @@ class PlanningProcessTest(unittest.TestCase):
         position, quaternion = components(np.array([[pose((.005, 0., 0.), (0., 0., .015))]*4]))
         position.requires_grad_(); quaternion.requires_grad_()
         original = request.residuals(position, quaternion, progress, trajectory_time=times)
-        feasibility = request.optimizer_preferences(position, quaternion, progress,
+        preference = request.optimizer_preferences(position, quaternion, progress,
             trajectory_time=times, phase="feasibility")
+        signed, masks = request.functional_inequalities(position, quaternion, progress, trajectory_time=times)
+        augmented = FunctionalAugmentedLagrangian(request.functional_constraint_keys)
+        augmented.bind(progress)
+        feasibility = sum(torch.where(masks[key], value[..., None], 0.)
+                          for key, value in augmented.terms(signed).items())
         quality = request.optimizer_preferences(position, quaternion, progress,
             trajectory_time=times, phase="quality")
         np.testing.assert_array_equal(feasibility.detach().numpy(), np.zeros((1, 4)))
+        np.testing.assert_array_equal(preference.detach().numpy(), np.zeros((1, 4)))
         for derivative in torch.autograd.grad(feasibility.sum(), (position, quaternion), retain_graph=True):
             torch.testing.assert_close(derivative, torch.zeros_like(derivative), rtol=0, atol=0)
         np.testing.assert_allclose(quality.detach().numpy(), [[0., 0., 0., .25+.75**2]], atol=1e-12)
@@ -362,8 +371,13 @@ class PlanningProcessTest(unittest.TestCase):
         # Each component is inside its nominal number, but both original norm
         # tolerances are exceeded. Per-axis hinge penalties would miss this.
         self.assertGreater(float(goal.evaluate(position, quaternion)), 0.)
-        value = request.optimizer_preferences(position, quaternion, progress, phase="feasibility")
+        signed, _ = request.functional_inequalities(position, quaternion, progress)
+        augmented = FunctionalAugmentedLagrangian(request.functional_constraint_keys)
+        augmented.bind(progress)
+        value = sum(augmented.terms(signed).values())
         self.assertAlmostEqual(float(value), 2*(np.sqrt(2)*.8-1.)**2, places=12)
+        self.assertEqual(float(request.optimizer_preferences(
+            position, quaternion, progress, phase="feasibility")), 0.)
         self.assertAlmostEqual(float(request.optimizer_preferences(
             position, quaternion, progress, phase="quality")), 2.56, places=12)
         with self.assertRaisesRegex(ValueError, "Optimization phase"):
@@ -385,9 +399,14 @@ class PlanningProcessTest(unittest.TestCase):
                     p, q = components(model.poses(np.array([[.1], [.3+.01*relative_error]]))[None])
                     p.requires_grad_()
                     before = request.residuals(p, q, progress)
-                    first = request.optimizer_preferences(p, q, progress, phase="feasibility")
+                    signed, _ = request.functional_inequalities(p, q, progress)
+                    augmented = FunctionalAugmentedLagrangian(request.functional_constraint_keys)
+                    augmented.bind(progress)
+                    first = sum(augmented.terms(signed).values())
                     second = request.optimizer_preferences(p, q, progress, phase="quality")
                     self.assertAlmostEqual(float(first.detach().sum()), max(0., relative_error-1.)**2, places=12)
+                    self.assertEqual(float(request.optimizer_preferences(
+                        p, q, progress, phase="feasibility").detach().sum()), 0.)
                     self.assertAlmostEqual(float(second.detach().sum()), relative_error**2, places=12)
                     derivative = torch.autograd.grad(first.sum(), p)[0]
                     self.assertEqual(float(derivative.abs().sum()) == 0., relative_error < 1.)
@@ -475,9 +494,13 @@ class PlanningProcessTest(unittest.TestCase):
         self.assertLess(request.evaluate(p[:, order], q[:, order], progress[:, order]).max().item(), 1e-10)
         p, q = components(model.poses(np.zeros((101, 1)))[None])
         self.assertGreater(request.evaluate(p, q, progress).max().item(), 6.2)
-        # BEGIN feasibility retains accumulated-turn goals, not just endpoint orientation.
-        for phase in ("feasibility", "quality"):
-            self.assertGreater(float(request.optimizer_preferences(p, q, progress, phase=phase).max()), 1e10)
+        # BEGIN AL retains accumulated-turn goals, not just endpoint orientation.
+        signed, _ = request.functional_inequalities(p, q, progress)
+        augmented = FunctionalAugmentedLagrangian(request.functional_constraint_keys)
+        augmented.bind(progress)
+        self.assertGreater(float(sum(augmented.terms(signed).values()).max()), 1e10)
+        self.assertGreater(float(request.optimizer_preferences(p, q, progress, phase="quality").max()), 1e10)
+        self.assertEqual(float(request.optimizer_preferences(p, q, progress, phase="feasibility").max()), 0.)
         # END the same Cartesian pose cannot erase the original winding requirement.
 
     def test_ambiguous_axis_projection_has_finite_gradients_and_is_rejected(self):

@@ -186,6 +186,10 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     native = SimpleNamespace(position=position, velocity=velocity,
                              dt=torch.tensor([dt], dtype=torch.float64))
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    # BEGIN the exporter owns historical failure anchors independently of active queries.
+    from manipulation.planning_diagnostics import AttemptWitnesses
+    planner.witnesses = AttemptWitnesses()
+    # END empty history preserves the original analytic fixture's sample set.
     planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
     planner.problem = problem
     # The Cartesian test coordinates span metres; declare their metric sampling
@@ -1398,9 +1402,13 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         from curobo._src.types.device_cfg import DeviceCfg
         self.JointLimits = JointLimits
         self.device_cfg = DeviceCfg("cpu")
+        # BEGIN native-only configuration declares an explicitly empty AL state.
         # Empty process_mode selects native costs alone; no task, scene or FK
         # stand-in is needed to exercise the actual integration boundary.
-        self.config_type = _process_manager_type(None, None, None, None, None)
+        from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
+        self.config_type = _process_manager_type(None, None, None, None, None,
+            functional_constraints=FunctionalAugmentedLagrangian(()))
+        # END configuration ownership tests do not invent functional requirements.
         self.raw = {
             "self_collision_cfg": {"weight": 5000., "convert_to_binary": True},
             "cspace_cfg": {
@@ -1490,6 +1498,11 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             transform_robot_spheres=lambda value: value,
             evaluate=lambda p, *args, **kwargs: p[..., 0]*0,
             optimizer_preferences=lambda p, *args, **kwargs: p[..., 0]*0)
+        # BEGIN this geometry oracle has no functional point inequalities.
+        problem.functional_constraint_keys = ()
+        problem.functional_inequalities = lambda *args, **kwargs: ({}, {})
+        problem.residuals = lambda *args, **kwargs: {"synthetic_process": problem.evaluate(*args, **kwargs)}
+        # END the original process tensor remains unchanged under the named interface.
         scene = SimpleNamespace(gripper=hand, robot_coverage=None, robot_owner_permissions=(),
             required_progress_anchors=(), evaluate=lambda spheres, p, *args, **kwargs: p[..., 0]*0,
             # BEGIN native metrics query an explicit source-world fixture independently of self.
@@ -1807,6 +1820,11 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                     transform_robot_spheres=lambda value: value,
                     evaluate=Mock(side_effect=lambda p, *args, **kwargs: p.square().sum(-1)),
                     optimizer_preferences=Mock(side_effect=lambda p, *args, **kwargs: p[..., 0]*0))
+                # BEGIN preserve the original nonfunctional process and gradient oracle.
+                problem.functional_constraint_keys = ()
+                problem.functional_inequalities = lambda *args, **kwargs: ({}, {})
+                problem.residuals = lambda *args, **kwargs: {"synthetic_process": problem.evaluate(*args, **kwargs)}
+                # END an empty AL contribution cannot change native scene ownership.
                 # BEGIN the synthetic scene explicitly declares no owner contact permissions.
                 scene = SimpleNamespace(gripper=None, robot_coverage=object(), robot_owner_permissions=(),
                     required_progress_anchors=(0., 1.),
@@ -1894,8 +1912,12 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 scene.clone_for_rollout = lambda: scene
                 transition = self.transition()
                 transition.joint_names = ("first_joint", "second_joint")
+                # BEGIN this seed-only timing fixture has no functional inequalities.
+                from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
                 config_type = _process_manager_type(None, scene, None, None, None,
-                    clock={"duration": 2.}, seed_parameter=torch.tensor([[.375]]))
+                    clock={"duration": 2.}, seed_parameter=torch.tensor([[.375]]),
+                    functional_constraints=FunctionalAugmentedLagrangian(()))
+                # END native finger-clock assertions still execute unchanged.
                 config = config_type.create({"process_mode": mode}, device_cfg=self.device_cfg)
                 manager = self.manager(config, transition)
                 state = SimpleNamespace(joint_state=SimpleNamespace(position=torch.zeros((3, 1, 2))))
@@ -2894,7 +2916,10 @@ class ExportedCurveContractTests(unittest.TestCase):
         # BEGIN the selector normally adds each completed export to this ledger.
         from manipulation.planning_diagnostics import AttemptWitnesses
         planner.witnesses = AttemptWitnesses()
-        planner.witnesses.add_validation(planner.last_validation)
+        # BEGIN this completed curve is the explicitly selected continuation.
+        planner.witnesses.set_current({}, validation=planner.last_validation,
+                                      duration=planner.formal_clock["duration"])
+        # END adding unrelated history alone cannot select optimizer queries.
         # END direct-export fixtures must explicitly perform that same handoff.
         # Neither ordinary sample failures nor pose anchors identify this
         # knot's left acceleration. Its analytic witness must drive the same
@@ -3160,6 +3185,10 @@ class PlannerRetryContractTests(unittest.TestCase):
                                   seed_cost=torch.tensor([[float(index)]]), metrics=None, interpolated_metrics=None)
                   for index, flag in enumerate(native_flags)]
         trajectories = [SimpleNamespace(residuals={"required_process": value}, candidate_index=index,
+                                         # BEGIN exact curve identity is independent of cost/ranking.
+                                         joint_names=("x", "y", "z"), times=np.array([0., 1.]),
+                                         position=np.full((2, 3), float(index+1)), velocity=np.zeros((2, 3)),
+                                         # END different scripted candidates cannot refute each other.
                                          executable_until=.4,
                                          next_verification={"time": .4, "skill_id": "grasp", "event_id": "verify",
                                                             "requires_evidence": "actual Holding observation"})
@@ -3171,6 +3200,9 @@ class PlannerRetryContractTests(unittest.TestCase):
         planner = SimpleNamespace(
             budget=PlanningBudget(),
             phase="feasibility", witnesses=AttemptWitnesses(),
+            # BEGIN the selected working-set report belongs to the current candidate.
+            last_working_set={},
+            # END empty diagnostic state is explicit in the scripted planner.
             formal_clock={"duration": 1.}, refinement_parameters=np.empty(0),
             optimize_phases=stages,
             # BEGIN explicit allocation diagnostics in the CPU retry fixture.
@@ -3190,12 +3222,16 @@ class PlannerRetryContractTests(unittest.TestCase):
             reference_seeds=Mock(return_value=(torch.zeros((1, 2, 4, 3)), [2, 2, 2])),
             close=Mock(),
             refinement_samples=Mock(return_value=None),
+            # BEGIN scripted native solves expose the owned AL lifecycle explicitly.
+            update_functional_constraints=Mock(return_value={"changed": False}),
+            reset_functional_constraints=Mock(),
+            # END an absent fixture method must never require a production fallback.
             ompl_seed=Mock(return_value=(None, {"success": False})),
         )
         planner.native_diagnostics = MethodType(_CuroboPlanner.native_diagnostics, planner)
         planner.select_candidate = MethodType(_CuroboPlanner.select_candidate, planner)
 
-        # BEGIN fixture transitions are observable and retain all active parameters.
+        # BEGIN fixture transitions replace gradient slots without altering the history ledger.
         def optimize(seed):
             index = len(stages)
             stages.append(planner.phase)
@@ -3206,13 +3242,19 @@ class PlannerRetryContractTests(unittest.TestCase):
             return native[index]
 
         def refine(parameters, *, phase=None):
-            planner.refinement_parameters = np.unique(np.r_[planner.refinement_parameters, parameters])
+            planner.refinement_parameters = np.unique(parameters)
             if phase is not None:
                 planner.phase = phase
 
         def curve(result):
             index = next(index for index, candidate in enumerate(native) if candidate is result)
             return SimpleNamespace(residuals={}, candidate_index=index, executable_until=.4,
+                                   # BEGIN cheap reconstruction names the same candidate's full curve.
+                                   joint_names=trajectories[index].joint_names,
+                                   times=trajectories[index].times.copy(),
+                                   position=trajectories[index].position.copy(),
+                                   velocity=trajectories[index].velocity.copy(),
+                                   # END equality is physical identity, not shared object identity.
                                    next_verification=trajectories[index].next_verification)
 
         planner.optimize = Mock(side_effect=optimize)
@@ -3317,7 +3359,11 @@ class PlannerRetryContractTests(unittest.TestCase):
         self.assertTrue(result.diagnostics["used_ompl"])
         self.assertEqual(planner.optimize.call_count, 2)
         self.assertIs(planner.optimize.call_args_list[1].args[0], seed)
-        planner.refine_validation.assert_not_called()
+        # BEGIN a new spatial initializer cannot retain another curve's multipliers.
+        planner.reset_functional_constraints.assert_called_once_with()
+        planner.refine_validation.assert_called_once()
+        np.testing.assert_array_equal(planner.refine_validation.call_args.args[0], [])
+        # END the one rebuild does not authorize the new seed or consume another solve.
         self.assertEqual(planner.ompl_seed.call_count, 1)
         self.assertEqual(len(result.diagnostics["attempts"]), 2)
 
@@ -3336,34 +3382,32 @@ class PlannerRetryContractTests(unittest.TestCase):
             self.assertNotEqual(seed.data_ptr(), native[index-1].solution.data_ptr())
         planner.ompl_seed.assert_not_called()
 
-    # BEGIN unchanged rejected curves keep witnesses without expanding themselves.
-    def test_stagnant_candidate_stops_before_refinement_capacity_is_spent(self):
+    # BEGIN unchanged curves may benefit from a changed bounded optimizer query set.
+    def test_stagnant_candidate_without_new_subproblem_stops_before_another_solve(self):
         planner, _, _ = self.scripted_planner([True], [.004], optimizer_unchanged=[True])
-        planner.refinement_samples.side_effect = AssertionError("The same curve must not consume new queries")
         result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=3, search_seconds=0.))
         self.assertFalse(result.success)
         self.assertEqual(result.diagnostics["failure"], "optimization_stagnated")
         self.assertIn(.5, result.diagnostics["attempts"][0]["failure_witness_parameters"])
         self.assertEqual(planner.optimize.call_count, 1)
-        planner.refinement_samples.assert_not_called()
+        planner.refinement_samples.assert_called_once_with()
         planner.refine_validation.assert_not_called()
 
-    def test_stagnation_allows_existing_search_before_requiring_new_curve_witnesses(self):
-        planner, _, _ = self.scripted_planner([True, True], [.004, 0.],
-                                              optimizer_unchanged=[True, False])
-        seed = torch.full((1, 1, 4, 3), 17.)
-        planner.ompl_seed.return_value = seed, {"success": True}
+    def test_stagnation_with_new_active_queries_rebuilds_before_spatial_search(self):
+        planner, native, _ = self.scripted_planner([True, True], [.004, 0.],
+                                                   optimizer_unchanged=[True, False])
 
         def added_times():
-            self.assertEqual(planner.ompl_seed.call_count, 1)
+            self.assertEqual(planner.ompl_seed.call_count, 0)
             self.assertIn(.5, planner.witnesses.parameters)
             return np.array([.5])
 
         planner.refinement_samples.side_effect = added_times
         result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
         self.assertTrue(result.success)
-        self.assertTrue(result.diagnostics["used_ompl"])
-        self.assertIs(planner.optimize.call_args_list[1].args[0], seed)
+        self.assertFalse(result.diagnostics["used_ompl"])
+        torch.testing.assert_close(planner.optimize.call_args_list[1].args[0], native[0].solution)
+        planner.ompl_seed.assert_not_called()
         planner.refine_validation.assert_called_once()
         np.testing.assert_array_equal(planner.refine_validation.call_args.args[0], [.5])
 
@@ -3373,9 +3417,9 @@ class PlannerRetryContractTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.diagnostics["failure"], "optimization_stagnated")
         planner.ompl_seed.assert_called_once()
-        planner.refinement_samples.assert_not_called()
+        planner.refinement_samples.assert_called_once_with()
         self.assertIn(.5, planner.witnesses.parameters)
-    # END a different proposed curve inherits the complete retained witness set.
+    # END scheduling never discards the permanent source-failure history.
 
     def test_last_budgeted_verified_export_preserves_its_evidence_barrier(self):
         planner, _, trajectories = self.scripted_planner([True, True], [.003, 0.])
