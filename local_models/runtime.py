@@ -139,12 +139,7 @@ def _guard_memory(parent_pid: int) -> None:
         try:
             rss = worker.memory_info().rss + parent.memory_info().rss
             available = psutil.virtual_memory().available
-            # BEGIN reclaim dead checkpoint pages before bounded callers reach
-            # their 8/10 GiB process-tree caps. Six GiB is a cleanup trigger,
-            # not a larger allocation allowance; all live weights and the
-            # existing hard-stop conditions below remain untouched.
-            if rss > 6 * 2**30 or available < 1.5 * 2**30:
-            # END early allocator reclamation; no model or tensor is offloaded.
+            if rss > 12 * 2**30 or available < 1.5 * 2**30:
                 # BEGIN reclaim before enforcing the same resource limits.
                 # Re-sample both RSS and host availability after reclamation;
                 # a live working set above either bound must still stop.
@@ -156,12 +151,9 @@ def _guard_memory(parent_pid: int) -> None:
                     print(f"Local model stopped: combined RSS={rss / 2**30:.2f} GiB, "
                           f"available={available / 2**30:.2f} GiB", file=sys.stderr, flush=True)
                     os._exit(75)
-                # BEGIN log actual returned pages, not every high-RSS sample.
-                if previous_rss - rss >= 128 * 2**20:
-                    print(f"Local model reclaimed unused CPU memory: combined RSS "
-                          f"{previous_rss / 2**30:.2f} -> {rss / 2**30:.2f} GiB",
-                          file=sys.stderr, flush=True)
-                # END reclamation evidence without repeated no-change messages.
+                print(f"Local model reclaimed unused CPU memory: combined RSS "
+                      f"{previous_rss / 2**30:.2f} -> {rss / 2**30:.2f} GiB",
+                      file=sys.stderr, flush=True)
                 # END reclamation; resource thresholds are unchanged.
         except psutil.NoSuchProcess:
             os._exit(75)
