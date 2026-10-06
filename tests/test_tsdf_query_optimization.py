@@ -313,27 +313,29 @@ def test_cached_component_rows_match_fresh_native_queries_after_pose_changes(geo
 def test_surface_cache_keeps_exact_witnesses_and_invalidates_changed_inputs(geometry, monkeypatch, change):
     from copy import deepcopy
     from manipulation.robot_geometry_check import _scene_component_pairs
+    # BEGIN surface calls now enter one state-local native batch.
+    from manipulation import scene_surface_batch
+    from manipulation.scene_surface_batch import SurfaceDistanceBatch
 
     actor = {"owner": "robot", "name": "body", "shape": coal.Box(.1, .1, .1),
         "vertices": None, "pose": world_pose(.13, [-2., .2, .3]), "source": "native solid"}
     target = {"owner": "target", "name": "map", "shape": geometry, "vertices": geometry,
         "pose": np.eye(4), "source": "observed field", "layer": None}
     request, cache, calls = coal.DistanceRequest(), {}, []
-    original = coal.distance
+    original = scene_surface_batch.ordered_distances
 
     def counted(*args):
-        # Count this test's complete zero-surface query only. Spatial search
-        # also requeries one raw component seed through the same Coal function.
-        if args[2] is target["shape"].surface_shape:
-            calls.append(1)
+        calls.extend([1] * len(args[0]))
         return original(*args)
 
-    monkeypatch.setattr(coal, "distance", counted)
+    monkeypatch.setattr(scene_surface_batch, "ordered_distances", counted)
 
     def sample(retained):
         rows = []
+        surfaces = SurfaceDistanceBatch([actor], [target], {}, request, retained)
         pieces = list(_scene_component_pairs(actor, [target], {}, 1e-6, rows,
-            request, set(), set(), retained, hints={}, statistics={}))
+            request, set(), set(), surfaces, hints={}, statistics={}))
+        # END signed-component enumeration remains the original independent path.
         assert pieces  # Reusing a surface row never skips signed-piece enumeration.
         assert len(rows) == 1
         return rows[0]
@@ -368,29 +370,35 @@ def test_surface_cache_keeps_exact_witnesses_and_invalidates_changed_inputs(geom
 @pytest.mark.parametrize("failure", ("request_mutated", "nonfinite"))
 def test_surface_cache_does_not_reuse_stateful_or_nonfinite_calls(geometry, monkeypatch, failure):
     from manipulation.robot_geometry_check import _scene_component_pairs
+    # BEGIN fault injection targets the state-local surface batch only.
+    from manipulation import scene_surface_batch
+    from manipulation.scene_surface_batch import SurfaceDistanceBatch
 
     actor = {"owner": "robot", "name": "body", "shape": coal.Box(.1, .1, .1),
         "vertices": None, "pose": world_pose(.13, [-2., .2, .3]), "source": "native solid"}
     target = {"owner": "target", "name": "map", "shape": geometry, "vertices": geometry,
         "pose": np.eye(4), "source": "observed field", "layer": None}
     request, cache, calls = coal.DistanceRequest(), {}, []
-    original = coal.distance
+    original = scene_surface_batch.ordered_distances
 
     def altered(*args):
-        if args[2] is not target["shape"].surface_shape:
-            return original(*args)
-        calls.append(1)
-        result = original(*args)
+        calls.extend([1] * len(args[0]))
+        batch = original(*args)
         if failure == "request_mutated":
             request.gjk_tolerance *= 2.
-        else:
-            args[-1].min_distance = float("nan")
-        return result
+        class AlteredBatch:
+            def result(self, index):
+                result = batch.result(index)
+                if failure == "nonfinite":
+                    result.min_distance = float("nan")
+                return result
+        return AlteredBatch()
 
-    monkeypatch.setattr(coal, "distance", altered)
+    monkeypatch.setattr(scene_surface_batch, "ordered_distances", altered)
     for _ in range(2):
+        surfaces = SurfaceDistanceBatch([actor], [target], {}, request, cache)
         samples = _scene_component_pairs(actor, [target], {}, 1e-6, [],
-            request, set(), set(), cache, hints={}, statistics={})
+            request, set(), set(), surfaces, hints={}, statistics={})
         if failure == "nonfinite":
             with pytest.raises(RuntimeError, match="nonfinite evidence"):
                 list(samples)
@@ -398,6 +406,7 @@ def test_surface_cache_does_not_reuse_stateful_or_nonfinite_calls(geometry, monk
             list(samples)
         assert not cache
     assert len(calls) == 2
+    # END the request guard and nonfinite rejection still occur at consumption.
 # END later queries must repeat the real native call and retain its failures.
 
 
@@ -405,6 +414,8 @@ def test_surface_cache_does_not_reuse_stateful_or_nonfinite_calls(geometry, monk
 @pytest.mark.parametrize("stop_after_first", (False, True))
 def test_component_batch_defers_later_materialization_error_until_consumed(monkeypatch, stop_after_first):
     from manipulation.robot_geometry_check import _scene_component_pairs
+    # BEGIN the no-surface fixture still uses the sole current batch interface.
+    from manipulation.scene_surface_batch import SurfaceDistanceBatch
 
     field = ObservedTsdfGeometry(component_record((), [
         np.array([[0., 0., 0.]]), np.array([[.01, 0., 0.]])]))
@@ -423,8 +434,11 @@ def test_component_batch_defers_later_materialization_error_until_consumed(monke
 
     monkeypatch.setattr(tsdf_geometry, "coal_component", fail_second)
     stopped = set()
-    pairs = _scene_component_pairs(actor, [target], {}, 1e-6, [], coal.DistanceRequest(),
-                                   set(), stopped, {}, hints={}, statistics={})
+    request = coal.DistanceRequest()
+    surfaces = SurfaceDistanceBatch([actor], [target], {}, request, {})
+    pairs = _scene_component_pairs(actor, [target], {}, 1e-6, [], request,
+                                   set(), stopped, surfaces, hints={}, statistics={})
+    # END the component failure and stop boundary are unchanged.
     first, second, key = next(pairs)
     assert first is actor
     assert second["tsdf_component_id"] == ("negative", 0)

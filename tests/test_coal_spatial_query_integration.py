@@ -125,6 +125,8 @@ def test_binding_a_new_source_epoch_discards_the_previous_hint(hint_scene):
 @pytest.mark.parametrize("stop_at_first", [False, True])
 def test_a_later_hint_preparation_error_waits_for_its_original_position(monkeypatch, stop_at_first):
     from manipulation.robot_geometry_check import _scene_component_pairs
+    # BEGIN point-only targets require no native surface work.
+    from manipulation.scene_surface_batch import SurfaceDistanceBatch
 
     record = tsdf_geometry_from_samples(-np.ones((2, 1, 1)), np.ones((2, 1, 1), bool),
         origin=[0., 0., 0.], voxel_size=.01, name="points", source="two original observed points")
@@ -145,8 +147,11 @@ def test_a_later_hint_preparation_error_waits_for_its_original_position(monkeypa
     monkeypatch.setattr(geometry, "collision_component", fail_later_hint)
     hints = {("robot", "body", "target", "points", None): (geometry, 1)}
     stopped = set()
-    pairs = _scene_component_pairs(actor, [target], {}, 1e-6, [], coal.DistanceRequest(),
-        set(), stopped, {}, hints=hints, statistics={})
+    request = coal.DistanceRequest()
+    surfaces = SurfaceDistanceBatch([actor], [target], {}, request, {})
+    pairs = _scene_component_pairs(actor, [target], {}, 1e-6, [], request,
+        set(), stopped, surfaces, hints=hints, statistics={})
+    # END original hint consumption retains the same deferred exception.
     _, component, key = next(pairs)
     assert prepared == [1, 0]
     assert component["tsdf_component_id"] == ("negative", 0)

@@ -60,10 +60,12 @@ def build():
     # BEGIN interval support certificates require real directed IEEE rounding.
     # Disable reassociation/FMA and tell the compiler that arithmetic observes
     # the saved rounding mode. Existing Coal itself remains the installed lib.
-    command = [*compiler, "-std=c++17", "-O3", "-DNDEBUG", "-shared", "-fPIC",
+    # BEGIN standard threads parallelize independent raw-distance batch slots.
+    command = [*compiler, "-std=c++17", "-O3", "-DNDEBUG", "-shared", "-fPIC", "-pthread",
                "-frounding-math", "-fno-fast-math", "-ffp-contract=off", "-Wall", "-Wextra",
                *[f"-I{path}" for path in includes], *eigen_flags, str(source),
                *map(str, libraries), f"-Wl,-rpath,{prefix / 'lib'}", "-o", str(temporary_path)]
+    # END no additional threading package or runtime is installed.
     # END building never substitutes an approximate epsilon for this contract.
     try:
         # One compiler process: no build pool, package manager, or parallel jobs.

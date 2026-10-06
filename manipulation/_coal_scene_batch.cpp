@@ -20,12 +20,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cfenv>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <queue>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -740,6 +743,183 @@ bp::tuple scan_separated_prefix(
   bp::object prefix = minimum_index < 0 ? bp::object() : bp::object(minimum_result);
   return bp::make_tuple(count, minimum_index, prefix, -1, bp::object());
 }
+
+// BEGIN independent raw distances preserve input bits and indexed consumption.
+// Python ownership and error objects are created/destroyed with the GIL held.
+// Workers only read copied transforms/native pointers and write their own slot.
+struct OrderedDistanceEntry {
+  bp::object first_owner, second_owner;
+  bp::object error_type, error_value, error_traceback;
+  const coal::CollisionGeometry* first = nullptr;
+  const coal::CollisionGeometry* second = nullptr;
+  coal::Transform3s first_transform, second_transform;
+  coal::DistanceResult distance;
+  std::exception_ptr native_error;
+  bool prepared = false;
+};
+
+class ReleasedGIL {
+ public:
+  ReleasedGIL() : state_(PyEval_SaveThread()) {}
+  ~ReleasedGIL() { PyEval_RestoreThread(state_); }
+  ReleasedGIL(const ReleasedGIL&) = delete;
+  ReleasedGIL& operator=(const ReleasedGIL&) = delete;
+ private:
+  PyThreadState* state_;
+};
+
+class QueryFloatingEnvironment {
+ public:
+  explicit QueryFloatingEnvironment(const std::fenv_t& requested) {
+    if (std::fegetenv(&previous_) != 0)
+      throw std::runtime_error("Cannot save distance worker floating-point environment");
+    if (std::fesetenv(&requested) != 0) {
+      std::fesetenv(&previous_);
+      throw std::runtime_error("Cannot inherit distance caller floating-point environment");
+    }
+  }
+  ~QueryFloatingEnvironment() { std::fesetenv(&previous_); }
+  QueryFloatingEnvironment(const QueryFloatingEnvironment&) = delete;
+  QueryFloatingEnvironment& operator=(const QueryFloatingEnvironment&) = delete;
+ private:
+  std::fenv_t previous_;
+};
+
+class OrderedDistanceBatch {
+ public:
+  OrderedDistanceBatch(bp::object first_shapes, bp::object first_transforms,
+      bp::object second_shapes, bp::object second_transforms,
+      const coal::DistanceRequest& request, int workers) : request_(request) {
+    if (workers < 1 || workers > 4)
+      throw std::invalid_argument("Distance workers must be between 1 and 4, including the caller");
+    // A shared request with history would make later inputs depend on earlier
+    // calls. Copying it per slot is deliberately forbidden for this interface.
+    COAL_COMPILER_DIAGNOSTIC_PUSH
+    COAL_COMPILER_DIAGNOSTIC_IGNORED_DEPRECECATED_DECLARATIONS
+    const bool stateful = request.gjk_initial_guess == coal::GJKInitialGuess::CachedGuess
+        || request.enable_cached_gjk_guess;
+    COAL_COMPILER_DIAGNOSTIC_POP
+    if (stateful)
+      throw std::invalid_argument("Independent distance batches require requests without cached GJK history");
+    const Py_ssize_t count = PySequence_Size(first_shapes.ptr());
+    if (count < 0) bp::throw_error_already_set();
+    for (const auto* sequence : {&first_transforms, &second_shapes, &second_transforms}) {
+      const Py_ssize_t length = PySequence_Size(sequence->ptr());
+      if (length < 0) bp::throw_error_already_set();
+      if (length != count)
+        throw std::invalid_argument("Distance batch shape and transform sequences must have equal lengths");
+    }
+    entries_.resize(static_cast<std::size_t>(count));
+    worker_count_ = std::min<std::size_t>(static_cast<std::size_t>(workers), entries_.size());
+    for (Py_ssize_t index = 0; index < count; ++index) {
+      auto& entry = entries_[static_cast<std::size_t>(index)];
+      try {
+        // Keep direct owners, rather than merely retaining a mutable input list.
+        // Transform copies invoke no FK, matrix product or normalization.
+        entry.first_owner = first_shapes[index];
+        entry.first = &bp::extract<const coal::CollisionGeometry&>(entry.first_owner)();
+        entry.first_transform = bp::extract<const coal::Transform3s&>(first_transforms[index]);
+        entry.second_owner = second_shapes[index];
+        entry.second = &bp::extract<const coal::CollisionGeometry&>(entry.second_owner)();
+        entry.second_transform = bp::extract<const coal::Transform3s&>(second_transforms[index]);
+        entry.prepared = true;
+      } catch (const bp::error_already_set&) {
+        // A later malformed descriptor must not preempt an earlier caller-side
+        // component/contact failure. Preserve its Python exception until result().
+        PyObject *type = nullptr, *value = nullptr, *traceback = nullptr;
+        PyErr_Fetch(&type, &value, &traceback);
+        entry.error_type = type ? bp::object(bp::handle<>(type)) : bp::object();
+        entry.error_value = value ? bp::object(bp::handle<>(value)) : bp::object();
+        entry.error_traceback = traceback ? bp::object(bp::handle<>(traceback)) : bp::object();
+      } catch (...) {
+        entry.native_error = std::current_exception();
+      }
+    }
+    if (entries_.empty()) return;
+    std::fenv_t caller_environment;
+    if (std::fegetenv(&caller_environment) != 0)
+      throw std::runtime_error("Cannot read distance caller floating-point environment");
+    {
+      const ReleasedGIL released;
+      const auto run = [this, &caller_environment](std::size_t lane) noexcept {
+        try {
+          const QueryFloatingEnvironment environment(caller_environment);
+          for (std::size_t index = lane; index < entries_.size(); index += worker_count_) {
+            auto& entry = entries_[index];
+            if (!entry.prepared) continue;
+            try {
+              // Each item has exactly the caller's initial request and a cold
+              // solver, even when a preceding item used the same shape pair.
+              // No original request, shape, shared result or solver is mutated.
+              const coal::DistanceRequest local_request(request_);
+              coal::distance(entry.first, entry.first_transform, entry.second,
+                             entry.second_transform, local_request, entry.distance);
+            } catch (...) {
+              entry.native_error = std::current_exception();
+            }
+          }
+        } catch (...) {
+          const std::exception_ptr error = std::current_exception();
+          for (std::size_t index = lane; index < entries_.size(); index += worker_count_)
+            if (entries_[index].prepared) entries_[index].native_error = error;
+        }
+      };
+      std::vector<std::thread> threads;
+      threads.reserve(worker_count_ - 1);
+      try {
+        for (std::size_t lane = 1; lane < worker_count_; ++lane) threads.emplace_back(run, lane);
+        run(0);  // The caller is one worker, so total concurrency never exceeds 4.
+      } catch (...) {
+        // A thread creation failure must never destroy a joinable thread or
+        // return while a worker still refers to the batch under construction.
+        for (auto& thread : threads) thread.join();
+        throw;
+      }
+      for (auto& thread : threads) thread.join();
+    }
+  }
+
+  bp::object result(Py_ssize_t index) const {
+    if (index < 0 || static_cast<std::size_t>(index) >= entries_.size())
+      throw std::out_of_range("Distance batch result index is out of range");
+    const auto& entry = entries_[static_cast<std::size_t>(index)];
+    if (entry.error_type.ptr() != Py_None) {
+      PyObject* type = entry.error_type.ptr();
+      PyObject* value = entry.error_value.ptr() == Py_None ? nullptr : entry.error_value.ptr();
+      PyObject* traceback = entry.error_traceback.ptr() == Py_None ? nullptr : entry.error_traceback.ptr();
+      Py_INCREF(type); Py_XINCREF(value); Py_XINCREF(traceback);
+      PyErr_Restore(type, value, traceback);
+      bp::throw_error_already_set();
+    }
+    if (entry.native_error) std::rethrow_exception(entry.native_error);
+    // A value copy keeps repeated alias consumption and earlier Python results
+    // independent. Geometry pointers have Coal's usual borrowed-shape lifetime;
+    // this batch owns every shape until the caller has consumed its results.
+    return bp::object(entry.distance);
+  }
+
+  std::size_t size() const { return entries_.size(); }
+  std::size_t worker_count() const { return worker_count_; }
+  std::size_t storage_nbytes() const {
+    // Native value storage only. Existing shape payloads, Python referents,
+    // exception allocations and transient thread/solver work are not counted.
+    return sizeof(*this) + entries_.capacity() * sizeof(OrderedDistanceEntry);
+  }
+
+ private:
+  coal::DistanceRequest request_;
+  std::vector<OrderedDistanceEntry> entries_;
+  std::size_t worker_count_ = 0;
+};
+
+std::shared_ptr<OrderedDistanceBatch> ordered_distances(
+    bp::object first_shapes, bp::object first_transforms,
+    bp::object second_shapes, bp::object second_transforms,
+    const coal::DistanceRequest& request, int workers) {
+  return std::make_shared<OrderedDistanceBatch>(first_shapes, first_transforms,
+      second_shapes, second_transforms, request, workers);
+}
+// END independent batches never own scene policy, spatial hints or cache writes.
 }  // namespace
 
 BOOST_PYTHON_MODULE(_coal_scene_batch) {
@@ -750,6 +930,21 @@ BOOST_PYTHON_MODULE(_coal_scene_batch) {
   boost::python::import("coal");
   boost::python::scope().attr("MAX_BATCH_SIZE") = kMaximumBatchSize;
   boost::python::scope().attr("MAX_PROJECTION_DIRECTIONS") = kMaximumProjectionDirections;
+  // BEGIN owned ordered results defer every item failure to its consumption.
+  bp::class_<OrderedDistanceBatch, std::shared_ptr<OrderedDistanceBatch>, boost::noncopyable>(
+      "OrderedDistanceBatch", bp::no_init)
+      .def("result", &OrderedDistanceBatch::result, (bp::arg("index")))
+      .def("__len__", &OrderedDistanceBatch::size)
+      .add_property("worker_count", &OrderedDistanceBatch::worker_count)
+      .add_property("storage_nbytes", &OrderedDistanceBatch::storage_nbytes);
+  bp::def("ordered_distances", &ordered_distances,
+      (bp::arg("first_shapes"), bp::arg("first_transforms"), bp::arg("second_shapes"),
+       bp::arg("second_transforms"), bp::arg("request"), bp::arg("workers") = 1),
+      "Evaluate independent cold-request distances in input slots with at most four workers.\n"
+      "Transforms are copied without arithmetic. No request history is propagated between items.\n"
+      "batch.result(index) returns a fresh result copy or rethrows that item's deferred exception.\n"
+      "Keep the batch or original geometries alive while consuming Coal result geometry pointers.");
+  // END ordinary prefix scans and spatial queries retain their original order.
   // BEGIN snapshot-owned tree and ephemeral-query bindings share Coal types.
   bp::class_<ComponentAABBTree, std::shared_ptr<ComponentAABBTree>, boost::noncopyable>(
       "ComponentAABBTree", bp::init<bp::object, bp::object, bp::object>(

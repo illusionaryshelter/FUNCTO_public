@@ -424,6 +424,13 @@ class RobotGeometryChecker:
             # BEGIN one live batch: shape reserve plus references/pose scratch.
             + (4096 * (4096 + 1024) if component_cache_bytes else 0))
             # END the reserve is per query, never multiplied by map components.
+        # BEGIN surface jobs own separate bounded descriptors, solvers and stacks.
+        from .scene_surface_batch import surface_batch_workspace_bytes
+        surface_targets = sum(isinstance(row["shape"], ObservedTsdfGeometry)
+                              and row["shape"].surface_shape is not None for row in self._scene_shapes)
+        surface_pairs = surface_targets * (len(self._geometries) + len(self._scene_shapes))
+        self.scene_query_workspace_nbytes += surface_batch_workspace_bytes(surface_pairs, self._request)
+        # END this is additional to the resident surface-result cache above.
         # END full cache capacity remains charged in scene_storage_nbytes once.
         # END planning clones share this immutable scene allocation.
 
@@ -608,6 +615,11 @@ class RobotGeometryChecker:
         decisions, selection_checks, selection_snapshot = self._consume_layer_selection(
             layer_selection, layer_selection_index, actors, poses, gaps, unmodelled_geometries)
         # END a query gap cannot silently switch either the layer or the body.
+        # BEGIN only independent zero-surface facts execute before ordered consumption.
+        from .scene_surface_batch import SurfaceDistanceBatch
+        surface_queries = SurfaceDistanceBatch(actors, targets, decisions,
+            self._request, self._scene_surface_distance_cache)
+        # END state order, signed-component hints and contact decisions remain serial.
         checked, stopped_pairs, component_summaries = set(), set(), {}
         # BEGIN separate actual distance work from components covered by bounds.
         component_searches = {}
@@ -623,7 +635,7 @@ class RobotGeometryChecker:
             # BEGIN carry the unchanged physical-pair identity through its pieces.
             for first, second, pair_key in _scene_component_pairs(
                     actor_body, targets, decisions, boundary, rows, self._request, checked, stopped_pairs,
-                    self._scene_surface_distance_cache, hints=self._scene_component_hints,
+                    surface_queries, hints=self._scene_component_hints,
                     statistics=component_searches):
             # END component identities still remain on the individual rows.
                 row_count = len(rows)
@@ -1367,10 +1379,6 @@ def _record_unpermitted_clearance(summary, distance, margin, actor_geometry,
 # END stable first-minimum ties preserve source enumeration order.
 
 
-def _body_pair_key(first, second):
-    return tuple(sorted(((first["owner"], first["name"]), (second["owner"], second["name"]))))
-
-
 # BEGIN the component enumerator supplies the stable whole-body pair key once.
 def _summarize_component_result(key, rows, previous_count, issues, issue_counts, summaries, stopped,
                                 *, measured_count=1):
@@ -1453,7 +1461,7 @@ def _component_rows(row, world_bounds, margin):
 
 
 def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, request,
-                           visited, stopped, surface_cache, *, hints, statistics):
+                           visited, stopped, surface_queries, *, hints, statistics):
     """Query a surface distance and all potentially intersecting signed pieces.
 
     A positive triangle distance cannot reject the negative-volume containment
@@ -1461,50 +1469,17 @@ def _scene_component_pairs(actor, targets, decisions, boundary, evidence_rows, r
     candidate zero/negative component, including lower-dimensional samples.
     """
     from .tsdf_geometry import ObservedTsdfGeometry
-    for target in targets:
-        if actor["owner"] == target["owner"]:
-            continue
-        selected = decisions.get((actor["owner"], actor["name"], target["owner"]))
-        if target["layer"] is not None and (selected is None or target["layer"] != selected["layer"]):
-            continue
-        key = _body_pair_key(actor, target)
-        if key in visited:
-            continue
-        visited.add(key)
+    # BEGIN collector and consumer share selection/deduplication for every pair.
+    from .scene_surface_batch import selected_body_pairs
+    for target, key, selected in selected_body_pairs(actor, targets, decisions, visited):
+        # END non-surface pairs retain the same visited effect as surface pairs.
         margin = max(boundary, 0. if selected is None else selected["measurement_allowance_m"])
         a_tsdf = isinstance(actor["shape"], ObservedTsdfGeometry)
         b_tsdf = isinstance(target["shape"], ObservedTsdfGeometry)
         if not a_tsdf and b_tsdf and target["shape"].surface_shape is not None:
-            # BEGIN reuse only bit-identical inputs to this diagnostic distance.
-            # The scene owns immutable native shapes. Pose dtype and all bytes
-            # distinguish even signed zero; Coal's serialization includes every
-            # DistanceRequest setting and initial guess. Keep just the latest
-            # entry for each shape pair, never a quantized or historical pose.
-            surface = target["shape"].surface_shape
-            cache_key = (id(actor["shape"]), id(surface))
-            signature = (request.saveToString(), actor["pose"].dtype.str,
-                actor["pose"].tobytes(), target["pose"].dtype.str, target["pose"].tobytes())
-            cached = surface_cache.get(cache_key)
-            if cached is not None and cached[0] == signature:
-                _, value, witness_first, witness_second = cached
-            else:
-                result = coal.DistanceResult()
-                transforms = [coal.Transform3s(row["pose"][:3, :3], row["pose"][:3, 3])
-                              for row in (actor, target)]
-                coal.distance(actor["shape"], transforms[0], surface,
-                              transforms[1], request, result)
-                value = float(result.min_distance)
-                if not np.isfinite(value):
-                    raise RuntimeError("Observed TSDF surface distance returned nonfinite evidence")
-                witness_first = np.asarray(result.getNearestPoint1()).copy()
-                witness_second = np.asarray(result.getNearestPoint2()).copy()
-                # Never memoize a call that changes its native request: a hit
-                # must have neither solver-history nor request side effects.
-                if request.saveToString() == signature[0]:
-                    surface_cache[cache_key] = (signature, value, witness_first, witness_second)
-                else:
-                    surface_cache.pop(cache_key, None)
-            # END fresh report lists prevent callers from mutating cached points.
+            # BEGIN consume prefetched evidence at the original error/cache position.
+            value, witness_first, witness_second = surface_queries.consume(actor, target)
+            # END fresh report lists still isolate public evidence from the cache.
             evidence_rows.append({"actor": actor["owner"], "actor_geometry": actor["name"],
                 "target_owner": target["owner"], "target_geometry": target["name"],
                 "layer": target["layer"], "signed_distance_m": value,
