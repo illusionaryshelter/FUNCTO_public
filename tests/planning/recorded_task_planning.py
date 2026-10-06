@@ -23,6 +23,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+# BEGIN share one complete-curve archive admission bound with its reader.
+# A formal archive contains the scene, its validated input copy and the full
+# bounded layer-query evidence. Their aggregate is larger than one collision
+# array or ordinary input document; those independent bounds remain in force.
+MAX_CURVE_METADATA_BYTES = 512 * 1024**2
+# END writers cannot emit metadata that the matching reader will refuse by size.
+
 
 def _json_value(value):
     if isinstance(value, np.ndarray):
@@ -343,8 +350,10 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
             },
         }
     # END full/prefix diagnostics do not relabel or resample the saved curve.
-    np.savez_compressed(path, **arrays)
-    path.with_suffix(".json").write_text(json.dumps(
+    # BEGIN admit the complete metadata before creating either archive file.
+    # ensure_ascii makes the character count the exact UTF-8 byte count without
+    # allocating a second encoded copy of this potentially large document.
+    rendered = json.dumps(
         {"classification": classification, "validation_status": validation_status,
          "execution_binding": binding,
          "execution_limits": deepcopy(execution_limits),
@@ -354,7 +363,12 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
          "duration_seconds": curve.duration,
          "executable_until_seconds": curve.executable_until,
          "next_verification": curve.next_verification, **derivative_metadata},
-        default=_json_value, indent=2, allow_nan=False)+"\n")
+        default=_json_value, indent=2, allow_nan=False, ensure_ascii=True)+"\n"
+    if len(rendered) > MAX_CURVE_METADATA_BYTES:
+        raise ValueError("Trajectory metadata exceeds the bounded 512 MiB archive size")
+    np.savez_compressed(path, **arrays)
+    path.with_suffix(".json").write_text(rendered, encoding="utf-8")
+    # END every geometry and validation field is retained without truncation.
 
 
 # BEGIN rejected curves retain the exact scene and query scope without authorization.

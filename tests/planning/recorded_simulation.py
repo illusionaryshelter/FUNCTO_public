@@ -23,6 +23,10 @@ from manipulation.execution import ExecutionLimits
 from manipulation.gripper_trajectory import FingerTrajectory
 from manipulation.robosuite_execution import RobosuiteExecutionBackend
 
+# BEGIN use the same complete formal archive bound as its writer.
+from recorded_task_planning import MAX_CURVE_METADATA_BYTES
+# END ordinary input-document and per-array limits remain separate.
+
 # BEGIN archive inspection is separate from execution authorization.
 def load_curve_archive(path):
     """Inspect exact recorded arrays, including rejected diagnostic curves."""
@@ -34,9 +38,9 @@ def load_curve_archive(path):
     # metadata. Preserve them intact under a separate explicit archive limit;
     # reject oversized input before allocating text or decoding JSON.
     metadata_path = path.with_suffix(".json")
-    if metadata_path.stat().st_size > 64 * 1024**2:
-        raise ValueError(f"Trajectory metadata exceeds the bounded 64 MiB archive size: {metadata_path}")
-    metadata = json.loads(metadata_path.read_text())
+    if metadata_path.stat().st_size > MAX_CURVE_METADATA_BYTES:
+        raise ValueError(f"Trajectory metadata exceeds the bounded 512 MiB archive size: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     # END the archive is parsed once, without geometry or evidence truncation.
     with np.load(path, allow_pickle=False) as arrays:
         if str(arrays["classification"].item()) != metadata["classification"]:

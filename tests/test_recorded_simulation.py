@@ -367,18 +367,33 @@ class SavedExecutionContractTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             path = Path(temporary)/"oversized.npz"
             # A sparse metadata file exercises the real filesystem size check
-            # without allocating a 64-MiB string or requiring an NPZ payload.
+            # without allocating a 512-MiB string or requiring an NPZ payload.
             with path.with_suffix(".json").open("wb") as stream:
-                stream.truncate(64*1024**2+1)
+                stream.truncate(512*1024**2+1)
             with patch("recorded_simulation.Path.read_text") as read, \
                     patch("recorded_simulation.json.loads") as decode, \
                     patch("recorded_simulation.np.load") as arrays:
-                with self.assertRaisesRegex(ValueError, "64 MiB archive"):
+                with self.assertRaisesRegex(ValueError, "512 MiB archive"):
                     load_curve_archive(path)
             read.assert_not_called()
             decode.assert_not_called()
             arrays.assert_not_called()
     # END ordinary metadata bounds and physical limits are not relaxed.
+
+    # BEGIN reject an oversized write before it leaves a partial NPZ/JSON pair.
+    def test_curve_writer_checks_shared_archive_bound_before_writing(self):
+        from recorded_task_planning import save_curve
+
+        simulation, curve, _ = _fixture()
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary)/"oversized.npz"
+            with patch("recorded_task_planning.MAX_CURVE_METADATA_BYTES", 1):
+                with self.assertRaisesRegex(ValueError, "archive size"):
+                    save_curve(path, curve, classification="rejected_diagnostic_not_executable",
+                               execution_limits=_limits(simulation, curve).describe())
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_suffix(".json").exists())
+    # END the test uses small inputs while exercising the real writer boundary.
 
     # BEGIN saved command curves cannot be replaced by old step targets.
     def test_saved_finger_polynomial_requires_matching_metadata_and_all_arrays(self):
