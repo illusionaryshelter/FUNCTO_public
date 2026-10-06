@@ -1136,7 +1136,8 @@ class PlanningProblem:
             # A caller may use a different progress dtype; retain the original
             # support evaluator's pose dtype rather than the clock's dtype.
             result[f"support:{index}"] = torch.zeros_like(progress, dtype=value.dtype).scatter(-1, selected, value)
-            # END absent or unselected events retain zero residual and gradient.
+            # END absent or unselected events retain zero residual; finite
+            # pose inputs also retain their zero gradient outside the event.
         for index, requirement in enumerate(self.interiors):
             mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
             result[f"interior:{index}"] = torch.where(mask, requirement.evaluate(position, quaternion, self.numerical), 0.)

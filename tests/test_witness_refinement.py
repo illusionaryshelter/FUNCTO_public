@@ -173,7 +173,11 @@ class BoundedRefinementTests(unittest.TestCase):
         source = _FrozenBackgroundRefinement(views, masks,
             SimpleNamespace(device="cuda:0"),
             {"voxel_size_m": .01, "measurement_allowance_m": .001,
-             "measurement_evidence": "calibration", "source": "raw depth"}, .001)
+             "measurement_evidence": "calibration", "source": "raw depth"}, .001,
+            # BEGIN refinements retain the explicit original request limits.
+            max_mapping_bytes=1024**3, max_host_rss_bytes=8*1024**3,
+            max_device_used_bytes=6*1024**3)
+            # END no refinement silently restores an unrelated default budget.
         return source, views, masks
 
     def witnesses(self, extent=.02):
@@ -211,6 +215,31 @@ class BoundedRefinementTests(unittest.TestCase):
         self.assertIsNone(replacement)
         self.assertEqual(report["status"], "mapping_byte_budget_refused")
         mapper.assert_not_called()
+
+    # BEGIN expanded maps inherit the request budget instead of a one-GiB cap.
+    def test_expansion_above_one_gib_reaches_same_request_total_admission(self):
+        from manipulation.resource_admission import ResourceLimitError
+        _, views, masks = self.source()
+        source = _FrozenBackgroundRefinement(views, masks, SimpleNamespace(device="cuda:0"),
+            {"voxel_size_m": .01, "measurement_allowance_m": .001,
+             "measurement_evidence": "calibration", "source": "raw depth"}, .001,
+            max_mapping_bytes=2*1024**3, max_host_rss_bytes=12*1024**3,
+            max_device_used_bytes=8*1024**3)
+        estimate = 1024**3+1
+        with patch("manipulation.planning_observation._fine_mapper_config", return_value=source.config), \
+                patch("manipulation.planning_observation._mapper_memory_bound", return_value=estimate), \
+                patch("manipulation.planning_observation._require_mapping_memory",
+                      side_effect=ResourceLimitError("host_process_rss", 13*1024**3,
+                                                     12*1024**3)) as admission, \
+                patch("manipulation.planning_observation._map_partition") as mapper:
+            replacement, report = source.refine(supported_query(), self.witnesses(.2))
+        self.assertIsNone(replacement)
+        self.assertEqual(report["status"], "live_mapping_memory_refused")
+        self.assertEqual(report["max_mapping_bytes"], 2*1024**3)
+        admission.assert_called_once_with(estimate, "cuda:0",
+            max_host_rss_bytes=12*1024**3, max_device_used_bytes=8*1024**3)
+        mapper.assert_not_called()
+    # END refusal preserves the existing scene and its already allocated fields.
 
     # BEGIN reproduce native float32 spacing without allocating a native map.
     def native_query(self, shape, pose):

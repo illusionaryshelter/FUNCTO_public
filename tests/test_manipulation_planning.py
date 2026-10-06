@@ -239,6 +239,12 @@ def export_fixture(problem, progress_map, position, velocity, dt):
         get_cost={"cspace": cspace}.get,
         compute_costs=lambda state: SimpleNamespace(names=(), values=()))
     # END these analytic fixture bounds are not a robot-model assertion.
+    # BEGIN this analytic export also declares its small CPU record reserve.
+    from manipulation.planning import _validation_storage_admission
+    planner.scene_cpu_live_bytes = 0
+    planner.validation_storage = _validation_storage_admission(problem, planner._verification_scene,
+        {"active_joint_names": list(problem.joint_names)}, planner.budget)
+    # END there is no native source-query scratch in this analytic fixture.
     return planner, SimpleNamespace(batch_size=1, num_seeds=1, get_interpolated_plan=lambda: native)
 
 
@@ -2154,7 +2160,8 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         workspace = _PlanningWorkspace(0, 0, 200, 0, 600, False)
         # Existing cached pages count in device-used but can satisfy future
         # tensors. One byte less reuse must fail the actual physical limit.
-        with self.assertRaisesRegex(ValueError, "device-used"):
+        # BEGIN shared allocation admission reports the whole-device boundary.
+        with self.assertRaisesRegex(ValueError, "gpu_device_used"):
             _require_planning_memory(runtime, "cuda:0", workspace,
                                      max_device_used_bytes=4*1024**3+500)
         cuda.memory_allocated.return_value = 100
@@ -2162,8 +2169,9 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                                                max_device_used_bytes=4*1024**3+500), workspace)
         cuda.mem_get_info.return_value = native_reserve-1, 12*1024**3
         cuda.memory_reserved.return_value = 10*1024**3
-        with self.assertRaisesRegex(ValueError, "GPU memory"):
+        with self.assertRaisesRegex(ValueError, "gpu_native_reserve"):
             _require_planning_memory(runtime, "cuda:0", workspace, max_device_used_bytes=8*1024**3)
+        # END native storage never borrows reserved Torch pages.
 
     def test_refinement_rechecks_workspaces_without_retiming(self):
         import gc
@@ -2171,6 +2179,9 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.budget = PlanningBudget(max_refinement_points=0)
+        # BEGIN isolate this allocator-lifecycle fixture from record payloads.
+        planner.validation_storage = {"encoded_record_bytes_upper": 0}
+        # END record peak admission has its own byte-boundary regressions.
         planner.anchors = np.array([0., 1., 2.])
         planner.problem = object()
         planner.scene = SimpleNamespace(required_progress_anchors=(), contacts=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:

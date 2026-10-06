@@ -56,7 +56,11 @@ def run(output):
                                                              "source": "current plane depth and fixed observed frame"}},
             mapper_cfg=config, depth_error_m=.005, reference_frame="camera0_current",
             robot_sphere_materials=(None,), robot_geometry_source="synthetic probe sphere",
-            has_gripper=False, max_mapping_bytes=256*1024**2)
+            # BEGIN synthetic owners use the same explicit per-owner API.
+            has_gripper=False, owner_voxel_sizes_m={"surface_patch": .04},
+            max_mapping_bytes=256*1024**2,
+            max_host_rss_bytes=8*1024**3, max_device_used_bytes=6*1024**3)
+            # END the analytic patch does not infer resolution from its name.
         report["observation_build"] = scene.observation_report
         if scene.owners[0].geometry_complete:
             raise AssertionError("Observed surface was incorrectly declared complete")

@@ -12,6 +12,7 @@ import argparse
 from copy import deepcopy
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -25,6 +26,28 @@ import yaml
 
 PROJECT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT))
+
+
+# BEGIN each observed owner has an explicit CLI resolution, without aliases.
+def owner_voxel_sizes(arguments, owner_ids):
+    """Parse repeated owner/spacing pairs without silently replacing duplicates.
+
+    The scene adapter repeats the strict mapping check for non-CLI callers.
+    Resolving identities here also rejects mistakes before creating a CUDA
+    hand model, so a missing or misspelled owner cannot incur GPU work.
+    """
+    result = {}
+    for identity, raw_value in arguments:
+        if identity in result:
+            raise ValueError(f"Duplicate owner voxel size for {identity!r}")
+        value = float(raw_value)
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError("Each owner voxel size must be a finite positive metre value")
+        result[identity] = value
+    if set(result) != set(owner_ids):
+        raise ValueError("Owner voxel sizes must name every observed owner exactly once")
+    return result
+# END no object name, dataset or extent selects an implicit resolution.
 
 
 # BEGIN independent finger reference on the planner's exact physical clock.
@@ -263,6 +286,18 @@ def run(args):
               "robot_fixture_path": str(args.robot_fixture.resolve())}
     started = time.monotonic()
     try:
+        # BEGIN include a retained execution session in this request's host cap.
+        # The explicit root must be this process or a real ancestor; standalone
+        # runs select themselves. Model/planner subprocesses cannot hide their
+        # still-live simulation parent behind a child-only RSS measurement.
+        from manipulation.resource_admission import configure_host_process_root
+        report["host_process_scope"] = configure_host_process_root(
+            os.getpid() if args.host_process_root_pid is None else args.host_process_root_pid)
+        # END the same root is used by all nested source-geometry admissions.
+        # BEGIN reject impossible module limits before any CUDA preparation.
+        if not 0 < args.mapping_memory_mib <= min(args.max_host_rss_mib, args.max_device_used_mib):
+            raise ValueError("Mapping capacity must be positive and fit both declared total resource limits")
+        # END native maps repeat this admission for callers outside this CLI.
         manifest = json.loads(args.manifest.read_text())
         root = Path(manifest["workspace_root"])
         segment = next(s for s in manifest["segments"] if s["id"] == args.segment)
@@ -307,6 +342,12 @@ def run(args):
         # relabelled world observation at this narrow recorded-test boundary.
         if problem.reference_frame != "world":
             raise ValueError("Recorded world camera calibration requires a world-frame planning problem")
+        # BEGIN resolve all owner resolutions while preparation is still on CPU.
+        owner_frames, supplied_masks = recorded_owner_observation_inputs(
+            problem, scene_input, segment["snapshot"]["views"], args.owner_mask,
+            source=str(root/candidate["scene_path"]))
+        owner_resolutions = owner_voxel_sizes(args.owner_voxel_size, owner_frames)
+        # END subsequent masks, map configurations and reports share these IDs.
         robot = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
         # BEGIN verify the physical policy and separation certificates before GPU use.
         # The fixture distinguishes native exclusions from queries completed
@@ -376,7 +417,8 @@ def run(args):
                                      "scene_gpu_workspace_bytes": args.scene_gpu_workspace_mib*1024**2,
                                      "max_host_rss_bytes": args.max_host_rss_mib*1024**2,
                                      "max_device_used_bytes": args.max_device_used_mib*1024**2,
-                                     "mapping_bytes": 1024**3}
+                                     "mapping_bytes": args.mapping_memory_mib*1024**2,
+                                     "owner_voxel_sizes_m": owner_resolutions}
         device = DeviceCfg("cuda:0")
         # BEGIN source hand topology from the bound robot fixture, not feedback.
         # Continuous proprioception measures q/dq and names its joints. Static
@@ -444,9 +486,6 @@ def run(args):
                 source=contact_inputs["source"], materials=material_binding,
                 rule_ids=[rule.rule_id for rule in contacts])
         # END permissions affect software collision legality, never native physical contact.
-        owner_frames, supplied_masks = recorded_owner_observation_inputs(
-            problem, scene_input, segment["snapshot"]["views"], args.owner_mask,
-            source=str(root/candidate["scene_path"]))
         report["owner_observations"] = {
             "owners": {identity: {"initial_pose": frame["T_output_owner"].tolist(),
                 "mask_paths": {view["id"]: str(supplied_masks[identity, view["id"]].resolve())
@@ -547,9 +586,13 @@ def run(args):
             # BEGIN both independent and planner models retain the exact pair policy.
             robot_owner_permissions=pair_permissions,
             # END a current measured arrival is still required by execution.
-            owner_voxel_size_m=args.owner_voxel_size,
+            # BEGIN distinct physical owners share one total resource envelope.
+            owner_voxel_sizes_m=owner_resolutions,
             fine_regions=fine_regions, robot_collision_bodies=collision_bodies,
-            max_mapping_bytes=1024**3)
+            max_mapping_bytes=args.mapping_memory_mib*1024**2,
+            max_host_rss_bytes=args.max_host_rss_mib*1024**2,
+            max_device_used_bytes=args.max_device_used_mib*1024**2)
+            # END module capacity cannot bypass the measured host/device limits.
             # END the RGB-D partition remains partial.
         report["observation_build"] = scene.observation_report
         if args.owner_geometry is not None:
@@ -626,8 +669,8 @@ def run(args):
             "scope": "Measured native q0; the formally bound planner performs the only entrance verdict"}
         # END no uncertainty envelope is labelled as the current hand state.
         # BEGIN bind refined device geometry to an explicit unchanged-work budget.
-        # A supplied request ledger must declare this same model capacity;
-        # historical work is retained by the existing exact-ledger validation.
+        # A supplied ledger freezes the work/model dimensions. Physical memory
+        # limits may change explicitly while the ledger retains all spent work.
         budget = PlanningBudget(knots=args.knots, interpolation_buffer_size=args.interpolation_buffer_size,
                                 max_robot_spheres=640, ik_seeds=args.ik_seeds,
                                 trajectory_seeds=args.trajectory_seeds,
@@ -696,7 +739,9 @@ if __name__ == "__main__":
     parser.add_argument("--extent", type=float, nargs=3, required=True)
     parser.add_argument("--voxel-size", type=float, required=True)
     # BEGIN current owner precision is declared before a planning result exists.
-    parser.add_argument("--owner-voxel-size", type=float, required=True)
+    parser.add_argument("--owner-voxel-size", nargs=2, action="append", required=True,
+                        metavar=("OWNER_ID", "METRES"),
+                        help="Repeat exactly once for each observed owner; no shared owner resolution")
     # BEGIN freeze reviewed local bounds, resolution and measurement evidence.
     parser.add_argument("--fine-regions", type=Path,
                         help="JSON array of owner_id (null for background), local bounds and measured-allowance evidence")
@@ -721,8 +766,12 @@ if __name__ == "__main__":
     parser.add_argument("--scene-gpu-workspace-mib", type=int, choices=(1024, 2048, 3072, 6144), default=1024)
     # END this separate capacity is not the physical device-used limit.
     # BEGIN request-level physical limits remain explicit in standalone runs.
-    parser.add_argument("--max-host-rss-mib", type=int, choices=(8192, 10240), default=8192)
+    parser.add_argument("--max-host-rss-mib", type=int, choices=(8192, 10240, 12288), default=8192)
     parser.add_argument("--max-device-used-mib", type=int, choices=(6144, 8192), default=6144)
+    parser.add_argument("--mapping-memory-mib", type=int, default=1024,
+                        help="Explicit combined map-buffer estimate cap, also checked against total live host/device budgets")
+    parser.add_argument("--host-process-root-pid", type=int,
+                        help="Existing ancestor owning the retained execution session; omitted for standalone planning")
     # END defaults preserve the original half-host/half-device limits.
     parser.add_argument("--torch-memory-mib", type=int, choices=(2048, 4096), default=2048)
     # BEGIN opt-in host profiling covers preparation, planning and persistence.

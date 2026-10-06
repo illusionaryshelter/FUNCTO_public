@@ -168,7 +168,11 @@ def test_contained_native_grid_witnesses_do_not_rebuild_scene_or_solver(admissio
                         "K": np.eye(3), "T_output_camera": np.eye(4)}}
     source = _FrozenBackgroundRefinement(views, {"camera": {None: np.ones((3, 3), bool)}},
         SimpleNamespace(device="cuda:0"), {"voxel_size_m": .002, "measurement_allowance_m": .0001,
-            "measurement_evidence": "explicit calibration", "source": "original RGB-D"}, .0001)
+            "measurement_evidence": "explicit calibration", "source": "original RGB-D"}, .0001,
+        # BEGIN refinements retain the explicit original request limits.
+        max_mapping_bytes=1024**3, max_host_rss_bytes=8*1024**3,
+        max_device_used_bytes=6*1024**3)
+        # END no refinement silently restores an unrelated default budget.
     background.refinement_source = source
     scene = PlanningScene(background=background, owners=(),
         coverage=ObservedSpace(np.ones((5, 5, 5), bool), origin=[-1.]*3, voxel_size=.5,
@@ -246,7 +250,11 @@ def real_guidance_refinement_scene(scene_factory):
     background.refinement_source = _FrozenBackgroundRefinement(views,
         {"camera": {None: np.ones((3, 3), bool)}}, SimpleNamespace(device="cuda:0"),
         {"voxel_size_m": .002, "measurement_allowance_m": .0001,
-         "measurement_evidence": "explicit calibration", "source": "original RGB-D"}, .0001)
+         "measurement_evidence": "explicit calibration", "source": "original RGB-D"}, .0001,
+        # BEGIN refinements retain the explicit original request limits.
+        max_mapping_bytes=1024**3, max_host_rss_bytes=8*1024**3,
+        max_device_used_bytes=6*1024**3)
+        # END no refinement silently restores an unrelated default budget.
     bodies = ({"body_id": "tool", "sphere_indices": [0], "geometry_names": ["tool_box"]},)
     current = scene_factory(background, bodies=bodies,
         owners=(owner(ProxyQuery("target", observed_plane())),))
@@ -461,6 +469,6 @@ def test_capacity_functions_report_the_exact_failed_byte_comparison():
         _require_planning_memory(SimpleNamespace(cuda=cuda), "cpu",
             _PlanningWorkspace(0, 0, 100, 0, 200, False), max_device_used_bytes=8*1024**3)
     assert (captured.value.resource, captured.value.required_bytes, captured.value.limit_bytes) == (
-        "gpu_planner_workspace", reserve+300, reserve+50)
+        "gpu_allocation_capacity", reserve+300, reserve+50)
 # END shape/runtime failures propagate; byte-cap refusals preserve the old scene.
 # END map proposals never acquire a trajectory acceptance verdict.

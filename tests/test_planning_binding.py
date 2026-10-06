@@ -2,7 +2,7 @@
 
 # BEGIN frozen binding and target generation contracts independent of CUDA.
 from types import SimpleNamespace
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from copy import deepcopy
 import unittest
 from unittest.mock import Mock, patch
@@ -193,6 +193,43 @@ class PlanningBindingTest(unittest.TestCase):
             np.interp(times+.25, [0., .5, 1.], [0., .8, 1.]), atol=1e-15)
         self.assertEqual(mapping.event_clock[("current", "close", 0)]["activation_time_s"], .65)
         self.assertEqual(mapping.event_clock[("current", "close", 0)]["request_intent_time_s"], .9)
+
+    # BEGIN resource changes coexist with an older frozen execution binding.
+    def test_continuation_resource_change_retains_original_work_and_physics(self):
+        from manipulation.planning import plan_trajectory
+
+        problem = self.problem((PlanningEvent("close", "current", .9, 1, "close", "task"),))
+        continuation = self.continuation(problem)
+        original = deepcopy(continuation)
+        requested = replace(PlanningBudget(**continuation["original_binding"]["planning_budget"]),
+            max_host_rss_bytes=12*1024**3, max_device_used_bytes=8*1024**3,
+            max_scene_gpu_workspace_bytes=3*1024**3)
+        scene = SimpleNamespace(clone_for_rollout=lambda: SimpleNamespace(
+            bind_robot_validator=Mock(), gripper=None))
+        with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("native allocation refused")) as native:
+            first = plan_trajectory(problem, scene, {}, robot_validator=object(),
+                budget=requested, continuation=continuation)
+            continued = deepcopy(continuation)
+            continued["request_ledger"] = deepcopy(first.request_ledger)
+            second = plan_trajectory(problem, scene, {}, robot_validator=object(), continuation=continued)
+        self.assertEqual(native.call_count, 2)
+        self.assertEqual(continuation, original)
+        for call in native.call_args_list:
+            admitted = call.args[3]
+            self.assertEqual(admitted.max_host_rss_bytes, 12*1024**3)
+            self.assertEqual(admitted.max_device_used_bytes, 8*1024**3)
+            self.assertEqual(admitted.maximum_trajectory_solves, 2)
+            self.assertAlmostEqual(admitted.search_seconds, 1.3)
+            self.assertEqual(call.kwargs["continuation"]["consumed_physics_steps"], 350)
+            self.assertEqual(call.kwargs["continuation"]["remaining_physics_steps"], 650)
+        self.assertEqual(second.request_ledger["request_id"], original["original_binding"]["request_ledger"]["request_id"])
+        changes = [row for row in second.request_ledger["binding_records"] if row["mode"] == "resource_limits_changed"]
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(second.request_ledger["consumed_planning"]["trajectory_solves"], 2)
+        self.assertEqual(second.request_ledger["original_events"], original["original_binding"]["request_ledger"]["original_events"])
+        self.assertEqual(second.request_ledger["binding_records"][:len(first.request_ledger["binding_records"])],
+            first.request_ledger["binding_records"])
+    # END resource changes cannot manufacture new physical time or solver work.
 
     # BEGIN a paid but stationary attempt never advances the physical clock.
     def test_continuation_separates_charges_from_exact_confirmed_steps(self):

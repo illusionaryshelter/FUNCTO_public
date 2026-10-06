@@ -54,7 +54,10 @@ def main():
         grid_center=torch.tensor(point, dtype=torch.float32), truncation_distance=.004,
         image_height=height, image_width=width, depth_minimum_distance=.05,
         depth_maximum_distance=5., device='cuda:0', seeding_method='scatter')
-    _require_mapping_memory(_mapper_memory_bound(cfg), cfg.device)
+    # BEGIN this direct native probe uses the shared total-resource admission.
+    _require_mapping_memory(_mapper_memory_bound(cfg), cfg.device,
+        max_host_rss_bytes=8*1024**3, max_device_used_bytes=6*1024**3)
+    # END no native Mapper is created before host and device admission.
     mapper = Mapper(cfg)
     camera = CameraObservation(name='analytic_plane', depth_image=device.to_device(depth)[None],
         rgb_image=torch.zeros((1, height, width, 3), dtype=torch.uint8, device=device.device),

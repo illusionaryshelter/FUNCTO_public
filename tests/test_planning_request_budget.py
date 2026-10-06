@@ -105,6 +105,50 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         self.assertEqual(rejected.request_ledger["binding_records"][-1]["mode"], "remaining")
         # END this reporting fix does not reclassify explicit executor decisions.
 
+    # BEGIN physical allocation changes preserve the original request's work.
+    def test_explicit_resource_change_is_recorded_and_survives_failed_initialization(self):
+        original = replace(self.budget, maximum_trajectory_solves=4)
+        changed = replace(original, max_host_rss_bytes=12*1024**3,
+            max_device_used_bytes=8*1024**3, max_scene_gpu_workspace_bytes=3*1024**3)
+        with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("native allocation refused")) as native:
+            first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=original)
+            saved = deepcopy(first.request_ledger)
+            second = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator,
+                request_ledger=first.request_ledger, budget=changed)
+            third = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator,
+                request_ledger=second.request_ledger)
+        self.assertEqual(native.call_count, 3)
+        self.assertEqual(first.request_ledger, saved)
+        for index, result in enumerate((second, third), start=2):
+            self.assertEqual(result.diagnostics["failed_stage"], "initialization")
+            ledger = result.request_ledger
+            self.assertEqual(ledger["request_id"], saved["request_id"])
+            self.assertEqual(ledger["consumed_planning"]["initializations"], index)
+            self.assertEqual(ledger["consumed_planning"]["trajectory_solves"], 0)
+            self.assertEqual(ledger["planning_budget"]["max_host_rss_bytes"], 12*1024**3)
+            self.assertEqual(ledger["planning_budget"]["maximum_trajectory_solves"], 4)
+            self.assertEqual(ledger["binding_records"][:len(saved["binding_records"])], saved["binding_records"])
+            self.assertEqual(native.call_args_list[index-1].args[3], changed)
+        changes = [row for row in third.request_ledger["binding_records"] if row["mode"] == "resource_limits_changed"]
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["previous"]["max_host_rss_bytes"], 8*1024**3)
+        self.assertEqual(changes[0]["current"]["max_host_rss_bytes"], 12*1024**3)
+        self.assertEqual(changes[0]["consumed_planning"]["initializations"], 1)
+
+    def test_resource_change_does_not_authorize_a_work_budget_change(self):
+        with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("initialization failed")) as native:
+            first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=self.budget)
+            rejected = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator,
+                request_ledger=first.request_ledger,
+                budget=replace(self.budget, max_host_rss_bytes=12*1024**3, max_validation_points=8192))
+        self.assertEqual(native.call_count, 1)
+        self.assertEqual(rejected.diagnostics["error_type"], "ContinuationBindingError")
+        self.assertEqual(rejected.request_ledger["planning_budget"], first.request_ledger["planning_budget"])
+        self.assertEqual(rejected.request_ledger["consumed_planning"]["binding_attempts"], 2)
+        self.assertFalse(any(row["mode"] == "resource_limits_changed"
+            for row in rejected.request_ledger["binding_records"]))
+    # END an explicit physical quota never replenishes samples, solves or time.
+
 
 if __name__ == "__main__":
     unittest.main()

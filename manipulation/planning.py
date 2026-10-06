@@ -26,9 +26,9 @@ from .geometry_motion_bound import SphereBody, build_geometry_motion_bound
 from .collision_records import encode_array
 # BEGIN physical memory ownership is independent of optimizer workspace size.
 from .resource_admission import (
-    ResourceLimitError, require_host_memory,
+    ResourceLimitError, require_host_memory, require_device_memory,
     DEFAULT_MAX_HOST_RSS_BYTES, MAX_HOST_RSS_BYTES,
-    DEFAULT_MAX_DEVICE_USED_BYTES, MAX_DEVICE_USED_BYTES, MIN_DEVICE_FREE_BYTES,
+    DEFAULT_MAX_DEVICE_USED_BYTES, MAX_DEVICE_USED_BYTES,
 )
 # END source geometry and native CUDA buffers use the same typed refusals.
 
@@ -155,7 +155,7 @@ class PlanningBudget:
             raise ValueError("GPU scene workspaces must remain within the local six-GiB allocation budget")
         if (type(self.max_host_rss_bytes) is not int
                 or not 0 < self.max_host_rss_bytes <= MAX_HOST_RSS_BYTES):
-            raise ValueError("Host RSS must remain within the explicit ten-GiB maximum")
+            raise ValueError("Host RSS must remain within the explicit twelve-GiB maximum")
         if (type(self.max_device_used_bytes) is not int
                 or not 0 < self.max_device_used_bytes <= MAX_DEVICE_USED_BYTES):
             raise ValueError("Device usage must remain within the explicit eight-GiB maximum")
@@ -830,13 +830,22 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     # END current device usage is checked separately before any native allocation.
 
 
-def _require_planning_host_memory(workspace, *, max_host_rss_bytes):
-    """Reserve live CPU work and every still-lazy, identity-deduplicated shape."""
+def _require_planning_host_memory(cpu_live_bytes, *, encoded_record_bytes_upper, max_host_rss_bytes):
+    """Reserve new CPU work, candidate records and still-lazy shared shapes.
+
+    Three encoded payloads conservatively cover the new validation record,
+    its candidate snapshot and serialization copy. Earlier candidates and
+    resident source geometry already appear in measured RSS. Rechecking at
+    each export therefore accounts for accumulated history without charging
+    the same existing map or previous record as a fresh allocation.
+    """
     from .tsdf_geometry import ObservedTsdfGeometry
 
-    require_host_memory(workspace.cpu_live_bytes,
+    # BEGIN record retention participates in the same total host admission.
+    require_host_memory(cpu_live_bytes+3*encoded_record_bytes_upper,
         pending_existing_bytes=ObservedTsdfGeometry.pending_storage_total_nbytes(),
         max_rss_bytes=max_host_rss_bytes)
+    # END the independent encoded-record and process-tensor bounds still apply.
 
 
 def _require_planning_memory(torch, device, workspace, *, max_device_used_bytes):
@@ -853,33 +862,14 @@ def _require_planning_memory(torch, device, workspace, *, max_device_used_bytes)
     If the extra graph pools do not fit but the eager solver does, retain the
     existing eager path with the same geometry, samples and optimizer work.
     """
-    if type(max_device_used_bytes) is not int or not 0 < max_device_used_bytes <= MAX_DEVICE_USED_BYTES:
-        raise ValueError("Device admission requires an explicit limit no larger than eight GiB")
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-    reusable_torch_bytes = max(0, torch.cuda.memory_reserved(device)-torch.cuda.memory_allocated(device))
-    other_native_bytes = 2*1024**3
-    # BEGIN expose only explicit capacity comparisons as resource refusals.
-    description = "Available GPU memory does not cover the bounded planner, anchor FK and scene workspaces"
-    if free_bytes < other_native_bytes:
-        raise ResourceLimitError("gpu_native_reserve", other_native_bytes, free_bytes,
-                                 description=description)
+    # BEGIN the common guard accounts for whole-device usage at every boundary.
     def refusal(candidate):
-        required_bytes = other_native_bytes+candidate.gpu_bytes+candidate.anchor_fk_bytes
-        available_bytes = free_bytes+reusable_torch_bytes
-        if available_bytes < required_bytes:
-            return ResourceLimitError("gpu_planner_workspace", required_bytes, available_bytes,
-                                      description=description)
-        # Cached Torch pages are already included in device-used. Only their
-        # unused part can satisfy future tensors without increasing that value;
-        # the native reserve cannot borrow those allocator-owned pages.
-        new_bytes = other_native_bytes+max(0, candidate.gpu_bytes+candidate.anchor_fk_bytes-reusable_torch_bytes)
-        projected_used = total_bytes-free_bytes+new_bytes
-        if projected_used > max_device_used_bytes:
-            return ResourceLimitError("gpu_device_used", projected_used, max_device_used_bytes,
-                                      description="Planner allocations exceed the request device-used limit")
-        if new_bytes+MIN_DEVICE_FREE_BYTES > free_bytes:
-            return ResourceLimitError("gpu_free_reserve", new_bytes+MIN_DEVICE_FREE_BYTES, free_bytes,
-                                      description="Device memory must retain two GiB after planner allocations")
+        try:
+            require_device_memory(torch, device, native_bytes=2*1024**3,
+                torch_bytes=candidate.gpu_bytes+candidate.anchor_fk_bytes,
+                max_device_used_bytes=max_device_used_bytes)
+        except ResourceLimitError as error:
+            return error
         return None
 
     error = refusal(workspace)
@@ -1369,6 +1359,17 @@ class PlanningWorkExhausted(ValueError):
     """The original request has no remaining admitted computation budget."""
 
 
+# BEGIN physical allocation limits do not replenish cumulative planning work.
+_ALLOCATION_BUDGET_FIELDS = frozenset(("max_host_rss_bytes", "max_device_used_bytes",
+                                     "max_scene_gpu_workspace_bytes"))
+
+
+def _planning_work_budget(values):
+    """Retain every work, geometry, timing and numerical field for comparison."""
+    return {name: value for name, value in values.items() if name not in _ALLOCATION_BUDGET_FIELDS}
+# END a resource change cannot alter samples, iterations, clocks or tolerances.
+
+
 def _request_work_ledger(problem, budget, previous=None, continuation=None):
     """Copy an append-only request record, never mutate a caller's failed result."""
     from .execution_binding import plain
@@ -1381,10 +1382,16 @@ def _request_work_ledger(problem, budget, previous=None, continuation=None):
         "completed_goal_ids": [], "goal_evidence": [], "completed_direction_ids": [], "direction_evidence": [],
         "effects": {}, "effect_history": [], "binding_records": []}
         if previous is None else deepcopy(previous))
+    requested_budget = asdict(budget)
+    recorded_budget = ledger.get("planning_budget")
     if (not isinstance(ledger.get("request_id"), str) or not ledger["request_id"]
             or type(ledger.get("requires_continuation")) is not bool
-            or ledger.get("planning_budget") != asdict(budget)):
+            or not isinstance(recorded_budget, dict)
+            or _planning_work_budget(recorded_budget) != _planning_work_budget(requested_budget)):
         raise ContinuationBindingError("A same-request ledger cannot reset its identity or planning budget")
+    # A previously recorded allocation also has to satisfy the explicit
+    # physical contract; malformed historical limits are not an override.
+    PlanningBudget(**recorded_budget)
     if not isinstance(ledger.get("obligation_contract"), dict):
         raise ContinuationBindingError("The request ledger lacks its original goal/process identity contract")
     consumed = ledger.get("consumed_planning", {})
@@ -1397,6 +1404,15 @@ def _request_work_ledger(problem, budget, previous=None, continuation=None):
                  "completed_direction_ids", "direction_evidence", "effect_history", "binding_records"):
         if not isinstance(ledger.get(name), list):
             raise ContinuationBindingError(f"The request ledger lacks its append-only {name}")
+    # BEGIN record a reviewed allocation change without rewriting work history.
+    if recorded_budget != requested_budget:
+        ledger["binding_records"].append({"mode": "resource_limits_changed",
+            "source": "explicit_planning_budget",
+            "previous": {name: recorded_budget[name] for name in sorted(_ALLOCATION_BUDGET_FIELDS)},
+            "current": {name: requested_budget[name] for name in sorted(_ALLOCATION_BUDGET_FIELDS)},
+            "consumed_planning": deepcopy(consumed)})
+        ledger["planning_budget"] = requested_budget
+    # END original identity, obligations, execution facts and counters survive.
     if continuation is not None:
         original = continuation["original_binding"]
         old = original["request_ledger"]
@@ -1672,8 +1688,12 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
     if "planning_budget" not in original or "consumed_planning" not in original:
         raise ContinuationBindingError("Continuation lacks the original cumulative planning budget")
     request_budget = PlanningBudget(**original["planning_budget"])
-    if budget is not None and asdict(budget) != asdict(request_budget):
-        raise ContinuationBindingError("A continuation cannot reset or enlarge its original planning budget")
+    # BEGIN the frozen execution binding fixes work, not a later machine quota.
+    if budget is not None:
+        if _planning_work_budget(asdict(budget)) != _planning_work_budget(asdict(request_budget)):
+            raise ContinuationBindingError("A continuation cannot reset or enlarge its original planning budget")
+        request_budget = budget
+    # END remaining solves/search time below still subtract all historical work.
     consumed = deepcopy(continuation.get("consumed_planning", original["consumed_planning"]))
     for key in (*_PLANNING_COUNTS, *_PLANNING_SECONDS):
         value = consumed.get(key)
@@ -3422,7 +3442,9 @@ class _CuroboPlanner:
         # END source identity is established before allocating GPU solvers.
         self.validation_storage = _validation_storage_admission(problem, scene, self.robot_metadata, budget)
         workspace = _planning_workspace_bytes(scene, self.robot_metadata, budget, self.anchor_capacity)
-        _require_planning_host_memory(workspace, max_host_rss_bytes=budget.max_host_rss_bytes)
+        _require_planning_host_memory(workspace.cpu_live_bytes,
+            encoded_record_bytes_upper=self.validation_storage["encoded_record_bytes_upper"],
+            max_host_rss_bytes=budget.max_host_rss_bytes)
         # END preserve all required source points within the total query budget.
         import torch
         from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
@@ -3448,6 +3470,9 @@ class _CuroboPlanner:
                                              max_device_used_bytes=budget.max_device_used_bytes)
         self.scene_workspace_bytes = workspace.total_bytes
         self.scene_cpu_workspace_bytes, self.scene_gpu_workspace_bytes = workspace.cpu_bytes, workspace.gpu_bytes
+        # BEGIN export needs only new CPU scratch; shared geometry is in RSS.
+        self.scene_cpu_live_bytes = workspace.cpu_live_bytes
+        # END subsequent record admission does not re-charge resident maps.
         self.anchor_fk_workspace_bytes = workspace.anchor_fk_bytes
         self._trajectory_optimizer_graph_admitted = workspace.trajectory_graph
         # END include request-sized anchor FK in native allocation admission.
@@ -4143,7 +4168,9 @@ class _CuroboPlanner:
             storage = _validation_storage_admission(self.problem, replacement, self.robot_metadata, self.budget)
             capacity = _anchor_capacity(self.progress_map, self.anchors, self.budget, self.refinement_parameters)
             workspace = _planning_workspace_bytes(replacement, self.robot_metadata, self.budget, capacity)
-            _require_planning_host_memory(workspace, max_host_rss_bytes=self.budget.max_host_rss_bytes)
+            _require_planning_host_memory(workspace.cpu_live_bytes,
+                encoded_record_bytes_upper=storage["encoded_record_bytes_upper"],
+                max_host_rss_bytes=self.budget.max_host_rss_bytes)
             workspace = _require_planning_memory(self.torch, self.device_cfg.device, workspace,
                                                  max_device_used_bytes=self.budget.max_device_used_bytes)
         except ResourceLimitError as error:
@@ -4163,6 +4190,7 @@ class _CuroboPlanner:
             "anchor_fk_workspace_bytes": workspace.anchor_fk_bytes, "trajectory_graph": workspace.trajectory_graph,
             "validation_storage": deepcopy(storage)}
         self.validation_storage = storage
+        self.scene_cpu_live_bytes = workspace.cpu_live_bytes
         # END ordinary geometry/shape/runtime errors are never resource refusals.
         # BEGIN source geometry and guidance have separate replacement scopes.
         # The factory rebinds the source checker only for a new observed field;
@@ -4202,7 +4230,9 @@ class _CuroboPlanner:
         # END capacity is admitted before destroying the working solver.
         capacity = _anchor_capacity(progress_map, self.anchors, self.budget, parameters)
         workspace = _planning_workspace_bytes(self.scene, self.robot_metadata, self.budget, capacity)
-        _require_planning_host_memory(workspace, max_host_rss_bytes=self.budget.max_host_rss_bytes)
+        _require_planning_host_memory(workspace.cpu_live_bytes,
+            encoded_record_bytes_upper=self.validation_storage["encoded_record_bytes_upper"],
+            max_host_rss_bytes=self.budget.max_host_rss_bytes)
         self.trajopt.destroy()
         self.trajopt = None
         # Native destroy() releases graphs, while optimizer callbacks can keep
@@ -4216,6 +4246,7 @@ class _CuroboPlanner:
         self.anchor_capacity = capacity
         self.scene_workspace_bytes = workspace.total_bytes
         self.scene_cpu_workspace_bytes, self.scene_gpu_workspace_bytes = workspace.cpu_bytes, workspace.gpu_bytes
+        self.scene_cpu_live_bytes = workspace.cpu_live_bytes
         self.anchor_fk_workspace_bytes = workspace.anchor_fk_bytes
         self._trajectory_optimizer_graph_admitted = workspace.trajectory_graph
         manager_type = _process_manager_type(self.problem, self.scene, progress_map, self.anchors,
@@ -5171,6 +5202,11 @@ class _CuroboPlanner:
 
     def export(self, result):
         """Build the same cubic on CPU, then check exact anchors and midpoints."""
+        # BEGIN previous candidates remain measured while admitting new records.
+        _require_planning_host_memory(self.scene_cpu_live_bytes,
+            encoded_record_bytes_upper=self.validation_storage["encoded_record_bytes_upper"],
+            max_host_rss_bytes=self.budget.max_host_rss_bytes)
+        # END the current candidate cannot spend another candidate's memory.
         trajectory = self._native_curve(result)
         torch = self.torch
         times, position, velocity = trajectory.times, trajectory.position, trajectory.velocity
@@ -5498,8 +5534,16 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                                initial_seconds=initial_seconds, stage=next_stage)
         check("binding_attempts")
         consumed["binding_attempts"] += 1
+        # BEGIN explicit allocation changes preserve the existing request ledger.
+        # Validate and retain the old ledger before considering the new limits,
+        # so an invalid change still returns this attempt's cumulative work.
         if previous is not None and budget is not None and asdict(budget) != asdict(original_budget):
-            raise ContinuationBindingError("A same request cannot reset or enlarge its original planning budget")
+            ledger = _request_work_ledger(problem, budget, ledger)
+            original_budget = budget
+            consumed = ledger["consumed_planning"]
+            request_budget = asdict(original_budget)
+            diagnostics.update(planning_budget=request_budget, consumed_planning=consumed)
+        # END allocation admission never buys a new solve, second or obligation.
         # BEGIN each admitted binding owns mutable problem and device state.
         # Initial clock construction can bind a hand before native allocation
         # fails. A private problem is therefore required for both first and

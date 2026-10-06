@@ -816,7 +816,9 @@ def parse_args():
     parser.add_argument("--max-refinement-points", type=int, default=16)
     parser.add_argument("--scene-gpu-workspace-mib", type=int, choices=(2048,), default=2048)
     # BEGIN request-level physical limits remain explicit in standalone runs.
-    parser.add_argument("--max-host-rss-mib", type=int, choices=(8192, 10240), default=8192)
+    # BEGIN expose the same explicit total cap as the production runner.
+    parser.add_argument("--max-host-rss-mib", type=int, choices=(8192, 10240, 12288), default=8192)
+    # END the unchanged default still requires an explicit larger allowance.
     parser.add_argument("--max-device-used-mib", type=int, choices=(6144, 8192), default=6144)
     # END defaults preserve the original half-host/half-device limits.
     parser.add_argument("--torch-memory-mib", type=int, choices=(4096,), default=4096)
