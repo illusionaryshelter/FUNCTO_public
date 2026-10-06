@@ -256,11 +256,16 @@ def run(args):
         if args.torch_memory_mib not in (2048, 4096) or args.scene_gpu_workspace_mib not in (1024, 2048, 3072, 6144):
             raise ValueError("Use only the explicitly bounded local Torch and scene allocations")
         # END process-tree and device-growth guards remain separate run limits.
-        torch.set_num_threads(2)
+        # BEGIN use the user-authorized eight CPU threads in this local runner.
+        # Native Coal batches join before Python resumes; their workers never
+        # call Torch/BLAS, so these pools do not multiply inside a Coal batch.
+        torch.set_num_threads(8)
+        # END CPU pool size does not change the separate GPU allocation cap.
         torch.cuda.set_per_process_memory_fraction(
             args.torch_memory_mib*1024**2/torch.cuda.get_device_properties(0).total_memory)
         torch.cuda.reset_peak_memory_stats()
         report["resource_limits"] = {"torch_allocator_bytes": args.torch_memory_mib*1024**2,
+                                     "torch_cpu_threads": torch.get_num_threads(),
                                      "scene_gpu_workspace_bytes": args.scene_gpu_workspace_mib*1024**2,
                                      "max_host_rss_bytes": args.max_host_rss_mib*1024**2,
                                      "max_device_used_bytes": args.max_device_used_mib*1024**2,

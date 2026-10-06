@@ -111,7 +111,12 @@ def test_snapshot_cache_reserve_covers_the_complete_inventory(count):
     record["shape_xyz"] = [count + 1, 2, 2]
     target = ObservedTsdfGeometry(record)
     assert target._collision_cache_capacity == count
-    assert target.collision_cache_storage_nbytes == target.pending_storage_nbytes == count * 4096
+    # BEGIN world-pose storage is reserved separately from native leaf shapes.
+    assert target.collision_cache_storage_nbytes == count * 4096
+    unallocated_preparation = (target.component_preparation_storage_nbytes
+                              - target._component_table.storage_nbytes)
+    assert target.pending_storage_nbytes == count*4096 + unallocated_preparation
+    # END an unqueried map already reserves future prepared target instances.
     assert target.storage_nbytes >= count * 4096
     assert not target._collision_cache  # Pre-admission reserves are not eager Coal allocations.
     # BEGIN the last source component belongs to the same admitted inventory.
@@ -177,7 +182,10 @@ def test_interleaved_states_never_evict_or_reconstruct_source_geometry(monkeypat
     assert list(target._collision_cache) == [("surface", 0), ("surface", 1), ("surface", 2)]
     again = select(1)
     assert len(calls) == 3 and len(target._collision_cache) == 3
-    assert target.pending_storage_nbytes == 0
+    # BEGIN constructing all shapes does not consume the world-pose reservation.
+    assert target.pending_storage_nbytes == (target.component_preparation_storage_nbytes
+                                             - target._component_table.storage_nbytes)
+    # END immutable source geometry and prepared query targets have distinct storage.
     assert again[2] is one[2]
     np.testing.assert_array_equal(again[3], one[3])
     np.testing.assert_array_equal(again[4], one[4])

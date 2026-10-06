@@ -419,11 +419,14 @@ class RobotGeometryChecker:
         # allowance; persistent source shapes are not duplicated per query.
         component_cache_bytes = sum(row["shape"].collision_cache_storage_nbytes
             for row in self._scene_shapes if isinstance(row["shape"], ObservedTsdfGeometry))
+        # BEGIN persistent prepared targets are not copied into query scratch.
+        component_cache_bytes += sum(row["shape"].component_preparation_storage_nbytes
+            for row in self._scene_shapes if isinstance(row["shape"], ObservedTsdfGeometry))
+        from .tsdf_spatial_query import component_batch_workspace_bytes
         self.scene_query_workspace_nbytes = (pair_bound * (131072 + 4096 * len(scene_binding["contacts"]))
             + 2 * (self.scene_storage_nbytes - self.native_query_storage_nbytes - component_cache_bytes)
-            # BEGIN one live batch: shape reserve plus references/pose scratch.
-            + (4096 * (4096 + 1024) if component_cache_bytes else 0))
-            # END the reserve is per query, never multiplied by map components.
+            + (component_batch_workspace_bytes(self._request) if component_cache_bytes else 0))
+        # END one bounded component batch includes its private workers and solvers.
         # BEGIN surface jobs own separate bounded descriptors, solvers and stacks.
         from .scene_surface_batch import surface_batch_workspace_bytes
         surface_targets = sum(isinstance(row["shape"], ObservedTsdfGeometry)
@@ -621,7 +624,7 @@ class RobotGeometryChecker:
             self._request, self._scene_surface_distance_cache)
         # END state order, signed-component hints and contact decisions remain serial.
         checked, stopped_pairs, component_summaries = set(), set(), {}
-        # BEGIN separate actual distance work from components covered by bounds.
+        # BEGIN distinguish admitted evidence, bounded physical work and pruning.
         component_searches = {}
         # END one aggregate per physical body/target/layer bounds report storage.
         boundary = max(self.numerics["gjk_tolerance"], self.numerics["epa_tolerance"])
@@ -639,9 +642,9 @@ class RobotGeometryChecker:
                     statistics=component_searches):
             # END component identities still remain on the individual rows.
                 row_count = len(rows)
-                # BEGIN a separated native prefix represents actual Coal calls.
+                # BEGIN a separated prefix counts evidence admitted in source order.
                 measured_count = second.get("_component_count", 1)
-                # END near/contact components always retain their individual row.
+                # END speculative suffix calls appear only in execution diagnostics.
                 issue_counts = tuple(len(items) for items in (violations, gaps, unresolved))
                 try:
             # END each component retains its original owner, body and layer identity.
@@ -1535,7 +1538,7 @@ def _target_component_runs(first, target, world_bounds, margin, request, *, hint
         "retained_pass_count": 0,
         "query_count": 0, "completed_queries": 0, "completed": False,
         "workspace_nbytes_upper": 0,
-        "scope": "physical component work; a seed can be queried before its source-order evidence is consumed"})
+        "scope": "original-order component schedule; a seed can be queried before its source-order evidence is consumed; physical executions and unconsumed work are reported in execution"})
     best, best_id = float("inf"), None
     for flat, component, pose, distance, measured in iter_component_distances(
             geometry, first["shape"], first["pose"], target["pose"], local_bounds, margin, request,

@@ -2,7 +2,7 @@
 // Static trees own only component bounds/IDs. Query objects contain current
 // support certificates, never contact policy, solver history or old distances.
 
-// BEGIN exact Coal distance scans stop before any later near-contact work.
+// BEGIN exact Coal evidence is consumed only through the first near-contact item.
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <Python.h>
 #include <numpy/arrayobject.h>
@@ -30,6 +30,12 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+// BEGIN cache keys include the SSE arithmetic controls when this target has SSE.
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
+// END status flags are excluded because ordinary arithmetic changes them.
 
 namespace {
 namespace bp = boost::python;
@@ -664,86 +670,6 @@ double pose_value(PyArrayObject* poses, Py_ssize_t index, int row, int column) {
   return value;
 }
 
-bp::tuple scan_separated_prefix(
-    const coal::CollisionGeometry& actor_shape,
-    const coal::Transform3s& actor_transform,
-    bp::object target_shapes,
-    bp::object target_world_poses,
-    const coal::DistanceRequest& request,
-    double stop_distance) {
-  if (!std::isfinite(stop_distance) || stop_distance < 0.) {
-    throw std::invalid_argument("stop_distance must be finite and nonnegative");
-  }
-  const Py_ssize_t count = PySequence_Size(target_shapes.ptr());
-  if (count < 0) bp::throw_error_already_set();
-  if (count > kMaximumBatchSize) {
-    throw std::invalid_argument("Scene distance batches may contain at most 4096 targets");
-  }
-  if (!PyArray_Check(target_world_poses.ptr())) {
-    throw std::invalid_argument("target_world_poses must be a NumPy float64[N,4,4] array");
-  }
-  auto* poses = reinterpret_cast<PyArrayObject*>(target_world_poses.ptr());
-  if (PyArray_NDIM(poses) != 3 || PyArray_DIM(poses, 0) != count
-      || PyArray_DIM(poses, 1) != 4 || PyArray_DIM(poses, 2) != 4
-      || PyArray_TYPE(poses) != NPY_DOUBLE || !PyArray_ISNOTSWAPPED(poses)) {
-    throw std::invalid_argument("target_world_poses must use native float64 with shape [N,4,4]");
-  }
-
-  Py_ssize_t minimum_index = -1;
-  double minimum_distance = std::numeric_limits<double>::infinity();
-  coal::DistanceResult minimum_result;
-  for (Py_ssize_t index = 0; index < count; ++index) {
-    // Extract only the shape actually visited. In particular, an invalid later
-    // entry must not raise after an earlier near item would stop Python policy.
-    bp::object target = target_shapes[index];
-    const coal::CollisionGeometry& target_shape =
-        bp::extract<const coal::CollisionGeometry&>(target);
-    coal::Matrix3s rotation;
-    coal::Vec3s translation;
-    for (int row = 0; row < 3; ++row) {
-      translation[row] = pose_value(poses, index, row, 3);
-      if (!std::isfinite(translation[row])) {
-        throw std::invalid_argument("A visited target transform contains nonfinite values");
-      }
-      for (int column = 0; column < 3; ++column) {
-        rotation(row, column) = pose_value(poses, index, row, column);
-        if (!std::isfinite(rotation(row, column))) {
-          throw std::invalid_argument("A visited target transform contains nonfinite values");
-        }
-      }
-    }
-    const coal::Transform3s target_transform(rotation, translation);
-
-    // Keep exactly the raw geometry/transform overload used by query_scene.
-    // A fresh result and coal::distance's fresh solver avoid ComputeDistance's
-    // persistent GJK/EPA/support history even when the request uses DefaultGuess.
-    coal::DistanceResult result;
-    coal::distance(&actor_shape, actor_transform, &target_shape, target_transform,
-                   request, result);
-    const double distance = result.min_distance;
-    if (!std::isfinite(distance)) {
-      throw std::runtime_error("Independent scene distance returned nonfinite evidence");
-    }
-    if (distance <= stop_distance) {
-      // Copy the native results through Coal's existing Boost.Python converter.
-      // Result geometry pointers have the same borrowed lifetime as a normal
-      // Coal DistanceResult; callers retain the representative shape while
-      // consuming it. No target or query state is retained by this module.
-      bp::object prefix = minimum_index < 0 ? bp::object() : bp::object(minimum_result);
-      return bp::make_tuple(index, minimum_index, prefix, index, bp::object(result));
-    }
-    if (distance < minimum_distance) {
-      // Strict comparison preserves the first component on equal distances,
-      // including numerically identical results and differently signed zeros.
-      minimum_index = index;
-      minimum_distance = distance;
-      minimum_result = result;
-    }
-  }
-  bp::object prefix = minimum_index < 0 ? bp::object() : bp::object(minimum_result);
-  return bp::make_tuple(count, minimum_index, prefix, -1, bp::object());
-}
-
 // BEGIN independent raw distances preserve input bits and indexed consumption.
 // Python ownership and error objects are created/destroyed with the GIL held.
 // Workers only read copied transforms/native pointers and write their own slot.
@@ -790,8 +716,10 @@ class OrderedDistanceBatch {
   OrderedDistanceBatch(bp::object first_shapes, bp::object first_transforms,
       bp::object second_shapes, bp::object second_transforms,
       const coal::DistanceRequest& request, int workers) : request_(request) {
-    if (workers < 1 || workers > 4)
-      throw std::invalid_argument("Distance workers must be between 1 and 4, including the caller");
+    // BEGIN the caller participates in the explicitly authorized eight-worker limit.
+    if (workers < 1 || workers > 8)
+      throw std::invalid_argument("Distance workers must be between 1 and 8, including the caller");
+    // END scheduling, request isolation and result consumption are unchanged.
     // A shared request with history would make later inputs depend on earlier
     // calls. Copying it per slot is deliberately forbidden for this interface.
     COAL_COMPILER_DIAGNOSTIC_PUSH
@@ -868,7 +796,7 @@ class OrderedDistanceBatch {
       threads.reserve(worker_count_ - 1);
       try {
         for (std::size_t lane = 1; lane < worker_count_; ++lane) threads.emplace_back(run, lane);
-        run(0);  // The caller is one worker, so total concurrency never exceeds 4.
+        run(0);  // The caller is one worker, so total concurrency never exceeds 8.
       } catch (...) {
         // A thread creation failure must never destroy a joinable thread or
         // return while a worker still refers to the batch under construction.
@@ -920,6 +848,372 @@ std::shared_ptr<OrderedDistanceBatch> ordered_distances(
       second_shapes, second_transforms, request, workers);
 }
 // END independent batches never own scene policy, spatial hints or cache writes.
+
+// BEGIN stable component ownership and prepared original-world-pose batches.
+// Every registered slot becomes immutable. An evicted Python pose-cache entry
+// remains valid while a generator or batch holds its prepared object alive.
+struct ComponentShapeEntry {
+  bp::object owner;
+  const coal::CollisionGeometry* shape = nullptr;
+};
+static_assert(sizeof(ComponentShapeEntry) <= 128,
+              "Update the Python component-table reservation for this ABI");
+
+class ComponentTable {
+ public:
+  explicit ComponentTable(Py_ssize_t count) {
+    if (count < 0) throw std::invalid_argument("Component table size must be nonnegative");
+    entries_.resize(static_cast<std::size_t>(count));
+  }
+
+  const coal::CollisionGeometry* register_shape(std::size_t index, const bp::object& owner) {
+    auto& entry = entries_.at(index);
+    if (entry.shape) {
+      // A flat ID belongs to exactly one geometry for this source map. Existing
+      // entries bypass Boost extraction, but never silently accept a new shape.
+      if (entry.owner.ptr() != owner.ptr())
+        throw std::invalid_argument("A registered component ID cannot change its native shape");
+      return entry.shape;
+    }
+    const auto* shape = &bp::extract<const coal::CollisionGeometry&>(owner)();
+    entry.owner = owner;
+    entry.shape = shape;
+    return shape;
+  }
+
+  std::size_t size() const { return entries_.size(); }
+  std::size_t slot_nbytes() const { return sizeof(ComponentShapeEntry); }
+  std::size_t storage_nbytes() const {
+    return sizeof(*this) + entries_.capacity() * sizeof(ComponentShapeEntry);
+  }
+
+ private:
+  std::vector<ComponentShapeEntry> entries_;
+};
+
+// Both callers use source-order, bounded arrays. Validation happens while the
+// GIL is held; workers never read a caller-mutable NumPy descriptor.
+std::vector<npy_intp> component_ids(const bp::object& object, std::size_t capacity) {
+  auto* values = checked_array(object, NPY_INTP, 1,
+      "Component IDs must be a sorted native intp array");
+  const npy_intp count = PyArray_DIM(values, 0);
+  if (count > kMaximumBatchSize)
+    throw std::invalid_argument("Scene distance batches may contain at most 4096 targets");
+  std::vector<npy_intp> ids;
+  ids.reserve(static_cast<std::size_t>(count));
+  npy_intp previous = -1;
+  for (npy_intp index = 0; index < count; ++index) {
+    const npy_intp value = array_value<npy_intp>(values, index);
+    if (value <= previous || value < 0 || static_cast<std::size_t>(value) >= capacity)
+      throw std::invalid_argument("Component IDs must be unique, sorted and within their table");
+    ids.push_back(value);
+    previous = value;
+  }
+  return ids;
+}
+
+struct DeferredComponentError {
+  bp::object type, value, traceback;
+  std::exception_ptr native;
+
+  void capture_python() {
+    PyObject *error_type = nullptr, *error_value = nullptr, *error_traceback = nullptr;
+    PyErr_Fetch(&error_type, &error_value, &error_traceback);
+    type = error_type ? bp::object(bp::handle<>(error_type)) : bp::object();
+    value = error_value ? bp::object(bp::handle<>(error_value)) : bp::object();
+    traceback = error_traceback ? bp::object(bp::handle<>(error_traceback)) : bp::object();
+  }
+
+  void raise() const {
+    if (type.ptr() != Py_None) {
+      PyObject* error_type = type.ptr();
+      PyObject* error_value = value.ptr() == Py_None ? nullptr : value.ptr();
+      PyObject* error_traceback = traceback.ptr() == Py_None ? nullptr : traceback.ptr();
+      Py_INCREF(error_type); Py_XINCREF(error_value); Py_XINCREF(error_traceback);
+      PyErr_Restore(error_type, error_value, error_traceback);
+      bp::throw_error_already_set();
+    }
+    if (native) std::rethrow_exception(native);
+  }
+};
+
+struct PreparedComponentEntry {
+  std::array<double, 16> original_pose{};
+  coal::Transform3s transform;
+  const coal::CollisionGeometry* shape = nullptr;
+  DeferredComponentError error;
+  bool initialized = false;
+  bool ready = false;
+};
+static_assert(sizeof(PreparedComponentEntry) <= 512,
+              "Update the Python prepared-pose reservation for this ABI");
+
+class ComponentDistanceBatch;
+
+class PreparedComponents : public std::enable_shared_from_this<PreparedComponents> {
+ public:
+  explicit PreparedComponents(std::shared_ptr<ComponentTable> table) : table_(std::move(table)) {
+    if (!table_) throw std::invalid_argument("Prepared components require their source table");
+    entries_.resize(table_->size());
+  }
+
+  bp::object missing(const bp::object& object) const {
+    const auto ids = component_ids(object, size());
+    std::vector<npy_intp> selected;
+    selected.reserve(ids.size());
+    for (const auto id : ids)
+      if (!entries_[static_cast<std::size_t>(id)].initialized) selected.push_back(id);
+    npy_intp dimensions[] = {static_cast<npy_intp>(selected.size())};
+    auto* array = reinterpret_cast<PyArrayObject*>(PyArray_SimpleNew(1, dimensions, NPY_INTP));
+    if (!array) bp::throw_error_already_set();
+    if (!selected.empty())
+      std::memcpy(PyArray_DATA(array), selected.data(), selected.size() * sizeof(npy_intp));
+    return bp::object(bp::handle<>(reinterpret_cast<PyObject*>(array)));
+  }
+
+  void register_components(const bp::object& object, const bp::object& shapes,
+                           const bp::object& world_poses) {
+    const auto ids = component_ids(object, size());
+    const Py_ssize_t count = PySequence_Size(shapes.ptr());
+    if (count < 0) bp::throw_error_already_set();
+    auto* poses = checked_array(world_poses, NPY_DOUBLE, 3,
+        "Component world poses must be native float64[N,4,4]");
+    if (static_cast<std::size_t>(count) != ids.size() || PyArray_DIM(poses, 0) != count
+        || PyArray_DIM(poses, 1) != 4 || PyArray_DIM(poses, 2) != 4)
+      throw std::invalid_argument("Component IDs, shapes and float64[N,4,4] poses must align");
+    // Global descriptor failures above belong to this registration call. A
+    // particular shape/pose failure below belongs only to that source ID and
+    // must not override an earlier near-contact decision.
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+      auto& entry = entries_[static_cast<std::size_t>(ids[index])];
+      if (entry.initialized)
+        throw std::invalid_argument("Prepared component slots cannot be registered twice");
+    }
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+      auto& entry = entries_[static_cast<std::size_t>(ids[index])];
+      entry.initialized = true;
+      try {
+        entry.shape = table_->register_shape(static_cast<std::size_t>(ids[index]),
+                                            shapes[static_cast<Py_ssize_t>(index)]);
+        coal::Matrix3s rotation;
+        coal::Vec3s translation;
+        for (int row = 0; row < 4; ++row) {
+          for (int column = 0; column < 4; ++column) {
+            const double value = pose_value(poses, static_cast<Py_ssize_t>(index), row, column);
+            entry.original_pose[static_cast<std::size_t>(row * 4 + column)] = value;
+            // Coal reads the first three rows. Preserve even unused bottom-row
+            // bits rather than regenerating a homogeneous matrix on retrieval.
+            if (row < 3) {
+              if (!std::isfinite(value))
+                throw std::invalid_argument("A visited target transform contains nonfinite values");
+              if (column < 3) rotation(row, column) = value;
+              else translation[row] = value;
+            }
+          }
+        }
+        entry.transform = coal::Transform3s(rotation, translation);
+        entry.ready = true;
+      } catch (const bp::error_already_set&) {
+        entry.error.capture_python();
+      } catch (...) {
+        entry.error.native = std::current_exception();
+      }
+    }
+  }
+
+  bp::object pose(Py_ssize_t index) const {
+    const auto& entry = checked_entry(index);
+    entry.error.raise();
+    npy_intp dimensions[] = {4, 4};
+    auto* array = reinterpret_cast<PyArrayObject*>(PyArray_SimpleNew(2, dimensions, NPY_DOUBLE));
+    if (!array) bp::throw_error_already_set();
+    std::memcpy(PyArray_DATA(array), entry.original_pose.data(), sizeof(double) * 16);
+    return bp::object(bp::handle<>(reinterpret_cast<PyObject*>(array)));
+  }
+
+  const PreparedComponentEntry& checked_entry(Py_ssize_t index) const {
+    if (index < 0 || static_cast<std::size_t>(index) >= size())
+      throw std::out_of_range("Prepared component ID is out of range");
+    const auto& entry = entries_[static_cast<std::size_t>(index)];
+    if (!entry.initialized)
+      throw std::invalid_argument("A required component has not been prepared");
+    return entry;
+  }
+
+  std::shared_ptr<ComponentDistanceBatch> scan(const bp::object& actor,
+      const coal::Transform3s& actor_transform, const bp::object& ids,
+      const coal::DistanceRequest& request, int workers);
+
+  std::size_t size() const { return entries_.size(); }
+  std::size_t slot_nbytes() const { return sizeof(PreparedComponentEntry); }
+  std::size_t storage_nbytes() const {
+    // The separately reported table owns shapes once, independent of poses.
+    return sizeof(*this) + entries_.capacity() * sizeof(PreparedComponentEntry);
+  }
+
+ private:
+  std::shared_ptr<ComponentTable> table_;
+  std::vector<PreparedComponentEntry> entries_;
+};
+
+struct ComponentDistanceEntry {
+  const PreparedComponentEntry* target = nullptr;
+  coal::DistanceResult distance;
+  std::exception_ptr error;
+  bool queried = false;
+};
+static_assert(sizeof(ComponentDistanceEntry) <= 1024,
+              "Update the Python component-batch reservation for this ABI");
+
+class ComponentDistanceBatch {
+ public:
+  ComponentDistanceBatch(std::shared_ptr<PreparedComponents> prepared, const bp::object& actor,
+      const coal::Transform3s& actor_transform, const bp::object& object,
+      const coal::DistanceRequest& request, int workers)
+      : prepared_(std::move(prepared)), actor_owner_(actor), actor_transform_(actor_transform),
+        request_(request) {
+    // BEGIN component work shares the explicitly authorized eight-worker limit.
+    if (workers < 1 || workers > 8)
+      throw std::invalid_argument("Distance workers must be between 1 and 8, including the caller");
+    // END contiguous worker ranges and original-order reduction are unchanged.
+    COAL_COMPILER_DIAGNOSTIC_PUSH
+    COAL_COMPILER_DIAGNOSTIC_IGNORED_DEPRECECATED_DECLARATIONS
+    const bool stateful = request.gjk_initial_guess == coal::GJKInitialGuess::CachedGuess
+        || request.enable_cached_gjk_guess;
+    COAL_COMPILER_DIAGNOSTIC_POP
+    if (stateful)
+      throw std::invalid_argument("Independent component batches require requests without cached GJK history");
+    actor_ = &bp::extract<const coal::CollisionGeometry&>(actor_owner_)();
+    const auto ids = component_ids(object, prepared_->size());
+    entries_.resize(ids.size());
+    worker_count_ = std::min(static_cast<std::size_t>(workers), entries_.size());
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+      try {
+        entries_[index].target = &prepared_->checked_entry(ids[index]);
+      } catch (...) {
+        // Missing preparation, like a prepared bad shape, is exposed at its
+        // own source position rather than during speculative suffix setup.
+        entries_[index].error = std::current_exception();
+      }
+    }
+    if (entries_.empty()) return;
+    std::fenv_t caller_environment;
+    if (std::fegetenv(&caller_environment) != 0)
+      throw std::runtime_error("Cannot read component caller floating-point environment");
+    {
+      const ReleasedGIL released;
+      const auto run = [this, &caller_environment](std::size_t lane) noexcept {
+        const std::size_t begin = lane * entries_.size() / worker_count_;
+        const std::size_t end = (lane + 1) * entries_.size() / worker_count_;
+        try {
+          const QueryFloatingEnvironment environment(caller_environment);
+          for (std::size_t index = begin; index < end; ++index) {
+            auto& entry = entries_[index];
+            if (!entry.target || !entry.target->ready) continue;
+            try {
+              // Raw Coal distance creates a fresh solver for each independent
+              // item. The original request and every persistent shape stay read-only.
+              const coal::DistanceRequest local_request(request_);
+              entry.queried = true;
+              coal::distance(actor_, actor_transform_, entry.target->shape,
+                  entry.target->transform, local_request, entry.distance);
+              if (!std::isfinite(entry.distance.min_distance))
+                throw std::runtime_error("Independent scene distance returned nonfinite evidence");
+            } catch (...) {
+              entry.error = std::current_exception();
+            }
+          }
+        } catch (...) {
+          const auto error = std::current_exception();
+          for (std::size_t index = begin; index < end; ++index)
+            if (entries_[index].target && entries_[index].target->ready) entries_[index].error = error;
+        }
+      };
+      std::vector<std::thread> threads;
+      threads.reserve(worker_count_ - 1);
+      try {
+        for (std::size_t lane = 1; lane < worker_count_; ++lane) threads.emplace_back(run, lane);
+        run(0);
+      } catch (...) {
+        for (auto& thread : threads) thread.join();
+        throw;
+      }
+      for (auto& thread : threads) thread.join();
+    }
+    // Read worker-written counters only after joining; there is no shared
+    // counter contention. Include failing Coal calls and speculative suffixes.
+    for (const auto& entry : entries_) physical_query_count_ += entry.queried;
+  }
+
+  bp::tuple prefix(Py_ssize_t start, double stop_distance) const {
+    if (start < 0 || static_cast<std::size_t>(start) > entries_.size())
+      throw std::out_of_range("Component prefix start is out of range");
+    if (!std::isfinite(stop_distance) || stop_distance < 0.)
+      throw std::invalid_argument("stop_distance must be finite and nonnegative");
+    Py_ssize_t minimum = -1;
+    double minimum_distance = kInfinity;
+    const coal::DistanceResult* minimum_result = nullptr;
+    for (std::size_t index = static_cast<std::size_t>(start); index < entries_.size(); ++index) {
+      const auto& entry = entries_[index];
+      if (entry.error) std::rethrow_exception(entry.error);
+      entry.target->error.raise();
+      const Py_ssize_t relative = static_cast<Py_ssize_t>(index) - start;
+      if (entry.distance.min_distance <= stop_distance) {
+        bp::object result = minimum_result ? bp::object(*minimum_result) : bp::object();
+        return bp::make_tuple(relative, minimum, result, relative, bp::object(entry.distance));
+      }
+      if (entry.distance.min_distance < minimum_distance) {
+        // Completion order cannot select a different equal-distance component.
+        minimum = relative;
+        minimum_distance = entry.distance.min_distance;
+        minimum_result = &entry.distance;
+      }
+    }
+    bp::object result = minimum_result ? bp::object(*minimum_result) : bp::object();
+    return bp::make_tuple(static_cast<Py_ssize_t>(entries_.size()) - start,
+                         minimum, result, -1, bp::object());
+  }
+
+  std::size_t size() const { return entries_.size(); }
+  std::size_t worker_count() const { return worker_count_; }
+  std::size_t physical_query_count() const { return physical_query_count_; }
+  std::size_t slot_nbytes() const { return sizeof(ComponentDistanceEntry); }
+  std::size_t storage_nbytes() const {
+    // Prepared poses and geometry payloads are separately owned/reserved. This
+    // reports fixed native batch values, excluding solver/thread transients.
+    return sizeof(*this) + entries_.capacity() * sizeof(ComponentDistanceEntry);
+  }
+
+ private:
+  std::shared_ptr<PreparedComponents> prepared_;
+  bp::object actor_owner_;
+  const coal::CollisionGeometry* actor_ = nullptr;
+  coal::Transform3s actor_transform_;
+  coal::DistanceRequest request_;
+  std::vector<ComponentDistanceEntry> entries_;
+  std::size_t worker_count_ = 0;
+  std::size_t physical_query_count_ = 0;
+};
+
+std::shared_ptr<ComponentDistanceBatch> PreparedComponents::scan(const bp::object& actor,
+    const coal::Transform3s& actor_transform, const bp::object& ids,
+    const coal::DistanceRequest& request, int workers) {
+  return std::make_shared<ComponentDistanceBatch>(shared_from_this(), actor,
+      actor_transform, ids, request, workers);
+}
+
+bp::tuple floating_point_mode_key() {
+  const int rounding = std::fegetround();
+  if (rounding < 0) throw std::runtime_error("Cannot read floating-point rounding mode");
+  unsigned int controls = 0;
+#if defined(__SSE__)
+  // MXCSR bits 0..5 are sticky exception status. Bits 6..15 contain DAZ,
+  // exception masks, rounding and FTZ; these can affect NumPy's multiplication.
+  controls = _mm_getcsr() & 0xffc0u;
+#endif
+  return bp::make_tuple(rounding, controls);
+}
+// END prepared data never caches distances, search certificates or contact policy.
 }  // namespace
 
 BOOST_PYTHON_MODULE(_coal_scene_batch) {
@@ -930,6 +1224,39 @@ BOOST_PYTHON_MODULE(_coal_scene_batch) {
   boost::python::import("coal");
   boost::python::scope().attr("MAX_BATCH_SIZE") = kMaximumBatchSize;
   boost::python::scope().attr("MAX_PROJECTION_DIRECTIONS") = kMaximumProjectionDirections;
+  // BEGIN prepared component bindings own geometry and preserve source-order evidence.
+  bp::class_<ComponentTable, std::shared_ptr<ComponentTable>, boost::noncopyable>(
+      "ComponentTable", bp::init<Py_ssize_t>((bp::arg("count"))))
+      .add_property("size", &ComponentTable::size)
+      .add_property("slot_nbytes", &ComponentTable::slot_nbytes)
+      .add_property("storage_nbytes", &ComponentTable::storage_nbytes);
+  bp::class_<PreparedComponents, std::shared_ptr<PreparedComponents>, boost::noncopyable>(
+      "PreparedComponents", bp::init<std::shared_ptr<ComponentTable>>((bp::arg("table"))))
+      .def("missing", &PreparedComponents::missing, (bp::arg("ids")))
+      .def("register", &PreparedComponents::register_components,
+           (bp::arg("ids"), bp::arg("shapes"), bp::arg("world_poses")))
+      .def("pose", &PreparedComponents::pose, (bp::arg("flat_id")))
+      .def("scan", &PreparedComponents::scan,
+           (bp::arg("actor_shape"), bp::arg("actor_transform"), bp::arg("ids"),
+            bp::arg("request"), bp::arg("workers") = 8))
+      .add_property("size", &PreparedComponents::size)
+      .add_property("slot_nbytes", &PreparedComponents::slot_nbytes)
+      .add_property("storage_nbytes", &PreparedComponents::storage_nbytes);
+  bp::class_<ComponentDistanceBatch, std::shared_ptr<ComponentDistanceBatch>, boost::noncopyable>(
+      "ComponentDistanceBatch", bp::no_init)
+      .def("prefix", &ComponentDistanceBatch::prefix,
+           (bp::arg("start"), bp::arg("stop_distance")),
+           "Return (count, minimum_index, minimum_result, near_index, near_result).\n"
+           "Indices are relative to start. Only errors through the first near item are exposed.\n"
+           "Already computed suffix slots can be consumed by a later prefix call.")
+      .def("__len__", &ComponentDistanceBatch::size)
+      .add_property("worker_count", &ComponentDistanceBatch::worker_count)
+      .add_property("physical_query_count", &ComponentDistanceBatch::physical_query_count)
+      .add_property("slot_nbytes", &ComponentDistanceBatch::slot_nbytes)
+      .add_property("storage_nbytes", &ComponentDistanceBatch::storage_nbytes);
+  bp::def("floating_point_mode_key", &floating_point_mode_key,
+          "Return rounding and platform arithmetic-control bits, excluding exception status flags.");
+  // END one immutable source table can back successive exact owner-pose instances.
   // BEGIN owned ordered results defer every item failure to its consumption.
   bp::class_<OrderedDistanceBatch, std::shared_ptr<OrderedDistanceBatch>, boost::noncopyable>(
       "OrderedDistanceBatch", bp::no_init)
@@ -939,8 +1266,8 @@ BOOST_PYTHON_MODULE(_coal_scene_batch) {
       .add_property("storage_nbytes", &OrderedDistanceBatch::storage_nbytes);
   bp::def("ordered_distances", &ordered_distances,
       (bp::arg("first_shapes"), bp::arg("first_transforms"), bp::arg("second_shapes"),
-       bp::arg("second_transforms"), bp::arg("request"), bp::arg("workers") = 1),
-      "Evaluate independent cold-request distances in input slots with at most four workers.\n"
+       bp::arg("second_transforms"), bp::arg("request"), bp::arg("workers") = 8),
+      "Evaluate independent cold-request distances in input slots with at most eight workers.\n"
       "Transforms are copied without arithmetic. No request history is propagated between items.\n"
       "batch.result(index) returns a fresh result copy or rethrows that item's deferred exception.\n"
       "Keep the batch or original geometries alive while consuming Coal result geometry pointers.");
@@ -965,15 +1292,5 @@ BOOST_PYTHON_MODULE(_coal_scene_batch) {
        bp::arg("target_transform"), bp::arg("distance_result")),
       "Return an outward upper distance from feasible native-geometry points; infinity if uncertified.");
   // END no contact rule or prior-state result is stored in the native index.
-  boost::python::def(
-      "scan_separated_prefix", &scan_separated_prefix,
-      (boost::python::arg("actor_shape"), boost::python::arg("actor_transform"),
-       boost::python::arg("target_shapes"), boost::python::arg("target_world_poses"),
-       boost::python::arg("request"), boost::python::arg("stop_distance")),
-      "Query at most 4096 targets in order using fresh Coal distance results.\n"
-      "Return (separated_count, minimum_index, minimum_result, near_index, near_result).\n"
-      "The first distance <= stop_distance ends the scan; later shapes and poses\n"
-      "are not inspected. Missing indices/results are -1/None. Indices are local\n"
-      "to this batch. Input poses must be original native float64[N,4,4] values.");
 }
-// END near-contact decisions and all later queries stay in Python's original order.
+// END near-contact decisions and result consumption stay in Python's original order.

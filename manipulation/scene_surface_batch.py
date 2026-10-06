@@ -14,7 +14,9 @@ from ._coal_scene_batch import ordered_distances
 from .tsdf_geometry import ObservedTsdfGeometry
 
 
-SURFACE_QUERY_WORKERS = 4
+# BEGIN use the user's eight-worker default, including the calling thread.
+SURFACE_QUERY_WORKERS = 8
+# END component batches run later, so the two worker groups never nest.
 
 
 def selected_body_pairs(actor, targets, decisions, visited):
@@ -39,7 +41,7 @@ def selected_body_pairs(actor, targets, decisions, visited):
 
 
 def surface_batch_workspace_bytes(pair_bound, request):
-    """Reserve descriptors/results and four private solver/stack workspaces.
+    """Reserve descriptors/results and the selected private worker workspaces.
 
     Shared native shapes/BVHs and the persistent last-result cache are already
     charged by the scene. The new 16-KiB per-pair reserve includes Python slots,
@@ -47,7 +49,9 @@ def surface_batch_workspace_bytes(pair_bound, request):
     Native container bytes remain separately observable; this conservative
     admission reserve does not pretend to measure third-party peak allocation.
     """
-    workers = min(pair_bound, 4)
+    # BEGIN admission follows the production worker count, not an obsolete cap.
+    workers = min(pair_bound, SURFACE_QUERY_WORKERS)
+    # END benchmark overrides change both dispatch and its conservative reserve.
     solver = 32768 + 512 * int(request.epa_max_iterations)
     return int(pair_bound * 16384 + workers * (8 * 1024**2 + solver))
 

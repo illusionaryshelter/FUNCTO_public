@@ -320,7 +320,8 @@ class ObservedTsdfGeometry:
     Bounds and all returned vertices use the Mapper integration frame. The
     caller applies an owner's current pose once. The tree preserves the closed
     AABB candidate predicate. Shapes are constructed only on first use and stay
-    with this source map; query poses, distances and permissions never do.
+    with this source map. One exact owner pose may retain its prepared world
+    transforms; distances, robot poses and contact permissions never do.
     """
 
     # BEGIN count every still-live map's unmaterialized shapes before allocation.
@@ -334,8 +335,17 @@ class ObservedTsdfGeometry:
 
     @property
     def pending_storage_nbytes(self):
-        """Admitted shapes not yet represented in the process's resident bytes."""
-        return (self._collision_cache_capacity-len(self._collision_cache))*4096
+        """Admitted shape/pose capacity not yet represented in resident bytes."""
+        # BEGIN include the future prepared table and its replacement overlap.
+        # The fixed component table is already allocated. A prepared instance
+        # allocates all its slots together; its bytes are resident even while
+        # most slots have no world transform yet. The second reserve covers a
+        # pose change while the preceding query still holds its old instance.
+        prepared_bytes = (0 if self._prepared_components is None else
+                          int(self._prepared_components.storage_nbytes))
+        return ((self._collision_cache_capacity-len(self._collision_cache))*4096
+                + self._prepared_component_capacity_nbytes-prepared_bytes)
+        # END consumed capacity is not charged a second time as future work.
 
     @staticmethod
     def initial_allocation_bound(record):
@@ -362,8 +372,13 @@ class ObservedTsdfGeometry:
         count = sum(counts)
         # 256 B per component is the native tree's complete construction reserve,
         # not just sizeof(node); 64 B covers Python-owned boxes/flags/index scratch.
-        return (3*sum(sizes.values()) + count*(4096+256+64)
-                + counts[0]*(4*512+512) + 8*1024**2)
+        # BEGIN fixed native pointer slots and two bounded prepared pose tables.
+        # 128 B covers a component slot; 512 B covers a full original matrix,
+        # Coal transform and delayed-error bookkeeping. These are conservative
+        # admission allowances, checked against the native container sizes.
+        return (3*sum(sizes.values()) + count*(4096+256+64+128+2*512)
+                + counts[0]*(4*512+512) + 8*1024**2 + 16384)
+        # END no trajectory-length pose history can accumulate.
     # END full map capacity is reserved before a sparse first query can hide it.
 
     def __init__(self, record, *, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
@@ -374,7 +389,7 @@ class ObservedTsdfGeometry:
             pending_existing_bytes=self.pending_storage_total_nbytes(),
             max_rss_bytes=max_host_rss_bytes)
         try:
-            from ._coal_scene_batch import ComponentAABBTree
+            from ._coal_scene_batch import ComponentAABBTree, ComponentTable
         except ImportError as error:
             raise RuntimeError("Build the project Coal adapter with PYTHONNOUSERSITE=1 "
                                "python tests/planning/build_coal_scene_batch.py") from error
@@ -455,7 +470,14 @@ class ObservedTsdfGeometry:
         # IDs rather than an evicting subset. Query batches borrow these objects.
         self._collision_cache_capacity = sum(self._counts)
         self._collision_cache = {}
+        # BEGIN fixed component identity plus one most-recent exact pose.
+        self._component_table = ComponentTable(self._collision_cache_capacity)
+        self._prepared_components = None
+        self._prepared_components_key = None
+        self._prepared_component_capacity_nbytes = 2*(4096+512*self._collision_cache_capacity)
         self.storage_nbytes += self.collision_cache_storage_nbytes
+        self.storage_nbytes += self.component_preparation_storage_nbytes
+        # END shape construction and world-pose preparation remain lazy.
         self._live_geometries.add(self)
         # END map identity, not state count, owns the complete residency bound.
 
@@ -465,6 +487,42 @@ class ObservedTsdfGeometry:
         """Full source-component residency reserve, independent of occupancy."""
         return self._collision_cache_capacity * 4096
     # END a query borrows cached shapes without cloning this reserve.
+
+    # BEGIN exact world-transform reuse is scoped to this immutable source map.
+    @property
+    def component_preparation_storage_nbytes(self):
+        """Native pointer table plus current/replacement world-pose capacity."""
+        return int(self._component_table.storage_nbytes)+self._prepared_component_capacity_nbytes
+
+    def prepared_components(self, owner_pose):
+        """Borrow the most recent pose's native slots without changing its bits.
+
+        The caller fills only misses in its current bounded component segment,
+        using the original individual NumPy matrix products. Geometry object
+        identity already separates source snapshots and coarse/fine layers.
+        A replacement is a new object so an earlier generator may safely keep
+        its strong reference; no cached result or permission is carried over.
+        """
+        from ._coal_scene_batch import PreparedComponents, floating_point_mode_key
+
+        pose = np.asarray(owner_pose)
+        if pose.shape != (4, 4) or pose.dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+            raise ValueError("Prepared owner poses require a float32 or float64 [4,4] matrix")
+        # Equal operands alone do not imply equal products: NumPy can select a
+        # different multiplication loop for strided or unaligned matrices.
+        # Rounding/subnormal controls and error policies also belong to this
+        # identity. Sticky status flags naturally change and are not a key.
+        key = (pose.dtype.str, pose.shape, pose.strides, bool(pose.flags.aligned),
+               pose.tobytes(order="C"),
+               floating_point_mode_key(), tuple(np.geterr().items()))
+        if key != self._prepared_components_key:
+            prepared = PreparedComponents(self._component_table)
+            if int(prepared.storage_nbytes) > self._prepared_component_capacity_nbytes//2:
+                raise RuntimeError("Native prepared slots exceed their admitted storage reserve")
+            self._prepared_components = prepared
+            self._prepared_components_key = key
+        return self._prepared_components
+    # END pose reuse never changes the NumPy product used for an unprepared ID.
 
     # BEGIN select exact component IDs before deciding whether vertices are needed.
     def iter_components(self, bounds=None, *, surface=True, negative=True):

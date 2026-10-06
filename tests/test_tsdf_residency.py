@@ -23,11 +23,16 @@ def test_pending_residency_counts_shared_maps_once_and_releases_retired_maps():
     first = ObservedTsdfGeometry(component_record([[[x, 0., 0.]] for x in (0., 1., 2.)]))
     shared = first
     reference = weakref.ref(first)
-    assert ObservedTsdfGeometry.pending_storage_total_nbytes()-before == 3*4096
+    # BEGIN count admitted prepared-target capacity alongside unbuilt shapes.
+    first_pending = first.pending_storage_nbytes
+    assert first_pending > 3*4096
+    assert ObservedTsdfGeometry.pending_storage_total_nbytes()-before == first_pending
     first.collision_component(1)
-    assert shared.pending_storage_nbytes == 2*4096
+    assert shared.pending_storage_nbytes == first_pending-4096
     second = ObservedTsdfGeometry(component_record([[[0., 1., 0.]], [[1., 1., 0.]]]))
-    assert ObservedTsdfGeometry.pending_storage_total_nbytes()-before == 4*4096
+    assert ObservedTsdfGeometry.pending_storage_total_nbytes()-before == (
+        first_pending-4096+second.pending_storage_nbytes)
+    # END sharing a map counts its complete pending reservation only once.
     del first, shared
     gc.collect()
     assert reference() is None

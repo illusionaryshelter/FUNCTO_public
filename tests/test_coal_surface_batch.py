@@ -50,7 +50,7 @@ def surface():
     return mesh
 
 
-@pytest.mark.parametrize("workers", [1, 2, 4])
+@pytest.mark.parametrize("workers", [1, 8])
 def test_shared_bvh_and_native_shapes_match_original_bits_and_remain_immutable(workers):
     box, sphere, mesh = coal.Box(.04, .06, .08), coal.Sphere(.015), surface()
     first = [box, box, sphere, box, box, sphere, box, box]
@@ -84,7 +84,7 @@ def test_shared_bvh_and_native_shapes_match_original_bits_and_remain_immutable(w
     assert evidence(batch.result(0)) == expected[0]
 
 
-@pytest.mark.parametrize("workers", [1, 2, 4])
+@pytest.mark.parametrize("workers", [1, 8])
 def test_non_degenerate_normal_bits_match_fresh_coal_calls(workers):
     first, second = coal.Box(.03, .04, .05), coal.Sphere(.01)
     poses = [transform((.2, -.1, .03)), transform((-.2, .03, -.04))]
@@ -97,7 +97,7 @@ def test_non_degenerate_normal_bits_match_fresh_coal_calls(workers):
         assert np.asarray(actual.normal).tobytes() == np.asarray(original.normal).tobytes()
 
 
-@pytest.mark.parametrize("workers", [1, 2, 4])
+@pytest.mark.parametrize("workers", [1, 8])
 def test_python_conversion_and_native_failures_wait_for_the_requested_index(workers):
     box, empty_mesh = coal.Box(.1, .1, .1), coal.BVHModelOBBRSS()
     request = coal.DistanceRequest()
@@ -129,21 +129,25 @@ def test_python_sequence_error_preserves_original_exception_until_consumption():
 
     sphere, request = coal.Sphere(.01), coal.DistanceRequest()
     batch = ordered_distances([sphere]*3, [transform()]*3, [sphere]*3,
-                              BrokenSequence(), request, 2)
+                              BrokenSequence(), request, 8)
     assert evidence(batch.result(0)) == evidence(batch.result(2))
     for _ in range(2):
         with pytest.raises(LookupError, match="later descriptor deliberately failed"):
             batch.result(1)
 
 
-@pytest.mark.parametrize("workers", [1, 2, 4])
+@pytest.mark.parametrize("workers", [1, 8])
 def test_each_worker_inherits_and_restores_caller_rounding_mode(workers):
     library = ctypes.CDLL(None)
     previous = library.fegetround()
     actor, target, request = coal.Box(.03, .04, .05), surface(), coal.DistanceRequest()
+    # BEGIN eight jobs verify the floating environment on all default lanes.
     actor_poses = [transform((.2, -.03, .07)), transform((-.1, .02, .08)),
-                   transform((.04, .03, .11)), transform((.15, -.02, .13))]
-    target_poses = [transform()]*4
+                   transform((.04, .03, .11)), transform((.15, -.02, .13)),
+                   transform((.21, -.04, .08)), transform((-.11, .03, .09)),
+                   transform((.05, .04, .12)), transform((.16, -.03, .14))]
+    target_poses = [transform()]*len(actor_poses)
+    # END all transforms precede each change of rounding mode.
     try:
         # Linux/x86 FE_TONEAREST, FE_DOWNWARD, FE_UPWARD and FE_TOWARDZERO.
         # All transforms are already constructed: only the native query's
@@ -152,10 +156,11 @@ def test_each_worker_inherits_and_restores_caller_rounding_mode(workers):
             assert library.fesetround(mode) == 0
             expected = [evidence(raw(actor, pose, target, target_poses[index], request))
                         for index, pose in enumerate(actor_poses)]
-            batch = ordered_distances([actor]*4, actor_poses, [target]*4,
+            batch = ordered_distances([actor]*len(actor_poses), actor_poses, [target]*len(actor_poses),
                                       target_poses, request, workers)
+            assert batch.worker_count == workers
             assert library.fegetround() == mode
-            for index in range(4):
+            for index in range(len(actor_poses)):
                 assert evidence(batch.result(index)) == expected[index]
             assert library.fegetround() == mode
     finally:
@@ -164,21 +169,23 @@ def test_each_worker_inherits_and_restores_caller_rounding_mode(workers):
 
 def test_empty_large_batch_and_request_history_contract():
     sphere, request = coal.Sphere(.01), coal.DistanceRequest()
-    empty = ordered_distances([], [], [], [], request, 4)
+    empty = ordered_distances([], [], [], [], request, 8)
     assert len(empty) == 0 and empty.worker_count == 0
     with pytest.raises(IndexError):
         empty.result(0)
     # The old prefix-scan's 4096 leaf cap is not a new scene-inventory limit.
     count = 4097
     first, second = transform(), transform((.3, -0., +0.))
+    # BEGIN omitted worker arguments use the same eight-worker production default.
     batch = ordered_distances([sphere]*count, [first]*count, [sphere]*count,
-                              [second]*count, request, 4)
-    assert len(batch) == count
+                              [second]*count, request)
+    assert len(batch) == count and batch.worker_count == 8
+    # END raw distance evidence below is still compared to a fresh public call.
     assert evidence(batch.result(count-1)) == evidence(raw(sphere, first, sphere, second, request))
     with pytest.raises(ValueError, match="equal lengths"):
         ordered_distances([sphere], [], [sphere], [second], request)
-    for workers in (0, 5):
-        with pytest.raises(ValueError, match="between 1 and 4"):
+    for workers in (0, 9):
+        with pytest.raises(ValueError, match="between 1 and 8"):
             ordered_distances([], [], [], [], request, workers)
     request.gjk_initial_guess = coal.GJKInitialGuess.CachedGuess
     with pytest.raises(ValueError, match="without cached GJK history"):
