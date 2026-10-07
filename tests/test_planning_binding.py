@@ -36,6 +36,81 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertLessEqual(budget.maximum_trajectory_dt, PlanningBudget().maximum_trajectory_dt)
         self.assertNotEqual(budget.maximum_trajectory_dt, PlanningBudget().maximum_trajectory_dt)
 
+    # BEGIN source duration owns timing; output spacing cannot stretch it to 16 seconds.
+    def test_source_duration_selects_exact_dense_grid_within_existing_capacity(self):
+        original = PlanningBudget(knots=16, interpolation_buffer_size=768)
+        problem = self.problem(source_times=(0., 4., 9.850000000000293))
+        selected, mapping = _initial_timing(problem, original)
+        grid = _fixed_spline_grid(intervals=20, native_dt=selected.maximum_trajectory_dt,
+            interpolation_steps=selected.interpolation_steps, interpolation_dt=selected.interpolation_dt)
+        self.assertEqual((grid["subdivisions"], grid["valid_count"]), (32, 641))
+        self.assertGreaterEqual(grid["duration"], problem.source_timestamps[-1])
+        self.assertLess(grid["duration"]-problem.source_timestamps[-1], 2e-6)
+        self.assertLessEqual(grid["interpolation_dt"], original.interpolation_dt)
+        self.assertEqual(grid["interpolation_dt"]*32, grid["knot_dt"])
+        self.assertEqual(grid["native_dt"]*4, grid["knot_dt"])
+        self.assertEqual(grid["interpolation_dt"]*640, grid["duration"])
+        np.testing.assert_array_equal(mapping.u, problem.source_timestamps/problem.source_timestamps[-1])
+
+    def test_source_clock_keeps_general_step_counts_and_original_duration_cap(self):
+        # These clocks were already admissible. Source quantization must also
+        # preserve the exact native multiplication for odd step counts.
+        for steps in (1, 2, 3, 4, 5, 6, 7, 8):
+            with self.subTest(steps=steps):
+                original = PlanningBudget(knots=6, interpolation_steps=steps,
+                    maximum_trajectory_dt=.125, interpolation_dt=.03125, interpolation_buffer_size=512)
+                problem = self.problem(source_times=(0., .4, 1.001))
+                selected, _ = _initial_timing(problem, original)
+                grid = _fixed_spline_grid(intervals=10, native_dt=selected.maximum_trajectory_dt,
+                    interpolation_steps=steps, interpolation_dt=selected.interpolation_dt)
+                self.assertGreaterEqual(grid["duration"], 1.001)
+                self.assertLess(grid["duration"]-1.001, 2e-6)
+                self.assertLessEqual(selected.maximum_trajectory_dt, .125)
+                longer = self.problem(source_times=(0., 20., 100.))
+                capped, _ = _initial_timing(longer, original)
+                self.assertEqual(capped.maximum_trajectory_dt, .125)
+
+    def test_selected_source_clock_binds_native_events_and_timed_fingers_together(self):
+        from curobo._src.types.control_space import ControlSpace
+        from manipulation.planning import JointTrajectory, _formal_native_clock
+        from manipulation.planning_scene import PrismaticGripper
+
+        event = PlanningEvent("close", "current", .8, 183, "close", "transferred reference command")
+        problem = self.problem((event,), source_times=(0., 9.15, 9.85), source_progress=(0., .8, 1.))
+        budget, mapping = _initial_timing(problem, PlanningBudget(knots=16, interpolation_buffer_size=768))
+        native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=budget.maximum_trajectory_dt,
+            maximum_trajectory_dt=budget.maximum_trajectory_dt, interpolation_dt=budget.interpolation_dt),
+            interpolation_steps=budget.interpolation_steps, action_horizon=budget.knots,
+            transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3))
+        grid = _formal_native_clock(native)
+        mapping, _ = _progress_for_cubic_boundaries(mapping, budget.knots, problem.start_dq,
+            stop_progress=problem.stop_progress, anchors=problem.anchors)
+        mapping = _bind_event_clock(problem, mapping, grid["duration"], .002)
+        seen = []
+
+        def fingers(duration, progress_map):
+            seen.append((duration, progress_map))
+            return JointTrajectory(("finger",), np.array([0., duration]), np.full((2, 1), .04),
+                np.zeros((2, 1)), progress_map.u, progress_map.s, (), (), {})
+
+        hand = PrismaticGripper(controller="timed_reference", control_timestep_s=.002,
+            joint_names=("finger",), current_positions=[.04], joint_limits=[[0., .04]], joint_bounds=None,
+            finger_trajectory_factory=fingers, nominal_finger_trajectory_factory=fingers,
+            coupling_matrix=np.empty((0, 1)), coupling_offset=[], sphere_indices=(0,),
+            local_spheres=[[0., 0., 0., .001]], sphere_joint_translation=[[[1.], [0.], [0.]]],
+            self_collision_pairs=(), commands=[{"skill_id": "current", "event_id": "close", "occurrence": 0,
+                "command": "close", "progress": .8}], source="explicit CPU clock contract")
+        hand.bind_clock(grid["duration"], mapping)
+        self.assertTrue(all(duration == grid["duration"] and actual_map is mapping for duration, actual_map in seen))
+        self.assertEqual(hand.finger_trajectory.duration, hand.nominal_finger_trajectory.duration)
+        self.assertEqual(hand.finger_trajectory.duration, grid["duration"])
+        record = mapping.event_clock[("current", "close", 0)]
+        self.assertEqual(record["activation_time_s"], mapping.anchor_parameters([.8])[0, 0]*grid["duration"])
+        self.assertEqual(record["activation_time_s"], record["bound_activation_step"]*.002)
+        self.assertEqual(grid["duration"], (grid["valid_count"]-1)*grid["interpolation_dt"])
+        self.assertEqual(grid["duration"], (budget.knots+4)*budget.interpolation_steps*grid["native_dt"])
+    # END no extra retiming optimizer or relaxed interpolation equality is introduced.
+
     def test_command_goal_query_uses_activation_and_keeps_intent_separate(self):
         event = PlanningEvent("close", "current", .5, 10, "close", "source close")
         problem = self.problem((event,))
@@ -459,7 +534,10 @@ class PlanningBindingTest(unittest.TestCase):
                                        quaternion=quaternion))
         hand = SimpleNamespace(controller="timed_reference", nominal_finger_trajectory=None,
             sphere_indices=(0, 1), sphere_joint_translation=np.array([[[0., 0., 0.]], [[1., 0., 0.]]]),
-            state=lambda *args, **kwargs: (None, None, None), spheres=lambda values, *args: values)
+            # BEGIN match the explicit hand-state interface used by native geometry.
+            state=lambda *args, **kwargs: SimpleNamespace(coordinates=None, half=None,
+                uncertain=kwargs["trajectory_time"] > 0), spheres=lambda values, *args: values)
+            # END uncertainty is per physical query, not a tuple convention.
         with patch("manipulation.planning._native_gradient_layout_type",
                    return_value=SimpleNamespace(apply=lambda value: value)), \
              patch("manipulation.planning._orientation_vjp_type",

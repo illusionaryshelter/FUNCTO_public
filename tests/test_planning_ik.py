@@ -111,12 +111,25 @@ def test_chain_success_cannot_be_replaced_by_a_stationary_failed_reference():
     assert selected[0]["reference_success"]
 
 
+# BEGIN missing task/model evidence cannot discard a successful reference proposal.
 def test_task_and_source_screening_are_independent_of_reference_pose_success():
     selected = chains([[[.1], [.5]]],
         [[report(model_valid=False), report(native_pose_ik_success=False)]])
-    # Neither a colliding pose solution nor a pose-failed safe state is a
-    # successful reference anchor; both remain available as caller evidence.
-    assert selected == []
+    assert len(selected) == 1 and selected[0]["candidate_indices"] == [0]
+    assert selected[0]["reference_success"]
+    assert selected[0]["selection_cost"]["static_model_failure_count"] == 1
+
+
+def test_static_failures_rank_chains_without_erasing_the_only_native_solution():
+    selected = chains([[[.1], [.5]], [[.2], [.6]]],
+        [[report(task_satisfied=False, model_valid=False), report()]]*2, count=4)
+    assert selected[0]["candidate_indices"] == [1, 1]
+    assert len(selected) == 4
+    only = chains([[[.1]], [[.2]]], [[report(task_satisfied=False, model_valid=False)]]*2)
+    assert only[0]["candidate_indices"] == [0, 0]
+    assert only[0]["selection_cost"]["static_task_failure_count"] == 2
+    assert only[0]["selection_cost"]["static_model_failure_count"] == 2
+# END whole-curve task and scene acceptance is not asserted by these proposals.
 
 
 def test_failed_and_carried_queries_cannot_supply_reference_anchors():

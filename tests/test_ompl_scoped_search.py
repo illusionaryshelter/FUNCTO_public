@@ -138,6 +138,35 @@ class ScopedOmplSearchTest(unittest.TestCase):
         return planner.ompl_seed(torch.zeros((1, 1, 8, len(planner.joint_names)), dtype=torch.float64),
                                 SimpleNamespace(duration=1., _curve=curve))
 
+    # BEGIN failed alternative IK cannot consume the only qualified boundary attempt.
+    def test_functional_boundary_uses_qualified_indices_before_preferring_an_alternative(self):
+        good = {"task_satisfied": True, "model_valid": True, "native_pose_ik_success": True}
+        failed = {"task_satisfied": False, "model_valid": False, "native_pose_ik_success": False}
+        cases = (
+            ([([.5, 0., 0.], good), ([1.8, 1.8, 1.8], failed)], 0, [.5, 0., 0.]),
+            ([([.5, 0., 0.], good), ([1.8, 1.8, 1.8], failed), ([.51, 0., 0.], good)], 2, [.51, 0., 0.]),
+            ([([float("nan"), 0., 0.], good), ([1.8, 1.8, 1.8], failed)], None, [.5, 0., 0.]),
+        )
+        for candidates, index, expected in cases:
+            with self.subTest(selected_original_index=index):
+                planner = cartesian_planner(problem(pose_events=(pose_goal(1., [.5, 0., 0.]),)))
+                planner.budget = replace(planner.budget, ik_seeds=2, trajectory_seeds=1)
+                planner.goal_ik_candidates = {1.: {"candidates": [
+                    {"joint_position": q, "report": report} for q, report in candidates]}}
+                seed, result = self.search(planner, lambda t: np.array([.5*t, 0., 0.]))
+                self.assertIsNotNone(seed, result)
+                first = result["branches"][0]
+                self.assertNotIn("failure", first)
+                np.testing.assert_allclose(first["boundary_state"][:3], expected, atol=1e-12)
+                if index is None:
+                    self.assertEqual(first["proposal_source"], "candidate_curve")
+                    self.assertNotIn("functional_ik_candidate_index", first)
+                else:
+                    self.assertEqual(first["proposal_source"], "ranked_functional_ik")
+                    self.assertEqual(first["functional_ik_candidate_index"], index)
+                    self.assertEqual(first["functional_ik_report"], good)
+    # END native OMPL projection and scene/connection validation remain active.
+
     # BEGIN registered sphere pairs constrain every OMPL goal proposal.
     def test_registered_robot_self_pair_rejects_an_otherwise_free_boundary(self):
         request=problem(pose_events=(pose_goal(1.,[.5,0.,0.],tolerance=.001),))

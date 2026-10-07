@@ -1173,6 +1173,29 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         self.assertEqual(planner._rank_ik_candidates.call_count, 6)
         constant.assert_not_called()
 
+    # BEGIN transfer IK remains an initializer when static observations are incomplete.
+    def test_reference_native_success_survives_static_task_and_scene_failures(self):
+        primary, _, pools, flags = self.two_tracks()
+        planner, constant, warm_starts = self.planner_for(pools, flags, seed_count=1,
+            report_for=lambda row, success, parameter: {"task_satisfied": False, "model_valid": False})
+        before_q, before_dq = planner.start.position.clone(), planner.start.velocity.clone()
+        seeds, success = planner.reference_seeds()
+        np.testing.assert_allclose(planner.reference_ik_chains[0]["joint_positions"], primary, atol=1e-14)
+        self.assertEqual(success, [3]*6)
+        self.assertEqual(planner.reference_ik_distinct_counts, [3]*6)
+        self.assertTrue(all(row["reference_status"] == "SOLVED" for row in planner.reference_ik_queries))
+        self.assertTrue(all(not candidate["report"]["model_valid"] and not candidate["report"]["task_satisfied"]
+                            for query in planner.reference_ik_queries for candidate in query["candidates"]))
+        self.assertEqual(tuple(warm_starts[1].shape), (1, 3, 3))
+        cost = planner.reference_ik_chains[0]["selection_cost"]
+        self.assertEqual((cost["static_task_failure_count"], cost["static_model_failure_count"]), (6, 6))
+        self.assertTrue(planner.reference_seed_fits[0]["success"])
+        torch.testing.assert_close(planner.start.position, before_q, rtol=0, atol=0)
+        torch.testing.assert_close(planner.start.velocity, before_dq, rtol=0, atol=0)
+        self.assertTrue(torch.isfinite(seeds).all())
+        constant.assert_not_called()
+    # END no failed native pose or measured-entry replacement enters the curve.
+
     def test_off_grid_functional_goal_is_fitted_at_its_actual_time_with_fixed_entrance(self):
         _, _, pools, flags = self.two_tracks()
         ordinary, _, _ = self.planner_for(pools, flags)
@@ -1180,12 +1203,14 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner, _, _ = self.planner_for(pools, flags)
         original_q, original_dq = planner.start.position.clone(), planner.start.velocity.clone()
         valid = {"task_satisfied": True, "model_valid": True}
-        rejected = {"task_satisfied": True, "model_valid": False}
+        # BEGIN task-valid functional hints survive missing scene support or nominal-centre failure.
+        unobserved = {"task_satisfied": True, "model_valid": False, "native_pose_ik_success": False}
+        rejected = {"task_satisfied": False, "model_valid": True}
         target_postures = ([.9, .8, .7], [.6, .5, .4])
         planner._build_goal_ik_candidates.return_value = {
             0.: {"candidates": [{"joint_position": [99., 99., 99.], "report": valid}]},
             .47: {"candidates": [
-                {"joint_position": target_postures[0], "report": valid},
+                {"joint_position": target_postures[0], "report": unobserved},
                 {"joint_position": [90., 90., 90.], "report": rejected},
                 {"joint_position": target_postures[1], "report": valid}]}}
         seeds, success = planner.reference_seeds()
@@ -1208,6 +1233,10 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         self.assertEqual(len(planner.goal_ik_fit_hints), 2)
         self.assertTrue(all(row["event_u"] == .47 and "control_index" not in row
                             for row in planner.goal_ik_fit_hints))
+        self.assertEqual(planner.goal_ik_fit_hints[0]["proposal_report"], unobserved)
+        self.assertEqual(planner.goal_ik_fit_hints[0]["source"], "functional_pose_ik")
+        self.assertTrue(planner.goal_ik_fit_hints[0]["applied"])
+        # END source evidence persists even when the optional hint is fitted.
         self.assertTrue(all(value.endswith("+ranked_functional_ik") for value in planner.seed_strategies))
 
     def test_functional_events_sharing_a_nearest_control_keep_separate_physical_queries(self):

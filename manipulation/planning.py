@@ -784,12 +784,13 @@ def _reference_clock_issues(problem, trajectory, timestep):
 
 # BEGIN source rhythm proposes the initial clock before any solver is created.
 def _initial_timing(problem, budget):
-    """Quantize a source-time proposal within this device's finite capacity.
+    """Quantize source duration, then sample its exact native clock densely.
 
     Source duration/rhythm are soft initialization information. The native
     interval cap bounds one request; an overlong demonstration may therefore
-    propose a compressed clock. Hard event deadlines remain separate inputs.
-    All later seed and refinement operations retain the returned clock.
+    propose a compressed clock. ``interpolation_dt`` bounds sample spacing at
+    admission; the returned budget records the exact selected spacing. Hard
+    event deadlines remain separate. Later refinement retains this clock.
     """
     source = problem.source_time_map
     seconds, progress = np.asarray(source["source_times"], float), np.asarray(source["progress"], float)
@@ -797,26 +798,35 @@ def _initial_timing(problem, budget):
             or not np.isfinite(seconds).all() or np.any(np.diff(seconds) <= 0)):
         raise ValueError("Initial scheduling needs explicit increasing source seconds and their progress")
     source_duration = float(seconds[-1]-seconds[0])
-    output_dt = float(np.float32(budget.interpolation_dt))
+    # BEGIN bind physical duration before choosing a representable output grid.
+    # Fixing output_dt first admits only a few binary-exact knot durations
+    # and can stretch a 9.85-second reference to 16 seconds. Instead round
+    # native dt upward by at most a few float32 ulps, retaining suffix coverage
+    # for continuations, and derive output_dt through exact power-of-two
+    # division. The unchanged grid validator still checks every multiplication.
+    output_limit = float(np.float32(budget.interpolation_dt))
     maximum = _fixed_spline_grid(intervals=budget.knots+4,
         native_dt=budget.maximum_trajectory_dt, interpolation_steps=budget.interpolation_steps,
         interpolation_dt=budget.interpolation_dt)
-    subdivisions = min(maximum["subdivisions"], max(1,
-        int(np.ceil(source_duration/((budget.knots+4)*output_dt)))))
-    # A power-of-two divisor preserves the existing binary32 grid contract;
-    # enumerate exact realizable intervals when the subdivision count does not.
-    selected = None
-    for count in range(subdivisions, maximum["subdivisions"]+1):
-        native_dt = float(np.float32(output_dt*count/budget.interpolation_steps))
-        try:
-            _fixed_spline_grid(intervals=budget.knots+4, native_dt=native_dt,
-                interpolation_steps=budget.interpolation_steps, interpolation_dt=output_dt)
-        except ValueError:
-            continue
-        selected = replace(budget, maximum_trajectory_dt=native_dt)
-        break
-    if selected is None:
+    proposed_dt = min(source_duration, maximum["duration"])/((budget.knots+4)*budget.interpolation_steps)
+    native_dt = np.float32(proposed_dt)
+    if float(native_dt) < proposed_dt:
+        native_dt = np.nextafter(native_dt, np.float32(np.inf))
+    # General admitted step counts include 3, 5, 6 and 7. At most the next
+    # power of two float32 values contains a product exactly representable
+    # at the larger exponent; the original admitted maximum is also exact.
+    for _ in range(1 << (budget.interpolation_steps-1).bit_length()):
+        knot_dt = np.float32(native_dt*np.float32(budget.interpolation_steps))
+        if float(native_dt)*budget.interpolation_steps == float(knot_dt):
+            break
+        native_dt = np.nextafter(native_dt, np.float32(np.inf))
+    if not 0 < float(native_dt) <= maximum["native_dt"]:
         raise ValueError("Source-time proposal has no exact representable device clock within the budget")
+    needed = max(1, int(np.ceil(float(knot_dt)/output_limit)))
+    subdivisions = 1 << (needed-1).bit_length()
+    output_dt = float(knot_dt)/subdivisions
+    selected = replace(budget, maximum_trajectory_dt=float(native_dt), interpolation_dt=output_dt)
+    # END capacity and strict native/dense clock equality remain mandatory.
     return selected, _ProgressMap((seconds-seconds[0])/source_duration, progress.copy())
 # END no search path or candidate geometry can subsequently retime this binding.
 
@@ -3352,6 +3362,11 @@ class _CuroboPlanner:
         self._verification_scene = scene.clone_for_rollout()
         self.trajopt.config.minimum_trajectory_dt = budget.maximum_trajectory_dt
         self.trajopt.config.maximum_trajectory_dt = budget.maximum_trajectory_dt
+        # BEGIN resident rebindings replace every value in the selected clock.
+        self.trajopt.config.interpolation_dt = budget.interpolation_dt
+        if self.trajopt._interpolation_dt_buffer is not None:
+            self.trajopt._interpolation_dt_buffer.fill_(budget.interpolation_dt)
+        # END reuse storage; never carry an earlier request's output spacing.
         self._bind_formal_clock()
         self.seed_parameter.zero_()
         self.last_validation, self.last_optimizer_diagnostics, self.goal_ik_candidates = None, [], {}
@@ -3502,11 +3517,12 @@ class _CuroboPlanner:
     def reference_seeds(self, joint_reference=None):
         """Build bounded initializers from explicit reference-query evidence.
 
-        Native outputs retain their diagnostics, but only successful pose IK
-        passing static task/online checks enters the next warm start or the
-        anchor graph. Failed queries are filled from successful anchors and
-        measured q0, never from a failed native posture. Samples are fitted in
-        the actual native cubic representation before becoming optimizer actions.
+        Finite native IK successes enter the next warm start and anchor graph.
+        Native success includes its pose convergence and native constraints;
+        it is not whole-curve task or observation evidence. Static task/scene
+        reports rank proposals without deleting transferred reference data.
+        Failed native queries are filled from successful anchors and measured
+        q0. Every fitted curve still needs the complete candidate constraints.
         """
         self.joint_reference_report = None
         if joint_reference is not None:
@@ -3564,14 +3580,16 @@ class _CuroboPlanner:
             success_counts.append(int((flags & np.isfinite(values).all(-1)).sum()))
             ranked, reports = self._rank_ik_candidates(values, flags,
                 previous[0].detach().cpu().numpy(), float(u))
-            # BEGIN failed reference poses remain evidence, never future warm starts.
-            qualified = [int(index) for index in ranked if all(reports[index][name] for name in
-                ("native_pose_ik_success", "task_satisfied", "model_valid"))]
+            # BEGIN proposal admission must not confuse missing observations with failed IK.
+            # The diagnostic name refers to native pose-IK solver
+            # success, including its joint/self constraints. Task and online
+            # scene results remain independent evidence for ranking and for
+            # the final complete-curve checks; neither authorizes this seed.
+            qualified = [int(index) for index in ranked if reports[index]["native_pose_ik_success"]]
             self.reference_ik_distinct_counts.append(len(qualified))
             for index, report in enumerate(reports):
                 report["reference_status"] = ("SOLVED" if np.isfinite(values[index]).all()
-                    and all(report[name] for name in
-                            ("native_pose_ik_success", "task_satisfied", "model_valid"))
+                    and report["native_pose_ik_success"]
                     else "FAILED_REFERENCE")
             # Native result errors describe convergence to the nominal pose;
             # static task and geometry evidence above remain independent.
@@ -3596,12 +3614,13 @@ class _CuroboPlanner:
                                                     for value in row], "report": report}
                                for row, report in zip(values, reports)]})
             if qualified:
-                # Static checks apply at this query only. Carrying this pool
-                # supplies numerical IK initializers, not acceptance evidence
-                # for later task modes, permissions, or physical times.
+                # Carrying this pool supplies numerical IK initializers,
+                # including those whose current scene checks failed. The
+                # failure reports survive and the whole candidate is checked
+                # before any planning or execution success can be returned.
                 previous = self.device_cfg.to_device(values[qualified][None]).contiguous()
                 warm_start_query = query_index
-            # END an empty/failed query leaves the most recent successful pool intact.
+            # END only failed native queries retain the preceding successful pool.
         chains = select_ik_chains(pools, evidence, self.start.position.detach().cpu().numpy(),
             control_u*self.formal_clock["duration"], velocity_bounds, count=count,
             joint_tolerance=self.problem.numerical.joint)
@@ -3647,15 +3666,24 @@ class _CuroboPlanner:
         for branch in range(count):
             samples, postures = list(control_u), list(targets[branch])
             for parameter, entry in sorted(pool.items()):
+                # BEGIN functional poses are soft initializer hints, not search connections.
+                # Actual membership in the declared task allowed set matters;
+                # nominal-centre IK convergence and missing scene coverage do
+                # not erase this proposal. Keep their full evidence below.
+                # OMPL retains its separate task/model-valid connection rule.
                 candidates = [row for row in entry["candidates"]
-                              if row["report"]["task_satisfied"] and row["report"]["model_valid"]]
+                              if row["report"]["task_satisfied"]
+                              and np.isfinite(row["joint_position"]).all()]
                 if not candidates or parameter == 0.:
                     continue
                 rank = min(branch, len(candidates)-1)
                 samples.append(float(parameter))
                 postures.append(candidates[rank]["joint_position"])
                 self.goal_ik_fit_hints.append({"event_u": float(parameter), "branch": branch,
-                    "rank": rank, "scope": "Soft observation at the exact event time; no interpolation equality"})
+                    "rank": rank, "source": "functional_pose_ik",
+                    "proposal_report": deepcopy(candidates[rank]["report"]),
+                    "scope": "Soft observation at the exact event time; no interpolation equality or scene acceptance"})
+                # END the fitted complete curve still requires every original constraint.
             if len(samples) == len(control_u):
                 continue
             control, fit = self.physical_domain.fit_reference(np.asarray(samples),
@@ -3818,30 +3846,35 @@ class _CuroboPlanner:
 
         # BEGIN a two-attempt boundary budget includes a non-reference posture.
         def proposals(begin, parameter):
-            # BEGIN a retained alternative posture can escape a failed trajectory basin.
+            # BEGIN choose alternatives only within the statically qualified IK pool.
             entry = self.goal_ik_candidates.get(float(parameter))
-            if entry and entry["candidates"]:
+            qualified = ([] if entry is None else [(index, row) for index, row in enumerate(entry["candidates"])
+                if row["report"]["task_satisfied"] and row["report"]["model_valid"]
+                and np.isfinite(row["joint_position"]).all()])
+            if qualified:
                 # The primary proposal already shaped the trajectory seed.
-                # Preserve one random attempt in the existing two-attempt budget.
-                row = entry["candidates"][min(1, len(entry["candidates"])-1)]
-                yield "ranked_functional_ik", np.r_[row["joint_position"], parameter]
+                # Prefer a qualified alternative when one exists; a failed
+                # second IK row cannot displace the only qualified primary.
+                index, row = qualified[min(1, len(qualified)-1)]
+                yield "ranked_functional_ik", np.r_[row["joint_position"], parameter], {
+                    "functional_ik_candidate_index": index, "functional_ik_report": deepcopy(row["report"])}
             else:
-                yield "candidate_curve", np.r_[candidate_trajectory._curve(parameter*candidate_trajectory.duration), parameter]
-            # END actual prefix release geometry and allowed-set projection recheck all proposals.
+                yield "candidate_curve", np.r_[candidate_trajectory._curve(parameter*candidate_trajectory.duration), parameter], {}
+            # END actual prefix geometry, projection and state checks recheck every proposal.
             # Reference hints must not consume every small attempt budget.
             # This proposal still uses the same allowed-set projection and
             # complete state/edge validity checks as every other member.
-            yield "joint_box_random", np.r_[rng.uniform(lower, upper), parameter]
+            yield "joint_box_random", np.r_[rng.uniform(lower, upper), parameter], {}
             # BEGIN proposal states come from the represented cubic, not coefficients.
             for controls in source_controls:
                 yield "reference_curve", np.r_[self.physical_domain.evaluate(
-                    controls, np.asarray([parameter]))[0], parameter]
+                    controls, np.asarray([parameter]))[0], parameter], {}
             # END the original scene/projection checks still qualify each proposal.
-            yield "previous_boundary", np.r_[begin[:-1], parameter]
+            yield "previous_boundary", np.r_[begin[:-1], parameter], {}
             # Sampling the actual joint box permits different support tangents,
             # yaw and redundant IK branches. There is no reference corridor.
             while True:
-                yield "joint_box_random", np.r_[rng.uniform(lower, upper), parameter]
+                yield "joint_box_random", np.r_[rng.uniform(lower, upper), parameter], {}
         # END proposal ordering changes neither attempts nor time/query limits.
 
         # An explicit stack permits bounded backtracking without recursive
@@ -3862,7 +3895,7 @@ class _CuroboPlanner:
                 frame["attempts"] += 1
                 begin, scene = frame["start"], frame["scene"]
                 # BEGIN retain the initializer identity through projection.
-                proposal_source, goal = next(frame["proposals"])
+                proposal_source, goal, proposal_evidence = next(frame["proposals"])
                 # END the source labels a proposal, not a validity certificate.
                 goal_s = float(anchor_progress.get(hi, np.interp(hi, self.progress_map.u, self.progress_map.s)))
                 middle_s = float(np.interp((lo+hi)/2, self.progress_map.u, self.progress_map.s))
@@ -3876,7 +3909,7 @@ class _CuroboPlanner:
                 # BEGIN rejected projections retain their proposal source too.
                 evidence = {"chart": stage, "time_interval": [float(lo), float(hi)],
                             "goals": list(goal_ids), "attempt": frame["attempts"],
-                            "proposal_source": proposal_source}
+                            "proposal_source": proposal_source, **proposal_evidence}
                 # END provenance does not alter projection or validity results.
                 if goal is None:
                     report["branches"].append({**evidence, "failure": "allowed_boundary_projection_failed"})
@@ -4808,6 +4841,13 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         grid = _fixed_spline_grid(intervals=planner.budget.knots+4,
             native_dt=planner.budget.maximum_trajectory_dt, interpolation_steps=planner.budget.interpolation_steps,
             interpolation_dt=planner.budget.interpolation_dt)
+        # BEGIN report the admitted clock without claiming unchanged source timestamps.
+        source_seconds = problem.source_time_map["source_times"]
+        source_duration = float(source_seconds[-1]-source_seconds[0])
+        diagnostics["reference_clock"] = {**grid, "source_duration_s": source_duration,
+            "duration_change_s": grid["duration"]-source_duration,
+            "scope": "Source duration is a soft proposal; native, dense, event and finger consumers share the bound clock"}
+        # END hard event deadlines are checked separately on this exact binding.
         diagnostics["event_time_checks"] = _validate_bound_event_times(problem, planner.progress_map, grid["duration"],
             0. if prior is None else prior["request_time_origin_s"], ledger["history"],
             None if prior is None else prior["goal_identities"], ledger["timing_events"])
