@@ -41,12 +41,11 @@ class Native:
         self.outcomes = iter(outcomes)
         self.collision, self.ompl_available = collision, ompl
         self.calls = []
-        # BEGIN satisfy the shared native-confirmation lifecycle in CPU fixtures.
-        # These orchestration tests never query geometry. A bound adapter with
-        # an empty report lets metric-buffer/cleanup tests reach their sentries.
+        # BEGIN give the lazy planning-only adapter its named robot fixture.
+        # These orchestration tests never query geometry; model access would
+        # be a test error rather than an execution-validator factory fallback.
         self.check_request = lambda: None
-        self.robot_validator = SimpleNamespace(online_collision_confirmation=
-            lambda scene, **kwargs: SimpleNamespace(last_report={}))
+        self.robot_validator = SimpleNamespace()
         # END geometry correctness remains covered by native confirmation tests.
         self.budget = PlanningBudget()
         core = lambda: SimpleNamespace(optimizers=[])

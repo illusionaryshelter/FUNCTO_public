@@ -59,10 +59,10 @@ class CollisionRecordTests(unittest.TestCase):
                 encode_array(supplied)
 
     def test_oversized_encoding_is_rejected_before_payload_copy(self):
-        # A broadcast view proves admission without actually allocating 32 MiB.
+        # A broadcast view proves admission without allocating the record cap.
         oversized = np.broadcast_to(np.array(1., dtype=np.float32), (MAX_ARRAY_BYTES//4+1,))
         with patch("manipulation.collision_records.base64.b64encode") as encoder:
-            with self.assertRaisesRegex(ValueError, "32 MiB"):
+            with self.assertRaisesRegex(ValueError, f"{MAX_ARRAY_BYTES // 1024**2} MiB"):
                 encode_array(oversized)
             encoder.assert_not_called()
 

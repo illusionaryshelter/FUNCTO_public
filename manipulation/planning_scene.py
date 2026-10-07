@@ -95,9 +95,19 @@ def _world_spheres(spheres, position, quaternion):
 
 
 # BEGIN bounded batched hand-pair penalties with unchanged sum and derivatives.
+# BEGIN size pair batches by live tensor elements instead of a tiny pair cap.
+_SELF_PAIR_STATE_ELEMENTS = 1_048_576
+
+
 def _self_pair_chunk_size(states, pairs):
-    """Bound temporary pair expansion independently of a robot's sphere count."""
-    return min(pairs, 512, max(1, 1_048_576 // states)) if pairs else 0
+    """Bound expansion while evaluating every declared pair exactly once.
+
+    Larger chunks change floating sum grouping, not the nonnegative pair
+    terms or their mathematical zero set. One pair is the irreducible chunk
+    when the state batch itself exceeds the element target.
+    """
+    return min(pairs, max(1, _SELF_PAIR_STATE_ELEMENTS // states)) if pairs else 0
+# END no pair is discarded and checkpointing still bounds backward scratch.
 
 
 # BEGIN bound guidance scratch while avoiding thousands of tiny IK launches.
@@ -155,7 +165,7 @@ def _self_pair_sum(spheres, pair_indices):
         return total
     # BEGIN keep the original integer pair order without repeated host copies.
     pairs = constant_tensor(pair_indices, spheres, dtype=torch.long)
-    # END pair chunking and floating-point reduction order remain unchanged.
+    # END the declared pair order is preserved within memory-bounded chunks.
     step = _self_pair_chunk_size(math.prod(spheres.shape[:2]), len(pairs))
     gradients = torch.is_grad_enabled() and spheres.requires_grad
     for begin in range(0, len(pairs), step):

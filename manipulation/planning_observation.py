@@ -1290,7 +1290,9 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     for config in configs.values():
         shape=tuple(math.ceil(float(x)/config.esdf_voxel_size) for x in config.extent_esdf_meters_xyz)
         if min(shape)<2 or math.prod(shape)*4>MAX_ARRAY_BYTES:
-            raise ValueError('UNSUPPORTED_MODEL: frozen distance field exceeds the 32 MiB binary record limit')
+            # BEGIN report the common codec limit rather than a stale local cap.
+            raise ValueError(f'UNSUPPORTED_MODEL: frozen distance field exceeds the {MAX_ARRAY_BYTES // 1024**2} MiB binary record limit')
+            # END allocation still also requires the unchanged total budgets.
     if sum(estimates.values())>max_mapping_bytes:
         raise ValueError('UNSUPPORTED_MODEL: fixed scene exceeds declared mapping allocation')
     background_cfg=configs[None]

@@ -2,6 +2,7 @@
 
 # BEGIN physical q, nonzero entrance velocity and native step invariants.
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from scipy.interpolate import BSpline, PPoly
@@ -95,8 +96,10 @@ class PhysicalJointDomainTest(unittest.TestCase):
         base = torch.full((2, 8, 1), .2)
         direction = torch.tensor([4., float("nan")]).reshape(2, 1, 1).expand_as(base)
         scales = torch.tensor([0., .1, .5, 1.]).reshape(1, 4, 1, 1)
-        with RejectScalarRead():
+        # BEGIN graph and warmup scopes retain the original tensor-only map.
+        with DeviceChecks("cpu").scope(), RejectScalarRead():
             limited = domain.limit_step_tensor(base, direction, scales)
+        # END eager calls may now read one full-step feasibility predicate.
         self.assertTrue(bool(domain.feasible(base[:, None]+scales*limited[:, None]).all()))
         self.assertTrue(torch.equal(limited[1], torch.zeros_like(limited[1])))
 
@@ -114,6 +117,56 @@ class PhysicalJointDomainTest(unittest.TestCase):
         checks.reset()
         checks.raise_if_failed()
     # END no GPU context is initialized by this regression suite.
+
+    # BEGIN exact eager shortcut comparisons against the retained graph map.
+    def test_full_step_shortcut_preserves_values_gradients_and_checks_all_trials(self):
+        generator = torch.Generator().manual_seed(37)
+        for domain, shape in ((JointPositionDomain(torch.tensor([-1., -1.]),
+                               torch.tensor([1., 1.])), (2, 1, 2)),
+                              (self.domain(q=.2, dq=.1), (2, 8, 1))):
+            for dtype in (torch.float32, torch.float64):
+                base = torch.full(shape, .2, dtype=dtype)
+                scales = torch.tensor([0., .1, .5, 1., 2.], dtype=dtype).reshape(1, 5, 1, 1)
+                direction = torch.randn(shape, generator=generator, dtype=dtype)*.03
+                actual_input = direction.clone().requires_grad_()
+                reference_input = direction.clone().requires_grad_()
+                with patch.object(domain, "feasible", wraps=domain.feasible) as checked:
+                    actual = domain.limit_step_tensor(base, actual_input, scales)
+                self.assertEqual(checked.call_count, 2)
+                self.assertEqual(checked.call_args_list[1].args[0].shape, (2, 5, *shape[1:]))
+                with DeviceChecks("cpu").scope():
+                    expected = domain.limit_step_tensor(base, reference_input, scales)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                weights = torch.randn(shape, generator=generator, dtype=dtype)
+                actual_grad = torch.autograd.grad((actual*weights).sum(), actual_input)[0]
+                expected_grad = torch.autograd.grad((expected*weights).sum(), reference_input)[0]
+                torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+    def test_boundary_mixed_rows_and_nonfinite_steps_keep_exact_original_map(self):
+        domain = JointPositionDomain(torch.tensor([-1., -1.]), torch.tensor([1., 1.]))
+        scales = torch.tensor([0., .125, .5, 1.]).reshape(1, 4, 1, 1)
+        for direction in ([[[.1, -.1]], [[4., -4.]]],
+                          [[[float("nan"), .1]], [[.1, -.1]]],
+                          [[[float("inf"), .1]], [[float("-inf"), 0.]]],
+                          [[[0., 0.]], [[0., -0.]]]):
+            base = torch.tensor([[[.9, -.9]], [[1., -1.]]])
+            step = torch.tensor(direction)
+            actual = domain.limit_step(base, step, scales)
+            with DeviceChecks("cpu").scope():
+                expected = domain.limit_step_tensor(base, step, scales)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            self.assertTrue(bool(domain.feasible(base[:, None]+scales*actual[:, None]).all()))
+            self.assertTrue(bool(torch.isfinite(actual).all()))
+
+    def test_eager_shortcut_does_not_bypass_invalid_base_or_scales(self):
+        domain = JointPositionDomain(torch.tensor([-1.]), torch.tensor([1.]))
+        base, step = torch.zeros((1, 1, 1)), torch.zeros((1, 1, 1))
+        for scale in (-1., float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                domain.limit_step(base, step, torch.tensor([scale]).reshape(1, 1, 1, 1))
+        with self.assertRaises(JointDomainInitializationError):
+            domain.limit_step(base+2., step, torch.ones((1, 1, 1, 1)))
+    # END shortcut success requires the unchanged public validation contract.
 
 
 if __name__ == '__main__':

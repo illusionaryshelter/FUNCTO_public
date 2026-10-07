@@ -14,7 +14,7 @@ from scipy.interpolate import BSpline, CubicHermiteSpline, PPoly
 from scipy.optimize import linprog
 
 # BEGIN a graph scope records errors without changing any domain arithmetic.
-from .optimizer_device_checks import require_tensor
+from .optimizer_device_checks import has_active_device_checks, require_tensor
 # END public calls outside an optimizer graph still raise synchronously.
 
 # BEGIN CPU QPs share the exact cubic representation used by the tensor domain.
@@ -100,13 +100,12 @@ class JointPositionDomain:
 
     def limit_step_tensor(self, base: torch.Tensor, step: torch.Tensor,
                           scales: torch.Tensor) -> torch.Tensor:
-        """Apply the original step map to an already validated base/scales.
+        """Apply the exact step map to an already validated base/scales.
 
-        Every operation, bracket, dtype and reduction below is retained from
-        the strict wrapper's original implementation. This is deliberately
-        ordinary Torch, with no new tracing, compilation, fusion or reduction
-        rewrite. The optimizer separately records/checks the resulting trial
-        predicate before calling either native rollout.
+        Eager calls can return an unchanged full step after checking every
+        actual trial. Graph/warmup scopes retain device-only control flow.
+        The optimizer separately validates the resulting trial predicates
+        before calling either native rollout.
         """
         finite = torch.isfinite(step).all(dim=(-1, -2), keepdim=True)
         step = torch.where(finite, step, torch.zeros_like(step))
@@ -114,6 +113,21 @@ class JointPositionDomain:
         low = torch.zeros_like(base[:, :1, :1])
         high = torch.ones_like(low)
         full = self.feasible(base+maximum*step)
+        # BEGIN skip only iterations proved to leave the entire step unchanged.
+        # With every endpoint feasible, the old bisection has low=high=1
+        # throughout. Checking every native-dtype trial also proves that none
+        # of the eight rounding guards would halve this step. A failed proof
+        # continues through the unchanged limiter below, including mixed rows.
+        # Exclude both the owned warmup scope and external CUDA capture: a host
+        # predicate must neither specialize a graph nor synchronize its stream.
+        eager = (not has_active_device_checks()
+                 and (step.device.type != "cuda"
+                      or not torch.cuda.is_current_stream_capturing()))
+        if eager:
+            trials = base[:, None]+scales*step[:, None]
+            if bool(full.all() & self.feasible(trials).all()):
+                return step
+        # END the finite-row mask, physical bounds and trial arithmetic survive.
         low = torch.where(full[:, None, None], high, low)
         # A fixed bound keeps resource use independent of requested precision.
         for _ in range(24):

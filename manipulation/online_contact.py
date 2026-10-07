@@ -25,7 +25,10 @@ from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES, require_host_memory
 MODEL = "frozen_planar_contact_v2"
 _MAX_RULES = 16
 _MAX_FIELDS = 16
-_MAX_STORED_BYTES = 8 * MAX_ARRAY_BYTES
+# BEGIN aggregate contact storage is independent of the single-record limit.
+# A larger field must not silently double the permitted total channel bank.
+_MAX_STORED_BYTES = 256 * 1024**2
+# END preserve the existing total-memory contract.
 _WITNESS_BINS = 4
 _PREPARE_CHUNK = 65_536
 

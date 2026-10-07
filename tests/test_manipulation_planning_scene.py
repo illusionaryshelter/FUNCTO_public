@@ -8,6 +8,7 @@ do not add a second production collision backend or certify any real scene.
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -18,7 +19,8 @@ from manipulation.planning_problem import (
 )
 from manipulation.planning_scene import (
     Attachment, CollisionOwner, ContactRule, CuroboSphereQuery, ObservedSpace,
-    PlanningScene, PrismaticGripper, _self_pair_sum,
+    PlanningScene, PrismaticGripper, _self_pair_sum, _self_pair_chunk_size,
+    _SELF_PAIR_STATE_ELEMENTS,
     _coverage_halfspace_max, _coverage_plane_chunk_size, _COVERAGE_POINT_PLANE_ELEMENTS,
 )
 
@@ -75,6 +77,51 @@ class CoverageGuidanceScratchTest(unittest.TestCase):
 
 
 class BatchedHandCollisionTest(unittest.TestCase):
+    # BEGIN memory-bounded regrouping must preserve all pair terms and gradients.
+    def test_pair_chunks_fill_the_bound_without_dropping_a_tail(self):
+        for states in (1, 2, 89, 356, 776, 4096, _SELF_PAIR_STATE_ELEMENTS+1):
+            for pairs in (0, 1, 562, 60544, 109952):
+                size = _self_pair_chunk_size(states, pairs)
+                if not pairs:
+                    self.assertEqual(size, 0)
+                    continue
+                self.assertGreaterEqual(size, 1)
+                self.assertLessEqual(states*size, max(states, _SELF_PAIR_STATE_ELEMENTS))
+                self.assertEqual(sum(min(size, pairs-start) for start in range(0, pairs, size)), pairs)
+        self.assertEqual(_self_pair_chunk_size(1, 109952), 109952)
+        self.assertEqual(_self_pair_chunk_size(356, 109952), 2945)
+
+    def test_regrouped_float_values_and_gradients_match_old_512_pair_chunks(self):
+        generator = torch.Generator().manual_seed(73)
+        pairs = np.asarray([(a, b) for a in range(48) for b in range(a+1, 48)] + [(1, 0)])
+        for dtype, tolerance in ((torch.float32, 2e-5), (torch.float64, 1e-12)):
+            values = torch.randn((2, 3, 48, 4), generator=generator, dtype=dtype)
+            values[..., 3] = .9
+            values[..., 1, :3] = values[..., 0, :3]
+            original_input, new_input = values.clone().requires_grad_(), values.clone().requires_grad_()
+            with patch('manipulation.planning_scene._self_pair_chunk_size',
+                       side_effect=lambda states, count: min(count, 512, max(1, 1048576//states))):
+                original = _self_pair_sum(original_input, pairs)
+            # Force a non-divisible bounded chunk too, so final tails survive.
+            with patch('manipulation.planning_scene._SELF_PAIR_STATE_ELEMENTS', 4096):
+                actual = _self_pair_sum(new_input, pairs)
+            weights = torch.randn((2, 3), generator=generator, dtype=dtype)
+            original_grad = torch.autograd.grad((original*weights).sum(), original_input)[0]
+            actual_grad = torch.autograd.grad((actual*weights).sum(), new_input)[0]
+            torch.testing.assert_close(actual, original, atol=tolerance, rtol=tolerance)
+            torch.testing.assert_close(actual_grad, original_grad, atol=tolerance, rtol=tolerance)
+
+    def test_zero_tiny_positive_and_nan_pairs_keep_their_decisions(self):
+        values = torch.tensor([[[[0., 0., 0., .5], [1., 0., 0., .5],
+                                [2., 0., 0., .5]]]], dtype=torch.float64)
+        pairs = np.asarray([[0, 1]]*1024+[[1, 2]])
+        self.assertEqual(_self_pair_sum(values, pairs).item(), 0.)
+        values[..., 2, 0] -= 1e-12
+        self.assertGreater(_self_pair_sum(values, pairs).item(), 0.)
+        values[..., 2, 0] = float('nan')
+        self.assertTrue(bool(torch.isnan(_self_pair_sum(values, pairs)).all()))
+    # END no zero tolerance, pair list or nonfinite policy changes for batching.
+
     def test_all_pair_penetrations_and_gradients_survive_chunk_boundaries(self):
         generator = torch.Generator().manual_seed(29)
         values = torch.randn((2, 3, 34, 4), generator=generator, dtype=torch.float64)

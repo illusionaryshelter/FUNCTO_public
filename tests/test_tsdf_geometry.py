@@ -60,9 +60,9 @@ class ObservedTsdfGeometryTests(unittest.TestCase):
         values = np.broadcast_to(np.array(-1., dtype=np.float32), (count, 1, 1))
         observed = np.broadcast_to(np.array(True), values.shape)
         with patch("manipulation.tsdf_geometry.np.zeros") as allocator:
-            with self.assertRaisesRegex(ValueError, "32 MiB"):
+            with self.assertRaisesRegex(ValueError, f"{MAX_ARRAY_BYTES // 1024**2} MiB"):
                 build_tsdf_geometry(mapper, "too_large", "explicit oversized sample grid")
-            with self.assertRaisesRegex(ValueError, "32 MiB"):
+            with self.assertRaisesRegex(ValueError, f"{MAX_ARRAY_BYTES // 1024**2} MiB"):
                 tsdf_geometry_from_samples(values, observed, origin=(0., 0., 0.),
                     voxel_size=.001, name="too_large", source="broadcast sample grid")
         export_blocks.assert_not_called()

@@ -188,9 +188,9 @@ def test_effective_rule_for_one_owner_does_not_remove_another_owner(tmp_path):
 
 # BEGIN adapter regressions preserve nonfinite and non-collision obligations.
 def _adapter(checker, scene):
-    from manipulation.robot_validation import _OnlineCollisionConfirmation
+    from manipulation.online_native_confirmation import OnlineCollisionConfirmation
     validator = SimpleNamespace(checker=checker, joint_names=['slide'], T_reference_base=np.eye(4))
-    return _OnlineCollisionConfirmation(validator, scene)
+    return OnlineCollisionConfirmation(validator, scene)
 
 
 def _candidate_evidence(values):

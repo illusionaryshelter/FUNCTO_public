@@ -1,9 +1,8 @@
-"""Measured robot-state checks against the planner's bound online geometry.
+"""Measured robot model, joint limits and native mechanical pair checks.
 
-The robot model supplies calibrated FK and scalar joint limits. A production
-scene uses the accepted robot spheres and online distance fields, including
-finite material permissions. Source-solid pair queries remain standalone
-robot audits. Commands never substitute for measured finger coordinates.
+Frozen observed-world queries belong to planning. Physical execution consumes
+actual joint feedback and checks only the declared robot model here. Commands
+never substitute for measured finger coordinates.
 """
 
 # BEGIN independent preflight and actual-state execution gates.
@@ -24,114 +23,6 @@ def _positive_scalar(value, label):
     return float(value)
 
 
-# BEGIN shared native confirmation of robot/world sphere candidates.
-class _OnlineCollisionConfirmation:
-    """Confirm only positive sphere candidates; preserve every other constraint.
-
-    The differentiable rollout never calls this object. Final candidate
-    metrics and measured execution use exactly the same adapter and frozen
-    observed cells. Native FK is performed only for states needing confirmation.
-    """
-
-    def __init__(self, validator, scene, check_request=None):
-        self.validator, self.scene, self.engine = validator, scene, None
-        self.check_request = check_request
-        self.last_report = {}
-
-    def __call__(self, costs, evidence):
-        from .online_native_confirmation import NativeCollisionConfirmation
-
-        # All candidates were masked for unresolved hand geometry and native
-        # exclusions before reaching this boundary. Non-finite costs remain
-        # failures; a finite positive candidate is the only confirmable input.
-        candidates = {}
-        for name, value in evidence['targets'].items():
-            if not bool((value > 0).any().item()):
-                continue
-            raw = value.detach().cpu().numpy()
-            # BEGIN incomplete/non-finite broad-phase evidence cannot become clear.
-            finite = np.isfinite(raw).all(axis=-1) & np.isfinite(costs[name].detach().cpu().numpy())
-            retained = np.where(finite[..., None], raw, 0.)
-            if np.any(retained > 0):
-                candidates[name] = retained
-            # END a NaN beside a positive sphere keeps the original failed term.
-        self.last_report = {'scope': 'native robot solids against the same frozen observed geometry',
-                            'candidate_states': 0, 'states': []}
-        if not candidates:
-            return costs
-        if self.engine is None:
-            self.engine = NativeCollisionConfirmation(self.validator.checker, self.scene)
-        if evidence['joint_position'] is None or not evidence['joint_names']:
-            raise ValueError('Native confirmation requires this query\'s complete named robot coordinates')
-        joints = evidence['joint_position'].detach().cpu().numpy()
-        fingers = (None if evidence['finger_positions'] is None else
-                   evidence['finger_positions'].detach().cpu().numpy())
-        poses = {name: (p.detach().cpu().numpy(), q.detach().cpu().numpy())
-                 for name, (p, q) in evidence['owner_poses'].items()}
-        effective = {name: value.detach().cpu().numpy()
-                     for name, value in evidence['effective_rules'].items()}
-        locations = np.argwhere(np.logical_or.reduce([np.any(value > 0, axis=-1)
-                                                       for value in candidates.values()]))
-        result = dict(costs)
-        for batch, index in locations:
-            named = dict(zip(evidence['joint_names'], joints[batch, index]))
-            if self.scene.gripper is not None:
-                named.update(zip(self.scene.gripper.joint_names, fingers[batch, index]))
-            if set(named) != set(self.validator.joint_names):
-                raise ValueError('Native confirmation cannot fill absent joints with a command or default')
-            robot = self.validator.checker.query(joint_names=self.validator.joint_names,
-                joint_positions=[named[name] for name in self.validator.joint_names],
-                T_reference_base=self.validator.T_reference_base, pairs=(), frames=[])
-            owner_poses = {}
-            for owner, (p, q) in poses.items():
-                pose = np.eye(4)
-                pose[:3, :3] = Rotation.from_quat(q[batch, index][[1, 2, 3, 0]]).as_matrix()
-                pose[:3, 3] = p[batch, index]
-                owner_poses[owner] = pose
-            by_owner = {name.removeprefix('collision/robot/'): np.flatnonzero(value[batch, index] > 0).tolist()
-                        for name, value in candidates.items() if np.any(value[batch, index] > 0)}
-            record = self.engine.confirm(robot_state=robot, candidates=by_owner,
-                owner_poses=owner_poses,
-                effective_contact_rule_ids=frozenset(name for name, active in effective.items()
-                                                     if bool(active[batch, index])),
-                check_request=self.check_request)
-            record['query_index'] = [int(batch), int(index)]
-            record['sphere_residuals'] = {name: float(costs[name][batch, index].item())
-                                         for name in candidates if name.removeprefix('collision/robot/') in by_owner}
-            self.last_report['states'].append(record)
-            for owner in record['cleared_targets']:
-                name = 'collision/robot/'+owner
-                if owner not in by_owner or name not in result:
-                    raise ValueError('Native confirmation returned an unqueried collision target')
-                if result[name] is costs[name]:
-                    result[name] = costs[name].clone()
-                result[name][batch, index] = 0.
-        self.last_report['candidate_states'] = len(self.last_report['states'])
-        return result
-# END no contact, coverage, unknown, controller or self-collision term is relaxed.
-
-
-# BEGIN one execution-facing failure schema, with original scene evidence intact.
-def _scene_gate_violations(scene):
-    """Name physical violations and mandatory query gaps without losing cause."""
-    def identity(issue):
-        if "rule_id" in issue:
-            return "contact_rule:" + str(issue["rule_id"])
-        if "owner" in issue:
-            return "owner:" + str(issue["owner"])
-        evidence = issue.get("evidence", issue)
-        if "actor" in evidence or "target_owner" in evidence:
-            return "/".join(str(evidence.get(key, "")) for key in
-                            ("actor", "actor_geometry", "target_owner", "target_geometry"))
-        return str(issue.get("reason", issue.get("kind", "online_scene")))
-    violations = [{"kind": "online_scene_collision", **deepcopy(issue), "name": identity(issue)} for issue in scene["violations"]]
-    violations.extend({"kind": "online_scene_query_incomplete", "name": identity(issue),
-                       "reason": issue["reason"], "query_evidence": deepcopy(issue)}
-                      for issue in scene["query_gaps"])
-    return violations
-# END an uncompleted required query is never a generic exception or a false pass.
-
-
 class RobotStateValidator:
     """Complete native pair policy and independent FK for measured states.
 
@@ -141,8 +32,9 @@ class RobotStateValidator:
     Coal's reported numerical boundary. A model-declared ``mechanical_contact``
     pair permits exactly those two solids to contact within the independently
     checked mechanical joint domain, including native soft-contact overlap.
-    Native-filtered and mechanically permitted pairs still retain raw distances
-    and their distinct policy provenance. No permission is inferred from
+    Native-filtered and mechanically permitted pairs retain their distinct
+    policy provenance; runtime queries only required pairs and does not
+    manufacture distance/contact evidence for unqueried permitted pairs. No permission is inferred from
     proximity, a control command, native contact enablement or a task name.
     """
 
@@ -181,13 +73,16 @@ class RobotStateValidator:
         if self.velocity_limits != checker.joint_velocity_limits:
             raise ValueError("Declared hardware velocities must equal the independent URDF's named velocity limits")
         self.pairs = tuple(pairs)
+        # BEGIN only required pairs can reject runtime robot geometry.
+        self.required_pairs = tuple(pair for pair in self.pairs if pair.policy == "required")
+        # END excluded/mechanical declarations remain in the full model policy.
         expected = {frozenset(pair) for pair in combinations(checker.geometry_names, 2)}
         supplied = [frozenset((pair.first, pair.second)) for pair in self.pairs]
         # BEGIN model-level mechanical permissions are separate pair identities.
         if (len(supplied) != len(set(supplied)) or set(supplied) != expected
                 or any(pair.policy not in ("required", "excluded", "mechanical_contact") for pair in self.pairs)):
             raise ValueError("Acceptance requires a complete unique required/excluded/mechanical_contact policy for every native geometry pair")
-        # END every native solid pair is still queried exactly once.
+        # END every native solid pair has one explicit policy.
         for pair in self.pairs:
             _name(pair.source, "native pair policy source")
 
@@ -313,7 +208,7 @@ class RobotStateValidator:
                 "rounded_limit_representations": rounded_limits,
                 "joint_names": result["joint_names"], "joint_positions": result["joint_positions"]}
 
-    # BEGIN planning world queries reuse the execution geometry and hand contract.
+    # BEGIN planning world queries own their source geometry and nominal hand contract.
     def check_planning_world(self, joint_positions, joint_names, *, time_s, gripper,
                              scene_checker, progress, nominal_owner_poses,
                              layer_selection, robot_owner_permission_progress):
@@ -321,9 +216,8 @@ class RobotStateValidator:
 
         The caller has already selected each map layer using the actual native
         sphere inputs. Its one-state record and candidate owner poses travel
-        unchanged to the same scene query used by execution. The separate
-        checker owns this planning binding; the execution checker's scene and
-        release history are never rebound by an optimizer or search branch.
+        unchanged to the planning scene query. The separate checker owns
+        this planning binding; measured execution never binds or queries it.
         """
         if not isinstance(scene_checker, RobotGeometryChecker):
             raise TypeError("Planning world acceptance needs a bound source scene checker")
@@ -358,90 +252,13 @@ class RobotStateValidator:
     def planning_binding_record(self):
         """Freeze the same source geometry, complete pair policy and numerics."""
         record = self.describe()
-        # Scene binding is a separate execution epoch, not robot model identity.
-        record.pop("scene_bound")
-        record.pop("object_contact_permission_checked")
-        # BEGIN source audit identity stays independent of an online epoch.
-        record["pair_order"] = [asdict(pair) for pair in self.pairs]
-        # END changing execution distance layout cannot change the robot model.
+        # BEGIN planning identity retains the complete model pair policy.
+        record["pair_order"] = record.pop("pair_policy")
+        # END the smaller runtime distance layout cannot change model identity.
         record["model"] = self.checker.model_record()
         record["scope"] = "complete source robot/installation solids and required/excluded/mechanical pair policy"
         return record
-    # END planning never changes the execution gate's complete actual-state policy.
-
-    # BEGIN execution reuses the planner's serialized online distance fields.
-    def bind_scene(self, binding, progress_at_time, nominal_fingers=None):
-        """Bind one scene epoch and its robot-sphere layout, without source meshes.
-
-        Pinocchio supplies frame transforms at measured named joints. Distances,
-        material contact rules and sphere self pairs come from the very same
-        OnlinePlanningScene record used by native planning residuals.
-        """
-        from .online_geometry import OnlinePlanningScene
-        if binding["reference_frame"] != self.reference_frame or not callable(progress_at_time):
-            raise ValueError("Online scene and execution clock must share the bound reference frame")
-        hand = binding.get("gripper")
-        if hand is not None and tuple(hand["joint_names"]) != self.finger_joint_names:
-            raise ValueError("Online scene and measured fingers must use the same named order")
-        geometry = binding.get("robot_sphere_geometry")
-        if not isinstance(geometry, list) or not geometry:
-            raise ValueError("The online execution scene requires its native robot-sphere geometry")
-        # BEGIN FK must interpret the saved native spheres in the same model.
-        expected_model = {"urdf_path": str(self.checker.urdf_path), "base_frame": self.checker.base_frame,
-                          "tool_frame": self.tool_frame, "T_reference_base": self.T_reference_base.tolist(),
-                          "T_frame_tcp": self.T_frame_tcp.tolist()}
-        if binding.get("robot_model") != expected_model:
-            raise ValueError("Online robot sphere FK model and calibration differ from execution")
-        # END matching link names alone cannot establish calibrated identity.
-        indices = []
-        for row in geometry:
-            self.checker._frame_id(row["link_name"])
-            centers, radii = np.asarray(row["centers_local"], float), np.asarray(row["radii"], float)
-            ids = row["sphere_indices"]
-            if (centers.shape != (len(ids), 3) or radii.shape != (len(ids),)
-                    or not np.isfinite(centers).all() or not np.isfinite(radii).all()
-                    or any(type(index) is not int or index < 0 for index in ids)):
-                raise ValueError("Online robot spheres require finite local centers, radii and native indices")
-            indices.extend(ids)
-        if sorted(indices) != list(range(len(indices))):
-            raise ValueError("Online robot sphere indices must cover the exact native layout once")
-        scene = OnlinePlanningScene.from_binding(binding)
-        self._scene_binding = deepcopy(binding)
-        self._online_scene = scene
-        # BEGIN one request-owned confirmation cache serves all actual states.
-        self._online_confirmation = self.online_collision_confirmation(scene)
-        # END frozen scene data are prepared lazily only if sphere candidates occur.
-        self._online_sphere_count = len(indices)
-        self._progress_at_time = progress_at_time
-
-    # BEGIN expose the same acceptance adapter to final planning metrics.
-    def online_collision_confirmation(self, scene, *, check_request=None):
-        """Create a scene-owned native confirmation adapter without binding execution."""
-        return _OnlineCollisionConfirmation(self, scene, check_request)
-    # END planner and executor own separate caches of identical immutable geometry.
-
-    def _scene_state(self, robot_state, tool_pose, time_s, *, feedback=None,
-                     active_contact_rule_ids=frozenset()):
-        """Transform the accepted native sphere layout with current measured FK."""
-        feedback = feedback or {}
-        spheres = np.empty((self._online_sphere_count, 4), float)
-        for row in self._scene_binding["robot_sphere_geometry"]:
-            pose = np.asarray(robot_state["frame_poses"][row["link_name"]], float)
-            ids = np.asarray(row["sphere_indices"], int)
-            spheres[ids, :3] = np.asarray(row["centers_local"], float) @ pose[:3, :3].T + pose[:3, 3]
-            spheres[ids, 3] = row["radii"]
-        scene = self._online_scene.query_state(spheres, tool_pose,
-            float(self._progress_at_time(float(time_s))),
-            joint_position=robot_state["joint_positions"], joint_names=robot_state["joint_names"],
-            trajectory_time=float(time_s), active_contact_rule_ids=frozenset(active_contact_rule_ids),
-            owner_poses=feedback.get("scene_owner_poses"),
-            condition_evidence=feedback.get("scene_condition_evidence"),
-            native_confirmation=self._online_confirmation)
-        # Query gaps are explicit online failures when present; source-mesh
-        # coverage and nominal release reconstruction are not execution gates.
-        scene.setdefault("query_gaps", [])
-        return scene
-    # END fresh binding owns no inherited arrival latch or source-world checker.
+    # END planning and execution preserve the same required/excluded/mechanical policy.
 
     def describe(self):
         """Static report defines the order of every per-state distance vector."""
@@ -454,7 +271,8 @@ class RobotStateValidator:
                 "joint_position_limits": {name: list(self.checker.joint_limits[name]) for name in self.joint_names},
                 "joint_velocity_limits": dict(self.velocity_limits),
                 "geometry_sources": self.checker.geometry_sources,
-                "pair_order": ([] if hasattr(self, "_online_scene") else [asdict(pair) for pair in self.pairs]),
+                "pair_order": [asdict(pair) for pair in self.required_pairs],
+                "pair_policy": [asdict(pair) for pair in self.pairs],
                 "numerics": dict(self.checker.numerics),
                 "fk_model_translation_tolerance_m": self.fk_translation_tolerance_m,
                 "fk_model_rotation_tolerance_rad": self.fk_rotation_tolerance_rad,
@@ -462,19 +280,15 @@ class RobotStateValidator:
                 "fk_tolerance_scope": "Consistency of known robot models/calibration at the same measured joints; even a 1e-8 tolerance is not physical Cartesian sensing accuracy",
                 "robot_pose_scope": "Fixed calibrated base and TCP FK estimates from measured joint positions; no independent Cartesian observation",
                 # END physical tracking and task tolerances keep their own meaning.
-                "scope": ("bound online geometry, measured robot spheres, model FK and joint limits"
-                          if hasattr(self, "_online_scene") else
-                          "standalone source robot self-collision audit, model FK and joint limits"),
+                "scope": "known robot/installation native pair policy, model FK and joint limits",
                 "observed_scene_checked": False, "unknown_space_checked": False,
-                "continuous_collision_certified": False,
-                "scene_bound": hasattr(self, "_scene_binding"),
-                "object_contact_permission_checked": bool(getattr(self, "_scene_binding", {}).get("contacts"))}
+                "continuous_collision_certified": False, "world_collision_checked": False}
 
     def _pose_difference(self, actual, expected):
         return {"translation_m": float(np.linalg.norm(actual[:3, 3]-expected[:3, 3])),
                 "rotation_rad": float(Rotation.from_matrix(expected[:3, :3].T @ actual[:3, :3]).magnitude())}
 
-    def check_state(self, feedback, *, stage, trajectory_time, active_contact_rule_ids=frozenset()):
+    def check_state(self, feedback, *, stage, trajectory_time):
         """Gate full actual q, after the executor validates identity and time.
 
         Clock freshness and physical tracking use the execution layer's own
@@ -505,15 +319,10 @@ class RobotStateValidator:
         velocities = np.asarray(feedback["dq"])
         if velocities.shape != (len(self.joint_names),) or velocities.dtype.kind not in "iuf" or not np.isfinite(velocities).all():
             raise ValueError("Independent validation requires one finite actual velocity per named joint")
-        # BEGIN online acceptance needs FK only from the source robot model.
-        frames = [self.tool_frame]
-        if hasattr(self, "_online_scene"):
-            frames.extend(row["link_name"] for row in self._scene_binding["robot_sphere_geometry"])
+        # BEGIN execution checks known robot geometry without rebuilding a world scene.
         result = self.checker.query(joint_names=self.joint_names, joint_positions=feedback["q"],
-            T_reference_base=self.T_reference_base,
-            pairs=() if hasattr(self, "_online_scene") else self.pairs,
-            frames=list(dict.fromkeys(frames)))
-        # END standalone source self-collision checks remain an explicit audit.
+            T_reference_base=self.T_reference_base, pairs=self.required_pairs, frames=[self.tool_frame])
+        # END frozen observed fields and sphere confirmation are planning-only.
         expected_tool = np.asarray(result["frame_poses"][self.tool_frame]) @ self.T_frame_tcp
         base_error = self._pose_difference(base, self.T_reference_base)
         tool_error = self._pose_difference(estimated_tool, expected_tool)
@@ -537,37 +346,21 @@ class RobotStateValidator:
                                    "measured": row["signed_distance_m"], "pair_index": index,
                                    "relation": row["relation"], "evidence": deepcopy(row)})
         required = [row["signed_distance_m"] for row in result["pairs"] if row["policy"] == "required"]
-        # BEGIN retain legal contact evidence while keeping all scalar/FK guards.
-        mechanical_contacts = [deepcopy(row) for row in result["pairs"]
-                               if row["policy"] == "mechanical_contact" and row["relation"] != "separated"]
-        # END allowed contact does not imply separation or stable task Holding.
         report = {"passed": not violations, "violations": violations, "stage": stage,
                 "trajectory_time": float(trajectory_time),
                 "distances_m": [row["signed_distance_m"] for row in result["pairs"]],
-                "mechanical_contacts": mechanical_contacts,
                 "min_required_clearance_m": min(required) if required else None,
                 "base_model_error": base_error, "tcp_model_error": tool_error,
                 # BEGIN disclose what the small residual actually establishes.
                 "fk_error_scope": "Agreement of calibrated robot models at measured joints, not independent Cartesian sensing or physical accuracy",
                 # END a zero model residual cannot fill a missing object observation.
                 "actual_joint_positions": result["joint_positions"],
+                "world_collision_checked": False,
                 "scope": "supplied robot solids at this actual state; no between-state or scene certificate"}
-        # BEGIN current scene geometry consumes actual q and current explicit evidence.
-        if hasattr(self, "_scene_binding"):
-            # BEGIN the execution epoch alone authorizes a measured-arrival permission.
-            scene = self._scene_state(result, expected_tool, trajectory_time, feedback=feedback,
-                                      active_contact_rule_ids=active_contact_rule_ids)
-            # END actual time by itself cannot remove a robot/owner collision.
-            report["scene"] = scene
-            report["violations"].extend(_scene_gate_violations(scene))
-            report["query_gaps"] = scene["query_gaps"]
-            report["passed"] = report["passed"] and scene["passed"]
-            report["scope"] = "supplied robot and observed scene solids at actual state; no hidden-space or continuous certificate"
         return report
         # END commands and nominal predictions never replace measured fingers.
 
-    def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0., until=None, current_time=None,
-                  active_contact_rule_ids=frozenset()):
+    def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0., until=None, current_time=None):
         """Check actual entrance and reference cubic q/dq over its whole prefix.
 
         Each scalar cubic's exact polynomial derivative supplies its critical
@@ -589,10 +382,9 @@ class RobotStateValidator:
                 or not 0 <= current_time <= trajectory.duration):
             raise ValueError("Current actual feedback must use its own original trajectory time")
         # END device tick alignment must not silently shift a contact-rule interval.
-        # BEGIN continuation preflight consumes this execution's same arrival latch.
-        initial = self.check_state(initial_feedback, stage="preflight_actual_state", trajectory_time=float(current_time),
-                                   active_contact_rule_ids=active_contact_rule_ids)
-        # END a newly created validator does not infer prior arrival from progress.
+        # BEGIN preflight validates actual robot feedback, never frozen world geometry.
+        initial = self.check_state(initial_feedback, stage="preflight_actual_state", trajectory_time=float(current_time))
+        # END task observation and close-arrival gates remain executor responsibilities.
         times = np.asarray(trajectory.times, dtype=float)
         positions, velocities = np.asarray(trajectory.position, dtype=float), np.asarray(trajectory.velocity, dtype=float)
         expected_shape = (len(times), len(self.arm_joint_names))
@@ -644,12 +436,11 @@ class RobotStateValidator:
         # Preflight keeps cheap scalar polynomial checks and the actual entrance;
         # it never starts another full-curve source-world certification chain.
         return {"passed": not violations and initial["passed"], "violations": violations,
-                "query_gaps": initial.get("query_gaps", []),
-                "scope": "Same online scene at measured entrance, model FK and scalar reference q/dq",
+                "scope": "Known robot geometry at measured entrance, model FK and scalar reference q/dq",
                 "checked_interval_s": [float(start_time), stop], "reference_cubic_extrema": extrema,
                 "actual_state": initial, "future_finger_states_assumed": False,
                 "reference_collision_checked": False, "continuous_collision_certified": False,
-                "observed_scene_checked": bool(hasattr(self, "_online_scene")),
+                "observed_scene_checked": False, "world_collision_checked": False,
                 "unknown_space_checked": False}
         # END actual fingers are always feedback coordinates, never commands.
 # END independent preflight and actual-state execution gates.

@@ -468,6 +468,35 @@ def continuation_execution_inputs(continuation, finger_targets, execution_limits
 # END same-request continuation does not replay or relabel a completed command.
 
 
+# BEGIN current Holding dependencies are task evidence, not world geometry.
+def _holding_dependency_violations(scene, progress, observation):
+    """Require fresh explicit evidence while an owner uses an attachment pose.
+
+    A currently observed owner pose replaces attachment-based pose inference.
+    Otherwise the active attachment needs its declared condition to be true.
+    The caller supplies only freshness-validated observations (or the exact
+    entrance feedback). Frozen owner poses and command intent are never proof.
+    """
+    evidence = observation or {}
+    poses = evidence.get("scene_owner_poses", {})
+    conditions = evidence.get("scene_condition_evidence", {})
+    failures = []
+    for owner in scene.get("owners", ()):
+        owner_id = owner["owner_id"]
+        if owner_id in poses:
+            _pose_array(poses[owner_id], "current observed owner pose")
+            continue
+        for relation in owner.get("attachments", ()):
+            lower, upper = relation["interval"]
+            active = lower <= progress < upper or (progress == upper and relation["release_condition_id"] is None)
+            if active and conditions.get(relation["condition_id"]) is not True:
+                failures.append({"kind": "actual_holding_unverified", "name": relation["condition_id"],
+                    "owner": owner_id, "progress": float(progress),
+                    "reason": "Active owner attachment needs current Holding evidence or a current owner pose"})
+    return failures
+# END a frozen attachment transform cannot supply its own current validity.
+
+
 class TrajectoryExecutor:
     """Follow the exported cubic using one concrete backend and geometry gate.
 
@@ -661,21 +690,18 @@ class TrajectoryExecutor:
         mark_wallclock("execute_called")
         # END all later failures retain any milestones already attached to the report.
         # BEGIN formal candidate handoff: labels cannot authorize commands.
-        from .execution_binding import (check_result, nominal_finger_sampler,
+        from .execution_binding import (check_result,
             validate_controller_policy, validate_result_only_goal_ids)
         binding = check_result(result, execution_limits=execution_limits)
         trajectory = result.trajectory
-        if not callable(getattr(self.geometry_checker, "bind_scene", None)):
-            raise ValueError("Execution requires independent geometry with the bound scene scope")
-        self.geometry_checker.bind_scene(binding["scene"],
-            progress_at_time=lambda t: float(trajectory.sample(t)[3]),
-            nominal_fingers=nominal_finger_sampler(binding["scene"]))
-        # BEGIN the active online binding owns the actual distance layout.
+        # BEGIN planning evidence binds the curve; execution owns only robot checks.
+        # check_result above still verifies the accepted model/problem/scene identity.
+        # No frozen world, material field or sphere layout is rebuilt for playback.
         self._geometry_description = deepcopy(self.geometry_checker.describe())
         if not isinstance(self._geometry_description.get("pair_order"), list):
-            raise ValueError("Bound online geometry must declare its distance order")
+            raise ValueError("Robot geometry must declare its measured distance order")
         self._geometry_pair_count = len(self._geometry_description["pair_order"])
-        # END source audit pairs are not silently retained as execution gates.
+        # END device/model checks retain their own complete, stable query contract.
         if type(max_hold_steps) is not int or not 1 <= max_hold_steps <= 10_000:
             raise ValueError("Emergency hold needs a positive bounded device step budget")
         if observation_callback is not None and not callable(observation_callback):
@@ -885,7 +911,8 @@ class TrajectoryExecutor:
         report.update(execution_limits=execution_limits.describe(),
             named_hardware_velocity_limits=deepcopy(backend.velocity_limits),
             native_joint_position_ranges=limit_binding["joint_ranges"].tolist(),
-            execution_guard_scope="Measured joint tracking, robot FK estimates and independently queried bound robot/scene geometry; FK consistency is a model check, and current owner/effect observations remain separate",
+            execution_guard_scope="Measured joint tracking, calibrated robot FK and known robot/installation geometry; explicit current task observations remain separate and frozen world geometry is planning-only",
+            world_collision_checked=False,
             geometry_checker=deepcopy(self._geometry_description), geometry_preflight=None,
             geometry_check_counts={"initial_state": 0, "before_step": 0, "command_event": 0, "after_step": 0},
             last_geometry_check=None,
@@ -1000,7 +1027,7 @@ class TrajectoryExecutor:
                 trajectory, requirement.progress, backend.timestep)
         pose_goal_queries, evaluated_result_goals = set(), set()
         report["pose_goal_checks"] = []
-        # BEGIN bind each contact permission to one original close and arrival.
+        # BEGIN retain declared close-arrival identity and observed attachment provenance.
         # These records are part of the already validated formal scene/problem;
         # neither a task name nor a close command invents a target or a pair.
         contact_gates = {}
@@ -1015,12 +1042,12 @@ class TrajectoryExecutor:
         contact_rows = binding["scene"].get("contacts", ())
         finite_permission_ids = set()
         # END missing scene metadata cannot silently turn a gated rule into an ordinary rule.
-        # BEGIN Holding authorization is rebuilt from this entrance, never a prior latch.
+        # BEGIN attachment evidence is verified against this execution entrance.
         # The caller supplies verified evidence; execution checks its identity,
         # clock and frozen attachment geometry without reading native object truth.
-        holding_permissions = {}
+        holding_bindings = {}
         start_progress = float(trajectory.sample(0.)[3])
-        # BEGIN current Holding authorizes only explicitly named finite rules.
+        # BEGIN retain the accepted attachment and finite-rule identity contract.
         rules_by_id = {row["rule_id"]: row for row in contact_rows}
         for condition in binding["problem"].get("conditions", ()):
             if condition.get("kind") != "observed_attachment" or "contact_rule_ids" not in condition:
@@ -1069,7 +1096,7 @@ class TrajectoryExecutor:
                         or identity in finite_permission_ids):
                     raise ValueError("Holding must identify unique finite robot material rules on the same attached owner and interval")
                 finite_permission_ids.add(identity)
-                holding_permissions[identity] = {"rule_id": identity, "condition_id": condition_id,
+                holding_bindings[identity] = {"rule_id": identity, "condition_id": condition_id,
                     "target_owner": condition["carrier_id"], "interval": [lower, upper],
                     "release_condition_id": relation["release_condition_id"],
                     "feedback_id": initial_feedback["feedback_id"], "timestamp_s": float(timestamp),
@@ -1103,34 +1130,10 @@ class TrajectoryExecutor:
                 raise ValueError("A contact activation needs one unchanged close, fixed perceived arrival and matching scene permission")
             contact_gates[identity] = {"condition": deepcopy(condition),
                 "rule_ids": rule_ids, "requirement": requirement}
-        # Execution-local state deliberately does not inherit a prior trial's
-        # latch or a completed-goal label. A new close needs a new FK witness.
-        active_contact_permissions = frozenset(holding_permissions)
+        # BEGIN close-arrival checks carry no world-collision permission latch.
         report["grasp_contact_gate_checks"] = []
-        report["grasp_contact_permission_changes"] = []
-        report["finite_contact_permission_expirations"] = []
-        # BEGIN keep finite latches separate at every geometry API and report boundary.
-        def contact_permission_arguments(identities):
-            return {"active_contact_rule_ids": frozenset(identities) & finite_permission_ids}
-
-        def record_active_contact_permissions():
-            for name, identities in contact_permission_arguments(active_contact_permissions).items():
-                report[name] = sorted(identities)
-
-        record_active_contact_permissions()
-        # END an internal identity set never broadens finite material scope.
-        # BEGIN original release progress, rather than open intent, ends Holding permission.
-        report["holding_contact_permission_changes"] = [
-            {**deepcopy(row), "action": "activated", "curve_progress": start_progress}
-            for row in holding_permissions.values()]
-
-        def current_holding_permissions(curve_time):
-            progress = float(trajectory.sample(curve_time)[3])
-            return frozenset(identity for identity, row in holding_permissions.items()
-                if row["interval"][0] <= progress and (progress < row["interval"][1]
-                    or (progress == row["interval"][1] and row["release_condition_id"] is None)))
-        # END this predicate grants no new Holding after the initial binding.
-        # END source pair policy and current activation evidence stay distinct.
+        report["observed_attachment_bindings"] = list(holding_bindings.values())
+        # END attachment provenance is evidence, not inferred contact success.
         # BEGIN retain the distinction between FK estimates and physical accuracy.
         report["pose_goal_scope"] = (
             "Original functional allowed sets evaluated from robot TCP FK estimates and explicitly required current owner/holding observations; "
@@ -1194,7 +1197,7 @@ class TrajectoryExecutor:
         report["feedback_policy"] = {
             "native_period_s": float(backend.timestep),
             "robot_checks": "Initial state and every native step boundary, before and after integration",
-            "geometry_checks": "Every robot check and explicit event gate; same bound current scene",
+            "geometry_checks": "Every robot check and explicit event gate; known robot model only",
             "observations": deepcopy(execution_limits.observation_policy),
             "timestamp_roundoff_s": 1e-8,
             "stale_required_feedback": "Reject current obligation and send bounded hold",
@@ -1740,15 +1743,13 @@ class TrajectoryExecutor:
                     "geometry_check": None,
                     "progress": float(progress), "gripper_command": command}
 
-        # BEGIN reuse one actual-arrival proof before every provisional contact query.
-        def provisional_contact_permissions(feedback, *, curve_time, physical_elapsed, point,
-                                            contact_event, permissions, failures):
-            """Inspect an already validated sample without committing a contact latch.
+        # BEGIN prove actual arrival before the original close command is written.
+        def check_close_arrival(feedback, *, curve_time, physical_elapsed, point,
+                                contact_event, failures):
+            """Check the declared target with this sample's measured-joint FK.
 
-            The caller supplies scalar/identity/clock failures first. In
-            particular, a zero-tick close needs this proof before preflight's
-            actual-state geometry check; the loop still obtains a fresh proof
-            before it may write that close command.
+            This proves robot arrival and event timing only. It neither grants
+            a world-collision exemption nor claims actual contact or Holding.
             """
             contact_check = None
             if not failures and contact_event is not None:
@@ -1770,47 +1771,17 @@ class TrajectoryExecutor:
                     "within_bound_interval": in_interval, "activation_due": due_now,
                     "passed": measured["value"] == "T" and in_interval and due_now,
                     "control_applied": False,
-                    "source": "Frozen perceived interaction target and this sample's measured-joint FK; software contact authorization only, not current owner observation or Holding"}
+                    "source": "Declared perceived target and this sample's measured-joint FK; robot arrival only, not current owner observation or Holding"}
                 report["grasp_contact_gate_checks"].append(contact_check)
-                if contact_check["passed"]:
-                    # A new close never inherits permissions for another
-                    # target or a previous occurrence, even inside this trial.
-                    # BEGIN a new grasp latch does not revoke a separate observed attachment.
-                    permissions = current_holding_permissions(curve_time) | frozenset(rule_ids)
-                    # END only the old arrival-based latch is replaced by this close.
-                else:
+                if not contact_check["passed"]:
                     failures.append({"kind": "grasp_contact_arrival_rejected",
                         "name": condition["condition_id"], "evidence": deepcopy(contact_check)})
-            return permissions, contact_check
+            return contact_check
         # END elapsed time selects a gate; only this measured pose can satisfy it.
 
         # BEGIN reject measured violations before changing an event's command.
         def guard(feedback, *, curve_time, physical_elapsed, point, event=None, sample=None,
-                  contact_event=None, contact_permissions=None):
-            # BEGIN remove expired Holding authorization before this state's geometry query.
-            nonlocal active_contact_permissions
-            holding_now = current_holding_permissions(curve_time)
-            expired = (active_contact_permissions & holding_permissions.keys())-holding_now
-            for identity in sorted(expired):
-                report["holding_contact_permission_changes"].append({
-                    **deepcopy(holding_permissions[identity]), "action": "expired",
-                    "curve_progress": float(trajectory.sample(curve_time)[3]),
-                    "observed_feedback_id": feedback["feedback_id"],
-                    "observed_timestamp_s": float(feedback["timestamp_s"])})
-            active_contact_permissions -= expired
-            # BEGIN finite latch reports expire with their original allowed interval.
-            current_progress = float(trajectory.sample(curve_time)[3])
-            expired_finite = {row["rule_id"] for row in contact_rows
-                if row["rule_id"] in finite_permission_ids & active_contact_permissions
-                and current_progress > float(row["interval"][1])}
-            if expired_finite:
-                active_contact_permissions -= expired_finite
-                report["finite_contact_permission_expirations"].append({
-                    "rule_ids": sorted(expired_finite), "curve_time_s": float(curve_time),
-                    "progress": current_progress, "feedback_id": feedback["feedback_id"]})
-            # END expiration never activates a replacement rule or implies release.
-            record_active_contact_permissions()
-            # END open commands are deliberately absent from this attachment lifetime.
+                  contact_event=None):
             # BEGIN consume allowed observations without native object truth.
             observation = observation_at(feedback, curve_time, physical_elapsed)
             if observation is not None:
@@ -1886,25 +1857,23 @@ class TrajectoryExecutor:
             failures = self._execution_violations(feedback, reference_q, reference_dq, reference_tcp,
                 limits=execution_limits, binding=limit_binding, finger_state=finger_state,
                 expected_sim_time=sim_start+physical_elapsed, require_stop=requires_stop)
-            # BEGIN actual arrival may authorize only this pending close's pair.
-            # The temporary query mode is not a latch. It becomes execution
-            # state only after the same command has passed every guard and its
-            # actuator write has succeeded. A second read before that write
-            # must prove arrival again, even when a goal was completed earlier.
-            queried_permissions = (active_contact_permissions if contact_permissions is None
-                                   else frozenset(contact_permissions))
-            # BEGIN provisional overrides cannot retain a Holding rule beyond release.
-            queried_permissions = (queried_permissions-holding_permissions.keys()) | holding_now
-            # END explicit F attachment evidence remains a separate geometry violation.
-            queried_permissions, contact_check = provisional_contact_permissions(feedback,
+            # BEGIN task dependency validity is independent of frozen world geometry.
+            current_evidence = observation
+            if float(feedback["timestamp_s"]) == float(initial_feedback["timestamp_s"]):
+                # Entrance attachment provenance was checked against this exact
+                # sample. A simultaneous explicit observation may override it;
+                # no later tick can inherit these entrance-only facts.
+                current_evidence = {**initial_feedback, **(observation or {})}
+            failures.extend(_holding_dependency_violations(binding["scene"],
+                float(trajectory.sample(curve_time)[3]), current_evidence))
+            contact_check = check_close_arrival(feedback,
                 curve_time=curve_time, physical_elapsed=physical_elapsed, point=point,
-                contact_event=contact_event, permissions=queried_permissions, failures=failures)
+                contact_event=contact_event, failures=failures)
             # END elapsed time merely selects a gate; it cannot satisfy it.
             geometry = None
             if not failures:
                 geometry = self._geometry_result("check_state", deepcopy(feedback),
-                    stage=point, trajectory_time=float(curve_time),
-                    **contact_permission_arguments(queried_permissions))
+                    stage=point, trajectory_time=float(curve_time))
                 report["geometry_check_counts"][point] += 1
                 report["last_geometry_check"] = deepcopy(geometry)
                 failures.extend(geometry["violations"])
@@ -1931,7 +1900,7 @@ class TrajectoryExecutor:
             check_pose_goals(observation, feedback, curve_time, physical_elapsed)
             check_deadlines(feedback, physical_elapsed)
             # END original task accuracy is checked before another native command.
-            return queried_permissions, contact_check
+            return contact_check
         # END reject measured violations before changing an event's command.
 
         # BEGIN evaluate due effects and check measured stops without adding waits.
@@ -2075,12 +2044,8 @@ class TrajectoryExecutor:
             # BEGIN retain one initial sample even when preflight later rejects.
             emit_independent_evidence(samples[-1], "initial_state")
             # END the runner must not separately duplicate this initial exposure.
-            # BEGIN a close due at entry needs its actual proof before geometry.
-            # Select the same last command as the zero-tick loop, without
-            # consuming any event. Only this special entrance uses a temporary
-            # permission, and both geometry consumers receive its same fresh
-            # feedback. The execution latch remains empty until apply_control.
-            initial_permissions = active_contact_permissions
+            # BEGIN a close due at entry needs current arrival evidence before control.
+            # Select the same last command as the zero-tick loop without consuming it.
             preflight_feedback = initial_feedback
             entry_commands = [event for event in command_events if event["activation_step"] == 0]
             entry_close = (entry_commands[-1] if entry_commands and entry_commands[-1]["kind"] == "close"
@@ -2091,9 +2056,9 @@ class TrajectoryExecutor:
                 failures = self._execution_violations(preflight_feedback, q, dq, reference_tcp,
                     limits=execution_limits, binding=limit_binding, finger_state=finger_state,
                     expected_sim_time=sim_start, require_stop=bool(entry_close.get("stop", False)))
-                initial_permissions, _ = provisional_contact_permissions(preflight_feedback,
+                check_close_arrival(preflight_feedback,
                     curve_time=0., physical_elapsed=0., point="initial_contact_gate",
-                    contact_event=entry_close, permissions=initial_permissions, failures=failures)
+                    contact_event=entry_close, failures=failures)
                 if failures:
                     report["status"] = "feedback_rejected"
                     report["feedback_failure"] = {"point": "initial_contact_gate", "curve_time_s": 0.,
@@ -2104,12 +2069,11 @@ class TrajectoryExecutor:
                         "actual_finger_interval": deepcopy(finger_state),
                         "last_applied_finger_goal": target_positions.tolist(), "rejected_event": deepcopy(entry_close)}
                     raise ExecutionGuardError(f"Actual feedback violates initial_contact_gate: {failures[0]['kind']} / {failures[0]['name']}")
-            # END preflight still prepares the geometry context before any state guard.
+            # END no command has been issued while validating the actual entrance.
             # Preflight checks the declared model/reference contract without
             # stepping or preparing an actuator goal. Formal planning success
-            # does not bypass this independent current-scene acceptance gate.
-            preflight = self._geometry_result("preflight", trajectory, deepcopy(preflight_feedback), execution_limits,
-                **contact_permission_arguments(initial_permissions))
+            # does not bypass these measured robot and scalar curve checks.
+            preflight = self._geometry_result("preflight", trajectory, deepcopy(preflight_feedback), execution_limits)
             report["geometry_preflight"] = deepcopy(preflight)
             if not preflight["passed"]:
                 report["status"] = "feedback_rejected"
@@ -2121,8 +2085,7 @@ class TrajectoryExecutor:
                     "actual_finger_interval": deepcopy(finger_state),
                     "last_applied_finger_goal": target_positions.tolist(), "rejected_event": None}
                 raise ExecutionGuardError("Independent geometry preflight rejected the execution reference")
-            guard(samples[-1]["feedback"], curve_time=0., physical_elapsed=0., point="initial_state", sample=samples[-1],
-                contact_permissions=initial_permissions)
+            guard(samples[-1]["feedback"], curve_time=0., physical_elapsed=0., point="initial_state", sample=samples[-1])
             # BEGIN geometric preflight and initial actual-state guards have both passed.
             mark_wallclock("preflight_completed")
             # END event/dependency gates may still prevent the first trajectory step.
@@ -2146,11 +2109,9 @@ class TrajectoryExecutor:
                 # BEGIN check arrival before entering the pending close mode.
                 pending_close = (due[-1] if due and due[-1]["kind"] == "close"
                     and event_occurrence_key(due[-1]) in contact_gates else None)
-                next_contact_permissions, contact_check = guard(before,
+                contact_check = guard(before,
                     curve_time=min(elapsed, stop), physical_elapsed=elapsed, point="before_step",
-                    contact_event=pending_close,
-                    contact_permissions=(current_holding_permissions(min(elapsed, stop)) if due and due[-1]["kind"] == "close"
-                                         and pending_close is None else None))
+                    contact_event=pending_close)
                 # END a missed gate stops before sampling or writing the close ramp.
                 next_command = command
                 next_finger_positions = target_positions.copy()
@@ -2159,10 +2120,9 @@ class TrajectoryExecutor:
                     # Distinct source events can fall in one native interval.
                     # Retain every identity, and never label overwritten goals
                     # as applied to a physical step.
-                    # BEGIN target, permission and command share the activation tick.
+                    # BEGIN command timing and measured arrival share the activation tick.
                     guard(before, curve_time=float(due[-1]["applied_time_s"]), physical_elapsed=elapsed,
-                          point="command_event", event=due[-1],
-                          contact_permissions=next_contact_permissions)
+                          point="command_event", event=due[-1])
                     checks = _timing_checks(due[-1], "activation", request_origin+elapsed, report["history"])
                     reject_timing(before, elapsed, checks, event=due[-1])
                     # END original intent time remains in the event ledger only.
@@ -2182,20 +2142,10 @@ class TrajectoryExecutor:
                 # BEGIN the backend receives the same endpoint q/dq/ddq as the saved reference.
                 control = backend.apply_control(q, dq, ddq, next_finger_positions)
                 # END actuator interpretation cannot change the candidate's clock or polynomial.
-                # BEGIN only a successful command write commits/revokes a latch.
-                if due and due[-1]["kind"] in ("open", "close"):
-                    previous_permissions = sorted(active_contact_permissions)
-                    active_contact_permissions = (next_contact_permissions if pending_close is not None
-                                                  else current_holding_permissions(min(elapsed, stop)))
-                    if contact_check is not None:
-                        contact_check["control_applied"] = True
-                    record_active_contact_permissions()
-                    report["grasp_contact_permission_changes"].append({
-                        "event": deepcopy(due[-1]), "feedback_id": before["feedback_id"],
-                        "timestamp_s": float(before["timestamp_s"]), "applied_at_s": float(elapsed),
-                        "previous_rule_ids": previous_permissions,
-                        "active_rule_ids": sorted(active_contact_permissions)})
-                # END open and a different close cannot borrow an earlier target.
+                # BEGIN record successful actuator dispatch without inventing contact.
+                if contact_check is not None:
+                    contact_check["control_applied"] = True
+                # END the independent observer still owns actual task effects.
                 # BEGIN aggregate only the backend's named arm clipping count.
                 arm_control_saturation_count += control["arm_control_saturated_coordinates"]
                 # END native finger force limits are measured separately.
@@ -2223,10 +2173,10 @@ class TrajectoryExecutor:
                 # evaluator contacts, before rejecting its measured feedback.
                 try:
                     # BEGIN the arrival tick is checked before its next control write.
-                    # A close due at this completed tick may use a provisional
-                    # pair mode only after actual FK arrival passes. The next
-                    # iteration re-reads and rechecks it before committing, so
-                    # this state check cannot become a stale authorization.
+                    # A close due at this completed tick needs actual FK
+                    # arrival. The next iteration re-reads and rechecks it
+                    # before actuator dispatch; no completed-goal label can
+                    # substitute for that new feedback sample.
                     upcoming = [event for event in command_events[event_index:]
                                 if event["activation_step"] <= index+1]
                     upcoming_close = (upcoming[-1] if upcoming and upcoming[-1]["kind"] == "close"
@@ -2234,7 +2184,7 @@ class TrajectoryExecutor:
                     guard(current["feedback"], curve_time=min(next_time, stop),
                           physical_elapsed=next_time, point="after_step", sample=current,
                           contact_event=upcoming_close)
-                    # END only an explicit pending close can request that mode.
+                    # END only an explicit pending close requests this arrival check.
                 finally:
                     # BEGIN post-step evaluation cannot mask or create a guard failure.
                     emit_independent_evidence(current, "after_step")

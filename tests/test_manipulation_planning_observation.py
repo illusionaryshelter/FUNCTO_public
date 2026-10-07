@@ -430,16 +430,22 @@ class PlanningObservationTest(unittest.TestCase):
 
     def test_dense_tsdf_record_limit_is_checked_before_any_gpu_mapping(self):
         from curobo.perception import MapperCfg
-        # TSDF and ESDF are distinct native grids. This source has more than
-        # eight million TSDF samples despite an inexpensive coarse ESDF, so its
-        # float32 independent-evidence record would exceed the existing cap.
-        cfg = MapperCfg(extent_meters_xyz=(1.1, 1.1, 1.1), voxel_size=.005,
-            extent_esdf_meters_xyz=(1.1, 1.1, 1.1), esdf_voxel_size=.05,
+        # BEGIN the source must exceed the actual common record limit.
+        from manipulation.collision_records import MAX_ARRAY_BYTES
+        # Native dense dimensions align to eight-voxel blocks. Step past a
+        # complete block rather than landing on the exact cube-root boundary.
+        samples = (int(round((MAX_ARRAY_BYTES // 4) ** (1 / 3))) // 8 + 1) * 8
+        extent = (samples * .005,) * 3
+        # TSDF and ESDF are distinct grids: retain a cheap coarse ESDF while
+        # the dense source is rejected before mapping or allocation begins.
+        cfg = MapperCfg(extent_meters_xyz=extent, voxel_size=.005,
+            extent_esdf_meters_xyz=extent, esdf_voxel_size=.05,
             image_height=96, image_width=96, device="cuda:0")
+        # END this test does not allocate a capacity-sized source array.
         with patch("manipulation.planning_observation._require_audit_mapping_memory") as admission, \
                 patch("manipulation.planning_observation._known_free_voxels") as coverage, \
                 patch("curobo.perception.Mapper") as mapper:
-            with self.assertRaisesRegex(ValueError, "32 MiB collision-array"):
+            with self.assertRaisesRegex(ValueError, f"{MAX_ARRAY_BYTES // 1024**2} MiB collision-array"):
                 build_audit_scene_from_rgbd({"current": view()}, {}, owner_voxel_sizes_m={},
                     mapper_cfg=cfg, depth_error_m=.01, reference_frame="world",
                     robot_sphere_materials=(None,), robot_geometry_source="Explicit robot",
@@ -850,7 +856,10 @@ class OnlineObservationContractTest(unittest.TestCase):
         samples=torch.tensor([[.18,.29,1.],[.2,.29,1.],[.22,.29,1.]],dtype=torch.float64)
         np.testing.assert_allclose(query.signed_distance(samples).numpy(),values.float().numpy()[:,1,2],atol=1e-12)
         self.assertEqual(report['shape_xyz'],[3,4,5])
-        self.assertEqual(sources.call_args.kwargs['max_cells'],32*1024**2//4)
+        # BEGIN native source export and frozen-field codec share one limit.
+        from manipulation.collision_records import MAX_ARRAY_BYTES
+        self.assertEqual(sources.call_args.kwargs['max_cells'], MAX_ARRAY_BYTES // 4)
+        # END a stale lower export cap cannot reintroduce the rejected capacity.
 
     def test_online_builder_maps_one_selected_field_and_uses_complete_robot_radius(self):
         from manipulation.planning_observation import build_scene_from_rgbd

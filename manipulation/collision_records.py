@@ -14,7 +14,11 @@ import numpy as np
 import torch
 
 
-MAX_ARRAY_BYTES = 32 * 1024**2
+# BEGIN one bounded record may use the admitted scene's full field layout.
+# This is a serialization limit, not a mapping or aggregate contact allowance.
+# Those consumers retain their independent total-memory and archive limits.
+MAX_ARRAY_BYTES = 64 * 1024**2
+# END no geometric resolution, observation or acceptance threshold changes.
 _MAX_ARRAY_DIMENSIONS = 5
 _DTYPES = {name: np.dtype(name) for name in ("|b1", "<i8", "<f4", "<f8")}
 _ARRAY_KEYS = {"shape", "dtype", "data_base64"}
@@ -31,7 +35,7 @@ def _array_layout(shape, dtype):
     # Bound individual dimensions too, including shapes with a zero axis.
     byte_count = math.prod(shape) * _DTYPES[dtype].itemsize
     if byte_count > MAX_ARRAY_BYTES:
-        raise ValueError("One collision record array cannot exceed 32 MiB")
+        raise ValueError(f"One collision record array cannot exceed {MAX_ARRAY_BYTES // 1024**2} MiB")
     return _DTYPES[dtype], byte_count
 
 

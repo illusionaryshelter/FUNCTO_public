@@ -22,7 +22,7 @@ from .planning_problem import PosePath, quaternion_conjugate, quaternion_rotate,
 from .online_contact import PreparedContactFields, planar_material_conditions, require_planar_material
 from .planning_scene import (Attachment, CollisionOwner, ContactRule, CoverageField, ObservedSpace,
     PlanningScene, PrismaticGripper, _tensor, _local_spheres, _world_spheres,
-    _self_pair_sum, grasp_contact_rule_ids, validate_grasp_contact_arrival)
+    _self_pair_sum, _self_pair_chunk_size, grasp_contact_rule_ids, validate_grasp_contact_arrival)
 from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES, require_host_memory
 
 
@@ -681,7 +681,7 @@ class OnlinePlanningScene:
             pairs, known_pairs = self._self_collision_pair_tensors(spheres)
             all_self=_self_pair_sum(padded,pairs)
             known_self=_self_pair_sum(padded,known_pairs)
-            # END chunking, both sums and the all-minus-known order are unchanged.
+            # END both pair sets and the all-minus-known order are unchanged.
             costs['collision/robot/self']=torch.where(uncertain_hand,known_self,all_self)
             costs['conditional/collision/robot/self']=torch.where(uncertain_hand,(all_self-known_self).clamp_min(0),0.)
         if geometry_state is not None and self.gripper.self_collision_model is not None:
@@ -872,6 +872,19 @@ class OnlinePlanningScene:
             len(owner.local_spheres) for owner in self.owners if owner.moving)
         coverage_states = int(batch)*int(horizon)*coverage_spheres
         cpu_live, gpu_live = live+256*coverage_states, live+128*coverage_states
+        # BEGIN explicitly admit the larger checkpointed self-pair expansion.
+        # Both ordered partitions execute sequentially; one chunk is live at
+        # a time, including its recomputation during backward. The established
+        # 24-scalar bound includes indexed balls, displacement, norm/ReLU and
+        # their gradients. Sphere inputs/gradients remain in the per-sphere
+        # allowance above, and pair index caches were counted separately.
+        # Host queries may use float64; native planning queries use float32.
+        pair_count = max([0, *(size//16 for size in pair_table_sizes)])
+        pair_states = int(batch)*int(horizon)
+        pair_elements = pair_states*_self_pair_chunk_size(pair_states, pair_count)
+        cpu_live += pair_elements*24*8
+        gpu_live += pair_elements*24*4
+        # END one-state ranking/validation cannot hide pair scratch in sphere bytes.
         # Every analytic box contributes differentiable face minima and a
         # maximum with the grid certificate. Reserve their saved operands and
         # backward temporaries per box, rather than treating the old Boolean

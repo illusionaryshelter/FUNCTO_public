@@ -59,44 +59,56 @@ def refresh_validation(result):
         key: result.execution_binding[key] for key in ("problem", "scene")})
 
 
-def execute_fixture(fixture, *, checker=None, feedback=None, result_only_goal_ids=()):
+def execute_fixture(fixture, *, checker=None, feedback=None, result_only_goal_ids=(), observation_callback=None):
     simulation, _, targets, result, limits = fixture
     gate = checker or _GeometryChecker(simulation.joint_names)
     executor = TrajectoryExecutor(simulation, geometry_checker=gate)
     if feedback is None:
         feedback = _initial_feedback(simulation)
         feedback["scene_condition_evidence"] = {"observed_holding": True}
+    # BEGIN successful sequencing fixtures explicitly supply fresh task facts.
+    # The entrance fact must not act as a perpetual geometry permission latch.
+    if observation_callback is None:
+        def observation_callback(current, curve_time):
+            return {"source": "Explicit CPU Holding observation fixture",
+                    "timestamp_s": current["timestamp_s"],
+                    "scene_condition_evidence": {"observed_holding": True}}
+    # END these declared synthetic facts are never simulator contact feedback.
     with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
         report = _execute_bound(executor, result,
             finger_targets=FixedFingerTargets.from_mapping(targets), execution_limits=limits,
-            result_only_goal_ids=result_only_goal_ids, initial_feedback=feedback, output=Path(temporary)/"trial")
+            result_only_goal_ids=result_only_goal_ids, initial_feedback=feedback,
+            observation_callback=observation_callback, output=Path(temporary)/"trial")
     return report, gate
 
 
+# BEGIN current evidence and declared release replace runtime geometry latches.
 @pytest.mark.parametrize("release", [False, True])
-def test_current_holding_activates_before_preflight_survives_open_and_expires_only_at_release(release):
+def test_current_holding_dependency_is_independent_of_open_and_ends_at_release(release):
     fixture = holding_fixture(release=release)
 
     class EntranceChecker(_GeometryChecker):
         def preflight(self, *args, **kwargs):
-            self.entrance_permissions = kwargs["active_contact_rule_ids"]
+            self.entrance_arguments = dict(kwargs)
             return super().preflight(*args, **kwargs)
 
-    report, gate = execute_fixture(fixture, checker=EntranceChecker(fixture[0].joint_names))
+    # After a declared release the attachment estimate is no longer needed.
+    # Open alone still does not release a Holding dependency.
+    def observation(current, curve_time):
+        return {"source": "Fresh declared Holding/release fixture", "timestamp_s": current["timestamp_s"],
+                "scene_condition_evidence": {"observed_holding": not release or curve_time < .009}}
+    report, gate = execute_fixture(fixture, checker=EntranceChecker(fixture[0].joint_names),
+                                   observation_callback=observation)
     assert report["status"] == "curve_finished"
-    assert gate.entrance_permissions == {"current_holding"}
+    assert "active_contact_rule_ids" not in gate.entrance_arguments
     # Both the original open and the later close preserve the independently
     # observed attachment; neither command silently means physical release.
     assert [row["kind"] for row in report["events"]][:2] == ["open", "close"]
-    assert all(row["active_rule_ids"] == ["current_holding"]
-               for row in report["grasp_contact_permission_changes"])
-    for row in gate.states:
-        expected = [] if release and row["trajectory_time"] >= .009 else ["current_holding"]
-        assert row["active_contact_rule_ids"] == expected
-    changes = report["holding_contact_permission_changes"]
-    assert [row["action"] for row in changes] == (["activated", "expired"] if release else ["activated"])
-    assert changes[0]["source"]["verified"] is True
-    assert report["active_contact_rule_ids"] == ([] if release else ["current_holding"])
+    assert all("active_contact_rule_ids" not in row for row in gate.states)
+    assert report["observed_attachment_bindings"][0]["source"]["verified"] is True
+    assert "active_contact_rule_ids" not in report
+    assert "holding_contact_permission_changes" not in report
+# END entrance provenance is retained separately from current task truth.
 
 
 @pytest.mark.parametrize("field,value", [
@@ -145,12 +157,13 @@ def test_explicit_current_false_holding_cannot_be_hidden_by_verified_entrance_re
     assert fixture[0].arm_goals == []
 
 
-def test_holding_permission_does_not_bypass_other_geometry_rejections():
+def test_current_holding_does_not_bypass_robot_state_rejections():
     fixture = holding_fixture()
     gate = _GeometryChecker(fixture[0].joint_names, rejected_stage="command_event", rejected_time=.002)
     with pytest.raises(ExecutionGuardError):
         execute_fixture(fixture, checker=gate)
-    assert gate.states[-1]["active_contact_rule_ids"] == ["current_holding"]
+    assert gate.states[-1]["stage"] == "command_event"
+    assert "active_contact_rule_ids" not in gate.states[-1]
 
 
 def test_structured_holding_provenance_is_retained_without_rewriting_the_input():
@@ -161,10 +174,10 @@ def test_structured_holding_provenance_is_retained_without_rewriting_the_input()
     result.execution_binding["problem"]["conditions"][0]["source"]["source"] = provenance
     refresh_validation(result)
     report, _ = execute_fixture(fixture)
-    assert report["holding_contact_permission_changes"][0]["source"]["source"] == provenance
+    assert report["observed_attachment_bindings"][0]["source"]["source"] == provenance
 
 
-def test_arrival_close_and_later_open_change_only_the_grasp_latch_when_holding_is_active():
+def test_arrival_close_and_later_open_keep_independent_holding_evidence():
     fixture = recorded_tests.GraspContactActivationTests.fixture(reopen=True)
     simulation, _, _, result, _ = fixture
     _, _, _, holding_result, _ = holding_fixture(release=False)
@@ -177,9 +190,10 @@ def test_arrival_close_and_later_open_change_only_the_grasp_latch_when_holding_i
     refresh_validation(result)
     report, _ = execute_fixture(fixture, result_only_goal_ids=[["pose_events", 0]])
     assert report["status"] == "curve_finished"
-    assert [row["active_rule_ids"] for row in report["grasp_contact_permission_changes"]] == [
-        ["current_holding"], ["contact-rule", "current_holding"], ["current_holding"]]
-    assert report["active_contact_rule_ids"] == ["current_holding"]
+    assert report["grasp_contact_gate_checks"][-1]["control_applied"]
+    assert report["observed_attachment_bindings"][0]["condition_id"] == "observed_holding"
+    assert "grasp_contact_permission_changes" not in report
+    assert "active_contact_rule_ids" not in report
 
 
 @pytest.mark.parametrize("change", [None, "kind", "owner", "interval", "transform"])

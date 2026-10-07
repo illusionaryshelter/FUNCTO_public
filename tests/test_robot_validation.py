@@ -82,8 +82,9 @@ def test_pair_inventory_and_native_exclusion_are_explicit_and_preserved(model):
     gate = validator(model, [PairQuery("first", "second", "excluded", "verified native welded-body rule")])
     result = gate.check_state(feedback(finger=0.), stage="after_step", trajectory_time=.1)
     assert result["passed"] is True
-    assert result["distances_m"][0] < 0
-    assert gate.describe()["pair_order"][0]["source"] == "verified native welded-body rule"
+    assert result["distances_m"] == []
+    assert gate.describe()["pair_order"] == []
+    assert gate.describe()["pair_policy"][0]["source"] == "verified native welded-body rule"
     assert gate.describe()["continuous_collision_certified"] is False
 
 
@@ -95,16 +96,16 @@ def test_numerical_contact_boundary_is_not_a_contact_permission(model):
 
 # BEGIN legal model contact is distinct from filtering or blanket collision removal.
 @pytest.mark.parametrize("finger", [-.01000025, 0.])
-def test_explicit_mechanical_contact_preserves_boundary_and_overlap_evidence(model, finger):
+def test_explicit_mechanical_contact_retains_policy_without_querying_permitted_pair(model, finger):
     permitted = PairQuery("first", "second", "mechanical_contact", "Declared robot-local mechanical contact")
     gate = validator(model, [permitted])
     result = gate.check_state(feedback(finger=finger), stage="after_step", trajectory_time=.1)
     assert result["passed"] is True
-    assert len(result["mechanical_contacts"]) == 1
-    assert result["mechanical_contacts"][0]["policy"] == "mechanical_contact"
-    assert result["mechanical_contacts"][0]["signed_distance_m"] == result["distances_m"][0]
+    assert "mechanical_contacts" not in result
+    assert result["distances_m"] == []
+    assert gate.describe()["pair_order"] == []
     assert result["min_required_clearance_m"] is None
-    assert gate.describe()["pair_order"][0]["source"] == permitted.source
+    assert gate.planning_binding_record()["pair_order"][0]["source"] == permitted.source
     # An identical unpermitted pair still fails; closeness never grants permission.
     assert validator(model).check_state(feedback(finger=finger), stage="after_step", trajectory_time=.1)["passed"] is False
 
@@ -116,7 +117,7 @@ def test_mechanical_contact_cannot_exempt_joint_or_fk_checks(model):
     result = gate.check_state(state, stage="after_step", trajectory_time=.1)
     assert result["passed"] is False
     assert {row["kind"] for row in result["violations"]} == {"independent_joint_velocity", "independent_model_fk"}
-    assert result["mechanical_contacts"][0]["signed_distance_m"] < 0
+    assert "mechanical_contacts" not in result
 # END contact permission changes only the declared geometry-pair acceptance.
 
 
@@ -492,60 +493,66 @@ def online_binding(gate, *, distance=1., supported=True):
     return scene.to_execution_binding()
 
 
-def test_online_preflight_and_actual_tick_never_query_source_world(model, monkeypatch):
+# BEGIN execution never rebuilds or queries a frozen world, even at preflight.
+def test_preflight_and_actual_tick_query_required_robot_pairs_only(model, monkeypatch):
+    from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
+    from manipulation.online_native_confirmation import NativeCollisionConfirmation
     gate = validator(model)
     curve = trajectory([.03, .03], [0., 0.])
-    binding = online_binding(gate)
     def forbidden(*args, **kwargs):
-        raise AssertionError("Source scene queries are outside production execution")
+        raise AssertionError("Frozen-world queries are outside physical execution")
     monkeypatch.setattr(model, "bind_scene", forbidden)
     monkeypatch.setattr(model, "query_scene", forbidden)
+    monkeypatch.setattr(OnlinePlanningScene, "from_binding", forbidden)
+    monkeypatch.setattr(OnlinePlanningScene, "query_state", forbidden)
+    monkeypatch.setattr(FrozenESDF, "signed_distance", forbidden)
+    monkeypatch.setattr(NativeCollisionConfirmation, "confirm", forbidden)
     native_query = model.query
     calls = []
     def query(**kwargs):
         calls.append(deepcopy(kwargs))
         return native_query(**kwargs)
     monkeypatch.setattr(model, "query", query)
-    gate.bind_scene(binding, progress_at_time=lambda t: float(curve.sample(t)[3]))
-    result = gate.preflight(curve, feedback(finger=0.), LIMITS)
-    assert result["passed"] and result["observed_scene_checked"]
-    assert len(calls) == 1 and calls[0]["pairs"] == ()
-    assert set(calls[0]["frames"]) == {"left", "right", "tool"}
+    assert not hasattr(gate, "bind_scene")
+    result = gate.preflight(curve, feedback(), LIMITS)
+    assert result["passed"] and not result["observed_scene_checked"]
+    assert len(calls) == 1 and calls[0]["pairs"] == gate.required_pairs
+    assert calls[0]["frames"] == ["tool"]
     assert result["reference_collision_checked"] is False
-    assert result["actual_state"]["distances_m"] == []
-    assert gate.describe()["pair_order"] == []
+    assert len(result["actual_state"]["distances_m"]) == len(gate.describe()["pair_order"])
     gate.check_state(feedback(finger=-.08), stage="actual", trajectory_time=.1)
     assert calls[-1]["joint_positions"][1] == -.08
-    assert calls[-1]["pairs"] == ()
+    assert calls[-1]["pairs"] == gate.required_pairs
+    assert gate.preflight(curve, feedback(), LIMITS, start_time=.2, current_time=.2, until=.8)["passed"]
 
 
 @pytest.mark.parametrize("failure", ["collision", "unsupported_field"])
-def test_online_failures_keep_named_geometry_evidence_through_executor(model, failure):
+def test_frozen_world_failures_remain_planning_verdicts_only(model, failure):
     from manipulation.execution import TrajectoryExecutor
+    from manipulation.online_geometry import OnlinePlanningScene
+    from manipulation.online_native_confirmation import OnlineCollisionConfirmation
     gate = validator(model)
     binding = online_binding(gate, distance=-.1 if failure == "collision" else 1.,
                              supported=failure != "unsupported_field")
-    gate.bind_scene(binding, progress_at_time=lambda t: t)
-    adapter = SimpleNamespace(geometry_checker=gate, _geometry_pair_count=0)
-    result = TrajectoryExecutor._geometry_result(adapter, "check_state", feedback(),
-        stage="actual", trajectory_time=0.)
-    assert not result["passed"]
-    assert all(row["kind"] != "geometry_checker_error" and row["name"] for row in result["violations"])
-    # BEGIN assert the intended physical/query cause, not merely any rejection.
-    if failure == 'collision':
-        confirmation = result['scene']['native_confirmation']['states']
-        assert confirmation and confirmation[0]['collision_targets'] == ['background']
+    scene = OnlinePlanningScene.from_binding(binding)
+    state = feedback()
+    robot = model.query(joint_names=NAMES, joint_positions=state["q"],
+                        T_reference_base=np.eye(4), pairs=(), frames=["left", "right"])
+    spheres = np.empty((2, 4))
+    for row in binding["robot_sphere_geometry"]:
+        pose = np.asarray(robot["frame_poses"][row["link_name"]])
+        ids = row["sphere_indices"]
+        spheres[ids, :3] = np.asarray(row["centers_local"]) @ pose[:3, :3].T + pose[:3, 3]
+        spheres[ids, 3] = row["radii"]
+    planning = scene.query_state(spheres, state["tool_pose"], 0., joint_position=state["q"],
+        joint_names=NAMES, native_confirmation=OnlineCollisionConfirmation(gate, scene))
+    assert not planning["passed"]
+    if failure == "collision":
+        assert planning["native_confirmation"]["states"][0]["collision_targets"] == ["background"]
     else:
-        assert result['scene']['status'] == 'SCENE_UPDATE_REQUIRED'
-        assert result['scene']['components']['scene_update/background/robot'] > 0
-    # END incomplete fixtures cannot pass by becoming generic checker errors.
-
-
-def test_online_rebind_checks_sphere_fk_calibration_before_changing_scene(model):
-    gate = validator(model)
-    binding = online_binding(gate)
-    binding["robot_model"]["T_frame_tcp"][0][3] = .001
-    with pytest.raises(ValueError, match="FK model and calibration"):
-        gate.bind_scene(binding, progress_at_time=lambda t: t)
-    assert not hasattr(gate, "_scene_binding")
-# END source meshes neither certify nor veto the measured online scene.
+        assert planning["status"] == "SCENE_UPDATE_REQUIRED"
+    adapter = SimpleNamespace(geometry_checker=gate, _geometry_pair_count=len(gate.required_pairs))
+    actual = TrajectoryExecutor._geometry_result(adapter, "check_state", state,
+        stage="actual", trajectory_time=0.)
+    assert actual["passed"] and "scene" not in actual
+# END bad frozen observations cannot erase actual robot safety checks or certify the world.

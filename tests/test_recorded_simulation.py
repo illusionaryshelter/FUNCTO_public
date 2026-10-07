@@ -163,16 +163,14 @@ class _GeometryChecker:
                 "scope": "Scripted control-contract test verdicts; no independent geometry calculation",
                 "pair_order": [["mock_link_a", "mock_link_b"]]}
 
-    # BEGIN record the exact scene handoff in this nonphysical test double.
-    def bind_scene(self, binding, *, progress_at_time, nominal_fingers):
-        self.scene_binding = deepcopy(binding)
-        self.progress_at_time = progress_at_time
-        self.nominal_fingers = nominal_fingers
-    # END production geometry is independently tested elsewhere.
+    # BEGIN a frozen scene binding is a forbidden execution-side operation.
+    def bind_scene(self, *args, **kwargs):
+        raise AssertionError("Physical execution must never bind frozen world geometry")
+    # END every sequencing path shares this fail-fast sentinel.
 
     # BEGIN actual preflight receives the current execution-local permission set.
     def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0., until=None,
-                  current_time=None, active_robot_owner_permissions=frozenset(), active_contact_rule_ids=frozenset()):
+                  current_time=None):
         self.preflight_inputs.append(deepcopy(initial_feedback))
         return {"passed": self.preflight_passed,
                 "violations": [] if self.preflight_passed else [
@@ -180,11 +178,8 @@ class _GeometryChecker:
     # END nominal planner assumptions do not become an implicit actual latch.
 
     # BEGIN scripted geometry retains the explicit actual contact query mode.
-    def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset(),
-                    active_contact_rule_ids=frozenset()):
-        self.states.append({"feedback": deepcopy(feedback), "stage": stage, "trajectory_time": trajectory_time,
-                            "active_robot_owner_permissions": sorted(active_robot_owner_permissions),
-                            "active_contact_rule_ids": sorted(active_contact_rule_ids)})
+    def check_state(self, feedback, *, stage, trajectory_time):
+        self.states.append({"feedback": deepcopy(feedback), "stage": stage, "trajectory_time": trajectory_time})
         # END the double never derives permissions from a command or nominal clock.
         rejected = (stage == self.rejected_stage
                     and (self.rejected_time is None or trajectory_time == self.rejected_time))
@@ -2199,50 +2194,16 @@ class GraspContactActivationTests(unittest.TestCase):
                 return executor.last_execution_report, checker
             return run(), checker
 
-    # BEGIN zero-tick entry proves arrival before testing current target overlap.
-    def test_zero_tick_arrival_provisionally_allows_entry_geometry_before_close_commit(self):
-        simulation, curve, targets, result, limits = self.fixture(zero_tick=True)
+    # BEGIN zero-tick entry proves arrival without world permission state.
+    def test_zero_tick_arrival_is_checked_before_robot_preflight_and_close(self):
+        fixture = self.fixture(zero_tick=True)
+        simulation = fixture[0]
         simulation.scripted_tcp_estimate_offset[0] = .0005
-        initial_control = simulation.finger_control.copy()
-        query_latches = []
-        test = self
-
-        class EntryContactChecker(_GeometryChecker):
-            """The declared hand/target pair overlaps even in the initial state."""
-
-            def preflight(self, trajectory, initial_feedback, execution_limits, **kwargs):
-                verdict = super().preflight(trajectory, initial_feedback, execution_limits, **kwargs)
-                permissions = kwargs["active_contact_rule_ids"]
-                self.preflight_permissions = sorted(permissions)
-                query_latches.append(("preflight", list(executor.last_execution_report["active_contact_rule_ids"])))
-                test.assertEqual(simulation.arm_goals, [])
-                np.testing.assert_array_equal(simulation.finger_control, initial_control)
-                if "contact-rule" not in permissions:
-                    verdict.update(passed=False, violations=[{"kind": "named_target_contact", "name": "named_left_pad/perceived_part"}])
-                return verdict
-
-            def check_state(self, feedback, *, stage, trajectory_time, active_contact_rule_ids=frozenset()):
-                verdict = super().check_state(feedback, stage=stage, trajectory_time=trajectory_time,
-                    active_contact_rule_ids=active_contact_rule_ids)
-                query_latches.append((stage, list(executor.last_execution_report["active_contact_rule_ids"])))
-                if "contact-rule" not in active_contact_rule_ids:
-                    verdict.update(passed=False, violations=[{"kind": "named_target_contact", "name": "named_left_pad/perceived_part"}])
-                return verdict
-
-        checker = EntryContactChecker(simulation.joint_names)
-        executor = TrajectoryExecutor(simulation, geometry_checker=checker)
-        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
-            report = _execute_bound(executor, result, result_only_goal_ids=[["pose_events", 0]],
-                finger_targets=FixedFingerTargets.from_mapping(targets), execution_limits=limits,
-                initial_feedback=_initial_feedback(simulation), output=Path(temporary)/"trial")
+        report, checker = self.run_trial(fixture)
         self.assertEqual(report["status"], "curve_finished")
-        self.assertEqual(checker.preflight_permissions, ["contact-rule"])
-        self.assertEqual(query_latches[:4], [("preflight", []), ("initial_state", []),
-                                           ("before_step", []), ("command_event", [])])
-        self.assertEqual(query_latches[4], ("after_step", ["contact-rule"]))
-        self.assertTrue(all(row["active_contact_rule_ids"] == ["contact-rule"] for row in checker.states))
+        self.assertFalse(report["world_collision_checked"])
+        self.assertNotIn("active_contact_rule_ids", report)
         np.testing.assert_array_equal(checker.preflight_inputs[0]["q"], checker.states[0]["feedback"]["q"])
-        self.assertEqual(checker.preflight_inputs[0]["feedback_id"], checker.states[0]["feedback"]["feedback_id"])
         checks = report["grasp_contact_gate_checks"]
         self.assertEqual([row["point"] for row in checks], ["initial_contact_gate", "before_step"])
         self.assertEqual([row["measurement"]["value"] for row in checks], ["T", "T"])
@@ -2261,8 +2222,8 @@ class GraspContactActivationTests(unittest.TestCase):
         self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "grasp_contact_arrival_rejected")
         self.assertEqual(report["executed_steps"], 0)
         self.assertEqual(report["events"], [])
-        self.assertEqual(report["active_contact_rule_ids"], [])
-        self.assertEqual(report["grasp_contact_permission_changes"], [])
+        self.assertNotIn("active_contact_rule_ids", report)
+        self.assertNotIn("grasp_contact_permission_changes", report)
         self.assertEqual(checker.preflight_inputs, [])
         self.assertEqual(checker.states, [])
         self.assertEqual([row["measurement"]["value"] for row in report["grasp_contact_gate_checks"]], ["F"])
@@ -2278,11 +2239,11 @@ class GraspContactActivationTests(unittest.TestCase):
         result.execution_binding["completed_goal_ids"] = [["pose_events", 1]]
         report, checker = self.run_trial(fixture, rejects=True)
         self.assertEqual(report["executed_steps"], 2)
-        self.assertEqual(report["active_contact_rule_ids"], [])
+        self.assertNotIn("active_contact_rule_ids", report)
         self.assertEqual([row["kind"] for row in report["events"]], ["open"])
         self.assertEqual(report["grasp_contact_gate_checks"][-1]["measurement"]["value"], "F")
         self.assertFalse(report["grasp_contact_gate_checks"][-1]["control_applied"])
-        self.assertTrue(all(not row["active_contact_rule_ids"] for row in checker.states))
+        self.assertTrue(all("active_contact_rule_ids" not in row for row in checker.states))
         np.testing.assert_array_equal(simulation.finger_control, curve.finger_trajectory.sample(.004)[0])
 
     def test_same_tick_arrival_is_provisional_and_rechecked_before_close(self):
@@ -2294,33 +2255,24 @@ class GraspContactActivationTests(unittest.TestCase):
         report, _ = self.run_trial(fixture, callback=drift, rejects=True)
         self.assertEqual([row["measurement"]["value"] for row in report["grasp_contact_gate_checks"]], ["T", "F"])
         self.assertIn(["pose_events", 1], report["completed_goal_ids"])
-        self.assertEqual(report["active_contact_rule_ids"], [])
+        self.assertNotIn("active_contact_rule_ids", report)
         self.assertFalse(any(row["kind"] == "close" for row in report["events"]))
 
     def test_valid_arrival_allows_its_contact_mode_without_adding_a_pose_hold_goal(self):
         fixture = self.fixture()
         simulation = fixture[0]
-        class ContactChecker(_GeometryChecker):
-            def check_state(self, feedback, *, stage, trajectory_time, active_contact_rule_ids=frozenset()):
-                result = super().check_state(feedback, stage=stage, trajectory_time=trajectory_time,
-                    active_contact_rule_ids=active_contact_rule_ids)
-                if trajectory_time >= .004 and "contact-rule" not in active_contact_rule_ids:
-                    result.update(passed=False, violations=[{"kind": "named_target_contact", "name": "named_left_pad/perceived_part"}])
-                return result
         def later_departure(model, data, row):
             if row["elapsed"] >= .006:
                 simulation.scripted_tcp_estimate_offset[0] = .002
-        checker = ContactChecker(simulation.joint_names)
+        checker = _GeometryChecker(simulation.joint_names)
         report, _ = self.run_trial(fixture, checker=checker, callback=later_departure)
         self.assertEqual(report["status"], "curve_finished")
-        self.assertEqual(report["active_contact_rule_ids"], ["contact-rule"])
+        self.assertNotIn("active_contact_rule_ids", report)
         self.assertEqual(sum(row["control_applied"] for row in report["grasp_contact_gate_checks"]), 1)
         self.assertTrue(all(row["passed"] for row in report["grasp_contact_gate_checks"]))
         self.assertFalse(report["evidence_passed"])
         self.assertNotIn(["pose_events", 0], report["completed_goal_ids"])
-        self.assertEqual(checker.states[0]["active_contact_rule_ids"], [])
-        self.assertTrue(all(row["active_contact_rule_ids"] == ["contact-rule"]
-            for row in checker.states if row["trajectory_time"] >= .004))
+        self.assertTrue(all("active_contact_rule_ids" not in row for row in checker.states))
 
     def test_new_mode_still_runs_geometry_guard_and_does_not_commit_a_rejected_close(self):
         fixture = self.fixture()
@@ -2329,17 +2281,16 @@ class GraspContactActivationTests(unittest.TestCase):
         self.assertEqual(report["feedback_failure"]["point"], "command_event")
         self.assertTrue(report["grasp_contact_gate_checks"][-1]["passed"])
         self.assertFalse(report["grasp_contact_gate_checks"][-1]["control_applied"])
-        self.assertEqual(report["active_contact_rule_ids"], [])
-        self.assertEqual(checker.states[-1]["active_contact_rule_ids"], ["contact-rule"])
+        self.assertNotIn("active_contact_rule_ids", report)
+        self.assertNotIn("active_contact_rule_ids", checker.states[-1])
         self.assertFalse(any(row["kind"] == "close" for row in report["events"]))
 
-    def test_open_revokes_the_local_latch(self):
+    def test_open_keeps_original_event_order_without_permission_state(self):
         report, checker = self.run_trial(self.fixture(reopen=True))
         self.assertEqual(report["status"], "curve_finished")
-        self.assertEqual(report["active_contact_rule_ids"], [])
-        self.assertEqual([row["active_rule_ids"] for row in report["grasp_contact_permission_changes"]],
-                         [[], ["contact-rule"], []])
-        self.assertEqual(checker.states[-1]["active_contact_rule_ids"], [])
+        self.assertNotIn("active_contact_rule_ids", report)
+        self.assertNotIn("grasp_contact_permission_changes", report)
+        self.assertEqual([row["kind"] for row in report["events"]], ["open", "close", "open"])
 
     def test_contact_arrival_cannot_be_result_only_or_mismatched_to_another_owner(self):
         from manipulation.execution_binding import rebind_execution_result

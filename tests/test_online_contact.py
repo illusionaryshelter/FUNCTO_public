@@ -73,6 +73,24 @@ def test_same_sphere_keeps_second_obstacle_outside_permitted_patch_and_gradient(
     assert not hasattr(query, "_contact_regions")
 
 
+# BEGIN a larger single field does not increase the aggregate contact bank.
+def test_record_capacity_does_not_expand_contact_bank_or_allocate_rejected_fields():
+    # Four overlapping permissions produce fifteen nonempty combinations.
+    # This 32.25 MiB broadcast source fits the new single-record contract,
+    # but its complete combination bank exceeds the unchanged 256 MiB cap.
+    values = np.broadcast_to(np.float32(1.), (129, 256, 256))
+    rules = tuple(rule(f"patch{index}", x=index * .001) for index in range(4))
+    with patch("manipulation.online_contact.require_host_memory") as admission, \
+            patch("manipulation.online_contact.distance_transform_edt") as edt:
+        with pytest.raises(ValueError, match="field combinations exceed the fixed storage budget"):
+            PreparedContactFields.prepare(distance=values, site_valid=None, observed_sign=None,
+                origin=np.zeros(3), voxel_size=.001, rules=rules,
+                maximum_radii={item.rule_id: .01 for item in rules}, source="capacity boundary")
+    admission.assert_not_called()
+    edt.assert_not_called()
+# END aggregate rejection precedes dense allocation or EDT computation.
+
+
 def test_two_rules_use_true_removed_union_and_inactive_rule_cannot_borrow_it():
     left, right = rule(), rule("right", .006)
     query = prepare(field(), [left, right])

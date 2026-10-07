@@ -966,7 +966,7 @@ map refinement, or solver reconstruction loop. A recorded joint reference is
 explicit guidance; when native fitting changes its representation, diagnostics
 say so rather than claiming the original curve was preserved.
 
-The native optimizer, native success metrics, OMPL checks and actual execution
+The native optimizer, native success metrics and OMPL checks
 use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
 
 - `FrozenESDF` retains the current Mapper field and source-validity bits.
@@ -987,8 +987,8 @@ use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
 
 <!-- BEGIN native confirmation of conservative robot/world sphere candidates. -->
 Positive robot/world sphere costs are collision candidates. Final candidate
-acceptance and measured execution share `online_native_confirmation.py` through
-`RobotStateValidator.online_collision_confirmation`: only those candidates are
+acceptance uses `online_native_confirmation.OnlineCollisionConfirmation`:
+only those candidates are
 checked with the registered native robot solids and the same frozen observed
 occupied cells (or analytic frozen primitives). One spatial index is prepared
 per confirmation adapter. Effective finite contact rules remove only wholly
@@ -1014,13 +1014,23 @@ request allowance while retaining cumulative work and physical-step history.
 
 Delivery checks the exact native-to-Hermite representation, measured entry,
 continuous named joint position/velocity/acceleration and bound clock once.
-`PlanningResult.execution_binding` carries the exact curve and the same online
-scene. `TrajectoryExecutor` checks actual entrance and measured state using
-that model; it does not re-audit the nominal full curve against source solids.
-A finite close permission requires current measured arrival before control
-application. Current Holding activates only explicitly bound finite rule IDs
-with matching fresh attachment evidence. Commanded fingers remain separate
-from measured finger positions.
+<!-- BEGIN planning geometry and physical execution have distinct duties. -->
+`PlanningResult.execution_binding` retains the exact curve and frozen planning
+scene for authorization and provenance. `TrajectoryExecutor` does not rebuild
+or query that frozen world during preflight or physical execution.
+`RobotStateValidator` checks measured joint limits, model/FK identity and the
+registered required native robot/fixed-installation collision pairs only.
+Tracking, event timing, real arrival before close, fresh observations, current
+Holding dependencies and effect requirements remain execution duties. An
+attachment-dependent owner needs current Holding evidence or a current owner
+pose; entrance facts cannot silently persist into later samples. Commanded
+fingers remain separate from measured finger positions. Frozen occupied cells
+and their conservative envelopes cannot establish actual physical contact.
+
+Array records admit at most 64 MiB per array. Contact fields retain their
+independent 256 MiB aggregate limit; overall planning, archive and process
+resource limits remain independent checks.
+<!-- END physical outcomes require current evidence, not frozen geometry. -->
 
 CPU contracts live under `tests/test_motion_backend_contract.py`,
 `tests/test_online_geometry.py`, and the affected planning/execution tests.

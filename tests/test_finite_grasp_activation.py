@@ -14,8 +14,6 @@ from manipulation.planning_scene import CollisionOwner, ContactRule, grasp_conta
 from test_independent_scene_validation import binding, checker, rule
 from test_manipulation_planning_problem import problem
 from test_manipulation_planning_scene import SphereQuery, pose_path, scene
-from test_robot_owner_permission import gate_for
-from test_robot_validation import LIMITS, trajectory
 
 
 def activation(**changes):
@@ -76,18 +74,10 @@ def test_latched_finite_rule_still_checks_entire_material_overlap(checker):
     assert native_query(checker, binding([rule()]))["passed"]
 
 
-def test_validator_transmits_finite_latch_to_actual_state_and_preflight(checker):
-    curve = trajectory([.03, .03], [0., 0.])
-    gate = gate_for(checker, model_binding(), curve)
-    feedback = {"joint_names": checker.joint_names, "arm_joint_names": checker.joint_names[:1],
-        "finger_joint_names": checker.joint_names[1:], "q": [.03, 0.], "dq": [0., 0.],
-        "reference_frame": "world", "tool_link": "base", "tool_transform": np.eye(4),
-        "base_pose": np.eye(4), "tool_pose": np.eye(4)}
-    assert not gate.check_state(feedback, stage="before_close", trajectory_time=.6)["passed"]
-    assert gate.check_state(feedback, stage="after_arrival", trajectory_time=.6,
-        active_contact_rule_ids={"pad_to_target"})["passed"]
-    assert gate.preflight(curve, feedback, LIMITS, start_time=.6, until=.6, current_time=.6,
-        active_contact_rule_ids={"pad_to_target"})["passed"]
+# BEGIN execution no longer accepts frozen-scene permission latches.
+# Runtime world-query sentries and actual device failures are covered by
+# test_execution_responsibilities; finite geometry remains a planning contract.
+# END remove the obsolete validator latch forwarding test.
 
 
 @pytest.mark.parametrize("changes", [
@@ -166,33 +156,34 @@ def finite_execution_fixture(*, reopen=False, zero_tick=False):
 
 
 @pytest.mark.parametrize("arrived", [False, True])
-def test_executor_only_activates_finite_rules_after_current_arrival(arrived):
+def test_executor_preserves_current_arrival_without_world_geometry_permissions(arrived):
     fixture = finite_execution_fixture(zero_tick=True)
     if not arrived:
         fixture[0].scripted_tcp_estimate_offset[0] = .002
     report, checker = execution_tests.GraspContactActivationTests.run_trial(fixture, rejects=not arrived)
-    assert report["active_robot_owner_permissions"] == []
-    assert report["active_contact_rule_ids"] == (["pad_to_target"] if arrived else [])
-    assert all(not row["active_robot_owner_permissions"] for row in checker.states)
+    # BEGIN execution retains the actual command gate, not geometric latches.
+    assert "active_robot_owner_permissions" not in report
+    assert "active_contact_rule_ids" not in report
+    assert all("active_contact_rule_ids" not in row for row in checker.states)
     if arrived:
         assert report["status"] == "curve_finished"
-        assert all(row["active_contact_rule_ids"] == ["pad_to_target"] for row in checker.states)
         assert report["grasp_contact_gate_checks"][-1]["control_applied"]
     else:
         assert checker.states == [] and report["events"] == []
         assert report["feedback_failure"]["violations"][0]["kind"] == "grasp_contact_arrival_rejected"
+    # END a missing arrival still prevents the actual actuator command.
 
 
-def test_open_revokes_finite_latch_without_creating_a_pair_permission():
+def test_open_after_close_does_not_create_runtime_geometry_permission():
     report, checker = execution_tests.GraspContactActivationTests.run_trial(finite_execution_fixture(reopen=True))
     assert report["status"] == "curve_finished"
-    assert report["active_contact_rule_ids"] == []
-    assert any(row["active_contact_rule_ids"] == ["pad_to_target"] for row in checker.states)
-    assert checker.states[-1]["active_contact_rule_ids"] == []
-    assert all(not row["active_robot_owner_permissions"] for row in checker.states)
+    assert "active_contact_rule_ids" not in report
+    assert all("active_contact_rule_ids" not in row for row in checker.states)
+    assert report["grasp_contact_gate_checks"][-1]["control_applied"]
+    assert [row["kind"] for row in report["events"]] == ["open", "close", "open"]
 
 
-def test_finite_latch_report_expires_when_its_original_interval_ends():
+def test_planning_permission_interval_does_not_create_an_execution_expiration_gate():
     fixture = finite_execution_fixture()
     bound = fixture[3].execution_binding
     bound["problem"]["conditions"][0]["interval"][1] = .8
@@ -202,7 +193,8 @@ def test_finite_latch_report_expires_when_its_original_interval_ends():
     bound["curve"] = curve_snapshot(fixture[1])
     bound["validation"]["inputs"] = deepcopy({key: bound[key] for key in ("problem", "scene")})
     report, checker = execution_tests.GraspContactActivationTests.run_trial(fixture)
-    assert report["active_contact_rule_ids"] == []
-    assert report["finite_contact_permission_expirations"][0]["rule_ids"] == ["pad_to_target"]
-    assert checker.states[-1]["active_contact_rule_ids"] == []
+    assert report["status"] == "curve_finished"
+    assert "active_contact_rule_ids" not in report
+    assert "finite_contact_permission_expirations" not in report
+    assert all("active_contact_rule_ids" not in row for row in checker.states)
 # END CPU contracts do not claim an online TSDF migration or simulated grasp success.

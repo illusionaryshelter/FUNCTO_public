@@ -31,7 +31,9 @@ _EDGES = tuple(combinations(range(4), 2))
 def _require_sample_array_budget(shape):
     """Admit the dense float32 source against the existing record-array limit."""
     if math.prod(shape) * np.dtype(np.float32).itemsize > MAX_ARRAY_BYTES:
-        raise ValueError("Observed TSDF source samples exceed the existing 32 MiB collision-array budget")
+        # BEGIN audit records follow the same bounded codec as frozen fields.
+        raise ValueError(f"Observed TSDF source samples exceed the existing {MAX_ARRAY_BYTES // 1024**2} MiB collision-array budget")
+        # END this does not change reconstruction or its total memory admission.
 
 
 class _Components:

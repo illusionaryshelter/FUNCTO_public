@@ -19,6 +19,13 @@ import numpy as np
 _active_checks = ContextVar("functo_optimizer_device_checks", default=None)
 
 
+# BEGIN expose the existing graph/warmup boundary without exposing its mask.
+def has_active_device_checks():
+    """Whether this context must retain device-only optimizer control flow."""
+    return _active_checks.get() is not None
+# END eager shortcuts must never specialize a captured graph to warmup data.
+
+
 class DeviceChecks:
     """One fixed device mask with stable, warmup-registered error categories."""
 

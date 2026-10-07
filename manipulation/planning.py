@@ -35,8 +35,9 @@ from .resource_admission import (
 # BEGIN final validation separates total finite work from live geometry storage.
 _VALIDATION_CHUNK_SIZE = 256
 _NATIVE_STAGE_POINT_LIMIT = 8192
-_VALIDATION_RECORD_BYTE_LIMIT = 512 * 1024**2
-_PROCESS_GEOMETRY_BYTE_LIMIT = 256 * 1024**2
+# BEGIN byte admission is owned by actual record/scene consumers.
+# No unused byte constants here may be mistaken for enforced protections.
+# END finite-work limits above remain active.
 # END increasing final work cannot enlarge native anchor/search batches.
 
 # BEGIN reusable physical-domain contract for native numerical iterates.
@@ -3572,6 +3573,9 @@ class _CuroboPlanner:
     # BEGIN reject an immutable infeasible entrance before running native IK.
     def initial_state_diagnostics(self):
         """Test measured q/dq and online collision geometry before proposing motion."""
+        # BEGIN frozen-world confirmation belongs to planning, not device supervision.
+        from .online_native_confirmation import OnlineCollisionConfirmation
+        # END robot_validation supplies only the registered robot model here.
         limits = self._verification_native.get_cost("cspace").config.joint_limits
         columns = [limits.joint_names.index(name) for name in self.joint_names]
         q, dq = self.start.position[:, None], self.start.velocity[:, None]
@@ -3598,8 +3602,8 @@ class _CuroboPlanner:
                 progress, q, self.joint_names, trajectory_time=q.new_zeros(q.shape[:2]),
                 normalized_time=q.new_zeros(q.shape[:2]),
                 # BEGIN measured entrance uses the same candidate confirmation rule.
-                native_confirmation=self.robot_validator.online_collision_confirmation(
-                    self.scene, check_request=self.check_request))
+                native_confirmation=OnlineCollisionConfirmation(
+                    self.robot_validator, self.scene, check_request=self.check_request))
             # END proxy geometry alone cannot declare an immutable entrance impossible.
             residuals = {name: float(value.max().item()) for name, value in components.items()}
         failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
@@ -4413,10 +4417,11 @@ class _CuroboPlanner:
         """
         from curobo._src.solver.solve_mode import SolveMode
         from curobo._src.solver.solve_state import SolveState
-        # BEGIN candidate and measured execution share the native confirmation adapter.
+        # BEGIN candidate acceptance owns its model-only collision confirmation.
+        from .online_native_confirmation import OnlineCollisionConfirmation
         candidate_scene = self.scene if candidate_scene is None else candidate_scene
-        native_confirmation = self.robot_validator.online_collision_confirmation(
-            candidate_scene, check_request=self.check_request)
+        native_confirmation = OnlineCollisionConfirmation(
+            self.robot_validator, candidate_scene, check_request=self.check_request)
         # END no confirmation object is installed in an optimization rollout.
         mapping = _ProgressMap(trajectory.progress_u, trajectory.progress_s)
         pairs = mapping.anchor_parameters(self.anchors)

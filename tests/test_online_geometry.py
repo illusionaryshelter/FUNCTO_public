@@ -136,3 +136,21 @@ def test_cloned_queries_do_not_replace_another_requests_prepared_model():
     assert query._contact_model is original
     assert other._contact_model is not original
 # END no positive geometric residual becomes a different runtime success set.
+
+
+# BEGIN one-state and large-state admission must cover expanded self-pair scratch.
+def test_pair_workspace_cannot_hide_behind_a_small_sphere_count():
+    current = scene()
+    current.robot_sphere_materials = ('body', 'body')
+    # Repeated declared pairs remain distinct positive terms at this generic
+    # interface. They make pair storage much larger than two sphere records.
+    pairs = [[0, 1]]*2048
+    current.bind_online_robot(robot_sphere_geometry=[{
+        'link_name': 'link', 'sphere_indices': [0, 1],
+        'centers_local': [[0., 0., 0.], [1., 0., 0.]], 'radii': [.01, .01]}],
+        robot_self_collision_pairs=pairs)
+    for states, expanded_pairs in ((1, 2048), (4096, 1048576)):
+        allocation = current.estimated_workspace_allocation(1, states)
+        assert allocation['gpu_live'] >= expanded_pairs*24*4
+        assert allocation['cpu_live'] >= expanded_pairs*24*8
+# END float64 host scratch and float32 native scratch have separate admissions.
