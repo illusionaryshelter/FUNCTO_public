@@ -138,6 +138,65 @@ class ScopedOmplSearchTest(unittest.TestCase):
         return planner.ompl_seed(torch.zeros((1, 1, 8, len(planner.joint_names)), dtype=torch.float64),
                                 SimpleNamespace(duration=1., _curve=curve))
 
+    # BEGIN required connections share one deadline without an artificial chart quota.
+    def _search_with_charged_clock(self, cost_per_query, *, attempts=1):
+        """Charge unique scene queries while retaining the installed OMPL connector.
+
+        Only the first connection is expensive in this deterministic fixture.
+        No real sleep or GPU timing is involved: the clock isolates whether a
+        necessary connection receives the request's remaining time.
+        """
+        bounds = np.tile([-np.inf, np.inf], (6, 1)); bounds[1] = 0.
+        relation = PoseProcessRequirement(.3, .7, pose_path((0., .2, 0.)), bounds, "required y plane")
+        planner = cartesian_planner(problem(pose_relations=(relation,)))
+        planner.budget = replace(planner.budget, ik_seeds=attempts, trajectory_seeds=1)
+        clock, calls = [0.], []
+
+        def connector(start, goal, lower, upper, valid, equality, **kwargs):
+            calls.append({"allocated_seconds": kwargs["seconds"], "started": clock[0]})
+            seen = set()
+
+            def charged_valid(value):
+                key = np.asarray(value, dtype=float).tobytes()
+                if key not in seen:
+                    seen.add(key)
+                    clock[0] += cost_per_query if len(calls) == 1 else 0.
+                return valid(value)
+
+            return _ompl_stage(start, goal, lower, upper, charged_valid, equality, **kwargs)
+
+        with patch("manipulation.planning.time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                patch("manipulation.planning._ompl_stage", side_effect=connector):
+            seed, report = self.search(planner, lambda t: np.array([t, 0., 0.]))
+        return seed, report, calls, clock[0]
+
+    def test_first_required_connection_can_use_remaining_global_time(self):
+        seed, report, calls, elapsed = self._search_with_charged_clock(.2)
+        self.assertIsNotNone(seed, report)
+        self.assertEqual(len(calls), 3)
+        self.assertGreater(elapsed, .75)
+        self.assertLess(elapsed, 3.)
+        self.assertEqual(report["elapsed_seconds"], elapsed)
+        for call, branch in zip(calls, report["branches"]):
+            self.assertAlmostEqual(call["allocated_seconds"], 3.-call["started"])
+            self.assertEqual(branch["allocated_seconds"], call["allocated_seconds"])
+        self.assertGreater(report["branches"][0]["elapsed_seconds"], .75)
+
+    def test_expired_global_deadline_stops_later_charts_and_attempts(self):
+        seed, report, calls, elapsed = self._search_with_charged_clock(.8, attempts=2)
+        self.assertIsNone(seed)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(report["branches"]), 1)
+        self.assertGreaterEqual(elapsed, 3.)
+        # A finite state check can cross the deadline; it cannot grant a new
+        # connection or candidate its own renewed three-second budget.
+        self.assertLessEqual(elapsed, 3.8)
+        self.assertEqual(report["elapsed_seconds"], elapsed)
+        self.assertEqual(report["branches"][0]["allocated_seconds"], 3.)
+        self.assertEqual(report["branches"][0]["elapsed_seconds"], elapsed)
+        self.assertEqual(report["branches"][0]["failure"], "whole_search_time_budget_exhausted")
+    # END existing state-query and alternative-proposal caps remain independently tested.
+
     # BEGIN failed alternative IK cannot consume the only qualified boundary attempt.
     def test_functional_boundary_uses_qualified_indices_before_preferring_an_alternative(self):
         good = {"task_satisfied": True, "model_valid": True, "native_pose_ik_success": True}

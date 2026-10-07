@@ -287,7 +287,11 @@ def test_workspace_counts_unique_source_arrays_and_both_float_caches_on_cpu_and_
     query = prepare(field(), [rule()])
     coverage = SimpleNamespace(_known=np.ones((2, 2, 2), bool), _known_free=np.ones((2, 2, 2), bool),
                               _distance=torch.zeros((1, 1, 2, 2, 2), dtype=torch.float32))
-    scene = SimpleNamespace(background=query, owners=(), coverage=coverage, robot_sphere_materials=("pad",), gripper=None)
+    # BEGIN resource fixture includes the bound scene's empty integer partitions.
+    scene = SimpleNamespace(background=query, owners=(), coverage=coverage, robot_sphere_materials=("pad",), gripper=None,
+                            robot_sphere_geometry=({'link_name': 'pad'},),
+                            _self_collision_pair_arrays=(np.empty((0, 2), np.int64), np.empty((0, 2), np.int64)))
+    # END fixed pair storage is exercised separately with a real robot binding.
     base = OnlinePlanningScene.estimated_workspace_allocation(scene, 1, 1)
     # One ESDF owns distance float32 + two bool arrays: 6N. One prepared
     # channel adds 4N. Distance, site-validity and prepared-bank caches each

@@ -3720,7 +3720,10 @@ class _CuroboPlanner:
         A selected prefix supplies its actual release FK to its child scene.
         """
         torch = self.torch
-        deadline = time.monotonic()+self.budget.search_seconds
+        # BEGIN every required connection consumes the same request deadline.
+        search_started = time.monotonic()
+        deadline = search_started+self.budget.search_seconds
+        # END later charts and alternate proposals never replenish search time.
         report = {"branches": [], "success": False, "state": "q,u=t/T",
                   "budget_seconds": self.budget.search_seconds, "clock_changed": False}
         lower = self.trajopt.transition_model.action_bound_lows.detach().cpu().numpy().reshape(-1)
@@ -3920,10 +3923,12 @@ class _CuroboPlanner:
                     report["branches"].append({**evidence, "failure": "singular_active_relation_chart"})
                     continue
                 invalid_states.clear()
-                # Reserve work for alternate boundary members and later
-                # charts. All chart construction and queries share deadline.
-                remaining_stages = len(boundaries)-1-stage
-                seconds = max(0., deadline-time.monotonic())/(remaining_stages+1)
+                # BEGIN a necessary connection may use all remaining request time.
+                # Dividing time by future charts can reject this prerequisite
+                # before they are reachable and leave the global budget idle.
+                # Existing state-query and proposal caps still bound the work.
+                stage_started = time.monotonic()
+                seconds = max(0., deadline-stage_started)
                 validity_cache = {}
                 def stage_valid(value):
                     key = np.asarray(value, dtype=float).tobytes()
@@ -3936,7 +3941,10 @@ class _CuroboPlanner:
                     sample_limit=min(self.budget.max_validation_points, _NATIVE_STAGE_POINT_LIMIT)-work["state_queries"],
                     query_parameters=query_u[(query_u >= lo) & (query_u <= hi)])
                 evidence.update(stage_report, independent_equalities=rank,
+                                allocated_seconds=seconds,
+                                elapsed_seconds=time.monotonic()-stage_started,
                                 first_invalid_states=deepcopy(invalid_states))
+                # END projection, connection and later charts share one deadline.
                 report["branches"].append(evidence)
                 if path is None:
                     continue
@@ -3985,12 +3993,18 @@ class _CuroboPlanner:
                     evidence.update(failure="native_cubic_fit_failed", fit=fit)
                     continue
                 report.update(success=True, samples=len(whole_path), state_queries=work["state_queries"],
-                              cubic_fit=fit)
+                              cubic_fit=fit,
+                              # BEGIN coarse wall time includes boundary and path work.
+                              elapsed_seconds=time.monotonic()-search_started)
+                # END timing is diagnostic and does not grant additional work.
                 return controls[None, None].contiguous(), report
                 # END fitted curves still need full trajectory optimization/verification.
         except TimeoutError:
             report["budget_exhausted"] = True
         report["state_queries"] = work["state_queries"]
+        # BEGIN unsuccessful searches also expose actual shared-budget consumption.
+        report["elapsed_seconds"] = time.monotonic()-search_started
+        # END an exhausted attempt cap may still leave unused wall time.
         report["failure"] = "no_complete_time_state_seed_within_budget"
         return None, report
     # END OMPL has no schedule replacement return value or side effect.

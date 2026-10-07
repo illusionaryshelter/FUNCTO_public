@@ -699,7 +699,9 @@ def run(args):
                                 # The supplied ledger must match these values;
                                 # flags cannot reset or enlarge it implicitly.
                                 maximum_trajectory_solves=args.maximum_trajectory_solves,
-                                planning_seconds=args.planning_seconds, search_seconds=3.)
+                                # BEGIN use the existing explicit search budget input.
+                                planning_seconds=args.planning_seconds, search_seconds=args.search_seconds)
+        # END this caller cannot bypass the total planning time or ledger contract.
         # END geometry capacity does not replenish planning time or solve counts.
         # END reviewed input revisions remain caller-owned.
         report["planning_called"] = True
@@ -785,6 +787,10 @@ if __name__ == "__main__":
     # BEGIN make the existing request work limits reviewable in run commands.
     parser.add_argument("--maximum-trajectory-solves", type=int, default=2)
     parser.add_argument("--planning-seconds", type=float, default=120.)
+    # BEGIN expose bounded OMPL time without changing the production default.
+    parser.add_argument("--search-seconds", type=float, default=3.,
+                        help="OMPL search time within the existing total planning budget")
+    # END PlanningBudget rejects negative or nonfinite search durations.
     # END the production PlanningBudget and ledger checks validate these inputs.
     # BEGIN scene tensor capacity excludes all CPU geometry and its reservations.
     parser.add_argument("--scene-gpu-workspace-mib", type=int, choices=(1024, 2048, 3072, 6144), default=1024)

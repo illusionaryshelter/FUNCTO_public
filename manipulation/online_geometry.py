@@ -315,6 +315,10 @@ class OnlinePlanningScene:
                     or np.any(lower >= upper) or not row.get('source')):
                 raise ValueError('Conditional unknown regions need finite ordered bounds and provenance')
         self.robot_sphere_geometry, self.robot_self_collision_pairs = [], []
+        # BEGIN unbound scenes own empty pair metadata until robot binding.
+        self.native_self_collision_pairs = []
+        self._prepare_self_collision_pairs()
+        # END the same preparation is repeated only when the binding changes.
         self.robot_self_collision_padding = [0.]*len(self.robot_sphere_materials)
         self.robot_model = {}
         self.required_robot_links = ()
@@ -370,10 +374,47 @@ class OnlinePlanningScene:
         self.native_self_collision_pairs = (self.gripper.self_collision_model.filter_pairs(pairs, padding)
             if self.gripper is not None and self.gripper.self_collision_model is not None else pairs.tolist())
         # END no entire finger, link, or owner collision class is disabled.
+        # BEGIN compile fixed pair identities before any state query.
+        self._prepare_self_collision_pairs()
+        # END a rebind replaces this scene's arrays and device-cache dictionary.
         self.robot_self_collision_padding = padding.tolist()
         self.robot_model = deepcopy(robot_model or {})
         self.required_robot_links = tuple(row['link_name'] for row in robot_sphere_geometry)
         self._prepare_contacts(radii)
+
+    # BEGIN binding-owned immutable pair partitions; no per-state host filtering.
+    def _prepare_self_collision_pairs(self):
+        """Preserve pair order while separating pairs without moving fingers.
+
+        Whether a finger is currently uncertain remains a state-dependent
+        Torch selection. Only its possible motion and pair membership belong
+        to this fixed robot binding. Replacing the dictionary, rather than
+        clearing it, leaves existing rollout clones on their original model.
+        """
+        self._uncertain_sphere_indices = (() if self.gripper is None else tuple(
+            index for index, mapping in zip(self.gripper.sphere_indices, self.gripper.sphere_joint_translation)
+            if np.any(mapping != 0)))
+        pairs = np.asarray(self.native_self_collision_pairs, dtype=np.int64).reshape(-1, 2)
+        moving = np.zeros(len(self.robot_sphere_materials), dtype=bool)
+        moving[list(self._uncertain_sphere_indices)] = True
+        known = pairs[~moving[pairs].any(axis=1)]
+        self._self_collision_pair_arrays = (pairs, known)
+        for value in self._self_collision_pair_arrays:
+            value.flags.writeable = False
+        self._self_collision_pair_device = {}
+
+    def _self_collision_pair_tensors(self, spheres):
+        """Upload each immutable int64 partition once per binding and device."""
+        key = spheres.device
+        if key not in self._self_collision_pair_device:
+            # Own writable staging memory instead of exposing a Torch alias
+            # to the read-only source arrays. Integer indices have one dtype
+            # regardless of the query's floating-point dtype.
+            self._self_collision_pair_device[key] = tuple(torch.as_tensor(
+                np.array(value, copy=True), device=key, dtype=torch.long)
+                for value in self._self_collision_pair_arrays)
+        return self._self_collision_pair_device[key]
+    # END clones share these constants; rebinding never mutates an old cache.
 
     # BEGIN compile complete per-owner field banks once after exact sphere binding.
     def _prepare_contacts(self, robot_radii):
@@ -504,7 +545,9 @@ class OnlinePlanningScene:
         uncertain_hand = torch.zeros_like(progress,dtype=torch.bool)
         if geometry_state is not None:
             uncertain_hand = geometry_state.uncertain
-            uncertain_indices = [index for index,mapping in zip(self.gripper.sphere_indices,self.gripper.sphere_joint_translation) if np.any(mapping!=0)]
+            # BEGIN motion membership is prepared with this robot binding.
+            uncertain_indices = list(self._uncertain_sphere_indices)
+            # END actual uncertainty remains the unchanged dynamic hand state.
             costs['conditional/hand_geometry'] = uncertain_hand.to(progress.dtype)
         moving = torch.zeros(spheres.shape[-2], dtype=torch.bool, device=spheres.device)
         moving[uncertain_indices] = True
@@ -528,10 +571,11 @@ class OnlinePlanningScene:
         if self.robot_self_collision_pairs:
             padded = spheres.clone()
             padded[...,3] = padded[...,3]+_tensor(self.robot_self_collision_padding,spheres)
-            pairs=np.asarray(self.native_self_collision_pairs, dtype=np.int64).reshape(-1, 2)
+            # BEGIN reuse the same ordered pair partitions on this device.
+            pairs, known_pairs = self._self_collision_pair_tensors(spheres)
             all_self=_self_pair_sum(padded,pairs)
-            known_pairs=np.asarray([pair for pair in pairs if not set(pair)&set(uncertain_indices)],dtype=np.int64).reshape(-1,2)
             known_self=_self_pair_sum(padded,known_pairs)
+            # END chunking, both sums and the all-minus-known order are unchanged.
             costs['collision/robot/self']=torch.where(uncertain_hand,known_self,all_self)
             costs['conditional/collision/robot/self']=torch.where(uncertain_hand,(all_self-known_self).clamp_min(0),0.)
         if geometry_state is not None and self.gripper.self_collision_model is not None:
@@ -678,6 +722,21 @@ class OnlinePlanningScene:
             constants += self.gripper.self_collision_model.storage_nbytes*4
         cpu_shared = source_bytes + sampled_elements * (4 + 8) + coverage_cells * 8 + constants
         gpu_shared = (sampled_elements + coverage_cells) * (4 + 8) + constants
+        # BEGIN pair sources and their one int64 cache per device stay resident.
+        # CPU tensors own a copy; GPU indices do not duplicate per float dtype.
+        pair_table_sizes = [value.nbytes for value in self._self_collision_pair_arrays]
+        if not self.robot_sphere_geometry:
+            # Native-planner admission precedes FK/pair binding. Its native
+            # configuration enumerates each unordered sphere pair at most once;
+            # reserve those complete tables without allocating them. Once bound,
+            # use actual bytes even if another caller supplies repeated pairs.
+            count = len(self.robot_sphere_materials)
+            fixed = count-len(self._uncertain_sphere_indices)
+            pair_table_sizes = [count*(count-1)*8, fixed*(fixed-1)*8]
+        pair_bytes = sum(pair_table_sizes)
+        cpu_shared += 2*pair_bytes
+        gpu_shared += pair_bytes
+        # END clones share the binding rather than adding per-rollout copies.
         live = int(batch)*int(horizon)*max(1,len(self.robot_sphere_materials))*512
         if self.gripper is not None and self.gripper.self_collision_model is not None:
             live += int(batch)*int(horizon)*len(self.gripper.self_collision_model.axis_pairs)*48
@@ -685,7 +744,10 @@ class OnlinePlanningScene:
         # before the owning Torch tensor is copied/converted. This CPU scratch
         # is separate from the final caches counted above.
         upload_scratch = max([0, *(query.distance.nbytes for query in fields),
-            *(model.storage_nbytes for model in contact_models.values())])
+            *(model.storage_nbytes for model in contact_models.values()),
+            # BEGIN one host staging array at a time prepares cached indices.
+            *pair_table_sizes])
+        # END pair staging is independent of the retained CPU/device copies.
         return dict(cpu_shared=int(cpu_shared),cpu_live=int(live+upload_scratch),
                     gpu_shared=int(gpu_shared),gpu_live=live,gpu_retained=0,gpu_graph_live=live)
         # END no duplicate group bank or bool-as-one-byte floating cache assumption.
