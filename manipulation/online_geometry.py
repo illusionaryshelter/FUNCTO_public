@@ -314,6 +314,9 @@ class OnlinePlanningScene:
             if (lower.shape != (3,) or upper.shape != (3,) or not np.isfinite([lower, upper]).all()
                     or np.any(lower >= upper) or not row.get('source')):
                 raise ValueError('Conditional unknown regions need finite ordered bounds and provenance')
+        # BEGIN compose observed and explicitly permitted volume before a ball query.
+        self._prepare_unknown_coverage()
+        # END the original coverage remains the only observation evidence.
         self.robot_sphere_geometry, self.robot_self_collision_pairs = [], []
         # BEGIN unbound scenes own empty pair metadata until robot binding.
         self.native_self_collision_pairs = []
@@ -508,8 +511,40 @@ class OnlinePlanningScene:
             if commands != events:
                 raise ValueError('Online hand commands must preserve exact problem event occurrences')
 
+    # BEGIN a fixed spatial permission applies to unknown volume, not whole bodies.
+    def _prepare_unknown_coverage(self):
+        """Prepare one conservative certificate for observed OR permitted cells.
+
+        A ball can span observed space and a permitted unknown region without
+        fitting entirely in either set. Requiring whole-ball containment in a
+        single region would incorrectly forbid that composition. Admit only
+        complete cells inside a declared box; centre-only rasterization would
+        leak permission outside its metric boundary. The existing distance
+        transform and interpolation margin remain unchanged.
+
+        This private numerical coverage object is NOT observation evidence.
+        Binding export, unknown diagnostics and mapping retain ``coverage``;
+        construction from a binding derives this same immutable policy field.
+        """
+        regions = self.unknown_policy['conditional_regions']
+        self._permitted_coverage = self.coverage
+        if not regions:
+            return
+        allowed = self.coverage._known.copy()
+        h, origin = self.coverage.voxel_size, self.coverage.origin
+        axes = [origin[i]+np.arange(allowed.shape[2-i])*h for i in range(3)]
+        for region in regions:
+            inside = [(axis-h/2 >= region['lower_m'][i]) &
+                      (axis+h/2 <= region['upper_m'][i]) for i, axis in enumerate(axes)]
+            allowed |= (inside[2][:, None, None] & inside[1][None, :, None]
+                        & inside[0][None, None, :])
+        self._permitted_coverage = ObservedSpace(allowed, origin=origin, voxel_size=h,
+            observation_ids=self.coverage.observation_ids, reference_frame=self.coverage.reference_frame)
+
     def _unknown(self, spheres, uncertain=None):
         unresolved = self.coverage.violation(spheres)
+        forbidden = (unresolved if self._permitted_coverage is self.coverage
+                     else self._permitted_coverage.violation(spheres))
         conditional = torch.zeros_like(unresolved, dtype=torch.bool)
         for row in self.unknown_policy['conditional_regions']:
             centre, radius = spheres[..., :3], spheres[..., 3:4].clamp_min(0)
@@ -517,7 +552,16 @@ class OnlinePlanningScene:
                             (centre+radius <= _tensor(row['upper_m'], centre))).all(-1)
         if uncertain is not None:
             conditional |= uncertain
-        return torch.where(conditional, 0., unresolved).amax(-1), torch.where(conditional, unresolved, 0.).amax(-1)
+        # An entire ball inside an analytic permission box needs no finite-grid
+        # certificate, including beyond the observation grid. The grid proves
+        # mixed observed/permitted balls and unions of rasterized region cells.
+        hard = torch.where(conditional, 0., forbidden)
+        # Preserve an upper bound on original observation uncertainty whenever
+        # permission helps. A difference of distance residuals is not a physical
+        # depth of permitted unknown and must not masquerade as one.
+        retained = conditional | (forbidden < unresolved)
+        return hard.amax(-1), torch.where(retained, unresolved, 0.).amax(-1)
+    # END collisions remain independent; permission never rewrites known_free.
 
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time=None,
@@ -706,17 +750,22 @@ class OnlinePlanningScene:
                 for row in model.channels:
                     if row['kind'] == 'field':
                         sources[id(row['distance'])] = row['distance'].nbytes
-        for name in ('_known', '_known_free'):
-            array = getattr(self.coverage, name)
-            if array is not None:
-                sources[id(array)] = array.nbytes
-        coverage_cells = self.coverage._distance.numel()
+        # BEGIN count the distinct observation and policy fields once per scene.
+        # Empty policies alias the original field; rollout clones share both.
+        coverages = {id(value): value for value in (self.coverage, self._permitted_coverage)}
+        for cover in coverages.values():
+            for name in ('_known', '_known_free'):
+                array = getattr(cover, name)
+                if array is not None:
+                    sources[id(array)] = array.nbytes
+        coverage_cells = sum(cover._distance.numel() for cover in coverages.values())
+        # END both fields need float32/float64 caches under the existing bound.
         source_bytes = sum(sources.values()) + coverage_cells * 4
         sampled_elements = sum(ordinary_caches.values()) + sum(
             model.storage_nbytes // 4 for model in contact_models.values())
         # Reserve both dtypes on the CPU and on the one permitted GPU. CPU
         # coverage float32 aliases its source tensor; its float64 copy is new.
-        constants = 65536 * (1 + len(ordinary_caches) + sum(
+        constants = 65536 * (len(coverages) + len(ordinary_caches) + sum(
             len(model.rule_records) for model in contact_models.values()))
         if self.gripper is not None and self.gripper.self_collision_model is not None:
             constants += self.gripper.self_collision_model.storage_nbytes*4
