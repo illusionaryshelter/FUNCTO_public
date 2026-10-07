@@ -45,8 +45,11 @@ CLASSIFICATIONS = {
     "planner_accepted": ("规划接受", "#2677b8"),
     "rejected_diagnostic_not_executable": ("规划拒绝 · 仅诊断曲线", "#cb6e1e"),
 }
+# BEGIN acquisition/setup failure is a reportable outcome, never physics success.
 PHYSICS = {"passed": "物理判定通过", "failed": "物理判定失败",
-           "not_evaluated": "物理未判定", "unverified": "已执行 · 完整任务谓词未验证"}
+           "not_evaluated": "物理未判定", "unverified": "已执行 · 完整任务谓词未验证",
+           "incomplete_evidence": "证据不完整 · 物理结果未确认"}
+# END preserve the evaluator's current classification without rewriting reports.
 
 
 def escape(value):
@@ -110,7 +113,10 @@ def load_trial(path):
     report = read_json(path)
     if report["physics_outcome"] not in PHYSICS:
         raise ValueError("Physics outcome must retain the evaluator's explicit classification")
-    expected_success = {"passed": True, "failed": False, "not_evaluated": None, "unverified": None}
+    # BEGIN incomplete collection cannot be rendered as a passed or failed task.
+    expected_success = {"passed": True, "failed": False, "not_evaluated": None,
+                        "unverified": None, "incomplete_evidence": None}
+    # END classification and success must still agree exactly.
     if report["physics_success"] is not expected_success[report["physics_outcome"]]:
         raise ValueError("Physics outcome and explicit success value disagree")
     result = {"path": path, "report": report, "physical": None,
@@ -203,9 +209,11 @@ def load_runs(run_dirs, trial_dirs, manifest):
         # planner classification to an executor that never read it.
         if trial_classification is not None and trial_classification != curve["classification"]:
             raise ValueError(f"Physics trial relabelled the planner result: {path}")
+        # BEGIN setup can fail before the formal curve was loaded or executed.
         if trial_classification is None and (trial["report"]["execution_tested"]
-                or trial["report"]["physics_outcome"] != "not_evaluated"):
+                or trial["report"]["physics_outcome"] not in {"not_evaluated", "incomplete_evidence"}):
             raise ValueError(f"An executed or graded trial must retain its planner classification: {path}")
+        # END an evidence failure supplies no missing trajectory identity.
         curve["trials"].append(trial)
     return runs, unmatched
 
@@ -529,7 +537,13 @@ def render(manifest, audit, runs, unmatched, output, *, defer_untested=False, st
                             +" · "+link(curve["path"].with_suffix(".json"), output, "事件与屏障")
                             +eef_plot(curve, segment["snapshot"]["reference_frame"], historical)
                             +joint_plot(curve)+details("当前候选检查", curve["attempt"])
-                            +details("原导出事件与条件", curve["metadata"]))
+                            # BEGIN dense collision fields stay in the linked archive.
+                            # The execution binding includes large encoded voxel
+                            # arrays. Embedding it again makes a browser page
+                            # hundreds of MiB without adding a visual result.
+                            +details("原导出事件与条件", {key: value for key, value in
+                                curve["metadata"].items() if key != "execution_binding"}))
+                            # END the original JSON link retains complete evidence.
                 if curve.get("display_error"):
                     body.append(f'<p class="error">显示数据记录问题：{escape(curve["display_error"])}</p>')
                 body.extend(trial_panel(trial, output) for trial in curve["trials"])

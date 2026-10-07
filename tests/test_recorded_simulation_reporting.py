@@ -5,9 +5,6 @@ from contextlib import ExitStack
 # BEGIN live-session tests preserve caller-owned robot feedback by value.
 from copy import deepcopy
 # END mutations inside capture callbacks must not edit execution records.
-# BEGIN recorded fixture creation binds an immutable reference to its named file.
-from dataclasses import replace
-# END production execution never rewrites an archived feedback identity.
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +42,10 @@ def _runner_inputs(tmp_path, simulation, curve, targets, initial, *, skill_id="d
         "reference_frame": "world", "tool_transform": initial["tool_transform"],
         "start_q": initial["q"].tolist(), "start_dq": initial["dq"].tolist(),
         "base_pose": initial["base_pose"].tolist(), "eef_pose": initial["tool_pose"].tolist(),
-        "sim_time_s": initial["sim_time"], "source": initial["source"]}
+        # BEGIN recorded metadata retains the same original measured sample.
+        "sim_time_s": initial["sim_time"], "timestamp_s": initial["timestamp_s"],
+        "feedback_id": initial["feedback_id"], "source": initial["source"]}
+        # END moving a feedback file cannot change its reference identity.
     save("program.json", {"skill_kind": "grasp", "demo": {"roles": {}}})
     manifest = {"workspace_root": str(tmp_path), "source_recording": "recording", "segments": [{
         "id": skill_id, "program_path": "program.json", "source_library_segment": skill_id,
@@ -121,6 +121,10 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
         last_execution_report = None
 
         def execute(self, *args, **kwargs):
+            # BEGIN the runner must preserve the archived finger reference binding.
+            assert kwargs["initial_feedback"]["feedback_id"] == curve.finger_trajectory.feedback_id
+            assert kwargs["initial_feedback"]["timestamp_s"] == curve.finger_trajectory.timestamp_s
+            # END source file paths never replace measured sample identities.
             self.last_execution_report = shared_report
             for index in range(normal_steps+1):
                 kwargs["step_callback"](simulation.native_model, simulation.native_data, {"elapsed": index*.002})
@@ -688,7 +692,7 @@ def test_borrowed_capture_failure_cannot_replace_a_later_native_error(tmp_path):
 
 # BEGIN a validated recorded entrance can be retained for the next live skill.
 def _recorded_ready_inputs(tmp_path, simulation, curve, targets):
-    """Create a new recorded fixture whose original finger identity is a file."""
+    """Archive the original measured identity without rewriting the finger curve."""
     initial = simulation.proprioception()
     curve.events[2].update(kind="effect", requires_evidence=None, stop=False)
     curve.conditions = ({"condition_id": "declared_skill:effect",
@@ -697,7 +701,6 @@ def _recorded_ready_inputs(tmp_path, simulation, curve, targets):
     _bind_fingers(simulation, curve, targets)
     args, _ = _runner_inputs(tmp_path, simulation, curve, targets, initial)
     args.no_video = True
-    curve.finger_trajectory = replace(curve.finger_trajectory, feedback_id=str(args.feedback.resolve()))
     result = _result(curve)
     result.diagnostics["archive_classification"] = "planner_accepted"
     return args, result, initial
@@ -731,7 +734,7 @@ def test_recorded_ready_hook_retains_backend_and_original_identity_for_next_skil
     assert lifecycle.count("ready") == 1 and first["restore"] == restore_report
     assert restore_report == {"source": {"entry_frame": 0}}
     first_feedback = json.loads(Path(first["robot_feedback_path"]).read_text())
-    assert first_feedback["initial_feedback_id"] == str(args.feedback.resolve())
+    assert first_feedback["initial_feedback_id"] == initial["feedback_id"]
     assert first["simulation_ownership"] == "recorded_trial"
     assert first["native_end_time_s"] == pytest.approx(initial["sim_time"]+.012)
 

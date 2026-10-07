@@ -282,10 +282,12 @@ def run(args, *, simulation=None, initial_feedback=None,
                 "arm_joint_names": feedback["arm_joint_names"], "finger_joint_names": feedback["finger_joint_names"],
                 "q": feedback["start_q"], "dq": feedback["start_dq"],
                 "base_pose": feedback["base_pose"], "tool_pose": feedback["eef_pose"],
-                "sim_time": feedback["sim_time_s"], "timestamp_s": feedback["sim_time_s"],
+                # BEGIN preserve the sample identity used by the saved finger curve.
+                "sim_time": feedback["sim_time_s"], "timestamp_s": feedback["timestamp_s"],
                 "reference_frame": feedback["reference_frame"], "tool_link": feedback["tool_link"],
                 "tool_transform": feedback["tool_transform"],
-                "feedback_id": str(args.feedback.resolve()), "source": feedback["source"]}
+                "feedback_id": feedback["feedback_id"], "source": feedback["source"]}
+                # END an archive path identifies storage, not a measured sample.
         if any(tuple(initial_feedback[key]) != tuple(fixture[key])
                for key in ("joint_names", "arm_joint_names", "finger_joint_names")):
             raise ValueError("The trial fixture and named feedback must have identical robot bindings")
