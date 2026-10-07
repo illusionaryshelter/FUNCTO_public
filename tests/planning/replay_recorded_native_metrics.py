@@ -1,4 +1,4 @@
-"""Replay archived native q/dq through the current source acceptance managers.
+"""Replay archived native q/dq through the current online acceptance managers.
 
 Use the ordinary recorded runner arguments plus --native-result. The runner
 builds its unchanged observed scene, then this scoped boundary performs only
@@ -49,8 +49,8 @@ def main():
     signal.alarm(args.replay_seconds)
 
     def replay(problem, scene, robot, output, *, robot_validator, budget, provenance, execution_limits,
-               continuation=None, rebind=None, request_ledger=None):
-        if any(value is not None for value in (continuation, rebind, request_ledger)):
+               continuation=None, rebind=None, request_ledger=None, backend=None, joint_reference=None):
+        if any(value is not None for value in (continuation, rebind, request_ledger, joint_reference)):
             raise ValueError("Diagnostic replay cannot continue or reset a planning request")
         import torch
         from curobo.types import JointState

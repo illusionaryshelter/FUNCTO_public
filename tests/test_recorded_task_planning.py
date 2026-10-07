@@ -1,6 +1,6 @@
-"""CPU regressions for retaining distinct native trajectory representations."""
+"""CPU checks for passive result recording and exact curve archives."""
+# BEGIN recording never initiates candidate selection or another validation.
 from dataclasses import dataclass
-from enum import Enum
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,99 +8,9 @@ import sys
 
 import numpy as np
 import pytest
-import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
-from recorded_task_planning import save_curve, save_native_configuration, save_native_result, verification_joint_limits
-
-
-# BEGIN effective-bound fixtures stay distinct from input robot configuration.
-def native_verifier():
-    """Supply a live test cost with a deliberately different named order."""
-    limits = SimpleNamespace(joint_names=["a", "b"],
-        position=torch.tensor([[-8., -9.], [8., 9.]]),
-        velocity=torch.tensor([[-2., -3.], [2., 3.]]),
-        acceleration=torch.tensor([[-5., -.1], [5., .1]]),
-        jerk=torch.tensor([[-60., -70.], [60., 70.]]))
-    cost = SimpleNamespace(enabled=True, config=SimpleNamespace(joint_limits=limits))
-    return SimpleNamespace(get_cost={"cspace": cost}.get)
-# END saved limits must come from this instance, not a YAML scalar.
-
-
-def test_native_record_keeps_seed_layout_padding_and_distinct_clocks(tmp_path):
-    """Control points, rollout and valid formal samples cannot share one clock."""
-    def state(length, dt, knot_dt):
-        q = torch.arange(2*length*3, dtype=torch.float32).reshape(2, length, 3)
-        return SimpleNamespace(position=q, velocity=q+1, acceleration=None, jerk=None,
-                               dt=torch.tensor([dt, dt]), knot_dt=torch.tensor([knot_dt]),
-                               joint_names=["joint_b", "joint_a", "joint_c"])
-
-    result = SimpleNamespace(batch_size=1, num_seeds=2,
-        solution=torch.full((1, 2, 6, 3), 31.), optimized_seeds=None,
-        success=torch.tensor([[False, True]]), seed_rank=torch.tensor([[1, 0]]),
-        seed_cost=torch.tensor([[8., 3.]]), interpolated_last_tstep=torch.tensor([7, 5]),
-        js_solution=state(8, .8, 1.6), interpolated_trajectory=state(9, .025, 1.65))
-    target = tmp_path / "native.npz"
-    save_native_result(target, result, ("joint_b", "joint_a", "joint_c"))
-    # Mutating the native buffer afterwards must not alter retained evidence.
-    result.solution.fill_(-99.)
-    with np.load(target, allow_pickle=False) as saved:
-        assert saved["solution"].shape == (1, 2, 6, 3)
-        assert np.all(saved["solution"] == 31.)
-        np.testing.assert_array_equal(saved["seed_rank"], [[1, 0]])
-        np.testing.assert_array_equal(saved["interpolated_last_tstep"], [7, 5])
-        assert saved["interpolated_trajectory.position"].shape == (2, 9, 3)
-        np.testing.assert_allclose(saved["js_solution.dt"], [.8, .8])
-        np.testing.assert_allclose(saved["interpolated_trajectory.dt"], [.025, .025])
-        np.testing.assert_allclose(saved["interpolated_trajectory.knot_dt"], [1.65])
-        assert "optimized_seeds" not in saved
-    metadata = json.loads(target.with_suffix(".json").read_text())
-    assert metadata["classification"] == "native_diagnostic_not_executable"
-    assert metadata["states"]["js_solution"]["joint_names"][0] == "joint_b"
-
-
-def test_effective_config_uses_constructed_values_and_rejects_opaque_objects(tmp_path):
-    """A modified effective weight must survive without repr or live traversal."""
-    class Space(Enum):
-        BSPLINE = 3
-
-    @dataclass
-    class Config:
-        weight: torch.Tensor
-        control_space: Space
-        robot_config: object
-        optional: object = None
-
-    config = Config(torch.tensor([2., 5.]), Space.BSPLINE, object())
-    planner = SimpleNamespace(ik=SimpleNamespace(config=config),
-        trajopt=SimpleNamespace(config=config, horizon=8, action_horizon=6),
-        robot_dict={"kinematics": {"joint_names": ["b", "a"]}}, joint_names=("b", "a"),
-        progress_map=SimpleNamespace(u=np.array([0., 1.]), s=np.array([0., 2.])),
-        formal_clock={"duration": 4.5, "interpolation_dt": .025, "valid_count": 181,
-                      "source": "explicit test formal clock"},
-        _verification_native=native_verifier())
-    config.weight[0] = 9.
-    target = tmp_path / "configuration"
-    save_native_configuration(target, planner)
-    document = json.loads(target.with_suffix(".json").read_text())
-    assert document["ik"]["robot_config"]["reference"] == "bounded_robot_input"
-    assert document["ik"]["control_space"]["enum"].endswith("Space.BSPLINE")
-    assert document["formal_clock"] == planner.formal_clock
-    with np.load(target.with_suffix(".npz"), allow_pickle=False) as saved:
-        np.testing.assert_array_equal(saved[document["ik"]["weight"]["npz_key"]], [9., 5.])
-        # BEGIN all four runtime matrices retain native ordering and dtype.
-        effective = document["verification_joint_limits"]
-        assert effective["joint_names"] == ["a", "b"]
-        limits = planner._verification_native.get_cost("cspace").config.joint_limits
-        for label in ("position", "velocity", "acceleration", "jerk"):
-            array = saved[effective[label]["npz_key"]]
-            assert array.dtype == np.float32
-            np.testing.assert_array_equal(array, getattr(limits, label).numpy())
-        # END no live solver object or repr replaces effective numerical bounds.
-    config.optional = object()
-    with pytest.raises(TypeError, match="configuration.ik.optional"):
-        save_native_configuration(tmp_path / "unsupported", planner)
-    assert not (tmp_path / "unsupported.json").exists()
+from recorded_task_planning import save_curve, plan_and_record
 
 
 # BEGIN candidate reports reuse production calculus without reclassification.
@@ -117,10 +27,7 @@ def test_curve_record_keeps_classification_and_separates_full_curve_from_barrier
         np.array([[0., 0.], [0., 1.], [0., 4.]]),
         np.array([[0., 0.], [0., 3.], [0., 3.]]),
         np.array([0., 1.]), np.array([0., 1.]), events, (), {"unchanged": 0.})
-    planner = SimpleNamespace(joint_names=curve.joint_names, _verification_native=native_verifier())
-    limits = verification_joint_limits(planner)
-    source = planner._verification_native.get_cost("cspace").config.joint_limits
-    source.acceleration.fill_(99.)
+    limits = {"joint_names": ["a", "b"], "acceleration": [[-5., -.1], [5., .1]]}
     target = tmp_path / "curve.npz"
     save_curve(target, curve, classification=classification, execution_limits={"source": "explicit test contract"},
                joint_limits=limits)
@@ -142,18 +49,60 @@ def test_curve_record_keeps_classification_and_separates_full_curve_from_barrier
         np.testing.assert_array_equal(arrays["velocity"], curve.velocity)
 
 
-def test_native_effective_limits_require_enabled_complete_real_matrices():
-    planner = SimpleNamespace(joint_names=("b", "a"), _verification_native=native_verifier())
-    cost = planner._verification_native.get_cost("cspace")
-    cost.enabled = False
-    with pytest.raises(ValueError, match="enabled"):
-        verification_joint_limits(planner)
-    cost.enabled = True
-    cost.config.joint_limits.joint_names = ["b", "b"]
-    with pytest.raises(ValueError, match="every active joint"):
-        verification_joint_limits(planner)
-    cost.config.joint_limits.joint_names = ["a", "b"]
-    cost.config.joint_limits.acceleration[0, 0] = float("nan")
-    with pytest.raises(ValueError, match="acceleration bounds"):
-        verification_joint_limits(planner)
-# END diagnostic reports retain actual limits and the original executable clock.
+def test_passive_failure_recorder_calls_planner_once_and_keeps_first_cause(tmp_path, monkeypatch):
+    from manipulation import planning
+    @dataclass
+    class Budget:
+        maximum_trajectory_solves: int = 2
+    curve = planning.JointTrajectory(("q",), np.array([0., 1.]), np.array([[0.], [1.]]),
+        np.zeros((2, 1)), np.array([0., 1.]), np.array([0., 1.]), (), (), {"collision": .1})
+    curve.satisfied_dependencies = ("verified prefix",)
+    result = planning.PlanningResult(False, None,
+        {"failure": "no_solution_within_budget", "diagnostic_trajectory": curve},
+        request_ledger={"spent_solves": 2})
+    calls = []
+    backend = object()
+    def plan(*args, **kwargs):
+        calls.append(kwargs)
+        return result
+    monkeypatch.setattr(planning, "plan_trajectory", plan)
+    output = tmp_path / "run"
+    returned = plan_and_record(SimpleNamespace(phase_count=1), object(), {}, output,
+        robot_validator=object(), budget=Budget(), backend=backend, provenance={}, execution_limits={})
+    assert returned is result
+    assert len(calls) == 1 and calls[0]["backend"] is backend
+    assert not (output / "trajectory.npz").exists()
+    report = json.loads((output / "planning-report.json").read_text())
+    assert report["diagnostics"]["failure"] == "no_solution_within_budget"
+    assert report["candidates"][0]["curve_saved"]
+    metadata = json.loads((output / "diagnostic-trajectory.json").read_text())
+    assert metadata["execution_binding"] is None
+    assert metadata["satisfied_dependencies"] == ["verified prefix"]
+    assert metadata["validation_status"] == "not_completed"
+# END the archived diagnostic never receives formal execution authorization.
+
+# BEGIN the real formal binding consumes and preserves the online scene record.
+def test_real_binding_and_cpu_scene_roundtrip_keep_candidate_and_consumed_dependency():
+    from manipulation.execution_binding import bind_candidate, check_result
+    from manipulation.planning import JointTrajectory, PlanningResult
+    from manipulation.online_geometry import OnlinePlanningScene
+    from test_online_geometry import scene
+    from test_motion_backend_contract import problem
+    original = scene(conditional=True)
+    curve = JointTrajectory(("q",), np.array([0., 1.]), np.zeros((2, 1)), np.zeros((2, 1)),
+        np.array([0., 1.]), np.array([0., 1.]),
+        ({"event_id": "observed", "skill_id": "s", "time": 0., "progress": 0., "requires_evidence": "held"},), (), {},
+        satisfied_dependencies=("held",))
+    binding = bind_candidate(curve, problem=problem(), scene=original,
+        validation={"u": np.array([0., 1.]), "violations": np.zeros(2)}, native_report={"accepted": True})
+    result = PlanningResult(True, curve, {}, binding)
+    checked = check_result(result)
+    assert checked["curve"]["satisfied_dependencies"] == ["held"]
+    assert checked["curve"]["next_verification"] is None
+    restored = OnlinePlanningScene.from_binding(checked["scene"])
+    sphere = np.array([[0., 0., 0., .01]])
+    assert restored.query_state(sphere, np.eye(4), .5) == original.query_state(sphere, np.eye(4), .5)
+    curve.satisfied_dependencies = ()
+    with pytest.raises(ValueError, match="(?i)curve|trajectory|candidate"):
+        check_result(result)
+# END no fake binding or source geometry query bypasses this handoff check.

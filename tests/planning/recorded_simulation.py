@@ -48,7 +48,10 @@ def load_curve_archive(path):
         curve = JointTrajectory(tuple(arrays["joint_names"].tolist()), arrays["times"].copy(),
             arrays["position"].copy(), arrays["velocity"].copy(), arrays["progress_u"].copy(),
             arrays["progress_s"].copy(), tuple(metadata["events"]), tuple(metadata["conditions"]),
-            metadata["residuals"])
+            metadata["residuals"],
+            # BEGIN preserve verified prefix obligations before deriving the next barrier.
+            satisfied_dependencies=tuple(metadata["satisfied_dependencies"]))
+            # END reloaded blocks cannot reactivate an already consumed barrier.
         # BEGIN load the exact planner finger polynomial and cross-check its arrays.
         command_events = [row for row in curve.events if row["kind"] in ("open", "close", "hold")]
         if "finger_trajectory" not in metadata:

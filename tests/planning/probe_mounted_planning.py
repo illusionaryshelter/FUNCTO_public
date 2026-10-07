@@ -29,28 +29,7 @@ from manipulation.planning import PlanningBudget
 from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath, PoseEventRequirement
 from recorded_task_planning import _json_value, plan_and_record
 from robot_validation_fixture import build_robot_validator
-from probe_robot_fixture import fixed_probe_hand
-
-
-class DeclaredEmptyBackground:
-    """Zero occupied background in this explicitly synthetic experiment only.
-
-    Mounts are separate production CollisionOwners. A zero background query
-    neither declares the recorded table/objects absent nor supplies observed
-    free-space evidence; the experiment's finite box is labelled separately.
-    """
-
-    owner_ids = ()
-    # BEGIN explicit empty synthetic geometry can be independently rechecked.
-    source = "Declared synthetic empty background for mounted reach experiment"
-    independent_geometry = {"solids": [], "query_gaps": []}
-    # END the source recording's scene is outside this fixture's scope.
-
-    def __call__(self, spheres, *, key):
-        return spheres[..., 0] * 0.
-
-    def clone_for_rollout(self):
-        return DeclaredEmptyBackground()
+from probe_robot_fixture import fixed_probe_hand, empty_background
 
 
 def read_json(path):
@@ -182,7 +161,8 @@ def run(args):
         import torch
         from curobo.kinematics import Kinematics, KinematicsCfg
         from curobo.types import DeviceCfg, JointState
-        from manipulation.planning_scene import ObservedSpace, PlanningScene
+        from manipulation.planning_scene import ObservedSpace
+        from manipulation.online_geometry import OnlinePlanningScene
 
         torch.set_num_threads(2)
         if not torch.cuda.is_available():
@@ -220,9 +200,10 @@ def run(args):
         coverage = ObservedSpace(np.ones((81, 81, 81), bool), origin=origin, voxel_size=.05,
             observation_ids=("explicit synthetic known box; no recorded observation evidence",),
             reference_frame=problem.reference_frame)
-        scene = PlanningScene(background=DeclaredEmptyBackground(), owners=owners, coverage=coverage,
+        scene = OnlinePlanningScene(background=empty_background(coverage), owners=owners, coverage=coverage,
             reference_frame=problem.reference_frame, robot_sphere_materials=(None,) * sphere_count,
-            robot_geometry_source=fixture["robot_geometry_source"], gripper=hand)
+            robot_geometry_source=fixture["robot_geometry_source"], gripper=hand,
+            unknown_policy={"outside_regions": "forbid", "conditional_regions": []})
         scene.observation_report = {"scope": scope, "synthetic_known_box_origin_m": origin.tolist(),
                                     "synthetic_known_box_shape_zyx": [81, 81, 81], "voxel_size_m": .05}
         with torch.no_grad():
@@ -242,20 +223,15 @@ def run(args):
         # This newly constructed short-reach problem owns its own duration;
         # a 0.05-s native step keeps the resulting physical probe bounded. No
         # saved skill timing or solver feasibility tolerance is changed.
-        # Reserve 256 export slots, 384 validation points and 16 refinements
-        # BEGIN capacity for dense sampling of the unchanged native clock.
-        # for this two-anchor experiment. Its 161 native export points
-        # require 321 validation samples (each interval is subdivided twice),
-        # END no extra spline interval or physical retiming is introduced.
-        # plus the original anchors. Exceeding this budget still rejects.
-        # The production estimator checks this exact source sphere inventory,
-        # its installations and finite coverage against the same workspace
-        # allowance and two-GiB allocator cap before constructing rollouts.
+        # BEGIN fixed native spline and finite task-anchor allocation.
+        # Geometry uses the frozen online model; export checks only the exact
+        # candidate polynomial and never starts source-geometry refinement.
         budget = PlanningBudget(knots=16, ik_seeds=2, trajectory_seeds=1,
             ik_iterations=80, trajectory_iterations=100, maximum_trajectory_dt=.05,
-            interpolation_buffer_size=256, max_validation_points=384, max_refinement_points=16,
+            interpolation_buffer_size=256, max_validation_points=384, max_task_anchors=16,
             maximum_trajectory_solves=1, search_seconds=0., max_robot_spheres=sphere_count,
             max_scene_gpu_workspace_bytes=512 * 1024**2)
+        # END native query capacities are fixed before the request.
         report["planning_called"] = True
         # BEGIN reuse the same source validator that checked measured entrance.
         result = plan_and_record(problem, scene, robot, output / "planning",

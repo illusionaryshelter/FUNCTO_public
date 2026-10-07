@@ -10,7 +10,7 @@ from manipulation.planning_ik import rank_ik_candidates, select_ik_chains
 
 
 def report(**changes):
-    return {"task_satisfied": True, "source_valid": True, "native_pose_ik_success": True,
+    return {"task_satisfied": True, "model_valid": True, "native_pose_ik_success": True,
             "candidate_source": "native_ik", "environment_clearance_m": .001,
             "self_clearance_m": .002, "joint_limit_margin_fraction": .2, **changes}
 
@@ -37,8 +37,8 @@ def test_extra_clearance_cannot_buy_a_large_continuity_loss():
 
 
 @pytest.mark.parametrize("first,second", [
-    (report(task_satisfied=False, environment_clearance_m=100.), report(source_valid=False)),
-    (report(source_valid=False, environment_clearance_m=100.), report()),
+    (report(task_satisfied=False, environment_clearance_m=100.), report(model_valid=False)),
+    (report(model_valid=False, environment_clearance_m=100.), report()),
     (report(native_pose_ik_success=False, environment_clearance_m=100.), report()),
 ])
 def test_same_query_qualification_precedes_any_continuity_or_clearance_advantage(first, second):
@@ -67,7 +67,7 @@ def test_unknown_distance_never_masquerades_as_infinite_clearance(missing):
 
 def test_duplicate_representative_retains_the_better_evidence_before_deduplication():
     values = [[0.], [.25e-5], [.5], [float("nan")]]
-    reports = [report(source_valid=False), report(), report(), report(environment_clearance_m=100.)]
+    reports = [report(model_valid=False), report(), report(), report(environment_clearance_m=100.)]
     assert select(values, reports, count=4) == [1, 2]
     assert select(values, reports, count=1) == [1]
 
@@ -87,7 +87,7 @@ def test_all_broken_values_produce_no_candidate_instead_of_a_fabricated_state():
 
 def test_validity_must_be_explicit_not_a_missing_default():
     with pytest.raises(ValueError, match="explicit booleans"):
-        select([[0.]], [{"task_satisfied": True, "source_valid": True}])
+        select([[0.]], [{"task_satisfied": True, "model_valid": True}])
     with pytest.raises(ValueError, match="explicit candidate_source"):
         chains([[[.1]]], [[{key: value for key, value in report().items()
                            if key != "candidate_source"}]])
@@ -113,7 +113,7 @@ def test_chain_success_cannot_be_replaced_by_a_stationary_failed_reference():
 
 def test_task_and_source_screening_are_independent_of_reference_pose_success():
     selected = chains([[[.1], [.5]]],
-        [[report(source_valid=False), report(native_pose_ik_success=False)]])
+        [[report(model_valid=False), report(native_pose_ik_success=False)]])
     # Neither a colliding pose solution nor a pose-failed safe state is a
     # successful reference anchor; both remain available as caller evidence.
     assert selected == []
@@ -122,7 +122,7 @@ def test_task_and_source_screening_are_independent_of_reference_pose_success():
 def test_failed_and_carried_queries_cannot_supply_reference_anchors():
     selected = chains([[[.1], [.9]], [[.1]]],
         [[report(native_pose_ik_success=False), report(native_pose_ik_success=False)],
-         [report(native_pose_ik_success=False, candidate_source="carried_previous", source_valid=False)]])
+         [report(native_pose_ik_success=False, candidate_source="carried_previous", model_valid=False)]])
     assert selected == []
 
 
@@ -178,10 +178,9 @@ def test_invalid_clock_is_rejected_instead_of_retimed(times):
 # END these candidates are initialization evidence, never a checked continuous trajectory.
 
 
-# BEGIN production IK integration consumes explicit fake static-query contracts on CPU.
-def _static_planner(monkeypatch, *, complete=True, self_failure=False, release_missing=False,
-                    future_hand=False, clearance_limitations=()):
-    """Exercise real planner screening, without pretending to run native robot IK."""
+# BEGIN production IK screening uses the same native and online residuals.
+def _static_planner(monkeypatch, *, self_failure=False, online_failure=False):
+    """Exercise real planner screening without allocating native GPU IK."""
     from types import SimpleNamespace
     import torch
     from manipulation import planning
@@ -191,18 +190,16 @@ def _static_planner(monkeypatch, *, complete=True, self_failure=False, release_m
     planner.joint_names = ("x", "y", "z")
     planner.budget = SimpleNamespace(ik_seeds=2, interpolation_dt=.01)
     planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float64))
-    planner.JointState = SimpleNamespace
+    planner.JointState = planner._RobotState = SimpleNamespace
     planner.formal_clock = {"duration": 2.}
     planner.progress_map = planning._ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
     planner.problem = SimpleNamespace(tool_link="tool", numerical=SimpleNamespace(joint=1e-5),
         transform_tool_pose=lambda p, r: (p, r), transform_robot_spheres=lambda value: value,
         residuals=lambda p, r, progress, *args, **kwargs: {"process": torch.zeros_like(progress),
-            # A static API placeholder cannot certify or reject real stop dynamics.
+            # A static candidate cannot reject the trajectory's stop dynamics.
             "stop:test": torch.ones_like(progress)})
-    planner.trajopt = SimpleNamespace(transition_model=SimpleNamespace(
-        action_bound_lows=torch.full((3,), -1., dtype=torch.float64),
-        action_bound_highs=torch.full((3,), 1., dtype=torch.float64)))
-    calls = {"source": [], "self": [], "coverage": []}
+    planner.scene = SimpleNamespace(gripper=None)
+    calls = {"online": [], "native": []}
 
     def forward(js):
         return SimpleNamespace(tool_poses=SimpleNamespace(tool_frames=["tool"],
@@ -210,99 +207,54 @@ def _static_planner(monkeypatch, *, complete=True, self_failure=False, release_m
             quaternion=torch.tensor([[[[1., 0., 0., 0.]]]], dtype=js.position.dtype)),
             robot_spheres=torch.zeros((1, 1, 1, 4), dtype=js.position.dtype))
 
-    def own(q, names, times, *, diagnostics):
-        calls["self"].append(q.clone())
+    def native(state):
+        q = state.joint_state.position
+        calls["native"].append(q.clone())
         rejected = self_failure and float(q[0, 0, 0]) > .5
-        diagnostics.update(worst_state={"minimum_required_clearance_m": -.01 if rejected else .02},
-                           unmodelled_geometry_names=["finger"] if future_hand else [])
-        return torch.full_like(times, float(rejected))
+        return SimpleNamespace(names=["self_collision"], values=[q.new_full(q.shape[:2], float(rejected))])
 
-    def coverage(q, names, times):
-        calls["coverage"].append(q.clone())
-        return [{"attempt_allowed": True, "passed": not future_hand}]
-
-    scene = SimpleNamespace(check_robot_self_collision=own, check_robot_coverage=coverage)
-    scene.clone_for_rollout = lambda: SimpleNamespace(**scene.__dict__)
-    planner._verification_scene = scene
     planner._verification_fk = SimpleNamespace(compute_kinematics=forward)
+    planner._verification_native = SimpleNamespace(get_cost=lambda _: None, compute_costs=native)
 
-    def source(scene, problem, progress_map, spheres, p, r, progress, q, names, *, trajectory_time,
-               normalized_time, source_geometry, diagnostics, source_components_out):
-        assert source_geometry
-        calls["source"].append((float(trajectory_time.item()), float(normalized_time.item())))
-        diagnostics.update(unpermitted_clearance={"minimum_recorded_distance_m": float(q[0, 0, 0])*.001,
-            "complete_query": complete, "distance_complete": False,
-            "limitations": ["observed_tsdf_local_components_not_global_solid_distance", *clearance_limitations]},
-            unmodelled_geometry_names=["finger"] if future_hand else [])
-        source_components_out["source_world_collision"] = torch.zeros_like(progress)
-        source_components_out["unknown/release_anchor/object/0"] = torch.full_like(progress, float(release_missing))
-        source_components_out["unknown/future_hand"] = torch.full_like(progress, float(future_hand))
-        return source_components_out["source_world_collision"]
+    def online(scene, problem, progress_map, spheres, p, r, progress, q, names, *,
+               trajectory_time, normalized_time):
+        calls["online"].append((float(trajectory_time.item()), float(normalized_time.item())))
+        rejected = online_failure and float(q[0, 0, 0]) > .5
+        return torch.full_like(progress, float(rejected))
 
-    monkeypatch.setattr(planning, "_scene_boundary_evaluate", source)
+    monkeypatch.setattr(planning, "_scene_boundary_evaluate", online)
     return planner, calls
 
 
-def test_actual_task_and_source_checks_rank_reference_ik_without_hardening_its_pose(monkeypatch):
+def test_actual_task_and_online_checks_rank_reference_ik_without_hardening_its_pose(monkeypatch):
     planner, calls = _static_planner(monkeypatch)
     selected, reports = planner._rank_ik_candidates(
         [[.1, 0., 0.], [.7, 0., 0.]], [True, False], [[0., 0., 0.]], .4)
     assert selected.tolist() == [0, 1]
-    assert all(row["task_satisfied"] and row["source_valid"] for row in reports)
+    assert all(row["task_satisfied"] and row["model_valid"] for row in reports)
     assert not reports[1]["native_pose_ik_success"]
-    assert "stop:test" not in reports[1]["task_residuals"]
-    assert "stop_dynamics" in reports[1]["not_checked"]
-    assert calls["source"] == [(.8, .4), (.8, .4)]
-    assert len(calls["self"]) == len(calls["coverage"]) == 2
+    assert calls["online"] == [(.8, .4), (.8, .4)]
+    assert len(calls["native"]) == 2
 
 
 def test_functional_static_pool_keeps_allowed_pose_when_nominal_center_ik_failed(monkeypatch):
-    from types import SimpleNamespace
-
     planner, _ = _static_planner(monkeypatch)
-    planner.problem.pose_events = [SimpleNamespace(progress=.4)]
     selected, reports = planner._rank_ik_candidates(
         [[.7, 0., 0.], [.1, 0., 0.]], [True, False], [[0., 0., 0.]], .4,
         (("pose_events", 0),))
     assert selected.tolist() == [1, 0]
-    assert reports[1]["task_satisfied"] and reports[1]["source_valid"]
+    assert reports[1]["task_satisfied"] and reports[1]["model_valid"]
     assert not reports[1]["native_pose_ik_success"]
 
 
-def test_static_source_self_rejection_cannot_be_overruled_by_environment_clearance(monkeypatch):
-    planner, _ = _static_planner(monkeypatch, self_failure=True)
+@pytest.mark.parametrize("failure", ["self_failure", "online_failure"])
+def test_either_native_self_or_online_residual_rejects_static_model(monkeypatch, failure):
+    planner, _ = _static_planner(monkeypatch, **{failure: True})
     selected, reports = planner._rank_ik_candidates(
         [[.1, 0., 0.], [.7, 0., 0.]], [True, True], [[0., 0., 0.]], .4)
     assert selected.tolist() == [0, 1]
-    assert not reports[1]["source_valid"] and reports[1]["environment_clearance_m"] is None
-
-
-@pytest.mark.parametrize("complete,missing_release", [(False, False), (True, True)])
-def test_incomplete_distance_or_unbound_release_cannot_supply_a_ranked_margin(monkeypatch, complete, missing_release):
-    planner, _ = _static_planner(monkeypatch, complete=complete, release_missing=missing_release)
-    _, reports = planner._rank_ik_candidates([[.7, 0., 0.]], [True], [[0., 0., 0.]], .4)
-    assert reports[0]["environment_clearance_m"] is None
-    if missing_release:
-        assert not reports[0]["source_valid"]
-
-
-def test_future_hand_limitations_survive_modeled_static_acceptance(monkeypatch):
-    planner, _ = _static_planner(monkeypatch, future_hand=True)
-    _, reports = planner._rank_ik_candidates([[.7, 0., 0.]], [True], [[0., 0., 0.]], .4)
-    assert reports[0]["source_valid"]
-    assert not reports[0]["full_robot_coverage_certified"]
-    assert reports[0]["unmodelled_geometry_names"] == ["finger"]
-
-
-@pytest.mark.parametrize("limitation", ["finite_patch_unpermitted_subset_distance_unmeasured",
-                                        "surface_permission_not_resolved_by_finite_patch"])
-def test_unmeasured_unpermitted_subset_cannot_be_ranked_by_another_distant_pair(monkeypatch, limitation):
-    """A completed collision check need not measure every unpermitted distance."""
-    planner, _ = _static_planner(monkeypatch, clearance_limitations=(limitation,))
-    _, reports = planner._rank_ik_candidates([[.7, 0., 0.]], [True], [[0., 0., 0.]], .4)
-    assert reports[0]["source_valid"]
-    assert reports[0]["environment_clearance_m"] is None
-    assert limitation in reports[0]["source_clearance"]["limitations"]
+    assert reports[0]["model_valid"] and not reports[1]["model_valid"]
+# END source-mesh audit margins are not inputs to production IK screening.
 
 
 def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_outputs():

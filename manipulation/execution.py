@@ -632,8 +632,8 @@ class TrajectoryExecutor:
         # END only the separately declared online observer supplies semantics.
         The
         ``observation_callback(feedback, curve_time)`` supplies current allowed
-        scene/effect evidence. Only a true declared prerequisite can extend
-        the authorized prefix, after independent checks of the same suffix.
+        scene/effect evidence. A declared dependency ends this finite motion
+        block; its actual T/F/U result is retained for a fresh scene binding.
         The last native step can finish less than one timestep after the
         barrier's clock time, but its commanded q/dq/progress is clamped to the
         barrier itself. Finger events use the archived reference's original
@@ -662,6 +662,12 @@ class TrajectoryExecutor:
         self.geometry_checker.bind_scene(binding["scene"],
             progress_at_time=lambda t: float(trajectory.sample(t)[3]),
             nominal_fingers=nominal_finger_sampler(binding["scene"]))
+        # BEGIN the active online binding owns the actual distance layout.
+        self._geometry_description = deepcopy(self.geometry_checker.describe())
+        if not isinstance(self._geometry_description.get("pair_order"), list):
+            raise ValueError("Bound online geometry must declare its distance order")
+        self._geometry_pair_count = len(self._geometry_description["pair_order"])
+        # END source audit pairs are not silently retained as execution gates.
         if type(max_hold_steps) is not int or not 1 <= max_hold_steps <= 10_000:
             raise ValueError("Emergency hold needs a positive bounded device step budget")
         if observation_callback is not None and not callable(observation_callback):
@@ -982,11 +988,9 @@ class TrajectoryExecutor:
         # BEGIN bind each contact permission to one original close and arrival.
         # These records are part of the already validated formal scene/problem;
         # neither a task name nor a close command invents a target or a pair.
-        contact_gates, matched_permission_ids = {}, set()
-        permission_rows = binding["scene"].get("robot_owner_permissions", [])
-        permission_ids = [row["rule_id"] for row in permission_rows]
-        if len(set(permission_ids)) != len(permission_ids):
-            raise ValueError("Robot-owner contact permission identities must be unique")
+        contact_gates = {}
+        if binding["scene"].get("robot_owner_permissions"):
+            raise ValueError("Online execution requires finite material rules, not robot-owner pair exemptions")
         # BEGIN finite material gates share the frozen problem/scene binding.
         from .planning_scene import grasp_contact_rule_ids, validate_grasp_contact_arrival
         finite_conditions = [row for row in binding["problem"].get("conditions", ())
@@ -1001,56 +1005,61 @@ class TrajectoryExecutor:
         # clock and frozen attachment geometry without reading native object truth.
         holding_permissions = {}
         start_progress = float(trajectory.sample(0.)[3])
-        for rule in permission_rows:
-            condition_id = rule.get("holding_condition_id")
-            if condition_id is None:
+        # BEGIN current Holding authorizes only explicitly named finite rules.
+        rules_by_id = {row["rule_id"]: row for row in contact_rows}
+        for condition in binding["problem"].get("conditions", ()):
+            if condition.get("kind") != "observed_attachment" or "contact_rule_ids" not in condition:
                 continue
-            conditions = [row for row in binding["problem"].get("conditions", ())
-                          if row.get("condition_id") == condition_id]
+            condition_id = condition["condition_id"]
+            rule_ids = condition["contact_rule_ids"]
+            if (not isinstance(rule_ids, (list, tuple)) or not rule_ids
+                    or any(not isinstance(identity, str) or not identity for identity in rule_ids)
+                    or len(set(rule_ids)) != len(rule_ids)):
+                raise ValueError("Current Holding needs unique explicit finite contact-rule IDs")
             owners = [row for row in binding["scene"].get("owners", ())
-                      if row.get("owner_id") == rule["target_owner"]]
+                      if row.get("owner_id") == condition["carrier_id"]]
             relations = [row for owner in owners for row in owner.get("attachments", ())
-                         if row.get("condition_id") == condition_id
-                         and tuple(row.get("interval", ())) == tuple(rule["interval"])]
-            if (rule.get("arrival_goal_id") not in ([], ()) or rule.get("activation_event") != {}
-                    or len(conditions) != 1 or len(owners) != 1 or len(relations) != 1):
-                raise ValueError("A Holding permission needs one observed condition and matching owner attachment")
-            condition, relation = conditions[0], relations[0]
-            lower, upper = map(float, rule["interval"])
-            if (condition.get("kind") != "observed_attachment"
-                    or condition.get("carrier_id") != rule["target_owner"]
-                    or condition.get("progress") != lower
-                    or not lower <= start_progress <= upper
+                         if row.get("condition_id") == condition_id]
+            if len(owners) != 1 or len(relations) != 1:
+                raise ValueError("Current Holding needs one observed owner and matching attachment")
+            relation = relations[0]
+            lower, upper = map(float, relation["interval"])
+            if (condition.get("progress") != lower or not lower <= start_progress <= upper
                     or (start_progress == upper and relation["release_condition_id"] is not None)):
-                raise ValueError("A Holding permission must bind the currently active observed attachment")
+                raise ValueError("Holding permission must bind the currently active observed attachment")
             evidence = condition.get("source")
             provenance = evidence.get("source") if isinstance(evidence, Mapping) else None
             if (not isinstance(evidence, dict) or evidence.get("verified") is not True
                     or evidence.get("robot_feedback_id") != initial_feedback["feedback_id"]
-                    or evidence.get("carrier_id") != rule["target_owner"]
+                    or evidence.get("carrier_id") != condition["carrier_id"]
                     or not ((isinstance(provenance, str) and provenance.strip())
                             or (isinstance(provenance, Mapping) and provenance))):
-                raise ValueError("Holding permission evidence must identify this current robot feedback and owner")
+                raise ValueError("Holding permission evidence must identify current robot feedback and owner")
             timestamp = evidence.get("timestamp_s")
             if (not isinstance(timestamp, (int, float)) or not np.isfinite(timestamp)
                     or abs(float(timestamp)-float(initial_feedback["timestamp_s"])) > 1e-9):
-                raise ValueError("Holding permission evidence must use the current robot feedback timestamp")
+                raise ValueError("Holding permission evidence must use the current feedback timestamp")
             expected = np.linalg.inv(_pose_array(condition.get("T_carrier_eef"), "observed Holding transform"))
             actual = np.eye(4)
             actual[:3, 3] = relation["position_tool_owner"]
             actual[:3, :3] = Rotation.from_quat(np.asarray(relation["quaternion_tool_owner"])[[1, 2, 3, 0]]).as_matrix()
             if not np.allclose(actual, expected, atol=1e-7, rtol=0):
-                raise ValueError("Holding permission and collision attachment transform disagree")
-            if initial_feedback.get("scene_condition_evidence", {}).get(condition_id) is False:
-                raise ValueError("Current feedback refutes the Holding permission condition")
-            holding_permissions[rule["rule_id"]] = {
-                "rule_id": rule["rule_id"], "condition_id": condition_id,
-                "target_owner": rule["target_owner"], "interval": [lower, upper],
-                "release_condition_id": relation["release_condition_id"],
-                "feedback_id": initial_feedback["feedback_id"],
-                "timestamp_s": float(initial_feedback["timestamp_s"]),
-                "source": deepcopy(evidence)}
-            matched_permission_ids.add(rule["rule_id"])
+                raise ValueError("Holding permission and bound attachment transform disagree")
+            if initial_feedback.get("scene_condition_evidence", {}).get(condition_id) is not True:
+                raise ValueError("Current feedback must positively verify the Holding condition")
+            for identity in rule_ids:
+                rule = rules_by_id.get(identity)
+                if (rule is None or rule["actor"] != "robot" or rule["target_owner"] != condition["carrier_id"]
+                        or tuple(rule["interval"]) != tuple(relation["interval"])
+                        or identity in finite_permission_ids):
+                    raise ValueError("Holding must identify unique finite robot material rules on the same attached owner and interval")
+                finite_permission_ids.add(identity)
+                holding_permissions[identity] = {"rule_id": identity, "condition_id": condition_id,
+                    "target_owner": condition["carrier_id"], "interval": [lower, upper],
+                    "release_condition_id": relation["release_condition_id"],
+                    "feedback_id": initial_feedback["feedback_id"], "timestamp_s": float(timestamp),
+                    "source": deepcopy(evidence)}
+        # END no previous execution latch, proximity or command proves Holding.
         # END false or stale evidence cannot be repaired by a software pair rule.
         for condition in binding["problem"].get("conditions", ()):
             if condition.get("kind") != "grasp_contact_activation":
@@ -1062,24 +1071,13 @@ class TrajectoryExecutor:
             commands = [event for event in command_events
                         if event_occurrence_key(event) == identity and event["kind"] == "close"]
             # BEGIN explicit finite rules use the same actual-arrival gate.
-            if "contact_rule_ids" in condition:
-                rule_ids = grasp_contact_rule_ids(condition, contact_rows)
-                if requirement is None or len(commands) != 1:
-                    raise ValueError("Finite grasp continuation requires a fresh arrival/close binding; a prior latch is not reusable")
-                validate_grasp_contact_arrival(condition, requirement)
-                if finite_permission_ids.intersection(rule_ids) or set(permission_ids).intersection(rule_ids):
-                    raise ValueError("Finite grasp rule identities must belong to one activation only")
-                finite_permission_ids.update(rule_ids)
-            else:
-                # Historical whole-pair archives remain independent audit inputs.
-                rules = [row for row in permission_rows
-                         if row["target_owner"] == condition["carrier_id"]
-                         and row["arrival_goal_id"] == condition["arrival_goal_id"]
-                         and row["activation_event"] == activation and row["interval"] == condition["interval"]]
-                if len(rules) != 1 or rules[0]["rule_id"] in matched_permission_ids:
-                    raise ValueError("A contact activation needs one matching scene permission")
-                rule_ids = (rules[0]["rule_id"],)
-                matched_permission_ids.update(rule_ids)
+            rule_ids = grasp_contact_rule_ids(condition, contact_rows)
+            if requirement is None or len(commands) != 1:
+                raise ValueError("Finite grasp continuation requires a fresh arrival/close binding; a prior latch is not reusable")
+            validate_grasp_contact_arrival(condition, requirement)
+            if finite_permission_ids.intersection(rule_ids):
+                raise ValueError("Finite contact rule identities must belong to one current activation only")
+            finite_permission_ids.update(rule_ids)
             # END no finite declaration additionally activates a robot/owner pair.
             if (activation.get("kind") != "close" or identity in contact_gates
                     or len(commands) != 1
@@ -1090,8 +1088,6 @@ class TrajectoryExecutor:
                 raise ValueError("A contact activation needs one unchanged close, fixed perceived arrival and matching scene permission")
             contact_gates[identity] = {"condition": deepcopy(condition),
                 "rule_ids": rule_ids, "requirement": requirement}
-        if matched_permission_ids != set(permission_ids):
-            raise ValueError("Every robot-owner permission needs its explicit arrival or current Holding activation")
         # Execution-local state deliberately does not inherit a prior trial's
         # latch or a completed-goal label. A new close needs a new FK witness.
         active_contact_permissions = frozenset(holding_permissions)
@@ -1100,8 +1096,7 @@ class TrajectoryExecutor:
         report["finite_contact_permission_expirations"] = []
         # BEGIN keep finite latches separate at every geometry API and report boundary.
         def contact_permission_arguments(identities):
-            return {"active_robot_owner_permissions": frozenset(identities) & set(permission_ids),
-                    "active_contact_rule_ids": frozenset(identities) & finite_permission_ids}
+            return {"active_contact_rule_ids": frozenset(identities) & finite_permission_ids}
 
         def record_active_contact_permissions():
             for name, identities in contact_permission_arguments(active_contact_permissions).items():
@@ -1203,14 +1198,22 @@ class TrajectoryExecutor:
             "arm_velocity_feedforward_torque", "arm_acceleration_feedforward_torque", "arm_bias_torque")}
         # END these values come from the actual issued controller calculation.
         command = "restored_ctrl"
-        # BEGIN evidence dependencies authorize intervals on the same clock.
+        # BEGIN only unmet dependencies delimit this already bounded curve.
+        satisfied_dependencies = frozenset(trajectory.satisfied_dependencies)
+        def dependency_already_observed(event):
+            # A prior occurrence's T only discharges the current entrance;
+            # reusing its condition name at a later boundary requires new T.
+            return (event["requires_evidence"] in satisfied_dependencies
+                    and float(event["progress"]) <= float(trajectory.progress_s[0]))
         barriers = sorted((deepcopy(event) for event in trajectory.events
-                           if event["requires_evidence"] is not None), key=lambda row: row["time"])
+                           if event["requires_evidence"] is not None
+                           and not dependency_already_observed(event)), key=lambda row: row["time"])
         barrier_index = 0
         # END effect-only events do not appear in this dependency sequence.
         # BEGIN nonblocking evaluations and explicit stops keep their identities.
         ordinary_events = sorted((deepcopy(event) for event in trajectory.events
-            if event["requires_evidence"] is None and event["kind"] not in ("open", "close", "hold")
+            if (event["requires_evidence"] is None or dependency_already_observed(event))
+            and event["kind"] not in ("open", "close", "hold")
             and (event["kind"] in ("effect", "function") or event.get("stop", False)
                  or any(item["check_target"] == "activation" for item in event.get("timing", ())))),
             key=lambda row: row["time"])
@@ -2016,31 +2019,16 @@ class TrajectoryExecutor:
                         "Actual prerequisite gate accepted before entering its dependent interval",
                         feedback_id=feedback["feedback_id"])
                 barrier_index += 1
-                previous_stop = stop
-                stop = (float(barriers[barrier_index]["time"]) if barrier_index < len(barriers)
-                        else trajectory.duration)
-                if int(np.ceil(stop/backend.timestep-1e-10)) > max_physics_steps:
-                    raise ExecutionGuardError("Remaining authorized interval exceeds the original cumulative physics budget")
-                # The curve and all clocks remain untouched. Query the newly
-                # authorized nominal interval before another native command.
-                preflight = self._geometry_result("preflight", trajectory, deepcopy(feedback),
-                    execution_limits, start_time=previous_stop, until=stop,
-                    current_time=min(float(elapsed), trajectory.duration),
-                    **contact_permission_arguments(active_contact_permissions))
-                report["extended_preflights"].append({"until": stop, "verdict": deepcopy(preflight)})
-                if not preflight["passed"]:
-                    report["status"] = "feedback_rejected"
-                    report["feedback_failure"] = {"point": "extended_geometry_preflight",
-                        "curve_time_s": min(float(elapsed), trajectory.duration),
-                        "physical_elapsed_s": float(elapsed), "actual_feedback": deepcopy(feedback),
-                        "violations": deepcopy(preflight["violations"]), "geometry_check": deepcopy(preflight),
-                        "last_applied_finger_goal": target_positions.tolist(), "rejected_event": None}
-                    raise ExecutionGuardError("Independent geometry rejected the newly authorized interval")
-                report["authorized_prefix_extended"] = True
+                # BEGIN evidence permits a new binding, never an absent suffix.
+                # This candidate was solved only through this dependency. Even
+                # T cannot extend its geometry snapshot or invent future q/dq.
                 report["evidence_passed"] = True
-                report["next_verification"] = (deepcopy(barriers[barrier_index])
-                    if barrier_index < len(barriers) else None)
+                report["status"] = "needs_rebind"
+                report["next_verification"] = None
                 report["planned_stop_s"] = stop
+                run_hold("dependency_hold", feedback, expected_sim_time=sim_start+elapsed)
+                return False
+                # END original event facts and the charged hold survive rebind.
             return True
         # END unknown or false evidence causes a physical hold, never success.
 
@@ -2420,6 +2408,9 @@ class TrajectoryExecutor:
                     float(binding.get("request_time_origin_s", 0.))+final_elapsed),
                 "applied_events": deepcopy(report["events"]),
                 "verified_events": deepcopy(report["verified_events"]),
+                # BEGIN retain the exact observed fact that authorized a new block.
+                "dependency_outcomes": deepcopy(report["dependency_outcomes"]),
+                # END final observations cannot replace a boundary's acquired T/F/U.
                 "evaluated_events": deepcopy(report["evaluated_events"]),
                 "stopped_events": deepcopy(report["stopped_events"]),
                 "reached_events": deepcopy(report["reached_events"]),

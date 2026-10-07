@@ -36,7 +36,7 @@ def holding_fixture(*, release=True):
     feedback = _initial_feedback(simulation)
     upper = .75 if release else 1.
     condition = {"kind": "observed_attachment", "carrier_id": "target",
-        "condition_id": "observed_holding", "progress": 0., "T_carrier_eef": np.eye(4).tolist(),
+        "condition_id": "observed_holding", "contact_rule_ids": ["current_holding"], "progress": 0., "T_carrier_eef": np.eye(4).tolist(),
         "source": {"verified": True, "carrier_id": "target", "robot_feedback_id": feedback["feedback_id"],
             "timestamp_s": feedback["timestamp_s"], "source": "Explicit synthetic entrance Holding observation"}}
     curve.conditions = (deepcopy(condition),)
@@ -47,7 +47,9 @@ def holding_fixture(*, release=True):
                     quaternion_tool_owner=relation["quaternion_tool_owner"].tolist())
     result.execution_binding["problem"]["conditions"] = [condition]
     result.execution_binding["scene"].update(owners=[{"owner_id": "target", "attachments": [relation]}],
-        robot_owner_permissions=[asdict(holding_rule(interval=(0., upper)))])
+        contacts=[{"rule_id": "current_holding", "actor": "robot", "target_owner": "target",
+                   "interval": [0., upper], "sphere_indices": [0], "material_id": "held_pad",
+                   "source": "Explicit finite material permission fixture"}])
     refresh_validation(result)
     return simulation, curve, targets, result, ExecutionLimits.from_mapping(_limit_values(simulation, curve))
 
@@ -57,14 +59,17 @@ def refresh_validation(result):
         key: result.execution_binding[key] for key in ("problem", "scene")})
 
 
-def execute_fixture(fixture, *, checker=None, feedback=None):
+def execute_fixture(fixture, *, checker=None, feedback=None, result_only_goal_ids=()):
     simulation, _, targets, result, limits = fixture
     gate = checker or _GeometryChecker(simulation.joint_names)
     executor = TrajectoryExecutor(simulation, geometry_checker=gate)
+    if feedback is None:
+        feedback = _initial_feedback(simulation)
+        feedback["scene_condition_evidence"] = {"observed_holding": True}
     with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
         report = _execute_bound(executor, result,
             finger_targets=FixedFingerTargets.from_mapping(targets), execution_limits=limits,
-            initial_feedback=feedback or _initial_feedback(simulation), output=Path(temporary)/"trial")
+            result_only_goal_ids=result_only_goal_ids, initial_feedback=feedback, output=Path(temporary)/"trial")
     return report, gate
 
 
@@ -74,7 +79,7 @@ def test_current_holding_activates_before_preflight_survives_open_and_expires_on
 
     class EntranceChecker(_GeometryChecker):
         def preflight(self, *args, **kwargs):
-            self.entrance_permissions = kwargs["active_robot_owner_permissions"]
+            self.entrance_permissions = kwargs["active_contact_rule_ids"]
             return super().preflight(*args, **kwargs)
 
     report, gate = execute_fixture(fixture, checker=EntranceChecker(fixture[0].joint_names))
@@ -87,11 +92,11 @@ def test_current_holding_activates_before_preflight_survives_open_and_expires_on
                for row in report["grasp_contact_permission_changes"])
     for row in gate.states:
         expected = [] if release and row["trajectory_time"] >= .009 else ["current_holding"]
-        assert row["active_robot_owner_permissions"] == expected
+        assert row["active_contact_rule_ids"] == expected
     changes = report["holding_contact_permission_changes"]
     assert [row["action"] for row in changes] == (["activated", "expired"] if release else ["activated"])
     assert changes[0]["source"]["verified"] is True
-    assert report["active_robot_owner_permissions"] == ([] if release else ["current_holding"])
+    assert report["active_contact_rule_ids"] == ([] if release else ["current_holding"])
 
 
 @pytest.mark.parametrize("field,value", [
@@ -108,7 +113,7 @@ def test_holding_activation_rejects_stale_false_unknown_or_unsourced_evidence_be
     assert simulation.arm_goals == [] and simulation.sim_time == 1.3
 
 
-@pytest.mark.parametrize("change", ["kind", "owner", "interval", "transform", "duplicate", "arrival"])
+@pytest.mark.parametrize("change", ["owner", "interval", "transform", "duplicate", "actor"])
 def test_holding_activation_cannot_relabel_a_different_condition_or_attachment(change):
     fixture = holding_fixture()
     binding = fixture[3].execution_binding
@@ -124,7 +129,7 @@ def test_holding_activation_cannot_relabel_a_different_condition_or_attachment(c
     elif change == "duplicate":
         binding["problem"]["conditions"].append(deepcopy(condition))
     else:
-        binding["scene"]["robot_owner_permissions"][0]["arrival_goal_id"] = ["pose_events", 0]
+        binding["scene"]["contacts"][0]["actor"] = "another_owner"
     refresh_validation(fixture[3])
     with pytest.raises(ValueError):
         execute_fixture(fixture)
@@ -135,7 +140,7 @@ def test_explicit_current_false_holding_cannot_be_hidden_by_verified_entrance_re
     fixture = holding_fixture()
     feedback = _initial_feedback(fixture[0])
     feedback["scene_condition_evidence"] = {"observed_holding": False}
-    with pytest.raises(ValueError, match="refutes"):
+    with pytest.raises(ValueError, match="positively verify"):
         execute_fixture(fixture, feedback=feedback)
     assert fixture[0].arm_goals == []
 
@@ -145,7 +150,7 @@ def test_holding_permission_does_not_bypass_other_geometry_rejections():
     gate = _GeometryChecker(fixture[0].joint_names, rejected_stage="command_event", rejected_time=.002)
     with pytest.raises(ExecutionGuardError):
         execute_fixture(fixture, checker=gate)
-    assert gate.states[-1]["active_robot_owner_permissions"] == ["current_holding"]
+    assert gate.states[-1]["active_contact_rule_ids"] == ["current_holding"]
 
 
 def test_structured_holding_provenance_is_retained_without_rewriting_the_input():
@@ -167,14 +172,14 @@ def test_arrival_close_and_later_open_change_only_the_grasp_latch_when_holding_i
     condition["source"]["robot_feedback_id"] = _initial_feedback(simulation)["feedback_id"]
     result.execution_binding["problem"]["conditions"].append(condition)
     result.execution_binding["scene"]["owners"] = holding_result.execution_binding["scene"]["owners"]
-    result.execution_binding["scene"]["robot_owner_permissions"].extend(
-        holding_result.execution_binding["scene"]["robot_owner_permissions"])
+    result.execution_binding["scene"]["contacts"].extend(
+        holding_result.execution_binding["scene"]["contacts"])
     refresh_validation(result)
-    report, _ = recorded_tests.GraspContactActivationTests.run_trial(fixture)
+    report, _ = execute_fixture(fixture, result_only_goal_ids=[["pose_events", 0]])
     assert report["status"] == "curve_finished"
     assert [row["active_rule_ids"] for row in report["grasp_contact_permission_changes"]] == [
         ["current_holding"], ["contact-rule", "current_holding"], ["current_holding"]]
-    assert report["active_robot_owner_permissions"] == ["current_holding"]
+    assert report["active_contact_rule_ids"] == ["current_holding"]
 
 
 @pytest.mark.parametrize("change", [None, "kind", "owner", "interval", "transform"])

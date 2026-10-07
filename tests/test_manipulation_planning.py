@@ -85,7 +85,7 @@ def bind_analytic_ik_screening(planner, report_for=None):
     def rank(candidates, success, previous, parameter, goal_ids=()):
         reports = []
         for row, flag in zip(candidates, success):
-            evidence = {"task_satisfied": True, "source_valid": bool(np.isfinite(row).all()),
+            evidence = {"task_satisfied": True, "model_valid": bool(np.isfinite(row).all()),
                 "native_pose_ik_success": bool(flag), "candidate_source": "native_ik",
                 "environment_clearance_m": 1., "self_clearance_m": 1.,
                 "joint_limit_margin_fraction": .5}
@@ -98,6 +98,7 @@ def bind_analytic_ik_screening(planner, report_for=None):
         return indices, reports
 
     planner._rank_ik_candidates = Mock(side_effect=rank)
+    planner.check_request = Mock()
     planner._build_goal_ik_candidates = Mock(return_value={})
     planner.device_cfg = SimpleNamespace(to_device=lambda values: torch.as_tensor(
         values, dtype=planner.start.position.dtype))
@@ -186,10 +187,7 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     native = SimpleNamespace(position=position, velocity=velocity,
                              dt=torch.tensor([dt], dtype=torch.float64))
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
-    # BEGIN the exporter owns historical failure anchors independently of active queries.
-    from manipulation.planning_diagnostics import AttemptWitnesses
-    planner.witnesses = AttemptWitnesses()
-    # END empty history preserves the original analytic fixture's sample set.
+    planner.check_request = Mock()
     planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
     planner.problem = problem
     # The Cartesian test coordinates span metres; declare their metric sampling
@@ -205,7 +203,7 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     planner.torch = torch
     planner.device_cfg = SimpleNamespace(to_device=lambda x: torch.as_tensor(x, dtype=torch.float64))
     planner.JointState = SimpleNamespace
-    planner._RobotState = SimpleNamespace
+    planner._RobotState = lambda **kwargs: SimpleNamespace(**kwargs, robot_spheres=kwargs["cuda_robot_model_state"].robot_spheres)
     planner.trajopt = SimpleNamespace(get_active_js=lambda state: state)
     planner.formal_clock = {"valid_count": position.shape[1], "interpolation_dt": dt,
                             "duration": (position.shape[1]-1)*dt}
@@ -233,18 +231,13 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     # BEGIN give the real exporter explicit, finite native acceleration bounds.
     limits = SimpleNamespace(joint_names=list(problem.joint_names),
         position=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64),
+        velocity=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64),
         acceleration=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64))
     cspace = SimpleNamespace(enabled=True, config=SimpleNamespace(joint_limits=limits))
     planner._verification_native = SimpleNamespace(
         get_cost={"cspace": cspace}.get,
         compute_costs=lambda state: SimpleNamespace(names=(), values=()))
     # END these analytic fixture bounds are not a robot-model assertion.
-    # BEGIN this analytic export also declares its small CPU record reserve.
-    from manipulation.planning import _validation_storage_admission
-    planner.scene_cpu_live_bytes = 0
-    planner.validation_storage = _validation_storage_admission(problem, planner._verification_scene,
-        {"active_joint_names": list(problem.joint_names)}, planner.budget)
-    # END there is no native source-query scratch in this analytic fixture.
     return planner, SimpleNamespace(batch_size=1, num_seeds=1, get_interpolated_plan=lambda: native)
 
 
@@ -321,67 +314,13 @@ class PlannerCalculusTests(unittest.TestCase):
     # END no synthetic zero-speed case substitutes for boundary preservation.
 
 
-    def test_export_required_query_failure_is_hard_even_when_all_gpu_costs_zero(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-        planner, native = export_fixture(problem, mapping, np.zeros((2, 3)), np.zeros((2, 3)), 1.)
-        calls = []
-
-        def coverage(q, names, t, *, entrance=False):
-            calls.append((q.numpy().copy(), t.numpy().copy(), entrance))
-            return [{"passed": bool(value != .5), "attempt_allowed": bool(value != .5), "failure": None if value != .5 else "required_query_incomplete"}
-                    for value in t.reshape(-1).tolist()]
-
-        planner._verification_scene.check_robot_coverage = coverage
-        curve, count = planner.export(native)
-        self.assertEqual(count, 3)
-        self.assertEqual(curve.residuals["unknown/new_robot_volume"], 1.)
-        self.assertTrue(calls[0][2])
-        self.assertFalse(calls[1][2])
-        self.assertEqual(calls[1][0].dtype, np.float64)
-        self.assertEqual(planner.last_validation["robot_coverage"]["failed"][0]["time_s"], .5)
 
     # BEGIN a rounded spline boundary is a reference state, not measured q0.
-    def test_export_nearby_first_sample_gets_ordinary_volume_residual(self):
-        from manipulation.planning_scene import PlanningScene
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-        baseline = np.array([.123456789, 0., 0.])
-        rounded = np.float32(baseline[0])
-        first = np.array([float(np.nextafter(rounded, np.float32(np.inf))), 0., 0.])
-        position = np.repeat(first[None], 2, axis=0)
-        planner, native = export_fixture(problem, mapping, position, np.zeros((2, 3)), 1.)
-        queries = []
-
-        def check_state(**kwargs):
-            queries.append(kwargs)
-            return {"passed": False, "attempt_allowed": True, "failure": "new_unknown_volume", "witness": {"sample": "ordinary"}}
-
-        world = PlanningScene.__new__(PlanningScene)
-        world.gripper = None
-        world.owners = ()
-        world.background = planner._verification_scene.background
-        world.required_progress_anchors = ()
-        world.robot_coverage = SimpleNamespace(baseline_joint_names=planner.joint_names,
-            baseline_joint_positions=baseline, check_state=check_state)
-        # BEGIN this volume-policy fixture keeps its separate zero source-world result.
-        world.evaluate_source = planner._verification_scene.evaluate_source
-        # END the real coverage implementation still evaluates every exported state.
-        world.check_robot_self_collision = separated_source_self
-        planner._verification_scene = world
-        curve, count = planner.export(native)
-        self.assertEqual(count, 3)
-        self.assertFalse(queries[0]["entrance"])
-        np.testing.assert_array_equal(queries[0]["joint_positions"], first)
-        np.testing.assert_array_equal(curve.position, position)
-        self.assertEqual(curve.residuals["unknown/new_robot_volume"], 0.)
-        failure = planner.last_validation["robot_coverage"]["failed"][0]
-        self.assertEqual(failure["time_s"], 0.)
-        self.assertEqual(failure["result"]["failure"], "new_unknown_volume")
     # END no tolerance, start replacement or alternate curve enters acceptance.
 
     def test_initializer_plateau_inverse_is_explicitly_earliest(self):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.check_request = Mock()
         planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.progress_map = _ProgressMap(np.array([0., .2, .4, 1.]), np.array([0., 1., 1., 2.]))
         self.assertEqual(planner._seed_u(1.), .2)
@@ -854,6 +793,7 @@ class NativeCubicClockTests(unittest.TestCase):
         path = np.array([[0., 0., 0., 0.], [.3, 0., 0., .25],
                          [.3, .6, 0., .7], [1.5, .1, 0., 1.]])
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.check_request = Mock()
         planner.torch, planner.problem, planner.progress_map = torch, problem, mapping
         planner.budget = PlanningBudget(knots=15, interpolation_buffer_size=768)
         planner.anchors, planner.joint_names = problem.anchors, problem.joint_names
@@ -923,6 +863,7 @@ class NativeCubicClockTests(unittest.TestCase):
                                    success=torch.tensor([[True, True]]))
 
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.check_request = Mock()
         planner.torch = torch
         planner.budget = PlanningBudget(ik_seeds=2, trajectory_seeds=1)
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=1e-5))
@@ -968,6 +909,7 @@ class NativeCubicClockTests(unittest.TestCase):
                                    success=torch.tensor([[False, False]]))
 
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.check_request = Mock()
         planner.torch = torch
         planner.budget = PlanningBudget(ik_seeds=2, trajectory_seeds=2)
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=1e-5))
@@ -1031,6 +973,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
 
         horizon, candidates = len(pools), len(pools[0])
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.check_request = Mock()
         planner.torch = torch
         planner.budget = PlanningBudget(knots=horizon, ik_seeds=candidates, trajectory_seeds=seed_count)
         planner.problem = SimpleNamespace(numerical=SimpleNamespace(joint=joint_tolerance))
@@ -1217,7 +1160,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         primary, _, pools, flags = self.two_tracks()
 
         def report(row, success, parameter):
-            return {"task_satisfied": success, "source_valid": success,
+            return {"task_satisfied": success, "model_valid": success,
                     "environment_clearance_m": .002 if row[0] > 1. else .0001,
                     "self_clearance_m": 1., "joint_limit_margin_fraction": .5}
 
@@ -1236,8 +1179,8 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         baseline, _ = ordinary.reference_seeds()
         planner, _, _ = self.planner_for(pools, flags)
         original_q, original_dq = planner.start.position.clone(), planner.start.velocity.clone()
-        valid = {"task_satisfied": True, "source_valid": True}
-        rejected = {"task_satisfied": True, "source_valid": False}
+        valid = {"task_satisfied": True, "model_valid": True}
+        rejected = {"task_satisfied": True, "model_valid": False}
         target_postures = ([.9, .8, .7], [.6, .5, .4])
         planner._build_goal_ik_candidates.return_value = {
             0.: {"candidates": [{"joint_position": [99., 99., 99.], "report": valid}]},
@@ -1270,7 +1213,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
     def test_functional_events_sharing_a_nearest_control_keep_separate_physical_queries(self):
         _, _, pools, flags = self.two_tracks()
         planner, _, _ = self.planner_for(pools, flags, seed_count=1)
-        valid = {"task_satisfied": True, "source_valid": True}
+        valid = {"task_satisfied": True, "model_valid": True}
         planner._build_goal_ik_candidates.return_value = {
             .47: {"candidates": [{"joint_position": [.18, .15, .1], "report": valid}]},
             .49: {"candidates": [{"joint_position": [.2, .17, .12], "report": valid}]}}
@@ -1290,7 +1233,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner, _, _ = self.planner_for(pools, flags, seed_count=1)
         planner._build_goal_ik_candidates.return_value = {
             .47: {"candidates": [{"joint_position": [.9, .8, .7],
-                "report": {"task_satisfied": True, "source_valid": True}}]}}
+                "report": {"task_satisfied": True, "model_valid": True}}]}}
         original_fit = planner.physical_domain.fit_reference
 
         def fit(samples, values, **kwargs):
@@ -1449,7 +1392,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
 
     # BEGIN required/refinement anchors share native self-collision semantics.
     @contextmanager
-    def anchor_self_collision_fixture(self, mode, *, required=(), refinement=(), hand=None, padding=0.):
+    def anchor_self_collision_fixture(self, mode, *, required=(), hand=None, padding=0.):
         """Keep native cost/buffer behavior; replace GPU FK and its pair kernel.
 
         The analytic robot has a sphere at x=q[0] and a fixed sphere at zero.
@@ -1499,7 +1442,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         joints.velocity = torch.zeros_like(q)
         joints.dt = torch.ones(2)
         state = RobotState(joint_state=joints, cuda_robot_model_state=kinematics(joints))
-        problem = SimpleNamespace(tool_link="tool", start_progress=0., phase_count=1., base_pose=np.eye(4),
+        problem = SimpleNamespace(tool_link="tool", start_progress=0., phase_count=1., end_progress=1., base_pose=np.eye(4),
             mechanisms=(), stop_progress=(), transform_tool_pose=lambda p, r: (p, r),
             transform_robot_spheres=lambda value: value,
             evaluate=lambda p, *args, **kwargs: p[..., 0]*0,
@@ -1537,7 +1480,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             stack.enter_context(patch.object(SelfCollisionCost, "forward", autospec=True, side_effect=native_forward))
             config_type = _process_manager_type(problem, scene,
                 _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), required,
-                PlanningBudget(constraint_weight=777.), refinement_parameters=refinement,
+                PlanningBudget(constraint_weight=777., max_task_anchors=2),
                 clock={"duration": 2.}, seed_parameter=torch.tensor([[.3]]))
             data = {"process_mode": mode}
             if mode.endswith("optimizer"):
@@ -1547,9 +1490,9 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             yield SimpleNamespace(manager=manager, state=state, q=q, forwarded=forwarded, config=config,
                                   scene=scene, kinematics=kinematics)
 
-    def test_required_and_refinement_self_collision_anchors_retain_native_values_and_gradient(self):
+    def test_required_self_collision_anchors_retain_native_values_and_gradient(self):
         for mode in ("trajectory_optimizer",):
-            for source in ("required", "refinement"):
+            for source in ("required",):
                 with self.subTest(mode=mode, source=source):
                     # u=.55 is inside the endpoint spheres' overlap region but
                     # off its symmetric maximum, so its gradient must be nonzero.
@@ -1571,14 +1514,14 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                         anchor_cost = costs.values[costs.names.index("anchor_self_collision")]
                         torch.testing.assert_close(main_cost, main["value"], rtol=0., atol=0.)
                         self.assertEqual(anchor_cost.shape, main_cost.shape)
-                        torch.testing.assert_close(anchor_cost.sum(1), anchor["value"].sum(1), rtol=0., atol=0.)
+                        torch.testing.assert_close(anchor_cost.sum(1), (anchor["value"]*fixture.manager._anchor_valid[..., None]).sum(1), rtol=0., atol=0.)
                         # The native weight/binary operation is authoritative:
                         # no project constraint weight or second square applies.
                         center = anchor["spheres"][..., 0, 0]
                         expected = (.4**2-center.square()).clamp_min(0)
                         if mode.endswith("metrics"):
                             expected = torch.where(expected > 0, expected.clamp_max(1)+1, expected)
-                        torch.testing.assert_close(anchor_cost.sum(1).squeeze(-1), expected.sum(1))
+                        torch.testing.assert_close(anchor_cost.sum(1).squeeze(-1), (expected*fixture.manager._anchor_valid).sum(1))
                         sum(value.sum() for value in costs.values).backward()
                         self.assertTrue(bool(torch.isfinite(fixture.q.grad).all()))
                         self.assertGreater(fixture.q.grad.abs().max().item(), 0.)
@@ -1586,14 +1529,14 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
     def test_disabled_self_collision_and_reference_ik_do_not_add_anchor_checks(self):
         for mode in ("trajectory_optimizer", "seed_optimizer"):
             with self.subTest(mode=mode):
-                with self.anchor_self_collision_fixture(mode, required=(.55,), refinement=(.65,)) as fixture:
+                with self.anchor_self_collision_fixture(mode, required=(.55, .65)) as fixture:
                     if mode.startswith("trajectory_"):
                         fixture.manager.disable_cost_component("self_collision")
                     costs = fixture.manager.compute_costs(fixture.state)
                     self.assertNotIn("anchor_self_collision", costs.names)
                     self.assertEqual(len(fixture.forwarded), 1 if mode.startswith("seed_") else 0)
 
-    # BEGIN source-self metrics flow through CuRobo's original complete success formula.
+    # BEGIN native metrics retain their installed complete success formula.
     @staticmethod
     def native_success(collection, *, position_error=0., interpolated=None):
         from curobo._src.rollout.metrics import CostCollection, CostsAndConstraints
@@ -1610,66 +1553,10 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         TrajOptSolverResult._process_metrics(result)
         return result.success
 
-    def test_source_separation_accepts_proxy_overlap_and_preserves_other_native_failures(self):
-        # The optimizer fixture proves these anchors overlap as spheres. The
-        # metrics fixture supplies a separately declared source-solid answer.
-        with self.anchor_self_collision_fixture("trajectory_optimizer", required=(.55,)) as fixture:
-            guidance = fixture.manager.compute_costs(fixture.state)
-            self.assertGreater(guidance.values[guidance.names.index("anchor_self_collision")].sum().item(), 0.)
-        with self.anchor_self_collision_fixture("trajectory_metrics", required=(.55,)) as fixture:
-            metrics = fixture.manager.compute_costs(fixture.state)
-            self.assertEqual(fixture.forwarded, [])
-            self.assertNotIn("self_collision", metrics.names)
-            self.assertTrue(bool(self.native_success(metrics).all()))
-            self.assertFalse(bool(self.native_success(metrics, position_error=.2).any()))
-            metrics.add(torch.ones_like(metrics.values[0]), "cspace")
-            self.assertFalse(bool(self.native_success(metrics).any()))
 
-    def test_required_and_refinement_source_collision_rejects_regular_and_dense_metrics(self):
-        for source in ("required", "refinement"):
-            with self.subTest(source=source):
-                with self.anchor_self_collision_fixture("trajectory_metrics", **{source: (.55,)}) as fixture:
-                    safe = fixture.manager.compute_costs(fixture.state)
-                    fixture.scene.check_robot_self_collision.side_effect = lambda q, names, times, **kwargs: (
-                        (times > 1.) & (times < 1.5)).to(times)
-                    failed = fixture.manager.compute_costs(fixture.state)
-                    self.assertEqual(fixture.forwarded, [])
-                    query = fixture.scene.check_robot_self_collision.call_args
-                    torch.testing.assert_close(query.args[2], torch.tensor([[0., 1.1, 2.], [0., 1.1, 2.]]))
-                    source_value = failed.values[failed.names.index("source_self_collision")]
-                    torch.testing.assert_close(source_value[:, 0], torch.zeros((2, 1)))
-                    torch.testing.assert_close(source_value[:, -1], torch.ones((2, 1)))
-                    self.assertFalse(bool(self.native_success(failed).any()))
-                    self.assertFalse(bool(self.native_success(safe, interpolated=failed).any()))
 
-    def test_dense_source_queries_receive_valid_prefix_before_query_and_exact_anchor_time(self):
-        with self.anchor_self_collision_fixture("trajectory_metrics", refinement=(.55,)) as fixture:
-            joints = fixture.state.joint_state
-            joints.position = torch.cat((joints.position, joints.position[:, -1:].expand(-1, 2, -1)), 1)
-            joints.velocity = torch.zeros_like(joints.position)
-            fixture.state.cuda_robot_model_state = fixture.kinematics(joints)
-            fixture.manager.set_dense_counts(torch.tensor([2, 3]))
-            fixture.manager.compute_costs(fixture.state)
-            query = fixture.scene.check_robot_self_collision.call_args
-            torch.testing.assert_close(query.args[2], torch.tensor([[0., 1.1, 2., 2., 2.],
-                                                                   [0., 1., 1.1, 2., 2.]]))
-            torch.testing.assert_close(query.kwargs["valid"], torch.tensor([[True, True, True, False, False],
-                                                                            [True, True, True, True, False]]))
-            # BEGIN world and self receive the identical original native states and padding mask.
-            world_query = fixture.scene.evaluate_source.call_args
-            torch.testing.assert_close(world_query.args[4], query.args[0])
-            torch.testing.assert_close(world_query.kwargs["trajectory_time"], query.args[2])
-            torch.testing.assert_close(world_query.kwargs["valid"], query.kwargs["valid"])
             # END padding cannot become source-world evidence through the scene callback.
 
-    def test_seed_source_metrics_use_the_bound_physical_time_without_proxy_collision(self):
-        with self.anchor_self_collision_fixture("seed_metrics", required=(.55,)) as fixture:
-            metrics = fixture.manager.compute_costs(fixture.state)
-            self.assertEqual(metrics.names, ["source_self_collision"])
-            self.assertEqual(fixture.forwarded, [])
-            query = fixture.scene.check_robot_self_collision.call_args
-            torch.testing.assert_close(query.args[0], fixture.q)
-            torch.testing.assert_close(query.args[2], torch.full((2, 2), .6))
     # END source collisions replace only self feasibility, never native joint or pose requirements.
 
     def test_anchor_self_collision_uses_timed_hand_geometry_and_native_padding(self):
@@ -1692,8 +1579,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                     hand = SimpleNamespace(controller=controller, state=hand_state, spheres=hand_spheres,
                         nominal_finger_trajectory=object() if nominal else None,
                         sphere_indices=(1,), sphere_joint_translation=[[[1.], [0.], [0.]]])
-                    with self.anchor_self_collision_fixture("trajectory_optimizer", required=(.55,),
-                            refinement=(.65,), hand=hand, padding=.3) as fixture:
+                    with self.anchor_self_collision_fixture("trajectory_optimizer", required=(.55, .65), hand=hand, padding=.3) as fixture:
                         original = fixture.state.robot_spheres.detach().clone()
                         costs = fixture.manager.compute_costs(fixture.state)
                         self.assertEqual(len(times), 2)
@@ -1737,6 +1623,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         metrics_template = deepcopy(template)
         metrics_template.self_collision_cfg = None
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.check_request = Mock()
         planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.device_cfg = self.device_cfg
         planner.trajopt = SimpleNamespace(
@@ -1821,7 +1708,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 state = SimpleNamespace(joint_state=joints, tool_poses=native.tool_poses,
                     cuda_robot_model_state=native, robot_spheres=native.robot_spheres)
                 mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-                problem = SimpleNamespace(tool_link="tool", start_progress=0., phase_count=1.,
+                problem = SimpleNamespace(tool_link="tool", start_progress=0., phase_count=1., end_progress=1.,
                     mechanisms=(), stop_progress=(), transform_tool_pose=lambda p, r: (p, r),
                     transform_robot_spheres=lambda value: value,
                     evaluate=Mock(side_effect=lambda p, *args, **kwargs: p.square().sum(-1)),
@@ -1832,7 +1719,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 problem.residuals = lambda *args, **kwargs: {"synthetic_process": problem.evaluate(*args, **kwargs)}
                 # END an empty AL contribution cannot change native scene ownership.
                 # BEGIN the synthetic scene explicitly declares no owner contact permissions.
-                scene = SimpleNamespace(gripper=None, robot_coverage=object(), robot_owner_permissions=(),
+                scene = SimpleNamespace(gripper=None, contacts=(), owners=(), robot_coverage=object(), robot_owner_permissions=(),
                     required_progress_anchors=(0., 1.),
                     check_robot_self_collision=Mock(side_effect=separated_source_self),
                     # BEGIN nonzero guidance checks the original summed optimizer objective.
@@ -1856,12 +1743,10 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                            return_value=SimpleNamespace(apply=lambda q, r, jacobian: r)), \
                      patch("curobo.kinematics.Kinematics", return_value=SimpleNamespace(
                            compute_kinematics=kinematics)) as anchor_fk, \
-                     patch("manipulation.planning._RobotCoverageFK", return_value=SimpleNamespace(
-                           poses=lambda q, *args: q)) as coverage_fk, \
                      patch.object(RobotCostManager, "compute_costs", autospec=True,
                                   side_effect=native_cost) as native_evaluate:
                     config_type = _process_manager_type(problem, scene, mapping, (0., 1.),
-                        PlanningBudget(), clock={"duration": 1.}, seed_parameter=torch.tensor([[.4]]))
+                        PlanningBudget(max_task_anchors=2), clock={"duration": 1.}, seed_parameter=torch.tensor([[.4]]))
                     config = config_type.create({"process_mode": mode}, device_cfg=self.device_cfg)
                     manager = self.manager(config, transition)
                     collection = manager.compute_costs(state)
@@ -1870,15 +1755,13 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                     loss.backward()
                     self.assertTrue(bool(torch.isfinite(q.grad).all()))
                     if mode.startswith("seed_"):
-                        self.assertEqual(collection.names, ["native", "source_self_collision"]
-                                         if mode == "seed_metrics" else ["native"])
+                        self.assertEqual(collection.names, ["native"])
                         torch.testing.assert_close(q.grad, 2*q.detach(), rtol=0., atol=0.)
                         problem.evaluate.assert_not_called()
                         scene.evaluate.assert_not_called()
                         scene.evaluate_source.assert_not_called()
                         scene.robot_coverage_guidance.assert_not_called()
                         anchor_fk.assert_not_called()
-                        coverage_fk.assert_not_called()
                     else:
                         self.assertIn("skill_process", collection.names)
                         self.assertIn("process_scene", collection.names)
@@ -1886,27 +1769,22 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                         anchor_fk.assert_called_once()
                         self.assertTrue(bool((q.grad > 2*q.detach()).all()))
                         if mode == "trajectory_optimizer":
-                            # BEGIN only the optimizer consumes differentiable proxy collision.
+                            # BEGIN the optimizer weights the same online residual.
                             scene.evaluate.assert_called_once()
                             scene.evaluate_source.assert_not_called()
-                            # END source metrics have a separate explicit callback below.
-                            # The source fixture has E(q)=S(q)=||q||².
-                            # Original scene guidance is (E+S)², including
-                            # its cross term; separate squares would halve it.
-                            regular = (2*q.square().sum(-1)).square()
+                            # The online scene already owns self collision;
+                            # no second source/proxy term is added to E(q).
+                            regular = q.square().sum(-1).square()
                             expected = regular.clone()
                             expected[:, -1] += regular.sum(1)
                             scene_cost = collection.values[collection.names.index("process_scene")]
                             torch.testing.assert_close(scene_cost[..., 0],
                                 expected*PlanningBudget().constraint_weight)
-                            coverage_fk.assert_called_once()
-                            scene.robot_coverage_guidance.assert_called_once()
                         else:
-                            # BEGIN trajectory acceptance queries source geometry exactly once.
-                            scene.evaluate.assert_not_called()
-                            scene.evaluate_source.assert_called_once()
+                            # BEGIN success metrics use that same online residual.
+                            scene.evaluate.assert_called_once()
+                            scene.evaluate_source.assert_not_called()
                             # END reference seed modes above query neither scene callback.
-                            coverage_fk.assert_not_called()
                             scene.robot_coverage_guidance.assert_not_called()
 
     def test_reference_ik_still_supplies_same_clock_finger_geometry_to_native_costs(self):
@@ -1970,60 +1848,30 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         mapping = self.clock(problem)
         pairs = mapping.anchor_parameters(problem.anchors)
         self.assertEqual(len(pairs), 6)
-        self.assertEqual(_anchor_capacity(mapping, problem.anchors, PlanningBudget()), 70)
-        no_refinement = PlanningBudget(max_refinement_points=0)
-        self.assertEqual(_anchor_capacity(mapping, problem.anchors, no_refinement), 6)
-        with self.assertRaisesRegex(ValueError, "refinement-point budget"):
-            _anchor_capacity(mapping, problem.anchors, no_refinement, [.123])
-        self.assertEqual(_anchor_capacity(mapping, problem.anchors, PlanningBudget(max_validation_points=32, max_refinement_points=26)), 32)
+        self.assertEqual(_anchor_capacity(mapping, problem.anchors, PlanningBudget()), 256)
+        exact = PlanningBudget(max_task_anchors=6)
+        self.assertEqual(_anchor_capacity(mapping, problem.anchors, exact), 6)
+        with self.assertRaisesRegex(ValueError, "Task anchors"):
+            _anchor_capacity(mapping, problem.anchors, PlanningBudget(max_task_anchors=5))
     # END reference vertices remain source data instead of required IK/validation poses.
 
     def test_true_scene_query_overflow_fails_before_native_construction(self):
         problem = self.timeline_problem()
         scene = SimpleNamespace(bind_robot_validator=Mock(), validate_problem=Mock(), required_progress_anchors=np.linspace(0., 3., 129),
-                                reference_frame=problem.reference_frame)
+                                reference_frame=problem.reference_frame, gripper=None)
+        # BEGIN metadata validation precedes the separate allocation boundary.
+        validator = SimpleNamespace(validate_planning_binding=Mock())
+        # END this fixture still forbids native construction for excess anchors.
         with patch("manipulation.planning._bounded_robot_configuration") as robot, \
                 patch("manipulation.planning._process_manager_type") as manager:
             with self.assertRaisesRegex(ValueError, "anchors|source knots"):
                 _CuroboPlanner(problem, scene, object(), PlanningBudget(
-                    max_validation_points=128, max_refinement_points=0), "cuda:0", robot_validator=object())
+                    max_validation_points=128, max_task_anchors=128), "cuda:0", robot_validator=validator)
+        validator.validate_planning_binding.assert_called_once_with(problem, None)
         robot.assert_not_called()
         manager.assert_not_called()
 
     # BEGIN mandatory native midpoints must fit before any expensive initialization.
-    def test_clock_validation_lower_bound_refuses_512_before_native_and_admits_1536(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        problem.source_timestamps = np.array([0., 16.])
-        # BEGIN the accepted clock path freezes source geometry before native metadata allocation.
-        scene = SimpleNamespace(bind_robot_validator=Mock(), bind_source_scene=Mock(), validate_problem=Mock(), required_progress_anchors=(), gripper=None,
-                                reference_frame=problem.reference_frame)
-        # END the rejected 512-sample case still exits before this source freeze.
-        before_cuda = torch.cuda.is_initialized()
-        for capacity in (512, 1536):
-            with self.subTest(capacity=capacity):
-                budget = PlanningBudget(knots=16, maximum_trajectory_dt=.2, interpolation_steps=4,
-                    interpolation_dt=.025, interpolation_buffer_size=768, max_validation_points=capacity)
-                with patch("torch.cuda._lazy_init", side_effect=AssertionError("preflight must stay CPU-only")), \
-                     patch("manipulation.planning._bounded_robot_configuration",
-                           side_effect=RuntimeError("metadata boundary reached after preflight")) as robot, \
-                     patch("manipulation.planning._process_manager_type") as manager:
-                    if capacity == 512:
-                        with self.assertRaisesRegex(ValueError, "requires at least 1281 points, allowed 512") as error:
-                            _CuroboPlanner(problem, scene, object(), budget, "cuda:0", robot_validator=object())
-                        self.assertIn("duration_s=16.00000023841858", str(error.exception))
-                        self.assertIn("interpolation_dt_s=0.02500000037252903", str(error.exception))
-                        self.assertIn("native_samples=641", str(error.exception))
-                        robot.assert_not_called()
-                        scene.bind_source_scene.assert_not_called()
-                    else:
-                        with self.assertRaisesRegex(RuntimeError, "metadata boundary reached"):
-                            _CuroboPlanner(problem, scene, object(), budget, "cuda:0", robot_validator=object())
-                        robot.assert_called_once()
-                        scene.bind_source_scene.assert_called_once()
-                    manager.assert_not_called()
-                self.assertEqual(budget.max_validation_points, capacity)
-                self.assertEqual(budget.maximum_trajectory_dt, .2)
-        self.assertEqual(torch.cuda.is_initialized(), before_cuda)
 
     # BEGIN source identity is checked before device allocation, against consumed XML.
     def test_source_configuration_rejects_changed_xml_overrides_and_unmodelled_locks(self):
@@ -2054,7 +1902,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                         _frame_id=lambda name: 0, model=SimpleNamespace(
                             frames=[SimpleNamespace(parentJoint=1 if tool_descendant else 0)],
                             names=["root", "finger"], parents=[0, 0]))
-                    validator = SimpleNamespace(checker=checker, tool_frame="tool")
+                    # BEGIN isolate XML/tree identity from calibrated metadata.
+                    validator = SimpleNamespace(checker=checker, tool_frame="tool",
+                        validate_planning_binding=Mock())
+                    # END production metadata validation is invoked, not bypassed.
                     hand = (SimpleNamespace(controller="binary", joint_names=("finger",), current_positions=(.1,),
                         control_timestep_s=.01, bind_clock=Mock(), finger_trajectory=None) if has_hand else None)
                     problem = cartesian_problem((MotionPhase("free", constant_path()),))
@@ -2064,32 +1915,17 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                     # END XML, joint-lock and ancestor checks below retain their original assertions.
                     robot = {"robot_cfg": {"kinematics": {"urdf_path": str(path), "base_link": "base", **changes}}}
                     planner = _CuroboPlanner.__new__(_CuroboPlanner)
+                    planner.check_request = Mock()
                     with patch("torch.cuda._lazy_init", side_effect=AssertionError("source preflight must stay CPU-only")), \
                          patch("manipulation.planning._bounded_robot_configuration", return_value=(robot, {})), \
-                         patch("manipulation.planning._validation_storage_admission", side_effect=RuntimeError("source admitted")) as storage:
+                         patch("manipulation.planning._planning_workspace_bytes", side_effect=RuntimeError("source admitted")) as storage:
                         with self.assertRaisesRegex(RuntimeError if admitted else ValueError,
                                 "source admitted" if admitted else "source URDF|joint locks|ancestor"):
                             planner._initialize(problem, scene, robot, PlanningBudget(), "cuda:0", robot_validator=validator)
                     self.assertEqual(storage.call_count, int(admitted))
+                    validator.validate_planning_binding.assert_called_once_with(problem, hand)
     # END a later edit of the original URDF cannot silently redefine consumed source geometry.
 
-    def test_constant_curve_keeps_midpoints_and_extra_anchor_after_preflight_lower_bound(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-        dt = float(np.float32(.025))
-        planner, result = export_fixture(problem, mapping, np.zeros((641, 3)), np.zeros((641, 3)), dt)
-        planner.anchors = np.array([0., .3333, 1.])
-        planner.budget = PlanningBudget(knots=16, interpolation_buffer_size=768, max_validation_points=1281)
-        with self.assertRaisesRegex(ValueError, "Final curve validation"):
-            planner.export(result)
-        # Passing the binding lower bound is not a claim that every actual
-        # candidate fits it. Keep the off-grid anchor and original midpoint
-        # rule; the explicitly larger capacity admits the same exact curve.
-        planner.budget = PlanningBudget(knots=16, interpolation_buffer_size=768, max_validation_points=1536)
-        trajectory, count = planner.export(result)
-        self.assertEqual(count, 1282)
-        self.assertEqual(trajectory.duration, 640*dt)
-        self.assertIn(.3333, planner.last_validation["u"])
     # END neither impossible admission nor a later overflow weakens verification.
 
     def test_native_anchor_estimate_matches_installed_meta_buffer_layout(self):
@@ -2173,104 +2009,8 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             _require_planning_memory(runtime, "cuda:0", workspace, max_device_used_bytes=8*1024**3)
         # END native storage never borrows reserved Torch pages.
 
-    def test_refinement_rechecks_workspaces_without_retiming(self):
-        import gc
-        import weakref
-        planner = _CuroboPlanner.__new__(_CuroboPlanner)
-        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
-        planner.budget = PlanningBudget(max_refinement_points=0)
-        # BEGIN isolate this allocator-lifecycle fixture from record payloads.
-        planner.validation_storage = {"encoded_record_bytes_upper": 0}
-        # END record peak admission has its own byte-boundary regressions.
-        planner.anchors = np.array([0., 1., 2.])
-        planner.problem = object()
-        planner.scene = SimpleNamespace(required_progress_anchors=(), contacts=(), estimated_workspace_allocation=lambda batch, horizon, **kwargs:
-                                        {"gpu_retained": batch*horizon, "gpu_live": 0, "cpu_shared": 0, "cpu_live": 0, "gpu_shared": 0, "gpu_graph_live": 0})
-        planner.robot_metadata = self.robot_metadata()
-        planner.progress_map = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
-        planner.seed_parameter, planner.formal_clock, planner.robot_dict = object(), {}, {}
-        planner.refinement_parameters = np.empty(0)
-        # BEGIN replacement preserves the explicit optimization phase.
-        planner.phase = "feasibility"
-        planner._quality_optimizer_config = {"rollout": {"cost_cfg": {"cspace_cfg": {
-            "squared_l2_regularization_weight": [1.]*5}}}}
-        # END this allocation fixture has no second quality solver.
-        planner.torch = SimpleNamespace(cuda=SimpleNamespace(
-            mem_get_info=Mock(return_value=(12*1024**3, 12*1024**3)),
-            memory_reserved=Mock(return_value=0), memory_allocated=Mock(return_value=0)))
-        planner.device_cfg = SimpleNamespace(device="cuda:0")
-        # Match the native optimizer/core bound-method cycle. destroy() only
-        # records graph teardown; it deliberately does not break the cycle.
-        destroyed = Mock()
-
-        class CyclicSolver:
-            def __init__(self):
-                self.core = SimpleNamespace(callback=self.step)
-
-            def step(self):
-                pass
-
-            def destroy(self):
-                destroyed()
-
-        planner.trajopt = CyclicSolver()
-        previous = weakref.ref(planner.trajopt)
-
-        def memory_after_release(device):
-            self.assertIsNone(previous())
-            return planner.torch.cuda.mem_get_info.return_value
-
-        planner.torch.cuda.mem_get_info.side_effect = memory_after_release
-        planner._trajectory_configuration = {}
-        planner._optimizer_config_class = SimpleNamespace(create=Mock(return_value="new configuration"))
-        planner._optimizer_class = Mock(return_value=SimpleNamespace(destroy=Mock()))
-        planner._initialize_verification_constraints = Mock()
-        planner._bind_formal_clock = Mock()
-        planner._bind_physical_domains = Mock()
-        mapping = _ProgressMap(np.array([0., .3, .6, 1.]), np.array([0., 1., 1., 2.]))
-        with patch("manipulation.planning._process_manager_type", return_value="new manager") as manager, \
-                patch("manipulation.planning.gc.collect", wraps=gc.collect) as collect, \
-                patch("manipulation.planning._formal_native_clock", return_value={}):
-            original_map = planner.progress_map
-            planner.refine_validation(())
-            self.assertIs(planner.progress_map, original_map)
-            planner._bind_formal_clock.assert_not_called()
-            self.assertEqual(planner.anchor_capacity, 4)
-            expected = _planning_workspace_bytes(planner.scene, planner.robot_metadata, planner.budget, 4)
-            self.assertEqual((planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes,
-                              planner._trajectory_optimizer_graph_admitted),
-                             (expected.total_bytes, expected.anchor_fk_bytes, expected.trajectory_graph))
-            self.assertEqual((planner.scene_cpu_workspace_bytes, planner.scene_gpu_workspace_bytes),
-                             (expected.cpu_bytes, expected.gpu_bytes))
-            destroyed.assert_called_once_with()
-            collect.assert_called_once_with()
-            manager.assert_called_once()
-            planner._optimizer_class.assert_called_once_with("new configuration")
-            # A second replacement must repeat the current device check. The
-            # old solver is released, but an inadmissible new one is not built.
-            planner.torch.cuda.mem_get_info.return_value = 2*1024**3, 12*1024**3
-            planner._optimizer_class.reset_mock()
-            with self.assertRaisesRegex(ValueError, "GPU memory"):
-                planner.refine_validation(())
-            planner._optimizer_class.assert_not_called()
-            self.assertIsNone(planner.trajopt)
-        self.assertEqual(planner.torch.cuda.mem_get_info.call_count, 2)
 
     # BEGIN refinement admission cannot delete old witnesses or destroy a usable solver.
-    def test_refinement_union_exhaustion_happens_before_solver_mutation(self):
-        planner = _CuroboPlanner.__new__(_CuroboPlanner)
-        planner.phase = "feasibility"
-        planner.budget = PlanningBudget(max_refinement_points=1)
-        planner.anchors = np.array([0., 1.])
-        planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-        planner.refinement_parameters = np.array([.2])
-        planner.trajopt = SimpleNamespace(destroy=Mock())
-        original_solver = planner.trajopt
-        with self.assertRaisesRegex(ValueError, "finite refinement-point budget"):
-            planner.refine_validation([.3])
-        self.assertIs(planner.trajopt, original_solver)
-        planner.trajopt.destroy.assert_not_called()
-        np.testing.assert_array_equal(planner.refinement_parameters, [.2])
     # END a caller cannot replace the old witness with a new one to fit the budget.
 
     def test_close_releases_both_native_cycles_and_remains_idempotent(self):
@@ -2287,6 +2027,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                 destroyed.append(self.name)
 
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.check_request = Mock()
         planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.ik, planner.trajopt = CyclicSolver("ik"), CyclicSolver("trajectory")
         references = (weakref.ref(planner.ik), weakref.ref(planner.trajopt))
@@ -2314,8 +2055,8 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             _planning_workspace_bytes(scene, self.robot_metadata(), PlanningBudget(), 322)
         with self.assertRaises(TypeError):
             PlanningBudget(max_anchors=128)
-        with self.assertRaisesRegex(ValueError, "Refinement points"):
-            PlanningBudget(max_refinement_points=-1)
+        with self.assertRaises(TypeError):
+            PlanningBudget(max_refinement_points=1)
 
     # BEGIN a large finite scene must fit by lifetime, without dropping queries.
     def test_graph_admission_preserves_eager_budget_and_counts_shared_grids_once(self):
@@ -2336,7 +2077,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         for capacity, expected_bytes, expected_graph in (
                 (eager_bytes, eager_bytes, False),
                 (graph_bytes-1, eager_bytes, False),
-                (graph_bytes, graph_bytes, True)):
+                (graph_bytes, eager_bytes, False)):
             with self.subTest(capacity=capacity):
                 estimator.reset_mock()
                 actual = _planning_workspace_bytes(scene, metadata,
@@ -2393,7 +2134,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         # END changing only complete component inventory still changes shared bytes exactly once.
         world._contact_cells = {"target": cells}
         budget = PlanningBudget(ik_seeds=2, trajectory_seeds=1, knots=16, interpolation_steps=4,
-            interpolation_buffer_size=768, max_refinement_points=16, max_validation_points=512)
+            interpolation_buffer_size=768, max_task_anchors=256, max_validation_points=512)
         metadata = {"active_joint_names": range(7), "links": 13, "spheres": 416}
         cuda_before = torch.cuda.is_initialized()
         empty = _planning_workspace_bytes(world, metadata, budget, 22)
@@ -2553,61 +2294,6 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
             total_cost_reshaped=torch.tensor([[1e16, 1e16]], dtype=torch.float32),
             seed_rank=torch.tensor([[0, 1]]), batch_size=1, num_seeds=2)
 
-    @staticmethod
-    def selection_fixture(residuals, errors=()):
-        from manipulation.planning_diagnostics import AttemptWitnesses
-
-        planner = _CuroboPlanner.__new__(_CuroboPlanner)
-        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
-        planner.torch = torch
-        planner.budget = PlanningBudget()
-        planner.seed_strategies = ["reference_ik", "reference_ik_alternative"]
-        planner.last_optimizer_diagnostics = [
-            {"seed_index": index, "unchanged_from_seed": False, "maximum_control_update": .1,
-             "cores": []} for index in range(2)]
-        # BEGIN selection owns one attempt ledger and an explicit phase.
-        planner.phase = "feasibility"
-        planner.witnesses = AttemptWitnesses()
-        planner.formal_clock = {"duration": 1., "valid_count": 9}
-        planner.trajopt = SimpleNamespace(horizon=9)
-        planner.candidate_quality = Mock(side_effect=lambda curve, validation: {
-            "score": float(2-curve.candidate_index)})
-        # END the score is independent of native phase-dependent seed costs.
-        exported = []
-
-        # BEGIN native reconstruction is observable separately from verification.
-        def curve(candidate):
-            index = int(candidate.solution[0, 0, 0, 0].item())-1
-            if index in errors:
-                raise ValueError(f"candidate {index} exceeds finite sample budget")
-            native = candidate.get_interpolated_plan()
-            expected_count = (9, 5)[index]
-            if tuple(native.position.shape) != (1, 1, expected_count, 3):
-                raise AssertionError("A selected candidate must retain only its own valid samples")
-            np.testing.assert_array_equal(native.position[0, 0, 1:].numpy(),
-                                          np.full((expected_count-1, 3), index+1))
-            np.testing.assert_allclose(native.dt.numpy(), [[(.07, .11)[index]]], rtol=1e-7)
-            return SimpleNamespace(residuals={}, candidate_index=index,
-                                   executable_until=.4, next_verification=None)
-
-        def export(candidate):
-            trajectory = curve(candidate)
-            index = trajectory.candidate_index
-            expected_count = (9, 5)[index]
-            trajectory.residuals = {"required_process": residuals[index]}
-            planner.last_validation = {
-                "measurements": {"candidate_index": index},
-                "numerical_tolerances": {"position_m": 1e-4},
-                "u": np.array([0., .5, 1.]),
-                "violations": np.array([0., residuals[index], 0.]),
-            }
-            exported.append(index)
-            return trajectory, expected_count
-
-        planner.export = Mock(side_effect=export)
-        planner._native_curve = Mock(side_effect=curve)
-        # END a rejected native seed cannot consume an independent export.
-        return planner, exported
 
     def test_native_single_seed_gather_preserves_clock_valid_length_and_original_rank(self):
         from manipulation.planning import _trajectory_candidate
@@ -2676,101 +2362,37 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
                 torch.testing.assert_close(result.js_solution.knot, controls, rtol=0, atol=0)
     # END locked-joint active/full dimension regression.
 
-    def test_second_seed_with_native_and_export_success_cannot_be_discarded(self):
-        result = self.native_candidates(flags=(False, True))
-        planner, exported = self.selection_fixture((.01, 0.))
-        chosen, trajectory, attempt = planner.select_candidate(result)
-        self.assertEqual(exported, [1])
-        self.assertEqual(planner._native_curve.call_count, 1)
-        self.assertTrue(bool(chosen.success.all()))
-        self.assertEqual(trajectory.candidate_index, 1)
-        self.assertEqual(attempt["selected_seed_index"], 1)
-        self.assertEqual([candidate["accepted"] for candidate in attempt["candidates"]], [False, True])
-        self.assertEqual(attempt["validation_points"], 5)
-        self.assertEqual(attempt["measurements"]["candidate_index"], 1)
-        torch.testing.assert_close(chosen.solution, result.solution[:, 1:2])
 
     # BEGIN immediate feasibility archival and phase-independent quality ranking.
-    def test_first_feasible_seed_returns_before_spending_another_export_budget(self):
-        result = self.native_candidates(flags=(True, True), native_violations=(0., 0.))
-        result.seed_cost = torch.tensor([[100., 1.]])
-        planner, exported = self.selection_fixture((0., 0.))
-        planner.seed_strategies = ["reference_ik", "measured_state_constant"]
-        _, trajectory, attempt = planner.select_candidate(result)
-        self.assertEqual(exported, [0])
-        self.assertEqual(trajectory.candidate_index, 0)
-        self.assertEqual(attempt["seed_provenance"], "reference_ik")
-        planner, _ = self.selection_fixture((.01, 0.))
-        planner.seed_strategies = ["reference_ik", "measured_state_constant"]
-        self.assertEqual(planner.select_candidate(result)[1].candidate_index, 1)
 
-    def test_quality_phase_uses_common_quality_without_provenance_or_native_cost_priority(self):
-        result = self.native_candidates(flags=(True, True), native_violations=(0., 0.))
-        result.seed_cost = torch.tensor([[1., 100.]])
-        planner, exported = self.selection_fixture((0., 0.))
-        planner.phase = "quality"
-        planner.seed_strategies = ["reference_ik", "measured_state_constant"]
-        _, trajectory, attempt = planner.select_candidate(result)
-        self.assertEqual(exported, [0, 1])
-        self.assertEqual(trajectory.candidate_index, 1)
-        self.assertEqual(attempt["quality"]["score"], 1.)
     # END hard acceptance is required before either phase can select a result.
 
-    def test_failed_candidates_use_per_seed_actual_constraints_instead_of_float32_rank(self):
-        result = self.native_candidates(flags=(False, False), native_violations=(.02, 0.))
-        planner, exported = self.selection_fixture((.004, .009))
-        chosen, trajectory, attempt = planner.select_candidate(result)
-        self.assertEqual(exported, [])
-        self.assertEqual(planner._native_curve.call_count, 2)
-        self.assertFalse(bool(chosen.success.any()))
-        self.assertEqual(trajectory.candidate_index, 1)
-        self.assertEqual(attempt["selected_seed_index"], 1)
-        candidates = attempt["candidates"]
-        self.assertFalse(any(item["accepted"] for item in candidates))
-        self.assertLess(candidates[1]["continuation_violation"], candidates[0]["continuation_violation"])
-        self.assertAlmostEqual(candidates[0]["native_metrics"]["rollout"]["constraints"]["cspace"], .02, places=7)
-        self.assertEqual(candidates[1]["native_metrics"]["rollout"]["constraints"]["cspace"], 0.)
 
-    def test_native_rejection_has_no_borrowed_validation_and_cannot_become_success(self):
-        result = self.native_candidates(flags=(False, False), native_violations=(0., 0.))
-        planner, _ = self.selection_fixture((0., .03))
-        _, trajectory, attempt = planner.select_candidate(result)
-        self.assertEqual(trajectory.candidate_index, 0)
-        self.assertFalse(attempt["native_success"])
-        self.assertFalse(any(item["accepted"] for item in attempt["candidates"]))
-        self.assertIsNone(planner.last_validation)
-        planner.export.assert_not_called()
-        self.assertEqual(attempt["independent_validation"], "skipped_native_rejection")
 
-    def test_one_unexportable_seed_does_not_hide_another_verified_curve(self):
-        result = self.native_candidates(flags=(False, True))
-        planner, exported = self.selection_fixture((.01, 0.), errors=(0,))
-        _, trajectory, attempt = planner.select_candidate(result)
-        self.assertEqual(exported, [1])
-        self.assertEqual(trajectory.candidate_index, 1)
-        self.assertEqual(attempt["selected_seed_index"], 1)
-        self.assertEqual(len(attempt["candidates"]), 2)
-        planner, _ = self.selection_fixture((.01, 0.), errors=(0, 1))
-        with self.assertRaisesRegex(ValueError, "export|finite sample budget"):
-            planner.select_candidate(result)
 
     # BEGIN global budget failure must keep its identity and stop seed work.
-    def test_export_work_exhaustion_is_not_wrapped_or_retried_as_a_seed_error(self):
-        from manipulation.planning import PlanningWorkExhausted
-
-        result = self.native_candidates(flags=(False, True))
-        planner, _ = self.selection_fixture((.01, 0.))
-        exhausted = PlanningWorkExhausted("original cumulative wall-time exhausted")
-        planner.export.side_effect = exhausted
-        with self.assertRaises(PlanningWorkExhausted) as caught:
-            planner.select_candidate(result)
-        self.assertIs(caught.exception, exhausted)
-        self.assertEqual(planner.export.call_count, 1)
     # END an admitted alternative never replenishes the request budget.
 # END independent native-result selection and continuation regressions.
 
 
 # BEGIN exact knot-side, barrier and named-bound acceleration regressions.
+# BEGIN candidate ranking cannot trigger independent per-seed geometry exports.
+def test_native_selection_uses_shared_residuals_and_exports_no_rejected_seed():
+    planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    planner.check_request = Mock()
+    planner.seed_strategies = ["reference", "alternate"]
+    planner.last_optimizer_diagnostics = []
+    planner._native_curve = Mock(return_value=object())
+    planner.export = Mock(side_effect=AssertionError("Selection must not run output delivery"))
+    candidates = PlannerCandidateSelectionTests.native_candidates()
+    _, curve, report = planner.select_candidate(candidates)
+    assert report["accepted"] and report["selected_seed_index"] == 1
+    assert [row["accepted"] for row in report["candidates"]] == [False, True]
+    planner._native_curve.assert_called_once()
+    planner.export.assert_not_called()
+# END only the selected native candidate reaches the later delivery boundary.
+
+
 class ContinuousCubicDerivativeTests(unittest.TestCase):
     @staticmethod
     def curve():
@@ -2845,67 +2467,9 @@ class ContinuousCubicDerivativeTests(unittest.TestCase):
 
 class ExportedCurveContractTests(unittest.TestCase):
     # BEGIN observer failures cannot alter checks or replace the budget error.
-    def test_partial_observer_sees_only_completed_batches_before_budget_failure(self):
-        from manipulation.planning import PlanningWorkExhausted
 
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        planner, native = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-            np.zeros((5, 3)), np.zeros((5, 3)), .25)
-        old_validation = {"candidate": "previous_seed"}
-        planner.last_validation = old_validation
-        snapshots = []
-        planner._export_progress_observer = lambda value: snapshots.append(deepcopy(value))
-        exhausted = PlanningWorkExhausted("original batch-boundary deadline")
-        checks = []
-        def check():
-            checks.append(True)
-            if len(checks) == 2:
-                raise exhausted
-        planner._check_validation_work = check
-        with patch("manipulation.planning._VALIDATION_CHUNK_SIZE", 2), self.assertRaises(PlanningWorkExhausted) as caught:
-            planner.export(native)
-        self.assertIs(caught.exception, exhausted)
-        self.assertEqual([row["checked_points"] for row in snapshots], [0, 2])
-        self.assertEqual(snapshots[-1]["source_self_collision_batch"]["checked_states"], 2)
-        self.assertGreater(snapshots[-1]["planned_points"], 2)
-        self.assertIs(planner.last_validation, old_validation)
-
-    def test_throwing_partial_observer_leaves_complete_export_unchanged(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        planner, native = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-            np.zeros((5, 3)), np.zeros((5, 3)), .25)
-        expected, expected_count = planner.export(native)
-        planner._export_progress_observer = Mock(side_effect=OSError("diagnostic disk full"))
-        actual, actual_count = planner.export(native)
-        self.assertEqual(actual_count, expected_count)
-        self.assertEqual(actual.residuals, expected.residuals)
-        np.testing.assert_array_equal(actual.position, expected.position)
-        np.testing.assert_array_equal(actual.velocity, expected.velocity)
-        self.assertGreater(planner._export_progress_observer.call_count, 1)
     # END evidence collection cannot revoke a numerically unchanged candidate.
     # BEGIN exported source checks preserve the exact native query precision and failure time.
-    def test_source_collision_uses_native_query_values_and_enters_exported_residuals(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        value = .123456789
-        planner, native = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-            [[value, 0., 0.], [value, 0., 0.]], np.zeros((2, 3)), 1.)
-        planner.device_cfg.to_device = lambda values: torch.as_tensor(values, dtype=torch.float32)
-        calls = []
-
-        def source_check(q, names, times, *, diagnostics):
-            calls.append((q.clone(), times.clone()))
-            diagnostics.update(checked_states=times.numel(), unmodelled_geometry_names=[],
-                               worst_state={"trajectory_time_s": .5})
-            return (times == .5).to(times)
-
-        planner._verification_scene.check_robot_self_collision = source_check
-        trajectory, count = planner.export(native)
-        self.assertEqual(trajectory.residuals["source_self_collision"], 1.)
-        self.assertEqual(planner.last_validation["measurements"]["source_self_collision:maximum_violation_time"], .5)
-        self.assertEqual(planner.last_validation["source_self_collision"]["checked_states"], count)
-        self.assertEqual(calls[0][0].dtype, torch.float32)
-        self.assertEqual(calls[0][1].dtype, torch.float32)
-        np.testing.assert_array_equal(calls[0][0][0, :, 0].numpy(), np.full(count, np.float32(value)))
     # END a source collision cannot disappear behind passing native joint constraints.
 
     # BEGIN the real exporter consumes the complete scalar acceleration check.
@@ -2916,27 +2480,10 @@ class ExportedCurveContractTests(unittest.TestCase):
             [[0., 0., 0.], [3., 0., 0.], [3., 0., 0.]], 1.)
         limits = planner._verification_native.get_cost("cspace").config.joint_limits
         limits.acceleration[:, 0] = torch.tensor([-2., 5.], dtype=torch.float64)
-        trajectory, _ = planner.export(result)
-        self.assertEqual(trajectory.residuals["continuous_acceleration"], 1.)
-        self.assertEqual(planner.last_validation["cubic_derivatives"]["checked_interval_s"], [0., 2.])
-        self.assertEqual(planner.last_validation["measurements"]["continuous_acceleration:maximum_violation_time"], 1.)
-        self.assertEqual(planner.last_validation["u"][-1], .5)
-        self.assertEqual(planner.last_validation["violations"][-1], 1.)
-        planner.refinement_parameters = np.empty(0)
-        planner.trajopt.horizon = 4
-        # BEGIN the selector normally adds each completed export to this ledger.
-        from manipulation.planning_diagnostics import AttemptWitnesses
-        planner.witnesses = AttemptWitnesses()
-        # BEGIN this completed curve is the explicitly selected continuation.
-        planner.witnesses.set_current({}, validation=planner.last_validation,
-                                      duration=planner.formal_clock["duration"])
-        # END adding unrelated history alone cannot select optimizer queries.
-        # END direct-export fixtures must explicitly perform that same handoff.
-        # Neither ordinary sample failures nor pose anchors identify this
-        # knot's left acceleration. Its analytic witness must drive the same
-        # existing bounded refinement path as other curve violations.
-        self.assertIn(.5, planner.refinement_samples())
-        self.assertFalse(all(value <= 0. for value in trajectory.residuals.values()))
+        from manipulation.planning import MotionPlanningError
+        with self.assertRaises(MotionPlanningError) as caught:
+            planner.export(result)
+        self.assertEqual(caught.exception.reason, "output_inconsistent")
     # END a zero sampled native residual cannot hide a left-limit violation.
 
     def test_multiple_native_seeds_cannot_be_flattened_into_one_export(self):
@@ -2986,8 +2533,6 @@ class ExportedCurveContractTests(unittest.TestCase):
         self.assertAlmostEqual(first["hold_until"], .45*trajectory.duration)
         self.assertAlmostEqual(trajectory.executable_until, first["time"])
         self.assertEqual(trajectory.next_verification["source_frame"], 79)
-        self.assertTrue(np.any(np.isclose(.2, planner.last_validation["u"], rtol=0, atol=1e-14)))
-        self.assertTrue(np.any(np.isclose(.45, planner.last_validation["u"], rtol=0, atol=1e-14)))
         # Returned barrier details cannot mutate the trajectory's authorization
         # boundary or turn a future verification into supplied evidence.
         returned = trajectory.next_verification
@@ -3002,17 +2547,6 @@ class ExportedCurveContractTests(unittest.TestCase):
         self.assertIsNone(trajectory.next_verification)
         self.assertEqual(trajectory.executable_until, trajectory.duration)
 
-    def test_excessive_curve_subdivision_is_rejected_before_allocation(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-                                         np.zeros((2, 3)), np.array([[1e9, 0., 0.], [-1e9, 0., 0.]]), 1.)
-        # Keep this intentionally huge excursion in its declared domain so
-        # this test reaches the separate finite-work rejection it exercises.
-        planner._verification_fk.config.kinematics_config.joint_limits.position *= 1e6
-        with patch("manipulation.planning.np.linspace", wraps=np.linspace) as allocations:
-            with self.assertRaisesRegex(ValueError, "finite sample budget"):
-                planner.export(result)
-            allocations.assert_not_called()
 
 
 # BEGIN measured-entrance necessary conditions without invented derivatives.
@@ -3034,6 +2568,7 @@ class InitialStatePreflightTests(unittest.TestCase):
             base_pose=base, tool_transform=tool,
             phases=(MotionPhase("free", constant_path()),))
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.check_request = Mock()
         planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
         planner.problem, planner.joint_names = problem, problem.joint_names
         # BEGIN entrance source checks receive the same explicit progress/time mapping.
@@ -3041,7 +2576,7 @@ class InitialStatePreflightTests(unittest.TestCase):
         # END this fixture has no material or attachment mode switches.
         planner.budget = PlanningBudget()
         planner.torch, planner.JointState = torch, SimpleNamespace
-        planner._RobotState = SimpleNamespace
+        planner._RobotState = lambda **kwargs: SimpleNamespace(**kwargs, robot_spheres=kwargs["cuda_robot_model_state"].robot_spheres)
         planner.start = SimpleNamespace(
             position=torch.tensor([position], dtype=torch.float64),
             velocity=torch.tensor([velocity], dtype=torch.float64))
@@ -3083,17 +2618,11 @@ class InitialStatePreflightTests(unittest.TestCase):
                 "translation_m": float(np.linalg.norm(actual[:3, 3]-expected[:3, 3])),
                 "rotation_rad": float(Rotation.from_matrix(expected[:3, :3].T @ actual[:3, :3]).magnitude())})
         # END this diagnostic compares identical q without relaxing any gate.
-        # BEGIN source acceptance exposes per-term entrance evidence through its own API.
-        def evaluate_source(spheres, position, quaternion, progress, joints, names, *, components_out, **kwargs):
-            value = torch.full_like(progress, scene_value)
-            components_out[scene_name] = value
-            return value
-
-        planner._verification_scene = SimpleNamespace(gripper=None, required_progress_anchors=(), check_robot_coverage=Mock(return_value=[]),
-            check_robot_self_collision=Mock(side_effect=lambda q, names, times, **kwargs:
-                torch.full_like(times, native_collision)),
-            evaluate_source=Mock(side_effect=evaluate_source))
-        # END no proxy component callback can stand in for the source entrance verdict.
+        planner.scene = SimpleNamespace(gripper=None, required_progress_anchors=(),
+            contacts=(), owners=(), robot_owner_permissions=(),
+            evaluate=Mock(side_effect=lambda spheres, p, r, progress, *args, **kwargs:
+                          torch.full_like(progress, scene_value)))
+        planner._verification_scene = planner.scene
         planner.scene_workspace_bytes, planner.anchor_fk_workspace_bytes, planner.anchor_capacity = 64, 32, 4
         planner.scene_cpu_workspace_bytes, planner.scene_gpu_workspace_bytes = 24, 40
         planner.reference_seeds = Mock(side_effect=AssertionError("an infeasible fixed entrance must stop before IK"))
@@ -3105,8 +2634,6 @@ class InitialStatePreflightTests(unittest.TestCase):
         result = planner.initial_state_diagnostics()
         self.assertTrue(result["passed"])
         self.assertEqual(result["failed_components"], [])
-        np.testing.assert_array_equal(result["joint_bounds"]["position"]["upper"], [.2, .4, .6])
-        np.testing.assert_array_equal(result["joint_bounds"]["velocity"]["upper"], [1., 2., 3.])
         measured = planner._verification_fk.compute_kinematics.call_args.args[0]
         torch.testing.assert_close(measured.position[:, 0], planner.start.position, rtol=0, atol=0)
         torch.testing.assert_close(measured.velocity[:, 0], planner.start.velocity, rtol=0, atol=0)
@@ -3114,15 +2641,9 @@ class InitialStatePreflightTests(unittest.TestCase):
             self.assertIsNone(getattr(measured, field, None))
         cspace.forward.assert_not_called()
         planner._verification_native.compute_costs.assert_not_called()
-        collision.setup_batch_tensors.assert_not_called()
-        collision.forward.assert_not_called()
-        source = planner._verification_scene.check_robot_self_collision
-        source.assert_called_once()
-        torch.testing.assert_close(source.call_args.args[0], planner.start.position[:, None])
-        torch.testing.assert_close(source.call_args.args[2], torch.zeros((1, 1), dtype=torch.float64))
-        # BEGIN inspect the actual source-world call with the unchanged native entrance FK.
-        spheres, position, quaternion, progress, joints, names = planner._verification_scene.evaluate_source.call_args.args
-        # END named limits and absent derivative assertions above retain their independent scope.
+        collision.setup_batch_tensors.assert_called_once_with(1, 1)
+        collision.forward.assert_called_once()
+        spheres, position, quaternion, progress, joints, names = planner.scene.evaluate.call_args.args
         expected_position = (planner.problem.base_pose[:3, :3]
                              @ (planner.problem.start_q+planner.problem.tool_transform[:3, 3])
                              + planner.problem.base_pose[:3, 3])
@@ -3133,440 +2654,25 @@ class InitialStatePreflightTests(unittest.TestCase):
         torch.testing.assert_close(progress, torch.zeros((1, 1), dtype=torch.float64), rtol=0, atol=0)
         torch.testing.assert_close(joints[:, 0], planner.start.position, rtol=0, atol=0)
         self.assertEqual(names, planner.joint_names)
-        self.assertIn("unprovided_locked_joint_velocity", result["scope"]["not_checked"])
-        self.assertIn("future_trajectory_feasibility", result["scope"]["not_checked"])
-        self.assertLess(result["source_native_fk"]["translation_m"], 1e-14)
-        self.assertLess(result["source_native_fk"]["rotation_rad"], 1e-14)
-
-    def test_each_immutable_violation_stops_before_ik_optimization_or_search(self):
-        cases = (
-            ("native:position", {"position": (.21, -.3, .5)}, .01),
-            ("native:velocity", {"velocity": (.7, -2.3, 2.4)}, .3),
-            ("source_self_collision", {"native_collision": 1.}, 1.),
-            # BEGIN source world collision is binary; nonfinite source evidence still rejects.
-            ("scene:source_world_collision", {"scene_value": 1.}, 1.),
-            ("scene:source_world_collision", {"scene_value": np.nan}, np.nan),
-            # END neither an unknown-space proxy nor its magnitude owns acceptance.
-        )
-        scene = SimpleNamespace(bind_robot_validator=Mock(), describe=lambda: {"scope": "analytic entrance fixture"})
-        scene.clone_for_rollout = lambda: deepcopy(scene)
-        for component, arguments, expected in cases:
+    def test_each_immutable_violation_rejects_the_same_measured_entrance(self):
+        for component, arguments in (("position", {"position": (.21, -.3, .5)}),
+            ("velocity", {"velocity": (.7, -2.3, 2.4)}),
+            ("self_collision", {"native_collision": 1.}),
+            ("scene", {"scene_value": 1.}), ("scene", {"scene_value": np.nan})):
             with self.subTest(component=component):
                 planner, _, _ = self.fixture(**arguments)
                 before = (planner.start.position.clone(), planner.start.velocity.clone())
-                with patch("manipulation.planning._CuroboPlanner", return_value=planner):
-                    result = plan_trajectory(planner.problem, scene, object(), robot_validator=object(), device="cpu")
-                self.assertFalse(result.success)
-                self.assertIsNone(result.trajectory)
-                self.assertEqual(result.diagnostics["failure"], "initial_state_infeasible")
-                entrance = result.diagnostics["initial_state"]
-                self.assertEqual(entrance["failed_components"], [component])
-                actual = entrance["residuals"][component]
-                if np.isfinite(expected):
-                    self.assertAlmostEqual(actual, expected)
-                    self.assertEqual(entrance["nonfinite_components"], [])
-                else:
-                    # BEGIN strict JSON must retain the nonfinite rejection.
-                    self.assertIsNone(actual)
-                    self.assertEqual(entrance["nonfinite_components"], [component])
-                    # END strict JSON must retain the nonfinite rejection.
-                json.dumps(result.diagnostics, allow_nan=False)
-                self.assertEqual(result.diagnostics["attempts"], [])
-                self.assertFalse(result.diagnostics["used_ompl"])
+                result = planner.initial_state_diagnostics()
+                self.assertFalse(result["passed"])
+                self.assertIn(component, result["failed_components"])
                 planner.reference_seeds.assert_not_called()
                 planner.optimize.assert_not_called()
                 planner.ompl_seed.assert_not_called()
-                planner.close.assert_called_once_with()
                 torch.testing.assert_close(planner.start.position, before[0], rtol=0, atol=0)
                 torch.testing.assert_close(planner.start.velocity, before[1], rtol=0, atol=0)
 # END measured-entrance necessary conditions without invented derivatives.
 
 
-class PlannerRetryContractTests(unittest.TestCase):
-    """Exercise authorization and finite retry semantics without native GPU work."""
-
-    @staticmethod
-    def scripted_planner(native_flags, residuals, *, quality_scores=None, optimizer_unchanged=None):
-        from manipulation.planning_diagnostics import AttemptWitnesses
-
-        # Distinct solutions and exports reveal accidental candidate leakage
-        # across attempts; a graph-search seed is never an accepted curve.
-        native = [SimpleNamespace(success=torch.tensor([[flag]]), batch_size=1, num_seeds=1,
-                                  solution=torch.full((1, 1, 4, 3), float(index+1)),
-                                  seed_cost=torch.tensor([[float(index)]]), metrics=None, interpolated_metrics=None)
-                  for index, flag in enumerate(native_flags)]
-        trajectories = [SimpleNamespace(residuals={"required_process": value}, candidate_index=index,
-                                         # BEGIN exact curve identity is independent of cost/ranking.
-                                         joint_names=("x", "y", "z"), times=np.array([0., 1.]),
-                                         position=np.full((2, 3), float(index+1)), velocity=np.zeros((2, 3)),
-                                         # END different scripted candidates cannot refute each other.
-                                         executable_until=.4,
-                                         next_verification={"time": .4, "skill_id": "grasp", "event_id": "verify",
-                                                            "requires_evidence": "actual Holding observation"})
-                        for index, value in enumerate(residuals)]
-        # BEGIN stages share this one planner and one cumulative witness ledger.
-        qualities = list(range(len(trajectories))) if quality_scores is None else quality_scores
-        stages = []
-        # END different explicit scores expose invalid phase-native comparisons.
-        planner = SimpleNamespace(
-            budget=PlanningBudget(),
-            phase="feasibility", witnesses=AttemptWitnesses(),
-            # BEGIN the selected working-set report belongs to the current candidate.
-            last_working_set={},
-            # END empty diagnostic state is explicit in the scripted planner.
-            formal_clock={"duration": 1.}, refinement_parameters=np.empty(0),
-            optimize_phases=stages,
-            # BEGIN explicit allocation diagnostics in the CPU retry fixture.
-            scene_workspace_bytes=64, scene_cpu_workspace_bytes=24, scene_gpu_workspace_bytes=40,
-            anchor_fk_workspace_bytes=32, anchor_capacity=4,
-            # END explicit allocation diagnostics in the CPU retry fixture.
-            progress_map=_ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-            ik=SimpleNamespace(config=SimpleNamespace(exit_early=False)),
-            reference_ik_distinct_counts=[2, 2, 2],
-            reference_ik_queries=[], reference_ik_chains=[], reference_seed_fits=[], goal_ik_fit_hints=[],
-            initial_seed_strategies=["reference_ik", "reference_ik_alternative"],
-            seed_strategies=["reference_ik", "reference_ik_alternative"],
-            # BEGIN valid measured entrance for the independent retry fixture.
-            initial_state_diagnostics=Mock(return_value={"passed": True, "residuals": {},
-                "failed_components": [], "scope": {"kind": "analytic retry fixture"}}),
-            # END valid measured entrance for the independent retry fixture.
-            reference_seeds=Mock(return_value=(torch.zeros((1, 2, 4, 3)), [2, 2, 2])),
-            close=Mock(),
-            refinement_samples=Mock(return_value=None),
-            # BEGIN scripted native solves expose the owned AL lifecycle explicitly.
-            update_functional_constraints=Mock(return_value={"changed": False}),
-            reset_functional_constraints=Mock(),
-            # END an absent fixture method must never require a production fallback.
-            ompl_seed=Mock(return_value=(None, {"success": False})),
-        )
-        planner.native_diagnostics = MethodType(_CuroboPlanner.native_diagnostics, planner)
-        planner.select_candidate = MethodType(_CuroboPlanner.select_candidate, planner)
-
-        # BEGIN fixture transitions replace gradient slots without altering the history ledger.
-        def optimize(seed):
-            index = len(stages)
-            stages.append(planner.phase)
-            planner.last_optimizer_diagnostics = [{"seed_index": 0,
-                "unchanged_from_seed": False if optimizer_unchanged is None else optimizer_unchanged[index],
-                "maximum_control_update": 0. if optimizer_unchanged is not None and optimizer_unchanged[index] else .1,
-                "cores": []}]
-            return native[index]
-
-        def refine(parameters, *, phase=None):
-            planner.refinement_parameters = np.unique(parameters)
-            if phase is not None:
-                planner.phase = phase
-
-        def curve(result):
-            index = next(index for index, candidate in enumerate(native) if candidate is result)
-            return SimpleNamespace(residuals={}, candidate_index=index, executable_until=.4,
-                                   # BEGIN cheap reconstruction names the same candidate's full curve.
-                                   joint_names=trajectories[index].joint_names,
-                                   times=trajectories[index].times.copy(),
-                                   position=trajectories[index].position.copy(),
-                                   velocity=trajectories[index].velocity.copy(),
-                                   # END equality is physical identity, not shared object identity.
-                                   next_verification=trajectories[index].next_verification)
-
-        planner.optimize = Mock(side_effect=optimize)
-        planner.refine_validation = Mock(side_effect=refine)
-        planner._native_curve = Mock(side_effect=curve)
-        planner.candidate_quality = Mock(side_effect=lambda trajectory, validation: {
-            "score": float(qualities[trajectory.candidate_index])})
-        # END a cheap curve is an initializer and never shares an exported residual.
-
-        def export(result):
-            index = next(index for index, candidate in enumerate(native) if candidate is result)
-            planner.last_validation = {"measurements": {"position_error_m": residuals[index],
-                                                       "candidate_index": index},
-                                       "numerical_tolerances": {"position_m": 1e-4},
-                                       "u": np.array([0., .5, 1.]),
-                                       "violations": np.array([0., residuals[index], 0.])}
-            return trajectories[index], 17
-
-        planner.export = Mock(side_effect=export)
-        return planner, native, trajectories
-
-    def run_planner(self, planner, budget):
-        scene = SimpleNamespace(bind_robot_validator=Mock(), describe=lambda: {"scope": "explicit analytic retry fixture"})
-        scene.clone_for_rollout = lambda: deepcopy(scene)
-        # BEGIN the handoff fixture declares its real empty request ledger.
-        problem = SimpleNamespace(events=(), pose_events=(), coordinate_events=(), supports=())
-        # END accepted planning never depends on an undeclared object sentinel.
-        # BEGIN each binding owns the exact validation that qualified its curve.
-        def bind(trajectory, **kwargs):
-            return {"fixture": "accepted", "candidate_id": f"candidate-{trajectory.candidate_index}",
-                    "validation": deepcopy(kwargs["validation"]),
-                    "native_report": deepcopy(kwargs["native_report"])}
-
-        with patch("manipulation.planning._CuroboPlanner", return_value=planner), \
-                patch("manipulation.execution_binding.bind_candidate", side_effect=bind) as binder:
-            result = plan_trajectory(problem, scene, object(), robot_validator=object(), budget=budget)
-        planner.bound_candidates = binder.call_args_list
-        # END replacing a candidate cannot mutate an earlier archived binding.
-        planner.close.assert_called_once_with()
-        return result
-
-    def test_native_and_exported_curve_must_both_pass_without_candidate_leakage(self):
-        for native_success, residual in ((False, 0.), (True, .002), (True, np.nan)):
-            with self.subTest(native_success=native_success, residual=residual):
-                planner, _, _ = self.scripted_planner([native_success], [residual])
-                result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=1))
-                self.assertFalse(result.success)
-                self.assertIsNone(result.trajectory)
-                self.assertEqual(planner.optimize.call_count, 1)
-                planner.ompl_seed.assert_not_called()
-
-    # BEGIN error classification and conservative export charging are independent.
-    def test_exhausted_export_keeps_request_category_and_charges_once(self):
-        from manipulation.planning import PlanningWorkExhausted
-
-        planner, _, _ = self.scripted_planner([True], [.1])
-        planner.export.side_effect = PlanningWorkExhausted("original cumulative wall-time exhausted")
-        budget = PlanningBudget(maximum_trajectory_solves=2)
-        result = self.run_planner(planner, budget)
-        self.assertFalse(result.success)
-        self.assertEqual(result.diagnostics["failure"], "cumulative_planning_budget_exhausted")
-        self.assertEqual(result.diagnostics["error_type"], "PlanningWorkExhausted")
-        self.assertEqual(result.diagnostics["reason"], "original cumulative wall-time exhausted")
-        consumed = result.diagnostics["consumed_planning"]
-        self.assertEqual(consumed["validation_passes"], 1)
-        self.assertEqual(consumed["validation_queries"], 1+budget.max_validation_points)
-        self.assertEqual(planner.export.call_count, 1)
-        planner.ompl_seed.assert_not_called()
-    # END no diagnostic or exception handler spends another solve allowance.
-
-    # BEGIN diagnose the completed native seed selection, not a static budget guess.
-    def test_diagnostics_report_actual_seed_policy_and_native_early_exit_configuration(self):
-        for strategies, distinct in ((["reference_ik", "reference_ik_alternative"], [3, 2, 3]),
-                                     (["reference_ik", "measured_state_constant"], [3, 0, 3])):
-            with self.subTest(strategies=strategies):
-                planner, _, _ = self.scripted_planner([True], [0.])
-                planner.initial_seed_strategies = ["not selected yet"]
-                planner.reference_ik_distinct_counts = []
-
-                def select():
-                    planner.initial_seed_strategies = strategies.copy()
-                    planner.reference_ik_distinct_counts = distinct.copy()
-                    return torch.zeros((1, 2, 4, 3)), [3, distinct[1], 3]
-
-                planner.reference_seeds.side_effect = select
-                result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=1))
-                self.assertTrue(result.success)
-                self.assertEqual(result.diagnostics["initial_seed_strategies"], strategies)
-                self.assertEqual(result.diagnostics["reference_ik_distinct_counts"], distinct)
-                self.assertEqual(result.diagnostics["reference_ik_success_counts"], [3, distinct[1], 3])
-                self.assertIs(result.diagnostics["ik_exit_early"], False)
-    # END diagnose the completed native seed selection.
-
-    def test_ompl_success_is_only_a_seed_and_cannot_bypass_the_final_complete_solve(self):
-        planner, _, _ = self.scripted_planner([False, True], [.004, .001])
-        seed = torch.full((1, 1, 4, 3), 17.)
-        mapping = _ProgressMap(np.array([0., .3, 1.]), np.array([0., .1, 1.]))
-        planner.ompl_seed.return_value = seed, {"success": True}
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
-        self.assertFalse(result.success)
-        self.assertIsNone(result.trajectory)
-        self.assertTrue(result.diagnostics["used_ompl"])
-        self.assertEqual(planner.optimize.call_count, 2)
-        self.assertIs(planner.optimize.call_args_list[1].args[0], seed)
-        # BEGIN a new spatial initializer cannot retain another curve's multipliers.
-        planner.reset_functional_constraints.assert_called_once_with()
-        planner.refine_validation.assert_called_once()
-        np.testing.assert_array_equal(planner.refine_validation.call_args.args[0], [])
-        # END the one rebuild does not authorize the new seed or consume another solve.
-        self.assertEqual(planner.ompl_seed.call_count, 1)
-        self.assertEqual(len(result.diagnostics["attempts"]), 2)
-
-    def test_curve_refinement_reoptimizes_whole_candidates_with_a_hard_solve_cap(self):
-        planner, native, _ = self.scripted_planner([True, True, True], [.004, .002, .001])
-        planner.refinement_samples.side_effect = [np.array([.27]), np.array([.27, .53])]
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=3, search_seconds=0.))
-        self.assertFalse(result.success)
-        self.assertIsNone(result.trajectory)
-        self.assertEqual(planner.optimize.call_count, 3)
-        self.assertEqual(planner.refine_validation.call_count, 2)
-        self.assertEqual(planner.refinement_samples.call_count, 2)
-        for index in (1, 2):
-            seed = planner.optimize.call_args_list[index].args[0]
-            torch.testing.assert_close(seed, native[index-1].solution)
-            self.assertNotEqual(seed.data_ptr(), native[index-1].solution.data_ptr())
-        planner.ompl_seed.assert_not_called()
-
-    # BEGIN unchanged curves may benefit from a changed bounded optimizer query set.
-    def test_stagnant_candidate_without_new_subproblem_stops_before_another_solve(self):
-        planner, _, _ = self.scripted_planner([True], [.004], optimizer_unchanged=[True])
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=3, search_seconds=0.))
-        self.assertFalse(result.success)
-        self.assertEqual(result.diagnostics["failure"], "optimization_stagnated")
-        self.assertIn(.5, result.diagnostics["attempts"][0]["failure_witness_parameters"])
-        self.assertEqual(planner.optimize.call_count, 1)
-        planner.refinement_samples.assert_called_once_with()
-        planner.refine_validation.assert_not_called()
-
-    def test_stagnation_with_new_active_queries_rebuilds_before_spatial_search(self):
-        planner, native, _ = self.scripted_planner([True, True], [.004, 0.],
-                                                   optimizer_unchanged=[True, False])
-
-        def added_times():
-            self.assertEqual(planner.ompl_seed.call_count, 0)
-            self.assertIn(.5, planner.witnesses.parameters)
-            return np.array([.5])
-
-        planner.refinement_samples.side_effect = added_times
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
-        self.assertTrue(result.success)
-        self.assertFalse(result.diagnostics["used_ompl"])
-        torch.testing.assert_close(planner.optimize.call_args_list[1].args[0], native[0].solution)
-        planner.ompl_seed.assert_not_called()
-        planner.refine_validation.assert_called_once()
-        np.testing.assert_array_equal(planner.refine_validation.call_args.args[0], [.5])
-
-    def test_failed_search_leaves_stagnation_and_does_not_discard_failure_times(self):
-        planner, _, _ = self.scripted_planner([True], [.004], optimizer_unchanged=[True])
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=3))
-        self.assertFalse(result.success)
-        self.assertEqual(result.diagnostics["failure"], "optimization_stagnated")
-        planner.ompl_seed.assert_called_once()
-        planner.refinement_samples.assert_called_once_with()
-        self.assertIn(.5, planner.witnesses.parameters)
-    # END scheduling never discards the permanent source-failure history.
-
-    def test_last_budgeted_verified_export_preserves_its_evidence_barrier(self):
-        planner, _, trajectories = self.scripted_planner([True, True], [.003, 0.])
-        planner.refinement_samples.return_value = np.array([.27])
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2, search_seconds=0.))
-        self.assertTrue(result.success)
-        self.assertIs(result.trajectory, trajectories[1])
-        self.assertEqual(planner.optimize.call_count, 2)
-        self.assertEqual(result.diagnostics["executable_until"], .4)
-        self.assertEqual(result.diagnostics["next_verification"]["requires_evidence"], "actual Holding observation")
-        self.assertEqual(planner.refinement_samples.call_count, 1)
-
-    def test_export_rejection_releases_native_resources(self):
-        planner, _, _ = self.scripted_planner([True], [0.])
-        planner.export.side_effect = ValueError("finite sample budget exceeded")
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=1))
-        self.assertFalse(result.success)
-        self.assertIn("finite sample budget", result.diagnostics["reason"])
-        self.assertEqual(result.request_ledger["consumed_planning"]["validation_passes"], 1)
-        planner.close.assert_called_once_with()
-
-    # BEGIN a bound feasible curve survives only ordinary optional-work rejection.
-    def test_quality_improvement_replaces_archive_with_same_request_budget_and_serial_stages(self):
-        planner, native, trajectories = self.scripted_planner([True, True], [0., 0.],
-                                                              quality_scores=[2., 1.])
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
-        self.assertTrue(result.success)
-        self.assertIs(result.trajectory, trajectories[1])
-        self.assertEqual(planner.optimize_phases, ["feasibility", "quality"])
-        self.assertEqual([row.kwargs.get("phase") for row in planner.refine_validation.call_args_list], ["quality"])
-        torch.testing.assert_close(planner.optimize.call_args_list[1].args[0], native[0].solution)
-        self.assertEqual(len(planner.bound_candidates), 2)
-        self.assertEqual(result.execution_binding["candidate_id"], "candidate-1")
-        self.assertEqual(result.execution_binding["validation"]["measurements"]["candidate_index"], 1)
-        self.assertEqual(result.diagnostics["returned_candidate"]["quality"]["score"], 1.)
-        work = result.request_ledger["consumed_planning"]
-        self.assertEqual((work["initializations"], work["ik_batches"], work["trajectory_solves"]), (1, 1, 2))
-        self.assertEqual((work["validation_passes"], work["validation_queries"]), (2, 35))
-        self.assertEqual(result.execution_binding["request_ledger"], result.request_ledger)
-        planner.ompl_seed.assert_not_called()
-
-    def test_worse_or_equal_quality_keeps_exact_archived_curve_binding_and_validation(self):
-        for quality in (1., 2.):
-            with self.subTest(candidate_quality=quality):
-                planner, _, trajectories = self.scripted_planner([True, True], [0., 0.],
-                                                                 quality_scores=[1., quality])
-                result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
-                self.assertTrue(result.success)
-                self.assertIs(result.trajectory, trajectories[0])
-                self.assertEqual(len(planner.bound_candidates), 1)
-                self.assertEqual(result.execution_binding["candidate_id"], "candidate-0")
-                self.assertEqual(result.execution_binding["validation"]["measurements"]["candidate_index"], 0)
-                self.assertEqual(planner.last_validation["measurements"]["candidate_index"], 1)
-                self.assertEqual(result.diagnostics["returned_candidate"]["phase"], "feasibility")
-                self.assertEqual(result.diagnostics["attempts"][-1]["quality_decision"],
-                                 "retained_better_or_equal_feasible_candidate")
-                self.assertEqual(result.request_ledger["consumed_planning"]["trajectory_solves"], 2)
-
-    def test_native_or_independent_quality_rejection_cannot_replace_archive(self):
-        for native_success, residual in ((False, 0.), (True, .01), (True, np.nan)):
-            with self.subTest(native_success=native_success, residual=residual):
-                planner, _, trajectories = self.scripted_planner([True, native_success], [0., residual],
-                                                                 quality_scores=[2., 1.])
-                result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
-                self.assertTrue(result.success)
-                self.assertIs(result.trajectory, trajectories[0])
-                self.assertEqual(len(planner.bound_candidates), 1)
-                self.assertEqual(result.execution_binding["candidate_id"], "candidate-0")
-                self.assertEqual(result.execution_binding["validation"]["measurements"]["candidate_index"], 0)
-                self.assertFalse(result.diagnostics["attempts"][-1]["accepted"])
-                work = result.request_ledger["consumed_planning"]
-                self.assertEqual(work["trajectory_solves"], 2)
-                self.assertEqual(work["validation_passes"], 2 if native_success else 1)
-
-    def test_quality_export_budget_exhaustion_keeps_archive_and_charges_partial_pass_once(self):
-        from manipulation.planning import PlanningWorkExhausted
-
-        planner, _, trajectories = self.scripted_planner([True, True], [0., 0.])
-        original = planner.export.side_effect
-
-        def export(candidate):
-            if candidate.solution[0, 0, 0, 0].item() == 2.:
-                raise PlanningWorkExhausted("optional quality exhausted the original request")
-            return original(candidate)
-
-        planner.export.side_effect = export
-        budget = PlanningBudget(maximum_trajectory_solves=2)
-        result = self.run_planner(planner, budget)
-        self.assertTrue(result.success)
-        self.assertIs(result.trajectory, trajectories[0])
-        self.assertEqual(len(planner.bound_candidates), 1)
-        self.assertEqual(result.execution_binding["candidate_id"], "candidate-0")
-        self.assertEqual(result.diagnostics["quality_stop_reason"],
-                         "optional quality exhausted the original request")
-        work = result.request_ledger["consumed_planning"]
-        self.assertEqual((work["trajectory_solves"], work["validation_passes"]), (2, 2))
-        self.assertEqual(work["validation_queries"], 1+17+budget.max_validation_points)
-        self.assertEqual(result.execution_binding["request_ledger"], result.request_ledger)
-
-    def test_quality_runtime_error_is_not_hidden_by_archive_or_simultaneous_timeout(self):
-        planner, _, _ = self.scripted_planner([True, True], [0., 0.])
-        original = planner.export.side_effect
-        now = [0.]
-        budget = PlanningBudget(maximum_trajectory_solves=2)
-
-        def export(candidate):
-            if candidate.solution[0, 0, 0, 0].item() == 2.:
-                now[0] = budget.planning_seconds+1.
-                raise RuntimeError("source geometry API failed before returning")
-            return original(candidate)
-
-        planner.export.side_effect = export
-        with patch("manipulation.planning.time.monotonic", side_effect=lambda: now[0]):
-            result = self.run_planner(planner, budget)
-        self.assertFalse(result.success)
-        self.assertIsNone(result.trajectory)
-        self.assertIsNone(result.execution_binding)
-        self.assertEqual(len(planner.bound_candidates), 1)
-        self.assertEqual(result.diagnostics["failure"], "planning_stage_failed")
-        self.assertEqual(result.diagnostics["error_type"], "RuntimeError")
-        self.assertEqual(result.diagnostics["reason"], "source geometry API failed before returning")
-        work = result.request_ledger["consumed_planning"]
-        self.assertEqual((work["trajectory_solves"], work["validation_passes"]), (2, 2))
-        self.assertEqual(work["validation_queries"], 1+17+budget.max_validation_points)
-        self.assertGreater(work["planning_seconds"], budget.planning_seconds)
-
-    def test_cleanup_failure_cannot_be_hidden_by_best_feasible_archive(self):
-        planner, _, _ = self.scripted_planner([True, True], [0., .01])
-        planner.close.side_effect = OSError("native cleanup failed")
-        result = self.run_planner(planner, PlanningBudget(maximum_trajectory_solves=2))
-        self.assertFalse(result.success)
-        self.assertIsNone(result.trajectory)
-        self.assertIsNone(result.execution_binding)
-        self.assertEqual(result.diagnostics["failure"], "planner_cleanup_failed")
-        self.assertEqual(result.diagnostics["reason"], "native cleanup failed")
-        self.assertEqual(len(planner.bound_candidates), 1)
     # END the archive preserves qualified motion but cannot mask environment failures.
 
 

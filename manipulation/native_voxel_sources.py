@@ -36,13 +36,13 @@ def _source_kernel(lookup):
     return kernel
 
 
-def export_source_bits(mapper, config, voxel):
+def export_source_bits(mapper, config, voxel, *, max_cells=MAX_FINE_CELLS):
     """Return XYZ bits: nearest site (1), observed sign (2), negative sign (4)."""
     if config.enable_static:
         raise ValueError("Snapshot source validity does not admit static map history")
     shape = tuple(voxel.feature_tensor.shape)
     # BEGIN share the byte-admitted local inventory bound with its consumers.
-    if len(shape) != 3 or math.prod(shape) > MAX_FINE_CELLS:
+    if len(shape) != 3 or type(max_cells) is not int or max_cells <= 0 or math.prod(shape) > max_cells:
         raise ValueError("Fine source export requires a bounded complete XYZ grid")
     # END a larger inventory never skips mapping's independent memory check.
     device = voxel.feature_tensor.device

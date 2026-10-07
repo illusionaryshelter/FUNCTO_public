@@ -41,7 +41,7 @@ def plain(value):
 
 
 def curve_snapshot(trajectory):
-    """Keep the polynomial, commands and scope, including the full suffix."""
+    """Keep the polynomial, original events and this finite block's authority."""
     return plain({"joint_names": trajectory.joint_names, "times": trajectory.times,
         "position": trajectory.position, "velocity": trajectory.velocity,
         "coefficients": trajectory._curve.c,
@@ -49,15 +49,19 @@ def curve_snapshot(trajectory):
         "events": trajectory.events, "conditions": trajectory.conditions,
         "duration": trajectory.duration, "executable_until": trajectory.executable_until,
         "next_verification": trajectory.next_verification,
+        # BEGIN observed dependencies authorize scope without rewriting events.
+        "satisfied_dependencies": trajectory.satisfied_dependencies,
+        # END rebinding cannot silently reset a previously consumed dependency.
         "fingers": None if trajectory.finger_trajectory is None else
             trajectory.finger_trajectory.describe()})
 
 
 def bind_candidate(trajectory, *, problem, scene, validation, native_report):
-    """Bind only a natively accepted, fully checked exported curve.
+    """Bind the accepted native curve and the exact online geometry snapshot.
 
-    Independent solid geometry and actual tracking are still executor work.
-    Their absence cannot be relabelled as a completed planning query.
+    Native residuals and exported Hermite coefficients name one candidate.
+    Execution checks current measured state against this same scene binding;
+    an independent source-mesh audit cannot authorize or veto the handoff.
     """
     violations = np.asarray(validation["violations"], dtype=float)
     queries = np.asarray(validation["u"], dtype=float)
@@ -65,14 +69,14 @@ def bind_candidate(trajectory, *, problem, scene, validation, native_report):
             or queries.shape != violations.shape or not np.isfinite(queries).all()
             or not np.isfinite(violations).all() or np.any(violations > 0)
             or np.any(queries < 0) or np.any(queries > 1)):
-        raise ValueError("Execution binding requires completed accepted native/export validation")
+        raise ValueError("Execution binding requires completed accepted native online validation")
     candidate_id = str(uuid4())
     inputs = {"problem": plain(problem), "scene": plain(scene.to_execution_binding())}
     return {"candidate_id": candidate_id, "curve": curve_snapshot(trajectory),
         **deepcopy(inputs),
         "validation": {"candidate_id": candidate_id, "completed": True,
             "inputs": inputs,
-            "scope": "native constraints and exported full curve; independent execution preflight pending",
+            "scope": "same native curve, event clock and online scene; actual entrance preflight pending",
             "export": plain(validation), "native": plain(native_report)},
         "execution_limits": None}
 

@@ -18,7 +18,7 @@ import test_manipulation_planning as fixtures
 
 
 def _report(solved):
-    return {"task_satisfied": True, "source_valid": True,
+    return {"task_satisfied": True, "model_valid": True,
             "native_pose_ik_success": solved, "candidate_source": "native_ik"}
 
 
@@ -74,7 +74,7 @@ def test_extreme_failed_poses_do_not_change_warm_starts_or_fitted_seed_branches(
         torch.testing.assert_close(first, second, rtol=0., atol=0.)
 
 
-@pytest.mark.parametrize("failed_check", ["task_satisfied", "source_valid"])
+@pytest.mark.parametrize("failed_check", ["task_satisfied", "model_valid"])
 def test_pose_convergence_without_static_feasibility_is_not_a_solved_reference(failed_check):
     _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
     planner, constant, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(

@@ -223,11 +223,17 @@ def test_native_arm_stop_keeps_the_original_finger_position_fault_visible(record
 # END position-domain failure remains distinct from actual velocity convergence.
 
 
-# BEGIN replay the real formal probe's near-contact feedback without CUDA.
+# BEGIN audit the recorded near-contact coordinates without a physics runtime.
 def test_complete_solid_empty_intersection_resolves_coal_numerical_boundary(tmp_path):
-    from probe_contact_execution_gpu import build_native
-
-    backend, validator, _, _, _ = build_native(tmp_path)
+    # The source-solid audit owns its own model. No production validator,
+    # MuJoCo model, controller or simulation step is needed for these three
+    # independently supplied joint configurations.
+    urdf = tmp_path / "audit-robot.urdf"
+    urdf.write_text(native_model_text(pad_width=.01)[1])
+    checker = RobotGeometryChecker(urdf, base_frame="base", geometries=[
+        NativePrimitive("pad", "arm", "box", (.01, .01, .1), np.eye(4), "explicit thin audit pad"),
+        NativePrimitive("left_pad", "left", "box", (.02, .02, .02), np.eye(4), "explicit audit left finger"),
+        NativePrimitive("right_pad", "right", "box", (.02, .02, .02), np.eye(4), "explicit audit right finger")])
     rule = ContactRule(rule_id="press", actor="robot", target_owner="target", interval=(0., 1.),
         sphere_indices=(0,), material_id="press_face",
         feature_points=[[-.005,-.005,0.],[.005,-.005,0.],[.005,.005,0.],[-.005,.005,0.]],
@@ -236,14 +242,14 @@ def test_complete_solid_empty_intersection_resolves_coal_numerical_boundary(tmp_
         geometry_error_m=.003, minimum_thickness_m=.1, source="unchanged formal probe finite contact permission")
 
     def check(arm_q, *, permit):
-        backend.native_data.qpos[0] = arm_q
-        mujoco.mj_forward(backend.native_model, backend.native_data)
-        actual = backend.proprioception()
         binding = _scene(rule)
         if not permit:
             binding["contacts"] = []
-        validator.bind_scene(binding, progress_at_time=lambda _: 1.)
-        return validator.check_state(actual, stage="saved_actual_replay", trajectory_time=0.)
+        checker.bind_scene(binding)
+        state = checker.query(joint_names=("arm_q", "left_q", "right_q"),
+            joint_positions=[arm_q, .01, -.01], T_reference_base=np.eye(4), pairs=(), frames=("tcp",))
+        return checker.query_scene(state, tool_pose=np.asarray(state["frame_poses"]["tcp"]), progress=1.,
+            finger_positions=[.01, -.01], state_kind="actual")
 
     # This exact q was rejected after native step 434 in the formal planner
     # probe. The actual face has +0.178556 micrometres clearance, while Coal
@@ -251,7 +257,7 @@ def test_complete_solid_empty_intersection_resolves_coal_numerical_boundary(tmp_
     # resolve it as disjoint without any task permission or wider tolerance.
     separated = check(-.019999821444431916, permit=False)
     assert separated["passed"]
-    pad = next(row for row in separated["scene"]["pairs"] if row["actor_geometry"] == "pad")
+    pad = next(row for row in separated["pairs"] if row["actor_geometry"] == "pad")
     assert pad["signed_distance_m"] == 0.
     assert pad["relation"] == "numerical_boundary_with_proven_empty_intersection"
     assert pad["boundary_intersection_check"]["intersection_empty"]
@@ -263,6 +269,6 @@ def test_complete_solid_empty_intersection_resolves_coal_numerical_boundary(tmp_
     assert not penetrating["passed"] and penetrating["violations"]
     permitted = check(-.0201, permit=True)
     assert permitted["passed"]
-    pad = next(row for row in permitted["scene"]["pairs"] if row["actor_geometry"] == "pad")
+    pad = next(row for row in permitted["pairs"] if row["actor_geometry"] == "pad")
     assert pad["permission"] == "press"
 # END physical separation and allowed local overlap remain separate query results.

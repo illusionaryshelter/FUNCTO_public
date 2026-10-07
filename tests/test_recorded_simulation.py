@@ -769,7 +769,7 @@ class DependencyExecutionTests(unittest.TestCase):
         self.assertIsNone(report["dependency_hold"])
     # END missing future evidence does not erase successful robot supervision.
 
-    def test_true_current_prerequisite_extends_only_the_same_bound_curve(self):
+    def test_true_current_prerequisite_requires_new_binding_before_suffix(self):
         simulation, curve, targets = _fixture()
         curve.conditions = ({"condition_id": "entry_attachment", "kind": "observed_attachment"},)
 
@@ -782,13 +782,13 @@ class DependencyExecutionTests(unittest.TestCase):
             report = _execute_bound(_executor(simulation), _result(curve),
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=_limits(simulation, curve), output=Path(temporary)/"trial", observation_callback=observe)
-        self.assertEqual(report["status"], "curve_finished")
-        self.assertEqual(report["executed_steps"], 6)
+        self.assertEqual(report["status"], "needs_rebind")
+        self.assertEqual(report["executed_steps"], 4)
         self.assertEqual(report["effect_result"], "T")
         self.assertIsNone(report["next_verification"])
-        self.assertIsNone(report["dependency_hold"])
-        self.assertEqual(report["extended_preflights"][0]["until"], curve.duration)
-        self.assertIn("hold-later", [event["event_id"] for event in report["events"]])
+        self.assertTrue(report["dependency_hold"]["prepared"])
+        self.assertEqual(report["extended_preflights"], [])
+        self.assertNotIn("hold-later", [event["event_id"] for event in report["events"]])
 
     def test_false_prerequisite_physically_holds_without_sending_later_command(self):
         simulation, curve, targets = _fixture()
@@ -2154,7 +2154,8 @@ class GraspContactActivationTests(unittest.TestCase):
         condition = {"kind": "grasp_contact_activation", "condition_id": "declared-contact",
             "carrier_id": "perceived_part", "arrival_goal_id": ["pose_events", 1],
             "activation_event": activation, "interval": [close["progress"], .75 if reopen else 1.],
-            "source": "Explicit synthetic frozen RGBD interaction binding"}
+            "source": "Explicit synthetic frozen RGBD interaction binding",
+            "contact_rule_ids": ["contact-rule"]}
         curve.conditions = (deepcopy(condition),)
         _bind_fingers(simulation, curve, targets)
         result = _result(curve)
@@ -2164,13 +2165,17 @@ class GraspContactActivationTests(unittest.TestCase):
         terminal = {**deepcopy(goal), "actual_relation": {"target_owner_id": "perceived_part",
             "T_owner_target": np.eye(4).tolist()}}
         result.execution_binding["problem"].update(conditions=[condition],
-            pose_events=[terminal, {**goal, "progress": close["progress"]}])
+            pose_events=[terminal, {**goal, "progress": close["progress"],
+                "source": {"kind": "frozen_perception_grasp_arrival", "carrier_id": "perceived_part",
+                           "activation_event": deepcopy(activation)}}])
         result.execution_binding["goal_identities"] = {"pose_events": [0, 1]}
-        result.execution_binding["scene"]["robot_owner_permissions"] = [{
-            "rule_id": "contact-rule", "target_owner": "perceived_part",
-            "native_geometry_names": ["named_left_pad", "named_right_pad"], "sphere_indices": [0, 1],
-            "interval": deepcopy(condition["interval"]), "arrival_goal_id": ["pose_events", 1],
-            "activation_event": deepcopy(activation), "source": "Same explicit synthetic pair binding"}]
+        # BEGIN fixture grants only the explicitly bound finite material rule.
+        result.execution_binding["scene"]["contacts"] = [{
+            "rule_id": "contact-rule", "actor": "robot", "target_owner": "perceived_part",
+            "material_id": "named_left_pad", "sphere_indices": [0],
+            "interval": deepcopy(condition["interval"]), "source": "Synthetic finite pad permission"}]
+        result.execution_binding["scene"]["grasp_contact_activations"] = [deepcopy(condition)]
+        # END scripted geometry verdicts do not claim a physical contact result.
         result.execution_binding["validation"]["inputs"] = deepcopy({
             key: result.execution_binding[key] for key in ("problem", "scene")})
         values = _limit_values(simulation, curve)
@@ -2207,22 +2212,20 @@ class GraspContactActivationTests(unittest.TestCase):
 
             def preflight(self, trajectory, initial_feedback, execution_limits, **kwargs):
                 verdict = super().preflight(trajectory, initial_feedback, execution_limits, **kwargs)
-                permissions = kwargs["active_robot_owner_permissions"]
+                permissions = kwargs["active_contact_rule_ids"]
                 self.preflight_permissions = sorted(permissions)
-                query_latches.append(("preflight", list(executor.last_execution_report["active_robot_owner_permissions"])))
+                query_latches.append(("preflight", list(executor.last_execution_report["active_contact_rule_ids"])))
                 test.assertEqual(simulation.arm_goals, [])
                 np.testing.assert_array_equal(simulation.finger_control, initial_control)
                 if "contact-rule" not in permissions:
                     verdict.update(passed=False, violations=[{"kind": "named_target_contact", "name": "named_left_pad/perceived_part"}])
                 return verdict
 
-            def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset(),
-                            active_contact_rule_ids=frozenset()):
+            def check_state(self, feedback, *, stage, trajectory_time, active_contact_rule_ids=frozenset()):
                 verdict = super().check_state(feedback, stage=stage, trajectory_time=trajectory_time,
-                    active_robot_owner_permissions=active_robot_owner_permissions,
                     active_contact_rule_ids=active_contact_rule_ids)
-                query_latches.append((stage, list(executor.last_execution_report["active_robot_owner_permissions"])))
-                if "contact-rule" not in active_robot_owner_permissions:
+                query_latches.append((stage, list(executor.last_execution_report["active_contact_rule_ids"])))
+                if "contact-rule" not in active_contact_rule_ids:
                     verdict.update(passed=False, violations=[{"kind": "named_target_contact", "name": "named_left_pad/perceived_part"}])
                 return verdict
 
@@ -2237,7 +2240,7 @@ class GraspContactActivationTests(unittest.TestCase):
         self.assertEqual(query_latches[:4], [("preflight", []), ("initial_state", []),
                                            ("before_step", []), ("command_event", [])])
         self.assertEqual(query_latches[4], ("after_step", ["contact-rule"]))
-        self.assertTrue(all(row["active_robot_owner_permissions"] == ["contact-rule"] for row in checker.states))
+        self.assertTrue(all(row["active_contact_rule_ids"] == ["contact-rule"] for row in checker.states))
         np.testing.assert_array_equal(checker.preflight_inputs[0]["q"], checker.states[0]["feedback"]["q"])
         self.assertEqual(checker.preflight_inputs[0]["feedback_id"], checker.states[0]["feedback"]["feedback_id"])
         checks = report["grasp_contact_gate_checks"]
@@ -2258,7 +2261,7 @@ class GraspContactActivationTests(unittest.TestCase):
         self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "grasp_contact_arrival_rejected")
         self.assertEqual(report["executed_steps"], 0)
         self.assertEqual(report["events"], [])
-        self.assertEqual(report["active_robot_owner_permissions"], [])
+        self.assertEqual(report["active_contact_rule_ids"], [])
         self.assertEqual(report["grasp_contact_permission_changes"], [])
         self.assertEqual(checker.preflight_inputs, [])
         self.assertEqual(checker.states, [])
@@ -2275,11 +2278,11 @@ class GraspContactActivationTests(unittest.TestCase):
         result.execution_binding["completed_goal_ids"] = [["pose_events", 1]]
         report, checker = self.run_trial(fixture, rejects=True)
         self.assertEqual(report["executed_steps"], 2)
-        self.assertEqual(report["active_robot_owner_permissions"], [])
+        self.assertEqual(report["active_contact_rule_ids"], [])
         self.assertEqual([row["kind"] for row in report["events"]], ["open"])
         self.assertEqual(report["grasp_contact_gate_checks"][-1]["measurement"]["value"], "F")
         self.assertFalse(report["grasp_contact_gate_checks"][-1]["control_applied"])
-        self.assertTrue(all(not row["active_robot_owner_permissions"] for row in checker.states))
+        self.assertTrue(all(not row["active_contact_rule_ids"] for row in checker.states))
         np.testing.assert_array_equal(simulation.finger_control, curve.finger_trajectory.sample(.004)[0])
 
     def test_same_tick_arrival_is_provisional_and_rechecked_before_close(self):
@@ -2291,19 +2294,17 @@ class GraspContactActivationTests(unittest.TestCase):
         report, _ = self.run_trial(fixture, callback=drift, rejects=True)
         self.assertEqual([row["measurement"]["value"] for row in report["grasp_contact_gate_checks"]], ["T", "F"])
         self.assertIn(["pose_events", 1], report["completed_goal_ids"])
-        self.assertEqual(report["active_robot_owner_permissions"], [])
+        self.assertEqual(report["active_contact_rule_ids"], [])
         self.assertFalse(any(row["kind"] == "close" for row in report["events"]))
 
     def test_valid_arrival_allows_its_contact_mode_without_adding_a_pose_hold_goal(self):
         fixture = self.fixture()
         simulation = fixture[0]
         class ContactChecker(_GeometryChecker):
-            def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset(),
-                            active_contact_rule_ids=frozenset()):
+            def check_state(self, feedback, *, stage, trajectory_time, active_contact_rule_ids=frozenset()):
                 result = super().check_state(feedback, stage=stage, trajectory_time=trajectory_time,
-                    active_robot_owner_permissions=active_robot_owner_permissions,
                     active_contact_rule_ids=active_contact_rule_ids)
-                if trajectory_time >= .004 and "contact-rule" not in active_robot_owner_permissions:
+                if trajectory_time >= .004 and "contact-rule" not in active_contact_rule_ids:
                     result.update(passed=False, violations=[{"kind": "named_target_contact", "name": "named_left_pad/perceived_part"}])
                 return result
         def later_departure(model, data, row):
@@ -2312,13 +2313,13 @@ class GraspContactActivationTests(unittest.TestCase):
         checker = ContactChecker(simulation.joint_names)
         report, _ = self.run_trial(fixture, checker=checker, callback=later_departure)
         self.assertEqual(report["status"], "curve_finished")
-        self.assertEqual(report["active_robot_owner_permissions"], ["contact-rule"])
+        self.assertEqual(report["active_contact_rule_ids"], ["contact-rule"])
         self.assertEqual(sum(row["control_applied"] for row in report["grasp_contact_gate_checks"]), 1)
         self.assertTrue(all(row["passed"] for row in report["grasp_contact_gate_checks"]))
         self.assertFalse(report["evidence_passed"])
         self.assertNotIn(["pose_events", 0], report["completed_goal_ids"])
-        self.assertEqual(checker.states[0]["active_robot_owner_permissions"], [])
-        self.assertTrue(all(row["active_robot_owner_permissions"] == ["contact-rule"]
+        self.assertEqual(checker.states[0]["active_contact_rule_ids"], [])
+        self.assertTrue(all(row["active_contact_rule_ids"] == ["contact-rule"]
             for row in checker.states if row["trajectory_time"] >= .004))
 
     def test_new_mode_still_runs_geometry_guard_and_does_not_commit_a_rejected_close(self):
@@ -2328,17 +2329,17 @@ class GraspContactActivationTests(unittest.TestCase):
         self.assertEqual(report["feedback_failure"]["point"], "command_event")
         self.assertTrue(report["grasp_contact_gate_checks"][-1]["passed"])
         self.assertFalse(report["grasp_contact_gate_checks"][-1]["control_applied"])
-        self.assertEqual(report["active_robot_owner_permissions"], [])
-        self.assertEqual(checker.states[-1]["active_robot_owner_permissions"], ["contact-rule"])
+        self.assertEqual(report["active_contact_rule_ids"], [])
+        self.assertEqual(checker.states[-1]["active_contact_rule_ids"], ["contact-rule"])
         self.assertFalse(any(row["kind"] == "close" for row in report["events"]))
 
     def test_open_revokes_the_local_latch(self):
         report, checker = self.run_trial(self.fixture(reopen=True))
         self.assertEqual(report["status"], "curve_finished")
-        self.assertEqual(report["active_robot_owner_permissions"], [])
+        self.assertEqual(report["active_contact_rule_ids"], [])
         self.assertEqual([row["active_rule_ids"] for row in report["grasp_contact_permission_changes"]],
                          [[], ["contact-rule"], []])
-        self.assertEqual(checker.states[-1]["active_robot_owner_permissions"], [])
+        self.assertEqual(checker.states[-1]["active_contact_rule_ids"], [])
 
     def test_contact_arrival_cannot_be_result_only_or_mismatched_to_another_owner(self):
         from manipulation.execution_binding import rebind_execution_result
@@ -2347,9 +2348,9 @@ class GraspContactActivationTests(unittest.TestCase):
             rebind_execution_result(result, controller_policy=simulation.describe()["controller_policy"],
                 result_only_goal_ids=[["pose_events", 1]], finger_targets=FixedFingerTargets.from_mapping(targets),
                 execution_limits=limits, source="Explicit synthetic forbidden result-only request")
-        result.execution_binding["scene"]["robot_owner_permissions"][0]["target_owner"] = "another_part"
+        result.execution_binding["scene"]["contacts"][0]["target_owner"] = "another_part"
         result.execution_binding["validation"]["inputs"]["scene"] = deepcopy(result.execution_binding["scene"])
-        with TemporaryDirectory() as temporary, self.assertRaisesRegex(ValueError, "matching scene permission"):
+        with TemporaryDirectory() as temporary, self.assertRaisesRegex(ValueError, "exact activation interval"):
             _execute_bound(_executor(simulation), result, result_only_goal_ids=[["pose_events", 0]],
                 finger_targets=FixedFingerTargets.from_mapping(targets), initial_feedback=_initial_feedback(simulation),
                 execution_limits=limits, output=Path(temporary)/"trial")

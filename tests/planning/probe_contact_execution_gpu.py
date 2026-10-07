@@ -108,10 +108,9 @@ def build_problem(backend):
 def build_scene(device, robot, backend, targets, problem):
     """Build native queries and derive every sphere identity from native FK metadata."""
     from curobo.kinematics import Kinematics, KinematicsCfg
-    from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
-    from curobo._src.geom.types import Cuboid, SceneCfg
     from manipulation.planning_problem import PosePath
-    from manipulation.planning_scene import CollisionOwner, ContactRule, CuroboSphereQuery, ObservedSpace, PlanningScene, PrismaticGripper
+    from manipulation.online_geometry import FrozenPrimitives, OnlinePlanningScene
+    from manipulation.planning_scene import CollisionOwner, ContactRule, ObservedSpace, PrismaticGripper
     from run_recorded_skill import finger_trajectory_factory
 
     kinematics = Kinematics(KinematicsCfg.from_robot_yaml_file(deepcopy(robot), device_cfg=device))
@@ -140,11 +139,12 @@ def build_scene(device, robot, backend, targets, problem):
         commands=({"skill_id": "press_fixture", "event_id": "hold", "occurrence": 0, "command": "hold", "progress": 0.},),
         source="explicit independent free finger actuators", control_timestep_s=DT,
         finger_trajectory_factory=factory, nominal_finger_trajectory_factory=free_finger_model)
+    # BEGIN this synthetic fixture declares its finite contact grid explicitly.
     def query(name, position, dimensions):
-        native = SceneCollision.from_config(SceneCollisionCfg(device_cfg=device,
-            scene_model=SceneCfg(cuboid=[Cuboid(name=name, pose=[*position, 1., 0., 0., 0.], dims=dimensions)]),
-            cache={"cuboid": 1}))
-        return CuroboSphereQuery(native, owner_ids=(name,), source="explicit complete native fixture solid")
+        return FrozenPrimitives(primitives=[{"kind": "cuboid", "pose": [*position, 1., 0., 0., 0.],
+            "dimensions": dimensions}], owner_ids=(name,), contact_voxel_size_m=.01,
+            source="explicit complete native fixture solid; 10 mm finite contact cells")
+    # END no native physics value contributes to this planning field.
     background = query("far_background", [0., 0., -1.], [.1, .1, .1])
     owner = CollisionOwner("target", query("target", [0., 0., -.05], [.6, .6, .1]),
         PosePath(np.array([0., 1.]), np.stack((np.eye(4), np.eye(4))), "explicit static target pose"),
@@ -158,7 +158,7 @@ def build_scene(device, robot, backend, targets, problem):
     materials[sphere_ids["arm"][0]] = "press_face"
     coverage = ObservedSpace(np.ones((41,41,41), bool), origin=[-.5,-.5,-.5], voxel_size=.025,
         observation_ids=("explicit complete known fixture volume",), reference_frame="world")
-    return PlanningScene(background=background, owners=(owner,), coverage=coverage, reference_frame="world",
+    return OnlinePlanningScene(unknown_policy={"outside_regions": "forbid", "conditional_regions": []}, background=background, owners=(owner,), coverage=coverage, reference_frame="world",
         robot_sphere_materials=materials, robot_geometry_source="three exact outward native box covers",
         contacts=(rule,), gripper=hand, native_geometry_materials={"pad": "press_face"})
 
@@ -218,9 +218,9 @@ def run(output, *, cpu_check=False):
             trajectory_iterations=200, maximum_trajectory_dt=.1, maximum_trajectory_solves=2,
             search_seconds=0., max_robot_spheres=64, max_validation_points=256)
         report["budget"] = asdict(budget)
-        # BEGIN the exact three-box source model gates planning and execution.
+        # BEGIN the registered sphere and fixed field model gates planning and execution.
         result = plan_trajectory(problem, scene, robot, robot_validator=validator, budget=budget)
-        # END sphere covers remain optimizer geometry, not a source-model substitute.
+        # END independent native contact grading remains separate result evidence.
         report["planning"] = {"success": result.success, "diagnostics": result.diagnostics}
         if result.request_ledger is not None:
             (output/"request-ledger.json").write_text(json.dumps(result.request_ledger, indent=2, allow_nan=False)+"\n")

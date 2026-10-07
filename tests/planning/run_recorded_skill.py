@@ -1,11 +1,7 @@
-"""Audit one observed skill with the existing source-geometry planning chain.
+"""Plan one observed skill with a resident backend and fixed online geometry.
 
-Every episode, candidate, camera and robot choice comes from the CLI inputs.
-The selected historical result is not read: the compiled source program and
-its observed geometric binding are rebuilt by today's planning interface.
-The RGB-D field remains partial and all current unknown-space checks remain
-enabled. Physics execution consumes the saved curve in a separate process.
-This runner does not certify the PRD resident online backend migration.
+All task, camera, contact and unknown-region inputs come from the caller.
+The saved accepted curve is executed separately against actual robot feedback.
 """
 
 # BEGIN observed skill integration using existing production scene contracts.
@@ -49,6 +45,37 @@ def owner_voxel_sizes(arguments, owner_ids):
         raise ValueError("Owner voxel sizes must name every observed owner exactly once")
     return result
 # END no object name, dataset or extent selects an implicit resolution.
+
+
+# BEGIN explicit joint reference is guidance with no saved authorization.
+def load_joint_reference(path, problem):
+    """Read a bounded named q/dq recording without changing current task goals.
+
+    All coordinates and timestamps come from the supplied record. Shape,
+    ordering and finite-value checks prevent malformed guidance from entering
+    a native seed fit; goal/domain acceptance still belongs to the backend.
+    """
+    from manipulation.planning import JointTrajectory
+    if path is None:
+        return None
+    path = Path(path)
+    if path.stat().st_size > 16 * 1024**2:
+        raise ValueError("Joint reference exceeds its 16 MiB input bound")
+    with np.load(path, allow_pickle=False) as record:
+        if set(record.files) != {"joint_names", "times", "position", "velocity", "progress"}:
+            raise ValueError("Joint reference requires names, times, position, velocity and progress")
+        names = tuple(record["joint_names"].tolist())
+        t, q, dq, progress = (np.asarray(record[key], float).copy()
+                             for key in ("times", "position", "velocity", "progress"))
+    if (names != problem.joint_names or t.ndim != 1 or not 2 <= len(t) <= 8192
+            or t[0] != 0 or np.any(np.diff(t) <= 0)
+            or q.shape != (len(t), len(names)) or dq.shape != q.shape or progress.shape != t.shape
+            or np.any(np.diff(progress) <= 0) or progress[0] != problem.start_progress
+            or progress[-1] != problem.phase_count
+            or not all(np.isfinite(value).all() for value in (t, q, dq, progress))):
+        raise ValueError("Joint reference requires finite increasing time/progress and exact named layout")
+    return JointTrajectory(names, t, q, dq, t/t[-1], progress, (), (), {})
+# END a recorded reference never substitutes for the current measured entrance.
 
 
 # BEGIN independent finger reference on the planner's exact physical clock.
@@ -225,42 +252,6 @@ def recorded_owner_observation_inputs(problem, scene_input, views, mask_rows, *,
     return frames, masks
 
 
-def build_hand_owner_permissions(problem, hand_binding):
-    """Bind native hand solids to arrival/close or the observed held interval.
-
-    Holding uses the same condition and attachment span as the moving owner;
-    it cannot manufacture a new close command or an arrival pose event.
-    """
-    from manipulation.planning_scene import RobotOwnerContactPermission
-    from recorded_owner_geometry import _problem_binding
-
-    rules = []
-    for row in problem.conditions:
-        kind = row.get("kind")
-        if kind not in {"grasp_contact_activation", "observed_attachment"}:
-            continue
-        # BEGIN finite grasp bindings never acquire a second whole-hand rule.
-        if kind == "grasp_contact_activation" and "contact_rule_ids" in row:
-            continue
-        # END historical whole-hand records remain only in this audit runner.
-        common = dict(rule_id=row["condition_id"], target_owner=row["carrier_id"],
-            native_geometry_names=tuple(hand_binding["native_geometry_names"]),
-            sphere_indices=tuple(hand_binding["sphere_indices"]),
-            source=f"{hand_binding['source']}; bound {kind}: {row['condition_id']}")
-        if kind == "grasp_contact_activation":
-            rules.append(RobotOwnerContactPermission(**common, interval=tuple(row["interval"]),
-                arrival_goal_id=tuple(row["arrival_goal_id"]), activation_event=row["activation_event"]))
-        else:
-            _, attachments = _problem_binding(problem, row["carrier_id"])
-            spans = [relation["interval"] for relation in attachments
-                     if relation["condition_id"] == row["condition_id"]]
-            if len(spans) != 1 or spans[0][0] != row["progress"]:
-                raise ValueError("Observed Holding permission needs exactly its compiled attachment span")
-            rules.append(RobotOwnerContactPermission(**common, interval=tuple(spans[0]),
-                arrival_goal_id=(), activation_event={}, holding_condition_id=row["condition_id"]))
-    return tuple(rules)
-
-
 def install_complete_owner(scene, owner, *, contacts):
     """Replace one observed partition while retaining all other scene owners.
 
@@ -268,16 +259,16 @@ def install_complete_owner(scene, owner, *, contacts):
     cover and its attachment replace the partial RGB-D query. Reference
     partitions and the original coverage grid retain their exact identities.
     """
-    from manipulation.planning_scene import PlanningScene
     if not owner.geometry_complete or owner.owner_id not in {row.owner_id for row in scene.owners}:
         raise ValueError("Complete geometry must replace an already observed owner partition")
-    result = PlanningScene(background=scene.background,
+    result = type(scene)(background=scene.background,
         owners=tuple(owner if row.owner_id == owner.owner_id else row for row in scene.owners),
         coverage=scene.coverage, reference_frame=scene.reference_frame,
+        unknown_policy=scene.unknown_policy,
         robot_sphere_materials=scene.robot_sphere_materials,
         robot_collision_bodies=scene.robot_collision_bodies,
         robot_geometry_source=scene.robot_geometry_source, gripper=scene.gripper,
-        has_gripper=scene.gripper is not None, robot_coverage=scene.robot_coverage,
+        has_gripper=scene.gripper is not None,
         contacts=contacts, native_geometry_materials=scene.native_geometry_materials,
         robot_owner_permissions=scene.robot_owner_permissions,
         numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
@@ -290,11 +281,11 @@ def install_complete_owner(scene, owner, *, contacts):
 def run(args):
     from prepare_recorded_task import prepare_candidate
     from recorded_observation import render_robot_mask
-    from recorded_task_planning import plan_and_record
+    from recorded_task_planning import plan_and_record, _write_diagnostic_json
     # BEGIN use the production execution contract shared with the executor.
     from manipulation.execution import ExecutionLimits, FixedFingerTargets
     # END production execution contract.
-    from manipulation.planning import PlanningBudget
+    from manipulation.planning import MotionBackend, PlanningBudget
     from manipulation.planning_observation import build_scene_from_rgbd
     from curobo.perception import MapperCfg
     from curobo.types import DeviceCfg
@@ -303,8 +294,8 @@ def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     report = {"status": "preparing", "segment_id": args.segment,
               # BEGIN report backend scope even when preparation fails early.
-              "backend_scope": "legacy_source_audit_regression",
-              "new_prd_production_acceptance": False,
+              "backend_scope": "resident_motion_backend",
+              "new_prd_production_acceptance": True,
               # END finite-rule input does not change the planner implementation.
               "candidate_id": args.candidate, "planning_called": False,
               "execution_tested": False, "scope": "Observed independent skill snapshot",
@@ -458,11 +449,8 @@ def run(args):
             trajectory_factory=reference_factory)
         # END actual measured positions, velocities and identity are unchanged.
         report["gripper"] = hand_report
-        # BEGIN audit explicit finite bindings through the current source chain.
-        # This runner still uses the historical source-geometry planner. It can
-        # regress finite rules or reproduce its old whole-hand inputs; neither
-        # path is acceptance of the PRD resident online motion backend.
-        from robot_fixture import bind_fixture_contact_materials, bind_fixture_gripper_geometry
+        # BEGIN finite contact inputs are required for contact activation.
+        from robot_fixture import bind_fixture_contact_materials
         from manipulation.contact_binding import build_material_contact_rules
         from recorded_owner_geometry import bind_box_owner_materials
         activations = [row for row in problem.conditions
@@ -488,8 +476,8 @@ def run(args):
             contact_inputs = json.loads(args.contact_bindings.read_text())
             required = {"material_faces", "contacts", "source"}
             if (not isinstance(contact_inputs, dict) or not required <= set(contact_inputs)
-                    or set(contact_inputs)-required-{"grasp_activations"}):
-                raise ValueError("Contact bindings need material_faces, contacts, source and optional grasp_activations")
+                    or set(contact_inputs)-required-{"grasp_activations", "holding_activations"}):
+                raise ValueError("Contact bindings need material_faces, contacts, source and optional grasp_activations/holding_activations")
             if not isinstance(contact_inputs["source"], str) or not contact_inputs["source"].strip():
                 raise ValueError("Contact bindings require a current evidence source")
             if contact_inputs["material_faces"]:
@@ -506,26 +494,21 @@ def run(args):
                 bind_grasp_contact_rules(problem, contacts, contact_inputs.get("grasp_activations"))
             elif contact_inputs.get("grasp_activations"):
                 raise ValueError("Finite grasp activations require compiled grasp conditions")
+            if any(row["kind"] == "observed_attachment" for row in activations):
+                from manipulation.contact_binding import bind_holding_contact_rules
+                bind_holding_contact_rules(problem, contacts, contact_inputs.get("holding_activations"))
+            elif contact_inputs.get("holding_activations"):
+                raise ValueError("Finite Holding activations require current attachment obligations")
             # END a finite patch cannot silently become an ungated grasp rule.
             report["contact_binding"]["policies"].append("explicit_finite_material_contacts")
             report["contact_binding"].update(path=str(args.contact_bindings.resolve()),
                 source=contact_inputs["source"], materials=material_binding,
                 rule_ids=[rule.rule_id for rule in contacts])
-        # BEGIN finite-only inputs have no dependency on whole-hand calibration.
-        audit_pair_conditions = [row for row in problem.conditions
-            if row.get("kind") == "observed_attachment" or
-            (row.get("kind") == "grasp_contact_activation" and "contact_rule_ids" not in row)]
-        if audit_pair_conditions:
-            hand_binding = bind_fixture_gripper_geometry(
-                fixture, robot, entrance_fk["sphere_indices_by_link"], feedback["finger_joint_names"])
-            pair_permissions = build_hand_owner_permissions(problem, hand_binding)
-            report["contact_binding"].update(hand_geometry=hand_binding,
-                permissions=[asdict(rule) for rule in pair_permissions])
-            report["contact_binding"]["policies"].extend(sorted({row["kind"] for row in activations}))
-        # END old pair calibration remains confined to explicit audit inputs.
-        report["backend_scope"] = "legacy_source_audit_regression"
+        if any(row.get("kind") == "grasp_contact_activation" and "contact_rule_ids" not in row
+               for row in problem.conditions):
+            raise ValueError("Grasp activation requires explicit finite material contact bindings")
+        # END no whole-hand permission is manufactured from a grasp condition.
         report["requirement_consumption"] = problem.requirement_consumption
-        # END input choice changes audit rules, never the declared backend scope.
         # END permissions affect software collision legality, never native physical contact.
         report["owner_observations"] = {
             "owners": {identity: {"initial_pose": frame["T_output_owner"].tolist(),
@@ -630,6 +613,7 @@ def run(args):
             # BEGIN distinct physical owners share one total resource envelope.
             owner_voxel_sizes_m=owner_resolutions,
             fine_regions=fine_regions, robot_collision_bodies=collision_bodies,
+            unknown_policy=json.loads(args.unknown_policy.read_text()),
             max_mapping_bytes=args.mapping_memory_mib*1024**2,
             max_host_rss_bytes=args.max_host_rss_mib*1024**2,
             max_device_used_bytes=args.max_device_used_mib*1024**2)
@@ -642,7 +626,7 @@ def run(args):
             # conditional attachment still come from this planning problem;
             # no reference, unlabelled surface or unknown volume is removed.
             from recorded_owner_geometry import create_box_owner
-            owner = create_box_owner(prepared, device_cfg=device)
+            owner = create_box_owner(prepared, contact_voxel_size_m=owner_resolutions[prepared["owner_id"]])
             scene = install_complete_owner(scene, owner, contacts=contacts)
             report["complete_carrier_geometry"] = prepared["provenance"]
         # BEGIN retain self-filtered installation as complete static collision owners.
@@ -655,11 +639,11 @@ def run(args):
             fixture, device_cfg=device, T_output_base=feedback["base_pose"],
             sphere_indices_by_link=entrance_fk["sphere_indices_by_link"])
         if fixed_owners:
-            from manipulation.planning_scene import PlanningScene
             observed_report = scene.observation_report
-            scene = PlanningScene(
+            scene = type(scene)(
                 background=scene.background, owners=(*scene.owners, *fixed_owners), coverage=scene.coverage,
-                reference_frame=scene.reference_frame, robot_sphere_materials=scene.robot_sphere_materials,
+                reference_frame=scene.reference_frame, unknown_policy=scene.unknown_policy,
+                robot_sphere_materials=scene.robot_sphere_materials,
                 robot_collision_bodies=scene.robot_collision_bodies,
                 robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
                 # BEGIN native identity survives fixed-installation augmentation.
@@ -673,31 +657,12 @@ def run(args):
             scene.observation_report = observed_report
         report["fixed_robot_installation"] = fixed_report
         # END fixed installation remains independently collision checked.
-        # BEGIN same-model baseline occupancy, separate from observed free F.
-        from robot_coverage_fixture import build_robot_coverage
-        from manipulation.planning_scene import PlanningScene
-        coverage = build_robot_coverage(fixture, feedback, scene.coverage,
-            initialization_source=args.initial_state_assumption_source,
-            max_queries=(2*args.trajectory_seeds+2)*args.max_validation_points+1)
-        observed_report = scene.observation_report
-        scene = PlanningScene(background=scene.background, owners=scene.owners, coverage=scene.coverage,
-            reference_frame=scene.reference_frame, robot_sphere_materials=scene.robot_sphere_materials,
-            robot_collision_bodies=scene.robot_collision_bodies,
-            robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
-            # BEGIN robot occupancy evidence preserves object-contact identity.
-            native_geometry_materials=scene.native_geometry_materials,
-            # BEGIN occupied-volume evidence does not change contact policy.
-            robot_owner_permissions=scene.robot_owner_permissions,
-            # END keep identical robot/owner pairs through every scene rebuild.
-            # END occupancy does not grant or remove contact permissions.
-            robot_coverage=coverage, numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
-            numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
-        scene.observation_report = observed_report
-        report["robot_coverage"] = scene.robot_coverage.describe()
+        # BEGIN persist observed-free evidence without source-volume coverage.
         np.savez_compressed(args.output/"observed-free.npz", known_free=scene.coverage.known_free,
             origin=scene.coverage.origin, voxel_size=np.asarray(scene.coverage.voxel_size),
             observation_ids=np.asarray(scene.coverage.observation_ids))
-        report["robot_coverage"]["original_free_grid_path"] = "observed-free.npz"
+        report["unknown_policy"] = scene.unknown_policy
+        # END conditional unknown permission is distinct from observed freedom.
         scene.validate_problem(problem)
         # Only native measured data is available here. The planner owns the
         # single entrance verdict after binding the formal finger clock.
@@ -717,7 +682,7 @@ def run(args):
                                 trajectory_seeds=args.trajectory_seeds,
                                 ik_iterations=80, trajectory_iterations=100,
                                 max_validation_points=args.max_validation_points,
-                                max_refinement_points=args.max_refinement_points,
+                                max_task_anchors=args.max_task_anchors,
                                 max_scene_gpu_workspace_bytes=args.scene_gpu_workspace_mib*1024**2,
                                 max_host_rss_bytes=args.max_host_rss_mib*1024**2,
                                 max_device_used_bytes=args.max_device_used_mib*1024**2,
@@ -729,19 +694,23 @@ def run(args):
         # END geometry capacity does not replenish planning time or solve counts.
         # END reviewed input revisions remain caller-owned.
         report["planning_called"] = True
-        # BEGIN keep this exact source model throughout recording and planning.
-        result = plan_and_record(problem, scene, robot, args.output/"planning",
-                                 robot_validator=robot_validator, budget=budget,
-                                 execution_limits=execution_limits.describe(),
-                                 continuation=continuation, rebind=rebind, request_ledger=request_ledger,
-                                 provenance={**provenance, "robot_fixture": str(args.robot_fixture),
-                                             "current_views": list(observations),
-                                             "old_selection_comparison_only": segment["grounding"]["status"]})
-        # END source geometry and policy are not reconstructed by the recorder.
+        # BEGIN the caller owns resident native models across motion requests.
+        backend = MotionBackend(robot, robot_validator=robot_validator, budget=budget)
+        try:
+            result = plan_and_record(problem, scene, robot, args.output/"planning",
+                robot_validator=robot_validator, budget=budget, backend=backend,
+                execution_limits=execution_limits.describe(),
+                joint_reference=load_joint_reference(args.joint_reference, problem),
+                continuation=continuation, rebind=rebind, request_ledger=request_ledger,
+                provenance={**provenance, "robot_fixture": str(args.robot_fixture),
+                    "current_views": list(observations),
+                    "old_selection_comparison_only": segment["grounding"]["status"]})
+        finally:
+            backend.close()
         report.update(status="completed", planning_success=result.success,
                       initial_state=result.diagnostics.get("initial_state"),
-                      robot_coverage={**scene.robot_coverage.describe(),
-                                      "original_free_grid_path": "observed-free.npz"})
+                      failure=result.diagnostics.get("failure"))
+        # END persistence cannot recreate a planner or initiate validation.
     except KeyboardInterrupt:
         report.update(status="interrupted", interruption_reason="Explicit operator interrupt")
         (args.output/"exception.txt").write_text(traceback.format_exc())
@@ -752,7 +721,7 @@ def run(args):
         raise
     finally:
         report["elapsed_seconds"] = time.monotonic()-started
-        (args.output/"run-report.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
+        _write_diagnostic_json(args.output/"run-report.json", report)
 
 
 if __name__ == "__main__":
@@ -791,14 +760,16 @@ if __name__ == "__main__":
     parser.add_argument("--depth-error", type=float, required=True)
     parser.add_argument("--robot-depth-tolerance", type=float, required=True)
     parser.add_argument("--robot-depth-tolerance-source", required=True)
-    parser.add_argument("--initial-state-assumption-source", required=True,
-                        help="Explicit provenance for accepting the frozen native robot model occupancy at measured q0")
+    parser.add_argument("--unknown-policy", type=Path, required=True,
+                        help="Explicit bounded conditional unknown regions; outside them unknown is forbidden")
+    parser.add_argument("--joint-reference", type=Path,
+                        help="Optional named recorded q/dq curve; guidance has no execution authorization")
     parser.add_argument("--knots", type=int, default=16)
     parser.add_argument("--interpolation-buffer-size", type=int, default=768)
     parser.add_argument("--ik-seeds", type=int, default=4)
     parser.add_argument("--trajectory-seeds", type=int, default=2)
     parser.add_argument("--max-validation-points", type=int, default=2048)
-    parser.add_argument("--max-refinement-points", type=int, default=64)
+    parser.add_argument("--max-task-anchors", type=int, default=256)
     # BEGIN make the existing request work limits reviewable in run commands.
     parser.add_argument("--maximum-trajectory-solves", type=int, default=2)
     parser.add_argument("--planning-seconds", type=float, default=120.)

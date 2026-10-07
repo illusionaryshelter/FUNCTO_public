@@ -52,6 +52,32 @@ def bind_grasp_contact_rules(problem, contacts, activations):
 # END a finite binding never creates whole-hand permissions or new evidence.
 
 
+# BEGIN current Holding selects finite rules by explicit attachment identity.
+def bind_holding_contact_rules(problem, contacts, activations):
+    """Bind permissions to existing measured attachment obligations.
+
+    This association does not create Holding evidence. Scene binding checks
+    the attachment relation and intervals; execution requires current verified
+    evidence before activating these material IDs in a new motion request.
+    """
+    conditions = [row for row in problem.conditions if row.get("kind") == "observed_attachment"]
+    identities = [row["condition_id"] for row in conditions]
+    if (not isinstance(activations, dict) or len(set(identities)) != len(identities)
+            or set(activations) != set(identities)):
+        raise ValueError("Finite Holding bindings must name every current attachment exactly once")
+    rules = {rule.rule_id: rule for rule in contacts}
+    replacements = {}
+    for condition in conditions:
+        selected = activations[condition["condition_id"]]
+        if (not isinstance(selected, (list, tuple)) or not selected or len(set(selected)) != len(selected)
+                or any(identity not in rules or rules[identity].actor != "robot"
+                       or rules[identity].target_owner != condition["carrier_id"] for identity in selected)):
+            raise ValueError("Holding permission requires distinct finite robot material rules for its carrier")
+        replacements[condition["condition_id"]] = {**deepcopy(condition), "contact_rule_ids": list(selected)}
+    problem.conditions = tuple(replacements.get(row.get("condition_id"), row) for row in problem.conditions)
+# END binding identities never copy a previous close activation latch.
+
+
 def calibrate_box_material_features(model, *, tcp_site, joint_positions,
                                     finger_joint_names, material_faces):
     """Return complete box faces and verified affine finger translations.

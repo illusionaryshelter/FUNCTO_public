@@ -80,12 +80,8 @@ class PhysicalGradientCore(GradientOptCore):
         self._native_step_direction_fn = kwargs["step_direction_fn"]
         kwargs["step_direction_fn"] = self._guarded_step_direction
         self._all_exhausted = False
+        self.request_guard = None
         self._recovery_reports = []
-        # BEGIN optional trajectory observations stay outside native capture.
-        # The observer owns validation, not optimization or best-cost tracking.
-        # IK cores leave this unset and keep their existing lifecycle.
-        self.candidate_observer = None
-        # END an observer never changes the exploration or L-BFGS state.
         # END no third-party optimizer or process-wide callback is replaced.
         super().__init__(*args, **kwargs)
         # BEGIN scope graph checks independently of the CPU metrics rollout.
@@ -367,17 +363,15 @@ class PhysicalGradientCore(GradientOptCore):
         result = super().reinitialize(action, mask=mask,
             clear_optimizer_state=clear_optimizer_state, reset_num_iters=reset_num_iters)
         # BEGIN native reinitialize bypasses the graph dispatch initializer.
-        self._observe_candidate(self._iteration_state, "initial_seed")
         return result
         # END the seed has its actual goal and physical clock before observation.
 
-    def _observe_candidate(self, state, kind):
-        """Publish one complete batch after native evaluation, outside graphs."""
-        if self.candidate_observer is not None:
-            self.candidate_observer(state.exploration_action.detach().clone(), {
-                "kind": kind, "iterations": self._iterations.detach().cpu().tolist()})
-
     def optimize(self, seed_action):
+        # BEGIN every solve starts with fresh curvature and current objective values.
+        self._iteration_state = None
+        if self._on_reinitialize is not None:
+            self._on_reinitialize(None)
+        # END an AL recovery never retains the old scalar-cost ordering.
         self._prepare_solve(seed_action)
         self._reset_progress()
         return super().optimize(seed_action)
@@ -423,6 +417,10 @@ class PhysicalGradientCore(GradientOptCore):
             tensor.copy_(saved)
 
     def _dispatch(self, method_name, *args):
+        # BEGIN cancellation/deadline authorization is checked outside native kernels.
+        if self.request_guard is not None:
+            self.request_guard()
+        # END an in-flight native kernel is not claimed to be preemptible.
         # BEGIN stop exhausted solves before any further native rollout block.
         if method_name == "_opt_iters" and self._all_exhausted:
             return args[0]
@@ -430,9 +428,6 @@ class PhysicalGradientCore(GradientOptCore):
             result = super()._dispatch(method_name, *args)
             if method_name == "_opt_iters":
                 result = self._recover_stalled(result)
-                self._observe_candidate(result, "optimization_block")
-            elif method_name == "_prepare_initial_iteration_state":
-                self._observe_candidate(result, "initial_seed")
             return result
         # One fault boundary surrounds the original inner-iteration block.
         # Its native loop calls our _opt_step and records each replayed state;
@@ -454,10 +449,6 @@ class PhysicalGradientCore(GradientOptCore):
                                ("current_iteration", "current_iteration"),
                                ("converged", "converged")):
             getattr(self._best, target).copy_(getattr(result, source))
-        # BEGIN geometry validation never executes during warmup or graph replay.
-        if method_name in {"_opt_iters", "_prepare_initial_iteration_state"}:
-            self._observe_candidate(result, "optimization_block" if method_name == "_opt_iters" else "initial_seed")
-        # END only requested native states enter candidate observation.
         return result
 
     def _replay_graph(self, method_name, *args):
@@ -514,7 +505,7 @@ class PhysicalGradientCore(GradientOptCore):
     # END native kernels are reused; guarded history and recovery are owned here.
 
     def bind_domain(self, domain: JointPositionDomain):
-        """Rebind after FUNCTO rebuilds validation workspaces on the same clock."""
+        """Rebind the measured entrance and clear history for the next request."""
         # BEGIN a captured closure must not keep the previous bounds/prefix.
         self.reset_cuda_graph()
         # END the next solve validates and binds its own safe seed again.

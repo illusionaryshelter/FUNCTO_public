@@ -280,7 +280,6 @@ def test_nonalias_fixed_robot_base_still_collides_with_background(checker):
 
 def test_static_alias_retains_native_robot_installation_pair_gate(checker):
     from manipulation.robot_geometry_check import PairQuery
-    from manipulation.robot_validation import RobotStateValidator
 
     arm_local = rigid(.049)
     arm_local[1, 3] = -.2  # The URDF's left slide origin is +.2 on y.
@@ -293,61 +292,43 @@ def test_static_alias_retains_native_robot_installation_pair_gate(checker):
     target["native_geometry_names"] = ["installation"]
     target["geometry"]["solids"] = [{"name": "installation_proxy", "kind": "cuboid", "dimensions": [.11]*3,
         "pose": [0., 0., .049, 1., 0., 0., 0.], "source": "outward planning installation proxy"}]
-    gate = RobotStateValidator(robot, joint_names=robot.joint_names,
-        arm_joint_names=robot.joint_names[:1], finger_joint_names=robot.joint_names[1:],
-        pairs=[PairQuery("arm", "installation", "required", "native enabled robot/installation pair")],
-        named_velocity_limits={name: 1. for name in robot.joint_names}, reference_frame="world",
-        T_reference_base=np.eye(4), tool_frame="base", T_frame_tcp=np.eye(4),
-        fk_translation_tolerance_m=1e-8, fk_rotation_tolerance_rad=1e-8, source="explicit native pair test")
-    gate.bind_scene(model, progress_at_time=lambda t: t)
-    feedback = {"joint_names": robot.joint_names, "arm_joint_names": robot.joint_names[:1],
-        "finger_joint_names": robot.joint_names[1:], "q": [0., 0.], "dq": [0., 0.],
-        "reference_frame": "world", "tool_link": "base", "tool_transform": np.eye(4),
-        "base_pose": np.eye(4), "tool_pose": np.eye(4)}
-    result = gate.check_state(feedback, stage="initial_state", trajectory_time=0.)
-    assert not result["passed"]
-    assert any(row["kind"] == "independent_robot_collision" for row in result["violations"])
-    assert len(result["distances_m"]) == 1 and result["distances_m"][0] < 0
-    rows = result["scene"]["pairs"]
+    # BEGIN source installation evidence remains an explicit independent audit.
+    robot.bind_scene(model)
+    native = robot.query(joint_names=robot.joint_names, joint_positions=[0., 0.],
+        T_reference_base=np.eye(4),
+        pairs=[PairQuery("arm", "installation", "required", "native enabled robot/installation pair")])
+    assert len(native["pairs"]) == 1 and native["pairs"][0]["signed_distance_m"] < 0
+    result = robot.query_scene(native, tool_pose=np.eye(4), progress=0.,
+        finger_positions=[0.], state_kind="actual")
+    # The aliased scene edge retains evidence from the already queried native
+    # pair; the separate native robot verdict still rejects that overlap.
+    assert native["pairs"][0]["relation"] != "separated"
+    rows = result["pairs"]
     assert len(rows) == 1 and rows[0]["actor_geometry"] == "arm"
     assert rows[0]["target_geometry"] == "installation"
     assert rows[0]["native_pair_evidence"]["policy"] == "required"
-    assert rows[0]["native_pair_evidence"]["signed_distance_m"] == result["distances_m"][0]
+    assert rows[0]["native_pair_evidence"]["signed_distance_m"] == native["pairs"][0]["signed_distance_m"]
+    # END this source audit does not bind or certify a production online scene.
 # END complete self-policy and every moving actor-to-installation edge survive.
 
 # BEGIN exact endpoint permissions cannot hide a forbidden adjacent mode.
-def test_independent_preflight_checks_both_contact_modes_at_the_same_state(checker):
-    from manipulation.robot_validation import RobotStateValidator
-    from test_robot_validation import trajectory
-
-    gate = RobotStateValidator(checker, joint_names=checker.joint_names,
-        arm_joint_names=checker.joint_names[:1], finger_joint_names=checker.joint_names[1:], pairs=(),
-        named_velocity_limits={name: 1. for name in checker.joint_names}, reference_frame="world",
-        T_reference_base=np.eye(4), tool_frame="base", T_frame_tcp=np.eye(4),
-        fk_translation_tolerance_m=1e-8, fk_rotation_tolerance_rad=1e-8, source="independent boundary fixture")
-    curve = trajectory([.03, .03], [0., 0.])
-    # BEGIN the joint sample now includes analytic acceleration before progress.
-    gate.bind_scene(binding([rule(interval=(.5, 1.))]), progress_at_time=lambda t: float(curve.sample(t)[3]))
-    # END independent contact modes still consume the original progress clock.
-    result = gate._nominal_scene_preflight(curve, np.asarray([.5]))
-    exact = next(row for row in result["states"] if row["mode"] == "bound_progress")
-    preceding = next(row for row in result["states"] if row["mode"] == "before_switch")
-    assert exact["scene"]["passed"]
-    assert not preceding["scene"]["passed"] and not result["passed"]
-    assert exact["time_s"] == preceding["time_s"] == .5
-    assert exact["scene"]["pairs"][0]["signed_distance_m"] == preceding["scene"]["pairs"][0]["signed_distance_m"]
-    # A dwell at the boundary has old mode only at entry, new mode only at exit.
-    curve.progress_u = np.asarray([0., .4, .6, 1.])
-    curve.progress_s = np.asarray([0., .5, .5, 1.])
-    assert [mode for _, mode in gate._scene_progress_modes(curve, .4)] == ["bound_progress", "before_switch"]
-    assert [mode for _, mode in gate._scene_progress_modes(curve, .5)] == ["bound_progress"]
-    assert [mode for _, mode in gate._scene_progress_modes(curve, .6)] == ["bound_progress", "after_switch"]
-    curve.progress_u = curve.progress_u.astype(np.float32)
-    curve.progress_s = curve.progress_s.astype(np.float32)
-    boundary_times = gate._scene_query_times(curve, np.asarray([0., 1.]), 0., 1.)
-    entry = float(curve.progress_u[1])
-    assert entry in boundary_times
-    assert [mode for _, mode in gate._scene_progress_modes(curve, entry)] == ["bound_progress", "before_switch"]
+def test_independent_source_audit_keeps_adjacent_contact_modes_distinct(checker):
+    # BEGIN the audit caller explicitly queries both laws at identical joints.
+    # Automatic nominal preflight scheduling was removed from production;
+    # this regression concerns only the independent finite-material oracle.
+    checker.bind_scene(binding([rule(interval=(.5, 1.))]))
+    robot = checker.query(joint_names=checker.joint_names, joint_positions=[.03, 0.],
+        T_reference_base=np.eye(4), pairs=())
+    def audit(progress):
+        return checker.query_scene(robot, tool_pose=np.eye(4), progress=progress,
+            finger_positions=[0.], state_kind="nominal")
+    exact = audit(.5)
+    preceding = audit(float(np.nextafter(.5, -np.inf)))
+    assert exact["passed"] and not preceding["passed"]
+    assert exact["pairs"][0]["signed_distance_m"] == preceding["pairs"][0]["signed_distance_m"]
+    assert exact["pairs"][0]["permission"] == "pad_to_target"
+    assert preceding["pairs"][0]["permission"] is None
+    # END no audit result participates in production trajectory acceptance.
 # END samples retain q/t/finger geometry while discrete laws change sides.
 
 # BEGIN pair ordering and complete occupied-leaf localization are invariant.

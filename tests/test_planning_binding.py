@@ -94,30 +94,30 @@ class PlanningBindingTest(unittest.TestCase):
     def test_nonfinite_single_ik_seed_does_not_hide_a_valid_success(self):
         candidates = np.array([[np.nan, 0.], [1., 2.], [3., 4.]])
         selected = rank_ik_candidates(candidates,
-            [{"task_satisfied": flag, "source_valid": flag, "native_pose_ik_success": flag}
+            [{"task_satisfied": flag, "model_valid": flag, "native_pose_ik_success": flag}
              for flag in [True, True, False]],
             np.array([[0., 0.]]), count=1, joint_tolerance=1e-6, query_kind="reference")
         np.testing.assert_array_equal(selected, [1])
 
-    def test_both_trajectory_phases_disable_duplicate_native_pose_objective(self):
+    def test_structural_routes_bind_real_terminal_pose_or_no_pose_goal(self):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.problem = self.problem()
-        planner.problem.pose_events = (PoseEventRequirement(1., np.eye(4), np.eye(4), .001, .02, "goal"),)
-        planner.physical_domain = SimpleNamespace(validate=Mock())
-        native = SimpleNamespace(solution=torch.zeros((1, 1, 4, 1)))
+        target = PoseEventRequirement(1., np.eye(4), np.eye(4), .001, .02, "goal")
+        planner.problem.pose_events = (target,)
+        planner.scene = SimpleNamespace(contacts=())
         planner.trajopt = SimpleNamespace(disable_tool_pose_tracking=Mock(),
-            enable_tool_pose_tracking=Mock(), solve_pose=Mock(return_value=native),
-            core=SimpleNamespace(optimizers=[SimpleNamespace(_core=SimpleNamespace(
-                solve_diagnostics=[{"exhausted": False, "effective_updates": 0}]))]))
-        planner.torch, planner.budget, planner.start = torch, PlanningBudget(), object()
-        metadata = object()
-        planner._goal = Mock(return_value=metadata)
-        for phase in ("feasibility", "quality"):
-            planner.phase = phase
-            self.assertIs(planner.optimize(torch.zeros((1, 1, 4, 1))), native)
-            self.assertIs(planner.trajopt.solve_pose.call_args.kwargs["goal_tool_poses"], metadata)
-        self.assertEqual(planner.trajopt.disable_tool_pose_tracking.call_count, 2)
-        planner.trajopt.enable_tool_pose_tracking.assert_not_called()
+            enable_tool_pose_tracking=Mock(), disable_joint_position_tracking=Mock())
+        goal = SimpleNamespace(tool_frames=["tool"])
+        planner._functional_goal = Mock(return_value=goal)
+        _, bound = planner._native_request(torch.zeros((1, 1, 4, 1)))
+        self.assertIs(bound, goal)
+        planner._functional_goal.assert_called_once_with(target)
+        self.assertEqual(planner.route, "native_pose")
+        planner.problem.pose_events = ()
+        _, bound = planner._native_request(torch.zeros((1, 1, 4, 1)))
+        self.assertIsNone(bound)
+        self.assertEqual(planner.route, "constrained")
+        planner.trajopt.disable_tool_pose_tracking.assert_called_once()
     # END full functional tolerances are checked by typed process residuals only.
 
     def test_dependency_boundary_inside_reference_interval_uses_device_tick(self):
@@ -147,7 +147,7 @@ class PlanningBindingTest(unittest.TestCase):
                     request_activation_step=step, request_activation_time_s=applied,
                     request_intent_time_s=row["time"], request_time_origin_step=0,
                     device_timestep_s=timestep)
-        budget = PlanningBudget(maximum_trajectory_solves=4, search_seconds=2.)
+        budget = PlanningBudget(maximum_trajectory_solves=2, search_seconds=2.)
         original = {"candidate_id": "candidate", "planning_budget": asdict(budget),
                     "consumed_planning": {"binding_attempts": 1, "initializations": 1, "ik_batches": 1,
                         "ik_queries": 24, "search_queries": 0, "validation_passes": 2, "validation_queries": 20,
@@ -179,7 +179,7 @@ class PlanningBindingTest(unittest.TestCase):
         continuation = self.continuation(problem)
         budget, prior = _prepare_continuation(problem, SimpleNamespace(gripper=None), None, continuation)
         self.assertEqual(budget.maximum_trajectory_solves, 2)
-        self.assertAlmostEqual(budget.search_seconds, 1.3)
+        self.assertAlmostEqual(budget.search_seconds, 2.)
         self.assertEqual(prior["consumed_planning"]["trajectory_solves"], 2)
         self.assertEqual(prior["consumed_physics_steps"], 350)
         self.assertEqual(prior["remaining_physics_steps"], 650)
@@ -212,7 +212,7 @@ class PlanningBindingTest(unittest.TestCase):
             continued = deepcopy(continuation)
             continued["request_ledger"] = deepcopy(first.request_ledger)
             second = plan_trajectory(problem, scene, {}, robot_validator=object(), continuation=continued)
-        self.assertEqual(native.call_count, 2)
+        self.assertEqual(native.call_count, 1)
         self.assertEqual(continuation, original)
         for call in native.call_args_list:
             admitted = call.args[3]
@@ -424,10 +424,10 @@ class PlanningBindingTest(unittest.TestCase):
         observations = []
         # BEGIN the unchanged material-mode fixture declares no arrival pair permission.
         def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
-                     robot_owner_permission_progress):
+                     contact_permission_progress):
             observations.append((s.clone(), joints.clone(), trajectory_time.clone()))
             return ((s < .5) & (joints[..., 0] > 0)).to(s.dtype)
-        scene = SimpleNamespace(required_progress_anchors=(.5,), robot_owner_permissions=(), evaluate=evaluate)
+        scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate)
         # END the existing test still proves both original material-mode sides.
         def check(joints):
             return _scene_boundary_evaluate(scene, self.problem(), mapping,

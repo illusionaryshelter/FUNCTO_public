@@ -24,19 +24,6 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
-class EmptyBackground:
-    """An explicitly empty synthetic fixture, never a perception substitute."""
-    owner_ids = ()
-    source = "Declared synthetic empty world for native planner regression"
-    independent_geometry = {"solids": [], "query_gaps": []}
-
-    def __call__(self, spheres, *, key):
-        return spheres[..., 0]*0.
-
-    def clone_for_rollout(self):
-        return EmptyBackground()
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -50,8 +37,9 @@ def main():
     from manipulation.execution_binding import plain
     from manipulation.planning import PlanningBudget, plan_trajectory
     from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath, PoseEventRequirement
-    from manipulation.planning_scene import ObservedSpace, PlanningScene
-    from probe_robot_fixture import load_probe_fixture, fixed_probe_hand
+    from manipulation.planning_scene import ObservedSpace
+    from manipulation.online_geometry import OnlinePlanningScene
+    from probe_robot_fixture import load_probe_fixture, fixed_probe_hand, empty_background
 
     torch.set_num_threads(1)
     if not torch.cuda.is_available():
@@ -81,8 +69,8 @@ def main():
     # The archived 1 s / 256-query run exhausted its finite OMPL connection
     # budget for the changed goal. This probe grants bounded additional search
     # work; it does not change production defaults or relax an acceptance gate.
-    budget = PlanningBudget(max_validation_points=512, max_refinement_points=32, max_robot_spheres=sphere_count,
-                            search_seconds=3., maximum_trajectory_solves=3)
+    budget = PlanningBudget(max_validation_points=512, max_task_anchors=32, max_robot_spheres=sphere_count,
+                            search_seconds=3., maximum_trajectory_solves=2)
     # END keep the complete budget in every probe report.
     rows = []
     for name, reference_bend, goal_offset in (("straight", 0., .015),
@@ -105,14 +93,15 @@ def main():
         # BEGIN nominal fixed geometry is explicit and source installations stay present.
         hand, owners, hand_report = fixed_probe_hand(fixture, robot, problem, device=device,
                                                     full_current_positions=full_positions)
-        scene = PlanningScene(reference_frame="synthetic_base", background=EmptyBackground(), owners=owners,
-            coverage=ObservedSpace(np.ones((20, 20, 20), bool), origin=[-2., -2., -2.], voxel_size=.2,
-                                   reference_frame="synthetic_base", observation_ids=("declared-synthetic-empty-box",)),
-            robot_sphere_materials=(None,)*sphere_count, gripper=hand,
-            robot_geometry_source=fixture["robot_geometry_source"])
+        coverage = ObservedSpace(np.ones((20, 20, 20), bool), origin=[-2., -2., -2.], voxel_size=.2,
+            reference_frame="synthetic_base", observation_ids=("declared-synthetic-empty-box",))
+        scene = OnlinePlanningScene(reference_frame="synthetic_base", background=empty_background(coverage),
+            owners=owners, coverage=coverage, robot_sphere_materials=(None,)*sphere_count, gripper=hand,
+            robot_geometry_source=fixture["robot_geometry_source"],
+            unknown_policy={"outside_regions": "forbid", "conditional_regions": []})
         started = time.monotonic()
         result = plan_trajectory(problem, scene, robot, robot_validator=validator, budget=budget)
-        # END native spheres guide optimization; verified source solids gate acceptance.
+        # END planning and execution retain the same frozen online geometry.
         row = {"case": name, "success": result.success, "elapsed_s": time.monotonic()-started,
                "goal": goal.tolist(), "reference": path.poses.tolist(), "diagnostics": result.diagnostics,
                "execution_binding": result.execution_binding, "fixed_hand_hypothesis": hand_report}

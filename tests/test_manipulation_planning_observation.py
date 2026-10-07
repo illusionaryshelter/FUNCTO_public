@@ -10,9 +10,9 @@ import torch
 
 from manipulation.planning_observation import (
     _add_known_solid_voxels, _known_free_voxels, _known_solid_evidence,
-    _mapper_memory_bound, _owner_mapper_config, _partition_masks, _require_mapping_memory,
+    _mapper_memory_bound, _owner_mapper_config, _partition_masks, _require_audit_mapping_memory,
     _require_native_voxel_layout, _views,
-    build_scene_from_rgbd, observed_space_from_rgbd,
+    build_audit_scene_from_rgbd, observed_space_from_rgbd,
 )
 from manipulation.planning_scene import ObservedSpace
 
@@ -126,7 +126,7 @@ class PlanningObservationTest(unittest.TestCase):
         self.assertEqual(cfg.max_blocks, 10_000)
         self.assertGreater(_mapper_memory_bound(cfg), 2*10_000*8**3*4)
         with self.assertRaisesRegex(ValueError, "declared budget"):
-            build_scene_from_rgbd({"current": view()}, {}, mapper_cfg=cfg, depth_error_m=.01,
+            build_audit_scene_from_rgbd({"current": view()}, {}, mapper_cfg=cfg, depth_error_m=.01,
                                   owner_voxel_sizes_m={},
                                   reference_frame="world", robot_sphere_materials=(None,),
                                   robot_geometry_source="explicit_model", has_gripper=False,
@@ -213,12 +213,12 @@ class PlanningObservationTest(unittest.TestCase):
             has_gripper=False, max_mapping_bytes=1024**3)
         with patch("manipulation.planning_observation.ObservedSpace", side_effect=capture_space), \
                 patch("manipulation.planning_observation._mapper_memory_bound", side_effect=capture_budget), \
-                patch("manipulation.planning_observation._require_mapping_memory", side_effect=stop_before_native), \
+                patch("manipulation.planning_observation._require_audit_mapping_memory", side_effect=stop_before_native), \
                 patch("torch.cuda.mem_get_info", side_effect=AssertionError("CPU audit touched CUDA")), \
                 patch("curobo.perception.Mapper") as mapper:
             for resolution in (.01, .005):
                 with self.assertRaisesRegex(ValueError, "CPU admission stop"):
-                    build_scene_from_rgbd(views, frames, owner_voxel_sizes_m={"part": resolution}, **options)
+                    build_audit_scene_from_rgbd(views, frames, owner_voxel_sizes_m={"part": resolution}, **options)
             mapper.assert_not_called()
         self.assertEqual(len(configs), 4)
         self.assertIs(configs[0], cfg)
@@ -234,10 +234,10 @@ class PlanningObservationTest(unittest.TestCase):
         # Each allocation fits separately; their combined allocation does not.
         # The real builder must reject their sum before live-device admission.
         individual = [_mapper_memory_bound(config) for config in configs[2:]]
-        with patch("manipulation.planning_observation._require_mapping_memory") as memory, \
+        with patch("manipulation.planning_observation._require_audit_mapping_memory") as memory, \
                 patch("curobo.perception.Mapper") as mapper:
             with self.assertRaisesRegex(ValueError, "declared budget"):
-                build_scene_from_rgbd(views, frames, owner_voxel_sizes_m={"part": .005},
+                build_audit_scene_from_rgbd(views, frames, owner_voxel_sizes_m={"part": .005},
                     **{**options, "max_mapping_bytes": max(individual)})
             memory.assert_not_called()
             mapper.assert_not_called()
@@ -251,14 +251,14 @@ class PlanningObservationTest(unittest.TestCase):
                 patch("curobo.perception.Mapper") as mapper:
             for resolution in (0., -.001, float("nan"), float("inf"), True, "0.005", [0.005]):
                 with self.subTest(resolution=resolution), self.assertRaisesRegex(ValueError, "positive metres"):
-                    build_scene_from_rgbd(views, frames, owner_voxel_sizes_m={"part": resolution}, **options)
+                    build_audit_scene_from_rgbd(views, frames, owner_voxel_sizes_m={"part": resolution}, **options)
             for sizes in (None, .005, {}, {"part": .005, "extra": .01}, {"other": .005}):
                 with self.subTest(sizes=sizes), self.assertRaisesRegex(ValueError, "exactly every"):
-                    build_scene_from_rgbd(views, frames, owner_voxel_sizes_m=sizes, **options)
+                    build_audit_scene_from_rgbd(views, frames, owner_voxel_sizes_m=sizes, **options)
             for record in views.values():
                 record["depth"][record["owner_masks"]["part"]] = 0.
             with self.assertRaisesRegex(ValueError, "current valid depth"):
-                build_scene_from_rgbd(views, frames, owner_voxel_sizes_m={"part": .005}, **options)
+                build_audit_scene_from_rgbd(views, frames, owner_voxel_sizes_m={"part": .005}, **options)
             memory.assert_not_called()
             mapper.assert_not_called()
     # END owner precision does not change background evidence or bypass budgets.
@@ -276,16 +276,16 @@ class PlanningObservationTest(unittest.TestCase):
                 patch("curobo.perception.Mapper") as mapper:
             for value in (0, True, -1, 6*1024**3+1):
                 with self.subTest(mapping=value), self.assertRaisesRegex(ValueError, "both declared total"):
-                    build_scene_from_rgbd({"current": view()}, {}, has_gripper=False,
+                    build_audit_scene_from_rgbd({"current": view()}, {}, has_gripper=False,
                                           max_mapping_bytes=value, **options)
             with self.assertRaisesRegex(ValueError, "twelve GiB"):
-                build_scene_from_rgbd({"current": view()}, {}, has_gripper=False,
+                build_audit_scene_from_rgbd({"current": view()}, {}, has_gripper=False,
                                       max_host_rss_bytes=12*1024**3+1, **options)
             with self.assertRaisesRegex(ValueError, "eight GiB"):
-                build_scene_from_rgbd({"current": view()}, {}, has_gripper=False,
+                build_audit_scene_from_rgbd({"current": view()}, {}, has_gripper=False,
                                       max_device_used_bytes=8*1024**3+1, **options)
             with self.assertRaisesRegex(ValueError, "current feedback"):
-                build_scene_from_rgbd({"current": view()}, {}, has_gripper=True, **options)
+                build_audit_scene_from_rgbd({"current": view()}, {}, has_gripper=True, **options)
             memory.assert_not_called()
             mapper.assert_not_called()
 
@@ -300,7 +300,7 @@ class PlanningObservationTest(unittest.TestCase):
                 patch("manipulation.planning_observation.require_host_memory"), \
                 patch("curobo.perception.Mapper") as mapper:
             with self.assertRaisesRegex(ValueError, "gpu_native_reserve"):
-                build_scene_from_rgbd({"current": view()}, {}, mapper_cfg=cfg, depth_error_m=.01,
+                build_audit_scene_from_rgbd({"current": view()}, {}, mapper_cfg=cfg, depth_error_m=.01,
                                       owner_voxel_sizes_m={},
                                       reference_frame="world", robot_sphere_materials=(None,),
                                       robot_geometry_source="explicit_model", has_gripper=False)
@@ -310,7 +310,7 @@ class PlanningObservationTest(unittest.TestCase):
         # admitted. No real CUDA context is needed for this policy boundary.
         with patch("torch.cuda.mem_get_info", return_value=(required+2*1024**3, required+2*1024**3)), \
                 patch("manipulation.planning_observation.require_host_memory"):
-            self.assertEqual(_require_mapping_memory(estimated, "cuda:0"), required)
+            self.assertEqual(_require_audit_mapping_memory(estimated, "cuda:0"), required)
     # END mapping resource-limit counterexamples.
 
     # BEGIN independent owner spacing and total-resource policy counterexamples.
@@ -336,12 +336,12 @@ class PlanningObservationTest(unittest.TestCase):
             return result
 
         with patch("manipulation.planning_observation._owner_mapper_config", side_effect=capture_owner), \
-                patch("manipulation.planning_observation._require_mapping_memory",
+                patch("manipulation.planning_observation._require_audit_mapping_memory",
                       side_effect=ValueError("CPU admission stop")), \
                 patch("torch.cuda.mem_get_info", side_effect=AssertionError("CPU audit touched CUDA")), \
                 patch("curobo.perception.Mapper") as mapper:
             with self.assertRaisesRegex(ValueError, "CPU admission stop"):
-                build_scene_from_rgbd(views, frames, mapper_cfg=cfg, depth_error_m=.003,
+                build_audit_scene_from_rgbd(views, frames, mapper_cfg=cfg, depth_error_m=.003,
                     owner_voxel_sizes_m={"part": .003, "large_part": .015},
                     reference_frame="world", robot_sphere_materials=(None,),
                     robot_geometry_source="Explicit synthetic robot", has_gripper=False,
@@ -374,11 +374,11 @@ class PlanningObservationTest(unittest.TestCase):
         # A mocked capacity estimate exercises >1 GiB policy without allocating
         # the memory. Real normalization, coverage and static gates still run.
         with patch("manipulation.planning_observation._mapper_memory_bound", return_value=estimate), \
-                patch("manipulation.planning_observation._require_mapping_memory",
+                patch("manipulation.planning_observation._require_audit_mapping_memory",
                       side_effect=ValueError("reached live admission")) as admission, \
                 patch("curobo.perception.Mapper") as mapper:
             with self.assertRaisesRegex(ValueError, "reached live admission"):
-                build_scene_from_rgbd({"current": view()}, {}, owner_voxel_sizes_m={},
+                build_audit_scene_from_rgbd({"current": view()}, {}, owner_voxel_sizes_m={},
                     mapper_cfg=cfg, depth_error_m=.01, reference_frame="world",
                     robot_sphere_materials=(None,), robot_geometry_source="Explicit robot",
                     has_gripper=False, max_mapping_bytes=2*1024**3,
@@ -395,9 +395,9 @@ class PlanningObservationTest(unittest.TestCase):
                 patch("manipulation.tsdf_geometry.ObservedTsdfGeometry.pending_storage_total_nbytes", return_value=12345), \
                 patch("manipulation.planning_observation.require_host_memory") as host:
             with self.assertRaisesRegex(ValueError, "gpu_device_used"):
-                _require_mapping_memory(estimate, "cuda:0",
+                _require_audit_mapping_memory(estimate, "cuda:0",
                     max_host_rss_bytes=12*gib, max_device_used_bytes=6*gib)
-            required = _require_mapping_memory(estimate, "cuda:0",
+            required = _require_audit_mapping_memory(estimate, "cuda:0",
                 max_host_rss_bytes=12*gib, max_device_used_bytes=8*gib)
             self.assertEqual(required, estimate+64*1024**2)
             host.assert_called_with(required, pending_existing_bytes=12345, max_rss_bytes=12*gib)
@@ -408,7 +408,7 @@ class PlanningObservationTest(unittest.TestCase):
                 patch("manipulation.tsdf_geometry.ObservedTsdfGeometry.pending_storage_total_nbytes", return_value=0), \
                 patch("torch.cuda.mem_get_info", side_effect=AssertionError("Host refusal touched CUDA")):
             with self.assertRaisesRegex(ValueError, "host total exceeded"):
-                _require_mapping_memory(1024, "cuda:0", max_host_rss_bytes=12*1024**3,
+                _require_audit_mapping_memory(1024, "cuda:0", max_host_rss_bytes=12*1024**3,
                                         max_device_used_bytes=8*1024**3)
             host.assert_called_once_with(1024+64*1024**2,
                 pending_existing_bytes=0, max_rss_bytes=12*1024**3)
@@ -421,11 +421,11 @@ class PlanningObservationTest(unittest.TestCase):
         cfg = MapperCfg(extent_meters_xyz=(1.1, 1.1, 1.1), voxel_size=.005,
             extent_esdf_meters_xyz=(1.1, 1.1, 1.1), esdf_voxel_size=.05,
             image_height=96, image_width=96, device="cuda:0")
-        with patch("manipulation.planning_observation._require_mapping_memory") as admission, \
+        with patch("manipulation.planning_observation._require_audit_mapping_memory") as admission, \
                 patch("manipulation.planning_observation._known_free_voxels") as coverage, \
                 patch("curobo.perception.Mapper") as mapper:
             with self.assertRaisesRegex(ValueError, "32 MiB collision-array"):
-                build_scene_from_rgbd({"current": view()}, {}, owner_voxel_sizes_m={},
+                build_audit_scene_from_rgbd({"current": view()}, {}, owner_voxel_sizes_m={},
                     mapper_cfg=cfg, depth_error_m=.01, reference_frame="world",
                     robot_sphere_materials=(None,), robot_geometry_source="Explicit robot",
                     has_gripper=False, max_mapping_bytes=4*1024**3)
@@ -474,11 +474,11 @@ class PlanningObservationTest(unittest.TestCase):
             return result
 
         with patch("manipulation.planning_observation.ObservedSpace", side_effect=capture_space), \
-                patch("manipulation.planning_observation._require_mapping_memory",
+                patch("manipulation.planning_observation._require_audit_mapping_memory",
                       side_effect=ValueError("stop before native mapping")), \
                 patch("curobo.perception.Mapper") as mapper:
             with self.assertRaisesRegex(ValueError, "stop before native mapping"):
-                build_scene_from_rgbd({"current": record}, frames, mapper_cfg=cfg, depth_error_m=.01,
+                build_audit_scene_from_rgbd({"current": record}, frames, mapper_cfg=cfg, depth_error_m=.01,
                     owner_voxel_sizes_m={"part": .05},
                     reference_frame="world", robot_sphere_materials=(None,),
                     robot_geometry_source="synthetic_robot", has_gripper=False,
@@ -665,7 +665,7 @@ class NativeVoxelLayoutTest(unittest.TestCase):
         cfg = MapperCfg(extent_meters_xyz=(.06, .06, .06), voxel_size=.015,
             extent_esdf_meters_xyz=(.06, .06, .06), esdf_voxel_size=.015,
             image_height=96, image_width=96, device="cuda:0")
-        with patch("manipulation.planning_observation._require_mapping_memory"), \
+        with patch("manipulation.planning_observation._require_audit_mapping_memory"), \
                 patch("curobo.perception.Mapper") as mapper, \
                 patch("curobo.types.DeviceCfg", return_value=DeviceCfg("cpu")), \
                 patch("curobo.types.CameraObservation", side_effect=lambda **values: SimpleNamespace(**values)), \
@@ -677,7 +677,7 @@ class NativeVoxelLayoutTest(unittest.TestCase):
                 "allocation_failures": 0, "num_allocated": 0, "active_blocks": 0, "free_count": 0}
             mapper.return_value.compute_esdf.return_value = voxel
             with self.assertRaisesRegex(ValueError, "native_rounded_shape_xyz=\\(2, 2, 2\\)"):
-                build_scene_from_rgbd({"current": view()}, {}, mapper_cfg=cfg, depth_error_m=.001,
+                build_audit_scene_from_rgbd({"current": view()}, {}, mapper_cfg=cfg, depth_error_m=.001,
                     owner_voxel_sizes_m={},
                     reference_frame="world", robot_sphere_materials=(None,),
                     robot_geometry_source="Explicit CPU robot fixture", has_gripper=False,
@@ -689,6 +689,83 @@ class NativeVoxelLayoutTest(unittest.TestCase):
 # END no mismatched native world is silently reinterpreted by its consumers.
 
 
+# END pixel ownership and observed-free volume tests without CUDA execution.
+
+# BEGIN production tests admit one fixed model without source reconstruction.
+class OnlineObservationContractTest(unittest.TestCase):
+    def test_registered_sphere_radius_expands_owner_support_before_mapping(self):
+        views,frames,cfg=PlanningObservationTest.refined_owner_fixture()
+        normalized=_views(views,'world',(.1,3.))
+        masks=_partition_masks(normalized,frames)
+        pose=frames['part']['T_output_owner']
+        small=_owner_mapper_config(cfg,normalized,masks,'part',pose,.005,.003)
+        supported=_owner_mapper_config(cfg,normalized,masks,'part',pose,.005,.003,query_radius_m=.072)
+        np.testing.assert_allclose(np.asarray(supported.extent_esdf_meters_xyz)-small.extent_esdf_meters_xyz,[.144]*3,atol=1e-12)
+        np.testing.assert_array_equal(supported.grid_center,small.grid_center)
+        self.assertEqual(supported.voxel_size,small.voxel_size)
+
+    def test_native_samples_keep_xyz_order_positive_free_sign_and_physical_centres(self):
+        from curobo.perception import MapperCfg
+        from curobo.types import DeviceCfg
+        from manipulation.planning_observation import _map_online_partition
+        cfg=MapperCfg(extent_meters_xyz=(.06,.08,.1),voxel_size=.02,
+            extent_esdf_meters_xyz=(.06,.08,.1),esdf_voxel_size=.02,
+            grid_center=torch.tensor([.2,.3,1.]),image_height=96,image_width=96,device='cuda:0')
+        values=torch.tensor(np.broadcast_to(np.array([-.02,0.,.02])[:,None,None],(3,4,5)).copy(),dtype=torch.float16)
+        voxel=SimpleNamespace(feature_tensor=values,pose=[.2,.3,1.,1.,0.,0.,0.],voxel_size=.02)
+        normalized=_views({'A':view()},'world',(.1,3.))
+        masks=_partition_masks(normalized,{})
+        bits=np.full((3,4,5),3,dtype=np.uint8)
+        with patch('curobo.perception.Mapper') as mapper, \
+             patch('curobo.types.DeviceCfg',return_value=DeviceCfg('cpu')), \
+             patch('curobo.types.CameraObservation',side_effect=lambda **kw:SimpleNamespace(**kw)), \
+             patch('curobo.types.Pose.from_matrix',return_value=SimpleNamespace()), \
+             patch('manipulation.native_voxel_sources.export_source_bits',return_value=bits) as sources, \
+             patch('manipulation.tsdf_geometry.build_tsdf_geometry',side_effect=AssertionError('online map exported source solid')), \
+             patch('curobo._src.geom.collision.collision_scene.SceneCollision.from_config',side_effect=AssertionError('online map created second collision scene')):
+            mapper.return_value.get_stats.return_value={'allocation_failures':0,'num_allocated':0,'active_blocks':0,'free_count':0}
+            mapper.return_value.compute_esdf.return_value=voxel
+            query,report=_map_online_partition(normalized,masks,None,cfg,np.eye(4))
+        np.testing.assert_allclose(query.origin,[.18,.27,.96],atol=1e-12)
+        np.testing.assert_array_equal(query.distance,values.float().numpy())
+        samples=torch.tensor([[.18,.29,1.],[.2,.29,1.],[.22,.29,1.]],dtype=torch.float64)
+        np.testing.assert_allclose(query.signed_distance(samples).numpy(),values.float().numpy()[:,1,2],atol=1e-12)
+        self.assertEqual(report['shape_xyz'],[3,4,5])
+        self.assertEqual(sources.call_args.kwargs['max_cells'],32*1024**2//4)
+
+    def test_online_builder_maps_one_selected_field_and_uses_complete_robot_radius(self):
+        from manipulation.planning_observation import build_scene_from_rgbd
+        from manipulation.online_geometry import FrozenESDF,OnlinePlanningScene
+        views,frames,cfg=PlanningObservationTest.refined_owner_fixture()
+        captured={}
+        def make(normalized,masks,identity,config,inverse):
+            captured[identity]=config
+            shape=np.ceil(np.asarray(config.extent_esdf_meters_xyz)/config.esdf_voxel_size).astype(int)
+            origin=config.grid_center.numpy()-(shape-1)*config.esdf_voxel_size/2
+            values=np.ones(tuple(shape),dtype=np.float32)
+            query=FrozenESDF(values,origin=origin,voxel_size=config.esdf_voxel_size,
+                site_valid=np.zeros_like(values,dtype=bool),observed_sign=np.zeros_like(values,dtype=bool),
+                owner_ids=('observed_background' if identity is None else identity,),source='mock current field')
+            return query,{'shape_xyz':shape.tolist()}
+        fine={None:{'center_m':[0.,0.,1.],'extent_m':[.2,.2,.2],'voxel_size_m':.01,
+            'measurement_allowance_m':.003,'measurement_evidence':'measured depth bound','source':'declared operation bounds'}}
+        body=[{'body_id':'link','sphere_indices':[0],'local_spheres':[[0.,0.,0.,.04]],'geometry_names':['body']}]
+        with patch('manipulation.planning_observation._map_online_partition',side_effect=make) as mapper, \
+             patch('manipulation.planning_observation._require_mapping_memory'), \
+             patch('torch.cuda.mem_get_info',side_effect=AssertionError('CPU contract touched CUDA')):
+            result=build_scene_from_rgbd(views,frames,mapper_cfg=cfg,depth_error_m=.003,
+                owner_voxel_sizes_m={'part':.005},reference_frame='world',robot_sphere_materials=(None,),
+                robot_geometry_source='declared native robot',has_gripper=False,max_mapping_bytes=1024**3,
+                fine_regions=fine,robot_collision_bodies=body,
+                unknown_policy={'conditional_regions':[],'outside_regions':'forbid'})
+        self.assertIsInstance(result,OnlinePlanningScene)
+        self.assertEqual(mapper.call_count,2)
+        self.assertEqual(captured[None].esdf_voxel_size,.01)
+        normalized=_views(views,'world',(.1,3.))
+        expected=_owner_mapper_config(cfg,normalized,_partition_masks(normalized,frames),'part',frames['part']['T_output_owner'],.005,.003,query_radius_m=.04)
+        np.testing.assert_allclose(captured['part'].extent_esdf_meters_xyz,expected.extent_esdf_meters_xyz)
+        self.assertFalse(hasattr(result.background,'refinement_source'))
+# END these CPU tests never allocate native mapping or simulator state.
+
 if __name__ == "__main__":
     unittest.main()
-# END pixel ownership and observed-free volume tests without CUDA execution.

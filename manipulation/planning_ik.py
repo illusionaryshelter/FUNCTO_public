@@ -16,7 +16,7 @@ def _validate_reports(reports, count):
         raise ValueError("IK candidates and static reports must align")
     for report in reports:
         if any(type(report.get(name)) not in (bool, np.bool_)
-               for name in ("task_satisfied", "source_valid", "native_pose_ik_success")):
+               for name in ("task_satisfied", "model_valid", "native_pose_ik_success")):
             raise ValueError("IK task, source and native pose validity must be explicit booleans")
 
 
@@ -40,7 +40,7 @@ def _quality(report):
 
 def _tier(report, query_kind):
     """Keep task/source checks independent of optional nominal pose success."""
-    return (not report["task_satisfied"], not report["source_valid"],
+    return (not report["task_satisfied"], not report["model_valid"],
             not report["native_pose_ik_success"] if query_kind == "reference" else False)
 
 
@@ -148,7 +148,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
         qualified = [int(index) for index in np.flatnonzero(np.isfinite(values).all(axis=-1))
                      if rows[index]["candidate_source"] == "native_ik"
                      and all(rows[index][name] for name in
-                             ("task_satisfied", "source_valid", "native_pose_ik_success"))]
+                             ("task_satisfied", "model_valid", "native_pose_ik_success"))]
         retained = []
         for index in sorted(qualified,
                             key=lambda index: (*_quality(rows[index]), index)):

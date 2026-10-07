@@ -271,33 +271,6 @@ def test_real_tsdf_native_reports_equal_original_order_checks(scene_factory, mon
     assert diagnostics["checked_states"] == 4 and diagnostics["failed_states"] == 2
 
 
-@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
-@pytest.mark.parametrize("plateau", (False, True))
-def test_real_boundary_modes_preserve_arrival_expiry_and_plateau(scene_factory, monkeypatch, dtype, plateau):
-    permission = RobotOwnerContactPermission(rule_id="arrived_target", target_owner="target",
-        native_geometry_names=("tool_box",), sphere_indices=(0,), interval=(.5, .9),
-        arrival_goal_id=("pose_events", 1),
-        activation_event={"skill_id": "test", "event_id": "close", "occurrence": 0, "kind": "close"},
-        source="explicit arrival policy")
-    current = scene_factory(owners=(owner(ProxyQuery("target", box_geometry())),), permissions=(permission,))
-    if plateau:
-        mapping = _ProgressMap(np.array([0., .25, .75, 1.]), np.array([0., .5, .5, 1.]))
-        args = states([[0., 0., 0.]], [[.5, .5, .5]], dtype=dtype)
-        clock = torch.tensor([[.25, .5, .75]], dtype=dtype)
-    else:
-        mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-        args = states([[0.]*5], [[.499, .5, .9, .5, .499]], dtype=dtype)
-        clock = args[3]
-
-    def operation(scene, diagnostics, layers, components):
-        return _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., phase_count=1),
-            mapping, *args, trajectory_time=clock, normalized_time=clock, source_geometry=True,
-            diagnostics=diagnostics, layer_selection_out=layers, source_components_out=components)
-
-    residual, diagnostics, layers = native_differential(current, operation, monkeypatch)
-    assert residual.tolist() == ([[0., 0., 0.]] if plateau else [[1., 0., 1., 0., 1.]])
-    assert diagnostics["checked_states"] == args[3].numel()*3
-    assert layers["query_order"] == ["exact", "left", "right"]
 
 
 def test_real_candidate_release_pose_is_not_reused_across_calls(scene_factory, monkeypatch):
@@ -677,79 +650,8 @@ def test_state_and_two_batch_slots_share_one_fixed_capacity(monkeypatch):
     assert not session._batches and session.storage_nbytes == 0
 
 
-@pytest.mark.parametrize("failure", (None, "ordinary", "dense"))
-def test_native_metrics_wrappers_preserve_every_call_and_release_sessions_on_errors(failure):
-    from manipulation.planning import _bind_candidate_source_world_reuse
-
-    ordinary, dense, calls = paired_recording_scenes()
-    for current in (ordinary, dense):
-        current.begin_source_world_reuse = MethodType(PlanningScene.begin_source_world_reuse, current)
-        current.end_source_world_reuse = MethodType(PlanningScene.end_source_world_reuse, current)
-    ordinary_inputs = sequence_inputs([.1, .2])
-    dense_inputs = sequence_inputs([.1, .15, .2])
-    metrics_calls = []
-    sessions = []
-
-    def evaluate(kind, current, inputs):
-        metrics_calls.append(kind)
-        session = current._source_world_reuse
-        sessions.append(session)
-        args, kwargs = inputs
-        result = current.check_world_geometry(*args, **kwargs, diagnostics={"capture_components": True})
-        if failure == kind:
-            raise RuntimeError(kind)
-        return result
-
-    rollout = SimpleNamespace(metrics_constraint_manager=SimpleNamespace(_scene=ordinary),
-        compute_metrics_from_action=lambda _: evaluate("ordinary", ordinary, ordinary_inputs))
-    optimizer = SimpleNamespace(metrics_rollout=rollout,
-        additional_metrics_rollouts={"interpolated_rollout": SimpleNamespace(
-            metrics_constraint_manager=SimpleNamespace(_scene=dense))},
-        _interpolate_and_compute_metrics=lambda _: evaluate("dense", dense, dense_inputs))
-    cleanup = _bind_candidate_source_world_reuse(optimizer)
-    if failure is None:
-        for _ in range(2):
-            rollout.compute_metrics_from_action("same actions")
-            optimizer._interpolate_and_compute_metrics("same native states")
-            assert not ordinary._source_world_reuse._reports
-        assert metrics_calls == ["ordinary", "dense", "ordinary", "dense"]
-        assert len(calls) == 3 and all(session is sessions[0] for session in sessions)
-        assert sessions[0].reused_batches == 2
-        cleanup()
-    else:
-        with pytest.raises(RuntimeError, match=failure):
-            rollout.compute_metrics_from_action("actions")
-            optimizer._interpolate_and_compute_metrics("states")
-    assert ordinary._source_world_reuse is dense._source_world_reuse is None
-    assert all(not session._batches and not session._reports and session.storage_nbytes == 0 for session in sessions)
 
 
-@pytest.mark.parametrize("active_solve", (False, True))
-@pytest.mark.parametrize("failure", (None, "postprocess"))
-def test_observation_keeps_batches_only_for_its_successful_enclosing_solve(active_solve, failure):
-    from unittest.mock import Mock
-    from manipulation.planning import _CuroboPlanner
-
-    actions = torch.zeros((1, 8, 2))
-    joint = SimpleNamespace(dt=torch.full((1, 1), .2))
-    metrics = SimpleNamespace(state=SimpleNamespace(joint_state=joint), actions=actions)
-    output = object()
-    optimizer = SimpleNamespace(solve_state=SimpleNamespace(batch_size=1, num_seeds=1),
-        horizon=49, interpolation_steps=4, joint_names=["a", "b"],
-        _source_world_solve_active=active_solve,
-        metrics_rollout=SimpleNamespace(compute_metrics_from_action=Mock(return_value=metrics)),
-        _interpolate_and_compute_metrics=Mock(return_value=("metrics", "trajectory", "last")),
-        _get_result=Mock(return_value=output),
-        _get_best_result=Mock(side_effect=RuntimeError("postprocess") if failure else None, return_value=output),
-        end_source_world_reuse=Mock())
-    planner = SimpleNamespace(trajopt=optimizer, torch=torch, formal_clock={"valid_count": 385},
-        anchors=[0., 1.], refinement_parameters=np.empty(0), _charge_candidate_queries=Mock())
-    if failure:
-        with pytest.raises(RuntimeError, match=failure):
-            _CuroboPlanner._observed_native_result(planner, actions)
-    else:
-        assert _CuroboPlanner._observed_native_result(planner, actions) is output
-    assert optimizer.end_source_world_reuse.call_count == int(bool(failure) or not active_solve)
 # END native metrics and export accumulation remain outside this source-only memo.
 
 
@@ -1008,65 +910,5 @@ def test_actual_tsdf_repeated_candidate_skips_all_source_calls_and_keeps_evidenc
 # END source-only memoization leaves proxy/process checks in evaluate_source active.
 
 
-def test_actual_dense_failure_trace_preserves_all_twenty_one_new_times(scene_factory):
-    from manipulation.planning_diagnostics import AttemptWitnesses, bind_trace_to_native_seed
-    permission = RobotOwnerContactPermission(rule_id="distant_target_permission", target_owner="target",
-        native_geometry_names=("tool_box",), sphere_indices=(0,), interval=(.4, .6),
-        arrival_goal_id=("pose_events", 1),
-        activation_event={"skill_id": "test", "event_id": "close", "occurrence": 0, "kind": "close"},
-        source="explicit distant-owner permission creates original three-mode checks")
-    ordinary = scene_factory(ProxyQuery("background", observed_plane()),
-        owners=(owner(ProxyQuery("target", box_geometry(.8))),), permissions=(permission,))
-    dense = ordinary.clone_for_rollout()
-    session = ordinary.begin_source_world_reuse(dense)
-    parameters = torch.linspace(0., 1., 24, dtype=torch.float64)
-    ordinary_parameters = parameters[[0, 12, 23]]
-    mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-    traces = []
-    try:
-        for current, times in ((ordinary, ordinary_parameters), (dense, parameters)):
-            args = states([[0.]*len(times)], [times.tolist()])
-            diagnostics, components = {"capture_components": True}, {}
-            residual = _scene_boundary_evaluate(current, SimpleNamespace(start_progress=0., phase_count=1),
-                mapping, *args, trajectory_time=args[3], normalized_time=args[3], source_geometry=True,
-                diagnostics=diagnostics, source_components_out=components)
-            assert residual.tolist() == [[1.]*len(times)]
-            failures = diagnostics.pop("component_failures")
-            diagnostics.pop("capture_components")
-            # The manager binds these same original typed input q/dq arrays;
-            # no cached previous-call indices are substituted into this trace.
-            q = args[4]
-            for row in failures:
-                row["normalized_time"] = float(times[row["ordered_query_index"]])
-            trace = {"input_position": q.numpy().copy(), "input_velocity": torch.zeros_like(q).numpy(),
-                "component_failures": failures, "world_geometry": diagnostics}
-            native_state = SimpleNamespace(position=q.unsqueeze(0), velocity=torch.zeros_like(q).unsqueeze(0),
-                joint_names=["slide"])
-            bound = bind_trace_to_native_seed(trace, native_state, 0, ("slide",))
-            assert bound["status"] == "recorded"
-            assert len(bound["component_failures"]) == 3*len(times)
-            for row in bound["component_failures"]:
-                witness, = row["geometry_witnesses"]
-                assert witness["trajectory_time_s"] == row["time_s"]
-                assert witness["planning_joint_positions"] == row["joint_position"]
-            traces.append(bound)
-        assert session.reused_states == session.stored_states == 3
-    finally:
-        ordinary.end_source_world_reuse()
-    ledger = AttemptWitnesses()
-    # BEGIN exchange finite optimizer queries while retaining every exact source failure.
-    ledger.set_current({"rollout": {"source_trace": traces[0]},
-                        "interpolated": {"source_trace": traces[1]}}, duration=1.)
-    np.testing.assert_array_equal(ledger.parameters, parameters.numpy())
-    arguments = {"fixed_parameters": [], "regular_parameters": ordinary_parameters.numpy()}
-    first = ledger.select_parameters(**arguments, max_points=16)
-    assert len(first) == 16
-    assert len(ledger.last_selection["pending_parameters"]) == 5
-    second = ledger.select_parameters(**arguments, max_points=16)
-    assert len(second) == 16
-    eligible = set(parameters.numpy())-set(ordinary_parameters.numpy())
-    assert set(first) | set(second) == eligible
-    np.testing.assert_array_equal(ledger.parameters, parameters.numpy())
-    assert ledger.last_selection["slack_certified"] is False
     # END scheduling changes neither mode attribution nor the permanent validation ledger.
 # END bounded sharing changes physical query count, never logical state evidence.

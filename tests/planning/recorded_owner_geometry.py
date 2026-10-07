@@ -303,8 +303,8 @@ def bind_box_owner_materials(prepared):
 # END a face identity grants no permission by itself.
 
 
-def create_box_owner(prepared, *, device_cfg):
-    """Allocate the existing native cuboid query only in the caller's GPU stage."""
+def create_box_owner(prepared, *, contact_voxel_size_m):
+    """Bind declared complete cuboids to the shared finite online model."""
     # BEGIN preserve explicit completeness at the serialized input boundary.
     # Loading an external JSON cannot upgrade a partial or undeclared body.
     # The preparation proof must still identify every native source box.
@@ -313,15 +313,16 @@ def create_box_owner(prepared, *, device_cfg):
             or source.get("geometry_complete") is not True):
         raise ValueError("An owner query requires explicitly complete prepared and source geometry")
     # END preserve explicit completeness at the serialized input boundary.
-    from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
-    from curobo._src.geom.types import Cuboid, SceneCfg
+    # BEGIN complete object boxes use the same CPU/Torch online query.
+    from manipulation.online_geometry import FrozenPrimitives
     from manipulation.planning_problem import PosePath
-    from manipulation.planning_scene import Attachment, CollisionOwner, CuroboSphereQuery
+    from manipulation.planning_scene import Attachment, CollisionOwner
 
-    cuboids = [Cuboid(**box) for box in prepared["cuboids"]]
-    native = SceneCollision.from_config(SceneCollisionCfg(
-        device_cfg=device_cfg, scene_model=SceneCfg(cuboid=cuboids), cache={"cuboid": len(cuboids)}))
-    query = CuroboSphereQuery(native, owner_ids=(prepared["owner_id"],), source=prepared["source"])
+    query = FrozenPrimitives(primitives=[{"kind": "cuboid", "dimensions": row["dims"],
+        "pose": row["pose"]} for row in prepared["cuboids"]],
+        owner_ids=(prepared["owner_id"],), source=prepared["source"],
+        contact_voxel_size_m=contact_voxel_size_m)
+    # END no source solid or separate device collision store is reconstructed.
     initial = np.asarray(prepared["initial_pose"], float)
     return CollisionOwner(
         prepared["owner_id"], query,

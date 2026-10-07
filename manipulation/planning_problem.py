@@ -10,7 +10,7 @@ Torch is imported only when differentiable evaluation is requested.
 # BEGIN shared skill-process constraints for generation and verification.
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from copy import deepcopy
 
 import numpy as np
@@ -938,6 +938,9 @@ class PlanningProblem:
     source_timestamps: np.ndarray | None = None
     source_progress: np.ndarray | None = None
     start_progress: float = 0.
+    # BEGIN the authorized motion block retains original skill coordinates.
+    end_progress: float | None = None
+    # END phase_count remains the original reference inventory, not solve scope.
 
     def __post_init__(self):
         self.joint_names = tuple(self.joint_names)
@@ -953,7 +956,9 @@ class PlanningProblem:
             raise ValueError("A planning problem needs current named joint state, calibrated frames and references")
         self.base_pose = _pose_array(self.base_pose, "T_reference_robot_base")
         self.tool_transform = _pose_array(self.tool_transform, "T_link_tool")
-        if not np.isfinite(self.start_progress) or not 0 <= self.start_progress < self.phase_count:
+        self.end_progress = float(self.phase_count) if self.end_progress is None else float(self.end_progress)
+        if (not np.isfinite([self.start_progress, self.end_progress]).all()
+                or not 0 <= self.start_progress < self.end_progress <= self.phase_count):
             raise ValueError("Actual entry progress must lie in the remaining original skill interval")
         skill_ids = [phase.metadata["skill_id"] for phase in self.phases if "skill_id" in phase.metadata]
         skill_ids.extend(event.skill_id for event in self.events)
@@ -988,12 +993,70 @@ class PlanningProblem:
                     or self.source_progress.shape != self.source_timestamps.shape
                     or not np.isfinite(self.source_timestamps).all() or not np.isfinite(self.source_progress).all()
                     or np.any(np.diff(self.source_timestamps) <= 0) or np.any(np.diff(self.source_progress) <= 0)
-                    or self.source_progress[0] != self.start_progress or self.source_progress[-1] != self.phase_count):
-                raise ValueError("The original timestamp/progress map must increase across the complete current skill")
+                    or self.source_progress[0] != self.start_progress or self.source_progress[-1] != self.end_progress):
+                raise ValueError("The original timestamp/progress map must increase across the authorized motion block")
 
     @property
     def phase_count(self):
         return len(self.phases)
+
+    # BEGIN compile the next evidence dependency before allocating a solver.
+    def bound_motion_block(self, goal_identities=None, satisfied_dependencies=()):
+        """Copy the authorized interval without inventing stops or new clocks.
+
+        Only an explicit unmet evidence dependency ends a block. Ordinary
+        events and reference phase boundaries do not split moving process
+        relations. Original phase coordinates and process origins survive;
+        point-goal identities refer to the request ledger made before this
+        copy. The boundary event remains available for actual T/F/U reporting.
+        """
+        satisfied = frozenset(satisfied_dependencies)
+        dependencies = [event for event in self.events
+                        if event.requires_evidence is not None
+                        and not (event.requires_evidence in satisfied
+                                 and event.progress <= self.start_progress)
+                        and self.start_progress <= event.progress <= self.end_progress]
+        boundary = min(dependencies, key=lambda event: event.progress, default=None)
+        end = self.end_progress if boundary is None else float(boundary.progress)
+        if end <= self.start_progress:
+            raise ValueError("The current entrance requires fresh dependency evidence before any motion block")
+        block = deepcopy(self)
+        block.end_progress = end
+        block.events = tuple(event for event in block.events
+                             if self.start_progress <= event.progress <= end)
+        identities = {}
+        for name in ("pose_events", "coordinate_events", "supports"):
+            rows = getattr(block, name)
+            original = (list(range(len(rows))) if goal_identities is None
+                        else list(goal_identities.get(name, range(len(rows)))))
+            if len(original) != len(rows) or len(set(original)) != len(original):
+                raise ValueError("Motion blocks require unchanged original point-goal identities")
+            selected = [index for index, row in enumerate(rows)
+                        if self.start_progress <= row.progress <= end]
+            setattr(block, name, tuple(rows[index] for index in selected))
+            identities[name] = [original[index] for index in selected]
+        if block.source_timestamps is not None:
+            keep = (block.source_progress > block.start_progress) & (block.source_progress < end)
+            progress = np.r_[block.start_progress, block.source_progress[keep], end]
+            block.source_timestamps = np.interp(progress, block.source_progress, block.source_timestamps)
+            block.source_progress = progress
+        # Scene assumptions retain their original identities and intervals.
+        # They do not add motion goals outside this block, and scene attachment
+        # records may still reference a release that belongs to a later block.
+        block.conditions = tuple(condition for condition in block.conditions
+            if condition.get("kind") != "grasp_contact_activation"
+            or block.start_progress <= float(condition["interval"][0]) <= end)
+        block.__post_init__()
+        record = {"start_progress": float(block.start_progress), "end_progress": end,
+                  "skill_end_progress": float(self.phase_count),
+                  "goal_identities": identities,
+                  "satisfied_dependencies": sorted(satisfied),
+                  "boundary_event": None if boundary is None else asdict(boundary),
+                  "requires_rebind": boundary is not None,
+                  "source_time_map": (None if block.source_timestamps is None else block.source_time_map),
+                  "scope": "Original coordinates through the next explicit unmet evidence dependency"}
+        return block, record
+    # END later goals remain in the request ledger and cannot enter this solve.
 
     # BEGIN derive consumption records from the actual compiled requirements.
     @property
@@ -1101,12 +1164,12 @@ class PlanningProblem:
     @property
     def terminal_pose_target(self):
         """A true complete terminal pose goal for native H=1 goal consumers."""
-        return next((goal for goal in self.pose_events if goal.progress == self.phase_count), None)
+        return next((goal for goal in self.pose_events if goal.progress == self.end_progress), None)
 
     @property
     def anchors(self):
         """Exact evaluation sites, never fixed IK states or mandatory robot poses."""
-        anchors = np.unique([self.start_progress, float(self.phase_count), *(e.progress for e in self.events),
+        anchors = np.unique([self.start_progress, self.end_progress, *(e.progress for e in self.events),
                           *(r.progress for r in self.supports),
                           *(s for r in self.interiors for s in (r.start, r.end)),
                           *(r.progress for r in self.pose_events),
@@ -1115,7 +1178,7 @@ class PlanningProblem:
                           *(s for r in self.mechanisms for d in r.directions for s in (d.start, d.end)),
                           *(r.start+float(s)*(r.end-r.start)
                             for r in self.pose_relations for s in r.reference.progress)])
-        return anchors[anchors >= self.start_progress]
+        return anchors[(anchors >= self.start_progress) & (anchors <= self.end_progress)]
 
     @property
     def stop_progress(self):
@@ -1168,7 +1231,7 @@ class PlanningProblem:
         import torch
         if position.shape != (*progress.shape, 3) or quaternion.shape != (*progress.shape, 4):
             raise ValueError("Pose arrays must align with the complete progress horizon")
-        result = {"progress_bounds": torch.relu(self.start_progress-progress)+torch.relu(progress-self.phase_count)}
+        result = {"progress_bounds": torch.relu(self.start_progress-progress)+torch.relu(progress-self.end_progress)}
         selected_goals = None if point_goal_ids is None else set(point_goal_ids)
         def event_mask(collection, index, requirement):
             return (_first_event_query(progress, requirement.progress, trajectory_time)

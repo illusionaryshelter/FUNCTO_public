@@ -76,15 +76,14 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
         import torch
         from curobo.kinematics import Kinematics, KinematicsCfg
         from curobo.types import DeviceCfg, JointState
-        from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
-        from curobo._src.geom.types import Cuboid, SceneCfg
+        from manipulation.online_geometry import FrozenPrimitives, OnlinePlanningScene
         from manipulation.planning import PlanningBudget, plan_trajectory
         from manipulation import planning as planner_module
         from manipulation.planning_problem import (
             JointCoupling, MotionPhase, NumericalTolerance, PlanningEvent, PlanningProblem,
             PosePath, PoseEventRequirement, PoseProcessRequirement)
         from manipulation.planning_scene import (
-            CuroboSphereQuery, ObservedSpace, PlanningScene, PrismaticGripper)
+            ObservedSpace, PrismaticGripper)
         from probe_robot_fixture import load_probe_fixture, calibrate_native_hand
         from robot_fixture import create_fixed_installation_owners
 
@@ -150,7 +149,7 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
             "drive_contract": "explicit synthetic equal fraction of the signed mechanical opening ranges",
             "fixed_installation_owners": installation_report,
         }
-        # END complete source solids remain the independent hard self-collision authority.
+        # END native registered sphere pairs remain the online self-collision model.
 
         # BEGIN vary solver capacity while preserving the physical command.
         budget = PlanningBudget(ik_seeds=2, trajectory_seeds=1, knots=native_knots,
@@ -183,15 +182,14 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
             commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id, "occurrence": event.occurrence,
                             "command": event.kind, "progress": event.progress} for event in events),
             source="explicit synthetic position-tracking drive; geometry calibrated against native source FK")
-        native_scene = SceneCollision.from_config(SceneCollisionCfg(
-            device_cfg=device, scene_model=SceneCfg(cuboid=[Cuboid(
-                name="synthetic_far_obstacle", pose=[0., 0., -1., 1., 0., 0., 0.], dims=[.1, .1, .1])]),
-            cache={"cuboid": 1}))
-        background = CuroboSphereQuery(native_scene, owner_ids=("synthetic_far_obstacle",),
-                                       source="fully specified synthetic distant cuboid")
+        # BEGIN fixed analytic distance field for the declared distant cuboid.
+        background = FrozenPrimitives(primitives=[{"kind": "cuboid", "pose": [0., 0., -1., 1., 0., 0., 0.],
+            "dimensions": [.1, .1, .1]}], owner_ids=("synthetic_far_obstacle",),
+            source="fully specified synthetic distant cuboid")
+        # END planning and execution serialize this same field.
         coverage = ObservedSpace(np.ones((81, 81, 81), bool), origin=[-2., -2., -2.], voxel_size=.05,
                                  observation_ids=("explicit synthetic known-space grid",), reference_frame="robot_base")
-        scene = PlanningScene(background=background, owners=installations, coverage=coverage, reference_frame="robot_base",
+        scene = OnlinePlanningScene(unknown_policy={"outside_regions": "forbid", "conditional_regions": []}, background=background, owners=installations, coverage=coverage, reference_frame="robot_base",
                               robot_sphere_materials=(None,)*kinematics.total_spheres,
                               robot_geometry_source=fixture["robot_geometry_source"],
                               gripper=hand)
@@ -230,7 +228,7 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
         report["candidate_scene_components"] = []
 
         def measured_export(planner, native_result):
-            """Measure actual exported candidates, including rejected ones."""
+            """Inspect the one accepted export without changing its result."""
             curve, count = original_export(planner, native_result)
             times = np.linspace(0., curve.duration, 401)
             # BEGIN the joint sample exposes acceleration before progress.

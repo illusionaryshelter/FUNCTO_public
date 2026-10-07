@@ -8,6 +8,7 @@ production IK backend or evidence about a physical robot's dynamics.
 # BEGIN scoped manifolds and true allowed-goal search regressions.
 from types import SimpleNamespace
 from dataclasses import replace
+from copy import copy
 import time
 import unittest
 from unittest.mock import patch
@@ -22,56 +23,57 @@ from manipulation.motion import MotionModel
 from manipulation.planning_problem import (MotionPhase, PlanningProblem,
     CoordinateEventRequirement, MechanismRequirement, PoseEventRequirement, PoseProcessRequirement,
     SupportRequirement)
-from manipulation.planning_scene import PlanningScene
+from manipulation.online_geometry import OnlinePlanningScene, FrozenPrimitives
 from tests.test_manipulation_planning_scene import (Attachment, CollisionOwner,
                                                     SphereQuery, pose_path, scene)
 
 
-# BEGIN bind the Cartesian fixture's declared exact sphere geometry explicitly.
-class CartesianSphereScene(PlanningScene):
-    """Source evaluator for this test's analytic sphere bodies only.
+# BEGIN Cartesian tests use the same registered-sphere online cost model.
+class CartesianSphereScene(OnlinePlanningScene):
+    """Convert test-only analytic spheres into the production online primitive.
 
-    The Cartesian robot and each obstacle are the spheres themselves, not
-    covering approximations to unbound mesh/URDF solids. Reuse their existing
-    distance evaluator and all task/attachment/unknown-space terms. This
-    explicit test adapter cannot be selected by a production scene, and does
-    not return an unconditional free-space result for the source interface.
+    These synthetic bodies are exact spheres, not mesh proxies. Explicit
+    robot pairs enter the same components() query as world geometry; there
+    is no independent source-self or source-world acceptance hook.
     """
-    def __init__(self, source):
-        if (source.gripper is not None or source.contacts or source.robot_validator is not None
-                or any(type(query) is not SphereQuery
-                       for query in (source.background, *(owner.query for owner in source.owners)))):
-            raise ValueError("Cartesian OMPL fixture requires its declared exact sphere bodies")
-        self.__dict__.update(source.__dict__)
+    def __init__(self, source, fixed_self_sphere=None):
+        if source.gripper is not None or source.contacts or any(type(query) is not SphereQuery
+                for query in (source.background,*(owner.query for owner in source.owners))):
+            raise ValueError('Cartesian fixture requires its declared exact sphere bodies')
+        def convert(query):
+            return FrozenPrimitives(primitives=[{'kind':'sphere','dimensions':[query.radius],
+                'pose':[*query.center,1.,0.,0.,0.]}],owner_ids=query.owner_ids,source=query.source)
+        owners=tuple(copy(owner) for owner in source.owners)
+        for owner in owners:
+            owner.query=convert(owner.query)
+        count=1 if fixed_self_sphere is None else 2
+        super().__init__(background=convert(source.background),owners=owners,coverage=source.coverage,
+            reference_frame=source.reference_frame,robot_sphere_materials=(None,)*count,
+            robot_geometry_source='declared Cartesian sphere robot',has_gripper=False,
+            unknown_policy={'outside_regions':'forbid','conditional_regions':[{
+                'lower_m':[-3.]*3,'upper_m':[3.]*3,'source':'bounded synthetic joint workspace'}]})
+        geometry=[{'link_name':'Cartesian_tool','sphere_indices':[0],
+            'centers_local':[[0.,0.,0.]],'radii':[.01]}]
+        if fixed_self_sphere is not None:
+            geometry.append({'link_name':'fixed_robot_base','sphere_indices':[1],
+                'centers_local':[list(fixed_self_sphere[:3])],'radii':[fixed_self_sphere[3]]})
+        self.bind_online_robot(robot_sphere_geometry=geometry,
+            robot_self_collision_pairs=[] if count==1 else [[0,1]])
+# END selected prefixes share immutable geometry and own their release history.
 
-    def evaluate_source(self, *args, valid=None, diagnostics=None, components_out=None, **kwargs):
-        if diagnostics is not None:
-            raise ValueError("Cartesian OMPL fixture does not supply production solid reports")
-        terms = self.components(*args, **kwargs)
-        if valid is not None:
-            terms = {name: torch.where(valid, value, torch.zeros_like(value))
-                     for name, value in terms.items()}
-        if components_out is not None:
-            components_out.update(terms)
-        known = [value for name, value in terms.items()
-                 if not name.startswith("unknown/") or name.startswith("unknown/release_anchor/")]
-        return torch.stack(known).sum(0) if known else torch.zeros_like(args[3])
-# END cloned search scenes retain the same analytic source evaluator and history.
 
-
-def cartesian_planner(problem, world=None):
+def cartesian_planner(problem, world=None, *, fixed_self_sphere=None):
     """Three named translation joints with a fixed tool orientation."""
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.torch, planner.problem = torch, problem
     planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
     planner.budget = PlanningBudget(search_seconds=3., validation_joint_step=.08)
     planner.joint_names = problem.joint_names
-    # BEGIN the synthetic robot supplies its own explicit source-world model.
-    planner.scene = CartesianSphereScene(scene() if world is None else world)
-    # END real planning scenes still require their bound Pinocchio/Coal checker.
-    # BEGIN this one-body Cartesian fixture has no source self-collision pair.
-    planner.scene.check_robot_self_collision = lambda q, names, times, **kwargs: torch.zeros_like(times)
-    # END OMPL still checks every configured task and observed obstacle.
+    planner.scene=CartesianSphereScene(scene() if world is None else world,fixed_self_sphere)
+    # A CPU test has no external scene epoch or cancellation sender. Production
+    # installs this request checker when binding the resident backend.
+    planner.check_request=lambda:None
+    planner.goal_ik_candidates={}
     planner.anchors = np.unique(np.r_[problem.anchors, planner.scene.required_progress_anchors])
     planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.tensor(value, dtype=torch.float64))
     planner.start = SimpleNamespace(position=torch.tensor(problem.start_q[None], dtype=torch.float64))
@@ -79,7 +81,18 @@ def cartesian_planner(problem, world=None):
     planner.trajopt = SimpleNamespace(action_horizon=8, transition_model=SimpleNamespace(
         action_bound_lows=torch.full((dof,), -2.), action_bound_highs=torch.full((dof,), 2.)))
     planner.formal_clock, planner.finger_trajectory = {"duration": 1.}, None
-    planner.physical_domain = SimpleNamespace(initialize=lambda values: values)
+    def fit_test_initializer(parameters,positions,*,prior_controls,velocity_bounds):
+        # The fixture has Cartesian sample controls, not a native GPU spline.
+        # This resampling only packages the geometrically checked OMPL path;
+        # physical native spline fitting has its own representation tests.
+        values=positions.detach().cpu().numpy()
+        output=np.column_stack([np.interp(np.linspace(0.,1.,len(prior_controls)),
+            parameters,values[:,joint]) for joint in range(values.shape[-1])])
+        return positions.new_tensor(output),{'model':'test Cartesian sample initializer'}
+    planner.physical_domain=SimpleNamespace(initialize=lambda values:values,fit_reference=fit_test_initializer,
+        evaluate=lambda controls,parameters:np.column_stack([
+            np.interp(parameters,np.linspace(0.,1.,len(controls)),controls[:,j])
+            for j in range(controls.shape[-1])]))
     planner.JointState, planner._RobotState = SimpleNamespace, SimpleNamespace
 
     def fk(state):
@@ -92,13 +105,19 @@ def cartesian_planner(problem, world=None):
             jacobian[..., 0, 5, 3] = 1.
         # A small attached test proxy, with a known finite collision model.
         spheres = torch.cat((q[..., :3], q.new_full((*q.shape[:2], 1), .01)), -1)[:, :, None]
+        if fixed_self_sphere is not None:
+            fixed=q.new_tensor(fixed_self_sphere).expand(*q.shape[:2],1,4)
+            spheres=torch.cat((spheres,fixed),dim=-2)
         return SimpleNamespace(tool_poses=SimpleNamespace(tool_frames=[problem.tool_link],
             position=q[:, :, None, :3], quaternion=orientation), robot_spheres=spheres,
             tool_jacobians=jacobian)
     planner._verification_fk = SimpleNamespace(compute_kinematics=fk)
     planner._orientation_vjp = _orientation_vjp_type()
     planner._native_layout = SimpleNamespace(apply=lambda value: value)
-    planner._verification_native = SimpleNamespace(get_cost=lambda name: None,
+    limits=SimpleNamespace(joint_names=planner.joint_names,
+        velocity=torch.tensor([[-20.]*dof,[20.]*dof],dtype=torch.float64))
+    cspace=SimpleNamespace(config=SimpleNamespace(joint_limits=limits))
+    planner._verification_native = SimpleNamespace(get_cost=lambda name: cspace if name=='cspace' else None,
         compute_costs=lambda state: SimpleNamespace(names=(), values=()))
     return planner
 
@@ -119,27 +138,18 @@ class ScopedOmplSearchTest(unittest.TestCase):
         return planner.ompl_seed(torch.zeros((1, 1, 8, len(planner.joint_names)), dtype=torch.float64),
                                 SimpleNamespace(duration=1., _curve=curve))
 
-    # BEGIN OMPL requires source separation even when every proxy/scene term is zero.
-    def test_source_self_collision_rejects_an_otherwise_free_boundary(self):
-        planner = cartesian_planner(problem())
-        planner.budget = replace(planner.budget, ik_seeds=2, trajectory_seeds=1)
-        calls = []
-
-        def source_check(q, names, times, **kwargs):
-            calls.append((q.clone(), times.clone()))
-            return (times == 1.).to(times)
-
-        planner.scene.check_robot_self_collision = source_check
-        seed, report = self.search(planner, lambda t: np.zeros(3))
+    # BEGIN registered sphere pairs constrain every OMPL goal proposal.
+    def test_registered_robot_self_pair_rejects_an_otherwise_free_boundary(self):
+        request=problem(pose_events=(pose_goal(1.,[.5,0.,0.],tolerance=.001),))
+        planner=cartesian_planner(request,fixed_self_sphere=(.5,0.,0.,.1))
+        planner.budget=replace(planner.budget,ik_seeds=2,trajectory_seeds=1)
+        seed,report=self.search(planner,lambda t:np.array([.5*t,0.,0.]))
         self.assertIsNone(seed)
-        self.assertEqual(len(report["branches"]), 2)
-        for branch in report["branches"]:
-            self.assertEqual(branch["failure"], "boundary_candidate_not_feasible")
-            terms = branch["first_invalid_states"][0]["terms"]
-            self.assertEqual(terms["scene"], 0.)
-            self.assertEqual(terms["source_self_collision"], 1.)
-        self.assertTrue(any(bool((times == 1.).any()) for _, times in calls))
-    # END all proposals still pass the same actual-time solid check.
+        self.assertEqual(len(report['branches']),2)
+        for branch in report['branches']:
+            self.assertEqual(branch['failure'],'boundary_candidate_not_feasible')
+            self.assertGreater(branch['first_invalid_states'][0]['terms']['scene'],0.)
+    # END no separate source checker supplies or overrides this online result.
 
     def test_native_goal_projection_preserves_free_direction_and_fixed_time(self):
         # Two bands, one free tangent, one duplicate equation. A projected
@@ -279,7 +289,7 @@ class ScopedOmplSearchTest(unittest.TestCase):
 
     def test_shared_query_budget_never_overshoots_on_complete_path_batch(self):
         planner = cartesian_planner(problem())
-        planner.budget = replace(planner.budget, max_validation_points=32, max_refinement_points=32)
+        planner.budget = replace(planner.budget, max_validation_points=32,max_task_anchors=32)
         seed, report = self.search(planner, lambda t: np.array([t, 0., 0.]))
         self.assertLessEqual(report["state_queries"], 32)
         self.assertIsNone(seed)
@@ -297,7 +307,7 @@ class ScopedOmplSearchTest(unittest.TestCase):
         self.assertIsNotNone(seed, report)
         self.assertEqual(report["chart_times"], [0., .4, 1.])
         self.assertFalse(world._fixed_release_poses)
-        self.assertFalse(any("unknown/release_anchor" in str(row.get("first_invalid_states", ""))
+        self.assertFalse(any("unsupported/release_anchor" in str(row.get("first_invalid_states", ""))
                              for row in report["branches"]))
 
     def test_two_turn_path_survives_local_screening_and_checks_full_lifted_history(self):

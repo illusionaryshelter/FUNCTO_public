@@ -87,16 +87,13 @@ def main():
     paired_optimizers = []
     try:
         planner = _CuroboPlanner(problem, scene, robot, budget, "cuda:0", robot_validator=validator)
-        # BEGIN match production: typed process goals own both trajectory phases.
-        planner.trajopt.disable_tool_pose_tracking()
-        goal = planner._goal(planner.problem.phase_count)
-        # END native goal metadata supplies storage only.
+        # BEGIN bind the same real functional goal or goal-free native route.
         seed = planner.start.position[:, None].expand(1, planner.trajopt.action_horizon, -1).clone()
         planner.physical_domain.validate(seed)
+        solve_state, goal = planner._native_request(seed[:, None])
         seed_goal = JointState.from_position(seed[:, -1:, :].clone())
         seed_goal.dt = torch.full((1, 1), budget.maximum_trajectory_dt, device=device.device)
-        solve_state = SolveState(SolveMode.SINGLE, num_trajopt_seeds=1, batch_size=1,
-            num_envs=1, num_goalset=1, tool_frames=goal.tool_frames)
+        # END no reference endpoint is installed as a storage-only pose goal.
         goal_buffer, _ = planner.trajopt._prepare_goal_buffer(
             solve_state, goal, planner.start, False, seed_goal, None)
         planner.trajopt._update_rollout_params(goal_buffer)

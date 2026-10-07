@@ -1,10 +1,9 @@
-"""Mandatory independent robot checks at the execution boundary.
+"""Measured robot-state checks against the planner's bound online geometry.
 
-This gate covers native robot/installation solids, their complete pair policy,
-model FK and scalar joint limits. When a formal scene snapshot is bound it also
-checks observed scene/target/payload solids and finite local material permissions.
-It never certifies hidden space or collision between checked instants. Future independently actuated fingers are never frozen to a measured
-snapshot or replaced by position commands to claim a trajectory certificate.
+The robot model supplies calibrated FK and scalar joint limits. A production
+scene uses the accepted robot spheres and online distance fields, including
+finite material permissions. Source-solid pair queries remain standalone
+robot audits. Commands never substitute for measured finger coordinates.
 """
 
 # BEGIN independent preflight and actual-state execution gates.
@@ -37,9 +36,9 @@ def _scene_gate_violations(scene):
         if "actor" in evidence or "target_owner" in evidence:
             return "/".join(str(evidence.get(key, "")) for key in
                             ("actor", "actor_geometry", "target_owner", "target_geometry"))
-        return str(issue["reason"])
-    violations = [{**deepcopy(issue), "name": identity(issue)} for issue in scene["violations"]]
-    violations.extend({"kind": "independent_scene_query_incomplete", "name": identity(issue),
+        return str(issue.get("reason", issue.get("kind", "online_scene")))
+    violations = [{"kind": "online_scene_collision", **deepcopy(issue), "name": identity(issue)} for issue in scene["violations"]]
+    violations.extend({"kind": "online_scene_query_incomplete", "name": identity(issue),
                        "reason": issue["reason"], "query_evidence": deepcopy(issue)}
                       for issue in scene["query_gaps"])
     return violations
@@ -275,247 +274,77 @@ class RobotStateValidator:
         # Scene binding is a separate execution epoch, not robot model identity.
         record.pop("scene_bound")
         record.pop("object_contact_permission_checked")
+        # BEGIN source audit identity stays independent of an online epoch.
+        record["pair_order"] = [asdict(pair) for pair in self.pairs]
+        # END changing execution distance layout cannot change the robot model.
         record["model"] = self.checker.model_record()
         record["scope"] = "complete source robot/installation solids and required/excluded/mechanical pair policy"
         return record
     # END planning never changes the execution gate's complete actual-state policy.
 
-    # BEGIN bind independent scene validation to the exact accepted input snapshot.
+    # BEGIN execution reuses the planner's serialized online distance fields.
     def bind_scene(self, binding, progress_at_time, nominal_fingers=None):
-        """Bind f(t)->progress and optional nominal f(t)->(named finger q,dq).
+        """Bind one scene epoch and its robot-sphere layout, without source meshes.
 
-        The optional callback represents declared future geometry, never an
-        actuator command. Actual checks always take every coordinate directly
-        from feedback. The scene copy is owned by this validation epoch.
+        Pinocchio supplies frame transforms at measured named joints. Distances,
+        material contact rules and sphere self pairs come from the very same
+        OnlinePlanningScene record used by native planning residuals.
         """
+        from .online_geometry import OnlinePlanningScene
         if binding["reference_frame"] != self.reference_frame or not callable(progress_at_time):
-            raise ValueError("Independent scene and clock must share the bound reference frame")
-        if nominal_fingers is not None and not callable(nominal_fingers):
-            raise TypeError("Nominal finger geometry must be an explicit time sampler")
-        # BEGIN execution must retain the source solids that qualified a plan.
-        # A standalone scene diagnostic has no planned model to compare. A
-        # formal planning scene carries the complete model and pair policy;
-        # matching joint names or TCP calibration alone cannot substitute a
-        # smaller solid or a more permissive mechanical-contact declaration.
-        planned_robot = binding.get("robot_self_collision")
-        if planned_robot is not None and planned_robot != self.planning_binding_record():
-            raise ValueError("Execution source robot geometry and pair policy differ from the planned binding")
-        # END reject before changing the active execution scene or its clock.
+            raise ValueError("Online scene and execution clock must share the bound reference frame")
         hand = binding.get("gripper")
         if hand is not None and tuple(hand["joint_names"]) != self.finger_joint_names:
-            raise ValueError("Scene material translations and independent actual fingers must share the same named order")
+            raise ValueError("Online scene and measured fingers must use the same named order")
+        geometry = binding.get("robot_sphere_geometry")
+        if not isinstance(geometry, list) or not geometry:
+            raise ValueError("The online execution scene requires its native robot-sphere geometry")
+        # BEGIN FK must interpret the saved native spheres in the same model.
+        expected_model = {"urdf_path": str(self.checker.urdf_path), "base_frame": self.checker.base_frame,
+                          "tool_frame": self.tool_frame, "T_reference_base": self.T_reference_base.tolist(),
+                          "T_frame_tcp": self.T_frame_tcp.tolist()}
+        if binding.get("robot_model") != expected_model:
+            raise ValueError("Online robot sphere FK model and calibration differ from execution")
+        # END matching link names alone cannot establish calibrated identity.
+        indices = []
+        for row in geometry:
+            self.checker._frame_id(row["link_name"])
+            centers, radii = np.asarray(row["centers_local"], float), np.asarray(row["radii"], float)
+            ids = row["sphere_indices"]
+            if (centers.shape != (len(ids), 3) or radii.shape != (len(ids),)
+                    or not np.isfinite(centers).all() or not np.isfinite(radii).all()
+                    or any(type(index) is not int or index < 0 for index in ids)):
+                raise ValueError("Online robot spheres require finite local centers, radii and native indices")
+            indices.extend(ids)
+        if sorted(indices) != list(range(len(indices))):
+            raise ValueError("Online robot sphere indices must cover the exact native layout once")
+        scene = OnlinePlanningScene.from_binding(binding)
         self._scene_binding = deepcopy(binding)
+        self._online_scene = scene
+        self._online_sphere_count = len(indices)
         self._progress_at_time = progress_at_time
-        self._nominal_fingers = nominal_fingers
-        self.checker.bind_scene(binding)
 
-    def _scene_state(self, robot_state, tool_pose, finger_positions, time_s, *, state_kind, feedback=None,
-                     progress=None, active_robot_owner_permissions=frozenset(), active_contact_rule_ids=frozenset()):
+    def _scene_state(self, robot_state, tool_pose, time_s, *, feedback=None,
+                     active_contact_rule_ids=frozenset()):
+        """Transform the accepted native sphere layout with current measured FK."""
         feedback = feedback or {}
-        # BEGIN an old material-mode probe retains the pair permission just earned at arrival.
-        bound_progress = float(self._progress_at_time(float(time_s)))
-        progress = bound_progress if progress is None else progress
-        permission_progress = progress
-        if state_kind == "nominal" and progress < bound_progress and any(
-                rule["interval"][0] == bound_progress
-                for rule in self._scene_binding.get("robot_owner_permissions", ())):
-            permission_progress = bound_progress
-        # END all other scene laws still see their requested adjacent progress.
-        return self.checker.query_scene(robot_state, tool_pose=tool_pose,
-            progress=float(progress), finger_positions=finger_positions,
-            state_kind=state_kind, owner_poses=feedback.get("scene_owner_poses"),
-            condition_evidence=feedback.get("scene_condition_evidence"),
-            # BEGIN only actual execution carries arrival-latched authorization.
-            active_robot_owner_permissions=(None if state_kind == "nominal" else active_robot_owner_permissions),
-            # BEGIN finite material activation is independent of historical pair exemptions.
-            active_contact_rule_ids=(None if state_kind == "nominal" else active_contact_rule_ids),
-            # END actual progress cannot substitute for measured-arrival authorization.
-            robot_owner_permission_progress=permission_progress,
-            # BEGIN an additional nominal/actual state owns one shared selection.
-            # These CPU preflight or measured states have no captured native
-            # query to replay. Select once from their complete bound covers;
-            # query_scene archives that decision before any distance query.
-            select_layers=True)
-            # END diagnostic native-query replay supplies its original record.
-            # END nominal geometry remains explicitly conditional on the bound arrival.
-
-    # BEGIN release anchors come from the same executable cubic and bound clock.
-    def _bind_release_predictions(self, trajectory):
-        """Compute conditional release FK at its first bound progress occurrence.
-
-        This is the same explicit first-occurrence convention as the planning
-        scene's release gather. It does not invert arbitrary progress queries
-        to guess a finger time or claim the object was observed at this pose.
-        """
-        from scipy.spatial.transform import Rotation
-        predictions = {}
-        s, u = np.asarray(trajectory.progress_s, float), np.asarray(trajectory.progress_u, float)
-        if s.shape != u.shape or len(s) < 2 or np.any(np.diff(s) < 0) or np.any(np.diff(u) <= 0):
-            raise ValueError("Release predictions require the exact finite monotone bound clock")
-        for owner in self._scene_binding["owners"]:
-            for index, relation in enumerate(owner["attachments"]):
-                if relation["release_condition_id"] is None:
-                    continue
-                progress = relation["interval"][1]
-                matches = np.flatnonzero(s >= progress)
-                if not len(matches):
-                    raise ValueError("Release relation exceeds the executable progress domain")
-                right = int(matches[0])
-                parameter = u[right] if s[right] == progress or right == 0 else np.interp(progress, s[right-1:right+1], u[right-1:right+1])
-                time_s = float(parameter * trajectory.duration)
-                arm = trajectory._curve(time_s)
-                fingers = ([sum(self.checker.joint_limits[name])/2 for name in self.finger_joint_names]
-                           if self._nominal_fingers is None else self._nominal_fingers(time_s)[0])
-                # Unmodelled finger descendants cannot determine a release TCP.
-                joint = int(self.checker.model.frames[self.checker._frame_id(self.tool_frame)].parentJoint)
-                if self._nominal_fingers is None:
-                    while joint:
-                        if str(self.checker.model.names[joint]) in self.finger_joint_names:
-                            raise ValueError("A release TCP depending on unknown fingers needs explicit nominal geometry")
-                        joint = int(self.checker.model.parents[joint])
-                state = self.checker.query(joint_names=self.joint_names, joint_positions=np.r_[arm, fingers],
-                    T_reference_base=self.T_reference_base, pairs=(), frames=[self.tool_frame])
-                offset = np.eye(4)
-                offset[:3, :3] = Rotation.from_quat(np.asarray(relation["quaternion_tool_owner"])[[1, 2, 3, 0]]).as_matrix()
-                offset[:3, 3] = relation["position_tool_owner"]
-                pose = np.asarray(state["frame_poses"][self.tool_frame]) @ self.T_frame_tcp @ offset
-                predictions[(owner["owner_id"], index)] = {"pose": pose, "time_s": time_s,
-                    "source": "independent FK of the same bound cubic at first release progress"}
-        self.checker._scene_release_predictions = predictions
-    # END predicted release remains a model hypothesis, not actual release evidence.
-
-    # BEGIN required scene/event boundaries are explicit independent query times.
-    def _scene_query_times(self, trajectory, endpoints, start, stop):
-        values = list(endpoints)
-        for event in trajectory.events:
-            for key in ("time", "activation_time_s"):
-                if event.get(key) is not None:
-                    values.append(float(event[key]))
-        anchors = [value for rule in self._scene_binding["contacts"] for value in rule["interval"]]
-        # BEGIN independent validation samples each explicit pair-policy boundary.
-        anchors += [value for rule in self._scene_binding.get("robot_owner_permissions", ())
-                    for value in rule["interval"]]
-        # END these boundaries do not replace the measured execution arrival latch.
-        anchors += [value for owner in self._scene_binding["owners"]
-                    for relation in owner["attachments"] for value in relation["interval"]]
-        # Use the same binary64 clock arithmetic as sample() and the mode
-        # probes below, even when the archived native progress keys are f32.
-        s, u = np.asarray(trajectory.progress_s, float), np.asarray(trajectory.progress_u, float)
-        for anchor in anchors:
-            exact = np.flatnonzero(s == anchor)
-            if len(exact):
-                values.extend((float(u[exact[0]]*trajectory.duration), float(u[exact[-1]]*trajectory.duration)))
-            elif s[0] <= anchor <= s[-1]:
-                right = int(np.searchsorted(s, anchor))
-                values.append(float(np.interp(anchor, s[right-1:right+1], u[right-1:right+1])*trajectory.duration))
-        hand = self._scene_binding.get("gripper")
-        if hand is not None and hand["nominal_model"] is not None:
-            values.extend(hand["nominal_model"]["times"])
-        result = np.asarray(values, float)
-        if not np.isfinite(result).all():
-            raise ValueError("Required independent scene query times must be finite")
-        return np.unique(result[(result >= start) & (result <= stop)])
-    # END querying a boundary never changes the native curve or its clock.
-
-    # BEGIN each mode switch is checked on both sides at the identical state.
-    def _scene_progress_modes(self, trajectory, time_s):
-        """Keep q(t), fingers(t) and TCP(t) fixed while selecting adjacent laws.
-
-        Contact/attachment masks are discontinuous even for continuous motion.
-        At a progress plateau only its entrance has a preceding mode and only
-        its exit has a following mode. Float64 neighbours are consumed directly
-        by the independent checker, never converted to a planner float32 grid.
-        """
-        modes = [(float(self._progress_at_time(float(time_s))), "bound_progress")]
-        anchors = {value for rule in self._scene_binding["contacts"] for value in rule["interval"]}
-        anchors.update(value for owner in self._scene_binding["owners"]
-                       for relation in owner["attachments"] for value in relation["interval"])
-        # BEGIN arrival is checked before enabling the new pair policy at this state.
-        # A counterfactual old collision law at that same already-arrived state
-        # would undo the declared permission. Its preceding trajectory samples
-        # retain the old law; an interval end still checks the subsequent law.
-        pair_ends = {rule["interval"][1]
-                     for rule in self._scene_binding.get("robot_owner_permissions", ())}
-        ordinary_anchors = set(anchors)
-        anchors.update(pair_ends)
-        # END finite material/attachment boundaries retain their original checks.
-        s, u = np.asarray(trajectory.progress_s, float), np.asarray(trajectory.progress_u, float)
-        for anchor in sorted(anchors):
-            if not s[0] <= anchor <= s[-1]:
-                continue
-            exact = np.flatnonzero(s == anchor)
-            if len(exact):
-                first, last = u[exact[0]]*trajectory.duration, u[exact[-1]]*trajectory.duration
-            else:
-                right = int(np.searchsorted(s, anchor))
-                first = last = float(np.interp(anchor, s[right-1:right+1], u[right-1:right+1])*trajectory.duration)
-            if time_s == first and anchor > s[0] and anchor in ordinary_anchors:
-                modes.append((float(np.nextafter(anchor, -np.inf)), "before_switch"))
-            if time_s == last and anchor < s[-1]:
-                modes.append((float(np.nextafter(anchor, np.inf)), "after_switch"))
-        return modes
-    # END mode probes do not advance the command clock or freeze actual fingers.
-
-    def _nominal_scene_preflight(self, trajectory, times):
-        """Discrete future solid evidence with explicit uncertainty and coverage.
-
-        No actual finger snapshot is frozen along the reference. Without a
-        declared model, future hand geometry remains an allowed unresolved
-        assumption; the report cannot claim that its solids were checked.
-        Actual complete robot/scene checks remain mandatory while executing.
-        """
-        unmodelled = (() if self._nominal_fingers is not None else
-                      self.checker.geometry_depending_on(self.finger_joint_names))
-        known_pairs = tuple(pair for pair in self.pairs if pair.first not in unmodelled and pair.second not in unmodelled)
-        queries = [(time_s, self._scene_progress_modes(trajectory, time_s)) for time_s in times]
-        requested = sum(len(modes) for _, modes in queries)
-        if requested > 2048:
-            gap = {"reason": "independent_nominal_state_budget", "requested": requested}
-            return {"passed": False, "violations": _scene_gate_violations({"violations": [], "query_gaps": [gap]}),
-                    "states": [], "observed_scene_checked": False, "query_gaps": [gap]}
-        states, violations, gaps = [], [], []
-        for time_s, modes in queries:
-            arm_q, arm_dq = trajectory._curve(time_s), trajectory._curve(time_s, 1)
-            if self._nominal_fingers is None:
-                # Pinocchio requires a complete vector to evaluate the tree.
-                # These interior placeholders affect ONLY excluded descendant
-                # solids; no finger geometry, limit or relation is certified.
-                finger_q = [sum(self.checker.joint_limits[name])/2 for name in self.finger_joint_names]
-                finger_dq = np.zeros(len(self.finger_joint_names))
-                contact_fingers = None
-            else:
-                finger_q, finger_dq = self._nominal_fingers(float(time_s))
-                contact_fingers = np.asarray(finger_q)
-            q, dq = np.r_[arm_q, finger_q], np.r_[arm_dq, finger_dq]
-            if q.shape != (len(self.joint_names),) or dq.shape != q.shape or not np.isfinite(np.r_[q, dq]).all():
-                raise ValueError("Nominal full state must supply each named arm/finger coordinate")
-            robot = self.checker.query(joint_names=self.joint_names, joint_positions=q,
-                T_reference_base=self.T_reference_base, pairs=known_pairs, frames=[self.tool_frame])
-            robot["unmodelled_geometry_names"] = unmodelled
-            tool_pose = np.asarray(robot["frame_poses"][self.tool_frame]) @ self.T_frame_tcp
-            for name, row in robot["joint_limit_violations"].items():
-                violations.append({"kind": "nominal_joint_position", "name": name, "time_s": float(time_s), **row})
-            for name, speed in zip(self.joint_names, dq):
-                if abs(speed) > self.velocity_limits[name]:
-                    violations.append({"kind": "nominal_joint_velocity", "name": name, "time_s": float(time_s), "measured": float(speed)})
-            for pair in robot["pairs"]:
-                if pair["policy"] == "required" and pair["relation"] != "separated":
-                    violations.append({"kind": "independent_nominal_robot_collision", "name": pair["first"]+" / "+pair["second"],
-                                       "time_s": float(time_s), "evidence": pair})
-            # BEGIN raw evidence identifies the same-time one-sided rule scope.
-            for progress, mode in modes:
-                scene = self._scene_state(robot, tool_pose, contact_fingers, time_s,
-                    state_kind="nominal", progress=progress)
-                scope = {"time_s": float(time_s), "mode": mode, "progress": progress}
-                violations.extend({**row, **scope} for row in _scene_gate_violations(scene))
-                gaps.extend({**row, **scope} for row in scene["query_gaps"])
-                states.append({**scope, "scene": scene, "robot_pairs": robot["pairs"]})
-            # END an endpoint permission never suppresses an adjacent old mode.
-        return {"passed": not violations and not gaps, "violations": violations, "query_gaps": gaps,
-                "states": states, "observed_scene_checked": not gaps and not unmodelled and all(row["scene"]["observed_scene_checked"] for row in states),
-                "unresolved_assumptions": ([] if not unmodelled else [{"kind": "future_finger_geometry_unbound", "geometry_names": list(unmodelled)}]),
-                "continuous_collision_certified": False}
-    # END only explicit geometry models enter nominal solid checks.
+        spheres = np.empty((self._online_sphere_count, 4), float)
+        for row in self._scene_binding["robot_sphere_geometry"]:
+            pose = np.asarray(robot_state["frame_poses"][row["link_name"]], float)
+            ids = np.asarray(row["sphere_indices"], int)
+            spheres[ids, :3] = np.asarray(row["centers_local"], float) @ pose[:3, :3].T + pose[:3, 3]
+            spheres[ids, 3] = row["radii"]
+        scene = self._online_scene.query_state(spheres, tool_pose,
+            float(self._progress_at_time(float(time_s))),
+            joint_position=robot_state["joint_positions"], joint_names=robot_state["joint_names"],
+            trajectory_time=float(time_s), active_contact_rule_ids=frozenset(active_contact_rule_ids),
+            owner_poses=feedback.get("scene_owner_poses"),
+            condition_evidence=feedback.get("scene_condition_evidence"))
+        # Query gaps are explicit online failures when present; source-mesh
+        # coverage and nominal release reconstruction are not execution gates.
+        scene.setdefault("query_gaps", [])
+        return scene
+    # END fresh binding owns no inherited arrival latch or source-world checker.
 
     def describe(self):
         """Static report defines the order of every per-state distance vector."""
@@ -528,7 +357,7 @@ class RobotStateValidator:
                 "joint_position_limits": {name: list(self.checker.joint_limits[name]) for name in self.joint_names},
                 "joint_velocity_limits": dict(self.velocity_limits),
                 "geometry_sources": self.checker.geometry_sources,
-                "pair_order": [asdict(pair) for pair in self.pairs],
+                "pair_order": ([] if hasattr(self, "_online_scene") else [asdict(pair) for pair in self.pairs]),
                 "numerics": dict(self.checker.numerics),
                 "fk_model_translation_tolerance_m": self.fk_translation_tolerance_m,
                 "fk_model_rotation_tolerance_rad": self.fk_rotation_tolerance_rad,
@@ -536,7 +365,9 @@ class RobotStateValidator:
                 "fk_tolerance_scope": "Consistency of known robot models/calibration at the same measured joints; even a 1e-8 tolerance is not physical Cartesian sensing accuracy",
                 "robot_pose_scope": "Fixed calibrated base and TCP FK estimates from measured joint positions; no independent Cartesian observation",
                 # END physical tracking and task tolerances keep their own meaning.
-                "scope": "robot self/installation solids, model FK and joint position/velocity limits only",
+                "scope": ("bound online geometry, measured robot spheres, model FK and joint limits"
+                          if hasattr(self, "_online_scene") else
+                          "standalone source robot self-collision audit, model FK and joint limits"),
                 "observed_scene_checked": False, "unknown_space_checked": False,
                 "continuous_collision_certified": False,
                 "scene_bound": hasattr(self, "_scene_binding"),
@@ -546,8 +377,7 @@ class RobotStateValidator:
         return {"translation_m": float(np.linalg.norm(actual[:3, 3]-expected[:3, 3])),
                 "rotation_rad": float(Rotation.from_matrix(expected[:3, :3].T @ actual[:3, :3]).magnitude())}
 
-    def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset(),
-                    active_contact_rule_ids=frozenset()):
+    def check_state(self, feedback, *, stage, trajectory_time, active_contact_rule_ids=frozenset()):
         """Gate full actual q, after the executor validates identity and time.
 
         Clock freshness and physical tracking use the execution layer's own
@@ -578,8 +408,15 @@ class RobotStateValidator:
         velocities = np.asarray(feedback["dq"])
         if velocities.shape != (len(self.joint_names),) or velocities.dtype.kind not in "iuf" or not np.isfinite(velocities).all():
             raise ValueError("Independent validation requires one finite actual velocity per named joint")
+        # BEGIN online acceptance needs FK only from the source robot model.
+        frames = [self.tool_frame]
+        if hasattr(self, "_online_scene"):
+            frames.extend(row["link_name"] for row in self._scene_binding["robot_sphere_geometry"])
         result = self.checker.query(joint_names=self.joint_names, joint_positions=feedback["q"],
-                                    T_reference_base=self.T_reference_base, pairs=self.pairs, frames=[self.tool_frame])
+            T_reference_base=self.T_reference_base,
+            pairs=() if hasattr(self, "_online_scene") else self.pairs,
+            frames=list(dict.fromkeys(frames)))
+        # END standalone source self-collision checks remain an explicit audit.
         expected_tool = np.asarray(result["frame_poses"][self.tool_frame]) @ self.T_frame_tcp
         base_error = self._pose_difference(base, self.T_reference_base)
         tool_error = self._pose_difference(estimated_tool, expected_tool)
@@ -620,10 +457,8 @@ class RobotStateValidator:
                 "scope": "supplied robot solids at this actual state; no between-state or scene certificate"}
         # BEGIN current scene geometry consumes actual q and current explicit evidence.
         if hasattr(self, "_scene_binding"):
-            fingers = np.asarray(feedback["q"], float)[len(self.arm_joint_names):]
             # BEGIN the execution epoch alone authorizes a measured-arrival permission.
-            scene = self._scene_state(result, expected_tool, fingers, trajectory_time, state_kind="actual", feedback=feedback,
-                                      active_robot_owner_permissions=active_robot_owner_permissions,
+            scene = self._scene_state(result, expected_tool, trajectory_time, feedback=feedback,
                                       active_contact_rule_ids=active_contact_rule_ids)
             # END actual time by itself cannot remove a robot/owner collision.
             report["scene"] = scene
@@ -635,7 +470,7 @@ class RobotStateValidator:
         # END commands and nominal predictions never replace measured fingers.
 
     def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0., until=None, current_time=None,
-                  active_robot_owner_permissions=frozenset(), active_contact_rule_ids=frozenset()):
+                  active_contact_rule_ids=frozenset()):
         """Check actual entrance and reference cubic q/dq over its whole prefix.
 
         Each scalar cubic's exact polynomial derivative supplies its critical
@@ -657,11 +492,8 @@ class RobotStateValidator:
                 or not 0 <= current_time <= trajectory.duration):
             raise ValueError("Current actual feedback must use its own original trajectory time")
         # END device tick alignment must not silently shift a contact-rule interval.
-        if hasattr(self, "_scene_binding"):
-            self._bind_release_predictions(trajectory)
         # BEGIN continuation preflight consumes this execution's same arrival latch.
         initial = self.check_state(initial_feedback, stage="preflight_actual_state", trajectory_time=float(current_time),
-                                   active_robot_owner_permissions=active_robot_owner_permissions,
                                    active_contact_rule_ids=active_contact_rule_ids)
         # END a newly created validator does not infer prior arrival from progress.
         times = np.asarray(trajectory.times, dtype=float)
@@ -711,19 +543,16 @@ class RobotStateValidator:
                                        "maximum_absolute": self.velocity_limits[name],
                                        "time_s": row["velocity"][bound+"_time_s"]})
             extrema[name] = row
-        # BEGIN nominal geometry is checked at the exported knots and authorized endpoint.
-        nominal = None
-        if hasattr(self, "_scene_binding"):
-            nominal = self._nominal_scene_preflight(trajectory, self._scene_query_times(trajectory, endpoints, start_time, stop))
-            violations.extend(nominal["violations"])
-        return {"passed": not violations and initial["passed"] and (nominal is None or nominal["passed"]),
-                "violations": violations, "nominal_scene": nominal,
-                "query_gaps": ([] if nominal is None else nominal["query_gaps"]) + initial.get("query_gaps", []),
-                "scope": "actual entrance solids/FK, continuous scalar q/dq and explicitly modeled discrete nominal solids",
+        # BEGIN native acceptance already owns this exact nominal curve.
+        # Preflight keeps cheap scalar polynomial checks and the actual entrance;
+        # it never starts another full-curve source-world certification chain.
+        return {"passed": not violations and initial["passed"], "violations": violations,
+                "query_gaps": initial.get("query_gaps", []),
+                "scope": "Same online scene at measured entrance, model FK and scalar reference q/dq",
                 "checked_interval_s": [float(start_time), stop], "reference_cubic_extrema": extrema,
-                "actual_state": initial, "future_finger_states_assumed": bool(nominal is not None and self._nominal_fingers is not None),
-                "reference_collision_checked": bool(nominal is not None and nominal["states"]), "continuous_collision_certified": False,
-                "observed_scene_checked": bool(nominal is not None and nominal["observed_scene_checked"]),
+                "actual_state": initial, "future_finger_states_assumed": False,
+                "reference_collision_checked": False, "continuous_collision_certified": False,
+                "observed_scene_checked": bool(hasattr(self, "_online_scene")),
                 "unknown_space_checked": False}
-        # END missing future hand geometry remains explicit unresolved evidence.
+        # END actual fingers are always feedback coordinates, never commands.
 # END independent preflight and actual-state execution gates.

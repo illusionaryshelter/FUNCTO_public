@@ -30,7 +30,7 @@ def problem(events=(), goals=()):
 
 def continuation(request, *, elapsed=.4, curve_time=.4, applied=(), completed=()):
     """One previous native binding plus actual execution facts, independently built."""
-    budget = PlanningBudget(maximum_trajectory_solves=4)
+    budget = PlanningBudget(maximum_trajectory_solves=2)
     ledger = _request_work_ledger(request, budget)
     ledger["consumed_planning"].update(binding_attempts=1, initializations=1, ik_batches=1,
         ik_queries=8, trajectory_solves=1, validation_passes=1, validation_queries=33, planning_seconds=.1)
@@ -554,14 +554,14 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
 
     def test_failed_first_initialization_does_not_mutate_callers_hand_or_problem(self):
         request = problem((PlanningEvent("future", "s", .8, 2, "open", "source"),))
-        scene = SimpleNamespace(gripper=SimpleNamespace(clock=None, commands=["original"]),
+        scene = SimpleNamespace(gripper=SimpleNamespace(clock=None, commands=[plain(request.events[0])]),
                                 required_progress_anchors=(), bind_robot_validator=Mock())
         scene.clone_for_rollout = lambda: deepcopy(scene)
         before = plain(request)
         def partially_initialize(private_problem, private_scene, *args, **kwargs):
             private_problem.events = ()
             private_scene.gripper.clock = {"bound": True}
-            private_scene.gripper.commands.clear()
+            private_scene.gripper.commands = ()
             raise ValueError("native allocation failed after clock binding")
         with patch("manipulation.planning._CuroboPlanner", side_effect=partially_initialize):
             result = plan_trajectory(request, scene, {}, robot_validator=self.robot_validator)
@@ -569,40 +569,40 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
         self.assertIn("native allocation failed", result.diagnostics["reason"])
         self.assertEqual(plain(request), before)
         self.assertIsNone(scene.gripper.clock)
-        self.assertEqual(scene.gripper.commands, ["original"])
+        self.assertEqual(scene.gripper.commands, [plain(request.events[0])])
         self.assertEqual(result.request_ledger["consumed_planning"]["initializations"], 1)
 
     def test_cleanup_overrun_keeps_an_already_qualified_candidate(self):
-        from test_manipulation_planning import PlannerRetryContractTests
-        fixture = PlannerRetryContractTests()
-        planner, _, _ = fixture.scripted_planner([True], [0.])
+        from test_motion_backend_contract import Native, Scene
+        planner = Native([True])
         clock = {"time": 0.}
-        planner.close.side_effect = lambda: clock.update(time=2.)
-        with patch("manipulation.planning.time.monotonic", side_effect=lambda: clock["time"]):
-            result = fixture.run_planner(planner, PlanningBudget(maximum_trajectory_solves=1, planning_seconds=1.))
+        planner.close = lambda: clock.update(time=2.)
+        with patch("manipulation.planning.time.monotonic", side_effect=lambda: clock["time"]), \
+                patch("manipulation.planning._CuroboPlanner", return_value=planner), \
+                patch("manipulation.execution_binding.bind_candidate", return_value={"candidate_id": "accepted"}):
+            result = plan_trajectory(problem(), Scene(), {}, robot_validator=self.robot_validator,
+                                     budget=PlanningBudget(planning_seconds=1.))
         self.assertTrue(result.success)
-        self.assertIsNotNone(result.execution_binding)
         self.assertEqual(result.diagnostics["qualified_candidate_elapsed_seconds"], 0.)
         self.assertEqual(result.request_ledger["consumed_planning"]["planning_seconds"], 2.)
-        self.assertTrue(result.diagnostics["budget_exhausted_after_qualification"])
+        self.assertTrue(result.diagnostics["planning_budget_exhausted"])
 
     def test_binding_stage_overrun_is_not_an_already_qualified_candidate(self):
-        from test_manipulation_planning import PlannerRetryContractTests
-        planner, _, _ = PlannerRetryContractTests().scripted_planner([True], [0.])
+        from test_motion_backend_contract import Native, Scene
+        planner = Native([True])
         clock = {"time": 0.}
         def expensive_binding(*args, **kwargs):
             clock["time"] = 2.
             return {"candidate_id": "too-late"}
-        scene = SimpleNamespace(describe=lambda: {}, bind_robot_validator=Mock())
-        scene.clone_for_rollout = lambda: deepcopy(scene)
         with patch("manipulation.planning.time.monotonic", side_effect=lambda: clock["time"]), \
                 patch("manipulation.planning._CuroboPlanner", return_value=planner), \
                 patch("manipulation.execution_binding.bind_candidate", side_effect=expensive_binding):
-            result = plan_trajectory(problem(), scene, {}, robot_validator=self.robot_validator,
-                                     budget=PlanningBudget(maximum_trajectory_solves=1, planning_seconds=1.))
+            result = plan_trajectory(problem(), Scene(), {}, robot_validator=self.robot_validator,
+                                     budget=PlanningBudget(planning_seconds=1.))
         self.assertFalse(result.success)
         self.assertIsNone(result.execution_binding)
         self.assertEqual(result.diagnostics["failure"], "cumulative_planning_budget_exhausted")
+        self.assertIs(result.diagnostics["diagnostic_trajectory"], planner.curve)
 
     def test_single_goal_on_progress_plateau_does_not_require_later_holding(self):
         goal = PoseEventRequirement(.5, np.eye(4), np.eye(4), .01, .02, "single arrival")

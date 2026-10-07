@@ -929,234 +929,89 @@ false: this module does not add cuRobo/OMPL, whole-robot collision, trajectory
 optimization or proof of complete `inside`/physical execution.
 <!-- END production projective registration screening and selected trajectory. -->
 
-<!-- BEGIN complete-window constrained robot planning. -->
-### Plan a robot trajectory for grounded skills
+<!-- BEGIN shared resident motion backend and fixed online scene. -->
+## Robot motion planning and execution
 
-The [Motion Planner PRD](motion_planner_prd.md) defines the system and component
-contracts, acceptance criteria, existing implementation gaps, and decisions
-that still require approval. It is a requirements baseline for review, not a
-claim that the current planner or physical execution has passed every gate.
+The motion contract is defined in [motion_planner_prd.md](motion_planner_prd.md).
+Skills supply typed goals, process requirements, current object bindings,
+finite material permissions and original event identities. Ordinary `PosePath`
+samples provide initialization guidance; they do not create mandatory approach
+poses, stops, motion requests or additional validation capacity.
 
-Grounding produces the interaction requirements and geometric reference.
-`manipulation.planning.plan_trajectory` uses cuRobo V2 to solve one joint
-trajectory through the current skill and at most one explicitly supplied next
-skill. Requests with more than two skills are rejected before grounding;
-each accepted skill retains all of its motion phases. Required local
-motion, functional events, joint limits, self collision and scene constraints
-participate in generation. When needed, OMPL searches ordinary or constrained
-`(q, progress)` connections and supplies an initializer for another complete
-cuRobo optimization.
-
-<!-- BEGIN retain native smoothness and reject an infeasible fixed entrance. -->
-The optimizer retains cuRobo's native trajectory regularization. Independent
-native and exported-curve constraints still determine acceptance. Before IK,
-the planner checks measured active-joint position/velocity against effective
-native limits, source-solid self collision and scene components at actual entrance
-FK. A failed necessary condition returns `initial_state_infeasible` with its
-individual residuals and no trajectory. This check does not invent unmeasured
-acceleration, jerk, torque or locked-joint velocity. A conservative binary-hand
-violation describes that controller model's feasibility, rather than proving
-current physical contact. An independently commanded hand uses measured
-entrance coordinates and, when supplied, its separately declared nominal
-geometry trajectory. A command alone does not establish future finger geometry.
-<!-- END retain native smoothness and reject an infeasible fixed entrance. -->
-
-<!-- BEGIN one source-solid self-collision authority throughout planning. -->
-Every request supplies a `RobotStateValidator` containing the complete source
-solids and explicit required/excluded/mechanical-contact pair policy. Entrance,
-IK and trajectory feasibility, OMPL states and final curve samples query all
-known required pairs with Pinocchio FK and Coal. Native sphere self costs,
-hand self proxies and duplicate robot/installation proxies guide optimization;
-they do not independently veto a source-separated state. Environment and
-payload constraints, native joint limits and terminal convergence stay required.
-The accepted binding contains the consumed URDF, geometry and pair policy;
-execution rejects a different robot validator. Checks remain discrete and do
-not establish continuous collision freedom or the positions of unknown fingers.
-<!-- END optimizer guidance and sampled source acceptance have separate roles. -->
-
-| Module | Responsibility |
-|---|---|
-| `planning_problem` | Compile grounded skill instances, required motion, functional freedom, original events and actual/conditional attachment evidence |
-| `planning_scene` | Share observed-space, owner, contact, payload and gripper constraints across optimization, search and final checks |
-| `planning_observation` | Convert calibrated current RGB-D and explicit pixel masks into owner-separated native Mapper fields and conservative coverage |
-| `planning` | Bound native work, solve the complete window, refine failing samples and export the verified cubic joint curve |
-| `robot_coverage` | Check newly entered native robot volume against frozen initial model occupancy and original depth-proven free cells |
-| `robot_validation` / `robot_geometry_check` | Bind source geometry and pair policy; perform Pinocchio/Coal self checks in planning and full measured-state checks in execution |
-| `gripper_trajectory` | Preserve a named C1 finger command reference on the formal arm clock, separately from measured finger motion |
-| `execution` / `robosuite_execution` | Gate original events and measured full robot state, then send the saved references through native controllers |
+`MotionBackend` owns a robot's native cuRobo IK and trajectory optimizer. Its
+first binding initializes the fixed-capacity native models; later requests
+replace values and clear optimizer/request state without rebuilding those
+models. Concurrent use of the same backend is rejected while its buffers are
+owned by a request. Cancellation or deadline expiry revokes a late result's
+execution authorization.
 
 ```python
-from manipulation.planning_problem import build_planning_problem
-from manipulation.planning import PlanningBudget, plan_trajectory
+from manipulation.planning import MotionBackend, PlanningBudget
 
-problem = build_planning_problem(
-    skill_instances,  # One or two {skill_id, program, scene, barrier_can_stop} entries.
-    joint_names=joint_names,
-    start_q=measured_joint_positions,
-    start_dq=measured_joint_velocities,
-    tool_link=robot_tool_link,
-    reference_frame=planning_frame,
-    base_pose=T_reference_robot_base,
-    tool_transform=T_link_tool,
-    couplings=actual_joint_couplings,
-)
-result = plan_trajectory(
-    problem, collision_scene, robot_config,
-    robot_validator=source_robot_validator,  # Same named source robot and calibration.
-    budget=PlanningBudget(knots=12, interpolation_buffer_size=768),
-)
-if result.success:
-    curve = result.trajectory
-    q, dq, ddq, progress = curve.sample(controller_sample_times)
-    # Execution requires actual evidence before crossing this boundary.
-    permitted_end_time = curve.executable_until
-    next_evidence = curve.next_verification
+backend = MotionBackend(robot_configuration, robot_validator=robot_validator,
+                        budget=PlanningBudget())
+try:
+    result = backend.plan(problem, online_scene)
+    # Reuse backend.plan(...) for later, freshly observed motion requests.
+finally:
+    backend.close()
 ```
 
-Each skill instance supplies the same compiled `program` and bound `scene`
-already consumed by `ground_program` in the existing prepared-input flow.
-Serialized JSON matrices and NumPy matrices use the same validated pose contract;
-the builder leaves the caller's inputs unchanged.
-<!-- BEGIN explicit pre-grasp planning and preserved Cartesian approach. -->
-Each grasp entry also supplies `pregrasp_frame`, an original source observation
-strictly before `protected_start_frame`. Free planning ends at that pre-grasp.
-From there through closure, the builder constrains the complete bound Cartesian
-reference and preserves every original source vertex. Grounding only adjusts
-the earlier free connection, so it cannot warp the approach before the planner
-receives it. Closing commands and the stable-Holding evidence barrier keep their
-original source IDs. The planner rejects a missing or invalid pre-grasp boundary.
-<!-- END explicit pre-grasp planning and preserved Cartesian approach. -->
-The builder reuses that grounding implementation, including functional events,
-necessary motion and release semantics. Use those structured inputs rather
-than reconstructing requirements from the final pose arrays in `trajectory.json`.
-All entries share an explicit tool and planning frame. The builder binds the
-next skill's initial state to the preceding predicted boundary;
-it never fills actual Holding evidence from a proposed grasp. A requested
-grasp/release evidence barrier requires `barrier_can_stop=True` and a zero
-velocity condition at that boundary. Rebind the remaining window after actual
-feedback establishes or changes the attachment.
+Each request evaluates its initialization candidate first. A feasible candidate
+proceeds directly to delivery. Otherwise it receives one primary solve and at
+most one recovery: OMPL initialization for collision difficulty, or a bounded
+functional-multiplier update for a numerical task residual. There is no
+post-feasibility quality stage, per-candidate export validation, witness-driven
+map refinement, or solver reconstruction loop. A recorded joint reference is
+explicit guidance; when native fitting changes its representation, diagnostics
+say so rather than claiming the original curve was preserved.
 
-The production implementation lives in `manipulation/planning*.py`, with CPU
-regressions in `tests/test_manipulation_planning*.py`. Explicit native-backend
-checks and diagnostics live in [`tests/planning`](tests/planning/README.md).
-They are not imported by production or run by ordinary CPU test discovery;
-no source code is loaded from a dated planning directory. Their synthetic
-scenes establish local backend behavior, not acceptance of a particular
-grounded manipulation task.
+The native optimizer, native success metrics, OMPL checks and actual execution
+use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
 
-The robot YAML/configuration, active joint names, measured state, base transform
-and link-to-TCP calibration are mandatory. `collision_scene` must be a
-`PlanningScene` with the actual robot sphere identities, observed-space coverage,
-background and separately identified moving/contact owners. Owner attachment
-intervals, transforms, condition IDs and original gripper commands must agree
-with the problem. Dedicated material contact proxies can receive bounded local
-allowances; complete targets and whole finger links are not removed to permit
-contact. An actuated hand requires its measured coordinates, actual drive
-coupling, controller capability and calibrated geometry. Position tracking uses
-the supplied executable command path. Independently commanded fingers can use
-`timed_reference`, with seven arm optimization coordinates and a separately
-named finger curve on the same formal native output clock. Its reference
-starts at measured finger q/dq, retains original command identities and the
-evidence barrier, and is saved and reloaded without regeneration. Hardware
-protection intervals apply to actual feedback; they do not define future hand
-geometry. Contact can keep actual fingers away from a closing target, so the
-reference does not certify tracking or Holding. Binary control uses a conservative
-mechanical envelope at every query, including repeated zero progress, and may
-therefore remain uncertified. Progress can pause while the fingers move, so it
-cannot identify the instant of the initial feedback.
+- `FrozenESDF` retains the current Mapper field and source-validity bits.
+  Each background/owner partition has one fixed field. Owner support is
+  prepared from the observed extent and registered robot sphere radius before
+  solving; requests cannot enlarge it after a failed query.
+- `FrozenPrimitives` retains calibrated complete boxes/cylinders and their
+  declared transforms. Robot sphere layout and self-collision exclusions are
+  bound to the same registered robot model.
+- Unknown-space policy explicitly lists finite regions where conditional
+  attempts are allowed. Known occupied geometry remains active there, and an
+  out-of-field query requires a scene update. Conditional permission never
+  creates observed-free evidence or a successful task fact.
+- `ContactRule` names a finite material feature, target owner, target region,
+  interval, normal and gap allowance. Contact subtraction preserves every
+  represented cell outside that finite permission, including cells covered by
+  the same robot sphere. A whole hand/owner pair exemption is not accepted.
 
-For position tracking, optimization also aims at the supplied command inside
-its allowed tracking band. The final check still uses that original band.
-Declared verification stops similarly target zero velocity. Pose preferences
-only target finite, equal source bounds and retain their actual functional
-endpoint and release-frame dependence. Finite-width and unbounded pose axes
-receive no invented center; numerical tolerances and final residuals stay
-separate from these optimizer objectives.
-Export diagnostics also report `phase:N:original_reference_position_error_m`
-and `phase:N:original_reference_rotation_error_rad`, with corresponding
-component maxima. These compare the actual TCP against the original grounded
-reference at the same source progress, including free approaches and retreat.
-They remain fixed when the candidate changes a permitted endpoint or release
-anchor. The existing phase error fields measure the constraint reference;
-neither set invents an additional acceptance threshold or changes source
-freedoms. Reported peaks are over the exported curve's validation samples.
-Physical mechanisms additionally retain their original position-norm and
-rotation-angle tolerances on the attached body. Generic path tolerances do not
-widen those limits; OMPL projection uses the strictest declared tolerances.
-Every returned trajectory seed is checked independently using its own active
-joint layout, final time step, valid sample count and original events; one
-candidate cannot inherit another candidate's feasibility or timing.
+`planning_observation.build_scene_from_rgbd` creates this production model.
+`build_audit_scene_from_rgbd`, source TSDF geometry, complete-volume coverage
+and detailed source-geometry checkers are separate audit tools; they do not
+participate in production candidate success or control ticks.
 
-With two trajectory seeds, native IK evaluates the declared candidate budget
-and retains two distinct continuous chains when available. Temporary merging
-does not prevent later separation. If nominal IK fails or the complete chains
-coincide, the second initializer uses the measured state, allowing the full
-optimizer to find an admissible functional endpoint family. Diagnostics report
-the actual initializer strategies and distinct candidate counts.
-These counts describe numerical joint separation within the requested budget;
-equivalent full-turn representations do not establish different arm geometry
-or exhaustive physical branch coverage.
+`PlanningProblem.bound_motion_block` uses actual evidence dependencies to bound
+one request while preserving original progress and event identities. Coupled
+process/velocity requirements cannot be split by inserting a new stop. Actual
+T evidence at a boundary permits a newly bound request; it does not authorize
+an unplanned suffix of an old curve. Validated forward progress starts another
+request allowance while retaining cumulative work and physical-step history.
 
-Phase progress uses a bounded scalar clock in the native cubic basis, including
-the explicitly permitted verification stops. Original motion vertices, event
-identities and search-path pauses retain their progress values. The same clock
-maps search-path joints into control initializers; it never replaces measured
-initial velocity. A control horizon too small for the required stops is rejected
-before solver allocation.
+Delivery checks the exact native-to-Hermite representation, measured entry,
+continuous named joint position/velocity/acceleration and bound clock once.
+`PlanningResult.execution_binding` carries the exact curve and the same online
+scene. `TrajectoryExecutor` checks actual entrance and measured state using
+that model; it does not re-audit the nominal full curve against source solids.
+A finite close permission requires current measured arrival before control
+application. Current Holding activates only explicitly bound finite rule IDs
+with matching fresh attachment evidence. Commanded fingers remain separate
+from measured finger positions.
 
-Required source vertices and their clock pauses are retained in full.
-`PlanningBudget.max_refinement_points` limits only additional failure samples;
-the combined exact queries must fit `max_validation_points`. Scene queries and
-the extra native FK buffers are sized from that actual capacity and checked
-against available memory before initial allocation and each clock replacement.
-Those queries do not add native optimization variables or enlarge the control
-horizon.
-
-`build_scene_from_rgbd` takes identified current views containing aligned
-`image`, metric camera-z `depth`, rectified `K`, `T_output_camera`,
-`reference_frame`, disjoint `owner_masks` and an explicit `robot_mask`.
-`owner_frames` supplies each observed `T_output_owner` and its source; the
-native `MapperCfg` supplies bounded mapping volumes and resolution. Ray
-coverage is computed independently from the original depth. Hidden surfaces,
-occlusion and surface uncertainty remain unknown. This adapter supplies partial
-owner geometry; rigid payload coverage and contact precision require their own
-evidence.
-
-Observed space includes both observed free space and evidenced current solid
-interiors. Optional `known_solids` can add cells wholly inside a verified
-physical solid or verified inner solid after accounting for geometry and pose
-error. It requires explicit geometry provenance and a current observed owner
-pose or synchronized `current_robot` feedback. Robot evidence is checked
-against the planner's actual FK, locked joints and collision model. Outer
-collision proxies, partial reconstructions, watertightness alone and future
-predicted poses cannot establish solid occupancy. Added occupied coverage
-keeps every collision check active; unobserved exterior gaps remain unknown.
-
-<!-- BEGIN distinguish initial model occupancy from observed free space. -->
-With an explicit valid-initial-state assumption, `RobotCoverage` freezes the
-same native robot solid model at complete measured q0 as V0. It accepts a
-queried state only when `V(q) \ (V0 ∪ F)` is empty, where F contains the
-original depth-proven free cells. No collision sphere, installation obstacle
-or unobserved exterior is added to F. Original free cells remain separate from
-optional occupied-solid evidence. Sparse native geometry points guide the
-optimizer; bounded CPU solid Boolean queries decide whole-volume coverage at
-the entrance, search states and exported validation samples. Numerical and
-resource failures reject the query. This model assumption is not a claim that
-hidden environment geometry has been observed, and these state queries do not
-provide a continuous swept-volume certificate.
-<!-- END initial-model assumptions never modify observation evidence. -->
-
-Success requires both native acceptance and independent checks of the exported
-curve. Planning uses the request's `maximum_trajectory_dt` as both native time
-bounds: feasibility is solved at one declared time step, preserving measured
-boundary velocities and evidence stops. The result reports its actual exported
-duration; it does not claim minimum duration. The same `sample(t)` defines downstream positions, velocities and phase
-progress; do not add an unchecked interpolation. Original event identities,
-conditions, numerical residuals and the first evidence barrier accompany the
-curve. Diagnostics separate task measurements from numerical tolerances and
-report search/resource failures. A failed bounded solve returns no executable
-trajectory and does not establish physical impossibility. Discrete sphere and
-observed-space checks do not certify unseen geometry, arbitrary continuous
-contact dynamics or real robot execution. Importing these modules does not
-create a robot connection or run GPU solvers.
-<!-- END complete-window constrained robot planning. -->
+CPU contracts live under `tests/test_motion_backend_contract.py`,
+`tests/test_online_geometry.py`, and the affected planning/execution tests.
+The recorded-task CLI in `tests/planning/run_recorded_skill.py` owns the backend
+lifetime and requires explicit finite-contact and unknown-policy inputs.
+Its result recorder saves only returned artifacts and never initiates another
+solve or validation. Dataset-specific selections and user-run experiments
+belong in the workspace's `sim-version-plans` directories.
+<!-- END shared resident motion backend and fixed online scene. -->

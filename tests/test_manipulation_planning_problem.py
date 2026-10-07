@@ -922,3 +922,50 @@ class PlanningBuilderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# BEGIN finite motion blocks preserve source coordinates and live process scope.
+def test_motion_block_crops_future_goals_without_splitting_ordinary_motion():
+    reference = path([pose(), pose((.1, 0., 0.))])
+    phases = tuple(MotionPhase(f"phase_{index}", reference, metadata={"skill_id": "skill"}) for index in range(3))
+    goals = tuple(PoseEventRequirement(s, np.eye(4), pose(), .01, .1, "declared goal")
+                  for s in (.5, 1.5, 3.))
+    relation = PoseProcessRequirement(0., 3., reference, np.zeros((6, 2)), "continuous relation")
+    ordinary = PlanningEvent("ordinary", "skill", .5, 1, "function", "source")
+    dependency = PlanningEvent("observe", "skill", 1.5, 3, "function", "source", "observed_effect")
+    later = PlanningEvent("later", "skill", 3., 6, "function", "source")
+    original = problem(phases, start_dq=np.array([.1, 0., 0.]), pose_events=goals,
+        pose_relations=(relation,), events=(ordinary, dependency, later),
+        source_timestamps=np.array([10., 11., 13., 16.]), source_progress=np.array([0., 1., 2., 3.]))
+    block, record = original.bound_motion_block()
+    assert (block.start_progress, block.end_progress, block.phase_count) == (0., 1.5, 3)
+    assert [event.event_id for event in block.events] == ["ordinary", "observe"]
+    assert not any(event.stop for event in block.events)
+    assert np.array_equal(block.start_dq, original.start_dq)
+    assert [goal.progress for goal in block.pose_events] == [.5, 1.5]
+    assert record["goal_identities"]["pose_events"] == [0, 1]
+    assert block.terminal_pose_target.progress == 1.5
+    assert np.array_equal(block.source_progress, [0., 1., 1.5])
+    assert np.array_equal(block.source_timestamps, [10., 11., 12.])
+    assert block.pose_relations[0].end == 3.
+    assert block.anchors.max() == 1.5
+    assert original.end_progress == 3. and len(original.pose_events) == 3
+    # A condition name observed in an earlier block cannot waive a future
+    # occurrence that explicitly asks for the same condition again.
+    repeated, _ = original.bound_motion_block(satisfied_dependencies=("observed_effect",))
+    assert repeated.end_progress == 1.5
+    resumed = deepcopy(original)
+    resumed.start_progress = 1.5
+    resumed.source_timestamps = np.array([12., 13., 16.])
+    resumed.source_progress = np.array([1.5, 2., 3.])
+    continued, record = resumed.bound_motion_block(satisfied_dependencies=("observed_effect",))
+    assert continued.end_progress == 3. and not record["requires_rebind"]
+
+
+def test_motion_block_cannot_plan_through_unobserved_entrance_dependency():
+    import pytest
+    reference = path([pose(), pose((.1, 0., 0.))])
+    request = problem((MotionPhase("phase", reference),), events=(
+        PlanningEvent("entry", "skill", 0., 0, "function", "source", "observation"),))
+    with pytest.raises(ValueError, match="fresh dependency evidence"):
+        request.bound_motion_block()
+# END no zero-duration block or manufactured stop can replace current evidence.

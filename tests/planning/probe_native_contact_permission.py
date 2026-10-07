@@ -105,13 +105,13 @@ def run(output, *, fixture_path):
         import torch
         from curobo.kinematics import Kinematics, KinematicsCfg
         from curobo.types import DeviceCfg, JointState
-        from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
-        from curobo._src.geom.types import Cuboid, SceneCfg
+        from curobo._src.geom.types import Cuboid
+        from manipulation.online_geometry import FrozenPrimitives, OnlinePlanningScene
         from manipulation.planning import PlanningBudget, plan_trajectory, _ProgressMap
         from manipulation.planning_problem import (MotionPhase, NumericalTolerance,
             PlanningProblem, PosePath, PoseProcessRequirement)
         from manipulation.planning_scene import (
-            CollisionOwner, ContactRule, CuroboSphereQuery, ObservedSpace, PlanningScene, _local_spheres)
+            CollisionOwner, ContactRule, ObservedSpace, _local_spheres)
         from probe_robot_fixture import load_probe_fixture, fixed_probe_hand
 
         if not torch.cuda.is_available():
@@ -177,10 +177,12 @@ def run(output, *, fixture_path):
         second_pose = tool_pose.copy()
         second_pose[:3, 3] = original_spheres[contact_index, :3]
 
+        # BEGIN explicit 1 mm contact cells bound this small synthetic patch.
         def query(identity, boxes):
-            native = SceneCollision.from_config(SceneCollisionCfg(
-                device_cfg=device, scene_model=SceneCfg(cuboid=boxes), cache={"cuboid": len(boxes)}))
-            return CuroboSphereQuery(native, owner_ids=(identity,), source="explicit synthetic solid cuboids")
+            return FrozenPrimitives(primitives=[{"kind": "cuboid", "pose": box.pose,
+                "dimensions": box.dims} for box in boxes], owner_ids=(identity,),
+                contact_voxel_size_m=.001, source="explicit synthetic solid cuboids")
+        # END paired scenes query the same frozen model and finite-cell rule.
 
         def owner(identity, pose, extra_palm_blocker=False):
             dimensions = [.016, .016, .02] if identity == "contact_owner" else [.002, .002, .002]
@@ -229,7 +231,7 @@ def run(output, *, fixture_path):
         report["nominal_hand_hypothesis"] = hand_report
 
         def scene(owners, permissions):
-            return PlanningScene(background=background, owners=(*installations, *owners), contacts=permissions, coverage=coverage,
+            return OnlinePlanningScene(unknown_policy={"outside_regions": "forbid", "conditional_regions": []}, background=background, owners=(*installations, *owners), contacts=permissions, coverage=coverage,
                                  reference_frame="robot_base", robot_sphere_materials=materials,
                                  # BEGIN preserve the installation filters' exact source identity.
                                  robot_geometry_source=fixture["robot_geometry_source"],
@@ -284,7 +286,9 @@ def run(output, *, fixture_path):
             # nominal fingers; binding cannot turn that hypothesis into feedback.
             world.gripper.bind_clock(curve.duration, _ProgressMap(curve.progress_u, curve.progress_s))
             world.validate_problem(problem)
-            world.bind_robot_validator(validator, problem)
+            model = result.execution_binding["scene"]
+            world.bind_online_robot(**{key: model[key] for key in (
+                "robot_sphere_geometry", "robot_self_collision_pairs", "robot_self_collision_padding", "robot_model")})
             tool_p, tool_r = problem.transform_tool_pose(native.tool_poses.position[:, :, tool_index],
                                                          native.tool_poses.quaternion[:, :, tool_index])
             terms = world.components(problem.transform_robot_spheres(native.robot_spheres), tool_p, tool_r, progress,

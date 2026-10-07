@@ -16,13 +16,13 @@ from copy import copy, deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 import gc
 import time
+from threading import Lock, get_ident
 from uuid import uuid4
 from types import SimpleNamespace
 
 import numpy as np
 from scipy.interpolate import BSpline, CubicHermiteSpline
 from .planning_problem import event_occurrence_key
-from .geometry_motion_bound import SphereBody, build_geometry_motion_bound
 from .collision_records import encode_array
 # BEGIN physical memory ownership is independent of optimizer workspace size.
 from .resource_admission import (
@@ -89,9 +89,8 @@ class PlanningBudget:
     seeds or a larger batch must not be silently allocated by native defaults.
     The interpolation buffer covers the largest allowed native knot interval.
     Native solvers use eager execution for the dynamic process/scene tensors.
-    Required source vertices use their actual count; ``max_refinement_points``
-    bounds only additional queries. Both share ``max_validation_points`` and
-    the checked scene/native allocation budgets.
+    ``max_task_anchors`` is the fixed semantic-anchor capacity. Native queries
+    and bounded search share the checked scene/native allocation budgets.
     ``maximum_trajectory_dt`` fixes both native time bounds for this request:
     process feasibility and evidence stops take precedence over compression.
     """
@@ -107,7 +106,7 @@ class PlanningBudget:
     interpolation_buffer_size: int = 512
     constraint_weight: float = 100000.0
     # BEGIN reserve optional refinement work separately from required evidence.
-    max_refinement_points: int = 64
+    max_task_anchors: int = 256
     # END reserve optional refinement work separately from required evidence.
     max_robot_spheres: int = 256
     max_robot_dof: int = 16
@@ -123,7 +122,7 @@ class PlanningBudget:
     validation_spatial_step_m: float = 0.001
     # END this relative-displacement bound is not a physical collision margin.
     search_seconds: float = 3.0
-    maximum_trajectory_solves: int = 3
+    maximum_trajectory_solves: int = 2
     # BEGIN wall work is cumulative across binding attempts, independently of physics.
     planning_seconds: float = 120.0
     # END a stage may finish over this limit, but its candidate cannot be accepted.
@@ -142,12 +141,12 @@ class PlanningBudget:
                 or not 1 <= self.max_robot_dof <= 16
                 or not 1 <= self.max_robot_links <= 64
                 or not 32 <= self.max_validation_points <= 65536
-                or not 1 <= self.maximum_trajectory_solves <= 4):
+                or not 1 <= self.maximum_trajectory_solves <= 2):
             raise ValueError("Planning budget exceeds the bounded local single-batch configuration")
-        # BEGIN bound optional samples without capping a skill's source knots.
-        if (type(self.max_refinement_points) is not int
-                or not 0 <= self.max_refinement_points <= self.max_validation_points):
-            raise ValueError("Refinement points must fit the finite validation-point budget")
+        # BEGIN semantic anchors have one fixed resident capacity.
+        if (type(self.max_task_anchors) is not int
+                or not 2 <= self.max_task_anchors <= self.max_validation_points):
+            raise ValueError("Task anchors must fit the finite native point budget")
         # END bound optional samples without capping a skill's source knots.
         # BEGIN physical host/device caps are separate from GPU scene capacity.
         if (type(self.max_scene_gpu_workspace_bytes) is not int
@@ -202,6 +201,7 @@ class JointTrajectory:
     residuals: dict[str, float]
     # BEGIN archive the exact independently controlled finger reference.
     finger_trajectory: object | None = None
+    satisfied_dependencies: tuple[str, ...] = ()
     # END a missing hand curve is valid only for plans without hand events.
     _curve: CubicHermiteSpline = field(init=False, repr=False)
 
@@ -215,7 +215,9 @@ class JointTrajectory:
     @property
     def next_verification(self):
         """The first original evidence barrier, without claiming it was met."""
-        barriers = [event for event in self.events if event["requires_evidence"] is not None]
+        barriers = [event for event in self.events if event["requires_evidence"] is not None
+                    and not (event["requires_evidence"] in self.satisfied_dependencies
+                             and event["progress"] <= self.progress_s[0])]
         return deepcopy(min(barriers, key=lambda event: event["time"])) if barriers else None
 
     @property
@@ -346,255 +348,19 @@ def cubic_derivative_report(trajectory, acceleration_bounds, *, joint_names, unt
 
 
 # BEGIN complete-body spatial sampling of the original cubic, with finite work.
-def _cubic_speed_upper(curve, left, right):
-    """Enclose |dq| on pieces split at every original polynomial breakpoint.
-
-    Endpoints and any quadratic vertex exhaust derivative extrema. Directed
-    binary64 interval operations include evaluation and vertex-division
-    rounding; no sampled Jacobian or endpoint displacement replaces this bound.
-    """
-    index = np.clip(np.searchsorted(curve.x, left, side="right")-1, 0, len(curve.x)-2)
-    down, up = lambda x: np.nextafter(x, -np.inf), lambda x: np.nextafter(x, np.inf)
-    def add(x, y):
-        return down(x[0]+y[0]), up(x[1]+y[1])
-    def multiply(x, y):
-        terms = np.stack([x[i]*y[j] for i in (0, 1) for j in (0, 1)])
-        return down(terms.min(axis=0)), up(terms.max(axis=0))
-    def absolute(x):
-        return np.maximum(abs(x[0]), abs(x[1]))
-    a, b, c = curve.c[:3, index]
-    qa, qb = multiply((a, a), (3., 3.)), multiply((b, b), (2., 2.))
-    lo, hi = (left-curve.x[index])[:, None], (right-curve.x[index])[:, None]
-    result = np.zeros_like(c)
-    for x in (lo, hi):
-        point = (down(x), up(x))
-        result = np.maximum(result, absolute(add(multiply(add(multiply(qa, point), qb), point), (c, c))))
-    # At an interior vertex the derivative equals c-b*b/(3*a). Include it
-    # whenever the outward root enclosure intersects this interval.
-    nonzero = a != 0
-    denominator = tuple(np.where(nonzero, value, 1.) for value in qa)
-    reciprocal = (down(1./denominator[1]), up(1./denominator[0]))
-    root = multiply((-b, -b), reciprocal)
-    vertex = add((c, c), multiply(multiply((b, b), (b, b)),
-                                (-reciprocal[1], -reciprocal[0])))
-    present = nonzero & (root[1] >= lo) & (root[0] <= hi)
-    result = np.maximum(result, np.where(present, absolute(vertex), 0.))
-    if not np.isfinite(result).all():
-        raise ValueError("Cubic speed bound is nonfinite")
-    return result
 
 
-def _export_sample_times(trajectory, motion, *, spatial_step, anchors, budget, owner_speed_per_progress=0.,
-                         finger_geometry=None):
-    """Bound all body and pair displacement, retaining the old joint-step rule.
-
-    Twice the fastest body's speed bounds relative motion of every robot
-    pair. This deliberately includes native-excluded pairs rather than risk
-    omitting a required pair.
-    External owner rates and every attached owner's complete cover also enter
-    the maximum. The spatial step is a sampling resolution, never a physical error margin
-    or a continuous collision-freedom certificate.
-    """
-    curves = [(tuple(trajectory.joint_names), trajectory._curve)]
-    # Executable finger commands and nominal future geometry are distinct.
-    # The caller supplies precisely the model selected by scene.hand.state;
-    # trajectory.finger_trajectory retains its original command meaning.
-    fingers = finger_geometry
-    if fingers is not None:
-        curves.append((tuple(fingers.joint_names), fingers._curve))
-    if sorted(name for names, _ in curves for name in names) != sorted(motion.joint_names):
-        raise ValueError("Every body-motion coordinate requires exactly one original cubic")
-    # The full-range lever arms in L are valid only inside their declared
-    # position ranges. Establish that premise analytically before creating
-    # any spatial evidence; eventual sampled native rejection is insufficient.
-    for names, curve in curves:
-        columns = [motion.joint_names.index(name) for name in names]
-        domain = cubic_position_report(curve, *motion.joint_position_limits[:, columns])
-        if domain["maximum_bound_excess"] > 0:
-            raise ValueError("Spatial motion bound requires the complete original arm/finger cubic "
-                             "inside its declared joint position limits")
-    if not np.isfinite(spatial_step) or spatial_step <= 0:
-        raise ValueError("Spatial validation needs a finite positive observed voxel resolution")
-    breaks = np.unique(np.concatenate([*(curve.x for _, curve in curves), np.asarray(anchors, float),
-        (trajectory.times[:-1]+trajectory.times[1:])/2,
-        trajectory.progress_u*trajectory.duration if owner_speed_per_progress else np.empty(0)]))
-    if breaks[0] != 0 or breaks[-1] != trajectory.duration:
-        raise ValueError("Validation anchors must lie within the unchanged physical clock")
-    speed_arrays = [(names, _cubic_speed_upper(curve, breaks[:-1], breaks[1:])) for names, curve in curves]
-    widths = np.diff(breaks)
-    # A global bound on the actual piecewise-linear clock is sufficient for
-    # external motion and remains valid at every slope switch and plateau.
-    progress_rate = float(np.max(np.nextafter(np.diff(trajectory.progress_s), np.inf)
-        / np.nextafter(np.diff(trajectory.progress_u)*trajectory.duration, -np.inf)))
-    relative, joint_required = [], []
-    for i, width in enumerate(widths):
-        speed = {name: float(values[i, j]) for names, values in speed_arrays for j, name in enumerate(names)}
-        body_speed = motion.speed_bounds(speed)
-        moving_speed = np.nextafter(owner_speed_per_progress*progress_rate, np.inf)
-        pair_speed = np.nextafter(2*max(float(body_speed.max()), moving_speed), np.inf)
-        relative.append(np.nextafter(width*pair_speed, np.inf))
-        arm_speed = [speed[name] for name in trajectory.joint_names]
-        joint_required.append(width*np.linalg.norm(arm_speed)/budget.validation_joint_step)
-    required = np.maximum(np.nextafter(np.asarray(relative)/spatial_step, np.inf), joint_required)
-    if not np.isfinite(required).all():
-        raise ValueError("Final curve spatial validation requires nonfinite work")
-    counts = [max(1, int(np.ceil(value))) for value in required]
-    total = 1+sum(counts)
-    if total > budget.max_validation_points:
-        raise ValueError(f"Final curve validation exceeds its declared finite sample budget: requires {total} points, allowed {budget.max_validation_points}; "
-                         f"body-pair spatial step={spatial_step} m, live chunk={_VALIDATION_CHUNK_SIZE}")
-    queries = np.concatenate(([0.], *[np.linspace(a, b, count+1)[1:]
-        for a, b, count in zip(breaks[:-1], breaks[1:], counts)]))
-    return queries, {"query_count": total, "point_budget": budget.max_validation_points,
-        "chunk_size": _VALIDATION_CHUNK_SIZE, "spatial_step_m": float(spatial_step),
-        "maximum_interval_relative_displacement_bound_m": float(np.max(np.asarray(relative)/counts)),
-        "body_names": list(motion.body_names), "joint_names": list(motion.joint_names),
-        "coefficients_m_per_joint_unit": motion.coefficients.tolist(),
-        "relative_motion": "twice maximum complete-body point speed; every required self pair included",
-        "scene_owner_motion": "bound external PosePath and mechanism rate plus every attachment cover",
-        "owner_speed_m_per_progress": float(owner_speed_per_progress),
-        "scope": "continuous-model displacement bounds between finite queries; not continuous collision proof"}
 
 
-def _owner_path_speed(owner):
-    """Bound any owner point's m/progress for the existing PosePath models.
-
-    A global maximum across path pieces is conservative across all attachment
-    modes. Release has zero subsequent speed; attached motion is separately
-    represented as a native-tree SphereBody. Unknown custom pose samplers are
-    rejected because neither a motion flag nor a few poses bounds their path.
-    """
-    from .planning_problem import PosePath
-    from .geometry_motion_bound import _norm_up, _add_up, _mul_up
-    path = owner.pose_path
-    if not isinstance(path, PosePath):
-        raise ValueError(f"No point-motion bound for owner {owner.owner_id!r}'s custom pose sampler")
-    if (path.motion_model is None and np.array_equal(path.poses,
-            np.broadcast_to(path.poses[0], path.poses.shape))):
-        return 0.
-    if (path.motion_model is not None and np.array_equal(path.coordinates,
-            np.broadcast_to(path.coordinates[0], path.coordinates.shape))):
-        # Compare unwrapped mechanism coordinates: equal endpoint poses could
-        # still hide a complete revolution, whereas equal coordinates cannot.
-        return 0.
-    if owner.local_spheres is None:
-        raise ValueError(f"Moving owner {owner.owner_id!r} lacks its complete declared sphere cover")
-    rho = max(_add_up(_norm_up(row[:3]), _add_up(float(row[3]), owner.sphere_cover_error_m))
-              for row in owner.local_spheres)
-    lever = _add_up(rho, _norm_up(path.attachment[:3, 3]))
-    rates = []
-    for i, width in enumerate(np.diff(path.progress)):
-        model = path.motion_model
-        if model is None:
-            linear = _norm_up(path.poses[i+1, :3, 3]-path.poses[i, :3, 3])
-            a, b = path._quaternions[i:i+2]
-            # 4*tan(theta/4) bounds both slerp and the native normalized-linear
-            # small-angle branch's maximum SO(3) angular speed per fraction.
-            # Quaternion chord/sum norms give tan(theta/4) without acos loss.
-            b = b if np.dot(a, b) >= 0 else -b
-            angular = np.nextafter(4*_norm_up(a-b)/np.linalg.norm(a+b), np.inf)
-            rate = _add_up(linear, _mul_up(angular, lever))
-        else:
-            delta = path.coordinates[i+1]-path.coordinates[i]
-            if model.kind == "revolute":
-                rate = _mul_up(abs(float(delta[0])), _add_up(lever,
-                    _norm_up(model.reference_pose[:3, 3]-model.axis_point)))
-            elif model.kind == "prismatic":
-                rate = _mul_up(abs(float(delta[0])), _norm_up(model.axis))
-            elif model.kind in {"planar", "translation_plane"}:
-                linear = _add_up(_mul_up(abs(float(delta[0])), _norm_up(model.basis[:, 0])),
-                                 _mul_up(abs(float(delta[1])), _norm_up(model.basis[:, 1])))
-                rate = linear if model.kind == "translation_plane" else _add_up(linear,
-                    _mul_up(abs(float(delta[2])), lever))
-            else:
-                raise ValueError(f"Unsupported owner motion kind {model.kind!r}")
-        rates.append(np.nextafter(rate/width/(owner.pose_interval[1]-owner.pose_interval[0]), np.inf))
-    return max(rates, default=0.)
 
 
-def _geometry_finger_model(hand):
-    """Choose exactly the independent polynomial used by PrismaticGripper.state."""
-    if hand is not None and (hand.controller == "timed_reference" or hand.nominal_finger_trajectory is not None):
-        model = hand.nominal_finger_trajectory or hand.finger_trajectory
-        if model is None:
-            raise ValueError("Timed finger geometry requires its bound original polynomial")
-        return model
-    return None
 
 
-def _export_motion_inputs(params, scene, problem, *, spatial_step_m):
-    """Bind full native covers and timed affine fingers without a second FK."""
-    cpu = lambda value: value.detach().cpu().numpy()
-    spheres = cpu(params.link_spheres).reshape(-1, 4)
-    indices = cpu(params.link_sphere_idx_map).reshape(-1)
-    links = dict(params.link_name_to_idx_map)
-    names = tuple(params.joint_names)
-    hand = scene.gripper
-    replaced = set(() if hand is None else hand.sphere_indices)
-    bodies, extra = [], {}
-    for link, index in links.items():
-        selected = [i for i in np.flatnonzero(indices == index) if i not in replaced and spheres[i, 3] >= 0]
-        if selected:
-            bodies.append(SphereBody("native/"+link, link, spheres[selected], {}))
-    if hand is not None:
-        local = np.asarray(hand.local_spheres, float).copy()
-        local_mapping = np.asarray(hand.sphere_joint_translation, float)
-        model = _geometry_finger_model(hand)
-        envelope = hand.controller == "binary" and model is None
-        if envelope:
-            # Reproduce the complete mechanical-box spheres used by hand.state
-            # and hand.spheres. The envelope is rigid in TCP coordinates; its
-            # bound says nothing about unobserved physical finger velocities.
-            middle = np.asarray(hand.joint_limits).mean(axis=1)
-            half = np.diff(hand.joint_limits, axis=1).reshape(-1)/2
-            local[:, :3] += np.einsum("scj,j->sc", local_mapping, middle)
-            local[:, 3] += np.linalg.norm(np.einsum("scj,j->sc", abs(local_mapping), half), axis=1)
-        transform = np.asarray(problem.tool_transform, float)
-        local[:, :3] = local[:, :3] @ transform[:3, :3].T + transform[:3, 3]
-        mapping = np.einsum("ab,sbj->saj", transform[:3, :3], local_mapping)
-        bodies.append(SphereBody("unknown_hand_mechanical_envelope" if envelope else "actual_query_hand",
-            problem.tool_link, local, {} if envelope else
-            {name: mapping[:, :, j] for j, name in enumerate(hand.joint_names)}))
-        extra = {} if envelope else {name: hand.joint_limits[j] for j, name in enumerate(hand.joint_names) if name not in names}
-    owner_speed = 0.
-    from scipy.spatial.transform import Rotation
-    for owner in scene.owners:
-        owner_speed = max(owner_speed, _owner_path_speed(owner))
-        for index, relation in enumerate(owner.attachments):
-            local = np.asarray(owner.local_spheres, float).copy()
-            rotation = Rotation.from_quat(np.roll(relation.quaternion_tool_owner, -1)).as_matrix()
-            local[:, :3] = local[:, :3] @ rotation.T + relation.position_tool_owner
-            transform = np.asarray(problem.tool_transform, float)
-            local[:, :3] = local[:, :3] @ transform[:3, :3].T + transform[:3, 3]
-            local[:, 3] += owner.sphere_cover_error_m
-            bodies.append(SphereBody(f"owner/{owner.owner_id}/attachment/{index}", problem.tool_link, local, {}))
-    resolutions = []
-    def collect(query):
-        if hasattr(query, "coarse") and hasattr(query, "fine"):
-            collect(query.coarse)
-            collect(query.fine)
-            return
-        model = getattr(getattr(query, "scene_collision", None), "scene_model", None)
-        for voxel in getattr(model, "voxel", ()) or ():
-            resolutions.append(float(voxel.voxel_size))
-        for solid in getattr(query, "independent_geometry", {}).get("solids", ()):
-            # BEGIN source TSDF spacing also bounds formal geometric sampling.
-            if solid["kind"] == "tsdf":
-                resolutions.append(float(solid["voxel_size"]))
-            # END the removed occupied-ESDF voxel record is not an alternate model.
-    if scene.background is not None:
-        collect(scene.background)
-    for owner in scene.owners:
-        collect(owner.query)
-    if (not np.isfinite(spatial_step_m) or spatial_step_m <= 0
-            or not np.isfinite(resolutions).all() or (resolutions and min(resolutions) <= 0)):
-        raise ValueError("Spatial validation requires finite positive metric and voxel resolutions")
-    motion = build_geometry_motion_bound(**{key: cpu(getattr(params, key)) for key in
-        ("fixed_transforms", "link_map", "joint_map", "joint_map_type", "joint_offset_map")},
-        joint_names=names, joint_position_limits=cpu(params.joint_limits.position),
-        link_name_to_idx_map=links, bodies=bodies, extra_joint_limits=extra)
-    step = min(spatial_step_m, min(resolutions)/2) if resolutions else spatial_step_m
-    return motion, step, owner_speed
+
+
+
+
+
 # END no source resampling, timing change, or physical margin is introduced.
 
 
@@ -612,104 +378,15 @@ class PlanningResult:
 
 
 # BEGIN size required evidence and native anchor buffers from the actual request.
-def _anchor_capacity(progress_map, anchors, budget, refinement_parameters=()):
-    """Keep every required clock anchor; bound only additional refinement.
-
-    A stopped source vertex can have two clock parameters. Count those actual
-    pairs before reserving optional samples, so no source point or pause is
-    removed to fit the refinement allowance.
-    """
+def _anchor_capacity(progress_map, anchors, budget):
+    """Admit semantic anchors into a fixed native workspace; never add witnesses."""
     required = len(progress_map.anchor_parameters(anchors))
-    capacity = min(budget.max_validation_points, _NATIVE_STAGE_POINT_LIMIT)
-    if required > capacity:
-        raise ValueError("Required source anchors exceed the finite validation-point budget")
-    additional = np.unique(np.asarray(refinement_parameters, float))
-    refinement_limit = min(budget.max_refinement_points, capacity-required)
-    if (not np.isfinite(additional).all() or np.any(additional < 0) or np.any(additional > 1)
-            or len(additional) > refinement_limit):
-        raise ValueError("Refinement samples exceed the finite refinement-point budget")
-    return required+refinement_limit
+    if required > budget.max_task_anchors:
+        raise MotionPlanningError("capacity_exceeded", "Task anchors exceed the resident backend capacity")
+    return budget.max_task_anchors
 
 
-def _validation_storage_admission(problem, scene, robot_metadata, budget):
-    """Bound cumulative CPU records and full-history process geometry pre-GPU.
 
-    A 256-state native batch does not bound retained records. Each actor/target
-    decision owns one bool, six float64 bounds and six int64 stencil indices
-    per body/state. Encode each bounded chunk without Python scalar lists.
-    The fixed 512-MiB encoded-payload cap leaves room for candidate/capture and
-    JSON copies within the local RAM budget. Process geometry has a separate
-    256-MiB peak cap: support expands one event pose, while interval constraints
-    retain their full history. All scalar outputs still span the full history.
-    """
-    from .voxel_layers import LayeredVoxelQuery
-    total = budget.max_validation_points
-    modes = 3 if scene.required_progress_anchors else 1
-    dof = len(robot_metadata["active_joint_names"])
-    # UTF-8 identifiers may expand to JSON escapes. Six times their byte
-    # length bounds that expansion; fixed dictionary/shape overhead is per
-    # array/chunk, never per numeric element.
-    text_size = lambda value: 6*len(str(value).encode("utf-8"))
-    chunk_count = (total+_VALIDATION_CHUNK_SIZE-1)//_VALIDATION_CHUNK_SIZE
-    query_metadata = 4096+sum(text_size(name) for name in robot_metadata["active_joint_names"])
-    targets = {"background": scene.background, **{owner.owner_id: owner.query for owner in scene.owners}}
-    layered = [(name, query) for name, query in targets.items() if isinstance(query, LayeredVoxelQuery)]
-    actors = {"robot": [row["body_id"] for row in scene.robot_collision_bodies]} if layered else {}
-    actors.update({owner.owner_id: [owner.owner_id] for owner in scene.owners if owner.moving})
-    if layered and not actors["robot"]:
-        raise ValueError("Layer recording requires every robot body's explicit identity")
-    pairs = [(actor, target, body_ids) for actor, body_ids in actors.items()
-             for target, _ in layered if actor != target]
-    encoded_bytes = 0
-    for start in range(0, total, _VALIDATION_CHUNK_SIZE):
-        typed = modes*min(_VALIDATION_CHUNK_SIZE, total-start)
-        # Actual native arrays are float32; float64 reserves CPU oracle use
-        # too, retaining exact dtype without assuming a smaller byte width.
-        encoded_bytes += sum(4*((typed*8*width+2)//3) for width in (1, 1, 1, dof)) + query_metadata
-        for actor, target, body_ids in pairs:
-            cells = typed*len(body_ids)
-            encoded_bytes += 128*cells+4*((cells+2)//3)
-            encoded_bytes += 4096+text_size(actor)+text_size(target)+sum(map(text_size, body_ids))
-    if encoded_bytes > _VALIDATION_RECORD_BYTE_LIMIT:
-        raise ValueError(f"Complete typed collision records require at most {encoded_bytes} encoded bytes; "
-                         f"allowed {_VALIDATION_RECORD_BYTE_LIMIT}; reduce declared total work or scene complexity")
-    # Complete history retains scalar residuals and measurements for every
-    # requirement, not merely the largest geometric temporary. Include the
-    # small q/TCP/twist arrays and sorting/coordinate work used by mechanisms.
-    residual_count = (1+len(problem.pose_relations)+len(problem.supports)+len(problem.interiors)
-        +len(problem.pose_events)+len(problem.coordinate_events)+len(problem.couplings)
-        +sum(event.stop for event in problem.events)
-        +sum(1+int(item.coordinate_limits is not None)+len(item.directions) for item in problem.mechanisms))
-    measurement_count = (4*len(problem.phases)+2*len(problem.mechanisms)
-                         +2*len(problem.pose_events)+len(problem.coordinate_events))
-    process_retained = 8*total*(4*dof+68+residual_count+measurement_count)
-    process_peak = 8*total*128
-    for item in problem.supports:
-        body, contact, planes = len(item.body_points), len(item.contact_points), len(item.surface._hull.equations)
-        # BEGIN the full-history verifier evaluates one trajectory at a time.
-        # Support residuals gather its unique event pose before expanding all
-        # body/contact points and support planes. Keep that complete one-pose
-        # temporary; process_retained above still includes every output state.
-        # Eight bytes also covers CPU float64; no autograd graph is retained.
-        process_peak = max(process_peak, 8*(2*body*planes+24*body+16*contact+64))
-        # END interval constraints below still evaluate their complete history.
-    for item in problem.interiors:
-        body, planes = len(item.body_points), len(item.halfspaces)
-        process_peak = max(process_peak, 8*total*(2*body*planes+24*body+64))
-    for item in problem.couplings:
-        rows, columns = item.matrix.shape
-        process_peak = max(process_peak, 8*(total*(4*rows+columns)+rows*columns))
-    process_peak += process_retained
-    if process_peak > _PROCESS_GEOMETRY_BYTE_LIMIT:
-        raise ValueError(f"Full-history process tensors require at most {process_peak} bytes; "
-                         f"allowed {_PROCESS_GEOMETRY_BYTE_LIMIT}; original geometry cannot be silently thinned")
-    return {"encoded_record_bytes_upper": int(encoded_bytes),
-        "encoded_record_byte_limit": _VALIDATION_RECORD_BYTE_LIMIT,
-        "process_geometry_peak_bytes_upper": int(process_peak),
-        "process_geometry_peak_byte_limit": _PROCESS_GEOMETRY_BYTE_LIMIT,
-        "physical_states": total, "typed_modes": modes, "chunks": chunk_count,
-        "layered_actor_target_pairs": len(pairs),
-        "layered_body_records_per_typed_state": sum(len(row[2]) for row in pairs)}
 
 
 # BEGIN one value carries independent host/device ownership through rebuilds.
@@ -801,7 +478,7 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
                      in zip(allocations, allocation_shapes) if guidance)
     # END the ordinary live bound above still reserves all validation scratch.
     graph_scene_bytes = gpu_eager_bytes+2*graph_live
-    trajectory_graph = not scene.contacts and graph_scene_bytes <= budget.max_scene_gpu_workspace_bytes
+    trajectory_graph = False
     # END no independent captured pool is treated as reusable eager scratch.
     dof, links, spheres = (len(robot_metadata["active_joint_names"]),
                            robot_metadata["links"], robot_metadata["spheres"])
@@ -1730,11 +1407,7 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
             or not isinstance(timestep, (float, int)) or not np.isfinite(timestep) or timestep <= 0
             or physics_consumed != original.get("consumed_physics_steps", 0)+local_steps):
         raise ContinuationBindingError("Continuation requires cumulative charges, exact confirmed steps and the unchanged native device timestep")
-    remaining_solves = request_budget.maximum_trajectory_solves-consumed["trajectory_solves"]
-    if remaining_solves <= 0:
-        raise ContinuationBindingError("The current skill's cumulative trajectory-solve budget is exhausted")
-    remaining = replace(request_budget, maximum_trajectory_solves=remaining_solves,
-                        search_seconds=max(0., request_budget.search_seconds-consumed["search_seconds"]))
+    remaining = request_budget
     feedback = continuation.get("actual_feedback", {})
     # BEGIN failed final capture cannot be replaced by stale or absent feedback.
     if not isinstance(feedback, dict):
@@ -1778,7 +1451,7 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
     if not isinstance(curve_elapsed, (int, float)) or not np.isfinite(curve_elapsed) or not 0 <= curve_elapsed <= duration:
         raise ContinuationBindingError("Rebinding requires the last actually executed curve time, separately from hold time")
     start_progress = float(np.interp(curve_elapsed/duration, original_map.u, original_map.s))
-    if start_progress >= problem.phase_count and rebind is None:
+    if start_progress >= problem.end_progress and rebind is None:
         raise ContinuationBindingError("The original skill progress is finished; unresolved effects need assessment or an explicit same-goal retry")
     request_events = deepcopy(original["request_ledger"]["original_events"])
     source_events = {(row["skill_id"], row["event_id"]): row for row in request_events}
@@ -1888,6 +1561,13 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
     selected_events = {}
     for identity in pending_ids:
         selected_events[identity[:2]] = replace(current_events[identity[:2]], occurrence=identity[2])
+    # BEGIN completed motion blocks never consume events that were not planned.
+    for event in problem.events:
+        identity = event_occurrence_key(event)
+        if (identity not in old_occurrences and identity not in applied
+                and event.progress >= start_progress):
+            selected_events[(event.skill_id, event.event_id)] = deepcopy(event)
+    # END the original request ledger remains the owner of deferred obligations.
     for identity in retry_ids:
         if any(key[:2] == identity for key in pending_ids):
             raise ContinuationBindingError("Retry selects consumed occurrences; pending work uses remaining rebind")
@@ -1906,7 +1586,7 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
         # A terminal unresolved effect/goal needs a nonempty new source window;
         # taking the preceding source interval proposes timing only, not q or a
         # re-execution of already consumed commands.
-        if start_progress >= problem.phase_count:
+        if start_progress >= problem.end_progress:
             start_progress = float(problem.source_progress[-2])
     # END original frame/progress associations remain unchanged across occurrences.
     for collection in ("pose_events", "coordinate_events", "supports"):
@@ -2033,7 +1713,7 @@ def _continuation_timing(problem, budget, continuation):
     remaining = continuation["original_duration"]-continuation["elapsed"]
     proposal = SimpleNamespace(source_time_map={
         "source_times": np.array([0., remaining]),
-        "progress": np.array([problem.start_progress, float(problem.phase_count)])})
+        "progress": np.array([problem.start_progress, float(problem.end_progress)])})
     selected, _ = _initial_timing(proposal, budget)
     grid = _fixed_spline_grid(intervals=selected.knots+4,
         native_dt=selected.maximum_trajectory_dt, interpolation_steps=selected.interpolation_steps,
@@ -2691,62 +2371,7 @@ def _formal_native_clock(trajopt):
     # END dense sampling never invents a new physical duration.
 
 
-class _RobotCoverageFK:
-    """An independent same-model FK buffer for native solid body frames."""
 
-    def __init__(self, problem, scene, robot_dict, device_cfg):
-        self.problem, self.scene = problem, scene
-        self.fk = None
-        if scene.robot_coverage is None:
-            return
-        from curobo.kinematics import Kinematics, KinematicsCfg
-        from curobo.types import JointState
-        from curobo.content import get_assets_path
-        from curobo._src.util.config_io import join_path
-        from pathlib import Path
-        self.JointState = JointState
-        configuration = deepcopy(robot_dict)
-        kinematics = configuration["robot_cfg"]["kinematics"]
-        urdf = join_path(kinematics.get("external_asset_path") or get_assets_path(), kinematics["urdf_path"])
-        if Path(urdf).resolve() != Path(scene._coverage_geometry["urdf_path"]).resolve():
-            raise ValueError("Native coverage FK must use the exact independently checked URDF")
-        locks = kinematics.get("lock_joints", {})
-        if (scene.gripper is not None
-                and scene.gripper.controller in {"timed_reference", "binary"}
-                and scene.gripper.nominal_finger_trajectory is not None):
-            for name in scene.gripper.joint_names:
-                if name not in locks:
-                    raise ValueError("Coverage may unlock only the explicitly independent finger joints")
-                del locks[name]
-        self.fk = Kinematics(KinematicsCfg.from_robot_yaml_file(
-            configuration, tool_frames=list(scene.robot_coverage.required_link_names), device_cfg=device_cfg),
-            compute_jacobian=True, compute_spheres=False, compute_com=False)
-        if set(self.fk.joint_names) != set(scene.robot_coverage.baseline_joint_names):
-            raise ValueError("Coverage FK and the native solid oracle must use exactly the same full joint set")
-        self._quaternion = _orientation_vjp_type()
-        self._layout = _native_gradient_layout_type()
-
-    def poses(self, joint_position, joint_names, trajectory_time):
-        if self.fk is None:
-            return None
-        import torch
-        from scipy.spatial.transform import Rotation
-        from .planning_problem import quaternion_multiply
-        from .optimizer_device_checks import constant_tensor
-        names, full = self.scene.full_robot_positions(joint_position, joint_names, trajectory_time)
-        columns = [names.index(name) for name in self.fk.joint_names]
-        # BEGIN retain integer indices and pose constants in optimizer captures.
-        q = full[..., constant_tensor(columns, full, dtype=torch.long)].contiguous()
-        state = self.fk.compute_kinematics(self.JointState.from_position(q, joint_names=self.fk.joint_names))
-        p = self._layout.apply(state.tool_poses.position)
-        r = self._quaternion.apply(q, state.tool_poses.quaternion.detach(), state.tool_jacobians[..., 3:, :].detach())
-        base = constant_tensor(self.problem.base_pose, q)
-        base_quaternion = constant_tensor(
-            Rotation.from_matrix(self.problem.base_pose[:3, :3]).as_quat()[[3, 0, 1, 2]], q)
-        # END FK, matrix products and quaternion arithmetic remain unchanged.
-        p = p@base[:3, :3].T+base[:3, 3]
-        r = quaternion_multiply(base_quaternion, r)
-        return {name: (p[..., index, :], r[..., index, :]) for index, name in enumerate(self.fk.tool_frames)}
 
 
 def _timed_native_state(state, problem, scene, joint_names, trajectory_time, *, sphere_padding=0.):
@@ -2807,8 +2432,7 @@ def _native_collision_padding(manager):
 # BEGIN scene switches share q/t while querying distinct adjacent modes.
 def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion,
                              progress, joint_position, joint_names, *, trajectory_time,
-                             normalized_time, layer_selection_out=None, source_geometry=False,
-                             valid=None, diagnostics=None, source_components_out=None):
+                             normalized_time):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2819,34 +2443,12 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     """
     import torch
     from .optimizer_device_checks import constant_tensor
-    # BEGIN the same mode expansion owns both proxy guidance and source acceptance.
-    # This is a call-site mode, not a configurable collision fallback. Formal
-    # metrics/search/export explicitly choose source geometry; only optimizer
-    # objectives retain the differentiable sphere/ESDF evaluation.
-    evaluate = scene.evaluate_source if source_geometry else scene.evaluate
-    source_arguments = ({"valid": valid, "diagnostics": diagnostics,
-                         "components_out": source_components_out} if source_geometry else {})
-    # END actual arrival permissions are preserved identically in both modes.
+    evaluate = scene.evaluate
     anchors = [float(value) for value in scene.required_progress_anchors
-               if problem.start_progress <= value <= problem.phase_count]
+               if problem.start_progress <= value <= problem.end_progress]
     if not anchors:
-        selected = {} if layer_selection_out is not None else None
         result = evaluate(spheres, position, quaternion, progress, joint_position,
-                          joint_names, trajectory_time=trajectory_time, **source_arguments,
-                          **({"layer_selection_out": selected} if selected is not None else {}))
-        # BEGIN retain pre-reduction state identity only for native diagnostic calls.
-        if source_geometry and diagnostics is not None and diagnostics.get("capture_components"):
-            from .planning_diagnostics import scene_component_failures
-            try:
-                diagnostics["component_failures"] = scene_component_failures(
-                    source_components_out, trajectory_time, progress, progress, joint_position,
-                    position, quaternion, modes=("exact",))
-            except Exception as error:
-                diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
-        # END diagnostic conversion cannot alter the evaluated residual.
-        if layer_selection_out is not None:
-            layer_selection_out.update(_layer_query_record(trajectory_time, progress, progress,
-                joint_position, joint_names, selected, ("exact",)))
+                          joint_names, trajectory_time=trajectory_time)
         return result
     left = torch.zeros_like(progress, dtype=torch.bool)
     right = torch.zeros_like(progress, dtype=torch.bool)
@@ -2856,77 +2458,46 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
         matching = progress == constant_tensor(anchor, progress)
         if anchor > problem.start_progress:
             left |= matching & (normalized_time <= constant_tensor(parameters[0], normalized_time))
-        if anchor < problem.phase_count:
+        if anchor < problem.end_progress:
             right |= matching & (normalized_time >= constant_tensor(parameters[-1], normalized_time))
         # END only constant storage changes, including each original FP32 cast.
     lower = torch.where(left, torch.nextafter(progress, torch.full_like(progress, -float("inf"))), progress)
     upper = torch.where(right, torch.nextafter(progress, torch.full_like(progress, float("inf"))), progress)
-    # BEGIN an arrival authorizes its explicit pair before same-state mode probes.
-    # Keep the previous material/attachment law, but never revoke a new pair
-    # permission by applying that law counterfactually to an already-arrived
-    # state. Earlier actual samples and all interval-end probes stay unchanged.
+    # BEGIN exact arrival activates only declared finite material permission.
+    # The same-q left-limit probe keeps attachment/controller laws separate
+    # from the material permission granted at this exact required arrival.
     permission_lower = lower
-    for rule in scene.robot_owner_permissions:
+    for rule in scene.contacts:
+        if rule.actor != 'robot':
+            continue
         arrival = constant_tensor(rule.interval[0], progress)
         permission_lower = torch.where((progress == arrival) & (lower < arrival), progress, permission_lower)
     # END equality is in the native query dtype; no tolerance advances arrival.
     repeated = lambda value: torch.cat((value, value, value), dim=1)
-    selected = {} if layer_selection_out is not None else None
     expanded_progress = torch.cat((progress, lower, upper), dim=1)
     permission_progress = torch.cat((progress, permission_lower, upper), dim=1)
     # BEGIN padding masks and diagnostics follow exact/left/right state identity.
-    expanded_components = {} if source_components_out is not None else None
-    if source_geometry:
-        source_arguments.update(valid=None if valid is None else repeated(valid),
-                                components_out=expanded_components)
     terms = evaluate(repeated(spheres), repeated(position), repeated(quaternion),
         expanded_progress, repeated(joint_position), joint_names,
-        # BEGIN pair authorization and other discontinuous laws retain separate scope.
+        # BEGIN finite permission and attachment/controller modes retain separate scope.
         trajectory_time=repeated(trajectory_time),
-        robot_owner_permission_progress=permission_progress,
-        **source_arguments,
-        **({"layer_selection_out": selected} if selected is not None else {}))
+        contact_permission_progress=permission_progress)
         # END q, physical time and the command clock are unchanged.
-    # BEGIN preserve each original mode before taking its maximum.
-    if source_geometry and diagnostics is not None and diagnostics.get("capture_components"):
-        from .planning_diagnostics import scene_component_failures
-        try:
-            diagnostics["component_failures"] = scene_component_failures(
-                expanded_components, repeated(trajectory_time), expanded_progress, permission_progress,
-                repeated(joint_position), repeated(position), repeated(quaternion),
-                modes=("exact", "left", "right"))
-        except Exception as error:
-            diagnostics["component_capture_error"] = f"{type(error).__name__}: {error}"
-    # END no extra geometry query or acceptance calculation is performed.
-    if layer_selection_out is not None:
-        layer_selection_out.update(_layer_query_record(repeated(trajectory_time), expanded_progress,
-            permission_progress, repeated(joint_position), joint_names, selected, ("exact", "left", "right")))
-    if source_components_out is not None:
-        source_components_out.update({name: torch.stack(value.split(progress.shape[1], dim=1)).amax(0)
-                                      for name, value in expanded_components.items()})
-    # END source world checks never see native dense-buffer padding as a state.
+    # END all three mode probes consume the same frozen online field.
     return torch.stack(terms.split(progress.shape[1], dim=1)).amax(0)
 
 
-def _layer_query_record(times, progress, permission, joints, names, selected, modes):
-    """Retain the actual typed query and selected layer for independent binding."""
-    cpu = lambda value: encode_array(value.detach().cpu())
-    return {"time_s": cpu(times), "progress": cpu(progress),
-        "robot_owner_permission_progress": cpu(permission), "joint_position": cpu(joints),
-        "joint_names": list(names), "time_dtype": str(times.dtype), "progress_dtype": str(progress.dtype),
-        "query_order": list(modes), "layer_selection": selected}
-# END query-side selection never changes the command or nominal hand clock.
 
 
 def _process_manager_type(problem, scene, progress_map, anchors, budget,
-                          refinement_parameters=(), *, clock=None, seed_parameter=None, robot_dict=None,
+                          *, clock=None, seed_parameter=None, robot_dict=None,
                           phase="feasibility", functional_constraints=None):
     """Build V2's documented manager extension after GPU use is requested.
 
     Configuration construction must return the derived type and class_type;
     registering a custom name alone is not dispatched by V2's base manager.
     Only constraint_cfg enables this extension. Built-in joint constraints
-    remain intact; optimizer spheres guide motion and metrics use source solids.
+    remain intact; optimizer and metrics share the same frozen online model.
     """
     import torch
     from curobo.kinematics import Kinematics
@@ -2945,6 +2516,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
         functional_constraints = FunctionalAugmentedLagrangian(problem.functional_constraint_keys)
     # END a standalone manager uses the same zero-multiplier objective.
 
+    managers = []
+
     class ProcessCostManager(RobotCostManager):
         def initialize_from_config(self, config, transition_model, scene_collision_checker=None, **kwargs):
             # BEGIN give each native manager its own mutable cost configuration.
@@ -2956,6 +2529,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # END give each native manager its own mutable cost configuration.
             super().initialize_from_config(config, transition_model, scene_collision_checker, **kwargs)
             self._process_mode = config.process_mode
+            managers.append(self)
             self._dense_counts = None
             if not self._process_mode:
                 return
@@ -2970,25 +2544,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             if self._process_mode.startswith("seed_"):
                 return
             # END do not allocate coverage or anchor FK for reference IK.
-            self._coverage_fk = (_RobotCoverageFK(problem, self._scene, robot_dict, self.device_cfg)
-                                 if scene.robot_coverage is not None
-                                 and (scene.gripper is None or scene.gripper.controller == "position_tracking"
-                                      or scene.gripper.nominal_finger_trajectory is not None)
-                                 and self._process_mode == "trajectory_optimizer" else None)
             self._tool_index = transition_model.robot_model.tool_frames.index(problem.tool_link)
-            self._map_u = self.device_cfg.to_device(progress_map.u)
-            self._map_s = self.device_cfg.to_device(progress_map.s)
-            anchor_pairs = progress_map.anchor_parameters(anchors)
-            if len(refinement_parameters):
-                additional = np.asarray(refinement_parameters, float)
-                anchor_pairs = np.unique(np.concatenate((anchor_pairs, np.column_stack(
-                    (additional, np.interp(additional, progress_map.u, progress_map.s))))), axis=0)
-            self._anchor_u = self.device_cfg.to_device(anchor_pairs[:, 0]).unsqueeze(0)
-            self._anchor_s = self.device_cfg.to_device(anchor_pairs[:, 1]).unsqueeze(0)
-            # BEGIN bind small AL constants before any native graph capture.
-            if self._process_mode == "trajectory_optimizer":
-                functional_constraints.bind(self._anchor_u)
-            # END outer updates always precede a complete solver rebuild.
+            self.bind_request_data()
             # A separate native FK instance owns the anchor buffers.  Reusing
             # the main rollout FK would overwrite values needed by backward.
             self._anchor_fk = Kinematics(transition_model.robot_model.config, compute_jacobian=True)
@@ -3001,12 +2558,40 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 SelfCollisionCost(deepcopy(native_self.config)))
             # END ordinary reference IK creates no additional check buffers.
 
+        def bind_request_data(self):
+            """Replace request values in fixed-capacity native manager buffers."""
+            self._scene = scene.clone_for_rollout()
+            self._dense_counts = None
+            if not self._process_mode or self._process_mode.startswith("seed_"):
+                return
+            if len(progress_map.u) > _MAX_PROGRESS_KEYS:
+                raise MotionPlanningError("capacity_exceeded", "Progress clock exceeds its fixed capacity")
+            pad = _MAX_PROGRESS_KEYS-len(progress_map.u)
+            keys = np.r_[progress_map.u, 1.+np.arange(1, pad+1)]
+            values = np.r_[progress_map.s, np.full(pad, progress_map.s[-1])]
+            pairs = progress_map.anchor_parameters(anchors)
+            _anchor_capacity(progress_map, anchors, budget)
+            anchor_count = len(pairs)
+            pairs = np.concatenate((pairs, np.repeat(pairs[-1:], budget.max_task_anchors-anchor_count, axis=0)))
+            self._anchor_valid = self.device_cfg.to_device(np.arange(budget.max_task_anchors) < anchor_count)[None]
+            for name, value in (("_map_u", keys), ("_map_s", values),
+                                ("_anchor_u", pairs[:, 0][None]), ("_anchor_s", pairs[:, 1][None])):
+                tensor = self.device_cfg.to_device(value)
+                previous = getattr(self, name, None)
+                if previous is None:
+                    setattr(self, name, tensor)
+                elif previous.shape != tensor.shape:
+                    raise MotionPlanningError("capacity_exceeded", "A request changed fixed manager capacity")
+                else:
+                    previous.copy_(tensor)
+            functional_constraints.bind(self._anchor_u)
+
         def set_dense_counts(self, counts):
             self._dense_counts = counts.reshape(-1).long()
 
         def compute_costs(self, state, cost_collection=None, goal=None, **kwargs):
-            # BEGIN proxy geometry supplies gradients only; source solids own acceptance.
-            if self._process_mode.endswith("_optimizer") and self._scene.gripper is not None and self._scene.gripper.controller in {"timed_reference", "binary"}:
+            # BEGIN native constraints and online fields share one acceptance model.
+            if self._process_mode and self._scene.gripper is not None and self._scene.gripper.controller in {"timed_reference", "binary"}:
                 batch, horizon = state.joint_state.position.shape[:2]
                 if self._process_mode.startswith("seed_"):
                     query_time = (seed_parameter*clock["duration"]).expand(batch, horizon)
@@ -3018,11 +2603,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 state = _timed_native_state(state, problem, self._scene, self._joint_names, query_time,
                                             sphere_padding=_native_collision_padding(self))
             collection = super().compute_costs(state, cost_collection, goal, **kwargs)
-            if self._process_mode == "seed_metrics":
-                q = state.joint_state.position
-                query_time = (seed_parameter*clock["duration"]).expand(*q.shape[:2])
-                collection.add(self._scene.check_robot_self_collision(
-                    q, self._joint_names, query_time).unsqueeze(-1), "source_self_collision")
             # END reference IK receives the same physical time as its optimizer.
             # BEGIN native IK remains an initializer even if its reference collides.
             # Native pose and physical joint-domain evaluation remain intact.
@@ -3067,10 +2647,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 anchor_collision = self._anchor_self_collision.forward(
                     native_layout.apply(anchor_native.robot_spheres).contiguous())
                 # These values already contain the native optimizer weight
-                # and policy; metrics use source solids instead. Do not square or multiply them
+                # and policy in optimizer and metrics. Do not square or multiply them
                 # by the separate task/scene constraint weight below.
                 folded_collision = torch.cat((q.new_zeros((batch, horizon-1, 1)),
-                    anchor_collision.sum(1, keepdim=True)), dim=1)
+                    (anchor_collision*self._anchor_valid[..., None]).sum(1, keepdim=True)), dim=1)
                 collection.add(folded_collision, "anchor_self_collision")
             # END anchor sphere penalties retain native optimizer gradients.
             anchor_quaternion = orientation_vjp.apply(anchor_q, anchor_state.tool_poses.quaternion.detach(),
@@ -3110,74 +2690,12 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 if self._process_mode != "trajectory_optimizer"
                 or not name.startswith(("function_pose:", "function_coordinate:")))
             # END metrics retain the complete original hard residual dictionary.
-            # BEGIN only real native states enter source world/self acceptance.
+            # BEGIN optimizer and success metrics consume the identical online scene.
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
-            source_valid = (ordered(torch.cat((valid, torch.ones_like(anchor_u, dtype=torch.bool)), 1))
-                            if self._process_mode == "trajectory_metrics" else None)
-            # BEGIN native acceptance keeps component identity before anchor folding.
-            scene_diagnostics = ({"capture_components": True}
-                                 if self._process_mode == "trajectory_metrics" else None)
-            scene_components = {} if scene_diagnostics is not None else None
-            # END optimizer costs do not allocate diagnostic state snapshots.
             scene_value = _scene_boundary_evaluate(self._scene, problem, progress_map,
                 spheres, position, quaternion, progress, q, self._joint_names,
-                trajectory_time=trajectory_time, normalized_time=ordered(all_u),
-                source_geometry=self._process_mode == "trajectory_metrics", valid=source_valid,
-                diagnostics=scene_diagnostics, source_components_out=scene_components)
-            # BEGIN retain process/self failure times before folding exact anchors.
-            source_self = None
-            if self._process_mode == "trajectory_metrics":
-                source_self = self._scene.check_robot_self_collision(
-                    q, self._joint_names, trajectory_time, valid=source_valid)
-            # END the same self query supplies both evidence and native constraints.
-            # BEGIN copy only this metrics call; later calls replace all prior evidence.
-            if scene_diagnostics is not None:
-                try:
-                    if "component_capture_error" in scene_diagnostics:
-                        raise ValueError(scene_diagnostics["component_capture_error"])
-                    original = state.joint_state
-                    captured = [value.detach().cpu().numpy().copy()
-                                for value in (original.position, original.velocity, order)]
-                    from .planning_diagnostics import capture_component_failures
-                    scene_diagnostics["component_failures"].extend(capture_component_failures(
-                        {"skill_process": process_value*source_valid,
-                         "source_self_collision": source_self},
-                        trajectory_time, progress, q, position, quaternion,
-                        normalized_time=ordered(all_u)))
-                    normalized_times = ordered(all_u).detach().cpu().numpy()
-                    for row in scene_diagnostics["component_failures"]:
-                        column = int(captured[2][row["batch_index"], row["ordered_query_index"]])
-                        row.update(sample_kind="regular" if column < horizon else "anchor",
-                                   sample_index=column if column < horizon else column-horizon,
-                                   normalized_time=float(normalized_times[
-                                       row["batch_index"], row["ordered_query_index"]]))
-                    scene_diagnostics.pop("capture_components")
-                    self.last_source_diagnostics = {
-                        "input_position": captured[0], "input_velocity": captured[1],
-                        "component_failures": scene_diagnostics.pop("component_failures"),
-                        "world_geometry": scene_diagnostics}
-                except Exception as error:
-                    self.last_source_diagnostics = {"error": f"{type(error).__name__}: {error}"}
-            # END evidence failures remain separate from every numerical residual.
-            # END optimizer world gradients continue through the original ESDF.
-            # BEGIN all hard self checks use the same source geometry and exact query times.
-            if self._process_mode == "trajectory_metrics":
-                source_self = source_self.gather(1, inverse)
-                folded_self = torch.cat((q.new_zeros((batch, horizon-1)),
-                    source_self[:, horizon:].sum(1, keepdim=True)), 1)
-                collection.add((source_self[:, :horizon]+folded_self).unsqueeze(-1),
-                               "source_self_collision")
-            # END padded dense-buffer states are excluded before CPU geometry queries.
-            # BEGIN retain the original summed scene objective before squaring.
-            # Fixed installation proxies and same-time hand geometry are
-            # identical on both sides of a material mode boundary. Adding
-            # their guidance after the boundary maximum therefore preserves
-            # max(environment + self) and its original cross derivatives.
-            if self._process_mode == "trajectory_optimizer":
-                scene_value = scene_value + self._scene.robot_self_collision_guidance(
-                    spheres, position, quaternion, progress, q, self._joint_names,
-                    trajectory_time=trajectory_time)
-            # END metrics retain environment constraints and source self checks separately.
+                trajectory_time=trajectory_time, normalized_time=ordered(all_u))
+            # END raw residual zero sets are shared; only optimizer weights differ.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
             # A squared optimizer penalty has a gradient proportional to
             # the remaining violation. Metrics retain the original raw
@@ -3193,9 +2711,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 collection.add(folded_augmented * budget.constraint_weight,
                                "functional_augmented_lagrangian")
                 # END original tolerance and first-arrival identity belong to the problem.
-                if self._coverage_fk is not None:
-                    values.append(("robot_new_volume_guidance", self._scene.robot_coverage_guidance(
-                        self._coverage_fk.poses(q, self._joint_names, trajectory_time), progress).square()))
                 # BEGIN retain a gradient toward source-declared pose equalities.
                 # The problem owns equality-axis selection and its complete
                 # endpoint-family reference; free pose axes gain no target.
@@ -3221,7 +2736,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # Keep CostCollection's native [B,H,*] shape.  Summing exact
                 # anchor penalties into its final column retains their full
                 # gradient and makes any anchor violation fail feasibility.
-                folded = torch.cat((torch.zeros_like(regular[:, :-1]), value[:, horizon:].sum(1, keepdim=True)), 1)
+                folded = torch.cat((torch.zeros_like(regular[:, :-1]), (value[:, horizon:]*self._anchor_valid).sum(1, keepdim=True)), 1)
                 collection.add((regular+folded).unsqueeze(-1) * budget.constraint_weight, name)
             return collection
 
@@ -3238,6 +2753,13 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             values = {item.name: getattr(base, item.name) for item in fields(base) if item.name != "class_type"}
             return ProcessCostManagerCfg(**values, process_mode=data_dict.get("process_mode", ""))
 
+    def bind_request(new_problem, new_scene, new_progress, new_anchors, new_budget, new_constraints):
+        nonlocal problem, scene, progress_map, anchors, budget, functional_constraints
+        problem, scene, progress_map, anchors, budget = new_problem, new_scene, new_progress, new_anchors, new_budget
+        functional_constraints = new_constraints
+        for manager in managers:
+            manager.bind_request_data()
+    ProcessCostManagerCfg.bind_request = staticmethod(bind_request)
     return ProcessCostManagerCfg
 
 
@@ -3278,59 +2800,13 @@ def _trajectory_candidate(result, index):
 # END exact native candidate extraction before independent verification.
 
 
-# BEGIN one native solve owns bounded source reuse across repeated observations.
-def _bind_candidate_source_world_reuse(optimizer):
-    """Bind candidate state reports and completed batches to native calls.
-
-    Every ordinary call resets the short state-report segment. Its matching
-    dense call ends that segment, while each scene's last completed source
-    batch survives until solve cleanup. All native metrics still execute;
-    only exact source-world inputs may reuse a completed geometry verdict.
-    """
-    from functools import wraps
-    ordinary = optimizer.metrics_rollout
-    dense = optimizer.additional_metrics_rollouts["interpolated_rollout"]
-    ordinary_scene = ordinary.metrics_constraint_manager._scene
-    dense_scene = dense.metrics_constraint_manager._scene
-    ordinary_metrics = ordinary.compute_metrics_from_action
-    dense_metrics = optimizer._interpolate_and_compute_metrics
-
-    @wraps(ordinary_metrics)
-    def evaluate_ordinary(*args, **kwargs):
-        session = getattr(ordinary_scene, "_source_world_reuse", None)
-        if session is None or session.binding_for(ordinary_scene) is None:
-            session = ordinary_scene.begin_source_world_reuse(dense_scene)
-        session.begin_candidate()
-        try:
-            return ordinary_metrics(*args, **kwargs)
-        except BaseException:
-            ordinary_scene.end_source_world_reuse()
-            raise
-
-    @wraps(dense_metrics)
-    def evaluate_dense(*args, **kwargs):
-        try:
-            return dense_metrics(*args, **kwargs)
-        except BaseException:
-            ordinary_scene.end_source_world_reuse()
-            raise
-        finally:
-            session = getattr(ordinary_scene, "_source_world_reuse", None)
-            if session is not None:
-                session.finish_candidate()
-
-    ordinary.compute_metrics_from_action = evaluate_ordinary
-    optimizer._interpolate_and_compute_metrics = evaluate_dense
-    return ordinary_scene.end_source_world_reuse
-# END every solve/error closes both scene slots; dense success only ends its segment.
-
-
 class _CuroboPlanner:
-    """One request's native solvers and independent verification workspaces."""
+    """Resident native solvers with request-local online constraint inputs."""
 
     # BEGIN every planner binds one explicit source geometry and pair policy.
-    def __init__(self, problem, scene, robot, budget, device, *, robot_validator, continuation=None):
+    def __init__(self, problem, scene, robot, budget, device, *, robot_validator, continuation=None, goal_identities=None):
         self.ik = self.trajopt = None
+        self.check_request = lambda: None
         # BEGIN keep full float32 geometry through the complete native request.
         # TF32 truncates even an identity matrix product, so its coordinate
         # quantization can exceed the physical collision tolerance. Precision
@@ -3344,29 +2820,31 @@ class _CuroboPlanner:
         # END close() restores both settings on success and initialization error.
         try:
             self._initialize(problem, scene, robot, budget, device,
-                             robot_validator=robot_validator, continuation=continuation)
+                             robot_validator=robot_validator, continuation=continuation, goal_identities=goal_identities)
         except BaseException:
             # A later native configuration failure must release an IK solver
             # already created in this process before propagating the error.
             self.close()
             raise
 
-    def _initialize(self, problem, scene, robot, budget, device, *, robot_validator, continuation=None):
+    def _initialize(self, problem, scene, robot, budget, device, *, robot_validator, continuation=None, goal_identities=None):
         # Validate grounded evidence and bound independent scene workspaces
         # before importing native GPU solvers or creating any of their buffers.
-        scene.bind_robot_validator(robot_validator, problem)
         self.robot_validator = robot_validator
+        # BEGIN native planning and measured execution share calibrated FK identity.
+        robot_validator.validate_planning_binding(problem, scene.gripper)
+        # END this checks named inputs only and performs no source geometry query.
         # BEGIN continuation keeps original goal identities after local filtering.
-        scene.validate_problem(problem, goal_identities=(None if continuation is None
-                               else continuation["goal_identities"]))
+        scene.validate_problem(problem, goal_identities=goal_identities)
         # END finite arrival binding never treats an original ID as a local index.
         # END binding precedes native allocation and applies to direct planner construction.
         budget, initial_progress = (_initial_timing(problem, budget) if continuation is None
                                     else _continuation_timing(problem, budget, continuation))
         anchors = np.unique(np.concatenate((problem.anchors, np.asarray(scene.required_progress_anchors, float))))
+        anchors = anchors[(anchors >= problem.start_progress) & (anchors <= problem.end_progress)]
         # BEGIN preserve all required source points within the total query budget.
         if (len(anchors) > budget.max_validation_points or not np.isfinite(anchors).all()
-                or np.any(anchors < 0) or np.any(anchors > problem.phase_count)):
+                or np.any(anchors < 0) or np.any(anchors > problem.end_progress)):
             raise ValueError("All required source knots and scene anchors must fit the finite planning horizon and budget")
         if problem.reference_frame != scene.reference_frame:
             raise ValueError("Problem and planning scene must use the same explicitly calibrated reference frame")
@@ -3377,21 +2855,6 @@ class _CuroboPlanner:
         initial_clock = _fixed_spline_grid(intervals=budget.knots+4,
             native_dt=budget.maximum_trajectory_dt, interpolation_steps=budget.interpolation_steps,
             interpolation_dt=budget.interpolation_dt)
-        # BEGIN reject an intrinsically undersized export budget before native allocation.
-        # Export checks at least two subdivisions of every native output
-        # interval, even for a constant curve. This is a necessary lower
-        # bound only: actual joint motion and exact semantic anchors can add
-        # queries, whose unchanged limits are still checked by export().
-        minimum_validation_points = 2*(initial_clock["valid_count"]-1)+1
-        if minimum_validation_points > budget.max_validation_points:
-            raise ValueError(
-                "Final curve validation requires at least "
-                f"{minimum_validation_points} points, allowed {budget.max_validation_points}; "
-                f"bound clock duration_s={initial_clock['duration']!r}, "
-                f"interpolation_dt_s={initial_clock['interpolation_dt']!r}, "
-                f"native_samples={initial_clock['valid_count']} "
-                "(two subdivisions per output interval; anchors or motion may require more)")
-        # END admission never changes the clock, resolution, anchors or declared capacity.
         if continuation is None:
             self.progress_map = _bind_event_clock(problem, self.progress_map, initial_clock["duration"],
                 None if scene.gripper is None else scene.gripper.control_timestep_s)
@@ -3406,12 +2869,6 @@ class _CuroboPlanner:
             hand.bind_clock(initial_clock["duration"], self.progress_map)
         self.finger_trajectory = None if hand is None else hand.finger_trajectory
         # END every private scene receives the same already frozen hand clock.
-        # BEGIN build source world shapes once from the finalized request inputs.
-        # Continuation filtering and hand-clock binding precede this snapshot.
-        # Native managers/search children share its immutable geometry while
-        # supplying their own owner/release poses for every source query.
-        scene.bind_source_scene(max_host_rss_bytes=budget.max_host_rss_bytes)
-        # END execution keeps its own independently bound checker and arrival latches.
         self.anchor_capacity = _anchor_capacity(self.progress_map, anchors, budget)
         robot_dict, self.robot_metadata = _bounded_robot_configuration(robot, problem, scene, budget)
         # BEGIN native and source FK must consume the same complete robot description.
@@ -3443,7 +2900,7 @@ class _CuroboPlanner:
                     raise ValueError("An independently controlled finger cannot be an ancestor of the native TCP")
                 joint = int(checker.model.parents[joint])
         # END source identity is established before allocating GPU solvers.
-        self.validation_storage = _validation_storage_admission(problem, scene, self.robot_metadata, budget)
+        self.validation_storage = {"encoded_record_bytes_upper": 0}
         workspace = _planning_workspace_bytes(scene, self.robot_metadata, budget, self.anchor_capacity)
         _require_planning_host_memory(workspace.cpu_live_bytes,
             encoded_record_bytes_upper=self.validation_storage["encoded_record_bytes_upper"],
@@ -3477,7 +2934,7 @@ class _CuroboPlanner:
         self.scene_cpu_live_bytes = workspace.cpu_live_bytes
         # END subsequent record admission does not re-charge resident maps.
         self.anchor_fk_workspace_bytes = workspace.anchor_fk_bytes
-        self._trajectory_optimizer_graph_admitted = workspace.trajectory_graph
+        self._trajectory_optimizer_graph_admitted = False
         # END include request-sized anchor FK in native allocation admission.
         self.ik = self.trajopt = None
         self.anchors = anchors
@@ -3494,15 +2951,10 @@ class _CuroboPlanner:
             problem, scene, self.progress_map, self.anchors, budget,
             clock=self.formal_clock, seed_parameter=self.seed_parameter, robot_dict=self.robot_dict,
             functional_constraints=self.functional_constraints)
-        self.refinement_parameters = np.empty(0)
-        # BEGIN one attempt owns its phase and every discovered failure time.
-        from .planning_diagnostics import AttemptWitnesses
         self.phase = "feasibility"
-        self.witnesses = AttemptWitnesses()
-        self.last_working_set = {}
         self.goal_ik_candidates = {}
         self.last_optimizer_diagnostics = []
-        # END neither solver rebuilds nor candidate selection reset this state.
+        self.delivery_candidate = None
 
         def configuration(name, mode):
             data = deepcopy(load_yaml(join_path(get_task_configs_path(), name)))
@@ -3510,22 +2962,11 @@ class _CuroboPlanner:
             # All environment geometry is owned by PlanningScene in reference
             # coordinates. Spheres remain an optimizer gradient only.
             constraint.pop("scene_collision_cfg", None)
-            # BEGIN source solids replace only the self component of native feasibility.
-            if mode.endswith("_metrics"):
-                constraint.pop("self_collision_cfg", None)
-            # END native joint-domain checks keep their original policy.
             constraint["process_mode"] = mode
             return data
 
         ik_optimizer = configuration("ik/lbfgs_ik.yml", "seed_optimizer")
-        # BEGIN retain the native quality configuration for the second phase.
         trajectory_optimizer = configuration("trajopt/lbfgs_bspline_trajopt.yml", "trajectory_optimizer")
-        # BEGIN find a feasible curve before spending motion freedom on quality.
-        self._quality_optimizer_config = deepcopy(trajectory_optimizer)
-        trajectory_optimizer["rollout"]["cost_cfg"]["cspace_cfg"]["squared_l2_regularization_weight"] = [0.]*5
-        # Native limit penalties and independent constraints stay enabled.
-        # END Phase B restores the original motion regularization configuration.
-        # END independent hard constraints decide whether either curve is usable.
         for name, config, iterations in (("IK", ik_optimizer, budget.ik_iterations),
                                          ("trajectory", trajectory_optimizer, budget.trajectory_iterations)):
             inner_iterations = config["optimizer"]["inner_iters"]
@@ -3562,8 +3003,8 @@ class _CuroboPlanner:
         columns = [problem.joint_names.index(name) for name in self.joint_names]
         self.start = JointState.from_numpy(list(self.joint_names), problem.start_q[columns][None],
                                           velocity=problem.start_dq[columns][None], device_cfg=self.device_cfg)
+        self._bind_online_robot()
         self._verification_fk = Kinematics(self.ik.kinematics.config, compute_jacobian=True)
-        self._validate_occupied_robot_geometry()
         self._orientation_vjp = _orientation_vjp_type()
         self._native_layout = _native_gradient_layout_type()
         self._verification_scene = scene.clone_for_rollout()
@@ -3593,30 +3034,6 @@ class _CuroboPlanner:
         }
 
         class ProcessTrajectoryOptimizer(TrajectoryOptimizer):
-            # BEGIN install sessions on each construction, including grid rebuilds.
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.end_source_world_reuse = _bind_candidate_source_world_reuse(self)
-                self._source_world_solve_active = False
-
-            def solve_pose(self, *args, **kwargs):
-                # BEGIN a new native call cannot inherit a previous solve's batches.
-                self.end_source_world_reuse()
-                self._source_world_solve_active = True
-                # END observations below share only this call's frozen binding.
-                try:
-                    return super().solve_pose(*args, **kwargs)
-                finally:
-                    self._source_world_solve_active = False
-                    self.end_source_world_reuse()
-            # END an error between ordinary metrics and interpolation cannot leak.
-
-            # BEGIN explicit solver replacement also releases bounded CPU evidence.
-            def destroy(self):
-                self.end_source_world_reuse()
-                return super().destroy()
-            # END a rebuilt objective starts with two empty source batch slots.
-
             def get_interpolated_trajectory(self, js_optimized):
                 # BEGIN preserve raw controls and boundary derivatives on one clock.
                 from curobo._src.curobolib.cuda_ops.trajectory import get_bspline_interpolation
@@ -3676,6 +3093,90 @@ class _CuroboPlanner:
         self._bind_formal_clock()
         self._initialize_verification_constraints()
         self._bind_physical_domains()
+        self._manager_type.bind_request(problem, scene, self.progress_map, self.anchors, budget, self.functional_constraints)
+
+    # BEGIN resident native solvers rebind only request values and optimizer state.
+    def _bind_online_robot(self):
+        params = self.ik.kinematics.config.kinematics_config
+        spheres = params.link_spheres.detach().cpu().numpy().reshape(-1, 4)
+        links = params.link_sphere_idx_map.detach().cpu().numpy().reshape(-1)
+        names = {int(index): name for name, index in params.link_name_to_idx_map.items()}
+        geometry = [{"link_name": names[int(link)], "sphere_indices": np.flatnonzero(links == link).tolist(),
+                     "centers_local": spheres[links == link, :3].tolist(), "radii": spheres[links == link, 3].tolist()}
+                    for link in np.unique(links)]
+        collision = self.ik.kinematics.get_self_collision_config()
+        validator = self.robot_validator
+        self.scene.bind_online_robot(robot_sphere_geometry=geometry,
+            robot_self_collision_pairs=collision.collision_pairs.detach().cpu().numpy().tolist(),
+            robot_self_collision_padding=collision.sphere_padding.detach().cpu().numpy().tolist(),
+            robot_geometry_source=self.scene.robot_geometry_source,
+            robot_model={"urdf_path": str(validator.checker.urdf_path), "base_frame": validator.checker.base_frame,
+                         "tool_frame": validator.tool_frame, "T_reference_base": validator.T_reference_base.tolist(),
+                         "T_frame_tcp": validator.T_frame_tcp.tolist()})
+
+    def rebind(self, problem, scene, budget, *, continuation=None, goal_identities=None):
+        """Reuse IK/TrajOpt while clearing all prior candidate and request state."""
+        # BEGIN a new request cannot change the resident robot calibration.
+        self.robot_validator.validate_planning_binding(problem, scene.gripper)
+        # END measured entrance and hand coordinates keep their named model.
+        scene.validate_problem(problem, goal_identities=goal_identities)
+        budget, mapping = (_initial_timing(problem, budget) if continuation is None else
+                           _continuation_timing(problem, budget, continuation))
+        anchors = np.unique(np.r_[problem.anchors, scene.required_progress_anchors])
+        anchors = anchors[(anchors >= problem.start_progress) & (anchors <= problem.end_progress)]
+        if continuation is None:
+            mapping, _ = _progress_for_cubic_boundaries(mapping, budget.knots, problem.start_dq,
+                stop_progress=problem.stop_progress, anchors=anchors)
+        grid = _fixed_spline_grid(intervals=budget.knots+4, native_dt=budget.maximum_trajectory_dt,
+            interpolation_steps=budget.interpolation_steps, interpolation_dt=budget.interpolation_dt)
+        if continuation is None:
+            mapping = _bind_event_clock(problem, mapping, grid["duration"],
+                None if scene.gripper is None else scene.gripper.control_timestep_s)
+        _anchor_capacity(mapping, anchors, budget)
+        workspace = _planning_workspace_bytes(scene, self.robot_metadata, budget, self.anchor_capacity)
+        _require_planning_host_memory(workspace.cpu_live_bytes, encoded_record_bytes_upper=0,
+            max_host_rss_bytes=budget.max_host_rss_bytes)
+        _require_planning_memory(self.torch, self.device_cfg.device, workspace,
+            max_device_used_bytes=budget.max_device_used_bytes)
+        if scene.gripper is not None:
+            scene.gripper.bind_clock(grid["duration"], mapping)
+        self.problem, self.scene, self.budget, self.progress_map, self.anchors = problem, scene, budget, mapping, anchors
+        self.formal_clock.clear()
+        self.formal_clock.update(grid)
+        self.finger_trajectory = None if scene.gripper is None else scene.gripper.finger_trajectory
+        columns = [problem.joint_names.index(name) for name in self.joint_names]
+        self.start = self.JointState.from_numpy(list(self.joint_names), problem.start_q[columns][None],
+            velocity=problem.start_dq[columns][None], device_cfg=self.device_cfg)
+        self._bind_online_robot()
+        from .functional_augmented_lagrangian import FunctionalAugmentedLagrangian
+        self.functional_constraints = FunctionalAugmentedLagrangian(problem.functional_constraint_keys)
+        self._manager_type.bind_request(problem, scene, mapping, anchors, budget, self.functional_constraints)
+        self._verification_scene = scene.clone_for_rollout()
+        self.trajopt.config.minimum_trajectory_dt = budget.maximum_trajectory_dt
+        self.trajopt.config.maximum_trajectory_dt = budget.maximum_trajectory_dt
+        self._bind_formal_clock()
+        self.seed_parameter.zero_()
+        self.last_validation, self.last_optimizer_diagnostics, self.goal_ik_candidates = None, [], {}
+        self.delivery_candidate = None
+        for solver in (self.ik, self.trajopt):
+            solver.reset_seed()
+            # A missing goal must never reuse the previous request's pose.
+            manager = solver.core.goal_registry_manager
+            if manager._goal_buffer is not None:
+                manager._goal_buffer.link_goal_poses = None
+            rollouts = solver.core.get_all_rollout_instances()
+            if solver is self.trajopt:
+                rollouts += list(self.trajopt.additional_metrics_rollouts.values())
+            for rollout in rollouts:
+                rollout.reset()
+                for name in ("_num_particles_goal", "_metrics_goal"):
+                    goal = getattr(rollout, name, None)
+                    if goal is not None:
+                        goal.link_goal_poses = None
+                        goal.goal_js = None
+        self._bind_physical_domains()
+        return self
+    # END native solver objects and their fixed tensor capacities remain resident.
 
     # BEGIN bind the independently controlled fingers to native formal output.
     def _bind_formal_clock(self):
@@ -3693,47 +3194,7 @@ class _CuroboPlanner:
     # END formal export always evaluates its actual time, not this seed inverse.
 
     # BEGIN bind occupancy evidence to the actual bounded current robot model.
-    def _validate_occupied_robot_geometry(self):
-        """Verify q0 spheres and requested link poses before trajectory setup.
 
-        Collision spheres come from the actual planner's FK configuration.
-        Additional pose frames use the same already checked robot dictionary
-        and cannot add links, joints, meshes or optimizer tool targets. CPU
-        float64 frame transforms match the occupancy adapter's evidence path.
-        """
-        from scipy.spatial.transform import Rotation
-        from curobo.kinematics import Kinematics, KinematicsCfg
-
-        required = self.scene.required_robot_links
-        with self.torch.no_grad():
-            state = self._verification_fk.compute_kinematics(self.JointState.from_position(
-                self.start.position[:, None].contiguous(), joint_names=list(self.joint_names)))
-            spheres = state.robot_spheres[0, 0].detach().cpu().numpy().astype(float)
-            poses = {}
-            if required:
-                # The preflight already proved every requested link belongs
-                # to this selected tree. Only this single-state FK exposes
-                # more frames; IK retains its one-tool seed allocation.
-                pose_fk = Kinematics(KinematicsCfg.from_robot_yaml_file(
-                    deepcopy(self.robot_dict), tool_frames=list(required), device_cfg=self.device_cfg),
-                    compute_spheres=False, compute_com=False)
-                if (set(pose_fk.joint_names) != set(self.joint_names)
-                        or not set(pose_fk.config.kinematics_config.link_name_to_idx_map)
-                        <= set(self.robot_metadata["selected_link_names"])):
-                    raise ValueError("Occupied-link FK changed the bounded planning robot tree")
-                columns = [self.joint_names.index(name) for name in pose_fk.joint_names]
-                posed = pose_fk.compute_kinematics(self.JointState.from_position(
-                    self.start.position[:, None, columns].contiguous(), joint_names=pose_fk.joint_names))
-                positions = posed.tool_poses.position[0, 0].detach().cpu().numpy().astype(float)
-                quaternions = posed.tool_poses.quaternion[0, 0].detach().cpu().numpy().astype(float)
-                for name in required:
-                    index = pose_fk.tool_frames.index(name)
-                    pose = np.eye(4)
-                    pose[:3, 3] = positions[index]
-                    pose[:3, :3] = Rotation.from_quat(quaternions[index, [1, 2, 3, 0]]).as_matrix()
-                    poses[name] = self.problem.base_pose@pose
-        spheres[:, :3] = spheres[:, :3]@self.problem.base_pose[:3, :3].T+self.problem.base_pose[:3, 3]
-        self.scene.validate_robot_geometry(spheres, poses)
     # END bind occupancy evidence to the actual bounded current robot model.
 
     def _initialize_verification_constraints(self):
@@ -3741,8 +3202,8 @@ class _CuroboPlanner:
         from curobo._src.state.state_robot import RobotState
         self._RobotState = RobotState
         # The base manager supplies native joint/derivative limits at extra
-        # control-curve samples. Source self collision is checked separately
-        # using the same scene interface as metrics and the planning entrance.
+        # control-curve samples. The same native self-collision policy
+        # remains active in trajectory metrics, IK and the planning entrance.
         self._verification_native = RobotCostManager(self.device_cfg)
         self._verification_native.initialize_from_config(
             deepcopy(self.trajopt.config.metrics_rollout_config.constraint_cfg),
@@ -3761,7 +3222,7 @@ class _CuroboPlanner:
             self.start.position, self.start.velocity, self.formal_clock["knot_dt"],
             self.trajopt.action_horizon)
         # BEGIN solver metrics remain eager; only admitted CUDA cores capture.
-        cuda = self.device_cfg.device.type == "cuda"
+        cuda = False
         bind_solver_components(self.ik, self.position_domain, use_optimizer_graph=cuda)
         bind_solver_components(self.trajopt, self.physical_domain,
             use_optimizer_graph=cuda and self._trajectory_optimizer_graph_admitted)
@@ -3771,118 +3232,36 @@ class _CuroboPlanner:
 
     # BEGIN reject an immutable infeasible entrance before running native IK.
     def initial_state_diagnostics(self):
-        """Check only necessary conditions known at the measured entrance.
-
-        The complete native STATE cost requires acceleration, jerk and torque
-        inputs. Those measurements are absent, so inspect its effective q/dq
-        limits directly and query the bound source solids for self collision.
-        Scene terms retain their normal conservative meaning, including
-        unknown space and a binary gripper's reachable envelope; a positive
-        term need not mean that the actual robot is physically in contact.
-        """
-        torch = self.torch
-        cspace = self._verification_native.get_cost("cspace")
-        if cspace is None or not cspace.enabled:
-            raise RuntimeError("Entrance checks require the enabled native cspace constraints")
-        limits = cspace.config.joint_limits
-        if (len(limits.joint_names) != len(self.joint_names)
-                or set(limits.joint_names) != set(self.joint_names)):
-            raise RuntimeError("Native entrance limits must match the active feedback joints")
+        """Test measured q/dq and online collision geometry before proposing motion."""
+        limits = self._verification_native.get_cost("cspace").config.joint_limits
         columns = [limits.joint_names.index(name) for name in self.joint_names]
         q, dq = self.start.position[:, None], self.start.velocity[:, None]
-        joint_bounds = {}
-        with torch.no_grad():
+        with self.torch.no_grad():
             components = {}
-            for name, values in (("position", q), ("velocity", dq)):
+            for name, value in (("position", q), ("velocity", dq)):
                 bounds = getattr(limits, name)[:, columns]
-                violations = torch.relu(bounds[0]-values) + torch.relu(values-bounds[1])
-                components[f"native:{name}"] = violations
-                joint_bounds[name] = {
-                    "measured": values[0, 0].detach().cpu().tolist(),
-                    "lower": bounds[0].detach().cpu().tolist(),
-                    "upper": bounds[1].detach().cpu().tolist(),
-                    "violation": violations[0, 0].detach().cpu().tolist(),
-                }
-            # Construct only the measured fields. Native from_position/from_numpy
-            # helpers otherwise synthesize zero acceleration and jerk tensors.
-            measured = self.JointState(position=q.contiguous(), velocity=dq.contiguous(),
-                                       joint_names=list(self.joint_names))
-            state = self._verification_fk.compute_kinematics(measured)
-            # BEGIN the fixed entrance uses measured coordinates and the complete source pair policy.
-            source_self_evidence = {}
-            components["source_self_collision"] = self._verification_scene.check_robot_self_collision(
-                q, self.joint_names, q.new_zeros(q.shape[:2]), diagnostics=source_self_evidence)
-            # END a sphere overlap cannot reject a source-separated entrance.
-            tool = state.tool_poses
-            tool_index = tool.tool_frames.index(self.problem.tool_link)
+                components[name] = self.torch.relu(bounds[0]-value)+self.torch.relu(value-bounds[1])
+            js = self.JointState(position=q.contiguous(), velocity=dq.contiguous(), joint_names=list(self.joint_names))
+            state = self._verification_fk.compute_kinematics(js)
+            native = self._RobotState(joint_state=js, cuda_robot_model_state=state)
+            native = _timed_native_state(native, self.problem, self.scene, self.joint_names,
+                q.new_zeros(q.shape[:2]), sphere_padding=_native_collision_padding(self._verification_native))
+            collision = self._verification_native.get_cost("self_collision")
+            if collision is not None and collision.enabled:
+                collision.setup_batch_tensors(1, 1)
+                components["self_collision"] = collision.forward(native.robot_spheres.contiguous())
+            index = state.tool_poses.tool_frames.index(self.problem.tool_link)
             position, quaternion = self.problem.transform_tool_pose(
-                tool.position[:, :, tool_index], tool.quaternion[:, :, tool_index])
-            # BEGIN archive arithmetic differences at identical native entrance coordinates.
-            # The source validator's model tolerance describes double-precision
-            # model comparisons; it is not a new float32 or task acceptance band.
-            from scipy.spatial.transform import Rotation
-            validator = self.robot_validator
-            full_q, _ = validator._planning_positions(q[0, 0].detach().cpu().numpy(), self.joint_names,
-                time_s=0., gripper=self._verification_scene.gripper)
-            source_state = validator.checker.query(joint_names=validator.joint_names,
-                joint_positions=full_q, T_reference_base=validator.T_reference_base,
-                pairs=(), frames=[validator.tool_frame])
-            source_tcp = np.asarray(source_state["frame_poses"][validator.tool_frame]) @ validator.T_frame_tcp
-            native_tcp = np.eye(4)
-            native_tcp[:3, 3] = position[0, 0].detach().cpu().numpy()
-            native_tcp[:3, :3] = Rotation.from_quat(
-                quaternion[0, 0].detach().cpu().numpy()[[1, 2, 3, 0]]).as_matrix()
-            model_fk = {**validator._pose_difference(native_tcp, source_tcp),
-                "joint_names": list(validator.joint_names), "joint_position": full_q.tolist(),
-                "native_dtype": str(q.dtype), "source_dtype": "float64",
-                "scope": "same native entrance coordinates; numerical diagnostic, not a collision or task tolerance"}
-            # END both geometric interpretations retain their original numeric precision.
+                state.tool_poses.position[:, :, index], state.tool_poses.quaternion[:, :, index])
             progress = q.new_full(q.shape[:2], self.problem.start_progress)
-            unresolved_scene = {}
-            # BEGIN the entrance uses the same source world law as every candidate.
-            source_world_evidence, scene_components = {}, {}
-            _scene_boundary_evaluate(self._verification_scene, self.problem, self.progress_map,
-                self.problem.transform_robot_spheres(state.robot_spheres), position,
-                quaternion, progress, q, self.joint_names,
-                trajectory_time=torch.zeros_like(progress), normalized_time=torch.zeros_like(progress),
-                source_geometry=True, diagnostics=source_world_evidence,
-                source_components_out=scene_components)
-            for name, value in scene_components.items():
-                if name.startswith("unknown/") and not name.startswith("unknown/release_anchor/"):
-                    unresolved_scene[name] = float(value.max().item())
-                else:
-                    components[f"scene:{name}"] = value
-            # END individual terms retain the worst same-state material mode.
+            components["scene"] = _scene_boundary_evaluate(self.scene, self.problem, self.progress_map,
+                self.problem.transform_robot_spheres(native.robot_spheres), position, quaternion,
+                progress, q, self.joint_names, trajectory_time=q.new_zeros(q.shape[:2]),
+                normalized_time=q.new_zeros(q.shape[:2]))
             residuals = {name: float(value.max().item()) for name, value in components.items()}
-            coverage = self._verification_scene.check_robot_coverage(
-                q, self.joint_names, torch.zeros_like(progress), entrance=True)
-            if coverage:
-                residuals["scene:unknown/new_robot_volume"] = float(any(not item["attempt_allowed"] for item in coverage))
         failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
-        # BEGIN preserve nonfinite failures in strict JSON diagnostics.
-        # JSON null plus the explicit component list retains the rejection
-        # without emitting NaN/Infinity or losing the report during saving.
-        nonfinite = [name for name, value in residuals.items() if not np.isfinite(value)]
-        for name in nonfinite:
-            residuals[name] = None
-        # END preserve nonfinite failures in strict JSON diagnostics.
-        return {
-            "passed": not failed, "residuals": residuals, "failed_components": failed,
-            "nonfinite_components": nonfinite,
-            "joint_names": list(self.joint_names), "joint_bounds": joint_bounds,
-            "robot_coverage": coverage, "unresolved_scene": unresolved_scene,
-            "source_self_collision": source_self_evidence,
-            "source_world_collision": source_world_evidence,
-            "source_native_fk": model_fk,
-            "scope": {
-                "kind": "necessary_conditions_at_fixed_measured_entrance",
-                "progress": self.problem.start_progress, "active_joint_position_velocity": "native_effective_limits",
-                "source_self_collision_checked": True,
-                "scene": "source robot geometry against the same selected observed/native owner geometry",
-                "not_checked": ["acceleration", "jerk", "torque", "unprovided_locked_joint_velocity",
-                                "future_trajectory_feasibility", "physical_task_success"],
-            },
-        }
+        return {"passed": not failed, "residuals": residuals, "failed_components": failed,
+                "scope": "measured joint limits and selected online collision model"}
     # END reject an immutable infeasible entrance before running native IK.
 
     def close(self):
@@ -3922,15 +3301,41 @@ class _CuroboPlanner:
         columns = [limits.joint_names.index(name) for name in self.joint_names]
         return limits.velocity.detach().cpu().numpy()[:, columns]
 
-    def reference_seeds(self):
+    def reference_seeds(self, joint_reference=None):
         """Build bounded initializers from explicit reference-query evidence.
 
         Native outputs retain their diagnostics, but only successful pose IK
-        passing static task/source checks enters the next warm start or the
+        passing static task/online checks enters the next warm start or the
         anchor graph. Failed queries are filled from successful anchors and
         measured q0, never from a failed native posture. Samples are fitted in
         the actual native cubic representation before becoming optimizer actions.
         """
+        self.joint_reference_report = None
+        if joint_reference is not None:
+            if not isinstance(joint_reference, JointTrajectory) or set(joint_reference.joint_names) != set(self.joint_names):
+                raise MotionPlanningError("unsupported_reference", "Joint reference must name the backend's active joints")
+            columns = [joint_reference.joint_names.index(name) for name in self.joint_names]
+            q = joint_reference.position[:, columns]
+            dq = joint_reference.velocity[:, columns]
+            if (not np.isfinite(q).all() or not np.isfinite(dq).all()
+                    or joint_reference.duration <= 0 or joint_reference.times[0] != 0):
+                raise MotionPlanningError("unsupported_reference", "Joint reference must have finite q/dq and a zero-origin clock")
+            # Fitting is optional proposal generation. It never rewrites the
+            # measured entrance or replaces current grounded functional goals.
+            controls, fit = self.physical_domain.fit_reference(joint_reference.times/joint_reference.duration,
+                self.device_cfg.to_device(q), velocity_bounds=self._seed_velocity_bounds())
+            self.joint_reference_report = {"fit": fit, "source_curve_preserved": False,
+                "source_duration_s": joint_reference.duration,
+                "bound_duration_s": self.formal_clock["duration"],
+                "scope": "Native-basis proposal; only exact native/model success can authorize it"}
+            if controls is not None:
+                count = self.budget.trajectory_seeds
+                seeds = controls[None, None].expand(1, count, -1, -1).contiguous()
+                self.reference_ik_queries, self.reference_ik_distinct_counts, self.reference_ik_chains = [], [], []
+                self.reference_seed_fits, self.goal_ik_fit_hints = [fit], []
+                self.initial_seed_strategies = self.seed_strategies = ["recorded_joint_reference"]*count
+                self.physical_domain.validate(seeds)
+                return seeds, []
         from .planning_ik import select_ik_chains
         torch, count = self.torch, self.budget.trajectory_seeds
         velocity_bounds = self._seed_velocity_bounds()
@@ -3940,6 +3345,7 @@ class _CuroboPlanner:
         pools, evidence, success_counts = [], [], []
         self.reference_ik_queries, self.reference_ik_distinct_counts = [], []
         for query_index, u in enumerate(control_u):
+            self.check_request()
             progress = float(np.interp(u, self.progress_map.u, self.progress_map.s))
             self.seed_parameter.fill_(float(u))
             result = self.ik.solve_pose(self._goal(progress), current_state=self.start,
@@ -3951,12 +3357,12 @@ class _CuroboPlanner:
                 previous[0].detach().cpu().numpy(), float(u))
             # BEGIN failed reference poses remain evidence, never future warm starts.
             qualified = [int(index) for index in ranked if all(reports[index][name] for name in
-                ("native_pose_ik_success", "task_satisfied", "source_valid"))]
+                ("native_pose_ik_success", "task_satisfied", "model_valid"))]
             self.reference_ik_distinct_counts.append(len(qualified))
             for index, report in enumerate(reports):
                 report["reference_status"] = ("SOLVED" if np.isfinite(values[index]).all()
                     and all(report[name] for name in
-                            ("native_pose_ik_success", "task_satisfied", "source_valid"))
+                            ("native_pose_ik_success", "task_satisfied", "model_valid"))
                     else "FAILED_REFERENCE")
             # Native result errors describe convergence to the nominal pose;
             # static task and geometry evidence above remain independent.
@@ -4033,7 +3439,7 @@ class _CuroboPlanner:
             samples, postures = list(control_u), list(targets[branch])
             for parameter, entry in sorted(pool.items()):
                 candidates = [row for row in entry["candidates"]
-                              if row["report"]["task_satisfied"] and row["report"]["source_valid"]]
+                              if row["report"]["task_satisfied"] and row["report"]["model_valid"]]
                 if not candidates or parameter == 0.:
                     continue
                 rank = min(branch, len(candidates)-1)
@@ -4062,215 +3468,8 @@ class _CuroboPlanner:
         return seeds.contiguous(), success_counts
     # END q0/dq0, native clock, hard task checks and admitted seed count are fixed.
 
-    # BEGIN source-supported spatial refinement precedes each frozen solve.
-    def refine_background_for_seed(self, seed, *, rebuild=True):
-        """Rebuild local background guidance from this initializer's witnesses.
 
-        A witness is a complete body's positive coarse proxy query at a real
-        physical time. Sample the same native regular grid and exact anchors
-        used by trajectory costs. These extra FK/proxy queries propose map
-        resolution only; they neither certify the curve nor consume a source
-        geometry acceptance pass. The request's wall deadline still applies.
-        Every later solve starts here, including a changed OMPL initializer.
-        """
-        from .voxel_layers import LayeredVoxelQuery
 
-        background = self.scene.background
-        if (not isinstance(background, LayeredVoxelQuery)
-                or getattr(background, "refinement_source", None) is None):
-            return {"updated": False, "reason": "no_observed_background_refinement_source"}
-        self.physical_domain.validate(seed)
-        anchors = self.progress_map.anchor_parameters(self.anchors)[:, 0]
-        parameters = np.unique(np.r_[np.linspace(0., 1., self.trajopt.horizon),
-                                     anchors, self.refinement_parameters])
-        # CPU cubic evaluation uses the actual free controls and fixed q0/dq0;
-        # interpolating those free controls themselves would be another curve.
-        controls = seed[0].detach().cpu().numpy()
-        q = self.physical_domain.evaluate(controls, parameters)
-        progress = np.interp(parameters, self.progress_map.u, self.progress_map.s)
-        times = parameters*self.formal_clock["duration"]
-        check = getattr(self, "_check_validation_work", None)
-
-        def collect(scene):
-            rows = []
-            with self.torch.no_grad():
-                for begin in range(0, len(parameters), _VALIDATION_CHUNK_SIZE):
-                    if check is not None:
-                        check()
-                    end = min(begin+_VALIDATION_CHUNK_SIZE, len(parameters))
-                    joints = self.device_cfg.to_device(q[:, begin:end]).contiguous()
-                    state = self._verification_fk.compute_kinematics(self.JointState.from_position(
-                        joints, joint_names=list(self.joint_names)))
-                    tool = state.tool_poses
-                    index = tool.tool_frames.index(self.problem.tool_link)
-                    position, quaternion = self.problem.transform_tool_pose(
-                        tool.position[:, :, index], tool.quaternion[:, :, index])
-                    spheres = self.problem.transform_robot_spheres(state.robot_spheres)
-                    s = self.device_cfg.to_device(progress[None, begin:end]).expand(len(controls), -1)
-                    t = self.device_cfg.to_device(times[None, begin:end]).expand(len(controls), -1)
-                    rows.extend(scene.background_refinement_witnesses(
-                        spheres, position, quaternion, s, joints, self.joint_names,
-                        trajectory_time=t, include_satisfied=True))
-            return rows
-
-        def summarize(rows):
-            # Costs sum sphere penalties at the sampled body/time queries;
-            # they are neither signed distances nor source collision verdicts.
-            bodies = {}
-            for row in rows:
-                body = bodies.setdefault(row["body_id"], {"queries": 0, "positive_spheres": 0,
-                    "source_supported_queries": 0, "full_fine_weight_queries": 0,
-                    "coarse_cost_sum": 0., "guidance_cost_sum": 0.,
-                    "fine_cost_sum_on_supported_queries": 0.})
-                body["queries"] += 1
-                body["positive_spheres"] += row["positive_spheres"]
-                body["source_supported_queries"] += int(row["fine_supported"])
-                body["full_fine_weight_queries"] += int(row["guidance_weight"] == 1.)
-                body["coarse_cost_sum"] += row["coarse_cost"]
-                body["guidance_cost_sum"] += row["guidance_cost"]
-                if row["fine_supported"]:
-                    body["fine_cost_sum_on_supported_queries"] += row["fine_cost"]
-            return {"body_queries": len(rows), "bodies": bodies,
-                    "largest_coarse_query": None if not rows else max(rows, key=lambda row: row["coarse_cost"]),
-                    "scope": "Same cubic and times; proxy penalties only, not geometry acceptance"}
-
-        before = collect(self.scene)
-        witnesses = [row for row in before if row["guidance_weight"] < 1.]
-        if check is not None:
-            check()
-        # BEGIN host construction refusals preserve the still-running scene.
-        # Source-array/tree allocation is admitted inside the builder, before
-        # a replacement exists. Only typed capacity refusals are recoverable;
-        # mapper/API/model errors retain their original exception identity.
-        construction_refusal = None
-        try:
-            replacement, report = self.scene.refine_background(witnesses)
-        except ResourceLimitError as error:
-            construction_refusal = {"resource": error.resource, "required_bytes": error.required_bytes,
-                                    "limit_bytes": error.limit_bytes, "reason": str(error)}
-        if construction_refusal is not None:
-            gc.collect()
-            if check is not None:
-                check()
-            return {"status": "resource_refused", "updated": False,
-                    "resource_refusal": construction_refusal, "sampled_times": len(parameters),
-                    "sampled_seeds": len(controls), "before": summarize(before)}
-        # END failed construction never reaches scene/solver replacement.
-        report = {**report, "sampled_times": len(parameters), "sampled_seeds": len(controls),
-                  "updated": replacement is not None, "before": summarize(before)}
-        if replacement is None:
-            return report
-        # BEGIN admit the complete replacement while the working scene survives.
-        # Mapping's own capacity check does not include source-solid snapshots,
-        # dense query scratch, candidate records or planner FK. None of those
-        # limits may be discovered only after replacing the old scene/solver.
-        # Live GPU admission is deliberately conservative: the old solver is
-        # still allocated and its storage is not promised as already reusable.
-        refusal = None
-        try:
-            storage = _validation_storage_admission(self.problem, replacement, self.robot_metadata, self.budget)
-            capacity = _anchor_capacity(self.progress_map, self.anchors, self.budget, self.refinement_parameters)
-            workspace = _planning_workspace_bytes(replacement, self.robot_metadata, self.budget, capacity)
-            _require_planning_host_memory(workspace.cpu_live_bytes,
-                encoded_record_bytes_upper=storage["encoded_record_bytes_upper"],
-                max_host_rss_bytes=self.budget.max_host_rss_bytes)
-            workspace = _require_planning_memory(self.torch, self.device_cfg.device, workspace,
-                                                 max_device_used_bytes=self.budget.max_device_used_bytes)
-        except ResourceLimitError as error:
-            refusal = {"resource": error.resource, "required_bytes": error.required_bytes,
-                       "limit_bytes": error.limit_bytes, "reason": str(error)}
-        if refusal is not None:
-            # Leave the exception scope before collection: its traceback would
-            # otherwise keep the refused scene alive through the preflight frame.
-            del replacement
-            gc.collect()
-            report.update(status="resource_refused", updated=False, resource_refusal=refusal)
-            if check is not None:
-                check()
-            return report
-        report["planner_admission"] = {"scene_workspace_bytes": workspace.total_bytes,
-            "scene_cpu_workspace_bytes": workspace.cpu_bytes, "scene_gpu_workspace_bytes": workspace.gpu_bytes,
-            "anchor_fk_workspace_bytes": workspace.anchor_fk_bytes, "trajectory_graph": workspace.trajectory_graph,
-            "validation_storage": deepcopy(storage)}
-        self.validation_storage = storage
-        self.scene_cpu_live_bytes = workspace.cpu_live_bytes
-        # END ordinary geometry/shape/runtime errors are never resource refusals.
-        # BEGIN source geometry and guidance have separate replacement scopes.
-        # The factory rebinds the source checker only for a new observed field;
-        # changed guidance boxes retain the existing immutable source shapes.
-        # Either replacement changes rollout inputs, so rebuild all trajectory
-        # rollouts/captures while retaining the frozen hand/trajectory clock.
-        # END a reused field does not imply unchanged optimization guidance.
-        self.scene = replacement
-        self._verification_scene = replacement.clone_for_rollout()
-        # BEGIN outer AL/working-set transitions combine all changes into one rebuild.
-        if rebuild:
-            self.refine_validation(self.refinement_parameters)
-        # END callers deferring this rebuild must do it before the next solve.
-        report["after"] = summarize(collect(replacement))
-        # IK seed metrics use only native pose/domain and robot self geometry;
-        # they do not query background fields. Static IK screening and OMPL use
-        # this new verification scene, so the unchanged IK core needs no rebuild.
-        if check is not None:
-            check()
-        return report
-    # END no map or blend-region mutation occurs inside an optimizer block.
-
-    def refine_validation(self, refinement_parameters, *, phase=None):
-        """Rebuild only validation workspaces in the already frozen binding.
-
-        Release old solver workspaces before constructing new rollouts. IK and
-        immutable robot/scene configuration are retained; no second planner
-        and no duplicate native roadmap is allocated.
-        """
-        # BEGIN apply the same point and memory admission to every new clock.
-        progress_map = self.progress_map
-        # BEGIN replace gradient query slots; the independent witness ledger survives.
-        parameters = np.unique(np.asarray(refinement_parameters, float))
-        selected_phase = self.phase if phase is None else phase
-        if selected_phase not in {"feasibility", "quality"}:
-            raise ValueError("Unknown trajectory optimization phase")
-        # END capacity is admitted before destroying the working solver.
-        capacity = _anchor_capacity(progress_map, self.anchors, self.budget, parameters)
-        workspace = _planning_workspace_bytes(self.scene, self.robot_metadata, self.budget, capacity)
-        _require_planning_host_memory(workspace.cpu_live_bytes,
-            encoded_record_bytes_upper=self.validation_storage["encoded_record_bytes_upper"],
-            max_host_rss_bytes=self.budget.max_host_rss_bytes)
-        self.trajopt.destroy()
-        self.trajopt = None
-        # Native destroy() releases graphs, while optimizer callbacks can keep
-        # rollout tensors in a reference cycle. Collect only at this explicit
-        # replacement boundary before querying live allocator statistics.
-        gc.collect()
-        workspace = _require_planning_memory(self.torch, self.device_cfg.device, workspace,
-                                             max_device_used_bytes=self.budget.max_device_used_bytes)
-        self.refinement_parameters = parameters
-        self.phase = selected_phase
-        self.anchor_capacity = capacity
-        self.scene_workspace_bytes = workspace.total_bytes
-        self.scene_cpu_workspace_bytes, self.scene_gpu_workspace_bytes = workspace.cpu_bytes, workspace.gpu_bytes
-        self.scene_cpu_live_bytes = workspace.cpu_live_bytes
-        self.anchor_fk_workspace_bytes = workspace.anchor_fk_bytes
-        self._trajectory_optimizer_graph_admitted = workspace.trajectory_graph
-        manager_type = _process_manager_type(self.problem, self.scene, progress_map, self.anchors,
-                                             self.budget, parameters,
-                                             clock=self.formal_clock, seed_parameter=self.seed_parameter,
-                                             robot_dict=self.robot_dict, phase=self.phase,
-                                             functional_constraints=self.functional_constraints)
-        # BEGIN rebuilding avoids stale captured Python branches and cost weights.
-        optimizer = deepcopy(self._quality_optimizer_config)
-        if self.phase == "feasibility":
-            optimizer["rollout"]["cost_cfg"]["cspace_cfg"]["squared_l2_regularization_weight"] = [0.]*5
-        self._trajectory_configuration["optimizer_configs"] = [optimizer]
-        # END one solver at a time preserves the admitted memory bound.
-        self._trajectory_configuration["cost_manager_config_instance_type"] = manager_type
-        self.trajopt = self._optimizer_class(
-            self._optimizer_config_class.create(**deepcopy(self._trajectory_configuration)))
-        # BEGIN refinement may add queries but cannot regenerate hand commands.
-        if _formal_native_clock(self.trajopt) != self.formal_clock:
-            raise ValueError("Validation refinement changed the frozen native clock")
-        self._initialize_verification_constraints()
-        self._bind_physical_domains()
         # END schedule changes require a separately bound planning request.
 
     # BEGIN scoped spatial search on one already bound physical clock.
@@ -4331,6 +3530,7 @@ class _CuroboPlanner:
             return tuple(goals_by_time.get(float(parameter), ()))
 
         def state_parts(values):
+            self.check_request()
             count = int(np.prod(values.shape[:-1]))
             if (time.monotonic() >= deadline
                     or work["state_queries"]+count > min(self.budget.max_validation_points, _NATIVE_STAGE_POINT_LIMIT)):
@@ -4394,19 +3594,11 @@ class _CuroboPlanner:
                     "scene": _scene_boundary_evaluate(scene, self.problem, self.progress_map,
                         self.problem.transform_robot_spheres(state.robot_spheres), p, r, progress,
                         js.position, self.joint_names, trajectory_time=clock_time,
-                        normalized_time=values_t[..., -1], source_geometry=True)}
-                # BEGIN OMPL shares the metrics source-solid self-collision contract.
+                        normalized_time=values_t[..., -1])}
+                # BEGIN OMPL shares the native registered-sphere self-collision contract.
                 native = self._verification_native.compute_costs(
                     self._RobotState(joint_state=js, cuda_robot_model_state=state))
                 terms.update({f"native:{name}": value for name, value in zip(native.names, native.values)})
-                terms["source_self_collision"] = scene.check_robot_self_collision(
-                    js.position, self.joint_names, clock_time)
-                # END all other native, task and scene constraints remain hard.
-                coverage = scene.check_robot_coverage(js.position, self.joint_names, clock_time,
-                    entrance=bool(values[-1] == 0 and np.array_equal(values, start)))
-                if coverage:
-                    terms["robot_query_incomplete"] = progress.new_tensor([[float(any(
-                        not row["attempt_allowed"] for row in coverage))]])
                 # BEGIN all existing tensors precede one exact boolean host read.
                 accepted = _ompl_terms_accepted(terms)
                 # END rejected-state diagnostics retain their original order/values.
@@ -4580,115 +3772,42 @@ class _CuroboPlanner:
             quaternion=quaternion[:, :, None, None].contiguous())
 
     def _rank_ik_candidates(self, candidates, success, previous, u, goal_ids=()):
-        """Screen finite CPU joint candidates at one physical time, then rank.
-
-        Returned indices preserve up to the existing IK seed count, independently
-        of the TrajOpt seed count. Reports describe static point constraints,
-        known source solids and the existing attempt-allowed coverage policy.
-        Zero velocities merely satisfy the point API: stop/rate/trajectory
-        history requirements are not certified. The caller must charge every
-        finite state to its original cumulative validation budget before entry.
-        """
+        """Rank bounded IK proposals with the same online geometry as trajectory metrics."""
         from .planning_ik import rank_ik_candidates
-        values = np.asarray(candidates)
-        flags = np.asarray(success, bool)
-        prior = np.asarray(previous)
-        if (values.ndim != 2 or values.shape[1] != len(self.joint_names)
-                or len(values) > self.budget.ik_seeds or flags.shape != (len(values),)
-                or not np.isfinite(u) or not 0 <= u <= 1):
-            raise ValueError("IK static screening must fit the declared joint/seed/clock bounds")
-        goal_ids = tuple(goal_ids)
-        phase = (float(getattr(self.problem, goal_ids[0][0])[goal_ids[0][1]].progress)
-                 if goal_ids else float(np.interp(u, self.progress_map.u, self.progress_map.s)))
-        if any(getattr(self.problem, name)[index].progress != phase for name, index in goal_ids):
-            raise ValueError("One IK query cannot combine goals at different physical arrivals")
-        lower = self.trajopt.transition_model.action_bound_lows.detach().cpu().numpy().reshape(-1)
-        upper = self.trajopt.transition_model.action_bound_highs.detach().cpu().numpy().reshape(-1)
+        values, flags = np.asarray(candidates), np.asarray(success, bool)
+        phase = float(np.interp(u, self.progress_map.u, self.progress_map.s))
         reports = []
         for index, row in enumerate(values):
             report = {"native_pose_ik_success": bool(flags[index]), "candidate_source": "native_ik",
-                "task_satisfied": False,
-                "source_valid": False, "environment_clearance_m": None,
-                "self_clearance_m": None, "joint_limit_margin_fraction": None,
-                "progress": phase, "u": float(u), "time_s": float(u*self.formal_clock["duration"]),
-                "goal_ids": [list(value) for value in goal_ids],
-                "scope": "Static point requirements and modeled source geometry; initializer only",
-                "not_checked": ["joint_velocity", "acceleration", "jerk", "torque",
-                                "stop_dynamics", "winding_and_direction_history", "complete_trajectory"]}
+                      "task_satisfied": False, "model_valid": False}
             reports.append(report)
             if not np.isfinite(row).all():
-                report["failure"] = "nonfinite_ik_candidate"
                 continue
-            # Each candidate receives a private scene. In particular, an absent
-            # earlier release FK stays unknown/release_anchor; no demonstration
-            # or another candidate is allowed to provide that release state.
-            scene = self._verification_scene.clone_for_rollout()
             with self.torch.no_grad():
                 q = self.device_cfg.to_device(row[None, None]).contiguous()
                 zero = self.torch.zeros_like(q)
-                state = self._verification_fk.compute_kinematics(self.JointState(
-                    position=q, velocity=zero, acceleration=zero, jerk=zero,
-                    dt=self.device_cfg.to_device([self.budget.interpolation_dt]),
-                    joint_names=list(self.joint_names)))
-                tools = state.tool_poses
-                tool_index = tools.tool_frames.index(self.problem.tool_link)
-                position, quaternion = self.problem.transform_tool_pose(
-                    tools.position[:, :, tool_index], tools.quaternion[:, :, tool_index])
-                progress = q.new_full(q.shape[:2], phase)
-                parameter = q.new_full(q.shape[:2], float(u))
-                times = q.new_full(q.shape[:2], report["time_s"])
-                task = self.problem.residuals(position, quaternion, progress, q, self.joint_names,
-                    joint_velocity=zero, trajectory_time=times, point_goal_ids=goal_ids,
-                    direction_mode="point")
-                # Static IK has no actual velocity. The explicit stop still
-                # belongs to complete TrajOpt and dense validation, unchanged.
+                js = self.JointState(position=q, velocity=zero, acceleration=zero, jerk=zero,
+                    dt=self.device_cfg.to_device([self.budget.interpolation_dt]), joint_names=list(self.joint_names))
+                state = self._verification_fk.compute_kinematics(js)
+                index = state.tool_poses.tool_frames.index(self.problem.tool_link)
+                p, r = self.problem.transform_tool_pose(state.tool_poses.position[:, :, index],
+                                                       state.tool_poses.quaternion[:, :, index])
+                progress, times = q.new_full(q.shape[:2], phase), q.new_full(q.shape[:2], u*self.formal_clock["duration"])
+                task = self.problem.residuals(p, r, progress, q, self.joint_names,
+                    joint_velocity=zero, trajectory_time=times, point_goal_ids=goal_ids, direction_mode="point")
                 task = {name: value for name, value in task.items() if not name.startswith("stop:")}
-                world, components, own = {}, {}, {}
-                _scene_boundary_evaluate(scene, self.problem, self.progress_map,
-                    self.problem.transform_robot_spheres(state.robot_spheres), position, quaternion,
-                    progress, q, self.joint_names, trajectory_time=times,
-                    normalized_time=parameter, source_geometry=True, diagnostics=world,
-                    source_components_out=components)
-                self_residual = scene.check_robot_self_collision(q, self.joint_names, times, diagnostics=own)
-                coverage = scene.check_robot_coverage(q, self.joint_names, times)
-            task_values = {name: float(value.max().item()) for name, value in task.items()}
-            source_values = {name: float(value.max().item()) for name, value in components.items()
-                             if not name.startswith("unknown/") or name.startswith("unknown/release_anchor/")}
-            source_values["source_self_collision"] = float(self_residual.max().item())
-            source_values["joint_position_bounds"] = float(np.maximum(lower-row, 0.).sum()
-                                                           +np.maximum(row-upper, 0.).sum())
-            task_ok = all(np.isfinite(value) and value <= 0 for value in task_values.values())
-            coverage_ok = all(item["attempt_allowed"] for item in coverage)
-            source_ok = coverage_ok and all(np.isfinite(value) and value <= 0 for value in source_values.values())
-            clearance = world["unpermitted_clearance"]
-            # complete_query concerns this declared source query; distance_complete
-            # additionally describes global geometry coverage. Observed TSDF
-            # distances remain explicitly scoped measurements, never a proof.
-            incomplete_subset = bool(set(clearance["limitations"]) & {
-                "finite_patch_unpermitted_subset_distance_unmeasured",
-                "surface_permission_not_resolved_by_finite_patch"})
-            environment = (clearance["minimum_recorded_distance_m"]
-                           if source_ok and clearance["complete_query"] and not incomplete_subset else None)
-            self_clearance = own["worst_state"]["minimum_required_clearance_m"]
-            widths = upper-lower
-            positive_width = widths > 0
-            margin = (float((np.minimum(row-lower, upper-row)[positive_width]
-                              /widths[positive_width]).min()) if positive_width.any() else None)
-            report.update(task_satisfied=task_ok, source_valid=source_ok,
-                environment_clearance_m=environment, self_clearance_m=self_clearance,
-                joint_limit_margin_fraction=margin,
-                task_residuals={name: value if np.isfinite(value) else None for name, value in task_values.items()},
-                source_residuals={name: value if np.isfinite(value) else None for name, value in source_values.items()},
-                source_clearance=clearance, robot_coverage=coverage,
-                unmodelled_geometry_names=sorted(set(world["unmodelled_geometry_names"])
-                                                |set(own["unmodelled_geometry_names"])),
-                full_robot_coverage_certified=bool(coverage) and all(item["passed"] for item in coverage))
-        # BEGIN nominal reference success and actual goal satisfaction stay distinct.
-        selected = rank_ik_candidates(values, reports, prior, count=self.budget.ik_seeds,
-            joint_tolerance=self.problem.numerical.joint,
-            query_kind="functional" if goal_ids else "reference")
-        # END a functional allowed set never acquires an extra centre-pose equality.
-        return selected, reports
+                online = _scene_boundary_evaluate(self.scene, self.problem, self.progress_map,
+                    self.problem.transform_robot_spheres(state.robot_spheres), p, r, progress, q,
+                    self.joint_names, trajectory_time=times, normalized_time=q.new_full(q.shape[:2], u))
+                native = _timed_native_state(self._RobotState(joint_state=js, cuda_robot_model_state=state),
+                    self.problem, self.scene, self.joint_names, times,
+                    sphere_padding=_native_collision_padding(self._verification_native))
+                constraints = self._verification_native.compute_costs(native)
+                model = {"scene": online, **dict(zip(constraints.names, constraints.values))}
+                report.update(task_satisfied=_ompl_terms_accepted(task), model_valid=_ompl_terms_accepted(model))
+        ranked = rank_ik_candidates(values, reports, np.asarray(previous), count=self.budget.ik_seeds,
+            joint_tolerance=self.problem.numerical.joint, query_kind="functional" if goal_ids else "reference")
+        return ranked, reports
 
     def _build_goal_ik_candidates(self, reference_seeds):
         """Retain bounded CPU proposals at actual full-pose functional events.
@@ -4734,112 +3853,22 @@ class _CuroboPlanner:
     # END static candidates cannot manufacture release history or trajectory feasibility.
 
     # BEGIN independently qualify bounded seed and exploration observations.
-    def _functional_candidate_mask(self, actions):
-        """Screen exact pose-event anchors; this is never a feasibility verdict.
 
-        Use the native sampled cubic and the same Hermite anchor evaluation as
-        ProcessCostManager. Source solids, all other process requirements and
-        continuous derivative bounds remain mandatory in metrics/export.
-        """
-        goals = [goal for goal in self.problem.pose_events
-                 if goal.progress >= self.problem.start_progress]
-        count = actions.shape[0]
-        if not goals:
-            return np.ones(count, dtype=bool)
-        self._charge_candidate_queries(count*(self.trajopt.horizon+len(goals)))
-        with self.torch.no_grad():
-            state = self.trajopt.metrics_rollout.compute_state_from_action(actions)
-            joint = state.joint_state
-            # BEGIN keep each point goal paired with its own first arrival.
-            # A combined anchor query sorts and deduplicates goals and expands
-            # pauses into two endpoints. Its columns cannot be indexed in the
-            # original goal order. Like _first_event_query, a pose event owns
-            # only its earliest arrival, not a maintained pose over a pause.
-            # One query per goal also matches the FK work charged above.
-            parameters = np.asarray([self.progress_map.anchor_parameters([goal.progress])[0, 0]
-                                     for goal in goals])
-            # END repeated progress values still retain every separate goal.
-            u = self.device_cfg.to_device(parameters)[None].expand(count, -1)
-            counts = self.torch.full((count,), joint.position.shape[1], device=actions.device,
-                                     dtype=self.torch.long)
-            q, _ = _hermite_at_parameters(joint.position, joint.velocity, joint.dt, counts, u)
-            kinematics = self._verification_fk.compute_kinematics(self.JointState.from_position(
-                q.contiguous(), joint_names=list(self.joint_names)))
-            tools = kinematics.tool_poses
-            index = tools.tool_frames.index(self.problem.tool_link)
-            position = self._native_layout.apply(tools.position)[:, :, index]
-            quaternion = tools.quaternion[:, :, index]
-            position, quaternion = self.problem.transform_tool_pose(position, quaternion)
-            eligible = self.torch.ones(count, dtype=self.torch.bool, device=actions.device)
-            for column, goal in enumerate(goals):
-                p, r = goal.errors(position[:, column], quaternion[:, column])
-                eligible &= (self.torch.isfinite(p) & self.torch.isfinite(r)
-                             & (p <= goal.position_tolerance_m) & (r <= goal.rotation_tolerance_rad))
-        return eligible.detach().cpu().numpy()
 
     def _observed_native_result(self, actions):
-        """Reuse native postprocessing on its unchanged complete seed layout."""
+        """Evaluate a complete reference seed through native success metrics once."""
         count = actions.shape[0]
-        if self.trajopt.solve_state.batch_size != 1 or self.trajopt.solve_state.num_seeds != count:
-            raise ValueError("Observed actions changed the active native seed layout")
-        # Extra source metrics are real validation work, even when no candidate
-        # survives to export. The native oracle also retains its own work limit.
-        self._charge_candidate_queries(count*(self.trajopt.horizon+self.formal_clock["valid_count"]
-                                              +2*(len(self.anchors)+len(self.refinement_parameters))))
         with self.torch.no_grad():
-            # BEGIN observations have the same bounded candidate lifecycle as solve.
-            completed = False
-            try:
-                metrics = self.trajopt.metrics_rollout.compute_metrics_from_action(actions)
-                joint = metrics.state.joint_state
-                joint.joint_names = self.trajopt.joint_names
-                joint.knot = metrics.actions
-                joint.knot_dt = joint.dt*self.trajopt.interpolation_steps
-                interpolated, trajectory, last = self.trajopt._interpolate_and_compute_metrics(joint)
-                result = self.trajopt._get_result(actions, metrics, interpolated, trajectory, last, count, count)
-                result = self.trajopt._get_best_result(result, count)
-                completed = True
-                return result
-            finally:
-                # Standalone diagnostic callers have no enclosing solve finalizer.
-                if not completed or not getattr(self.trajopt, "_source_world_solve_active", False):
-                    self.trajopt.end_source_world_reuse()
+            metrics = self.trajopt.metrics_rollout.compute_metrics_from_action(actions)
+            joint = metrics.state.joint_state
+            joint.joint_names = self.trajopt.joint_names
+            joint.knot, joint.knot_dt = metrics.actions, joint.dt*self.trajopt.interpolation_steps
+            interpolated, trajectory, last = self.trajopt._interpolate_and_compute_metrics(joint)
+            result = self.trajopt._get_result(actions, metrics, interpolated, trajectory, last, count, count)
+            return self.trajopt._get_best_result(result, count)
             # END normal dense completion keeps only the two bounded batch slots.
 
-    def _observe_actions(self, actions, origin, initial, seen):
-        """Validate new block states without replacing the optimizer's state."""
-        controls = actions.detach().cpu().numpy()
-        fresh = np.asarray([not any(np.array_equal(value, old) for old in seen[index])
-                            for index, value in enumerate(controls)])
-        if not fresh.any():
-            return
-        for index in np.flatnonzero(fresh):
-            seen[index].append(controls[index].copy())
-        eligible = self._functional_candidate_mask(actions) & fresh
-        summary = {**deepcopy(origin), "eligible_seed_indices": np.flatnonzero(eligible).tolist(),
-                   "accepted": False, "selection_policy": "first_complete_feasible_candidate",
-                   "scope": "pose-event screen followed by complete native/export validation"}
-        self.candidate_observations.append(summary)
-        if not eligible.any():
-            return
-        self._check_validation_work("validation_passes")
-        result = self._observed_native_result(actions)
-        previous = self.last_optimizer_diagnostics
-        try:
-            self._observing_candidate = True
-            self.last_optimizer_diagnostics = self._optimizer_reports(result.solution, initial)
-            _, trajectory, attempt = self.select_candidate(result,
-                candidate_indices=np.flatnonzero(eligible), first_feasible=True, origin=origin)
-            summary.update(accepted=attempt["accepted"], residuals=deepcopy(attempt["residuals"]),
-                           selected_seed_index=attempt["selected_seed_index"],
-                           validation_points=attempt["validation_points"])
-            if attempt["accepted"]:
-                # Capture this validation before any later native metrics or
-                # export can replace the planner's mutable diagnostic pointer.
-                self._candidate_qualified(trajectory, self.last_validation, attempt)
-        finally:
-            self._observing_candidate = False
-            self.last_optimizer_diagnostics = previous
+
 
     def _optimizer_reports(self, solution, initial):
         core_reports = [optimizer._core.solve_diagnostics for optimizer in self.trajopt.core.optimizers]
@@ -4860,7 +3889,7 @@ class _CuroboPlanner:
         Use the same float32 Hermite anchors, complete ordered history and
         functional-frame FK as the optimizer. This inexpensive constraint
         measurement is neither source-geometry validation nor acceptance.
-        Updating the objective requires rebuilding the solver before reuse.
+        The next native solve clears curvature and evaluates the updated objective.
         """
         if result.batch_size != 1 or result.num_seeds != 1:
             raise ValueError("Functional multipliers require one selected continuation curve")
@@ -4869,16 +3898,8 @@ class _CuroboPlanner:
         torch = self.torch
         native = self.trajopt.get_active_js(result.js_solution)
         pairs = self.progress_map.anchor_parameters(self.anchors)
-        # BEGIN preserve the optimizer's complete coordinate-unwrapping history.
-        # Extra working-set samples can change adjacent angular increments;
-        # omitting them would update duals from a different coordinate event.
-        if len(self.refinement_parameters):
-            additional = self.refinement_parameters
-            pairs = np.unique(np.concatenate((pairs, np.column_stack((additional,
-                np.interp(additional, self.progress_map.u, self.progress_map.s))))), axis=0)
-        # END goal anchors and active query samples match ProcessCostManager.
         horizon = native.position.shape[-2]
-        self._charge_candidate_queries(horizon+len(pairs))
+        self.check_request()
         with torch.no_grad():
             q = native.position.reshape(1, horizon, -1)
             dq = native.velocity.reshape_as(q)
@@ -4914,261 +3935,102 @@ class _CuroboPlanner:
         self.functional_constraints.reset()
     # END solver rebuilds reset curvature and scalar-best records for the new objective.
 
-    def optimize(self, seed):
+    def _native_request(self, seed):
+        """Bind real terminal poses or the task-only native constraint route."""
+        from curobo._src.solver.solve_mode import SolveMode
+        from curobo._src.solver.solve_state import SolveState
+        target = next((goal for goal in self.problem.pose_events
+                       if goal.progress == self.problem.end_progress), None)
+        self.route = ("native_pose" if target is not None and not any((self.problem.pose_relations,
+            self.problem.mechanisms, self.problem.interiors, self.problem.coordinate_events,
+            self.problem.supports, self.scene.contacts)) and len(self.problem.pose_events) == 1 else "constrained")
+        # Functional frames can be displaced from the TCP; their exact allowed
+        # set remains in ProcessCostManager. Only an identity calibration can
+        # share the native link-pose convergence tolerance without changing it.
+        direct = self.route == "native_pose" and np.array_equal(target.tool_from_function, np.eye(4))
+        if direct:
+            self.trajopt.enable_tool_pose_tracking()
+        else:
+            self.trajopt.disable_tool_pose_tracking()
+        self.trajopt.disable_joint_position_tracking()
+        goal = None if target is None else self._functional_goal(target)
+        state = SolveState(solve_type=SolveMode.BATCH, num_trajopt_seeds=seed.shape[1],
+                          batch_size=1, num_envs=1, num_goalset=1,
+                          tool_frames=[] if goal is None else goal.tool_frames)
+        return state, goal
+
+    def evaluate_reference(self, seed):
+        """Accept a feasible complete reference candidate before changing its controls."""
         self.physical_domain.validate(seed)
-        # BEGIN functional-frame goals have one owner and their original tolerances.
-        # Native link tracking is a second soft centre objective, including
-        # inside the allowed set. ProcessCostManager owns all trajectory goals;
-        # the native API only needs an inert H=1 pose for its storage layout.
-        self.trajopt.disable_tool_pose_tracking()
-        goal = self._goal(self.problem.phase_count)
-        # END IK retains its own native pose tracking for proposal generation.
-        # BEGIN result provenance uses the full unsorted native seed layout.
-        # Returning every seed makes native get_topk_seeds return the original
-        # layout; per-seed history and input/output displacement remain aligned.
+        state, goal = self._native_request(seed)
+        endpoint = self.JointState.from_position(seed[:, :, -1].contiguous())
+        endpoint.dt = self.torch.full((1, seed.shape[1]), self.budget.maximum_trajectory_dt,
+                                      dtype=seed.dtype, device=seed.device)
+        buffer, _ = self.trajopt._prepare_goal_buffer(state, goal, self.start, False, endpoint)
+        self.trajopt._update_rollout_params(buffer)
+        self.last_optimizer_diagnostics = [{"unchanged_from_seed": True, "maximum_control_update": 0.,
+                                           "source": "reference_evaluation"} for _ in range(seed.shape[1])]
+        return self._observed_native_result(seed.reshape(-1, self.trajopt.action_horizon, self.trajopt.action_dim))
+
+    def optimize(self, seed):
+        """One native solve with the current physical domain and unchanged clock."""
+        self.physical_domain.validate(seed)
+        state, goal = self._native_request(seed)
         initial = seed.detach().clone()
-        # BEGIN solve-local observers have no references in captured closures.
-        cores = [optimizer._core for optimizer in self.trajopt.core.optimizers]
-        observing = callable(getattr(self, "_candidate_qualified", None))
-        seen = [[] for _ in range(seed.shape[1])]
-        # Keep only small verdicts. Complete validation evidence is serialized
-        # once into the bound archive, never retained for every explored curve.
-        self._observed_verdicts = []
-        if observing:
-            for core in cores:
-                core.candidate_observer = lambda actions, origin: self._observe_actions(actions, origin, initial, seen)
-        try:
-            result = self.trajopt.solve_pose(
-                goal_tool_poses=goal, current_state=self.start,
-                seed_traj=seed, num_seeds=seed.shape[1], return_seeds=seed.shape[1],
-                dt=self.torch.full((1, seed.shape[1]), self.budget.maximum_trajectory_dt,
-                                   dtype=seed.dtype, device=seed.device),
-                use_implicit_goal=False, goal_state=None,
-                finetune_attempts=0, finetune_dt_scale=1.)
-        finally:
-            for core in cores:
-                core.candidate_observer = None
-        # END partial solves cannot retain stale callbacks into another request.
+        result = self.trajopt._solve_impl(current_state=self.start, solve_state=state,
+            goal_tool_poses=goal, seed_traj=seed, num_seeds=seed.shape[1], return_seeds=seed.shape[1],
+            dt=self.torch.full((1, seed.shape[1]), self.budget.maximum_trajectory_dt,
+                               dtype=seed.dtype, device=seed.device),
+            use_implicit_goal=False, goal_state=None, finetune_attempts=0, finetune_dt_scale=1.)
         if result.solution.shape != initial.shape:
-            raise ValueError("Native trajectory solving changed the admitted seed layout")
+            raise ValueError("Native solve changed the admitted seed layout")
         self.last_optimizer_diagnostics = self._optimizer_reports(result.solution, initial)
         return result
         # END unchanged output is separate from movement of native exploration states.
     # END intermediate and terminal goals share the same typed requirement owner.
 
     def native_diagnostics(self, result, seed_index=None):
-        """Expose the native reason for rejection, including dense metrics.
-
-        Native pose tracking is disabled for trajectories. Typed skill and
-        source constraints supply the complete discrete verdict. Every native
-        accepted curve still receives the independent :meth:`export` checks.
-        """
+        """Report the native success flag and original online-model residuals."""
         success = result.success if seed_index is None else result.success[:, seed_index]
         report = {"success": bool(success.all().item())}
-
-        def maximum(value):
-            # Native rollout batch is [batch*seeds,H,...]. This planner's
-            # batch is explicitly one, so this is an exact seed slice.
-            if seed_index is not None:
-                if result.batch_size != 1 or value.shape[0] != result.num_seeds:
-                    raise ValueError("Native metrics do not match the single-batch seed layout")
-                value = value[seed_index]
-            return float(value.max().item())
-
-        for label, metrics in (("rollout", result.metrics),
-                               ("interpolated", result.interpolated_metrics)):
+        for label, metrics in (("rollout", result.metrics), ("interpolated", result.interpolated_metrics)):
             if metrics is None:
                 continue
+            def maximum(value):
+                return float((value if seed_index is None else value[seed_index]).max().item())
             constraints = metrics.costs_and_constraints.constraints
-            report[label] = {
-                "constraints": {name: maximum(value)
-                                for name, value in zip(constraints.names, constraints.values)},
-                "convergence": {name: maximum(value)
-                                for name, value in zip(metrics.convergence.names, metrics.convergence.values)},
-            }
-            # BEGIN preserve native violation columns and match pre-fold scene evidence.
-            # The last cost column can contain extra anchors. Its index alone
-            # is not a physical failure time; source_trace keeps that identity.
-            if seed_index is not None:
-                try:
-                    samples = []
-                    for name, value in zip(constraints.names, constraints.values):
-                        array = value[seed_index].detach().cpu().numpy()
-                        for index in np.argwhere((array > 0) | ~np.isfinite(array)):
-                            row = {"constraint": name, "index": index.tolist(),
-                                   "value": float(array[tuple(index)])}
-                            # BEGIN only non-folded native columns identify a time directly.
-                            count = (self.trajopt.horizon if label == "rollout"
-                                     else self.formal_clock["valid_count"])
-                            if name == "cspace" and int(index[0]) < count:
-                                row["normalized_time"] = float(np.float32(index[0])/np.float32(count-1))
-                            # END scene/process/self times come from their original trace.
-                            samples.append(row)
-                    report[label]["violating_constraint_samples"] = samples
-                    from .planning_diagnostics import bind_trace_to_native_seed
-                    rollout = (self.trajopt.metrics_rollout if label == "rollout" else
-                               self.trajopt.additional_metrics_rollouts["interpolated_rollout"])
-                    state = result.js_solution if label == "rollout" else result.interpolated_trajectory
-                    report[label]["source_trace"] = bind_trace_to_native_seed(
-                        getattr(rollout.metrics_constraint_manager, "last_source_diagnostics", None),
-                        state, seed_index, self.joint_names)
-                    # BEGIN distinguish a replayed report from new source work.
-                    source_scene = getattr(rollout.metrics_constraint_manager, "_scene", None)
-                    execution = getattr(source_scene, "_last_source_world_execution", None)
-                    if execution is not None:
-                        report[label]["source_query_execution"] = deepcopy(execution)
-                    # END geometry evidence itself keeps its original exact fields.
-                except Exception as error:
-                    report[label]["source_trace"] = {"status": "error", "error": f"{type(error).__name__}: {error}"}
-            # END a trace failure never changes native acceptance or selection.
+            report[label] = {"constraints": {name: maximum(value) for name, value in
+                zip(constraints.names, constraints.values)}, "convergence": {name: maximum(value)
+                for name, value in zip(metrics.convergence.names, metrics.convergence.values)}}
         return report
 
     # BEGIN feasibility precedes quality and rejected native curves never execute.
-    def candidate_quality(self, trajectory, validation):
-        """Compare all accepted curves with the same CPU functional."""
-        from .planning_quality import trajectory_quality
-        limits = self._verification_native.get_cost("cspace").config.joint_limits
-        return trajectory_quality(trajectory, validation["measurements"], self.problem,
-            limit_joint_names=limits.joint_names,
-            velocity_bounds=limits.velocity.detach().cpu().numpy(),
-            acceleration_bounds=limits.acceleration.detach().cpu().numpy(),
-            jerk_bounds=limits.jerk.detach().cpu().numpy())
 
-    def select_candidate(self, result, *, candidate_indices=None, first_feasible=False, origin=None):
-        """Keep failure evidence from every visited seed and accept only checked curves.
 
-        The first feasible Phase A curve returns immediately so another seed
-        cannot spend the budget needed to bind it. Phase B ranks independently
-        accepted curves by the same quality functional used for that saved A.
-        Native seed_cost is diagnostic only: its objective changes by phase.
-        """
-        if result.batch_size != 1 or not 1 <= result.num_seeds <= self.budget.trajectory_seeds:
-            raise ValueError("Native results exceed the declared single-batch candidate budget")
+    def select_candidate(self, result):
+        """Select the first native-feasible seed; export is a single later delivery step."""
         reports, selected, selected_key = [], None, None
-        indices = range(result.num_seeds) if candidate_indices is None else candidate_indices
-        for index in indices:
-            index = int(index)
-            native_metrics = self.native_diagnostics(result, seed_index=index)
-            self.witnesses.add_native(native_metrics, duration=self.formal_clock["duration"])
-            native_success = native_metrics["success"]
-            candidate = _trajectory_candidate(result, index)
-            report = {"seed_index": index, "native_success": native_success,
-                "native_metrics": native_metrics, "native_seed_cost": float(result.seed_cost[0, index].item()),
-                "seed_provenance": self.seed_strategies[index], "phase": self.phase,
-                "optimizer": deepcopy(self.last_optimizer_diagnostics[index])}
-            if origin is not None:
-                report["candidate_origin"] = deepcopy(origin)
-            validation = None
-            # BEGIN final scalar-best output may already have been fully checked.
-            # Its exact controls, scene and clock are unchanged within a solve.
-            # Reuse a small verdict; execution still uses the existing bound
-            # archive, never reconstructed or incomplete validation evidence.
-            prior_verdict = None
-            if origin is None:
-                controls = candidate.solution[0, 0].detach().cpu().numpy()
-                required_history = set(self.witnesses.parameters.tolist())
-                prior_verdict = next((row for row in getattr(self, "_observed_verdicts", ())
-                    if np.array_equal(controls, row["controls"])
-                    and required_history.issubset(row["validated_history_parameters"])), None)
-            # END no native cost or approximate control comparison identifies a curve.
-            try:
-                if native_success and prior_verdict is not None:
-                    trajectory, points = self._native_curve(candidate), 0
-                    trajectory.residuals = deepcopy(prior_verdict["residuals"])
-                elif native_success:
-                    trajectory, points = self.export(candidate)
-                    validation = self.last_validation
-                    self.witnesses.add_validation(validation)
-                else:
-                    trajectory, points = self._native_curve(candidate), 0
-            except PlanningWorkExhausted:
-                raise
-            except ValueError as error:
-                reports.append({**report, "accepted": False, "export_error": str(error)})
-                continue
-            accepted = native_success and all(np.isfinite(value) and value <= 0
-                                               for value in trajectory.residuals.values())
-            violations = [*trajectory.residuals.values(), *(
-                value for label in ("rollout", "interpolated") if label in native_metrics
-                for value in native_metrics[label]["constraints"].values())]
-            severity = (sum(max(0., value) for value in violations)
-                        if all(np.isfinite(violations)) else float("inf"))
-            report.update(accepted=accepted, validation_points=points,
-                independent_validation="completed" if native_success else "skipped_native_rejection",
-                residuals=trajectory.residuals, continuation_violation=severity)
-            if native_success and prior_verdict is not None:
-                report.update(independent_validation="completed_prior_observation",
-                    previously_considered=True, original_validation_points=prior_verdict["validation_points"],
-                    candidate_origin=deepcopy(prior_verdict["candidate_origin"]),
-                    measurements=deepcopy(prior_verdict["measurements"]),
-                    numerical_tolerances=deepcopy(prior_verdict["numerical_tolerances"]))
-            if validation is not None:
-                report.update(measurements=validation["measurements"],
-                              numerical_tolerances=validation["numerical_tolerances"])
-            # BEGIN a completed hard check can refute an identical saved candidate.
-            # Native rejection already forbids this curve; native success needs
-            # a completed export verdict. Exceptions never reach this callback.
-            # Observe every seed before selecting the next continuation.
-            rejected = getattr(self, "_candidate_rejected", None)
-            if not accepted and callable(rejected):
-                rejected(trajectory, report)
-            # END unfinished checks and unrelated curves cannot revoke an archive.
-            if accepted:
-                report["quality"] = (deepcopy(prior_verdict["quality"]) if prior_verdict is not None
-                                     else self.candidate_quality(trajectory, validation))
-            # BEGIN only a complete accepted verdict can avoid another export.
-            # Failed exports must supply fresh per-time violations to the next
-            # working set; retaining just their scalar residuals loses that data.
-            if origin is not None and validation is not None and accepted:
-                verdict = {name: deepcopy(report[name]) for name in (
-                    "residuals", "validation_points", "candidate_origin", "measurements", "numerical_tolerances")}
-                verdict["quality"] = deepcopy(report["quality"])
-                verdict["controls"] = candidate.solution[0, 0].detach().cpu().numpy().copy()
-                # BEGIN cache reuse also requires all currently known historical queries.
-                # New witnesses from another observed curve do not certify
-                # these times on this curve; a larger history forces export.
-                verdict["validated_history_parameters"] = self.witnesses.parameters.tolist()
-                # END accepted controls alone no longer identify the entire validation input.
-                self._observed_verdicts.append(verdict)
-            # END a rejected observed curve is rechecked before continuing its optimization.
+        for index in range(result.num_seeds):
+            metrics = self.native_diagnostics(result, index)
+            residuals = {f"{label}:{name}": value for label in ("rollout", "interpolated")
+                for name, value in metrics.get(label, {}).get("constraints", {}).items()}
+            accepted = metrics["success"] and all(np.isfinite(v) and v <= 0 for v in residuals.values())
+            severity = sum(max(0., v) for v in residuals.values()) if all(np.isfinite(list(residuals.values()))) else float("inf")
+            report = {"seed_index": index, "native_success": metrics["success"], "accepted": accepted,
+                      "native_metrics": metrics, "residuals": residuals,
+                      "seed_provenance": self.seed_strategies[index],
+                      "optimizer": self.last_optimizer_diagnostics[index] if self.last_optimizer_diagnostics else {}}
             reports.append(report)
-            key = (0, report["quality"]["score"], index) if accepted else (1, severity, index)
+            key = (not accepted, severity, index)
             if selected_key is None or key < selected_key:
-                selected_key = key
-                selected = candidate, trajectory, validation, report
-            if accepted and (first_feasible or self.phase == "feasibility"):
+                selected, selected_key = index, key
+            if accepted:
                 break
-        if selected is None:
-            errors = "; ".join(f"seed {item['seed_index']}: {item['export_error']}" for item in reports)
-            raise ValueError(f"No native candidate has an exportable bounded curve: {errors}")
-        candidate, trajectory, validation, report = selected
-        self.last_validation = validation
-        # BEGIN only the selected continuation supplies current working-set priorities.
-        # Other seeds and block observations already contributed to history;
-        # their failures must not masquerade as this candidate's current state.
-        if origin is None:
-            self.witnesses.set_current(report["native_metrics"], validation=validation,
-                                       duration=self.formal_clock["duration"])
-        # END observer selection cannot overwrite the final continuation's evidence.
-        attempt = {**report, "selected_seed_index": report["seed_index"], "candidates": reports,
-                   "failure_witness_parameters": self.witnesses.parameters.tolist()}
-        return candidate, trajectory, attempt
+        report = reports[selected]
+        candidate = _trajectory_candidate(result, selected)
+        return candidate, self._native_curve(candidate), {**report, "selected_seed_index": selected, "candidates": reports}
 
-    def refinement_samples(self):
-        """Schedule bounded gradient queries; full history remains in export checks."""
-        fixed = self.progress_map.anchor_parameters(self.anchors)[:, 0]
-        capacity = min(self.budget.max_refinement_points,
-                       min(self.budget.max_validation_points, _NATIVE_STAGE_POINT_LIMIT)-len(fixed))
-        # BEGIN exact fixed/native representations do not consume extra query slots.
-        # Existing extra points are deliberately excluded from covered_fixed:
-        # they remain subject to this selection and may need their slot again.
-        regular = np.arange(self.trajopt.horizon, dtype=np.float32)/np.float32(self.trajopt.horizon-1)
-        covered_fixed = np.unique(np.r_[fixed, fixed.astype(np.float32).astype(float)])
-        parameters = self.witnesses.select_parameters(fixed_parameters=covered_fixed,
-            regular_parameters=regular, max_points=capacity)
-        self.last_working_set = self.witnesses.last_selection
-        # END finite capacity changes optimization scheduling, never the history ledger.
-        return None if np.array_equal(parameters, self.refinement_parameters) else parameters
+
     # END the attempt witness set is independent of the selected continuation.
 
     # BEGIN cheap native reconstruction supplies initializers, never acceptance.
@@ -5200,305 +4062,182 @@ class _CuroboPlanner:
                                      self.progress_map.u.copy(), self.progress_map.s.copy(),
                                      tuple(event_records), deepcopy(self.problem.conditions), {})
         trajectory.finger_trajectory = self.finger_trajectory
+        trajectory.satisfied_dependencies = tuple(getattr(self, "satisfied_dependencies", ()))
         return trajectory
     # END native rejection can still initialize OMPL on the identical clock.
 
     def export(self, result):
-        """Build the same cubic on CPU, then check exact anchors and midpoints."""
-        # BEGIN previous candidates remain measured while admitting new records.
-        _require_planning_host_memory(self.scene_cpu_live_bytes,
-            encoded_record_bytes_upper=self.validation_storage["encoded_record_bytes_upper"],
-            max_host_rss_bytes=self.budget.max_host_rss_bytes)
-        # END the current candidate cannot spend another candidate's memory.
+        """Deliver the accepted native cubic with one representation-consistency check.
+
+        Geometry was already evaluated by native regular/dense metrics and exact
+        task anchors. This boundary does no alternate source-geometry sampling.
+        Analytic joint checks protect the CPU polynomial representation itself.
+        """
         trajectory = self._native_curve(result)
-        torch = self.torch
-        times, position, velocity = trajectory.times, trajectory.position, trajectory.velocity
-        dt = self.formal_clock["interpolation_dt"]
-        anchor_pairs = self.progress_map.anchor_parameters(self.anchors)
-        # BEGIN every historical failure remains a mandatory independent query.
-        # Moving a point out of the gradient working set does not establish
-        # positive clearance. The original spatial/query budget admits this
-        # complete union or rejects export; no witness is silently truncated.
-        validation_anchors = np.unique(np.r_[anchor_pairs[:, 0], self.witnesses.parameters])
-        # END source goals and witness times share the unchanged physical clock.
-        # BEGIN complete the existing native acceleration bound between samples.
-        # These are the actual verification manager's named limits, after
-        # native model construction. Input YAML scalars and sampled right-side
-        # accelerations cannot substitute for the complete exported curve.
-        cspace = self._verification_native.get_cost("cspace")
-        if cspace is None or not cspace.enabled:
-            raise ValueError("Export requires enabled native joint-state limits")
-        limits = cspace.config.joint_limits
-        derivatives = cubic_derivative_report(
-            trajectory, limits.acceleration.detach().cpu().numpy(), joint_names=limits.joint_names)
-        # END no new bound, tolerance, C2 requirement or retiming is introduced.
-        # BEGIN bounded spatial work uses original cubics and complete body covers.
-        motion, spatial_step, owner_speed = _export_motion_inputs(
-            self._verification_fk.config.kinematics_config, self._verification_scene, self.problem,
-            spatial_step_m=self.budget.validation_spatial_step_m)
-        queries, spatial_report = _export_sample_times(trajectory, motion, spatial_step=spatial_step,
-            owner_speed_per_progress=owner_speed, anchors=validation_anchors*times[-1], budget=self.budget,
-            finger_geometry=_geometry_finger_model(self._verification_scene.gripper))
-        spatial_report["finger_geometry_scope"] = ("complete rigid mechanical envelope; unknown physical finger speed"
-            if "unknown_hand_mechanical_envelope" in motion.body_names else
-            "same nominal-or-command polynomial or active coordinates selected by scene.gripper.state")
-        q, dq, _ddq, progress = trajectory.sample(queries)
-        q_t = self.device_cfg.to_device(q[None])
-        dq_t = self.device_cfg.to_device(dq[None])
-        s_t = self.device_cfg.to_device(progress[None])
-        time_t = self.device_cfg.to_device(queries[None])
-        scene = self._verification_scene
-        positions, rotations, linear, angular = [], [], [], []
-        geometry_terms, layer_queries = {}, []
-        # BEGIN retain bounded source-solid witnesses for every exported validation chunk.
-        source_self_reports = []
-        # END complete per-pair arrays never accumulate across the trajectory.
-        # BEGIN world diagnostics retain one worst source state for the complete curve.
-        source_world_report = {}
-        # END every state is checked even when its proxy cost vanishes.
-        coverage_count, coverage_passed, coverage_failed = 0, True, []
-        coverage_unknown = np.zeros(len(queries))
-        needs_twist = any(direction.kind == "local_rate" for mechanism in self.problem.mechanisms
-                          for direction in mechanism.directions)
-        def check_work():
-            # The outer request ledger owns the original wall-work deadline.
-            # Check between bounded native batches, never reset it per chunk.
-            callback = getattr(self, "_check_validation_work", None)
-            if callback is not None:
-                callback()
-        # BEGIN completed batches may publish existing CPU-only evidence.
-        # This optional recorder hook never observes an unfinished batch or
-        # borrows last_validation from a previous candidate. In particular it
-        # does not reduce/copy native tensor costs or repeat a geometry query.
-        # A recorder owns any copies it retains. Ordinary diagnostic failures
-        # cannot change verification, work checks, or candidate acceptance.
-        progress_observer = getattr(self, "_export_progress_observer", None)
-        def publish_progress(completed_points, source_self=None):
-            if progress_observer is None:
-                return
-            try:
-                progress_observer({
-                    "planned_points": len(queries), "checked_points": completed_points,
-                    "curve_duration_s": trajectory.duration,
-                    "checked_time_interval_s": (None if not completed_points else
-                        [float(queries[0]), float(queries[completed_points-1])]),
-                    "source_world_collision": source_world_report,
-                    "source_self_collision_batch": source_self,
-                    "robot_coverage": {"checked_states": coverage_count,
-                        "passed": coverage_passed,
-                        "attempt_disallowed_states": int(np.count_nonzero(coverage_unknown[:completed_points])),
-                        "failed_witnesses": coverage_failed},
-                    "analytic_acceleration": derivatives,
-                })
-            except Exception:
-                # The experiment recorder reports its own I/O errors. Other
-                # optional observers are equally unable to alter the result.
-                pass
-        publish_progress(0)
-        # END no partial record supplies a planner validation verdict.
-        def fk_at(moments, values, rates):
-            check_work()
-            joint_state = self.JointState(position=values, velocity=rates,
-                acceleration=self.device_cfg.to_device(trajectory._curve(moments, 2)[None]),
-                jerk=self.device_cfg.to_device(trajectory._curve(moments, 3)[None]),
-                dt=self.device_cfg.to_device([dt]), joint_names=list(self.joint_names))
-            state = self._verification_fk.compute_kinematics(joint_state)
-            tool = state.tool_poses
-            index = tool.tool_frames.index(self.problem.tool_link)
-            p, r = self.problem.transform_tool_pose(tool.position[:, :, index], tool.quaternion[:, :, index])
-            return joint_state, state, index, p, r
-        with torch.no_grad():
-            # Freeze every release from the complete ordered anchor history
-            # before splitting geometry. A later batch must not substitute
-            # its first local sample for an earlier actual release pose.
-            if any(relation.release_condition_id is not None for owner in scene.owners
-                   for relation in owner.attachments):
-                anchor_times = anchor_pairs[:, 0]*times[-1]
-                aq, adq, _, aprogress = trajectory.sample(anchor_times)
-                anchor_p, anchor_r = [], []
-                for begin in range(0, len(anchor_times), _VALIDATION_CHUNK_SIZE):
-                    end = begin+_VALIDATION_CHUNK_SIZE
-                    _, _, _, p, r = fk_at(anchor_times[begin:end],
-                        self.device_cfg.to_device(aq[None, begin:end]),
-                        self.device_cfg.to_device(adq[None, begin:end]))
-                    anchor_p.append(p.clone())
-                    anchor_r.append(r.clone())
-                scene = scene.with_release_history(torch.cat(anchor_p, dim=1), torch.cat(anchor_r, dim=1),
-                                                   self.device_cfg.to_device(aprogress[None]))
-                del anchor_p, anchor_r
-            for begin in range(0, len(queries), _VALIDATION_CHUNK_SIZE):
-                end = min(begin+_VALIDATION_CHUNK_SIZE, len(queries))
-                selected = slice(begin, end)
-                joint_state, state, tool_index, p, r = fk_at(queries[selected], q_t[:, selected], dq_t[:, selected])
-                # FK reuses its output buffers. Own only small TCP/twist arrays;
-                # complete robot sphere arrays never survive this iteration.
-                positions.append(p.clone())
-                rotations.append(r.clone())
-                if needs_twist:
-                    twist = torch.einsum("...kd,...d->...k", state.tool_jacobians[:, :, tool_index], dq_t[:, selected])
-                    v, w = self.problem.transform_tool_velocity(twist[..., :3], twist[..., 3:],
-                                                                 state.tool_poses.quaternion[:, :, tool_index])
-                    linear.append(v.clone())
-                    angular.append(w.clone())
-                layer_record = {}
-                components = {"scene": _scene_boundary_evaluate(scene,
-                    self.problem, self.progress_map, self.problem.transform_robot_spheres(state.robot_spheres),
-                    p, r, s_t[:, selected], q_t[:, selected], self.joint_names,
-                    trajectory_time=time_t[:, selected],
-                    normalized_time=self.device_cfg.to_device((queries[selected]/times[-1])[None]),
-                    layer_selection_out=layer_record, source_geometry=True,
-                    diagnostics=source_world_report)}
-                layer_record["sample_start"] = begin
-                layer_record["sample_count"] = end-begin
-                layer_queries.append(layer_record)
-                native_constraints = self._verification_native.compute_costs(
-                    self._RobotState(joint_state=joint_state, cuda_robot_model_state=state))
-                for name, value in zip(native_constraints.names, native_constraints.values):
-                    components[f"native:{name}"] = value
-                # BEGIN export repeats the same source-solid decision on each actual query state.
-                source_report = {}
-                components["source_self_collision"] = scene.check_robot_self_collision(
-                    q_t[:, selected], self.joint_names, time_t[:, selected], diagnostics=source_report)
-                source_self_reports.append(source_report)
-                # END joint/derivative constraints remain owned by the native manager.
-                for name, value in components.items():
-                    reduced = value.reshape(value.shape[0], value.shape[1], -1).amax(-1)
-                    geometry_terms.setdefault(name, []).append(reduced.clone())
-                # The shared complete-solid oracle consumes bounded CPU batches
-                # with the true entrance flag exactly once, preserving its own
-                # cumulative finite-work accounting and unknown-space policy.
-                coverage = []
-                start = begin
-                if begin == 0:
-                    coverage = scene.check_robot_coverage(torch.as_tensor(q[None, :1], dtype=torch.float64),
-                        self.joint_names, torch.as_tensor(queries[None, :1], dtype=torch.float64), entrance=True)
-                    start = 1
-                if start < end:
-                    coverage += scene.check_robot_coverage(torch.as_tensor(q[None, start:end], dtype=torch.float64),
-                        self.joint_names, torch.as_tensor(queries[None, start:end], dtype=torch.float64))
-                if coverage:
-                    if len(coverage) != end-begin:
-                        raise ValueError("Complete-solid coverage returned an incomplete validation chunk")
-                    coverage_count += len(coverage)
-                    coverage_unknown[selected] = [0. if row["attempt_allowed"] else 1. for row in coverage]
-                    coverage_passed &= all(row["passed"] for row in coverage)
-                    coverage_failed.extend({"time_s": float(queries[begin+i]), "result": row}
-                        for i, row in enumerate(coverage) if not row["passed"] and len(coverage_failed) < 16)
-                    coverage_failed = coverage_failed[:16]
-                # BEGIN checkpoint only after every original batch operation.
-                publish_progress(end, source_report)
-                # END the existing cumulative-budget boundary remains here.
-                check_work()
-            # Process constraints may use ordered winding/first-event history.
-            # Evaluate them once on the full small TCP/q arrays, never on an
-            # isolated geometry chunk. Native spheres are no longer required.
-            p, r = torch.cat(positions, dim=1), torch.cat(rotations, dim=1)
-            tool_linear = torch.cat(linear, dim=1) if needs_twist else None
-            tool_angular = torch.cat(angular, dim=1) if needs_twist else None
-            components = self.problem.residuals(p, r, s_t, q_t, self.joint_names, joint_velocity=dq_t,
-                trajectory_time=time_t, tool_linear_velocity=tool_linear, tool_angular_velocity=tool_angular)
-            components.update({name: torch.cat(values, dim=1) for name, values in geometry_terms.items()})
-            residuals = {name: float(value.max().item()) for name, value in components.items()}
-            measurements = {name: float(value.max().item()) for name, value in
-                            self.problem.measurements(p, r, s_t, trajectory_time=time_t).items()}
-            violation = torch.zeros_like(s_t)
-            for name, value in components.items():
-                reduced = value.reshape(value.shape[0], value.shape[1], -1).amax(-1)
-                violation = torch.maximum(violation, reduced)
-                if residuals[name] > 0:
-                    index = int(reduced.reshape(-1).argmax().item())
-                    measurements[f"{name}:maximum_violation_u"] = float(queries[index]/times[-1])
-                    measurements[f"{name}:maximum_violation_progress"] = float(progress[index])
-                    measurements[f"{name}:maximum_violation_time"] = float(queries[index])
-            self.last_validation = {
-                "measurements": measurements, "numerical_tolerances": asdict(self.problem.numerical),
-                "u": queries/times[-1], "violations": violation.detach().cpu().numpy().reshape(-1),
-                "spatial_resolution": spatial_report, "scene_layer_queries": layer_queries,
-                "source_self_collision": {"checked_states": sum(
-                    report["checked_states"] for report in source_self_reports), "chunks": source_self_reports},
-                "source_world_collision": source_world_report,
-                "coordinate_direction_resolution": {"query_count": len(queries),
-                    "maximum_physical_time_gap_s": float(np.max(np.diff(queries))),
-                    "local_rate": "instantaneous native geometric Jacobian times actual cubic joint velocity",
-                    "scope": "finite query validation; no continuous-time sign certificate"},
-            }
-            if coverage_count:
-                residuals["unknown/new_robot_volume"] = float(coverage_unknown.max())
-                self.last_validation["violations"] = np.maximum(self.last_validation["violations"], coverage_unknown)
-                self.last_validation["robot_coverage"] = {"queries": coverage_count,
-                    "attempt_allowed": bool(not coverage_unknown.any()), "passed": coverage_passed,
-                    "failed": coverage_failed,
-                    "scope": "native solid volume at every exported validation sample; not continuous collision proof"}
-        # END geometry is bounded in memory; chronological process history is complete.
-        # BEGIN final scope and physical-domain checks refer to this exact curve.
-        scope_issues = self.problem.verification_issues(progress)
-        self.last_validation["scope_issues"] = scope_issues
-        residuals["required_relation_query_incomplete"] = float(bool(scope_issues))
+        limits = self._verification_native.get_cost("cspace").config.joint_limits
         columns = [limits.joint_names.index(name) for name in self.joint_names]
-        position_limits = limits.position[:, columns].detach().cpu().numpy()
-        position_report = cubic_position_report(trajectory._curve, *position_limits)
-        residuals["continuous_position"] = position_report["maximum_bound_excess"]
-        self.last_validation["continuous_position"] = position_report
-        # END sampled native success does not replace polynomial or history checks.
-        residuals["initial_position"] = max(0., float(np.max(np.abs(position[0]-self.start.position[0].detach().cpu().numpy())))
-                                              - self.problem.numerical.joint)
-        residuals["initial_velocity"] = max(0., float(np.max(np.abs(velocity[0]-self.start.velocity[0].detach().cpu().numpy())))
-                                              - self.problem.numerical.velocity)
-        # BEGIN require the existing acceleration limits on every cubic piece.
-        # This residual is raw joint-coordinate acceleration excess, not a
-        # weighted native cost. The original candidate selector already rejects
-        # every positive residual. Jump magnitudes remain diagnostic only.
-        residuals["continuous_acceleration"] = derivatives["acceleration"]["maximum_bound_excess"]
-        self.last_validation["cubic_derivatives"] = derivatives
-        witness = derivatives["acceleration"]["maximum_violation"]
-        if witness is not None:
-            parameter = witness["time_s"]/times[-1]
-            self.last_validation["measurements"].update({
-                "continuous_acceleration:maximum_violation_time": witness["time_s"],
-                "continuous_acceleration:maximum_violation_u": parameter,
-                "continuous_acceleration:maximum_violation_progress": float(np.interp(
-                    parameter, self.progress_map.u, self.progress_map.s)),
-            })
-            # The existing bounded refinement consumes these coordinates and
-            # residuals, not measurements. Retain the exact analytic witness
-            # even if that time already has a sampled right-side acceleration;
-            # cubic_derivatives above identifies the failing piece and side.
-            self.last_validation["u"] = np.r_[self.last_validation["u"], parameter]
-            self.last_validation["violations"] = np.r_[
-                self.last_validation["violations"], witness["excess"]]
-        # END continuous acceleration acceptance; C1/C2 reports do not add gates.
-        trajectory.residuals = residuals
-        return trajectory, len(queries)
+        bounds = limits.position[:, columns].detach().cpu().numpy()
+        position = cubic_position_report(trajectory._curve, *bounds)
+        velocity_bounds = limits.velocity[:, columns].detach().cpu().numpy()
+        velocity = cubic_position_report(trajectory._curve.derivative(), *velocity_bounds)
+        if velocity["maximum_violation"] is not None:
+            velocity["maximum_violation"]["velocity"] = velocity["maximum_violation"].pop("position")
+        derivatives = cubic_derivative_report(trajectory, limits.acceleration.detach().cpu().numpy(),
+                                              joint_names=limits.joint_names)
+        trajectory.residuals = {
+            "continuous_position": position["maximum_bound_excess"],
+            "continuous_velocity": velocity["maximum_bound_excess"],
+            "continuous_acceleration": derivatives["acceleration"]["maximum_bound_excess"],
+            "initial_position": max(0., float(np.max(np.abs(trajectory.position[0]-self.start.position[0].detach().cpu().numpy())))-self.problem.numerical.joint),
+            "initial_velocity": max(0., float(np.max(np.abs(trajectory.velocity[0]-self.start.velocity[0].detach().cpu().numpy())))-self.problem.numerical.velocity)}
+        self.delivery_candidate = trajectory
+        worst = max(trajectory.residuals.values())
+        if not np.isfinite(worst) or worst > 0:
+            raise MotionPlanningError("output_inconsistent", "Accepted native curve failed exact output/domain consistency")
+        self.last_validation = {"u": np.array([0., 1.]), "violations": np.zeros(2),
+            "scope": "native online-model success; exact output polynomial and measured entrance consistency",
+            "continuous_position": position, "continuous_velocity": velocity, "cubic_derivatives": derivatives,
+            "numerical_tolerances": asdict(self.problem.numerical)}
+        return trajectory, 0
+
+
+# BEGIN one resident native backend with typed refusal and explicit ownership.
+def _verified_dependency_outcomes(continuation):
+    """Name only dependencies with the executed occurrence's fresh T record."""
+    if continuation is None:
+        return set()
+    verified = {event_occurrence_key(row) for row in continuation.get("verified_events", ())}
+    original = continuation["original_binding"]
+    events = {event_occurrence_key(row): row for row in original["curve"]["events"]}
+    satisfied = set()
+    for row in continuation.get("dependency_outcomes", ()):
+        event, evidence = row.get("event", {}), row.get("evidence", {})
+        identity = event_occurrence_key(event)
+        elapsed = row.get("physical_elapsed_s")
+        if (identity in verified and identity in events and event == events[identity]
+                and evidence.get("value") == "T" and evidence.get("source") and row.get("feedback_id")
+                and isinstance(elapsed, (int, float)) and np.isfinite(elapsed)
+                and 0 <= elapsed <= continuation["elapsed_physical_s"]):
+            dependency = event.get("requires_evidence")
+            if dependency is not None:
+                satisfied.add(dependency)
+    return satisfied
+
+
+def _bind_motion_work_ledger(ledger, block, continuation, entrance_consumed):
+    """Start another two-solve allowance only after a verified block boundary."""
+    previous = ledger.get("motion_request")
+    new_request = previous is None
+    if continuation is not None and previous is not None:
+        old = continuation["original_binding"].get("motion_block", {})
+        event = old.get("boundary_event")
+        verified = _verified_dependency_outcomes(continuation)
+        new_request = bool(old.get("requires_rebind") and event is not None
+            and event.get("requires_evidence") in verified
+            and block["start_progress"] >= old["end_progress"]
+            and block["end_progress"] > old["end_progress"])
+    if new_request:
+        ledger["motion_request"] = {"index": 0 if previous is None else previous["index"]+1,
+            "start_progress": block["start_progress"], "end_progress": block["end_progress"],
+            "planning_baseline": (dict.fromkeys(entrance_consumed, 0) if previous is None else deepcopy(entrance_consumed))}
+    return ledger["motion_request"]["planning_baseline"]
+
+
+class MotionPlanningError(ValueError):
+    """A failed bounded request, never a proof that the mathematical problem is infeasible."""
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+
+
+class MotionBackend:
+    """Own one robot's reusable native IK and trajectory optimizer instances.
+
+    The robot, device and tensor capacities are constructor inputs. Requests
+    replace goals, measured q/dq, scene values and clocks; they cannot resize
+    the robot or silently buy another solve. close() is the owner's lifecycle.
+    """
+    def __init__(self, robot, *, robot_validator, budget=None, device="cuda:0"):
+        self.robot, self.robot_validator, self.device = deepcopy(robot), robot_validator, device
+        self.budget = PlanningBudget() if budget is None else budget
+        self._planner = None
+        self._closed = False
+        self._busy = Lock()
+        self._request_owner = None
+
+    def _claim(self):
+        if not self._busy.acquire(blocking=False):
+            raise MotionPlanningError("backend_busy", "A native request still owns this backend's buffers")
+        self._request_owner = get_ident()
+
+    def _release(self):
+        if self._request_owner != get_ident():
+            raise RuntimeError("Only the active motion request can release native buffers")
+        self._request_owner = None
+        self._busy.release()
+
+    def bind_request(self, problem, scene, *, budget, continuation=None, goal_identities=None):
+        if self._request_owner != get_ident():
+            raise MotionPlanningError("backend_busy", "Request binding requires ownership of the native buffers")
+        if self._closed:
+            raise MotionPlanningError("backend_closed", "MotionBackend is closed")
+        for name in ("knots", "interpolation_steps", "interpolation_dt", "interpolation_buffer_size",
+                     "ik_seeds", "trajectory_seeds", "max_task_anchors", "ik_iterations", "trajectory_iterations"):
+            if getattr(budget, name) != getattr(self.budget, name):
+                raise MotionPlanningError("capacity_exceeded", f"Resident backend cannot change {name}")
+        if self._planner is None:
+            self._planner = _CuroboPlanner(problem, scene, self.robot, budget, self.device,
+                robot_validator=self.robot_validator, continuation=continuation, goal_identities=goal_identities)
+        else:
+            self._planner.rebind(problem, scene, budget, continuation=continuation, goal_identities=goal_identities)
+        return self._planner
+
+    def plan(self, problem, scene, *, continuation=None, request_ledger=None, rebind=None,
+             cancelled=None, deadline=None, joint_reference=None):
+        return plan_trajectory(problem, scene, self.robot, robot_validator=self.robot_validator,
+            budget=self.budget, device=self.device, continuation=continuation,
+            request_ledger=request_ledger, rebind=rebind, backend=self,
+            cancelled=cancelled, deadline=deadline, joint_reference=joint_reference)
+
+    def close(self):
+        self._claim()
+        try:
+            if self._planner is not None:
+                self._planner.close()
+                self._planner = None
+            self._closed = True
+        finally:
+            self._release()
+# END a failed request leaves the resident solvers available for the next binding.
 
 
 # BEGIN request-wide execution, failure and rebind accounting.
 def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, device="cuda:0", continuation=None,
-                    request_ledger=None, rebind=None):
+                    request_ledger=None, rebind=None, backend=None, cancelled=None, deadline=None, joint_reference=None):
     """Generate one fully checked candidate within the original request budget.
 
     ``request_ledger`` continues failed planning attempts. ``continuation``
     carries actual execution facts. An explicit ``rebind`` rebuilds the soft
     schedule of remaining work or creates selected retry occurrences; ordinary
     continuation preserves the original frozen clock. Every request admitted
-    after source-model binding, including initialization failure, carries the cumulative ledger. No GPU stage is
+    including initialization failure carries the cumulative ledger. No GPU stage is
     claimed to be preemptible: elapsed overrun rejects its candidate.
     """
     from .execution_binding import bind_candidate, plain
     from .planning_problem import TimeBindingError
     started = time.monotonic()
-    prior = planner = ledger = None
-    # BEGIN only a fully validated and bound CPU candidate enters this archive.
-    best_attempt = None
-    # END the shared request ledger remains outside candidate snapshots.
+    prior = planner = ledger = trajectory = None
     initial_seconds = 0.
+    motion_ready, motion_baseline = False, {}
     original_export = original_ik_solve = original_ik_rank = None
+    owned_backend = backend is None
+    backend_claimed = False
     diagnostics = {"attempts": []}
     outcome = PlanningResult(False, None, diagnostics)
     stage = "request_binding"
     try:
-        # BEGIN every request owns its mutable scene and binds mandatory source solids before its ledger.
+        # BEGIN every request owns its mutable online scene and cumulative ledger.
         scene = scene.clone_for_rollout()
-        scene.bind_robot_validator(robot_validator, problem)
         # END clones share the immutable model policy, not candidate hand clocks or query evidence.
         previous = request_ledger
         if previous is None and isinstance(continuation, dict) and isinstance(continuation.get("original_binding"), dict):
@@ -5530,11 +4269,19 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         # END pending facts remain diagnostics, not completed obligations.
         consumed = ledger["consumed_planning"]
         initial_seconds = consumed["planning_seconds"]
+        entrance_consumed = deepcopy(consumed)
         request_budget = asdict(original_budget)
         diagnostics.update(planning_budget=request_budget, consumed_planning=consumed)
         def check(next_stage=None):
-            _check_work_budget(original_budget, consumed, started=started,
-                               initial_seconds=initial_seconds, stage=next_stage)
+            if cancelled is not None and cancelled():
+                raise MotionPlanningError("cancelled", "Motion request was cancelled")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise MotionPlanningError("deadline_exceeded", "Motion request deadline elapsed")
+            consumed["planning_seconds"] = initial_seconds+time.monotonic()-started
+            if motion_ready:
+                relative = {name: value-motion_baseline.get(name, 0) for name, value in consumed.items()}
+                _check_work_budget(original_budget, relative, started=started,
+                    initial_seconds=initial_seconds-motion_baseline.get("planning_seconds", 0.), stage=next_stage)
         check("binding_attempts")
         consumed["binding_attempts"] += 1
         # BEGIN explicit allocation changes preserve the existing request ledger.
@@ -5584,16 +4331,40 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 raise ContinuationBindingError("A failed-request retry changed the original event/source requirements")
             if rebind is not None and (not rebind.get("source") or rebind.get("kind") != "remaining"):
                 raise ContinuationBindingError("Creating retry occurrences requires an actual execution continuation")
-            remaining_solves = original_budget.maximum_trajectory_solves-consumed["trajectory_solves"]
-            if remaining_solves <= 0:
-                raise PlanningWorkExhausted("The original cumulative trajectory-solve budget is exhausted")
-            budget = replace(original_budget, maximum_trajectory_solves=remaining_solves,
-                search_seconds=max(0., original_budget.search_seconds-consumed["search_seconds"]))
-        check("initializations")
+            budget = original_budget
         stage = "initialization"
+        satisfied_dependencies = _verified_dependency_outcomes(continuation)
+        try:
+            problem, block_record = problem.bound_motion_block(
+                goal_identities=None if prior is None else prior["goal_identities"],
+                satisfied_dependencies=satisfied_dependencies)
+        except ValueError as error:
+            if "requires fresh dependency evidence" in str(error):
+                raise MotionPlanningError("needs_rebind", str(error)) from error
+            raise
+        motion_baseline = _bind_motion_work_ledger(ledger, block_record, continuation, entrance_consumed)
+        motion_ready = True
+        check()
+        budget = replace(budget, search_seconds=max(0., original_budget.search_seconds-
+            (consumed["search_seconds"]-motion_baseline.get("search_seconds", 0.))))
+        diagnostics["motion_block"] = block_record
+        if backend is None:
+            backend = MotionBackend(robot, robot_validator=robot_validator, budget=original_budget, device=device)
+        check("initializations")
         consumed["initializations"] += 1
-        planner = _CuroboPlanner(problem, scene, robot, budget, device,
-                                 robot_validator=robot_validator, continuation=prior)
+        backend._claim()
+        backend_claimed = True
+        if scene.gripper is not None:
+            occurrences = {event_occurrence_key(event) for event in problem.events}
+            scene.gripper.commands = tuple(row for row in scene.gripper.commands
+                                           if event_occurrence_key(row) in occurrences)
+        planner = backend.bind_request(problem, scene, budget=budget, continuation=prior,
+                                       goal_identities=block_record["goal_identities"])
+        planner.check_request = check
+        planner.satisfied_dependencies = tuple(sorted(satisfied_dependencies))
+        for solver in (planner.ik, planner.trajopt):
+            for optimizer in solver.core.optimizers:
+                optimizer._core.request_guard = check
         check()
         diagnostics.update(backend="curobo_v2", batch_size=1, ik_seeds=budget.ik_seeds,
             trajectory_seeds=budget.trajectory_seeds, used_ompl=False,
@@ -5605,6 +4376,10 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             scene_gpu_workspace_bytes=planner.scene_gpu_workspace_bytes,
             anchor_fk_workspace_bytes=planner.anchor_fk_workspace_bytes, exact_anchor_capacity=planner.anchor_capacity,
             validation_storage=deepcopy(getattr(planner, "validation_storage", {})))
+        limits = planner._verification_native.get_cost("cspace").config.joint_limits
+        diagnostics["verification_joint_limits"] = {"joint_names": list(limits.joint_names),
+            **{name: getattr(limits, name).detach().cpu().numpy().tolist()
+               for name in ("position", "velocity", "acceleration")}}
         stage = "initial_state_verification"
         consumed["validation_queries"] += 1
         diagnostics["initial_state"] = planner.initial_state_diagnostics()
@@ -5619,67 +4394,10 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             0. if prior is None else prior["request_time_origin_s"], ledger["history"],
             None if prior is None else prior["goal_identities"], ledger["timing_events"])
 
-        # Count actual export passes for all declared candidates. An export
-        # exception consumes its admitted maximum query allowance because its
-        # partial native work cannot be reconstructed from a missing result.
-        planner._check_validation_work = check
-        original_export = planner.export
-        def tracked_export(*args, **kwargs):
-            check("validation_passes")
-            consumed["validation_passes"] += 1
-            observation = bool(getattr(planner, "_observing_candidate", False))
-            if observation:
-                work = diagnostics.setdefault("candidate_observation_work", {})
-                work["export_passes"] = work.get("export_passes", 0)+1
-            queries = budget.max_validation_points
-            try:
-                exported = original_export(*args, **kwargs)
-                queries = int(exported[1])
-            finally:
-                consumed["validation_queries"] += queries
-                if observation:
-                    work["export_queries"] = work.get("export_queries", 0)+queries
-            # BEGIN preserve an original environment/API exception during charging.
-            check()
-            return exported
-            # END only a normally returned export is checked for subsequent exhaustion.
-        planner.export = tracked_export
-        # BEGIN static IK screening shares the request's finite source-state budget.
-        if callable(getattr(planner, "_rank_ik_candidates", None)):
-            original_ik_rank = planner._rank_ik_candidates
-            def tracked_ik_rank(candidates, *args, **kwargs):
-                check("validation_queries")
-                consumed["validation_queries"] += int(np.isfinite(candidates).all(axis=-1).sum())
-                check()
-                result = original_ik_rank(candidates, *args, **kwargs)
-                check()
-                return result
-            planner._rank_ik_candidates = tracked_ik_rank
-        # END errors preserve both their original identity and admitted work charge.
-        # Reference IK and any later native IK calls share the same counter.
-        # Seed proposal loops with no native IK are charged by search work.
-        if callable(getattr(planner.ik, "solve_pose", None)):
-            original_ik_solve = planner.ik.solve_pose
-            def tracked_ik(*args, **kwargs):
-                check("ik_queries")
-                goal = args[0] if args else kwargs["goal_tool_poses"]
-                # return_seeds is only an output count; native IK still
-                # evaluates its configured seed population for each goal.
-                queries = int(goal.batch_size)*max(int(planner.ik.config.num_seeds),
-                                                   int(kwargs.get("return_seeds", 1)))
-                if consumed["ik_queries"]+queries > original_budget.max_validation_points*original_budget.ik_seeds*original_budget.maximum_trajectory_solves:
-                    raise PlanningWorkExhausted("The original cumulative ik_queries budget is exhausted")
-                consumed["ik_queries"] += queries
-                # BEGIN an IK runtime error must not become an ignorable quality timeout.
-                result = original_ik_solve(*args, **kwargs)
-                check()
-                return result
-                # END counts were charged before the native call, including errors.
-            planner.ik.solve_pose = tracked_ik
         check("ik_batches")
         consumed["ik_batches"] += 1
         stage = "reference_ik"
-        seeds, ik_success = planner.reference_seeds()
+        seeds, ik_success = planner.reference_seeds(joint_reference=joint_reference)
         check()
         diagnostics.update(reference_ik_success_counts=ik_success,
             ik_exit_early=bool(planner.ik.config.exit_early),
@@ -5690,14 +4408,11 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             reference_seed_fits=deepcopy(planner.reference_seed_fits))
         diagnostics["functional_ik_candidates"] = deepcopy(getattr(planner, "goal_ik_candidates", {}))
         diagnostics["functional_ik_fit_hints"] = deepcopy(planner.goal_ik_fit_hints)
+        diagnostics["joint_reference"] = deepcopy(planner.joint_reference_report)
         # BEGIN seed, block and final candidates share one complete binding boundary.
         def qualify_candidate(trajectory, validation, attempt):
-            nonlocal best_attempt
             if not attempt["accepted"] or validation is None:
                 raise ValueError("Only a completely validated candidate may enter execution binding")
-            if best_attempt is not None and attempt["quality"]["score"] >= best_attempt["quality"]["score"]:
-                attempt["quality_decision"] = "retained_better_or_equal_feasible_candidate"
-                return False
             diagnostics.update(executable_until=trajectory.executable_until,
                                next_verification=trajectory.next_verification)
             binding = bind_candidate(trajectory, problem=problem, scene=scene,
@@ -5708,12 +4423,10 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     ledger["timing_events"].append(plain(event))
             retry_goal_ids = set() if prior is None else set(prior["retry_goal_ids"])
             retry_direction_ids = set() if prior is None else set(prior["retry_direction_ids"])
-            binding.update(planning_budget=deepcopy(request_budget),
+            binding.update(motion_block=deepcopy(block_record), planning_budget=deepcopy(request_budget),
                 request_events=deepcopy(ledger["original_events"]),
                 consumed_events=[] if prior is None else prior["consumed_events"],
-                goal_identities=({name: list(range(len(getattr(problem, name))))
-                    for name in ("pose_events", "coordinate_events", "supports")}
-                    if prior is None else prior["goal_identities"]),
+                goal_identities=deepcopy(block_record["goal_identities"]),
                 completed_goal_ids=[deepcopy(value) for value in
                                     (ledger["completed_goal_ids"] if prior is None else prior["completed_goal_ids"])
                                     if tuple(value) not in retry_goal_ids],
@@ -5740,220 +4453,98 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             check()
             diagnostics["qualified_candidate_elapsed_seconds"] = time.monotonic()-started
             outcome.success, outcome.trajectory, outcome.execution_binding = True, trajectory, binding
-            # BEGIN preserve the qualified curve before rebuilding the sole solver.
-            best_attempt = deepcopy(attempt)
-            diagnostics["best_feasible_quality"] = deepcopy(attempt["quality"])
             return True
 
-        def charge_candidate_queries(count):
-            check("validation_queries")
-            consumed["validation_queries"] += int(count)
-            work = diagnostics.setdefault("candidate_observation_work", {})
-            work["screen_and_native_queries"] = work.get("screen_and_native_queries", 0)+int(count)
-            check()
-
-        planner._candidate_qualified = qualify_candidate
-        # BEGIN newly discovered history can explicitly refute a prior identical curve.
-        def reject_candidate(trajectory, report):
-            nonlocal best_attempt
-            saved = outcome.trajectory
-            if (best_attempt is not None and saved is not None
-                    and trajectory.joint_names == saved.joint_names
-                    and all(np.array_equal(getattr(trajectory, name), getattr(saved, name))
-                            for name in ("times", "position", "velocity"))):
-                diagnostics["invalidated_feasible_candidate"] = {
-                    "reason": "same_curve_failed_additional_validation", "rejection": deepcopy(report)}
-                diagnostics.pop("best_feasible_quality", None)
-                best_attempt = None
-                outcome.success, outcome.trajectory, outcome.execution_binding = False, None, None
-        planner._candidate_rejected = reject_candidate
-        # END another candidate's failure alone leaves the original complete binding intact.
-        planner._charge_candidate_queries = charge_candidate_queries
-        planner.candidate_observations = diagnostics.setdefault("candidate_observations", [])
-        planner._observed_verdicts = []
-        # END observations use the original request ledger and explicit validation.
-        reference_seeds, searched = seeds, False
-        background_already_refined = False
-        for iteration in range(budget.maximum_trajectory_solves):
-            # BEGIN map refinement is fixed before the next native solve/observer.
-            refine_background = getattr(planner, "refine_background_for_seed", None)
-            if callable(refine_background) and not background_already_refined:
-                stage = "background_refinement"
-                report = (refine_background(seeds) if best_attempt is None else
-                          {"updated": False, "reason": "preserve_qualified_candidate_scene"})
-                diagnostics.setdefault("background_refinements", []).append(report)
-                scene = planner.scene
-                diagnostics["scene"] = scene.describe()
-                check()
-            background_already_refined = False
-            # END each later binding names the scene actually used for validation.
+        # BEGIN one reference verdict, one main solve and one mutually exclusive recovery.
+        reference_result = planner.evaluate_reference(seeds)
+        native_result, trajectory, attempt = planner.select_candidate(reference_result)
+        if joint_reference is not None and planner.joint_reference_report is not None:
+            same = (trajectory.joint_names == joint_reference.joint_names
+                    and np.array_equal(trajectory.times, joint_reference.times)
+                    and np.array_equal(trajectory.position, joint_reference.position)
+                    and np.array_equal(trajectory.velocity, joint_reference.velocity))
+            diagnostics["joint_reference"]["source_curve_preserved"] = same
+            diagnostics["joint_reference"]["candidate_kind"] = "original_joint_curve" if same else "native_fitted_joint_reference"
+        diagnostics["reference_candidate"] = deepcopy(attempt)
+        recovery = None
+        if not attempt["accepted"]:
             check("trajectory_solves")
             consumed["trajectory_solves"] += 1
-            stage = "trajectory_optimization_and_verification"
+            stage = "main_solve"
             native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
-            # BEGIN rejected continuations advance their own functional objective.
-            # A completely accepted candidate must be bound before optional
-            # queries can exhaust work. Its existing duals also remain valid
-            # during optional quality work; acceptance needs no further AL step.
-            attempt["functional_augmented_lagrangian"] = (
-                planner.update_functional_constraints(native_result)
-                if not attempt["accepted"] and best_attempt is None else
-                {"changed": False, "reason": "preserve_completely_qualified_candidate"})
-            # END map changes cannot skip or duplicate this multiplier update.
+            diagnostics["attempts"].append(deepcopy(attempt))
             check()
-            native_success = attempt["native_success"]
-            diagnostics["attempts"].append(attempt)
-            diagnostics.update(attempt)
-            if attempt["accepted"]:
-                if attempt.get("previously_considered"):
-                    if best_attempt is None:
-                        raise RuntimeError("A qualified observation lost its execution archive")
-                    attempt["quality_decision"] = "retained_previously_bound_observation"
-                    break
-                if not qualify_candidate(trajectory, planner.last_validation, attempt):
-                    break
-                if planner.phase == "quality" or iteration+1 >= budget.maximum_trajectory_solves:
-                    break
-                stage = "quality_phase_initialization"
-                check("trajectory_solves")
-                seeds = native_result.solution.detach().clone()
-                planner.seed_strategies = [attempt["seed_provenance"]]
-                # A complete accepted curve has no current violations. Old
-                # evidence stays in independent validation, not gradient slots.
-                additional = planner.refinement_samples()
-                attempt["working_set"] = deepcopy(planner.last_working_set)
-                planner.refine_validation(planner.refinement_parameters if additional is None else additional,
-                                          phase="quality")
-                attempt["next_action"] = "improve_bound_feasible_curve"
-                check()
-                continue
-                # END optional quality work consumes the original shared budget.
-            if best_attempt is not None:
-                attempt["quality_decision"] = "retained_feasible_candidate_after_rejection"
-                break
-            # BEGIN all changes to the next subproblem share one rebuild boundary.
-            stagnant = attempt["optimizer"]["unchanged_from_seed"]
-            if stagnant:
-                attempt["stop_reason"] = "optimizer_returned_unchanged_infeasible_curve"
-            if iteration+1 >= budget.maximum_trajectory_solves:
-                break
-            stage = "validation_refinement"
-            additional = planner.refinement_samples()
-            attempt["working_set"] = deepcopy(planner.last_working_set)
-            parameters = planner.refinement_parameters if additional is None else additional
-            check()
-            map_changed = False
-            if callable(refine_background):
-                stage = "rejected_candidate_background_refinement"
-                refinement_seed = native_result.solution.detach().clone()
-                report = refine_background(refinement_seed, rebuild=False)
-                diagnostics.setdefault("background_refinements", []).append({**report, "phase": "rejected_candidate"})
-                scene = planner.scene
-                diagnostics["scene"] = scene.describe()
-                check()
-                map_changed = report["updated"]
-            functional_changed = attempt["functional_augmented_lagrangian"]["changed"]
-            if map_changed or functional_changed or (native_success and additional is not None):
-                seeds = native_result.solution.detach().clone()
-                planner.seed_strategies = [attempt["seed_provenance"]]
-                planner.refine_validation(parameters, phase="feasibility")
-                background_already_refined = True
-                attempt.update(next_action="optimize_updated_constraints", refinement_parameters=parameters.tolist(),
-                    subproblem_changes={"functional_parameters": functional_changed,
-                                        "background": map_changed, "working_set": additional is not None})
-                check()
-                continue
-            # END no old curvature, cost tracker or capture survives changed objective inputs.
-            if not searched and budget.search_seconds > 0:
-                searched, stage = True, "bounded_seed_search"
-                search_started = time.monotonic()
-                try:
-                    path_seed, search_report = planner.ompl_seed(reference_seeds, trajectory)
-                    consumed["search_queries"] += int(search_report.get("state_queries", 0))
-                except Exception:
-                    consumed["search_queries"] += budget.max_validation_points
-                    raise
-                finally:
+            if not attempt["accepted"] and consumed["trajectory_solves"]-motion_baseline.get("trajectory_solves", 0) < original_budget.maximum_trajectory_solves:
+                residuals = attempt["residuals"]
+                collision_failed = any(value > 0 and ("scene" in name or "collision" in name)
+                                       for name, value in residuals.items())
+                if collision_failed and budget.search_seconds > 0:
+                    recovery, stage = "ompl", "bounded_seed_search"
+                    search_started = time.monotonic()
+                    recovered, report = planner.ompl_seed(seeds, trajectory)
                     consumed["search_seconds"] += time.monotonic()-search_started
-                check()
-                diagnostics["ompl"] = search_report
-                if path_seed is not None:
-                    seeds, planner.seed_strategies = path_seed, ["ompl"]
-                    # BEGIN an independent initializer owns a fresh multiplier sequence.
-                    planner.reset_functional_constraints()
-                    # Its new spatial path can require another observed map.
-                    # Defer that replacement too, so reset, map and query-set
-                    # changes still construct only one next native solver.
-                    if callable(refine_background):
-                        stage = "searched_candidate_background_refinement"
-                        report = refine_background(seeds, rebuild=False)
-                        diagnostics.setdefault("background_refinements", []).append(
-                            {**report, "phase": "ompl_initializer"})
-                        scene = planner.scene
-                        diagnostics["scene"] = scene.describe()
-                        check()
-                    planner.refine_validation(parameters, phase="feasibility")
-                    background_already_refined = True
-                    # END independent validation still checks every historical witness.
-                    diagnostics["used_ompl"] = True
-                    attempt["next_action"] = "optimize_complete_ompl_seed"
-                    continue
-            if additional is not None:
-                seeds = native_result.solution.detach().clone()
-                planner.seed_strategies = [attempt["seed_provenance"]]
-                planner.refine_validation(additional, phase="feasibility")
-                background_already_refined = True
-                attempt.update(next_action="refine_uncovered_curve_samples", refinement_parameters=additional.tolist())
-                check()
-                continue
-            break
-            # END every failure remains recorded even when no new solve is useful.
-        if best_attempt is not None:
-            diagnostics.update(best_attempt)
-            diagnostics["returned_candidate"] = deepcopy(best_attempt)
+                    consumed["search_queries"] += report.get("state_queries", 0)
+                    diagnostics["ompl"] = report
+                    if recovered is not None:
+                        seeds = recovered
+                        planner.seed_strategies = ["ompl"]*seeds.shape[1]
+                        planner.reset_functional_constraints()
+                    else:
+                        recovery = "ompl_failed"
+                elif planner.functional_constraints.keys:
+                    recovery, stage = "augmented_lagrangian", "functional_recovery"
+                    diagnostics["functional_update"] = planner.update_functional_constraints(native_result)
+                    seeds = native_result.solution.detach().clone().expand(1, budget.trajectory_seeds, -1, -1).contiguous()
+                    planner.seed_strategies = [attempt["seed_provenance"]]*budget.trajectory_seeds
+                if recovery in {"ompl", "augmented_lagrangian"}:
+                    check("trajectory_solves")
+                    consumed["trajectory_solves"] += 1
+                    native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
+                    diagnostics["attempts"].append(deepcopy(attempt))
+                    check()
+        diagnostics.update(attempt, route=planner.route, recovery=recovery, used_ompl=recovery in {"ompl", "ompl_failed"})
+        if not attempt["accepted"]:
+            diagnostics.update(failure="no_feasible_solution_found", diagnostic_trajectory=trajectory)
             return outcome
-        diagnostics["failure"] = ("optimization_stagnated" if diagnostics["attempts"][-1]["optimizer"]["unchanged_from_seed"]
-            else "exported_curve_constraint_violation" if diagnostics["native_success"]
-            else "complete_process_optimization_not_feasible")
+        stage = "delivery"
+        check()
+        trajectory, points = planner.export(native_result)
+        consumed["validation_passes"] += 1
+        consumed["validation_queries"] += points
+        qualify_candidate(trajectory, planner.last_validation, attempt)
+        diagnostics["returned_candidate"] = deepcopy(attempt)
+        limits = planner._verification_native.get_cost("cspace").config.joint_limits
+        outcome.execution_binding["verification_joint_limits"] = deepcopy(diagnostics["verification_joint_limits"])
         return outcome
+        # END success immediately delivers; optional quality work does not exist.
     except Exception as error:
-        # BEGIN optional work exhaustion cannot erase a previously bound feasible curve.
-        if isinstance(error, PlanningWorkExhausted) and best_attempt is not None:
-            diagnostics.update(best_attempt)
-            diagnostics.update(quality_stop_reason=str(error), quality_stopped_stage=stage,
-                               returned_candidate=deepcopy(best_attempt))
-            return outcome
-        # END unexpected runtime/API/cleanup failures remain explicit failures below.
-        diagnostics.update(failure=("cumulative_planning_budget_exhausted" if isinstance(error, PlanningWorkExhausted)
+        diagnostics.update(failure=(error.reason if isinstance(error, MotionPlanningError)
+            else "cumulative_planning_budget_exhausted" if isinstance(error, PlanningWorkExhausted)
             else "continuation_binding_gap" if isinstance(error, ContinuationBindingError)
             else "event_time_requirement_unsatisfied" if isinstance(error, TimeBindingError)
             else "physical_domain_initializer_not_constructed" if isinstance(error, JointDomainInitializationError)
             else "planning_stage_failed"), failed_stage=stage, reason=str(error), error_type=type(error).__name__)
+        candidate = (getattr(planner, "delivery_candidate", None) if planner is not None else None)
+        candidate = trajectory if candidate is None else candidate
+        if isinstance(candidate, JointTrajectory):
+            diagnostics["diagnostic_trajectory"] = candidate
+            diagnostics["diagnostic_candidate_scope"] = "last completed native candidate; no execution authorization"
         outcome.success, outcome.trajectory, outcome.execution_binding = False, None, None
         return outcome
     finally:
-        if planner is not None:
-            if original_export is not None:
-                planner.export = original_export
-            if original_ik_solve is not None:
-                planner.ik.solve_pose = original_ik_solve
-            if original_ik_rank is not None:
-                planner._rank_ik_candidates = original_ik_rank
-            for name in ("scene_workspace_bytes", "scene_cpu_workspace_bytes", "scene_gpu_workspace_bytes",
-                         "anchor_fk_workspace_bytes", "anchor_capacity"):
-                diagnostics["exact_anchor_capacity" if name == "anchor_capacity" else name] = getattr(planner, name)
-            try:
-                planner.close()
-            except Exception as error:
-                outcome.success, outcome.trajectory, outcome.execution_binding = False, None, None
-                diagnostics.update(failure="planner_cleanup_failed", reason=str(error))
+        if backend_claimed:
+            # Native kernels/iteration blocks have returned before this point.
+            # A timeout cannot release storage while their call is in flight.
+            backend._release()
+        if owned_backend and backend is not None:
+            backend.close()
         diagnostics["elapsed_seconds"] = time.monotonic()-started
         if ledger is not None:
             ledger["consumed_planning"]["planning_seconds"] = initial_seconds+diagnostics["elapsed_seconds"]
-            if ledger["consumed_planning"]["planning_seconds"] >= ledger["planning_budget"]["planning_seconds"]:
-                diagnostics["wall_time_overrun_s"] = ledger["consumed_planning"]["planning_seconds"]-ledger["planning_budget"]["planning_seconds"]
+            request_seconds = ledger["consumed_planning"]["planning_seconds"]-motion_baseline.get("planning_seconds", 0.)
+            if request_seconds >= ledger["planning_budget"]["planning_seconds"]:
+                diagnostics["wall_time_overrun_s"] = request_seconds-ledger["planning_budget"]["planning_seconds"]
                 diagnostics["planning_budget_exhausted"] = True
-                diagnostics["budget_exhausted_after_qualification"] = outcome.success
             # BEGIN distinguish planning-only retries from actual-world continuation.
             # A previous work ledger carries cumulative computation, but does
             # not by itself supply executed state, events or a physical clock.

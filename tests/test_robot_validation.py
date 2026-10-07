@@ -236,27 +236,6 @@ def test_source_pair_policy_rejects_disabled_contact_physics(flag_name):
 # END actual-state and whole-cubic preflight regressions.
 
 # BEGIN prefix extension preserves the same curve and does not recheck expired obligations.
-def test_explicit_prefix_extension_still_checks_known_arm_with_unknown_fingers(model):
-    from test_independent_scene_validation import binding
-    scene = binding()
-    scene["owners"][0]["geometry"]["solids"][0].update(
-        dimensions=[.01, .01, .01], pose=[.095, .2, 0., 1., 0., 0., 0.])
-    curve = trajectory([.03, .09], [0., 0.], barrier=.4)
-    gate = validator(model)
-    # BEGIN use progress after the same-curve q/dq/ddq sample components.
-    gate.bind_scene(scene, progress_at_time=lambda t: float(curve.sample(t)[3]))
-    # END no derivative can replace the original scene progress clock.
-    prefix = gate.preflight(curve, feedback(), LIMITS)
-    assert prefix["passed"] and not prefix["observed_scene_checked"]
-    assert prefix["nominal_scene"]["unresolved_assumptions"][0]["geometry_names"] == ["second"]
-    current = feedback(arm=float(curve._curve(.4)[0]), arm_speed=float(curve._curve(.4, 1)[0]))
-    extension = gate.preflight(curve, current, LIMITS, start_time=.4, until=1.)
-    assert extension["checked_interval_s"] == [.4, 1.]
-    assert not extension["passed"]
-    assert any(row["kind"] == "independent_scene_collision" for row in extension["violations"])
-    assert curve.executable_until == .4
-
-
 def test_scalar_preflight_new_interval_does_not_replay_old_peak(model):
     curve = trajectory([.03, .03], [.4, -.4])
     gate = validator(model)
@@ -268,36 +247,6 @@ def test_scalar_preflight_new_interval_does_not_replay_old_peak(model):
 # END no callback can silently expand or retime an authorized interval.
 
 # BEGIN the real validator must survive the execution adapter without losing cause.
-@pytest.mark.parametrize("failure", ["collision", "required_query_gap"])
-def test_scene_failures_keep_named_physical_evidence_through_executor(model, failure):
-    from manipulation.execution import TrajectoryExecutor
-    from test_independent_scene_validation import binding
-
-    scene = binding()
-    scene["owners"][0]["geometry"]["solids"][0].update(
-        dimensions=[.01, .01, .01], pose=[.03, .2, 0., 1., 0., 0., 0.])
-    expected = "independent_scene_collision"
-    if failure == "required_query_gap":
-        scene["owners"][0]["geometry"] = {"solids": [], "query_gaps": ["unsupported_required_native_shape"]}
-        expected = "independent_scene_query_incomplete"
-    gate = validator(model)
-    curve = trajectory([.03, .03], [0., 0.])
-    # BEGIN use progress after the same-curve q/dq/ddq sample components.
-    gate.bind_scene(scene, progress_at_time=lambda t: float(curve.sample(t)[3]))
-    # END no derivative can replace the original scene progress clock.
-    adapter = SimpleNamespace(geometry_checker=gate, _geometry_pair_count=1)
-    for method, args, kwargs in (
-        ("check_state", (feedback(),), {"stage": "actual", "trajectory_time": 0.}),
-        ("preflight", (curve, feedback(), LIMITS), {}),
-    ):
-        result = TrajectoryExecutor._geometry_result(adapter, method, *args, **kwargs)
-        assert not result["passed"]
-        assert all(row["kind"] != "geometry_checker_error" and row["name"] for row in result["violations"])
-        assert any(row["kind"] == expected for row in result["violations"])
-        if failure == "required_query_gap":
-            assert any(row.get("reason") == "unsupported_required_native_shape" for row in result["violations"])
-
-
 def test_prefix_preflight_uses_actual_feedback_time_separately_from_authorized_start(model):
     curve = trajectory([.03, .03], [0., 0.])
     result = validator(model).preflight(curve, feedback(), LIMITS, start_time=.4, until=1., current_time=.5)
@@ -499,32 +448,76 @@ def test_planning_binding_records_owned_source_geometry_and_complete_policy(mode
 # END every planning decision uses the same native solid and mechanical policy.
 
 
-# BEGIN execution checks the exact robot model saved with accepted planning inputs.
-@pytest.mark.parametrize("changed", ["geometry", "pair_policy"])
-def test_execution_scene_rejects_different_planned_source_solids_or_pair_policy(model, changed):
-    from test_independent_scene_validation import binding
-    gate, scene = validator(model), binding()
-    scene["robot_self_collision"] = gate.planning_binding_record()
-    if changed == "geometry":
-        scene["robot_self_collision"]["model"]["geometries"][0]["dimensions"][0] = .08
-    else:
-        scene["robot_self_collision"]["pair_order"][0]["policy"] = "mechanical_contact"
-    with pytest.raises(ValueError, match="source robot geometry and pair policy"):
-        gate.bind_scene(scene, progress_at_time=lambda time: time)
+# BEGIN production runtime shares online fields, sphere layout and actual joints.
+def online_binding(gate, *, distance=1., supported=True):
+    from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
+    from manipulation.planning_scene import ObservedSpace
+    shape = (9, 9, 9)
+    field = FrozenESDF(np.full(shape, distance, np.float32),
+        origin=[-1., -1., -1.] if supported else [10., 10., 10.],
+        voxel_size=.25, site_valid=np.ones(shape, bool),
+        observed_sign=np.ones(shape, bool), owner_ids=(), source="online sensor field")
+    coverage = ObservedSpace(np.ones(shape, bool), origin=[-1., -1., -1.], voxel_size=.25,
+        observation_ids=["observation"], reference_frame="world")
+    scene = OnlinePlanningScene(background=field, owners=(), coverage=coverage,
+        reference_frame="world", robot_sphere_materials=("left", "right"),
+        robot_geometry_source="native sphere fixture", has_gripper=False,
+        unknown_policy={"conditional_regions": [], "outside_regions": "forbid"})
+    scene.bind_online_robot(robot_sphere_geometry=[
+        {"link_name": link, "sphere_indices": [index], "centers_local": [[0., 0., 0.]], "radii": [.005]}
+        for index, link in enumerate(("left", "right"))], robot_self_collision_pairs=[],
+        robot_model={"urdf_path": str(gate.checker.urdf_path), "base_frame": gate.checker.base_frame,
+            "tool_frame": gate.tool_frame, "T_reference_base": gate.T_reference_base.tolist(),
+            "T_frame_tcp": gate.T_frame_tcp.tolist()})
+    return scene.to_execution_binding()
+
+
+def test_online_preflight_and_actual_tick_never_query_source_world(model, monkeypatch):
+    gate = validator(model)
+    curve = trajectory([.03, .03], [0., 0.])
+    binding = online_binding(gate)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Source scene queries are outside production execution")
+    monkeypatch.setattr(model, "bind_scene", forbidden)
+    monkeypatch.setattr(model, "query_scene", forbidden)
+    native_query = model.query
+    calls = []
+    def query(**kwargs):
+        calls.append(deepcopy(kwargs))
+        return native_query(**kwargs)
+    monkeypatch.setattr(model, "query", query)
+    gate.bind_scene(binding, progress_at_time=lambda t: float(curve.sample(t)[3]))
+    result = gate.preflight(curve, feedback(finger=0.), LIMITS)
+    assert result["passed"] and result["observed_scene_checked"]
+    assert len(calls) == 1 and calls[0]["pairs"] == ()
+    assert set(calls[0]["frames"]) == {"left", "right", "tool"}
+    assert result["reference_collision_checked"] is False
+    assert result["actual_state"]["distances_m"] == []
+    assert gate.describe()["pair_order"] == []
+    gate.check_state(feedback(finger=-.08), stage="actual", trajectory_time=.1)
+    assert calls[-1]["joint_positions"][1] == -.08
+    assert calls[-1]["pairs"] == ()
+
+
+@pytest.mark.parametrize("failure", ["collision", "unsupported_field"])
+def test_online_failures_keep_named_geometry_evidence_through_executor(model, failure):
+    from manipulation.execution import TrajectoryExecutor
+    gate = validator(model)
+    binding = online_binding(gate, distance=-.1 if failure == "collision" else 1.,
+                             supported=failure != "unsupported_field")
+    gate.bind_scene(binding, progress_at_time=lambda t: t)
+    adapter = SimpleNamespace(geometry_checker=gate, _geometry_pair_count=0)
+    result = TrajectoryExecutor._geometry_result(adapter, "check_state", feedback(),
+        stage="actual", trajectory_time=0.)
+    assert not result["passed"]
+    assert all(row["kind"] != "geometry_checker_error" and row["name"] for row in result["violations"])
+
+
+def test_online_rebind_checks_sphere_fk_calibration_before_changing_scene(model):
+    gate = validator(model)
+    binding = online_binding(gate)
+    binding["robot_model"]["T_frame_tcp"][0][3] = .001
+    with pytest.raises(ValueError, match="FK model and calibration"):
+        gate.bind_scene(binding, progress_at_time=lambda t: t)
     assert not hasattr(gate, "_scene_binding")
-
-
-def test_execution_scene_rebinding_preserves_frozen_robot_identity_after_first_bind(model):
-    from test_independent_scene_validation import binding
-    gate, scene = validator(model), binding()
-    identity = gate.planning_binding_record()
-    scene["robot_self_collision"] = identity
-    for _ in range(2):
-        gate.bind_scene(scene, progress_at_time=lambda time: time)
-        assert gate.describe()["scene_bound"] is True
-        assert gate.planning_binding_record() == identity
-    standalone = binding()
-    standalone["robot_self_collision"] = None
-    gate.bind_scene(standalone, progress_at_time=lambda time: time)
-    assert gate._scene_binding["robot_self_collision"] is None
-# END source equality is independent of mutable execution-scene bookkeeping.
+# END source meshes neither certify nor veto the measured online scene.

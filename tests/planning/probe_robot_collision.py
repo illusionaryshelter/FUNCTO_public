@@ -34,9 +34,8 @@ def run(output, knots=8, *, fixture_path):
         import torch
         from curobo.kinematics import Kinematics, KinematicsCfg
         from curobo.types import DeviceCfg, JointState
-        from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
-        from curobo._src.geom.types import Cuboid, SceneCfg
-        from manipulation.planning_scene import CuroboSphereQuery, ObservedSpace, PlanningScene
+        from manipulation.online_geometry import FrozenPrimitives, OnlinePlanningScene
+        from manipulation.planning_scene import ObservedSpace
         from manipulation.planning_problem import (PlanningProblem, MotionPhase, PosePath,
             NumericalTolerance, PoseEventRequirement, PoseProcessRequirement)
         from manipulation import planning
@@ -82,12 +81,11 @@ def run(output, knots=8, *, fixture_path):
         _, index, center, clearance = max(choices, key=lambda item: item[0])
         report["obstacle"] = {"center": center.tolist(), "dimensions": (2*half).tolist(),
                               "witness_robot_sphere": index, "direct_path_clearance_m": clearance}
-        native = SceneCollision.from_config(SceneCollisionCfg(
-            device_cfg=config, scene_model=SceneCfg(cuboid=[Cuboid(
-                name="synthetic_obstacle", pose=[*center, 1., 0., 0., 0.], dims=(2*half).tolist())]),
-            cache={"cuboid": 1}))
-        background = CuroboSphereQuery(native, owner_ids=("synthetic_obstacle",),
-                                       source="fully specified synthetic cuboid")
+        # BEGIN one explicit fixed online cuboid shared by every query.
+        background = FrozenPrimitives(primitives=[{"kind": "cuboid", "pose": [*center, 1., 0., 0., 0.],
+            "dimensions": (2*half).tolist()}], owner_ids=("synthetic_obstacle",),
+            source="fully specified synthetic cuboid")
+        # END no separate source-world geometry gate is constructed.
         coverage = ObservedSpace(np.ones((81, 81, 81), bool), origin=[-2., -2., -2.], voxel_size=.05,
                                  observation_ids=("explicit synthetic known-space grid",), reference_frame="robot_base")
         poses = np.repeat(np.eye(4)[None], 3, axis=0)
@@ -110,7 +108,7 @@ def run(output, knots=8, *, fixture_path):
         # BEGIN the hand hypothesis and physical installation survive scene construction.
         hand, owners, hand_report = fixed_probe_hand(fixture, robot, problem, device=config,
                                                     full_current_positions=full_positions)
-        scene = PlanningScene(background=background, owners=owners, coverage=coverage, reference_frame="robot_base",
+        scene = OnlinePlanningScene(unknown_policy={"outside_regions": "forbid", "conditional_regions": []}, background=background, owners=owners, coverage=coverage, reference_frame="robot_base",
             robot_sphere_materials=(None,)*kinematics.total_spheres,
             robot_geometry_source=fixture["robot_geometry_source"], gripper=hand)
         report["fixed_hand_hypothesis"] = hand_report
@@ -118,7 +116,7 @@ def run(output, knots=8, *, fixture_path):
         budget = planning.PlanningBudget(ik_seeds=4, trajectory_seeds=2, ik_iterations=80,
                                          max_robot_spheres=kinematics.total_spheres,
                                          knots=knots, interpolation_buffer_size=768,
-                                         trajectory_iterations=150, maximum_trajectory_solves=3, search_seconds=3.)
+                                         trajectory_iterations=150, maximum_trajectory_solves=2, search_seconds=3.)
         report["knots"] = knots
         original = planning._CuroboPlanner.optimize
         report["generation_attempts"] = []

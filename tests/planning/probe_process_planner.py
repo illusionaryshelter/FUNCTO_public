@@ -29,14 +29,16 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # BEGIN use the production scene contract for this explicit empty fixture.
 def no_obstacle_scene(sphere_count, *, hand, installation_owners, geometry_source):
     """Build a declared synthetic empty world, with no perception claim."""
-    from manipulation.planning_scene import ObservedSpace, PlanningScene
-    from probe_planning_gpu import EmptyBackground
+    from manipulation.planning_scene import ObservedSpace
+    from manipulation.online_geometry import OnlinePlanningScene
+    from probe_robot_fixture import empty_background
 
-    return PlanningScene(background=EmptyBackground(), owners=installation_owners,
-        coverage=ObservedSpace(np.ones((20, 20, 20), bool), origin=[-2., -2., -2.], voxel_size=.2,
-            reference_frame="robot_base", observation_ids=("declared synthetic empty box",)),
-        reference_frame="robot_base", robot_sphere_materials=(None,)*sphere_count,
-        robot_geometry_source=geometry_source, gripper=hand)
+    coverage = ObservedSpace(np.ones((20, 20, 20), bool), origin=[-2., -2., -2.], voxel_size=.2,
+        reference_frame="robot_base", observation_ids=("declared synthetic empty box",))
+    return OnlinePlanningScene(background=empty_background(coverage), owners=installation_owners,
+        coverage=coverage, reference_frame="robot_base", robot_sphere_materials=(None,)*sphere_count,
+        robot_geometry_source=geometry_source, gripper=hand,
+        unknown_policy={"outside_regions": "forbid", "conditional_regions": []})
 # END there is no partial mock of the changing planner/scene interface.
 
 

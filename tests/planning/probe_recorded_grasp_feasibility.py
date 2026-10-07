@@ -119,8 +119,8 @@ def observed_scene(args):
 
     # BEGIN retain every explicit current runner argument without a permissive sink.
     def capture(problem, scene, robot, output, *, robot_validator, budget, provenance, execution_limits,
-                continuation=None, rebind=None, request_ledger=None):
-        if continuation is not None or rebind is not None or request_ledger is not None:
+                continuation=None, rebind=None, request_ledger=None, backend=None, joint_reference=None):
+        if continuation is not None or rebind is not None or request_ledger is not None or joint_reference is not None:
             raise ValueError("Prepared grasp diagnostics do not create or continue a planning request")
         if captured:
             raise ValueError("The recorded runner must reach its preparation boundary exactly once")
@@ -143,7 +143,13 @@ def observed_scene(args):
     runner_args.interpolation_buffer_size = 512
     runner_args.trajectory_seeds = 1
     runner_args.max_validation_points = 1024
-    runner_args.max_refinement_points = 0
+    # BEGIN diagnostic preparation supplies the current bounded runner contract.
+    runner_args.max_task_anchors = 256
+    runner_args.maximum_trajectory_solves = 2
+    runner_args.planning_seconds = 120.
+    runner_args.joint_reference = None
+    runner_args.host_process_root_pid = None
+    # END capture still prevents all native planning work.
     try:
         with patch("recorded_task_planning.plan_and_record", new=capture):
             run_recorded_skill.run(runner_args)
@@ -488,13 +494,20 @@ def run(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "output"):
+    for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "finger-targets", "output"):
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--segment", required=True)
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--target-frame", type=int, action="append", required=True,
                         help="One original source frame per target; repeat for at most three targets")
-    parser.add_argument("--owner-mask", nargs=2, action="append", required=True, metavar=("VIEW_ID", "MASK_PATH"))
+    parser.add_argument("--owner-mask", nargs=3, action="append", required=True,
+                        metavar=("OWNER_ID", "VIEW_ID", "MASK_PATH"))
+    parser.add_argument("--owner-voxel-size", nargs=2, action="append", required=True,
+                        metavar=("OWNER_ID", "METRES"))
+    parser.add_argument("--unknown-policy", type=Path, required=True)
+    parser.add_argument("--fine-regions", type=Path)
+    parser.add_argument("--contact-bindings", type=Path)
+    parser.add_argument("--mapping-memory-mib", type=int, default=1024)
     parser.add_argument("--owner-geometry", type=Path)
     parser.add_argument("--center", type=float, nargs=3, required=True)
     parser.add_argument("--extent", type=float, nargs=3, required=True)

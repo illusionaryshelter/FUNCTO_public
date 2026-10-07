@@ -713,11 +713,11 @@ def create_fixed_installation_owners(fixture, *, device_cfg, T_output_base, sphe
     or URDF ordering. These owners remain obstacles to payloads and every
     robot link whose native installation pair is enabled.
     """
-    from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
-    from curobo._src.geom.types import Cuboid, Mesh as SceneMesh, SceneCfg
+    # BEGIN exact finite online primitives replace source and mesh proxies.
+    from manipulation.online_geometry import FrozenPrimitives
     from manipulation.motion import _pose_array
     from manipulation.planning_problem import PosePath
-    from manipulation.planning_scene import CollisionOwner, CuroboSphereQuery
+    from manipulation.planning_scene import CollisionOwner
 
     base = _pose_array(T_output_base, "current calibrated robot installation base")
     records = fixture["fixed_collision_geometries"]
@@ -729,23 +729,21 @@ def create_fixed_installation_owners(fixture, *, device_cfg, T_output_base, sphe
         raise ValueError("Installation policy requires the complete actual native sphere/link layout")
     owners, reports = [], []
     for record in records:
-        prepared = fixed_installation_proxy(record)
         owner_id = f"robot_installation/{record['geom']}"
         # BEGIN scene aliases name the same compiled geom as the Coal adapter.
         # The fixture's descriptive installation source remains in its record;
         # this explicit identity binds the proxy to one physical native solid.
         native_source = f"{fixture['robot_mjcf_path']}::geom[{record['geom']}]"
         # END an outward proxy remains an approximation of this exact source.
-        if prepared["kind"] == "cuboid":
-            world = SceneCfg(cuboid=[Cuboid(**prepared["arguments"])])
-            cache = {"cuboid": 1}
+        dimensions = np.asarray(record["dimensions"], float)
+        kind = record["shape_kind"]
+        if kind == "box":
+            primitive = {"kind": "cuboid", "dimensions": dimensions.tolist()}
+        elif kind == "cylinder":
+            primitive = {"kind": "cylinder", "dimensions": [float(dimensions[0]), float(dimensions[1]/2)]}
         else:
-            world = SceneCfg(mesh=[SceneMesh(**prepared["arguments"])])
-            cache = {"mesh": 1}
-        native = SceneCollision.from_config(SceneCollisionCfg(
-            device_cfg=device_cfg, scene_model=world, cache=cache))
-        # BEGIN preserve exact native source identity through the scene owner.
-        query = CuroboSphereQuery(native, owner_ids=(owner_id,), source=native_source)
+            raise ValueError("Fixed installation supports the registered box/cylinder primitives")
+        query = FrozenPrimitives(primitives=[primitive], owner_ids=(owner_id,), source=native_source)
         pose = base @ _pose_array(record["T_base_geom"], "native fixed primitive base transform")
         excluded = tuple(int(index) for link in record["robot_excluded_links"]
                          for index in sphere_indices_by_link[link])
@@ -761,13 +759,14 @@ def create_fixed_installation_owners(fixture, *, device_cfg, T_output_base, sphe
         # END source-string binding does not alter geometry or native masks.
         reports.append({"owner_id": owner_id, "native_geom": record["geom"],
                         "native_shape_kind": record["shape_kind"], "native_dimensions": record["dimensions"],
-                        "T_output_geom": pose.tolist(), "approximation": prepared["approximation"],
+                        "T_output_geom": pose.tolist(), "approximation": {"kind": "exact registered analytic primitive"},
                         "robot_excluded_links": record["robot_excluded_links"],
                         "robot_excluded_sphere_indices": list(excluded),
                         "pair_policy_source": record["policy_source"],
                         "geometry_complete": True, "moving_actor": False,
                         "occupied_space_evidence_supplied": False})
     return tuple(owners), reports
+    # END same calibrated primitives and exclusions serve every online query.
 # END separate fixed installation ownership without increasing the sphere budget.
 
 

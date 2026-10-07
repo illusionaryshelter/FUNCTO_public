@@ -13,10 +13,8 @@ import torch
 from manipulation.planning import _ProgressMap, _scene_boundary_evaluate
 from manipulation.planning_scene import CollisionOwner, RobotOwnerContactPermission
 from manipulation.robot_geometry_check import NativePrimitive, PairQuery, RobotGeometryChecker
-from manipulation.robot_validation import RobotStateValidator
-from test_independent_scene_validation import binding, checker, rigid, rule as material_rule
+from test_independent_scene_validation import binding, checker, rigid
 from test_manipulation_planning_scene import SphereQuery, inputs, pose_path, scene
-from test_robot_validation import trajectory
 
 
 def permission(**changes):
@@ -140,40 +138,46 @@ def test_unbound_native_owner_or_sphere_identity_is_rejected(checker):
         scene((target,), robot_owner_permissions=(permission(sphere_indices=(3,)),))
 
 
-def gate_for(checker, model, curve):
-    gate = RobotStateValidator(checker, joint_names=checker.joint_names, arm_joint_names=checker.joint_names[:1],
-        finger_joint_names=checker.joint_names[1:], pairs=(), named_velocity_limits={name: 1. for name in checker.joint_names},
-        reference_frame="world", T_reference_base=np.eye(4), tool_frame="base", T_frame_tcp=np.eye(4),
-        fk_translation_tolerance_m=1e-8, fk_rotation_tolerance_rad=1e-8, source="arrival boundary test")
-    gate.bind_scene(model, progress_at_time=lambda t: float(curve.sample(t)[3]))
-    return gate
 
-
-def test_independent_nominal_arrival_does_not_reapply_old_pair_law(checker):
-    curve = trajectory([.03, .03], [0., 0.])
-    gate = gate_for(checker, model_binding(), curve)
-    assert set(gate._scene_query_times(curve, np.array([0., 1.]), 0., 1.)) == {0., .5, .9, 1.}
-    assert gate._nominal_scene_preflight(curve, np.array([.5]))["passed"]
-    assert not gate._nominal_scene_preflight(curve, np.array([.499]))["passed"]
-    assert not gate._nominal_scene_preflight(curve, np.array([.9]))["passed"]
-    # An unrelated local-material switch at the same arrival keeps its old
-    # rule probe; that probe cannot revoke this explicit arrived pair policy.
-    model = model_binding()
-    model["contacts"] = [material_rule(interval=(.5, 1.))]
-    gate = gate_for(checker, model, curve)
-    result = gate._nominal_scene_preflight(curve, np.array([.5]))
-    assert result["passed"]
-    assert {row["mode"] for row in result["states"]} == {"bound_progress", "before_switch", "after_switch"}
-
-
-def test_native_boundary_keeps_new_permission_and_all_other_laws():
-    target = CollisionOwner("target", SphereQuery(("target",), center=(0., 0., 0.)), pose_path(), "observed target", True)
-    current = scene((target,), robot_owner_permissions=(permission(),))
-    mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-    arguments = inputs(progress=(.499, .5, .9), sphere_rows=[[[0., 0., 0., .1]]]*3, dtype=torch.float32)
-    spheres, position, quaternion, progress = arguments
-    result = _scene_boundary_evaluate(current, SimpleNamespace(start_progress=0., phase_count=1), mapping,
-        spheres, position, quaternion, progress, torch.zeros((1, 3, 1)), ("joint",),
-        trajectory_time=progress, normalized_time=progress)
-    assert result[0, 0] > 0 and result[0, 1] == 0 and result[0, 2] > 0
-# END physical contact evidence, unknown space and unrelated collisions keep their meaning.
+# BEGIN online boundaries retain finite contact only at the exact arrival.
+def test_native_boundary_keeps_finite_arrival_permission_and_other_laws():
+    from manipulation.online_geometry import FrozenESDF,OnlinePlanningScene
+    from manipulation.planning_scene import ContactRule,ObservedSpace
+    axis=np.arange(-20,21)*.001
+    values=np.broadcast_to(axis[:,None,None],(41,41,41)).astype(np.float32)
+    valid=np.ones_like(values,dtype=bool)
+    target_query=FrozenESDF(values,origin=[-.02]*3,voxel_size=.001,
+        site_valid=valid,observed_sign=valid,owner_ids=('target',),source='observed finite plane')
+    background=FrozenESDF(np.ones_like(values),origin=[-.02]*3,voxel_size=.001,
+        site_valid=~valid,observed_sign=~valid,owner_ids=('background',),source='no visible background')
+    target=CollisionOwner('target',target_query,pose_path(),'current target',False)
+    rule=ContactRule(rule_id='finite_pad',actor='robot',target_owner='target',interval=(.5,.9),
+        sphere_indices=(0,),material_id='pad',feature_points=[[0.,-.005,-.005],[0.,.005,-.005],
+            [0.,.005,.005],[0.,-.005,.005]],feature_normal=[-1.,0.,0.],patch_origin=[0.,0.,0.],
+        patch_axes=[[0.,0.,1.],[1.,0.,0.],[0.,1.,0.]],patch_half_size=[.005,.005],
+        gap_bounds=(-.003,.003),normal_tolerance_rad=.1,modeling_allowance_m=.003,
+        geometry_error_m=.003,minimum_thickness_m=.01,source='explicit complete pad polygon')
+    coverage=ObservedSpace(~valid,origin=[-.02]*3,voxel_size=.001,
+        observation_ids=('A',),reference_frame='world')
+    current=OnlinePlanningScene(background=background,owners=(target,),coverage=coverage,
+        reference_frame='world',robot_sphere_materials=('pad',),robot_geometry_source='native sphere',
+        contacts=(rule,),has_gripper=False,unknown_policy={'outside_regions':'forbid',
+            'conditional_regions':[{'lower_m':[-.02]*3,'upper_m':[.02]*3,'source':'explicit finite operation'}]})
+    current.bind_online_robot(robot_sphere_geometry=[{'link_name':'pad','sphere_indices':[0],
+        'centers_local':[[.003,0.,0.]],'radii':[.004]}],robot_self_collision_pairs=[])
+    mapping=_ProgressMap(np.array([0.,1.]),np.array([0.,1.]))
+    arguments=inputs(progress=(.499,.5,.9),sphere_rows=[[[.003,0.,0.,.004]]]*3,dtype=torch.float32)
+    spheres,position,quaternion,progress=arguments
+    result=_scene_boundary_evaluate(current,SimpleNamespace(start_progress=0.,end_progress=1.),mapping,
+        spheres,position,quaternion,progress,torch.zeros((1,3,1)),('joint',),
+        trajectory_time=progress,normalized_time=progress)
+    assert result[0,0]>0 and result[0,1]==0 and result[0,2]>0
+    # Reaching the arrival cannot forgive a reversed material normal. The
+    # finite rule retains its normal test and the ordinary occupied cells.
+    quaternion=quaternion.clone()
+    quaternion[...,0]=0.;quaternion[...,3]=1.
+    reversed_normal=_scene_boundary_evaluate(current,SimpleNamespace(start_progress=0.,end_progress=1.),mapping,
+        spheres,position,quaternion,progress,torch.zeros((1,3,1)),('joint',),
+        trajectory_time=progress,normalized_time=progress)
+    assert reversed_normal[0,1]>0
+# END legacy pair-level source geometry tests above are explicit audit only.

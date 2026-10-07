@@ -192,3 +192,15 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
         "fixed_installation_owners": owner_report}
     return hand, owners, report
 # END no source geometry or collision policy is invented by these probe adapters.
+
+
+# BEGIN declared empty online background for synthetic planning probes only.
+def empty_background(coverage):
+    """No observed occupied sites inside this explicitly declared free fixture."""
+    from manipulation.online_geometry import FrozenESDF
+    return FrozenESDF(np.ones(coverage.known_free.shape, dtype=np.float32),
+        origin=coverage.origin, voxel_size=coverage.voxel_size,
+        site_valid=np.zeros(coverage.known_free.shape, dtype=bool),
+        observed_sign=coverage.known_free, owner_ids=(),
+        source="declared synthetic empty background; no recorded observation claim")
+# END physical unknown-space policy remains the separate finite coverage grid.
