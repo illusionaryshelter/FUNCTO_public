@@ -1074,7 +1074,11 @@ def _require_mapping_memory(estimated_bytes, device, *,
     if device.type!='cuda' or type(estimated_bytes) is not int or estimated_bytes<0:
         raise ValueError('Native snapshot mapping requires explicit CUDA and a nonnegative byte estimate')
     required=estimated_bytes+64*1024**2
-    require_host_memory(required,max_rss_bytes=max_host_rss_bytes)
+    # BEGIN online fields are materialized eagerly and have no lazy reservations.
+    # Previously allocated partitions are already included in measured RSS;
+    # charge only this partition, without importing source-audit reservations.
+    require_host_memory(required,pending_existing_bytes=0,max_rss_bytes=max_host_rss_bytes)
+    # END retain the same measured host and whole-device resource limits.
     require_device_memory(torch,device,native_bytes=required,max_device_used_bytes=max_device_used_bytes)
     return required
 

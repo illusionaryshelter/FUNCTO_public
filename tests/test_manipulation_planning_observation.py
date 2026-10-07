@@ -693,6 +693,22 @@ class NativeVoxelLayoutTest(unittest.TestCase):
 
 # BEGIN production tests admit one fixed model without source reconstruction.
 class OnlineObservationContractTest(unittest.TestCase):
+    # BEGIN exercise actual admission signatures with measured-resource fixtures.
+    def test_online_mapping_admission_uses_real_checks_without_lazy_reservations(self):
+        from manipulation.planning_observation import _require_mapping_memory
+        from manipulation.resource_admission import ResourceLimitError
+        process = SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=1024**3),
+                                  children=lambda **kwargs: [])
+        with patch('psutil.Process', return_value=process), \
+             patch('psutil.virtual_memory', return_value=SimpleNamespace(available=16*1024**3)), \
+             patch('torch.cuda.mem_get_info', return_value=(11*1024**3, 12*1024**3)) as device:
+            self.assertEqual(_require_mapping_memory(1024**3, 'cuda:0'), 1088*1024**2)
+            device.assert_called_once()
+            with self.assertRaises(ResourceLimitError):
+                _require_mapping_memory(1024**3, 'cuda:0', max_host_rss_bytes=2*1024**3)
+            self.assertEqual(device.call_count, 1)
+    # END a host refusal must occur before device admission or native allocation.
+
     def test_registered_sphere_radius_expands_owner_support_before_mapping(self):
         views,frames,cfg=PlanningObservationTest.refined_owner_fixture()
         normalized=_views(views,'world',(.1,3.))
