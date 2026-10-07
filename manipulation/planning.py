@@ -2490,7 +2490,7 @@ def _native_collision_padding(manager):
 def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion,
                              progress, joint_position, joint_names, *, trajectory_time,
                              normalized_time, query_counts=None, component_diagnostics=None,
-                             native_confirmation=None):
+                             native_confirmation=None, collision_out=None):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2507,20 +2507,32 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
         def evaluate(*args, **kwargs):
             return scene.evaluate(*args, **kwargs, native_confirmation=native_confirmation)
     # END differentiable optimizer queries retain their sphere proposal costs.
-    # BEGIN retain component witnesses during the same candidate scene query.
-    if component_diagnostics is not None:
+    # BEGIN classify collision evidence without changing the hard scene sum.
+    # The recovery consumer needs actual collision components, not the mixed
+    # process_scene constraint (which also includes missing model support,
+    # unknown space, contact requirements and controller violations). Only
+    # requested metric/diagnostic queries retain these same-call components.
+    if component_diagnostics is not None or collision_out is not None:
         base_evaluate = evaluate
         def evaluate(*args, **kwargs):
             components = {}
             value = base_evaluate(*args, **kwargs, components_out=components)
-            for name, residual in components.items():
-                flat = residual.detach().reshape(-1)
-                index = int(flat.argmax().item())
-                maximum = float(flat[index].item())
-                if maximum > 0 or not np.isfinite(maximum):
-                    component_diagnostics[name] = {"maximum": maximum,
-                        "time_s": float(kwargs["trajectory_time"].detach().reshape(-1)[index].item()),
-                        "progress": float(args[3].detach().reshape(-1)[index].item())}
+            if collision_out is not None:
+                collision_out["value"] = sum((term.detach() for name, term in components.items()
+                    if name.startswith("collision/")), torch.zeros_like(value))
+            if component_diagnostics is not None:
+                for name, residual in components.items():
+                    flat = residual.detach().reshape(-1)
+                    # A finite maximum must not hide another NaN or -inf.
+                    # Use the first non-finite witness when present, retaining
+                    # its original value and physical time in this summary.
+                    index = int(torch.where(torch.isfinite(flat), flat,
+                        torch.full_like(flat, float("inf"))).argmax().item())
+                    maximum = float(flat[index].item())
+                    if maximum > 0 or not np.isfinite(maximum):
+                        component_diagnostics[name] = {"maximum": maximum,
+                            "time_s": float(kwargs["trajectory_time"].detach().reshape(-1)[index].item()),
+                            "progress": float(args[3].detach().reshape(-1)[index].item())}
             return value
     # END diagnostics never rerun, relax, or replace any scene constraint.
     anchors = [float(value) for value in scene.required_progress_anchors
@@ -2593,6 +2605,18 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                                      terms[:, exact_count:exact_count+left_count])
     right_terms = exact_terms.scatter(1, right_columns[None].expand(progress.shape[0], -1),
                                       terms[:, exact_count+left_count:])
+    # BEGIN collision modes reduce independently of the aggregate winner.
+    # A missing-support cost may win the hard max while a different side has
+    # a real collision. Neither side's collision can be lost or relabelled.
+    if collision_out is not None:
+        collision = collision_out["value"]
+        exact_collision = collision[:, :exact_count]
+        left_collision = exact_collision.scatter(1, left_columns[None].expand(progress.shape[0], -1),
+            collision[:, exact_count:exact_count+left_count])
+        right_collision = exact_collision.scatter(1, right_columns[None].expand(progress.shape[0], -1),
+            collision[:, exact_count+left_count:])
+        collision_out["value"] = torch.stack((exact_collision, left_collision, right_collision)).amax(0)
+    # END the original three-way aggregate and its max-tie gradient stay below.
     # Reconstruct only these small scalar residuals before max. Its original
     # three-way tie weights matter for gradients: replacing this with a max
     # over the compact query would change derivatives at equal-cost modes.
@@ -2656,6 +2680,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             self._process_mode = config.process_mode
             managers.append(self)
             self._dense_counts = None
+            # BEGIN metric evidence is request-local and bound by tensor identity.
+            self._collision_evidence = None
+            # END optimizer/IK managers never supply collision recovery evidence.
             # BEGIN retain only aggregate last-evaluation counts, never states.
             self._query_counts = {"process_mode": self._process_mode}
             # END request rebind clears this lightweight diagnostic in place.
@@ -2690,6 +2717,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             """Replace request values in fixed-capacity native manager buffers."""
             self._scene = scene.clone_for_rollout()
             self._dense_counts = None
+            # BEGIN a rebind invalidates the previous query's recovery evidence.
+            self._collision_evidence = None
+            # END no old batch or owner binding may enter the new request.
             self._query_counts.clear()
             self._query_counts.update(process_mode=self._process_mode)
             if not self._process_mode or self._process_mode.startswith("seed_"):
@@ -2721,6 +2751,24 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
 
         def set_dense_counts(self, counts):
             self._dense_counts = counts.reshape(-1).long()
+
+        # BEGIN bind diagnostics only to the exact completed native metric query.
+        def bind_collision_evidence(self, metrics):
+            """Attach the last query's tensor only when its constraint is identical.
+
+            Native CostCollection.merge retains the constraint tensor object.
+            Shape equality would not distinguish another candidate/seed batch;
+            object identity does, without storing or comparing complete states.
+            RolloutMetrics.clone already clones a tensor-valued debug field.
+            """
+            constraints = metrics.costs_and_constraints.constraints
+            if self._collision_evidence is None or "process_scene" not in constraints.names:
+                raise RuntimeError("Native scene metrics have no same-query collision evidence")
+            source, collision = self._collision_evidence
+            if constraints.values[constraints.names.index("process_scene")] is not source:
+                raise RuntimeError("Collision evidence belongs to a different native metric query")
+            metrics.debug = collision.detach().clone()
+        # END diagnostics do not enter native costs, feasibility or seed ranking.
 
         def compute_costs(self, state, cost_collection=None, goal=None, **kwargs):
             # BEGIN one-shot explicit queries reuse the ordinary native metrics.
@@ -2843,13 +2891,17 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # END metrics retain the complete original hard residual dictionary.
             # BEGIN optimizer and success metrics consume the identical online scene.
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
+            # BEGIN only metrics retain collision evidence; optimizer work is unchanged.
+            collision_out = {} if self._process_mode == "trajectory_metrics" else None
+            # END no gradients or geometry history are retained for this evidence.
             scene_value = _scene_boundary_evaluate(active_scene, problem, active_map,
                 spheres, position, quaternion, progress, q, self._joint_names,
                 trajectory_time=trajectory_time, normalized_time=ordered(all_u),
                 query_counts=self._query_counts,
                 component_diagnostics=None if context is None else context["scene_components"],
                 # BEGIN only the complete candidate boundary runs CPU confirmation.
-                native_confirmation=None if context is None else context.get("native_confirmation"))
+                native_confirmation=None if context is None else context.get("native_confirmation"),
+                collision_out=collision_out)
             # END ordinary optimizer and proposal metric calls remain unchanged.
             # END raw residual zero sets are shared; only optimizer weights differ.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
@@ -2895,7 +2947,17 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # anchor penalties into its final column retains their full
                 # gradient and makes any anchor violation fail feasibility.
                 folded = torch.cat((torch.zeros_like(regular[:, :-1]), (value[:, horizon:]*anchor_valid).sum(1, keepdim=True)), 1)
-                collection.add((regular+folded).unsqueeze(-1) * budget.constraint_weight, name)
+                # BEGIN retain the unchanged aggregate tensor as the query identity.
+                weighted = (regular+folded).unsqueeze(-1) * budget.constraint_weight
+                collection.add(weighted, name)
+                if name == "process_scene" and collision_out is not None:
+                    collision = collision_out["value"].gather(1, inverse)
+                    regular_collision = collision[:, :horizon] * valid
+                    folded_collision = torch.cat((torch.zeros_like(regular_collision[:, :-1]),
+                        (collision[:, horizon:]*anchor_valid).sum(1, keepdim=True)), 1)
+                    self._collision_evidence = (weighted,
+                        (regular_collision+folded_collision).unsqueeze(-1) * budget.constraint_weight)
+                # END recovery evidence never adds another cost or constraint.
             return collection
 
     @dataclass
@@ -2985,21 +3047,49 @@ def _trajectory_candidate(result, index):
             # its seed column too, even though batch is exactly one.
             single.dt = state.dt[:, index:index+1].clone()
         setattr(candidate, name, single)
-    # BEGIN native top-k drops metrics; retain the selected dense evidence.
+    # BEGIN native top-k drops metrics; retain both selected collision queries.
     # RolloutMetrics.__getitem__ is explicitly unimplemented in V2. Its
     # costs use a flattened [batch*seed, horizon, component] layout, while
     # the joint states above retain separate batch/seed axes. Copy only the
-    # selected constraint tensors needed for collision witness selection;
+    # selected constraint tensors needed for collision routing and witnesses;
     # acceptance still uses the complete original metrics in select_candidate.
-    if result.interpolated_metrics is not None:
-        from curobo._src.rollout.metrics import CostCollection, CostsAndConstraints, RolloutMetrics
-        constraints = result.interpolated_metrics.costs_and_constraints.constraints
-        candidate.interpolated_metrics = RolloutMetrics(costs_and_constraints=CostsAndConstraints(
+    from curobo._src.rollout.metrics import CostCollection, CostsAndConstraints, RolloutMetrics
+    for name in ("metrics", "interpolated_metrics"):
+        metrics = getattr(result, name)
+        if metrics is None:
+            continue
+        constraints = metrics.costs_and_constraints.constraints
+        selected_metrics = RolloutMetrics(costs_and_constraints=CostsAndConstraints(
             constraints=CostCollection(names=list(constraints.names),
-                values=[value[index:index+1].detach().clone() for value in constraints.values])))
+                values=[value[index:index+1].detach().clone() for value in constraints.values])),
+            debug=None if metrics.debug is None else metrics.debug[index:index+1].detach().clone())
+        setattr(candidate, name, selected_metrics)
     # END a different seed's dense times can never enter this continuation.
     return candidate
 # END exact native candidate extraction before independent verification.
+
+
+# BEGIN collision recovery consumes typed evidence, never aggregate name matching.
+def _collision_metric_residuals(metrics, seed_index=None):
+    """Summarize scene collisions and the registered native self-collision terms.
+
+    Anchor self collision is a folded constraint: it may require recovery but
+    does not identify a new physical sampling time. Scene diagnostic tensors
+    contain the same query's collision components only; missing evidence is
+    an integration error, never permission to reinterpret process_scene.
+    """
+    constraints = metrics.costs_and_constraints.constraints
+    def maximum(value):
+        return float((value if seed_index is None else value[seed_index]).max().item())
+    residuals = {name: maximum(value) for name, value in zip(constraints.names, constraints.values)
+        if name in {"self_collision", "anchor_self_collision"}}
+    if "process_scene" in constraints.names:
+        scene = constraints.values[constraints.names.index("process_scene")]
+        if metrics.debug is None or metrics.debug.shape != scene.shape:
+            raise RuntimeError("Native scene metrics lack aligned collision-only evidence")
+        residuals["scene_collision"] = maximum(metrics.debug)
+    return residuals
+# END these summaries do not contribute to acceptance or candidate severity.
 
 
 # BEGIN promote existing selected dense collisions without another geometry pass.
@@ -3032,11 +3122,15 @@ def _dense_collision_witnesses(result, *, regular_horizon, anchor_parameters, ca
     known = set(regular_u.astype(float)) | set(np.asarray(anchor_parameters, dtype=dense_u.dtype).astype(float))
     eligible = np.array([float(u) not in known and index != horizon-1 for index, u in enumerate(dense_u)])
     constraints = result.interpolated_metrics.costs_and_constraints.constraints
+    # BEGIN validate collision evidence before interpreting any dense scene time.
+    _collision_metric_residuals(result.interpolated_metrics)
+    measurements = [(name, tensor) for name, tensor in zip(constraints.names, constraints.values)
+                    if name == "self_collision"]
+    if "process_scene" in constraints.names:
+        measurements.insert(0, ("scene_collision", result.interpolated_metrics.debug))
+    # END anchor-only self constraints still route recovery but supply no time.
     component_peaks = []
-    for name, tensor in zip(constraints.names, constraints.values):
-        # anchor_self_collision is a folded sum, not a per-time measurement.
-        if name not in {"process_scene", "self_collision"}:
-            continue
+    for name, tensor in measurements:
         if tensor.shape[:2] != (1, horizon):
             raise ValueError("Selected native collision metrics changed their sample layout")
         values = tensor[0, :count].detach().reshape(count, -1).amax(-1).cpu().numpy()
@@ -3322,6 +3416,16 @@ class _CuroboPlanner:
                 buffer.batch_size = solve_state.batch_size
                 return buffer, update_reference
             # END no synthetic tracking goal or third-party mutation is needed.
+
+            # BEGIN bind both completed query identities before native cloning/ranking.
+            def _get_result(self, opt_result, metrics_result, interpolated_metrics,
+                            interpolated_trajectory, last_tstep, num_seeds, return_seeds):
+                self.metrics_rollout.metrics_constraint_manager.bind_collision_evidence(metrics_result)
+                self.additional_metrics_rollouts["interpolated_rollout"].metrics_constraint_manager.bind_collision_evidence(
+                    interpolated_metrics)
+                return super()._get_result(opt_result, metrics_result, interpolated_metrics,
+                    interpolated_trajectory, last_tstep, num_seeds, return_seeds)
+            # END regular-only collisions cannot disappear behind a clear dense grid.
 
             def get_interpolated_trajectory(self, js_optimized):
                 # BEGIN preserve raw controls and boundary derivatives on one clock.
@@ -4172,6 +4276,9 @@ class _CuroboPlanner:
                       "task_satisfied": False, "model_valid": False}
             reports.append(report)
             if not np.isfinite(row).all():
+                # BEGIN an invalid proposal reports its actual missing input.
+                report["invalid_joint_indices"] = np.flatnonzero(~np.isfinite(row)).tolist()
+                # END non-finite joints never enter FK or acquire scene evidence.
                 continue
             with self.torch.no_grad():
                 q = self.device_cfg.to_device(row[None, None]).contiguous()
@@ -4186,15 +4293,32 @@ class _CuroboPlanner:
                 task = self.problem.residuals(p, r, progress, q, self.joint_names,
                     joint_velocity=zero, trajectory_time=times, point_goal_ids=goal_ids, direction_mode="point")
                 task = {name: value for name, value in task.items() if not name.startswith("stop:")}
+                # BEGIN reuse the existing static query for bounded rejection reasons.
+                scene_components = {}
+                # END no second geometry evaluation or new ranking criterion is added.
                 online = _scene_boundary_evaluate(self.scene, self.problem, self.progress_map,
                     self.problem.transform_robot_spheres(state.robot_spheres), p, r, progress, q,
-                    self.joint_names, trajectory_time=times, normalized_time=q.new_full(q.shape[:2], u))
+                    self.joint_names, trajectory_time=times, normalized_time=q.new_full(q.shape[:2], u),
+                    component_diagnostics=scene_components)
                 native = _timed_native_state(self._RobotState(joint_state=js, cuda_robot_model_state=state),
                     self.problem, self.scene, self.joint_names, times,
                     sphere_padding=_native_collision_padding(self._verification_native))
                 constraints = self._verification_native.compute_costs(native)
                 model = {"scene": online, **dict(zip(constraints.names, constraints.values))}
                 report.update(task_satisfied=_ompl_terms_accepted(task), model_valid=_ompl_terms_accepted(model))
+                # BEGIN preserve positive/non-finite residuals in their original families.
+                def failures(terms):
+                    maxima = {}
+                    for name, value in terms.items():
+                        flat = value.detach().reshape(-1)
+                        index = self.torch.where(self.torch.isfinite(flat), flat,
+                            self.torch.full_like(flat, float("inf"))).argmax()
+                        maxima[name] = float(flat[index].item())
+                    return {name: value for name, value in maxima.items() if value > 0 or not np.isfinite(value)}
+                report.update(task_violations=failures(task),
+                    native_violations=failures(dict(zip(constraints.names, constraints.values))),
+                    scene_components=scene_components)
+                # END conditional scene entries retain their names and have no veto.
         ranked = rank_ik_candidates(values, reports, np.asarray(previous), count=self.budget.ik_seeds,
             joint_tolerance=self.problem.numerical.joint, query_kind="functional" if goal_ids else "reference")
         return ranked, reports
@@ -4474,6 +4598,10 @@ class _CuroboPlanner:
                 metrics = rollout.compute_metrics_from_state(native)
             self.check_request()
             constraints = metrics.costs_and_constraints.constraints
+            # BEGIN exact-curve confirmation owns the same query's collision evidence.
+            rollout.metrics_constraint_manager.bind_collision_evidence(metrics)
+            collision_residuals = _collision_metric_residuals(metrics)
+            # END a confirmed-clear proxy cannot trigger a collision recovery.
             residuals = {f"interpolated:{name}": float(value.max().item())
                          for name, value in zip(constraints.names, constraints.values)}
             feasible = bool(metrics.feasible) if isinstance(metrics.feasible, bool) else bool(metrics.feasible.all().item())
@@ -4485,6 +4613,9 @@ class _CuroboPlanner:
                 manager._candidate_query = None
         report = {"native_success": feasible, "accepted": feasible,
             "residuals": residuals, "seed_provenance": "supplied_joint_curve",
+            # BEGIN classification is diagnostic-only, outside hard residuals.
+            "collision_residuals": {f"interpolated:{name}": value for name, value in collision_residuals.items()},
+            # END the original metrics determine feasibility and severity.
             "native_metrics": {"success": feasible, "interpolated": {"constraints": residuals}},
             "scene_components": context["scene_components"],
             # BEGIN retain raw broad-phase positives and native confirmation evidence.
@@ -4539,7 +4670,10 @@ class _CuroboPlanner:
             constraints = metrics.costs_and_constraints.constraints
             report[label] = {"constraints": {name: maximum(value) for name, value in
                 zip(constraints.names, constraints.values)}, "convergence": {name: maximum(value)
-                for name, value in zip(metrics.convergence.names, metrics.convergence.values)}}
+                for name, value in zip(metrics.convergence.names, metrics.convergence.values)},
+                # BEGIN typed collision evidence is separate from native constraints.
+                "collision_residuals": _collision_metric_residuals(metrics, seed_index)}
+                # END diagnostics never affect the original severity calculation.
         return report
 
     # BEGIN feasibility precedes quality and rejected native curves never execute.
@@ -4556,6 +4690,10 @@ class _CuroboPlanner:
             severity = sum(max(0., v) for v in residuals.values()) if all(np.isfinite(list(residuals.values()))) else float("inf")
             report = {"seed_index": index, "native_success": metrics["success"], "accepted": accepted,
                       "native_metrics": metrics, "residuals": residuals,
+                      # BEGIN preserve both real sampling grids for recovery routing.
+                      "collision_residuals": {f"{label}:{name}": value for label in ("rollout", "interpolated")
+                          for name, value in metrics.get(label, {}).get("collision_residuals", {}).items()},
+                      # END no aggregate scene constraint is inferred to be a collision.
                       "seed_provenance": self.seed_strategies[index],
                       "optimizer": self.last_optimizer_diagnostics[index] if self.last_optimizer_diagnostics else {}}
             reports.append(report)
@@ -5121,9 +5259,9 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             diagnostics["attempts"].append(deepcopy(attempt))
             check()
             if not attempt["accepted"] and consumed["trajectory_solves"]-motion_baseline.get("trajectory_solves", 0) < original_budget.maximum_trajectory_solves:
-                residuals = attempt["residuals"]
-                collision_failed = any(value > 0 and ("scene" in name or "collision" in name)
-                                       for name, value in residuals.items())
+                # BEGIN mixed scene support/contact failures cannot consume collision recovery.
+                collision_failed = any(value > 0 for value in attempt["collision_residuals"].values())
+                # END all original hard residuals still reject the candidate above.
                 # BEGIN reuse dense collision evidence inside the existing second solve.
                 promoted = (planner.promote_collision_witnesses(native_result) if collision_failed else None)
                 if promoted is not None:

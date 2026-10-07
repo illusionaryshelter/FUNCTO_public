@@ -23,6 +23,9 @@ def selection_fixture(*, scene=(.01, .02), task=(0., 0.), flags=(False, False)):
     constraints.names = ["process_scene", "skill_process"]
     constraints.values = [torch.tensor(values)[:, None, None].expand(2, 9, 1).clone()
                           for values in (scene, task)]
+    # BEGIN this fixture explicitly models ordinary world collision components.
+    result.metrics.debug = constraints.values[0].clone()
+    # END the aggregate alone is not a collision classifier.
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.scene = object()
     planner.seed_strategies = ["reference", "alternate"]
@@ -41,6 +44,7 @@ def completed(*, accepted, residual, points):
     """Evidence returned by the shared complete-candidate native metric path."""
     report = {"accepted": accepted, "native_success": accepted,
         "residuals": {"interpolated:process_scene": residual},
+        "collision_residuals": {"interpolated:scene_collision": residual},
         "native_metrics": {"success": accepted},
         "seed_provenance": "supplied_joint_curve",
         "native_confirmation": {"status": "completed"}}
@@ -55,6 +59,7 @@ def test_smaller_task_failure_cannot_hide_another_confirmable_sphere_seed():
     assert report["accepted"] and report["selected_seed_index"] == curve.seed_index == 1
     assert candidate.solution[0, 0, 0, 0].item() == 2.
     assert report["confirmation_validation_points"] == 7
+    assert report["collision_residuals"] == {"interpolated:scene_collision": 0.}
     assert not report["candidates"][0]["accepted"]
     assert report["seed_provenance"] == "alternate" and report["optimizer"] == {"seed": 1}
     assert report["sphere_proposal_metrics"]["rollout"]["constraints"]["process_scene"] > 0
@@ -109,3 +114,15 @@ def test_confirmation_success_flag_cannot_override_invalid_residual(value):
     assert report["confirmation_validation_points"] == 4
     planner.export.assert_not_called()
 # END conditional confirmation changes collision evidence, not acceptance rules.
+
+
+# BEGIN collision diagnostics cannot change the existing severity ordering.
+def test_scene_support_severity_selects_same_seed_despite_opposite_collision_order():
+    planner, result = selection_fixture(scene=(.02, .01), task=(.1, .1))
+    result.metrics.debug = torch.stack((torch.zeros((9, 1)), torch.ones((9, 1))))
+    _, curve, report = planner.select_candidate(result)
+    assert not report["accepted"] and curve.seed_index == report["selected_seed_index"] == 1
+    assert report["collision_residuals"] == {"rollout:scene_collision": 1.}
+    assert report["residuals"]["rollout:process_scene"] == pytest.approx(.01)
+    planner._candidate_metrics.assert_not_called()
+# END diagnostics are absent from acceptance and candidate severity sums.

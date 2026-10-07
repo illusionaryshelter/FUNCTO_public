@@ -81,7 +81,10 @@ class Native:
         return next(self.outcomes)
     def select_candidate(self, accepted):
         report = {"accepted": accepted, "native_success": accepted, "seed_provenance": "test",
-                  "residuals": {"process_scene" if self.collision else "skill_process": 0. if accepted else 1.}}
+                  "residuals": {"process_scene" if self.collision else "skill_process": 0. if accepted else 1.},
+                  # BEGIN recovery evidence is distinct from the hard scene aggregate.
+                  "collision_residuals": {"rollout:scene_collision": float(self.collision and not accepted)}}
+                  # END the deterministic fixture supplies explicit query classification.
         return SimpleNamespace(solution=torch.zeros((1, 1, 8, 1))), self.curve, report
     def ompl_seed(self, seed, trajectory):
         self.calls.append("ompl")
@@ -185,6 +188,31 @@ def test_recovery_failure_returns_no_execution_binding_or_export():
     assert result.diagnostics["diagnostic_trajectory"] is native.curve
     assert native.calls.count("solve") == 2 and "export" not in native.calls
     backend.close()
+
+
+# BEGIN a model-support gap cannot spend the collision recovery branch.
+@pytest.mark.parametrize("functional", [False, True])
+def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_recovery(functional):
+    native = Native([False, False, False])
+    native.functional_constraints.keys = ("event",) if functional else ()
+    select = native.select_candidate
+    def missing_support(accepted):
+        candidate, curve, report = select(accepted)
+        report["residuals"] = {"rollout:process_scene": 400000., "interpolated:process_scene": 500000.}
+        report["collision_residuals"] = {"rollout:scene_collision": 0., "interpolated:scene_collision": 0.}
+        return candidate, curve, report
+    native.select_candidate = missing_support
+    native.promote_collision_witnesses = lambda _: pytest.fail("Support gap is not collision evidence")
+    result, backend = run(native)
+    try:
+        assert not result.success and result.execution_binding is None
+        assert "ompl" not in native.calls and "export" not in native.calls
+        assert native.calls.count("solve") == (2 if functional else 1)
+        assert native.calls.count("al") == int(functional)
+        assert result.diagnostics["failure"] == "no_feasible_solution_found"
+    finally:
+        backend.close()
+# END one rejected exploration candidate does not prove a request-wide scene gap.
 
 
 # BEGIN collision witnesses consume the original unique second solve.

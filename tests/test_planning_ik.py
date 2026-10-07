@@ -230,9 +230,14 @@ def _static_planner(monkeypatch, *, self_failure=False, online_failure=False):
     planner._verification_native = SimpleNamespace(get_cost=lambda _: None, compute_costs=native)
 
     def online(scene, problem, progress_map, spheres, p, r, progress, q, names, *,
-               trajectory_time, normalized_time):
+               trajectory_time, normalized_time, component_diagnostics):
         calls["online"].append((float(trajectory_time.item()), float(normalized_time.item())))
         rejected = online_failure and float(q[0, 0, 0]) > .5
+        # BEGIN the same-call fixture distinguishes support from collision.
+        if rejected:
+            component_diagnostics["scene_update/background/robot"] = {
+                "maximum": 1., "time_s": float(trajectory_time.item()), "progress": float(progress.item())}
+        # END no extra static scene query supplies this reason.
         return torch.full_like(progress, float(rejected))
 
     monkeypatch.setattr(planning, "_scene_boundary_evaluate", online)
@@ -262,12 +267,47 @@ def test_functional_static_pool_keeps_allowed_pose_when_nominal_center_ik_failed
 
 @pytest.mark.parametrize("failure", ["self_failure", "online_failure"])
 def test_either_native_self_or_online_residual_rejects_static_model(monkeypatch, failure):
-    planner, _ = _static_planner(monkeypatch, **{failure: True})
+    planner, calls = _static_planner(monkeypatch, **{failure: True})
     selected, reports = planner._rank_ik_candidates(
         [[.1, 0., 0.], [.7, 0., 0.]], [True, True], [[0., 0., 0.]], .4)
     assert selected.tolist() == [0, 1]
     assert reports[0]["model_valid"] and not reports[1]["model_valid"]
+    # BEGIN rejection reasons reuse the original two state queries.
+    assert len(calls["online"]) == len(calls["native"]) == 2
+    assert reports[1]["task_violations"] == {}
+    if failure == "self_failure":
+        assert reports[1]["native_violations"] == {"self_collision": 1.}
+        assert reports[1]["scene_components"] == {}
+    else:
+        assert reports[1]["native_violations"] == {}
+        assert reports[1]["scene_components"] == {"scene_update/background/robot": {
+            "maximum": 1., "time_s": .8, "progress": .4}}
+    # END the failure category cannot change rank or static acceptance.
 # END source-mesh audit margins are not inputs to production IK screening.
+
+
+# BEGIN invalid proposals are explained before geometry access.
+def test_nonfinite_ik_proposal_reports_columns_without_fk_or_scene_query(monkeypatch):
+    planner, calls = _static_planner(monkeypatch)
+    selected, reports = planner._rank_ik_candidates(
+        [[float("nan"), 0., float("inf")]], [False], [[0., 0., 0.]], .4)
+    assert selected.size == 0
+    assert reports[0]["invalid_joint_indices"] == [0, 2]
+    assert not reports[0]["task_satisfied"] and not reports[0]["model_valid"]
+    assert calls == {"online": [], "native": []}
+# END no invented task/model evidence accompanies an invalid joint state.
+
+
+# BEGIN mixed finite/non-finite task entries retain the actual rejection reason.
+def test_task_reason_does_not_hide_negative_infinity_behind_finite_maximum(monkeypatch):
+    import torch
+    planner, calls = _static_planner(monkeypatch)
+    planner.problem.residuals = lambda *args, **kwargs: {"process": torch.tensor([[float("-inf"), 0.]])}
+    _, reports = planner._rank_ik_candidates([[.1, 0., 0.]], [True], [[0., 0., 0.]], .4)
+    assert not reports[0]["task_satisfied"]
+    assert reports[0]["task_violations"] == {"process": float("-inf")}
+    assert len(calls["online"]) == len(calls["native"]) == 1
+# END no scalar maximum conceals unavailable task data.
 
 
 def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_outputs():

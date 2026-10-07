@@ -1593,7 +1593,14 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         world = FrozenPrimitives(primitives=[{"kind": "sphere", "dimensions": [.2],
             "pose": [.03, 0., 0., 1., 0., 0., 0.]}], owner_ids=("obstacle",), source="analytic obstacle")
         with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
-            fixture.scene.evaluate = lambda spheres, *args, **kwargs: world(spheres[..., :1, :]).sum(-1)
+            # BEGIN the oracle exposes the same completed collision query to metrics.
+            def evaluate(spheres, *args, components_out=None, **kwargs):
+                collision = world(spheres[..., :1, :]).sum(-1)
+                if components_out is not None:
+                    components_out["collision/robot/obstacle"] = collision
+                return collision
+            fixture.scene.evaluate = evaluate
+            # END optimizer calls still request only their original aggregate.
             fixture.state.joint_state.dt = torch.full((2,), 2.)
             coarse = fixture.manager.compute_costs(fixture.state)
             coarse_scene = coarse.values[coarse.names.index("process_scene")]
@@ -1606,11 +1613,17 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 torch.full((2,), 2.), torch.full((2,), 2, dtype=torch.long), parameters)
             joints = JointState.from_position(q.contiguous(), joint_names=["first_joint", "second_joint"])
             joints.velocity, joints.dt = dq.contiguous(), torch.full((2,), .1)
+            # BEGIN only metric-mode queries retain recovery classification.
+            fixture.manager._process_mode = "trajectory_metrics"
             dense = fixture.manager.compute_costs(RobotState(joint_state=joints,
                 cuda_robot_model_state=fixture.kinematics(joints)))
+            collision_evidence = fixture.manager._collision_evidence[1][:1].clone()
+            fixture.manager._process_mode = "trajectory_optimizer"
+            # END the following optimizer query preserves the original gradient test.
             result = SimpleNamespace(batch_size=1, num_seeds=1, interpolated_last_tstep=torch.tensor([[21]]),
                 interpolated_trajectory=SimpleNamespace(position=q[:1]),
-                interpolated_metrics=SimpleNamespace(costs_and_constraints=SimpleNamespace(constraints=
+                interpolated_metrics=SimpleNamespace(debug=collision_evidence,
+                    costs_and_constraints=SimpleNamespace(constraints=
                     SimpleNamespace(names=dense.names, values=[value[:1] for value in dense.values]))))
             report = _dense_collision_witnesses(result, regular_horizon=2,
                 anchor_parameters=(0., 1.), capacity=2)
@@ -1645,6 +1658,57 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping, (0., 1.), budget, augmented)
             np.testing.assert_array_equal(fixture.config_type.query_anchor_parameters(), [[0., 0.], [1., 1.]])
             self.assertEqual(fixture.manager._anchor_count, 2)
+
+    # BEGIN same-query diagnostic binding does not alter scene costs or gradients.
+    def test_metric_collision_binding_preserves_aggregate_and_rejects_stale_query(self):
+        from curobo._src.rollout.metrics import CostsAndConstraints, RolloutMetrics
+        from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
+        results = {}
+        for mode in ("trajectory_optimizer", "trajectory_metrics"):
+            with self.anchor_self_collision_fixture(mode, required=(.55,), capacity=2) as fixture:
+                calls = []
+                def evaluate(spheres, p, *args, components_out=None, **kwargs):
+                    calls.append(components_out is not None)
+                    terms = {"collision/robot/background": p[..., 0].square(),
+                             "scene_update/background/robot": torch.ones_like(p[..., 0]),
+                             "conditional/collision/robot/background": torch.full_like(p[..., 0], 100.)}
+                    if components_out is not None:
+                        components_out.update(terms)
+                    return terms["collision/robot/background"]+terms["scene_update/background/robot"]
+                fixture.scene.evaluate = evaluate
+                costs = fixture.manager.compute_costs(fixture.state)
+                scene = costs.values[costs.names.index("process_scene")]
+                gradient = torch.autograd.grad(scene.sum(), fixture.q)[0]
+                results[mode] = (scene.detach().clone(), gradient)
+                self.assertEqual(calls, [mode == "trajectory_metrics"])
+                if mode == "trajectory_optimizer":
+                    self.assertIsNone(fixture.manager._collision_evidence)
+                    continue
+                metrics = RolloutMetrics(costs_and_constraints=CostsAndConstraints(constraints=costs))
+                fixture.manager.bind_collision_evidence(metrics)
+                self.assertFalse(metrics.debug.requires_grad)
+                self.assertEqual(costs.names.count("process_scene"), 1)
+                # Two regular states and one folded anchor each retain their
+                # unit support gap in the hard sum, never in collision debug.
+                torch.testing.assert_close(scene.detach()-metrics.debug,
+                    torch.tensor([[[777.], [1554.]], [[777.], [1554.]]]), rtol=1e-7, atol=0)
+                clone = metrics.clone()
+                self.assertNotEqual(clone.debug.data_ptr(), metrics.debug.data_ptr())
+                with self.assertRaisesRegex(RuntimeError, "different native metric query"):
+                    fixture.manager.bind_collision_evidence(clone)
+                later_costs = fixture.manager.compute_costs(fixture.state)
+                with self.assertRaisesRegex(RuntimeError, "different native metric query"):
+                    fixture.manager.bind_collision_evidence(metrics)
+                later = RolloutMetrics(costs_and_constraints=CostsAndConstraints(constraints=later_costs))
+                fixture.manager.bind_collision_evidence(later)
+                fixture.config_type.bind_request(fixture.problem, fixture.scene,
+                    _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), (.55,),
+                    PlanningBudget(max_task_anchors=2), FunctionalAugmentedLagrangian(()))
+                with self.assertRaisesRegex(RuntimeError, "no same-query"):
+                    fixture.manager.bind_collision_evidence(later)
+        torch.testing.assert_close(results["trajectory_optimizer"][0], results["trajectory_metrics"][0], rtol=0, atol=0)
+        torch.testing.assert_close(results["trajectory_optimizer"][1], results["trajectory_metrics"][1], rtol=0, atol=0)
+    # END rejected stale diagnostics never replace the already computed constraints.
 
     def test_tiny_positive_scene_violation_keeps_linear_gradient_and_skill_square(self):
         with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
@@ -2466,6 +2530,9 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         constraints.values = [torch.zeros(2, 9, 1)]
         constraints.values[0][0, 1] = 10.
         constraints.values[0][1, 3] = 2.
+        # BEGIN aggregate values do not serve as implicit collision evidence.
+        result.interpolated_metrics.debug = constraints.values[0].clone()
+        # END explicit same-seed evidence must survive the native top-k gather.
         selected = _trajectory_candidate(result, 1)
         copied = selected.interpolated_metrics.costs_and_constraints.constraints.values[0]
         self.assertEqual(tuple(copied.shape), (1, 9, 1))
@@ -2475,6 +2542,8 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         self.assertEqual(report["valid_count"], 5)
         constraints.values[0].zero_()
         self.assertEqual(float(copied[0, 3]), 2.)
+        result.interpolated_metrics.debug.zero_()
+        self.assertEqual(float(selected.interpolated_metrics.debug[0, 3]), 2.)
     # END selected dense evidence survives native scratch-buffer reuse.
 
     # BEGIN locked-joint native result layout: active knots and full robot state.
