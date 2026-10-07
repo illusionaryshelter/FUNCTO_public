@@ -2488,7 +2488,8 @@ def _native_collision_padding(manager):
 # BEGIN scene switches share q/t while querying distinct adjacent modes.
 def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion,
                              progress, joint_position, joint_names, *, trajectory_time,
-                             normalized_time, query_counts=None, component_diagnostics=None):
+                             normalized_time, query_counts=None, component_diagnostics=None,
+                             native_confirmation=None):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2500,11 +2501,17 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     import torch
     from .optimizer_device_checks import constant_tensor
     evaluate = scene.evaluate
+    # BEGIN final acceptance can confirm sphere candidates using native solids.
+    if native_confirmation is not None:
+        def evaluate(*args, **kwargs):
+            return scene.evaluate(*args, **kwargs, native_confirmation=native_confirmation)
+    # END differentiable optimizer queries retain their sphere proposal costs.
     # BEGIN retain component witnesses during the same candidate scene query.
     if component_diagnostics is not None:
+        base_evaluate = evaluate
         def evaluate(*args, **kwargs):
             components = {}
-            value = scene.evaluate(*args, **kwargs, components_out=components)
+            value = base_evaluate(*args, **kwargs, components_out=components)
             for name, residual in components.items():
                 flat = residual.detach().reshape(-1)
                 index = int(flat.argmax().item())
@@ -2839,7 +2846,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 spheres, position, quaternion, progress, q, self._joint_names,
                 trajectory_time=trajectory_time, normalized_time=ordered(all_u),
                 query_counts=self._query_counts,
-                component_diagnostics=None if context is None else context["scene_components"])
+                component_diagnostics=None if context is None else context["scene_components"],
+                # BEGIN only the complete candidate boundary runs CPU confirmation.
+                native_confirmation=None if context is None else context.get("native_confirmation"))
+            # END ordinary optimizer and proposal metric calls remain unchanged.
             # END raw residual zero sets are shared; only optimizer weights differ.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
             # BEGIN retain collision gradients for small positive clearance deficits.
@@ -3586,7 +3596,11 @@ class _CuroboPlanner:
             components["scene"] = _scene_boundary_evaluate(self.scene, self.problem, self.progress_map,
                 self.problem.transform_robot_spheres(native.robot_spheres), position, quaternion,
                 progress, q, self.joint_names, trajectory_time=q.new_zeros(q.shape[:2]),
-                normalized_time=q.new_zeros(q.shape[:2]))
+                normalized_time=q.new_zeros(q.shape[:2]),
+                # BEGIN measured entrance uses the same candidate confirmation rule.
+                native_confirmation=self.robot_validator.online_collision_confirmation(
+                    self.scene, check_request=self.check_request))
+            # END proxy geometry alone cannot declare an immutable entrance impossible.
             residuals = {name: float(value.max().item()) for name, value in components.items()}
         failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
         return {"passed": not failed, "residuals": residuals, "failed_components": failed,
@@ -4394,10 +4408,16 @@ class _CuroboPlanner:
         The installed rollout does not forward query kwargs to its managers.
         A short-lived manager context therefore carries actual times and exact
         source-curve anchors; finally clears it even when native evaluation
-        raises. No source geometry checker or alternate feasibility law runs.
+        raises. Positive robot/world sphere candidates are confirmed against
+        the native robot solids and the same frozen observed geometry.
         """
         from curobo._src.solver.solve_mode import SolveMode
         from curobo._src.solver.solve_state import SolveState
+        # BEGIN candidate and measured execution share the native confirmation adapter.
+        candidate_scene = self.scene if candidate_scene is None else candidate_scene
+        native_confirmation = self.robot_validator.online_collision_confirmation(
+            candidate_scene, check_request=self.check_request)
+        # END no confirmation object is installed in an optimization rollout.
         mapping = _ProgressMap(trajectory.progress_u, trajectory.progress_s)
         pairs = mapping.anchor_parameters(self.anchors)
         times = _candidate_sample_times(trajectory, self.budget)
@@ -4413,7 +4433,7 @@ class _CuroboPlanner:
             "anchor_u": tensor(pairs[:, 0])[None], "anchor_s": tensor(pairs[:, 1])[None],
             "anchor_q": tensor(anchor_q[:, columns])[None].contiguous(),
             "anchor_dq": tensor(anchor_dq[:, columns])[None].contiguous(),
-            "scene_components": {}}
+            "scene_components": {}, "native_confirmation": native_confirmation}
         # The task manager owns all real pose requirements. These inert goal
         # slots only initialize the same resident native rollout buffers.
         self.trajopt.disable_tool_pose_tracking()
@@ -4452,6 +4472,9 @@ class _CuroboPlanner:
             residuals = {f"interpolated:{name}": float(value.max().item())
                          for name, value in zip(constraints.names, constraints.values)}
             feasible = bool(metrics.feasible) if isinstance(metrics.feasible, bool) else bool(metrics.feasible.all().item())
+            # BEGIN native feasibility flags cannot hide an invalid raw constraint.
+            feasible = feasible and all(np.isfinite(value) and value <= 0 for value in residuals.values())
+            # END confirmation changes only proved-clear robot/world candidates.
         finally:
             for manager in managers:
                 manager._candidate_query = None
@@ -4459,6 +4482,9 @@ class _CuroboPlanner:
             "residuals": residuals, "seed_provenance": "supplied_joint_curve",
             "native_metrics": {"success": feasible, "interpolated": {"constraints": residuals}},
             "scene_components": context["scene_components"],
+            # BEGIN retain raw broad-phase positives and native confirmation evidence.
+            "native_confirmation": deepcopy(native_confirmation.last_report),
+            # END corrected metrics do not erase the original suspected collision.
             "optimizer": {"unchanged_from_seed": True, "maximum_control_update": 0.}}
         return report, times/trajectory.duration, len(times)+len(pairs)
 
@@ -4535,7 +4561,41 @@ class _CuroboPlanner:
                 break
         report = reports[selected]
         candidate = _trajectory_candidate(result, selected)
-        return candidate, self._native_curve(candidate), {**report, "selected_seed_index": selected, "candidates": reports}
+        trajectory = self._native_curve(candidate)
+        # BEGIN a world-sphere proxy alone cannot conclusively reject a candidate.
+        # Other task, joint, self-collision and non-finite failures still reject
+        # immediately. Reuse the ordinary complete-candidate metric path only
+        # when its native confirmation can actually change this decision.
+        confirmation_points = 0
+        if not report['accepted']:
+            ordered = sorted(range(len(reports)), key=lambda index: (
+                sum(max(0., value) for value in reports[index]['residuals'].values())
+                if all(np.isfinite(value) for value in reports[index]['residuals'].values()) else float('inf'), index))
+            for index in ordered:
+                original = reports[index]
+                positives = {name for name, value in original['residuals'].items() if value > 0}
+                if (not positives or not all(name.endswith(':process_scene') for name in positives)
+                        or not all(np.isfinite(value) for value in original['residuals'].values())):
+                    continue
+                proposed = candidate if index == selected else _trajectory_candidate(result, index)
+                curve = trajectory if index == selected else self._native_curve(proposed)
+                confirmed, _, points = self._candidate_metrics(curve, self.scene)
+                confirmation_points += points
+                # BEGIN keep selection strict even if a metrics producer is inconsistent.
+                confirmed['accepted'] = bool(confirmed['accepted']) and all(
+                    np.isfinite(value) and value <= 0 for value in confirmed['residuals'].values())
+                # END a failed candidate cannot prevent checking another existing seed.
+                reports[index] = {**original, **confirmed,
+                    'sphere_proposal_metrics': original['native_metrics'],
+                    'optimizer': original['optimizer'], 'seed_provenance': original['seed_provenance'],
+                    'confirmation_validation_points': points}
+                if confirmed['accepted']:
+                    selected, candidate, trajectory = index, proposed, curve
+                    break
+            report = reports[selected]
+        # END acceptance still requires all task and scene constraints to pass.
+        return candidate, trajectory, {**report, "selected_seed_index": selected, "candidates": reports,
+                                       'confirmation_validation_points': confirmation_points}
 
 
     # END the attempt witness set is independent of the selected continuation.
@@ -4736,6 +4796,13 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
     owned_backend = backend is None
     backend_claimed = False
     diagnostics = {"attempts": []}
+    # BEGIN passive request milestones distinguish lazy native initialization from solving.
+    diagnostics["wallclock"] = {"scope": "One planning request; Unix timestamps join processes, elapsed seconds use the request monotonic clock", "events": {}}
+    def mark_wallclock(name):
+        diagnostics["wallclock"]["events"][name] = {
+            "unix_time_ns": time.time_ns(), "elapsed_seconds": time.monotonic()-started}
+    mark_wallclock("planning_request_started")
+    # END timing never changes the cumulative work ledger or triggers GPU synchronization.
     outcome = PlanningResult(False, None, diagnostics)
     stage = "request_binding"
     try:
@@ -4877,8 +4944,12 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             occurrences = {event_occurrence_key(event) for event in problem.events}
             scene.gripper.commands = tuple(row for row in scene.gripper.commands
                                            if event_occurrence_key(row) in occurrences)
+        # BEGIN bind_request creates native solvers on first use or rebinds resident ones.
+        mark_wallclock("backend_binding_started")
         planner = backend.bind_request(problem, scene, budget=budget, continuation=prior,
                                        goal_identities=block_record["goal_identities"])
+        mark_wallclock("backend_binding_completed")
+        # END failed initialization retains only the start milestone.
         planner.check_request = check
         planner.satisfied_dependencies = tuple(sorted(satisfied_dependencies))
         for solver in (planner.ik, planner.trajopt):
@@ -4950,6 +5021,9 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             check()
             diagnostics["qualified_candidate_elapsed_seconds"] = time.monotonic()-started
             outcome.success, outcome.trajectory, outcome.execution_binding = True, trajectory, binding
+            # BEGIN only a fully qualified candidate receives this readiness milestone.
+            mark_wallclock("qualified_candidate_ready")
+            # END report persistence and execution preflight are later stages.
             return True
 
         # BEGIN preserve a supplied polynomial before creating native proposals.
@@ -5013,8 +5087,18 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         diagnostics["functional_ik_fit_hints"] = deepcopy(planner.goal_ik_fit_hints)
         diagnostics["joint_reference"] = deepcopy(planner.joint_reference_report)
         # BEGIN one reference verdict, one main solve and one mutually exclusive recovery.
+        # BEGIN charge every conditional native confirmation through the existing ledger.
+        def select_candidate_with_accounting(result):
+            native, curve, report = planner.select_candidate(result)
+            points = report.get('confirmation_validation_points', 0)
+            if points:
+                consumed['validation_passes'] += 1
+                consumed['validation_queries'] += points
+                check()
+            return native, curve, report
+        # END proxy-only rejections without confirmation spend no additional queries.
         reference_result = planner.evaluate_reference(seeds)
-        native_result, trajectory, attempt = planner.select_candidate(reference_result)
+        native_result, trajectory, attempt = select_candidate_with_accounting(reference_result)
         if joint_reference is not None and planner.joint_reference_report is not None:
             same = (trajectory.joint_names == joint_reference.joint_names
                     and np.array_equal(trajectory.times, joint_reference.times)
@@ -5028,7 +5112,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             check("trajectory_solves")
             consumed["trajectory_solves"] += 1
             stage = "main_solve"
-            native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
+            native_result, trajectory, attempt = select_candidate_with_accounting(planner.optimize(seeds))
             diagnostics["attempts"].append(deepcopy(attempt))
             check()
             if not attempt["accepted"] and consumed["trajectory_solves"]-motion_baseline.get("trajectory_solves", 0) < original_budget.maximum_trajectory_solves:
@@ -5067,7 +5151,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 if recovery in {"collision_witnesses", "ompl", "augmented_lagrangian"}:
                     check("trajectory_solves")
                     consumed["trajectory_solves"] += 1
-                    native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
+                    native_result, trajectory, attempt = select_candidate_with_accounting(planner.optimize(seeds))
                     diagnostics["attempts"].append(deepcopy(attempt))
                     check()
         diagnostics.update(attempt, route=planner.route, recovery=recovery, used_ompl=recovery in {"ompl", "ompl_failed"})

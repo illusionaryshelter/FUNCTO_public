@@ -307,6 +307,12 @@ def run(args):
               "feedback_path": str(args.feedback.resolve()),
               "robot_fixture_path": str(args.robot_fixture.resolve())}
     started = time.monotonic()
+    # BEGIN wall milestones use Unix time for process joins and monotonic durations locally.
+    report["wallclock"] = {"scope": "Saved scene inputs through planning and artifact persistence; external perception is excluded", "events": {}}
+    def mark_wallclock(name):
+        report["wallclock"]["events"][name] = {
+            "unix_time_ns": time.time_ns(), "elapsed_seconds": time.monotonic()-started}
+    # END these passive samples do not synchronize CUDA or query geometry.
     try:
         # BEGIN include a retained execution session in this request's host cap.
         # The explicit root must be this process or a real ancestor; standalone
@@ -320,6 +326,9 @@ def run(args):
         if not 0 < args.mapping_memory_mib <= min(args.max_host_rss_mib, args.max_device_used_mib):
             raise ValueError("Mapping capacity must be positive and fit both declared total resource limits")
         # END native maps repeat this admission for callers outside this CLI.
+        # BEGIN identify the first saved scene input read, independently of process startup.
+        mark_wallclock("scene_input_read_started")
+        # END the external runner owns any earlier image acquisition/perception timing.
         manifest = json.loads(args.manifest.read_text())
         root = Path(manifest["workspace_root"])
         segment = next(s for s in manifest["segments"] if s["id"] == args.segment)
@@ -705,6 +714,10 @@ def run(args):
         # END geometry capacity does not replenish planning time or solve counts.
         # END reviewed input revisions remain caller-owned.
         report["planning_called"] = True
+        # BEGIN model initialization remains inside the planner's lazy bind_request.
+        mark_wallclock("scene_preparation_completed")
+        mark_wallclock("planning_call_started")
+        # END constructing MotionBackend alone is not native initialization.
         # BEGIN the caller owns resident native models across motion requests.
         backend = MotionBackend(robot, robot_validator=robot_validator, budget=budget)
         try:
@@ -716,6 +729,10 @@ def run(args):
                 provenance={**provenance, "robot_fixture": str(args.robot_fixture),
                     "current_views": list(observations),
                     "old_selection_comparison_only": segment["grounding"]["status"]})
+            # BEGIN record readiness before native cleanup, after artifact persistence.
+            mark_wallclock("planning_result_saved")
+            report["planner_wallclock"] = result.diagnostics.get("wallclock")
+            # END a returned failure is timed without claiming an executable result.
         finally:
             backend.close()
         report.update(status="completed", planning_success=result.success,

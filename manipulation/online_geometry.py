@@ -612,7 +612,7 @@ class OnlinePlanningScene:
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time=None,
                    active_contact_rule_ids=None, contact_permission_progress=None,
-                   owner_poses=None, condition_evidence=None):
+                   owner_poses=None, condition_evidence=None, native_confirmation=None):
         """Same nonnegative numerical constraints in solve, final check and runtime."""
         if robot_spheres.shape[:2] != progress.shape or robot_spheres.shape[-2:] != (len(self.robot_sphere_materials),4):
             raise ValueError('Online scene requires aligned [batch,time,sphere,4] native FK')
@@ -622,6 +622,13 @@ class OnlinePlanningScene:
         if permission_progress.shape!=progress.shape:
             raise ValueError('Finite permission progress must align with the queried states')
         costs, spheres = {}, robot_spheres
+        # BEGIN retain broad-phase evidence only for explicit acceptance queries.
+        # Optimizer calls keep their differentiable sphere costs and allocate
+        # none of this diagnostic state. Confirmation never creates permission.
+        confirmation = None if native_confirmation is None else {
+            'targets': {}, 'effective_rules': {}, 'joint_position': joint_position,
+            'joint_names': joint_names, 'finger_positions': None, 'owner_poses': {}}
+        # END final acceptance and actual feedback share the same evidence schema.
         coordinates = half = geometry_state = None
         if self.gripper is not None:
             # BEGIN measured, nominal and unresolved geometry are selected once.
@@ -631,6 +638,10 @@ class OnlinePlanningScene:
             costs['gripper/controller'] = geometry_state.controller_residual
             # END commands are never independently promoted to actual positions.
             spheres = self.gripper.spheres(spheres, position, quaternion, coordinates, half)
+            # BEGIN reuse this query's measured/nominal hand geometry exactly.
+            if confirmation is not None:
+                confirmation['finger_positions'] = coordinates
+            # END uncertain moving spheres remain masked below, never confirmed by a guess.
         uncertain_indices = []
         uncertain_hand = torch.zeros_like(progress,dtype=torch.bool)
         if geometry_state is not None:
@@ -651,6 +662,11 @@ class OnlinePlanningScene:
                 costs[name]=torch.where(uncertainty,0.,values).sum(-1)
             else:
                 costs[name]=values.sum(-1)
+            # BEGIN preserve per-sphere candidates before reducing to one owner cost.
+            if confirmation is not None and actor == 'robot':
+                confirmation['targets'][name] = torch.where(
+                    uncertain_spheres, 0., values)
+            # END native checks can only revise the corresponding robot/world term.
         def max_constraint(values, name, actor):
             # Numerical gaps of an unresolved future finger remain explicit
             # conditional gaps; known arm/palm gaps remain hard scene updates.
@@ -699,6 +715,10 @@ class OnlinePlanningScene:
                         costs[f'unsupported/holding/{owner.owner_id}/{index}'] = active.to(progress.dtype)
             poses[owner.owner_id] = owner.pose(position,quaternion,progress,releases)
         actors = {'robot':(spheres,(position,quaternion))}
+        # BEGIN use the already resolved owner poses, including attachment modes.
+        if confirmation is not None:
+            confirmation['owner_poses'] = poses
+        # END current truth or a second nominal pose reconstruction is not consulted.
         for owner in self.owners:
             if owner.moving:
                 if not owner.geometry_complete:
@@ -734,6 +754,10 @@ class OnlinePlanningScene:
                         uncertain_hand=uncertain_hand)
                     if active_contact_rule_ids is not None:
                         policy['active'] &= rule.rule_id in active_contact_rule_ids
+                    # BEGIN the latch alone is insufficient: retain the effective policy.
+                    if confirmation is not None and actor == 'robot':
+                        confirmation['effective_rules'][rule.rule_id] = policy['active']
+                    # END interval and geometry/unresolved-hand conditions are preserved.
                     policies.append((rule,policy))
                     costs[f'contact/normal/{rule.rule_id}'] = normal*policy['active']
                     costs[f'conditional/finger/{rule.rule_id}'] = uncertainty
@@ -765,6 +789,10 @@ class OnlinePlanningScene:
                 intersects=owner.query.intersects_geometry(local)
                 max_constraint((intersects & ~owner.query.supports_centres(local) & (local[...,3]>0)).to(progress.dtype),
                                f'scene_update/{actor}/{owner.owner_id}', actor)
+        # BEGIN broad-phase positives require native-solid confirmation at acceptance.
+        if native_confirmation is not None:
+            costs = native_confirmation(costs, confirmation)
+        # END contact, unknown-space and model-support residuals are not replaced.
         return costs
 
     def evaluate(self,*args,**kwargs):
@@ -865,7 +893,8 @@ class OnlinePlanningScene:
         # END no duplicate group bank or bool-as-one-byte floating cache assumption.
 
     def query_state(self,spheres,tool_pose,progress,*,joint_position=None,joint_names=None,
-                    trajectory_time=0.,active_contact_rule_ids=frozenset(),owner_poses=None,condition_evidence=None):
+                    trajectory_time=0.,active_contact_rule_ids=frozenset(),owner_poses=None,condition_evidence=None,
+                    native_confirmation=None):
         """Cheap actual-state query; fresh finite latches and evidence are explicit."""
         tool = np.asarray(tool_pose,dtype=float)
         p = torch.as_tensor(tool[:3,3],dtype=torch.float64)[None,None]
@@ -874,14 +903,23 @@ class OnlinePlanningScene:
         joints = None if joint_position is None else torch.as_tensor(joint_position,dtype=torch.float64)[None,None]
         terms = self.components(torch.as_tensor(spheres,dtype=torch.float64)[None,None],p,q,step,
             joint_position=joints,joint_names=joint_names,trajectory_time=torch.tensor([[float(trajectory_time)]],dtype=torch.float64),
-            active_contact_rule_ids=active_contact_rule_ids,owner_poses=owner_poses,condition_evidence=condition_evidence)
+            active_contact_rule_ids=active_contact_rule_ids,owner_poses=owner_poses,condition_evidence=condition_evidence,
+            native_confirmation=native_confirmation)
         values = {name:float(value.item()) for name,value in terms.items()}
-        violations = {name:value for name,value in values.items() if not name.startswith('conditional/') and value>0}
+        # BEGIN a missing numerical result cannot be cleared by native confirmation.
+        violations = {name:value for name,value in values.items()
+                      if not name.startswith('conditional/') and (not np.isfinite(value) or value>0)}
+        # END NaN and infinity retain a failed actual-state verdict.
         status = ('SCENE_UPDATE_REQUIRED' if any(k.startswith('scene_update/') for k in violations) else
                   'UNSUPPORTED_MODEL' if any(k.startswith('unsupported/') for k in violations) else
                   'COLLISION_OR_CONSTRAINT' if violations else 'PASS')
-        return {'passed':not violations,'violations':[{'kind':name.split('/')[0],'name':name,'residual':value} for name,value in violations.items()],'components':values,'status':status,
+        report = {'passed':not violations,'violations':[{'kind':name.split('/')[0],'name':name,'residual':value} for name,value in violations.items()],'components':values,'status':status,
             'conditional_unknown':{k:v for k,v in values.items() if k.startswith('conditional/') and v>0}}
+        # BEGIN keep the original sphere evidence and native verdict inspectable.
+        if native_confirmation is not None:
+            report['native_confirmation'] = deepcopy(native_confirmation.last_report)
+        # END a clear native pair is distinct from an unqueried broad-phase zero.
+        return report
 
     def describe(self):
         return {'model':'frozen_online_esdf_planar_contact_v2','reference_frame':self.reference_frame,

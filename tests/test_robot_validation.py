@@ -453,22 +453,42 @@ def online_binding(gate, *, distance=1., supported=True):
     from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
     from manipulation.planning_scene import ObservedSpace
     shape = (9, 9, 9)
-    field = FrozenESDF(np.full(shape, distance, np.float32),
-        origin=[-1., -1., -1.] if supported else [10., 10., 10.],
+    # BEGIN represent a genuinely unsupported boundary, not an empty remote map.
+    # The left solid's measured sphere centre is x=.03. A field starting at
+    # x=.04 has no sample there, but its first occupied cell and that sphere
+    # overlap. An unrelated all-positive field at x=10 correctly has no such
+    # scene-update obligation; the previous fixture did not test this failure.
+    values = np.full(shape, distance, np.float32)
+    if not supported:
+        values[0, :, :] = 0.
+    field = FrozenESDF(values,
+        origin=[-1., -1., -1.] if supported else [.04, -1., -1.],
         voxel_size=.25, site_valid=np.ones(shape, bool),
         observed_sign=np.ones(shape, bool), owner_ids=(), source="online sensor field")
+    # END unqueried numerical support remains independent of collision evidence.
     coverage = ObservedSpace(np.ones(shape, bool), origin=[-1., -1., -1.], voxel_size=.25,
         observation_ids=["observation"], reference_frame="world")
+    # BEGIN complete native box covers and explicit source identities.
+    # Both fixture boxes have 40 mm sides. The second box is translated 400 mm
+    # in its link frame; its cover must include that native local transform.
+    radius = float(np.sqrt(3.) * .02 + 1e-6)
+    centers = [[0., 0., 0.], [0., .4, 0.]]
+    bodies = [{'body_id': link, 'frame': link, 'sphere_indices': [index],
+        'geometry_names': [name], 'local_spheres': [[*centers[index], radius]],
+        'source': 'Complete circum-sphere of the explicit native test box'}
+        for index, (link, name) in enumerate((('left', 'first'), ('right', 'second')))]
     scene = OnlinePlanningScene(background=field, owners=(), coverage=coverage,
         reference_frame="world", robot_sphere_materials=("left", "right"),
         robot_geometry_source="native sphere fixture", has_gripper=False,
+        robot_collision_bodies=bodies,
         unknown_policy={"conditional_regions": [], "outside_regions": "forbid"})
     scene.bind_online_robot(robot_sphere_geometry=[
-        {"link_name": link, "sphere_indices": [index], "centers_local": [[0., 0., 0.]], "radii": [.005]}
+        {"link_name": link, "sphere_indices": [index], "centers_local": [centers[index]], "radii": [radius]}
         for index, link in enumerate(("left", "right"))], robot_self_collision_pairs=[],
         robot_model={"urdf_path": str(gate.checker.urdf_path), "base_frame": gate.checker.base_frame,
             "tool_frame": gate.tool_frame, "T_reference_base": gate.T_reference_base.tolist(),
             "T_frame_tcp": gate.T_frame_tcp.tolist()})
+    # END native confirmation receives the same complete robot sphere inventory.
     return scene.to_execution_binding()
 
 
@@ -511,6 +531,14 @@ def test_online_failures_keep_named_geometry_evidence_through_executor(model, fa
         stage="actual", trajectory_time=0.)
     assert not result["passed"]
     assert all(row["kind"] != "geometry_checker_error" and row["name"] for row in result["violations"])
+    # BEGIN assert the intended physical/query cause, not merely any rejection.
+    if failure == 'collision':
+        confirmation = result['scene']['native_confirmation']['states']
+        assert confirmation and confirmation[0]['collision_targets'] == ['background']
+    else:
+        assert result['scene']['status'] == 'SCENE_UPDATE_REQUIRED'
+        assert result['scene']['components']['scene_update/background/robot'] > 0
+    # END incomplete fixtures cannot pass by becoming generic checker errors.
 
 
 def test_online_rebind_checks_sphere_fk_calibration_before_changing_scene(model):

@@ -985,10 +985,25 @@ use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
   represented cell outside that finite permission, including cells covered by
   the same robot sphere. A whole hand/owner pair exemption is not accepted.
 
+<!-- BEGIN native confirmation of conservative robot/world sphere candidates. -->
+Positive robot/world sphere costs are collision candidates. Final candidate
+acceptance and measured execution share `online_native_confirmation.py` through
+`RobotStateValidator.online_collision_confirmation`: only those candidates are
+checked with the registered native robot solids and the same frozen observed
+occupied cells (or analytic frozen primitives). One spatial index is prepared
+per confirmation adapter. Effective finite contact rules remove only wholly
+contained cells for the exact registered material; unknown-space, field support,
+contact conditions and self-collision constraints retain their own verdicts.
+Numerical boundary or unsupported native results keep the sphere rejection.
+Optimization still uses the differentiable sphere costs. This is a discrete
+observed-model check, not a continuous or unobserved-space safety certificate.
+<!-- END native confirmation of conservative robot/world sphere candidates. -->
+
 `planning_observation.build_scene_from_rgbd` creates this production model.
 `build_audit_scene_from_rgbd`, source TSDF geometry, complete-volume coverage
-and detailed source-geometry checkers are separate audit tools; they do not
-participate in production candidate success or control ticks.
+and detailed source-scene component checkers are separate audit tools. The
+bounded native robot/cell confirmation above does not reconstruct that scene
+audit or enumerate its source TSDF components.
 
 `PlanningProblem.bound_motion_block` uses actual evidence dependencies to bound
 one request while preserving original progress and event identities. Coupled

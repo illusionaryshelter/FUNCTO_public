@@ -189,10 +189,20 @@ def run(args, *, simulation=None, initial_feedback=None,
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
+    # BEGIN Unix time connects this process to planning; monotonic time measures local work.
+    wallclock = {"scope": "Simulation runner preparation and executor call; physical simulation seconds are separate", "events": {}}
+    def mark_wallclock(name):
+        wallclock["events"][name] = {
+            "unix_time_ns": time.time_ns(), "elapsed_seconds": time.monotonic()-started}
+    mark_wallclock("simulation_runner_started")
+    # END these milestones require no additional robot or geometry queries.
     # BEGIN record session ownership and absolute time separately from each curve.
     borrowed_simulation = simulation is not None
     # END a second skill has a new local curve while the native clock continues.
     report = {"status": "preparing", "segment_id": args.segment,
+        # BEGIN keep early preparation failures on the same passive wall timeline.
+        "wallclock": wallclock,
+        # END the executor owns preflight and the actual first integration boundary.
         "simulation_ownership": "borrowed" if borrowed_simulation else "recorded_trial",
         "trial_id": None, "native_start_time_s": None, "native_end_time_s": None,
         "trajectory_path": str(args.trajectory.resolve()), "trajectory_classification": None,
@@ -471,6 +481,9 @@ def run(args, *, simulation=None, initial_feedback=None,
             tool_frame=initial_feedback["tool_link"], T_frame_tcp=tool_transform)
         executor = TrajectoryExecutor(simulation, geometry_checker=validator)
         report["status"] = "executing"
+        # BEGIN timestamp before admission, including cases rejected before executor report creation.
+        mark_wallclock("executor_call_started")
+        # END this is not the first physical step.
         execution = executor.execute(planning_result,
             finger_targets=finger_targets, initial_feedback=initial_feedback,
             execution_limits=execution_limits,
@@ -506,6 +519,9 @@ def run(args, *, simulation=None, initial_feedback=None,
         if execution is None and executor is not None:
             execution = executor.last_execution_report
         if execution is not None:
+            # BEGIN copy already-recorded milestones on success and exceptional cleanup alike.
+            report["executor_wallclock"] = deepcopy(execution.get("wallclock"))
+            # END never infer dispatch from elapsed_sim_s, which can also include holds.
             try:
                 hold_steps = sum(0 if execution.get(key) is None else
                                  execution[key]["physical_steps"]

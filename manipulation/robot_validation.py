@@ -24,6 +24,93 @@ def _positive_scalar(value, label):
     return float(value)
 
 
+# BEGIN shared native confirmation of robot/world sphere candidates.
+class _OnlineCollisionConfirmation:
+    """Confirm only positive sphere candidates; preserve every other constraint.
+
+    The differentiable rollout never calls this object. Final candidate
+    metrics and measured execution use exactly the same adapter and frozen
+    observed cells. Native FK is performed only for states needing confirmation.
+    """
+
+    def __init__(self, validator, scene, check_request=None):
+        self.validator, self.scene, self.engine = validator, scene, None
+        self.check_request = check_request
+        self.last_report = {}
+
+    def __call__(self, costs, evidence):
+        from .online_native_confirmation import NativeCollisionConfirmation
+
+        # All candidates were masked for unresolved hand geometry and native
+        # exclusions before reaching this boundary. Non-finite costs remain
+        # failures; a finite positive candidate is the only confirmable input.
+        candidates = {}
+        for name, value in evidence['targets'].items():
+            if not bool((value > 0).any().item()):
+                continue
+            raw = value.detach().cpu().numpy()
+            # BEGIN incomplete/non-finite broad-phase evidence cannot become clear.
+            finite = np.isfinite(raw).all(axis=-1) & np.isfinite(costs[name].detach().cpu().numpy())
+            retained = np.where(finite[..., None], raw, 0.)
+            if np.any(retained > 0):
+                candidates[name] = retained
+            # END a NaN beside a positive sphere keeps the original failed term.
+        self.last_report = {'scope': 'native robot solids against the same frozen observed geometry',
+                            'candidate_states': 0, 'states': []}
+        if not candidates:
+            return costs
+        if self.engine is None:
+            self.engine = NativeCollisionConfirmation(self.validator.checker, self.scene)
+        if evidence['joint_position'] is None or not evidence['joint_names']:
+            raise ValueError('Native confirmation requires this query\'s complete named robot coordinates')
+        joints = evidence['joint_position'].detach().cpu().numpy()
+        fingers = (None if evidence['finger_positions'] is None else
+                   evidence['finger_positions'].detach().cpu().numpy())
+        poses = {name: (p.detach().cpu().numpy(), q.detach().cpu().numpy())
+                 for name, (p, q) in evidence['owner_poses'].items()}
+        effective = {name: value.detach().cpu().numpy()
+                     for name, value in evidence['effective_rules'].items()}
+        locations = np.argwhere(np.logical_or.reduce([np.any(value > 0, axis=-1)
+                                                       for value in candidates.values()]))
+        result = dict(costs)
+        for batch, index in locations:
+            named = dict(zip(evidence['joint_names'], joints[batch, index]))
+            if self.scene.gripper is not None:
+                named.update(zip(self.scene.gripper.joint_names, fingers[batch, index]))
+            if set(named) != set(self.validator.joint_names):
+                raise ValueError('Native confirmation cannot fill absent joints with a command or default')
+            robot = self.validator.checker.query(joint_names=self.validator.joint_names,
+                joint_positions=[named[name] for name in self.validator.joint_names],
+                T_reference_base=self.validator.T_reference_base, pairs=(), frames=[])
+            owner_poses = {}
+            for owner, (p, q) in poses.items():
+                pose = np.eye(4)
+                pose[:3, :3] = Rotation.from_quat(q[batch, index][[1, 2, 3, 0]]).as_matrix()
+                pose[:3, 3] = p[batch, index]
+                owner_poses[owner] = pose
+            by_owner = {name.removeprefix('collision/robot/'): np.flatnonzero(value[batch, index] > 0).tolist()
+                        for name, value in candidates.items() if np.any(value[batch, index] > 0)}
+            record = self.engine.confirm(robot_state=robot, candidates=by_owner,
+                owner_poses=owner_poses,
+                effective_contact_rule_ids=frozenset(name for name, active in effective.items()
+                                                     if bool(active[batch, index])),
+                check_request=self.check_request)
+            record['query_index'] = [int(batch), int(index)]
+            record['sphere_residuals'] = {name: float(costs[name][batch, index].item())
+                                         for name in candidates if name.removeprefix('collision/robot/') in by_owner}
+            self.last_report['states'].append(record)
+            for owner in record['cleared_targets']:
+                name = 'collision/robot/'+owner
+                if owner not in by_owner or name not in result:
+                    raise ValueError('Native confirmation returned an unqueried collision target')
+                if result[name] is costs[name]:
+                    result[name] = costs[name].clone()
+                result[name][batch, index] = 0.
+        self.last_report['candidate_states'] = len(self.last_report['states'])
+        return result
+# END no contact, coverage, unknown, controller or self-collision term is relaxed.
+
+
 # BEGIN one execution-facing failure schema, with original scene evidence intact.
 def _scene_gate_violations(scene):
     """Name physical violations and mandatory query gaps without losing cause."""
@@ -321,8 +408,17 @@ class RobotStateValidator:
         scene = OnlinePlanningScene.from_binding(binding)
         self._scene_binding = deepcopy(binding)
         self._online_scene = scene
+        # BEGIN one request-owned confirmation cache serves all actual states.
+        self._online_confirmation = self.online_collision_confirmation(scene)
+        # END frozen scene data are prepared lazily only if sphere candidates occur.
         self._online_sphere_count = len(indices)
         self._progress_at_time = progress_at_time
+
+    # BEGIN expose the same acceptance adapter to final planning metrics.
+    def online_collision_confirmation(self, scene, *, check_request=None):
+        """Create a scene-owned native confirmation adapter without binding execution."""
+        return _OnlineCollisionConfirmation(self, scene, check_request)
+    # END planner and executor own separate caches of identical immutable geometry.
 
     def _scene_state(self, robot_state, tool_pose, time_s, *, feedback=None,
                      active_contact_rule_ids=frozenset()):
@@ -339,7 +435,8 @@ class RobotStateValidator:
             joint_position=robot_state["joint_positions"], joint_names=robot_state["joint_names"],
             trajectory_time=float(time_s), active_contact_rule_ids=frozenset(active_contact_rule_ids),
             owner_poses=feedback.get("scene_owner_poses"),
-            condition_evidence=feedback.get("scene_condition_evidence"))
+            condition_evidence=feedback.get("scene_condition_evidence"),
+            native_confirmation=self._online_confirmation)
         # Query gaps are explicit online failures when present; source-mesh
         # coverage and nominal release reconstruction are not execution gates.
         scene.setdefault("query_gaps", [])

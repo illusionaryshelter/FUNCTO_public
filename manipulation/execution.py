@@ -652,6 +652,14 @@ class TrajectoryExecutor:
         # BEGIN a rejected new binding cannot expose an earlier trial report.
         self.last_execution_report = None
         # END this invocation publishes its own object only after creation.
+        # BEGIN measure execution admission separately from the native simulation clock.
+        invocation_started = time.monotonic()
+        wallclock = {"scope": "Executor admission and first normal trajectory step dispatch; dispatch does not prove integration completed; abort/dependency holds are excluded", "events": {}}
+        def mark_wallclock(name):
+            wallclock["events"][name] = {
+                "unix_time_ns": time.time_ns(), "elapsed_seconds": time.monotonic()-invocation_started}
+        mark_wallclock("execute_called")
+        # END all later failures retain any milestones already attached to the report.
         # BEGIN formal candidate handoff: labels cannot authorize commands.
         from .execution_binding import (check_result, nominal_finger_sampler,
             validate_controller_policy, validate_result_only_goal_ids)
@@ -869,6 +877,9 @@ class TrajectoryExecutor:
             "unconsumed_events": deepcopy(trajectory.events)}
         # BEGIN retain this same object through normal return and exceptional cleanup.
         self.last_execution_report = report
+        # BEGIN retain wall time separately; elapsed_sim_s keeps its existing physical meaning.
+        report["wallclock"] = wallclock
+        # END first-dispatch timing is written before the potentially failing backend call.
         # END finally updates the shared report with actual hold and continuation facts.
         # BEGIN physical guard provenance and actual-event evidence.
         report.update(execution_limits=execution_limits.describe(),
@@ -940,6 +951,10 @@ class TrajectoryExecutor:
             normal_accounting["charged_steps"] += 1
             primary = None
             try:
+                # BEGIN sample once at the actual normal playback integration call boundary.
+                if "first_trajectory_step_dispatched" not in wallclock["events"]:
+                    mark_wallclock("first_trajectory_step_dispatched")
+                # END no per-step clock reads, geometry queries or device synchronization.
                 backend.step()
             except Exception as error:
                 primary = error
@@ -2108,6 +2123,9 @@ class TrajectoryExecutor:
                 raise ExecutionGuardError("Independent geometry preflight rejected the execution reference")
             guard(samples[-1]["feedback"], curve_time=0., physical_elapsed=0., point="initial_state", sample=samples[-1],
                 contact_permissions=initial_permissions)
+            # BEGIN geometric preflight and initial actual-state guards have both passed.
+            mark_wallclock("preflight_completed")
+            # END event/dependency gates may still prevent the first trajectory step.
             consume_ordinary_events(samples[-1]["feedback"], 0.)
             active = release_dependencies(samples[-1]["feedback"], 0.)
             for index in range(count):
