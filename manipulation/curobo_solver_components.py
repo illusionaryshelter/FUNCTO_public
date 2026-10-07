@@ -102,10 +102,73 @@ class PhysicalGradientCore(GradientOptCore):
                 device=self.device_cfg.device, use_cuda_graph=True)
         # END metrics and the original Python iteration loop stay outside capture.
 
+    # BEGIN the same request deadline bounds each actual native optimization step.
+    def _check_request(self, *, wait_for_device=False):
+        """Check cancellation/budget without inventing another deadline.
+
+        Checks surround bounded calls; an already submitted CUDA kernel or
+        backward pass remains non-preemptible. Captured steps are checked by
+        their host replay boundary, never by a timer frozen into the graph.
+        """
+        if self.request_guard is not None:
+            # Synchronize only this core's current CUDA stream at completed
+            # forward/backward/step boundaries. Otherwise a fast CPU could
+            # enqueue a whole overdue block before the host clock sees it.
+            # Graph capture cannot synchronize internally; its host replay
+            # boundary completes the captured step before checking instead.
+            if (wait_for_device and self.device_cfg.device.type == "cuda"
+                    and not torch.cuda.is_current_stream_capturing()):
+                torch.cuda.current_stream(self.device_cfg.device).synchronize()
+            self.request_guard()
+
     def _opt_step(self, iteration_state):
-        if not self.use_cuda_graph:
-            return self._guarded_opt_step(iteration_state)
-        return self._replay_graph("_opt_step", iteration_state)
+        self._check_request()
+        result = (self._guarded_opt_step(iteration_state) if not self.use_cuda_graph
+                  else self._replay_graph("_opt_step", iteration_state))
+        self._check_request(wait_for_device=True)
+        return result
+
+    def _run_initial_evaluation(self, iteration_state):
+        # Native reinitialize bypasses _dispatch and the preparation wrapper;
+        # this hook covers both initialization entrances with their real cost.
+        self._check_request()
+        result = super()._run_initial_evaluation(iteration_state)
+        self._check_request(wait_for_device=True)
+        return result
+
+    def _cost_and_gradient_with_guard(self, x, rollout):
+        """Keep native cost/backward arithmetic, checking their host boundary.
+
+        cuRobo's two cost callbacks have no before-backward hook. This owned
+        implementation retains their detach, reshape, reduction, backward
+        vector and return tensors. The only added operation is the same
+        request check before forward, before backward and after backward.
+        """
+        from curobo._src.util.logging import log_and_raise
+        self._check_request()
+        x_n = x.detach().requires_grad_(True)
+        x_in = x_n.view(self.config.num_problems * self.config.num_particles,
+                       self.action_horizon, self.action_dim)
+        trajectories = rollout.evaluate_action(x_in, use_cuda_graph=False)
+        costs = trajectories.costs_and_constraints.get_sum_cost_and_constraint(sum_horizon=True)
+        if costs.shape != (self.config.num_problems * self.config.num_particles,):
+            log_and_raise(f"costs.shape != (num_problems*num_particles,): {costs.shape}")
+        cost = costs.view(self.config.num_problems, self.config.num_particles, 1)
+        # A forward evaluation that consumes the deadline must not initiate
+        # another expensive backward pass or publish its partial candidate.
+        self._check_request(wait_for_device=True)
+        cost.backward(gradient=self._l_vec, retain_graph=False)
+        self._check_request(wait_for_device=True)
+        g_x = x_n.grad.detach()
+        return cost, g_x
+
+    def _compute_cost_constraint_and_gradient(self, x):
+        return self._cost_and_gradient_with_guard(x, self.rollout_fn)
+
+    def _compute_cost_constraint_and_gradient_initial(self, x):
+        rollout = self._rollout_list[1] if len(self._rollout_list) > 1 else self._rollout_list[0]
+        return self._cost_and_gradient_with_guard(x, rollout)
+    # END no native iteration count, line-search arithmetic or budget is relaxed.
 
     # BEGIN real-displacement history contract and bounded recovery lifecycle.
     _progress_buffers = ("_exhausted", "_stalled_steps", "_effective_updates", "_iterations",
@@ -210,6 +273,8 @@ class PhysicalGradientCore(GradientOptCore):
         layout, including a fresh zero-scale cost/gradient, and never enter
         approximate-Wolfe's non-descending exploration fallback.
         """
+        # BEGIN recovery uses the same bounded request as ordinary steps.
+        self._check_request()
         stalled = ((self._stalled_steps >= self.config.inner_iters) & ~self._exhausted)
         indices = stalled.nonzero().flatten().tolist()
         if not indices:
@@ -233,6 +298,7 @@ class PhysicalGradientCore(GradientOptCore):
         direction = torch.zeros_like(base)
         reports = {}
         for index in indices:
+            self._check_request()
             state.best_cost[index].copy_(best_costs.detach()[index, 0, 0])
             if bool(base_cost[index] < state.best_cost[index]):
                 state.best_cost[index].copy_(base_cost[index])
@@ -244,6 +310,7 @@ class PhysicalGradientCore(GradientOptCore):
                 base_gradient[index:index+1],
                 self.action_horizon_step_max.reshape(self.action_horizon, self.action_dim),
                 context.line_search_scale)
+            self._check_request()
             direction[index:index+1].copy_(proposed)
             reports[index] = {**report, "accepted": False, "line_search_evaluations": 0}
         pending = [index for index in indices if reports[index]["success"]]
@@ -251,6 +318,7 @@ class PhysicalGradientCore(GradientOptCore):
         # their ratios and halve the complete direction at most eight times;
         # this is a bounded recovery search, independent of normal Wolfe work.
         for backtrack in range(8):
+            self._check_request()
             if not pending:
                 break
             direction = self.domain.limit_step(base, direction, context.line_search_scale)
@@ -293,6 +361,7 @@ class PhysicalGradientCore(GradientOptCore):
                 direction[index].zero_()
             pending = remaining
             direction.mul_(.5)
+            self._check_request()
         for index in indices:
             if not reports[index]["accepted"]:
                 self._exhausted[index] = True
@@ -309,6 +378,8 @@ class PhysicalGradientCore(GradientOptCore):
             self._history_resets[index] += 1
             self._recovery_reports[index].append(reports[index])
         self._all_exhausted = bool(self._exhausted.all())
+        self._check_request()
+        # END the two re-evaluations also use guarded forward/backward callbacks.
         return state
     # END exhausted rows preserve their best candidate while other seeds continue.
 
@@ -418,8 +489,7 @@ class PhysicalGradientCore(GradientOptCore):
 
     def _dispatch(self, method_name, *args):
         # BEGIN cancellation/deadline authorization is checked outside native kernels.
-        if self.request_guard is not None:
-            self.request_guard()
+        self._check_request()
         # END an in-flight native kernel is not claimed to be preemptible.
         # BEGIN stop exhausted solves before any further native rollout block.
         if method_name == "_opt_iters" and self._all_exhausted:

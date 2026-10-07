@@ -559,6 +559,11 @@ class ContactRule:
     # BEGIN a complete native edge is distinct from a fabricated thin polygon.
     feature_kind: str = "polygon"
     # END existing polygon declarations retain their exact geometry semantics.
+    # BEGIN explicit production material model, separate from source-audit features.
+    # None remains meaningful only to the independent geometric audit. The
+    # online scene requires a source-bound complete planar extrusion record.
+    online_material: object = None
+    # END no inferred planar model or whole-link contact fallback.
 
     def __post_init__(self):
         for name in ("rule_id", "actor", "target_owner", "material_id", "source"):
@@ -633,6 +638,23 @@ class ContactRule:
                 or not np.isfinite(self.numerical_angle_tolerance_rad)
                 or min(self.numerical_position_tolerance_m, self.numerical_angle_tolerance_rad) < 0):
             raise ValueError("Numerical contact tolerances must be separately declared finite values")
+        # BEGIN frozen native material registration for the online model.
+        if self.online_material is not None:
+            from copy import deepcopy
+            value = self.online_material
+            required = {"kind", "thickness_m", "native_geometry", "source",
+                        "sphere_indices", "sphere_binding_source"}
+            if not isinstance(value, dict) or set(value) != required:
+                raise ValueError("Online material needs an explicit native extrusion and sphere binding")
+            if (value["kind"] != "native_planar_extrusion_v1" or self.feature_kind != "polygon"
+                    or not np.isscalar(value["thickness_m"]) or not np.isfinite(value["thickness_m"])
+                    or value["thickness_m"] < self.minimum_thickness_m
+                    or tuple(value["sphere_indices"]) != self.sphere_indices):
+                raise ValueError("Online material must bind this full polygon, physical thickness and exact sphere indices")
+            for name in ("native_geometry", "source", "sphere_binding_source"):
+                _text(value[name], f"online material {name}")
+            self.online_material = deepcopy(value)
+        # END legacy audit records do not acquire online capability implicitly.
 
 
 # BEGIN pose-arrival permission identifies a complete explicit robot/owner pair.

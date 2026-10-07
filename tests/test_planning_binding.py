@@ -436,12 +436,14 @@ class PlanningBindingTest(unittest.TestCase):
                 progress, joints, ("q",), trajectory_time=clock, normalized_time=clock)
         self.assertTrue(bool((check(q) == 0).all()))
         sides, positions, times = observations[-1]
+        # BEGIN only the plateau entrance/exit have distinct side queries.
+        self.assertEqual(sides.shape[1], 5)
         self.assertLess(float(sides[0, 3]), .5)
-        self.assertEqual(float(sides[0, 4]), .5)
-        self.assertGreater(float(sides[0, -1]), .5)
-        for columns in (slice(0, 3), slice(3, 6), slice(6, 9)):
-            torch.testing.assert_close(positions[:, columns], q, rtol=0., atol=0.)
-            torch.testing.assert_close(times[:, columns], clock, rtol=0., atol=0.)
+        self.assertGreater(float(sides[0, 4]), .5)
+        selected = torch.tensor([0, 1, 2, 0, 2])
+        torch.testing.assert_close(positions, q.index_select(1, selected), rtol=0., atol=0.)
+        torch.testing.assert_close(times, clock.index_select(1, selected), rtol=0., atol=0.)
+        # END all original exact states remain present at unchanged q/time.
         q[:, 0] = .1
         self.assertGreater(float(check(q)[0, 0]), 0.)
 

@@ -171,6 +171,14 @@ def calibrate_box_material_features(model, *, tcp_site, joint_positions,
         "feature_points": zero[index].tolist(), "feature_normal": normals[index].tolist(),
         "feature_joint_translation": mapping[index].tolist(),
         "finger_joint_names": list(names), "native_thickness_m": float(2*model.geom_size[local_faces[index][0], row["face_axis"]]),
+        # BEGIN a complete native box is exactly its face extruded inward.
+        # This proof concerns the source solid, not its exterior sphere cover.
+        # The fixture adapter adds verified runtime sphere identities later.
+        "online_material": {"kind": "native_planar_extrusion_v1",
+            "thickness_m": float(2*model.geom_size[local_faces[index][0], row["face_axis"]]),
+            "native_geometry": row["native_geometry"],
+            "source": f"{row['source']}; complete native box face and inward extrusion"},
+        # END arbitrary polygons are not silently treated as complete solids.
         "affine_fk_max_error_m": error, "source": row["source"]}
         for index, row in enumerate(declarations)}
 
@@ -195,12 +203,21 @@ def build_material_contact_rules(material_binding, declarations):
         if row["material_id"] not in materials:
             raise ValueError("Contact material must belong to its explicitly bound actor")
         material = materials[row["material_id"]]
-        if any(name in row for name in feature_fields):
+        if any(name in row for name in (*feature_fields, "online_material")):
             raise ValueError("Material geometry must come from its native binding")
         # END caller declarations only set the finite target patch and allowance.
         for name in feature_fields:
             row[name] = material[name]
         row["sphere_indices"] = tuple(row["sphere_indices"])
+        # BEGIN bind online planar capability only through source geometry.
+        if "online_material" in material:
+            model = deepcopy(material["online_material"])
+            if not material.get("cover_certificate_path"):
+                raise ValueError("Online native material requires its verified collision-sphere cover binding")
+            model.update(sphere_indices=list(row["sphere_indices"]),
+                         sphere_binding_source=material["cover_certificate_path"])
+            row["online_material"] = model
+        # END source-audit features without capability remain audit-only.
         if row["minimum_thickness_m"] > material["native_thickness_m"]:
             raise ValueError("Contact thin-part scale must also respect the native material thickness")
         row["source"] = f"{row['source']}; native material: {material['source']}"

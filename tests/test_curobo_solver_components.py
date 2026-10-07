@@ -62,6 +62,164 @@ class NativeComponentTest(unittest.TestCase):
             optimizers=[optimizer], goal_registry_manager=GoalManager(self.device)))
         return solver, optimizer, rollouts
 
+    # BEGIN actual CPU native steps exercise request cancellation inside a block.
+    def test_request_guard_stops_after_one_actual_step_inside_native_inner_block(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        seed = torch.zeros((1, 1, 2))
+        def guard():
+            if int(core._iterations[0]) >= 1:
+                raise TimeoutError("same request deadline")
+        core.request_guard = guard
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+            with self.assertRaisesRegex(TimeoutError, "same request deadline"):
+                optimizer.optimize(seed)
+        self.assertEqual(core.config.inner_iters, 2)
+        self.assertEqual(int(core._iterations[0]), 1)
+        self.assertEqual(core._recovery_reports, [[]])
+
+    def test_expired_forward_never_starts_backward_for_either_native_callback(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        for initial in (False, True):
+            with self.subTest(initial=initial):
+                expired, backward = [False], []
+                rollout = rollouts[int(initial)]
+                original = rollout.evaluate_action
+                def forward(action, **kwargs):
+                    result = original(action, **kwargs)
+                    costs = result.costs_and_constraints.get_sum_cost_and_constraint(True)
+                    costs.register_hook(lambda gradient: backward.append(True) or gradient)
+                    expired[0] = True
+                    return result
+                def guard():
+                    if expired[0]:
+                        raise TimeoutError("forward consumed deadline")
+                core.request_guard = guard
+                x = torch.full((core.config.num_problems, core.config.num_particles, core.opt_dim), .4)
+                callback = (core._compute_cost_constraint_and_gradient_initial if initial
+                            else core._compute_cost_constraint_and_gradient)
+                with patch.object(rollout, "evaluate_action", side_effect=forward):
+                    with self.assertRaisesRegex(TimeoutError, "forward consumed deadline"):
+                        callback(x)
+                self.assertEqual(backward, [])
+
+    def test_completed_cuda_boundary_waits_only_current_stream_before_guard(self):
+        # Mock the CUDA interface only: no CUDA tensor or environment is needed
+        # to prove that elapsed-device work precedes the deadline observation.
+        core = object.__new__(PhysicalGradientCore)
+        core.device_cfg = SimpleNamespace(device=torch.device("cuda:0"))
+        events = []
+        core.request_guard = lambda: events.append("guard")
+        stream = SimpleNamespace(synchronize=lambda: events.append("stream_done"))
+        with patch("torch.cuda.current_stream", return_value=stream) as current, \
+             patch("torch.cuda.is_current_stream_capturing", return_value=False), \
+             patch("torch.cuda.synchronize", side_effect=AssertionError("global device synchronization")):
+            core._check_request()
+            core._check_request(wait_for_device=True)
+        self.assertEqual(events, ["guard", "stream_done", "guard"])
+        current.assert_called_once_with(torch.device("cuda:0"))
+
+    def test_deadline_crossed_by_backward_rejects_completed_cost_callback(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        expired = [False]
+        original = rollouts[0].evaluate_action
+        def forward(action, **kwargs):
+            result = original(action, **kwargs)
+            costs = result.costs_and_constraints.get_sum_cost_and_constraint(True)
+            def backward(gradient):
+                expired[0] = True
+                return gradient
+            costs.register_hook(backward)
+            return result
+        def guard():
+            if expired[0]:
+                raise TimeoutError("backward consumed deadline")
+        core.request_guard = guard
+        x = torch.full((core.config.num_problems, core.config.num_particles, core.opt_dim), .4)
+        with patch.object(rollouts[0], "evaluate_action", side_effect=forward):
+            with self.assertRaisesRegex(TimeoutError, "backward consumed deadline"):
+                core._compute_cost_constraint_and_gradient(x)
+        self.assertTrue(expired[0])
+
+    def test_guarded_cost_and_gradient_preserve_both_native_callbacks(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        x = torch.full((core.config.num_problems, core.config.num_particles, core.opt_dim), .4)
+        checked = []
+        core.request_guard = lambda: checked.append(True)
+        for name in ("_compute_cost_constraint_and_gradient", "_compute_cost_constraint_and_gradient_initial"):
+            expected = getattr(GradientOptCore, name)(core, x)
+            actual = getattr(core, name)(x)
+            for before, after in zip(expected, actual):
+                torch.testing.assert_close(before, after, rtol=0., atol=0.)
+        self.assertEqual(len(checked), 6)
+
+    def test_recovery_rejects_a_qp_finishing_after_deadline_before_any_trial(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        seed = torch.ones((1, 1, 2))
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+        core = optimizer._core
+        core._stalled_steps.fill_(core.config.inner_iters)
+        expired = [False]
+        def proposal(*args):
+            expired[0] = True
+            return -torch.full_like(seed, .1), {"success": True, "reason": "synthetic QP"}
+        def guard():
+            if expired[0]:
+                raise TimeoutError("QP consumed deadline")
+        core.request_guard = guard
+        with patch.object(domain, "recovery_step", side_effect=proposal), \
+             patch.object(core, "_compute_cost_constraint_and_gradient",
+                          wraps=core._compute_cost_constraint_and_gradient) as evaluations:
+            with self.assertRaisesRegex(TimeoutError, "QP consumed deadline"):
+                core._recover_stalled(core._iteration_state)
+        # Current/best references were re-evaluated; no backtracking trial ran.
+        self.assertEqual(evaluations.call_count, 2)
+        self.assertEqual(core._recovery_reports, [[]])
+    def test_recovery_deadline_after_first_trial_prevents_another_backtrack(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        seed = torch.ones((1, 1, 2))
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+        core = optimizer._core
+        core._stalled_steps.fill_(core.config.inner_iters)
+        expired, count = [False], [0]
+        original = core._compute_cost_constraint_and_gradient
+        def evaluate(x):
+            result = original(x)
+            count[0] += 1
+            expired[0] = count[0] >= 3
+            return result
+        def guard():
+            if expired[0]:
+                raise TimeoutError("first recovery trial consumed deadline")
+        core.request_guard = guard
+        with patch.object(domain, "recovery_step", return_value=(-torch.full_like(seed, .1),
+                {"success": True, "reason": "inward ascending counterexample"})), \
+             patch.object(core, "_compute_cost_constraint_and_gradient", side_effect=evaluate):
+            with self.assertRaisesRegex(TimeoutError, "first recovery trial consumed deadline"):
+                core._recover_stalled(core._iteration_state)
+        self.assertEqual(count[0], 3)
+        self.assertEqual(core._recovery_reports, [[]])
+
+    # END deadline failures never become completed optimization candidates.
+
     def test_both_rollouts_obey_domains_through_native_resize_and_reinitialize(self):
         lower, upper = torch.tensor([.1, -.8]), torch.tensor([1., .9])
         domains = [(JointPositionDomain(lower, upper), 1),

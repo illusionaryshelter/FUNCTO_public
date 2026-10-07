@@ -1,10 +1,10 @@
 """One frozen, finite geometry model for planning and measured-state queries.
 
 The Mapper's signed distances use positive free space. Unknown samples never
-become free evidence. Contact subtraction operates on bounded field cells and
-requires the complete cell to fit a finite material permission; no owner/link
-pair can be disabled. CPU execution reads the exact arrays used by Torch during
-optimization. Source-mesh reconstruction belongs to the separate audit API.
+become free evidence. Contact preparation freezes forbidden-region fields once;
+online material conditions use registered finite native planar extrusions. No
+occupied-cell loop or whole-owner permission enters optimization. CPU execution
+reads the exact frozen arrays used by Torch. Source Boolean audits are separate.
 """
 # BEGIN unified frozen online geometry; no source-solid or layer fallback.
 from copy import copy, deepcopy
@@ -15,11 +15,11 @@ import math
 import numpy as np
 import torch
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint
 from scipy.spatial.transform import Rotation
 
 from .collision_records import encode_array, decode_array, MAX_ARRAY_BYTES
 from .planning_problem import PosePath, quaternion_conjugate, quaternion_rotate, event_occurrence_key
+from .online_contact import PreparedContactFields, planar_material_conditions, require_planar_material
 from .planning_scene import (Attachment, CollisionOwner, ContactRule, ObservedSpace,
     PlanningScene, PrismaticGripper, _tensor, _local_spheres, _world_spheres,
     _self_pair_sum, grasp_contact_rule_ids, validate_grasp_contact_arrival)
@@ -45,7 +45,7 @@ class FrozenESDF:
     free-space observation. Field bounds are fixed for the entire request.
     """
     def __init__(self, distance, *, origin, voxel_size, site_valid, observed_sign,
-                 owner_ids, source, contact_max_cells=32768):
+                 owner_ids, source):
         distance = np.asarray(distance, dtype=np.float32)
         valid, sign = np.asarray(site_valid), np.asarray(observed_sign)
         if (distance.ndim != 3 or min(distance.shape) < 2 or distance.nbytes > MAX_ARRAY_BYTES
@@ -60,11 +60,10 @@ class FrozenESDF:
         for value in (self.distance, self.site_valid, self.observed_sign):
             value.flags.writeable = False
         self.owner_ids, self.source = frozenset(owner_ids), str(source)
-        self.contact_max_cells = int(contact_max_cells)
+        # BEGIN immutable prepared contact fields replace per-cell inventories.
         self._device = {}
-        self._contact_regions = {}
-        self._contact_surfaces = {}
-        self._contact_unions = {}
+        self._contact_model = None
+        # END preparing a request never adds an occupied-cell rollout path.
         self.upper = self.origin+(np.asarray(distance.shape)-1)*self.voxel_size
         occupied=self.site_valid & ((np.abs(self.distance)<=self.voxel_size*.51) | ((self.distance<0)&self.observed_sign))
         if occupied.any():
@@ -75,13 +74,10 @@ class FrozenESDF:
             self.geometry_lower=self.geometry_upper=None
 
     def clone_for_rollout(self):
-        result=copy(self)
-        # Dense arrays are immutable; request-specific finite inventories own
-        # their dictionaries so a reused rule ID cannot rewrite a sibling.
-        result._contact_regions=dict(self._contact_regions)
-        result._contact_surfaces=dict(self._contact_surfaces)
-        result._contact_unions=dict(self._contact_unions)
-        return result
+        # BEGIN frozen arrays and prepared fields are safe to share read-only.
+        # Replacing this request's model never mutates a sibling's binding.
+        return copy(self)
+        # END only the query wrapper is request-local.
 
     def _sample(self, value, points, name):
         key = (name, points.device, points.dtype)
@@ -121,141 +117,51 @@ class FrozenESDF:
         valid = self._sample(self.site_valid,spheres[..., :3],'site') > 0
         return torch.where((spheres[..., 3] > 0) & intersects & valid, values, torch.zeros_like(values))
 
-    def prepare_contact(self, rule, radius):
-        """Freeze a bounded local inventory around the complete permission patch.
+    # BEGIN one preparation phase, followed only by bounded batched queries.
+    def prepare_contacts(self, rules, maximum_radii):
+        if self._contact_model is not None:
+            self._contact_model.validate_binding(rules, maximum_radii)
+            return
+        self._contact_model = PreparedContactFields.prepare(
+            distance=self.distance, site_valid=self.site_valid, observed_sign=self.observed_sign,
+            origin=self.origin, voxel_size=self.voxel_size, rules=rules,
+            maximum_radii=maximum_radii, source=self.source)
 
-        Inventory includes signed occupied cells and every source surface cell.
-        A complete query sphere must fit this inventory's interior; otherwise
-        its ordinary field collision remains in force and model support fails.
-        """
-        corners = np.asarray(list(product((-1., 1.), repeat=3)))
-        widths = np.r_[rule.patch_half_size, rule.modeling_allowance_m]
-        points = rule.patch_origin + (corners*widths) @ rule.patch_axes.T
-        support = float(radius)+2*math.sqrt(3)*self.voxel_size
-        lo = np.maximum(np.floor((points.min(0)-support-self.origin)/self.voxel_size).astype(int), 0)
-        hi = np.minimum(np.ceil((points.max(0)+support-self.origin)/self.voxel_size).astype(int)+1, self.distance.shape)
-        if np.any(hi <= lo):
-            raise ValueError('UNSUPPORTED_MODEL: finite contact ROI lies outside the frozen field')
-        slices = tuple(slice(a, b) for a, b in zip(lo, hi))
-        values, valid = self.distance[slices], self.site_valid[slices]
-        # ESDF zero sites retain the observed surface even when direct sign is
-        # absent there. Strict negative volume requires observed TSDF sign.
-        occupied = valid & ((np.abs(values) <= self.voxel_size*.51) |
-                           ((values < 0) & self.observed_sign[slices]))
-        # Count actual represented material cells, not free lattice samples.
-        # The parent field already bounds this view's memory; only occupied
-        # cells participate in per-state finite subtraction and its work cap.
-        if int(np.count_nonzero(occupied))>self.contact_max_cells:
-            raise ValueError('UNSUPPORTED_MODEL: finite contact material inventory exceeds frozen cell budget')
-        indices = np.argwhere(occupied)+lo
-        centres = self.origin+indices*self.voxel_size
-        self._contact_unions.clear()
-        self._contact_regions[rule.rule_id] = (centres, self.origin+lo*self.voxel_size,
-            self.origin+(hi-1)*self.voxel_size)
-        values_at_cells=self.distance[tuple(indices.T)] if len(indices) else np.empty(0)
-        self._contact_surfaces[rule.rule_id]=centres[np.abs(values_at_cells)<=self.voxel_size*.51]
-
-    def required_contact(self,rule,policy):
-        """Numerical finite surface/permission intersection, using actual field sites.
-
-        A patch declaration supplies no measured contact. Required contact has
-        a witness only when an observed zero-surface cell lies inside every
-        material, target-patch, gap and normal constraint at the queried FK.
-        """
-        normals,bounds=policy['normals'],policy['bounds']
-        points=self._contact_surfaces[rule.rule_id]
-        if not len(points):
-            return torch.ones_like(policy['active'],dtype=normals.dtype)
-        best=torch.full_like(bounds[...,0],float('inf'))
-        for start in range(0,len(points),256):
-            cells=_tensor(points[start:start+256],normals)
-            excess=torch.einsum('...pc,vc->...vp',normals,cells)-bounds.unsqueeze(-2)
-            best=torch.minimum(best,torch.relu(excess).amax(-1).amin(-1))
-        return best
+    def required_contact(self, rule, policy):
+        if self._contact_model is None:
+            raise ValueError('UNSUPPORTED_MODEL: finite contact fields must be prepared before querying')
+        return self._contact_model.required_contact(rule, policy)
 
     def contact_query(self, spheres, policies):
-        """Subtract only wholly permitted cells, then query every forbidden cell.
-
-        A box support function tests all eight cell corners against each
-        finite permission plane. The remaining cells use exact sphere/box
-        distance. Overlapping rules form a union; no sphere-level waiver is
-        possible. The inventory and native field are fixed before optimization.
-        """
         ordinary = self(spheres)
-        unsupported = torch.zeros_like(ordinary)
-        # The finite policy has no effect before its nominal interval, with
-        # uncertain future fingers, or without an actual runtime latch. These
-        # modes are already explicit tensors; omit their entire cell workload.
-        policies=[(rule,policy) for rule,policy in policies if bool(policy['active'].any())]
         if not policies:
-            return ordinary,unsupported
-        for index in sorted({i for rule, _ in policies for i in rule.sphere_indices}):
-            selected = [(rule, policy) for rule, policy in policies if index in rule.sphere_indices]
-            centre, radius = spheres[..., index, :3], spheres[..., index, 3]
-            # Union inventories before removing permitted volume. Duplicate
-            # cells are immaterial under max; a bounded concatenation avoids
-            # a state-dependent nearest-neighbour or CPU query in the solve.
-            arrays = [self._contact_regions[rule.rule_id] for rule, _ in selected]
-            union_key=tuple(rule.rule_id for rule,_ in selected)
-            if union_key not in self._contact_unions:
-                self._contact_unions[union_key]=np.unique(np.concatenate([row[0] for row in arrays]),axis=0)
-            cells=self._contact_unions[union_key]
-            if len(cells) > self.contact_max_cells:
-                raise ValueError('UNSUPPORTED_MODEL: combined finite contact cell budget exceeded')
-            any_active = torch.zeros_like(radius, dtype=torch.bool)
-            fits = torch.zeros_like(any_active)
-            for (rule, policy), (_, lower, upper) in zip(selected, arrays):
-                active = policy['active'] & policy['normal_valid']
-                any_active |= active
-                fits |= active & ((centre-radius[..., None] >= _tensor(lower, centre)) &
-                                  (centre+radius[..., None] <= _tensor(upper, centre))).all(-1)
-            maximum = torch.zeros_like(radius)
-            # Each chunk bounds state x cell x plane scratch; no horizon-sized
-            # full inventory or reconstructed target solid is allocated.
-            chunk = max(1, min(256, 131072//max(1, radius.numel())))
-            def cell_residual(centre,radius,points,*parameters):
-                permitted=torch.zeros((*radius.shape,len(points)),dtype=torch.bool,device=centre.device)
-                for offset in range(0,len(parameters),4):
-                    normals,bounds,active,normal_valid=parameters[offset:offset+4]
-                    projection=torch.einsum('...pc,vc->...vp',normals,points)
-                    support=normals.abs().sum(-1)*self.voxel_size/2
-                    inside=(projection+support.unsqueeze(-2)<=bounds.unsqueeze(-2)).all(-1)
-                    permitted|=inside & active.unsqueeze(-1) & normal_valid.unsqueeze(-1)
-                offset=(centre.unsqueeze(-2)-points).abs()-self.voxel_size/2
-                distance=torch.linalg.vector_norm(torch.relu(offset),dim=-1)+offset.amax(-1).clamp_max(0)
-                penetration=torch.relu(radius.unsqueeze(-1)-distance)
-                return torch.where(permitted,0.,penetration).amax(-1)
-            parameters=tuple(value for _,policy in selected for value in
-                (policy['normals'],policy['bounds'],policy['active'],policy['normal_valid']))
-            for start in range(0,len(cells),chunk):
-                points=_tensor(cells[start:start+chunk],centre)
-                # Recompute finite cell arithmetic in backward instead of
-                # retaining state x cell intermediates for every pad sphere.
-                value=(checkpoint(cell_residual,centre,radius,points,*parameters,
-                    use_reentrant=False,preserve_rng_state=False) if torch.is_grad_enabled() and centre.requires_grad
-                    else cell_residual(centre,radius,points,*parameters))
-                maximum=torch.maximum(maximum,value)
-            result = torch.where(fits, maximum, ordinary[..., index])
-            ordinary = ordinary.clone()
-            ordinary[..., index] = result
-            unsupported[..., index] = (any_active & ~fits).to(radius.dtype)
-        return ordinary, unsupported
+            return ordinary, torch.zeros_like(ordinary)
+        if self._contact_model is None:
+            raise ValueError('UNSUPPORTED_MODEL: finite contact fields must be prepared before querying')
+        return self._contact_model.query(spheres, policies, ordinary, self.intersects_geometry(spheres))
+    # END no source-site enumeration or checkpoint recomputation is online.
 
     def record(self):
-        return {'kind':'frozen_esdf_v1', 'distance':encode_array(self.distance),
+        return {'kind':'frozen_esdf_v2', 'distance':encode_array(self.distance),
             'site_valid':encode_array(self.site_valid), 'observed_sign':encode_array(self.observed_sign),
             'origin':self.origin.tolist(), 'voxel_size':self.voxel_size,
-            'owner_ids':sorted(self.owner_ids), 'source':self.source, 'contact_max_cells':self.contact_max_cells}
+            'owner_ids':sorted(self.owner_ids), 'source':self.source,
+            'contact_model':None if self._contact_model is None else self._contact_model.record()}
 
     @classmethod
     def from_record(cls, row):
-        if row.get('kind') == 'frozen_primitives_v1':
-            return FrozenPrimitives(primitives=row['primitives'],owner_ids=row['owner_ids'],source=row['source'],contact_voxel_size_m=row['contact_voxel_size_m'])
-        if row.get('kind') != 'frozen_esdf_v1':
-            raise ValueError('UNSUPPORTED_MODEL: online binding requires its frozen field')
-        return cls(decode_array(row['distance']), origin=row['origin'], voxel_size=row['voxel_size'],
-            site_valid=decode_array(row['site_valid']), observed_sign=decode_array(row['observed_sign']),
-            owner_ids=row['owner_ids'], source=row['source'], contact_max_cells=row['contact_max_cells'])
+        if row.get('kind') == 'frozen_primitives_v2':
+            result = FrozenPrimitives(primitives=row['primitives'],owner_ids=row['owner_ids'],
+                source=row['source'],contact_voxel_size_m=row['contact_voxel_size_m'])
+        elif row.get('kind') == 'frozen_esdf_v2':
+            result = cls(decode_array(row['distance']), origin=row['origin'], voxel_size=row['voxel_size'],
+                site_valid=decode_array(row['site_valid']), observed_sign=decode_array(row['observed_sign']),
+                owner_ids=row['owner_ids'], source=row['source'])
+        else:
+            raise ValueError('UNSUPPORTED_MODEL: online binding requires the current frozen-field schema')
+        if row['contact_model'] is not None:
+            result._contact_model = PreparedContactFields.from_record(row['contact_model'])
+        return result
 
 
 class FrozenPrimitives(FrozenESDF):
@@ -263,7 +169,7 @@ class FrozenPrimitives(FrozenESDF):
 
     cuboid dimensions are full lengths; box dimensions are half lengths.
     Cylinder/capsule dimensions are radius and half height. Poses are xyz+wxyz.
-    Contact discretization is explicit and required only for finite subtraction.
+    Contact-field resolution is explicit and used only during request preparation.
     """
     def __init__(self, *, primitives, owner_ids, source, contact_voxel_size_m=None):
         self.primitives=deepcopy(primitives)
@@ -271,10 +177,8 @@ class FrozenPrimitives(FrozenESDF):
             raise ValueError('Explicit bounded primitive inventory required')
         self.owner_ids,self.source=frozenset(owner_ids),str(source)
         self.contact_voxel_size_m=contact_voxel_size_m
-        self._contact_regions,self._device={},{}
-        self._contact_surfaces={}
-        self._contact_unions={}
-        self.contact_max_cells=32768
+        self._device={}
+        self._contact_model=None
         self.distance=np.empty((0,),dtype=np.float32)
         self.site_valid=self.observed_sign=np.empty((0,),dtype=bool)
         lower,upper=[],[]
@@ -328,28 +232,49 @@ class FrozenPrimitives(FrozenESDF):
             return self.signed_distance(points)
         return torch.ones(points.shape[:-1],dtype=points.dtype,device=points.device)
 
-    def prepare_contact(self,rule,radius):
-        if self.contact_voxel_size_m is None or not self.voxel_size>0:
-            raise ValueError('UNSUPPORTED_MODEL: primitive contact needs explicit finite contact_voxel_size_m')
-        corners=np.asarray(list(product((-1.,1.),repeat=3)))
-        points=rule.patch_origin+(corners*np.r_[rule.patch_half_size,rule.modeling_allowance_m])@rule.patch_axes.T
-        margin=radius+2*math.sqrt(3)*self.voxel_size
-        lo=points.min(0)-margin
-        hi=points.max(0)+margin
-        shape=np.ceil((hi-lo)/self.voxel_size).astype(int)+1
-        if math.prod(shape)>self.contact_max_cells:
-            raise ValueError('UNSUPPORTED_MODEL: primitive finite contact ROI exceeds cell budget')
-        indices=np.indices(shape).reshape(3,-1).T
-        centres=lo+indices*self.voxel_size
-        distance=self.signed_distance(torch.as_tensor(centres,dtype=torch.float64)).numpy()
-        cells=centres[distance<=math.sqrt(3)*self.voxel_size/2]
-        self._contact_unions.clear()
-        self._contact_regions[rule.rule_id]=(cells,lo,lo+(shape-1)*self.voxel_size)
-        self._contact_surfaces[rule.rule_id]=centres[np.abs(distance)<=math.sqrt(3)*self.voxel_size/2]
+    # BEGIN full registered primitive grid preparation, never a cropped contact inventory.
+    def prepare_contacts(self, rules, maximum_radii):
+        if self._contact_model is not None:
+            self._contact_model.validate_binding(rules, maximum_radii)
+            return
+        if self.contact_voxel_size_m is None or not self.voxel_size > 0:
+            raise ValueError('UNSUPPORTED_MODEL: primitive contact needs explicit contact_voxel_size_m')
+        margin = max(maximum_radii.values()) + 2 * math.sqrt(3.) * self.voxel_size
+        lower, upper = self.geometry_lower - margin, self.geometry_upper + margin
+        # Include the complete declared patch as well as every primitive, so
+        # no obstacle is dropped just because it lies beyond the contact area.
+        corners = np.asarray(list(product((-1., 1.), repeat=3)))
+        for rule in rules:
+            points = rule.patch_origin + (corners * np.r_[rule.patch_half_size,
+                rule.modeling_allowance_m]) @ rule.patch_axes.T
+            lower = np.minimum(lower, points.min(0) - margin)
+            upper = np.maximum(upper, points.max(0) + margin)
+        shape = np.ceil((upper - lower) / self.voxel_size).astype(int) + 1
+        count = math.prod(shape)
+        if count * 4 > MAX_ARRAY_BYTES:
+            raise ValueError('UNSUPPORTED_MODEL: complete primitive contact field exceeds source-grid capacity')
+        # Only one small query block is live; native signed distances remain
+        # exact in ordinary collision queries outside contact mode.
+        distance = np.empty(count, np.float32)
+        with torch.no_grad():
+            for start in range(0, count, 65536):
+                flat = np.arange(start, min(count, start + 65536))
+                indices = np.column_stack(np.unravel_index(flat, tuple(shape)))
+                points = lower + indices * self.voxel_size
+                distance[start:start + len(flat)] = self.signed_distance(
+                    torch.as_tensor(points, dtype=torch.float64)).numpy()
+        distance = distance.reshape(tuple(shape))
+        known = np.ones(tuple(shape), dtype=bool)
+        occupied = distance <= math.sqrt(3.) * self.voxel_size / 2
+        self._contact_model = PreparedContactFields.prepare(distance=distance, site_valid=known,
+            observed_sign=known, origin=lower, voxel_size=self.voxel_size, rules=rules,
+            maximum_radii=maximum_radii, source=self.source, occupied=occupied)
+    # END online queries only read these frozen prepared arrays.
 
     def record(self):
-        return {'kind':'frozen_primitives_v1','primitives':deepcopy(self.primitives),
-            'owner_ids':sorted(self.owner_ids),'source':self.source,'contact_voxel_size_m':self.contact_voxel_size_m}
+        return {'kind':'frozen_primitives_v2','primitives':deepcopy(self.primitives),
+            'owner_ids':sorted(self.owner_ids),'source':self.source,'contact_voxel_size_m':self.contact_voxel_size_m,
+            'contact_model':None if self._contact_model is None else self._contact_model.record()}
 
 
 class OnlinePlanningScene:
@@ -399,6 +324,15 @@ class OnlinePlanningScene:
             materials = self.robot_sphere_materials if rule.actor == 'robot' else next(o.sphere_materials for o in self.owners if o.owner_id == rule.actor)
             if any(i >= len(materials) or materials[i] != rule.material_id for i in rule.sphere_indices):
                 raise ValueError('Finite permission sphere indices must identify precisely the declared material')
+            # BEGIN explicit production capability and native geometry ownership.
+            require_planar_material(rule)
+            native = rule.online_material['native_geometry']
+            if rule.actor == 'robot' and self.native_geometry_materials.get(native) != rule.material_id:
+                raise ValueError('UNSUPPORTED_MODEL: online material must retain its source-verified native geometry identity')
+            # Owner actors retain their own material/sphere/source binding.
+            # native_geometry_names is a fixed-installation collision alias,
+            # not a general owner material registry and cannot be borrowed here.
+            # END arbitrary sphere labels do not establish a planar solid.
 
     def bind_online_robot(self, *, robot_sphere_geometry, robot_self_collision_pairs,
                           robot_self_collision_padding=None, robot_geometry_source=None, robot_model=None):
@@ -428,11 +362,19 @@ class OnlinePlanningScene:
         self.required_robot_links = tuple(row['link_name'] for row in robot_sphere_geometry)
         self._prepare_contacts(radii)
 
+    # BEGIN compile complete per-owner field banks once after exact sphere binding.
     def _prepare_contacts(self, robot_radii):
         owners = {owner.owner_id:owner for owner in self.owners}
-        for rule in self.contacts:
-            radii = robot_radii if rule.actor == 'robot' else owners[rule.actor].local_spheres[:, 3]
-            owners[rule.target_owner].query.prepare_contact(rule, max(radii[list(rule.sphere_indices)]))
+        for owner in self.owners:
+            rules = tuple(rule for rule in self.contacts if rule.target_owner == owner.owner_id)
+            if not rules:
+                continue
+            maximum = {}
+            for rule in rules:
+                radii = robot_radii if rule.actor == 'robot' else owners[rule.actor].local_spheres[:, 3]
+                maximum[rule.rule_id] = float(max(radii[list(rule.sphere_indices)]))
+            owner.query.prepare_contacts(rules, maximum)
+    # END a serialized model validates and reuses its exact prepared arrays.
 
     def clone_for_rollout(self):
         result = copy(self)
@@ -614,7 +556,7 @@ class OnlinePlanningScene:
                 for rule in self.contacts:
                     if rule.actor != actor or rule.target_owner != owner.owner_id:
                         continue
-                    if rule.rule_id not in owner.query._contact_regions:
+                    if owner.query._contact_model is None or rule.rule_id not in owner.query._contact_model.regions:
                         raise ValueError('UNSUPPORTED_MODEL: robot sphere geometry must bind before finite contact queries')
                     policy, normal, uncertainty = self._permission(rule,body,actor_pose,poses[owner.owner_id],
                         permission_progress if actor=='robot' else progress,coordinates,half)
@@ -623,6 +565,13 @@ class OnlinePlanningScene:
                     policies.append((rule,policy))
                     costs[f'contact/normal/{rule.rule_id}'] = normal*policy['active']
                     costs[f'conditional/finger/{rule.rule_id}'] = uncertainty
+                    # BEGIN native finite material replaces cell Boolean permission.
+                    normal_actor = quaternion_rotate(actor_pose[1], _tensor(rule.feature_normal, progress))
+                    normal_target = quaternion_rotate(quaternion_conjugate(poses[owner.owner_id][1]), normal_actor)
+                    material_terms = planar_material_conditions(rule, policy, normal_target, owner.query._contact_model)
+                    for term, residual in material_terms.items():
+                        costs[f'contact/{term}/{rule.rule_id}'] = residual
+                    # END gap/side/back constraints participate in every same-model decision.
                     if rule.required:
                         costs[f'contact/required/{rule.rule_id}'] = owner.query.required_contact(rule,policy)*policy['active']
                 values, gap = owner.query.contact_query(local,policies) if policies else (owner.query(local),torch.zeros_like(local[...,3]))
@@ -645,14 +594,47 @@ class OnlinePlanningScene:
         return torch.stack(hard).sum(0)
 
     def estimated_workspace_allocation(self,batch,horizon,robot_coverage_horizon=0):
+        # BEGIN account source arrays separately from both floating cache types.
+        # A read-only clone shares its array/cache identity. A distinct field
+        # with equal contents still owns separate storage and is counted twice.
         fields = [self.background]+[o.query for o in self.owners]
-        shared = sum(q.distance.nbytes+q.site_valid.nbytes+q.observed_sign.nbytes for q in fields)+self.coverage._distance.numel()*4
+        sources, ordinary_caches, contact_models = {}, {}, {}
+        for query in fields:
+            for array in (query.distance, query.site_valid, query.observed_sign):
+                sources[id(array)] = array.nbytes
+            if query.distance.size:
+                # Only distance and nearest-source validity are sampled. Both
+                # become float32/float64, including the original bool mask.
+                ordinary_caches[id(query._device)] = 2 * query.distance.size
+            if query._contact_model is not None:
+                model = query._contact_model
+                contact_models[id(model)] = model
+                for row in model.channels:
+                    if row['kind'] == 'field':
+                        sources[id(row['distance'])] = row['distance'].nbytes
+        for name in ('_known', '_known_free'):
+            array = getattr(self.coverage, name)
+            if array is not None:
+                sources[id(array)] = array.nbytes
+        coverage_cells = self.coverage._distance.numel()
+        source_bytes = sum(sources.values()) + coverage_cells * 4
+        sampled_elements = sum(ordinary_caches.values()) + sum(
+            model.storage_nbytes // 4 for model in contact_models.values())
+        # Reserve both dtypes on the CPU and on the one permitted GPU. CPU
+        # coverage float32 aliases its source tensor; its float64 copy is new.
+        constants = 65536 * (1 + len(ordinary_caches) + sum(
+            len(model.rule_records) for model in contact_models.values()))
+        cpu_shared = source_bytes + sampled_elements * (4 + 8) + coverage_cells * 8 + constants
+        gpu_shared = (sampled_elements + coverage_cells) * (4 + 8) + constants
         live = int(batch)*int(horizon)*max(1,len(self.robot_sphere_materials))*512
-        # These Torch queries own no per-manager native collision buffers.
-        # Autograd scratch is sequential live memory, not a retained copy for
-        # every manager/line-search particle; dense immutable grids are shared.
-        return dict(cpu_shared=shared,cpu_live=live,gpu_shared=shared*3,gpu_live=live,
-                    gpu_retained=0,gpu_graph_live=live)
+        # Preparing a new dtype may temporarily stack float32 source channels
+        # before the owning Torch tensor is copied/converted. This CPU scratch
+        # is separate from the final caches counted above.
+        upload_scratch = max([0, *(query.distance.nbytes for query in fields),
+            *(model.storage_nbytes for model in contact_models.values())])
+        return dict(cpu_shared=int(cpu_shared),cpu_live=int(live+upload_scratch),
+                    gpu_shared=int(gpu_shared),gpu_live=live,gpu_retained=0,gpu_graph_live=live)
+        # END no duplicate group bank or bool-as-one-byte floating cache assumption.
 
     def query_state(self,spheres,tool_pose,progress,*,joint_position=None,joint_names=None,
                     trajectory_time=0.,active_contact_rule_ids=frozenset(),owner_poses=None,condition_evidence=None):
@@ -674,11 +656,11 @@ class OnlinePlanningScene:
             'conditional_unknown':{k:v for k,v in values.items() if k.startswith('conditional/') and v>0}}
 
     def describe(self):
-        return {'model':'frozen_online_esdf_v1','reference_frame':self.reference_frame,
+        return {'model':'frozen_online_esdf_planar_contact_v2','reference_frame':self.reference_frame,
             'robot_geometry_source':self.robot_geometry_source,'owners':[o.owner_id for o in self.owners],
             'unknown_policy':deepcopy(self.unknown_policy),'required_progress_anchors':self.required_progress_anchors,
             'observation_report':deepcopy(self.observation_report),
-            'scope':'fixed observed fields; finite material subtraction; conditional unknown is not free evidence'}
+            'scope':'fixed observed fields and registered native planar contact; conservative projection bounds; conditional unknown is not free evidence'}
 
     def to_execution_binding(self):
         owners = []
@@ -695,7 +677,7 @@ class OnlinePlanningScene:
         hand_record = None
         if hand is not None:
             hand_record = {key:_plain(getattr(hand,key)) for key in ('controller','joint_names','current_positions','joint_limits','coupling_matrix','coupling_offset','sphere_indices','local_spheres','sphere_joint_translation','self_collision_pairs','commands','source','control_timestep_s','numerical_joint_tolerance')}
-        return {'schema':'online_scene_v1','reference_frame':self.reference_frame,
+        return {'schema':'online_scene_v2','reference_frame':self.reference_frame,
             'robot_geometry_source':self.robot_geometry_source,'robot_model':deepcopy(self.robot_model),
             'numerical_position_tolerance_m':self.numerical_position_tolerance_m,
             'numerical_rotation_tolerance_rad':self.numerical_rotation_tolerance_rad,
@@ -715,7 +697,7 @@ class OnlinePlanningScene:
 
     @classmethod
     def from_binding(cls,row):
-        if row.get('schema')!='online_scene_v1':
+        if row.get('schema')!='online_scene_v2':
             raise ValueError('Online scene binding schema is required')
         owners=[]
         for record in row['owners']:

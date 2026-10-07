@@ -1321,7 +1321,9 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     scene.observation_report={'source':'current calibrated owner-partitioned RGB-D','partitions':reports,
         'estimated_mapping_buffers_bytes':sum(estimates.values()),'depth_error_m':float(depth_error_m),
         'known_free_voxels':int(known.sum()),'coverage_voxels':int(known.size),
-        'geometry_model':'one frozen signed field per partition; finite cell subtraction for material contact',
+        # BEGIN describe the registered online contact model used by this scene.
+        'geometry_model':'one frozen signed field per partition; prepared forbidden-region fields and registered native planar contact',
+        # END source-cell interpretation is confined to preparation, not online queries.
         'unknown_policy':deepcopy(unknown_policy),
         'self_filter':_self_filter_report(normalized)}
     # END excluded surfaces remain independently auditable.

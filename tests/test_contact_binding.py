@@ -111,6 +111,13 @@ class ContactBindingTests(unittest.TestCase):
                 geometry_error_m=.001, minimum_thickness_m=.008, source="explicit observed test patch")
             rule, = build_material_contact_rules(binding, [declaration])
             self.assertEqual(asdict(rule)["sphere_indices"], (4, 5, 6, 7))
+            # BEGIN source geometry, thickness and exact runtime part stay bound.
+            self.assertEqual(rule.online_material["kind"], "native_planar_extrusion_v1")
+            self.assertEqual(rule.online_material["native_geometry"], "left_pad")
+            self.assertEqual(rule.online_material["sphere_indices"], [4, 5, 6, 7])
+            self.assertAlmostEqual(rule.online_material["thickness_m"], .008)
+            self.assertEqual(rule.online_material["sphere_binding_source"], records[0]["certificate_path"])
+            # END the task declaration cannot fabricate the online solid model.
             spheres["left"][0]["radius"] += .001
             with self.assertRaisesRegex(ValueError, "sphere cover"):
                 bind_fixture_contact_materials(fixture, robot, ordering, feedback, _FACES)

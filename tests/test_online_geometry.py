@@ -1,5 +1,5 @@
 """CPU-only invariants of the shared fixed online geometry model."""
-# BEGIN semantic tests: finite permission cannot erase forbidden material.
+# BEGIN semantic tests: fixed field and unknown-space semantics remain shared with execution.
 from types import SimpleNamespace
 
 import numpy as np
@@ -65,30 +65,6 @@ def test_known_collision_survives_conditional_unknown_permission():
     assert any(row['name']=='collision/robot/background' for row in result['violations'])
 
 
-def test_finite_contact_subtracts_only_permitted_cells_of_same_sphere():
-    size=.001
-    axis=np.arange(-10,11)*size
-    xyz=np.stack(np.meshgrid(axis,axis,axis,indexing='ij'),-1)
-    points=np.array([[-.002,0.,0.],[.002,0.,0.]])
-    distances=np.linalg.norm(xyz[...,None,:]-points,axis=-1).min(-1).astype(np.float32)
-    query=FrozenESDF(distances,origin=[-.01]*3,voxel_size=size,
-        site_valid=np.ones(distances.shape,bool),observed_sign=np.ones(distances.shape,bool),
-        owner_ids=('part',),source='two observed target surface components')
-    rule=SimpleNamespace(rule_id='pad',sphere_indices=(0,),patch_half_size=np.array([.002,.002]),
-        modeling_allowance_m=.001,patch_origin=np.zeros(3),patch_axes=np.eye(3))
-    query.prepare_contact(rule,.003)
-    spheres=torch.tensor([[[[0.,0.,0.,.003]]]],dtype=torch.float64,requires_grad=True)
-    policy={'active':torch.ones((1,1),dtype=torch.bool),'normal_valid':torch.ones((1,1),dtype=torch.bool),
-        'normals':torch.tensor([[[[1.,0.,0.]]]],dtype=torch.float64),
-        'bounds':torch.tensor([[[-.001]]],dtype=torch.float64)}
-    forbidden,gap=query.contact_query(spheres,[(rule,policy)])
-    assert gap.item()==0 and forbidden.item()>0
-    gradient=torch.autograd.grad(forbidden.sum(),spheres)[0]
-    assert gradient[0,0,0,0]>0 and torch.isfinite(gradient).all()
-    policy['bounds']=torch.tensor([[[.004]]],dtype=torch.float64)
-    allowed,gap=query.contact_query(spheres,[(rule,policy)])
-    assert gap.item()==0 and allowed.item()==0
-
 
 def test_primitive_pose_and_dimensions_keep_exact_native_meaning():
     query=FrozenPrimitives(primitives=[{'kind':'cuboid','dimensions':[.02,.04,.06],
@@ -112,13 +88,12 @@ def test_small_positive_collision_is_not_erased_by_an_execution_tolerance():
     assert not report['passed']
 
 
-def test_cloned_contact_inventories_cannot_replace_another_requests_rule():
+def test_cloned_queries_do_not_replace_another_requests_prepared_model():
     query=field()
-    query._contact_regions['same-rule']=(np.zeros((1,3)),np.zeros(3),np.ones(3))
-    query._contact_surfaces['same-rule']=np.zeros((1,3))
+    original=object()
+    query._contact_model=original
     other=query.clone_for_rollout()
-    other._contact_regions['same-rule']=(np.ones((2,3)),np.zeros(3),np.ones(3))
-    other._contact_surfaces['same-rule']=np.ones((2,3))
-    assert query._contact_regions['same-rule'][0].shape==(1,3)
-    assert query._contact_surfaces['same-rule'].shape==(1,3)
+    other._contact_model=object()
+    assert query._contact_model is original
+    assert other._contact_model is not original
 # END no positive geometric residual becomes a different runtime success set.

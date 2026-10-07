@@ -1392,7 +1392,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
 
     # BEGIN required/refinement anchors share native self-collision semantics.
     @contextmanager
-    def anchor_self_collision_fixture(self, mode, *, required=(), hand=None, padding=0.):
+    def anchor_self_collision_fixture(self, mode, *, required=(), hand=None, padding=0., capacity=2):
         """Keep native cost/buffer behavior; replace GPU FK and its pair kernel.
 
         The analytic robot has a sphere at x=q[0] and a fixed sphere at zero.
@@ -1480,7 +1480,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             stack.enter_context(patch.object(SelfCollisionCost, "forward", autospec=True, side_effect=native_forward))
             config_type = _process_manager_type(problem, scene,
                 _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), required,
-                PlanningBudget(constraint_weight=777., max_task_anchors=2),
+                PlanningBudget(constraint_weight=777., max_task_anchors=capacity),
                 clock={"duration": 2.}, seed_parameter=torch.tensor([[.3]]))
             data = {"process_mode": mode}
             if mode.endswith("optimizer"):
@@ -1488,7 +1488,8 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             config = config_type.create(data, device_cfg=self.device_cfg)
             manager = self.manager(config, transition)
             yield SimpleNamespace(manager=manager, state=state, q=q, forwarded=forwarded, config=config,
-                                  scene=scene, kinematics=kinematics)
+                                  scene=scene, kinematics=kinematics, config_type=config_type,
+                                  problem=problem, capacity=capacity)
 
     def test_required_self_collision_anchors_retain_native_values_and_gradient(self):
         for mode in ("trajectory_optimizer",):
@@ -1525,6 +1526,34 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                         sum(value.sum() for value in costs.values).backward()
                         self.assertTrue(bool(torch.isfinite(fixture.q.grad).all()))
                         self.assertGreater(fixture.q.grad.abs().max().item(), 0.)
+
+    # BEGIN fixed admission capacity does not create padded FK/scene work.
+    def test_real_anchor_count_and_rebind_preserve_capacity_and_required_times(self):
+        from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
+        with self.anchor_self_collision_fixture("trajectory_optimizer", required=(.55,), capacity=256) as fixture:
+            manager = fixture.manager
+            pointer = manager._anchor_u.data_ptr()
+            self.assertEqual(manager._anchor_u.shape[1], 256)
+            manager.compute_costs(fixture.state)
+            self.assertEqual(fixture.forwarded[-1]["spheres"].shape[1], 1)
+            self.assertEqual(manager._query_counts["anchor_count"], 1)
+            self.assertEqual(manager._query_counts["exact_states"], 2*(2+1))
+            # The same native manager and fixed input allocation accept another
+            # request with two genuine witnesses, rather than 254 duplicates.
+            mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+            budget = PlanningBudget(constraint_weight=777., max_task_anchors=256)
+            fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping,
+                (.55, .65), budget, FunctionalAugmentedLagrangian(()))
+            self.assertEqual(manager._anchor_u.data_ptr(), pointer)
+            self.assertEqual(manager._anchor_count, 2)
+            manager.compute_costs(fixture.state)
+            self.assertEqual(fixture.forwarded[-1]["spheres"].shape[1], 2)
+            self.assertEqual(manager._query_counts["exact_states"], 2*(2+2))
+            torch.testing.assert_close(manager._anchor_u[:, :2], torch.tensor([[.55, .65]]))
+            with self.assertRaisesRegex(ValueError, "Task anchors"):
+                fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping,
+                    np.linspace(0., 1., 257), budget, FunctionalAugmentedLagrangian(()))
+    # END overflow still fails admission; no original event witness is dropped.
 
     def test_disabled_self_collision_and_reference_ik_do_not_add_anchor_checks(self):
         for mode in ("trajectory_optimizer", "seed_optimizer"):

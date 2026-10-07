@@ -2432,7 +2432,7 @@ def _native_collision_padding(manager):
 # BEGIN scene switches share q/t while querying distinct adjacent modes.
 def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion,
                              progress, joint_position, joint_names, *, trajectory_time,
-                             normalized_time):
+                             normalized_time, query_counts=None):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2446,7 +2446,18 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     evaluate = scene.evaluate
     anchors = [float(value) for value in scene.required_progress_anchors
                if problem.start_progress <= value <= problem.end_progress]
+    # BEGIN compact side-query shapes are explicitly eager-only.
+    # Production solvers already disable CUDA graphs. Reject direct capture
+    # callers before nonzero or geometry allocation instead of silently using
+    # the former three-times-expanded query as a compatibility fallback.
+    if anchors and progress.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise MotionPlanningError("unsupported_model",
+            "Compact scene mode-boundary queries require eager execution; CUDA graph capture is unsupported")
+    # END the unrelated native-only optimizer graph API remains unchanged.
     if not anchors:
+        if query_counts is not None:
+            query_counts.update(exact_states=int(progress.numel()), left_states=0, right_states=0,
+                                evaluated_states=int(progress.numel()))
         result = evaluate(spheres, position, quaternion, progress, joint_position,
                           joint_names, trajectory_time=trajectory_time)
         return result
@@ -2473,18 +2484,41 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
         arrival = constant_tensor(rule.interval[0], progress)
         permission_lower = torch.where((progress == arrival) & (lower < arrival), progress, permission_lower)
     # END equality is in the native query dtype; no tolerance advances arrival.
-    repeated = lambda value: torch.cat((value, value, value), dim=1)
-    expanded_progress = torch.cat((progress, lower, upper), dim=1)
-    permission_progress = torch.cat((progress, permission_lower, upper), dim=1)
-    # BEGIN padding masks and diagnostics follow exact/left/right state identity.
-    terms = evaluate(repeated(spheres), repeated(position), repeated(quaternion),
-        expanded_progress, repeated(joint_position), joint_names,
-        # BEGIN finite permission and attachment/controller modes retain separate scope.
-        trajectory_time=repeated(trajectory_time),
+    # BEGIN evaluate exact witnesses once and only append real mode-side columns.
+    # Keep the union of columns over the batch so native geometry retains its
+    # rectangular [B,T,...] layout. A batch without a side at that column uses
+    # its unchanged exact mode; no physical q/time or arrival permission moves.
+    left_columns = left.any(0).nonzero().flatten()
+    right_columns = right.any(0).nonzero().flatten()
+    def expanded(value):
+        return torch.cat((value, value.index_select(1, left_columns),
+                          value.index_select(1, right_columns)), dim=1)
+    expanded_progress = torch.cat((progress, lower.index_select(1, left_columns),
+                                   upper.index_select(1, right_columns)), dim=1)
+    permission_progress = torch.cat((progress, permission_lower.index_select(1, left_columns),
+                                     upper.index_select(1, right_columns)), dim=1)
+    if query_counts is not None:
+        batch, exact = progress.shape
+        query_counts.update(exact_states=batch*exact, left_states=batch*left_columns.numel(),
+                            right_states=batch*right_columns.numel(),
+                            evaluated_states=batch*expanded_progress.shape[1])
+    # All exact states stay first in the same call: released owner poses need
+    # their exact release witness, even when a different time probes a side.
+    terms = evaluate(expanded(spheres), expanded(position), expanded(quaternion),
+        expanded_progress, expanded(joint_position), joint_names,
+        trajectory_time=expanded(trajectory_time),
         contact_permission_progress=permission_progress)
-        # END q, physical time and the command clock are unchanged.
-    # END all three mode probes consume the same frozen online field.
-    return torch.stack(terms.split(progress.shape[1], dim=1)).amax(0)
+    exact_count, left_count = progress.shape[1], left_columns.numel()
+    exact_terms = terms[:, :exact_count]
+    left_terms = exact_terms.scatter(1, left_columns[None].expand(progress.shape[0], -1),
+                                     terms[:, exact_count:exact_count+left_count])
+    right_terms = exact_terms.scatter(1, right_columns[None].expand(progress.shape[0], -1),
+                                      terms[:, exact_count+left_count:])
+    # Reconstruct only these small scalar residuals before max. Its original
+    # three-way tie weights matter for gradients: replacing this with a max
+    # over the compact query would change derivatives at equal-cost modes.
+    return torch.stack((exact_terms, left_terms, right_terms)).amax(0)
+    # END duplicate scalar costs are cheap; duplicate geometry queries are gone.
 
 
 
@@ -2531,6 +2565,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             self._process_mode = config.process_mode
             managers.append(self)
             self._dense_counts = None
+            # BEGIN retain only aggregate last-evaluation counts, never states.
+            self._query_counts = {"process_mode": self._process_mode}
+            # END request rebind clears this lightweight diagnostic in place.
             if not self._process_mode:
                 return
             transition_model.robot_model.compute_jacobian = True
@@ -2562,6 +2599,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             """Replace request values in fixed-capacity native manager buffers."""
             self._scene = scene.clone_for_rollout()
             self._dense_counts = None
+            self._query_counts.clear()
+            self._query_counts.update(process_mode=self._process_mode)
             if not self._process_mode or self._process_mode.startswith("seed_"):
                 return
             if len(progress_map.u) > _MAX_PROGRESS_KEYS:
@@ -2571,7 +2610,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             values = np.r_[progress_map.s, np.full(pad, progress_map.s[-1])]
             pairs = progress_map.anchor_parameters(anchors)
             _anchor_capacity(progress_map, anchors, budget)
-            anchor_count = len(pairs)
+            # BEGIN capacity admits requests; only actual witnesses are evaluated.
+            anchor_count = self._anchor_count = len(pairs)
+            self._query_counts.update(anchor_count=anchor_count, anchor_capacity=budget.max_task_anchors)
+            # END fixed host/device input storage still supports later rebindings.
             pairs = np.concatenate((pairs, np.repeat(pairs[-1:], budget.max_task_anchors-anchor_count, axis=0)))
             self._anchor_valid = self.device_cfg.to_device(np.arange(budget.max_task_anchors) < anchor_count)[None]
             for name, value in (("_map_u", keys), ("_map_s", values),
@@ -2631,8 +2673,11 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             u = (torch.arange(horizon, device=q.device, dtype=q.dtype)[None, :]
                  / (counts[:, None]-1)).clamp(0, 1)
             progress = _torch_interpolate(self._map_u, self._map_s, u)
-            anchor_u = self._anchor_u.expand(batch, -1)
-            anchor_s = self._anchor_s.expand(batch, -1)
+            # BEGIN no interpolation, FK or collision query for padded anchors.
+            anchor_u = self._anchor_u[:, :self._anchor_count].expand(batch, -1)
+            anchor_s = self._anchor_s[:, :self._anchor_count].expand(batch, -1)
+            anchor_valid = self._anchor_valid[:, :self._anchor_count]
+            # END the admission capacity is unchanged; the work is request-sized.
             anchor_q, anchor_dq = _hermite_at_parameters(q, dq, state.joint_state.dt, counts, anchor_u)
             # BEGIN retain the actual anchor state for native self collision.
             anchor_joints = JointState.from_position(anchor_q.contiguous(), joint_names=list(self._joint_names))
@@ -2650,7 +2695,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # and policy in optimizer and metrics. Do not square or multiply them
                 # by the separate task/scene constraint weight below.
                 folded_collision = torch.cat((q.new_zeros((batch, horizon-1, 1)),
-                    (anchor_collision*self._anchor_valid[..., None]).sum(1, keepdim=True)), dim=1)
+                    (anchor_collision*anchor_valid[..., None]).sum(1, keepdim=True)), dim=1)
                 collection.add(folded_collision, "anchor_self_collision")
             # END anchor sphere penalties retain native optimizer gradients.
             anchor_quaternion = orientation_vjp.apply(anchor_q, anchor_state.tool_poses.quaternion.detach(),
@@ -2694,7 +2739,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
             scene_value = _scene_boundary_evaluate(self._scene, problem, progress_map,
                 spheres, position, quaternion, progress, q, self._joint_names,
-                trajectory_time=trajectory_time, normalized_time=ordered(all_u))
+                trajectory_time=trajectory_time, normalized_time=ordered(all_u),
+                query_counts=self._query_counts)
             # END raw residual zero sets are shared; only optimizer weights differ.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
             # A squared optimizer penalty has a gradient proportional to
@@ -2736,7 +2782,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # Keep CostCollection's native [B,H,*] shape.  Summing exact
                 # anchor penalties into its final column retains their full
                 # gradient and makes any anchor violation fail feasibility.
-                folded = torch.cat((torch.zeros_like(regular[:, :-1]), (value[:, horizon:]*self._anchor_valid).sum(1, keepdim=True)), 1)
+                folded = torch.cat((torch.zeros_like(regular[:, :-1]), (value[:, horizon:]*anchor_valid).sum(1, keepdim=True)), 1)
                 collection.add((regular+folded).unsqueeze(-1) * budget.constraint_weight, name)
             return collection
 
@@ -2760,6 +2806,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
         for manager in managers:
             manager.bind_request_data()
     ProcessCostManagerCfg.bind_request = staticmethod(bind_request)
+    # BEGIN bounded aggregate evidence for real workload/performance reports.
+    ProcessCostManagerCfg.query_diagnostics = staticmethod(
+        lambda: [deepcopy(manager._query_counts) for manager in managers if manager._process_mode])
+    # END no per-state geometry or query trace is retained in the optimization loop.
     return ProcessCostManagerCfg
 
 
@@ -4532,6 +4582,11 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         outcome.success, outcome.trajectory, outcome.execution_binding = False, None, None
         return outcome
     finally:
+        # BEGIN report bounded aggregate query counts for success and timeout.
+        manager_type = getattr(planner, "_manager_type", None)
+        if manager_type is not None:
+            diagnostics["rollout_query_counts"] = manager_type.query_diagnostics()
+        # END report collection does not retain or repeat individual states.
         if backend_claimed:
             # Native kernels/iteration blocks have returned before this point.
             # A timeout cannot release storage while their call is in flight.
