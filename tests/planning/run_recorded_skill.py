@@ -190,6 +190,24 @@ def recorded_owner_observation_inputs(problem, scene_input, views, mask_rows, *,
             raise ValueError("A reference partition requires its distinct reference_id and current reference_pose")
         frames[reference] = {"T_output_owner": _pose_array(scene_input["reference_pose"],
                             "current reference-owner pose"), "source": source}
+    # BEGIN explicit static observations can participate without becoming goals.
+    # These are current collision partitions, not additional task references or
+    # moving attachments. Each owns its original RGB-D pixels and a declared
+    # coordinate frame. The common mapper retains all remaining background.
+    observations = scene_input.get("observation_owners", [])
+    if not isinstance(observations, list):
+        raise ValueError("Additional observation owners must be an explicit list")
+    for record in observations:
+        if not isinstance(record, dict) or set(record) != {"owner_id", "T_output_owner", "source"}:
+            raise ValueError("An observation owner requires exactly owner_id, T_output_owner and source")
+        identity, evidence = record["owner_id"], record["source"]
+        if (not isinstance(identity, str) or not identity.strip()
+                or identity in frames or identity in {"robot", "background", "observed_background"}
+                or not isinstance(evidence, str) or not evidence.strip()):
+            raise ValueError("Observation owners need distinct physical identities and explicit current sources")
+        frames[identity] = {"T_output_owner": _pose_array(record["T_output_owner"],
+                            "current observation-owner frame"), "source": evidence}
+    # END the mask completeness check below applies equally to every partition.
     view_ids = [view["id"] for view in views]
     if len(set(view_ids)) != len(view_ids) or not view_ids:
         raise ValueError("Current RGB-D views require distinct explicit IDs")

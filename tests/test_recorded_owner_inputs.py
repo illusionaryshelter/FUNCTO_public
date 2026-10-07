@@ -89,6 +89,50 @@ def test_every_reference_and_carrier_view_keeps_its_explicit_pose_and_mask():
             [{"id": "left"}], rows, source="current-scene.json")
 
 
+# BEGIN static contact targets are observations even when absent from goals.
+def test_additional_observed_owner_keeps_its_frame_and_requires_every_view_mask():
+    support = np.eye(4)
+    support[:3, 3] = [-.4, .2, .7]
+    current = dict(carrier_id="payload", observation_owners=[{
+        "owner_id": "initial_support", "T_output_owner": support,
+        "source": "Current synchronized calibrated support observation"}])
+    original = deepcopy(current)
+    rows = [[owner, view, f"{owner}-{view}.npy"]
+            for owner in ("payload", "initial_support") for view in ("left", "right")]
+    views = [{"id": "left"}, {"id": "right"}]
+    frames, masks = recorded_owner_observation_inputs(held_problem(), current,
+        views, rows, source="current-scene.json")
+    assert set(frames) == {"payload", "initial_support"}
+    np.testing.assert_array_equal(frames["initial_support"]["T_output_owner"], support)
+    np.testing.assert_array_equal(current["observation_owners"][0]["T_output_owner"],
+                                  original["observation_owners"][0]["T_output_owner"])
+    assert frames["initial_support"]["source"] == current["observation_owners"][0]["source"]
+    assert set(masks) == {(owner, view) for owner in frames for view in ("left", "right")}
+    with pytest.raises(ValueError, match="exactly one current owner mask"):
+        recorded_owner_observation_inputs(held_problem(), current, views, rows[:-1], source="current-scene.json")
+
+
+@pytest.mark.parametrize("identity", ["payload", "reference", "robot", "background", "observed_background", "", None])
+def test_additional_owner_cannot_replace_an_existing_or_reserved_identity(identity):
+    current = dict(carrier_id="payload", reference_id="reference", reference_pose=np.eye(4),
+        observation_owners=[{"owner_id": identity, "T_output_owner": np.eye(4), "source": "actual capture"}])
+    with pytest.raises(ValueError, match="distinct physical identities"):
+        recorded_owner_observation_inputs(held_problem(), current, [{"id": "left"}], [], source="scene.json")
+
+
+@pytest.mark.parametrize("changes,reason", [({"source": ""}, "distinct physical identities"),
+    ({"T_output_owner": np.zeros((4, 4))}, "invalid homogeneous last row"),
+    ({"geometry_complete": True}, "requires exactly")])
+def test_additional_owner_requires_a_valid_current_frame_and_cannot_claim_hidden_geometry(changes, reason):
+    record = {"owner_id": "extra", "T_output_owner": np.eye(4), "source": "actual capture", **changes}
+    with pytest.raises(ValueError, match=reason):
+        recorded_owner_observation_inputs(held_problem(),
+            {"carrier_id": "payload", "observation_owners": [record]},
+            [{"id": "left"}], [["payload", "left", "payload.npy"], ["extra", "left", "extra.npy"]],
+            source="scene.json")
+# END additional partitions use the existing strict per-owner mask contract.
+
+
 def test_holding_permission_uses_only_the_compiled_attachment_interval():
     problem = held_problem()
     hand = dict(native_geometry_names=["finger_left", "finger_right"],
@@ -147,26 +191,30 @@ def test_complete_payload_installation_keeps_reference_background_coverage_and_h
                              "Current payload RGB-D", geometry_complete=False)
     reference = CollisionOwner("reference", BoxQuery("reference"), pose_path(),
                                "Current reference RGB-D", geometry_complete=False)
+    # BEGIN replacing the held body must retain independent static observations.
+    initial_support = CollisionOwner("initial_support", BoxQuery("initial_support"), pose_path(),
+                                    "Current initial support RGB-D", geometry_complete=False)
+    # END this contact target is not the functional placement reference.
     coverage = ObservedSpace(np.ones((3, 3, 3), bool), origin=[-1., -1., -1.], voxel_size=1.,
                              observation_ids=("current-view",), reference_frame="world")
     permission, = build_hand_owner_permissions(held_problem(), dict(native_geometry_names=["hand"],
         sphere_indices=[0], source="Current native hand geometry"))
-    observed = PlanningScene(background=background, owners=(partial, reference), coverage=coverage,
+    observed = PlanningScene(background=background, owners=(partial, reference, initial_support), coverage=coverage,
         reference_frame="world", robot_sphere_materials=(None,), robot_geometry_source="Native test robot",
         has_gripper=False, robot_owner_permissions=(permission,),
         native_geometry_materials=binding["native_geometry_materials"])
-    observed.observation_report = {"partitions": ["payload", "reference", "background"]}
+    observed.observation_report = {"partitions": ["payload", "reference", "initial_support", "background"]}
     owner = CollisionOwner("payload", SphereQuery(("payload",)), pose_path(), "Complete native test body",
         geometry_complete=True, local_spheres=prepared["local_spheres"],
         sphere_materials=tuple(binding["sphere_materials"]),
         attachments=tuple(Attachment(**relation) for relation in prepared["attachments"]))
     result = install_complete_owner(observed, owner, contacts=contacts)
-    assert result.owners == (owner, reference)
+    assert result.owners == (owner, reference, initial_support)
     assert result.background is background and result.coverage is coverage
     assert result.observation_report is observed.observation_report
     assert result.robot_owner_permissions == (permission,)
     assert result.contacts == contacts and result.native_geometry_materials == binding["native_geometry_materials"]
-    assert observed.owners == (partial, reference) and observed.contacts == ()
+    assert observed.owners == (partial, reference, initial_support) and observed.contacts == ()
 
 
 @pytest.mark.parametrize("change", ["partial", "nonface", "extra_points", "missing_cover", "overlap"])
