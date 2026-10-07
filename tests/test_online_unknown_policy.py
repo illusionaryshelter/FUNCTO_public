@@ -158,7 +158,9 @@ def test_remaining_forbidden_unknown_has_finite_nonzero_position_gradient():
     known = _half_observed()
     known[30, 30, 23] = False  # x=-0.07 remains a forbidden unknown cell.
     scene = _scene(known, [_region()])
-    spheres = _sphere(x=-.02).requires_grad_()
+    # BEGIN cross the actual unknown-cell face, not just the former loose bound.
+    spheres = _sphere(x=-.02, radius=.05).requires_grad_()
+    # END tightening the certificate must retain a gradient for true overlap.
     hard, conditional = scene._unknown(spheres)
     assert hard > 0 and conditional > hard
     hard.backward()

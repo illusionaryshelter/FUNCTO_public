@@ -376,9 +376,9 @@ class PlanningSceneTest(unittest.TestCase):
         world = scene()
         world.robot_coverage = SimpleNamespace(required_link_names=("body",), baseline_joint_names=("q",))
         world._coverage_geometry = {"solids": [{"baseline_halfspaces_world": np.zeros((32, 4))}]}
-        world._free_distance = world.coverage._distance
-        # BEGIN explicit immutable free-grid storage used by workspace admission.
-        world._free_mask = world.coverage._distance
+        # BEGIN squared source supplies unchanged size-only workspace metadata.
+        world._free_distance = world.coverage._distance_squared
+        world._free_mask = world.coverage._distance_squared
         # END the fixture needs both actual production grid fields.
         # BEGIN storage admission now reads the real per-owner field count.
         world.owners = (SimpleNamespace(owner_id="payload", moving=True, local_spheres=np.zeros((1, 4)),
@@ -391,20 +391,20 @@ class PlanningSceneTest(unittest.TestCase):
         self.assertEqual(refined_robot-before, batch*horizon*16*2*60)
         world.owners[0].local_spheres = np.zeros((3, 4))
         refined_payload = world.estimated_workspace_bytes(batch, horizon)
-        self.assertEqual(refined_payload-refined_robot, batch*horizon*2*(60+128))
+        self.assertEqual(refined_payload-refined_robot, batch*horizon*2*(60+384))
         # The two native free-space grids remain cached even at stages without
         # guidance. Removing the native oracle also removes those two caches.
         without_guidance = world.estimated_workspace_bytes(batch, horizon, robot_coverage_guidance=False)
         self.assertGreater(refined_payload, without_guidance)
         shared = world.estimated_workspace_allocation(batch, horizon, robot_coverage_horizon=0)["gpu_shared"]
-        self.assertEqual(shared, 12*world.coverage._distance.numel())
+        self.assertEqual(shared, 12*world.coverage._distance_squared.numel())
         self.assertEqual(shared, world.estimated_workspace_allocation(
             batch, horizon, robot_coverage_horizon=horizon)["gpu_shared"])
         native_oracle, world.robot_coverage = world.robot_coverage, None
         ordinary = world.estimated_workspace_bytes(batch, horizon)
         world.robot_coverage = native_oracle
         self.assertEqual(ordinary-without_guidance,
-                         batch*horizon*17*128-16*world.coverage._distance.numel())
+                         batch*horizon*17*384-16*world.coverage._distance_squared.numel())
 
     def test_full_volume_entrance_accepts_only_exact_named_representations(self):
         baseline = np.array([.123456789, -.234567891])

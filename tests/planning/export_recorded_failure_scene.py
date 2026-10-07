@@ -189,9 +189,20 @@ def export(args):
             arrays[key].extend(value)
     if maximum_fk_error > 2e-6 or maximum_scene_error > 2e-5:
         raise ValueError(f'Frozen evidence changed: FK {maximum_fk_error}, scene {maximum_scene_error}')
+    # BEGIN export metric clearance at grid vertices, not squared source units.
+    cover = scene.coverage
+    clearance = np.sqrt(cover._distance_squared.cpu().numpy()[0, 0])-np.sqrt(3)*cover.voxel_size/2
+    for axis, count in enumerate(clearance.shape):
+        shape = [1, 1, 1]
+        shape[axis] = count
+        border = cover.voxel_size*np.minimum(np.arange(count), count-1-np.arange(count))
+        np.minimum(clearance, border.reshape(shape), out=clearance)
+    clearance -= 32*np.finfo(clearance.dtype).eps*cover._roundoff_scale_m
+    np.maximum(clearance, 0., out=clearance)
+    # END this visual slice uses the same zero-variance grid-vertex bound.
     np.savez_compressed(args.output/'states.npz', **{k: np.asarray(v) for k, v in arrays.items()},
                         sphere_links=sphere_links, hand_pairs=hand_pairs, native_pairs=native_pairs,
-                        coverage_clearance=scene.coverage._distance.cpu().numpy()[0, 0],
+                        coverage_clearance=clearance,
                         coverage_origin=scene.coverage.origin,
                         coverage_voxel_size=np.asarray(scene.coverage.voxel_size))
     report = {'status': 'exported', 'candidate_id': original['candidate_id'],

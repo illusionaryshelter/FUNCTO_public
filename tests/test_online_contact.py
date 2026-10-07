@@ -286,7 +286,9 @@ def test_loading_rejects_incomplete_or_nonfinite_contact_models(corruption):
 def test_workspace_counts_unique_source_arrays_and_both_float_caches_on_cpu_and_gpu():
     query = prepare(field(), [rule()])
     coverage = SimpleNamespace(_known=np.ones((2, 2, 2), bool), _known_free=np.ones((2, 2, 2), bool),
-                              _distance=torch.zeros((1, 1, 2, 2, 2), dtype=torch.float32))
+                              # BEGIN the coverage source now stores squared distances.
+                              _distance_squared=torch.zeros((1, 1, 2, 2, 2), dtype=torch.float32))
+    # END the storage size and resource contract are unchanged.
     # BEGIN resource fixture includes the bound scene's empty integer partitions.
     scene = SimpleNamespace(background=query, owners=(), coverage=coverage, robot_sphere_materials=("pad",), gripper=None,
                             # BEGIN empty policy shares the original coverage allocation.
@@ -300,11 +302,13 @@ def test_workspace_counts_unique_source_arrays_and_both_float_caches_on_cpu_and_
     # channel adds 4N. Distance, site-validity and prepared-bank caches each
     # reserve 4N+8N on both devices. Coverage adds two masks, float32 source,
     # one CPU float64 copy and both GPU dtypes, independently.
-    n, nc = query.distance.size, coverage._distance.numel()
+    n, nc = query.distance.size, coverage._distance_squared.numel()
     constants = 65536 * 3
     assert base["cpu_shared"] == 46 * n + 14 * nc + constants
     assert base["gpu_shared"] == 36 * n + 12 * nc + constants
-    scene.owners = (SimpleNamespace(query=query.clone_for_rollout()),)
+    # BEGIN shared static fields add no moving-owner coverage queries.
+    scene.owners = (SimpleNamespace(query=query.clone_for_rollout(), moving=False),)
+    # END their field caches still alias the original storage.
     shared = OnlinePlanningScene.estimated_workspace_allocation(scene, 1, 1)
     assert shared == base
     # The actual CPU caches may coexist; no per-membership bank duplication.

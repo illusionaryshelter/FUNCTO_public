@@ -2168,7 +2168,9 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         # END actual source snapshots are accounted by the same method when bound.
         world.background = None
         world.owners = tuple(SimpleNamespace(moving=False, owner_id=f"fixed-{i}", query=None) for i in range(4))
-        world.coverage = SimpleNamespace(_distance=SimpleNamespace(numel=lambda: 503840))
+        # BEGIN storage admission follows the squared coverage source contract.
+        world.coverage = SimpleNamespace(_distance_squared=SimpleNamespace(numel=lambda: 503840))
+        # END only the allocated shape is used in this metadata fixture.
         # BEGIN this metadata-only hand owns no timed polynomial cache.
         world.gripper = SimpleNamespace(self_collision_pairs=range(28672),
                                         finger_trajectory=None, nominal_finger_trajectory=None)
@@ -2179,8 +2181,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         planes = (200, 3174, 300, 300, 300, 300, 200, 200, 200, 32, 12, 32, 12)
         world._coverage_geometry = {"solids": [{"baseline_halfspaces_world": np.broadcast_to(0., (n, 4))}
                                                 for n in planes]}
-        world._free_distance = world.coverage._distance
-        world._free_mask = world.coverage._distance
+        # BEGIN use the squared source as size-only storage admission metadata.
+        world._free_distance = world.coverage._distance_squared
+        world._free_mask = world.coverage._distance_squared
+        # END this fixture never evaluates a free-distance value.
         world.contacts = tuple(SimpleNamespace(_feature_edge_normals=np.zeros((4, 3))) for _ in range(2))
         # BEGIN metadata implements the contact model's explicit storage/workspace interface.
         class ContactStorage(SimpleNamespace):

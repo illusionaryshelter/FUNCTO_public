@@ -270,9 +270,10 @@ class ObservedSpace:
     serve as a full-scene mask.
 
     SciPy computes distance to unknown cell centres with an unknown border.
-    Subtracting a full voxel diagonal accounts conservatively for unknown cell
-    volume and trilinear interpolation. It can reject narrow observed passages;
-    it never fills unobserved space to make a result pass.
+    Interpolating squared distances and subtracting the interpolation-position
+    variance gives a lower bound on the squared distance at the query point.
+    Half a voxel diagonal then covers unknown cell volume. This remains a
+    conservative certificate; no unobserved cells are filled to pass a query.
     """
 
     def __init__(self, known, *, origin, voxel_size, observation_ids, reference_frame,
@@ -326,11 +327,17 @@ class ObservedSpace:
             self._known_free.flags.writeable = False
         # END no collision model or initial-state assumption changes this mask.
         # END retain the physical bodies used to prove occupied interiors.
+        # BEGIN a squared-distance certificate avoids a fixed interpolation penalty.
         distance = distance_transform_edt(np.pad(mask, 1), sampling=voxel_size)[1:-1, 1:-1, 1:-1]
-        distance = np.maximum(distance - math.sqrt(3) * voxel_size, 0)
-        self._distance = torch.from_numpy(distance.astype(np.float32))[None, None]
-        # BEGIN retain immutable observation grids before CUDA graph capture.
-        self._device_distance = {}
+        squared = np.square(distance).astype(np.float32)
+        # Storing in float32 must not round a distance bound upward. One ULP
+        # toward zero also covers squaring the float64 EDT result; the query
+        # separately allows for coordinate and interpolation roundoff.
+        squared = np.maximum(np.nextafter(squared, -np.inf), 0.)
+        self._distance_squared = torch.from_numpy(squared)[None, None]
+        self._device_distance_squared = {}
+        upper = self.origin+(np.array(mask.shape[::-1])-1)*self.voxel_size
+        self._roundoff_scale_m = float(np.abs(self.origin).sum()+np.abs(upper).sum()+self.voxel_size)
         # END rollout clones share these request-owned, read-only tensors.
         self._shape_xyz = np.array(mask.shape[::-1], float)
         # BEGIN retain exact observation masks for the execution binding.
@@ -368,15 +375,37 @@ class ObservedSpace:
         centre = spheres[..., :3]
         coordinates = (centre - _tensor(self.origin, centre)) / self.voxel_size
         grid = 2 * coordinates / _tensor(self._shape_xyz - 1, centre) - 1
-        # BEGIN the same converted grid must outlive every captured query.
+        # BEGIN the same squared field and continuous bound serve every query.
         key = (centre.device, centre.dtype)
-        if key not in self._device_distance:
-            self._device_distance[key] = self._distance.to(device=centre.device, dtype=centre.dtype)
-        values = F.grid_sample(self._device_distance[key],
+        if key not in self._device_distance_squared:
+            self._device_distance_squared[key] = self._distance_squared.to(device=centre.device, dtype=centre.dtype)
+        values = F.grid_sample(self._device_distance_squared[key],
                                grid.reshape(1, 1, 1, -1, 3), mode="bilinear",
                                padding_mode="zeros", align_corners=True)
-        # END interpolation, input dtype and reduction order are unchanged.
-        clearance = values.reshape(spheres.shape[:-1])
+        # For every unknown centre z and each grid corner v_i,
+        # d_i² <= ||v_i-z||². Trilinear weights give
+        # sum(w_i*d_i²) - h²*sum(f*(1-f)) <= ||centre-z||².
+        # Taking the minimum over z proves the centre-distance lower bound.
+        # Subtract half the cell diagonal to cover the entire unknown voxel.
+        fraction = coordinates-coordinates.floor()
+        variance = self.voxel_size**2*(fraction*(1-fraction)).sum(-1)
+        half_diagonal = math.sqrt(3)*self.voxel_size/2
+        squared_bound = values.reshape(spheres.shape[:-1])-variance
+        # Clamping at half_diagonal² is equivalent after the final ReLU, and
+        # avoids the infinite derivative of sqrt(0) in unknown/zero cells.
+        clearance = squared_bound.clamp_min(half_diagonal**2).sqrt()-half_diagonal
+        # The finite grid's centre domain is an additional conservative bound.
+        # It makes clearance vanish continuously at every map face; zero
+        # padding alone would introduce a jump when a centre exits the grid.
+        extent = _tensor(self._shape_xyz-1, centre)
+        border = self.voxel_size*torch.minimum(coordinates, extent-coordinates).amin(-1)
+        clearance = torch.minimum(clearance, border)
+        # Normalized grid coordinates and interpolation use the query dtype.
+        # Reserve operation-scale roundoff in metres, not a configurable
+        # physical tolerance. This guard only shrinks admitted volume.
+        roundoff = 32*torch.finfo(centre.dtype).eps*self._roundoff_scale_m
+        clearance = (clearance-roundoff).clamp_min(0)
+        # END no observation, permission, or collision occupancy is changed.
         radius = spheres[..., 3]
         return torch.where(radius > 0, torch.relu(radius - clearance), torch.zeros_like(radius))
 
@@ -2438,12 +2467,18 @@ class PlanningScene:
         # below. No collision term or allowed volume changes here.
         coverage_spheres = sum(size for actor, size in actors.items()
                                if actor != "robot" or self.robot_coverage is None)
-        coverage_bytes = batch * horizon * coverage_spheres * 128
+        # BEGIN squared certificate peak includes its scalar bound and backward.
+        # CPU float32/float64 profiles peak at 147/283 bytes per sphere; retain
+        # room for query outputs and adjacent scene operations in both dtypes.
+        coverage_bytes = batch * horizon * coverage_spheres * 384
+        # END this counts payload coverage even when robot coverage is separate.
         # BEGIN host grid sources never consume the device workspace budget.
         # Every source has one immutable CPU array and one lazy planning-GPU
         # copy. Layer prefix/constant caches are likewise shared by all rollout
         # clones; they do not become a new allocation in each graph pool.
-        host_grid_bytes = self.coverage._distance.numel()*4
+        # BEGIN squared coverage stores the same one float32 source grid.
+        host_grid_bytes = self.coverage._distance_squared.numel()*4
+        # END the query's scalar variance needs no additional volume field.
         if self.robot_coverage is not None:
             host_grid_bytes += (self._free_distance.numel()+self._free_mask.numel())*4
         shared_gpu_bytes = host_grid_bytes+layer_bytes

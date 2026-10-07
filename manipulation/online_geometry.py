@@ -520,7 +520,7 @@ class OnlinePlanningScene:
         single region would incorrectly forbid that composition. Admit only
         complete cells inside a declared box; centre-only rasterization would
         leak permission outside its metric boundary. The existing distance
-        transform and interpolation margin remain unchanged.
+        transform and conservative interpolation bound remain shared.
 
         This private numerical coverage object is NOT observation evidence.
         Binding export, unknown diagnostics and mapping retain ``coverage``;
@@ -542,9 +542,17 @@ class OnlinePlanningScene:
             observation_ids=self.coverage.observation_ids, reference_frame=self.coverage.reference_frame)
 
     def _unknown(self, spheres, uncertain=None):
-        unresolved = self.coverage.violation(spheres)
-        forbidden = (unresolved if self._permitted_coverage is self.coverage
-                     else self._permitted_coverage.violation(spheres))
+        # BEGIN only the hard certificate participates in optimizer gradients.
+        if self._permitted_coverage is self.coverage:
+            unresolved = forbidden = self.coverage.violation(spheres)
+        else:
+            # Original uncertainty is a reported value and a Boolean selector,
+            # never part of the hard loss. Retaining its backward graph would
+            # duplicate a dense query graph without changing any derivative.
+            with torch.no_grad():
+                unresolved = self.coverage.violation(spheres)
+            forbidden = self._permitted_coverage.violation(spheres)
+        # END empty policies still differentiate the original hard certificate.
         conditional = torch.zeros_like(unresolved, dtype=torch.bool)
         for row in self.unknown_policy['conditional_regions']:
             centre, radius = spheres[..., :3], spheres[..., 3:4].clamp_min(0)
@@ -758,7 +766,7 @@ class OnlinePlanningScene:
                 array = getattr(cover, name)
                 if array is not None:
                     sources[id(array)] = array.nbytes
-        coverage_cells = sum(cover._distance.numel() for cover in coverages.values())
+        coverage_cells = sum(cover._distance_squared.numel() for cover in coverages.values())
         # END both fields need float32/float64 caches under the existing bound.
         source_bytes = sum(sources.values()) + coverage_cells * 4
         sampled_elements = sum(ordinary_caches.values()) + sum(
@@ -789,6 +797,15 @@ class OnlinePlanningScene:
         live = int(batch)*int(horizon)*max(1,len(self.robot_sphere_materials))*512
         if self.gripper is not None and self.gripper.self_collision_model is not None:
             live += int(batch)*int(horizon)*len(self.gripper.self_collision_model.axis_pairs)*48
+        # BEGIN include the tighter certificate's additional forward/backward work.
+        # CPU profiles bound its peak above the former query by 92 bytes per
+        # float32 sphere and 180 per float64 sphere. Reserve 128/256 bytes on
+        # top of the existing full scene allowance, including moving payloads.
+        coverage_spheres = len(self.robot_sphere_materials)+sum(
+            len(owner.local_spheres) for owner in self.owners if owner.moving)
+        coverage_states = int(batch)*int(horizon)*coverage_spheres
+        cpu_live, gpu_live = live+256*coverage_states, live+128*coverage_states
+        # END diagnostic-only observation queries do not retain a second graph.
         # Preparing a new dtype may temporarily stack float32 source channels
         # before the owning Torch tensor is copied/converted. This CPU scratch
         # is separate from the final caches counted above.
@@ -797,8 +814,8 @@ class OnlinePlanningScene:
             # BEGIN one host staging array at a time prepares cached indices.
             *pair_table_sizes])
         # END pair staging is independent of the retained CPU/device copies.
-        return dict(cpu_shared=int(cpu_shared),cpu_live=int(live+upload_scratch),
-                    gpu_shared=int(gpu_shared),gpu_live=live,gpu_retained=0,gpu_graph_live=live)
+        return dict(cpu_shared=int(cpu_shared),cpu_live=int(cpu_live+upload_scratch),
+                    gpu_shared=int(gpu_shared),gpu_live=gpu_live,gpu_retained=0,gpu_graph_live=gpu_live)
         # END no duplicate group bank or bool-as-one-byte floating cache assumption.
 
     def query_state(self,spheres,tool_pose,progress,*,joint_position=None,joint_names=None,
