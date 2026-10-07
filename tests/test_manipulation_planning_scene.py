@@ -879,7 +879,9 @@ class PlanningSceneTest(unittest.TestCase):
         self.assertGreater(blocked.components(*args)["collision/payload/background"][0, 1].item(), .015)
 
     def test_new_calibrated_view_makes_the_same_free_trajectory_observed_and_feasible(self):
-        from manipulation.planning_observation import observed_space_from_rgbd
+        # BEGIN explicit independent raw-depth solid-audit fixture.
+        from manipulation.planning_observation import observed_audit_space_from_rgbd
+        # END production online observations require three-state self filtering.
         first_depth, second_depth = np.full((96, 96), 2.), np.full((96, 96), 2.)
         first_depth[35:61, 35:61] = 0.
         matrix = np.array([[60., 0., 47.5], [0., 60., 47.5], [0., 0., 1.]])
@@ -888,7 +890,7 @@ class PlanningSceneTest(unittest.TestCase):
         second_pose[0, 3] = .3
         second = {"depth": second_depth, "K": matrix, "T_output_camera": second_pose, "reference_frame": "world"}
         def observed(views):
-            return observed_space_from_rgbd(views, origin=[-.5, -.5, .2], shape=(45, 21, 21),
+            return observed_audit_space_from_rgbd(views, origin=[-.5, -.5, .2], shape=(45, 21, 21),
                                               voxel_size=.05, depth_error_m=.01, reference_frame="world", depth_range_m=(.1, 3.))
         args = inputs((0., .25, .5, .75, 1.),
                       sphere_rows=[[[x, 0., 1., .02]] for x in (-.12, -.06, 0., .06, .12)])

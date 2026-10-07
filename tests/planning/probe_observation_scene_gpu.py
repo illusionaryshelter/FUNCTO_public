@@ -32,6 +32,7 @@ def run(output):
         from curobo.perception import MapperCfg
         from manipulation.planning_observation import build_scene_from_rgbd
         from manipulation.planning_scene import _local_spheres
+        from manipulation.robot_self_filter import ENVIRONMENT
 
         if not torch.cuda.is_available():
             raise RuntimeError("This experiment requires explicitly authorized CUDA access")
@@ -43,7 +44,13 @@ def run(output):
         observation = {"image": np.zeros((64, 64, 3), np.uint8), "depth": np.ones((64, 64)),
                        "K": np.array([[48., 0., 31.5], [0., 48., 31.5], [0., 0., 1.]]),
                        "T_output_camera": np.eye(4), "reference_frame": "camera0_current",
-                       "owner_masks": {"surface_patch": mask}, "robot_mask": np.zeros((64, 64), bool)}
+                       "owner_masks": {"surface_patch": mask},
+                       # BEGIN this synthetic plane has no robot in its observation.
+                       "self_filter": {"labels": np.full((64, 64), ENVIRONMENT, np.uint8),
+                           "free_ray_depth_m": np.ones((64, 64)),
+                           "source": "Synthetic plane fixture explicitly contains no robot solids"}
+                       # END synthetic provenance is explicit, never an online fallback.
+                       }
         owner_pose = np.eye(4)
         owner_pose[2, 3] = 1.
         config = MapperCfg(extent_meters_xyz=(1.28, 1.28, 1.28), voxel_size=.04,

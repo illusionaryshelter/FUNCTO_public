@@ -513,8 +513,11 @@ def parse_args():
     parser.add_argument("--extent", type=float, nargs=3, required=True)
     parser.add_argument("--voxel-size", type=float, required=True)
     parser.add_argument("--depth-error", type=float, required=True)
-    parser.add_argument("--robot-depth-tolerance", type=float, required=True)
-    parser.add_argument("--robot-depth-tolerance-source", required=True)
+    # BEGIN same three-state observation contract as the production runner.
+    parser.add_argument("--self-filter-padding-offset-m", type=float, required=True)
+    parser.add_argument("--self-filter-padding-scale", type=float, required=True)
+    parser.add_argument("--self-filter-source", required=True)
+    # END the probe declares its geometry uncertainty explicitly.
     parser.add_argument("--ik-seeds", type=int, choices=range(1, 9), default=8)
     parser.add_argument("--scene-gpu-workspace-mib", type=int, choices=(1024, 2048), default=1024)
     # BEGIN request-level physical limits remain explicit in standalone runs.

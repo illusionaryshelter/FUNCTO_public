@@ -1,15 +1,15 @@
-"""Derive visible robot pixels from a known robot and one current RGB-D view.
+"""Adapt a known native robot and synchronized RGB-D to three-state filtering.
 
-The only model admitted to the renderer is the explicitly named robot subtree
+The only model admitted to the compiler is the explicitly named robot subtree
 of an expanded MuJoCo XML file, plus that subtree's assets. Robot joint feedback
 and an explicit root pose determine its state. The observed scene segmentation
 and object joint/state arrays are never inputs. ``FixedCamera`` supplies the
 same pixel-centre projection and optical-depth convention as observation RGB-D.
 
-``prepare_robot_model`` and ``robot_mask_from_depth`` run on CPU. The public
-``render_robot_mask`` creates a GL renderer and must be called serially by the
-owning runner; importing this module never creates a renderer or a CUDA context.
-The helper returns masks and provenance, leaving all observation depth intact.
+``prepare_robot_model`` and ``classify_robot_observation`` run on CPU without
+creating a GL renderer or CUDA context. Each native collision component remains
+a distinct solid; the helper returns labels and provenance without editing raw
+depth. Camera helpers also serve the separate simulation camera adapters.
 """
 
 from __future__ import annotations
@@ -119,15 +119,16 @@ def prepare_robot_model(*, scene_xml: str | Path, robot_root: str,
     +1 or -1. The supplied mapping must cover every scalar robot joint exactly
     once. Measured positions are neither clipped nor replaced with defaults.
     The explicit base transform is the world pose of ``robot_root`` itself.
-    # BEGIN complete known assembly self filtering.
+    # BEGIN complete native collision assembly for three-state filtering.
     Choose the complete calibrated robot root, including its fixed mounting
-    assembly. The caller must retain those fixed bodies as explicit static
-    collision owners; removing their depth without collision ownership is not
-    a valid scene. Visual geometry determines pixel identity, while the native
-    collision primitives independently define installation collision queries.
-    # END visual self filtering does not certify free or occupied space.
+    assembly. The caller retains those fixed bodies as explicit static collision
+    owners. Native collision solids determine model-relative point ownership;
+    visual meshes do not determine removal and no rendering is performed.
+    # END self filtering does not certify free or occupied space.
     """
-    camera_config = camera_config_from_calibration(calibration)
+    # BEGIN validate the shared camera contract without creating render state.
+    camera_config_from_calibration(calibration)
+    # END camera projection remains available to separate simulator adapters.
     scene_xml = Path(scene_xml).resolve()
     robot_root = _text(robot_root, "robot_root")
     base = _pose_array(T_world_robot_root, "T_world_robot_root")
@@ -163,29 +164,13 @@ def prepare_robot_model(*, scene_xml: str | Path, robot_root: str,
     # incorrectly discard provenance and redirect those files.
     compiler.set("strippath", "false")
     minimal.append(compiler)
-    visual = deepcopy(scene.find("visual"))
-    if visual is None:
-        visual = ET.Element("visual")
-    global_options = visual.find("global")
-    if global_options is None:
-        global_options = ET.SubElement(visual, "global")
-    global_options.set("offwidth", str(calibration["width"]))
-    global_options.set("offheight", str(calibration["height"]))
-    clipping = visual.find("map")
-    if clipping is None:
-        clipping = ET.SubElement(visual, "map")
-    # Matching both clipping planes also matches the observed depth buffer's
-    # precision; the robot-only model's automatically computed extent must not
-    # change the camera projection/depth convention.
-    clipping.set("znear", str(float(calibration["near_m"])))
-    clipping.set("zfar", str(float(calibration["far_m"])))
-    minimal.append(visual)
-    ET.SubElement(minimal, "statistic", extent="1")
+    # BEGIN collision-only preparation needs no visual or depth-buffer configuration.
     assets = _robot_assets(scene, robot, scene_xml)
     minimal.append(assets)
     ET.SubElement(minimal, "worldbody").append(robot)
     model = mujoco.MjModel.from_xml_string(ET.tostring(minimal, encoding="unicode"))
     data = mujoco.MjData(model)
+    # END no renderer configuration is copied into the standalone robot model.
 
     rows = tuple(joint_map)
     if not 0 < len(rows) <= 16 or any(len(row) != 3 for row in rows):
@@ -211,7 +196,6 @@ def prepare_robot_model(*, scene_xml: str | Path, robot_root: str,
             raise ValueError("The known robot observation model accepts scalar hinge/slide joints only")
         data.qpos[joint.qposadr[0]] = value
     mujoco.mj_kinematics(model, data)
-    mujoco.mj_camlight(model, data)
     provenance = {
         "source_scene_xml": str(scene_xml), "robot_root": robot_root,
         "source_scope": "only named known-robot subtree and its explicit asset dependencies",
@@ -223,120 +207,75 @@ def prepare_robot_model(*, scene_xml: str | Path, robot_root: str,
         "body_names": [node.get("name") for node in robot.iter("body")],
         "cloned_assets": [{"kind": node.tag, "name": node.get("name"), "file": node.get("file")}
                           for node in assets],
-        "render_visibility": "existing FixedCamera groups: visual groups 1 and 2; collision group 0 hidden",
+        "geometry_selection": "all robot geoms with nonzero contype or conaffinity, independent of visual group",
         "fixed_installation_policy": "caller retains complete known assembly collision geometry as static owners",
     }
-    return model, data, camera_config, provenance
+    return model, data, provenance
 
 
-def robot_mask_from_depth(*, depth_m: Any, robot_depth_m: Any,
-                          robot_projection: Any, depth_tolerance_m: float,
-                          depth_tolerance_source: str) -> dict[str, Any]:
-    """Keep only depth-consistent projected pixels; leave all other depth alone.
+# BEGIN three-state native-collision observation adapter; no depth equality mask.
+def classify_robot_observation(*, scene_xml: str | Path, robot_root: str,
+                               joint_map: Sequence[tuple[str, str, float]],
+                               joint_positions: Mapping[str, float],
+                               T_world_robot_root: Any, calibration: Mapping[str, Any],
+                               observed_depth: Any, padding_scale: float,
+                               padding_offset_m: float, source: str) -> dict[str, Any]:
+    """Bind complete measured robot feedback to separate native collision geoms.
 
-    FixedCamera samples the same calibrated pixel centres without MSAA. No
-    dilation or erosion changes the observed support. A foreground occluder
-    more than the declared tolerance ahead of the robot is never removed. Any
-    other surface indistinguishable from the robot within that tolerance
-    remains a stated identification limit; this is not an occupancy certificate.
+    Compiled mesh vertices already contain asset scale and principal-axis
+    recentering. Their compiled geom pose is applied once. Scaling each geom
+    about its own compiled local origin preserves its pose and never scales a
+    link's translation. Fixed installation bodies are included regardless of
+    visual group; no object state, observed segmentation or renderer is read.
     """
-    observed, predicted = np.asarray(depth_m, float), np.asarray(robot_depth_m, float)
-    projection = np.asarray(robot_projection)
-    if (observed.ndim != 2 or observed.shape != predicted.shape or projection.shape != observed.shape
-            or projection.dtype != np.bool_ or observed.size > 2_000_000):
-        raise ValueError("Observed depth, robot depth, and boolean projection must share a bounded H,W grid")
-    tolerance = float(depth_tolerance_m)
-    if not np.isfinite(tolerance) or tolerance < 0:
-        raise ValueError("Depth tolerance must be explicit finite nonnegative metres")
-    source = _text(depth_tolerance_source, "depth tolerance source")
-    observed_valid = np.isfinite(observed) & (observed > 0)
-    predicted_valid = np.isfinite(predicted) & (predicted > 0)
-    if np.any(projection & ~predicted_valid):
-        raise ValueError("The robot-only projection contains invalid rendered robot depth")
-    comparable = projection & observed_valid
-    residual = observed - predicted
-    consistent = comparable & (np.abs(residual) <= tolerance)
-    mask = consistent
-    uncertain = projection & ~mask
+    from manipulation.robot_self_filter import RobotCollisionShape, classify_depth
+    from manipulation.tool_geometry import _collision_geometry
 
-    def statistics(values):
-        # These diagnostics never alter the caller's fixed metre tolerance.
-        if not values.size:
-            return {"count": 0, "min": None, "median": None, "p95": None, "p99": None, "max": None}
-        quantiles = np.percentile(values, [0, 50, 95, 99, 100])
-        return {"count": int(values.size), **dict(zip(
-            ("min", "median", "p95", "p99", "max"), map(float, quantiles)))}
-
-    return {
-        "robot_mask": mask, "unknown_boundary": uncertain,
-        "report": {
-            "depth_tolerance_m": tolerance, "depth_tolerance_source": source,
-            "robot_projection_pixels": int(projection.sum()),
-            "depth_consistent_pixels": int(consistent.sum()),
-            "robot_mask_pixels": int(mask.sum()), "unknown_boundary_pixels": int(uncertain.sum()),
-            "depth_inconsistent_pixels": int((comparable & ~consistent).sum()),
-            "occluding_foreground_pixels": int((comparable & (residual < -tolerance)).sum()),
-            "observation_behind_robot_pixels": int((comparable & (residual > tolerance)).sum()),
-            "invalid_observed_depth_under_robot_pixels": int((projection & ~observed_valid).sum()),
-            "comparable_depth_residual_m": statistics(residual[comparable]),
-            "comparable_absolute_depth_residual_m": statistics(np.abs(residual[comparable])),
-            "depth_consistent_absolute_residual_max_m": (
-                float(np.abs(residual[consistent]).max()) if consistent.any() else None),
-            "residual_definition": "observed optical depth minus robot-only optical depth, in metres",
-            "mask_policy": "same calibrated pixel centre; no dilation or erosion",
-            "input_depth_modified": False,
-            "unknown_boundary_scope": "unremoved/unresolved robot identity; retain original depth as obstacle/coverage evidence",
-            "limitation": "depth agreement cannot distinguish a coincident foreground surface within the stated tolerance; no occupancy or collision-completeness claim",
-        },
-    }
-
-
-def render_robot_mask(*, scene_xml: str | Path, robot_root: str,
-                      joint_map: Sequence[tuple[str, str, float]],
-                      joint_positions: Mapping[str, float], T_world_robot_root: Any,
-                      rgb: Any, depth_m: Any, calibration: Mapping[str, Any],
-                      observation_id: str, feedback_source: str,
-                      depth_tolerance_m: float, depth_tolerance_source: str) -> dict[str, Any]:
-    """Render one synchronized known-robot view; the caller owns GPU scheduling."""
-    observation_id = _text(observation_id, "synchronized observation_id")
-    feedback_source = _text(feedback_source, "current robot feedback source")
-    image, depth = np.asarray(rgb), np.asarray(depth_m, dtype=float)
-    shape = (calibration["height"], calibration["width"])
-    if image.dtype != np.uint8 or image.shape != (*shape, 3) or depth.shape != shape:
-        raise ValueError("Current RGB and metric depth must match their explicit camera calibration")
-    # Validate the public tolerance before any GL allocation.
-    if not np.isfinite(float(depth_tolerance_m)) or float(depth_tolerance_m) < 0:
-        raise ValueError("Depth tolerance must be finite nonnegative metres")
-    _text(depth_tolerance_source, "depth tolerance source")
-    model, data, config, provenance = prepare_robot_model(
+    depth = np.asarray(observed_depth, dtype=float)
+    if depth.shape != (calibration["height"], calibration["width"]):
+        raise ValueError("Observed metric depth must match the supplied calibrated image dimensions")
+    source = _text(source, "self-filter source")
+    model, data, provenance = prepare_robot_model(
         scene_xml=scene_xml, robot_root=robot_root, joint_map=joint_map,
         joint_positions=joint_positions, T_world_robot_root=T_world_robot_root,
         calibration=calibration)
-    sys.path.insert(0, str(WORKSPACE_ROOT))
-    from collect.camera import FixedCamera
-
-    camera = FixedCamera(model, data, width=shape[1], height=shape[0],
-                         camera_name=None, camera_config=config)
-    try:
-        rendered_calibration = camera.calibration
-        for key in ("K", "T_world_camera_cv"):
-            if not np.allclose(rendered_calibration[key], calibration[key], rtol=0, atol=1e-9):
-                raise ValueError(f"The robot-only rendered {key} differs from the current camera")
-        for key in ("near_m", "far_m"):
-            if not np.isclose(rendered_calibration[key], calibration[key], rtol=1e-7, atol=1e-9):
-                raise ValueError("Robot-only rendering changed the calibrated clipping planes")
-        rendered = camera.capture(data)
-    finally:
-        camera.close()
-    # These IDs come solely from the independently compiled known robot. They
-    # contain no observed-scene target labels or object visibility information.
-    projection = rendered["seg_geom_id"] >= 0
-    result = robot_mask_from_depth(
-        depth_m=depth, robot_depth_m=rendered["depth_m"], robot_projection=projection,
-        depth_tolerance_m=depth_tolerance_m, depth_tolerance_source=depth_tolerance_source)
-    result["robot_depth_m"] = rendered["depth_m"]
-    result["report"].update(
-        observation_id=observation_id, feedback_source=feedback_source,
-        source=provenance, rendered_calibration=rendered_calibration,
-        synchronization="caller-supplied robot feedback and RGB-D from one unchanged simulation/sensor snapshot")
-    return result
+    geometries, identities = [], []
+    for index in range(model.ngeom):
+        if not (model.geom_contype[index] or model.geom_conaffinity[index]):
+            continue
+        name = model.geom(index).name
+        # Native identifiers must remain explicit in diagnostics; inventing
+        # names would prevent an inventory check against collision ownership.
+        _text(name, "native collision geom name")
+        pose = np.eye(4)
+        pose[:3, :3] = data.geom_xmat[index].reshape(3, 3)
+        pose[:3, 3] = data.geom_xpos[index]
+        kind = model.geom_type[index]
+        arguments = {}
+        if kind == mujoco.mjtGeom.mjGEOM_MESH:
+            native = _collision_geometry(model, index, "known_robot_self_filter")
+            shape_kind, arguments = "convex", {"vertices": native["vertices"]}
+        elif kind == mujoco.mjtGeom.mjGEOM_BOX:
+            shape_kind, arguments = "box", {"dimensions": tuple(2 * model.geom_size[index])}
+        elif kind == mujoco.mjtGeom.mjGEOM_CYLINDER:
+            shape_kind = "cylinder"
+            arguments = {"dimensions": (float(model.geom_size[index, 0]),
+                                         float(2 * model.geom_size[index, 1]))}
+        else:
+            raise ValueError(f"Unsupported native self-filter collision geom type for {name}: {kind}")
+        geometry_source = f"{Path(scene_xml).resolve()}::geom[{name}]"
+        geometries.append(RobotCollisionShape(name, shape_kind, pose, geometry_source, **arguments))
+        identities.append({"name": name, "body": model.body(model.geom_bodyid[index]).name,
+                           "kind": shape_kind, "source": geometry_source,
+                           "contype": int(model.geom_contype[index]),
+                           "conaffinity": int(model.geom_conaffinity[index])})
+    classified = classify_depth(
+        observed_depth=depth, K=calibration["K"],
+        T_world_camera=calibration["T_world_camera_cv"], geometries=geometries,
+        padding_scale=padding_scale, padding_offset_m=padding_offset_m, source=source)
+    classified["provenance"].update(known_robot=provenance,
+        collision_geometries=identities, collision_geom_count=len(identities),
+        body_names=provenance["body_names"], robot_root=provenance["robot_root"],
+        synchronization="caller-supplied complete measured robot feedback and calibrated depth from one snapshot")
+    return classified
+# END unknown/self labels never create environmental surfaces or free rays.

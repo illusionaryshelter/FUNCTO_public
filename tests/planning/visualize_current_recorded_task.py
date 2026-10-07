@@ -354,8 +354,10 @@ def observation_panel(segment, workspace, output, run, run_index):
         figure.tight_layout()
         figure.savefig(depth_target, dpi=110)
         plt.close(figure)
-        mask_report = run["directory"] / "observations" / view["id"] / "robot-mask-report.json"
-        mask_detail = details("机器人掩码证据", read_json(mask_report)) if mask_report.is_file() else ""
+        # BEGIN display the current three-state model and ray evidence.
+        mask_report = run["directory"] / "observations" / view["id"] / "self-filter-report.json"
+        mask_detail = details("机器人三态过滤证据", read_json(mask_report)) if mask_report.is_file() else ""
+        # END no old binary mask is presented as the current classification.
         cards.append(f'<div class="view"><b>{escape(view["id"])}</b>'
             f'<img src="assets/{target.name}" alt="当前规划输入 RGB">'
             f'<img src="assets/{depth_target.name}" alt="当前规划输入 optical-z 深度">'

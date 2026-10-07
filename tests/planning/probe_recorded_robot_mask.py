@@ -1,12 +1,10 @@
-"""Render only the complete known robot against one explicit recorded RGB-D view.
+"""Classify one recorded RGB-D view with the production three-state self-filter.
 
-This bounded probe reuses the production observation helper and fixed-assembly
-fixture contract. It never builds a map, loads recorded object state, plans a
-trajectory, or advances physics. Pixel removal is a depth-consistency result;
-it supplies no evidence that occluded or unknown space is free.
+The bounded CPU probe compiles only the registered robot collision assembly.
+It neither renders depth nor builds maps, plans motion, or advances physics.
 """
 
-# BEGIN complete known-assembly RGB-D mask probe, with explicit provenance.
+# BEGIN explicit three-state known-assembly observation probe.
 from __future__ import annotations
 
 import argparse
@@ -22,7 +20,8 @@ from PIL import Image
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from recorded_observation import camera_config_from_calibration, render_robot_mask
+from recorded_observation import camera_config_from_calibration, classify_robot_observation
+from manipulation.robot_self_filter import SELF, ENVIRONMENT, AMBIGUOUS_SHADOW
 from robot_fixture import validate_fixture_collision_contract
 
 
@@ -35,21 +34,21 @@ def read_metadata(path):
 
 
 def run(args):
-    """Validate on CPU, render one known-robot view, and retain all residuals."""
-    if (not np.isfinite(args.depth_tolerance) or args.depth_tolerance < 0
-            or not args.depth_tolerance_source.strip() or not args.observation_id.strip()):
-        raise ValueError("Provide a finite nonnegative depth tolerance and explicit nonempty provenance")
+    """Validate one current view and preserve labels and their evidence source."""
+    if not args.observation_id.strip():
+        raise ValueError("Provide an explicit observation identity")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     report = {
         "status": "preparing",
-        "scope": "complete known-robot depth-consistency mask for one explicit RGB-D snapshot",
+        "scope": "three-state registered collision-model self-filter for one explicit RGB-D snapshot",
         "inputs": {name: str(getattr(args, name).resolve())
                    for name in ("fixture", "feedback", "rgb", "depth", "calibration")},
         "observation_id": args.observation_id,
-        "depth_tolerance_m": args.depth_tolerance,
-        "depth_tolerance_source": args.depth_tolerance_source,
+        "padding_offset_m": args.self_filter_padding_offset_m,
+        "padding_scale": args.self_filter_padding_scale,
+        "self_filter_source": args.self_filter_source,
         "physics_steps": 0, "mapper_called": False, "planning_called": False,
         "recorded_object_state_read": False, "observed_scene_segmentation_read": False,
         "input_depth_modified": False, "unknown_space_validated": False,
@@ -61,7 +60,7 @@ def run(args):
         feedback = json.loads(read_metadata(args.feedback))
         calibration = json.loads(read_metadata(args.calibration))
         robot = yaml.safe_load(read_metadata(fixture["robot_config_path"]))
-        # Recompute source/fixture completeness before allocating a renderer.
+        # Recompute source/fixture completeness before classifying any observation.
         # This contract requires visual_root == calibrated base_link and an
         # identity root offset, plus every separate fixed collision primitive.
         report["fixture_collision_contract"] = validate_fixture_collision_contract(fixture, robot)
@@ -89,32 +88,25 @@ def run(args):
         report.update(feedback_source=feedback["source"], feedback_entry_frame=feedback["entry_frame"],
                       feedback_sim_time_s=feedback["sim_time_s"], robot_visual_root=fixture["robot_visual_root"],
                       joint_positions=measured, T_world_robot_visual_root=visual_pose.tolist())
-        report["rendering_called"] = True
-        rendered = render_robot_mask(
+        filtered = classify_robot_observation(
             scene_xml=fixture["source_scene_xml"], robot_root=fixture["robot_visual_root"],
             joint_map=[(name, name, 1.) for name in names], joint_positions=measured,
-            T_world_robot_root=visual_pose, rgb=rgb, depth_m=depth, calibration=calibration,
-            observation_id=args.observation_id, feedback_source=feedback["source"],
-            depth_tolerance_m=args.depth_tolerance, depth_tolerance_source=args.depth_tolerance_source)
-        mask_report = rendered["report"]
-        fixed_links = sorted({row["link"] for row in fixture["fixed_collision_geometries"]})
-        rendered_links = set(mask_report["source"]["body_names"])
-        if (mask_report["source"]["robot_root"] != fixture["base_link"]
-                or not set(fixed_links) <= rendered_links):
-            raise ValueError("Rendered robot subtree omitted a validated fixed installation body")
+            T_world_robot_root=visual_pose, observed_depth=depth, calibration=calibration,
+            padding_scale=args.self_filter_padding_scale,
+            padding_offset_m=args.self_filter_padding_offset_m, source=args.self_filter_source)
+        labels = filtered["self_filter"]["labels"]
         report.update(
-            complete_visual_assembly_validated=True,
-            fixed_installation_links=fixed_links,
+            fixed_installation_links=sorted({row["link"] for row in fixture["fixed_collision_geometries"]}),
             fixed_installation_collision_geometry_count=len(fixture["fixed_collision_geometries"]),
-            collision_ownership_requirement="These fixed primitives must remain static collision owners in any later scene",
-            # OpenGL may select software despite an EGL/GLFW context. Record
-            # the actual existing renderer metadata instead of claiming CUDA.
-            rendering_device=mask_report["rendered_calibration"]["rendering_device"],
-            mask_report=mask_report)
-        for name in ("robot_mask", "unknown_boundary", "robot_depth_m"):
-            np.save(output / f"{name}.npy", rendered[name], allow_pickle=False)
+            collision_ownership_requirement="Fixed primitives remain static collision owners in any later scene",
+            provenance=filtered["provenance"],
+            counts={"SELF": int((labels == SELF).sum()),
+                    "ENVIRONMENT": int((labels == ENVIRONMENT).sum()),
+                    "AMBIGUOUS_SHADOW": int((labels == AMBIGUOUS_SHADOW).sum())})
+        for name in ("labels", "free_ray_depth_m"):
+            np.save(output / f"{name}.npy", filtered["self_filter"][name], allow_pickle=False)
         report["artifacts"] = {name: str(output / f"{name}.npy")
-                               for name in ("robot_mask", "unknown_boundary", "robot_depth_m")}
+                               for name in ("labels", "free_ray_depth_m")}
         report["status"] = "completed"
         return report
     except BaseException as error:
@@ -137,8 +129,9 @@ if __name__ == "__main__":
     parser.add_argument("--depth", required=True, type=Path)
     parser.add_argument("--calibration", required=True, type=Path)
     parser.add_argument("--observation-id", required=True)
-    parser.add_argument("--depth-tolerance", required=True, type=float)
-    parser.add_argument("--depth-tolerance-source", required=True)
+    parser.add_argument("--self-filter-padding-offset-m", required=True, type=float)
+    parser.add_argument("--self-filter-padding-scale", required=True, type=float)
+    parser.add_argument("--self-filter-source", required=True)
     parser.add_argument("--output", required=True, type=Path)
     run(parser.parse_args())
-# END complete known-assembly RGB-D mask probe.
+# END explicit three-state known-assembly observation probe.

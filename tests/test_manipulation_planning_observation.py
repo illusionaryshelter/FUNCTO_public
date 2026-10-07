@@ -10,9 +10,10 @@ import torch
 
 from manipulation.planning_observation import (
     _add_known_solid_voxels, _known_free_voxels, _known_solid_evidence,
-    _mapper_memory_bound, _owner_mapper_config, _partition_masks, _require_audit_mapping_memory,
+    _mapper_memory_bound, _owner_mapper_config, _audit_partition_masks, _require_audit_mapping_memory,
     _require_native_voxel_layout, _views,
-    build_audit_scene_from_rgbd, observed_space_from_rgbd,
+    build_audit_scene_from_rgbd, observed_audit_space_from_rgbd,
+    _partition_masks, _self_filtered_views, _self_filter_report,
 )
 from manipulation.planning_scene import ObservedSpace
 
@@ -23,8 +24,18 @@ def view(depth=None):
     return {"depth": depth, "K": np.array([[60., 0., (width-1)/2], [0., 60., (height-1)/2], [0., 0., 1.]]),
             "T_output_camera": np.eye(4), "reference_frame": "world",
             "image": np.zeros((*depth.shape, 3), np.uint8), "owner_masks": {},
-            "robot_mask": np.zeros(depth.shape, bool)}
+            "robot_mask": np.zeros(depth.shape, bool),
+            "self_filter": environment_evidence(depth)}
 
+
+# BEGIN explicit synthetic three-state evidence, independent of legacy audit masks.
+def environment_evidence(depth):
+    from manipulation.robot_self_filter import ENVIRONMENT, AMBIGUOUS_SHADOW
+    valid = np.isfinite(depth) & (depth > 0)
+    return {"labels": np.where(valid, ENVIRONMENT, AMBIGUOUS_SHADOW).astype(np.uint8),
+            "free_ray_depth_m": np.where(valid, depth, 0.),
+            "source": "Synthetic calibrated environment-only observation"}
+# END no test silently invents a production robot-mask fallback.
 
 def solid_fixture():
     """A declared synthetic physical cube whose front actually occludes depth."""
@@ -47,7 +58,7 @@ def solid_fixture():
 
 class PlanningObservationTest(unittest.TestCase):
     def test_full_sphere_in_ray_prefix_is_known_but_surface_and_hidden_back_are_not(self):
-        space = observed_space_from_rgbd({"camera0_now": view()}, origin=[-.5, -.5, .2], shape=(45, 21, 21),
+        space = observed_audit_space_from_rgbd({"camera0_now": view()}, origin=[-.5, -.5, .2], shape=(45, 21, 21),
                                          voxel_size=.05, depth_error_m=.01, reference_frame="world", depth_range_m=(.1, 3.))
         balls = torch.tensor([[[[0., 0., 1., .03], [0., 0., 2., .03], [0., 0., 2.3, .03]]]], dtype=torch.float64)
         costs = space.violation(balls)[0, 0]
@@ -59,7 +70,7 @@ class PlanningObservationTest(unittest.TestCase):
         record = view()
         record["depth"][47, 47] = np.nan
         normalized = _views({"current": record}, "world", (.1, 3.))
-        known = _known_free_voxels(normalized, origin=[0., 0., 1.], shape=(2, 2, 2),
+        known = _known_free_voxels(normalized, ray_depths={name: row["depth"] for name, row in normalized.items()}, origin=[0., 0., 1.], shape=(2, 2, 2),
                                    voxel_size=.01, depth_error_m=0.)
         self.assertFalse(known[0, 0, 0])
         # The valid surrounding depths never fill a missing ray.
@@ -70,20 +81,20 @@ class PlanningObservationTest(unittest.TestCase):
         first["depth"][:] = 0.
         second["T_output_camera"][0, 3] = .1
         normalized = _views({"missing": first, "valid_other_camera": second}, "world", (.1, 3.))
-        known = _known_free_voxels(normalized, origin=[0., 0., 1.], shape=(2, 2, 2),
+        known = _known_free_voxels(normalized, ray_depths={name: row["depth"] for name, row in normalized.items()}, origin=[0., 0., 1.], shape=(2, 2, 2),
                                    voxel_size=.01, depth_error_m=.01)
         self.assertTrue(known.all())
         second["depth"][:] = .6
         blocked = _views({"missing": first, "foreground": second}, "world", (.1, 3.))
-        self.assertFalse(_known_free_voxels(blocked, origin=[0., 0., 1.], shape=(2, 2, 2),
+        self.assertFalse(_known_free_voxels(blocked, ray_depths={name: row["depth"] for name, row in blocked.items()}, origin=[0., 0., 1.], shape=(2, 2, 2),
                                            voxel_size=.01, depth_error_m=.01).any())
 
     def test_field_of_view_and_metric_error_are_conservative(self):
         normalized = _views({"current": view()}, "world", (.1, 3.))
-        outside = _known_free_voxels(normalized, origin=[1., 0., 1.], shape=(2, 2, 2),
+        outside = _known_free_voxels(normalized, ray_depths={name: row["depth"] for name, row in normalized.items()}, origin=[1., 0., 1.], shape=(2, 2, 2),
                                      voxel_size=.01, depth_error_m=0.)
         self.assertFalse(outside.any())
-        near = _known_free_voxels(normalized, origin=[0., 0., 1.98], shape=(2, 2, 2),
+        near = _known_free_voxels(normalized, ray_depths={name: row["depth"] for name, row in normalized.items()}, origin=[0., 0., 1.98], shape=(2, 2, 2),
                                   voxel_size=.01, depth_error_m=.02)
         self.assertFalse(near.any())
 
@@ -94,7 +105,7 @@ class PlanningObservationTest(unittest.TestCase):
         record["owner_masks"] = {"part": owner, "other": other}
         record["robot_mask"][30, 30] = True
         normalized = _views({"current": record}, "world", (.1, 3.))
-        masks = _partition_masks(normalized, ("part", "other"))["current"]
+        masks = _audit_partition_masks(normalized, ("part", "other"))["current"]
         self.assertFalse(masks[None][40, 40])
         self.assertFalse(masks[None][30, 30])
         self.assertTrue(masks[None][44, 44])
@@ -103,13 +114,13 @@ class PlanningObservationTest(unittest.TestCase):
         np.testing.assert_array_equal(record["depth"], np.full((96, 96), 2.))
         record["owner_masks"]["other"][40, 40] = True
         with self.assertRaisesRegex(ValueError, "disjoint"):
-            _partition_masks(_views({"current": record}, "world", (.1, 3.)), ("part", "other"))
+            _audit_partition_masks(_views({"current": record}, "world", (.1, 3.)), ("part", "other"))
 
     def test_missing_owner_depth_and_wrong_calibration_cannot_create_geometry(self):
         record = view()
         record["owner_masks"] = {"part": np.zeros((96, 96), bool)}
         with self.assertRaisesRegex(ValueError, "current valid depth"):
-            _partition_masks(_views({"current": record}, "world", (.1, 3.)), ("part",))
+            _audit_partition_masks(_views({"current": record}, "world", (.1, 3.)), ("part",))
         record["K"][0, 1] = 1.
         with self.assertRaisesRegex(ValueError, "zero-skew"):
             _views({"current": record}, "world", (.1, 3.))
@@ -157,13 +168,17 @@ class PlanningObservationTest(unittest.TestCase):
             extent_esdf_meters_xyz=(.5, .5, .5), esdf_voxel_size=.025,
             grid_center=torch.tensor([0., 0., 1.]),
             image_height=96, image_width=96, device="cuda:0")
+        # BEGIN finish synthetic depth before deriving its explicit evidence.
+        for record in (first, second):
+            record["self_filter"] = environment_evidence(record["depth"])
+        # END test fixture edits never leave stale classification evidence.
         return {"first": first, "second": second}, {"part": {
             "T_output_owner": pose, "source": "Current calibrated two-view owner pose"}}, cfg
 
     def test_refined_owner_grid_encloses_every_valid_label_from_both_rotated_views(self):
         views, frames, cfg = self.refined_owner_fixture()
         normalized = _views(views, "world", (.1, 3.))
-        masks = _partition_masks(normalized, frames)
+        masks = _audit_partition_masks(normalized, frames)
         pose, voxel, error = frames["part"]["T_output_owner"], .005, .003
         refined = _owner_mapper_config(cfg, normalized, masks, "part", pose, voxel, error)
         points = []
@@ -447,8 +462,8 @@ class PlanningObservationTest(unittest.TestCase):
         record, frames, solids = solid_fixture()
         options = dict(origin=[-.6, -.6, .7], shape=(33, 25, 25), voxel_size=.05,
                        depth_error_m=.01, reference_frame="world", depth_range_m=(.1, 3.))
-        original = observed_space_from_rgbd({"current": record}, **options)
-        occupied = observed_space_from_rgbd({"current": record}, known_solids=solids,
+        original = observed_audit_space_from_rgbd({"current": record}, **options)
+        occupied = observed_audit_space_from_rgbd({"current": record}, known_solids=solids,
                                             owner_frames=frames, **options)
         np.testing.assert_array_equal(occupied.known_free, original.known_free)
         self.assertFalse(occupied.known_free[16, 12, 12])
@@ -486,7 +501,7 @@ class PlanningObservationTest(unittest.TestCase):
             mapper.assert_not_called()
         self.assertEqual(len(spaces), 1)
         space = spaces[0]
-        original = observed_space_from_rgbd({"current": record}, origin=space.origin,
+        original = observed_audit_space_from_rgbd({"current": record}, origin=space.origin,
             shape=space.known_free.shape, voxel_size=space.voxel_size, depth_error_m=.01,
             reference_frame="world", depth_range_m=(cfg.depth_minimum_distance, cfg.depth_maximum_distance))
         np.testing.assert_array_equal(space.known_free, original.known_free)
@@ -496,8 +511,8 @@ class PlanningObservationTest(unittest.TestCase):
         record, frames, solids = solid_fixture()
         options = dict(origin=[-.6, -.6, .7], shape=(33, 25, 25), voxel_size=.05,
                        depth_error_m=.01, reference_frame="world", depth_range_m=(.1, 3.))
-        before = observed_space_from_rgbd({"current": record}, **options)
-        after = observed_space_from_rgbd({"current": record}, known_solids=solids,
+        before = observed_audit_space_from_rgbd({"current": record}, **options)
+        after = observed_audit_space_from_rgbd({"current": record}, known_solids=solids,
                                          owner_frames=frames, **options)
         balls = torch.tensor([[[[0., 0., 1.5, .04], [.58, 0., 1.5, .02], [0., 0., 2.2, .02]]]], dtype=torch.float64)
         self.assertGreater(before.violation(balls)[0, 0, 0].item(), 0.)
@@ -515,7 +530,7 @@ class PlanningObservationTest(unittest.TestCase):
         inner.invert()
         solids["body"]["mesh"] = trimesh.util.concatenate((solids["body"]["mesh"], inner))
         self.assertTrue(solids["body"]["mesh"].is_volume)
-        space = observed_space_from_rgbd({"current": record}, known_solids=solids, owner_frames=frames,
+        space = observed_audit_space_from_rgbd({"current": record}, known_solids=solids, owner_frames=frames,
                                          origin=[-.45, -.45, 1.05], shape=(31, 31, 31), voxel_size=.03,
                                          depth_error_m=0., reference_frame="world", depth_range_m=(.1, 3.))
         balls = torch.tensor([[[[0., 0., 1.5, .02], [.33, 0., 1.5, .02]]]], dtype=torch.float64)
@@ -541,7 +556,7 @@ class PlanningObservationTest(unittest.TestCase):
         # Both proofs include full-cell/error margins before detecting conflict.
         record["depth"][:] = 3.
         with self.assertRaisesRegex(ValueError, "contradicts proved-free"):
-            observed_space_from_rgbd({"current": record}, known_solids=solids, owner_frames=frames,
+            observed_audit_space_from_rgbd({"current": record}, known_solids=solids, owner_frames=frames,
                                       origin=[-.1, -.1, 1.4], shape=(5, 5, 5), voxel_size=.05,
                                       depth_error_m=.01, reference_frame="world", depth_range_m=(.1, 4.))
 
@@ -693,6 +708,81 @@ class NativeVoxelLayoutTest(unittest.TestCase):
 
 # BEGIN production tests admit one fixed model without source reconstruction.
 class OnlineObservationContractTest(unittest.TestCase):
+    # BEGIN three-state mapping counterexamples without a GPU allocation.
+    def test_unknown_rays_never_prove_even_the_prefix_free(self):
+        from manipulation.robot_self_filter import SELF, AMBIGUOUS_SHADOW
+        records = {}
+        for name, label in (("self", SELF), ("shadow", AMBIGUOUS_SHADOW)):
+            record = view()
+            record["self_filter"]["labels"][:] = label
+            record["self_filter"]["free_ray_depth_m"][:] = 0.
+            records[name] = record
+        normalized = _self_filtered_views(records, "world", (.1, 3.))
+        options = dict(origin=[0., 0., 1.], shape=(2, 2, 2), voxel_size=.01, depth_error_m=.01)
+        rays = {name: row["self_filter"]["free_ray_depth_m"] for name, row in normalized.items()}
+        self.assertFalse(_known_free_voxels(normalized, ray_depths=rays, **options).any())
+        # A separate clear observation may supply evidence; excluded rays may not.
+        normalized.update(_self_filtered_views({"clear": view()}, "world", (.1, 3.)))
+        rays["clear"] = normalized["clear"]["self_filter"]["free_ray_depth_m"]
+        self.assertTrue(_known_free_voxels(normalized, ray_depths=rays, **options).all())
+
+    def test_partition_clips_both_excluded_states_and_keeps_semantic_conflicts(self):
+        from manipulation.robot_self_filter import SELF, AMBIGUOUS_SHADOW
+        record = view()
+        record["self_filter"]["labels"][30, 30] = SELF
+        record["self_filter"]["labels"][31, 31] = AMBIGUOUS_SHADOW
+        record["self_filter"]["free_ray_depth_m"][[30, 31], [30, 31]] = 0.
+        owner = np.zeros(record["depth"].shape, bool)
+        owner[[30, 31, 32], [30, 31, 32]] = True
+        record["owner_masks"] = {"part": owner}
+        normalized = _self_filtered_views({"camera": record}, "world", (.1, 3.))
+        masks = _partition_masks(normalized, ("part",))["camera"]
+        self.assertEqual(int(masks["part"].sum()), 1)
+        self.assertFalse(masks[None][30, 30])
+        self.assertFalse(masks[None][31, 31])
+        self.assertTrue(masks[None][33, 33])
+        report = _self_filter_report(normalized)["camera"]["owners"]["part"]
+        self.assertEqual(report["excluded_self_pixels"], 1)
+        self.assertEqual(report["excluded_ambiguous_shadow_pixels"], 1)
+        np.testing.assert_array_equal(record["depth"], np.full((96, 96), 2.))
+        # A semantic conflict cannot be hidden by subsequent self filtering.
+        other = np.zeros_like(owner)
+        other[30, 30] = True
+        normalized["camera"]["owner_masks"]["other"] = other
+        with self.assertRaisesRegex(ValueError, "disjoint"):
+            _partition_masks(normalized, ("part", "other"))
+        del normalized["camera"]["owner_masks"]["other"]
+        normalized["camera"]["owner_masks"]["part"][32, 32] = False
+        with self.assertRaisesRegex(ValueError, "after self filtering"):
+            _partition_masks(normalized, ("part",))
+
+    def test_online_evidence_is_required_and_cannot_grant_excluded_rays(self):
+        from manipulation.robot_self_filter import AMBIGUOUS_SHADOW
+        record = view()
+        del record["self_filter"]
+        with self.assertRaisesRegex(ValueError, "three-state self_filter"):
+            _self_filtered_views({"camera": record}, "world", (.1, 3.))
+        # An old robot_mask remains present and must not enable a fallback.
+        record["self_filter"] = environment_evidence(record["depth"])
+        record["self_filter"]["labels"][30, 30] = AMBIGUOUS_SHADOW
+        with self.assertRaises(ValueError):
+            _self_filtered_views({"camera": record}, "world", (.1, 3.))
+        record["self_filter"]["free_ray_depth_m"][30, 30] = 0.
+        record["self_filter"]["labels"][31, 31] = 255
+        with self.assertRaises(ValueError):
+            _self_filtered_views({"camera": record}, "world", (.1, 3.))
+
+    def test_mapper_range_clips_evidence_without_mutating_measured_classification(self):
+        from manipulation.robot_self_filter import ENVIRONMENT, AMBIGUOUS_SHADOW
+        record = view()
+        normalized = _self_filtered_views({"camera": record}, "world", (.1, 1.5))["camera"]
+        self.assertFalse(normalized["depth"].any())
+        self.assertFalse(normalized["self_filter"]["free_ray_depth_m"].any())
+        self.assertTrue((normalized["self_filter"]["labels"] == AMBIGUOUS_SHADOW).all())
+        self.assertTrue((record["self_filter"]["labels"] == ENVIRONMENT).all())
+        self.assertTrue((record["depth"] == 2.).all())
+    # END each test checks occupied endpoints separately from coverage evidence.
+
     # BEGIN exercise actual admission signatures with measured-resource fixtures.
     def test_online_mapping_admission_uses_real_checks_without_lazy_reservations(self):
         from manipulation.planning_observation import _require_mapping_memory
@@ -712,7 +802,7 @@ class OnlineObservationContractTest(unittest.TestCase):
     def test_registered_sphere_radius_expands_owner_support_before_mapping(self):
         views,frames,cfg=PlanningObservationTest.refined_owner_fixture()
         normalized=_views(views,'world',(.1,3.))
-        masks=_partition_masks(normalized,frames)
+        masks=_audit_partition_masks(normalized,frames)
         pose=frames['part']['T_output_owner']
         small=_owner_mapper_config(cfg,normalized,masks,'part',pose,.005,.003)
         supported=_owner_mapper_config(cfg,normalized,masks,'part',pose,.005,.003,query_radius_m=.072)
@@ -729,8 +819,15 @@ class OnlineObservationContractTest(unittest.TestCase):
             grid_center=torch.tensor([.2,.3,1.]),image_height=96,image_width=96,device='cuda:0')
         values=torch.tensor(np.broadcast_to(np.array([-.02,0.,.02])[:,None,None],(3,4,5)).copy(),dtype=torch.float16)
         voxel=SimpleNamespace(feature_tensor=values,pose=[.2,.3,1.,1.,0.,0.,0.],voxel_size=.02)
-        normalized=_views({'A':view()},'world',(.1,3.))
+        # BEGIN inspect the exact filtered depth passed to the native Mapper.
+        from manipulation.robot_self_filter import SELF, AMBIGUOUS_SHADOW
+        record=view()
+        record['self_filter']['labels'][30,30]=SELF
+        record['self_filter']['labels'][31,31]=AMBIGUOUS_SHADOW
+        record['self_filter']['free_ray_depth_m'][[30,31],[30,31]]=0.
+        normalized=_self_filtered_views({'A':record},'world',(.1,3.))
         masks=_partition_masks(normalized,{})
+        # END mixed labels must reach one unchanged native integration path.
         bits=np.full((3,4,5),3,dtype=np.uint8)
         with patch('curobo.perception.Mapper') as mapper, \
              patch('curobo.types.DeviceCfg',return_value=DeviceCfg('cpu')), \
@@ -742,6 +839,12 @@ class OnlineObservationContractTest(unittest.TestCase):
             mapper.return_value.get_stats.return_value={'allocation_failures':0,'num_allocated':0,'active_blocks':0,'free_count':0}
             mapper.return_value.compute_esdf.return_value=voxel
             query,report=_map_online_partition(normalized,masks,None,cfg,np.eye(4))
+        # BEGIN native mapping receives original ENVIRONMENT endpoints only.
+        mapped=mapper.return_value.integrate.call_args.kwargs['camera_observation'].depth_image.cpu().numpy()[0]
+        expected_depth=record['depth'].copy()
+        expected_depth[[30,31],[30,31]]=0.
+        np.testing.assert_array_equal(mapped,expected_depth)
+        # END no free-ray cap is integrated as a synthetic occupied surface.
         np.testing.assert_allclose(query.origin,[.18,.27,.96],atol=1e-12)
         np.testing.assert_array_equal(query.distance,values.float().numpy())
         samples=torch.tensor([[.18,.29,1.],[.2,.29,1.],[.22,.29,1.]],dtype=torch.float64)
@@ -753,6 +856,11 @@ class OnlineObservationContractTest(unittest.TestCase):
         from manipulation.planning_observation import build_scene_from_rgbd
         from manipulation.online_geometry import FrozenESDF,OnlinePlanningScene
         views,frames,cfg=PlanningObservationTest.refined_owner_fixture()
+        # BEGIN a valid measured ray explicitly excluded from online coverage.
+        from manipulation.robot_self_filter import AMBIGUOUS_SHADOW
+        views['first']['self_filter']['labels'][10,10]=AMBIGUOUS_SHADOW
+        views['first']['self_filter']['free_ray_depth_m'][10,10]=0.
+        # END raw depth stays valid, so using it would violate this evidence.
         captured={}
         def make(normalized,masks,identity,config,inverse):
             captured[identity]=config
@@ -768,17 +876,24 @@ class OnlineObservationContractTest(unittest.TestCase):
         body=[{'body_id':'link','sphere_indices':[0],'local_spheres':[[0.,0.,0.,.04]],'geometry_names':['body']}]
         with patch('manipulation.planning_observation._map_online_partition',side_effect=make) as mapper, \
              patch('manipulation.planning_observation._require_mapping_memory'), \
+             patch('manipulation.planning_observation._known_free_voxels',wraps=_known_free_voxels) as coverage, \
              patch('torch.cuda.mem_get_info',side_effect=AssertionError('CPU contract touched CUDA')):
             result=build_scene_from_rgbd(views,frames,mapper_cfg=cfg,depth_error_m=.003,
                 owner_voxel_sizes_m={'part':.005},reference_frame='world',robot_sphere_materials=(None,),
                 robot_geometry_source='declared native robot',has_gripper=False,max_mapping_bytes=1024**3,
                 fine_regions=fine,robot_collision_bodies=body,
                 unknown_policy={'conditional_regions':[],'outside_regions':'forbid'})
+        # BEGIN the production builder selects free-ray evidence explicitly.
+        for name,row in views.items():
+            np.testing.assert_array_equal(coverage.call_args.kwargs['ray_depths'][name],
+                                          row['self_filter']['free_ray_depth_m'])
+        self.assertEqual(result.observation_report['self_filter']['first']['ambiguous_shadow_pixels'],1)
+        # END unknown policy is preserved independently of those ray exclusions.
         self.assertIsInstance(result,OnlinePlanningScene)
         self.assertEqual(mapper.call_count,2)
         self.assertEqual(captured[None].esdf_voxel_size,.01)
         normalized=_views(views,'world',(.1,3.))
-        expected=_owner_mapper_config(cfg,normalized,_partition_masks(normalized,frames),'part',frames['part']['T_output_owner'],.005,.003,query_radius_m=.04)
+        expected=_owner_mapper_config(cfg,normalized,_audit_partition_masks(normalized,frames),'part',frames['part']['T_output_owner'],.005,.003,query_radius_m=.04)
         np.testing.assert_allclose(captured['part'].extent_esdf_meters_xyz,expected.extent_esdf_meters_xyz)
         self.assertFalse(hasattr(result.background,'refinement_source'))
 # END these CPU tests never allocate native mapping or simulator state.

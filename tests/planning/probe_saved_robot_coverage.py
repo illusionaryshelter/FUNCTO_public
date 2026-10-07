@@ -78,8 +78,12 @@ def run(args):
         if (expected_free.dtype != np.bool_ or expected_free.ndim != 3
                 or expected_free.size > 8_000_000 or set(observation_ids) != set(raw)):
             raise ValueError("Archived raw free cells require the exact bounded original view set")
-        known = _known_free_voxels(views, origin=origin, shape=expected_free.shape,
-                                  voxel_size=voxel_size, depth_error_m=args.depth_error)
+        # BEGIN explicit historical audit rays reproduce the saved raw-depth grid.
+        known = _known_free_voxels(views,
+            ray_depths={name: row["depth"] for name, row in views.items()},
+            origin=origin, shape=expected_free.shape,
+            voxel_size=voxel_size, depth_error_m=args.depth_error)
+        # END this archived audit does not construct a current online scene.
         if not np.array_equal(known, expected_free):
             raise ValueError("Original calibrated depth does not exactly reproduce the archived free mask")
         coverage = SimpleNamespace(known_free=known, origin=origin, voxel_size=voxel_size,

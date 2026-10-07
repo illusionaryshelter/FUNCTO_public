@@ -280,7 +280,8 @@ def install_complete_owner(scene, owner, *, contacts):
 
 def run(args):
     from prepare_recorded_task import prepare_candidate
-    from recorded_observation import render_robot_mask
+    from recorded_observation import classify_robot_observation
+    from manipulation.robot_self_filter import SELF, ENVIRONMENT, AMBIGUOUS_SHADOW
     from recorded_task_planning import plan_and_record, _write_diagnostic_json
     # BEGIN use the production execution contract shared with the executor.
     from manipulation.execution import ExecutionLimits, FixedFingerTargets
@@ -516,58 +517,63 @@ def run(args):
                                for view in segment["snapshot"]["views"]}}
                 for identity, frame in owner_frames.items()},
             "geometry_path": None if args.owner_geometry is None else str(args.owner_geometry.resolve()),
-            "background_partition": "Every visible non-owner non-robot surface remains in observed background"}
+            "background_partition": "Every ENVIRONMENT surface outside semantic owners remains in observed background"}
         observations = {}
         for view in segment["snapshot"]["views"]:
             calibration = json.loads((root/view["calibration_path"]).read_text())
             rgb = np.array(Image.open(root/view["rgb_path"]).convert("RGB"))
             depth = np.load(root/view["depth_path"], allow_pickle=False)
-            rendered = render_robot_mask(
+            # BEGIN classify native robot solids and their uncertain observation rays.
+            filtered = classify_robot_observation(
                 scene_xml=Path(fixture["source_scene_xml"]), robot_root=fixture["robot_visual_root"],
                 joint_map=[(name, name, 1.) for name in feedback["joint_names"]],
                 joint_positions=measured, T_world_robot_root=(np.asarray(feedback["base_pose"])
                     @ np.asarray(fixture["T_base_visual_root"])),
-                rgb=rgb, depth_m=depth, calibration=calibration,
-                observation_id=view["id"], feedback_source=feedback["source"],
-                depth_tolerance_m=args.robot_depth_tolerance,
-                depth_tolerance_source=args.robot_depth_tolerance_source)
+                observed_depth=depth, calibration=calibration,
+                padding_scale=args.self_filter_padding_scale,
+                padding_offset_m=args.self_filter_padding_offset_m,
+                source=args.self_filter_source)
+            labels = filtered["self_filter"]["labels"]
             view_output = args.output/"observations"/view["id"]
             view_output.mkdir(parents=True)
-            np.save(view_output/"robot_mask.npy", rendered["robot_mask"])
-            np.save(view_output/"unknown_boundary.npy", rendered["unknown_boundary"])
-            (view_output/"robot-mask-report.json").write_text(json.dumps(rendered["report"], indent=2)+"\n")
-            # BEGIN resolve semantic over-segmentation using evidenced robot pixels.
-            # Only the existing depth-consistent robot mask owns these pixels.
-            # Its unknown boundary is not subtracted. Raw depth and original
-            # semantic files stay intact; object/object conflicts still reach
-            # the mapper's strict disjointness check without a guessed winner.
+            np.save(view_output/"self-filter-labels.npy", labels)
+            np.save(view_output/"free-ray-depth-m.npy", filtered["self_filter"]["free_ray_depth_m"])
+            filter_report = {"provenance": filtered["provenance"],
+                "observation_id": view["id"], "feedback_source": feedback["source"],
+                "counts": {"SELF": int((labels == SELF).sum()),
+                    "ENVIRONMENT": int((labels == ENVIRONMENT).sum()),
+                    "AMBIGUOUS_SHADOW": int((labels == AMBIGUOUS_SHADOW).sum())}}
+            (view_output/"self-filter-report.json").write_text(json.dumps(filter_report, indent=2)+"\n")
+            # Save resolved masks for inspection; pass the original semantic masks
+            # to the mapper so one contract checks ownership and counts removals.
+            # Only ENVIRONMENT contributes either occupied endpoints or free rays.
             owner_masks, mask_report = {}, {}
             for index, identity in enumerate(owner_frames):
                 supplied = np.load(supplied_masks[identity, view["id"]], allow_pickle=False)
                 if supplied.dtype != np.bool_ or supplied.shape != depth.shape:
                     raise ValueError("Semantic owner masks must be aligned boolean images")
-                overlap = supplied & rendered["robot_mask"]
-                visible = supplied & ~rendered["robot_mask"]
+                visible = supplied & (labels == ENVIRONMENT)
                 resolved_path = view_output / f"owner-{index:03d}-mask.npy"
                 np.save(resolved_path, visible)
-                owner_masks[identity] = visible
+                owner_masks[identity] = supplied
                 mask_report[identity] = {
                     "semantic_mask_path": str(supplied_masks[identity, view["id"]].resolve()),
                     "collision_mask_path": str(resolved_path.resolve()),
                     "semantic_pixels": int(supplied.sum()),
-                    "depth_consistent_robot_overlap_pixels": int(overlap.sum()),
+                    "self_overlap_pixels": int((supplied & (labels == SELF)).sum()),
+                    "ambiguous_shadow_overlap_pixels": int((supplied & (labels == AMBIGUOUS_SHADOW)).sum()),
                     "collision_owner_pixels": int(visible.sum())}
             (view_output/"owner-mask-report.json").write_text(json.dumps({
-                "policy": "Subtract only depth-consistent robot pixels from semantic owner masks; preserve original depth and uncertain robot boundaries",
-                "robot_evidence": str((view_output/"robot-mask-report.json").resolve()),
+                "policy": "Only ENVIRONMENT pixels contribute occupied endpoints or free rays; original depth and semantic masks are retained",
+                "robot_evidence": str((view_output/"self-filter-report.json").resolve()),
                 "owners": mask_report}, indent=2)+"\n")
-            # END final collision ownership remains auditable per actual view.
             observations[view["id"]] = {
                 "image": rgb, "depth": depth, "K": np.asarray(calibration["K"]),
                 "T_output_camera": np.asarray(calibration["T_world_camera_cv"]),
                 "reference_frame": problem.reference_frame,
-                "robot_mask": rendered["robot_mask"],
+                "self_filter": filtered["self_filter"],
                 "owner_masks": owner_masks}
+            # END unknown robot shells and shadows remain unknown in both maps.
         # The finite grid is an explicit test resource limit. Space outside it
         # stays unknown; narrowing it never certifies a removed obstacle.
         height, width = next(iter(observations.values()))["depth"].shape
@@ -758,8 +764,11 @@ if __name__ == "__main__":
     # END the same generic ROI input is accepted for any observed partition.
     # END the mapper retains every current labelled sample in the refined field.
     parser.add_argument("--depth-error", type=float, required=True)
-    parser.add_argument("--robot-depth-tolerance", type=float, required=True)
-    parser.add_argument("--robot-depth-tolerance-source", required=True)
+    # BEGIN explicit geometric uncertainty, independent of measured depth error.
+    parser.add_argument("--self-filter-padding-offset-m", type=float, required=True)
+    parser.add_argument("--self-filter-padding-scale", type=float, required=True)
+    parser.add_argument("--self-filter-source", required=True)
+    # END no rendered depth-equality threshold is accepted.
     parser.add_argument("--unknown-policy", type=Path, required=True,
                         help="Explicit bounded conditional unknown regions; outside them unknown is forbidden")
     parser.add_argument("--joint-reference", type=Path,

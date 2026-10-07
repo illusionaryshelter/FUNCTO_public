@@ -2,9 +2,11 @@
 
 The input is a registered snapshot of the current scene: camera-z depth in
 metres, native pinhole calibration, camera-to-planning transforms, and explicit
-visible owner/robot masks. No demonstration mesh, simulator state, inferred
+visible owner masks and explicit three-state robot self-filter evidence.
+No demonstration mesh, simulator state, inferred
 back surface, or bounding-box erasure enters this adapter. cuRobo's existing
-Mapper builds the collision field; independent raw depth rays bound coverage.
+Mapper builds the collision field; independently admitted environment rays
+bound online coverage. Explicitly named audit APIs retain historical raw rays.
 Optional, separately verified physical solid interiors can supply current
 occupied evidence. A closed collision proxy is not such physical evidence.
 """
@@ -71,12 +73,15 @@ def _views(views, reference_frame, depth_range_m):
     return result
 
 
-def _known_free_voxels(views, *, origin, shape, voxel_size, depth_error_m):
+# BEGIN callers explicitly select independent free-ray evidence.
+def _known_free_voxels(views, *, ray_depths, origin, shape, voxel_size, depth_error_m):
     """Prove each complete voxel free under the supplied pixel-ray model.
 
     A ball of half the voxel diagonal encloses the cell. Its full projected
-    footprint must lie on valid pixels, and its furthest camera-z point must
-    precede the smallest measured depth in that footprint by depth_error_m.
+    footprint must lie on valid admitted rays, and its furthest camera-z point
+    must precede the smallest ray depth in that footprint by depth_error_m.
+    ``ray_depths`` is mandatory: online callers pass self-filtered free-ray
+    evidence; historical audit callers explicitly select original depth.
     Projection radii are rounded upward to powers of two to bound cached
     SciPy minimum filters. No interpolated invalid depth or hidden back volume
     can become observed. Subpixel geometry below the sensor's pixel model is
@@ -89,10 +94,17 @@ def _known_free_voxels(views, *, origin, shape, voxel_size, depth_error_m):
             or not np.isfinite(voxel_size) or voxel_size <= 0
             or not np.isfinite(depth_error_m) or depth_error_m < 0):
         raise ValueError("Coverage needs a bounded z,y,x grid and explicit metric error allowance")
+    if not isinstance(ray_depths, Mapping) or set(ray_depths) != set(views):
+        raise ValueError("Free-ray depths must explicitly identify every calibrated view")
+    for name, view in views.items():
+        rays = np.asarray(ray_depths[name])
+        if (rays.shape != view["depth"].shape or not np.isfinite(rays).all()
+                or np.any(rays < 0) or np.any(rays > view["depth"])):
+            raise ValueError("Free-ray depths must be aligned finite nonnegative measured prefixes")
     known = np.zeros(math.prod(shape), bool)
     radius = math.sqrt(3)*voxel_size/2
-    for view in views.values():
-        depth, matrix, transform = view["depth"], view["K"], view["T_output_camera"]
+    for name, view in views.items():
+        depth, matrix, transform = np.asarray(ray_depths[name]), view["K"], view["T_output_camera"]
         height, width = depth.shape
         filtered = {}
         for start in range(0, len(known), 65_536):
@@ -132,6 +144,7 @@ def _known_free_voxels(views, *, origin, shape, voxel_size, depth_error_m):
                 proved = camera[selected, 2]+radius+depth_error_m < low
                 known[indices[selected][proved]] = True
     return known.reshape(shape)
+# END masked endpoints never implicitly become free-ray evidence.
 
 
 # BEGIN current physical-solid evidence, separate from collision outer proxies.
@@ -382,10 +395,15 @@ def _add_known_solid_voxels(known, records, *, origin, voxel_size):
 # END current physical-solid evidence, separate from collision outer proxies.
 
 
-def observed_space_from_rgbd(views, *, origin, shape, voxel_size, depth_error_m,
+# BEGIN explicitly isolated raw-depth coverage for historical source audits.
+def observed_audit_space_from_rgbd(views, *, origin, shape, voxel_size, depth_error_m,
                              reference_frame, depth_range_m, known_solids=None,
                              owner_frames=None, current_robot=None):
-    """Build coverage from original depth, before owner/robot pixel removal.
+    """Historical source-audit coverage from original, unfiltered depth.
+
+    This function is not online collision coverage. The online scene builder
+    requires three-state self-filter evidence and excludes entire uncertain
+    rays; this audit intentionally replays the original raw-depth contract.
 
     ``views`` maps observation IDs to depth, K, T_output_camera and
     reference_frame. ``origin`` is the centre of cell [0,0,0], ``shape`` is
@@ -406,7 +424,7 @@ def observed_space_from_rgbd(views, *, origin, shape, voxel_size, depth_error_m,
     surface bands and air outside an evidenced solid remain unknown.
     """
     normalized = _views(views, reference_frame, depth_range_m)
-    known = _known_free_voxels(normalized, origin=origin, shape=shape, voxel_size=voxel_size,
+    known = _known_free_voxels(normalized, ray_depths={name: row["depth"] for name, row in normalized.items()}, origin=origin, shape=shape, voxel_size=voxel_size,
                                depth_error_m=depth_error_m)
     # BEGIN retain original ray evidence before adding current solid interiors.
     # K may grow by O below; the robot volume oracle must still consume F.
@@ -417,9 +435,11 @@ def observed_space_from_rgbd(views, *, origin, shape, voxel_size, depth_error_m,
                          observation_ids=tuple(normalized), reference_frame=reference_frame,
                          occupancy_evidence=evidence, known_free=known_free)
     # END occupied cells never become observed-free cells.
+# END online coverage instead consumes three-state free-ray evidence.
 
 
-def _partition_masks(views, owner_ids):
+# BEGIN explicitly historical binary-mask audit; production uses three states.
+def _audit_partition_masks(views, owner_ids):
     """Preserve every visible pixel outside explicit disjoint owner masks."""
     masks, observed = {}, {identity: 0 for identity in owner_ids}
     for name, view in views.items():
@@ -447,6 +467,93 @@ def _partition_masks(views, owner_ids):
     if any(count == 0 for count in observed.values()):
         raise ValueError("Every explicit collision owner needs current valid depth evidence")
     return masks
+# END this audit API cannot be selected by a missing production field.
+
+
+# BEGIN production three-state evidence contract and semantic ownership.
+def _self_filtered_views(views, reference_frame, depth_range_m):
+    """Validate measured classification before applying mapper depth limits.
+
+    A sensor-valid measurement can lie outside this mapper's configured range.
+    Such a pixel becomes ambiguous for this map and contributes neither an
+    endpoint nor a free ray. No caller arrays or original depths are changed.
+    """
+    from .robot_self_filter import AMBIGUOUS_SHADOW, validate_self_filter
+    normalized = _views(views, reference_frame, depth_range_m)
+    for name, original in views.items():
+        if "self_filter" not in original:
+            raise ValueError("Online RGB-D views require explicit three-state self_filter evidence")
+        evidence = validate_self_filter(original["self_filter"], original["depth"])
+        valid = normalized[name]["depth"] > 0
+        labels = evidence["labels"].copy()
+        labels[~valid] = AMBIGUOUS_SHADOW
+        normalized[name]["self_filter"] = {
+            "labels": labels,
+            "free_ray_depth_m": np.where(valid, evidence["free_ray_depth_m"], 0.),
+            "source": evidence["source"],
+        }
+    return normalized
+
+
+def _partition_masks(views, owner_ids):
+    """Keep only environmental endpoints, preserving semantic conflict checks.
+
+    Check owner/owner overlap on the supplied masks before self filtering;
+    uncertainty is not permission to silently choose a semantic winner.
+    """
+    from .robot_self_filter import ENVIRONMENT, validate_self_filter
+    masks, observed = {}, {identity: 0 for identity in owner_ids}
+    for name, view in views.items():
+        image, depth = np.asarray(view["image"]), view["depth"]
+        if image.dtype != np.uint8 or image.shape != (*depth.shape, 3):
+            raise ValueError("Current RGB must be an aligned uint8 H,W,3 image")
+        supplied = view["owner_masks"]
+        if not isinstance(supplied, Mapping) or set(supplied) != set(owner_ids):
+            raise ValueError("Each view must explicitly include every selected owner mask, including empty masks")
+        if "self_filter" not in view:
+            raise ValueError("Online RGB-D views require explicit three-state self_filter evidence")
+        evidence = validate_self_filter(view["self_filter"], depth)
+        environment = evidence["labels"] == ENVIRONMENT
+        occupied = np.zeros(depth.shape, bool)
+        masks[name] = {}
+        for identity in owner_ids:
+            mask = np.asarray(supplied[identity])
+            if mask.dtype != np.bool_ or mask.shape != depth.shape:
+                raise ValueError("Visible owner masks must be aligned boolean images")
+            if np.any(mask & occupied):
+                raise ValueError("Visible owner pixel identities must be disjoint before self filtering")
+            occupied |= mask
+            masks[name][identity] = mask & environment
+            observed[identity] += int(np.count_nonzero(masks[name][identity] & (depth > 0)))
+        masks[name][None] = environment & ~occupied
+    if any(count == 0 for count in observed.values()):
+        raise ValueError("Every explicit collision owner needs current valid depth evidence after self filtering")
+    return masks
+
+
+def _self_filter_report(views):
+    """Record excluded semantic pixels without converting unknown to free."""
+    from .robot_self_filter import SELF, ENVIRONMENT, AMBIGUOUS_SHADOW
+    reports = {}
+    for name, view in views.items():
+        evidence = view["self_filter"]
+        labels = evidence["labels"]
+        reports[name] = {
+            "source": evidence["source"],
+            "self_pixels": int(np.count_nonzero(labels == SELF)),
+            "environment_pixels": int(np.count_nonzero(labels == ENVIRONMENT)),
+            "ambiguous_shadow_pixels": int(np.count_nonzero(labels == AMBIGUOUS_SHADOW)),
+            "owners": {
+                identity: {
+                    "semantic_pixels": int(np.count_nonzero(mask)),
+                    "excluded_self_pixels": int(np.count_nonzero(mask & (labels == SELF))),
+                    "excluded_ambiguous_shadow_pixels": int(np.count_nonzero(mask & (labels == AMBIGUOUS_SHADOW))),
+                    "environment_pixels": int(np.count_nonzero(mask & (labels == ENVIRONMENT))),
+                } for identity, mask in view["owner_masks"].items()
+            },
+        }
+    return reports
+# END occupied endpoint selection and free-ray evidence remain independent.
 
 
 def _mapper_memory_bound(config):
@@ -668,7 +775,7 @@ def _map_partition(normalized, masks, identity, config, inverse, depth_error_m, 
         local_views = {name: {**view, "T_output_camera": inverse@view["T_output_camera"]}
                        for name, view in normalized.items()}
         fine_origin = np.asarray(voxel.pose[:3])-(np.asarray(shape)-1)*voxel.voxel_size/2
-        free = _known_free_voxels(local_views, origin=fine_origin, shape=shape[::-1],
+        free = _known_free_voxels(local_views, ray_depths={name: row["depth"] for name, row in local_views.items()}, origin=fine_origin, shape=shape[::-1],
             voxel_size=voxel.voxel_size, depth_error_m=depth_error_m).transpose(2, 1, 0)
         # Truncation, a full grid diagonal and one interpolation step
         # are numerical map support, never the sensor-error margin.
@@ -897,7 +1004,7 @@ def build_audit_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_
     must still supply its evidenced conservative sphere cover and attachment;
     this adapter never invents unseen geometry. Coverage near actual contact
     and inside a currently occluding robot may remain insufficient. Optional
-    known_solids/current_robot follow observed_space_from_rgbd's independently
+    known_solids/current_robot follow observed_audit_space_from_rgbd's independently
     verified occupied-interior contract. Their inner meshes never become an
     outer collision model or change geometry_complete. An owner supplying
     occupied evidence is unknown until its collision geometry is complete.
@@ -961,7 +1068,7 @@ def build_audit_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_
     if torch_device.type != "cuda":
         raise ValueError("Native RGB-D mapping requires an explicit CUDA device")
     # END reject CPU-checkable scene contracts before mapping/FK allocations.
-    masks = _partition_masks(normalized, frames)
+    masks = _audit_partition_masks(normalized, frames)
     center = mapper_cfg.grid_center.detach().cpu().numpy()
     configs = {None: mapper_cfg}
     # BEGIN all selected owner fields use every labelled point at their own spacing.
@@ -987,7 +1094,7 @@ def build_audit_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_
     # END a larger module quota cannot silently widen the geometry format.
     shape_xyz = tuple(math.ceil(x/mapper_cfg.esdf_voxel_size) for x in mapper_cfg.extent_esdf_meters_xyz)
     origin = center-(np.asarray(shape_xyz)-1)*mapper_cfg.esdf_voxel_size/2
-    known = _known_free_voxels(normalized, origin=origin, shape=shape_xyz[::-1],
+    known = _known_free_voxels(normalized, ray_depths={name: row["depth"] for name, row in normalized.items()}, origin=origin, shape=shape_xyz[::-1],
                                voxel_size=mapper_cfg.esdf_voxel_size, depth_error_m=depth_error_m)
     # BEGIN preserve the same raw F used by the CPU-only RGB-D builder.
     known_free = known.copy()
@@ -1127,6 +1234,11 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
                          fine_regions=None,robot_collision_bodies=()):
     """Build one fixed-resolution field per owner from the current snapshot.
 
+    Every view requires ``self_filter`` with uint8 ``labels``, independent
+    ``free_ray_depth_m`` and a nonempty ``source``. Only ENVIRONMENT pixels
+    contribute measured surface endpoints and free rays. SELF and
+    AMBIGUOUS_SHADOW contribute neither; raw depth remains unchanged.
+
     ``fine_regions`` now selects a partition's sole field before mapping. It
     never creates a coarse layer, blends resolutions or expands after solving.
     The explicit unknown policy is separate from both field values and raw
@@ -1145,7 +1257,9 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     if (type(max_mapping_bytes) is not int or not 0<max_mapping_bytes<=min(max_host_rss_bytes,max_device_used_bytes)
             or not 0<max_host_rss_bytes<=MAX_HOST_RSS_BYTES or not 0<max_device_used_bytes<=MAX_DEVICE_USED_BYTES):
         raise ValueError('Mapping budgets must fit explicit host/device limits')
-    normalized=_views(views,reference_frame,(mapper_cfg.depth_minimum_distance,mapper_cfg.depth_maximum_distance))
+    # BEGIN online views require audited three-state evidence, never old robot_mask.
+    normalized=_self_filtered_views(views,reference_frame,(mapper_cfg.depth_minimum_distance,mapper_cfg.depth_maximum_distance))
+    # END depth limits cannot restore excluded endpoints or free rays.
     if any(view['depth'].shape!=(mapper_cfg.image_height,mapper_cfg.image_width) for view in normalized.values()):
         raise ValueError('Snapshot image dimensions must match the allocated camera buffer')
     if set(owner_frames)!=set(owner_voxel_sizes_m) or len(owner_frames)>32:
@@ -1183,10 +1297,13 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     shape=tuple(math.ceil(float(x)/background_cfg.esdf_voxel_size) for x in background_cfg.extent_esdf_meters_xyz)
     center=background_cfg.grid_center.detach().cpu().numpy()
     origin=center-(np.asarray(shape)-1)*background_cfg.esdf_voxel_size/2
-    known=_known_free_voxels(normalized,origin=origin,shape=shape[::-1],
+    # BEGIN only ENVIRONMENT rays can prove free volume in the online scene.
+    ray_depths={name: row['self_filter']['free_ray_depth_m'] for name,row in normalized.items()}
+    known=_known_free_voxels(normalized,ray_depths=ray_depths,origin=origin,shape=shape[::-1],
         voxel_size=background_cfg.esdf_voxel_size,depth_error_m=depth_error_m)
     coverage=ObservedSpace(known,origin=origin,voxel_size=background_cfg.esdf_voxel_size,
         observation_ids=tuple(normalized),reference_frame=reference_frame)
+    # END SELF and AMBIGUOUS_SHADOW stay unknown to coverage.
     queries,reports={},{}
     for identity,config in configs.items():
         _require_mapping_memory(estimates[identity],config.device,max_host_rss_bytes=max_host_rss_bytes,
@@ -1200,10 +1317,13 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         robot_geometry_source=robot_geometry_source,unknown_policy=unknown_policy,
         contacts=contacts,gripper=gripper,has_gripper=has_gripper,
         robot_collision_bodies=robot_collision_bodies,native_geometry_materials=native_geometry_materials)
+    # BEGIN retain the exact self-filter and per-owner exclusion evidence.
     scene.observation_report={'source':'current calibrated owner-partitioned RGB-D','partitions':reports,
         'estimated_mapping_buffers_bytes':sum(estimates.values()),'depth_error_m':float(depth_error_m),
         'known_free_voxels':int(known.sum()),'coverage_voxels':int(known.size),
         'geometry_model':'one frozen signed field per partition; finite cell subtraction for material contact',
-        'unknown_policy':deepcopy(unknown_policy)}
+        'unknown_policy':deepcopy(unknown_policy),
+        'self_filter':_self_filter_report(normalized)}
+    # END excluded surfaces remain independently auditable.
     return scene
 # END the production builder never exports source solids or installs refinement.
