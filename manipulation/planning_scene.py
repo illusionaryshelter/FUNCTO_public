@@ -259,7 +259,82 @@ class CuroboSphereQuery:
         return value.clone()
 
 
-class ObservedSpace:
+# BEGIN a numerical coverage field owns no observation or permission evidence.
+class CoverageField:
+    """Conservative clearance inside an explicitly supplied Boolean cell set.
+
+    The caller owns the meaning of that set and admits preparation memory
+    before materializing it. Only grid geometry and a squared-distance field
+    remain resident; this object retains no evidence mask or provenance.
+    """
+
+    def __init__(self, allowed, *, origin, voxel_size):
+        mask = np.asarray(allowed)
+        if mask.dtype != np.bool_ or mask.ndim != 3 or min(mask.shape) < 2:
+            raise ValueError("An explicit 3D boolean coverage grid is required")
+        self.origin = _array(origin, (3,), "coverage grid origin")
+        if not np.isfinite(voxel_size) or voxel_size <= 0:
+            raise ValueError("Coverage voxel size must be positive metres")
+        self.voxel_size = float(voxel_size)
+        # BEGIN a squared-distance certificate avoids a fixed interpolation penalty.
+        distance = distance_transform_edt(np.pad(mask, 1), sampling=voxel_size)[1:-1, 1:-1, 1:-1]
+        squared = np.square(distance).astype(np.float32)
+        # Storing in float32 must not round a distance bound upward. One ULP
+        # toward zero also covers squaring the float64 EDT result; the query
+        # separately allows for coordinate and interpolation roundoff.
+        squared = np.maximum(np.nextafter(squared, -np.inf), 0.)
+        self._distance_squared = torch.from_numpy(squared)[None, None]
+        self._device_distance_squared = {}
+        upper = self.origin+(np.array(mask.shape[::-1])-1)*self.voxel_size
+        self._roundoff_scale_m = float(np.abs(self.origin).sum()+np.abs(upper).sum()+self.voxel_size)
+        # END rollout clones share these request-owned, read-only tensors.
+        self._shape_xyz = np.array(mask.shape[::-1], float)
+
+    def clearance(self, centre):
+        """Return a continuous conservative clearance for centres[..., XYZ]."""
+        coordinates = (centre - _tensor(self.origin, centre)) / self.voxel_size
+        grid = 2 * coordinates / _tensor(self._shape_xyz - 1, centre) - 1
+        # BEGIN the same squared field and continuous bound serve every query.
+        key = (centre.device, centre.dtype)
+        if key not in self._device_distance_squared:
+            self._device_distance_squared[key] = self._distance_squared.to(device=centre.device, dtype=centre.dtype)
+        values = F.grid_sample(self._device_distance_squared[key],
+                               grid.reshape(1, 1, 1, -1, 3), mode="bilinear",
+                               padding_mode="zeros", align_corners=True)
+        # For every unknown centre z and each grid corner v_i,
+        # d_i² <= ||v_i-z||². Trilinear weights give
+        # sum(w_i*d_i²) - h²*sum(f*(1-f)) <= ||centre-z||².
+        # Taking the minimum over z proves the centre-distance lower bound.
+        # Subtract half the cell diagonal to cover the entire unknown voxel.
+        fraction = coordinates-coordinates.floor()
+        variance = self.voxel_size**2*(fraction*(1-fraction)).sum(-1)
+        half_diagonal = math.sqrt(3)*self.voxel_size/2
+        squared_bound = values.reshape(centre.shape[:-1])-variance
+        # Clamping at half_diagonal² is equivalent after the final ReLU, and
+        # avoids the infinite derivative of sqrt(0) in unknown/zero cells.
+        clearance = squared_bound.clamp_min(half_diagonal**2).sqrt()-half_diagonal
+        # The finite grid's centre domain is an additional conservative bound.
+        # It makes clearance vanish continuously at every map face; zero
+        # padding alone would introduce a jump when a centre exits the grid.
+        extent = _tensor(self._shape_xyz-1, centre)
+        border = self.voxel_size*torch.minimum(coordinates, extent-coordinates).amin(-1)
+        clearance = torch.minimum(clearance, border)
+        # Normalized grid coordinates and interpolation use the query dtype.
+        # Reserve operation-scale roundoff in metres, not a configurable
+        # physical tolerance. This guard only shrinks admitted volume.
+        roundoff = 32*torch.finfo(centre.dtype).eps*self._roundoff_scale_m
+        clearance = (clearance-roundoff).clamp_min(0)
+        # END no observation, permission, or collision occupancy is changed.
+        return clearance
+
+    def violation(self, spheres):
+        clearance = self.clearance(spheres[..., :3])
+        radius = spheres[..., 3]
+        return torch.where(radius > 0, torch.relu(radius - clearance), torch.zeros_like(radius))
+# END observed and policy fields use the same numerical clearance certificate.
+
+
+class ObservedSpace(CoverageField):
     """Conservative whole-sphere coverage of a supplied observation grid.
 
     ``known[z,y,x]`` means the cell is covered by current observation evidence,
@@ -282,10 +357,6 @@ class ObservedSpace:
         if (mask.dtype != np.bool_ or mask.ndim != 3 or min(mask.shape) < 2
                 or mask.size > 8_000_000):
             raise ValueError("An explicit bounded 3D boolean observation grid is required")
-        self.origin = _array(origin, (3,), "observation grid origin")
-        if not np.isfinite(voxel_size) or voxel_size <= 0:
-            raise ValueError("Observation voxel size must be positive metres")
-        self.voxel_size = float(voxel_size)
         self.observation_ids = tuple(_text(item, "observation ID") for item in observation_ids)
         if not self.observation_ids:
             raise ValueError("Coverage needs current observation provenance")
@@ -327,19 +398,9 @@ class ObservedSpace:
             self._known_free.flags.writeable = False
         # END no collision model or initial-state assumption changes this mask.
         # END retain the physical bodies used to prove occupied interiors.
-        # BEGIN a squared-distance certificate avoids a fixed interpolation penalty.
-        distance = distance_transform_edt(np.pad(mask, 1), sampling=voxel_size)[1:-1, 1:-1, 1:-1]
-        squared = np.square(distance).astype(np.float32)
-        # Storing in float32 must not round a distance bound upward. One ULP
-        # toward zero also covers squaring the float64 EDT result; the query
-        # separately allows for coordinate and interpolation roundoff.
-        squared = np.maximum(np.nextafter(squared, -np.inf), 0.)
-        self._distance_squared = torch.from_numpy(squared)[None, None]
-        self._device_distance_squared = {}
-        upper = self.origin+(np.array(mask.shape[::-1])-1)*self.voxel_size
-        self._roundoff_scale_m = float(np.abs(self.origin).sum()+np.abs(upper).sum()+self.voxel_size)
-        # END rollout clones share these request-owned, read-only tensors.
-        self._shape_xyz = np.array(mask.shape[::-1], float)
+        # BEGIN retain observation evidence while sharing the numerical query.
+        super().__init__(mask, origin=origin, voxel_size=voxel_size)
+        # END the eight-million-cell input limit is not a policy-field limit.
         # BEGIN retain exact observation masks for the execution binding.
         self._known = mask.copy()
         self._known.flags.writeable = False
@@ -370,44 +431,6 @@ class ObservedSpace:
         result.occupancy_evidence = deepcopy(self.occupancy_evidence)
         return result
     # END rule/relationship edits cannot rewrite another candidate's metadata.
-
-    def violation(self, spheres):
-        centre = spheres[..., :3]
-        coordinates = (centre - _tensor(self.origin, centre)) / self.voxel_size
-        grid = 2 * coordinates / _tensor(self._shape_xyz - 1, centre) - 1
-        # BEGIN the same squared field and continuous bound serve every query.
-        key = (centre.device, centre.dtype)
-        if key not in self._device_distance_squared:
-            self._device_distance_squared[key] = self._distance_squared.to(device=centre.device, dtype=centre.dtype)
-        values = F.grid_sample(self._device_distance_squared[key],
-                               grid.reshape(1, 1, 1, -1, 3), mode="bilinear",
-                               padding_mode="zeros", align_corners=True)
-        # For every unknown centre z and each grid corner v_i,
-        # d_i² <= ||v_i-z||². Trilinear weights give
-        # sum(w_i*d_i²) - h²*sum(f*(1-f)) <= ||centre-z||².
-        # Taking the minimum over z proves the centre-distance lower bound.
-        # Subtract half the cell diagonal to cover the entire unknown voxel.
-        fraction = coordinates-coordinates.floor()
-        variance = self.voxel_size**2*(fraction*(1-fraction)).sum(-1)
-        half_diagonal = math.sqrt(3)*self.voxel_size/2
-        squared_bound = values.reshape(spheres.shape[:-1])-variance
-        # Clamping at half_diagonal² is equivalent after the final ReLU, and
-        # avoids the infinite derivative of sqrt(0) in unknown/zero cells.
-        clearance = squared_bound.clamp_min(half_diagonal**2).sqrt()-half_diagonal
-        # The finite grid's centre domain is an additional conservative bound.
-        # It makes clearance vanish continuously at every map face; zero
-        # padding alone would introduce a jump when a centre exits the grid.
-        extent = _tensor(self._shape_xyz-1, centre)
-        border = self.voxel_size*torch.minimum(coordinates, extent-coordinates).amin(-1)
-        clearance = torch.minimum(clearance, border)
-        # Normalized grid coordinates and interpolation use the query dtype.
-        # Reserve operation-scale roundoff in metres, not a configurable
-        # physical tolerance. This guard only shrinks admitted volume.
-        roundoff = 32*torch.finfo(centre.dtype).eps*self._roundoff_scale_m
-        clearance = (clearance-roundoff).clamp_min(0)
-        # END no observation, permission, or collision occupancy is changed.
-        radius = spheres[..., 3]
-        return torch.where(radius > 0, torch.relu(radius - clearance), torch.zeros_like(radius))
 
 
 @dataclass

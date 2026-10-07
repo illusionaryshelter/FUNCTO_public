@@ -292,7 +292,7 @@ def test_workspace_counts_unique_source_arrays_and_both_float_caches_on_cpu_and_
     # BEGIN resource fixture includes the bound scene's empty integer partitions.
     scene = SimpleNamespace(background=query, owners=(), coverage=coverage, robot_sphere_materials=("pad",), gripper=None,
                             # BEGIN empty policy shares the original coverage allocation.
-                            _permitted_coverage=coverage,
+                            _permitted_coverage=coverage, unknown_policy={'conditional_regions': []},
                             # END a second policy field is tested with real online scenes.
                             robot_sphere_geometry=({'link_name': 'pad'},),
                             _self_collision_pair_arrays=(np.empty((0, 2), np.int64), np.empty((0, 2), np.int64)))

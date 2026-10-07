@@ -1584,6 +1584,81 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                     np.linspace(0., 1., 257), budget, FunctionalAugmentedLagrangian(()))
     # END overflow still fails admission; no original event witness is dropped.
 
+    # BEGIN actual collision promotion retains gradients and request ownership.
+    def test_dense_scene_collision_becomes_an_exact_query_on_the_original_curve(self):
+        from manipulation.online_geometry import FrozenPrimitives
+        from manipulation.planning import _dense_collision_witnesses
+        from curobo.types import JointState
+        from curobo._src.state.state_robot import RobotState
+        world = FrozenPrimitives(primitives=[{"kind": "sphere", "dimensions": [.2],
+            "pose": [.03, 0., 0., 1., 0., 0., 0.]}], owner_ids=("obstacle",), source="analytic obstacle")
+        with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
+            fixture.scene.evaluate = lambda spheres, *args, **kwargs: world(spheres[..., :1, :]).sum(-1)
+            fixture.state.joint_state.dt = torch.full((2,), 2.)
+            coarse = fixture.manager.compute_costs(fixture.state)
+            coarse_scene = coarse.values[coarse.names.index("process_scene")]
+            self.assertEqual(float(coarse_scene.detach().sum()), 0.)
+            coarse_scene.sum().backward()
+            self.assertEqual(float(fixture.q.grad.abs().sum()), 0.)
+            fixture.q.grad.zero_()
+            parameters = torch.linspace(0., 1., 21)[None].expand(2, -1)
+            q, dq = _hermite_at_parameters(fixture.q, torch.zeros_like(fixture.q),
+                torch.full((2,), 2.), torch.full((2,), 2, dtype=torch.long), parameters)
+            joints = JointState.from_position(q.contiguous(), joint_names=["first_joint", "second_joint"])
+            joints.velocity, joints.dt = dq.contiguous(), torch.full((2,), .1)
+            dense = fixture.manager.compute_costs(RobotState(joint_state=joints,
+                cuda_robot_model_state=fixture.kinematics(joints)))
+            result = SimpleNamespace(batch_size=1, num_seeds=1, interpolated_last_tstep=torch.tensor([[21]]),
+                interpolated_trajectory=SimpleNamespace(position=q[:1]),
+                interpolated_metrics=SimpleNamespace(costs_and_constraints=SimpleNamespace(constraints=
+                    SimpleNamespace(names=dense.names, values=[value[:1] for value in dense.values]))))
+            report = _dense_collision_witnesses(result, regular_horizon=2,
+                anchor_parameters=(0., 1.), capacity=2)
+            self.assertTrue(report["parameters"])
+            fixture.config_type.add_collision_witnesses(report["parameters"])
+            promoted = fixture.manager.compute_costs(fixture.state)
+            loss = promoted.values[promoted.names.index("process_scene")].sum()
+            self.assertGreater(float(loss.detach()), 0.)
+            loss.backward()
+            self.assertTrue(bool(torch.isfinite(fixture.q.grad).all()))
+            self.assertGreater(float(fixture.q.grad.abs().sum()), 0.)
+
+    def test_collision_time_inside_plateau_survives_promotion_and_clears_on_rebind(self):
+        from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
+        with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
+            mapping = _ProgressMap(np.array([0., .25, .75, 1.]), np.array([0., .5, .5, 1.]))
+            augmented = FunctionalAugmentedLagrangian(("event",))
+            budget = PlanningBudget(constraint_weight=777., max_task_anchors=4)
+            fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping, (0., 1.), budget, augmented)
+            augmented.update({"event": torch.tensor([.25])})
+            before, pointer = augmented.snapshot(), augmented._multiplier_buffer.data_ptr()
+            fixture.config_type.add_collision_witnesses([.4, .6, .4])
+            pairs = fixture.config_type.query_anchor_parameters()
+            np.testing.assert_array_equal(pairs[:, 0], np.array([0., .4, .6, 1.], np.float32).astype(float))
+            np.testing.assert_array_equal(pairs[:, 1], [0., .5, .5, 1.])
+            self.assertEqual(augmented.snapshot(), before)
+            self.assertEqual(augmented._multiplier_buffer.data_ptr(), pointer)
+            self.assertEqual(len(fixture.config_type.add_collision_witnesses([.4])), 0)
+            with self.assertRaisesRegex(ValueError, "anchor capacity"):
+                fixture.config_type.add_collision_witnesses([.3])
+            self.assertEqual(fixture.manager._anchor_count, 4)
+            fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping, (0., 1.), budget, augmented)
+            np.testing.assert_array_equal(fixture.config_type.query_anchor_parameters(), [[0., 0.], [1., 1.]])
+            self.assertEqual(fixture.manager._anchor_count, 2)
+
+    def test_tiny_positive_scene_violation_keeps_linear_gradient_and_skill_square(self):
+        with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
+            fixture.scene.evaluate = lambda spheres, p, *args, **kwargs: p[..., 1]+1e-7
+            fixture.problem.evaluate = lambda p, *args, **kwargs: p[..., 1]+.2
+            costs = fixture.manager.compute_costs(fixture.state)
+            scene = costs.values[costs.names.index("process_scene")]
+            skill = costs.values[costs.names.index("skill_process")]
+            torch.testing.assert_close(scene.sum(), torch.tensor(8*777.*1e-7))
+            torch.testing.assert_close(skill.sum(), torch.tensor(8*777.*.2**2))
+            scene.sum().backward()
+            torch.testing.assert_close(fixture.q.grad[..., 1], torch.full((2, 2), 2*777.))
+    # END these tests exercise the production manager with analytic CPU FK.
+
     def test_disabled_self_collision_and_reference_ik_do_not_add_anchor_checks(self):
         for mode in ("trajectory_optimizer", "seed_optimizer"):
             with self.subTest(mode=mode):
@@ -1836,7 +1911,9 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                             scene.evaluate_source.assert_not_called()
                             # The online scene already owns self collision;
                             # no second source/proxy term is added to E(q).
-                            regular = q.square().sum(-1).square()
+                            # BEGIN scene violations retain their original linear scale.
+                            regular = q.square().sum(-1)
+                            # END only skill_process keeps its optimizer square.
                             expected = regular.clone()
                             expected[:, -1] += regular.sum(1)
                             scene_cost = collection.values[collection.names.index("process_scene")]
@@ -2378,6 +2455,27 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
             torch.testing.assert_close(result.seed_rank, original_rank, rtol=0, atol=0)
         with self.assertRaises(ValueError):
             _trajectory_candidate(result, 2)
+
+    # BEGIN native top-k must preserve selected collision evidence explicitly.
+    def test_native_multi_seed_selection_retains_only_its_own_dense_collision_values(self):
+        from manipulation.planning import _trajectory_candidate, _dense_collision_witnesses
+        result = self.native_candidates(flags=(False, False))
+        result.interpolated_metrics = result.metrics.clone()
+        constraints = result.interpolated_metrics.costs_and_constraints.constraints
+        constraints.names = ["process_scene"]
+        constraints.values = [torch.zeros(2, 9, 1)]
+        constraints.values[0][0, 1] = 10.
+        constraints.values[0][1, 3] = 2.
+        selected = _trajectory_candidate(result, 1)
+        copied = selected.interpolated_metrics.costs_and_constraints.constraints.values[0]
+        self.assertEqual(tuple(copied.shape), (1, 9, 1))
+        self.assertNotEqual(copied.data_ptr(), constraints.values[0].data_ptr())
+        report = _dense_collision_witnesses(selected, regular_horizon=3, anchor_parameters=(), capacity=4)
+        self.assertEqual(report["parameters"], [.75])
+        self.assertEqual(report["valid_count"], 5)
+        constraints.values[0].zero_()
+        self.assertEqual(float(copied[0, 3]), 2.)
+    # END selected dense evidence survives native scratch-buffer reuse.
 
     # BEGIN locked-joint native result layout: active knots and full robot state.
     def test_locked_finger_state_keeps_seven_control_dofs_and_nine_state_dofs_separate(self):

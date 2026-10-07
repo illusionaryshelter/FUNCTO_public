@@ -20,9 +20,10 @@ from scipy.spatial.transform import Rotation
 from .collision_records import encode_array, decode_array, MAX_ARRAY_BYTES
 from .planning_problem import PosePath, quaternion_conjugate, quaternion_rotate, event_occurrence_key
 from .online_contact import PreparedContactFields, planar_material_conditions, require_planar_material
-from .planning_scene import (Attachment, CollisionOwner, ContactRule, ObservedSpace,
+from .planning_scene import (Attachment, CollisionOwner, ContactRule, CoverageField, ObservedSpace,
     PlanningScene, PrismaticGripper, _tensor, _local_spheres, _world_spheres,
     _self_pair_sum, grasp_contact_rule_ids, validate_grasp_contact_arrival)
+from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES, require_host_memory
 
 
 def _plain(value):
@@ -511,35 +512,63 @@ class OnlinePlanningScene:
             if commands != events:
                 raise ValueError('Online hand commands must preserve exact problem event occurrences')
 
-    # BEGIN a fixed spatial permission applies to unknown volume, not whole bodies.
+    # BEGIN the complete observed/permission union has one admitted numerical domain.
     def _prepare_unknown_coverage(self):
         """Prepare one conservative certificate for observed OR permitted cells.
 
-        A ball can span observed space and a permitted unknown region without
-        fitting entirely in either set. Requiring whole-ball containment in a
-        single region would incorrectly forbid that composition. Admit only
-        complete cells inside a declared box; centre-only rasterization would
-        leak permission outside its metric boundary. The existing distance
-        transform and conservative interpolation bound remain shared.
-
-        This private numerical coverage object is NOT observation evidence.
-        Binding export, unknown diagnostics and mapping retain ``coverage``;
-        construction from a binding derives this same immutable policy field.
+        Observation-map faces are not permission boundaries. Keep the original
+        lattice and cover both the complete observed grid and every declared
+        box, plus one outer centre layer. Unknown padding then lies outside
+        all authorized volume. Complete-cell rasterization cannot grant space
+        beyond a declared box. The field retains no observation evidence, and
+        bindings reconstruct it from the unchanged original mask and policy.
         """
         regions = self.unknown_policy['conditional_regions']
         self._permitted_coverage = self.coverage
         if not regions:
             return
-        allowed = self.coverage._known.copy()
         h, origin = self.coverage.voxel_size, self.coverage.origin
-        axes = [origin[i]+np.arange(allowed.shape[2-i])*h for i in range(3)]
+        known = self.coverage._known
+        source_shape = known.shape[::-1]
+        lower = [min(float(origin[i]), *(float(row['lower_m'][i]) for row in regions))
+                 for i in range(3)]
+        upper = [max(float(origin[i])+(source_shape[i]-1)*h,
+                     *(float(row['upper_m'][i]) for row in regions)) for i in range(3)]
+        # Python integers prevent a very distant but finite box from wrapping
+        # an int64 cell count into a small admitted allocation. Refuse overflow
+        # in metric-to-lattice conversion before any dense array is created.
+        index_lower, index_upper = [], []
+        for i in range(3):
+            lo, hi = (lower[i]-float(origin[i]))/h, (upper[i]-float(origin[i]))/h
+            if not math.isfinite(lo) or not math.isfinite(hi):
+                raise ValueError('UNSUPPORTED_MODEL: permission bounds exceed the finite coverage lattice')
+            index_lower.append(math.floor(lo)-1)
+            index_upper.append(math.ceil(hi)+1)
+        shape_xyz = tuple(hi-lo+1 for lo, hi in zip(index_lower, index_upper))
+        # SciPy's exact EDT uses three int32 feature indices and three float64
+        # coordinate differences per cell, plus input/output temporaries. The
+        # 80-byte padded-cell allowance and fixed headroom include the allowed
+        # mask and source-to-float32 conversion. Existing frozen fields already
+        # contribute to measured RSS; this constructor has no pending rollout
+        # allocations or lazy source-audit reservations to charge a second time.
+        preparation_bytes = 80*math.prod(size+2 for size in shape_xyz)+64*1024**2
+        require_host_memory(preparation_bytes, pending_existing_bytes=0,
+                            max_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES)
+        field_origin = np.array([float(origin[i])+index_lower[i]*h for i in range(3)])
+        field_upper = field_origin+(np.asarray(shape_xyz)-1)*h
+        if not np.isfinite([field_origin, field_upper]).all():
+            raise ValueError('UNSUPPORTED_MODEL: permission lattice has nonfinite metric bounds')
+        allowed = np.zeros(shape_xyz[::-1], dtype=bool)
+        source_slices = tuple(slice(-offset, -offset+size)
+                              for offset, size in zip(index_lower[::-1], known.shape))
+        allowed[source_slices] = known
+        axes = [field_origin[i]+np.arange(shape_xyz[i])*h for i in range(3)]
         for region in regions:
             inside = [(axis-h/2 >= region['lower_m'][i]) &
                       (axis+h/2 <= region['upper_m'][i]) for i, axis in enumerate(axes)]
             allowed |= (inside[2][:, None, None] & inside[1][None, :, None]
                         & inside[0][None, None, :])
-        self._permitted_coverage = ObservedSpace(allowed, origin=origin, voxel_size=h,
-            observation_ids=self.coverage.observation_ids, reference_frame=self.coverage.reference_frame)
+        self._permitted_coverage = CoverageField(allowed, origin=field_origin, voxel_size=h)
 
     def _unknown(self, spheres, uncertain=None):
         # BEGIN only the hard certificate participates in optimizer gradients.
@@ -551,25 +580,34 @@ class OnlinePlanningScene:
             # duplicate a dense query graph without changing any derivative.
             with torch.no_grad():
                 unresolved = self.coverage.violation(spheres)
-            forbidden = self._permitted_coverage.violation(spheres)
+            centre, radius = spheres[..., :3], spheres[..., 3]
+            clearance = self._permitted_coverage.clearance(centre)
+            # Inside a box, the nearest face is the exact distance to its
+            # complement; outside, zero is a valid lower bound. Taking the
+            # maximum of this certificate and the grid certificate is still
+            # conservative for their union. It also preserves thin/subvoxel
+            # boxes without a discontinuous whole-ball permission branch.
+            for row in self.unknown_policy['conditional_regions']:
+                margin = torch.minimum(centre-_tensor(row['lower_m'], centre),
+                                       _tensor(row['upper_m'], centre)-centre).amin(-1)
+                scale = sum(abs(float(value)) for values in (row['lower_m'], row['upper_m'])
+                            for value in values)+self.coverage.voxel_size
+                roundoff = 32*torch.finfo(centre.dtype).eps*scale
+                clearance = torch.maximum(clearance, (margin-roundoff).clamp_min(0))
+            forbidden = torch.where(radius > 0, torch.relu(radius-clearance), torch.zeros_like(radius))
         # END empty policies still differentiate the original hard certificate.
-        conditional = torch.zeros_like(unresolved, dtype=torch.bool)
-        for row in self.unknown_policy['conditional_regions']:
-            centre, radius = spheres[..., :3], spheres[..., 3:4].clamp_min(0)
-            conditional |= ((centre-radius >= _tensor(row['lower_m'], centre)) &
-                            (centre+radius <= _tensor(row['upper_m'], centre))).all(-1)
+        hard = forbidden
+        retained = forbidden < unresolved
         if uncertain is not None:
-            conditional |= uncertain
-        # An entire ball inside an analytic permission box needs no finite-grid
-        # certificate, including beyond the observation grid. The grid proves
-        # mixed observed/permitted balls and unions of rasterized region cells.
-        hard = torch.where(conditional, 0., forbidden)
+            # Future hand geometry retains its separate pre-existing policy;
+            # spatial permission alone never erases a positive hard residual.
+            hard = torch.where(uncertain, 0., forbidden)
+            retained = retained | uncertain
         # Preserve an upper bound on original observation uncertainty whenever
         # permission helps. A difference of distance residuals is not a physical
         # depth of permitted unknown and must not masquerade as one.
-        retained = conditional | (forbidden < unresolved)
         return hard.amax(-1), torch.where(retained, unresolved, 0.).amax(-1)
-    # END collisions remain independent; permission never rewrites known_free.
+    # END continuous certificates retain hard collisions and original known_free.
 
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time=None,
@@ -761,11 +799,12 @@ class OnlinePlanningScene:
         # BEGIN count the distinct observation and policy fields once per scene.
         # Empty policies alias the original field; rollout clones share both.
         coverages = {id(value): value for value in (self.coverage, self._permitted_coverage)}
-        for cover in coverages.values():
-            for name in ('_known', '_known_free'):
-                array = getattr(cover, name)
-                if array is not None:
-                    sources[id(array)] = array.nbytes
+        # Only the original observation owns evidence masks. The derived
+        # permission field stores its numerical distance grid alone.
+        for name in ('_known', '_known_free'):
+            array = getattr(self.coverage, name)
+            if array is not None:
+                sources[id(array)] = array.nbytes
         coverage_cells = sum(cover._distance_squared.numel() for cover in coverages.values())
         # END both fields need float32/float64 caches under the existing bound.
         source_bytes = sum(sources.values()) + coverage_cells * 4
@@ -805,6 +844,13 @@ class OnlinePlanningScene:
             len(owner.local_spheres) for owner in self.owners if owner.moving)
         coverage_states = int(batch)*int(horizon)*coverage_spheres
         cpu_live, gpu_live = live+256*coverage_states, live+128*coverage_states
+        # Every analytic box contributes differentiable face minima and a
+        # maximum with the grid certificate. Reserve their saved operands and
+        # backward temporaries per box, rather than treating the old Boolean
+        # containment branch's storage allowance as sufficient.
+        permission_states = coverage_states*len(self.unknown_policy['conditional_regions'])
+        cpu_live += 256*permission_states
+        gpu_live += 128*permission_states
         # END diagnostic-only observation queries do not retain a second graph.
         # Preparing a new dtype may temporarily stack float32 source channels
         # before the owning Torch tensor is copied/converted. This CPU scratch

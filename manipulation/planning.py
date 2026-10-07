@@ -2622,6 +2622,18 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
     # END a standalone manager uses the same zero-multiplier objective.
 
     managers = []
+    # BEGIN collision witnesses retain physical time, including plateau interiors.
+    collision_witnesses = np.empty(0, dtype=float)
+
+    def query_anchor_parameters():
+        pairs = progress_map.anchor_parameters(anchors)
+        if len(collision_witnesses):
+            extra = np.column_stack((collision_witnesses,
+                                     np.interp(collision_witnesses, progress_map.u, progress_map.s)))
+            pairs = np.concatenate((pairs, extra))
+            pairs = pairs[np.argsort(pairs[:, 0], kind="stable")]
+        return pairs
+    # END progress alone cannot identify a collision inside a hold.
 
     class ProcessCostManager(RobotCostManager):
         def initialize_from_config(self, config, transition_model, scene_collision_checker=None, **kwargs):
@@ -2679,7 +2691,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             pad = _MAX_PROGRESS_KEYS-len(progress_map.u)
             keys = np.r_[progress_map.u, 1.+np.arange(1, pad+1)]
             values = np.r_[progress_map.s, np.full(pad, progress_map.s[-1])]
-            pairs = progress_map.anchor_parameters(anchors)
+            pairs = query_anchor_parameters()
             _anchor_capacity(progress_map, anchors, budget)
             # BEGIN capacity admits requests; only actual witnesses are evaluated.
             anchor_count = self._anchor_count = len(pairs)
@@ -2830,11 +2842,13 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 component_diagnostics=None if context is None else context["scene_components"])
             # END raw residual zero sets are shared; only optimizer weights differ.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
-            # A squared optimizer penalty has a gradient proportional to
-            # the remaining violation. Metrics retain the original raw
-            # nonnegative values and therefore their original zero sets.
+            # BEGIN retain collision gradients for small positive clearance deficits.
+            # The scene already returns nonnegative physical violations. A
+            # second square suppresses their gradient near zero; only the
+            # original skill penalty keeps its squared optimizer objective.
             if self._process_mode == "trajectory_optimizer":
-                values = [(name, value.square()) for name, value in values]
+                values = [("skill_process", process_value.square()), ("process_scene", scene_value)]
+                # END metrics and optimizer retain exactly the same scene zero set.
                 # BEGIN signed inequalities enter PHR directly, never squared twice.
                 signed, _ = problem.functional_inequalities(
                     position, quaternion, progress, trajectory_time=trajectory_time)
@@ -2887,12 +2901,36 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             return ProcessCostManagerCfg(**values, process_mode=data_dict.get("process_mode", ""))
 
     def bind_request(new_problem, new_scene, new_progress, new_anchors, new_budget, new_constraints):
-        nonlocal problem, scene, progress_map, anchors, budget, functional_constraints
+        nonlocal problem, scene, progress_map, anchors, budget, functional_constraints, collision_witnesses
         problem, scene, progress_map, anchors, budget = new_problem, new_scene, new_progress, new_anchors, new_budget
         functional_constraints = new_constraints
+        # BEGIN a resident backend must never inherit another request's collision times.
+        collision_witnesses = np.empty(0, dtype=float)
+        # END semantic anchors are rebuilt from the newly bound request.
         for manager in managers:
             manager.bind_request_data()
     ProcessCostManagerCfg.bind_request = staticmethod(bind_request)
+    # BEGIN add bounded exact times only between completed eager native solves.
+    def add_collision_witnesses(parameters):
+        nonlocal collision_witnesses
+        parameters = np.asarray(parameters, dtype=np.float32).astype(float).reshape(-1)
+        if not np.isfinite(parameters).all() or np.any((parameters < 0) | (parameters > 1)):
+            raise ValueError("Collision witnesses require finite normalized physical times")
+        known = set(query_anchor_parameters()[:, 0].astype(np.float32).astype(float))
+        extra = np.asarray(sorted(set(parameters)-known), dtype=float)
+        if len(query_anchor_parameters())+len(extra) > budget.max_task_anchors:
+            raise MotionPlanningError("capacity_exceeded", "Collision witnesses exceed the resident anchor capacity")
+        if len(extra):
+            collision_witnesses = np.sort(np.r_[collision_witnesses, extra])
+            # Each manager owns independent FK/collision scratch storage and
+            # resizes it on its next eager evaluation. AL parameters are keyed
+            # by functional event, not query count: preserve the same object.
+            for manager in managers:
+                manager.bind_request_data()
+        return extra
+    ProcessCostManagerCfg.add_collision_witnesses = staticmethod(add_collision_witnesses)
+    ProcessCostManagerCfg.query_anchor_parameters = staticmethod(query_anchor_parameters)
+    # END request rebinding, rather than another candidate, clears these times.
     # BEGIN bounded aggregate evidence for real workload/performance reports.
     ProcessCostManagerCfg.query_diagnostics = staticmethod(
         lambda: [deepcopy(manager._query_counts) for manager in managers if manager._process_mode])
@@ -2923,6 +2961,9 @@ def _trajectory_candidate(result, index):
     # indexer instead slices each tensor on the seed axis without that false
     # reshape, preserving both coordinate layouts and every timing field.
     ordered.js_solution = ordered.interpolated_trajectory = None
+    # BEGIN top-k discards metrics after cloning; avoid copying every seed first.
+    ordered.metrics = ordered.interpolated_metrics = None
+    # END selected dense constraint evidence is copied explicitly below.
     candidate = ordered.get_topk_seeds(1)
     for name in ("js_solution", "interpolated_trajectory"):
         state = getattr(result, name)
@@ -2933,8 +2974,83 @@ def _trajectory_candidate(result, index):
             # its seed column too, even though batch is exactly one.
             single.dt = state.dt[:, index:index+1].clone()
         setattr(candidate, name, single)
+    # BEGIN native top-k drops metrics; retain the selected dense evidence.
+    # RolloutMetrics.__getitem__ is explicitly unimplemented in V2. Its
+    # costs use a flattened [batch*seed, horizon, component] layout, while
+    # the joint states above retain separate batch/seed axes. Copy only the
+    # selected constraint tensors needed for collision witness selection;
+    # acceptance still uses the complete original metrics in select_candidate.
+    if result.interpolated_metrics is not None:
+        from curobo._src.rollout.metrics import CostCollection, CostsAndConstraints, RolloutMetrics
+        constraints = result.interpolated_metrics.costs_and_constraints.constraints
+        candidate.interpolated_metrics = RolloutMetrics(costs_and_constraints=CostsAndConstraints(
+            constraints=CostCollection(names=list(constraints.names),
+                values=[value[index:index+1].detach().clone() for value in constraints.values])))
+    # END a different seed's dense times can never enter this continuation.
     return candidate
 # END exact native candidate extraction before independent verification.
+
+
+# BEGIN promote existing selected dense collisions without another geometry pass.
+def _dense_collision_witnesses(result, *, regular_horizon, anchor_parameters, capacity):
+    """Pick one uncovered peak per positive interval and collision component.
+
+    Native dense metrics store real samples in a valid prefix. The final
+    allocated column also contains folded anchor penalties, so it is never
+    interpreted as a new physical-time observation. Work already performed
+    for the selected candidate is the only source of additional queries.
+    """
+    import torch
+    if result.batch_size != 1 or result.num_seeds != 1:
+        raise ValueError("Collision witnesses require exactly one selected native candidate")
+    if capacity < 0:
+        raise ValueError("Collision witness capacity cannot be negative")
+    report = {"parameters": [], "peak_count": 0, "pending_parameters": [],
+              "source": "selected_native_dense_valid_prefix"}
+    if result.interpolated_metrics is None:
+        return report
+    count = int(result.interpolated_last_tstep.reshape(-1)[0].item())
+    like = result.interpolated_trajectory.position
+    horizon = like.shape[-2]
+    if not 2 <= count <= horizon or regular_horizon < 2:
+        raise ValueError("Collision witness sampling requires valid native trajectory lengths")
+    # Use exactly the native float32 divisions, without epsilon-based merging.
+    dense_u = (torch.arange(count, device=like.device, dtype=like.dtype)/(count-1)).cpu().numpy()
+    regular_u = (torch.arange(regular_horizon, device=like.device, dtype=like.dtype)
+                 /(regular_horizon-1)).cpu().numpy()
+    known = set(regular_u.astype(float)) | set(np.asarray(anchor_parameters, dtype=dense_u.dtype).astype(float))
+    eligible = np.array([float(u) not in known and index != horizon-1 for index, u in enumerate(dense_u)])
+    constraints = result.interpolated_metrics.costs_and_constraints.constraints
+    component_peaks = []
+    for name, tensor in zip(constraints.names, constraints.values):
+        # anchor_self_collision is a folded sum, not a per-time measurement.
+        if name not in {"process_scene", "self_collision"}:
+            continue
+        if tensor.shape[:2] != (1, horizon):
+            raise ValueError("Selected native collision metrics changed their sample layout")
+        values = tensor[0, :count].detach().reshape(count, -1).amax(-1).cpu().numpy()
+        positive = np.isfinite(values) & (values > 0)
+        edges = np.flatnonzero(np.diff(np.r_[False, positive, False]))
+        peaks = []
+        for left, right in edges.reshape(-1, 2):
+            candidates = np.flatnonzero(eligible[left:right])+left
+            if len(candidates):
+                # Exclude already evaluated times before maximizing: a large
+                # regular-grid peak must not hide an adjacent off-grid failure.
+                index = candidates[np.argmax(values[candidates])]
+                peaks.append((float(values[index]), float(dense_u[index])))
+        component_peaks.append([u for _, u in sorted(peaks, key=lambda row: (-row[0], row[1]))])
+    # Alternate components without comparing native self-collision units to
+    # scene units. Capacity is the existing anchor allowance, never a new one.
+    candidates = []
+    for index in range(max((len(peaks) for peaks in component_peaks), default=0)):
+        for peaks in component_peaks:
+            if index < len(peaks) and peaks[index] not in candidates:
+                candidates.append(peaks[index])
+    report.update(parameters=sorted(candidates[:capacity]), peak_count=len(candidates),
+                  pending_parameters=sorted(candidates[capacity:]), valid_count=count)
+    return report
+# END these extra optimizer queries never certify trajectory feasibility.
 
 
 class _CuroboPlanner:
@@ -4139,6 +4255,19 @@ class _CuroboPlanner:
     # END functional screening cannot itself authorize execution.
 
     # BEGIN the selected curve alone advances the functional AL continuation.
+    def promote_collision_witnesses(self, result):
+        """Rebind every manager's exact queries before the one recovery solve."""
+        if self._trajectory_configuration["use_cuda_graph"]:
+            raise MotionPlanningError("unsupported_model", "Collision witness promotion requires eager native rollouts")
+        pairs = self._manager_type.query_anchor_parameters()
+        report = _dense_collision_witnesses(result,
+            regular_horizon=result.js_solution.position.shape[-2], anchor_parameters=pairs[:, 0],
+            capacity=self.budget.max_task_anchors-len(pairs))
+        added = self._manager_type.add_collision_witnesses(report["parameters"])
+        report.update(changed=bool(len(added)), added_count=len(added),
+                      anchor_count=len(self._manager_type.query_anchor_parameters()))
+        return report
+
     def update_functional_constraints(self, result):
         """Measure signed event inequalities on the original regular cubic.
 
@@ -4153,7 +4282,9 @@ class _CuroboPlanner:
             return {"changed": False, "reason": "no_functional_point_constraints"}
         torch = self.torch
         native = self.trajopt.get_active_js(result.js_solution)
-        pairs = self.progress_map.anchor_parameters(self.anchors)
+        # BEGIN the AL measurement uses the same ordered history as recovery.
+        pairs = self._manager_type.query_anchor_parameters()
+        # END adding collision times changes queries, not functional identities.
         horizon = native.position.shape[-2]
         self.check_request()
         with torch.no_grad():
@@ -4904,7 +5035,18 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 residuals = attempt["residuals"]
                 collision_failed = any(value > 0 and ("scene" in name or "collision" in name)
                                        for name, value in residuals.items())
-                if collision_failed and budget.search_seconds > 0:
+                # BEGIN reuse dense collision evidence inside the existing second solve.
+                promoted = (planner.promote_collision_witnesses(native_result) if collision_failed else None)
+                if promoted is not None:
+                    diagnostics["collision_witness_update"] = promoted
+                if promoted is not None and promoted["changed"]:
+                    recovery, stage = "collision_witnesses", "collision_witness_recovery"
+                    if planner.functional_constraints.keys:
+                        diagnostics["functional_update"] = planner.update_functional_constraints(native_result)
+                    seeds = native_result.solution.detach().clone().expand(1, budget.trajectory_seeds, -1, -1).contiguous()
+                    planner.seed_strategies = [attempt["seed_provenance"]]*budget.trajectory_seeds
+                # END no new witness leaves the original OMPL/AL decision intact.
+                elif collision_failed and budget.search_seconds > 0:
                     recovery, stage = "ompl", "bounded_seed_search"
                     search_started = time.monotonic()
                     recovered, report = planner.ompl_seed(seeds, trajectory)
@@ -4922,7 +5064,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     diagnostics["functional_update"] = planner.update_functional_constraints(native_result)
                     seeds = native_result.solution.detach().clone().expand(1, budget.trajectory_seeds, -1, -1).contiguous()
                     planner.seed_strategies = [attempt["seed_provenance"]]*budget.trajectory_seeds
-                if recovery in {"ompl", "augmented_lagrangian"}:
+                if recovery in {"collision_witnesses", "ompl", "augmented_lagrangian"}:
                     check("trajectory_solves")
                     consumed["trajectory_solves"] += 1
                     native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))

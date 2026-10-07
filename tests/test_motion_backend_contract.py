@@ -80,6 +80,10 @@ class Native:
     def ompl_seed(self, seed, trajectory):
         self.calls.append("ompl")
         return (seed if self.ompl_available else None), {"state_queries": 1}
+    # BEGIN the default fixture has no uncovered dense collision samples.
+    def promote_collision_witnesses(self, result):
+        return {"changed": False, "parameters": []}
+    # END dedicated recovery tests supply new physical-time evidence below.
     def update_functional_constraints(self, result):
         self.calls.append("al")
         return {"changed": True}
@@ -175,6 +179,45 @@ def test_recovery_failure_returns_no_execution_binding_or_export():
     assert result.diagnostics["diagnostic_trajectory"] is native.curve
     assert native.calls.count("solve") == 2 and "export" not in native.calls
     backend.close()
+
+
+# BEGIN collision witnesses consume the original unique second solve.
+@pytest.mark.parametrize("accepted", [False, True])
+def test_new_dense_witnesses_continue_current_controls_without_search_or_third_solve(accepted):
+    native = Native([False, False, accepted], collision=True)
+    original_select = native.select_candidate
+    optimized_controls = torch.full((1, 1, 8, 1), .37)
+    recovery_seeds = []
+
+    def select(outcome):
+        selected, curve, report = original_select(outcome)
+        selected.solution = optimized_controls.clone()
+        return selected, curve, report
+
+    def promote(result):
+        native.calls.append("promote")
+        torch.testing.assert_close(result.solution, optimized_controls)
+        return {"changed": True, "parameters": [.37], "added_count": 1}
+
+    original_optimize = native.optimize
+    def optimize(seed):
+        recovery_seeds.append(seed.clone())
+        return original_optimize(seed)
+
+    native.select_candidate, native.promote_collision_witnesses = select, promote
+    native.optimize = optimize
+    result, backend = run(native)
+    assert result.success is accepted
+    assert result.diagnostics["recovery"] == "collision_witnesses"
+    assert native.calls.count("solve") == 2 and native.calls.count("promote") == 1
+    assert native.calls.count("al") == 1 and "reset_al" not in native.calls and "ompl" not in native.calls
+    torch.testing.assert_close(recovery_seeds[1], optimized_controls.expand_as(recovery_seeds[1]))
+    assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 2
+    assert result.request_ledger["planning_budget"]["planning_seconds"] == 120.
+    if not accepted:
+        assert result.execution_binding is None and "export" not in native.calls
+    backend.close()
+# END second-solve rejection remains a finite planning failure.
 
 
 def test_failed_ompl_cannot_spend_an_al_or_second_solve_slot():
