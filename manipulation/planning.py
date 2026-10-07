@@ -3168,6 +3168,24 @@ class _CuroboPlanner:
         }
 
         class ProcessTrajectoryOptimizer(TrajectoryOptimizer):
+            # BEGIN every native entry point binds the explicit problem batch.
+            def _prepare_goal_buffer(self, solve_state, goal_tool_poses, current_state=None,
+                                     use_implicit_goal=False, seed_goal_state=None, goal_state=None):
+                """Preserve native buffers while completing goal-free metadata.
+
+                The installed registry infers its batch only from pose or joint
+                tracking goals. Our process constraints own those requirements,
+                so seed-only registries retain -1 unless the request supplies
+                this metadata. Bind it here for direct solves, candidate metrics
+                and resident reuse before any rollout allocates state storage.
+                """
+                buffer, update_reference = super()._prepare_goal_buffer(
+                    solve_state, goal_tool_poses, current_state, use_implicit_goal,
+                    seed_goal_state, goal_state)
+                buffer.batch_size = solve_state.batch_size
+                return buffer, update_reference
+            # END no synthetic tracking goal or third-party mutation is needed.
+
             def get_interpolated_trajectory(self, js_optimized):
                 # BEGIN preserve raw controls and boundary derivatives on one clock.
                 from curobo._src.curobolib.cuda_ops.trajectory import get_bspline_interpolation
@@ -4158,9 +4176,6 @@ class _CuroboPlanner:
         endpoint.dt = self.torch.full((1, seed.shape[1]), self.budget.maximum_trajectory_dt,
                                       dtype=seed.dtype, device=seed.device)
         buffer, _ = self.trajopt._prepare_goal_buffer(state, goal, self.start, False, endpoint)
-        # BEGIN pose-free references bind the declared batch before rollout setup.
-        buffer.batch_size = state.batch_size
-        # END later optimization reuses this same correctly sized goal registry.
         self.trajopt._update_rollout_params(buffer)
         self.last_optimizer_diagnostics = [{"unchanged_from_seed": True, "maximum_control_update": 0.,
                                            "source": "reference_evaluation"} for _ in range(seed.shape[1])]
@@ -4232,11 +4247,6 @@ class _CuroboPlanner:
         endpoint.dt = tensor([[self.budget.maximum_trajectory_dt]])
         # END GoalRegistry requires [batch, seeds, joints], even for one curve.
         buffer, _ = self.trajopt._prepare_goal_buffer(state, None, self.start, False, endpoint)
-        # BEGIN goal-free metrics still have the explicit request batch identity.
-        # Native GoalRegistry infers batch_size from pose/goal_js only; with
-        # seed_goal_js alone it retains -1, which cannot size rollout storage.
-        buffer.batch_size = state.batch_size
-        # END no synthetic pose/joint tracking goal is needed to bind one curve.
         self.trajopt._update_rollout_params(buffer)
         rollout = self.trajopt.additional_metrics_rollouts["interpolated_rollout"]
         managers = [manager for manager in rollout._cost_manager_list

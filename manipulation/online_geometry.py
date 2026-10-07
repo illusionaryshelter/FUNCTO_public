@@ -115,7 +115,16 @@ class FrozenESDF:
         values = torch.relu(spheres[..., 3]-self.signed_distance(spheres[..., :3]))
         intersects=self.intersects_geometry(spheres)
         valid = self._sample(self.site_valid,spheres[..., :3],'site') > 0
-        return torch.where((spheres[..., 3] > 0) & intersects & valid, values, torch.zeros_like(values))
+        # BEGIN finite-field boundaries cannot manufacture obstacle distances.
+        # Zero padding attenuates positive distances just outside the grid even
+        # while interpolated site validity remains nonzero. Such centres have
+        # no distance query: the scene's separate support and unknown checks
+        # retain the unresolved obligation. Analytic primitives support all
+        # centres through their existing supports_centres implementation.
+        supported = self.supports_centres(spheres)
+        return torch.where((spheres[..., 3] > 0) & intersects & valid & supported,
+                           values, torch.zeros_like(values))
+        # END unsupported queries contribute no invented collision residual.
 
     # BEGIN one preparation phase, followed only by bounded batched queries.
     def prepare_contacts(self, rules, maximum_radii):

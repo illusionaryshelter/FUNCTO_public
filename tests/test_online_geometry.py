@@ -52,6 +52,34 @@ def test_outside_centre_with_radius_intersecting_known_local_geometry_still_requ
     assert disjoint['components']['unknown/forbidden/robot'] > 0
 
 
+# BEGIN finite-field boundary regression: missing samples are not zero distances.
+def test_partial_zero_padding_cannot_manufacture_a_background_collision():
+    # The two remote observed sites make the coarse geometry bounds cover the
+    # query, while every interpolation vertex near it has +0.2 m clearance.
+    # One voxel beyond the last centre is missing data, not an obstacle plane.
+    distances = np.full((21, 21, 21), .2, np.float32)
+    distances[0, 0, 0] = distances[-1, -1, -1] = 0.
+    query = field(distances)
+    spheres = torch.tensor([[.1, 0., 0., .03], [.109, 0., 0., .03],
+                            [.12, 0., 0., .03]], dtype=torch.float64, requires_grad=True)
+    assert query.intersects_geometry(spheres).all()
+    assert query.supports_centres(spheres).tolist() == [True, False, False]
+    residual = query(spheres)
+    assert torch.equal(residual, torch.zeros_like(residual))
+    residual.sum().backward()
+    assert torch.equal(spheres.grad, torch.zeros_like(spheres))
+
+    # Removing an invented collision must leave the incomplete query and the
+    # independent lack of observed free space visible to execution validation.
+    result = scene(conditional=True, background=query).query_state(
+        spheres.detach().numpy()[1:2], np.eye(4), .5)
+    assert result['components']['collision/robot/background'] == 0
+    assert result['components']['scene_update/background/robot'] == 1
+    assert result['components']['unknown/forbidden/robot'] > 0
+    assert not result['passed'] and result['status'] == 'SCENE_UPDATE_REQUIRED'
+# END boundary handling never turns an unsupported query into free evidence.
+
+
 def test_absent_surface_cannot_create_collision_and_owner_outside_grid_is_disjoint():
     spheres=torch.tensor([[[[0.,0.,0.,.01],[1.,0.,0.,.01]]]],dtype=torch.float64)
     assert torch.equal(field(np.zeros((21,21,21),np.float32),valid=False)(spheres),torch.zeros((1,1,2),dtype=torch.float64))
