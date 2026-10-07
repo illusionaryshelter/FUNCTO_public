@@ -30,7 +30,7 @@ def scene(*,conditional=False,background=None):
     return result
 
 
-def test_bounded_unknown_is_conditional_not_free_and_outside_map_is_update():
+def test_bounded_unknown_is_conditional_and_empty_local_map_does_not_limit_arm_domain():
     sphere=np.array([[0.,0.,0.,.01]])
     denied=scene().query_state(sphere,np.eye(4),0.)
     assert not denied['passed']
@@ -38,7 +38,18 @@ def test_bounded_unknown_is_conditional_not_free_and_outside_map_is_update():
     assert allowed['passed'] and allowed['conditional_unknown']
     assert not scene(conditional=True).coverage.known_free.any()
     outside=scene(conditional=True).query_state(np.array([[.11,0.,0.,.01]]),np.eye(4),0.)
-    assert not outside['passed'] and outside['status']=='SCENE_UPDATE_REQUIRED'
+    assert not outside['passed'] and outside['status']=='COLLISION_OR_CONSTRAINT'
+    assert outside['components']['scene_update/background/robot'] == 0
+    assert outside['components']['unknown/forbidden/robot'] > 0
+
+
+def test_outside_centre_with_radius_intersecting_known_local_geometry_still_requires_update():
+    current = scene(conditional=True, background=field(np.zeros((21,21,21),np.float32)))
+    overlap = current.query_state(np.array([[.11,0.,0.,.02]]), np.eye(4), .5)
+    assert overlap['status'] == 'SCENE_UPDATE_REQUIRED'
+    disjoint = current.query_state(np.array([[.14,0.,0.,.02]]), np.eye(4), .5)
+    assert disjoint['components']['scene_update/background/robot'] == 0
+    assert disjoint['components']['unknown/forbidden/robot'] > 0
 
 
 def test_absent_surface_cannot_create_collision_and_owner_outside_grid_is_disjoint():

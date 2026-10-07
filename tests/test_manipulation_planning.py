@@ -1596,7 +1596,11 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
 
                     def hand_state(progress, q, names, *, trajectory_time):
                         times.append(trajectory_time.detach().clone())
-                        return (.1*trajectory_time)[..., None], torch.zeros_like(trajectory_time), None
+                        # BEGIN native and scene geometry consume one uncertainty flag.
+                        from manipulation.planning_scene import GripperState
+                        return GripperState((.1*trajectory_time)[..., None], torch.zeros_like(trajectory_time),
+                            None, torch.zeros_like(trajectory_time, dtype=torch.bool) if nominal else trajectory_time > 0)
+                        # END a command-only future is not a measured hand width.
 
                     def hand_spheres(spheres, position, quaternion, fingers, half):
                         # One translating finger sphere has an independent
@@ -2511,7 +2515,7 @@ class ExportedCurveContractTests(unittest.TestCase):
         limits.acceleration[:, 0] = torch.tensor([-2., 5.], dtype=torch.float64)
         from manipulation.planning import MotionPlanningError
         with self.assertRaises(MotionPlanningError) as caught:
-            planner.export(result)
+            planner.export(result, {"accepted": True, "residuals": {}})
         self.assertEqual(caught.exception.reason, "output_inconsistent")
     # END a zero sampled native residual cannot hide a left-limit violation.
 
@@ -2522,7 +2526,7 @@ class ExportedCurveContractTests(unittest.TestCase):
         result.num_seeds = 2
         result.get_interpolated_plan = Mock(side_effect=AssertionError("must reject before reading mixed curves"))
         with self.assertRaisesRegex(ValueError, "one.*seed|selected seed"):
-            planner.export(result)
+            planner.export(result, {"accepted": True, "residuals": {}})
         result.get_interpolated_plan.assert_not_called()
 
     # BEGIN changing ordinary reference shape cannot invent a process obligation.
@@ -2533,7 +2537,7 @@ class ExportedCurveContractTests(unittest.TestCase):
         problem = cartesian_problem((MotionPhase("reference loop", PosePath(knots, reference, "reference")),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                          np.zeros((9, 3)), np.zeros((9, 3)), .125)
-        trajectory, _ = planner.export(result)
+        trajectory, _ = planner.export(result, {"accepted": True, "residuals": {}})
         self.assertNotIn(.502, planner.last_validation["u"])
         self.assertTrue(all(value == 0. for value in trajectory.residuals.values()))
         self.assertFalse(any(key.startswith("phase:") for key in trajectory.residuals))
@@ -2553,7 +2557,7 @@ class ExportedCurveContractTests(unittest.TestCase):
         mapping = _ProgressMap(np.array([0., .2, .45, .75, 1.]), np.array([0., 1., 1., 2., 3.]))
         np.testing.assert_allclose(mapping.anchor_parameters([1.]), [[.2, 1.], [.45, 1.]])
         planner, result = export_fixture(problem, mapping, np.zeros((7, 3)), np.zeros((7, 3)), .2)
-        trajectory, _ = planner.export(result)
+        trajectory, _ = planner.export(result, {"accepted": True, "residuals": {}})
         self.assertEqual(len(trajectory.events), len(events))
         self.assertEqual([(event["skill_id"], event["event_id"]) for event in trajectory.events],
                          [(event.skill_id, event.event_id) for event in events])
@@ -2572,7 +2576,7 @@ class ExportedCurveContractTests(unittest.TestCase):
         problem = cartesian_problem((MotionPhase("free", constant_path()),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                          np.zeros((3, 3)), np.zeros((3, 3)), .25)
-        trajectory, _ = planner.export(result)
+        trajectory, _ = planner.export(result, {"accepted": True, "residuals": {}})
         self.assertIsNone(trajectory.next_verification)
         self.assertEqual(trajectory.executable_until, trajectory.duration)
 

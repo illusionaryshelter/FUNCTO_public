@@ -19,6 +19,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 import math
+from typing import NamedTuple
 
 from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES
 
@@ -769,6 +770,21 @@ def validate_grasp_contact_arrival(condition, requirement):
 # END rule identities never grant an entire robot/owner collision exemption.
 
 
+# BEGIN one typed state owns both future geometry and its uncertainty.
+class GripperState(NamedTuple):
+    """Coordinates/envelope and certainty shared by every collision consumer.
+
+    ``uncertain`` identifies unmodelled future finger positions. A zero-width
+    command reference is not evidence that this flag is false. ``half`` is the
+    mechanical interval used only for conservative conditional diagnostics.
+    """
+    coordinates: torch.Tensor
+    half: torch.Tensor
+    controller_residual: torch.Tensor
+    uncertain: torch.Tensor
+# END command timing cannot independently select a physical collision model.
+
+
 class PrismaticGripper:
     """Bind native finger coordinates to a supported controller and geometry.
 
@@ -795,7 +811,8 @@ class PrismaticGripper:
                  joint_bounds, coupling_matrix, coupling_offset, sphere_indices,
                  local_spheres, sphere_joint_translation, self_collision_pairs,
                  commands, source, control_timestep_s, numerical_joint_tolerance=1e-5,
-                 finger_trajectory_factory=None, nominal_finger_trajectory_factory=None):
+                 finger_trajectory_factory=None, nominal_finger_trajectory_factory=None,
+                 self_collision_geometry=()):
         # BEGIN independent position-control intervals without solver fingers.
         if controller not in {"position_tracking", "timed_reference", "binary"}:
             raise ValueError("Controller must declare solver tracking, a timed reference or binary intentions")
@@ -866,6 +883,14 @@ class PrismaticGripper:
             raise ValueError("Self-collision pair declarations must be unique")
         self._self_pair_indices = np.asarray(self.self_collision_pairs, dtype=np.int64).reshape(-1, 2)
         # END reject duplicate declarations before batched summation.
+        # BEGIN complete native prismatic solids may replace their proxy pairs.
+        from .prismatic_self_collision import PreparedPrismaticSelfCollision
+        self.self_collision_model = (PreparedPrismaticSelfCollision(
+            self_collision_geometry, joint_names=self.joint_names,
+            sphere_indices=self.sphere_indices, local_spheres=self.local_spheres,
+            sphere_joint_translation=self.sphere_joint_translation,
+            collision_pairs=self._self_pair_indices) if self_collision_geometry else None)
+        # END no source solid means the existing sphere model remains explicit.
         # BEGIN own each bound occurrence so later retry input cannot alter this scene.
         self.commands = tuple(deepcopy(commands))
         # BEGIN arm-only planning still binds measured fingers without issuing a command.
@@ -902,15 +927,32 @@ class PrismaticGripper:
                 raise ValueError("Nominal hand geometry must preserve measured entrance, names and bound clock")
             self.nominal_finger_trajectory = nominal
 
-    def state(self, progress, joint_position, joint_names, *, trajectory_time=None):
+    def state(self, progress, joint_position, joint_names, *, trajectory_time=None, measured=False):
         expected = (*progress.shape, len(self.joint_names))
         limits = _tensor(self.joint_limits, progress)
-        measured = _tensor(self.current_positions, progress)
-        if self.controller == "timed_reference" or self.nominal_finger_trajectory is not None:
-            if ((self.nominal_finger_trajectory is None and self.finger_trajectory is None)
-                    or trajectory_time is None or trajectory_time.shape != progress.shape):
+        initial_positions = _tensor(self.current_positions, progress)
+        certain = torch.zeros_like(progress, dtype=torch.bool)
+        # BEGIN complete measured feedback always overrides every future model.
+        if measured:
+            if joint_position is None or not set(self.joint_names) <= set(joint_names or ()):
+                raise ValueError("Measured hand geometry requires complete named finger coordinates")
+            columns = [tuple(joint_names).index(name) for name in self.joint_names]
+            coordinates = joint_position[..., constant_tensor(columns, joint_position, dtype=torch.long)]
+            if coordinates.shape != expected:
+                raise ValueError("Measured fingers must align with the queried states")
+            tolerance = self.numerical_joint_tolerance
+            violations = (torch.relu(limits[:, 0]-coordinates-tolerance).sum(-1)
+                          + torch.relu(coordinates-limits[:, 1]-tolerance).sum(-1))
+            if len(self.coupling_matrix):
+                coupling = _tensor(self.coupling_matrix, progress)
+                violations += torch.relu((coordinates @ coupling.T-_tensor(self.coupling_offset, progress)).abs()
+                                         -tolerance*coupling.abs().sum(-1)).sum(-1)
+            return GripperState(coordinates, torch.zeros_like(coordinates), violations, certain)
+        # END missing measured coordinates never fall back to commands.
+        if self.nominal_finger_trajectory is not None:
+            if trajectory_time is None or trajectory_time.shape != progress.shape:
                 raise ValueError("Timed finger geometry requires its bound trajectory and actual query time")
-            model = self.nominal_finger_trajectory or self.finger_trajectory
+            model = self.nominal_finger_trajectory
             coordinates, _ = model.sample_torch(trajectory_time)
             if coordinates.shape != expected:
                 raise ValueError("Named finger samples must align with the scene query")
@@ -922,8 +964,8 @@ class PrismaticGripper:
                 violations = violations + torch.relu(
                     (coordinates @ coupling.T-_tensor(self.coupling_offset, progress)).abs()
                     - tolerance*coupling.abs().sum(-1)).sum(-1)
-            return coordinates, torch.zeros_like(coordinates), violations
-        if self.controller == "binary":
+            return GripperState(coordinates, torch.zeros_like(coordinates), violations, certain)
+        if self.controller in {"binary", "timed_reference"}:
             # BEGIN binary progress cannot identify the measured initial instant.
             # Neither a repeated zero-progress sample nor an isolated IK/search
             # query carries a time/velocity contract for the fingers. Preserve
@@ -933,11 +975,16 @@ class PrismaticGripper:
             upper = limits[:, 1].expand(expected)
             if trajectory_time is not None:
                 initial = trajectory_time == 0
-                lower = torch.where(initial[..., None], measured, lower)
-                upper = torch.where(initial[..., None], measured, upper)
+                if trajectory_time.shape != progress.shape:
+                    raise ValueError("Finger physical times must align with the query")
+                lower = torch.where(initial[..., None], initial_positions, lower)
+                upper = torch.where(initial[..., None], initial_positions, upper)
+            uncertain = (torch.ones_like(progress, dtype=torch.bool) if trajectory_time is None
+                         else trajectory_time > 0)
             # END time-independent binary envelope.
         else:
             lower, upper = self.joint_bounds(progress)
+            uncertain = certain
         if lower.shape != expected or upper.shape != expected:
             raise ValueError("Reachable finger bounds must have shape [B,H,J]")
         tolerance = self.numerical_joint_tolerance
@@ -959,15 +1006,15 @@ class PrismaticGripper:
         else:
             coordinates = middle
         initial = (progress == 0).to(progress.dtype)
-        violations = violations + initial * (torch.relu(lower - measured - tolerance).sum(-1)
-                                             + torch.relu(measured - upper - tolerance).sum(-1))
+        violations = violations + initial * (torch.relu(lower - initial_positions - tolerance).sum(-1)
+                                             + torch.relu(initial_positions - upper - tolerance).sum(-1))
         if len(self.coupling_matrix) and self.controller == "position_tracking":
             coupling = _tensor(self.coupling_matrix, progress)
             coupling_tolerance = tolerance * coupling.abs().sum(-1)
             violations = violations + torch.relu((coordinates @ coupling.T
                                          - _tensor(self.coupling_offset, progress)).abs()
                                          - coupling_tolerance).sum(-1)
-        return coordinates, half, violations
+        return GripperState(coordinates, half, violations, uncertain)
     # END nominal finger geometry never asserts that commands equal actual feedback.
 
     def spheres(self, robot_spheres, position, quaternion, coordinates, half):
@@ -2118,24 +2165,24 @@ class PlanningScene:
             raise ValueError("Background witnesses need aligned native spheres, progress and physical times")
         spheres = robot_spheres
         if self.gripper is not None:
-            coordinates, half, _ = self.gripper.state(progress, joint_position, joint_names,
-                                                     trajectory_time=trajectory_time)
+            geometry_state = self.gripper.state(progress, joint_position, joint_names,
+                                                trajectory_time=trajectory_time)
+            coordinates, half = geometry_state.coordinates, geometry_state.half
             spheres = self.gripper.spheres(spheres, position, quaternion, coordinates, half)
         selected = query.region.select(spheres, self.robot_collision_bodies)
         expanded = query.inflated_spheres(spheres)
         values = query.coarse(expanded, key=("robot", "refinement_witness"))
         fine_values = query.fine(expanded, key=("robot", "refinement_witness"))
         hand = self.gripper
-        if (hand is not None and hand.controller in {"binary", "timed_reference"}
-                and hand.nominal_finger_trajectory is None):
+        if hand is not None:
             uncertain = [index for index, mapping in zip(hand.sphere_indices, hand.sphere_joint_translation)
                          if np.any(mapping != 0)]
             if uncertain:
                 values = values.clone()
                 fine_values = fine_values.clone()
-                values[..., uncertain] = torch.where(trajectory_time[..., None] > 0,
+                values[..., uncertain] = torch.where(geometry_state.uncertain[..., None],
                                                        0., values[..., uncertain])
-                fine_values[..., uncertain] = torch.where(trajectory_time[..., None] > 0,
+                fine_values[..., uncertain] = torch.where(geometry_state.uncertain[..., None],
                                                             0., fine_values[..., uncertain])
         _, weights = query.region.guidance_weights(spheres, self.robot_collision_bodies)
         envelopes = selected.influence_aabb+torch.as_tensor(query.region.pose[:3].copy(),
@@ -2600,7 +2647,8 @@ class PlanningScene:
         return result
     # END neither a source reference nor a sibling branch supplies release FK.
 
-    def _permission(self, rule, actor_spheres, actor_pose, target_pose, progress, coordinates, half):
+    def _permission(self, rule, actor_spheres, actor_pose, target_pose, progress, coordinates, half,
+                    *, uncertain_hand=None):
         # BEGIN complete finite overlap, without requiring the whole pad in the patch.
         points = _tensor(rule.feature_points, progress)
         if rule.feature_joint_translation is not None:
@@ -2608,7 +2656,9 @@ class PlanningScene:
             points = points + torch.einsum("vcj,bhj->bhvc", mapping, coordinates)
             # Material permission is not granted to an uncertain width. The
             # full conservative envelope continues to participate in collision.
-            certain = half.amax(-1) == 0
+            if uncertain_hand is None:
+                raise ValueError("Moving material permissions need the shared hand-state certainty")
+            certain = ~uncertain_hand
         else:
             certain = torch.ones_like(progress, dtype=torch.bool)
         world = _world_points(points, *actor_pose)
@@ -2683,13 +2733,13 @@ class PlanningScene:
         unknown_indices = set()
         total = torch.zeros_like(progress)
         if hand is not None:
-            coordinates, half, _ = hand.state(
+            geometry_state = hand.state(
                 progress, joint_position, joint_names, trajectory_time=trajectory_time)
+            coordinates, half = geometry_state.coordinates, geometry_state.half
             spheres = hand.spheres(spheres, position, quaternion, coordinates, half)
-            if hand.controller in {"binary", "timed_reference"} and hand.nominal_finger_trajectory is None:
-                uncertain = trajectory_time > 0
-                unknown_indices = {index for index, mapping in zip(hand.sphere_indices, hand.sphere_joint_translation)
-                                   if np.any(mapping != 0)}
+            uncertain = geometry_state.uncertain
+            unknown_indices = {index for index, mapping in zip(hand.sphere_indices, hand.sphere_joint_translation)
+                               if np.any(mapping != 0)}
             if hand.self_collision_pairs:
                 all_pairs = _self_pair_sum(spheres, hand._self_pair_indices)
                 known_pairs = [pair for pair in hand.self_collision_pairs if not set(pair) & unknown_indices]
@@ -2768,8 +2818,10 @@ class PlanningScene:
         coordinates = half = None
         spheres = robot_spheres
         if self.gripper is not None:
-            coordinates, half, costs["gripper/controller"] = self.gripper.state(
+            geometry_state = self.gripper.state(
                 progress, joint_position, joint_names, trajectory_time=trajectory_time)
+            coordinates, half = geometry_state.coordinates, geometry_state.half
+            costs["gripper/controller"] = geometry_state.controller_residual
             spheres = self.gripper.spheres(spheres, position, quaternion, coordinates, half)
             # BEGIN source solids own self acceptance; hand spheres guide only.
             # robot_self_collision_guidance retains their optimizer gradients.
@@ -2779,18 +2831,14 @@ class PlanningScene:
         uncertain_indices = []
         if self.gripper is not None:
             hand = self.gripper
-            if hand.controller in {"binary", "timed_reference"} and hand.nominal_finger_trajectory is None:
-                uncertain_hand = (torch.ones_like(progress, dtype=torch.bool) if trajectory_time is None else trajectory_time > 0)
-                uncertain_indices = [index for index, mapping in zip(hand.sphere_indices, hand.sphere_joint_translation)
-                                     if np.any(mapping != 0)]
-                # BEGIN partition by identity once, before numeric reductions.
-                uncertain_set = set(uncertain_indices)
-                known_indices = [index for index in range(spheres.shape[-2])
-                                 if index not in uncertain_set]
-                # END the same robot partition applies to every scene owner.
-                # BEGIN unknown self geometry is reported by the source query.
-                # Sphere overlap is not evidence about an unknown future width.
-                # END the known/unknown partition below still applies to owners.
+            uncertain_hand = geometry_state.uncertain
+            uncertain_indices = [index for index, mapping in zip(hand.sphere_indices, hand.sphere_joint_translation)
+                                 if np.any(mapping != 0)]
+            # BEGIN partition by identity once, before numeric reductions.
+            uncertain_set = set(uncertain_indices)
+            known_indices = [index for index in range(spheres.shape[-2])
+                             if index not in uncertain_set]
+            # END the same robot partition applies to every scene owner.
         def collision_terms(values, key, actor):
             if actor == "robot" and uncertain_indices:
                 # BEGIN graph-safe original known/unknown column partitions.
@@ -2902,7 +2950,8 @@ class PlanningScene:
                     if rule.actor != actor or rule.target_owner != owner.owner_id:
                         continue
                     policy, residual, uncertain = self._permission(
-                        rule, actor_spheres, actor_pose, poses[owner.owner_id], progress, coordinates, half)
+                        rule, actor_spheres, actor_pose, poses[owner.owner_id], progress, coordinates, half,
+                        uncertain_hand=uncertain_hand)
                     if actor == "robot" and rule.feature_joint_translation is not None:
                         policy["active"] = policy["active"] & ~uncertain_hand
                     if rule.required:

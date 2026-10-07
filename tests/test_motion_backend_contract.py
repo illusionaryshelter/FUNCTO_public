@@ -85,7 +85,11 @@ class Native:
         return {"changed": True}
     def reset_functional_constraints(self):
         self.calls.append("reset_al")
-    def export(self, result):
+    def export(self, result, native_report):
+        # BEGIN delivery consumes the already completed candidate metrics.
+        assert native_report["accepted"]
+        self.last_validation = {"u": np.array([0., 1.]), "violations": np.zeros(2)}
+        # END no second synthetic geometry verdict is introduced here.
         self.calls.append("export")
         return self.curve, 0
     def rebind(self, problem, scene, budget, **kwargs):

@@ -52,7 +52,7 @@ def load_probe_fixture(fixture_path, *, reference_frame, T_reference_base=None,
     return fixture, robot, validator
 
 
-def calibrate_native_hand(robot, feedback, problem, *, device, position_limits):
+def calibrate_native_hand(robot, feedback, problem, *, device, position_limits, fixture):
     """Measure the existing native hand's affine sphere geometry by named FK.
 
     This is the recorded runner's calibration: query both actual source limits,
@@ -63,6 +63,7 @@ def calibrate_native_hand(robot, feedback, problem, *, device, position_limits):
     import torch
     from curobo.kinematics import Kinematics, KinematicsCfg
     from curobo.types import JointState
+    from robot_fixture import bind_fixture_gripper_geometry, bind_fixture_prismatic_self_geometry
 
     unlocked = deepcopy(robot)
     unlocked["robot_cfg"]["kinematics"]["lock_joints"] = None
@@ -74,8 +75,13 @@ def calibrate_native_hand(robot, feedback, problem, *, device, position_limits):
     if len(columns) != 2:
         raise ValueError("This parallel-jaw calibration requires two explicitly named native fingers")
     parameters = native.config.kinematics_config
-    indices = tuple(int(i) for link in feedback["finger_link_names"]
-                    for i in parameters.get_sphere_index_from_link_name(link).cpu().tolist())
+    indices_by_link = {link: [int(index) for index in
+        parameters.get_sphere_index_from_link_name(link).cpu().tolist()]
+        for link in robot["robot_cfg"]["kinematics"]["collision_link_names"]}
+    # BEGIN include the complete verified hand subtree, including fixed palm.
+    binding = bind_fixture_gripper_geometry(fixture, robot, indices_by_link, finger_names)
+    indices = tuple(binding['sphere_indices'])
+    # END native solid replacement is never based on only convenient fingers.
     if not indices or len(set(indices)) != len(indices):
         raise ValueError("Native finger links must have disjoint nonempty sphere sets")
     limits = np.asarray([position_limits[name] for name in finger_names], dtype=float)
@@ -115,15 +121,26 @@ def calibrate_native_hand(robot, feedback, problem, *, device, position_limits):
         raise ValueError(f"Native finger geometry is not affine in the declared TCP: {error} m")
     pairs = native.get_self_collision_config().collision_pairs.cpu().numpy()
     self_pairs = tuple(tuple(int(i) for i in pair) for pair in pairs if set(pair)&set(indices))
-    return {"joint_names": names, "finger_joint_names": finger_names,
+    result = {"joint_names": names, "finger_joint_names": finger_names,
         "current_positions": initial[columns], "joint_limits": limits,
         "sphere_indices": indices, "local_spheres": local_spheres,
         "sphere_joint_translation": affine, "self_collision_pairs": self_pairs,
         "affine_fk_max_error_m": error, "robot_spheres": current,
         "tool_position": p, "tool_quaternion": q,
-        "sphere_indices_by_link": {link: [int(index) for index in
-            parameters.get_sphere_index_from_link_name(link).cpu().tolist()]
-            for link in robot["robot_cfg"]["kinematics"]["collision_link_names"]}}
+        "sphere_indices_by_link": indices_by_link}
+    binding = bind_fixture_prismatic_self_geometry(fixture, robot, result, feedback)
+    result['self_collision_geometry'] = binding['geometry']
+    result['local_spheres'] = binding['local_spheres']
+    result['sphere_joint_translation'] = binding['sphere_joint_translation']
+    result['native_geometry_binding'] = binding['audit']
+    # BEGIN canonical source coefficients must still reproduce measured GPU FK.
+    predicted = binding['local_spheres'][:, :3]+np.einsum(
+        'ncj,j->nc', binding['sphere_joint_translation'], initial[columns])
+    result['affine_fk_max_error_m'] = float(np.max(np.abs(current_local-predicted)))
+    if result['affine_fk_max_error_m'] > 2e-6:
+        raise ValueError('Canonical native hand model differs from measured GPU FK')
+    # END the original metre-error contract is unchanged.
+    return result
 
 
 def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
@@ -154,7 +171,7 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
     feedback = {"joint_names": names, "start_q": values, "finger_joint_names": fingers,
                 "finger_link_names": fixture["finger_link_names"]}
     geometry = calibrate_native_hand(robot, feedback, problem, device=device,
-                                     position_limits=fixture["position_limits"])
+                                     position_limits=fixture["position_limits"], fixture=fixture)
     commands = tuple({"event_id": event.event_id, "skill_id": event.skill_id,
         "occurrence": event.occurrence, "command": event.kind, "progress": event.progress}
         for event in problem.events if event.kind in {"hold", "open", "close"})
@@ -181,7 +198,8 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
         sphere_indices=geometry["sphere_indices"], local_spheres=geometry["local_spheres"],
         sphere_joint_translation=geometry["sphere_joint_translation"],
         self_collision_pairs=geometry["self_collision_pairs"], commands=commands,
-        source=source, control_timestep_s=control_timestep_s, nominal_finger_trajectory_factory=nominal)
+        source=source, control_timestep_s=control_timestep_s, nominal_finger_trajectory_factory=nominal,
+        self_collision_geometry=geometry['self_collision_geometry'])
     original_links = {row["link"] for row in fixture["collision_geometries"]}
     owners, owner_report = create_fixed_installation_owners(fixture, device_cfg=device,
         T_output_base=problem.base_pose, sphere_indices_by_link={name: indices for name, indices in
@@ -189,6 +207,7 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
     report = {"source": source, "current_positions": current.tolist(),
         "joint_names": list(fingers), "control_timestep_s": float(control_timestep_s),
         "affine_fk_max_error_m": geometry["affine_fk_max_error_m"],
+        "native_geometry_binding": geometry['native_geometry_binding'],
         "fixed_installation_owners": owner_report}
     return hand, owners, report
 # END no source geometry or collision policy is invented by these probe adapters.

@@ -57,9 +57,10 @@ def curve_snapshot(trajectory):
 
 
 def bind_candidate(trajectory, *, problem, scene, validation, native_report):
-    """Bind the accepted native curve and the exact online geometry snapshot.
+    """Bind the accepted joint curve and the exact online geometry snapshot.
 
-    Native residuals and exported Hermite coefficients name one candidate.
+    Native-backend metrics and the unchanged Hermite curve name one candidate,
+    whether it was supplied directly or produced by trajectory optimization.
     Execution checks current measured state against this same scene binding;
     an independent source-mesh audit cannot authorize or veto the handoff.
     """
@@ -69,14 +70,18 @@ def bind_candidate(trajectory, *, problem, scene, validation, native_report):
             or queries.shape != violations.shape or not np.isfinite(queries).all()
             or not np.isfinite(violations).all() or np.any(violations > 0)
             or np.any(queries < 0) or np.any(queries > 1)):
-        raise ValueError("Execution binding requires completed accepted native online validation")
+        # BEGIN supplied and optimized curves share one online acceptance gate.
+        raise ValueError("Execution binding requires completed accepted online validation")
+        # END source provenance cannot bypass any acceptance requirement.
     candidate_id = str(uuid4())
     inputs = {"problem": plain(problem), "scene": plain(scene.to_execution_binding())}
     return {"candidate_id": candidate_id, "curve": curve_snapshot(trajectory),
         **deepcopy(inputs),
         "validation": {"candidate_id": candidate_id, "completed": True,
             "inputs": inputs,
-            "scope": "same native curve, event clock and online scene; actual entrance preflight pending",
+            # BEGIN the binding does not claim a supplied curve has a native spline basis.
+            "scope": "same accepted joint curve, event clock and online scene; actual entrance preflight pending",
+            # END native metrics can evaluate either accepted curve representation.
             "export": plain(validation), "native": plain(native_report)},
         "execution_limits": None}
 

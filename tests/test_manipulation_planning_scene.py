@@ -343,7 +343,8 @@ class PlanningSceneTest(unittest.TestCase):
         hand.bind_clock(1., None)
         progress = torch.zeros((1, 2), dtype=torch.float64)
         times = torch.tensor([[0., .5]], dtype=torch.float64)
-        q, half, violations = hand.state(progress, None, None, trajectory_time=times)
+        q, half, violations, uncertain = hand.state(progress, None, None, trajectory_time=times)
+        self.assertFalse(uncertain.any().item())
         np.testing.assert_array_equal(q[0, 0], [.03, -.02])
         np.testing.assert_array_equal(q[0, 1], [.015, -.01])
         self.assertEqual(half.abs().max().item(), 0.)
@@ -780,9 +781,9 @@ class PlanningSceneTest(unittest.TestCase):
     def test_tracking_commands_and_coupling_use_separate_numerical_tolerance(self):
         hand = self.gripper("position_tracking")
         s = torch.tensor([[.5]], dtype=torch.float32)
-        _, _, small = hand.state(s, torch.tensor([[[.0400001]]]), ("finger",))
+        small = hand.state(s, torch.tensor([[[.0400001]]]), ("finger",)).controller_residual
         self.assertEqual(small.item(), 0.)
-        _, _, changed = hand.state(s, torch.tensor([[[.02]]]), ("finger",))
+        changed = hand.state(s, torch.tensor([[[.02]]]), ("finger",)).controller_residual
         self.assertGreater(changed.item(), .019)
         with self.assertRaisesRegex(ValueError, "named solver joints"):
             hand.state(s, None, None)

@@ -135,7 +135,7 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
         geometry = calibrate_native_hand(robot,
             {"joint_names": names, "start_q": initial.cpu().numpy(),
              "finger_joint_names": finger_names, "finger_link_names": fixture["finger_link_names"]},
-            frame_problem, device=device, position_limits=fixture["position_limits"])
+            frame_problem, device=device, position_limits=fixture["position_limits"], fixture=fixture)
         sphere_indices, self_pairs = geometry["sphere_indices"], geometry["self_collision_pairs"]
         local_spheres, affine = geometry["local_spheres"], geometry["sphere_joint_translation"]
         installations, installation_report = create_fixed_installation_owners(fixture,
@@ -181,7 +181,8 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
             sphere_joint_translation=affine, self_collision_pairs=self_pairs,
             commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id, "occurrence": event.occurrence,
                             "command": event.kind, "progress": event.progress} for event in events),
-            source="explicit synthetic position-tracking drive; geometry calibrated against native source FK")
+            source="explicit synthetic position-tracking drive; geometry calibrated against native source FK",
+            self_collision_geometry=geometry['self_collision_geometry'])
         # BEGIN fixed analytic distance field for the declared distant cuboid.
         background = FrozenPrimitives(primitives=[{"kind": "cuboid", "pose": [0., 0., -1., 1., 0., 0., 0.],
             "dimensions": [.1, .1, .1]}], owner_ids=("synthetic_far_obstacle",),

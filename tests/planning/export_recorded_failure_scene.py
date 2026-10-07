@@ -128,7 +128,8 @@ def export(args):
             query, state, position, quaternion, poses = native_fk(native, problem, values, names, device)
             spheres = problem.transform_robot_spheres(state.robot_spheres)
             progress = device.to_device(np.asarray([row['progress'] for row in batch]))[:, None]
-            coordinates, half, _ = hand.state(progress, query, names)
+            geometry_state = hand.state(progress, query, names)
+            coordinates, half = geometry_state.coordinates, geometry_state.half
             expanded = hand.spheres(spheres, position, quaternion, coordinates, half)
             unknown = scene.coverage.violation(expanded)
             background = scene.background(expanded, key=('robot', 'background'))

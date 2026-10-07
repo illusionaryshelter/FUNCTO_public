@@ -131,7 +131,7 @@ def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ct
 
 # BEGIN share unchanged native FK calibration with source-backed planning probes.
 def position_controlled_hand(robot, feedback, problem, *, device, execution_limits,
-                             position_limits, velocity_limits, trajectory_factory, execution_events=None):
+                             position_limits, velocity_limits, trajectory_factory, fixture, execution_events=None):
     """Bind independent command reference after checking actual execution limits.
 
     The shared test adapter calibrates exactly the same native spheres and
@@ -157,7 +157,8 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
             or np.any(np.abs([actual_dq[name] for name in finger_names])
                       > np.asarray(binding["initial_fingers"]["maximum_speed"]))):
         raise ValueError("Measured initial fingers violate the shared execution bounds")
-    geometry = calibrate_native_hand(robot, feedback, problem, device=device, position_limits=position_limits)
+    geometry = calibrate_native_hand(robot, feedback, problem, device=device,
+                                    position_limits=position_limits, fixture=fixture)
     hand = PrismaticGripper(
         controller="timed_reference", joint_names=finger_names,
         current_positions=geometry["current_positions"], joint_limits=geometry["joint_limits"],
@@ -170,8 +171,10 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
         commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id,
                         "occurrence": event.occurrence, "command": event.kind, "progress": event.progress}
                        for event in execution_events if event.kind in {"open", "close", "hold"}),
-        source=f"Native robot FK and synchronous independent position reference: {execution_limits.source}")
+        source=f"Native robot FK and synchronous independent position reference: {execution_limits.source}",
+        self_collision_geometry=geometry['self_collision_geometry'])
     report = {"affine_fk_max_error_m": geometry["affine_fk_max_error_m"],
+        "native_geometry_binding": geometry['native_geometry_binding'],
         "native_sphere_count": len(geometry["robot_spheres"]),
         "finger_sphere_indices": list(geometry["sphere_indices"]),
         "current_fingers": geometry["current_positions"].tolist(),
@@ -447,7 +450,7 @@ def run(args):
             robot, {**feedback, "finger_link_names": fixture["finger_link_names"]},
             problem, device=device, execution_limits=execution_limits,
             position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
-            trajectory_factory=reference_factory)
+            trajectory_factory=reference_factory, fixture=fixture)
         # END actual measured positions, velocities and identity are unchanged.
         report["gripper"] = hand_report
         # BEGIN finite contact inputs are required for contact activation.

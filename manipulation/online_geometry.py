@@ -357,6 +357,10 @@ class OnlinePlanningScene:
             raise ValueError('Native self padding must align with every bound sphere')
         self.robot_sphere_geometry = deepcopy(robot_sphere_geometry)
         self.robot_self_collision_pairs = pairs.tolist()
+        # BEGIN every backend consumes the same precise native-pair replacement.
+        self.native_self_collision_pairs = (self.gripper.self_collision_model.filter_pairs(pairs, padding)
+            if self.gripper is not None and self.gripper.self_collision_model is not None else pairs.tolist())
+        # END no entire finger, link, or owner collision class is disabled.
         self.robot_self_collision_padding = padding.tolist()
         self.robot_model = deepcopy(robot_model or {})
         self.required_robot_links = tuple(row['link_name'] for row in robot_sphere_geometry)
@@ -454,13 +458,15 @@ class OnlinePlanningScene:
             if commands != events:
                 raise ValueError('Online hand commands must preserve exact problem event occurrences')
 
-    def _unknown(self, spheres):
+    def _unknown(self, spheres, uncertain=None):
         unresolved = self.coverage.violation(spheres)
         conditional = torch.zeros_like(unresolved, dtype=torch.bool)
         for row in self.unknown_policy['conditional_regions']:
             centre, radius = spheres[..., :3], spheres[..., 3:4].clamp_min(0)
             conditional |= ((centre-radius >= _tensor(row['lower_m'], centre)) &
                             (centre+radius <= _tensor(row['upper_m'], centre))).all(-1)
+        if uncertain is not None:
+            conditional |= uncertain
         return torch.where(conditional, 0., unresolved).amax(-1), torch.where(conditional, unresolved, 0.).amax(-1)
 
     def components(self, robot_spheres, position, quaternion, progress,
@@ -476,23 +482,24 @@ class OnlinePlanningScene:
         if permission_progress.shape!=progress.shape:
             raise ValueError('Finite permission progress must align with the queried states')
         costs, spheres = {}, robot_spheres
-        coordinates = half = None
+        coordinates = half = geometry_state = None
         if self.gripper is not None:
-            if active_contact_rule_ids is not None and (joint_position is None or not set(self.gripper.joint_names)<=set(joint_names or ())):
-                raise ValueError('UNSUPPORTED_MODEL: actual hand query requires complete named measured fingers')
-            if active_contact_rule_ids is not None and joint_position is not None and set(self.gripper.joint_names) <= set(joint_names or ()):
-                columns = [tuple(joint_names).index(name) for name in self.gripper.joint_names]
-                coordinates = joint_position[..., columns]
-                half = torch.zeros_like(coordinates)
-            else:
-                coordinates, half, costs['gripper/controller'] = self.gripper.state(progress,
-                    joint_position, joint_names, trajectory_time=trajectory_time)
+            # BEGIN measured, nominal and unresolved geometry are selected once.
+            geometry_state = self.gripper.state(progress, joint_position, joint_names,
+                trajectory_time=trajectory_time, measured=active_contact_rule_ids is not None)
+            coordinates, half = geometry_state.coordinates, geometry_state.half
+            costs['gripper/controller'] = geometry_state.controller_residual
+            # END commands are never independently promoted to actual positions.
             spheres = self.gripper.spheres(spheres, position, quaternion, coordinates, half)
         uncertain_indices = []
         uncertain_hand = torch.zeros_like(progress,dtype=torch.bool)
-        if half is not None:
-            uncertain_hand = half.amax(-1)>0
+        if geometry_state is not None:
+            uncertain_hand = geometry_state.uncertain
             uncertain_indices = [index for index,mapping in zip(self.gripper.sphere_indices,self.gripper.sphere_joint_translation) if np.any(mapping!=0)]
+            costs['conditional/hand_geometry'] = uncertain_hand.to(progress.dtype)
+        moving = torch.zeros(spheres.shape[-2], dtype=torch.bool, device=spheres.device)
+        moving[uncertain_indices] = True
+        uncertain_spheres = uncertain_hand[..., None] & moving
         def sum_collision(values,name,actor):
             if actor=='robot' and uncertain_indices:
                 selected=torch.zeros(values.shape[-1],dtype=torch.bool,device=values.device)
@@ -502,15 +509,27 @@ class OnlinePlanningScene:
                 costs[name]=torch.where(uncertainty,0.,values).sum(-1)
             else:
                 costs[name]=values.sum(-1)
+        def max_constraint(values, name, actor):
+            # Numerical gaps of an unresolved future finger remain explicit
+            # conditional gaps; known arm/palm gaps remain hard scene updates.
+            uncertainty = uncertain_spheres if actor == 'robot' else torch.zeros_like(values, dtype=torch.bool)
+            costs[name] = torch.where(uncertainty, 0., values).amax(-1)
+            if actor == 'robot' and uncertain_indices:
+                costs['conditional/'+name] = torch.where(uncertainty, values, 0.).amax(-1)
         if self.robot_self_collision_pairs:
             padded = spheres.clone()
             padded[...,3] = padded[...,3]+_tensor(self.robot_self_collision_padding,spheres)
-            pairs=np.asarray(self.robot_self_collision_pairs)
+            pairs=np.asarray(self.native_self_collision_pairs, dtype=np.int64).reshape(-1, 2)
             all_self=_self_pair_sum(padded,pairs)
             known_pairs=np.asarray([pair for pair in pairs if not set(pair)&set(uncertain_indices)],dtype=np.int64).reshape(-1,2)
             known_self=_self_pair_sum(padded,known_pairs)
             costs['collision/robot/self']=torch.where(uncertain_hand,known_self,all_self)
             costs['conditional/collision/robot/self']=torch.where(uncertain_hand,(all_self-known_self).clamp_min(0),0.)
+        if geometry_state is not None and self.gripper.self_collision_model is not None:
+            native, conditional = self.gripper.self_collision_model.components(geometry_state)
+            costs['collision/robot/self'] = costs.get('collision/robot/self', torch.zeros_like(progress))+native
+            costs['conditional/collision/robot/self'] = costs.get(
+                'conditional/collision/robot/self', torch.zeros_like(progress))+conditional
         poses = {}
         for owner in self.owners:
             if owner_poses is not None and owner.owner_id in owner_poses:
@@ -545,8 +564,17 @@ class OnlinePlanningScene:
                 cover[:,3] += owner.sphere_cover_error_m
                 actors[owner.owner_id] = (_world_spheres(cover,*poses[owner.owner_id]),poses[owner.owner_id])
         for actor,(body,actor_pose) in actors.items():
-            costs[f'unknown/forbidden/{actor}'], costs[f'conditional/unknown/{actor}'] = self._unknown(body)
-            costs[f'scene_update/background/{actor}'] = ((body[...,3]>0) & ~self.background.supported(body)).to(progress.dtype).amax(-1)
+            costs[f'unknown/forbidden/{actor}'], costs[f'conditional/unknown/{actor}'] = self._unknown(
+                body, uncertain_spheres if actor == 'robot' else None)
+            # BEGIN numerical support belongs to represented local geometry.
+            # Even a sphere centre outside the map may intersect stored solids;
+            # those unresolved queries still request a scene update. Observation
+            # coverage remains an independent check immediately above.
+            max_constraint(((body[...,3]>0)
+                & self.background.intersects_geometry(body)
+                & ~self.background.supports_centres(body)).to(progress.dtype),
+                f'scene_update/background/{actor}', actor)
+            # END a local field never declares grid-exterior space observed free.
             sum_collision(self.background(body),f'collision/{actor}/background',actor)
             for owner in self.owners:
                 if owner.owner_id == actor:
@@ -559,12 +587,19 @@ class OnlinePlanningScene:
                     if owner.query._contact_model is None or rule.rule_id not in owner.query._contact_model.regions:
                         raise ValueError('UNSUPPORTED_MODEL: robot sphere geometry must bind before finite contact queries')
                     policy, normal, uncertainty = self._permission(rule,body,actor_pose,poses[owner.owner_id],
-                        permission_progress if actor=='robot' else progress,coordinates,half)
+                        permission_progress if actor=='robot' else progress,coordinates,half,
+                        uncertain_hand=uncertain_hand)
                     if active_contact_rule_ids is not None:
                         policy['active'] &= rule.rule_id in active_contact_rule_ids
                     policies.append((rule,policy))
                     costs[f'contact/normal/{rule.rule_id}'] = normal*policy['active']
                     costs[f'conditional/finger/{rule.rule_id}'] = uncertainty
+                    if rule.required:
+                        # A disabled uncertain permission does not satisfy a
+                        # required contact. The existing protocol does not bind
+                        # every generic required rule to a pre-contact evidence
+                        # barrier, so uncertainty cannot authorize this promise.
+                        costs[f'unsupported/required_contact_geometry/{rule.rule_id}'] = uncertainty
                     # BEGIN native finite material replaces cell Boolean permission.
                     normal_actor = quaternion_rotate(actor_pose[1], _tensor(rule.feature_normal, progress))
                     normal_target = quaternion_rotate(quaternion_conjugate(poses[owner.owner_id][1]), normal_actor)
@@ -575,7 +610,7 @@ class OnlinePlanningScene:
                     if rule.required:
                         costs[f'contact/required/{rule.rule_id}'] = owner.query.required_contact(rule,policy)*policy['active']
                 values, gap = owner.query.contact_query(local,policies) if policies else (owner.query(local),torch.zeros_like(local[...,3]))
-                costs[f'unsupported/contact/{actor}/{owner.owner_id}'] = gap.amax(-1)
+                max_constraint(gap, f'unsupported/contact/{actor}/{owner.owner_id}', actor)
                 if actor == 'robot' and owner.robot_excluded_spheres:
                     values = values.clone()
                     values[...,list(owner.robot_excluded_spheres)] = 0
@@ -585,11 +620,17 @@ class OnlinePlanningScene:
                 # its boundary, spheres intersecting its represented AABB need
                 # complete numerical support and cannot fall back to coarse.
                 intersects=owner.query.intersects_geometry(local)
-                costs[f'scene_update/{actor}/{owner.owner_id}'] = (intersects & ~owner.query.supports_centres(local) & (local[...,3]>0)).to(progress.dtype).amax(-1)
+                max_constraint((intersects & ~owner.query.supports_centres(local) & (local[...,3]>0)).to(progress.dtype),
+                               f'scene_update/{actor}/{owner.owner_id}', actor)
         return costs
 
     def evaluate(self,*args,**kwargs):
+        # BEGIN expose the same completed query for candidate diagnostics.
+        components_out = kwargs.pop('components_out', None)
         terms = self.components(*args,**kwargs)
+        if components_out is not None:
+            components_out.update(terms)
+        # END diagnostics never trigger a second geometry query.
         hard = [value for name,value in terms.items() if not name.startswith('conditional/')]
         return torch.stack(hard).sum(0)
 
@@ -624,9 +665,13 @@ class OnlinePlanningScene:
         # coverage float32 aliases its source tensor; its float64 copy is new.
         constants = 65536 * (1 + len(ordinary_caches) + sum(
             len(model.rule_records) for model in contact_models.values()))
+        if self.gripper is not None and self.gripper.self_collision_model is not None:
+            constants += self.gripper.self_collision_model.storage_nbytes*4
         cpu_shared = source_bytes + sampled_elements * (4 + 8) + coverage_cells * 8 + constants
         gpu_shared = (sampled_elements + coverage_cells) * (4 + 8) + constants
         live = int(batch)*int(horizon)*max(1,len(self.robot_sphere_materials))*512
+        if self.gripper is not None and self.gripper.self_collision_model is not None:
+            live += int(batch)*int(horizon)*len(self.gripper.self_collision_model.axis_pairs)*48
         # Preparing a new dtype may temporarily stack float32 source channels
         # before the owning Torch tensor is copied/converted. This CPU scratch
         # is separate from the final caches counted above.
@@ -677,7 +722,11 @@ class OnlinePlanningScene:
         hand_record = None
         if hand is not None:
             hand_record = {key:_plain(getattr(hand,key)) for key in ('controller','joint_names','current_positions','joint_limits','coupling_matrix','coupling_offset','sphere_indices','local_spheres','sphere_joint_translation','self_collision_pairs','commands','source','control_timestep_s','numerical_joint_tolerance')}
-        return {'schema':'online_scene_v2','reference_frame':self.reference_frame,
+            hand_record['self_collision_geometry'] = ([] if hand.self_collision_model is None
+                                                     else deepcopy(hand.self_collision_model.geometry))
+            hand_record['prepared_self_collision'] = (None if hand.self_collision_model is None
+                                                     else hand.self_collision_model.record())
+        return {'schema':'online_scene_v3','reference_frame':self.reference_frame,
             'robot_geometry_source':self.robot_geometry_source,'robot_model':deepcopy(self.robot_model),
             'numerical_position_tolerance_m':self.numerical_position_tolerance_m,
             'numerical_rotation_tolerance_rad':self.numerical_rotation_tolerance_rad,
@@ -697,7 +746,7 @@ class OnlinePlanningScene:
 
     @classmethod
     def from_binding(cls,row):
-        if row.get('schema')!='online_scene_v2':
+        if row.get('schema')!='online_scene_v3':
             raise ValueError('Online scene binding schema is required')
         owners=[]
         for record in row['owners']:
@@ -709,11 +758,19 @@ class OnlinePlanningScene:
         hand=None
         if row['gripper'] is not None:
             spec=deepcopy(row['gripper'])
+            prepared = spec.pop('prepared_self_collision')
+            # JSON represents an empty [0,J] coupling matrix as []; restore
+            # its declared native joint dimension before ordinary validation.
+            spec['coupling_matrix'] = np.asarray(spec['coupling_matrix'], dtype=float).reshape(-1, len(spec['joint_names']))
             # Runtime reads measured finger joints. No archived command curve
             # is promoted to future physical contact or guessed feedback.
             spec['controller']='binary'
             spec['joint_bounds']=None
             hand=PrismaticGripper(**spec)
+            if (prepared is None) != (hand.self_collision_model is None):
+                raise ValueError('Saved native hand geometry and prepared model must agree')
+            if prepared is not None:
+                hand.self_collision_model.validate_record(prepared)
         cover=row['coverage']
         known=decode_array(cover['known_free'])
         coverage=ObservedSpace(known,origin=cover['origin'],voxel_size=cover['voxel_size'],

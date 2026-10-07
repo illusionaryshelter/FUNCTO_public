@@ -1331,6 +1331,144 @@ def bind_fixture_gripper_geometry(fixture, robot_cfg, sphere_indices_by_link, fi
 # END permission changes software checks only, never native contact physics.
 
 
+# BEGIN source-verified affine convex geometry for complete native hand pairs.
+def bind_fixture_prismatic_self_geometry(fixture, robot_cfg, geometry, feedback):
+    """Freeze native hand convex solids in the same zero-coordinate TCP frame.
+
+    MuJoCo is used only during this fixture binding. The complete hand subtree
+    was already checked by ``bind_fixture_gripper_geometry``; each source joint
+    must be prismatic, and every native solid/sphere uses the same measured
+    affine translation. Online code receives vertices and constant matrices,
+    never a source model handle or callback.
+    """
+    names = tuple(geometry['finger_joint_names'])
+    partition = geometry['sphere_indices_by_link']
+    hand = bind_fixture_gripper_geometry(fixture, robot_cfg, partition, names)
+    selected = set(hand['sphere_indices'])
+    if selected != set(geometry['sphere_indices']):
+        raise ValueError('Prismatic self model must use the complete calibrated hand subtree')
+    model = mujoco.MjModel.from_xml_path(fixture['robot_mjcf_path'])
+    data = mujoco.MjData(model)
+    measured = dict(zip(feedback['joint_names'], feedback['start_q']))
+    for joint in range(model.njnt):
+        name = model.joint(joint).name
+        if name not in measured:
+            raise ValueError('Native hand preparation needs every measured robot joint')
+        data.qpos[model.jnt_qposadr[joint]] = measured[name]
+    joints = [model.joint(name).id for name in names]
+    if any(model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_SLIDE for joint in joints):
+        raise ValueError('UNSUPPORTED_MODEL: native hand self geometry requires prismatic joints')
+    limits = np.asarray(geometry['joint_limits'])
+    coordinates = [limits[:, 0].copy()]
+    for column in range(len(names)):
+        value = limits[:, 0].copy()
+        value[column] = limits[column, 1]
+        coordinates.append(value)
+    tool = fixture['tool_transform']
+    T_frame_tcp = _pose(tool['position'], tool['quaternion_wxyz'])
+    site = model.site(fixture['tcp_site']).id
+    records, offsets = [], {link: 0 for link in partition}
+    for row in fixture['collision_geometries']:
+        link, size = row['link'], row['sphere_count']
+        start = offsets[link]
+        offsets[link] += size
+        ids = partition[link][start:start+size]
+        if not set(ids) & selected:
+            continue
+        if not set(ids) <= selected:
+            raise ValueError('A native hand solid cannot have only some of its cover spheres replaced')
+        native_id = model.geom(row['geom']).id
+        native = _collision_geometry(model, native_id, 'prepared_prismatic_self_binding')
+        if native['collision_representation'] not in {'native_mesh_convex_collision_hull', 'native_box'}:
+            raise ValueError('UNSUPPORTED_MODEL: finite native convex hand solids are required')
+        with np.load(row['certificate_path'], allow_pickle=False) as saved:
+            vertices = saved['native_vertices'].copy()
+            centres = saved['sphere_centers_body'].copy()
+            if (not np.array_equal(vertices, native['vertices'])
+                    or not np.array_equal(saved['T_body_geom'], _native_geom_pose(model, native_id))):
+                raise ValueError('Native hand convex geometry differs from its source certificate')
+        records.append(dict(row=row, ids=ids, native_id=native_id, vertices=vertices, centres=centres))
+    snapshots = []
+    for fingers in coordinates:
+        for joint, value in zip(joints, fingers):
+            data.qpos[model.jnt_qposadr[joint]] = value
+        mujoco.mj_forward(model, data)
+        frame = np.eye(4)
+        frame[:3, :3], frame[:3, 3] = data.site_xmat[site].reshape(3, 3), data.site_xpos[site]
+        tcp = frame @ T_frame_tcp
+        pose_rows = []
+        for record in records:
+            geom, body = record['native_id'], model.geom_bodyid[record['native_id']]
+            world_vertices = record['vertices'] @ data.geom_xmat[geom].reshape(3, 3).T+data.geom_xpos[geom]
+            world_centres = record['centres'] @ data.xmat[body].reshape(3, 3).T+data.xpos[body]
+            pose_rows.append(((world_vertices-tcp[:3, 3]) @ tcp[:3, :3],
+                              (world_centres-tcp[:3, 3]) @ tcp[:3, :3]))
+        snapshots.append(pose_rows)
+    result, errors = [], []
+    canonical_spheres = np.array(geometry['local_spheres'], dtype=float, copy=True)
+    canonical_mapping = np.array(geometry['sphere_joint_translation'], dtype=float, copy=True)
+    hand_rows = {index: row for row, index in enumerate(geometry['sphere_indices'])}
+    def ancestors(body):
+        values = set()
+        while body:
+            values.add(int(body))
+            body = model.body_parentid[body]
+        return values
+    tcp_ancestors = ancestors(model.site_bodyid[site])
+    for index, record in enumerate(records):
+        vertices, centres = snapshots[0][index]
+        mapping = np.zeros((3, len(names)))
+        geom_ancestors = ancestors(model.geom_bodyid[record['native_id']])
+        for column, snapshot in enumerate(snapshots[1:]):
+            shifts = (snapshot[index][0]-vertices)/(limits[column, 1]-limits[column, 0])
+            if not np.allclose(shifts, shifts[:1], rtol=0, atol=2e-12):
+                raise ValueError('UNSUPPORTED_MODEL: relative hand geometry rotates with a finger joint')
+            joint_body = int(model.jnt_bodyid[joints[column]])
+            dependency = int(joint_body in geom_ancestors)-int(joint_body in tcp_ancestors)
+            # A shared slide translates TCP and geometry equally. Its relative
+            # coefficient is exactly zero by tree identity, never an epsilon
+            # test that could erase a small but real independent motion.
+            mapping[:, column] = dependency*(tcp[:3, :3].T @ data.xaxis[joints[column]])
+            if not np.allclose(shifts, mapping[:, column], atol=2e-12, rtol=0):
+                raise ValueError('Native hand joint dependency and measured affine endpoints disagree')
+        zero_vertices = vertices-(mapping @ coordinates[0])
+        zero_centres = centres-(mapping @ coordinates[0])
+        selected_rows = [hand_rows[i] for i in record['ids']]
+        # BEGIN compare physical positions over the complete mechanical box.
+        # A GPU finite difference divides float32 metre errors by the joint
+        # stroke. Its dimensionless coefficient error is not a metre error.
+        # The maximum absolute affine difference in each Cartesian coordinate
+        # over a box is exactly |d(midpoint)| + sum_j |dM_j|*halfwidth_j.
+        # Keep the existing 2 micrometre coordinate-FK contract unchanged.
+        delta_zero = geometry['local_spheres'][selected_rows, :3]-zero_centres
+        delta_mapping = geometry['sphere_joint_translation'][selected_rows]-mapping[None]
+        middle, half = limits.mean(-1), (limits[:, 1]-limits[:, 0])/2
+        bound = np.abs(delta_zero+np.einsum('ncj,j->nc', delta_mapping, middle))
+        bound += np.einsum('ncj,j->nc', np.abs(delta_mapping), half)
+        diagnostic = {'geometry_id': record['row']['geom'],
+            'zero_coordinate_max_difference_m': float(np.abs(delta_zero).max()),
+            'coefficient_max_difference': float(np.abs(delta_mapping).max()),
+            'full_mechanical_interval_coordinate_error_bound_m': float(bound.max())}
+        errors.append(diagnostic)
+        if diagnostic['full_mechanical_interval_coordinate_error_bound_m'] > 2e-6:
+            raise ValueError(f'Source native solids and calibrated native sphere FK disagree: {diagnostic}')
+        # The native source now owns both representations' exact coefficients;
+        # noisy differencing never survives as a separate collision model.
+        # This is a validated source transform, not an empirical pose offset.
+        canonical_spheres[selected_rows, :3] = zero_centres
+        canonical_mapping[selected_rows] = mapping
+        # END no physical clearance or collision allowance was increased.
+        result.append({'geometry_id': record['row']['geom'], 'sphere_indices': list(record['ids']),
+            'vertices': zero_vertices.tolist(), 'joint_translation': mapping.tolist(),
+            'source': f"{fixture['robot_mjcf_path']}::geom[{record['row']['geom']}]; {record['row']['certificate_path']}"})
+    return {'geometry': result, 'local_spheres': canonical_spheres,
+            'sphere_joint_translation': canonical_mapping,
+            'audit': {'position_tolerance_m': 2e-6,
+                'comparison': 'maximum absolute coordinate error over complete mechanical joint limits',
+                'geometry_errors': errors}}
+# END online convex projections retain the complete original pair policy.
+
+
 # BEGIN bind exact native material geometry to the runtime sphere ordering.
 def bind_fixture_contact_materials(fixture, robot_cfg, sphere_indices_by_link,
                                   feedback, material_faces):

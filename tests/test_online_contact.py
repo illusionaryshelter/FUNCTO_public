@@ -13,7 +13,7 @@ import torch
 from manipulation.online_contact import PreparedContactFields, planar_material_conditions
 from manipulation.online_geometry import FrozenESDF, FrozenPrimitives, OnlinePlanningScene
 from manipulation.planning_problem import PosePath
-from manipulation.planning_scene import ContactRule, PlanningScene, CollisionOwner, ObservedSpace
+from manipulation.planning_scene import ContactRule, PlanningScene, CollisionOwner, ObservedSpace, PrismaticGripper
 
 
 def rule(name="left", x=-.006, *, required=False, sphere_indices=(0,), material="pad"):
@@ -231,6 +231,40 @@ def test_full_scene_modes_material_guards_and_execution_use_same_frozen_model():
         assert restored.query_state(body, moved, .5, active_contact_rule_ids={item.rule_id}) == guarded
 
 
+def test_required_contact_with_command_only_fingers_retains_unresolved_obligation():
+    item = rule(required=True)
+    translation = np.zeros((*item.feature_points.shape, 1))
+    translation[:, 0, 0] = 1.
+    item = replace(item, feature_joint_translation=translation)
+    hand = PrismaticGripper(controller='binary', joint_names=('finger',), current_positions=[0.],
+        joint_limits=[[-.01, .01]], joint_bounds=None, coupling_matrix=np.empty((0, 1)), coupling_offset=[],
+        sphere_indices=(0,), local_spheres=[[0., 0., 0., .01]], sphere_joint_translation=[[[1.], [0.], [0.]]],
+        self_collision_pairs=(), commands=(), source='unmodelled independently commanded finger', control_timestep_s=.01)
+    owner_field = field(points=((-0.006, 0., 0.),))
+    background = field()
+    background.owner_ids = frozenset(('background',))
+    background.geometry_lower = background.geometry_upper = None
+    coverage = ObservedSpace(np.ones(owner_field.distance.shape, bool), origin=owner_field.origin,
+        voxel_size=owner_field.voxel_size, observation_ids=('A',), reference_frame='world')
+    owner = CollisionOwner('part', owner_field, PosePath(np.array([0., 1.]),
+        np.stack((np.eye(4), np.eye(4))), 'fixed observed owner'), 'observed owner', True)
+    scene = OnlinePlanningScene(background=background, owners=(owner,), coverage=coverage,
+        reference_frame='world', robot_sphere_materials=('pad',), robot_geometry_source='native model',
+        contacts=(item,), gripper=hand, unknown_policy={'conditional_regions': [], 'outside_regions': 'forbid'},
+        native_geometry_materials={'pad_box': 'pad'})
+    scene.bind_online_robot(robot_sphere_geometry=[{'link_name': 'pad', 'sphere_indices': [0],
+        'centers_local': [[0., 0., 0.]], 'radii': [.01]}], robot_self_collision_pairs=[])
+    terms = scene.components(spheres(), torch.zeros((1, 1, 3), dtype=torch.float64),
+        torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64), torch.tensor([[.5]], dtype=torch.float64),
+        trajectory_time=torch.tensor([[1.]], dtype=torch.float64))
+    assert terms['conditional/finger/left'].item() == 1.
+    assert terms['unsupported/required_contact_geometry/left'].item() == 1.
+    actual = scene.query_state(spheres().numpy()[0, 0], np.eye(4), .5, joint_position=[0.],
+        joint_names=('finger',), trajectory_time=1., active_contact_rule_ids={'left'})
+    assert actual['components']['unsupported/required_contact_geometry/left'] == 0.
+    assert actual['components']['conditional/finger/left'] == 0.
+
+
 @pytest.mark.parametrize("corruption", ["nonfinite_region", "missing_membership", "zero_radius", "missing_required_witness"])
 def test_loading_rejects_incomplete_or_nonfinite_contact_models(corruption):
     item = rule(required=corruption == "missing_required_witness")
@@ -253,7 +287,7 @@ def test_workspace_counts_unique_source_arrays_and_both_float_caches_on_cpu_and_
     query = prepare(field(), [rule()])
     coverage = SimpleNamespace(_known=np.ones((2, 2, 2), bool), _known_free=np.ones((2, 2, 2), bool),
                               _distance=torch.zeros((1, 1, 2, 2, 2), dtype=torch.float32))
-    scene = SimpleNamespace(background=query, owners=(), coverage=coverage, robot_sphere_materials=("pad",))
+    scene = SimpleNamespace(background=query, owners=(), coverage=coverage, robot_sphere_materials=("pad",), gripper=None)
     base = OnlinePlanningScene.estimated_workspace_allocation(scene, 1, 1)
     # One ESDF owns distance float32 + two bool arrays: 6N. One prepared
     # channel adds 4N. Distance, site-validity and prepared-bank caches each
