@@ -652,10 +652,19 @@ class ObservedContactGeometry:
         radii = np.nextafter(supplied[:, 3]+self.maximum_cell_radius, np.inf)
         lengths = self.tree.query_ball_point(supplied[:, :3], radii, return_length=True, workers=1)
         candidates = int(np.sum(lengths))
-        plane_count = max((policy["normals"].shape[-2] for policy in policies), default=1)
+        # BEGIN zero allowance never changes a component's collision cost.
+        # Keep every policy in the enabled material-sphere union above. A
+        # zero allowance contributes exactly zero for every region result,
+        # so only positive allowances need halfspace work or its budget.
+        # Complete component distances and required-contact checks remain
+        # independent of this algebraically irrelevant region calculation.
+        region_policies = tuple(policy for policy in policies if policy["allowance"] != 0.)
+        plane_count = max((policy["normals"].shape[-2] for policy in region_policies), default=1)
+        candidate_plane_products = candidates*plane_count*len(region_policies)
+        # END positive-allowance policies retain the original work estimate.
         if candidates > self.max_candidate_pairs:
             raise ValueError(f"Complete contact component query needs {candidates} candidate pairs, budget {self.max_candidate_pairs}")
-        if candidates*plane_count*len(policies) > self.max_candidate_plane_products:
+        if candidate_plane_products > self.max_candidate_plane_products:
             raise ValueError("Complete component/region queries exceed the 32000000-product budget")
         neighbors = self.tree.query_ball_point(supplied[:, :3], radii, workers=1)
         ball_indices = np.repeat(np.arange(len(supplied)), lengths)
@@ -675,10 +684,14 @@ class ObservedContactGeometry:
             nearest, signs = self._closest_points(ic, balls[:, :3])
             sdf = signs*np.linalg.norm(balls[:, :3]-nearest, axis=1)
             allowance = np.zeros(len(ib))
-            padded = np.asarray([np.pad(self.vertices[index], ((0, 8-len(self.vertices[index])), (0, 0)),
-                                         mode="edge") for index in ic])
-            states_index = selected_flat[ib]//count
-            for policy in policies:
+            # BEGIN omit only region work with identically zero allowance.
+            if region_policies:
+                # These arrays serve only the halfspace support tests. The
+                # complete distance query above never depends on padding.
+                padded = np.asarray([np.pad(self.vertices[index], ((0, 8-len(self.vertices[index])), (0, 0)),
+                                             mode="edge") for index in ic])
+                states_index = selected_flat[ib]//count
+            for policy in region_policies:
                 active = (policy["active"].reshape(-1).detach().cpu().numpy()[states_index]
                     & policy["normal_valid"].reshape(-1).detach().cpu().numpy()[states_index]
                     & np.isin(selected_flat[ib] % count, policy["sphere_indices"]))
@@ -688,6 +701,7 @@ class ObservedContactGeometry:
                 component_support = np.einsum("nki,nvi->nkv", normals, padded).max(-1)
                 inside = (np.minimum(sphere_support, component_support) <= bounds).all(-1)
                 allowance = np.maximum(allowance, (active & inside)*float(policy["allowance"]))
+            # END base collision and positive-allowance arithmetic are unchanged.
             cost = np.maximum(balls[:, 3]-sdf-allowance, 0.)
             permitted_pairs += int(np.count_nonzero(allowance))
             order = np.lexsort((np.arange(len(ib)), -cost, ib))
@@ -714,6 +728,11 @@ class ObservedContactGeometry:
             output = output.index_copy(0, chosen[selected], value)
         self.last_report = {"complete_components": len(self.vertices), "enabled_spheres": len(supplied),
             "candidate_pairs": candidates, "raw_pair_product": len(supplied)*len(self.vertices),
+            # BEGIN expose whole-query work separately from live storage.
+            "region_policy_count": len(region_policies),
+            "candidate_plane_products": candidate_plane_products,
+            "max_candidate_plane_products": self.max_candidate_plane_products,
+            # END this estimate matches the unchanged positive-policy guard.
             "maximum_live_pairs": min(candidates, live_chunk), "permitted_pairs": permitted_pairs,
             "scope": "optimization sphere guidance over complete TSDF surface and negative components"}
         return output.reshape(spheres.shape[:-1]), enabled.reshape(spheres.shape[:-1])

@@ -96,6 +96,77 @@ class TsdfCompleteContactTests(unittest.TestCase):
         torch.testing.assert_close(balls.grad[0, 0, 0],
             torch.tensor([0., 0., -1., 1.], dtype=torch.float64), atol=1e-12, rtol=0.)
 
+    # BEGIN zero permission allowance omits only irrelevant region work.
+    def test_zero_allowance_keeps_enabled_collision_and_exact_gradient(self):
+        # A single observed zero point gives an independent analytic sphere
+        # distance. Invalid normals still leave the material sphere enabled;
+        # a sphere with no policy remains outside this contact-only output.
+        geometry = contact_geometry(np.zeros((1, 1, 1)))
+        geometry.max_candidate_plane_products = 0
+        balls = torch.tensor([[[[.06, .08, 0., .2], [.1, 0., 0., .2],
+                                [0., .1, 0., .2]]]], dtype=torch.float64, requires_grad=True)
+        first = policy([-.5]*3, [.5]*3)
+        second = dict(policy([-.5]*3, [.5]*3), sphere_indices=(1,),
+                      normal_valid=torch.zeros((1, 1), dtype=torch.bool))
+        value, enabled = geometry.query(balls, [first, second])
+        expected = torch.cat((torch.relu(balls[..., :2, 3]
+            - torch.linalg.vector_norm(balls[..., :2, :3], dim=-1)), balls[..., 2:, 3]*0), dim=-1)
+        torch.testing.assert_close(value, expected, atol=1e-12, rtol=0.)
+        torch.testing.assert_close(torch.autograd.grad(value.sum(), balls)[0],
+            torch.autograd.grad(expected.sum(), balls)[0], atol=1e-12, rtol=0.)
+        self.assertEqual(enabled.tolist(), [[[True, True, False]]])
+        self.assertEqual(geometry.last_report["candidate_pairs"], 2)
+        self.assertEqual(geometry.last_report["region_policy_count"], 0)
+        self.assertEqual(geometry.last_report["candidate_plane_products"], 0)
+        self.assertEqual(geometry.last_report["permitted_pairs"], 0)
+
+    def test_mixed_zero_and_positive_allowances_keep_union_and_gradient(self):
+        # Both finite regions contain the observed point, so their original
+        # support test permits the larger positive allowance. A zero policy
+        # also enables its own sphere and has many redundant planes to prove
+        # that it contributes neither region work nor its maximum plane count.
+        for normal_valid in (True, False):
+            with self.subTest(normal_valid=normal_valid):
+                geometry = contact_geometry(np.zeros((1, 1, 1)))
+                geometry.max_candidate_plane_products = 24
+                balls = torch.tensor([[[[.06, .08, 0., .2], [.1, 0., 0., .2]]]],
+                                     dtype=torch.float64, requires_grad=True)
+                zero = policy([-.5]*3, [.5]*3)
+                zero["normals"] = zero["normals"].repeat(1, 1, 100, 1)
+                zero["bounds"] = zero["bounds"].repeat(1, 1, 100)
+                positive = [dict(policy([-.5]*3, [.5]*3, allowance=amount),
+                    sphere_indices=(1,), normal_valid=torch.full((1, 1), normal_valid, dtype=torch.bool))
+                    for amount in (.02, .05)]
+                value, enabled = geometry.query(balls, [zero, *positive])
+                allowance = balls.new_tensor([0., .05 if normal_valid else 0.])
+                expected = torch.relu(balls[..., 3]
+                    - torch.linalg.vector_norm(balls[..., :3], dim=-1)-allowance)
+                torch.testing.assert_close(value, expected, atol=1e-12, rtol=0.)
+                torch.testing.assert_close(torch.autograd.grad(value.sum(), balls)[0],
+                    torch.autograd.grad(expected.sum(), balls)[0], atol=1e-12, rtol=0.)
+                self.assertTrue(enabled.all())
+                self.assertEqual(geometry.last_report["region_policy_count"], 2)
+                self.assertEqual(geometry.last_report["candidate_plane_products"], 24)
+                self.assertEqual(geometry.last_report["permitted_pairs"], int(normal_valid))
+
+    def test_positive_allowance_still_obeys_whole_query_product_budget(self):
+        balls = torch.tensor([[[[.1, 0., 0., .2]]]], dtype=torch.float64)
+        for allowance in (.01, np.nextafter(0., 1.)):
+            with self.subTest(allowance=allowance):
+                geometry = contact_geometry(np.zeros((1, 1, 1)))
+                geometry.max_candidate_plane_products = 5
+                with self.assertRaisesRegex(ValueError, "product budget"):
+                    geometry.query(balls, [policy([-.5]*3, [.5]*3, allowance=allowance)])
+
+    def test_zero_allowance_still_obeys_whole_query_candidate_budget(self):
+        geometry = contact_geometry(np.zeros((1, 1, 1)))
+        geometry.max_candidate_pairs = 0
+        geometry.max_candidate_plane_products = 0
+        balls = torch.tensor([[[[.1, 0., 0., .2]]]], dtype=torch.float64)
+        with self.assertRaisesRegex(ValueError, "1 candidate pairs, budget 0"):
+            geometry.query(balls, [policy([-.5]*3, [.5]*3)])
+    # END no region-work shortcut relaxes collision or either complete-query cap.
+
     def test_negative_cell_cutoff_never_establishes_required_contact(self):
         geometry = contact_geometry(-np.ones((2, 2, 2)))
         cutoff = policy([-.01, .2, .2], [.01, .8, .8], allowance=.01)
