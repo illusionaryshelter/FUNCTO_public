@@ -987,6 +987,15 @@ class TrajectoryExecutor:
         permission_ids = [row["rule_id"] for row in permission_rows]
         if len(set(permission_ids)) != len(permission_ids):
             raise ValueError("Robot-owner contact permission identities must be unique")
+        # BEGIN finite material gates share the frozen problem/scene binding.
+        from .planning_scene import grasp_contact_rule_ids, validate_grasp_contact_arrival
+        finite_conditions = [row for row in binding["problem"].get("conditions", ())
+            if row.get("kind") == "grasp_contact_activation" and "contact_rule_ids" in row]
+        if list(binding["scene"].get("grasp_contact_activations", ())) != finite_conditions:
+            raise ValueError("Finite grasp activation metadata must match the validated problem and scene")
+        contact_rows = binding["scene"].get("contacts", ())
+        finite_permission_ids = set()
+        # END missing scene metadata cannot silently turn a gated rule into an ordinary rule.
         # BEGIN Holding authorization is rebuilt from this entrance, never a prior latch.
         # The caller supplies verified evidence; execution checks its identity,
         # clock and frozen attachment geometry without reading native object truth.
@@ -1052,21 +1061,35 @@ class TrajectoryExecutor:
             requirement = pose_requirements.get(arrival)
             commands = [event for event in command_events
                         if event_occurrence_key(event) == identity and event["kind"] == "close"]
-            rules = [row for row in permission_rows
-                     if row["target_owner"] == condition["carrier_id"]
-                     and row["arrival_goal_id"] == condition["arrival_goal_id"]
-                     and row["activation_event"] == activation and row["interval"] == condition["interval"]]
+            # BEGIN explicit finite rules use the same actual-arrival gate.
+            if "contact_rule_ids" in condition:
+                rule_ids = grasp_contact_rule_ids(condition, contact_rows)
+                if requirement is None or len(commands) != 1:
+                    raise ValueError("Finite grasp continuation requires a fresh arrival/close binding; a prior latch is not reusable")
+                validate_grasp_contact_arrival(condition, requirement)
+                if finite_permission_ids.intersection(rule_ids) or set(permission_ids).intersection(rule_ids):
+                    raise ValueError("Finite grasp rule identities must belong to one activation only")
+                finite_permission_ids.update(rule_ids)
+            else:
+                # Historical whole-pair archives remain independent audit inputs.
+                rules = [row for row in permission_rows
+                         if row["target_owner"] == condition["carrier_id"]
+                         and row["arrival_goal_id"] == condition["arrival_goal_id"]
+                         and row["activation_event"] == activation and row["interval"] == condition["interval"]]
+                if len(rules) != 1 or rules[0]["rule_id"] in matched_permission_ids:
+                    raise ValueError("A contact activation needs one matching scene permission")
+                rule_ids = (rules[0]["rule_id"],)
+                matched_permission_ids.update(rule_ids)
+            # END no finite declaration additionally activates a robot/owner pair.
             if (activation.get("kind") != "close" or identity in contact_gates
-                    or len(commands) != 1 or len(rules) != 1
+                    or len(commands) != 1
                     or requirement is None or requirement.actual_relation is not None
                     or arrival in result_goal_ids
                     or requirement.progress != float(commands[0]["progress"])
-                    or float(condition["interval"][0]) != float(commands[0]["progress"])
-                    or rules[0]["rule_id"] in matched_permission_ids):
+                    or float(condition["interval"][0]) != float(commands[0]["progress"])):
                 raise ValueError("A contact activation needs one unchanged close, fixed perceived arrival and matching scene permission")
-            matched_permission_ids.add(rules[0]["rule_id"])
             contact_gates[identity] = {"condition": deepcopy(condition),
-                "permission": deepcopy(rules[0]), "requirement": requirement}
+                "rule_ids": rule_ids, "requirement": requirement}
         if matched_permission_ids != set(permission_ids):
             raise ValueError("Every robot-owner permission needs its explicit arrival or current Holding activation")
         # Execution-local state deliberately does not inherit a prior trial's
@@ -1074,7 +1097,18 @@ class TrajectoryExecutor:
         active_contact_permissions = frozenset(holding_permissions)
         report["grasp_contact_gate_checks"] = []
         report["grasp_contact_permission_changes"] = []
-        report["active_robot_owner_permissions"] = sorted(active_contact_permissions)
+        report["finite_contact_permission_expirations"] = []
+        # BEGIN keep finite latches separate at every geometry API and report boundary.
+        def contact_permission_arguments(identities):
+            return {"active_robot_owner_permissions": frozenset(identities) & set(permission_ids),
+                    "active_contact_rule_ids": frozenset(identities) & finite_permission_ids}
+
+        def record_active_contact_permissions():
+            for name, identities in contact_permission_arguments(active_contact_permissions).items():
+                report[name] = sorted(identities)
+
+        record_active_contact_permissions()
+        # END an internal identity set never broadens finite material scope.
         # BEGIN original release progress, rather than open intent, ends Holding permission.
         report["holding_contact_permission_changes"] = [
             {**deepcopy(row), "action": "activated", "curve_progress": start_progress}
@@ -1701,14 +1735,14 @@ class TrajectoryExecutor:
             contact_check = None
             if not failures and contact_event is not None:
                 gate = contact_gates[event_occurrence_key(contact_event)]
-                condition, permission = gate["condition"], gate["permission"]
+                condition, rule_ids = gate["condition"], gate["rule_ids"]
                 measured = _actual_pose_goal(gate["requirement"], feedback, None)
                 current_progress = float(trajectory.sample(curve_time)[3])
                 in_interval = (float(condition["interval"][0]) <= current_progress
                                <= float(condition["interval"][1]))
                 due_now = float(physical_elapsed) >= float(contact_event["applied_time_s"])
                 contact_check = {"condition_id": condition["condition_id"],
-                    "rule_id": permission["rule_id"], "target_owner": permission["target_owner"],
+                    "rule_ids": list(rule_ids), "target_owner": condition["carrier_id"],
                     "activation_event": deepcopy(condition["activation_event"]),
                     "arrival_goal_id": deepcopy(condition["arrival_goal_id"]),
                     "candidate_id": binding["candidate_id"], "feedback_id": feedback["feedback_id"],
@@ -1724,7 +1758,7 @@ class TrajectoryExecutor:
                     # A new close never inherits permissions for another
                     # target or a previous occurrence, even inside this trial.
                     # BEGIN a new grasp latch does not revoke a separate observed attachment.
-                    permissions = current_holding_permissions(curve_time) | {permission["rule_id"]}
+                    permissions = current_holding_permissions(curve_time) | frozenset(rule_ids)
                     # END only the old arrival-based latch is replaced by this close.
                 else:
                     failures.append({"kind": "grasp_contact_arrival_rejected",
@@ -1746,7 +1780,18 @@ class TrajectoryExecutor:
                     "observed_feedback_id": feedback["feedback_id"],
                     "observed_timestamp_s": float(feedback["timestamp_s"])})
             active_contact_permissions -= expired
-            report["active_robot_owner_permissions"] = sorted(active_contact_permissions)
+            # BEGIN finite latch reports expire with their original allowed interval.
+            current_progress = float(trajectory.sample(curve_time)[3])
+            expired_finite = {row["rule_id"] for row in contact_rows
+                if row["rule_id"] in finite_permission_ids & active_contact_permissions
+                and current_progress > float(row["interval"][1])}
+            if expired_finite:
+                active_contact_permissions -= expired_finite
+                report["finite_contact_permission_expirations"].append({
+                    "rule_ids": sorted(expired_finite), "curve_time_s": float(curve_time),
+                    "progress": current_progress, "feedback_id": feedback["feedback_id"]})
+            # END expiration never activates a replacement rule or implies release.
+            record_active_contact_permissions()
             # END open commands are deliberately absent from this attachment lifetime.
             # BEGIN consume allowed observations without native object truth.
             observation = observation_at(feedback, curve_time, physical_elapsed)
@@ -1841,7 +1886,7 @@ class TrajectoryExecutor:
             if not failures:
                 geometry = self._geometry_result("check_state", deepcopy(feedback),
                     stage=point, trajectory_time=float(curve_time),
-                    active_robot_owner_permissions=queried_permissions)
+                    **contact_permission_arguments(queried_permissions))
                 report["geometry_check_counts"][point] += 1
                 report["last_geometry_check"] = deepcopy(geometry)
                 failures.extend(geometry["violations"])
@@ -1981,7 +2026,7 @@ class TrajectoryExecutor:
                 preflight = self._geometry_result("preflight", trajectory, deepcopy(feedback),
                     execution_limits, start_time=previous_stop, until=stop,
                     current_time=min(float(elapsed), trajectory.duration),
-                    active_robot_owner_permissions=active_contact_permissions)
+                    **contact_permission_arguments(active_contact_permissions))
                 report["extended_preflights"].append({"until": stop, "verdict": deepcopy(preflight)})
                 if not preflight["passed"]:
                     report["status"] = "feedback_rejected"
@@ -2061,7 +2106,7 @@ class TrajectoryExecutor:
             # stepping or preparing an actuator goal. Formal planning success
             # does not bypass this independent current-scene acceptance gate.
             preflight = self._geometry_result("preflight", trajectory, deepcopy(preflight_feedback), execution_limits,
-                active_robot_owner_permissions=initial_permissions)
+                **contact_permission_arguments(initial_permissions))
             report["geometry_preflight"] = deepcopy(preflight)
             if not preflight["passed"]:
                 report["status"] = "feedback_rejected"
@@ -2138,7 +2183,7 @@ class TrajectoryExecutor:
                                                   else current_holding_permissions(min(elapsed, stop)))
                     if contact_check is not None:
                         contact_check["control_applied"] = True
-                    report["active_robot_owner_permissions"] = sorted(active_contact_permissions)
+                    record_active_contact_permissions()
                     report["grasp_contact_permission_changes"].append({
                         "event": deepcopy(due[-1]), "feedback_id": before["feedback_id"],
                         "timestamp_s": float(before["timestamp_s"]), "applied_at_s": float(elapsed),

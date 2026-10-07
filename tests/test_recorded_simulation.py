@@ -172,7 +172,7 @@ class _GeometryChecker:
 
     # BEGIN actual preflight receives the current execution-local permission set.
     def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0., until=None,
-                  current_time=None, active_robot_owner_permissions=frozenset()):
+                  current_time=None, active_robot_owner_permissions=frozenset(), active_contact_rule_ids=frozenset()):
         self.preflight_inputs.append(deepcopy(initial_feedback))
         return {"passed": self.preflight_passed,
                 "violations": [] if self.preflight_passed else [
@@ -180,9 +180,11 @@ class _GeometryChecker:
     # END nominal planner assumptions do not become an implicit actual latch.
 
     # BEGIN scripted geometry retains the explicit actual contact query mode.
-    def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset()):
+    def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset(),
+                    active_contact_rule_ids=frozenset()):
         self.states.append({"feedback": deepcopy(feedback), "stage": stage, "trajectory_time": trajectory_time,
-                            "active_robot_owner_permissions": sorted(active_robot_owner_permissions)})
+                            "active_robot_owner_permissions": sorted(active_robot_owner_permissions),
+                            "active_contact_rule_ids": sorted(active_contact_rule_ids)})
         # END the double never derives permissions from a command or nominal clock.
         rejected = (stage == self.rejected_stage
                     and (self.rejected_time is None or trajectory_time == self.rejected_time))
@@ -2214,9 +2216,11 @@ class GraspContactActivationTests(unittest.TestCase):
                     verdict.update(passed=False, violations=[{"kind": "named_target_contact", "name": "named_left_pad/perceived_part"}])
                 return verdict
 
-            def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset()):
+            def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset(),
+                            active_contact_rule_ids=frozenset()):
                 verdict = super().check_state(feedback, stage=stage, trajectory_time=trajectory_time,
-                    active_robot_owner_permissions=active_robot_owner_permissions)
+                    active_robot_owner_permissions=active_robot_owner_permissions,
+                    active_contact_rule_ids=active_contact_rule_ids)
                 query_latches.append((stage, list(executor.last_execution_report["active_robot_owner_permissions"])))
                 if "contact-rule" not in active_robot_owner_permissions:
                     verdict.update(passed=False, violations=[{"kind": "named_target_contact", "name": "named_left_pad/perceived_part"}])
@@ -2294,9 +2298,11 @@ class GraspContactActivationTests(unittest.TestCase):
         fixture = self.fixture()
         simulation = fixture[0]
         class ContactChecker(_GeometryChecker):
-            def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset()):
+            def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset(),
+                            active_contact_rule_ids=frozenset()):
                 result = super().check_state(feedback, stage=stage, trajectory_time=trajectory_time,
-                    active_robot_owner_permissions=active_robot_owner_permissions)
+                    active_robot_owner_permissions=active_robot_owner_permissions,
+                    active_contact_rule_ids=active_contact_rule_ids)
                 if trajectory_time >= .004 and "contact-rule" not in active_robot_owner_permissions:
                     result.update(passed=False, violations=[{"kind": "named_target_contact", "name": "named_left_pad/perceived_part"}])
                 return result

@@ -310,7 +310,7 @@ class RobotStateValidator:
         self.checker.bind_scene(binding)
 
     def _scene_state(self, robot_state, tool_pose, finger_positions, time_s, *, state_kind, feedback=None,
-                     progress=None, active_robot_owner_permissions=frozenset()):
+                     progress=None, active_robot_owner_permissions=frozenset(), active_contact_rule_ids=frozenset()):
         feedback = feedback or {}
         # BEGIN an old material-mode probe retains the pair permission just earned at arrival.
         bound_progress = float(self._progress_at_time(float(time_s)))
@@ -327,6 +327,9 @@ class RobotStateValidator:
             condition_evidence=feedback.get("scene_condition_evidence"),
             # BEGIN only actual execution carries arrival-latched authorization.
             active_robot_owner_permissions=(None if state_kind == "nominal" else active_robot_owner_permissions),
+            # BEGIN finite material activation is independent of historical pair exemptions.
+            active_contact_rule_ids=(None if state_kind == "nominal" else active_contact_rule_ids),
+            # END actual progress cannot substitute for measured-arrival authorization.
             robot_owner_permission_progress=permission_progress,
             # BEGIN an additional nominal/actual state owns one shared selection.
             # These CPU preflight or measured states have no captured native
@@ -543,7 +546,8 @@ class RobotStateValidator:
         return {"translation_m": float(np.linalg.norm(actual[:3, 3]-expected[:3, 3])),
                 "rotation_rad": float(Rotation.from_matrix(expected[:3, :3].T @ actual[:3, :3]).magnitude())}
 
-    def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset()):
+    def check_state(self, feedback, *, stage, trajectory_time, active_robot_owner_permissions=frozenset(),
+                    active_contact_rule_ids=frozenset()):
         """Gate full actual q, after the executor validates identity and time.
 
         Clock freshness and physical tracking use the execution layer's own
@@ -619,7 +623,8 @@ class RobotStateValidator:
             fingers = np.asarray(feedback["q"], float)[len(self.arm_joint_names):]
             # BEGIN the execution epoch alone authorizes a measured-arrival permission.
             scene = self._scene_state(result, expected_tool, fingers, trajectory_time, state_kind="actual", feedback=feedback,
-                                      active_robot_owner_permissions=active_robot_owner_permissions)
+                                      active_robot_owner_permissions=active_robot_owner_permissions,
+                                      active_contact_rule_ids=active_contact_rule_ids)
             # END actual time by itself cannot remove a robot/owner collision.
             report["scene"] = scene
             report["violations"].extend(_scene_gate_violations(scene))
@@ -630,7 +635,7 @@ class RobotStateValidator:
         # END commands and nominal predictions never replace measured fingers.
 
     def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0., until=None, current_time=None,
-                  active_robot_owner_permissions=frozenset()):
+                  active_robot_owner_permissions=frozenset(), active_contact_rule_ids=frozenset()):
         """Check actual entrance and reference cubic q/dq over its whole prefix.
 
         Each scalar cubic's exact polynomial derivative supplies its critical
@@ -656,7 +661,8 @@ class RobotStateValidator:
             self._bind_release_predictions(trajectory)
         # BEGIN continuation preflight consumes this execution's same arrival latch.
         initial = self.check_state(initial_feedback, stage="preflight_actual_state", trajectory_time=float(current_time),
-                                   active_robot_owner_permissions=active_robot_owner_permissions)
+                                   active_robot_owner_permissions=active_robot_owner_permissions,
+                                   active_contact_rule_ids=active_contact_rule_ids)
         # END a newly created validator does not infer prior arrival from progress.
         times = np.asarray(trajectory.times, dtype=float)
         positions, velocities = np.asarray(trajectory.position, dtype=float), np.asarray(trajectory.velocity, dtype=float)

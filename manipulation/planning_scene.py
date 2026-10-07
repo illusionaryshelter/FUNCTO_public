@@ -696,6 +696,56 @@ class RobotOwnerContactPermission:
         self.activation_event = deepcopy(event)
 # END whole-pair permission is distinct from finite material ContactRule.
 
+# BEGIN bind finite grasp materials to their original arrival/close condition.
+def grasp_contact_rule_ids(condition, contacts):
+    """Validate the finite rules selected by one explicit grasp activation.
+
+    ``contacts`` contains serialized ContactRule records. The condition names
+    their existing identities; it cannot change material geometry or enlarge
+    owner/interval scope. Ordinary material rules without a grasp activation
+    keep their independently declared semantics.
+    """
+    identities = condition.get("contact_rule_ids")
+    if (not isinstance(identities, (list, tuple)) or not identities
+            or any(not isinstance(value, str) or not value.strip() for value in identities)
+            or len(set(identities)) != len(identities)):
+        raise ValueError("Finite grasp activation needs nonempty unique contact_rule_ids")
+    if condition.get("kind") != "grasp_contact_activation":
+        raise ValueError("Finite grasp rules require an explicit grasp contact activation")
+    _text(condition.get("condition_id"), "finite grasp condition ID")
+    _text(condition.get("carrier_id"), "finite grasp target owner")
+    event = condition.get("activation_event", {})
+    event_occurrence_key(event)
+    arrival = condition.get("arrival_goal_id", ())
+    if (event.get("kind") != "close" or len(arrival) != 2 or arrival[0] != "pose_events"
+            or type(arrival[1]) is not int or arrival[1] < 0 or not condition.get("source")):
+        raise ValueError("Finite grasp activation needs its original close, pose arrival and source")
+    interval = _valid_interval(condition.get("interval", ()))
+    rows = {row["rule_id"]: row for row in contacts}
+    if len(rows) != len(contacts):
+        raise ValueError("Finite contact rule identities must be unique")
+    for identity in identities:
+        rule = rows.get(identity)
+        if (rule is None or rule.get("actor") != "robot"
+                or rule.get("target_owner") != condition["carrier_id"]
+                or tuple(rule.get("interval", ())) != interval):
+            raise ValueError("Finite grasp rule must match the robot actor, target owner and exact activation interval")
+    return tuple(identities)
+
+
+def validate_grasp_contact_arrival(condition, requirement):
+    """Require the exact owner/event provenance of the frozen arrival target.
+
+    Equal progress and a valid collection index are insufficient: another
+    owner's pose at that instant must never authorize these material rules.
+    """
+    source = requirement.source
+    if (not isinstance(source, Mapping) or source.get("kind") != "frozen_perception_grasp_arrival"
+            or source.get("carrier_id") != condition["carrier_id"]
+            or source.get("activation_event") != condition["activation_event"]):
+        raise ValueError("Finite grasp arrival must retain the exact target owner and original close source")
+# END rule identities never grant an entire robot/owner collision exemption.
+
 
 class PrismaticGripper:
     """Bind native finger coordinates to a supported controller and geometry.
@@ -1233,6 +1283,9 @@ class PlanningScene:
             {owner.owner_id: owner.sphere_materials if owner.moving else None for owner in self.owners},
             self.robot_sphere_materials, contacts, gripper, has_gripper)
         self.gripper = gripper
+        # BEGIN execution activation metadata is installed only by problem validation.
+        self.grasp_contact_activations = ()
+        # END scene construction alone grants no arrival evidence.
         # END shared CPU-only hand/material validation.
         # BEGIN bind explicit robot/owner pairs without inferring a hand from materials.
         self.robot_owner_permissions = tuple(robot_owner_permissions)
@@ -1297,7 +1350,7 @@ class PlanningScene:
     # END bind occupied robot evidence to the actual planner's native model.
 
     # BEGIN bind one collision scene to the exact generated skill problem.
-    def validate_problem(self, problem):
+    def validate_problem(self, problem, *, goal_identities=None):
         """Reject independently edited payload, mechanism and hand contracts.
 
         This is a cheap CPU preflight, before native solver allocation. It
@@ -1330,6 +1383,36 @@ class PlanningScene:
         # BEGIN every nominal pair permission is tied to the same required arrival.
         activations = [row for row in problem.conditions if row.get("kind") == "grasp_contact_activation"]
         matched = set()
+        # BEGIN explicit finite declarations consume their own material rules.
+        finite_activations, finite_ids = [], set()
+        contact_records = [asdict(rule) for rule in self.contacts]
+        pose_ids = (list(range(len(problem.pose_events))) if goal_identities is None
+                    else list(goal_identities.get("pose_events", ())))
+        if (len(pose_ids) != len(problem.pose_events) or len(set(pose_ids)) != len(pose_ids)
+                or any(type(value) is not int or value < 0 for value in pose_ids)):
+            raise ValueError("Scene binding requires unique original pose-goal identities")
+        for index, condition in enumerate(activations):
+            if "contact_rule_ids" not in condition:
+                continue  # Historical pair-policy records remain independently auditable.
+            identities = grasp_contact_rule_ids(condition, contact_records)
+            if finite_ids.intersection(identities):
+                raise ValueError("A finite grasp rule must belong to exactly one activation condition")
+            original_arrival = condition["arrival_goal_id"][1]
+            commands = [event for event in problem.events
+                        if event_occurrence_key(event) == event_occurrence_key(condition["activation_event"])
+                        and event.kind == "close"]
+            if original_arrival not in pose_ids or len(commands) != 1:
+                raise ValueError("Finite grasp continuation requires a fresh arrival/close binding; a prior latch is not reusable")
+            arrival = pose_ids.index(original_arrival)
+            validate_grasp_contact_arrival(condition, problem.pose_events[arrival])
+            if (problem.pose_events[arrival].actual_relation is not None
+                    or problem.pose_events[arrival].progress != commands[0].progress
+                    or commands[0].progress != condition["interval"][0]):
+                raise ValueError("Finite grasp activation must retain its fixed arrival and original close progress")
+            finite_ids.update(identities)
+            finite_activations.append(deepcopy(condition))
+            matched.add(index)
+        # END finite declarations never require a second whole-hand permission.
         for rule in self.robot_owner_permissions:
             # BEGIN current Holding binds one owner and its complete attachment span.
             if rule.holding_condition_id is not None:
@@ -1518,6 +1601,8 @@ class PlanningScene:
                                       for name in hand.joint_names)+(target,)] += 1
             if actual_rows != required_rows:
                 raise ValueError("Tracking gripper and problem must share the same native A q=b coupling")
+        # Publish activation metadata only after every scene/problem check passed.
+        self.grasp_contact_activations = tuple(finite_activations)
     # END bind one collision scene to the exact generated skill problem.
 
     # BEGIN source-solid acceptance shared by entrance, native metrics and search.
@@ -1970,6 +2055,7 @@ class PlanningScene:
         result.contacts = deepcopy(self.contacts)
         # BEGIN candidate copies cannot mutate another candidate's pair policy.
         result.robot_owner_permissions = deepcopy(self.robot_owner_permissions)
+        result.grasp_contact_activations = deepcopy(self.grasp_contact_activations)
         # END native geometry remains shared read-only.
         # BEGIN immutable target cells/tree are shared; query diagnostics are private.
         result._contact_cells = {name: copy(value) for name, value in self._contact_cells.items()}
@@ -3022,6 +3108,9 @@ class PlanningScene:
                 "owners": owners, "contacts": plain([asdict(rule) for rule in self.contacts]),
                 # BEGIN keep the exact conditional pair policy in every formal archive.
                 "robot_owner_permissions": plain([asdict(rule) for rule in self.robot_owner_permissions]),
+                # BEGIN actual finite permission requires the archived arrival binding.
+                "grasp_contact_activations": plain(self.grasp_contact_activations),
+                # END the executor supplies fresh activation evidence separately.
                 # END execution must bind this snapshot before receiving actual latches.
                 # BEGIN records distinguish observed TSDF material from explicit native boxes.
                 "contact_query_models": {identity: {"complete_components": (value.layer_cell_counts if hasattr(value, "layers") else len(value.centres)),

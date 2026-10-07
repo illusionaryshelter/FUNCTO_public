@@ -1,10 +1,11 @@
-"""Test one observed skill with current joint planning and explicit robot data.
+"""Audit one observed skill with the existing source-geometry planning chain.
 
 Every episode, candidate, camera and robot choice comes from the CLI inputs.
 The selected historical result is not read: the compiled source program and
 its observed geometric binding are rebuilt by today's planning interface.
 The RGB-D field remains partial and all current unknown-space checks remain
 enabled. Physics execution consumes the saved curve in a separate process.
+This runner does not certify the PRD resident online backend migration.
 """
 
 # BEGIN observed skill integration using existing production scene contracts.
@@ -238,6 +239,10 @@ def build_hand_owner_permissions(problem, hand_binding):
         kind = row.get("kind")
         if kind not in {"grasp_contact_activation", "observed_attachment"}:
             continue
+        # BEGIN finite grasp bindings never acquire a second whole-hand rule.
+        if kind == "grasp_contact_activation" and "contact_rule_ids" in row:
+            continue
+        # END historical whole-hand records remain only in this audit runner.
         common = dict(rule_id=row["condition_id"], target_owner=row["carrier_id"],
             native_geometry_names=tuple(hand_binding["native_geometry_names"]),
             sphere_indices=tuple(hand_binding["sphere_indices"]),
@@ -297,6 +302,10 @@ def run(args):
 
     args.output.mkdir(parents=True, exist_ok=False)
     report = {"status": "preparing", "segment_id": args.segment,
+              # BEGIN report backend scope even when preparation fails early.
+              "backend_scope": "legacy_source_audit_regression",
+              "new_prd_production_acceptance": False,
+              # END finite-rule input does not change the planner implementation.
               "candidate_id": args.candidate, "planning_called": False,
               "execution_tested": False, "scope": "Observed independent skill snapshot",
               "manifest_path": str(args.manifest.resolve()),
@@ -449,10 +458,10 @@ def run(args):
             trajectory_factory=reference_factory)
         # END actual measured positions, velocities and identity are unchanged.
         report["gripper"] = hand_report
-        # BEGIN bind current Holding or arrival to the same native hand solids.
-        # Whole-hand grasp contact uses the problem's explicit arrival/close
-        # condition. Finite material faces remain a separate optional policy
-        # for tasks that explicitly need a particular local contact region.
+        # BEGIN audit explicit finite bindings through the current source chain.
+        # This runner still uses the historical source-geometry planner. It can
+        # regress finite rules or reproduce its old whole-hand inputs; neither
+        # path is acceptance of the PRD resident online motion backend.
         from robot_fixture import bind_fixture_contact_materials, bind_fixture_gripper_geometry
         from manipulation.contact_binding import build_material_contact_rules
         from recorded_owner_geometry import bind_box_owner_materials
@@ -475,20 +484,12 @@ def run(args):
             report["owner_material_geometry"] = owner_binding
             # END complete local feature evidence survives even without contacts.
         report["contact_binding"] = {"policies": []}
-        if activations:
-            if (args.contact_bindings is not None
-                    and any(row["kind"] == "grasp_contact_activation" for row in activations)):
-                raise ValueError("Pose-gated grasp uses its bound whole-hand permission, not obsolete finite grasp patches")
-            hand_binding = bind_fixture_gripper_geometry(
-                fixture, robot, entrance_fk["sphere_indices_by_link"], feedback["finger_joint_names"])
-            pair_permissions = build_hand_owner_permissions(problem, hand_binding)
-            report["contact_binding"].update(hand_geometry=hand_binding,
-                permissions=[asdict(rule) for rule in pair_permissions])
-            report["contact_binding"]["policies"].extend(sorted({row["kind"] for row in activations}))
         if args.contact_bindings is not None:
             contact_inputs = json.loads(args.contact_bindings.read_text())
-            if not isinstance(contact_inputs, dict) or set(contact_inputs) != {"material_faces", "contacts", "source"}:
-                raise ValueError("Contact bindings need explicit material_faces, contacts and source")
+            required = {"material_faces", "contacts", "source"}
+            if (not isinstance(contact_inputs, dict) or not required <= set(contact_inputs)
+                    or set(contact_inputs)-required-{"grasp_activations"}):
+                raise ValueError("Contact bindings need material_faces, contacts, source and optional grasp_activations")
             if not isinstance(contact_inputs["source"], str) or not contact_inputs["source"].strip():
                 raise ValueError("Contact bindings require a current evidence source")
             if contact_inputs["material_faces"]:
@@ -499,10 +500,32 @@ def run(args):
                 material_binding["materials"] = robot_binding["materials"]
                 material_binding["native_geometry_materials"].update(robot_binding["native_geometry_materials"])
             contacts = build_material_contact_rules(material_binding, contact_inputs["contacts"])
+            # BEGIN grasp permissions require explicit existing condition IDs.
+            if any(row["kind"] == "grasp_contact_activation" for row in activations):
+                from manipulation.contact_binding import bind_grasp_contact_rules
+                bind_grasp_contact_rules(problem, contacts, contact_inputs.get("grasp_activations"))
+            elif contact_inputs.get("grasp_activations"):
+                raise ValueError("Finite grasp activations require compiled grasp conditions")
+            # END a finite patch cannot silently become an ungated grasp rule.
             report["contact_binding"]["policies"].append("explicit_finite_material_contacts")
             report["contact_binding"].update(path=str(args.contact_bindings.resolve()),
                 source=contact_inputs["source"], materials=material_binding,
                 rule_ids=[rule.rule_id for rule in contacts])
+        # BEGIN finite-only inputs have no dependency on whole-hand calibration.
+        audit_pair_conditions = [row for row in problem.conditions
+            if row.get("kind") == "observed_attachment" or
+            (row.get("kind") == "grasp_contact_activation" and "contact_rule_ids" not in row)]
+        if audit_pair_conditions:
+            hand_binding = bind_fixture_gripper_geometry(
+                fixture, robot, entrance_fk["sphere_indices_by_link"], feedback["finger_joint_names"])
+            pair_permissions = build_hand_owner_permissions(problem, hand_binding)
+            report["contact_binding"].update(hand_geometry=hand_binding,
+                permissions=[asdict(rule) for rule in pair_permissions])
+            report["contact_binding"]["policies"].extend(sorted({row["kind"] for row in activations}))
+        # END old pair calibration remains confined to explicit audit inputs.
+        report["backend_scope"] = "legacy_source_audit_regression"
+        report["requirement_consumption"] = problem.requirement_consumption
+        # END input choice changes audit rules, never the declared backend scope.
         # END permissions affect software collision legality, never native physical contact.
         report["owner_observations"] = {
             "owners": {identity: {"initial_pose": frame["T_output_owner"].tolist(),

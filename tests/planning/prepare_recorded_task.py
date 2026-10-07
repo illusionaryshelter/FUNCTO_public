@@ -16,6 +16,7 @@ from pathlib import Path
 import resource
 import sys
 import time
+from uuid import uuid4
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -272,6 +273,12 @@ def _extract_named_feedback(manifest, fixture, fixture_path):
             result[segment["id"]] = {
                 "status": "validated", "segment_id": segment["id"], "entry_frame": frame,
                 "sim_time_s": timestamp, "reference_frame": frozen["reference_frame"],
+                # BEGIN a recorded adapter owns this imported feedback identity.
+                # The UUID names this validated snapshot, not its output path or
+                # a new physical observation. Keep the original recording clock
+                # so planning and execution can bind the same q/dq evidence.
+                "feedback_id": str(uuid4()), "timestamp_s": timestamp,
+                # END moving the saved file cannot replace its evidence identity.
                 "joint_names": names, "start_q": q.tolist(), "start_dq": dq.tolist(),
                 "arm_joint_names": arms, "finger_joint_names": fingers,
                 "finger_link_names": [link for links in finger_links.values() for link in links],
@@ -297,6 +304,9 @@ def _extract_named_feedback(manifest, fixture, fixture_path):
                                "frozen_feedback_path": str(frozen_path.resolve()),
                                "joint_binding": deepcopy(binding),
                                "datasets_read": ["states/qpos", "states/qvel", "states/sim_time"],
+                               # BEGIN distinguish snapshot import from live sensing.
+                               "feedback_identity_scope": "this validated import of the recorded robot entrance",
+                               # END UUID creation does not advance the physical clock.
                                "state_read_scope": "named robot scalar columns at the exact entrance frame",
                                "object_state_or_contact_values_read": False,
                                "physics_stepped": False, "q_dq_values_clipped_or_replaced": False},
@@ -335,6 +345,9 @@ def _problem_summary(problem):
                     "progress": event.progress, "requires_evidence": event.requires_evidence,
                     "stop": event.stop} for event in problem.events],
         "conditions": list(problem.conditions),
+        # BEGIN expose actual requirement consumers with the compiled inputs.
+        "requirement_consumption": problem.requirement_consumption,
+        # END the report is derived from the problem, never a second contract.
         "requirement_counts": {"supports": len(problem.supports),
                                "interiors": len(problem.interiors),
                                "pose_events": len(problem.pose_events),

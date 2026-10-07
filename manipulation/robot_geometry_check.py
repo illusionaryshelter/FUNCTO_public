@@ -380,7 +380,7 @@ class RobotGeometryChecker:
         if len(self._scene_shapes) * (len(self._geometries)+len(self._scene_shapes)) > 100000:
             raise ValueError("Independent scene pair inventory exceeds the bounded CPU query budget")
         # BEGIN native authorization is bound to explicit names, never inferred materials.
-        from .planning_scene import RobotOwnerContactPermission
+        from .planning_scene import RobotOwnerContactPermission, grasp_contact_rule_ids
         self._robot_owner_permissions = tuple(RobotOwnerContactPermission(**row)
             for row in scene_binding.get("robot_owner_permissions", ()))
         identities = [rule.rule_id for rule in self._robot_owner_permissions]
@@ -391,6 +391,19 @@ class RobotGeometryChecker:
             if (rule.target_owner not in self._scene_owners
                     or not set(rule.native_geometry_names) <= self._geometries.keys()):
                 raise ValueError("Robot-owner permission requires bound owner and native robot geometry names")
+        # BEGIN finite grasp gates retain their own actor/material scope.
+        self._gated_contact_rule_ids = set()
+        condition_ids = set()
+        for condition in scene_binding.get("grasp_contact_activations", ()):
+            identities = grasp_contact_rule_ids(condition, scene_binding["contacts"])
+            if (condition["condition_id"] in condition_ids
+                    or self._gated_contact_rule_ids.intersection(identities)):
+                raise ValueError("Finite grasp activation and rule identities must be unique")
+            if condition["carrier_id"] not in self._scene_owners:
+                raise ValueError("Finite grasp activation requires its bound target owner")
+            condition_ids.add(condition["condition_id"])
+            self._gated_contact_rule_ids.update(identities)
+        # END matching an owner alone never activates any finite rule.
         # END no MuJoCo/native physical contact policy is changed here.
         # BEGIN account once for the owned scene, decoded shapes and native cache.
         from .tsdf_geometry import ObservedTsdfGeometry
@@ -440,6 +453,7 @@ class RobotGeometryChecker:
     def query_scene(self, robot_state, *, tool_pose, progress, finger_positions, state_kind,
                     owner_poses=None, nominal_owner_poses=None, condition_evidence=None,
                     active_robot_owner_permissions=frozenset(), robot_owner_permission_progress=None,
+                    active_contact_rule_ids=frozenset(),
                     layer_selection=None, layer_selection_index=(0, 0), select_layers=False):
         """Query every robot/scene and moving-owner/other-owner solid pair.
 
@@ -459,6 +473,20 @@ class RobotGeometryChecker:
             raise ValueError("Independent scene query requires actual/nominal scope and bound progress")
         if not hasattr(self, "_scene_binding"):
             raise ValueError("Independent scene query has no bound scene model")
+        # BEGIN actual finite grasp contact needs this execution's arrival latch.
+        finite_active = active_contact_rule_ids
+        if finite_active is None:
+            if state_kind != "nominal":
+                raise ValueError("Actual finite contact permission requires an explicit active set")
+            finite_active = self._gated_contact_rule_ids
+        elif (not isinstance(finite_active, (set, frozenset))
+                or any(not isinstance(identity, str) for identity in finite_active)
+                or not finite_active <= self._gated_contact_rule_ids):
+            raise ValueError("Active finite contact rules must name only gated rules in the bound scene")
+        contact_rules = [rule for rule in self._scene_binding["contacts"]
+            if (rule["rule_id"] not in self._gated_contact_rule_ids
+                or state_kind == "nominal" or rule["rule_id"] in finite_active)]
+        # END all three material consumers use the same filtered finite rules.
         # BEGIN actual permission is an executor-owned arrival latch, never a clock inference.
         active = active_robot_owner_permissions
         known = {rule.rule_id for rule in self._robot_owner_permissions}
@@ -786,7 +814,7 @@ class RobotGeometryChecker:
                     # BEGIN unordered physical pairs may have either directed
                     # material permission. Enumeration order must not choose law.
                     possible_rules = [(actor, target, rule) for actor, target in ((first, second), (second, first))
-                                      for rule in binding["contacts"] if rule["actor"] == actor["owner"]
+                                      for rule in contact_rules if rule["actor"] == actor["owner"]
                                       and rule["target_owner"] == target["owner"]
                                       and rule["interval"][0] <= progress <= rule["interval"][1]]
                     unbound_material = any(actor["material"] is None for actor, _, _ in possible_rules)
@@ -874,7 +902,7 @@ class RobotGeometryChecker:
         # Required contact additionally needs actual supplied target occupancy
         # in the finite region; an abstract patch can contain unobserved air.
         required_checks = []
-        for rule in binding["contacts"]:
+        for rule in contact_rules:
             if not rule["required"] or not rule["interval"][0] <= progress <= rule["interval"][1]:
                 continue
             if rule["target_owner"] not in poses or (rule["actor"] != "robot" and rule["actor"] not in poses):
@@ -953,7 +981,7 @@ class RobotGeometryChecker:
             # actual piece query above. A missing material binding remains
             # ambiguous, because its contact test would itself be incomplete.
             local_permission = False
-            for rule in binding["contacts"]:
+            for rule in contact_rules:
                 if not rule["interval"][0] <= progress <= rule["interval"][1]:
                     continue
                 if rule["actor"] == "robot" and rule["target_owner"] == row["target_owner"]:
@@ -1004,6 +1032,9 @@ class RobotGeometryChecker:
                 "layer_selection": selection_snapshot,
                 # BEGIN expose authorization separately from geometry relation and task effects.
                 "active_robot_owner_permissions": sorted(rule.rule_id for rule in permitted_rules),
+                "active_contact_rule_ids": sorted(rule["rule_id"] for rule in contact_rules
+                    if rule["rule_id"] in self._gated_contact_rule_ids
+                    and rule["interval"][0] <= progress <= rule["interval"][1]),
                 "robot_owner_permission_progress": float(permission_progress),
                 # END a permission does not establish actual contact or Holding.
                 "progress": float(progress), "observed_scene_checked": not gaps and not uncertain_owners and not unmodelled_geometries,

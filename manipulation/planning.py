@@ -3356,7 +3356,10 @@ class _CuroboPlanner:
         # before importing native GPU solvers or creating any of their buffers.
         scene.bind_robot_validator(robot_validator, problem)
         self.robot_validator = robot_validator
-        scene.validate_problem(problem)
+        # BEGIN continuation keeps original goal identities after local filtering.
+        scene.validate_problem(problem, goal_identities=(None if continuation is None
+                               else continuation["goal_identities"]))
+        # END finite arrival binding never treats an original ID as a local index.
         # END binding precedes native allocation and applies to direct planner construction.
         budget, initial_progress = (_initial_timing(problem, budget) if continuation is None
                                     else _continuation_timing(problem, budget, continuation))

@@ -995,6 +995,94 @@ class PlanningProblem:
     def phase_count(self):
         return len(self.phases)
 
+    # BEGIN derive consumption records from the actual compiled requirements.
+    @property
+    def requirement_consumption(self):
+        """Describe existing consumers without introducing another request format.
+
+        Collection/index identities address the requirements used by residuals,
+        scene binding and execution. The returned records are independent copies;
+        changing them cannot change a goal or grant execution evidence. Ordinary
+        reference samples are deliberately absent. This inventory describes the
+        current complete-skill compiler, not a completed finite-block backend.
+        """
+        rows = []
+
+        def add(identity, categories, consumers, scope, source, **details):
+            rows.append({"requirement_id": identity, "categories": categories,
+                         "consumers": consumers, "progress_scope": scope,
+                         "source": deepcopy(source), **deepcopy(details)})
+
+        for name, category in (("pose_events", "functional_goal"),
+                               ("coordinate_events", "functional_goal"),
+                               ("supports", "functional_goal"),
+                               ("interiors", "process_requirement"),
+                               ("pose_relations", "process_requirement"),
+                               ("mechanisms", "process_requirement"),
+                               ("couplings", "process_requirement")):
+            for index, requirement in enumerate(getattr(self, name)):
+                scope = ((requirement.progress, requirement.progress)
+                         if hasattr(requirement, "progress") else
+                         (requirement.start, requirement.end) if hasattr(requirement, "start")
+                         else (self.start_progress, float(self.phase_count)))
+                consumers = (("PlanningProblem.residuals", "execution._actual_pose_goal")
+                             if name == "pose_events" else ("PlanningProblem.residuals",))
+                categories = ((category, "actual_evidence_obligation")
+                              if name == "pose_events" else (category,))
+                add((name, index), categories, consumers,
+                    scope, requirement.source)
+                if name == "mechanisms":
+                    if requirement.coordinate_limits is not None:
+                        add((name, index, "coordinate_limits"), ("process_requirement",),
+                            ("PlanningProblem.residuals",), scope, requirement.source)
+                    for direction_index, direction in enumerate(requirement.directions):
+                        add((name, index, "directions", direction_index), ("process_requirement",),
+                            ("MechanismRequirement.direction_residuals",),
+                            (direction.start, direction.end), direction.source)
+        for index, condition in enumerate(self.conditions):
+            kind = condition.get("kind")
+            if kind not in {"candidate_attachment", "observed_attachment",
+                            "predicted_release", "grasp_contact_activation"}:
+                raise ValueError(f"Unsupported compiled condition consumer: {kind!r}")
+            categories = ("scene_rule", "actual_evidence_obligation")
+            # Evidence is acquired at a point; an observed attachment governs
+            # the explicit held span in phase metadata. Do not mistake that
+            # observation point for the lifetime of its scene assumption.
+            point = condition.get("progress")
+            spans = tuple(tuple(phase.metadata["attachment_interval"]) for phase in self.phases
+                          if phase.metadata.get("attachment_condition_id") == condition.get("condition_id")
+                          and "attachment_interval" in phase.metadata)
+            if "interval" in condition:
+                spans = (tuple(condition["interval"]),)
+                point = spans[0][0]
+            scope = spans[0] if len(spans) == 1 else (point, point)
+            add(("conditions", index), categories,
+                ("PlanningScene.validate_problem", "TrajectoryExecutor.execute"),
+                scope, condition.get("source"), condition_id=condition.get("condition_id"), kind=kind,
+                evidence_progress=point, scene_rule_spans=spans,
+                scene_rule_boundary=point if kind == "predicted_release" else None)
+        for index, event in enumerate(self.events):
+            # Commands, evidence barriers, stops and time windows retain the
+            # same occurrence. They never manufacture a second physical event.
+            consumers = ["planning._bind_event_clock"]
+            if (event.kind in {"open", "close", "hold", "function", "effect"}
+                    or event.requires_evidence or event.stop or event.timing):
+                consumers.append("TrajectoryExecutor.execute")
+            if event.stop:
+                consumers.append("planning._verification_stop_preference")
+            if event.timing:
+                consumers.extend(("planning._validate_bound_event_times", "execution._timing_checks"))
+            categories = (("actual_evidence_obligation",) if event.kind == "effect" else
+                          ("process_requirement", "actual_evidence_obligation")
+                          if event.requires_evidence else ("process_requirement",))
+            add(("events", index), categories, tuple(consumers),
+                (event.progress, event.progress), event.source,
+                event_identity=event_occurrence_key(event), kind=event.kind,
+                requires_evidence=event.requires_evidence, stop=event.stop,
+                timing_count=len(event.timing))
+        return tuple(rows)
+    # END no reference density or diagnostic name creates a requirement.
+
     @property
     def source_time_map(self):
         """Return source seconds and progress; no phase-count clock is invented."""
@@ -1503,6 +1591,97 @@ def _model_from_diagnostics(value):
     # END require the current grounding model's complete serialization.
 
 
+# BEGIN reject requirement declarations without an implemented consumer.
+def _validate_skill_requirements(spec):
+    """Check requirement-bearing records while retaining scene evidence metadata.
+
+    A spelling error in a declared requirement must not become an inert dict
+    entry. Observed scene records and provenance are intentionally not closed
+    schemas: geometry consumers validate their own necessary input fields.
+    """
+    def fields(record, allowed, label):
+        if not isinstance(record, dict):
+            raise ValueError(f"{label} must be a requirement record")
+        unknown = set(record)-allowed
+        if unknown:
+            raise ValueError(f"Unsupported {label} fields without consumers: {sorted(unknown)}")
+
+    fields(spec, {"skill_id", "program", "scene", "execution_events", "coordinate_directions"},
+           "skill requirement")
+    program = spec["program"]
+    demo = program["demo"]
+    # These names explicitly declare requirements, rather than arbitrary
+    # observed metadata. The compiler accepts its typed inputs only at their
+    # supported entry points; it cannot silently swallow a parallel format.
+    unsupported = {"requirements", "pose_relations", "pose_events", "coordinate_events",
+                   "supports", "interiors", "couplings", "mechanisms"}
+    for label, record in (("program", program), ("demo", demo), ("scene", spec["scene"])):
+        rejected = unsupported & set(record)
+        if rejected:
+            raise ValueError(f"Unsupported {label} requirement declarations: {sorted(rejected)}")
+
+    common = {"event_id", "frame_index", "source", "requires_evidence", "stop", "occurrence", "timing"}
+    # BEGIN preserve the recorder's explicit command provenance fields.
+    # export_functo._command_events records source seconds and whether the
+    # command was the initial intention or a change. Both remain inside the
+    # compiled event's original_event source; neither is a physical deadline.
+    groups = (("gripper event", demo.get("gripper_events", ()),
+               common | {"command", "timestamp", "record_kind"}),
+              ("functional event", demo.get("functional_events", ()), common |
+               {"constraint_kind", "carrier_frame", "reference_frame", "position_tolerance_m",
+                "rotation_tolerance_rad", "coordinate_value", "coordinate_tolerance"}),
+              ("execution event", spec.get("execution_events", ()), common | {"kind"}))
+    # END unknown requirement names still fail the same closed event schema.
+    for label, events, allowed in groups:
+        if not isinstance(events, (list, tuple)):
+            raise ValueError(f"{label} declarations must be a sequence")
+        for event in events:
+            fields(event, allowed, label)
+            if type(event.get("stop", False)) is not bool:
+                raise ValueError(f"{label} stop must be an explicit boolean")
+            evidence = event.get("requires_evidence")
+            if evidence is not None and (not isinstance(evidence, str) or not evidence.strip()):
+                raise ValueError(f"{label} requires_evidence must name an actual evidence obligation")
+            if label == "functional event":
+                if program["skill_kind"] != "manipulation":
+                    raise ValueError("Functional events require the manipulation goal consumer")
+                actual_kind = ("on_region" if program["task"]["relation"] == "on" else
+                               "joint_coordinate" if event.get("constraint_kind") == "joint_coordinate"
+                               else "functional_frame")
+                if event.get("constraint_kind", actual_kind) != actual_kind:
+                    raise ValueError("Unsupported functional event constraint_kind for its relation consumer")
+                # BEGIN task tolerances must belong to the selected consumer.
+                coordinate_fields = {"coordinate_value", "coordinate_tolerance"}
+                pose_fields = {"position_tolerance_m", "rotation_tolerance_rad",
+                               "carrier_frame", "reference_frame"}
+                incompatible = ((pose_fields if actual_kind == "joint_coordinate" else coordinate_fields)
+                                & set(event))
+                if incompatible:
+                    raise ValueError(f"Unsupported {actual_kind} requirement fields without consumers: "
+                                     f"{sorted(incompatible)}")
+                # END existing on-region source-frame metadata does not create a pose goal.
+            if label == "execution event":
+                if event.get("kind") in {"open", "close", "hold", "function", "effect"}:
+                    raise ValueError("Execution events must not bypass gripper, functional or effect compilation")
+                # Generic event labels have no semantics of their own. The
+                # executor consumes only their explicit barrier/stop/clock.
+                activation_timing = any(
+                    (item.check_target if isinstance(item, EventTimeConstraint) else item.get("check_target"))
+                    == "activation" for item in event.get("timing", ()))
+                if not evidence and not event.get("stop", False) and not activation_timing:
+                    raise ValueError("Execution event has no evidence, stop or activation-time consumer")
+                if not isinstance(event.get("kind"), str) or not event["kind"].strip():
+                    raise ValueError("Execution event requires a nonempty kind")
+    directions = spec.get("coordinate_directions", ())
+    if not isinstance(directions, (list, tuple)):
+        raise ValueError("Coordinate direction declarations must be a sequence")
+    for direction in directions:
+        fields(direction, {"start_frame", "end_frame", "coordinate_index", "kind", "sign",
+                           "minimum", "tolerance", "source", "origin_coordinate", "origin_source"},
+               "coordinate direction")
+# END source/reference records cannot silently stand in for task requirements.
+
+
 # BEGIN compile exactly one current skill without source-phase obligations.
 def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
                            reference_frame, base_pose, tool_transform,
@@ -1522,6 +1701,9 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
     if not isinstance(skills, (list, tuple)) or len(skills) != 1:
         raise ValueError("Provide exactly one current skill")
     spec = skills[0]
+    # BEGIN validate explicit requirement entry points before grounding work.
+    _validate_skill_requirements(spec)
+    # END scene observation metadata remains owned by its geometry consumer.
     skill_id = spec.get("skill_id")
     if not isinstance(skill_id, str) or not skill_id:
         raise ValueError("The current skill needs a nonempty instance ID")
@@ -1583,6 +1765,9 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             "event_id": "__stable_holding__",
             "condition_id": f"{skill_id}:stable_holding", "carrier_id": carrier,
             "T_carrier_eef": candidate.tolist(), "progress": 1.,
+            # BEGIN retain the original compiled effect's source independently of reference rows.
+            "source": deepcopy(source),
+            # END the source records an obligation, never observed Holding.
             "effect_requirement": "stable_grasp_from_current_synchronized_evidence"})
         events.append(PlanningEvent("__stable_holding__", skill_id, 1., int(frames[-1]), "effect", source))
         # END no effect association is inferred from its name or clock value.
@@ -1695,6 +1880,9 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             conditions.append({"kind": "predicted_release", "carrier_id": carrier,
                 "skill_id": skill_id, "event_id": "__release_verified__",
                 "condition_id": release_id, "progress": held_end, "T_carrier_eef": attachment.tolist(),
+                # BEGIN the release effect and condition share their original source identity.
+                "source": deepcopy(source),
+                # END opening intent alone is still not actual release evidence.
                 "nominal_pose": objects[-1].tolist(), "effect_requirement": "actual_release_from_current_feedback"})
             events.append(PlanningEvent("__release_verified__", skill_id, held_end, int(release), "effect", source))
             # END release timing alone is not evidence of a release outcome.
@@ -1706,7 +1894,7 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             event.get("requires_evidence"), event.get("stop", False), event.get("occurrence", 0), tuple(event.get("timing", ()))))
     # Only explicitly supplied execution prerequisites or stops enter this list.
     # Evidence checks and zero velocity are independent fields, not implications.
-    for event in spec.get("execution_events", ()):
+    for event in deepcopy(spec.get("execution_events", ())):
         frame = event["frame_index"]
         if frame not in frame_progress:
             raise ValueError("An execution event must name an original source frame")
@@ -1714,7 +1902,7 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             event["kind"], event["source"], event.get("requires_evidence"), event.get("stop", False),
             event.get("occurrence", 0), tuple(event.get("timing", ()))))
     # BEGIN only explicit native direction declarations become process obligations.
-    direction_specs = spec.get("coordinate_directions", ())
+    direction_specs = deepcopy(spec.get("coordinate_directions", ()))
     if direction_specs:
         if len(mechanisms) != 1:
             raise ValueError("Coordinate directions require one independently evidenced current mechanism")
@@ -1722,16 +1910,35 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
         for row in direction_specs:
             if row["start_frame"] not in frame_progress or row["end_frame"] not in frame_progress:
                 raise ValueError("A coordinate direction must name original source scope frames")
+            # BEGIN initial compilation binds both scope ends to controlled motion.
+            # Continuations retain original direction history, so this check
+            # belongs here rather than changing MechanismRequirement rebinding.
+            if not (mechanisms[0].start <= frame_progress[row["start_frame"]]
+                    < frame_progress[row["end_frame"]] <= mechanisms[0].end):
+                raise ValueError("A coordinate direction must lie within the controlled mechanism scope")
+            # END a released retreat cannot inherit a held mechanism direction.
             directions.append(CoordinateDirectionRequirement(frame_progress[row["start_frame"]],
                 frame_progress[row["end_frame"]], row["coordinate_index"], row["kind"], row["sign"],
                 row["minimum"], row["tolerance"], row["source"], row.get("origin_coordinate"), row.get("origin_source")))
         mechanisms[0].directions = tuple(directions)
         mechanisms[0].__post_init__()
     # END reference increments alone never imply monotonicity or minimum rate.
-    return PlanningProblem(tuple(joint_names), start_q, start_dq, tool_link, reference_frame,
+    problem = PlanningProblem(tuple(joint_names), start_q, start_dq, tool_link, reference_frame,
         base_pose, tool_transform, tuple(phases), tuple(events), tuple(couplings), numerical,
         tuple(conditions), tuple(supports), tuple(interiors), tuple(pose_events), tuple(coordinate_events),
         mechanisms=tuple(mechanisms), source_timestamps=times,
         source_progress=np.asarray([frame_progress[int(frame)] for frame in frames]))
+    # BEGIN a time obligation must resolve to an actually compiled consumer.
+    condition_ids = {row["condition_id"] for row in problem.conditions if row.get("effect_requirement")}
+    for event in problem.events:
+        for constraint in event.timing:
+            if constraint.check_target == "arrival":
+                collection, index = constraint.goal_id
+                if index >= len(getattr(problem, collection)):
+                    raise ValueError("Arrival time requirement names an uncompiled functional goal")
+            elif constraint.check_target == "effect" and constraint.condition_id not in condition_ids:
+                raise ValueError("Effect time requirement names an uncompiled actual evidence obligation")
+    # END source timestamps do not supply missing goals or effect predicates.
+    return problem
 # END compile exactly one current skill without source-phase obligations.
 # END shared skill-process constraints for generation and verification.

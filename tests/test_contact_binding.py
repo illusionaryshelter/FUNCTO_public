@@ -3,6 +3,8 @@
 # BEGIN named material/cover/FK regressions.
 from dataclasses import asdict
 from pathlib import Path
+from copy import deepcopy
+from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
@@ -10,7 +12,8 @@ import unittest
 import mujoco
 import numpy as np
 
-from manipulation.contact_binding import calibrate_box_material_features, build_material_contact_rules
+from manipulation.contact_binding import (calibrate_box_material_features, build_material_contact_rules,
+                                         bind_grasp_contact_rules)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 from robot_fixture import _geom_cover, bind_fixture_contact_materials
@@ -29,6 +32,42 @@ _FACES = [dict(material_id="left_inner", native_geometry="left_pad", face_axis=0
 
 
 class ContactBindingTests(unittest.TestCase):
+    # BEGIN finite binding must be explicit and cannot partially mutate inputs.
+    def test_finite_grasp_binding_is_explicit_atomic_and_independent(self):
+        from test_manipulation_planning_scene import contact_rule
+
+        condition = {"kind": "grasp_contact_activation", "condition_id": "grasp:close:0",
+            "carrier_id": "surface", "interval": [0., 1.], "arrival_goal_id": ["pose_events", 0],
+            "activation_event": {"skill_id": "grasp", "event_id": "close", "occurrence": 0, "kind": "close"},
+            "source": "explicit current arrival"}
+        problem = SimpleNamespace(conditions=(deepcopy(condition),))
+        rule = contact_rule()
+        for invalid in (None, {}, {condition["condition_id"]: ["missing"]}):
+            with self.assertRaises(ValueError):
+                bind_grasp_contact_rules(problem, (rule,), invalid)
+            self.assertEqual(problem.conditions, (condition,))
+        supplied = {condition["condition_id"]: [rule.rule_id]}
+        bind_grasp_contact_rules(problem, (rule,), supplied)
+        supplied[condition["condition_id"]].clear()
+        self.assertEqual(problem.conditions[0]["contact_rule_ids"], [rule.rule_id])
+        self.assertNotIn("contact_rule_ids", condition)
+
+    def test_finite_grasp_binding_cannot_reuse_one_rule_for_two_close_events(self):
+        from test_manipulation_planning_scene import contact_rule
+
+        def condition(identity):
+            return {"kind": "grasp_contact_activation", "condition_id": identity,
+                "carrier_id": "surface", "interval": [0., 1.], "arrival_goal_id": ["pose_events", 0],
+                "activation_event": {"skill_id": "grasp", "event_id": identity, "occurrence": 0, "kind": "close"},
+                "source": "explicit current arrival"}
+        problem = SimpleNamespace(conditions=(condition("first"), condition("second")))
+        original = deepcopy(problem.conditions)
+        rule = contact_rule()
+        with self.assertRaisesRegex(ValueError, "multiple conditions"):
+            bind_grasp_contact_rules(problem, (rule,), {key: [rule.rule_id] for key in ("first", "second")})
+        self.assertEqual(problem.conditions, original)
+    # END a successful association grants no actual execution latch.
+
     def test_native_face_has_full_polygon_and_affine_named_motion(self):
         model = mujoco.MjModel.from_xml_string(_ROBOT)
         result = calibrate_box_material_features(model, tcp_site="tcp",
