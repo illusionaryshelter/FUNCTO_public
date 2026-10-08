@@ -13,8 +13,7 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 from manipulation.contact_binding import build_material_contact_rules
 from recorded_owner_geometry import bind_box_owner_materials, prepare_box_owner
-from run_recorded_skill import (recorded_owner_observation_inputs,
-                                install_complete_owner, require_feedback_identity)
+from run_recorded_skill import recorded_owner_observation_inputs, require_feedback_identity
 
 
 def held_problem():
@@ -164,45 +163,72 @@ def test_owner_material_is_the_real_planar_face_with_its_full_solid_cover():
         build_material_contact_rules(combined, [dict(contact_declaration(), feature_points=points)])
 
 
-def test_complete_payload_installation_keeps_reference_background_coverage_and_finite_rules():
-    # BEGIN current online scenes retain observations without whole-body exceptions.
-    from manipulation.planning_scene import CollisionOwner, ObservedSpace
-    from manipulation.online_geometry import OnlinePlanningScene
-    from test_manipulation_planning_scene import pose_path
-    from test_online_geometry import field
+# BEGIN complete input geometry enters the production builder with all contact rules.
+def test_complete_payload_enters_initial_scene_with_native_contacts_and_current_evidence():
+    from unittest.mock import patch
+    from curobo.perception import MapperCfg
+    import torch
+    from manipulation.online_geometry import FrozenESDF
+    from manipulation.planning_observation import build_scene_from_rgbd
     from recorded_owner_geometry import create_box_owner
+    from test_manipulation_planning_observation import view
+    from observed_geometry_fixtures import point_source
 
     prepared = complete_owner()
     binding = bind_box_owner_materials(prepared)
     contacts = build_material_contact_rules(
         dict(materials={}, owner_materials={"payload": binding["materials"]}), [contact_declaration()])
-    background = field()
-    partial = CollisionOwner("payload", field(owner="payload"), pose_path(),
-                             "Current payload RGB-D", geometry_complete=False)
-    reference = CollisionOwner("reference", field(owner="reference"), pose_path(),
-                               "Current reference RGB-D", geometry_complete=False)
-    # BEGIN replacing the held body must retain independent static observations.
-    initial_support = CollisionOwner("initial_support", field(owner="initial_support"), pose_path(),
-                                    "Current initial support RGB-D", geometry_complete=False)
-    # END this contact target is not the functional placement reference.
-    coverage = ObservedSpace(np.ones((3, 3, 3), bool), origin=[-1., -1., -1.], voxel_size=1.,
-                             observation_ids=("current-view",), reference_frame="world")
-    observed = OnlinePlanningScene(background=background, owners=(partial, reference, initial_support), coverage=coverage,
-        reference_frame="world", robot_sphere_materials=(None,), robot_geometry_source="Native test robot",
-        has_gripper=False, unknown_policy={"conditional_regions": [], "outside_regions": "forbid"},
-        native_geometry_materials=binding["native_geometry_materials"])
-    observed.observation_report = {"partitions": ["payload", "reference", "initial_support", "background"]}
     prepared["sphere_materials"] = binding["sphere_materials"]
-    owner = create_box_owner(prepared, contact_voxel_size_m=.001)
-    result = install_complete_owner(observed, owner, contacts=contacts)
-    assert result.owners == (owner, reference, initial_support)
-    assert result.background is background and result.coverage is coverage
-    assert result.observation_report is observed.observation_report
-    assert result.robot_owner_permissions == ()
-    assert result.unknown_policy == observed.unknown_policy
+    owner = create_box_owner(prepared, contact_voxel_size_m=.0015)
+    record = view()
+    identities = ("payload", "reference", "initial_support")
+    masks = {identity: np.zeros(record["depth"].shape, bool) for identity in identities}
+    for index, identity in enumerate(identities):
+        masks[identity][45+index, 45+index] = True
+    record["owner_masks"] = masks
+    frames = {identity: {"T_output_owner": np.eye(4), "source": "Current calibrated observation"}
+              for identity in identities}
+    frames["payload"]["T_output_owner"] = prepared["initial_pose"]
+    cfg = MapperCfg(extent_meters_xyz=(.2, .2, .2), voxel_size=.01,
+        extent_esdf_meters_xyz=(.2, .2, .2), esdf_voxel_size=.01,
+        grid_center=torch.tensor([0., 0., 1.]), image_height=96, image_width=96, device="cuda:0")
+    mapped = {}
+    def make(normalized, partition_masks, identity, config, inverse, *, query_center=None,
+             max_host_rss_bytes=None):
+        # Replace only device mapping. Production input checks, final scene
+        # construction and native material/sphere registration remain active.
+        assert not partition_masks["current"][None][45, 45]
+        shape = np.ceil(np.asarray(config.extent_esdf_meters_xyz)/config.esdf_voxel_size).astype(int)
+        center = config.grid_center.numpy() if query_center is None else np.asarray(query_center)
+        query = FrozenESDF.from_source(point_source(),
+            origin=center-(shape-1)*config.esdf_voxel_size/2, shape=tuple(shape),
+            voxel_size=config.esdf_voxel_size,
+            owner_ids=("observed_background" if identity is None else identity,),
+            source="Explicit synthetic CPU field")
+        mapped[identity] = query
+        return query, {"shape_xyz": shape.tolist()}
+
+    policy = {"conditional_regions": [], "outside_regions": "forbid"}
+    with patch("manipulation.planning_observation._map_online_partition", side_effect=make), \
+         patch("manipulation.planning_observation._require_mapping_memory"), \
+         patch("torch.cuda.mem_get_info", side_effect=AssertionError("CPU contract touched CUDA")):
+        result = build_scene_from_rgbd({"current": record}, frames, mapper_cfg=cfg,
+            depth_error_m=.003, owner_voxel_sizes_m={"payload": .0015, "reference": .005, "initial_support": .01},
+            reference_frame="world", robot_sphere_materials=(None,), robot_geometry_source="Native test robot",
+            complete_owners=(owner,), contacts=contacts, native_geometry_materials=binding["native_geometry_materials"],
+            has_gripper=False, unknown_policy=policy, max_mapping_bytes=1024**3)
+    assert set(mapped) == {None, "reference", "initial_support"}
+    assert result.owners[0] is owner and owner.query.contact_voxel_size_m == .0015
+    assert result.owners[1].query is mapped["reference"]
+    assert result.owners[2].query is mapped["initial_support"]
+    assert result.background is mapped[None] and result.coverage.observation_ids == ("current",)
     assert result.contacts == contacts and result.native_geometry_materials == binding["native_geometry_materials"]
-    assert observed.owners == (partial, reference, initial_support) and observed.contacts == ()
-    # END the replaced owner alone gains complete native box geometry.
+    assert result.robot_owner_permissions == () and result.unknown_policy == policy
+    np.testing.assert_array_equal(owner.pose_path.poses[0], prepared["initial_pose"])
+    assert owner.attachments[0].interval == tuple(prepared["attachments"][0]["interval"])
+    assert owner.attachments[0].condition_id == "actual-holding"
+    assert owner.attachments[0].release_condition_id == "actual-release"
+# END no discarded observed payload field or temporary contact subset exists.
 
 
 @pytest.mark.parametrize("change", ["partial", "nonface", "extra_points", "missing_cover", "overlap"])

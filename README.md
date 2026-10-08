@@ -970,9 +970,17 @@ The native optimizer, native success metrics and OMPL checks
 use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
 
 - `FrozenESDF` retains the current Mapper field and source-validity bits.
-  Each background/owner partition has one fixed field. Owner support is
+  <!-- BEGIN direct complete-owner admission without discarded observation maps. -->
+  Each observed background/owner partition has one fixed field. Explicit
+  complete `CollisionOwner` geometry may enter `build_scene_from_rgbd` through
+  `complete_owners`; it retains its current frame, native materials and semantic
+  mask partition without allocating an observation field that would be discarded.
+  Its RGB-D rays still contribute only their original observed-free evidence.
+  Per-owner resolution remains explicit, including the complete owner's contact
+  grid spacing. Owner support is
   prepared from the observed extent and registered robot sphere radius before
   solving; requests cannot enlarge it after a failed query.
+  <!-- END direct complete-owner admission. -->
 - `FrozenPrimitives` retains calibrated complete boxes/cylinders and their
   declared transforms. Robot sphere layout and self-collision exclusions are
   bound to the same registered robot model.
@@ -984,6 +992,12 @@ use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
   interval, normal and gap allowance. Contact subtraction preserves every
   represented cell outside that finite permission, including cells covered by
   the same robot sphere. A whole hand/owner pair exemption is not accepted.
+  <!-- BEGIN exact target-field storage sharing. -->
+  Rules with exactly equal target regions may share their immutable distance
+  arrays. Material identity, activation intervals and per-sphere rule subsets
+  remain independent; restored repeated fields must agree exactly. CPU and GPU
+  storage count each shared field once under the existing contact-bank limit.
+  <!-- END no permission or geometric tolerance is merged by storage sharing. -->
 
 <!-- BEGIN native confirmation of registered actor/world sphere candidates. -->
 Positive registered actor/world sphere costs are collision candidates. Final candidate

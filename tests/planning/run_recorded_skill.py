@@ -255,29 +255,6 @@ def recorded_owner_observation_inputs(problem, scene_input, views, mask_rows, *,
     return frames, masks
 
 
-def install_complete_owner(scene, owner, *, contacts):
-    """Replace one observed partition while retaining all other scene owners.
-
-    Owner-actor contact rules become valid only after this complete moving
-    cover and its attachment replace the partial RGB-D query. Reference
-    partitions and the original coverage grid retain their exact identities.
-    """
-    if not owner.geometry_complete or owner.owner_id not in {row.owner_id for row in scene.owners}:
-        raise ValueError("Complete geometry must replace an already observed owner partition")
-    result = type(scene)(background=scene.background,
-        owners=tuple(owner if row.owner_id == owner.owner_id else row for row in scene.owners),
-        coverage=scene.coverage, reference_frame=scene.reference_frame,
-        unknown_policy=scene.unknown_policy,
-        robot_sphere_materials=scene.robot_sphere_materials,
-        robot_collision_bodies=scene.robot_collision_bodies,
-        robot_geometry_source=scene.robot_geometry_source, gripper=scene.gripper,
-        has_gripper=scene.gripper is not None,
-        contacts=contacts, native_geometry_materials=scene.native_geometry_materials,
-        robot_owner_permissions=scene.robot_owner_permissions,
-        numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
-        numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
-    result.observation_report = scene.observation_report
-    return result
 # END input identities never supply simulated object geometry or contact truth.
 
 
@@ -615,15 +592,27 @@ def run(args):
                     raise ValueError("Only one bounded fine ROI is admitted per physical owner partition")
                 fine_regions[identity] = {key: value for key, value in row.items() if key != "owner_id"}
         # END no simulator obstacle pose or task-specific crop enters the mapper.
+        # BEGIN install declared complete geometry before any observed map allocation.
+        # The carrier keeps its semantic masks and current frame in observations:
+        # those pixels still exclude it from background and supply free-ray evidence.
+        # Only its redundant RGB-D distance field is omitted by the shared builder.
+        complete_owners = ()
+        if prepared is not None:
+            from recorded_owner_geometry import create_box_owner
+            complete_owners = (create_box_owner(
+                prepared, contact_voxel_size_m=owner_resolutions[prepared["owner_id"]]),)
+            report["complete_carrier_geometry"] = prepared["provenance"]
+        # END primitive geometry, native registration and attachments stay unchanged.
         scene = build_scene_from_rgbd(
             observations, owner_frames, mapper_cfg=config,
             depth_error_m=args.depth_error, reference_frame=problem.reference_frame,
             robot_sphere_materials=tuple(material_binding["robot_sphere_materials"]),
             robot_geometry_source=fixture["robot_geometry_source"], gripper=hand,
-            # BEGIN keep contact identities and finite permissions on the observed scene.
-            # RGB-D owners are still partial/static here. Moving-owner rules
-            # enter once their complete cover and attachment are installed.
-            contacts=tuple(rule for rule in contacts if rule.actor == "robot"),
+            # BEGIN bind every finite rule to the final owners in one scene.
+            # Native owner material validation runs during initial construction;
+            # no partial carrier scene or temporary contact subset is created.
+            complete_owners=complete_owners, contacts=contacts,
+            # END owner-actor and robot-actor rules share the same validated scene.
             native_geometry_materials=material_binding["native_geometry_materials"],
             # BEGIN both independent and planner models retain the exact pair policy.
             robot_owner_permissions=pair_permissions,
@@ -636,17 +625,7 @@ def run(args):
             max_host_rss_bytes=args.max_host_rss_mib*1024**2,
             max_device_used_bytes=args.max_device_used_mib*1024**2)
             # END module capacity cannot bypass the measured host/device limits.
-            # END the RGB-D partition remains partial.
         report["observation_build"] = scene.observation_report
-        if args.owner_geometry is not None:
-            # Replace only this explicitly partitioned carrier's partial query
-            # by its declared complete offline geometry. Its current pose and
-            # conditional attachment still come from this planning problem;
-            # no reference, unlabelled surface or unknown volume is removed.
-            from recorded_owner_geometry import create_box_owner
-            owner = create_box_owner(prepared, contact_voxel_size_m=owner_resolutions[prepared["owner_id"]])
-            scene = install_complete_owner(scene, owner, contacts=contacts)
-            report["complete_carrier_geometry"] = prepared["provenance"]
         # BEGIN retain self-filtered installation as complete static collision owners.
         # These primitives use the same calibrated base as FK. They have no
         # moving sphere cover, so a mount extending beyond the observed grid

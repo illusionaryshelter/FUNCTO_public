@@ -5,6 +5,7 @@ from dataclasses import replace
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
+import json
 
 import numpy as np
 import pytest
@@ -167,6 +168,107 @@ def test_two_rules_use_true_removed_union_and_inactive_rule_cannot_borrow_it():
     none, _ = query.contact_query(spheres(), [(left, policy(left, active=False)[0]),
                                             (right, policy(right, active=False)[0])])
     assert torch.equal(none, query(spheres()))
+
+
+# BEGIN exact target-region sharing preserves separate material permissions.
+def test_equal_target_fields_share_storage_without_borrowing_material_activation():
+    first = rule("first", material="first_pad")
+    second = replace(rule("second", sphere_indices=(1,), material="second_pad"), interval=(.6, .8))
+    query = field()
+    with patch.object(query.source_geometry, "distance_field",
+                      wraps=query.source_geometry.distance_field) as generate:
+        prepare(query, (first, second))
+    assert generate.call_count == 1
+    model = query._contact_model
+    assert len(model.channels) == 2
+    assert model.channels[0]["distance"] is model.channels[1]["distance"]
+    assert model.storage_nbytes == query.distance.nbytes
+    body = torch.cat((spheres(x=-.006, radius=.002), spheres(x=-.006, radius=.002)), dim=-2)
+    # The second rule has the same target geometry but a different material
+    # and phase interval. At progress .5 only the first permission is active.
+    result, missing = query.contact_query(body, [(first, policy(first)[0]), (second, policy(second)[0])])
+    assert result[0, 0, 0] == 0 and result[0, 0, 1] > 0
+    assert not missing.any()
+    bank = model._group_constants(0, body)[0]
+    assert bank.shape[1] == 1
+    assert model._group_constants(1, body)[0] is bank
+
+
+def test_repeated_patch_in_compound_subset_shares_one_field_and_roundtrips():
+    first, second = rule("first"), rule("second")
+    query = prepare(field(), (first, second))
+    model = query._contact_model
+    assert len(model.channels) == 3  # first, first+second, second stay distinct.
+    assert len({id(row["distance"]) for row in model.channels}) == 1
+    record = model.record()
+    assert all(row["distance"] is record["channels"][0]["distance"] for row in record["channels"])
+    # A real JSON roundtrip loses Python object sharing; restoration verifies
+    # every repeated payload and recreates the single immutable field bank.
+    restored = PreparedContactFields.from_record(json.loads(json.dumps(record)))
+    assert len({id(row["distance"]) for row in restored.channels}) == 1
+    assert restored.storage_nbytes == model.storage_nbytes == query.distance.nbytes
+    assert restored.groups == model.groups and restored.rule_records == model.rule_records
+    for active_first, active_second in ((False, False), (True, False), (False, True), (True, True)):
+        policies = [(first, policy(first, active=active_first)[0]),
+                    (second, policy(second, active=active_second)[0])]
+        body = spheres(x=-.006, radius=.002)
+        ordinary, intersects = query(body), query.intersects_geometry(body)
+        expected = model.query(body, policies, ordinary, intersects)
+        actual = restored.query(body, policies, ordinary, intersects)
+        assert all(torch.equal(a, b) for a, b in zip(expected, actual))
+
+
+@pytest.mark.parametrize("changed", ["patch_origin", "patch_axes", "patch_half_size",
+                                      "modeling_allowance_m", "numerical_position_tolerance_m", "target_owner"])
+def test_target_field_sharing_requires_exact_geometry(changed):
+    from manipulation.online_contact import _field_geometry_keys
+    first, second = rule("first"), rule("second", sphere_indices=(1,))
+    value = getattr(second, changed)
+    if isinstance(value, np.ndarray):
+        value = value.copy()
+        value.flat[0] = np.nextafter(value.flat[0], np.inf)
+    elif isinstance(value, str):
+        value = "other_target"
+    else:
+        value = np.nextafter(value, 0. if changed == "modeling_allowance_m" else np.inf)
+    second = replace(second, **{changed: value})
+    keys = _field_geometry_keys((first, second), [("first",), ("second",)])
+    assert keys[("first",)] != keys[("second",)]
+    if changed == "patch_origin":
+        model = prepare(field(), (first, second))._contact_model
+        # Even if the raster values happen to coincide, different exact
+        # regions never gain storage equivalence from numerical coincidence.
+        assert model.channels[0]["distance"] is not model.channels[1]["distance"]
+
+
+@pytest.mark.parametrize("tamper", ["field", "kind"])
+def test_duplicate_frozen_field_payload_cannot_hide_tampering(tamper):
+    from manipulation.collision_records import decode_array, encode_array
+    model = prepare(field(), (rule("first"), rule("second", sphere_indices=(1,))))._contact_model
+    record = json.loads(json.dumps(model.record()))
+    if tamper == "kind":
+        record["channels"][1]["kind"] = "empty"
+    else:
+        values = decode_array(record["channels"][1]["distance"]).copy()
+        values.flat[0] += .001
+        record["channels"][1]["distance"] = encode_array(values)
+    with pytest.raises(ValueError, match="Equivalent target regions must preserve identical frozen field"):
+        PreparedContactFields.from_record(record)
+
+
+def test_contact_bank_limit_counts_independent_geometry_and_rejects_before_preparation():
+    first, second = rule("first"), rule("second", sphere_indices=(1,))
+    query = field()
+    with patch("manipulation.online_contact._MAX_STORED_BYTES", query.distance.nbytes):
+        prepare(query, (first, second))
+        restored = PreparedContactFields.from_record(json.loads(json.dumps(query._contact_model.record())))
+        assert restored.storage_nbytes == query.distance.nbytes
+        independent = field()
+        with patch.object(independent.source_geometry, "distance_field") as generate:
+            with pytest.raises(ValueError, match="field combinations exceed the fixed storage budget"):
+                prepare(independent, (first, replace(second, patch_origin=np.array([.006, 0., 0.]))))
+        generate.assert_not_called()
+# END unchanged rule and channel-count bounds still reject distinct large banks.
 
 
 def test_nonmaterial_sphere_still_queries_complete_owner():

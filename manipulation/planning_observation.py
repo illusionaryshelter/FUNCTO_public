@@ -1318,8 +1318,8 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
                          max_mapping_bytes=256*1024**2,max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
                          max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES,
                          native_geometry_materials=None,robot_owner_permissions=(),
-                         fine_regions=None,robot_collision_bodies=()):
-    """Build one fixed-resolution field per owner from the current snapshot.
+                         fine_regions=None,robot_collision_bodies=(),complete_owners=()):
+    """Build observed fields and admit current complete owners exactly once.
 
     Every view requires ``self_filter`` with uint8 ``labels``, independent
     ``free_ray_depth_m`` and a nonempty ``source``. Only ENVIRONMENT pixels
@@ -1330,6 +1330,13 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     never creates a coarse layer, blends resolutions or expands after solving.
     The explicit unknown policy is separate from both field values and raw
     free-ray evidence. The audit builder remains explicitly named above.
+
+    ``complete_owners`` supplies existing CollisionOwner geometry in the same
+    current owner frames. Their semantic masks still exclude those pixels
+    from background mapping, and their measured rays still bound coverage.
+    Only the remaining partitions allocate a Mapper. The supplied resolution
+    must match each complete query's registered contact/field spacing; its
+    geometry and native material registration are validated by the final scene.
     """
     from curobo.perception import MapperCfg
     from .online_geometry import OnlinePlanningScene
@@ -1353,7 +1360,37 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         raise ValueError('Every selected owner must have exactly one explicit resolution')
     frames={identity:(_pose_array(row['T_output_owner'],'current owner pose'),_text(row['source'],'owner source')) for identity,row in owner_frames.items()}
     masks=_partition_masks(normalized,frames)
-    contacts=_validate_contact_and_gripper_inputs(dict.fromkeys(frames),tuple(robot_sphere_materials),contacts,gripper,has_gripper)
+    # BEGIN admit complete geometry before choosing observed map partitions.
+    # The semantic owner inventory remains intact: skipping its Mapper must
+    # neither turn its pixels into background nor assert its occluded space free.
+    direct={}
+    for owner in complete_owners:
+        if not isinstance(owner,CollisionOwner) or not owner.geometry_complete:
+            raise ValueError('Direct owners require complete CollisionOwner geometry')
+        identity=owner.owner_id
+        if identity not in frames or identity in direct:
+            raise ValueError('Direct owners require unique identities in the current owner frames and masks')
+        spacing=owner_voxel_sizes_m[identity]
+        query_spacing=getattr(owner.query,'voxel_size',None)
+        if (isinstance(spacing,(bool,np.bool_)) or not isinstance(spacing,Real)
+                or not np.isfinite(spacing) or spacing<=0
+                or not isinstance(query_spacing,Real) or not np.isfinite(query_spacing)
+                or not np.isclose(spacing,query_spacing,atol=1e-12,rtol=0)):
+            raise ValueError('Direct owner resolution must match its complete query spacing')
+        position,quaternion=owner.pose_path.sample(torch.tensor(0.,dtype=torch.float64))
+        position=position.detach().cpu().numpy()
+        quaternion=quaternion.detach().cpu().numpy()
+        pose=frames[identity][0]
+        if (position.shape!=(3,) or quaternion.shape!=(4,)
+                or not np.isfinite(position).all() or not np.isfinite(quaternion).all()
+                or not np.isclose(np.linalg.norm(quaternion),1.,atol=1e-7,rtol=0)
+                or not np.allclose(position,pose[:3,3],atol=1e-7,rtol=0)
+                or not np.allclose(Rotation.from_quat(quaternion[[1,2,3,0]]).as_matrix(),pose[:3,:3],atol=1e-7,rtol=0)):
+            raise ValueError('Direct owner initial pose must match its current observation frame')
+        direct[identity]=owner
+    owner_materials={identity:direct[identity].sphere_materials if identity in direct else None for identity in frames}
+    contacts=_validate_contact_and_gripper_inputs(owner_materials,tuple(robot_sphere_materials),contacts,gripper,has_gripper)
+    # END complete-owner material contacts enter the same final scene once.
     configs={None:mapper_cfg}
     # BEGIN derive fixed owner interpolation support from the declared robot
     # sphere model before allocating any map or trying any candidate.
@@ -1365,11 +1402,15 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         radius=max(radius,float(values[:,3].max(initial=0.)))
     # END no task identity or success/failure result chooses a map bound.
     for identity,(pose,_) in frames.items():
+        # BEGIN complete geometry needs no throwaway observed field.
+        if identity in direct:
+            continue
+        # END its semantic partition remains in masks for every Mapper call.
         configs[identity]=_owner_mapper_config(mapper_cfg,normalized,masks,identity,pose,
             owner_voxel_sizes_m[identity],depth_error_m,query_radius_m=radius)
     requests={} if fine_regions is None else dict(fine_regions)
     if not set(requests)<=set(configs):
-        raise ValueError('Fixed regions must identify an existing physical owner or background')
+        raise ValueError('Fixed regions must identify an observed mapped owner or background')
     for identity,request in requests.items():
         configs[identity]=_fine_mapper_config(configs[identity],request)
     # BEGIN observation coverage retains the pre-expansion background layout.
@@ -1395,7 +1436,12 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
             raise ValueError(f'UNSUPPORTED_MODEL: frozen distance field exceeds the {MAX_ARRAY_BYTES // 1024**2} MiB binary record limit')
             # END allocation still also requires the unchanged total budgets.
     if sum(estimates.values())>max_mapping_bytes:
-        raise ValueError('UNSUPPORTED_MODEL: fixed scene exceeds declared mapping allocation')
+        # BEGIN expose the actual allocation inventory before touching CUDA.
+        partitions={('observed_background' if identity is None else identity):value for identity,value in estimates.items()}
+        raise ValueError(f'UNSUPPORTED_MODEL: fixed scene exceeds declared mapping allocation: '
+            f'estimated_bytes={sum(estimates.values())}, limit_bytes={max_mapping_bytes}, '
+            f'mapped_partition_bytes={partitions}, direct_complete_owners={list(direct)}')
+        # END direct geometry is not charged as a discarded observation map.
     # BEGIN distance-query support cannot enlarge observed-free evidence.
     background_cfg=coverage_cfg
     # END all ray inputs and the original background coverage grid stay fixed.
@@ -1428,8 +1474,11 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
                 actual_geometry_upper_m=None if queries[None].geometry_upper is None else queries[None].geometry_upper.tolist())
             reports['observed_background']['query_support'] = background_support
         # END an incomplete exported field is rejected, never retried or relaxed.
-    owners=[CollisionOwner(identity,queries[identity],PosePath(np.array([0.,1.]),np.stack((pose,pose)),source),
+    # BEGIN assemble the original complete objects and newly observed fields.
+    owners=[direct[identity] if identity in direct else
+        CollisionOwner(identity,queries[identity],PosePath(np.array([0.,1.]),np.stack((pose,pose)),source),
         source,geometry_complete=False) for identity,(pose,source) in frames.items()]
+    # END no partial scene or post-mapping owner replacement is constructed.
     scene=OnlinePlanningScene(background=queries[None],owners=owners,coverage=coverage,
         reference_frame=reference_frame,robot_sphere_materials=robot_sphere_materials,
         robot_geometry_source=robot_geometry_source,unknown_policy=unknown_policy,
@@ -1438,6 +1487,11 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     # BEGIN retain the exact self-filter and per-owner exclusion evidence.
     scene.observation_report={'source':'current calibrated owner-partitioned RGB-D','partitions':reports,
         'estimated_mapping_buffers_bytes':sum(estimates.values()),'depth_error_m':float(depth_error_m),
+        # BEGIN distinguish native/complete geometry from allocated RGB-D fields.
+        'mapped_partition_estimates_bytes':{('observed_background' if identity is None else identity):value for identity,value in estimates.items()},
+        'direct_complete_owners':{identity:{'source':owner.source,'query_type':type(owner.query).__name__,
+            'voxel_size_m':float(owner.query.voxel_size),'mapping_allocated':False} for identity,owner in direct.items()},
+        # END mapping estimates do not claim to measure total scene residency.
         'known_free_voxels':int(known.sum()),'coverage_voxels':int(known.size),
         # BEGIN retain the independent free-ray grid beside numerical support.
         'coverage_grid': {'origin_m': origin.tolist(), 'shape_xyz': list(shape),
@@ -1445,7 +1499,7 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
             'source': 'Unchanged pre-query-expansion background grid and ENVIRONMENT free rays'},
         # END an enlarged ESDF is never recorded as newly observed free space.
         # BEGIN describe the registered online contact model used by this scene.
-        'geometry_model':'one observed affine TSDF source per partition; conservative proposal/contact fields and local native-solid confirmation',
+        'geometry_model':'observed affine TSDF sources and explicitly complete owner geometry; conservative proposal/contact fields and local native-solid confirmation',
         # END source-cell interpretation is confined to preparation, not online queries.
         'unknown_policy':deepcopy(unknown_policy),
         'self_filter':_self_filter_report(normalized)}

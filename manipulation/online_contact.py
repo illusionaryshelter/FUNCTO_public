@@ -87,6 +87,26 @@ def _field_layout(rules):
     return grouped, sorted(needed)
 
 
+# BEGIN identical target geometry shares storage, never material permissions.
+def _field_geometry_keys(rules, subsets):
+    """Identify exact target-region unions independently of actor rule IDs.
+
+    These are structural keys, not rounded coordinates or geometric hashes.
+    The field removes only target material inside these regions; actor shape,
+    interval and required-contact evidence remain on their original rules.
+    Repeated identical regions in a union do not change the removed material.
+    """
+    regions = {rule.rule_id: (
+        rule.target_owner,
+        tuple(np.asarray(rule.patch_origin, dtype=float).reshape(-1)),
+        tuple(np.asarray(rule.patch_axes, dtype=float).reshape(-1)),
+        tuple(np.asarray(rule.patch_half_size, dtype=float).reshape(-1)),
+        float(rule.modeling_allowance_m), float(rule.numerical_position_tolerance_m))
+        for rule in rules}
+    return {names: frozenset(regions[name] for name in names) for names in subsets}
+# END logical activation subsets retain their existing identities and lookups.
+
+
 class PreparedContactFields:
     """Request-owned frozen fields, bounded witnesses and immutable binding.
 
@@ -110,7 +130,10 @@ class PreparedContactFields:
         self.regions, self.channels, self.groups = regions, tuple(channels), tuple(_plain(groups))
         self.source = str(source)
         self._device = {}
-        self.storage_nbytes = sum(row["distance"].nbytes for row in self.channels if row["kind"] == "field")
+        # BEGIN count each immutable shared field once, including restored ones.
+        self.storage_nbytes = sum(array.nbytes for array in {
+            id(row["distance"]): row["distance"] for row in self.channels if row["kind"] == "field"}.values())
+        # END logical permissions do not each own a duplicate field allocation.
 
     # BEGIN contact fields derive from explicit source components or registered primitives.
     @classmethod
@@ -138,10 +161,14 @@ class PreparedContactFields:
                 or origin.shape != (3,) or not np.isfinite(origin).all() or not np.isfinite(h) or h <= 0):
             raise ValueError("UNSUPPORTED_MODEL: finite contact grid exceeds the bounded source-field layout")
         grouped, combinations_needed = _field_layout(rules)
-        if len(combinations_needed) > _MAX_FIELDS or len(combinations_needed) * values.size * 4 > _MAX_STORED_BYTES:
+        # BEGIN admit actual distinct target-region fields under the same cap.
+        geometry_keys = _field_geometry_keys(rules, combinations_needed)
+        field_count = len(set(geometry_keys.values()))
+        if len(combinations_needed) > _MAX_FIELDS or field_count * values.size * 4 > _MAX_STORED_BYTES:
             raise ValueError("UNSUPPORTED_MODEL: finite contact field combinations exceed the fixed storage budget")
-        require_host_memory(int(values.size * (96 + len(rules) + 4 * len(combinations_needed))),
+        require_host_memory(int(values.size * (96 + len(rules) + 4 * field_count)),
                             pending_existing_bytes=0, max_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES)
+        # END all original rule masks, witnesses and simultaneous-rule caps remain.
         # Neither producer may borrow the other's material representation.
         if source_geometry is None:
             if occupied is None:
@@ -217,8 +244,16 @@ class PreparedContactFields:
                 "element_kind": element_kind,
                 "surface_witnesses": _readonly(np.asarray(witnesses).reshape(-1, 3))}
         channels, lookup = [], {}
+        # BEGIN one preparation per exact target-region union, with separate IDs.
+        prepared_geometry = {}
         margin = math.sqrt(3.) * h
         for names in combinations_needed:
+            geometry_key = geometry_keys[names]
+            if geometry_key in prepared_geometry:
+                channel = {**prepared_geometry[geometry_key], "rule_ids": names}
+                lookup[names] = len(channels)
+                channels.append(channel)
+                continue
             if source_geometry is not None:
                 if not any(regions[name]["has_removed_material"] for name in names):
                     channel = {"rule_ids": names, "kind": "unchanged"}
@@ -245,6 +280,8 @@ class PreparedContactFields:
                         channel = {"rule_ids": names, "kind": "field", "distance": _readonly(field)}
             lookup[names] = len(channels)
             channels.append(channel)
+            prepared_geometry[geometry_key] = channel
+        # END shared arrays cannot activate another material's logical channel.
         groups = []
         for (actor, names), sphere_indices in sorted(grouped.items()):
             table = [-1]
@@ -274,11 +311,16 @@ class PreparedContactFields:
         # several disjoint sphere-membership groups can select that channel.
         bank_key = ("fields", points.device, points.dtype)
         if bank_key not in self._device:
-            arrays, field_indices = [], {}
+            # BEGIN upload each actual field once across logical channels.
+            arrays, field_indices, shared_indices = [], {}, {}
             for channel_index, channel in enumerate(self.channels):
                 if channel["kind"] == "field":
-                    field_indices[channel_index] = len(arrays)
-                    arrays.append(channel["distance"].transpose(2, 1, 0))
+                    identity = id(channel["distance"])
+                    if identity not in shared_indices:
+                        shared_indices[identity] = len(arrays)
+                        arrays.append(channel["distance"].transpose(2, 1, 0))
+                    field_indices[channel_index] = shared_indices[identity]
+            # END every group still chooses by its own exact active-rule bits.
             bank = (torch.as_tensor(np.stack(arrays), device=points.device, dtype=points.dtype)[None]
                     if arrays else None)
             self._device[bank_key] = bank, field_indices
@@ -359,6 +401,13 @@ class PreparedContactFields:
         return torch.relu(excess).amax(-1).amin(-1)
 
     def record(self):
+        # BEGIN retain the current schema while encoding each shared array once.
+        # JSON writers may repeat its bytes; no in-memory field bank is copied.
+        encoded = {id(row["distance"]): None for row in self.channels if row["kind"] == "field"}
+        for row in self.channels:
+            if row["kind"] == "field" and encoded[id(row["distance"])] is None:
+                encoded[id(row["distance"])] = encode_array(row["distance"])
+        # END accepted frozen records need no migration or compatibility path.
         return {"model": MODEL, "origin": self.origin.tolist(), "voxel_size": self.voxel_size,
             "shape": list(self.shape), "source": self.source, "rules": _plain(self.rule_records),
             "maximum_radii": dict(self.maximum_radii),
@@ -368,7 +417,7 @@ class PreparedContactFields:
                 "surface_witnesses": encode_array(row["surface_witnesses"])}
                 for name, row in self.regions.items()},
             "channels": [{"rule_ids": list(row["rule_ids"]), "kind": row["kind"],
-                **({"distance": encode_array(row["distance"])} if row["kind"] == "field" else {})}
+                **({"distance": encoded[id(row["distance"])]} if row["kind"] == "field" else {})}
                 for row in self.channels], "groups": _plain(self.groups),
             "numerics": {"cell_cover_margin_m": math.sqrt(3.) * self.voxel_size / 2,
                          "interpolation_margin_m": math.sqrt(3.) * self.voxel_size / 2,
@@ -410,20 +459,35 @@ class PreparedContactFields:
             raise ValueError("Frozen contact groups must preserve exact material sphere membership and field lookup")
         channels = []
         stored = 0
+        # BEGIN restore exact geometric sharing only after checking every copy.
+        geometry_keys = _field_geometry_keys(rules, combinations_needed)
+        restored_geometry = {}
         for item in row["channels"]:
             kind = item["kind"]
             if kind not in {"field", "empty", "unchanged"}:
                 raise ValueError("Unknown frozen contact field kind")
             channel = {"rule_ids": tuple(item["rule_ids"]), "kind": kind}
+            geometry_key = geometry_keys[channel["rule_ids"]]
+            previous = restored_geometry.get(geometry_key)
+            if previous is not None and previous["kind"] != kind:
+                raise ValueError("Equivalent target regions must preserve identical frozen field kinds")
             if kind == "field":
                 field = decode_array(item["distance"])
                 if tuple(field.shape) != tuple(row["shape"]) or field.dtype != np.float32 or not np.isfinite(field).all():
                     raise ValueError("Frozen contact field arrays must preserve their full layout and dtype")
-                stored += field.nbytes
-                if stored > _MAX_STORED_BYTES:
-                    raise ValueError("Frozen contact fields exceed their storage bound")
-                channel["distance"] = field
+                if previous is not None:
+                    if not np.array_equal(field, previous["distance"]):
+                        raise ValueError("Equivalent target regions must preserve identical frozen field arrays")
+                    channel["distance"] = previous["distance"]
+                else:
+                    stored += field.nbytes
+                    if stored > _MAX_STORED_BYTES:
+                        raise ValueError("Frozen contact fields exceed their storage bound")
+                    channel["distance"] = field
+                del field
             channels.append(channel)
+            restored_geometry[geometry_key] = channel
+        # END a modified duplicate can neither hide behind nor replace its peer.
         regions = {}
         rule_by_name = {rule.rule_id: rule for rule in rules}
         for name, item in row["regions"].items():

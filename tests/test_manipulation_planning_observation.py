@@ -926,6 +926,119 @@ class OnlineObservationContractTest(unittest.TestCase):
 # END these CPU tests never allocate native mapping or simulator state.
 
 
+# BEGIN complete geometry replaces allocation, never semantic/free-ray evidence.
+class DirectCompleteOwnerTest(unittest.TestCase):
+    @staticmethod
+    def inputs():
+        from manipulation.online_geometry import FrozenPrimitives
+        from manipulation.planning_problem import PosePath
+        from manipulation.planning_scene import CollisionOwner
+        views,frames,cfg=PlanningObservationTest.refined_owner_fixture()
+        pose=frames['part']['T_output_owner']
+        query=FrozenPrimitives(primitives=[{'kind':'cuboid','dimensions':[.03,.04,.05]}],
+            owner_ids=('part',),source='complete calibrated primitive',contact_voxel_size_m=.005)
+        owner=CollisionOwner('part',query,PosePath(np.array([0.,1.]),np.stack((pose,pose)),
+            'current pose'),source='complete calibrated primitive',geometry_complete=True)
+        options=dict(mapper_cfg=cfg,depth_error_m=.003,owner_voxel_sizes_m={'part':.005},
+            reference_frame='world',robot_sphere_materials=(None,),robot_geometry_source='declared robot',
+            has_gripper=False,max_mapping_bytes=1024**3,
+            unknown_policy={'conditional_regions':[],'outside_regions':'forbid'},complete_owners=(owner,))
+        return views,frames,owner,options
+
+    @staticmethod
+    def mapped_field(normalized,masks,identity,config,inverse,*,query_center=None,max_host_rss_bytes=None):
+        from manipulation.online_geometry import FrozenESDF
+        from observed_geometry_fixtures import point_source
+        shape=np.ceil(np.asarray(config.extent_esdf_meters_xyz)/config.esdf_voxel_size).astype(int)
+        center=config.grid_center.numpy() if query_center is None else np.asarray(query_center)
+        query=FrozenESDF.from_source(point_source(),origin=center-(shape-1)*config.esdf_voxel_size/2,
+            shape=tuple(shape),voxel_size=config.esdf_voxel_size,
+            owner_ids=('observed_background' if identity is None else identity,),source='CPU map fixture')
+        return query,{'shape_xyz':shape.tolist()}
+
+    def test_direct_owner_skips_map_and_budget_without_leaking_pixels_or_free_volume(self):
+        from manipulation.planning_observation import build_scene_from_rgbd
+        from manipulation.robot_self_filter import ENVIRONMENT
+        views,frames,owner,options=self.inputs()
+        with patch('manipulation.planning_observation._owner_mapper_config',side_effect=AssertionError('discarded owner map')), \
+             patch('manipulation.planning_observation._map_online_partition',side_effect=self.mapped_field) as mapper, \
+             patch('manipulation.planning_observation._require_mapping_memory'), \
+             patch('manipulation.planning_observation._mapper_memory_bound',return_value=1234) as budget, \
+             patch('manipulation.planning_observation._known_free_voxels',wraps=_known_free_voxels) as coverage, \
+             patch('torch.cuda.mem_get_info',side_effect=AssertionError('CPU test touched CUDA')):
+            # The old build-and-replace path would charge 2468 bytes and fail.
+            options['max_mapping_bytes']=1234
+            scene=build_scene_from_rgbd(views,frames,**options)
+        self.assertEqual(mapper.call_count,1)
+        self.assertEqual(budget.call_count,1)
+        self.assertIs(scene.owners[0],owner)
+        self.assertEqual(scene.observation_report['estimated_mapping_buffers_bytes'],1234)
+        self.assertEqual(scene.observation_report['mapped_partition_estimates_bytes'],{'observed_background':1234})
+        self.assertEqual(set(scene.observation_report['partitions']),{'observed_background'})
+        self.assertFalse(scene.observation_report['direct_complete_owners']['part']['mapping_allocated'])
+        normalized,masks,identity,*_=mapper.call_args.args
+        self.assertIsNone(identity)
+        for name,record in views.items():
+            self.assertFalse(np.any(masks[name][None] & record['owner_masks']['part']))
+            np.testing.assert_array_equal(masks[name]['part'],
+                record['owner_masks']['part'] & (record['self_filter']['labels']==ENVIRONMENT))
+            np.testing.assert_array_equal(coverage.call_args.kwargs['ray_depths'][name],
+                record['self_filter']['free_ray_depth_m'])
+        np.testing.assert_array_equal(scene.coverage.known_free,_known_free_voxels(normalized,**coverage.call_args.kwargs))
+
+    def test_invalid_direct_contracts_fail_before_any_coverage_or_map_allocation(self):
+        from manipulation.planning_observation import build_scene_from_rgbd
+        # Each mutation represents a different way of accidentally bypassing
+        # observed collision material by substituting unrelated geometry.
+        for case in ('incomplete','duplicate','unregistered','pose','resolution','invalid_resolution','fine_region','missing_mask'):
+            with self.subTest(case=case):
+                views,frames,owner,options=self.inputs()
+                if case=='incomplete':
+                    owner.geometry_complete=False
+                elif case=='duplicate':
+                    options['complete_owners']=(owner,owner)
+                elif case=='unregistered':
+                    owner.owner_id='unregistered'
+                elif case=='pose':
+                    frames['part']['T_output_owner']=frames['part']['T_output_owner'].copy()
+                    frames['part']['T_output_owner'][0,3]+=.01
+                elif case=='resolution':
+                    options['owner_voxel_sizes_m']['part']=.01
+                elif case=='invalid_resolution':
+                    options['owner_voxel_sizes_m']['part']=True
+                elif case=='fine_region':
+                    options['fine_regions']={'part':{}}
+                elif case=='missing_mask':
+                    views['first']['owner_masks'].clear()
+                with patch('manipulation.planning_observation._map_online_partition') as mapper, \
+                     patch('manipulation.planning_observation._known_free_voxels') as coverage:
+                    with self.assertRaises(ValueError):
+                        build_scene_from_rgbd(views,frames,**options)
+                mapper.assert_not_called()
+                coverage.assert_not_called()
+
+    def test_remaining_observed_owner_keeps_its_own_mapper_and_resolution(self):
+        from manipulation.planning_observation import build_scene_from_rgbd
+        views,frames,owner,options=self.inputs()
+        frames['fixture']={'T_output_owner':np.eye(4),'source':'independent observed fixture'}
+        options['owner_voxel_sizes_m']['fixture']=.01
+        for record in views.values():
+            record['owner_masks']['fixture']=np.zeros(record['depth'].shape,dtype=bool)
+            record['owner_masks']['fixture'][60:63,60:63]=True
+        with patch('manipulation.planning_observation._owner_mapper_config',wraps=_owner_mapper_config) as config, \
+             patch('manipulation.planning_observation._map_online_partition',side_effect=self.mapped_field) as mapper, \
+             patch('manipulation.planning_observation._require_mapping_memory'):
+            scene=build_scene_from_rgbd(views,frames,**options)
+        self.assertEqual(config.call_count,1)
+        self.assertEqual(config.call_args.args[3],'fixture')
+        self.assertEqual([call.args[2] for call in mapper.call_args_list],[None,'fixture'])
+        self.assertEqual(mapper.call_args_list[1].args[3].voxel_size,.01)
+        self.assertIs(scene.owners[0],owner)
+        self.assertFalse(scene.owners[1].geometry_complete)
+        self.assertEqual(set(scene.observation_report['partitions']),{'observed_background','fixture'})
+# END complete owners share the same scene without a partial intermediate scene.
+
+
 # BEGIN generic query-domain preparation reuses native mapping without new evidence.
 class BackgroundQueryDomainTest(unittest.TestCase):
     def test_query_lattice_preserves_source_config_and_contains_required_domain(self):
