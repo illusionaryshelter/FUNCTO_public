@@ -2954,6 +2954,40 @@ class InitialStatePreflightTests(unittest.TestCase):
         torch.testing.assert_close(progress, torch.zeros((1, 1), dtype=torch.float64), rtol=0, atol=0)
         torch.testing.assert_close(joints[:, 0], planner.start.position, rtol=0, atol=0)
         self.assertEqual(names, planner.joint_names)
+
+    # BEGIN entrance diagnostics reuse the authoritative final scene evaluation.
+    def test_scene_components_and_final_native_report_come_from_the_same_query(self):
+        planner, _, _ = self.fixture()
+        final_report = {"candidate_states": 1, "states": [{"pair": "robot/reference", "passed": False}]}
+
+        def evaluate(spheres, position, quaternion, progress, *args, components_out,
+                     native_confirmation, **kwargs):
+            # This fixture represents already confirmed scene terms: retaining
+            # diagnostics cannot call evaluate again or expose a pre-confirmation sum.
+            native_confirmation.last_report = final_report
+            components_out.update({
+                "collision/robot/reference": torch.full_like(progress, .25),
+                "scene_update/background/robot": torch.full_like(progress, .75),
+                "unknown/forbidden/robot": torch.zeros_like(progress)})
+            return sum(components_out.values(), torch.zeros_like(progress))
+
+        planner.scene.evaluate.side_effect = evaluate
+        result = planner.initial_state_diagnostics()
+        planner.scene.evaluate.assert_called_once()
+        planner._verification_fk.compute_kinematics.assert_called_once()
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failed_components"], ["scene"])
+        self.assertEqual(result["residuals"]["scene"], 1.)
+        self.assertEqual(result["scene_components"], {
+            "collision/robot/reference": {"maximum": .25, "time_s": 0., "progress": 0.},
+            "scene_update/background/robot": {"maximum": .75, "time_s": 0., "progress": 0.}})
+        self.assertEqual(result["native_confirmation"], final_report)
+        final_report["states"][0]["passed"] = True
+        self.assertFalse(result["native_confirmation"]["states"][0]["passed"])
+        planner.reference_seeds.assert_not_called()
+        planner.optimize.assert_not_called()
+    # END diagnostics neither replenish search nor change the entrance verdict.
+
     def test_each_immutable_violation_rejects_the_same_measured_entrance(self):
         for component, arguments in (("position", {"position": (.21, -.3, .5)}),
             ("velocity", {"velocity": (.7, -2.3, 2.4)}),

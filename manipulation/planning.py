@@ -3830,17 +3830,28 @@ class _CuroboPlanner:
             position, quaternion = self.problem.transform_tool_pose(
                 state.tool_poses.position[:, :, index], state.tool_poses.quaternion[:, :, index])
             progress = q.new_full(q.shape[:2], self.problem.start_progress)
+            # BEGIN retain the same entrance query's scene and native evidence.
+            # The hard scene residual remains authoritative. Capture named
+            # positive/nonfinite terms and the native confirmer's final report
+            # without rerunning geometry or changing any acceptance threshold.
+            scene_components = {}
+            native_confirmation = OnlineCollisionConfirmation(
+                self.robot_validator, self.scene, check_request=self.check_request)
+            # END diagnostic collection owns no additional collision query.
             components["scene"] = _scene_boundary_evaluate(self.scene, self.problem, self.progress_map,
                 self.problem.transform_robot_spheres(native.robot_spheres), position, quaternion,
                 progress, q, self.joint_names, trajectory_time=q.new_zeros(q.shape[:2]),
                 normalized_time=q.new_zeros(q.shape[:2]),
                 # BEGIN measured entrance uses the same candidate confirmation rule.
-                native_confirmation=OnlineCollisionConfirmation(
-                    self.robot_validator, self.scene, check_request=self.check_request))
+                native_confirmation=native_confirmation, component_diagnostics=scene_components)
             # END proxy geometry alone cannot declare an immutable entrance impossible.
             residuals = {name: float(value.max().item()) for name, value in components.items()}
         failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
         return {"passed": not failed, "residuals": residuals, "failed_components": failed,
+                # BEGIN expose final same-query evidence beside the unchanged verdict.
+                "scene_components": scene_components,
+                "native_confirmation": deepcopy(native_confirmation.last_report),
+                # END callers can identify a failed owner/pair without another solve.
                 "scope": "measured joint limits and selected online collision model"}
     # END reject an immutable infeasible entrance before running native IK.
 
