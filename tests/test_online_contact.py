@@ -2,6 +2,7 @@
 
 # BEGIN fixed-region queries retain obstacles and use finite native material.
 from dataclasses import replace
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -10,7 +11,7 @@ import pytest
 from scipy.spatial.transform import Rotation
 import torch
 
-from manipulation.online_contact import PreparedContactFields, planar_material_conditions
+from manipulation.online_contact import PreparedContactFields, native_material_conditions
 from manipulation.online_geometry import FrozenESDF, FrozenPrimitives, OnlinePlanningScene
 from manipulation.planning_problem import PosePath
 from manipulation.planning_scene import ContactRule, PlanningScene, CollisionOwner, ObservedSpace, PrismaticGripper
@@ -27,6 +28,29 @@ def rule(name="left", x=-.006, *, required=False, sphere_indices=(0,), material=
         online_material={"kind": "native_planar_extrusion_v1", "thickness_m": .008,
             "native_geometry": "pad_box", "sphere_indices": list(sphere_indices),
             "source": "complete native box extrusion", "sphere_binding_source": "verified test native cover"})
+
+
+# BEGIN a rotated native box meets the plane on a true edge, not a thin face.
+def edge_rule(*, required=False, allowance=.001, patch_half=(.015, .01)):
+    half = np.array([.01, .004, .004])
+    pose = np.eye(4)
+    pose[:3, :3] = Rotation.from_euler("x", 45., degrees=True).as_matrix()
+    pose[:3, 3] = -(np.array([0., -half[1], -half[2]]) @ pose[:3, :3].T)
+    endpoints = np.array([[-half[0], -half[1], -half[2]],
+                          [half[0], -half[1], -half[2]]]) @ pose[:3, :3].T+pose[:3, 3]
+    return ContactRule(rule_id="edge", actor="payload", target_owner="part", interval=(.2, .8),
+        sphere_indices=(0,), material_id="native_bottom_edge", feature_kind="edge",
+        feature_points=endpoints, feature_normal=np.array([0., 0., -1.]),
+        patch_origin=np.zeros(3), patch_axes=np.eye(3), patch_half_size=np.array(patch_half),
+        gap_bounds=(-.001, .001), normal_tolerance_rad=.2,
+        modeling_allowance_m=allowance, geometry_error_m=allowance,
+        minimum_thickness_m=.008, source="complete rotated native box edge", required=required,
+        online_material={"kind": "native_box_edge_v1", "native_geometry": "edge_box",
+            "thickness_m": .008, "source": "original native box dimensions and material edge",
+            "sphere_indices": [0], "sphere_binding_source": "complete native box cell cover",
+            "T_actor_box": pose.tolist(), "half_size_m": half.tolist(),
+            "edge_axis": 0, "edge_signs": [-1, -1]})
+# END neither the source solid nor its material has an invented bottom plate.
 
 
 # BEGIN test surfaces are explicit source components, never numerical field zeros.
@@ -180,11 +204,42 @@ def test_large_pad_small_patch_and_absent_optional_contact_do_not_force_contact(
     item = rule()
     query = prepare(field(points=((-0.006, 0., 0.),)), [item])
     current, normal = policy(item)
-    terms = planar_material_conditions(item, current, normal, query._contact_model)
+    terms, possible = native_material_conditions(item, current, normal, query._contact_model)
     assert all(value.item() == 0 for value in terms.values())
+    assert possible.item()
     far, normal = policy(item, position=(0., 0., .02))
-    terms = planar_material_conditions(item, far, normal, query._contact_model)
+    terms, possible = native_material_conditions(item, far, normal, query._contact_model)
     assert all(value.item() == 0 for value in terms.values())
+    assert not possible.item()
+
+
+# BEGIN optional normal scope follows the complete solid, not a time window alone.
+@pytest.mark.parametrize("kind", ["planar", "edge"])
+def test_optional_possible_contact_separates_far_wrong_normal_from_side_material(kind):
+    item = (replace(rule(x=0.), patch_half_size=np.array([.03, .03]))
+            if kind == "planar" else edge_rule())
+    rotation = Rotation.from_euler("x", 90., degrees=True).as_matrix()
+    # The point is inside the turned complete solid, away from its contact
+    # feature. Testing only the front feature would miss this side collision.
+    query = prepare(field(points=((0., -.004, 0.),)), [item])
+    near, normal = policy(item, rotation=rotation)
+    assert not near["normal_valid"].item()
+    _, possible = native_material_conditions(item, near, normal, query._contact_model)
+    assert possible.dtype == torch.bool and possible.shape == near["active"].shape
+    assert possible.item()
+    far, normal = policy(item, position=(0., 0., .1), rotation=rotation)
+    assert not far["normal_valid"].item()
+    terms, possible = native_material_conditions(item, far, normal, query._contact_model)
+    assert not possible.item()
+    assert all(value.item() == 0 for value in terms.values())
+    empty = prepare(field(points=()), [item])
+    terms, possible = native_material_conditions(item, near, normal, empty._contact_model)
+    assert not possible.item()
+    assert all(value.item() == 0 for value in terms.values())
+    inactive, normal = policy(item, rotation=rotation, active=False)
+    _, possible = native_material_conditions(item, inactive, normal, query._contact_model)
+    assert not possible.item()
+# END an optional permission never makes alignment a goal while separated.
 
 
 def test_actual_target_height_and_negative_gap_do_not_double_allowance():
@@ -196,7 +251,7 @@ def test_actual_target_height_and_negative_gap_do_not_double_allowance():
     # rasterized proposal cell must not add another half voxel of material.
     query = prepare(field(points=((-0.006, 0., .0005),), size=.0005), [item])
     current, normal = policy(item, position=(0., 0., -.001))
-    terms = planar_material_conditions(item, current, normal, query._contact_model)
+    terms, possible = native_material_conditions(item, current, normal, query._contact_model)
     assert terms["gap"].item() == 0
     assert terms["material_band"].item() == pytest.approx(.0005-item.numerical_position_tolerance_m, abs=1e-12)
 
@@ -207,11 +262,78 @@ def test_tilted_body_support_includes_back_projection_and_invalid_normal_is_fini
     for angle in (10., 90., 180.):
         rotation = Rotation.from_euler("y", angle, degrees=True).as_matrix()
         current, normal = policy(item, position=(0., 0., -.001), rotation=rotation)
-        terms = planar_material_conditions(item, current, normal, query._contact_model)
+        terms, possible = native_material_conditions(item, current, normal, query._contact_model)
         assert all(torch.isfinite(value).all() for value in terms.values())
     current, normal = policy(item, position=(0., 0., -.001),
                              rotation=Rotation.from_euler("y", -10., degrees=True).as_matrix())
-    assert planar_material_conditions(item, current, normal, query._contact_model)["material_band"].item() > 0
+    assert native_material_conditions(item, current, normal, query._contact_model)[0]["material_band"].item() > 0
+
+
+# BEGIN side-wedge and endpoint counterexamples protect the finite edge contract.
+def test_edge_positive_allowance_cannot_admit_a_side_wedge_of_the_complete_box():
+    item = edge_rule(allowance=.001)
+    # This observed point is inside the original box but 0.2 mm sideways from
+    # its edge. A 1 mm support-plane-only allowance would wrongly admit it.
+    query = prepare(field(points=((0., .0002, .0003),)), [item])
+    current, normal = policy(item)
+    current["feature_points"].requires_grad_(True)
+    terms, possible = native_material_conditions(item, current, normal, query._contact_model)
+    assert terms["gap"].item() == 0
+    assert terms["material_band"].item() > .00029
+    gradient = torch.autograd.grad(terms["material_band"].sum(), current["feature_points"])[0]
+    assert torch.isfinite(gradient).all()
+    # A point on the actual edge remains admissible under the identical model.
+    clear = prepare(field(points=((0., 0., 0.),)), [item])
+    assert all(value.item() == 0 for value in native_material_conditions(
+        item, current, normal, clear._contact_model)[0].values())
+
+
+def test_edge_gap_uses_only_the_real_segment_inside_the_patch():
+    item = replace(edge_rule(patch_half=(.001, .002)), gap_bounds=(-.0003, .0003))
+    query = prepare(field(points=((0., 0., 0.),)), [item])
+    current, normal = policy(item, rotation=Rotation.from_euler("y", 10., degrees=True).as_matrix())
+    assert current["feature_points"][..., 2].abs().max().item() > .001
+    assert native_material_conditions(item, current, normal, query._contact_model)[0]["gap"].item() == 0
+
+
+def test_required_edge_contact_cannot_borrow_points_beyond_its_endpoint_or_side():
+    item = edge_rule(required=True)
+    for point in ((.010005, 0., 0.), (0., .000005, 0.)):
+        query = prepare(field(points=(point,)), [item])
+        assert query.required_contact(item, policy(item)[0]).item() > 0
+    query = prepare(field(points=((.01, 0., 0.),)), [item])
+    assert query.required_contact(item, policy(item)[0]).item() == 0
+
+
+def test_edge_registration_rejects_support_cone_boundary_and_modified_native_endpoints():
+    item = edge_rule()
+    adjacent = item._native_edge_geometry["adjacent_normals_actor"]
+    for normal in (adjacent[0], adjacent[0]+1e-15*adjacent[1], -item.feature_normal):
+        with pytest.raises(ValueError, match="supporting normal cone"):
+            replace(item, feature_normal=normal)
+    points = item.feature_points.copy()
+    points[1, 0] -= .001
+    with pytest.raises(ValueError, match="complete registered native edge"):
+        replace(item, feature_points=points)
+    model = deepcopy(item.online_material)
+    model["T_actor_box"][0][0] += 1e-7
+    with pytest.raises(ValueError, match="rigid orthonormal"):
+        replace(item, online_material=model)
+
+
+def test_edge_record_roundtrip_preserves_native_box_and_forbidden_side_band():
+    item = edge_rule()
+    query = prepare(field(points=((0., .0002, .0003),)), [item])
+    with patch("manipulation.online_contact.distance_transform_edt", side_effect=AssertionError("not runtime")):
+        restored = FrozenESDF.from_record(query.record())
+        restored.prepare_contacts((item,), {item.rule_id: .01})
+    assert restored._contact_model.rule_records[0]["online_material"] == item.online_material
+    current, normal = policy(item)
+    original, original_possible = native_material_conditions(item, current, normal, query._contact_model)
+    actual, actual_possible = native_material_conditions(item, current, normal, restored._contact_model)
+    assert all(torch.equal(original[name], actual[name]) for name in original)
+    assert torch.equal(original_possible, actual_possible)
+# END accepted planar contacts still use their original formula and tolerances.
 
 
 def test_required_contact_uses_same_point_observed_evidence_and_absence_is_capability_gap():
@@ -241,7 +363,7 @@ def test_current_binding_reuses_exact_arrays_without_preparation_or_legacy_fallb
 
 
 def test_unregistered_material_or_too_many_joint_rule_channels_is_rejected():
-    with pytest.raises(ValueError, match="registered complete native planar extrusion"):
+    with pytest.raises(ValueError, match="registered complete native material"):
         prepare(field(), [replace(rule(), online_material=None)])
     items = [rule(f"rule{i}") for i in range(5)]
     with pytest.raises(ValueError, match="simultaneous-rule"):

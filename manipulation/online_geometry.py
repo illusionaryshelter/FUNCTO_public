@@ -2,7 +2,7 @@
 
 The source TSDF defines observed material; distance fields only propose
 collisions. Unknown samples never become free evidence. Contact preparation freezes forbidden-region fields once;
-online material conditions use registered finite native planar extrusions. No
+online material conditions use registered finite native faces or box edges. No
 occupied-cell loop or whole-owner permission enters optimization. CPU execution
 reads the exact frozen arrays used by Torch. Source Boolean audits are separate.
 """
@@ -19,7 +19,7 @@ from scipy.spatial.transform import Rotation
 
 from .collision_records import encode_array, decode_array, MAX_ARRAY_BYTES
 from .planning_problem import PosePath, quaternion_conjugate, quaternion_rotate, event_occurrence_key
-from .online_contact import PreparedContactFields, planar_material_conditions, require_planar_material
+from .online_contact import PreparedContactFields, native_material_conditions, require_native_material
 from .planning_scene import (Attachment, CollisionOwner, ContactRule, CoverageField, ObservedSpace,
     PlanningScene, PrismaticGripper, _tensor, _local_spheres, _world_spheres,
     _self_pair_sum, _self_pair_chunk_size, grasp_contact_rule_ids, validate_grasp_contact_arrival)
@@ -343,6 +343,15 @@ class OnlinePlanningScene:
         self.required_progress_anchors = tuple(sorted({x for r in self.contacts for x in r.interval} |
             {x for owner in self.owners for a in owner.attachments for x in a.interval}))
         identities = {owner.owner_id for owner in self.owners}
+        # BEGIN source registration is required even with zero proxy candidates.
+        # Otherwise an altered edge body could remove target material before
+        # the lazy native confirmer ever sees a positive collision candidate.
+        from .native_owner_geometry import bind_native_owner_geometry, check_native_owner_material
+        native_owners = {}
+        for owner in self.owners:
+            if isinstance(owner.query, FrozenPrimitives) and any('native_binding' in row for row in owner.query.primitives):
+                native_owners[owner.owner_id] = bind_native_owner_geometry(owner)
+        # END only local complete geometry is inspected, never the world field.
         for rule in self.contacts:
             if not isinstance(rule, ContactRule) or rule.target_owner not in identities or rule.actor not in {'robot', *identities}:
                 raise ValueError('Finite contact must identify an actual actor and target owner')
@@ -350,10 +359,20 @@ class OnlinePlanningScene:
             if any(i >= len(materials) or materials[i] != rule.material_id for i in rule.sphere_indices):
                 raise ValueError('Finite permission sphere indices must identify precisely the declared material')
             # BEGIN explicit production capability and native geometry ownership.
-            require_planar_material(rule)
+            require_native_material(rule)
             native = rule.online_material['native_geometry']
             if rule.actor == 'robot' and self.native_geometry_materials.get(native) != rule.material_id:
                 raise ValueError('UNSUPPORTED_MODEL: online material must retain its source-verified native geometry identity')
+            # BEGIN bind a known owner's material to its actual complete primitive.
+            if rule.actor != 'robot':
+                if rule.actor not in native_owners:
+                    raise ValueError('UNSUPPORTED_MODEL: owner contact requires complete native geometry registration')
+                geometry, sphere_geometry, groups = native_owners[rule.actor]
+                if (native not in geometry or set(rule.sphere_indices) != groups[native]
+                        or any(sphere_geometry[i] != (native,) for i in rule.sphere_indices)):
+                    raise ValueError('Owner contact needs exact complete native material/sphere ownership')
+                check_native_owner_material(rule, geometry[native])
+            # END a copied material label cannot establish physical body identity.
             # Owner actors retain their own material/sphere/source binding.
             # native_geometry_names is a fixed-installation collision alias,
             # not a general owner material registry and cannot be borrowed here.
@@ -361,18 +380,34 @@ class OnlinePlanningScene:
 
     # BEGIN one explicit component inventory identifies native-confirmable proposals.
     @property
-    def robot_world_collision_components(self):
-        """Exact scene terms that native robot/world confirmation may revisit.
+    def native_world_collision_components(self):
+        """Exact scene terms with an explicitly registered native confirmation.
 
         Membership declares a confirmation path, never a collision-free state.
         The confirmation engine still validates complete native geometry and
         sphere ownership before it may clear a positive candidate. Self,
-        contact, unknown-space and other actors' terms retain their own checks.
+        contact and unknown-space terms retain their own checks. An owner
+        lacking complete primitive/sphere registration is never eligible.
         """
-        names = {'collision/robot/background'}
-        names.update(f'collision/robot/{owner.owner_id}' for owner in self.owners)
-        names.discard('collision/robot/self')
-        return frozenset(names)
+        return frozenset(self.native_world_collision_pairs)
+
+    # BEGIN explicit pair identities avoid parsing arbitrary owner names.
+    @property
+    def native_world_collision_pairs(self):
+        actors = ['robot', *(owner.owner_id for owner in self.owners
+            if owner.moving and owner.geometry_complete and isinstance(owner.query, FrozenPrimitives)
+            and all('native_binding' in row for row in owner.query.primitives))]
+        pairs = {}
+        for actor in actors:
+            for target in ('background', *(owner.owner_id for owner in self.owners)):
+                if target == actor or (actor == 'robot' and target == 'self'):
+                    continue
+                key = f'collision/{actor}/{target}'
+                if key in pairs:
+                    raise ValueError('Native collision component identities must be unambiguous')
+                pairs[key] = (actor, target)
+        return pairs
+    # END declared capability does not replace per-body coverage verification.
     # END optimizer candidate retention and final confirmation share these names.
 
     def bind_online_robot(self, *, robot_sphere_geometry, robot_self_collision_pairs,
@@ -652,6 +687,9 @@ class OnlinePlanningScene:
         confirmation = None if native_confirmation is None else {
             'targets': {}, 'effective_rules': {}, 'joint_position': joint_position,
             'joint_names': joint_names, 'finger_positions': None, 'owner_poses': {}}
+        # BEGIN compute the bounded actor/target inventory once per query.
+        confirmable = frozenset() if confirmation is None else self.native_world_collision_components
+        # END optimization-only calls allocate no native confirmation inventory.
         # END final acceptance and actual feedback share the same evidence schema.
         coordinates = half = geometry_state = None
         if self.gripper is not None:
@@ -687,10 +725,10 @@ class OnlinePlanningScene:
             else:
                 costs[name]=values.sum(-1)
             # BEGIN preserve per-sphere candidates before reducing to one owner cost.
-            if confirmation is not None and actor == 'robot':
-                confirmation['targets'][name] = torch.where(
-                    uncertain_spheres, 0., values)
-            # END native checks can only revise the corresponding robot/world term.
+            if confirmation is not None and name in confirmable:
+                confirmation['targets'][name] = (torch.where(uncertain_spheres, 0., values)
+                    if actor == 'robot' else values)
+            # END native checks revise only the corresponding registered actor term.
         def max_constraint(values, name, actor):
             # Numerical gaps of an unresolved future finger remain explicit
             # conditional gaps; known arm/palm gaps remain hard scene updates.
@@ -779,11 +817,10 @@ class OnlinePlanningScene:
                     if active_contact_rule_ids is not None:
                         policy['active'] &= rule.rule_id in active_contact_rule_ids
                     # BEGIN the latch alone is insufficient: retain the effective policy.
-                    if confirmation is not None and actor == 'robot':
+                    if confirmation is not None:
                         confirmation['effective_rules'][rule.rule_id] = policy['active']
                     # END interval and geometry/unresolved-hand conditions are preserved.
                     policies.append((rule,policy))
-                    costs[f'contact/normal/{rule.rule_id}'] = normal*policy['active']
                     costs[f'conditional/finger/{rule.rule_id}'] = uncertainty
                     if rule.required:
                         # A disabled uncertain permission does not satisfy a
@@ -794,7 +831,15 @@ class OnlinePlanningScene:
                     # BEGIN native finite material replaces cell Boolean permission.
                     normal_actor = quaternion_rotate(actor_pose[1], _tensor(rule.feature_normal, progress))
                     normal_target = quaternion_rotate(quaternion_conjugate(poses[owner.owner_id][1]), normal_actor)
-                    material_terms = planar_material_conditions(rule, policy, normal_target, owner.query._contact_model)
+                    # BEGIN optional contact constrains orientation only at possible contact.
+                    # A separated object may rotate toward a future support.
+                    # Required contact still needs its normal throughout the
+                    # declared active interval, even without observed material.
+                    material_terms, possible_contact = native_material_conditions(
+                        rule, policy, normal_target, owner.query._contact_model)
+                    normal_scope = policy['active'] if rule.required else possible_contact
+                    costs[f'contact/normal/{rule.rule_id}'] = normal*normal_scope
+                    # END SupportRequirement and every contact band remain unchanged.
                     for term, residual in material_terms.items():
                         costs[f'contact/{term}/{rule.rule_id}'] = residual
                     # END gap/side/back constraints participate in every same-model decision.
@@ -965,7 +1010,7 @@ class OnlinePlanningScene:
             'robot_geometry_source':self.robot_geometry_source,'owners':[o.owner_id for o in self.owners],
             'unknown_policy':deepcopy(self.unknown_policy),'required_progress_anchors':self.required_progress_anchors,
             'observation_report':deepcopy(self.observation_report),
-            'scope':'fixed observed fields and registered native planar contact; conservative projection bounds; conditional unknown is not free evidence'}
+            'scope':'fixed observed fields and registered native face/edge contact; conservative projection bounds; conditional unknown is not free evidence'}
 
     def to_execution_binding(self):
         owners = []

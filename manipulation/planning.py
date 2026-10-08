@@ -2525,12 +2525,12 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                     scene_evidence_out[category] = sum((term.detach() for name, term in components.items()
                         if name.startswith(category+"/")), torch.zeros_like(value))
                 # END no category changes the original hard aggregate or gradient.
-                # BEGIN pending robot/world proposals cannot erase other hard requirements.
+                # BEGIN pending registered-actor proposals preserve other hard requirements.
                 if optimizer_candidate_evidence:
                     # A scene explicitly declares which exact terms have a
                     # final native-solid confirmation path. Undeclared terms,
-                    # including self and non-robot collisions, remain hard.
-                    confirmable = getattr(scene, "robot_world_collision_components", frozenset())
+                    # including self and unregistered-owner collisions, remain hard.
+                    confirmable = getattr(scene, "native_world_collision_components", frozenset())
                     invalid = ~torch.isfinite(value.detach())
                     for name, term in components.items():
                         if name.startswith("conditional/"):

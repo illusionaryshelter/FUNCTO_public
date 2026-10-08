@@ -985,25 +985,37 @@ use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
   represented cell outside that finite permission, including cells covered by
   the same robot sphere. A whole hand/owner pair exemption is not accepted.
 
-<!-- BEGIN native confirmation of conservative robot/world sphere candidates. -->
-Positive robot/world sphere costs are collision candidates. Final candidate
+<!-- BEGIN native confirmation of registered actor/world sphere candidates. -->
+Positive registered actor/world sphere costs are collision candidates. Final candidate
 acceptance uses `online_native_confirmation.OnlineCollisionConfirmation`:
 only those candidates are
-checked with the registered native robot solids and the same frozen observed
-occupied cells (or analytic frozen primitives). One spatial index is prepared
-per confirmation adapter. Effective finite contact rules remove only wholly
-contained cells for the exact registered material; unknown-space, field support,
+checked with registered native robot solids or complete known-owner box unions,
+against the same frozen observed TSDF source components (or analytic frozen
+primitives). Owner registration proves every box cell is covered by its assigned
+sphere and binds finite material geometry to that complete solid at scene
+admission, even when no positive candidate exists. Confirmation uses the same
+query's attachment/release pose. One spatial index is prepared per request.
+Effective finite contact rules remove only wholly contained source components
+for the exact registered material; unknown-space, field support,
 contact conditions and self-collision constraints retain their own verdicts.
 Numerical boundary or unsupported native results keep the sphere rejection.
 Optimization still uses the differentiable sphere costs. This is a discrete
 observed-model check, not a continuous or unobserved-space safety certificate.
-<!-- END native confirmation of conservative robot/world sphere candidates. -->
+Native finite materials support full planar extrusions and true box edges.
+An edge retains its two endpoints, supporting normal cone and complete box;
+a conservative depth bound preserves its original numerical lateral tolerance.
+Optional contacts constrain their normal only where the complete body can
+intersect removed target material. Required contacts and task support intervals
+retain their original normal requirements. A grasp handoff rigidly re-expresses
+its finite patches and binds the new request's Holding condition; it does not
+copy the previous close-event latch.
+<!-- END native confirmation of registered actor/world sphere candidates. -->
 
 `planning_observation.build_scene_from_rgbd` creates this production model.
 `build_audit_scene_from_rgbd`, source TSDF geometry, complete-volume coverage
 and detailed source-scene component checkers are separate audit tools. The
-bounded native robot/cell confirmation above does not reconstruct that scene
-audit or enumerate its source TSDF components.
+bounded native confirmation above queries only local source components for
+positive candidates; it does not reconstruct or scan the whole source scene.
 
 `PlanningProblem.bound_motion_block` uses actual evidence dependencies to bound
 one request while preserving original progress and event identities. Coupled

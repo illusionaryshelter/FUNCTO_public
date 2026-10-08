@@ -295,6 +295,18 @@ def bind_box_owner_materials(prepared):
             "native_thickness_m": thickness, "feature_geometry_audit": audit,
             "normal_cover_excess_m": float(np.max((balls[:, :3]-points[0]) @ normal+balls[:, 3])),
             "source": row["source"]}
+        # BEGIN register only complete native faces/edges and their original solid.
+        model = {"kind": "native_planar_extrusion_v1", "thickness_m": thickness,
+            "native_geometry": name, "source": row["source"]}
+        if row["feature_kind"] == "edge":
+            model.update(kind="native_box_edge_v1", T_actor_box=pose.tolist(),
+                half_size_m=halfsize.tolist(), edge_axis=row["edge_axis"],
+                edge_signs=list(row["edge_signs"]))
+        materials[identity].update(online_material=model,
+            sphere_binding_source=json.dumps({"kind": "complete_native_box_cell_cover",
+                "owner_id": owner_id, "native_geometry": name,
+                "coverage": covers[name], "geometry_source": source}, sort_keys=True, allow_nan=False))
+        # END ContactRule independently verifies the exposed edge and support cone.
         native[owner_id+"/"+name] = identity
         for index in selected:
             labels[index] = identity
@@ -318,10 +330,16 @@ def create_box_owner(prepared, *, contact_voxel_size_m):
     from manipulation.planning_problem import PosePath
     from manipulation.planning_scene import Attachment, CollisionOwner
 
+    # BEGIN native actor confirmation rechecks each complete box's sphere cover.
+    covers = {row["box_name"]: row for row in prepared["provenance"]["coverage_cells"]}
     query = FrozenPrimitives(primitives=[{"kind": "cuboid", "dimensions": row["dims"],
-        "pose": row["pose"]} for row in prepared["cuboids"]],
+        "pose": row["pose"], "native_binding": {"geometry_name": row["name"],
+            "sphere_indices": list(range(*covers[row["name"]]["sphere_range"])),
+            "subdivisions": list(covers[row["name"]]["subdivisions"]),
+            "source": prepared["source"]}} for row in prepared["cuboids"]],
         owner_ids=(prepared["owner_id"],), source=prepared["source"],
         contact_voxel_size_m=contact_voxel_size_m)
+    # END this metadata changes no primitive dimension, pose or analytic query.
     # END no source solid or separate device collision store is reconstructed.
     initial = np.asarray(prepared["initial_pose"], float)
     return CollisionOwner(

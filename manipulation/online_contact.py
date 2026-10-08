@@ -1,4 +1,4 @@
-"""Frozen forbidden-region fields and a bounded native planar contact model.
+"""Frozen forbidden-region fields and bounded native face/box-edge contact.
 
 Preparation visits explicit mapped source components or registered primitive
 cells. Online work has dimensions only for states, registered spheres, rule
@@ -8,7 +8,7 @@ conservative numerical fields propose motion; native source geometry remains
 available for independent collision confirmation.
 """
 
-# BEGIN finite registered contact fields and planar material constraints.
+# BEGIN finite registered contact fields and complete native material constraints.
 from dataclasses import asdict
 from itertools import combinations
 import math
@@ -23,7 +23,7 @@ from .planning_scene import _tensor
 from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES, require_host_memory
 
 
-MODEL = "frozen_planar_contact_v3"
+MODEL = "frozen_native_contact_v4"
 _MAX_RULES = 16
 _MAX_FIELDS = 16
 # BEGIN aggregate contact storage is independent of the single-record limit.
@@ -46,17 +46,20 @@ def _plain(value):
     return value
 
 
-def require_planar_material(rule):
-    """Admit an explicit source-bound full feature extrusion, never a guess."""
+def require_native_material(rule):
+    """Admit a registered complete planar extrusion or true native box edge."""
     material = rule.online_material
-    if (not isinstance(material, dict) or material.get("kind") != "native_planar_extrusion_v1"
-            or rule.feature_kind != "polygon" or len(rule.feature_points) > 16
+    # BEGIN a ContactRule already verified the complete native edge and its cone.
+    kinds = {"native_planar_extrusion_v1": "polygon", "native_box_edge_v1": "edge"}
+    if (not isinstance(material, dict) or material.get("kind") not in kinds
+            or rule.feature_kind != kinds[material["kind"]] or len(rule.feature_points) > 16
             or len(set(rule.sphere_indices)) != len(rule.sphere_indices)
             or tuple(material.get("sphere_indices", ())) != tuple(rule.sphere_indices)):
-        raise ValueError("UNSUPPORTED_MODEL: online finite contact requires a registered complete native planar extrusion")
+        raise ValueError("UNSUPPORTED_MODEL: online finite contact requires a registered complete native material")
+    # END a source-audit feature cannot acquire online capability implicitly.
     if (not np.isfinite(material["thickness_m"]) or material["thickness_m"] <= 0
             or rule.modeling_allowance_m >= material["thickness_m"] / 2):
-        raise ValueError("UNSUPPORTED_MODEL: online material band must be smaller than half its native extrusion thickness")
+        raise ValueError("UNSUPPORTED_MODEL: online material band must be smaller than half its native thickness scale")
 
 
 def _readonly(value, dtype=None):
@@ -124,7 +127,7 @@ class PreparedContactFields:
         if not 0 < len(rules) <= _MAX_RULES or len({r.rule_id for r in rules}) != len(rules):
             raise ValueError("UNSUPPORTED_MODEL: online contact requires one to sixteen distinct rules per owner")
         for rule in rules:
-            require_planar_material(rule)
+            require_native_material(rule)
         if set(maximum_radii) != {r.rule_id for r in rules} or any(
                 not np.isfinite(v) or v <= 0 for v in maximum_radii.values()):
             raise ValueError("Online contact must bind every rule's actual maximum sphere radius")
@@ -370,7 +373,7 @@ class PreparedContactFields:
             "numerics": {"cell_cover_margin_m": math.sqrt(3.) * self.voxel_size / 2,
                          "interpolation_margin_m": math.sqrt(3.) * self.voxel_size / 2,
                          "maximum_surface_witnesses": _WITNESS_BINS ** 2},
-            "scope": "source components filtered before conservative forbidden-region fields, or registered analytic primitive cells; native planar extrusion; bounded source surface witnesses may miss contact between points; no Boolean equivalence claim"}
+            "scope": "source components filtered before conservative forbidden-region fields, or registered analytic primitive cells; complete native planar or box-edge material; bounded source surface witnesses may miss contact between points; no Boolean equivalence claim"}
 
     @classmethod
     def from_record(cls, row):
@@ -378,7 +381,7 @@ class PreparedContactFields:
         from .planning_scene import ContactRule
         if (row.get("model") != MODEL or not 0 < len(row["channels"]) <= _MAX_FIELDS
                 or not 0 < len(row["rules"]) <= _MAX_RULES):
-            raise ValueError("UNSUPPORTED_MODEL: exact frozen planar-contact binding is required")
+            raise ValueError("UNSUPPORTED_MODEL: exact frozen native-contact binding is required")
         shape, origin, h = row["shape"], np.asarray(row["origin"], float), row["voxel_size"]
         if (not isinstance(shape, (list, tuple)) or len(shape) != 3
                 or any(type(value) is not int or value < 2 for value in shape)
@@ -392,7 +395,7 @@ class PreparedContactFields:
                 or any(not np.isscalar(v) or not np.isfinite(v) or v <= 0 for v in row["maximum_radii"].values())):
             raise ValueError("Frozen contact rules, radii and finite region inventory must agree exactly")
         for rule in rules:
-            require_planar_material(rule)
+            require_native_material(rule)
         grouped, combinations_needed = _field_layout(rules)
         if [tuple(item["rule_ids"]) for item in row["channels"]] != combinations_needed:
             raise ValueError("Frozen contact channels must retain every exact permitted rule union")
@@ -452,10 +455,10 @@ class PreparedContactFields:
             groups=row["groups"], source=row["source"])
 
 
-def planar_material_conditions(rule, policy, material_normal, prepared):
+def native_material_conditions(rule, policy, material_normal, prepared):
     """Few conservative supports cover complete native material, including tilt.
 
-    The full native body is F + [-thickness,0] * outward_normal. Its projected
+    A planar native body is F + [-thickness,0] * outward_normal. Its projected
     XY box, intersected with the removed target's projected box, encloses every
     possible material intersection. The minimum material-plane coordinate of
     that box occurs at one of four XY corners and the highest target material
@@ -466,7 +469,18 @@ def planar_material_conditions(rule, policy, material_normal, prepared):
     enclosures may reject feasible tilted/rotated contacts; they never require
     an entire larger pad to fit a smaller patch. Optional rules impose these
     conditions only when complete native-body/removed-material bounds overlap.
+
+    Return (residuals, possible_contact). The boolean is geometric evidence,
+    never a residual: the caller applies an optional normal condition only
+    where the complete body can meet removed material. Required contacts keep
+    their normal condition throughout the active interval independently.
     """
+    # BEGIN true box edges use all eight original solid vertices and a cone bound.
+    # Existing planar arithmetic stays below unchanged; the edge helper never
+    # treats an edge's supporting plane as a complete material face.
+    if rule.online_material["kind"] == "native_box_edge_v1":
+        return _box_edge_material_conditions(rule, policy, material_normal, prepared)
+    # END both models use the same immutable removed-source region evidence.
     front = policy["feature_points"]
     axes, origin = _tensor(rule.patch_axes, front), _tensor(rule.patch_origin, front)
     a = torch.einsum("...c,cd->...d", material_normal, axes)
@@ -475,7 +489,7 @@ def planar_material_conditions(rule, policy, material_normal, prepared):
     region = prepared.regions[rule.rule_id]
     zero = torch.zeros_like(policy["active"], dtype=front.dtype)
     if not region["has_removed_material"]:
-        return {"gap": zero, "material_band": zero}
+        return {"gap": zero, "material_band": zero}, torch.zeros_like(policy["active"])
     lower = prepared.constant((rule.rule_id, "lower_patch"), region["lower_patch"], front)
     upper = prepared.constant((rule.rule_id, "upper_patch"), region["upper_patch"], front)
     body_lower, body_upper = body.amin(-2), body.amax(-2)
@@ -505,5 +519,81 @@ def planar_material_conditions(rule, policy, material_normal, prepared):
     coordinate = (body_xy * a[..., None, :2]).sum(-1) + a[..., 2:3] * upper[2] - plane.unsqueeze(-1)
     penetration = torch.relu(-coordinate.amin(-1) - rule.modeling_allowance_m - tolerance)
     penetration = torch.where(possible & body_overlap, penetration, 0.)
-    return {"gap": gap, "material_band": penetration}
+    return {"gap": gap, "material_band": penetration}, possible
 # END online contact work is independent of the number of source occupied cells.
+
+
+# BEGIN bounded box-edge conditions preserve zero-width material semantics.
+def _box_edge_material_conditions(rule, policy, material_normal, prepared):
+    """Check the actual edge/patch overlap and exclude forbidden box material.
+
+    For a box edge, a support-plane band alone is insufficient: a shallow
+    wedge can extend sideways far beyond the zero-width edge. Registration
+    proves |lateral| <= K*depth throughout this complete box. Restricting depth
+    to min(allowance+epsilon, epsilon/K) therefore retains the original edge
+    side tolerance epsilon even when the declared normal allowance is large.
+    Endpoints need no additional expansion: the box's entire tangent extent
+    is the complete edge interval. This is a conservative sufficient check,
+    not an exact intersection or an enlarged physical material definition.
+    """
+    front = policy["feature_points"]
+    axes, origin = _tensor(rule.patch_axes, front), _tensor(rule.patch_origin, front)
+    normal = material_normal
+    tangent = front[..., 1, :]-front[..., 0, :]
+    tangent = tangent/torch.linalg.vector_norm(tangent, dim=-1, keepdim=True)
+    lateral = torch.linalg.cross(normal, tangent, dim=-1)
+    coordinates = prepared.constant((rule.rule_id, "edge_body_coordinates"),
+        rule._native_edge_geometry["body_coordinates"], front)
+    # Actor-to-target rotation is already encoded by the current edge tangent
+    # and material normal. Reuse it rather than performing another FK query.
+    body = (front[..., :1, :] + coordinates[:, 0:1]*tangent.unsqueeze(-2)
+            + coordinates[:, 1:2]*lateral.unsqueeze(-2)
+            + coordinates[:, 2:3]*normal.unsqueeze(-2))
+    feature = torch.einsum("...vc,cd->...vd", front-origin, axes)
+    body = torch.einsum("...vc,cd->...vd", body-origin, axes)
+    a = torch.einsum("...c,cd->...d", normal, axes)
+    region = prepared.regions[rule.rule_id]
+    zero = torch.zeros_like(policy["active"], dtype=front.dtype)
+    if not region["has_removed_material"]:
+        return {"gap": zero, "material_band": zero}, torch.zeros_like(policy["active"])
+    lower = prepared.constant((rule.rule_id, "lower_patch"), region["lower_patch"], front)
+    upper = prepared.constant((rule.rule_id, "upper_patch"), region["upper_patch"], front)
+    body_lower, body_upper = body.amin(-2), body.amax(-2)
+    possible = ((body_upper >= lower) & (body_lower <= upper)).all(-1) & policy["active"]
+
+    # Clip the actual segment in the target patch's XY rectangle. Endpoints
+    # outside the patch cannot impose extra gap requirements on a partial
+    # contact; a diagonal segment never becomes its enclosing rectangle.
+    half = _tensor(rule.patch_half_size, front)
+    start, delta = feature[..., 0, :], feature[..., 1, :]-feature[..., 0, :]
+    first, last = torch.zeros_like(zero), torch.ones_like(zero)
+    overlap = torch.ones_like(policy["active"])
+    for axis in (0, 1):
+        moving = delta[..., axis] != 0
+        divisor = torch.where(moving, delta[..., axis], torch.ones_like(zero))
+        left = (-half[axis]-start[..., axis])/divisor
+        right = (half[axis]-start[..., axis])/divisor
+        first = torch.maximum(first, torch.where(moving, torch.minimum(left, right), 0.))
+        last = torch.minimum(last, torch.where(moving, torch.maximum(left, right), 1.))
+        overlap &= moving | (start[..., axis].abs() <= half[axis])
+    overlap &= first <= last
+    heights = start[..., 2:3]+torch.stack((first.clamp(0., 1.), last.clamp(0., 1.)), -1)*delta[..., 2:3]
+    tolerance = rule.numerical_position_tolerance_m
+    gap = (torch.relu(rule.gap_bounds[0]-heights.amin(-1)-tolerance)
+           + torch.relu(heights.amax(-1)-rule.gap_bounds[1]-tolerance))
+    gap = torch.where(possible & overlap, gap, 0.)
+
+    # The overlap of two complete AABBs encloses every possible body/source
+    # intersection. Evaluate the supporting-plane minimum over its eight
+    # corners analytically, without assuming a particular normal sign.
+    lo, hi = torch.maximum(body_lower, lower), torch.minimum(body_upper, upper)
+    minimum = (a*(torch.where(a >= 0, lo, hi)-feature[..., 0, :])).sum(-1)
+    depth = min(rule.modeling_allowance_m+tolerance,
+                tolerance/rule._native_edge_geometry["lateral_depth_ratio"])
+    # Round the permitted depth toward zero in the query dtype. Do not add
+    # epsilon again here: it has already been spent on the finite edge band.
+    permitted = torch.as_tensor(depth, dtype=front.dtype, device=front.device)
+    permitted = torch.nextafter(permitted, torch.zeros_like(permitted))
+    penetration = torch.where(possible, torch.relu(-minimum-permitted), 0.)
+    return {"gap": gap, "material_band": penetration}, possible
+# END no source-component enumeration, widened edge or additional solver is used.

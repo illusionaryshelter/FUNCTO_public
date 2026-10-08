@@ -1,9 +1,9 @@
-"""Confirm online sphere candidates against native robot solids on the CPU.
+"""Confirm online sphere candidates against registered native actor solids on the CPU.
 
 The frozen online field still performs broad-phase queries and owns every
 unknown-space, numerical-support and finite-contact constraint. This module
-only decides whether a positive robot/target sphere term also intersects the
-registered native robot solid. It prepares occupied-cell indices once, then
+only decides whether a positive registered actor/target sphere term also intersects the
+registered native solid. It prepares target spatial indices once, then
 queries only the native geometry/target pairs named by positive spheres.
 
 An observed target uses its original affine TSDF surface and negative source
@@ -26,6 +26,7 @@ from scipy.spatial.transform import Rotation
 from .online_geometry import FrozenESDF, FrozenPrimitives, OnlinePlanningScene
 from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES, require_host_memory
 from .robot_geometry_check import RobotGeometryChecker, _rigid_pose, _solid_axis_bounds
+from .native_owner_geometry import bind_native_owner_geometry, check_native_owner_material
 
 
 _CHUNK = 65_536
@@ -65,6 +66,9 @@ def _bounds(vertices, shape, pose):
         extent = shape.radius + shape.halfLength * np.abs(pose[:3, 2])
         return pose[:3, 3] - extent, pose[:3, 3] + extent
     return _solid_axis_bounds(vertices, shape, pose)
+
+
+
 
 
 class _PrimitiveContactCells:
@@ -148,7 +152,7 @@ class _PrimitiveContactCells:
 
 
 class NativeCollisionConfirmation:
-    """Request-owned native confirmation of positive robot sphere terms.
+    """Request-owned confirmation of registered robot and owner sphere terms.
 
     ``checker`` owns source-verified robot shapes. ``scene`` owns the exact
     frozen fields and native geometry/sphere/material identities. Construct
@@ -157,9 +161,9 @@ class NativeCollisionConfirmation:
     Raw executor latch IDs are insufficient: interval, finger uncertainty and
     arrival activation must already be resolved by OnlinePlanningScene.
 
-    A cleared target only authorizes clearing its robot collision component.
+    A cleared target only authorizes clearing the queried actor component.
     It cannot clear contact conditions, scene-update obligations, unknown
-    space, self collision, or collisions of moving non-robot actors.
+    space, self collision, or any unregistered actor's collisions.
     """
 
     def __init__(self, checker, scene):
@@ -182,17 +186,38 @@ class NativeCollisionConfirmation:
                 geometry_spheres.setdefault(name, set()).update(group['sphere_indices'])
         if set(self.sphere_geometry) != set(range(len(scene.robot_sphere_materials))):
             raise ValueError('Native collision bodies must cover the complete robot sphere layout')
-        self.rules = {rule.rule_id: rule for rule in scene.contacts if rule.actor == 'robot'}
+        # BEGIN complete known owners retain independent native/sphere identities.
+        self.owner_geometries = {}
+        self.actor_spheres = {'robot': self.sphere_geometry}
+        actor_groups = {'robot': geometry_spheres}
+        actor_materials = {'robot': scene.robot_sphere_materials}
+        registered = {actor for actor, _ in scene.native_world_collision_pairs.values()} - {'robot'}
+        for owner in scene.owners:
+            if owner.owner_id in registered:
+                geometry, spheres, groups = bind_native_owner_geometry(owner)
+                self.owner_geometries[owner.owner_id] = {name: _primitive(row[0]) for name, row in geometry.items()}
+                self.actor_spheres[owner.owner_id] = spheres
+                actor_groups[owner.owner_id] = groups
+                actor_materials[owner.owner_id] = owner.sphere_materials
+        self.rules = {rule.rule_id: rule for rule in scene.contacts}
+        # END unknown/incomplete owners have no confirmation path.
         self.geometry_rules = {}
         for rule in self.rules.values():
+            if rule.actor not in self.actor_spheres:
+                continue
             name = rule.online_material['native_geometry']
             # A partial set of a native body's spheres must not grant its
             # whole physical solid a permission intended for another subset.
-            if (name not in geometry_spheres or set(rule.sphere_indices) != geometry_spheres[name]
-                    or any(self.sphere_geometry[index] != (name,) for index in rule.sphere_indices)
-                    or scene.native_geometry_materials.get(name) != rule.material_id):
+            groups, spheres = actor_groups[rule.actor], self.actor_spheres[rule.actor]
+            labels = actor_materials[rule.actor]
+            if (name not in groups or set(rule.sphere_indices) != groups[name]
+                    or any(spheres[index] != (name,) for index in rule.sphere_indices)
+                    or any(index >= len(labels) or labels[index] != rule.material_id for index in rule.sphere_indices)
+                    or (rule.actor == 'robot' and scene.native_geometry_materials.get(name) != rule.material_id)):
                 raise ValueError('Finite native permission needs exact complete material/sphere ownership')
-            self.geometry_rules.setdefault((name, rule.target_owner), set()).add(rule.rule_id)
+            if rule.actor != 'robot':
+                check_native_owner_material(rule, self.owner_geometries[rule.actor][name])
+            self.geometry_rules.setdefault((rule.actor, name, rule.target_owner), set()).add(rule.rule_id)
         self.targets = {}
         queries = [('background', scene.background), *((owner.owner_id, owner.query) for owner in scene.owners)]
         for name, query in queries:
@@ -214,13 +239,14 @@ class NativeCollisionConfirmation:
             'scope': 'One frozen target index per request; no current simulator object truth'}
 
     def confirm(self, *, robot_state, candidates, owner_poses, effective_contact_rule_ids,
-                check_request=None):
+                check_request=None, actor='robot'):
         """Confirm only supplied positive sphere/native-geometry target pairs.
 
         ``candidates`` maps target owner IDs (or ``background``) to positive
-        robot sphere indices. ``owner_poses`` maps the SAME queried owners to
+        sphere indices in the explicitly selected actor. ``owner_poses`` maps the SAME queried owners to
         world-from-owner transforms. Background already uses world axes.
-        ``robot_state`` is RobotGeometryChecker.query output; no new FK runs.
+        ``robot_state`` is RobotGeometryChecker.query output for robot candidates;
+        owner candidates use owner_poses and their registered local primitives.
         Unsupported/numerical-boundary results remain unresolved and cannot
         erase the original candidate. Finite collisions stop their pair early.
         ``check_request`` may reuse the caller's existing deadline/cancellation
@@ -231,35 +257,46 @@ class NativeCollisionConfirmation:
             raise TypeError('A supplied request guard must be callable')
         active = frozenset(effective_contact_rule_ids)
         if not active <= self.rules.keys():
-            raise ValueError('Effective contact policies must identify registered robot rules')
+            raise ValueError('Effective contact policies must identify registered scene rules')
+        # BEGIN the actor is explicit; a target name never chooses its solid.
+        if actor not in self.actor_spheres:
+            raise ValueError('Native confirmation actor lacks complete registered geometry')
+        sphere_geometry = self.actor_spheres[actor]
+        # END owner and robot indices occupy distinct inventories.
         pairs, stats = [], {'native_pairs': 0, 'coal_queries': 0, 'nearby_cells': 0, 'permitted_cells': 0,
                             'nearby_source_components': 0, 'retained_source_components': 0}
         for target_name, indices in candidates.items():
             # BEGIN native queries consume only the scene's declared world terms.
-            if (target_name not in self.targets or 'collision/robot/'+target_name
-                    not in self.scene.robot_world_collision_components):
+            if (target_name not in self.targets or f'collision/{actor}/{target_name}'
+                    not in self.scene.native_world_collision_components):
                 raise ValueError('Candidate target is absent from this frozen request')
             # END a target alias can never confer authority over self collision.
             indices = tuple(sorted(set(indices)))
-            if any(type(index) not in (int, np.int64, np.int32) or index not in self.sphere_geometry for index in indices):
-                raise ValueError('Candidate must name a registered robot sphere index')
+            if any(type(index) not in (int, np.int64, np.int32) or index not in sphere_geometry for index in indices):
+                raise ValueError('Candidate must name a registered actor sphere index')
             if not indices:
                 continue
             pose = np.eye(4) if target_name == 'background' else _rigid_pose(owner_poses[target_name], 'world from current owner')
             owner_world = np.linalg.inv(pose)
-            geometries = sorted({name for index in indices for name in self.sphere_geometry[index]})
+            geometries = sorted({name for index in indices for name in sphere_geometry[index]})
             target = self.targets[target_name]
             for name in geometries:
                 if check_request is not None:
                     check_request()
                 stats['native_pairs'] += 1
-                actor_pose = owner_world @ _rigid_pose(robot_state['geometry_poses'][name], 'world from native robot solid')
-                _, shape, _, _ = self.checker._geometries[name]
-                vertices = self.checker._solid_vertices[name]
+                # BEGIN use this query's already-resolved owner attachment/release pose.
+                if actor == 'robot':
+                    actor_pose = owner_world @ _rigid_pose(robot_state['geometry_poses'][name], 'world from native robot solid')
+                    _, shape, _, _ = self.checker._geometries[name]
+                    vertices = self.checker._solid_vertices[name]
+                else:
+                    shape, vertices, local_pose = self.owner_geometries[actor][name]
+                    actor_pose = owner_world @ _rigid_pose(owner_poses[actor], 'world from current actor') @ local_pose
+                # END no reference waypoint or simulator pose substitutes for attachment FK.
                 bounds = _bounds(vertices, shape, actor_pose)
-                rules = sorted(active & self.geometry_rules.get((name, target_name), set()))
-                record = {'target_owner': target_name, 'actor_geometry': name,
-                    'sphere_indices': [int(index) for index in indices if name in self.sphere_geometry[index]],
+                rules = sorted(active & self.geometry_rules.get((actor, name, target_name), set()))
+                record = {'actor': actor, 'target_owner': target_name, 'actor_geometry': name,
+                    'sphere_indices': [int(index) for index in indices if name in sphere_geometry[index]],
                     'effective_contact_rule_ids': rules, 'status': 'clear', 'coal_queries': 0,
                     'minimum_queried_distance_m': None}
                 pairs.append(record)
@@ -340,11 +377,11 @@ class NativeCollisionConfirmation:
             'collision_targets': [name for name, values in statuses.items() if 'collision' in values],
             'unresolved_targets': [name for name, values in statuses.items() if 'unresolved' in values],
             'statistics': stats,
-            'scope': 'Native robot solids against frozen observed source components or calibrated primitives at one state; finite source-component permissions; other scene constraints remain owned by the caller'}
+            'scope': 'Registered native actor solids against frozen observed source components or calibrated primitives at one state; finite source-component permissions; other scene constraints remain owned by the caller'}
 # END candidates retain their original residual and every non-collision obligation.
 
 
-# BEGIN shared native confirmation of robot/world sphere candidates.
+# BEGIN shared native confirmation of registered actor/world sphere candidates.
 class OnlineCollisionConfirmation:
     """Confirm only positive sphere candidates; preserve every other constraint.
 
@@ -363,9 +400,10 @@ class OnlineCollisionConfirmation:
         # exclusions before reaching this boundary. Non-finite costs remain
         # failures; a finite positive candidate is the only confirmable input.
         # BEGIN the shared inventory bounds authority before any FK or geometry work.
-        confirmable = self.scene.robot_world_collision_components
+        pair_names = self.scene.native_world_collision_pairs
+        confirmable = frozenset(pair_names)
         if not set(evidence['targets']) <= confirmable:
-            raise ValueError('Native confirmation requires declared robot/world collision components')
+            raise ValueError('Native confirmation requires declared actor/world collision components')
         # END even a zero or nonfinite foreign term cannot enter this adapter.
         candidates = {}
         for name, value in evidence['targets'].items():
@@ -378,15 +416,16 @@ class OnlineCollisionConfirmation:
             if np.any(retained > 0):
                 candidates[name] = retained
             # END a NaN beside a positive sphere keeps the original failed term.
-        self.last_report = {'scope': 'native robot solids against the same frozen observed geometry',
+        self.last_report = {'scope': 'registered native actor solids against the same frozen observed geometry',
                             'candidate_states': 0, 'states': []}
         if not candidates:
             return costs
         if self.engine is None:
             self.engine = NativeCollisionConfirmation(self.validator.checker, self.scene)
-        if evidence['joint_position'] is None or not evidence['joint_names']:
+        needs_robot = any(pair_names[name][0] == 'robot' for name in candidates)
+        if needs_robot and (evidence['joint_position'] is None or not evidence['joint_names']):
             raise ValueError('Native confirmation requires this query\'s complete named robot coordinates')
-        joints = evidence['joint_position'].detach().cpu().numpy()
+        joints = None if not needs_robot else evidence['joint_position'].detach().cpu().numpy()
         fingers = (None if evidence['finger_positions'] is None else
                    evidence['finger_positions'].detach().cpu().numpy())
         poses = {name: (p.detach().cpu().numpy(), q.detach().cpu().numpy())
@@ -397,40 +436,50 @@ class OnlineCollisionConfirmation:
                                                        for value in candidates.values()]))
         result = dict(costs)
         for batch, index in locations:
-            named = dict(zip(evidence['joint_names'], joints[batch, index]))
-            if self.scene.gripper is not None:
-                named.update(zip(self.scene.gripper.joint_names, fingers[batch, index]))
-            if set(named) != set(self.validator.joint_names):
-                raise ValueError('Native confirmation cannot fill absent joints with a command or default')
-            robot = self.validator.checker.query(joint_names=self.validator.joint_names,
-                joint_positions=[named[name] for name in self.validator.joint_names],
-                T_reference_base=self.validator.T_reference_base, pairs=(), frames=[])
+            # BEGIN group this state's candidates by their explicit registered actor.
+            by_actor = {}
+            for name, value in candidates.items():
+                if np.any(value[batch, index] > 0):
+                    actor, target = pair_names[name]
+                    by_actor.setdefault(actor, {})[target] = np.flatnonzero(value[batch, index] > 0).tolist()
+            robot = None
+            if 'robot' in by_actor:
+                named = dict(zip(evidence['joint_names'], joints[batch, index]))
+                if self.scene.gripper is not None:
+                    named.update(zip(self.scene.gripper.joint_names, fingers[batch, index]))
+                if set(named) != set(self.validator.joint_names):
+                    raise ValueError('Native confirmation cannot fill absent joints with a command or default')
+                robot = self.validator.checker.query(joint_names=self.validator.joint_names,
+                    joint_positions=[named[name] for name in self.validator.joint_names],
+                    T_reference_base=self.validator.T_reference_base, pairs=(), frames=[])
+            # END an owner-only confirmation does not trigger redundant robot FK.
             owner_poses = {}
             for owner, (p, q) in poses.items():
                 pose = np.eye(4)
                 pose[:3, :3] = Rotation.from_quat(q[batch, index][[1, 2, 3, 0]]).as_matrix()
                 pose[:3, 3] = p[batch, index]
                 owner_poses[owner] = pose
-            by_owner = {name.removeprefix('collision/robot/'): np.flatnonzero(value[batch, index] > 0).tolist()
-                        for name, value in candidates.items() if np.any(value[batch, index] > 0)}
-            record = self.engine.confirm(robot_state=robot, candidates=by_owner,
-                owner_poses=owner_poses,
-                effective_contact_rule_ids=frozenset(name for name, active in effective.items()
-                                                     if bool(active[batch, index])),
-                check_request=self.check_request)
-            record['query_index'] = [int(batch), int(index)]
-            record['sphere_residuals'] = {name: float(costs[name][batch, index].item())
-                                         for name in candidates if name.removeprefix('collision/robot/') in by_owner}
-            self.last_report['states'].append(record)
-            for owner in record['cleared_targets']:
-                name = 'collision/robot/'+owner
-                # BEGIN a returned clear must preserve both declaration and query identity.
-                if name not in confirmable or owner not in by_owner or name not in result:
-                    raise ValueError('Native confirmation returned an unqueried collision target')
-                # END a checker result cannot enlarge the shared component inventory.
-                if result[name] is costs[name]:
-                    result[name] = costs[name].clone()
-                result[name][batch, index] = 0.
-        self.last_report['candidate_states'] = len(self.last_report['states'])
+            for actor, by_owner in by_actor.items():
+                record = self.engine.confirm(robot_state=robot, candidates=by_owner,
+                    owner_poses=owner_poses, actor=actor,
+                    effective_contact_rule_ids=frozenset(name for name, active in effective.items()
+                                                         if bool(active[batch, index])),
+                    check_request=self.check_request)
+                record['actor'] = actor
+                record['query_index'] = [int(batch), int(index)]
+                record['sphere_residuals'] = {name: float(costs[name][batch, index].item())
+                    for name in candidates if pair_names[name][0] == actor and pair_names[name][1] in by_owner}
+                self.last_report['states'].append(record)
+                for owner in record['cleared_targets']:
+                    name = f'collision/{actor}/{owner}'
+                    # BEGIN a returned clear preserves actor, target and query identity.
+                    if name not in confirmable or owner not in by_owner or name not in result:
+                        raise ValueError('Native confirmation returned an unqueried collision target')
+                    # END a checker result cannot enlarge the shared component inventory.
+                    if result[name] is costs[name]:
+                        result[name] = costs[name].clone()
+                    result[name][batch, index] = 0.
+        self.last_report['candidate_states'] = len(locations)
+        self.last_report['actor_queries'] = len(self.last_report['states'])
         return result
 # END no contact, coverage, unknown, controller or self-collision term is relaxed.

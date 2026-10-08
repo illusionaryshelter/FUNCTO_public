@@ -13,7 +13,7 @@ import mujoco
 import numpy as np
 
 from manipulation.contact_binding import (calibrate_box_material_features, build_material_contact_rules,
-                                         bind_grasp_contact_rules)
+                                         bind_grasp_contact_rules, rebind_grasp_contacts_for_holding)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 from robot_fixture import _geom_cover, bind_fixture_contact_materials
@@ -32,6 +32,60 @@ _FACES = [dict(material_id="left_inner", native_geometry="left_pad", face_axis=0
 
 
 class ContactBindingTests(unittest.TestCase):
+    # BEGIN handoff must preserve finite geometry under nonidentity owner frames.
+    def test_holding_handoff_rotates_only_selected_patch_and_preserves_all_bounds(self):
+        from scipy.spatial.transform import Rotation
+
+        declaration = dict(rule_id="left-contact", material_id="left_inner", actor="robot",
+            target_owner="old", interval=[.8, 1.], patch_origin=[.2, -.3, .4],
+            patch_axes=Rotation.from_euler("xyz", [.2, -.4, .1]).as_matrix().tolist(),
+            patch_half_size=[.01, .02], gap_bounds=[-.0001, .0002], normal_tolerance_rad=.01,
+            modeling_allowance_m=.0001, geometry_error_m=.0002, minimum_thickness_m=.008,
+            required=False, source="prior finite patch")
+        prior = dict(material_faces=deepcopy(_FACES), contacts=[declaration,
+            dict(declaration, rule_id="unrelated", material_id="right_inner", target_owner="unrelated")],
+            grasp_activations={"old-close": ["left-contact"], "unrelated-close": ["unrelated"]})
+        original = deepcopy(prior)
+        condition = dict(kind="observed_attachment", condition_id="current-held", carrier_id="new")
+        problem = SimpleNamespace(conditions=[condition], phases=[SimpleNamespace(metadata=dict(
+            carrier_id="new", attachment_condition_id="current-held", attachment_interval=[0., .7]))])
+        transform = np.eye(4)
+        transform[:3, :3] = Rotation.from_euler("xyz", [.4, -.2, .3]).as_matrix()
+        transform[:3, 3] = [-.2, .8, .1]
+        kwargs = dict(grasp_condition_id="old-close", old_owner_id="old", new_owner_id="new",
+            T_new_owner_old_owner=transform, problem=problem, source="measured FK and fixed attachment")
+        result = rebind_grasp_contacts_for_holding(prior, **kwargs)
+        row, = result["contacts"]
+        np.testing.assert_allclose(row["patch_origin"], transform[:3, :3] @ declaration["patch_origin"]+transform[:3, 3])
+        np.testing.assert_allclose(row["patch_axes"], transform[:3, :3] @ declaration["patch_axes"])
+        for name in ("patch_half_size", "gap_bounds", "normal_tolerance_rad", "modeling_allowance_m",
+                     "geometry_error_m", "minimum_thickness_m", "required"):
+            self.assertEqual(row[name], declaration[name])
+        self.assertEqual(row["target_owner"], "new")
+        self.assertEqual(row["interval"], [0., .7])
+        self.assertEqual(result["holding_activations"], {"current-held": ["left-contact"]})
+        self.assertEqual(result["material_faces"], [_FACES[0]])
+        self.assertNotIn("grasp_activations", result)
+        self.assertEqual(prior, original)
+        self.assertNotIn("contact_rule_ids", condition)
+        for changes in ({"grasp_condition_id": "absent"}, {"old_owner_id": "wrong"},
+                        {"new_owner_id": "absent"}):
+            with self.assertRaises(ValueError):
+                rebind_grasp_contacts_for_holding(prior, **{**kwargs, **changes})
+        bad = deepcopy(prior)
+        bad["contacts"][0]["actor"] = "old"
+        with self.assertRaisesRegex(ValueError, "finite robot patches"):
+            rebind_grasp_contacts_for_holding(bad, **kwargs)
+        bad = deepcopy(prior)
+        bad["material_faces"] = []
+        with self.assertRaisesRegex(ValueError, "native material face"):
+            rebind_grasp_contacts_for_holding(bad, **kwargs)
+        problem.phases.append(SimpleNamespace(metadata=dict(carrier_id="new",
+            attachment_condition_id="current-held", attachment_interval=[0., .8])))
+        with self.assertRaisesRegex(ValueError, "compiled held interval"):
+            rebind_grasp_contacts_for_holding(prior, **kwargs)
+    # END old contact selection never implies a new execution evidence latch.
+
     # BEGIN finite binding must be explicit and cannot partially mutate inputs.
     def test_finite_grasp_binding_is_explicit_atomic_and_independent(self):
         from test_manipulation_planning_scene import contact_rule

@@ -13,7 +13,7 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 from manipulation.contact_binding import build_material_contact_rules
 from recorded_owner_geometry import bind_box_owner_materials, prepare_box_owner
-from run_recorded_skill import (build_hand_owner_permissions, recorded_owner_observation_inputs,
+from run_recorded_skill import (recorded_owner_observation_inputs,
                                 install_complete_owner, require_feedback_identity)
 
 
@@ -133,20 +133,6 @@ def test_additional_owner_requires_a_valid_current_frame_and_cannot_claim_hidden
 # END additional partitions use the existing strict per-owner mask contract.
 
 
-def test_holding_permission_uses_only_the_compiled_attachment_interval():
-    problem = held_problem()
-    hand = dict(native_geometry_names=["finger_left", "finger_right"],
-                sphere_indices=[7, 8, 9], source="Explicit native hand")
-    rule, = build_hand_owner_permissions(problem, hand)
-    assert rule.interval == (0., .8)
-    assert rule.holding_condition_id == "actual-holding"
-    assert rule.arrival_goal_id == () and rule.activation_event == {}
-    assert rule.target_owner == "payload" and rule.sphere_indices == (7, 8, 9)
-    problem.conditions[0]["condition_id"] = "unrelated-observation"
-    with pytest.raises(ValueError, match="compiled attachment span"):
-        build_hand_owner_permissions(problem, hand)
-
-
 def test_owner_material_is_the_real_planar_face_with_its_full_solid_cover():
     prepared = complete_owner()
     binding = bind_box_owner_materials(prepared)
@@ -178,43 +164,45 @@ def test_owner_material_is_the_real_planar_face_with_its_full_solid_cover():
         build_material_contact_rules(combined, [dict(contact_declaration(), feature_points=points)])
 
 
-def test_complete_payload_installation_keeps_reference_background_coverage_and_hand_permission():
-    from manipulation.planning_scene import Attachment, CollisionOwner, ObservedSpace, PlanningScene
-    from test_manipulation_planning_scene import BoxQuery, SphereQuery, pose_path
+def test_complete_payload_installation_keeps_reference_background_coverage_and_finite_rules():
+    # BEGIN current online scenes retain observations without whole-body exceptions.
+    from manipulation.planning_scene import CollisionOwner, ObservedSpace
+    from manipulation.online_geometry import OnlinePlanningScene
+    from test_manipulation_planning_scene import pose_path
+    from test_online_geometry import field
+    from recorded_owner_geometry import create_box_owner
 
     prepared = complete_owner()
     binding = bind_box_owner_materials(prepared)
     contacts = build_material_contact_rules(
         dict(materials={}, owner_materials={"payload": binding["materials"]}), [contact_declaration()])
-    background = SphereQuery(("background",))
-    partial = CollisionOwner("payload", SphereQuery(("payload",)), pose_path(),
+    background = field()
+    partial = CollisionOwner("payload", field(owner="payload"), pose_path(),
                              "Current payload RGB-D", geometry_complete=False)
-    reference = CollisionOwner("reference", BoxQuery("reference"), pose_path(),
+    reference = CollisionOwner("reference", field(owner="reference"), pose_path(),
                                "Current reference RGB-D", geometry_complete=False)
     # BEGIN replacing the held body must retain independent static observations.
-    initial_support = CollisionOwner("initial_support", BoxQuery("initial_support"), pose_path(),
+    initial_support = CollisionOwner("initial_support", field(owner="initial_support"), pose_path(),
                                     "Current initial support RGB-D", geometry_complete=False)
     # END this contact target is not the functional placement reference.
     coverage = ObservedSpace(np.ones((3, 3, 3), bool), origin=[-1., -1., -1.], voxel_size=1.,
                              observation_ids=("current-view",), reference_frame="world")
-    permission, = build_hand_owner_permissions(held_problem(), dict(native_geometry_names=["hand"],
-        sphere_indices=[0], source="Current native hand geometry"))
-    observed = PlanningScene(background=background, owners=(partial, reference, initial_support), coverage=coverage,
+    observed = OnlinePlanningScene(background=background, owners=(partial, reference, initial_support), coverage=coverage,
         reference_frame="world", robot_sphere_materials=(None,), robot_geometry_source="Native test robot",
-        has_gripper=False, robot_owner_permissions=(permission,),
+        has_gripper=False, unknown_policy={"conditional_regions": [], "outside_regions": "forbid"},
         native_geometry_materials=binding["native_geometry_materials"])
     observed.observation_report = {"partitions": ["payload", "reference", "initial_support", "background"]}
-    owner = CollisionOwner("payload", SphereQuery(("payload",)), pose_path(), "Complete native test body",
-        geometry_complete=True, local_spheres=prepared["local_spheres"],
-        sphere_materials=tuple(binding["sphere_materials"]),
-        attachments=tuple(Attachment(**relation) for relation in prepared["attachments"]))
+    prepared["sphere_materials"] = binding["sphere_materials"]
+    owner = create_box_owner(prepared, contact_voxel_size_m=.001)
     result = install_complete_owner(observed, owner, contacts=contacts)
     assert result.owners == (owner, reference, initial_support)
     assert result.background is background and result.coverage is coverage
     assert result.observation_report is observed.observation_report
-    assert result.robot_owner_permissions == (permission,)
+    assert result.robot_owner_permissions == ()
+    assert result.unknown_policy == observed.unknown_policy
     assert result.contacts == contacts and result.native_geometry_materials == binding["native_geometry_materials"]
     assert observed.owners == (partial, reference, initial_support) and observed.contacts == ()
+    # END the replaced owner alone gains complete native box geometry.
 
 
 @pytest.mark.parametrize("change", ["partial", "nonface", "extra_points", "missing_cover", "overlap"])
@@ -291,10 +279,43 @@ def test_edge_permission_copies_native_dimension_without_expanding_contact_toler
     assert rule.normal_tolerance_rad == 1e-4
     assert rule.gap_bounds == (-1e-4, 1e-4)
     assert rule.numerical_position_tolerance_m == 1e-6
+    # BEGIN registered online geometry retains the same nonidentity owner map.
+    model = rule.online_material
+    assert model["kind"] == "native_box_edge_v1" and model["native_geometry"] == "base"
+    assert model["sphere_indices"] == list(rule.sphere_indices)
+    assert rule._native_edge_geometry["lateral_depth_ratio"] == pytest.approx(4/3)
+    from itertools import product
+    pose = np.asarray(model["T_actor_box"])
+    vertices = np.asarray(list(product((-1., 1.), repeat=3)))*model["half_size_m"]
+    np.testing.assert_allclose(rule._native_edge_geometry["vertices_actor"],
+        vertices @ pose[:3, :3].T+pose[:3, 3], rtol=0, atol=1e-15)
+    assert np.linalg.norm(pose[:3, 3]) > .1
+    assert not np.allclose(pose[:3, :3], np.eye(3))
+    # END source/owner translations and rotations are not silently identities.
     for changed in ({"feature_kind": "polygon"}, {"feature_points": [[0., 0., 0.]]*4},
                     {"feature_normal": [0., 0., -1.]}):
         with pytest.raises(ValueError, match="native binding"):
             build_material_contact_rules(combined, [{**declaration, **changed}])
+
+
+# BEGIN actor confirmation can validate all boxes, including nonmaterial ones.
+def test_complete_owner_serializes_exact_primitive_sphere_registration():
+    from recorded_owner_geometry import create_box_owner
+    prepared = complete_owner()
+    native = bind_box_owner_materials(prepared)
+    prepared["sphere_materials"] = native["sphere_materials"]
+    owner = create_box_owner(prepared, contact_voxel_size_m=.001)
+    primitives = owner.query.primitives
+    assert len(primitives) == len(prepared["cuboids"])
+    groups = {row["box_name"]: row for row in prepared["provenance"]["coverage_cells"]}
+    for box, primitive in zip(prepared["cuboids"], primitives):
+        group = groups[box["name"]]
+        assert primitive["pose"] == box["pose"] and primitive["dimensions"] == box["dims"]
+        assert primitive["native_binding"] == {"geometry_name": box["name"],
+            "sphere_indices": list(range(*group["sphere_range"])),
+            "subdivisions": group["subdivisions"], "source": prepared["source"]}
+    assert owner.query.record()["primitives"] == list(primitives)
+# END geometry provenance does not change the analytic primitive union.
 
 
 @pytest.mark.parametrize("changes", [

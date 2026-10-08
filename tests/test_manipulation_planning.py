@@ -1764,7 +1764,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
     def test_optimizer_retains_pending_world_candidate_and_binds_its_scene_evidence(self):
         from curobo._src.rollout.metrics import CostsAndConstraints, RolloutResult
         with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
-            fixture.scene.robot_world_collision_components = frozenset({"collision/robot/background"})
+            fixture.scene.native_world_collision_components = frozenset({"collision/robot/background"})
             calls = []
             def evaluate(spheres, p, *args, components_out, **kwargs):
                 calls.append(1)

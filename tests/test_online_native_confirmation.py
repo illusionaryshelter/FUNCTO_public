@@ -256,7 +256,7 @@ def test_world_component_inventory_excludes_self_even_when_an_owner_uses_that_na
     alias = scene.owners[0].query.clone_for_rollout()
     alias.owner_ids = frozenset(('self',))
     scene.owners += (replace(scene.owners[0], owner_id='self', query=alias),)
-    assert scene.robot_world_collision_components == frozenset((
+    assert scene.native_world_collision_components == frozenset((
         'collision/robot/background', 'collision/robot/part'))
     # The declared name set does not depend on a lazy checker being created,
     # and the native engine cannot reinterpret a self term as a world target.
@@ -279,7 +279,7 @@ def test_adapter_rejects_undeclared_components_before_creating_a_checker(tmp_pat
     adapter = _adapter(checker, scene)
     evidence = _candidate_evidence([[[value]]])
     evidence['targets'] = {name: evidence['targets']['collision/robot/part']}
-    with pytest.raises(ValueError, match='declared robot/world collision components'):
+    with pytest.raises(ValueError, match='declared actor/world collision components'):
         adapter({name: torch.tensor([[value]], dtype=torch.float64)}, evidence)
     assert adapter.engine is None
 
@@ -298,3 +298,161 @@ def test_adapter_cannot_clear_an_undeclared_or_unqueried_component(tmp_path, tar
         adapter({'collision/robot/part': original, 'collision/robot/'+target: other}, evidence)
     assert original.item() == .01 and other.item() == .02
 # END neither an input name nor a checker response can enlarge confirmation authority.
+
+
+# BEGIN registered attached boxes use the same native candidate confirmation.
+def _payload(scene, *, two_boxes=False):
+    rows, balls = [], []
+    for index, x in enumerate((0., .005) if two_boxes else (0.,)):
+        rows.append({'kind': 'cuboid', 'dimensions': [.0008]*3,
+            'pose': [x, 0., 0., 1., 0., 0., 0.],
+            'native_binding': {'geometry_name': f'payload_box_{index}', 'sphere_indices': [index],
+                'subdivisions': [1, 1, 1], 'source': 'complete synthetic Cartesian box cells'}})
+        balls.append([x, 0., 0., .018])
+    query = FrozenPrimitives(primitives=rows, owner_ids=('payload',), source='known synthetic payload')
+    owner = CollisionOwner('payload', query, scene.owners[0].pose_path, 'fixed observed attachment',
+        True, local_spheres=balls, sphere_materials=tuple(None for _ in balls), moving=True)
+    scene.owners += (owner,)
+    return owner
+
+
+def test_owner_proxy_clear_preserves_other_body_collision_and_current_actor_pose(tmp_path):
+    checker, scene = _setup(tmp_path)
+    _payload(scene, two_boxes=True)
+    engine = NativeCollisionConfirmation(checker, scene)
+    poses = {'part': np.eye(4), 'payload': np.eye(4)}
+    def query(ids):
+        return engine.confirm(robot_state=None, candidates={'part': ids}, owner_poses=poses,
+            effective_contact_rule_ids=(), actor='payload')
+    assert query([0])['cleared_targets'] == ['part']
+    assert query([0, 1])['collision_targets'] == ['part']
+    poses['payload'][0, 3] = .005
+    assert query([0])['collision_targets'] == ['part']
+    assert 'collision/payload/part' in scene.native_world_collision_components
+    assert 'collision/payload/payload' not in scene.native_world_collision_components
+
+
+@pytest.mark.parametrize('fault', ['missing_cell', 'undersized_sphere', 'overlap_indices', 'unbound_primitive'])
+def test_owner_confirmation_rejects_incomplete_or_false_sphere_registration(tmp_path, fault):
+    checker, scene = _setup(tmp_path)
+    owner = _payload(scene, two_boxes=True)
+    if fault == 'missing_cell':
+        owner.query.primitives[0]['native_binding']['subdivisions'] = [2, 1, 1]
+    elif fault == 'undersized_sphere':
+        owner.local_spheres[0, 3] = .0001
+    elif fault == 'overlap_indices':
+        owner.query.primitives[1]['native_binding']['sphere_indices'] = [0]
+    else:
+        del owner.query.primitives[1]['native_binding']
+        assert 'collision/payload/part' not in scene.native_world_collision_components
+        engine = NativeCollisionConfirmation(checker, scene)
+        with pytest.raises(ValueError, match='actor lacks complete registered geometry'):
+            engine.confirm(robot_state=None, candidates={'part': [0]}, owner_poses={},
+                effective_contact_rule_ids=(), actor='payload')
+        return
+    with pytest.raises(ValueError, match='Native owner'):
+        NativeCollisionConfirmation(checker, scene)
+
+
+def test_owner_adapter_uses_query_pose_without_robot_fk_and_keeps_contact_unknown(tmp_path, monkeypatch):
+    checker, scene = _setup(tmp_path)
+    _payload(scene)
+    evidence = _candidate_evidence([[[.01]]])
+    evidence['targets'] = {'collision/payload/part': evidence['targets']['collision/robot/part']}
+    evidence['owner_poses']['payload'] = evidence['owner_poses']['part']
+    evidence['joint_position'], evidence['joint_names'] = None, None
+    monkeypatch.setattr(checker, 'query', lambda **kw: pytest.fail('owner poses already came from this query'))
+    adapter = _adapter(checker, scene)
+    costs = {'collision/payload/part': torch.tensor([[.01]], dtype=torch.float64),
+        'unknown/forbidden/payload': torch.ones(1, 1), 'contact/material_band/edge': torch.ones(1, 1)}
+    result = adapter(costs, evidence)
+    assert result['collision/payload/part'].item() == 0.
+    assert result['unknown/forbidden/payload'] is costs['unknown/forbidden/payload']
+    assert result['contact/material_band/edge'] is costs['contact/material_band/edge']
+    assert adapter.last_report['candidate_states'] == 1
+    assert adapter.last_report['states'][0]['actor'] == 'payload'
+
+
+def test_registered_owner_box_geometry_and_sphere_partition_survive_scene_binding(tmp_path):
+    _, scene = _setup(tmp_path)
+    original = _payload(scene)
+    restored = OnlinePlanningScene.from_binding(scene.to_execution_binding())
+    current = next(owner for owner in restored.owners if owner.owner_id == 'payload')
+    assert current.query.primitives == original.query.primitives
+    assert restored.native_world_collision_components == scene.native_world_collision_components
+
+
+def _edge_payload(scene):
+    from test_online_contact import edge_rule
+    from scipy.spatial.transform import Rotation
+    rule = edge_rule()
+    material = rule.online_material
+    pose = np.asarray(material['T_actor_box'])
+    query = FrozenPrimitives(primitives=[{'kind': 'cuboid',
+        'dimensions': (2*np.asarray(material['half_size_m'])).tolist(),
+        'pose': [*pose[:3, 3], *Rotation.from_matrix(pose[:3, :3]).as_quat()[[3, 0, 1, 2]]],
+        'native_binding': {'geometry_name': 'edge_box', 'sphere_indices': [0],
+            'subdivisions': [1, 1, 1], 'source': 'one complete native box cell'}}],
+        owner_ids=('payload',), source='registered actual edge body')
+    owner = CollisionOwner('payload', query, scene.owners[0].pose_path, 'same-query owner pose', True,
+        local_spheres=[[*pose[:3, 3], .02]], sphere_materials=(rule.material_id,), moving=True)
+    scene.owners += (owner,)
+    scene.contacts = (rule,)
+    return rule, owner
+
+
+def test_edge_native_clearance_does_not_clear_forbidden_side_material_condition(tmp_path):
+    # The source point lies inside a shallow box wedge, not on the finite edge.
+    # A finite target permission can remove it from the forbidden field; the
+    # material-band term must independently retain the actual side violation.
+    checker, scene = _setup(tmp_path, query=_field(points=((0., .0002, .0003),)))
+    rule, owner = _edge_payload(scene)
+    scene = OnlinePlanningScene.from_binding(scene.to_execution_binding())
+    engine = NativeCollisionConfirmation(checker, scene)
+    poses = {'part': np.eye(4), 'payload': np.eye(4)}
+    blocked = engine.confirm(robot_state=None, candidates={'part': [0]}, owner_poses=poses,
+        effective_contact_rule_ids=(), actor='payload')
+    assert blocked['collision_targets'] == ['part']
+    from test_online_contact import policy
+    from manipulation.online_contact import native_material_conditions
+    current, normal = policy(rule)
+    terms, _ = native_material_conditions(rule, current, normal, scene.owners[0].query._contact_model)
+    assert terms['material_band'].item() > .00029
+    permitted = engine.confirm(robot_state=None, candidates={'part': [0]}, owner_poses=poses,
+        effective_contact_rule_ids={'edge'}, actor='payload')
+    assert permitted['cleared_targets'] == ['part']
+
+
+@pytest.mark.parametrize('fault', ['body_changed', 'cover_changed'])
+def test_scene_admission_validates_native_owner_even_before_any_collision_query(tmp_path, fault):
+    _, scene = _setup(tmp_path)
+    _, owner = _edge_payload(scene)
+    if fault == 'body_changed':
+        # Keep the declared edge and its proof internally valid while changing
+        # the actual solid; labels alone must not authorize this mismatch.
+        owner.query.primitives[0]['dimensions'][0] *= 1.1
+        message = 'material differs from its registered complete solid'
+    else:
+        owner.local_spheres[0, 3] = .0001
+        message = 'sphere does not enclose'
+    with pytest.raises(ValueError, match=message):
+        OnlinePlanningScene.from_binding(scene.to_execution_binding())
+
+
+@pytest.mark.parametrize('required', [False, True])
+@pytest.mark.parametrize('separated', [False, True])
+def test_optional_normal_only_constrains_possible_full_body_contact(tmp_path, required, separated):
+    # Rotate a pad 90 degrees: its side is inside the patch at the near pose,
+    # and the entire solid is separated at the far pose. A required contact
+    # keeps its normal requirement even when separated; an optional one does not.
+    contact = replace(_rule(), required=required)
+    _, scene = _setup(tmp_path, query=_field(points=((0., -.001, .0003),)), contacts=(contact,),
+        native=_box(center=(0., 0., .004), half=(.01, .01, .004)))
+    position = torch.tensor([[[.1 if separated else 0., 0., 0.]]], dtype=torch.float64)
+    angle = np.sqrt(.5)
+    quaternion = torch.tensor([[[angle, angle, 0., 0.]]], dtype=torch.float64)
+    body = torch.cat((position.unsqueeze(-2), torch.full((1, 1, 1, 1), .018, dtype=torch.float64)), -1)
+    terms = scene.components(body, position, quaternion, torch.full((1, 1), .5, dtype=torch.float64))
+    residual = terms['contact/normal/patch'].item()
+    assert (residual > 0) == (required or not separated)
+# END native clearance never changes finite contact or observation requirements.

@@ -585,6 +585,66 @@ class CollisionOwner:
         return self.pose_path.sample(((progress - start) / (end - start)).clamp(0, 1))
 
 
+# BEGIN native box-edge capability is checked against the complete source solid.
+def _native_box_edge_geometry(rule, material):
+    """Validate a real exposed box edge and derive its finite-band bound.
+
+    The two inward incident directions span the box cross section. A normal
+    strictly inside their outward normal cone exposes only the declared edge.
+    For inward depth d, lateral displacement is at most K*d. The derived K
+    therefore bounds an allowed normal band without inventing physical width
+    for the edge. All coordinates are actor-local, including translated and
+    rotated source boxes; no world pose participates in this registration.
+    """
+    pose = _pose_array(material["T_actor_box"], "native edge actor-from-box")
+    # The cone proof uses a rigid orthonormal basis. The general pose loader's
+    # user-input tolerance cannot silently turn a sheared solid into a box.
+    roundoff = 256*np.finfo(float).eps
+    rotation = pose[:3, :3]
+    if (not np.allclose(rotation.T @ rotation, np.eye(3), atol=roundoff, rtol=0)
+            or abs(np.linalg.det(rotation)-1.) > roundoff):
+        raise ValueError("Online native edge box pose must retain a rigid orthonormal rotation")
+    half = _array(material["half_size_m"], (3,), "native edge box half size")
+    axis, signs = material["edge_axis"], material["edge_signs"]
+    if (np.any(half <= 0) or type(axis) is not int or axis not in (0, 1, 2)
+            or not isinstance(signs, (list, tuple)) or len(signs) != 2
+            or any(type(sign) is not int or sign not in (-1, 1) for sign in signs)):
+        raise ValueError("Online edge must name a complete positive-size native box edge")
+    fixed = [index for index in range(3) if index != axis]
+    endpoints = np.zeros((2, 3))
+    endpoints[:, axis] = (-half[axis], half[axis])
+    endpoints[:, fixed] = np.asarray(signs)*half[fixed]
+    endpoints = endpoints @ pose[:3, :3].T+pose[:3, 3]
+    # This is a float64 geometry-consistency bound, not a contact allowance.
+    scale = max(1., float(np.abs(endpoints).max()), float(half.max()))
+    if (rule.feature_kind != "edge" or not np.allclose(
+            rule.feature_points, endpoints, atol=roundoff*scale, rtol=0)):
+        raise ValueError("Online material endpoints must equal the complete registered native edge")
+    normal = rule.feature_normal
+    adjacent = (np.eye(3)[fixed]*np.asarray(signs)[:, None]) @ pose[:3, :3].T
+    coefficients = adjacent @ normal
+    if (abs(np.linalg.norm(normal)-1.) > roundoff or np.any(coefficients <= roundoff)
+            or np.linalg.norm(coefficients @ adjacent-normal) > roundoff):
+        raise ValueError("Online edge normal must lie strictly inside its native supporting normal cone")
+    thickness = float(2*np.min(half[fixed]))
+    if not np.isclose(material["thickness_m"], thickness, atol=roundoff*scale, rtol=0):
+        raise ValueError("Online edge thickness scale must equal its thinner complete incident box dimension")
+    tangent = pose[:3, axis]
+    lateral = np.cross(normal, tangent)
+    ratios = np.abs(adjacent @ lateral)/coefficients
+    # Upward rounding makes the derived permitted depth no larger than its
+    # exact cone bound. A face-normal boundary is refused above, never widened.
+    slope = float(np.nextafter(ratios.max(), np.inf))
+    from itertools import product
+    vertices = np.asarray(list(product((-1., 1.), repeat=3)))*half
+    vertices = vertices @ pose[:3, :3].T+pose[:3, 3]
+    coordinates = (vertices-endpoints[0]) @ np.column_stack((tangent, lateral, normal))
+    return {"body_coordinates": coordinates, "lateral_depth_ratio": slope,
+            "vertices_actor": vertices, "adjacent_normals_actor": adjacent,
+            "normal_cone_coefficients": coefficients}
+# END no edge is padded to a polygon or assigned a fabricated solid thickness.
+
+
 @dataclass
 class ContactRule:
     """A material edge/polygon and owner patch permission, never a link exemption.
@@ -624,7 +684,7 @@ class ContactRule:
     # END existing polygon declarations retain their exact geometry semantics.
     # BEGIN explicit production material model, separate from source-audit features.
     # None remains meaningful only to the independent geometric audit. The
-    # online scene requires a source-bound complete planar extrusion record.
+    # online scene requires a source-bound complete planar extrusion or box edge.
     online_material: object = None
     # END no inferred planar model or whole-link contact fallback.
 
@@ -707,16 +767,26 @@ class ContactRule:
             value = self.online_material
             required = {"kind", "thickness_m", "native_geometry", "source",
                         "sphere_indices", "sphere_binding_source"}
-            if not isinstance(value, dict) or set(value) != required:
-                raise ValueError("Online material needs an explicit native extrusion and sphere binding")
-            if (value["kind"] != "native_planar_extrusion_v1" or self.feature_kind != "polygon"
-                    or not np.isscalar(value["thickness_m"]) or not np.isfinite(value["thickness_m"])
+            # BEGIN admit only the two explicitly proved native material models.
+            if not isinstance(value, dict):
+                raise ValueError("Online material needs an explicit native model and sphere binding")
+            kind = value.get("kind")
+            if kind == "native_box_edge_v1":
+                required |= {"T_actor_box", "half_size_m", "edge_axis", "edge_signs"}
+            elif kind != "native_planar_extrusion_v1" or self.feature_kind != "polygon":
+                raise ValueError("Online material must identify a supported complete native feature")
+            if set(value) != required:
+                raise ValueError("Online material must retain its exact native geometry and sphere binding fields")
+            if (not np.isscalar(value["thickness_m"]) or not np.isfinite(value["thickness_m"])
                     or value["thickness_m"] < self.minimum_thickness_m
                     or tuple(value["sphere_indices"]) != self.sphere_indices):
-                raise ValueError("Online material must bind this full polygon, physical thickness and exact sphere indices")
+                raise ValueError("Online material must bind its physical thickness scale and exact sphere indices")
             for name in ("native_geometry", "source", "sphere_binding_source"):
                 _text(value[name], f"online material {name}")
+            if kind == "native_box_edge_v1":
+                self._native_edge_geometry = _native_box_edge_geometry(self, value)
             self.online_material = deepcopy(value)
+            # END edge geometry caches are derived again on every record restore.
         # END legacy audit records do not acquire online capability implicitly.
 
 

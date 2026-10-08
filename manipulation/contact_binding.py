@@ -78,6 +78,81 @@ def bind_holding_contact_rules(problem, contacts, activations):
 # END binding identities never copy a previous close activation latch.
 
 
+# BEGIN retain finite grasp patches through an explicit rigid owner-frame handoff.
+def rebind_grasp_contacts_for_holding(previous_bindings, *, grasp_condition_id,
+        old_owner_id, new_owner_id, T_new_owner_old_owner, problem, source):
+    """Return declarations for a current attachment, without copying its evidence.
+
+    Only rules named by the selected previous grasp activation are transferred.
+    Robot material faces remain robot-local; target patch origins and axes are
+    rigidly mapped into the new owner's frame. The new compiled attachment's
+    phase interval determines permission lifetime. Callers still acquire the
+    current Holding evidence through the ordinary execution contract.
+    """
+    from .motion import _pose_array
+
+    if any(not isinstance(value, str) or not value.strip()
+           for value in (grasp_condition_id, old_owner_id, new_owner_id, source)):
+        raise ValueError("Finite Holding handoff requires explicit identities and transform provenance")
+    transform = _pose_array(T_new_owner_old_owner, "new-owner from old-owner contact mapping")
+    rotation, translation = transform[:3, :3], transform[:3, 3]
+    if (not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-12, rtol=0)
+            or abs(np.linalg.det(rotation)-1.) > 1e-12):
+        raise ValueError("Finite contact handoff must preserve a rigid owner-frame mapping")
+    if not isinstance(previous_bindings, dict):
+        raise ValueError("Finite Holding handoff requires the previous declared grasp bindings")
+    selected = previous_bindings.get("grasp_activations", {}).get(grasp_condition_id)
+    if (not isinstance(selected, (list, tuple)) or not selected
+            or any(not isinstance(name, str) or not name for name in selected)
+            or len(set(selected)) != len(selected)):
+        raise ValueError("Finite Holding handoff must select one explicit prior grasp activation")
+    declarations = previous_bindings.get("contacts", ())
+    identities = [row["rule_id"] for row in declarations]
+    if len(set(identities)) != len(identities) or not set(selected) <= set(identities):
+        raise ValueError("Selected prior grasp rules must have unique complete contact declarations")
+    by_id = dict(zip(identities, declarations))
+    conditions = [row for row in problem.conditions
+                  if row.get("kind") == "observed_attachment" and row.get("carrier_id") == new_owner_id]
+    if len(conditions) != 1:
+        raise ValueError("Finite Holding handoff needs exactly one current attachment for the new owner")
+    condition_id = conditions[0].get("condition_id")
+    if not isinstance(condition_id, str) or not condition_id:
+        raise ValueError("Current attachment must carry an explicit condition identity")
+    spans = {tuple(phase.metadata["attachment_interval"]) for phase in problem.phases
+             if phase.metadata.get("attachment_condition_id") == condition_id
+             and phase.metadata.get("carrier_id") == new_owner_id
+             and "attachment_interval" in phase.metadata}
+    if len(spans) != 1:
+        raise ValueError("Current attachment must retain one explicit compiled held interval")
+    interval = np.asarray(next(iter(spans)), dtype=float)
+    if (interval.shape != (2,) or not np.isfinite(interval).all()
+            or interval[0] < 0 or interval[1] <= interval[0]):
+        raise ValueError("Current attachment held interval must be finite and ordered")
+    contacts, material_ids = [], set()
+    for identity in selected:
+        row = deepcopy(by_id[identity])
+        if row.get("actor", "robot") != "robot" or row.get("target_owner") != old_owner_id:
+            raise ValueError("Selected grasp contacts must be finite robot patches for the declared old owner")
+        origin, axes = np.asarray(row["patch_origin"], float), np.asarray(row["patch_axes"], float)
+        if (origin.shape != (3,) or axes.shape != (3, 3) or not np.isfinite(origin).all()
+                or not np.isfinite(axes).all()
+                or not np.allclose(axes.T @ axes, np.eye(3), atol=1e-10, rtol=0)
+                or abs(np.linalg.det(axes)-1.) > 1e-10):
+            raise ValueError("Prior finite contact patch must retain a proper rigid frame")
+        row.update(actor="robot", target_owner=new_owner_id, interval=interval.tolist(),
+            patch_origin=(rotation @ origin+translation).tolist(),
+            patch_axes=(rotation @ axes).tolist(), source=f"{row['source']}; current Holding frame: {source}")
+        contacts.append(row)
+        material_ids.add(row["material_id"])
+    faces = previous_bindings.get("material_faces", ())
+    face_ids = [row["material_id"] for row in faces]
+    if len(set(face_ids)) != len(face_ids) or not material_ids <= set(face_ids):
+        raise ValueError("Transferred finite robot patches require their exact native material face declarations")
+    return {"material_faces": [deepcopy(row) for row in faces if row["material_id"] in material_ids],
+        "contacts": contacts, "holding_activations": {condition_id: list(selected)}, "source": source}
+# END only a new Holding condition activates these unchanged finite permissions.
+
+
 def calibrate_box_material_features(model, *, tcp_site, joint_positions,
                                     finger_joint_names, material_faces):
     """Return complete box faces and verified affine finger translations.
@@ -209,13 +284,18 @@ def build_material_contact_rules(material_binding, declarations):
         for name in feature_fields:
             row[name] = material[name]
         row["sphere_indices"] = tuple(row["sphere_indices"])
-        # BEGIN bind online planar capability only through source geometry.
+        # BEGIN bind online native capability only through its actor's source proof.
         if "online_material" in material:
             model = deepcopy(material["online_material"])
-            if not material.get("cover_certificate_path"):
+            # Robot covers retain their calibrated certificate. Complete rigid
+            # owners carry their independently declared Cartesian box-cell
+            # proof; neither actor borrows the other's native geometry names.
+            sphere_source = (material.get("cover_certificate_path") if actor == "robot"
+                             else material.get("sphere_binding_source"))
+            if not isinstance(sphere_source, str) or not sphere_source.strip():
                 raise ValueError("Online native material requires its verified collision-sphere cover binding")
             model.update(sphere_indices=list(row["sphere_indices"]),
-                         sphere_binding_source=material["cover_certificate_path"])
+                         sphere_binding_source=sphere_source)
             row["online_material"] = model
         # END source-audit features without capability remain audit-only.
         if row["minimum_thickness_m"] > material["native_thickness_m"]:
