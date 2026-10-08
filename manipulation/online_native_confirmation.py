@@ -200,6 +200,11 @@ class NativeCollisionConfirmation:
                 actor_groups[owner.owner_id] = groups
                 actor_materials[owner.owner_id] = owner.sphere_materials
         self.rules = {rule.rule_id: rule for rule in scene.contacts}
+        # BEGIN initial support uses its own frozen source inventory and actor.
+        # These are current-state relations, not native material-face rules.
+        # Their depth condition is retained independently by the scene.
+        self.initial_supports = scene._initial_support_models
+        # END no material identity or whole-target exemption is fabricated.
         # END unknown/incomplete owners have no confirmation path.
         self.geometry_rules = {}
         for rule in self.rules.values():
@@ -239,7 +244,7 @@ class NativeCollisionConfirmation:
             'scope': 'One frozen target index per request; no current simulator object truth'}
 
     def confirm(self, *, robot_state, candidates, owner_poses, effective_contact_rule_ids,
-                check_request=None, actor='robot'):
+                check_request=None, actor='robot', effective_initial_support_ids=()):
         """Confirm only supplied positive sphere/native-geometry target pairs.
 
         ``candidates`` maps target owner IDs (or ``background``) to positive
@@ -258,6 +263,11 @@ class NativeCollisionConfirmation:
         active = frozenset(effective_contact_rule_ids)
         if not active <= self.rules.keys():
             raise ValueError('Effective contact policies must identify registered scene rules')
+        # BEGIN only this query's registered initial-support activations apply.
+        support_active = frozenset(effective_initial_support_ids)
+        if not support_active <= self.initial_supports.keys():
+            raise ValueError('Effective initial support must identify registered scene relations')
+        # END another actor or target cannot borrow these component identities.
         # BEGIN the actor is explicit; a target name never chooses its solid.
         if actor not in self.actor_spheres:
             raise ValueError('Native confirmation actor lacks complete registered geometry')
@@ -295,9 +305,15 @@ class NativeCollisionConfirmation:
                 # END no reference waypoint or simulator pose substitutes for attachment FK.
                 bounds = _bounds(vertices, shape, actor_pose)
                 rules = sorted(active & self.geometry_rules.get((actor, name, target_name), set()))
+                # BEGIN resolve the explicit actor/target pair before filtering.
+                supports = sorted(identity for identity in support_active
+                    if self.initial_supports[identity].relation.actor == actor
+                    and self.initial_supports[identity].relation.target_owner == target_name)
+                # END ordinary robot, background and other-owner checks remain.
                 record = {'actor': actor, 'target_owner': target_name, 'actor_geometry': name,
                     'sphere_indices': [int(index) for index in indices if name in sphere_geometry[index]],
                     'effective_contact_rule_ids': rules, 'status': 'clear', 'coal_queries': 0,
+                    'effective_initial_support_ids': supports,
                     'minimum_queried_distance_m': None}
                 pairs.append(record)
                 if bounds is None:
@@ -329,6 +345,14 @@ class NativeCollisionConfirmation:
                     expanded = (bounds[0]-self.boundary, bounds[1]+self.boundary)
                     nearby = observed.component_indices(expanded)
                     ids = observed.component_indices(expanded, active_rule_ids=rules) if rules else nearby
+                    # BEGIN consume the identical prepared source IDs as the field.
+                    # A relation only removes its frozen finite entrance material;
+                    # it cannot expand its inventory as the actor moves later.
+                    for identity in supports:
+                        ids = np.setdiff1d(ids,
+                            self.initial_supports[identity].selected_component_ids,
+                            assume_unique=True)
+                    # END the separate relative-height residual is never cleared.
                     stats['nearby_source_components'] += len(nearby)
                     stats['retained_source_components'] += len(ids)
                     record.update(target_representation='observed_affine_tsdf_components',
@@ -432,6 +456,10 @@ class OnlineCollisionConfirmation:
                  for name, (p, q) in evidence['owner_poses'].items()}
         effective = {name: value.detach().cpu().numpy()
                      for name, value in evidence['effective_rules'].items()}
+        # BEGIN keep current-support evidence on this same query clock.
+        effective_supports = {name: value.detach().cpu().numpy()
+            for name, value in evidence['effective_initial_supports'].items()}
+        # END no activation survives into a later query or candidate.
         locations = np.argwhere(np.logical_or.reduce([np.any(value > 0, axis=-1)
                                                        for value in candidates.values()]))
         result = dict(costs)
@@ -464,6 +492,10 @@ class OnlineCollisionConfirmation:
                     owner_poses=owner_poses, actor=actor,
                     effective_contact_rule_ids=frozenset(name for name, active in effective.items()
                                                          if bool(active[batch, index])),
+                    # BEGIN native support permission matches the evaluated state.
+                    effective_initial_support_ids=frozenset(name for name, active in effective_supports.items()
+                                                            if bool(active[batch, index])),
+                    # END a successful confirmation clears collision terms only.
                     check_request=self.check_request)
                 record['actor'] = actor
                 record['query_index'] = [int(batch), int(index)]

@@ -3,6 +3,7 @@
 # BEGIN current snapshots, complete source faces and held intervals stay explicit.
 from copy import deepcopy
 from pathlib import Path
+import json
 import sys
 from types import SimpleNamespace
 
@@ -13,7 +14,7 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 from manipulation.contact_binding import build_material_contact_rules
 from recorded_owner_geometry import bind_box_owner_materials, prepare_box_owner
-from run_recorded_skill import recorded_owner_observation_inputs, require_feedback_identity
+from run_recorded_skill import load_contact_bindings, recorded_owner_observation_inputs, require_feedback_identity
 
 
 def held_problem():
@@ -57,6 +58,51 @@ def contact_declaration():
         patch_axes=np.eye(3), patch_half_size=[.04, .06], gap_bounds=(-.0001, .0001),
         normal_tolerance_rad=.001, modeling_allowance_m=.0001, geometry_error_m=.0001,
         minimum_thickness_m=.008, source="Current finite reference-local observed support patch")
+
+
+# BEGIN the actual recorded parser keeps initial support outside material binding.
+def initial_support_declaration():
+    return dict(relation_id="current-support", actor="payload", target_owner="initial_support",
+        interval=[0., .8], patch_origin=[0., 0., 0.], patch_axes=np.eye(3).tolist(),
+        patch_half_size=[.04, .06], source={"kind": "observed_plane_with_declared_initial_support",
+            "observation_ids": ["current"], "assumption": "Current payload rests on this observed plane",
+            "scope": "Finite initial support, preserving all other observed geometry"})
+
+
+def test_recorded_parser_preserves_independent_initial_support_and_material_declarations(tmp_path):
+    declaration = initial_support_declaration()
+    # An unrelated future material declaration passes through verbatim; the
+    # initial support relation has no material label, gap or normal tolerance.
+    inputs = dict(material_faces=[], contacts=[{"rule_id": "future-support"}],
+        initial_support_relations=[declaration], source="Current explicit contact observations")
+    path = tmp_path/"contacts.json"
+    path.write_text(json.dumps(inputs))
+    actual, (relation,) = load_contact_bindings(path)
+    assert actual == inputs
+    assert relation.relation_id == declaration["relation_id"]
+    assert relation.actor == "payload" and relation.target_owner == "initial_support"
+    assert tuple(relation.interval) == (0., .8)
+    assert relation.source == declaration["source"]
+    np.testing.assert_array_equal(relation.patch_axes, np.eye(3))
+
+
+@pytest.mark.parametrize("value", [None, {}, "support", ["support"]])
+def test_recorded_parser_rejects_unstructured_initial_support(value, tmp_path):
+    path = tmp_path/"contacts.json"
+    path.write_text(json.dumps(dict(material_faces=[], contacts=[], source="Current observation",
+        initial_support_relations=value)))
+    with pytest.raises(ValueError, match="list of typed relation records"):
+        load_contact_bindings(path)
+
+
+def test_recorded_parser_cannot_supply_an_initial_penetration_allowance(tmp_path):
+    declaration = dict(initial_support_declaration(), modeling_allowance_m=.007)
+    path = tmp_path/"contacts.json"
+    path.write_text(json.dumps(dict(material_faces=[], contacts=[], source="Current observation",
+        initial_support_relations=[declaration])))
+    with pytest.raises(TypeError):
+        load_contact_bindings(path)
+# END baseline height and source inventory must be computed by the scene.
 
 
 def test_explicit_feedback_identity_survives_copied_file_and_missing_id_is_rejected():

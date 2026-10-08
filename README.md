@@ -1025,6 +1025,21 @@ its finite patches and binds the new request's Holding condition; it does not
 copy the previous close-event latch.
 <!-- END native confirmation of registered actor/world sphere candidates. -->
 
+<!-- BEGIN current support is distinct from future placement material. -->
+`initial_support.InitialSupportRelation` describes an existing finite support
+between a complete attached owner and an independently observed static plane.
+It does not reuse a future placement's material edges, gap or normal targets.
+Preparation freezes only observed source components wholly inside the declared
+patch, below its plane and intersecting the owner's entrance native geometry.
+The differentiable field and native confirmation remove the same component
+IDs for that actor/target pair. A separate whole-owner minimum-height constraint
+prevents nominal penetration from increasing beyond the approximate entrance
+model; it does not certify physical penetration depth. Separation, rotation and
+return require no new phase or latch. Other obstacles and final placement
+conditions retain their checks. Frozen bindings store the relation and prepared
+field, and workspace admission includes both field and vertex-query memory.
+<!-- END current support does not redefine grasp or placement success. -->
+
 `planning_observation.build_scene_from_rgbd` creates this production model.
 `build_audit_scene_from_rgbd`, source TSDF geometry, complete-volume coverage
 and detailed source-scene component checkers are separate audit tools. The

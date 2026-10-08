@@ -1318,7 +1318,8 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
                          max_mapping_bytes=256*1024**2,max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
                          max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES,
                          native_geometry_materials=None,robot_owner_permissions=(),
-                         fine_regions=None,robot_collision_bodies=(),complete_owners=()):
+                         fine_regions=None,robot_collision_bodies=(),complete_owners=(),
+                         initial_support_relations=()):
     """Build observed fields and admit current complete owners exactly once.
 
     Every view requires ``self_filter`` with uint8 ``labels``, independent
@@ -1337,6 +1338,12 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     Only the remaining partitions allocate a Mapper. The supplied resolution
     must match each complete query's registered contact/field spacing; its
     geometry and native material registration are validated by the final scene.
+    # BEGIN initial support remains a separate current-state relation.
+    ``initial_support_relations`` describes finite support already present at
+    this request's entrance. It is passed to the same frozen scene together
+    with the complete actor geometry, without copying a future placement's
+    material identities, pose tolerances or required-contact conditions.
+    # END no observation, free-space evidence or complete owner is replaced.
     """
     from curobo.perception import MapperCfg
     from .online_geometry import OnlinePlanningScene
@@ -1483,6 +1490,9 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         reference_frame=reference_frame,robot_sphere_materials=robot_sphere_materials,
         robot_geometry_source=robot_geometry_source,unknown_policy=unknown_policy,
         contacts=contacts,gripper=gripper,has_gripper=has_gripper,
+        # BEGIN bind explicit current support alongside ordinary material rules.
+        initial_support_relations=tuple(initial_support_relations),
+        # END the online scene owns support geometry and acceptance semantics.
         robot_collision_bodies=robot_collision_bodies,native_geometry_materials=native_geometry_materials)
     # BEGIN retain the exact self-filter and per-owner exclusion evidence.
     scene.observation_report={'source':'current calibrated owner-partitioned RGB-D','partitions':reports,

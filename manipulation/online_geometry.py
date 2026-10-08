@@ -301,7 +301,8 @@ class OnlinePlanningScene:
                  robot_sphere_materials, robot_geometry_source, contacts=(), gripper=None,
                  has_gripper=True, unknown_policy, robot_collision_bodies=(),
                  native_geometry_materials=None, robot_owner_permissions=(),
-                 numerical_position_tolerance_m=1e-6, numerical_rotation_tolerance_rad=1e-6):
+                 numerical_position_tolerance_m=1e-6, numerical_rotation_tolerance_rad=1e-6,
+                 initial_support_relations=()):
         if robot_owner_permissions:
             raise ValueError('Whole robot/owner permissions are not admitted online')
         if not isinstance(background, FrozenESDF) or any(not isinstance(o.query, FrozenESDF) for o in owners):
@@ -377,6 +378,34 @@ class OnlinePlanningScene:
             # native_geometry_names is a fixed-installation collision alias,
             # not a general owner material registry and cannot be borrowed here.
             # END arbitrary sphere labels do not establish a planar solid.
+        # BEGIN current support is independent of future native material goals.
+        self._bind_initial_supports(initial_support_relations)
+        # END no precise future gap/normal is imposed on an existing support.
+
+    def _bind_initial_supports(self, relations, records=None):
+        """Prepare or restore request-local support without changing its pose."""
+        from .initial_support import InitialSupportRelation, PreparedInitialSupport
+
+        relations = tuple(relations)
+        if (len(relations) > 32 or any(not isinstance(row, InitialSupportRelation) for row in relations)
+                or len({row.relation_id for row in relations}) != len(relations)
+                or len({(row.actor, row.target_owner) for row in relations}) != len(relations)
+                or {row.relation_id for row in relations} & {row.rule_id for row in self.contacts}):
+            raise ValueError('Initial supports need distinct bounded relation IDs and actor/target pairs')
+        owners = {owner.owner_id: owner for owner in self.owners}
+        if any(row.actor not in owners or row.target_owner not in owners for row in relations):
+            raise ValueError('Initial support must identify current scene owners')
+        if any((row.actor, row.target_owner) == (rule.actor, rule.target_owner)
+               for row in relations for rule in self.contacts):
+            raise ValueError('One actor/target pair cannot mix initial support and precise material contacts')
+        if records is not None and set(records) != {row.relation_id for row in relations}:
+            raise ValueError('Frozen initial support must retain every relation preparation')
+        self.initial_support_relations = relations
+        self._initial_support_models = {row.relation_id: PreparedInitialSupport(
+            row, owners[row.actor], owners[row.target_owner], self.numerical_position_tolerance_m,
+            record=None if records is None else records[row.relation_id]) for row in relations}
+        self.required_progress_anchors = tuple(sorted(set(self.required_progress_anchors) |
+            {value for row in relations for value in row.interval}))
 
     # BEGIN one explicit component inventory identifies native-confirmable proposals.
     @property
@@ -685,7 +714,7 @@ class OnlinePlanningScene:
         # Optimizer calls keep their differentiable sphere costs and allocate
         # none of this diagnostic state. Confirmation never creates permission.
         confirmation = None if native_confirmation is None else {
-            'targets': {}, 'effective_rules': {}, 'joint_position': joint_position,
+            'targets': {}, 'effective_rules': {}, 'effective_initial_supports': {}, 'joint_position': joint_position,
             'joint_names': joint_names, 'finger_positions': None, 'owner_poses': {}}
         # BEGIN compute the bounded actor/target inventory once per query.
         confirmable = frozenset() if confirmation is None else self.native_world_collision_components
@@ -846,6 +875,19 @@ class OnlinePlanningScene:
                     if rule.required:
                         costs[f'contact/required/{rule.rule_id}'] = owner.query.required_contact(rule,policy)*policy['active']
                 values, gap = owner.query.contact_query(local,policies) if policies else (owner.query(local),torch.zeros_like(local[...,3]))
+                # BEGIN existing support removes only its entrance source subset.
+                # The whole-owner relative height remains a separate constraint;
+                # native confirmation cannot erase it with a collision verdict.
+                for model in self._initial_support_models.values():
+                    relation = model.relation
+                    if relation.actor != actor or relation.target_owner != owner.owner_id:
+                        continue
+                    active, residual = model.components(actor_pose, poses[owner.owner_id], progress)
+                    costs[f'initial_support/depth/{relation.relation_id}'] = residual
+                    values = model.collision_values(local, values, active)
+                    if confirmation is not None:
+                        confirmation['effective_initial_supports'][relation.relation_id] = active
+                # END no latch, prescribed lift pose or future material rule enters.
                 max_constraint(gap, f'unsupported/contact/{actor}/{owner.owner_id}', actor)
                 if actor == 'robot' and owner.robot_excluded_spheres:
                     values = values.clone()
@@ -879,6 +921,9 @@ class OnlinePlanningScene:
         # A read-only clone shares its array/cache identity. A distinct field
         # with equal contents still owns separate storage and is counted twice.
         fields = [self.background]+[o.query for o in self.owners]
+        # BEGIN each finite initial-support field participates in shared budgets.
+        fields += [model.query for model in self._initial_support_models.values() if model.query is not None]
+        # END its observed source is shared by identity with the original owner.
         sources, ordinary_caches, contact_models, observed_sources = {}, {}, {}, {}
         for query in fields:
             sources[id(query.distance)] = query.distance.nbytes
@@ -907,12 +952,21 @@ class OnlinePlanningScene:
         coverage_cells = sum(cover._distance_squared.numel() for cover in coverages.values())
         # END both fields need float32/float64 caches under the existing bound.
         source_bytes = sum(sources.values()) + sum(observed_sources.values()) + coverage_cells * 4
+        # BEGIN frozen support IDs, native vertices and dtype constants are small
+        # but explicit; they do not multiply by optimizer batch or horizon.
+        source_bytes += sum(model.selected_component_ids.nbytes + model.actor_vertices.nbytes * 3
+                            for model in self._initial_support_models.values())
+        # END field arrays themselves are already counted in fields above.
         sampled_elements = sum(ordinary_caches.values()) + sum(
             model.storage_nbytes // 4 for model in contact_models.values())
         # Reserve both dtypes on the CPU and on the one permitted GPU. CPU
         # coverage float32 aliases its source tensor; its float64 copy is new.
         constants = 65536 * (len(coverages) + len(ordinary_caches) + sum(
             len(model.rule_records) for model in contact_models.values()))
+        # BEGIN both dtype caches include the complete native support vertices.
+        constants += sum(model.actor_vertices.nbytes * 2 + 65536
+                         for model in self._initial_support_models.values())
+        # END these small tensors are shared, not copied for each state.
         if self.gripper is not None and self.gripper.self_collision_model is not None:
             constants += self.gripper.self_collision_model.storage_nbytes*4
         cpu_shared = source_bytes + sampled_elements * (4 + 8) + coverage_cells * 8 + constants
@@ -943,6 +997,13 @@ class OnlinePlanningScene:
             len(owner.local_spheres) for owner in self.owners if owner.moving)
         coverage_states = int(batch)*int(horizon)*coverage_spheres
         cpu_live, gpu_live = live+256*coverage_states, live+128*coverage_states
+        # BEGIN two differentiable rigid transforms and a minimum inspect the
+        # full native support vertex set at every queried batch/time state.
+        support_states = int(batch)*int(horizon)*sum(len(model.actor_vertices)
+            for model in self._initial_support_models.values())
+        cpu_live += 512*support_states
+        gpu_live += 256*support_states
+        # END the field cache alone does not account for this autograd scratch.
         # BEGIN explicitly admit the larger checkpointed self-pair expansion.
         # Both ordered partitions execute sequentially; one chunk is live at
         # a time, including its recomputation during backward. The established
@@ -1040,6 +1101,10 @@ class OnlinePlanningScene:
             'robot_self_collision_pairs':deepcopy(self.robot_self_collision_pairs),
             'robot_self_collision_padding':list(self.robot_self_collision_padding),
             'background':self.background.record(),'owners':owners,'contacts':_plain([asdict(r) for r in self.contacts]),
+            # BEGIN an empty inventory means no current support capability.
+            'initial_support_relations':[row.record() for row in self.initial_support_relations],
+            'initial_support_preparation':{name:model.record() for name,model in self._initial_support_models.items()},
+            # END exact prepared source IDs and arrays survive scene restoration.
             'gripper':hand_record,'has_gripper':self.has_gripper,'unknown_policy':deepcopy(self.unknown_policy),
             'robot_collision_bodies':_plain(self.robot_collision_bodies),'native_geometry_materials':deepcopy(self.native_geometry_materials),
             'grasp_contact_activations':deepcopy(self.grasp_contact_activations),
@@ -1087,6 +1152,11 @@ class OnlinePlanningScene:
             robot_collision_bodies=row['robot_collision_bodies'],native_geometry_materials=row['native_geometry_materials'],
             numerical_position_tolerance_m=row['numerical_position_tolerance_m'],
             numerical_rotation_tolerance_rad=row['numerical_rotation_tolerance_rad'])
+        # BEGIN restore the optional support capability with its frozen binding.
+        from .initial_support import InitialSupportRelation
+        initial = tuple(InitialSupportRelation(**value) for value in row['initial_support_relations'])
+        scene._bind_initial_supports(initial, row['initial_support_preparation'])
+        # END ordinary scenes legitimately carry an empty support inventory.
         scene.bind_online_robot(robot_sphere_geometry=row['robot_sphere_geometry'],
             robot_self_collision_pairs=row['robot_self_collision_pairs'],robot_self_collision_padding=row['robot_self_collision_padding'],
             robot_model=row['robot_model'])

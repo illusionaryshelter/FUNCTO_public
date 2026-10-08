@@ -269,7 +269,7 @@ class FrozenObservedGeometry:
         mask = np.repeat(selected, np.diff(self.surface_offsets))
         return _readonly(np.unique(self.surface_vertices[mask], axis=0))
 
-    def distance_field(self, origin, shape, voxel_size, active_rule_ids=()):
+    def distance_field(self, origin, shape, voxel_size, active_rule_ids=(), *, excluded_component_ids=()):
         """Rasterize the retained source and return a conservative proposal field.
 
         Component AABBs over-cover the source. Grid cells intersecting those
@@ -288,6 +288,17 @@ class FrozenObservedGeometry:
             raise ValueError('Observed proposal field needs a bounded finite XYZ sample grid')
         shape = tuple(int(value) for value in shape)
         ids = self.component_indices(None, active_rule_ids)
+        # BEGIN a separately bound initial support uses exact source identities.
+        # The caller established entrance native intersection and finite plane
+        # scope. This operation never turns an arbitrary grid cell into material.
+        excluded = np.asarray(excluded_component_ids)
+        if excluded.size:
+            if (excluded.ndim != 1 or excluded.dtype.kind not in 'iu'
+                    or np.any(excluded < 0) or np.any(excluded >= self.component_count)
+                    or len(np.unique(excluded)) != len(excluded)):
+                raise ValueError('Excluded observed components must be distinct current source identities')
+            ids = ids[np.isin(ids, excluded, assume_unique=True, invert=True)]
+        # END ordinary fields and existing material-rule subsets are unchanged.
         if not len(ids):
             return None
         # Silent clipping would omit source material and destroy the lower

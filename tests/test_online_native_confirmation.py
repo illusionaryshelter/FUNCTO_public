@@ -202,7 +202,9 @@ def _candidate_evidence(values):
         'joint_position': torch.zeros((batch, horizon, 1), dtype=torch.float64), 'joint_names': ['slide'],
         'finger_positions': None,
         'owner_poses': {'part': (torch.zeros((batch, horizon, 3), dtype=torch.float64), quaternion)},
-        'effective_rules': {}}
+        # BEGIN the scene explicitly emits both contact inventories.
+        'effective_rules': {}, 'effective_initial_supports': {}}
+        # END an ordinary scene has an empty initial-support inventory.
 
 
 def test_adapter_only_clears_confirmed_collision_and_keeps_original_other_terms(tmp_path):

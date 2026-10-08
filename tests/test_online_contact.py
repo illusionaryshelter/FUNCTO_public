@@ -571,6 +571,7 @@ def test_workspace_counts_unique_source_arrays_and_both_float_caches_on_cpu_and_
     # END the storage size and resource contract are unchanged.
     # BEGIN resource fixture includes the bound scene's empty integer partitions.
     scene = SimpleNamespace(background=query, owners=(), coverage=coverage, robot_sphere_materials=("pad",), gripper=None,
+                            _initial_support_models={},
                             # BEGIN empty policy shares the original coverage allocation.
                             _permitted_coverage=coverage, unknown_policy={'conditional_regions': []},
                             # END a second policy field is tested with real online scenes.

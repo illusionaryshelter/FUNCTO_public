@@ -47,6 +47,32 @@ def owner_voxel_sizes(arguments, owner_ids):
 # END no object name, dataset or extent selects an implicit resolution.
 
 
+# BEGIN typed initial support is a separate recorded declaration channel.
+def load_contact_bindings(path):
+    """Validate recorded contact input and construct independent support facts.
+
+    Ordinary contact material still binds through the native-material adapter.
+    Initial support carries observed plane evidence and an existing interval;
+    its entrance geometry and height baseline belong to scene construction.
+    """
+    from manipulation.initial_support import InitialSupportRelation
+
+    inputs = json.loads(Path(path).read_text())
+    required = {"material_faces", "contacts", "source"}
+    optional = {"grasp_activations", "holding_activations", "initial_support_relations"}
+    if (not isinstance(inputs, dict) or not required <= set(inputs)
+            or set(inputs)-required-optional):
+        raise ValueError("Contact bindings need material_faces, contacts, source and optional "
+                         "grasp_activations/holding_activations/initial_support_relations")
+    if not isinstance(inputs["source"], str) or not inputs["source"].strip():
+        raise ValueError("Contact bindings require a current evidence source")
+    declarations = inputs.get("initial_support_relations", [])
+    if not isinstance(declarations, list) or any(not isinstance(row, dict) for row in declarations):
+        raise ValueError("Initial support declarations must be a list of typed relation records")
+    return inputs, tuple(InitialSupportRelation(**row) for row in declarations)
+# END no nominal penetration or source-component inventory is caller supplied.
+
+
 # BEGIN explicit joint reference is guidance with no saved authorization.
 def load_joint_reference(path, problem):
     """Read a bounded named q/dq recording without changing current task goals.
@@ -445,7 +471,7 @@ def run(args):
         from recorded_owner_geometry import bind_box_owner_materials
         activations = [row for row in problem.conditions
                        if row.get("kind") in {"grasp_contact_activation", "observed_attachment"}]
-        contacts, pair_permissions = (), ()
+        contacts, pair_permissions, initial_support_relations = (), (), ()
         material_binding = {"robot_sphere_materials": [None]*sphere_count,
                             "native_geometry_materials": {}, "materials": {}, "owner_materials": {}}
         prepared = None if args.owner_geometry is None else json.loads(args.owner_geometry.read_text())
@@ -463,13 +489,9 @@ def run(args):
             # END complete local feature evidence survives even without contacts.
         report["contact_binding"] = {"policies": []}
         if args.contact_bindings is not None:
-            contact_inputs = json.loads(args.contact_bindings.read_text())
-            required = {"material_faces", "contacts", "source"}
-            if (not isinstance(contact_inputs, dict) or not required <= set(contact_inputs)
-                    or set(contact_inputs)-required-{"grasp_activations", "holding_activations"}):
-                raise ValueError("Contact bindings need material_faces, contacts, source and optional grasp_activations/holding_activations")
-            if not isinstance(contact_inputs["source"], str) or not contact_inputs["source"].strip():
-                raise ValueError("Contact bindings require a current evidence source")
+            # BEGIN the parser constructs support relations outside material rules.
+            contact_inputs, initial_support_relations = load_contact_bindings(args.contact_bindings)
+            # END the scene alone binds initial source geometry and height.
             if contact_inputs["material_faces"]:
                 robot_binding = bind_fixture_contact_materials(
                     fixture, robot, entrance_fk["sphere_indices_by_link"], feedback,
@@ -491,9 +513,14 @@ def run(args):
                 raise ValueError("Finite Holding activations require current attachment obligations")
             # END a finite patch cannot silently become an ungated grasp rule.
             report["contact_binding"]["policies"].append("explicit_finite_material_contacts")
+            # BEGIN diagnostics distinguish initial support from exact materials.
+            if initial_support_relations:
+                report["contact_binding"]["policies"].append("explicit_initial_planar_support")
+            # END this label does not change collision activation or Holding facts.
             report["contact_binding"].update(path=str(args.contact_bindings.resolve()),
                 source=contact_inputs["source"], materials=material_binding,
-                rule_ids=[rule.rule_id for rule in contacts])
+                rule_ids=[rule.rule_id for rule in contacts],
+                initial_support_relation_ids=[row.relation_id for row in initial_support_relations])
         if any(row.get("kind") == "grasp_contact_activation" and "contact_rule_ids" not in row
                for row in problem.conditions):
             raise ValueError("Grasp activation requires explicit finite material contact bindings")
@@ -612,6 +639,9 @@ def run(args):
             # Native owner material validation runs during initial construction;
             # no partial carrier scene or temporary contact subset is created.
             complete_owners=complete_owners, contacts=contacts,
+            # BEGIN initial support reaches the same production scene as materials.
+            initial_support_relations=initial_support_relations,
+            # END no recorded adapter substitutes a future placement ContactRule.
             # END owner-actor and robot-actor rules share the same validated scene.
             native_geometry_materials=material_binding["native_geometry_materials"],
             # BEGIN both independent and planner models retain the exact pair policy.
@@ -643,6 +673,9 @@ def run(args):
                 robot_sphere_materials=scene.robot_sphere_materials,
                 robot_collision_bodies=scene.robot_collision_bodies,
                 robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
+                # BEGIN installation augmentation preserves initial support identity.
+                initial_support_relations=scene.initial_support_relations,
+                # END reconstructing a scene cannot discard its support contract.
                 # BEGIN native identity survives fixed-installation augmentation.
                 native_geometry_materials=scene.native_geometry_materials,
                 # BEGIN fixed installation cannot drop the bound hand/owner permission.
