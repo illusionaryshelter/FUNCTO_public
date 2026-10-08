@@ -217,9 +217,13 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
 def empty_background(coverage):
     """No observed occupied sites inside this explicitly declared free fixture."""
     from manipulation.online_geometry import FrozenESDF
-    return FrozenESDF(np.ones(coverage.known_free.shape, dtype=np.float32),
-        origin=coverage.origin, voxel_size=coverage.voxel_size,
-        site_valid=np.zeros(coverage.known_free.shape, dtype=bool),
-        observed_sign=coverage.known_free, owner_ids=(),
+    # BEGIN the synthetic free fixture explicitly supplies no observed material.
+    from manipulation.online_observed_geometry import FrozenObservedGeometry
+    from manipulation.tsdf_geometry import tsdf_geometry_from_samples
+    empty = tsdf_geometry_from_samples(np.ones((1, 1, 1), np.float32), np.zeros((1, 1, 1), bool),
+        origin=coverage.origin, voxel_size=coverage.voxel_size, name='empty', source='synthetic empty source')
+    return FrozenESDF.from_source(FrozenObservedGeometry(empty['solids'][0]),
+        origin=coverage.origin, shape=coverage.known_free.shape, voxel_size=coverage.voxel_size, owner_ids=(),
         source="declared synthetic empty background; no recorded observation claim")
+    # END neither an arbitrary field value nor coverage mask creates a solid.
 # END physical unknown-space policy remains the separate finite coverage grid.

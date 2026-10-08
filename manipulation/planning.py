@@ -2686,6 +2686,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             self._dense_counts = None
             # BEGIN metric evidence is request-local and bound by tensor identity.
             self._scene_evidence = None
+            # BEGIN optimizer evidence belongs to exactly one completed forward.
+            self._optimizer_evidence = None
+            # END it is not a new metric or an execution authorization.
             # END optimizer/IK managers never supply collision recovery evidence.
             # BEGIN retain only aggregate last-evaluation counts, never states.
             self._query_counts = {"process_mode": self._process_mode}
@@ -2723,6 +2726,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             self._dense_counts = None
             # BEGIN a rebind invalidates the previous query's recovery evidence.
             self._scene_evidence = None
+            # BEGIN request/clock/anchor rebinding invalidates optimizer evidence.
+            self._optimizer_evidence = None
+            # END no previous curve supplies hard-constraint evidence.
             # END no old batch or owner binding may enter the new request.
             self._query_counts.clear()
             self._query_counts.update(process_mode=self._process_mode)
@@ -2755,6 +2761,43 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
 
         def set_dense_counts(self, counts):
             self._dense_counts = counts.reshape(-1).long()
+
+        # BEGIN same-forward hard evidence and fixed objective for candidate retention.
+        @property
+        def optimization_constraints(self):
+            return functional_constraints if self._process_mode == "trajectory_optimizer" else None
+
+        def optimizer_evidence(self, trajectories):
+            """Read original sampled hard constraints without another rollout.
+
+            PHR and centering/command preferences are optimization objectives,
+            despite residing in the native constraint collection. Their values
+            cannot certify or disqualify feasibility. Original task residuals
+            are retained before that substitution; native/scene constraints
+            still come from the identical forward. Dense validation is separate.
+            """
+            constraints = trajectories.costs_and_constraints
+            collection = constraints.constraints
+            if self._optimizer_evidence is None:
+                raise RuntimeError("Optimizer has no same-query hard-constraint evidence")
+            source, feasible, signed = self._optimizer_evidence
+            if ("functional_augmented_lagrangian" not in collection.names
+                    or collection.values[collection.names.index("functional_augmented_lagrangian")] is not source):
+                raise RuntimeError("Optimizer evidence belongs to a different native query")
+            objective_names = {"functional_augmented_lagrangian", "skill_pose_equality_preference",
+                               "gripper_command_preference", "verification_stop_preference"}
+            fixed_objective = source.new_zeros(source.shape[0])
+            for costs, hard in ((constraints.costs, False), (collection, True),
+                                (constraints.hybrid_costs_constraints, True)):
+                for name, value in zip(costs.names, costs.values):
+                    detached = value.detach().flatten(1)
+                    if hard and name not in objective_names:
+                        feasible = feasible & torch.isfinite(detached).all(-1) & (detached <= 0).all(-1)
+                    if name != "functional_augmented_lagrangian":
+                        fixed_objective = fixed_objective+detached.sum(-1)
+            feasible = feasible & torch.isfinite(fixed_objective)
+            return feasible, signed, fixed_objective
+        # END these tensors preserve query identity and never add a cost term.
 
         # BEGIN bind diagnostics only to the exact completed native metric query.
         def bind_scene_evidence(self, metrics):
@@ -2924,8 +2967,18 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 augmented = sum(functional_constraints.terms(signed).values(), q.new_zeros(batch))
                 folded_augmented = torch.cat((q.new_zeros((batch, horizon-1, 1)),
                                                augmented[:, None, None]), dim=1)
-                collection.add(folded_augmented * budget.constraint_weight,
-                               "functional_augmented_lagrangian")
+                # BEGIN retain the original task zero set before objective substitution.
+                augmented_cost = folded_augmented * budget.constraint_weight
+                collection.add(augmented_cost, "functional_augmented_lagrangian")
+                original_process = sum(process_terms.values(), torch.zeros_like(progress))
+                active = ordered(torch.cat((valid, anchor_valid.expand(batch, -1).bool()), 1))
+                original_process = torch.where(active, original_process, 0.).detach()
+                feasible = torch.isfinite(original_process).all(-1) & (original_process <= 0).all(-1)
+                for residual in signed.values():
+                    feasible = feasible & torch.isfinite(residual.detach()) & (residual.detach() <= 0)
+                self._optimizer_evidence = (augmented_cost, feasible,
+                                           {name: value.detach() for name, value in signed.items()})
+                # END the core consumes this evidence before any other forward.
                 # END original tolerance and first-arrival identity belong to the problem.
                 # BEGIN retain a gradient toward source-declared pose equalities.
                 # The problem owns equality-axis selection and its complete
@@ -3341,10 +3394,10 @@ class _CuroboPlanner:
         # BEGIN native callbacks inherit the admitted clock during construction.
         self.formal_clock = dict(initial_clock)
         # END construction cannot observe a missing or independently chosen clock.
-        # BEGIN continuation multipliers survive only this attempt's solver rebuilds.
+        # BEGIN each native solve owns independent per-seed block continuation.
         from .functional_augmented_lagrangian import FunctionalAugmentedLagrangian
         self.functional_constraints = FunctionalAugmentedLagrangian(problem.functional_constraint_keys)
-        # END all first-round seeds start from the same zero multiplier vector.
+        # END the core binds/reset parameters before evaluating an independent seed layout.
         self._manager_type = _process_manager_type(
             problem, scene, self.progress_map, self.anchors, budget,
             clock=self.formal_clock, seed_parameter=self.seed_parameter, robot_dict=self.robot_dict,
@@ -4429,7 +4482,7 @@ class _CuroboPlanner:
         return reports
     # END functional screening cannot itself authorize execution.
 
-    # BEGIN the selected curve alone advances the functional AL continuation.
+    # BEGIN collision recovery changes sample coverage within its existing solve budget.
     def promote_collision_witnesses(self, result):
         """Rebind every manager's exact queries before the one recovery solve."""
         if self._trajectory_configuration["use_cuda_graph"]:
@@ -4443,59 +4496,7 @@ class _CuroboPlanner:
                       anchor_count=len(self._manager_type.query_anchor_parameters()))
         return report
 
-    def update_functional_constraints(self, result):
-        """Measure signed event inequalities on the original regular cubic.
-
-        Use the same float32 Hermite anchors, complete ordered history and
-        functional-frame FK as the optimizer. This inexpensive constraint
-        measurement is neither source-geometry validation nor acceptance.
-        The next native solve clears curvature and evaluates the updated objective.
-        """
-        if result.batch_size != 1 or result.num_seeds != 1:
-            raise ValueError("Functional multipliers require one selected continuation curve")
-        if not self.functional_constraints.keys:
-            return {"changed": False, "reason": "no_functional_point_constraints"}
-        torch = self.torch
-        native = self.trajopt.get_active_js(result.js_solution)
-        # BEGIN the AL measurement uses the same ordered history as recovery.
-        pairs = self._manager_type.query_anchor_parameters()
-        # END adding collision times changes queries, not functional identities.
-        horizon = native.position.shape[-2]
-        self.check_request()
-        with torch.no_grad():
-            q = native.position.reshape(1, horizon, -1)
-            dq = native.velocity.reshape_as(q)
-            counts = torch.full((1,), horizon, device=q.device, dtype=torch.long)
-            u = torch.arange(horizon, device=q.device, dtype=q.dtype)[None]/(horizon-1)
-            s = _torch_interpolate(self.device_cfg.to_device(self.progress_map.u),
-                                   self.device_cfg.to_device(self.progress_map.s), u)
-            anchor_u = self.device_cfg.to_device(pairs[:, 0])[None]
-            anchor_s = self.device_cfg.to_device(pairs[:, 1])[None]
-            anchor_q, _ = _hermite_at_parameters(q, dq, native.dt, counts, anchor_u)
-            all_u = torch.cat((u, anchor_u), 1)
-            order = torch.argsort(all_u, dim=1, stable=True)
-            q = torch.cat((q, anchor_q), 1).gather(1, order[..., None].expand(-1, -1, q.shape[-1]))
-            progress = torch.cat((s, anchor_s), 1).gather(1, order)
-            times = all_u.gather(1, order)*self.formal_clock["duration"]
-            state = self._verification_fk.compute_kinematics(self.JointState.from_position(
-                q.contiguous(), joint_names=list(self.joint_names)))
-            index = state.tool_poses.tool_frames.index(self.problem.tool_link)
-            position, quaternion = self.problem.transform_tool_pose(
-                state.tool_poses.position[:, :, index], state.tool_poses.quaternion[:, :, index])
-            signed, _ = self.problem.functional_inequalities(
-                position, quaternion, progress, trajectory_time=times)
-            measurements = self.problem.measurements(position, quaternion, progress, trajectory_time=times)
-            measurements = {name: float(value.amax().item()) for name, value in measurements.items()
-                            if name.startswith(("function:", "coordinate:"))}
-        report = self.functional_constraints.update(signed)
-        report["measurements"] = measurements
-        report["measurement_scope"] = "selected regular cubic with exact first-arrival anchors"
-        return report
-
-    def reset_functional_constraints(self):
-        """An independent spatial initializer starts a new multiplier sequence."""
-        self.functional_constraints.reset()
-    # END solver rebuilds reset curvature and scalar-best records for the new objective.
+    # END functional multipliers are owned by each native solve's inner blocks.
 
     def _native_request(self, seed):
         """Bind real terminal poses or the task-only native constraint route."""
@@ -5314,11 +5315,9 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     diagnostics["collision_witness_update"] = promoted
                 if promoted is not None and promoted["changed"]:
                     recovery, stage = "collision_witnesses", "collision_witness_recovery"
-                    if planner.functional_constraints.keys:
-                        diagnostics["functional_update"] = planner.update_functional_constraints(native_result)
                     seeds = native_result.solution.detach().clone().expand(1, budget.trajectory_seeds, -1, -1).contiguous()
                     planner.seed_strategies = [attempt["seed_provenance"]]*budget.trajectory_seeds
-                # END no new witness leaves the original OMPL/AL decision intact.
+                # END no new witness leaves the existing bounded OMPL decision intact.
                 elif collision_failed and budget.search_seconds > 0:
                     recovery, stage = "ompl", "bounded_seed_search"
                     search_started = time.monotonic()
@@ -5329,15 +5328,11 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     if recovered is not None:
                         seeds = recovered
                         planner.seed_strategies = ["ompl"]*seeds.shape[1]
-                        planner.reset_functional_constraints()
                     else:
                         recovery = "ompl_failed"
-                elif planner.functional_constraints.keys:
-                    recovery, stage = "augmented_lagrangian", "functional_recovery"
-                    diagnostics["functional_update"] = planner.update_functional_constraints(native_result)
-                    seeds = native_result.solution.detach().clone().expand(1, budget.trajectory_seeds, -1, -1).contiguous()
-                    planner.seed_strategies = [attempt["seed_provenance"]]*budget.trajectory_seeds
-                if recovery in {"collision_witnesses", "ompl", "augmented_lagrangian"}:
+                # BEGIN functional AL updates consume only the main solve's native blocks.
+                if recovery in {"collision_witnesses", "ompl"}:
+                    # END no extra full solve is authorized by task residuals alone.
                     check("trajectory_solves")
                     consumed["trajectory_solves"] += 1
                     native_result, trajectory, attempt = select_candidate_with_accounting(planner.optimize(seeds))

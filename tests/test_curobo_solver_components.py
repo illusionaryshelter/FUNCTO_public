@@ -1,7 +1,7 @@
 """Exercise FUNCTO composition using native CPU L-BFGS and goal allocation."""
 
 # BEGIN regression coverage for the behavior moved out of third-party source.
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -21,6 +21,7 @@ from manipulation.curobo_solver_components import (
 from manipulation.physical_joint_domain import (
     CubicJointDomain, JointDomainInitializationError, JointPositionDomain,
 )
+from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
 
 
 class AnalyticRollout:
@@ -61,6 +62,186 @@ class NativeComponentTest(unittest.TestCase):
             device_cfg=self.device, config=SimpleNamespace(use_cuda_graph=False),
             optimizers=[optimizer], goal_registry_manager=GoalManager(self.device)))
         return solver, optimizer, rollouts
+
+    # BEGIN block updates exercise the real CPU native optimizer, not a fake loop.
+    def attach_functional_objective(self, rollouts, owner, residual):
+        for rollout in rollouts:
+            rollout.constraint_manager = rollout
+            rollout.optimization_constraints = owner
+            rollout.objective_offset = 0.
+
+            def evaluate(action, use_cuda_graph=False, rollout=rollout):
+                rollout.domain.validate(action)
+                fixed = ((action-1.)**2).sum((-1, -2))+rollout.objective_offset
+                signed = {"event": residual(action, owner.num_seeds)}
+                costs = fixed+owner.terms(signed)["event"]
+                result = SimpleNamespace(costs_and_constraints=SimpleNamespace(
+                    get_sum_cost_and_constraint=lambda sum_horizon: costs))
+                rollout.evidence = (result, signed, fixed)
+                return result
+
+            def evidence(result, rollout=rollout):
+                source, signed, fixed = rollout.evidence
+                self.assertIs(source, result)
+                feasible = torch.isfinite(signed["event"]) & (signed["event"] <= 0)
+                return feasible, {key: value.detach() for key, value in signed.items()}, fixed.detach()
+
+            rollout.evaluate_action = evaluate
+            rollout.optimizer_evidence = evidence
+
+    def test_original_100_steps_four_blocks_keep_seed_parameters_and_total_work(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        owner = FunctionalAugmentedLagrangian(("event",))
+        self.attach_functional_objective(rollouts, owner,
+            lambda action, count: action.new_tensor([1., -1.]).repeat_interleave(action.shape[0]//count))
+        bind_solver_components(solver, domain)
+        optimizer.update_num_problems(2)
+        optimizer.config.num_iters, optimizer.config.inner_iters = 100, 25
+        seed = torch.ones((2, 1, 1))
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+            result = optimizer.optimize(seed)
+        self.assertEqual(tuple(result.shape), tuple(seed.shape))
+        reports = optimizer._core.solve_diagnostics
+        self.assertEqual([row["functional_continuation"]["outer_updates"] for row in reports], [3, 3])
+        self.assertEqual([row["functional_continuation"]["penalty"] for row in reports], [200., 2.])
+        self.assertEqual(reports[0]["iterations"], 100)
+        self.assertEqual(reports[1]["iterations"], 25)
+        self.assertEqual([row["sampled_feasible_candidate"] for row in reports], [False, True])
+        self.assertEqual(reports[0]["recovery_attempts"], 4)
+        self.assertEqual(reports[1]["recovery_attempts"], 1)
+        self.assertEqual(optimizer.config.num_iters, 100)
+
+    def test_changed_objective_clears_only_its_row_and_preserves_cumulative_counters(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        optimizer.update_num_problems(2)
+        core, history = optimizer._core, optimizer._qn
+        state = core._create_initial_iteration_state(torch.ones((2, 1, 1)))
+        state.current_iteration.fill_(25)
+        core._iterations.fill_(25)
+        core._exhausted.fill_(True)
+        core._stalled_steps.fill_(25)
+        core._recovery_reports = [[{"accepted": False}], [{"accepted": False}]]
+        for name in ("s", "y", "rho", "alpha"):
+            getattr(history, name).fill_(3.)
+        peer = {field.name: getattr(state, field.name)[1].clone() for field in fields(state)
+                if isinstance(getattr(state, field.name), torch.Tensor)}
+        core._restart_changed_objective(state, torch.zeros((2, 1, 1)),
+            torch.tensor([7., 8.]), torch.tensor([[[2.]], [[3.]]]), torch.tensor([True, False]))
+        for name in ("s", "y", "rho", "alpha"):
+            self.assertEqual(float(getattr(history, name)[:, 0].abs().sum()), 0.)
+            self.assertTrue(bool((getattr(history, name)[:, 1] == 3.).all()))
+        for name, value in peer.items():
+            torch.testing.assert_close(getattr(state, name)[1], value)
+        torch.testing.assert_close(core._iterations, torch.tensor([25, 25]))
+        torch.testing.assert_close(state.current_iteration, torch.tensor([25, 25], dtype=state.current_iteration.dtype))
+        self.assertEqual(core._exhausted.tolist(), [False, True])
+        self.assertEqual(core._stalled_steps.tolist(), [0, 25])
+        self.assertEqual([len(rows) for rows in core._recovery_reports], [1, 1])
+        self.assertEqual(float(state.best_cost[0]), 7.)
+        self.assertEqual(float(history.grad_0[0]), 2.)
+
+    def test_feasible_particle_survives_lower_augmented_cost_and_resets_for_new_solve(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        owner = FunctionalAugmentedLagrangian(("event",))
+        self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        core._begin_functional_solve(torch.zeros((1, 1, 1)))
+        first = torch.tensor([[[-.5], [.5], [1.]]])
+        costs, _ = core._compute_cost_constraint_and_gradient(first)
+        self.assertLess(float(costs[0, 1].detach()), float(costs[0, 0].detach()))
+        torch.testing.assert_close(core._candidate_action, torch.tensor([[[-.5]]]))
+        core._compute_cost_constraint_and_gradient(torch.tensor([[[.1], [.2], [.3]]]))
+        torch.testing.assert_close(core._candidate_action, torch.tensor([[[-.5]]]))
+        owner.update({"event": torch.tensor([1.])})
+        core._compute_cost_constraint_and_gradient(torch.tensor([[[-.25], [.2], [.3]]]))
+        torch.testing.assert_close(core._candidate_action, torch.tensor([[[-.25]]]))
+        core._begin_functional_solve(torch.ones((1, 1, 1)))
+        self.assertFalse(bool(core._candidate_found.any()))
+        self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
+
+    def test_block_update_measures_actual_continuation_instead_of_last_trial(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        owner = FunctionalAugmentedLagrangian(("event",))
+        self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        seed = torch.full((1, 1, 1), .25)
+        core._begin_functional_solve(seed)
+        state = core._create_initial_iteration_state(seed)
+        core._compute_cost_constraint_and_gradient(torch.tensor([[[.9], [1.], [1.1]]]))
+        core._al_blocks_remaining = 2
+        core._finish_functional_block(state)
+        self.assertEqual(owner.snapshot()["seeds"][0]["multipliers"]["event"], .5)
+        torch.testing.assert_close(state.exploration_action, seed)
+        torch.testing.assert_close(state.exploration_cost, torch.tensor([.8125]))
+        torch.testing.assert_close(state.exploration_gradient, torch.tensor([[[-.5]]]))
+        core._finish_functional_block(state)
+        self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 1)
+
+    def test_native_result_uses_retained_sampled_candidate_without_an_extra_seed(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        owner = FunctionalAugmentedLagrangian(("event",))
+        self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
+        bind_solver_components(solver, domain)
+        optimizer.config.num_iters = optimizer.config.inner_iters
+        seed = torch.full((1, 1, 1), -.5)
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+            result = optimizer.optimize(seed)
+        self.assertEqual(tuple(result.shape), tuple(seed.shape))
+        self.assertTrue(bool((result <= 0).all()))
+        torch.testing.assert_close(result, optimizer._core._candidate_action)
+        self.assertTrue(optimizer._core.solve_diagnostics[0]["sampled_feasible_candidate"])
+        self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
+
+    # BEGIN direct consecutive calls must not depend on an outer reinitialize.
+    def test_consecutive_optimize_clears_old_phr_best_before_new_seed_evaluation(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        owner = FunctionalAugmentedLagrangian(("event",))
+        self.attach_functional_objective(rollouts, owner,
+            lambda action, count: torch.ones_like(action[:, 0, 0]))
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        names = ("cost", "action", "iteration", "current_iteration", "converged")
+        pointers = {name: getattr(core._best, name).data_ptr() for name in names}
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.optimize(torch.full((1, 1, 1), .5))
+            self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 1)
+            self.assertLess(float(core._best.cost[0]), 100.)
+            for rollout in rollouts:
+                rollout.objective_offset = 100.
+            initial = core._run_initial_evaluation
+            entries = []
+
+            def inspect_entry(state):
+                entries.append(True)
+                # The old cost is below every new objective value. Keeping it
+                # would prevent ordinary native best tracking from improving.
+                self.assertGreater(float(state.best_cost[0]), 100.)
+                self.assertEqual(int(state.current_iteration[0]), 0)
+                self.assertEqual(int(core._iterations[0]), 0)
+                self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
+                self.assertEqual(float(optimizer._qn.s.abs().sum()), 0.)
+                return initial(state)
+
+            with patch.object(core, "_run_initial_evaluation", side_effect=inspect_entry):
+                result = optimizer.optimize(torch.full((1, 1, 1), -.5))
+        self.assertEqual(entries, [True])
+        self.assertGreaterEqual(float(core._best.cost[0]), 100.)
+        self.assertEqual(tuple(result.shape), (1, 1, 1))
+        self.assertGreater(float(result[0, 0, 0]), -.5)
+        self.assertEqual(pointers, {name: getattr(core._best, name).data_ptr() for name in names})
+    # END within-solve block tests separately prove cumulative clocks are kept.
+    # END no dense metric or extra native solve is used by candidate retention.
 
     # BEGIN actual CPU native steps exercise request cancellation inside a block.
     def test_request_guard_stops_after_one_actual_step_inside_native_inner_block(self):

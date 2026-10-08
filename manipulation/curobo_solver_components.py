@@ -82,6 +82,12 @@ class PhysicalGradientCore(GradientOptCore):
         self._all_exhausted = False
         self.request_guard = None
         self._recovery_reports = []
+        # BEGIN continuation state is local to one native optimize invocation.
+        self._functional_constraints = None
+        self._candidate_tracking = False
+        self._al_blocks_remaining = 0
+        self._last_functional_signed = None
+        # END independent seeds never inherit another solve's dual variables.
         # END no third-party optimizer or process-wide callback is replaced.
         super().__init__(*args, **kwargs)
         # BEGIN scope graph checks independently of the CPU metrics rollout.
@@ -160,6 +166,12 @@ class PhysicalGradientCore(GradientOptCore):
         cost.backward(gradient=self._l_vec, retain_graph=False)
         self._check_request(wait_for_device=True)
         g_x = x_n.grad.detach()
+        # BEGIN retain a feasible sampled candidate from this exact completed query.
+        if self._candidate_tracking:
+            feasible, signed, objective = rollout.constraint_manager.optimizer_evidence(trajectories)
+            self._last_functional_signed = signed
+            self._retain_sampled_candidate(x_in, feasible, objective)
+        # END this performs no FK, scene query, or dense validation.
         return cost, g_x
 
     def _compute_cost_constraint_and_gradient(self, x):
@@ -169,6 +181,124 @@ class PhysicalGradientCore(GradientOptCore):
         rollout = self._rollout_list[1] if len(self._rollout_list) > 1 else self._rollout_list[0]
         return self._cost_and_gradient_with_guard(x, rollout)
     # END no native iteration count, line-search arithmetic or budget is relaxed.
+
+    # BEGIN fixed-budget inexact PHR continuation and sampled-feasible retention.
+    _candidate_buffers = ("_candidate_action", "_candidate_objective", "_candidate_found")
+
+    def _begin_functional_solve(self, action):
+        """Declare seed layout before the first evaluation and reset in place.
+
+        A collision/search recovery can replace or replicate seeds. Each such
+        native optimize call therefore starts its own dual sequence; only its
+        existing inner blocks share parameters. Graph-owned addresses survive
+        unchanged layouts, and graph warmup snapshots include the incumbent.
+        """
+        manager = getattr(self.rollout_fn, "constraint_manager", None)
+        self._functional_constraints = getattr(manager, "optimization_constraints", None)
+        self._candidate_tracking = self._functional_constraints is not None
+        self._last_functional_signed = None
+        if not self._candidate_tracking:
+            return
+        if not self.config.fixed_iters:
+            raise ValueError("Functional block continuation requires the configured fixed iteration budget")
+        self._functional_constraints.bind(action, self.config.num_problems)
+        self._functional_constraints.reset()
+        self._candidate_action.copy_(action.detach().view_as(self._candidate_action))
+        self._candidate_objective.fill_(float("inf"))
+        self._candidate_found.zero_()
+
+    @torch.no_grad()
+    def _retain_sampled_candidate(self, action, feasible, objective):
+        """Keep one action per seed, ordered only by the parameter-free objective.
+
+        All evaluated line-search particles are eligible, including a feasible
+        point which Wolfe did not select. This is sampled evidence only; the
+        unchanged final ordinary/dense metrics still decide acceptance.
+        """
+        count, particles = self.config.num_problems, self.config.num_particles
+        actions = action.detach().view(count, particles, self.action_horizon, self.action_dim)
+        valid = feasible.view(count, particles) & torch.isfinite(actions).flatten(2).all(-1)
+        values = objective.detach().view(count, particles)
+        valid = valid & torch.isfinite(values)
+        ranked = torch.where(valid, values, float("inf"))
+        value, index = ranked.min(-1)
+        selected = actions.gather(1, index[:, None, None, None].expand(-1, 1,
+                                  self.action_horizon, self.action_dim)).squeeze(1)
+        improved = torch.isfinite(value) & (value < self._candidate_objective)
+        self._candidate_action.copy_(torch.where(improved[:, None, None], selected, self._candidate_action))
+        self._candidate_objective.copy_(torch.where(improved, value, self._candidate_objective))
+        self._candidate_found.logical_or_(improved)
+
+    def _finish_functional_block(self, state):
+        """Change parameters only between existing blocks, never add a solve.
+
+        Native exploration_action is the next line search's actual base. Its
+        residual cannot be inferred from the last callback, which evaluated
+        several different trials. Re-evaluate that base in the ordinary layout,
+        update each seed independently, then recompute changed-objective values.
+        No update follows the final block, which has no remaining iterations.
+        """
+        if not self._al_blocks_remaining:
+            return state
+        self._al_blocks_remaining -= 1
+        owner = self._functional_constraints
+        if not self._al_blocks_remaining or owner is None or not owner.keys:
+            return state
+        count, particles = self.config.num_problems, self.config.num_particles
+        base = state.exploration_action.detach().clone()
+        repeated = base[:, None].expand(-1, particles, -1, -1).contiguous().view(count, particles, self.opt_dim)
+        self._compute_cost_constraint_and_gradient(repeated)
+        signed = {name: value.view(count, particles)[:, 0]
+                  for name, value in self._last_functional_signed.items()}
+        changed = owner.update(signed)
+        self._check_request(wait_for_device=True)
+        if not bool(changed.any()):
+            return state
+        costs, gradients = self._compute_cost_constraint_and_gradient(repeated)
+        cost = costs.detach()[:, 0, 0]
+        gradient = gradients.detach().view(count, particles, self.action_horizon, self.action_dim)[:, 0]
+        if not bool((torch.isfinite(cost) & torch.isfinite(gradient).flatten(1).all(-1))[changed].all()):
+            raise ValueError("Changed functional objective has nonfinite continuation cost or gradient")
+        self._restart_changed_objective(state, base, cost, gradient, changed)
+        return state
+
+    @torch.no_grad()
+    def _restart_changed_objective(self, state, base, cost, gradient, changed):
+        """Invalidate only changed rows; retain all cumulative work counters."""
+        def copy_rows(target, value):
+            mask = changed.reshape((-1,)+(1,)*(target.ndim-1))
+            target.copy_(torch.where(mask, value.reshape_as(target), target))
+
+        for name in ("action", "exploration_action", "best_action"):
+            copy_rows(getattr(state, name), base)
+        for name in ("cost", "exploration_cost", "best_cost"):
+            copy_rows(getattr(state, name), cost)
+        for name in ("gradient", "exploration_gradient"):
+            copy_rows(getattr(state, name), gradient)
+        copy_rows(state.step_direction, -self.config.initial_step_scale*gradient)
+        copy_rows(state.best_iteration, state.current_iteration)
+        state.converged[changed] = 0
+        # The native tracker can own separate tensors (in particular in graph
+        # replay). Rebind its scalar/action ordering without clearing time or
+        # iteration counters through native reinitialize/BestTracker.clear.
+        copy_rows(self._best.cost, cost)
+        copy_rows(self._best.action, base)
+        copy_rows(self._best.iteration, state.current_iteration)
+        self._best.converged[changed] = 0
+        self._best.previous_step_direction[changed] = 0
+        if self._on_reinitialize is not None:
+            self._on_reinitialize(changed)
+        if self._on_initial_state is not None:
+            self._on_initial_state(state, changed)
+        if self._history_buffers is not None:
+            copy_rows(self._history_buffers.step_q_buffer, state.step_direction)
+        self._stalled_steps[changed] = 0
+        self._exhausted[changed] = False
+        self._last_displacement[changed] = 0
+        self._last_curvature[changed] = 0
+        self._history_resets.add_(changed.to(torch.int64))
+        self._all_exhausted = bool(self._exhausted.all())
+    # END finite block continuation cannot itself declare a feasible solution.
 
     # BEGIN real-displacement history contract and bounded recovery lifecycle.
     _progress_buffers = ("_exhausted", "_stalled_steps", "_effective_updates", "_iterations",
@@ -253,7 +383,7 @@ class PhysicalGradientCore(GradientOptCore):
     def solve_diagnostics(self):
         """Read per-seed progress once outside graphs after an optimizer solve."""
         values = {name: getattr(self, name).detach().cpu().tolist() for name in self._progress_buffers}
-        return [{"seed_index": index, "iterations": values["_iterations"][index],
+        reports = [{"seed_index": index, "iterations": values["_iterations"][index],
                  "effective_updates": values["_effective_updates"][index],
                  "history_skips": values["_history_skips"][index],
                  "history_resets": values["_history_resets"][index],
@@ -265,6 +395,17 @@ class PhysicalGradientCore(GradientOptCore):
                  "recovery_accepted": sum(row["accepted"] for row in self._recovery_reports[index]),
                  "recoveries": list(self._recovery_reports[index])}
                 for index in range(self.config.num_problems)]
+        # BEGIN report independent continuation and sampled-only incumbents.
+        if self._candidate_tracking:
+            duals = self._functional_constraints.snapshot()["seeds"]
+            found = self._candidate_found.detach().cpu().tolist()
+            objective = self._candidate_objective.detach().cpu().tolist()
+            for index, report in enumerate(reports):
+                report.update(functional_continuation=duals[index],
+                              sampled_feasible_candidate=found[index],
+                              sampled_candidate_objective=objective[index] if found[index] else None)
+        return reports
+        # END final ordinary/dense acceptance remains a separate planner report.
 
     def _recover_stalled(self, state):
         """Try one physically legal Armijo recovery per stalled block/seed.
@@ -415,6 +556,12 @@ class PhysicalGradientCore(GradientOptCore):
                      if name in ("_last_displacement", "_last_curvature") else torch.int64)
             setattr(self, name, torch.zeros(num_problems, device=self.device_cfg.device, dtype=dtype))
         self._reset_progress()
+        # BEGIN bounded incumbent storage has exactly the existing seed layout.
+        self._candidate_action = torch.zeros_like(self._safe_action)
+        self._candidate_objective = torch.full((num_problems,), float("inf"),
+            device=self.device_cfg.device, dtype=self.device_cfg.dtype)
+        self._candidate_found = torch.zeros(num_problems, device=self.device_cfg.device, dtype=torch.bool)
+        # END resize invalidated captured references before replacing these buffers.
         # END recovery records never leak across differently shaped solves.
         self._line_search_strategy.safe_action = self._safe_action
         self._initial_line_search_strategy.safe_action = self._safe_action
@@ -431,6 +578,7 @@ class PhysicalGradientCore(GradientOptCore):
     def reinitialize(self, action, mask=None, clear_optimizer_state=True, reset_num_iters=False):
         self._prepare_solve(action)
         self._reset_progress()
+        self._begin_functional_solve(action)
         result = super().reinitialize(action, mask=mask,
             clear_optimizer_state=clear_optimizer_state, reset_num_iters=reset_num_iters)
         # BEGIN native reinitialize bypasses the graph dispatch initializer.
@@ -445,7 +593,23 @@ class PhysicalGradientCore(GradientOptCore):
         # END an AL recovery never retains the old scalar-cost ordering.
         self._prepare_solve(seed_action)
         self._reset_progress()
-        return super().optimize(seed_action)
+        # BEGIN a new solve must not pair its seed with the previous PHR cost.
+        # Native callers commonly invoke reinitialize first, but optimize is
+        # also a complete owned entry point. Clear the tracker in place here:
+        # block-boundary changes deliberately preserve these cumulative clocks.
+        self._best.clear()
+        # END this full-solve reset is never called by _finish_functional_block.
+        # BEGIN run AL inside the original loop and retain one candidate per seed.
+        self._begin_functional_solve(seed_action)
+        self._al_blocks_remaining = self.outer_iters
+        try:
+            result = super().optimize(seed_action)
+            if self._candidate_tracking:
+                result = torch.where(self._candidate_found[:, None, None], self._candidate_action, result)
+            return result
+        finally:
+            self._al_blocks_remaining = 0
+        # END no iteration budget, solver call or result layout is added.
 
     def _capture_state(self):
         """Snapshot the native closure state omitted by GraphExecutor.clone().
@@ -469,7 +633,7 @@ class PhysicalGradientCore(GradientOptCore):
                 tensor = getattr(owner, name)
                 if tensor is not None:
                     records.append((owner, name, tensor, tensor.clone()))
-        for name in self._progress_buffers:
+        for name in self._progress_buffers+self._candidate_buffers:
             tensor = getattr(self, name)
             records.append((self, name, tensor, tensor.clone()))
         for strategy in (self._line_search_strategy, self._initial_line_search_strategy):
@@ -493,11 +657,12 @@ class PhysicalGradientCore(GradientOptCore):
         # END an in-flight native kernel is not claimed to be preemptible.
         # BEGIN stop exhausted solves before any further native rollout block.
         if method_name == "_opt_iters" and self._all_exhausted:
-            return args[0]
+            return self._finish_functional_block(args[0])
         if not self.use_cuda_graph:
             result = super()._dispatch(method_name, *args)
             if method_name == "_opt_iters":
                 result = self._recover_stalled(result)
+                result = self._finish_functional_block(result)
             return result
         # One fault boundary surrounds the original inner-iteration block.
         # Its native loop calls our _opt_step and records each replayed state;
@@ -510,6 +675,7 @@ class PhysicalGradientCore(GradientOptCore):
         self._device_checks.raise_if_failed()
         if method_name == "_opt_iters":
             result = self._recover_stalled(result)
+            result = self._finish_functional_block(result)
         # END QP and Armijo admission occur outside capture and its fault scope.
         # GraphExecutor clones iteration-state inputs. Native eager states
         # instead alias these persistent tracker tensors; carry updated bytes
@@ -570,7 +736,14 @@ class PhysicalGradientCore(GradientOptCore):
         """Known safety/snapshot storage, excluding measured CUDA graph pools."""
         safe_bytes = 0 if self._safe_action is None else self._safe_action.numel()*self._safe_action.element_size()
         progress_bytes = sum(getattr(self, name).numel()*getattr(self, name).element_size()
-                             for name in self._progress_buffers)
+                             for name in self._progress_buffers+self._candidate_buffers)
+        # BEGIN account for per-seed dual tensors once at their owning core.
+        if self._functional_constraints is not None:
+            owner = self._functional_constraints
+            progress_bytes += sum(value.numel()*value.element_size() for value in
+                (owner._multiplier_buffer, owner._penalty_buffer, owner._previous_residual,
+                 owner._updates, owner._penalty_capped) if value is not None)
+        # END the workspace report includes all newly persistent core tensors.
         return safe_bytes+progress_bytes+self._device_checks.storage_bytes+self.graph_snapshot_bytes
     # END native kernels are reused; guarded history and recovery are owned here.
 

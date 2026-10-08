@@ -1,10 +1,11 @@
 """Frozen forbidden-region fields and a bounded native planar contact model.
 
-Preparation may visit source grid sites once. Online work has dimensions only
-for states, registered spheres, rule combinations and a few material vertices
-or surface witnesses; there is no occupied-cell dimension in an optimizer's
-forward or backward graph. This is an explicitly different model from exact
-sphere/material-cell Boolean subtraction used by the independent audit.
+Preparation visits explicit mapped source components or registered primitive
+cells. Online work has dimensions only for states, registered spheres, rule
+combinations and a few material vertices or surface witnesses; there is no
+source-component dimension in an optimizer's forward or backward graph. The
+conservative numerical fields propose motion; native source geometry remains
+available for independent collision confirmation.
 """
 
 # BEGIN finite registered contact fields and planar material constraints.
@@ -22,7 +23,7 @@ from .planning_scene import _tensor
 from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES, require_host_memory
 
 
-MODEL = "frozen_planar_contact_v2"
+MODEL = "frozen_planar_contact_v3"
 _MAX_RULES = 16
 _MAX_FIELDS = 16
 # BEGIN aggregate contact storage is independent of the single-record limit.
@@ -90,8 +91,9 @@ class PreparedContactFields:
     one cell half-diagonal and one trilinear interpolation half-diagonal. The
     latter follows the 1-Lipschitz distance bound and the maximum weighted
     corner offset. Thus sampled values conservatively bound distance to the
-    retained cell union. They are not exact ESDF distances. Empty and unchanged
-    sets have explicit branches; neither relies on EDT's outside-array rules.
+    raster cover of the retained source components, or retained primitive cell
+    union. They are not exact ESDF distances. Empty and unchanged sets have
+    explicit branches; neither relies on EDT's outside-array rules.
     """
 
     def __init__(self, *, origin, voxel_size, shape, rules, maximum_radii,
@@ -107,10 +109,17 @@ class PreparedContactFields:
         self._device = {}
         self.storage_nbytes = sum(row["distance"].nbytes for row in self.channels if row["kind"] == "field")
 
+    # BEGIN contact fields derive from explicit source components or registered primitives.
     @classmethod
-    def prepare(cls, *, distance, site_valid, observed_sign, origin, voxel_size,
-                rules, maximum_radii, source, occupied=None):
-        """Build full-owner forbidden fields once, before any rollout graph."""
+    def prepare(cls, *, distance, origin, voxel_size, rules, maximum_radii, source,
+                source_geometry, occupied=None):
+        """Prepare every finite permission from its declared geometry once.
+
+        Mapped targets remove complete source components BEFORE rasterizing the
+        remaining geometry. Primitive targets retain their explicit analytic
+        occupancy preparation. A numerical distance zero is never interpreted
+        as mapped occupied material or a mapped contact witness.
+        """
         rules = tuple(rules)
         if not 0 < len(rules) <= _MAX_RULES or len({r.rule_id for r in rules}) != len(rules):
             raise ValueError("UNSUPPORTED_MODEL: online contact requires one to sixteen distinct rules per owner")
@@ -125,91 +134,112 @@ class PreparedContactFields:
         if (len(shape) != 3 or min(shape) < 2 or values.nbytes > MAX_ARRAY_BYTES
                 or origin.shape != (3,) or not np.isfinite(origin).all() or not np.isfinite(h) or h <= 0):
             raise ValueError("UNSUPPORTED_MODEL: finite contact grid exceeds the bounded source-field layout")
-        # Group spheres by their exact actor/rule membership. All simultaneous
-        # subsets are represented, including the true union of multiple patches.
         grouped, combinations_needed = _field_layout(rules)
         if len(combinations_needed) > _MAX_FIELDS or len(combinations_needed) * values.size * 4 > _MAX_STORED_BYTES:
             raise ValueError("UNSUPPORTED_MODEL: finite contact field combinations exceed the fixed storage budget")
-        # Includes site indices/coordinates, masks, EDT internal index/distance
-        # arrays, retained channels and one outward conversion buffer.
         require_host_memory(int(values.size * (96 + len(rules) + 4 * len(combinations_needed))),
                             pending_existing_bytes=0, max_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES)
-        valid, sign = np.asarray(site_valid), np.asarray(observed_sign)
-        if valid.shape != shape or sign.shape != shape or valid.dtype != bool or sign.dtype != bool:
-            raise ValueError("Contact preparation requires the same source site/sign validity masks")
-        occupied = (valid & ((np.abs(values) <= h * .51) | ((values < 0) & sign))
-                    if occupied is None else np.asarray(occupied, dtype=bool))
-        if occupied.shape != shape:
-            raise ValueError("Registered occupied material must share its source grid")
-        indices = np.argwhere(occupied)
-        centres = origin + indices * h
-        surface = np.abs(values[tuple(indices.T)]) <= h * .51 if len(indices) else np.empty(0, bool)
+        # Neither producer may borrow the other's material representation.
+        if source_geometry is None:
+            if occupied is None:
+                raise ValueError("Primitive contact preparation requires explicit analytic occupancy")
+            occupied = np.asarray(occupied)
+            if occupied.shape != shape or occupied.dtype != bool:
+                raise ValueError("Registered occupied material must share its source grid")
+            indices = np.argwhere(occupied)
+            centres = origin + indices * h
+            surface = np.abs(values[tuple(indices.T)]) <= h * .51 if len(indices) else np.empty(0, bool)
+        else:
+            if occupied is not None:
+                raise ValueError("Mapped contact preparation requires source components, not occupied-grid overrides")
+            source_geometry.prepare_rules(rules)
         upper = origin + (np.asarray(shape) - 1) * h
         masks, regions = {}, {}
         for rule in rules:
             tolerance = rule.numerical_position_tolerance_m
             axes = np.asarray(rule.patch_axes)
             widths = np.r_[rule.patch_half_size, rule.modeling_allowance_m]
-            # A permission outside the field is not silently clipped. A whole
-            # cell must fit both the finite permission and the source layout.
             corners = np.array([[x, y, z] for x in (-1., 1.) for y in (-1., 1.) for z in (-1., 1.)])
             patch_corners = rule.patch_origin + (corners * widths) @ axes.T
             if np.any(patch_corners.min(0) < origin) or np.any(patch_corners.max(0) > upper):
                 raise ValueError(f"UNSUPPORTED_MODEL: contact patch {rule.rule_id} extends beyond its frozen owner field")
-            half_support = np.abs(axes).sum(axis=0) * h / 2
-            selected = np.zeros(len(indices), bool)
-            for start in range(0, len(indices), _PREPARE_CHUNK):
-                local = (centres[start:start + _PREPARE_CHUNK] - rule.patch_origin) @ axes
-                selected[start:start + len(local)] = (np.abs(local) + half_support <= widths + tolerance).all(-1)
-            mask = np.zeros(shape, bool)
-            chosen = indices[selected]
-            if len(chosen):
-                mask[tuple(chosen.T)] = True
-                patch_points = (centres[selected] - rule.patch_origin) @ axes
-                lower = patch_points.min(0) - half_support
-                high = patch_points.max(0) + half_support
+            if source_geometry is None:
+                # Registered analytic primitives keep the existing complete-cell
+                # permission. Their distances are analytic, not Mapper seeds.
+                half_support = np.abs(axes).sum(axis=0) * h / 2
+                selected = np.zeros(len(indices), bool)
+                for start in range(0, len(indices), _PREPARE_CHUNK):
+                    local = (centres[start:start + _PREPARE_CHUNK] - rule.patch_origin) @ axes
+                    selected[start:start + len(local)] = (np.abs(local) + half_support <= widths + tolerance).all(-1)
+                mask = np.zeros(shape, bool)
+                chosen = indices[selected]
+                if len(chosen):
+                    mask[tuple(chosen.T)] = True
+                    patch_points = (centres[selected] - rule.patch_origin) @ axes
+                    lower = patch_points.min(0) - half_support
+                    high = patch_points.max(0) + half_support
+                else:
+                    lower, high = np.zeros(3), np.zeros(3)
+                masks[rule.rule_id] = mask
+                removed_elements, element_kind = int(len(chosen)), "primitive_cell"
+                witnessed = np.flatnonzero(selected & surface)
+                points = centres[witnessed]
+                scores = np.abs(values[tuple(indices[witnessed].T)]) if len(witnessed) else np.empty(0)
             else:
-                lower, high = np.zeros(3), np.zeros(3)
-            # Witnesses remain actual selected source sites; choosing at most
-            # one best zero-site per fixed patch bin is bounded and conservative.
-            witnessed = np.flatnonzero(selected & surface)
+                # Whole-component bounds include negative pieces; witnesses use
+                # only original source zero sections, never rasterized centres.
+                region = source_geometry.rule_region(rule.rule_id)
+                lower, high = region["lower_patch"], region["upper_patch"]
+                removed_elements, element_kind = int(region["removed_components"]), "source_component"
+                points = np.asarray(source_geometry.surface_points(rule.rule_id), dtype=float).reshape(-1, 3)
+                # Source resolution may be finer than the numerical query grid;
+                # charge witness binning against actual vertex count as well.
+                require_host_memory(int(96*len(points)), pending_existing_bytes=0,
+                                    max_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES)
+                scores = np.zeros(len(points))
             witnesses = []
-            if len(witnessed):
-                xy = (centres[witnessed] - rule.patch_origin) @ axes[:, :2]
+            if len(points):
+                xy = (points - rule.patch_origin) @ axes[:, :2]
                 bins = np.clip(((xy / rule.patch_half_size + 1) * (_WITNESS_BINS / 2)).astype(int),
                                0, _WITNESS_BINS - 1)
                 identities = bins[:, 0] * _WITNESS_BINS + bins[:, 1]
-                observed_distance = np.abs(values[tuple(indices[witnessed].T)])
                 for identity in range(_WITNESS_BINS ** 2):
                     candidates = np.flatnonzero(identities == identity)
                     if len(candidates):
-                        selected_index = candidates[np.argmin(observed_distance[candidates])]
-                        witnesses.append(centres[witnessed[selected_index]])
+                        witnesses.append(points[candidates[np.argmin(scores[candidates])]])
             if rule.required and not witnesses:
                 raise ValueError(f"UNSUPPORTED_MODEL: required contact {rule.rule_id} has no observed surface witness in its finite patch")
-            masks[rule.rule_id] = mask
             regions[rule.rule_id] = {"lower_patch": _readonly(lower), "upper_patch": _readonly(high),
-                "has_removed_material": bool(len(chosen)), "removed_cells": int(len(chosen)),
+                "has_removed_material": bool(removed_elements), "removed_elements": removed_elements,
+                "element_kind": element_kind,
                 "surface_witnesses": _readonly(np.asarray(witnesses).reshape(-1, 3))}
         channels, lookup = [], {}
-        margin = math.sqrt(3.) * h  # cell half-diagonal + interpolation half-diagonal
+        margin = math.sqrt(3.) * h
         for names in combinations_needed:
-            removed = np.zeros(shape, bool)
-            for name in names:
-                removed |= masks[name]
-            if not removed.any():
-                channel = {"rule_ids": names, "kind": "unchanged"}
-            else:
-                remaining = occupied & ~removed
-                if not remaining.any():
-                    channel = {"rule_ids": names, "kind": "empty"}
+            if source_geometry is not None:
+                if not any(regions[name]["has_removed_material"] for name in names):
+                    channel = {"rule_ids": names, "kind": "unchanged"}
                 else:
-                    transformed = distance_transform_edt(~remaining, sampling=h) - margin
-                    # Float32 conversion must not make the conservative field
-                    # larger. Interpolation has its own separately included margin.
-                    field = np.nextafter(transformed.astype(np.float32), np.float32(-np.inf))
-                    field.flags.writeable = False
-                    channel = {"rule_ids": names, "kind": "field", "distance": field}
+                    # Component filtering precedes rasterization for EVERY
+                    # active subset. A shared cell cannot erase forbidden parts.
+                    field = source_geometry.distance_field(origin=origin, shape=shape,
+                        voxel_size=h, active_rule_ids=names)
+                    channel = ({"rule_ids": names, "kind": "empty"} if field is None else
+                               {"rule_ids": names, "kind": "field", "distance": _readonly(field, np.float32)})
+            else:
+                removed = np.zeros(shape, bool)
+                for name in names:
+                    removed |= masks[name]
+                if not removed.any():
+                    channel = {"rule_ids": names, "kind": "unchanged"}
+                else:
+                    remaining = occupied & ~removed
+                    if not remaining.any():
+                        channel = {"rule_ids": names, "kind": "empty"}
+                    else:
+                        transformed = distance_transform_edt(~remaining, sampling=h) - margin
+                        field = np.nextafter(transformed.astype(np.float32), np.float32(-np.inf))
+                        channel = {"rule_ids": names, "kind": "field", "distance": _readonly(field)}
             lookup[names] = len(channels)
             channels.append(channel)
         groups = []
@@ -222,6 +252,7 @@ class PreparedContactFields:
                            "channel_lookup": tuple(table)})
         return cls(origin=origin, voxel_size=h, shape=shape, rules=rules,
                    maximum_radii=maximum_radii, regions=regions, channels=channels, groups=groups, source=source)
+    # END mapped material never comes from thresholded numerical distance samples.
 
     def validate_binding(self, rules, maximum_radii):
         if (tuple(_plain(asdict(rule)) for rule in rules) != self.rule_records
@@ -330,7 +361,8 @@ class PreparedContactFields:
             "maximum_radii": dict(self.maximum_radii),
             "regions": {name: {"lower_patch": row["lower_patch"].tolist(),
                 "upper_patch": row["upper_patch"].tolist(), "has_removed_material": row["has_removed_material"],
-                "removed_cells": row["removed_cells"], "surface_witnesses": encode_array(row["surface_witnesses"])}
+                "removed_elements": row["removed_elements"], "element_kind": row["element_kind"],
+                "surface_witnesses": encode_array(row["surface_witnesses"])}
                 for name, row in self.regions.items()},
             "channels": [{"rule_ids": list(row["rule_ids"]), "kind": row["kind"],
                 **({"distance": encode_array(row["distance"])} if row["kind"] == "field" else {})}
@@ -338,7 +370,7 @@ class PreparedContactFields:
             "numerics": {"cell_cover_margin_m": math.sqrt(3.) * self.voxel_size / 2,
                          "interpolation_margin_m": math.sqrt(3.) * self.voxel_size / 2,
                          "maximum_surface_witnesses": _WITNESS_BINS ** 2},
-            "scope": "fixed forbidden-region cells plus registered native planar extrusion; conservative projection enclosures; bounded observed witnesses may miss contact between sites; not exact cell Boolean equivalence"}
+            "scope": "source components filtered before conservative forbidden-region fields, or registered analytic primitive cells; native planar extrusion; bounded source surface witnesses may miss contact between points; no Boolean equivalence claim"}
 
     @classmethod
     def from_record(cls, row):
@@ -398,9 +430,11 @@ class PreparedContactFields:
             low, high = np.asarray(item["lower_patch"], float), np.asarray(item["upper_patch"], float)
             if (low.shape != (3,) or high.shape != (3,) or not np.isfinite([low, high]).all()
                     or np.any(low > high) or type(item["has_removed_material"]) is not bool
-                    or type(item["removed_cells"]) is not int or not 0 <= item["removed_cells"] <= math.prod(shape)
-                    or item["has_removed_material"] != (item["removed_cells"] > 0)):
-                raise ValueError("Frozen material region bounds and source-cell count must remain finite and consistent")
+                    or item["element_kind"] not in {"source_component", "primitive_cell"}
+                    or type(item["removed_elements"]) is not int or item["removed_elements"] < 0
+                    or (item["element_kind"] == "primitive_cell" and item["removed_elements"] > math.prod(shape))
+                    or item["has_removed_material"] != (item["removed_elements"] > 0)):
+                raise ValueError("Frozen material region bounds and declared element count must remain finite and consistent")
             rule = rule_by_name[name]
             widths = np.r_[rule.patch_half_size, rule.modeling_allowance_m]
             tolerance = rule.numerical_position_tolerance_m + 1e-12

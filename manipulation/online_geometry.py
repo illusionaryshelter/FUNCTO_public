@@ -1,7 +1,7 @@
 """One frozen, finite geometry model for planning and measured-state queries.
 
-The Mapper's signed distances use positive free space. Unknown samples never
-become free evidence. Contact preparation freezes forbidden-region fields once;
+The source TSDF defines observed material; distance fields only propose
+collisions. Unknown samples never become free evidence. Contact preparation freezes forbidden-region fields once;
 online material conditions use registered finite native planar extrusions. No
 occupied-cell loop or whole-owner permission enters optimization. CPU execution
 reads the exact frozen arrays used by Torch. Source Boolean audits are separate.
@@ -39,40 +39,47 @@ def _plain(value):
 
 
 class FrozenESDF:
-    """Immutable XYZ signed distance and source-validity arrays in one frame.
+    """Frozen conservative distance proposals backed by one observed source.
 
-    ``observed_sign`` identifies actual TSDF sign support; ``site_valid`` only
-    identifies a nearest observed surface. A distant positive sample is not a
-    free-space observation. Field bounds are fixed for the entire request.
+    A positive sphere residual is only a collision candidate. The source's
+    affine TSDF components define material, bounds and finite permissions;
+    neither a zero nor a negative proposal value is an occupied voxel or a
+    physical penetration depth. Free-space evidence remains in ObservedSpace.
     """
-    def __init__(self, distance, *, origin, voxel_size, site_valid, observed_sign,
+    # BEGIN source material replaces native ESDF seed/sign interpretation.
+    def __init__(self, distance, *, origin, voxel_size, source_geometry,
                  owner_ids, source):
+        from .online_observed_geometry import FrozenObservedGeometry
         distance = np.asarray(distance, dtype=np.float32)
-        valid, sign = np.asarray(site_valid), np.asarray(observed_sign)
         if (distance.ndim != 3 or min(distance.shape) < 2 or distance.nbytes > MAX_ARRAY_BYTES
-                or not np.isfinite(distance).all() or valid.shape != distance.shape
-                or sign.shape != distance.shape or valid.dtype != bool or sign.dtype != bool):
-            raise ValueError('UNSUPPORTED_MODEL: bounded complete XYZ field and source masks required')
+                or not np.isfinite(distance).all()
+                or not isinstance(source_geometry, FrozenObservedGeometry)):
+            raise ValueError('UNSUPPORTED_MODEL: bounded XYZ proposal field and observed source required')
         self.origin = np.asarray(origin, dtype=float).copy()
         self.voxel_size = float(voxel_size)
         if self.origin.shape != (3,) or not np.isfinite(self.origin).all() or not self.voxel_size > 0:
             raise ValueError('Finite field origin and positive voxel size required')
-        self.distance, self.site_valid, self.observed_sign = distance.copy(), valid.copy(), sign.copy()
-        for value in (self.distance, self.site_valid, self.observed_sign):
-            value.flags.writeable = False
+        self.distance = distance.copy()
+        self.distance.flags.writeable = False
+        self.source_geometry = source_geometry
         self.owner_ids, self.source = frozenset(owner_ids), str(source)
         # BEGIN immutable prepared contact fields replace per-cell inventories.
         self._device = {}
         self._contact_model = None
         # END preparing a request never adds an occupied-cell rollout path.
         self.upper = self.origin+(np.asarray(distance.shape)-1)*self.voxel_size
-        occupied=self.site_valid & ((np.abs(self.distance)<=self.voxel_size*.51) | ((self.distance<0)&self.observed_sign))
-        if occupied.any():
-            extents=[np.flatnonzero(occupied.any(axis=tuple(d for d in range(3) if d!=axis))) for axis in range(3)]
-            self.geometry_lower=self.origin+np.array([value[0] for value in extents])*self.voxel_size-self.voxel_size/2
-            self.geometry_upper=self.origin+np.array([value[-1] for value in extents])*self.voxel_size+self.voxel_size/2
-        else:
-            self.geometry_lower=self.geometry_upper=None
+        bounds = source_geometry.bounds
+        self.geometry_lower, self.geometry_upper = (None, None) if bounds is None else bounds
+
+    @classmethod
+    def from_source(cls, source_geometry, *, origin, shape, voxel_size, owner_ids, source):
+        """Prepare one proposal field; an empty source has no obstacle query."""
+        distance = source_geometry.distance_field(origin=origin, shape=shape, voxel_size=voxel_size)
+        if distance is None:
+            distance = np.zeros(shape, dtype=np.float32)
+        return cls(distance, origin=origin, voxel_size=voxel_size,
+                   source_geometry=source_geometry, owner_ids=owner_ids, source=source)
+    # END a field sample never establishes material or observed-free volume.
 
     def clone_for_rollout(self):
         # BEGIN frozen arrays and prepared fields are safe to share read-only.
@@ -94,12 +101,12 @@ class FrozenESDF:
         return self._sample(self.distance, points, 'distance')
 
     def supported(self, spheres):
-        """Whole influence must fit fixed bounds; interpolation needs valid sites."""
+        """The whole sphere influence must fit the fixed numerical domain."""
         radius = spheres[..., 3:4].clamp_min(0)
         interior = ((spheres[..., :3]-radius >= _tensor(self.origin, spheres)) &
                     (spheres[..., :3]+radius <= _tensor(self.upper, spheres))).all(-1)
-        # Site validity is not free-space evidence. Unknown within these
-        # numerical bounds is handled by the explicit scene policy.
+        # Numerical support is not free-space evidence. Unknown within these
+        # bounds is handled by the independent observation policy.
         return interior
 
     def supports_centres(self,spheres):
@@ -115,25 +122,27 @@ class FrozenESDF:
     def __call__(self, spheres, *, key=None):
         values = torch.relu(spheres[..., 3]-self.signed_distance(spheres[..., :3]))
         intersects=self.intersects_geometry(spheres)
-        valid = self._sample(self.site_valid,spheres[..., :3],'site') > 0
         # BEGIN finite-field boundaries cannot manufacture obstacle distances.
         # Zero padding attenuates positive distances just outside the grid even
-        # while interpolated site validity remains nonzero. Such centres have
+        # near the numerical boundary. Such centres have
         # no distance query: the scene's separate support and unknown checks
         # retain the unresolved obligation. Analytic primitives support all
         # centres through their existing supports_centres implementation.
         supported = self.supports_centres(spheres)
-        return torch.where((spheres[..., 3] > 0) & intersects & valid & supported,
+        return torch.where((spheres[..., 3] > 0) & intersects & supported,
                            values, torch.zeros_like(values))
         # END unsupported queries contribute no invented collision residual.
 
     # BEGIN one preparation phase, followed only by bounded batched queries.
     def prepare_contacts(self, rules, maximum_radii):
+        # BEGIN restored fields still bind source-component permissions once.
+        self.source_geometry.prepare_rules(rules)
+        # END no distance field is regenerated when its frozen binding matches.
         if self._contact_model is not None:
             self._contact_model.validate_binding(rules, maximum_radii)
             return
         self._contact_model = PreparedContactFields.prepare(
-            distance=self.distance, site_valid=self.site_valid, observed_sign=self.observed_sign,
+            distance=self.distance, source_geometry=self.source_geometry,
             origin=self.origin, voxel_size=self.voxel_size, rules=rules,
             maximum_radii=maximum_radii, source=self.source)
 
@@ -152,8 +161,8 @@ class FrozenESDF:
     # END no source-site enumeration or checkpoint recomputation is online.
 
     def record(self):
-        return {'kind':'frozen_esdf_v2', 'distance':encode_array(self.distance),
-            'site_valid':encode_array(self.site_valid), 'observed_sign':encode_array(self.observed_sign),
+        return {'kind':'frozen_observed_field_v3', 'distance':encode_array(self.distance),
+            'source_geometry':self.source_geometry.record(),
             'origin':self.origin.tolist(), 'voxel_size':self.voxel_size,
             'owner_ids':sorted(self.owner_ids), 'source':self.source,
             'contact_model':None if self._contact_model is None else self._contact_model.record()}
@@ -163,9 +172,10 @@ class FrozenESDF:
         if row.get('kind') == 'frozen_primitives_v2':
             result = FrozenPrimitives(primitives=row['primitives'],owner_ids=row['owner_ids'],
                 source=row['source'],contact_voxel_size_m=row['contact_voxel_size_m'])
-        elif row.get('kind') == 'frozen_esdf_v2':
+        elif row.get('kind') == 'frozen_observed_field_v3':
+            from .online_observed_geometry import FrozenObservedGeometry
             result = cls(decode_array(row['distance']), origin=row['origin'], voxel_size=row['voxel_size'],
-                site_valid=decode_array(row['site_valid']), observed_sign=decode_array(row['observed_sign']),
+                source_geometry=FrozenObservedGeometry(row['source_geometry']),
                 owner_ids=row['owner_ids'], source=row['source'])
         else:
             raise ValueError('UNSUPPORTED_MODEL: online binding requires the current frozen-field schema')
@@ -190,7 +200,6 @@ class FrozenPrimitives(FrozenESDF):
         self._device={}
         self._contact_model=None
         self.distance=np.empty((0,),dtype=np.float32)
-        self.site_valid=self.observed_sign=np.empty((0,),dtype=bool)
         lower,upper=[],[]
         corners=np.asarray(list(product((-1.,1.),repeat=3)))
         for row in self.primitives:
@@ -274,10 +283,9 @@ class FrozenPrimitives(FrozenESDF):
                 distance[start:start + len(flat)] = self.signed_distance(
                     torch.as_tensor(points, dtype=torch.float64)).numpy()
         distance = distance.reshape(tuple(shape))
-        known = np.ones(tuple(shape), dtype=bool)
         occupied = distance <= math.sqrt(3.) * self.voxel_size / 2
-        self._contact_model = PreparedContactFields.prepare(distance=distance, site_valid=known,
-            observed_sign=known, origin=lower, voxel_size=self.voxel_size, rules=rules,
+        self._contact_model = PreparedContactFields.prepare(distance=distance, source_geometry=None,
+            origin=lower, voxel_size=self.voxel_size, rules=rules,
             maximum_radii=maximum_radii, source=self.source, occupied=occupied)
     # END online queries only read these frozen prepared arrays.
 
@@ -810,14 +818,16 @@ class OnlinePlanningScene:
         # A read-only clone shares its array/cache identity. A distinct field
         # with equal contents still owns separate storage and is counted twice.
         fields = [self.background]+[o.query for o in self.owners]
-        sources, ordinary_caches, contact_models = {}, {}, {}
+        sources, ordinary_caches, contact_models, observed_sources = {}, {}, {}, {}
         for query in fields:
-            for array in (query.distance, query.site_valid, query.observed_sign):
-                sources[id(array)] = array.nbytes
+            sources[id(query.distance)] = query.distance.nbytes
+            # BEGIN source material/index/caches stay on the CPU and are shared.
+            if not isinstance(query, FrozenPrimitives):
+                geometry = query.source_geometry
+                observed_sources[id(geometry)] = geometry.storage_nbytes+geometry.pending_cache_bytes
+            # END no bool sign/source channel is retained or uploaded as a float.
             if query.distance.size:
-                # Only distance and nearest-source validity are sampled. Both
-                # become float32/float64, including the original bool mask.
-                ordinary_caches[id(query._device)] = 2 * query.distance.size
+                ordinary_caches[id(query._device)] = query.distance.size
             if query._contact_model is not None:
                 model = query._contact_model
                 contact_models[id(model)] = model
@@ -835,7 +845,7 @@ class OnlinePlanningScene:
                 sources[id(array)] = array.nbytes
         coverage_cells = sum(cover._distance_squared.numel() for cover in coverages.values())
         # END both fields need float32/float64 caches under the existing bound.
-        source_bytes = sum(sources.values()) + coverage_cells * 4
+        source_bytes = sum(sources.values()) + sum(observed_sources.values()) + coverage_cells * 4
         sampled_elements = sum(ordinary_caches.values()) + sum(
             model.storage_nbytes // 4 for model in contact_models.values())
         # Reserve both dtypes on the CPU and on the one permitted GPU. CPU

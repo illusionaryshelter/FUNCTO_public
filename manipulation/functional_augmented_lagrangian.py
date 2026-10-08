@@ -1,27 +1,21 @@
-"""Signed functional inequalities for one continued trajectory candidate.
+"""Per-seed PHR parameters for the planner's fixed-budget inner blocks.
 
-The planner supplies ``g = error / original_tolerance - 1 <= 0`` for each
-named event component. This module owns only the Powell--Hestenes--Rockafellar
-objective and its outer updates; physical validation and the solve budget
-remain owned by the planner. No scalar augmented cost certifies feasibility.
+The problem supplies ``g = error / original_tolerance - 1 <= 0``. Parameters
+are constant within one native inner block; neither their update nor a small
+augmented objective certifies feasibility. Original metrics own acceptance.
 """
 
-# BEGIN standard inequality AL with explicit, fixed-address device parameters.
-import math
+# BEGIN independent seed parameters; line-search particles never own dual state.
+import torch
 
 
 class FunctionalAugmentedLagrangian:
-    """A single continuation's multipliers, shared only while evaluating it.
+    """One multiplier vector and penalty per independently optimized seed.
 
-    Independent initial seeds may use the same zero multipliers. After the
-    planner selects one candidate, ``update`` accepts only that candidate's
-    scalar residual for every key. A new independent initializer must call
-    ``reset``; updates must never average different seeds or line-search trials.
-
-    ``bind`` runs before graph capture. ``terms`` reads its two device buffers;
-    ``update`` and ``reset`` copy new values into those same allocations outside
-    capture. The caller must re-evaluate current cost/gradient and reset solver
-    history after any parameter change, even when a graph remains replayable.
+    ``bind`` declares the seed layout before evaluation/capture. Rollout rows
+    are seed-major, then line-search-particle-major, exactly as GradientOptCore
+    reshapes actions. ``update`` requires one actual continuation point per
+    seed. It cannot average particles or implicitly select a different seed.
     """
 
     initial_penalty = 2.0
@@ -36,129 +30,123 @@ class FunctionalAugmentedLagrangian:
             raise ValueError("Functional inequalities require distinct nonempty keys")
         self._multiplier_buffer = None
         self._penalty_buffer = None
-        self.reset()
+        self.num_seeds = 1
 
-    def bind(self, like):
-        """Allocate once for the current solver's floating device and dtype.
+    def bind(self, like, num_seeds=None):
+        """Keep addresses for an unchanged layout; a changed layout starts fresh.
 
-        Rebinding to another device or dtype requires discarding any old graph
-        first. Repeated manager initialization on the same device retains the
-        allocations, so all rollouts of the current solver read the same state.
+        Manager rebinding only supplies dtype/device and therefore retains the
+        existing seed count. The core explicitly declares its count at each
+        solve entry, before either initial or ordinary rollout evaluation.
         """
         if not like.is_floating_point():
             raise ValueError("Functional AL parameters require a floating tensor")
-        if (self._multiplier_buffer is not None
+        count = self.num_seeds if num_seeds is None else num_seeds
+        if not isinstance(count, int) or count < 1:
+            raise ValueError("Functional AL requires a positive seed count")
+        if (self._multiplier_buffer is not None and count == self.num_seeds
                 and self._multiplier_buffer.device == like.device
                 and self._multiplier_buffer.dtype == like.dtype):
             return
-        self._multiplier_buffer = like.new_tensor(self._multipliers)
-        self._penalty_buffer = like.new_tensor(self._penalty)
+        self.num_seeds = count
+        self._multiplier_buffer = like.new_zeros((count, len(self.keys)))
+        self._penalty_buffer = like.new_empty(count)
+        self._previous_residual = like.new_empty(count)
+        self._updates = torch.zeros(count, dtype=torch.int64, device=like.device)
+        self._penalty_capped = torch.zeros(count, dtype=torch.bool, device=like.device)
+        self.reset()
 
-    def _check_keys(self, signed):
+    def reset(self):
+        """Reset an independent solve in place, preserving captured addresses."""
+        if self._multiplier_buffer is None:
+            return
+        self._multiplier_buffer.zero_()
+        self._penalty_buffer.fill_(self.initial_penalty)
+        self._previous_residual.fill_(float("inf"))
+        self._updates.zero_()
+        self._penalty_capped.zero_()
+
+    def _residuals(self, signed):
         if set(signed) != set(self.keys):
             raise ValueError("Functional inequality identities changed during continuation")
-
-    def terms(self, signed):
-        """Return nonnegative, constant-shifted PHR terms with input batch shape.
-
-        Each value in ``signed`` has shape ``[batch]`` (or a scalar for one
-        unbatched curve). All entries of a line-search batch use the unchanged
-        continuation parameters. The result is already a scalar cost term and
-        must not be squared again when folded into the event's query slot.
-
-        Full PHR subtracts ``lambda**2/(2*rho)``. This constant is independent
-        of the candidate within each inner solve, so omitting it preserves all
-        gradients and the subproblem minimizers. Native cuRobo best tracking
-        divides improvement by the old cost and therefore requires nonnegative
-        objectives. Parameters are frozen within a solve; scalar best costs
-        must be reset when parameters change, even with this constant omitted.
-        """
-        import torch
-        self._check_keys(signed)
-        if not self.keys:
-            return {}
         if self._multiplier_buffer is None:
             raise RuntimeError("Bind functional AL device parameters before evaluation")
+        if not self.keys:
+            return self._multiplier_buffer
         values = [signed[key] for key in self.keys]
         like = values[0]
-        if (like.device != self._multiplier_buffer.device
+        if (like.ndim != 1 or like.numel() % self.num_seeds
+                or like.device != self._multiplier_buffer.device
                 or like.dtype != self._multiplier_buffer.dtype
                 or any(value.shape != like.shape or value.device != like.device
                        or value.dtype != like.dtype for value in values)):
-            raise ValueError("Functional residuals must match the bound device, dtype and batch")
-        residual = torch.stack(values, dim=-1)
-        shifted = torch.relu(self._multiplier_buffer+self._penalty_buffer*residual)
-        costs = shifted.square()/(2*self._penalty_buffer)
-        return {key: costs[..., index] for index, key in enumerate(self.keys)}
+            raise ValueError("Functional residuals must match the seed-major device, dtype and batch layout")
+        return torch.stack(values, dim=-1)
 
-    def _copy_parameters(self):
-        """Keep graph input addresses unchanged; call only between inner solves."""
-        if self._multiplier_buffer is not None:
-            self._multiplier_buffer.copy_(self._multiplier_buffer.new_tensor(self._multipliers))
-            self._penalty_buffer.fill_(self._penalty)
+    def terms(self, signed):
+        """Nonnegative PHR terms, broadcasting only within each seed's particles.
 
-    def reset(self):
-        """Start an independent candidate without retaining another seed's duals."""
-        self._multipliers = [0.0]*len(self.keys)
-        self._penalty = self.initial_penalty
-        self._previous_residual = math.inf
-        self._updates = 0
-        self._copy_parameters()
+        Omitting the x-independent ``-lambda**2/(2*rho)`` preserves gradients
+        and minimizers while retaining the native tracker's nonnegative cost
+        convention. Such costs cannot be compared across parameter updates.
+        """
+        if not self.keys and not signed:
+            return {}
+        residual = self._residuals(signed)
+        particles = residual.shape[0] // self.num_seeds
+        residual = residual.view(self.num_seeds, particles, len(self.keys))
+        penalty = self._penalty_buffer[:, None, None]
+        shifted = torch.relu(self._multiplier_buffer[:, None, :]+penalty*residual)
+        costs = (shifted.square()/(2*penalty)).reshape(-1, len(self.keys))
+        return {key: costs[:, index] for index, key in enumerate(self.keys)}
+
+    @torch.no_grad()
+    def update(self, signed):
+        """Return changed seed rows after one block's inexact PHR update.
+
+        ``max(abs(max(g, -lambda/rho)))`` measures feasibility/complementarity
+        progress, not stationarity or full KKT convergence. The first update
+        establishes the comparison value. Finite steps may approach a boundary
+        from its infeasible side indefinitely; acceptance stays outside here.
+        """
+        residual = self._residuals(signed)
+        if residual.shape != self._multiplier_buffer.shape:
+            raise ValueError("Update functional AL from exactly one continuation point per seed")
+        if not bool(torch.isfinite(residual).all()):
+            raise ValueError("Functional AL cannot update from missing or nonfinite events")
+        if not self.keys:
+            return torch.zeros(self.num_seeds, dtype=torch.bool, device=residual.device)
+        measure = torch.maximum(residual, -self._multiplier_buffer/self._penalty_buffer[:, None]).abs().amax(-1)
+        multipliers = torch.relu(self._multiplier_buffer+self._penalty_buffer[:, None]*residual)
+        if not bool(torch.isfinite(multipliers).all()):
+            raise ValueError("Functional AL multiplier update exceeded finite arithmetic")
+        increase = measure > self.required_reduction*self._previous_residual
+        proposed_penalty = self._penalty_buffer*self.penalty_growth
+        penalty = torch.where(increase, proposed_penalty.clamp_max(self.maximum_penalty), self._penalty_buffer)
+        changed = (multipliers != self._multiplier_buffer).any(-1) | (penalty != self._penalty_buffer)
+        self._penalty_capped.copy_(increase & (proposed_penalty > self.maximum_penalty))
+        self._multiplier_buffer.copy_(multipliers)
+        self._penalty_buffer.copy_(penalty)
+        self._previous_residual.copy_(measure)
+        self._updates.add_(1)
+        return changed
 
     def snapshot(self):
-        """Return host diagnostics in normalized, pre-constraint-weight units."""
-        return {"constraint_keys": list(self.keys),
-                "multipliers": dict(zip(self.keys, self._multipliers)),
-                "penalty": self._penalty, "maximum_penalty": self.maximum_penalty,
-                "outer_updates": self._updates,
-                "previous_complementarity_residual": (
-                    self._previous_residual if math.isfinite(self._previous_residual) else None)}
+        """Copy small per-seed diagnostics only at a completed solve boundary."""
+        if self._multiplier_buffer is None:
+            return {"constraint_keys": list(self.keys), "seeds": []}
+        multipliers = self._multiplier_buffer.detach().cpu().tolist()
+        penalties = self._penalty_buffer.detach().cpu().tolist()
+        previous = self._previous_residual.detach().cpu().tolist()
+        updates = self._updates.cpu().tolist()
+        capped = self._penalty_capped.cpu().tolist()
+        return {"constraint_keys": list(self.keys), "maximum_penalty": self.maximum_penalty,
+                "seeds": [{"seed_index": index, "multipliers": dict(zip(self.keys, multipliers[index])),
+                    "penalty": penalties[index], "outer_updates": updates[index],
+                    "previous_complementarity_residual": previous[index] if updates[index] else None,
+                    "penalty_capped": capped[index]} for index in range(self.num_seeds)]}
 
     @property
     def report(self):
         return self.snapshot()
-
-    def update(self, signed):
-        """Update from one selected curve, using the previous lambda and rho.
-
-        The residual ``max(abs(max(g, -lambda/rho)))`` measures constraint and
-        complementarity progress; it does not include stationarity and is not
-        a full KKT residual. If it fails to halve, grow rho by ten, capped at
-        ``maximum_penalty``. The first update establishes the comparison value.
-        A reached cap is reported, never interpreted as successful convergence.
-
-        This is the standard PHR update also used by NLopt's augmented method:
-        https://github.com/stevengj/nlopt/blob/master/src/algs/auglag/auglag.c
-        """
-        import torch
-        self._check_keys(signed)
-        if any(value.numel() != 1 for value in signed.values()):
-            raise ValueError("Update functional AL from exactly one selected candidate")
-        if self.keys:
-            values = torch.stack([signed[key].reshape(()) for key in self.keys])
-            residuals = values.detach().to(device="cpu", dtype=torch.float64).tolist()
-        else:
-            residuals = []
-        if any(not math.isfinite(value) for value in residuals):
-            raise ValueError("Functional AL cannot update from missing or nonfinite events")
-        before = self.snapshot()
-        measure = max((abs(max(value, -multiplier/self._penalty))
-                       for value, multiplier in zip(residuals, self._multipliers)), default=0.)
-        multipliers = [max(0., multiplier+self._penalty*value)
-                       for value, multiplier in zip(residuals, self._multipliers)]
-        if any(not math.isfinite(value) for value in multipliers):
-            raise ValueError("Functional AL multiplier update exceeded finite arithmetic")
-        increase = measure > self.required_reduction*self._previous_residual
-        penalty = min(self.maximum_penalty, self._penalty*self.penalty_growth) if increase else self._penalty
-        changed = multipliers != self._multipliers or penalty != self._penalty
-        capped = increase and self._penalty*self.penalty_growth > self.maximum_penalty
-        self._multipliers, self._penalty = multipliers, penalty
-        self._previous_residual = measure
-        self._updates += 1
-        self._copy_parameters()
-        return {**self.snapshot(), "changed": changed, "before": before,
-                "signed_residuals": dict(zip(self.keys, residuals)),
-                "maximum_normalized_violation": max((max(0., value) for value in residuals), default=0.),
-                "complementarity_residual": measure,
-                "penalty_increased": penalty > before["penalty"], "penalty_capped": capped}
 # END hard tolerances, collision acceptance and iteration budgets are external.

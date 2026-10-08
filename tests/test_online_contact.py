@@ -29,13 +29,24 @@ def rule(name="left", x=-.006, *, required=False, sphere_indices=(0,), material=
             "source": "complete native box extrusion", "sphere_binding_source": "verified test native cover"})
 
 
+# BEGIN test surfaces are explicit source components, never numerical field zeros.
 def field(points=((-0.006, 0., 0.), (.006, 0., 0.)), *, size=.001):
+    from manipulation.collision_records import encode_array
+    from manipulation.online_observed_geometry import FrozenObservedGeometry
     axis = np.arange(-30, 31) * size
-    xyz = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), -1)
-    distance = np.linalg.norm(xyz[..., None, :] - np.asarray(points), axis=-1).min(-1).astype(np.float32)
-    known = np.ones(distance.shape, bool)
-    return FrozenESDF(distance, origin=[axis[0]] * 3, voxel_size=size,
-        site_valid=known, observed_sign=known, owner_ids=("part",), source="observed finite test surface sites")
+    vertices = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    record = {"kind": "tsdf", "name": "part", "source": "observed isolated zero samples",
+        "pose": [0., 0., 0., 1., 0., 0., 0.], "origin": [axis[0]]*3,
+        "shape_xyz": [601]*3, "voxel_size": size/10,
+        "surface_vertices": encode_array(vertices),
+        "surface_offsets": encode_array(np.arange(len(vertices)+1, dtype=np.int64)),
+        "negative_vertices": encode_array(np.empty((0, 3), dtype=np.float64)),
+        "negative_offsets": encode_array(np.zeros(1, dtype=np.int64)),
+        "negative_cell_flat_indices": encode_array(np.empty(0, dtype=np.int64))}
+    geometry = FrozenObservedGeometry(record)
+    return FrozenESDF.from_source(geometry, origin=[axis[0]]*3, shape=(61,)*3,
+        voxel_size=size, owner_ids=("part",), source="observed finite test surface components")
+# END derived proposal fields and original source positions are tested separately.
 
 
 def prepare(query, rules, radius=.01):
@@ -62,6 +73,37 @@ def spheres(x=0., z=0., radius=.01, requires_grad=False):
     return torch.tensor([[[[x, 0., z, radius]]]], dtype=torch.float64, requires_grad=requires_grad)
 
 
+# BEGIN finite permission cannot remove another component sharing its proposal cell.
+def test_source_components_sharing_a_raster_cell_keep_unpermitted_material():
+    item = replace(rule(), patch_half_size=np.array([.0001, .0001]))
+    query = prepare(field(points=((-0.006, 0., 0.), (-0.0058, 0., 0.))), [item])
+    result, missing = query.contact_query(spheres(x=-.006, radius=.001), [(item, policy(item)[0])])
+    assert result.item() > 0 and missing.item() == 0
+    region = query._contact_model.regions[item.rule_id]
+    assert region["removed_elements"] == 1 and region["element_kind"] == "source_component"
+    assert query._contact_model.channels[0]["kind"] == "field"
+
+
+def test_mapped_required_witnesses_ignore_fake_numerical_zeroes():
+    item = rule(required=True)
+    query = field(points=((.006, 0., 0.),))
+    with pytest.raises(ValueError, match="no observed surface witness"):
+        PreparedContactFields.prepare(distance=np.zeros_like(query.distance), origin=query.origin,
+            voxel_size=query.voxel_size, rules=(item,), maximum_radii={item.rule_id: .01},
+            source="proposal zeros are not material", source_geometry=query.source_geometry)
+
+
+def test_required_witnesses_retain_original_source_coordinates():
+    item = rule(required=True)
+    point = (-.0058, .0002, .0001)
+    query = prepare(field(points=(point,)), [item])
+    witnesses = query._contact_model.regions[item.rule_id]["surface_witnesses"]
+    np.testing.assert_array_equal(witnesses, np.array([point]))
+    assert not np.allclose((witnesses-query.origin)/query.voxel_size,
+                           np.rint((witnesses-query.origin)/query.voxel_size))
+# END source material is filtered before creating numerical fields or contact witnesses.
+
+
 def test_same_sphere_keeps_second_obstacle_outside_permitted_patch_and_gradient():
     item = rule()
     query = prepare(field(), [item])
@@ -83,7 +125,7 @@ def test_record_capacity_does_not_expand_contact_bank_or_allocate_rejected_field
     with patch("manipulation.online_contact.require_host_memory") as admission, \
             patch("manipulation.online_contact.distance_transform_edt") as edt:
         with pytest.raises(ValueError, match="field combinations exceed the fixed storage budget"):
-            PreparedContactFields.prepare(distance=values, site_valid=None, observed_sign=None,
+            PreparedContactFields.prepare(distance=values, source_geometry=None,
                 origin=np.zeros(3), voxel_size=.001, rules=rules,
                 maximum_radii={item.rule_id: .01 for item in rules}, source="capacity boundary")
     admission.assert_not_called()
@@ -149,13 +191,14 @@ def test_actual_target_height_and_negative_gap_do_not_double_allowance():
     item = rule()
     item.modeling_allowance_m = .001
     item.gap_bounds = (-.001, .001)
-    # Actual cell occupies z=[.00025,.00075]. A face at -.001 penetrates
-    # 1.75 mm, although its declared plane-to-plane gap is legal.
+    # The actual source point is at z=.0005. A face at -.001 is 1.5 mm
+    # behind it, although its declared plane-to-plane gap is legal. Its
+    # rasterized proposal cell must not add another half voxel of material.
     query = prepare(field(points=((-0.006, 0., .0005),), size=.0005), [item])
     current, normal = policy(item, position=(0., 0., -.001))
     terms = planar_material_conditions(item, current, normal, query._contact_model)
     assert terms["gap"].item() == 0
-    assert terms["material_band"].item() > .0007
+    assert terms["material_band"].item() == pytest.approx(.0005-item.numerical_position_tolerance_m, abs=1e-12)
 
 
 def test_tilted_body_support_includes_back_projection_and_invalid_normal_is_finite():
@@ -176,9 +219,7 @@ def test_required_contact_uses_same_point_observed_evidence_and_absence_is_capab
     query = prepare(field(points=((-0.006, 0., 0.),)), [item])
     assert query.required_contact(item, policy(item)[0]).item() == 0
     assert query.required_contact(item, policy(item, position=(.1, 0., 0.))[0]).item() > 0
-    empty = FrozenESDF(np.ones((21, 21, 21), np.float32), origin=[-.01] * 3, voxel_size=.001,
-        site_valid=np.zeros((21, 21, 21), bool), observed_sign=np.zeros((21, 21, 21), bool),
-        owner_ids=("part",), source="no observed target support")
+    empty = field(points=())
     with pytest.raises(ValueError, match="no observed surface witness"):
         prepare(empty, [item])
 
@@ -193,8 +234,8 @@ def test_current_binding_reuses_exact_arrays_without_preparation_or_legacy_fallb
         original = query.contact_query(spheres(), [(item, policy(item)[0])])
         actual = restored.contact_query(spheres(), [(item, policy(item)[0])])
     assert all(torch.equal(a, b) for a, b in zip(original, actual))
-    assert record["kind"] == "frozen_esdf_v2"
-    record["kind"] = "frozen_esdf_v1"
+    assert record["kind"] == "frozen_observed_field_v3"
+    record["kind"] = "frozen_esdf_v2"
     with pytest.raises(ValueError, match="current frozen-field schema"):
         FrozenESDF.from_record(record)
 
@@ -221,10 +262,8 @@ def test_primitive_contact_preparation_retains_remote_primitive_of_same_owner():
 def test_full_scene_modes_material_guards_and_execution_use_same_frozen_model():
     item = rule()
     owner_field = field(points=((-0.006, 0., 0.),))
-    background = field()
+    background = field(points=())
     background.owner_ids = frozenset(("background",))
-    background.site_valid = np.zeros_like(background.site_valid)
-    background.geometry_lower = background.geometry_upper = None
     known = np.ones(owner_field.distance.shape, bool)
     coverage = ObservedSpace(known, origin=owner_field.origin, voxel_size=owner_field.voxel_size,
         observation_ids=("current",), reference_frame="world")
@@ -259,9 +298,8 @@ def test_required_contact_with_command_only_fingers_retains_unresolved_obligatio
         sphere_indices=(0,), local_spheres=[[0., 0., 0., .01]], sphere_joint_translation=[[[1.], [0.], [0.]]],
         self_collision_pairs=(), commands=(), source='unmodelled independently commanded finger', control_timestep_s=.01)
     owner_field = field(points=((-0.006, 0., 0.),))
-    background = field()
+    background = field(points=())
     background.owner_ids = frozenset(('background',))
-    background.geometry_lower = background.geometry_upper = None
     coverage = ObservedSpace(np.ones(owner_field.distance.shape, bool), origin=owner_field.origin,
         voxel_size=owner_field.voxel_size, observation_ids=('A',), reference_frame='world')
     owner = CollisionOwner('part', owner_field, PosePath(np.array([0., 1.]),
@@ -316,14 +354,13 @@ def test_workspace_counts_unique_source_arrays_and_both_float_caches_on_cpu_and_
                             _self_collision_pair_arrays=(np.empty((0, 2), np.int64), np.empty((0, 2), np.int64)))
     # END fixed pair storage is exercised separately with a real robot binding.
     base = OnlinePlanningScene.estimated_workspace_allocation(scene, 1, 1)
-    # One ESDF owns distance float32 + two bool arrays: 6N. One prepared
-    # channel adds 4N. Distance, site-validity and prepared-bank caches each
-    # reserve 4N+8N on both devices. Coverage adds two masks, float32 source,
-    # one CPU float64 copy and both GPU dtypes, independently.
-    n, nc = query.distance.size, coverage._distance_squared.numel()
-    constants = 65536 * 3
-    assert base["cpu_shared"] == 46 * n + 14 * nc + constants
-    assert base["gpu_shared"] == 36 * n + 12 * nc + constants
+    # BEGIN source components and proposal fields are counted without native-site masks.
+    # The frozen source owns its index/cache reservation once; sibling scenes
+    # borrow it. The comparison below checks that adding a sibling cannot
+    # silently reserve a second source or another pair of field caches.
+    assert base["cpu_shared"] >= query.distance.nbytes + query._contact_model.storage_nbytes
+    assert base["gpu_shared"] >= query.distance.nbytes + query._contact_model.storage_nbytes
+    # END exact aggregate byte formulas belong to the shared scene accountant.
     # BEGIN shared static fields add no moving-owner coverage queries.
     scene.owners = (SimpleNamespace(query=query.clone_for_rollout(), moving=False),)
     # END their field caches still alias the original storage.

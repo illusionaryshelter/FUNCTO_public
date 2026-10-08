@@ -13,15 +13,15 @@ from manipulation.online_native_confirmation import NativeCollisionConfirmation
 from manipulation.planning_problem import PosePath
 from manipulation.planning_scene import CollisionOwner, ContactRule, ObservedSpace
 from manipulation.robot_geometry_check import NativeSolid, RobotGeometryChecker
+from observed_geometry_fixtures import point_source, surface_source
 
 
-def _field(points=((.005, 0., 0.),)):
-    axis = np.arange(-20, 21) * .001
-    grid = np.stack(np.meshgrid(axis, axis, axis, indexing='ij'), -1)
-    distance = np.linalg.norm(grid[..., None, :] - np.asarray(points), axis=-1).min(-1).astype(np.float32)
-    known = np.ones(distance.shape, bool)
-    return FrozenESDF(distance, origin=[-.02]*3, voxel_size=.001,
-        site_valid=known, observed_sign=known, owner_ids=('part',), source='synthetic observed sites')
+def _field(points=((.005, 0., 0.),), geometry=None):
+    # BEGIN source points have zero extent; proposal raster cells are not solids.
+    return FrozenESDF.from_source(point_source(points) if geometry is None else geometry,
+        origin=[-.02]*3, shape=(41, 41, 41), voxel_size=.001,
+        owner_ids=('part',), source='synthetic observed source')
+    # END native confirmation consumes this exact source even when its field is positive.
 
 
 def _box(center=(0., 0., 0.), half=(.0004, .0004, .0004)):
@@ -56,8 +56,7 @@ def _setup(tmp_path, *, query=None, native=None, contacts=(), second_body=False)
         NativeSolid(name, 'tool', shape, 'explicit synthetic native solid')
         for name, shape in zip(names, vertices)])
     query = _field() if query is None else query
-    background = FrozenESDF(np.ones((3, 3, 3), np.float32), origin=[-1.]*3, voxel_size=1.,
-        site_valid=np.zeros((3, 3, 3), bool), observed_sign=np.zeros((3, 3, 3), bool),
+    background = FrozenESDF.from_source(point_source(), origin=[-1.]*3, shape=(3, 3, 3), voxel_size=1.,
         owner_ids=('background',), source='empty synthetic background')
     cover = ObservedSpace(np.ones((3, 3, 3), bool), origin=[-1.]*3, voxel_size=1.,
         observation_ids=('test',), reference_frame='world')
@@ -110,7 +109,7 @@ def test_analytic_primitives_keep_exact_geometry_and_half_height_conventions(tmp
 
 def test_effective_finite_permission_never_exempts_nonpad_or_other_owner_material(tmp_path):
     contact = _rule()
-    native = _box(center=(0., 0., .004), half=(.01, .01, .004))
+    native = _box(center=(0., 0., .003), half=(.01, .01, .004))
     checker, scene = _setup(tmp_path, query=_field(points=((0., 0., 0.),)), native=native,
                             contacts=(contact,), second_body=True)
     confirm = NativeCollisionConfirmation(checker, scene)
@@ -121,15 +120,16 @@ def test_effective_finite_permission_never_exempts_nonpad_or_other_owner_materia
     assert next(row for row in both['pairs'] if row['actor_geometry'] == 'body_box')['effective_contact_rule_ids'] == []
 
 
-@pytest.mark.parametrize('points', [((.001, 0., 0.),), ((.005, 0., 0.),)])
-def test_permission_removes_whole_contained_cells_only_and_retains_other_patch_obstacle(tmp_path, points):
-    # Cell center x=1 mm lies in the patch, but its outer face is at 1.5 mm.
-    # A 1.1 mm patch cannot remove it. Another cell at 5 mm is unpermitted too.
+@pytest.mark.parametrize('points', [((.0005, 0., 0.), (.0015, 0., 0.)), ((.005, 0., 0.),)])
+def test_permission_removes_whole_source_components_only_and_retains_other_patch_obstacle(tmp_path, points):
+    # BEGIN a source segment crossing the patch boundary cannot inherit permission.
+    # Its centre is inside the patch, but its endpoint at 1.5 mm is outside.
     contact = _rule(half=(.0011, .002))
-    checker, scene = _setup(tmp_path, query=_field(points=points),
-        native=_box(center=(0., 0., .004), half=(.01, .01, .004)), contacts=(contact,))
+    checker, scene = _setup(tmp_path, query=_field(geometry=surface_source([points])),
+        native=_box(center=(0., 0., .003), half=(.01, .01, .004)), contacts=(contact,))
     assert _confirm(NativeCollisionConfirmation(checker, scene), checker,
                     active={'patch'})['collision_targets'] == ['part']
+    # END no voxel half-width is invented for the original source.
 
 
 def test_primitive_finite_mode_uses_same_prepared_cell_removal(tmp_path):
@@ -146,7 +146,7 @@ def test_primitive_finite_mode_uses_same_prepared_cell_removal(tmp_path):
     assert _confirm(confirm, checker, active=())['collision_targets'] == ['part']
     allowed = _confirm(confirm, checker, active={'patch'})
     assert allowed['cleared_targets'] == ['part']
-    assert allowed['pairs'][0]['target_representation'] == 'frozen_observed_occupied_cells'
+    assert allowed['pairs'][0]['target_representation'] == 'frozen_primitive_contact_cells'
 
 
 def test_partial_native_sphere_permission_cannot_expand_to_whole_native_body(tmp_path):
@@ -160,7 +160,7 @@ def test_partial_native_sphere_permission_cannot_expand_to_whole_native_body(tmp
 def test_numerical_boundary_and_request_cancellation_cannot_publish_clear(tmp_path):
     checker, scene = _setup(tmp_path)
     confirmation = NativeCollisionConfirmation(checker, scene)
-    touching = _confirm(confirmation, checker, x=.0041)
+    touching = _confirm(confirmation, checker, x=.0046)
     assert touching['unresolved_targets'] == ['part'] and not touching['cleared_targets']
 
     def cancelled():
@@ -174,7 +174,7 @@ def test_numerical_boundary_and_request_cancellation_cannot_publish_clear(tmp_pa
 def test_effective_rule_for_one_owner_does_not_remove_another_owner(tmp_path):
     contact = _rule()
     checker, scene = _setup(tmp_path, query=_field(points=((0., 0., 0.),)),
-        native=_box(center=(0., 0., .004), half=(.01, .01, .004)), contacts=(contact,))
+        native=_box(center=(0., 0., .003), half=(.01, .01, .004)), contacts=(contact,))
     other = _field(points=((0., 0., 0.),))
     other.owner_ids = frozenset(('other',))
     scene.owners += (CollisionOwner('other', other, scene.owners[0].pose_path,

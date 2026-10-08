@@ -39,11 +39,20 @@ def _require_sample_array_budget(shape):
 class _Components:
     """Accumulate a bounded CSR vertex array; no point becomes a full voxel."""
 
-    def __init__(self):
+    # BEGIN source construction obeys the same host budget before final encoding.
+    def __init__(self, *, max_host_rss_bytes):
         self.vertices = []
         self.offsets = [0]
+        self.max_host_rss_bytes = max_host_rss_bytes
 
     def append(self, vertices):
+        if len(self.vertices) % 1024 == 0:
+            # Existing Python components already reside in RSS. Reserve the
+            # next bounded batch and future contiguous/encoded copies of the
+            # actual accumulated inventory, not a whole-map shape cache.
+            pending = self.offsets[-1]*3*np.dtype(np.float64).itemsize+len(self.offsets)*8
+            require_host_memory(int(1024*2048+6*pending), pending_existing_bytes=0,
+                max_rss_bytes=self.max_host_rss_bytes)
         points = np.unique(np.asarray(vertices, dtype=np.float64).reshape(-1, 3), axis=0)
         end = self.offsets[-1] + len(points)
         if end * 3 * np.dtype(np.float64).itemsize > MAX_ARRAY_BYTES:
@@ -52,11 +61,16 @@ class _Components:
         self.offsets.append(end)
 
     def arrays(self):
+        size = self.offsets[-1]*3*np.dtype(np.float64).itemsize+len(self.offsets)*8
+        require_host_memory(int(2*size), pending_existing_bytes=0,
+            max_rss_bytes=self.max_host_rss_bytes)
         vertices = np.concatenate(self.vertices) if self.vertices else np.empty((0, 3), dtype=np.float64)
         return vertices, np.asarray(self.offsets, dtype=np.int64)
+    # END geometric component values and their original enumeration are unchanged.
 
 
-def tsdf_geometry_from_samples(sdf, observed, *, origin, voxel_size, name, source):
+def tsdf_geometry_from_samples(sdf, observed, *, origin, voxel_size, name, source,
+                               max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
     """Build a collision inventory from CPU XYZ sample arrays.
 
     ``origin`` is the centre of sample ``[0, 0, 0]``. A tetrahedron exists only
@@ -81,7 +95,14 @@ def tsdf_geometry_from_samples(sdf, observed, *, origin, voxel_size, name, sourc
             or not np.isfinite(size) or size <= 0 or not np.isfinite(values[valid]).all()
             or not isinstance(name, str) or not name or not isinstance(source, str) or not source):
         raise ValueError("TSDF geometry requires finite observed XYZ samples, a metric centre lattice, name and source")
-    surface, negative = _Components(), _Components()
+    # BEGIN admit cell masks and full candidate-index scratch before allocation.
+    # Per-component vertex lists and their final encoding are admitted from
+    # their actual size below; this bound only covers dense source traversal.
+    require_host_memory(int(values.size*48+8*1024**2), pending_existing_bytes=0,
+        max_rss_bytes=max_host_rss_bytes)
+    surface, negative = (_Components(max_host_rss_bytes=max_host_rss_bytes),
+                         _Components(max_host_rss_bytes=max_host_rss_bytes))
+    # END source observations never require an unbounded implicit CPU allowance.
     covered = np.zeros(values.shape, dtype=bool)
     cell_shape = tuple(n - 1 for n in values.shape)
     negative_cells = np.empty(0, dtype=np.int64)
@@ -135,6 +156,12 @@ def tsdf_geometry_from_samples(sdf, observed, *, origin, voxel_size, name, sourc
 
     surface_vertices, surface_offsets = surface.arrays()
     negative_vertices, negative_offsets = negative.arrays()
+    # BEGIN encode only after admitting actual raw/base64/string overlap.
+    encoded_inputs = (surface_vertices, surface_offsets, negative_vertices,
+                      negative_offsets, negative_cells)
+    require_host_memory(int(5*sum(array.nbytes for array in encoded_inputs)),
+        pending_existing_bytes=0, max_rss_bytes=max_host_rss_bytes)
+    # END encoding changes storage only, not surface or negative material.
     record = {
         "kind": "tsdf", "name": name, "source": source,
         "pose": [0., 0., 0., 1., 0., 0., 0.],
@@ -160,7 +187,7 @@ def tsdf_geometry_from_samples(sdf, observed, *, origin, voxel_size, name, sourc
     return {"solids": [record], "query_gaps": [], "field_summary": summary}
 
 
-def build_tsdf_geometry(mapper, name, source):
+def build_tsdf_geometry(mapper, name, source, *, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
     """Export the live Mapper's observed dynamic TSDF into an owned CPU record.
 
     The public block export contains ``(sum(weight*sdf), sum(weight))`` and
@@ -174,6 +201,16 @@ def build_tsdf_geometry(mapper, name, source):
     shape = tuple(int(n) for n in config.grid_shape[::-1])
     # Admit before public export clones GPU blocks or dense CPU buffers exist.
     _require_sample_array_budget(shape)
+    # BEGIN source export is charged before the public native clone operation.
+    # Weighted TSDF pairs need at most two float32 channels per voxel. The
+    # declared native pool bounds every exported block and its CPU transfer;
+    # dense sample/sign arrays are separate from those source-block buffers.
+    block_size = int(mapper.tsdf.block_size)
+    blocks_bound = int(config.max_blocks)
+    export_bytes = blocks_bound*(block_size**3*8+3*8)
+    require_host_memory(int(2*export_bytes+math.prod(shape)*5+block_size**3*16),
+        pending_existing_bytes=0, max_rss_bytes=max_host_rss_bytes)
+    # END original Mapper data and all source-coordinate arithmetic remain intact.
     size = float(config.voxel_size)
     centre = config.grid_center.detach().cpu().numpy().astype(np.float64)
     origin = centre - (np.asarray(shape) - 1) * size / 2
@@ -181,7 +218,6 @@ def build_tsdf_geometry(mapper, name, source):
     keys = blocks["active_block_coords"].detach().cpu().numpy()
     data = blocks["block_data"].detach().cpu().numpy()
     del blocks
-    block_size = int(mapper.tsdf.block_size)
     block_offset = (np.ceil(np.asarray(shape) / block_size).astype(np.int64)) // 2
     sdf = np.zeros(shape, dtype=np.float32)
     observed = np.zeros(shape, dtype=bool)
@@ -200,7 +236,8 @@ def build_tsdf_geometry(mapper, name, source):
         valid = weight >= float(config.minimum_tsdf_weight)
         observed[region] = valid
         np.divide(weighted[..., 0], weight, out=sdf[region], where=valid)
-    return tsdf_geometry_from_samples(sdf, observed, origin=origin, voxel_size=size, name=name, source=source)
+    return tsdf_geometry_from_samples(sdf, observed, origin=origin, voxel_size=size, name=name, source=source,
+        max_host_rss_bytes=max_host_rss_bytes)
 
 
 def _component_rank(vertices):

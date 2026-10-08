@@ -816,18 +816,17 @@ class OnlineObservationContractTest(unittest.TestCase):
         np.testing.assert_array_equal(supported.grid_center,small.grid_center)
         self.assertEqual(supported.voxel_size,small.voxel_size)
 
-    def test_native_samples_keep_xyz_order_positive_free_sign_and_physical_centres(self):
+    # BEGIN mapping freezes source material without constructing native ESDF sites.
+    def test_source_and_query_frames_stay_independent_without_native_seed_solids(self):
         from curobo.perception import MapperCfg
         from curobo.types import DeviceCfg
         from manipulation.planning_observation import _map_online_partition
+        from observed_geometry_fixtures import point_source
         cfg=MapperCfg(extent_meters_xyz=(.06,.08,.1),voxel_size=.02,
             extent_esdf_meters_xyz=(.06,.08,.1),esdf_voxel_size=.02,
-            # BEGIN source and query centres are independent native inputs.
             grid_center=torch.tensor([.25,.35,1.05]),image_height=96,image_width=96,device='cuda:0')
-        # END the mocked output below retains the requested query centre.
-        values=torch.tensor(np.broadcast_to(np.array([-.02,0.,.02])[:,None,None],(3,4,5)).copy(),dtype=torch.float16)
-        voxel=SimpleNamespace(feature_tensor=values,pose=[.2,.3,1.,1.,0.,0.,0.],voxel_size=.02)
-        # BEGIN inspect the exact filtered depth passed to the native Mapper.
+        source=point_source([[.25,.35,1.05]])
+        query_center=np.array([.24,.34,1.04])
         from manipulation.robot_self_filter import SELF, AMBIGUOUS_SHADOW
         record=view()
         record['self_filter']['labels'][30,30]=SELF
@@ -835,40 +834,33 @@ class OnlineObservationContractTest(unittest.TestCase):
         record['self_filter']['free_ray_depth_m'][[30,31],[30,31]]=0.
         normalized=_self_filtered_views({'A':record},'world',(.1,3.))
         masks=_partition_masks(normalized,{})
-        # END mixed labels must reach one unchanged native integration path.
-        bits=np.full((3,4,5),3,dtype=np.uint8)
+        exported={'solids':[source.record()], 'field_summary':{'observed_samples':1}}
         with patch('curobo.perception.Mapper') as mapper, \
              patch('curobo.types.DeviceCfg',return_value=DeviceCfg('cpu')), \
              patch('curobo.types.CameraObservation',side_effect=lambda **kw:SimpleNamespace(**kw)), \
              patch('curobo.types.Pose.from_matrix',return_value=SimpleNamespace()), \
-             patch('manipulation.native_voxel_sources.export_source_bits',return_value=bits) as sources, \
-             patch('manipulation.tsdf_geometry.build_tsdf_geometry',side_effect=AssertionError('online map exported source solid')), \
-             patch('curobo._src.geom.collision.collision_scene.SceneCollision.from_config',side_effect=AssertionError('online map created second collision scene')):
+             patch('manipulation.native_voxel_sources.export_source_bits',side_effect=AssertionError('proposal seeds are not source material')), \
+             patch('manipulation.tsdf_geometry.build_tsdf_geometry',return_value=exported) as source_export, \
+             patch('curobo._src.geom.collision.collision_scene.SceneCollision.from_config',side_effect=AssertionError('second scene')):
             mapper.return_value.get_stats.return_value={'allocation_failures':0,'num_allocated':0,'active_blocks':0,'free_count':0}
-            mapper.return_value.compute_esdf.return_value=voxel
-            query,report=_map_online_partition(normalized,masks,None,cfg,np.eye(4),
-                esdf_origin=np.asarray(voxel.pose[:3]))
-        # BEGIN Mapper integration owns the unchanged source centre.
+            query,report=_map_online_partition(normalized,masks,None,cfg,np.eye(4),query_center=query_center)
         self.assertIs(mapper.call_args.args[0],cfg)
+        self.assertIs(source_export.call_args.args[0],mapper.return_value)
+        mapper.return_value.compute_esdf.assert_not_called()
         np.testing.assert_allclose(cfg.grid_center.numpy(),[.25,.35,1.05],atol=1e-7)
-        requested=mapper.return_value.compute_esdf.call_args.kwargs['esdf_origin']
-        np.testing.assert_allclose(np.asarray(requested),voxel.pose[:3],atol=1e-7)
-        # END only the public ESDF query-origin argument moves the output lattice.
-        # BEGIN native mapping receives original ENVIRONMENT endpoints only.
         mapped=mapper.return_value.integrate.call_args.kwargs['camera_observation'].depth_image.cpu().numpy()[0]
         expected_depth=record['depth'].copy()
         expected_depth[[30,31],[30,31]]=0.
         np.testing.assert_array_equal(mapped,expected_depth)
-        # END no free-ray cap is integrated as a synthetic occupied surface.
-        np.testing.assert_allclose(query.origin,[.18,.27,.96],atol=1e-12)
-        np.testing.assert_array_equal(query.distance,values.float().numpy())
-        samples=torch.tensor([[.18,.29,1.],[.2,.29,1.],[.22,.29,1.]],dtype=torch.float64)
-        np.testing.assert_allclose(query.signed_distance(samples).numpy(),values.float().numpy()[:,1,2],atol=1e-12)
+        np.testing.assert_allclose(query.origin,[.22,.31,1.],atol=1e-12)
+        np.testing.assert_allclose(query.geometry_lower,[.25,.35,1.05])
+        np.testing.assert_array_equal(query.geometry_lower,query.geometry_upper)
+        self.assertEqual(query.distance.shape,(3,4,5))
+        self.assertEqual(query.distance.dtype,np.float32)
+        self.assertGreater(query(torch.tensor([[.25,.35,1.05,.01]],dtype=torch.float64)).item(),0.)
         self.assertEqual(report['shape_xyz'],[3,4,5])
-        # BEGIN native source export and frozen-field codec share one limit.
-        from manipulation.collision_records import MAX_ARRAY_BYTES
-        self.assertEqual(sources.call_args.kwargs['max_cells'], MAX_ARRAY_BYTES // 4)
-        # END a stale lower export cap cannot reintroduce the rejected capacity.
+        self.assertEqual(report['observed_geometry'],exported['field_summary'])
+    # END one source, independent numerical support and unchanged camera evidence.
 
     def test_online_builder_maps_one_selected_field_and_uses_complete_robot_radius(self):
         from manipulation.planning_observation import build_scene_from_rgbd
@@ -882,16 +874,16 @@ class OnlineObservationContractTest(unittest.TestCase):
         captured={}
         # BEGIN the mapper fixture honors the native independent query centre.
         query_centres={}
-        def make(normalized,masks,identity,config,inverse,*,esdf_origin=None):
+        def make(normalized,masks,identity,config,inverse,*,query_center=None,max_host_rss_bytes=None):
             captured[identity]=config
             shape=np.ceil(np.asarray(config.extent_esdf_meters_xyz)/config.esdf_voxel_size).astype(int)
-            centre=config.grid_center.numpy() if esdf_origin is None else np.asarray(esdf_origin)
+            centre=config.grid_center.numpy() if query_center is None else np.asarray(query_center)
             query_centres[identity]=centre.copy()
             origin=centre-(shape-1)*config.esdf_voxel_size/2
             # END output metadata must describe the actual query grid.
             values=np.ones(tuple(shape),dtype=np.float32)
-            query=FrozenESDF(values,origin=origin,voxel_size=config.esdf_voxel_size,
-                site_valid=np.zeros_like(values,dtype=bool),observed_sign=np.zeros_like(values,dtype=bool),
+            from observed_geometry_fixtures import point_source
+            query=FrozenESDF.from_source(point_source(),origin=origin,shape=tuple(shape),voxel_size=config.esdf_voxel_size,
                 owner_ids=('observed_background' if identity is None else identity,),source='mock current field')
             return query,{'shape_xyz':shape.tolist()}
         fine={None:{'center_m':[0.,0.,1.],'extent_m':[.2,.2,.2],'voxel_size_m':.01,
@@ -975,7 +967,7 @@ class BackgroundQueryDomainTest(unittest.TestCase):
                 np.testing.assert_allclose(lower_steps,np.rint(lower_steps),atol=1e-10)
                 self.assertTrue(np.all(lower_steps>=0))
                 source_half=np.asarray(config.grid_shape[::-1])*h_source/2
-                required_lower=old_c-source_half-h_source-h_query-radius
+                required_lower=old_c-source_half-h_query-radius
                 required_upper=old_c+source_half+h_query+radius
                 self.assertTrue(np.all(actual_lower<=required_lower+1e-12))
                 self.assertTrue(np.all(actual_upper>=required_upper-1e-12))
@@ -989,26 +981,19 @@ class BackgroundQueryDomainTest(unittest.TestCase):
     def test_actual_export_support_postcondition_handles_empty_clear_and_insufficient_fields(self):
         from manipulation.online_geometry import FrozenESDF
         from manipulation.planning_observation import _validate_background_query_support
-        values=np.ones((7,7,7),np.float32)
-        empty=FrozenESDF(values,origin=[-.3]*3,voxel_size=.1,
-            site_valid=np.zeros_like(values,dtype=bool),observed_sign=np.zeros_like(values,dtype=bool),
-            owner_ids=('background',),source='empty measured geometry')
+        # BEGIN numerical support is checked against actual point geometry.
+        from observed_geometry_fixtures import point_source
+        kwargs=dict(origin=[-.3]*3,shape=(7,7,7),voxel_size=.1,owner_ids=('background',),source='observed test source')
+        empty=FrozenESDF.from_source(point_source(),**kwargs)
         _validate_background_query_support(empty,.2)
-        values[3,3,3]=0.
-        occupied=FrozenESDF(values,origin=[-.3]*3,voxel_size=.1,
-            site_valid=np.ones_like(values,dtype=bool),observed_sign=np.zeros_like(values,dtype=bool),
-            owner_ids=('background',),source='one observed occupied cell')
+        occupied=FrozenESDF.from_source(point_source([[0.,0.,0.]]),**kwargs)
         _validate_background_query_support(occupied,.2)
         with self.assertRaises(ValueError):
-            _validate_background_query_support(occupied,.251)
-        # A nonzero field that reaches its last sample is insufficient even
-        # if its declared preparation formula expected additional padding.
-        values[6,3,3]=0.
-        at_boundary=FrozenESDF(values,origin=[-.3]*3,voxel_size=.1,
-            site_valid=np.ones_like(values,dtype=bool),observed_sign=np.zeros_like(values,dtype=bool),
-            owner_ids=('background',),source='actual export reaches query boundary')
+            _validate_background_query_support(occupied,.301)
+        at_boundary=FrozenESDF.from_source(point_source([[0.,0.,0.],[.3,0.,0.]]),**kwargs)
         with self.assertRaises(ValueError):
             _validate_background_query_support(at_boundary,.01)
+        # END no source point is expanded by a query voxel half-width.
 
     def test_gripper_mechanical_envelope_controls_background_radius_before_allocation(self):
         from curobo.perception import MapperCfg

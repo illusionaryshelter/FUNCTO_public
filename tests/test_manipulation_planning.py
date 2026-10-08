@@ -1726,6 +1726,37 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             torch.testing.assert_close(skill.sum(), torch.tensor(8*777.*.2**2))
             scene.sum().backward()
             torch.testing.assert_close(fixture.q.grad[..., 1], torch.full((2, 2), 2*777.))
+
+    # BEGIN optimizer candidate evidence retains hard residuals before PHR substitution.
+    def test_optimizer_evidence_rejects_removed_task_term_and_ignores_preferences(self):
+        from curobo._src.rollout.metrics import CostsAndConstraints, RolloutResult
+        with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
+            fixture.problem.optimizer_preferences = lambda p, *args, **kwargs: torch.ones_like(p[..., 0])
+            fixture.scene.optimizer_preferences = lambda progress, *args: torch.ones_like(progress)
+            fixture.problem.residuals = lambda p, *args, **kwargs: {
+                "function_pose:0": torch.full_like(p[..., 0], 1e-30),
+                "other": torch.zeros_like(p[..., 0])}
+            costs = fixture.manager.compute_costs(fixture.state)
+            result = RolloutResult(costs_and_constraints=CostsAndConstraints(constraints=costs))
+            feasible, _, objective = fixture.manager.optimizer_evidence(result)
+            self.assertFalse(bool(feasible.any()))
+            self.assertEqual(float(costs.values[costs.names.index("skill_process")].sum()), 0.)
+            self.assertTrue(bool((objective > 0).all()))
+            fixture.problem.residuals = lambda p, *args, **kwargs: {"other": torch.zeros_like(p[..., 0])}
+            later = fixture.manager.compute_costs(fixture.state)
+            with self.assertRaisesRegex(RuntimeError, "different native query"):
+                fixture.manager.optimizer_evidence(result)
+            result = RolloutResult(costs_and_constraints=CostsAndConstraints(constraints=later))
+            feasible, _, fixed = fixture.manager.optimizer_evidence(result)
+            self.assertTrue(bool(feasible.all()))
+            torch.testing.assert_close(fixed, objective)
+            # Same-query scene evidence remains hard even though preferences
+            # alone were harmless; an underflow-sized violation is not rounded.
+            fixture.scene.evaluate = lambda spheres, p, *args, **kwargs: torch.full_like(p[..., 0], 1e-20)
+            positive_scene = fixture.manager.compute_costs(fixture.state)
+            result = RolloutResult(costs_and_constraints=CostsAndConstraints(constraints=positive_scene))
+            self.assertFalse(bool(fixture.manager.optimizer_evidence(result)[0].any()))
+    # END the final ordinary/dense validation path is unchanged by this tracker.
     # END these tests exercise the production manager with analytic CPU FK.
 
     def test_disabled_self_collision_and_reference_ik_do_not_add_anchor_checks(self):

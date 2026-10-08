@@ -462,10 +462,12 @@ def online_binding(gate, *, distance=1., supported=True):
     values = np.full(shape, distance, np.float32)
     if not supported:
         values[0, :, :] = 0.
-    field = FrozenESDF(values,
+    # BEGIN construct the explicit source whose boundary requires an update.
+    from observed_geometry_fixtures import field_from_samples
+    field = field_from_samples(values,
         origin=[-1., -1., -1.] if supported else [.04, -1., -1.],
-        voxel_size=.25, site_valid=np.ones(shape, bool),
-        observed_sign=np.ones(shape, bool), owner_ids=(), source="online sensor field")
+        voxel_size=.25, observed=np.ones(shape, bool), owner_ids=(), source="online sensor source")
+    # END source geometry and numerical support have independent meanings.
     # END unqueried numerical support remains independent of collision evidence.
     coverage = ObservedSpace(np.ones(shape, bool), origin=[-1., -1., -1.], voxel_size=.25,
         observation_ids=["observation"], reference_frame="world")

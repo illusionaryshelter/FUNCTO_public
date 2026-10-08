@@ -171,8 +171,10 @@ class ObservedTsdfGeometryTests(unittest.TestCase):
                         world_x = 9. + 2 * block + x
                         value = world_x - 10.25 if world_x <= 11 else -100.
                         payload[block, z * 4 + y * 2 + x] = [2 * value, 2.]
-        config = SimpleNamespace(enable_static=False, grid_shape=(2, 2, 3), voxel_size=1.,
+        # BEGIN public export declares the same finite native block capacity.
+        config = SimpleNamespace(enable_static=False, grid_shape=(2, 2, 3), voxel_size=1., max_blocks=2,
                                  grid_center=torch.tensor([10., 20., 30.]), minimum_tsdf_weight=.1)
+        # END admission can precede the mocked native export allocation.
         exported = {"active_block_coords": torch.tensor([[-1, 0, 0], [0, 0, 0]]),
                     "block_data": torch.from_numpy(payload)}
         mapper = SimpleNamespace(config=config, tsdf=SimpleNamespace(block_size=2, export_blocks=lambda: exported))

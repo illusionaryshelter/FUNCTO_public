@@ -16,8 +16,11 @@ def make_scene(*, moving=None, bound=True):
         self_collision_pairs=((0, 1),), commands=(), source='calibrated linear test finger',
         control_timestep_s=.01)
     valid = np.ones((21, 21, 21), bool)
-    field = FrozenESDF(np.ones(valid.shape, np.float32), origin=[-.5]*3, voxel_size=.05,
-        site_valid=valid, observed_sign=valid, owner_ids=('background',), source='free test field')
+    # BEGIN the self-pair fixture has an explicit empty obstacle source.
+    from observed_geometry_fixtures import point_source
+    field = FrozenESDF.from_source(point_source(), origin=[-.5]*3, shape=valid.shape, voxel_size=.05,
+        owner_ids=('background',), source='empty test source')
+    # END measured-free coverage is supplied separately below.
     coverage = ObservedSpace(valid, origin=[-.5]*3, voxel_size=.05,
         observation_ids=('current',), reference_frame='world')
     result = OnlinePlanningScene(background=field, owners=(), coverage=coverage,

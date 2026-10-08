@@ -7,13 +7,21 @@ import torch
 
 from manipulation.online_geometry import FrozenESDF, FrozenPrimitives, OnlinePlanningScene
 from manipulation.planning_scene import ObservedSpace
+from observed_geometry_fixtures import source_from_samples
 
 
 def field(distance=None, valid=True, owner='background'):
     values=np.full((21,21,21),1.,np.float32) if distance is None else distance
-    mask=np.full(values.shape,valid,dtype=bool)
-    return FrozenESDF(values,origin=[-.1,-.1,-.1],voxel_size=.01,
-        site_valid=mask,observed_sign=mask,owner_ids=(owner,),source='test measured snapshot')
+    # BEGIN test material is explicit TSDF evidence, separate from proposal values.
+    # A constant cube needs only its eight corners to define the same affine
+    # material volume; avoid rebuilding thousands of identical zero sections.
+    constant = np.all(values == values.flat[0])
+    samples = np.full((2,2,2), values.flat[0], np.float32) if constant else values
+    geometry=source_from_samples(samples,origin=[-.1]*3,voxel_size=.2 if constant else .01,
+        observed=np.full(samples.shape,valid,dtype=bool))
+    return FrozenESDF.from_source(geometry,origin=[-.1]*3,shape=values.shape,voxel_size=.01,
+        owner_ids=(owner,),source='test measured snapshot')
+    # END absent source evidence cannot be manufactured by a numeric zero.
 
 
 def scene(*,conditional=False,background=None):
@@ -117,9 +125,11 @@ def test_primitive_pose_and_dimensions_keep_exact_native_meaning():
 
 # BEGIN exact zero-set and request-isolation regressions.
 def test_small_positive_collision_is_not_erased_by_an_execution_tolerance():
-    axis=np.linspace(-.1,.1,21)
-    distances=np.broadcast_to(axis[:,None,None],(21,21,21)).astype(np.float32)
-    model=scene(conditional=True,background=field(distances))
+    # BEGIN exact calibrated geometry isolates acceptance from proposal approximation.
+    solid=FrozenPrimitives(primitives=[{'kind':'cuboid','dimensions':[.2,.2,.2],
+        'pose':[-.1,0.,0.,1.,0.,0.,0.]}],owner_ids=('background',),source='exact test boundary')
+    model=scene(conditional=True,background=solid)
+    # END the original exact-zero acceptance rule is unchanged.
     sphere=np.array([[.01-1e-8,0.,0.,.01]])
     report=model.query_state(sphere,np.eye(4),0.)
     residual=report['components']['collision/robot/background']

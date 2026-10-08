@@ -12,6 +12,7 @@ import torch
 from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
 from manipulation.planning_scene import ObservedSpace
 from manipulation.resource_admission import ResourceLimitError
+from observed_geometry_fixtures import field_from_samples
 
 
 _ORIGIN = np.array([-.3, -.3, -.3])
@@ -35,9 +36,11 @@ def _scene(known, regions, *, occupied=False):
     coverage = ObservedSpace(known, origin=_ORIGIN, voxel_size=_STEP,
                              observation_ids=('measured-test-view',), reference_frame='world')
     valid = np.full(_SHAPE, occupied, dtype=bool)
-    background = FrozenESDF(np.full(_SHAPE, -.01 if occupied else 1., np.float32),
-        origin=_ORIGIN, voxel_size=_STEP, site_valid=valid, observed_sign=valid,
+    # BEGIN source material and free-ray observations remain independent fixtures.
+    background = field_from_samples(np.full(_SHAPE, -.01 if occupied else 1., np.float32),
+        origin=_ORIGIN, voxel_size=_STEP, observed=valid,
         owner_ids=('background',), source='fixed measured test geometry')
+    # END no proposal sign establishes observed occupancy.
     result = OnlinePlanningScene(background=background, owners=(), coverage=coverage,
         reference_frame='world', robot_sphere_materials=('body',),
         robot_geometry_source='test sphere geometry', has_gripper=False,

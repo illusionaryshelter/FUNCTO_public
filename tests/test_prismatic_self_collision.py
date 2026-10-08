@@ -53,8 +53,11 @@ def state(hand, values, uncertain=False, half=None):
 def scene(current_hand, *, distance=1.):
     values = np.full((11, 11, 11), distance, np.float32)
     valid = np.ones_like(values, bool)
-    background = FrozenESDF(values, origin=[-1.]*3, voxel_size=.2, site_valid=valid,
-        observed_sign=valid, owner_ids=('background',), source='bounded observed test field')
+    # BEGIN synthetic source values define material before proposal construction.
+    from observed_geometry_fixtures import field_from_samples
+    background = field_from_samples(values, origin=[-1.]*3, voxel_size=.2, observed=valid,
+        owner_ids=('background',), source='bounded observed test source')
+    # END collision proposals cannot replace source evidence.
     coverage = ObservedSpace(valid, origin=[-1.]*3, voxel_size=.2, observation_ids=('A',), reference_frame='world')
     result = OnlinePlanningScene(background=background, owners=(), coverage=coverage,
         reference_frame='world', robot_sphere_materials=(None,)*3, robot_geometry_source='test native geometry',

@@ -94,11 +94,6 @@ class Native:
     def promote_collision_witnesses(self, result):
         return {"changed": False, "parameters": []}
     # END dedicated recovery tests supply new physical-time evidence below.
-    def update_functional_constraints(self, result):
-        self.calls.append("al")
-        return {"changed": True}
-    def reset_functional_constraints(self):
-        self.calls.append("reset_al")
     def export(self, result, native_report):
         # BEGIN delivery consumes the already completed candidate metrics.
         assert native_report["accepted"]
@@ -140,9 +135,12 @@ def test_real_candidate_binding_roundtrips_online_geometry_and_rejects_mutation(
 
     shape = (7, 7, 7)
     observed = np.ones(shape, dtype=bool)
-    field = FrozenESDF(np.ones(shape, dtype=np.float32), origin=[-.3]*3, voxel_size=.1,
-        site_valid=observed, observed_sign=observed, owner_ids=("background",),
+    # BEGIN serialization retains an explicit empty obstacle source.
+    from observed_geometry_fixtures import point_source
+    field = FrozenESDF.from_source(point_source(), origin=[-.3]*3, shape=shape, voxel_size=.1,
+        owner_ids=("background",),
         source="fixed observed test field")
+    # END observed-free evidence is independently serialized by coverage.
     coverage = ObservedSpace(observed, origin=[-.3]*3, voxel_size=.1,
         observation_ids=("frame",), reference_frame="world")
     scene = OnlinePlanningScene(background=field, owners=(), coverage=coverage,
@@ -169,20 +167,30 @@ def test_real_candidate_binding_roundtrips_online_geometry_and_rejects_mutation(
 # END accepted evidence names exactly the field record handed to execution.
 
 
-@pytest.mark.parametrize("collision,recovery", [(True, "ompl"), (False, "al")])
-def test_failed_main_gets_exactly_one_exclusive_recovery(collision, recovery):
-    native = Native([False, False, True], collision=collision)
+# BEGIN only the existing collision branch may request a second full solve.
+def test_failed_main_collision_gets_one_bounded_recovery():
+    native = Native([False, False, True], collision=True)
     result, backend = run(native)
     assert result.success
     assert native.calls.count("solve") == 2 and native.calls.count("export") == 1
-    assert native.calls.count(recovery) == 1
-    assert ("al" if collision else "ompl") not in native.calls
+    assert native.calls.count("ompl") == 1
     assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 2
     backend.close()
 
 
+def test_task_only_failure_does_not_add_a_full_solve():
+    native = Native([False, False])
+    result, backend = run(native)
+    assert not result.success and result.execution_binding is None
+    assert native.calls.count("solve") == 1 and "export" not in native.calls
+    assert result.diagnostics["recovery"] is None
+    assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
+    backend.close()
+# END functional continuation runs inside each original native solve.
+
+
 def test_recovery_failure_returns_no_execution_binding_or_export():
-    native = Native([False, False, False])
+    native = Native([False, False, False], collision=True)
     result, backend = run(native)
     assert not result.success and result.execution_binding is None
     assert result.diagnostics["failure"] == "no_feasible_solution_found"
@@ -209,8 +217,7 @@ def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_
     try:
         assert not result.success and result.execution_binding is None
         assert "ompl" not in native.calls and "export" not in native.calls
-        assert native.calls.count("solve") == (2 if functional else 1)
-        assert native.calls.count("al") == int(functional)
+        assert native.calls.count("solve") == 1
         assert result.diagnostics["failure"] == "no_feasible_solution_found"
         assert result.diagnostics["scene_update_residuals"]["interpolated:scene_update"] == 500000.
         assert "failure_scope" in result.diagnostics
@@ -248,7 +255,7 @@ def test_new_dense_witnesses_continue_current_controls_without_search_or_third_s
     assert result.success is accepted
     assert result.diagnostics["recovery"] == "collision_witnesses"
     assert native.calls.count("solve") == 2 and native.calls.count("promote") == 1
-    assert native.calls.count("al") == 1 and "reset_al" not in native.calls and "ompl" not in native.calls
+    assert "ompl" not in native.calls
     torch.testing.assert_close(recovery_seeds[1], optimized_controls.expand_as(recovery_seeds[1]))
     assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 2
     assert result.request_ledger["planning_budget"]["planning_seconds"] == 120.
@@ -327,7 +334,6 @@ def test_new_motion_allowance_requires_boundary_t_evidence_and_forward_progress(
 # BEGIN support evidence cannot cancel the existing fixed-target finite search.
 @pytest.mark.parametrize("outcomes,collision,expected_solves", [
     ([False, True], False, 1),
-    ([False, False, True], False, 2),
     ([False, False, True], True, 2),
 ])
 def test_candidate_support_gaps_do_not_early_stop_main_or_recovery(outcomes, collision, expected_solves):
@@ -352,7 +358,7 @@ def test_candidate_support_gaps_do_not_early_stop_main_or_recovery(outcomes, col
         assert result.diagnostics["reference_candidate"]["scene_update_residuals"] == {"rollout:scene_update": 100000.}
         assert result.diagnostics["scene_update_residuals"] == {"rollout:scene_update": 0.}
         if expected_solves == 2:
-            assert ("ompl" if collision else "al") in native.calls
+            assert "ompl" in native.calls
         np.testing.assert_array_equal(source.phases[0].reference.poses, source_positions)
     finally:
         backend.close()

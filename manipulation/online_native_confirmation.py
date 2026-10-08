@@ -6,9 +6,10 @@ only decides whether a positive robot/target sphere term also intersects the
 registered native robot solid. It prepares occupied-cell indices once, then
 queries only the native geometry/target pairs named by positive spheres.
 
-An ESDF target is represented by the same complete occupied cells used when
-preparing finite contact fields. A primitive target retains its analytic Coal
-shape outside finite contact mode. This is a discrete observed-geometry check,
+An observed target uses its original affine TSDF surface and negative source
+components. Conservative proposal samples are never reconstructed as solids.
+A primitive target retains its analytic Coal shape outside finite contact
+mode. This is a discrete observed-geometry check,
 not a continuous-trajectory, sensor-error or unobserved-space certificate.
 """
 
@@ -66,8 +67,8 @@ def _bounds(vertices, shape, pose):
     return _solid_axis_bounds(vertices, shape, pose)
 
 
-class _OccupiedCells:
-    """One immutable spatial index and rule-membership bitset per target.
+class _PrimitiveContactCells:
+    """Prepared cells for the existing calibrated primitive contact model.
 
     Cell deletion uses the exact whole-cell containment test from
     PreparedContactFields.prepare. The index remains the full owner; active
@@ -75,35 +76,29 @@ class _OccupiedCells:
     """
 
     def __init__(self, query, rules):
-        if isinstance(query, FrozenPrimitives):
-            prepared = query._contact_model
-            if prepared is None:
-                raise ValueError('Primitive finite contact requires its prepared field')
-            origin, h, grid_shape = prepared.origin, prepared.voxel_size, prepared.shape
-            count = math.prod(grid_shape)
-            require_host_memory(count * 8 + _CHUNK * 128, pending_existing_bytes=0,
-                                max_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES)
-            # Match FrozenPrimitives.prepare_contacts exactly. No simulator
-            # geometry or separately chosen contact resolution is admitted.
-            import torch
-            occupied = np.empty(count, dtype=bool)
-            with torch.no_grad():
-                for start in range(0, count, _CHUNK):
-                    flat = np.arange(start, min(count, start + _CHUNK))
-                    indices = np.column_stack(np.unravel_index(flat, grid_shape))
-                    points = origin + indices * h
-                    distance = query.signed_distance(torch.as_tensor(points, dtype=torch.float64)).numpy()
-                    occupied[start:start + len(flat)] = distance <= math.sqrt(3.) * h / 2
-            occupied = occupied.reshape(grid_shape)
-        else:
-            origin, h = query.origin, query.voxel_size
-            # These are the source-valid/sign-supported occupied cells of the
-            # SAME frozen field, including negative observed interior samples.
-            count = query.distance.size
-            require_host_memory(count * 8, pending_existing_bytes=0,
-                                max_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES)
-            occupied = query.site_valid & ((np.abs(query.distance) <= h * .51)
-                                           | ((query.distance < 0) & query.observed_sign))
+        # BEGIN observed fields have no sample-to-solid conversion here.
+        if not isinstance(query, FrozenPrimitives):
+            raise TypeError('Contact cells belong only to calibrated primitives')
+        prepared = query._contact_model
+        if prepared is None:
+            raise ValueError('Primitive finite contact requires its prepared field')
+        origin, h, grid_shape = prepared.origin, prepared.voxel_size, prepared.shape
+        count = math.prod(grid_shape)
+        require_host_memory(count * 8 + _CHUNK * 128, pending_existing_bytes=0,
+                            max_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES)
+        # Match FrozenPrimitives.prepare_contacts exactly. No simulator
+        # geometry or separately chosen contact resolution is admitted.
+        import torch
+        occupied = np.empty(count, dtype=bool)
+        with torch.no_grad():
+            for start in range(0, count, _CHUNK):
+                flat = np.arange(start, min(count, start + _CHUNK))
+                indices = np.column_stack(np.unravel_index(flat, grid_shape))
+                points = origin + indices * h
+                distance = query.signed_distance(torch.as_tensor(points, dtype=torch.float64)).numpy()
+                occupied[start:start + len(flat)] = distance <= math.sqrt(3.) * h / 2
+        occupied = occupied.reshape(grid_shape)
+        # END primitives retain their prior complete-cell permission model.
         # Admission now uses the ACTUAL occupied count. The allowance covers
         # simultaneous integer argwhere coordinates, floating arithmetic and
         # retained centres, cKDTree indices/nodes, rule bits and chunk scratch;
@@ -203,11 +198,19 @@ class NativeCollisionConfirmation:
         for name, query in queries:
             rules = tuple(rule for rule in self.rules.values() if rule.target_owner == name)
             primitives = tuple(_primitive(row) for row in query.primitives) if isinstance(query, FrozenPrimitives) else ()
-            cells = _OccupiedCells(query, rules) if not primitives or rules else None
-            self.targets[name] = {'query': query, 'primitives': primitives, 'cells': cells}
+            # BEGIN all confirmations share the field's request-owned source index.
+            cells = _PrimitiveContactCells(query, rules) if primitives and rules else None
+            observed = None if primitives else query.source_geometry
+            if observed is not None:
+                observed.prepare_rules(tuple(rule for rule in scene.contacts if rule.target_owner == name))
+            self.targets[name] = {'query': query, 'primitives': primitives, 'cells': cells,
+                                  'observed': observed}
+            # END creating another candidate adapter never rebuilds source geometry.
         self.preparation = {'elapsed_seconds': perf_counter() - start,
             'occupied_cells': {name: 0 if row['cells'] is None else len(row['cells'].centers)
                                for name, row in self.targets.items()},
+            'source_components': {name: 0 if row['observed'] is None else row['observed'].component_count
+                                  for name, row in self.targets.items()},
             'scope': 'One frozen target index per request; no current simulator object truth'}
 
     def confirm(self, *, robot_state, candidates, owner_poses, effective_contact_rule_ids,
@@ -229,7 +232,8 @@ class NativeCollisionConfirmation:
         active = frozenset(effective_contact_rule_ids)
         if not active <= self.rules.keys():
             raise ValueError('Effective contact policies must identify registered robot rules')
-        pairs, stats = [], {'native_pairs': 0, 'coal_queries': 0, 'nearby_cells': 0, 'permitted_cells': 0}
+        pairs, stats = [], {'native_pairs': 0, 'coal_queries': 0, 'nearby_cells': 0, 'permitted_cells': 0,
+                            'nearby_source_components': 0, 'retained_source_components': 0}
         for target_name, indices in candidates.items():
             if target_name not in self.targets:
                 raise ValueError('Candidate target is absent from this frozen request')
@@ -268,17 +272,37 @@ class NativeCollisionConfirmation:
                                                        or np.any(other_bounds[1] + self.boundary < bounds[0]))):
                             obstacles.append((other, other_pose, {'primitive_index': index}))
                     record['target_representation'] = 'analytic_frozen_primitive'
-                else:
+                elif target['cells'] is not None:
                     cells = target['cells']
                     ids, removed = cells.nearby(bounds, rules, self.boundary)
                     stats['nearby_cells'] += len(ids) + removed
                     stats['permitted_cells'] += removed
-                    record.update(target_representation='frozen_observed_occupied_cells',
+                    record.update(target_representation='frozen_primitive_contact_cells',
                                   nearby_cell_count=len(ids) + removed, permitted_cell_count=removed)
                     # The list is local to this native AABB, not a world-sized
                     # per-state geometry inventory; one Coal box is reused.
                     obstacles = ((cells.shape, center, {'cell_index': int(index)})
                                  for index, center in zip(ids, cells.centers[ids]))
+                else:
+                    # BEGIN exact local source components replace ESDF seed cubes.
+                    observed = target['observed']
+                    expanded = (bounds[0]-self.boundary, bounds[1]+self.boundary)
+                    nearby = observed.component_indices(expanded)
+                    ids = observed.component_indices(expanded, active_rule_ids=rules) if rules else nearby
+                    stats['nearby_source_components'] += len(nearby)
+                    stats['retained_source_components'] += len(ids)
+                    record.update(target_representation='observed_affine_tsdf_components',
+                                  nearby_component_count=len(nearby),
+                                  permitted_component_count=len(nearby)-len(ids))
+
+                    def source_obstacles():
+                        for index in ids:
+                            kind, component, other, local_pose, _ = observed.collision_component(int(index))
+                            yield other, local_pose, {'source_component_id': int(index),
+                                'source_component_kind': kind, 'source_component_index': int(component)}
+
+                    obstacles = source_obstacles()
+                    # END only whole components with this body's effective permission disappear.
                 for other, other_pose, identity in obstacles:
                     if check_request is not None and record['coal_queries'] % 64 == 0:
                         check_request()
@@ -313,7 +337,7 @@ class NativeCollisionConfirmation:
             'collision_targets': [name for name, values in statuses.items() if 'collision' in values],
             'unresolved_targets': [name for name, values in statuses.items() if 'unresolved' in values],
             'statistics': stats,
-            'scope': 'Native source solids against the same frozen occupied cells/analytic primitives at one state; effective finite-cell permissions only; other scene constraints remain owned by the caller'}
+            'scope': 'Native robot solids against frozen observed source components or calibrated primitives at one state; finite source-component permissions; other scene constraints remain owned by the caller'}
 # END candidates retain their original residual and every non-collision obligation.
 
 

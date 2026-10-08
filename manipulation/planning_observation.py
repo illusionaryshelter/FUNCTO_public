@@ -1172,7 +1172,7 @@ def build_audit_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_
     return result
 # END current RGB-D observation bridge using the installed native mapper.
 
-# BEGIN production mapping creates only the fixed online numerical model.
+# BEGIN production mapping derives bounded proposals from one observed source.
 def _require_mapping_memory(estimated_bytes, device, *,
                             max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
                             max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES):
@@ -1195,12 +1195,11 @@ def _require_mapping_memory(estimated_bytes, device, *,
 def _background_query_config(config, query_radius_m):
     """Cover every declared-radius query that can reach this TSDF source.
 
-    Native gather probes a half ESDF cell beyond each sample; represented
-    occupied cells extend another half cell. Native conversion to integer
-    TSDF coordinates truncates toward zero, adding one source cell only on
-    the negative side. These are source-layout bounds, never a motion goal.
-    Integer padding preserves the original ESDF world lattice while the
-    public ``compute_esdf(esdf_origin=...)`` argument moves only its centre.
+    Source components lie between observed TSDF sample centres. Padding adds
+    the declared sphere radius and one query cell, keeping an empty border
+    for the conservative distance transform. It depends only on source and
+    query layouts, never on a goal or a failed trajectory. Integer padding
+    preserves the original proposal lattice without moving TSDF evidence.
     """
     if (isinstance(query_radius_m, (bool, np.bool_)) or not isinstance(query_radius_m, Real)
             or not np.isfinite(query_radius_m) or query_radius_m < 0):
@@ -1213,7 +1212,7 @@ def _background_query_config(config, query_radius_m):
     source_half = np.asarray(source_shape, dtype=float)*h_source/2
     source_lower, source_upper = center-source_half, center+source_half
     original_half = (np.asarray(original_shape, dtype=float)-1)*h_query/2
-    required_lower = source_lower-h_source-h_query-radius
+    required_lower = source_lower-h_query-radius
     required_upper = source_upper+h_query+radius
     lower_padding = tuple(max(0, math.ceil(float(value)/h_query))
         for value in center-original_half-required_lower)
@@ -1221,10 +1220,8 @@ def _background_query_config(config, query_radius_m):
         for value in required_upper-(center+original_half))
     shape = tuple(size+lower+upper for size, lower, upper
         in zip(original_shape, lower_padding, upper_padding))
-    # Packed native site coordinates admit ten bits per axis. Reject before
-    # constructing any Mapper, including its TSDF and camera allocations.
-    if min(shape) < 2 or max(shape) > 1024:
-        raise ValueError('UNSUPPORTED_MODEL: background query grid requires 2 to 1024 cells per axis')
+    if min(shape) < 2:
+        raise ValueError('UNSUPPORTED_MODEL: background query grid requires at least two cells per axis')
     query_center = center+(np.asarray(upper_padding)-np.asarray(lower_padding))*h_query/2
     # A rounded multiplication can make ceil(extent/h) allocate one extra
     # cell. Select the interior side of the exact requested cell count, then
@@ -1245,18 +1242,17 @@ def _background_query_config(config, query_radius_m):
         'query_shape_xyz': list(shape), 'query_center_m': query_center.tolist(),
         'query_lower_m': (query_center-query_half).tolist(),
         'query_upper_m': (query_center+query_half).tolist(), 'query_voxel_size_m': h_query,
-        'source': 'Native Mapper TSDF evidence retained; independent ESDF query extent and centre',
+        'source': 'Native Mapper TSDF evidence retained; independent source-derived proposal extent and centre',
     }
     return derived, query_center, report
 
 
 def _validate_background_query_support(query, query_radius_m):
-    """Reject incomplete native output instead of masking a support failure.
+    """Reject incomplete proposal support instead of masking a query failure.
 
-    The actual exported occupied-cell bounds account for gather and floating
-    point conversion. Their radius-expanded box must fit the actual sampling
-    centres; no tolerance, reduced radius or second map construction repairs
-    a failed preparation contract.
+    The actual source components' radius-expanded box must fit the numerical
+    sample centres. No tolerance, reduced radius or second map construction
+    repairs a failed preparation contract.
     """
     if query.geometry_lower is not None and (
             np.any(query.geometry_lower-query_radius_m < query.origin)
@@ -1265,12 +1261,20 @@ def _validate_background_query_support(query, query_radius_m):
 # END source observation coverage is never inferred from numerical query extent.
 
 
-def _map_online_partition(normalized, masks, identity, config, inverse, *, esdf_origin=None):
-    """Integrate one partition and export its exact finite native distance field."""
+def _map_online_partition(normalized, masks, identity, config, inverse, *, query_center=None,
+                          max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
+    """Integrate one source, then prepare a conservative field from its material.
+
+    The Mapper supplies observed TSDF samples through its existing public
+    block export. Its approximate ESDF seeds are not built or interpreted as
+    material. A single affine source defines both contact and confirmation.
+    """
+    from time import perf_counter
     from curobo.perception import Mapper
     from curobo.types import CameraObservation, DeviceCfg, Pose
-    from .native_voxel_sources import export_source_bits
     from .online_geometry import FrozenESDF
+    from .online_observed_geometry import FrozenObservedGeometry
+    from .tsdf_geometry import build_tsdf_geometry
     device = DeviceCfg(device=config.device)
     mapper = Mapper(config)
     for name, view in normalized.items():
@@ -1284,21 +1288,28 @@ def _map_online_partition(normalized, masks, identity, config, inverse, *, esdf_
     stats=mapper.get_stats(scan_pool=True)
     if stats['allocation_failures'] or stats['num_allocated'] != stats['active_blocks']+stats['free_count']:
         raise ValueError('UNSUPPORTED_MODEL: native mapping allocation lost observed geometry')
-    # BEGIN use the native independent query centre without moving TSDF evidence.
-    voxel=mapper.compute_esdf(esdf_origin=None if esdf_origin is None else device.to_device(esdf_origin))
-    # END None retains the native source-centred owner query API.
-    from .collision_records import MAX_ARRAY_BYTES
-    bits=export_source_bits(mapper,config,voxel,max_cells=MAX_ARRAY_BYTES//4)
-    values=voxel.feature_tensor.detach().cpu().float().numpy()
-    shape=np.asarray(values.shape)
-    origin=np.asarray(voxel.pose[:3])-(shape-1)*float(voxel.voxel_size)/2
+    # BEGIN freeze source geometry once; source and proposal have independent grids.
     name='observed_background' if identity is None else identity
-    query=FrozenESDF(values,origin=origin,voxel_size=voxel.voxel_size,
-        site_valid=(bits&1)!=0,observed_sign=(bits&2)!=0,owner_ids=(name,),
-        source=f"current_rgbd:{','.join(normalized)}")
+    source=f"current_rgbd:{','.join(normalized)}"
+    started = perf_counter()
+    exported = build_tsdf_geometry(mapper, name=name, source=source,
+                                   max_host_rss_bytes=max_host_rss_bytes)
+    geometry = FrozenObservedGeometry(exported['solids'][0], max_host_rss_bytes=max_host_rss_bytes)
+    source_seconds = perf_counter()-started
+    shape=np.asarray([math.ceil(float(value)/config.esdf_voxel_size)
+                      for value in config.extent_esdf_meters_xyz], dtype=int)
+    center = config.grid_center.detach().cpu().numpy() if query_center is None else np.asarray(query_center)
+    origin=center-(shape-1)*float(config.esdf_voxel_size)/2
+    started = perf_counter()
+    query=FrozenESDF.from_source(geometry,origin=origin,shape=tuple(shape),
+        voxel_size=config.esdf_voxel_size,owner_ids=(name,),source=source)
+    proposal_seconds = perf_counter()-started
+    # END no approximate seed becomes an occupied source cell.
     return query,{'allocated_blocks':stats['num_allocated'],'shape_xyz':shape.tolist(),
-        'voxel_size_m':float(voxel.voxel_size),'origin':origin.tolist(),
-        'source_surface_cells':int(((bits&1)!=0).sum()),'observed_sign_cells':int(((bits&2)!=0).sum())}
+        'voxel_size_m':float(config.esdf_voxel_size),'origin':origin.tolist(),
+        'observed_geometry':exported['field_summary'], 'source_preparation_seconds':source_seconds,
+        'proposal_preparation_seconds':proposal_seconds,
+        'proposal_model':'Conservative component-AABB distance bound; values are not source occupancy or penetration'}
 
 
 def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_voxel_sizes_m,
@@ -1379,10 +1390,6 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     from .collision_records import MAX_ARRAY_BYTES
     for config in configs.values():
         shape=tuple(math.ceil(float(x)/config.esdf_voxel_size) for x in config.extent_esdf_meters_xyz)
-        # BEGIN enforce the native packed-coordinate limit before allocation.
-        if max(shape)>1024:
-            raise ValueError('UNSUPPORTED_MODEL: frozen distance grid exceeds 1024 cells per axis')
-        # END unchanged byte and total-memory admission follows this layout check.
         if min(shape)<2 or math.prod(shape)*4>MAX_ARRAY_BYTES:
             # BEGIN report the common codec limit rather than a stale local cap.
             raise ValueError(f'UNSUPPORTED_MODEL: frozen distance field exceeds the {MAX_ARRAY_BYTES // 1024**2} MiB binary record limit')
@@ -1410,7 +1417,8 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         # BEGIN only the background uses the independently prepared query centre.
         queries[identity],reports['observed_background' if identity is None else identity]=_map_online_partition(
             normalized,masks,identity,config,inverse,
-            esdf_origin=background_query_center if identity is None else None)
+            query_center=background_query_center if identity is None else None,
+            max_host_rss_bytes=max_host_rss_bytes)
         if identity is None:
             _validate_background_query_support(queries[None], background_radius)
             background_support.update(
@@ -1437,10 +1445,10 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
             'source': 'Unchanged pre-query-expansion background grid and ENVIRONMENT free rays'},
         # END an enlarged ESDF is never recorded as newly observed free space.
         # BEGIN describe the registered online contact model used by this scene.
-        'geometry_model':'one frozen signed field per partition; prepared forbidden-region fields and registered native planar contact',
+        'geometry_model':'one observed affine TSDF source per partition; conservative proposal/contact fields and local native-solid confirmation',
         # END source-cell interpretation is confined to preparation, not online queries.
         'unknown_policy':deepcopy(unknown_policy),
         'self_filter':_self_filter_report(normalized)}
     # END excluded surfaces remain independently auditable.
     return scene
-# END the production builder never exports source solids or installs refinement.
+# END no old source-world audit, Boolean solver or adaptive refinement is installed.

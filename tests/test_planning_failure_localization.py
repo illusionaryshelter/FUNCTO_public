@@ -44,37 +44,37 @@ def test_ranked_native_seed_is_matched_by_typed_position_and_velocity():
     assert bind_trace_to_native_seed(trace, state, 0, ["a", "b"])["status"] == "unmatched"
 
 
-def test_boundary_capture_retains_left_failure_and_isolates_observer_error(monkeypatch):
+# BEGIN current boundary diagnostics summarize the same compact online query.
+def test_boundary_summary_retains_left_failure_at_original_time_without_requery():
+    calls = []
     def evaluate(spheres, p, r, s, q, names, **kwargs):
+        calls.append(s.detach().clone())
         value = (s < .5).to(s.dtype)
-        kwargs["components_out"]["required_rule"] = value
+        if "components_out" in kwargs:
+            kwargs["components_out"]["required_rule"] = value
         return value
 
-    scene = SimpleNamespace(required_progress_anchors=[.5], robot_owner_permissions=(),
-                            evaluate_source=evaluate)
-    problem = SimpleNamespace(start_progress=0., phase_count=1.)
+    scene = SimpleNamespace(required_progress_anchors=[.5], contacts=(), evaluate=evaluate)
+    problem = SimpleNamespace(start_progress=0., end_progress=1.)
     mapping = SimpleNamespace(anchor_parameters=lambda _: np.array([[.5, .5]]))
     s = torch.tensor([[.5]])
-    def run():
-        diagnostics, components = {"capture_components": True}, {}
-        result = _scene_boundary_evaluate(scene, problem, mapping,
+    def run(diagnostics):
+        return _scene_boundary_evaluate(scene, problem, mapping,
             torch.zeros((1, 1, 1, 4)), torch.zeros((1, 1, 3)), torch.zeros((1, 1, 4)),
             s, torch.zeros((1, 1, 2)), ("a", "b"), trajectory_time=s*4,
-            normalized_time=s, source_geometry=True, diagnostics=diagnostics,
-            source_components_out=components)
-        return result, diagnostics
+            normalized_time=s, component_diagnostics=diagnostics)
 
-    result, diagnostics = run()
-    assert result.item() == 1
-    assert len(diagnostics["component_failures"]) == 1
-    assert diagnostics["component_failures"][0]["mode"] == "left"
-    assert diagnostics["component_failures"][0]["time_s"] == 2
-    def fail(*args, **kwargs):
-        raise OSError("observer unavailable")
-    monkeypatch.setattr("manipulation.planning_diagnostics.scene_component_failures", fail)
-    failed_result, diagnostics = run()
-    assert torch.equal(failed_result, result)
-    assert diagnostics["component_capture_error"] == "OSError: observer unavailable"
+    diagnostics = {}
+    result = run(diagnostics)
+    assert result.item() == 1 and len(calls) == 1
+    assert set(diagnostics) == {"required_rule"}
+    witness = diagnostics["required_rule"]
+    assert witness["maximum"] == 1 and witness["time_s"] == 2
+    assert witness["progress"] == float(torch.nextafter(s, torch.full_like(s, -float("inf"))))
+    assert calls[0].shape == (1, 3)
+    # Omitting diagnostics does not rerun/change the scene acceptance query.
+    assert torch.equal(run(None), result) and len(calls) == 2
+# END source-world observer hooks are not part of the online boundary contract.
 
 
 def test_world_capture_keeps_each_distinct_failure_without_repeating_queries():

@@ -146,21 +146,30 @@ def test_native_boundary_keeps_finite_arrival_permission_and_other_laws():
     axis=np.arange(-20,21)*.001
     values=np.broadcast_to(axis[:,None,None],(41,41,41)).astype(np.float32)
     valid=np.ones_like(values,dtype=bool)
-    target_query=FrozenESDF(values,origin=[-.02]*3,voxel_size=.001,
-        site_valid=valid,observed_sign=valid,owner_ids=('target',),source='observed finite plane')
-    background=FrozenESDF(np.ones_like(values),origin=[-.02]*3,voxel_size=.001,
-        site_valid=~valid,observed_sign=~valid,owner_ids=('background',),source='no visible background')
+    # BEGIN use explicit plane-source and empty-background geometry.
+    from observed_geometry_fixtures import point_source
+    target_query=FrozenESDF.from_source(point_source([[0.,0.,0.]]),origin=[-.02]*3,
+        shape=values.shape,voxel_size=.001,owner_ids=('target',),source='observed point in finite pad')
+    background=FrozenESDF.from_source(point_source(),origin=[-.02]*3,shape=values.shape,voxel_size=.001,
+        owner_ids=('background',),source='no visible background')
+    # END no native ESDF site is interpreted as a source cell.
     target=CollisionOwner('target',target_query,pose_path(),'current target',False)
     rule=ContactRule(rule_id='finite_pad',actor='robot',target_owner='target',interval=(.5,.9),
         sphere_indices=(0,),material_id='pad',feature_points=[[0.,-.005,-.005],[0.,.005,-.005],
             [0.,.005,.005],[0.,-.005,.005]],feature_normal=[-1.,0.,0.],patch_origin=[0.,0.,0.],
         patch_axes=[[0.,0.,1.],[1.,0.,0.],[0.,1.,0.]],patch_half_size=[.005,.005],
         gap_bounds=(-.003,.003),normal_tolerance_rad=.1,modeling_allowance_m=.003,
-        geometry_error_m=.003,minimum_thickness_m=.01,source='explicit complete pad polygon')
+        geometry_error_m=.003,minimum_thickness_m=.01,source='explicit complete pad polygon',
+        # BEGIN arrival permissions require the existing registered material contract.
+        online_material={'kind':'native_planar_extrusion_v1','thickness_m':.01,
+            'native_geometry':'pad_box','sphere_indices':[0],
+            'source':'explicit native pad extrusion','sphere_binding_source':'complete test cover'})
+        # END the test exercises policy timing, not unsupported material inference.
     coverage=ObservedSpace(~valid,origin=[-.02]*3,voxel_size=.001,
         observation_ids=('A',),reference_frame='world')
     current=OnlinePlanningScene(background=background,owners=(target,),coverage=coverage,
         reference_frame='world',robot_sphere_materials=('pad',),robot_geometry_source='native sphere',
+        native_geometry_materials={'pad_box':'pad'},
         contacts=(rule,),has_gripper=False,unknown_policy={'outside_regions':'forbid',
             'conditional_regions':[{'lower_m':[-.02]*3,'upper_m':[.02]*3,'source':'explicit finite operation'}]})
     current.bind_online_robot(robot_sphere_geometry=[{'link_name':'pad','sphere_indices':[0],
