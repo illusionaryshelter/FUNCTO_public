@@ -2,7 +2,6 @@
 
 # BEGIN necessary CPU counterexamples for the independent support capability.
 from copy import deepcopy
-from dataclasses import replace
 import json
 from unittest.mock import patch
 
@@ -20,8 +19,7 @@ from observed_geometry_fixtures import point_source, surface_source, source_from
 def relation(**changes):
     return InitialSupportRelation(**{
         'relation_id': 'entry_support', 'actor': 'payload', 'target_owner': 'support',
-        'interval': (0., 1.), 'patch_origin': [0., 0., 0.], 'patch_axes': np.eye(3),
-        'patch_half_size': [.008, .008],
+        'interval': (0., 1.), 'plane_origin': [0., 0., 0.], 'plane_normal': [0., 0., 1.],
         'source': {'kind': 'observed_plane_with_declared_initial_support', 'observation_ids': ['camera'],
                    'assumption': 'Currently supported according to declared observation context',
                    'scope': 'Independent finite observed plane layer, not free-space evidence'}, **changes})
@@ -51,7 +49,7 @@ def poses(position=(0., 0., .001), quaternion=(1., 0., 0., 0.), *, requires_grad
             torch.tensor([[quaternion]], dtype=torch.float64))
 
 
-def test_source_selection_accepts_touching_volume_and_keeps_wall_and_noninitial_material():
+def test_source_selection_accepts_touching_volume_and_keeps_noninitial_material():
     # A perfect zero-height TSDF plane still contains negative solid pieces.
     # Those are valid current support; they need not fit a zero-thickness band.
     values = np.broadcast_to(np.array([-.001, 0., .001], np.float32), (3, 3, 3))
@@ -61,24 +59,26 @@ def test_source_selection_accepts_touching_volume_and_keeps_wall_and_noninitial_
     assert model.kind == 'empty'
     assert len(model.selected_component_ids) == geometry.component_count
     assert model.baseline_height == 0.
-    # The wall already intersects the actor at the entrance but rises above
-    # the declared plane; an unrelated below-plane point is not initially hit.
-    mixed = surface_source([[[0., 0., 0.]],
-        [[.001, -.001, -.001], [.001, .001, -.001], [.001, 0., .002]],
-        [[.006, 0., -.001]]])
+    # The independently observed plane has other material outside the entrance
+    # contact. Moving toward that material cannot expand the frozen inventory.
+    mixed = surface_source([[[0., 0., 0.]], [[.006, 0., -.001]]])
     actor, target = owners(mixed)
     model = PreparedInitialSupport(relation(), actor, target, 1e-6)
     np.testing.assert_array_equal(model.selected_component_ids, [0])
     assert model.kind == 'field'
-    body = torch.tensor([[[[.001, 0., .001, .0005]]]], dtype=torch.float64)
+    body = torch.tensor([[[[.006, 0., -.001, .0005]]]], dtype=torch.float64)
     assert model.collision_values(body, target.query(body), torch.ones((1, 1), dtype=torch.bool)).item() > 0
 
 
-def test_finite_patch_keeps_a_component_crossing_its_edge_even_with_inside_center():
-    geometry = surface_source([[[0., 0., 0.], [.004, 0., 0.]]])
+def test_observed_support_component_need_not_fit_future_rectangle_or_ideal_plane():
+    # An observed source atom can extend beyond a future functional footprint
+    # and across the fitted plane. Its entrance intersection, not either ideal
+    # boundary, defines this current support's finite material inventory.
+    geometry = surface_source([[[0., 0., 0.], [.004, 0., .0002]]])
     actor, target = owners(geometry)
-    model = PreparedInitialSupport(relation(patch_half_size=[.003, .003]), actor, target, 1e-6)
-    assert model.kind == 'unchanged' and len(model.selected_component_ids) == 0
+    model = PreparedInitialSupport(relation(), actor, target, 1e-6)
+    assert model.kind == 'empty'
+    np.testing.assert_array_equal(model.selected_component_ids, [0])
 
 
 def test_relative_whole_body_height_rejects_deeper_but_has_no_departure_or_pose_lock():

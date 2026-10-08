@@ -1029,14 +1029,19 @@ copy the previous close-event latch.
 `initial_support.InitialSupportRelation` describes an existing finite support
 between a complete attached owner and an independently observed static plane.
 It does not reuse a future placement's material edges, gap or normal targets.
-Preparation freezes only observed source components wholly inside the declared
-patch, below its plane and intersecting the owner's entrance native geometry.
+The target's entire observed source must belong to this independently selected
+support layer; supplying that partition is the caller's responsibility.
+Preparation freezes only source components intersecting the owner's entrance
+native geometry. This inventory is finite without a future material footprint
+or an ideal-plane clipping condition on the reconstructed source vertices.
 The differentiable field and native confirmation remove the same component
 IDs for that actor/target pair. A separate whole-owner minimum-height constraint
 prevents nominal penetration from increasing beyond the approximate entrance
 model; it does not certify physical penetration depth. Separation, rotation and
-return require no new phase or latch. Other obstacles and final placement
-conditions retain their checks. Frozen bindings store the relation and prepared
+return require no new phase or latch. Other owners, background, source components
+not intersecting at entrance, and final placement conditions retain their checks.
+The declaration cannot identify obstacles incorrectly mixed into a plane layer.
+Frozen bindings store the relation and prepared
 field, and workspace admission includes both field and vertex-query memory.
 <!-- END current support does not redefine grasp or placement success. -->
 

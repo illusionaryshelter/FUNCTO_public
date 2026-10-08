@@ -63,10 +63,10 @@ def contact_declaration():
 # BEGIN the actual recorded parser keeps initial support outside material binding.
 def initial_support_declaration():
     return dict(relation_id="current-support", actor="payload", target_owner="initial_support",
-        interval=[0., .8], patch_origin=[0., 0., 0.], patch_axes=np.eye(3).tolist(),
-        patch_half_size=[.04, .06], source={"kind": "observed_plane_with_declared_initial_support",
+        interval=[0., .8], plane_origin=[0., 0., 0.], plane_normal=[0., 0., 1.],
+        source={"kind": "observed_plane_with_declared_initial_support",
             "observation_ids": ["current"], "assumption": "Current payload rests on this observed plane",
-            "scope": "Finite initial support, preserving all other observed geometry"})
+            "scope": "Entire source belongs to the independently observed plane; initial full-actor intersections only"})
 
 
 def test_recorded_parser_preserves_independent_initial_support_and_material_declarations(tmp_path):
@@ -83,7 +83,7 @@ def test_recorded_parser_preserves_independent_initial_support_and_material_decl
     assert relation.actor == "payload" and relation.target_owner == "initial_support"
     assert tuple(relation.interval) == (0., .8)
     assert relation.source == declaration["source"]
-    np.testing.assert_array_equal(relation.patch_axes, np.eye(3))
+    np.testing.assert_array_equal(relation.plane_normal, [0., 0., 1.])
 
 
 @pytest.mark.parametrize("value", [None, {}, "support", ["support"]])

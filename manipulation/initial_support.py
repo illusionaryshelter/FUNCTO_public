@@ -22,15 +22,20 @@ from .planning_problem import quaternion_rotate, quaternion_conjugate
 
 @dataclass
 class InitialSupportRelation:
-    """Current actor/observed-plane relation, with no future contact material."""
+    """Current actor/independent plane layer, with no future contact material.
+
+    The target owner must be the separately observed support-plane layer, not
+    an arbitrary compound obstacle relabelled as support. Its finite allowed
+    material is established by entrance native intersection, not a rectangle
+    copied from a future placement feature.
+    """
 
     relation_id: str
     actor: str
     target_owner: str
     interval: tuple
-    patch_origin: object
-    patch_axes: object
-    patch_half_size: object
+    plane_origin: object
+    plane_normal: object
     source: dict
 
     def __post_init__(self):
@@ -41,13 +46,10 @@ class InitialSupportRelation:
         self.interval = _valid_interval(self.interval)
         if self.interval[0] != 0:
             raise ValueError('Initial support must start at the current request entrance')
-        self.patch_origin = _array(self.patch_origin, (3,), 'initial support origin')
-        self.patch_axes = _array(self.patch_axes, (3, 3), 'initial support axes')
-        self.patch_half_size = _array(self.patch_half_size, (2,), 'initial support half size')
-        if (np.any(self.patch_half_size <= 0)
-                or not np.allclose(self.patch_axes.T @ self.patch_axes, np.eye(3), atol=1e-6, rtol=0)
-                or not np.isclose(np.linalg.det(self.patch_axes), 1., atol=1e-6, rtol=0)):
-            raise ValueError('Initial support needs a finite rectangle and proper orthonormal plane frame')
+        self.plane_origin = _array(self.plane_origin, (3,), 'initial support plane origin')
+        self.plane_normal = _array(self.plane_normal, (3,), 'initial support plane normal')
+        if not np.isclose(np.linalg.norm(self.plane_normal), 1., atol=1e-6, rtol=0):
+            raise ValueError('Initial support needs a unit outward plane normal')
         evidence = self.source
         if (not isinstance(evidence, dict)
                 or evidence.get('kind') != 'observed_plane_with_declared_initial_support'
@@ -61,7 +63,7 @@ class InitialSupportRelation:
 
     def record(self):
         row = asdict(self)
-        for key in ('patch_origin', 'patch_axes', 'patch_half_size'):
+        for key in ('plane_origin', 'plane_normal'):
             row[key] = row[key].tolist()
         row['interval'] = list(row['interval'])
         return row
@@ -78,11 +80,11 @@ def _initial_pose(owner):
 class PreparedInitialSupport:
     """One frozen source subset and a differentiable whole-owner depth bound.
 
-    Only source components wholly inside the finite XY rectangle, wholly on
-    its support side (Z <= the scene's existing numerical tolerance), and
-    intersecting an entrance native box are eligible. Thus nearby/overhead
-    material is not erased merely because it shares an owner or patch column.
-    The selected source identity is shared by proposal and native confirmation.
+    Only components of the independently declared support-plane layer that
+    intersect an entrance native box are eligible. Other owners and components
+    not initially touched remain obstacles. The observation's discretization
+    need not fit an ideal zero-thickness plane or a future material rectangle.
+    Frozen finite source identities are shared by proposal and confirmation.
     """
 
     def __init__(self, relation, actor, target, numerical_tolerance, *, record=None):
@@ -106,7 +108,7 @@ class PreparedInitialSupport:
         self.actor_vertices.flags.writeable = False
         mapping = np.linalg.inv(_initial_pose(target)) @ _initial_pose(actor)
         entrance = self.actor_vertices @ mapping[:3, :3].T + mapping[:3, 3]
-        self.initial_height = float(((entrance - relation.patch_origin) @ relation.patch_axes[:, 2]).min())
+        self.initial_height = float(((entrance - relation.plane_origin) @ relation.plane_normal).min())
         self.baseline_height = min(0., self.initial_height)
         self._device = {}
         if record is None:
@@ -127,7 +129,7 @@ class PreparedInitialSupport:
                     (ids[0] < 0 or ids[-1] >= target.query.source_geometry.component_count
                      or np.any(np.diff(ids) <= 0)))):
                 raise ValueError('Frozen initial support component identities must be distinct source indices')
-            # Check every proposed exemption against the original native geometry;
+            # Check every proposed exemption against the entrance native geometry;
             # restored fields cannot smuggle a new source component into permission.
             checked = self._select_components(geometry, mapping, candidates=ids)
             if not np.array_equal(ids, checked):
@@ -147,7 +149,7 @@ class PreparedInitialSupport:
             source='Finite current support: ' + relation.relation_id) if self.kind == 'field' else None)
 
     def _select_components(self, geometry, mapping, *, candidates=None):
-        source, relation = self.target_query.source_geometry, self.relation
+        source = self.target_query.source_geometry
         boxes = []
         for row, vertices, pose in geometry.values():
             transform = mapping @ pose
@@ -164,10 +166,6 @@ class PreparedInitialSupport:
         selected = []
         for index in candidates:
             _, _, vertices = source._vertices(int(index))
-            local = (vertices - relation.patch_origin) @ relation.patch_axes
-            if (np.any(np.abs(local[:, :2]) > relation.patch_half_size + self.numerical_tolerance)
-                    or np.any(local[:, 2] > self.numerical_tolerance)):
-                continue
             lo, hi = vertices.min(0), vertices.max(0)
             native = None
             for shape, transform, lower, upper in boxes:
@@ -192,8 +190,8 @@ class PreparedInitialSupport:
         key = (position.device, position.dtype)
         if key not in self._device:
             self._device[key] = tuple(torch.tensor(value, device=position.device, dtype=position.dtype)
-                                     for value in (self.actor_vertices, self.relation.patch_origin,
-                                                   self.relation.patch_axes[:, 2]))
+                                     for value in (self.actor_vertices, self.relation.plane_origin,
+                                                   self.relation.plane_normal))
         vertices, origin, normal = self._device[key]
         world = quaternion_rotate(quaternion.unsqueeze(-2), vertices) + position.unsqueeze(-2)
         local = quaternion_rotate(quaternion_conjugate(target_pose[1]).unsqueeze(-2),

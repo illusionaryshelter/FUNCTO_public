@@ -18,8 +18,9 @@ def support_scene(tmp_path, *, additional_points=(), other_target=False):
     """Bind a small complete held box to an observed plane at its current pose.
 
     The first zero-source point lies inside the entrance box and below the
-    declared support plane. Additional points explicitly represent geometry
-    that may share this owner but must not inherit that initial permission.
+    declared support plane. The target is the independently observed support
+    layer. Its reconstruction may straddle the fitted plane; only entrance
+    intersection decides which of its components receives initial permission.
     """
     checker, original = _setup(tmp_path, query=_field(points=((0., 0., -.0002), *additional_points)))
     payload = _payload(original)
@@ -31,11 +32,11 @@ def support_scene(tmp_path, *, additional_points=(), other_target=False):
         query.owner_ids = frozenset(('other',))
         owners += (replace(owners[0], owner_id='other', query=query),)
     relation = InitialSupportRelation(relation_id='current-support', actor='payload',
-        target_owner='part', interval=(0., 1.), patch_origin=np.zeros(3),
-        patch_axes=np.eye(3), patch_half_size=[.005, .005], source={
+        target_owner='part', interval=(0., 1.), plane_origin=np.zeros(3),
+        plane_normal=[0., 0., 1.], source={
             'kind': 'observed_plane_with_declared_initial_support', 'observation_ids': ['test'],
             'assumption': 'Synthetic current box rests on this observed plane',
-            'scope': 'Only finite entrance-intersecting material on the support side'})
+            'scope': 'The entire target is this observed plane layer; only entrance-intersecting source is permitted'})
     scene = OnlinePlanningScene(background=original.background, owners=owners, coverage=original.coverage,
         reference_frame=original.reference_frame, robot_sphere_materials=original.robot_sphere_materials,
         robot_geometry_source=original.robot_geometry_source, robot_collision_bodies=original.robot_collision_bodies,
@@ -48,14 +49,17 @@ def support_scene(tmp_path, *, additional_points=(), other_target=False):
     (False, 'payload', 'part', (), 0., False),
     (True, 'robot', 'part', (), 0., False),
     (True, 'payload', 'other', (), 0., False),
-    (True, 'payload', 'part', ((0., 0., .0002),), 0., False),
+    (True, 'payload', 'part', ((0., 0., .0002),), 0., True),
     (True, 'payload', 'part', ((.003, 0., -.0002),), .003, False),
 ])
 def test_native_support_is_scoped_to_same_actor_target_and_frozen_source_inventory(
         tmp_path, active, actor, target, points, x, cleared):
     checker, scene = support_scene(tmp_path, additional_points=points, other_target=target == 'other')
     model = scene._initial_support_models['current-support']
-    np.testing.assert_array_equal(model.selected_component_ids, [0])
+    # BEGIN the fitted plane is not an exact clipping boundary for its source.
+    expected_ids = [0, 1] if points == ((0., 0., .0002),) else [0]
+    np.testing.assert_array_equal(model.selected_component_ids, expected_ids)
+    # END a new source component contacted only after movement is still retained.
     poses = {owner.owner_id: np.eye(4) for owner in scene.owners}
     poses['payload'][0, 3] = x
     report = NativeCollisionConfirmation(checker, scene).confirm(
