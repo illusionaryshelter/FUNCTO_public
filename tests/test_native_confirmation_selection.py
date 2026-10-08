@@ -24,7 +24,7 @@ def selection_fixture(*, scene=(.01, .02), task=(0., 0.), flags=(False, False)):
     constraints.values = [torch.tensor(values)[:, None, None].expand(2, 9, 1).clone()
                           for values in (scene, task)]
     # BEGIN this fixture explicitly models ordinary world collision components.
-    result.metrics.debug = constraints.values[0].clone()
+    result.metrics.debug = torch.cat((constraints.values[0], torch.zeros_like(constraints.values[0])), dim=-1)
     # END the aggregate alone is not a collision classifier.
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.scene = object()
@@ -45,6 +45,7 @@ def completed(*, accepted, residual, points):
     report = {"accepted": accepted, "native_success": accepted,
         "residuals": {"interpolated:process_scene": residual},
         "collision_residuals": {"interpolated:scene_collision": residual},
+        "scene_update_residuals": {"interpolated:scene_update": 0.},
         "native_metrics": {"success": accepted},
         "seed_provenance": "supplied_joint_curve",
         "native_confirmation": {"status": "completed"}}
@@ -119,10 +120,40 @@ def test_confirmation_success_flag_cannot_override_invalid_residual(value):
 # BEGIN collision diagnostics cannot change the existing severity ordering.
 def test_scene_support_severity_selects_same_seed_despite_opposite_collision_order():
     planner, result = selection_fixture(scene=(.02, .01), task=(.1, .1))
-    result.metrics.debug = torch.stack((torch.zeros((9, 1)), torch.ones((9, 1))))
+    result.metrics.debug = torch.stack((torch.zeros((9, 2)), torch.ones((9, 2))))
+    result.metrics.debug[0, :, 1] = 100000.
     _, curve, report = planner.select_candidate(result)
     assert not report["accepted"] and curve.seed_index == report["selected_seed_index"] == 1
     assert report["collision_residuals"] == {"rollout:scene_collision": 1.}
     assert report["residuals"]["rollout:process_scene"] == pytest.approx(.01)
     planner._candidate_metrics.assert_not_called()
 # END diagnostics are absent from acceptance and candidate severity sums.
+
+
+# BEGIN a candidate support gap cannot override another existing feasible seed.
+def test_unsupported_seed_does_not_block_another_accepted_seed():
+    planner, result = selection_fixture(scene=(100000., 0.), flags=(False, True))
+    result.metrics.debug.zero_()
+    result.metrics.debug[0, :, 1] = 100000.
+    _, curve, report = planner.select_candidate(result)
+    assert report["accepted"] and curve.seed_index == 1
+    assert report["candidates"][0]["scene_update_residuals"] == {"rollout:scene_update": 100000.}
+    assert report["scene_update_residuals"] == {"rollout:scene_update": 0.}
+    planner._candidate_metrics.assert_not_called()
+
+
+def test_native_confirmation_report_replaces_same_candidate_support_evidence():
+    planner, result = selection_fixture(scene=(.01, 0.), task=(0., .1))
+    result.metrics.debug[0, :, 0] = 0.
+    result.metrics.debug[0, :, 1] = .01
+    def confirm(curve, scene):
+        report, parameters, points = completed(accepted=False, residual=1., points=4)
+        report["collision_residuals"] = {"interpolated:scene_collision": 0.}
+        report["scene_update_residuals"] = {"interpolated:scene_update": 1.}
+        return report, parameters, points
+    planner._candidate_metrics.side_effect = confirm
+    _, _, report = planner.select_candidate(result)
+    assert not report["accepted"]
+    assert report["scene_update_residuals"] == {"interpolated:scene_update": 1.}
+    assert report["sphere_proposal_metrics"]["rollout"]["scene_update_residuals"]["scene_update"] == pytest.approx(.01)
+# END query evidence stays attached to its producer when confirmation replaces a report.

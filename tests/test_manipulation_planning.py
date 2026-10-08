@@ -1617,7 +1617,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             fixture.manager._process_mode = "trajectory_metrics"
             dense = fixture.manager.compute_costs(RobotState(joint_state=joints,
                 cuda_robot_model_state=fixture.kinematics(joints)))
-            collision_evidence = fixture.manager._collision_evidence[1][:1].clone()
+            collision_evidence = fixture.manager._scene_evidence[1][:1].clone()
             fixture.manager._process_mode = "trajectory_optimizer"
             # END the following optimizer query preserves the original gradient test.
             result = SimpleNamespace(batch_size=1, num_seeds=1, interpolated_last_tstep=torch.tensor([[21]]),
@@ -1682,30 +1682,35 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 results[mode] = (scene.detach().clone(), gradient)
                 self.assertEqual(calls, [mode == "trajectory_metrics"])
                 if mode == "trajectory_optimizer":
-                    self.assertIsNone(fixture.manager._collision_evidence)
+                    self.assertIsNone(fixture.manager._scene_evidence)
                     continue
                 metrics = RolloutMetrics(costs_and_constraints=CostsAndConstraints(constraints=costs))
-                fixture.manager.bind_collision_evidence(metrics)
+                fixture.manager.bind_scene_evidence(metrics)
                 self.assertFalse(metrics.debug.requires_grad)
                 self.assertEqual(costs.names.count("process_scene"), 1)
                 # Two regular states and one folded anchor each retain their
                 # unit support gap in the hard sum, never in collision debug.
-                torch.testing.assert_close(scene.detach()-metrics.debug,
+                # BEGIN each weighted/folded channel retains its own evidence.
+                self.assertEqual(tuple(metrics.debug.shape), (2, 2, 2))
+                torch.testing.assert_close(metrics.debug[..., 1:],
                     torch.tensor([[[777.], [1554.]], [[777.], [1554.]]]), rtol=1e-7, atol=0)
+                torch.testing.assert_close(scene.detach()-metrics.debug[..., :1],
+                    metrics.debug[..., 1:], rtol=1e-7, atol=0)
+                # END support remains hard but cannot enter collision witnesses.
                 clone = metrics.clone()
                 self.assertNotEqual(clone.debug.data_ptr(), metrics.debug.data_ptr())
                 with self.assertRaisesRegex(RuntimeError, "different native metric query"):
-                    fixture.manager.bind_collision_evidence(clone)
+                    fixture.manager.bind_scene_evidence(clone)
                 later_costs = fixture.manager.compute_costs(fixture.state)
                 with self.assertRaisesRegex(RuntimeError, "different native metric query"):
-                    fixture.manager.bind_collision_evidence(metrics)
+                    fixture.manager.bind_scene_evidence(metrics)
                 later = RolloutMetrics(costs_and_constraints=CostsAndConstraints(constraints=later_costs))
-                fixture.manager.bind_collision_evidence(later)
+                fixture.manager.bind_scene_evidence(later)
                 fixture.config_type.bind_request(fixture.problem, fixture.scene,
                     _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), (.55,),
                     PlanningBudget(max_task_anchors=2), FunctionalAugmentedLagrangian(()))
                 with self.assertRaisesRegex(RuntimeError, "no same-query"):
-                    fixture.manager.bind_collision_evidence(later)
+                    fixture.manager.bind_scene_evidence(later)
         torch.testing.assert_close(results["trajectory_optimizer"][0], results["trajectory_metrics"][0], rtol=0, atol=0)
         torch.testing.assert_close(results["trajectory_optimizer"][1], results["trajectory_metrics"][1], rtol=0, atol=0)
     # END rejected stale diagnostics never replace the already computed constraints.
@@ -2531,7 +2536,8 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         constraints.values[0][0, 1] = 10.
         constraints.values[0][1, 3] = 2.
         # BEGIN aggregate values do not serve as implicit collision evidence.
-        result.interpolated_metrics.debug = constraints.values[0].clone()
+        result.interpolated_metrics.debug = torch.cat((constraints.values[0],
+            torch.tensor([100., 200.])[:, None, None].expand(2, 9, 1)), dim=-1)
         # END explicit same-seed evidence must survive the native top-k gather.
         selected = _trajectory_candidate(result, 1)
         copied = selected.interpolated_metrics.costs_and_constraints.constraints.values[0]
@@ -2543,7 +2549,8 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         constraints.values[0].zero_()
         self.assertEqual(float(copied[0, 3]), 2.)
         result.interpolated_metrics.debug.zero_()
-        self.assertEqual(float(selected.interpolated_metrics.debug[0, 3]), 2.)
+        self.assertEqual(float(selected.interpolated_metrics.debug[0, 3, 0]), 2.)
+        self.assertEqual(float(selected.interpolated_metrics.debug[0, 3, 1]), 200.)
     # END selected dense evidence survives native scratch-buffer reuse.
 
     # BEGIN locked-joint native result layout: active knots and full robot state.

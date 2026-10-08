@@ -10,7 +10,7 @@ import torch
 from manipulation.planning import _dense_collision_witnesses
 
 
-def selected_result(values, *, collision, count=9):
+def selected_result(values, *, collision, count=9, scene_update=None):
     horizon = len(next(iter(values.values())))
     constraints = SimpleNamespace(names=list(values), values=[
         torch.tensor(value, dtype=torch.float32).reshape(1, horizon, 1) for value in values.values()])
@@ -18,7 +18,10 @@ def selected_result(values, *, collision, count=9):
         interpolated_last_tstep=torch.tensor([[count]]),
         interpolated_trajectory=SimpleNamespace(position=torch.zeros(1, 1, horizon, 2)),
         # BEGIN the fixture declares collision evidence independently of hard totals.
-        interpolated_metrics=SimpleNamespace(debug=torch.tensor(collision, dtype=torch.float32).reshape(1, horizon, 1),
+        interpolated_metrics=SimpleNamespace(debug=torch.stack((
+            torch.tensor(collision, dtype=torch.float32),
+            torch.zeros(horizon) if scene_update is None else torch.tensor(scene_update, dtype=torch.float32)),
+            dim=-1).reshape(1, horizon, 2),
             costs_and_constraints=SimpleNamespace(constraints=constraints)))
         # END no production fallback from process_scene is exercised by these tests.
 
@@ -71,3 +74,15 @@ def test_deduplication_is_exact_native_time_not_an_epsilon_window():
     with pytest.raises(ValueError, match="selected native candidate"):
         select(result)
 # END no geometry callback or new validation budget is consumed by selection.
+
+
+# BEGIN support peaks neither create nor suppress same-query collision witnesses.
+def test_mixed_support_and_collision_uses_only_collision_channel_for_times():
+    collision = [0, 0, 2, 3, 100, 4, 0, 0, 0, 1000, 2000]
+    support = [100000]*11
+    result = selected_result({"process_scene": np.asarray(collision)+support},
+        collision=collision, scene_update=support)
+    assert select(result)["parameters"] == [.625]
+    result.interpolated_metrics.debug[..., 0].zero_()
+    assert select(result)["parameters"] == []
+# END the hard scene total remains positive in both cases.

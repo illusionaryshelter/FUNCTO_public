@@ -83,7 +83,8 @@ class Native:
         report = {"accepted": accepted, "native_success": accepted, "seed_provenance": "test",
                   "residuals": {"process_scene" if self.collision else "skill_process": 0. if accepted else 1.},
                   # BEGIN recovery evidence is distinct from the hard scene aggregate.
-                  "collision_residuals": {"rollout:scene_collision": float(self.collision and not accepted)}}
+                  "collision_residuals": {"rollout:scene_collision": float(self.collision and not accepted)},
+                  "scene_update_residuals": {"rollout:scene_update": 0.}}
                   # END the deterministic fixture supplies explicit query classification.
         return SimpleNamespace(solution=torch.zeros((1, 1, 8, 1))), self.curve, report
     def ompl_seed(self, seed, trajectory):
@@ -200,6 +201,7 @@ def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_
         candidate, curve, report = select(accepted)
         report["residuals"] = {"rollout:process_scene": 400000., "interpolated:process_scene": 500000.}
         report["collision_residuals"] = {"rollout:scene_collision": 0., "interpolated:scene_collision": 0.}
+        report["scene_update_residuals"] = {"rollout:scene_update": 400000., "interpolated:scene_update": 500000.}
         return candidate, curve, report
     native.select_candidate = missing_support
     native.promote_collision_witnesses = lambda _: pytest.fail("Support gap is not collision evidence")
@@ -210,6 +212,8 @@ def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_
         assert native.calls.count("solve") == (2 if functional else 1)
         assert native.calls.count("al") == int(functional)
         assert result.diagnostics["failure"] == "no_feasible_solution_found"
+        assert result.diagnostics["scene_update_residuals"]["interpolated:scene_update"] == 500000.
+        assert "failure_scope" in result.diagnostics
     finally:
         backend.close()
 # END one rejected exploration candidate does not prove a request-wide scene gap.
@@ -318,3 +322,38 @@ def test_new_motion_allowance_requires_boundary_t_evidence_and_forward_progress(
         _bind_motion_work_ledger(ledger, block, continuation, {"trajectory_solves": 4})
         assert ledger == previous
 # END no native CUDA call or simulated physical completion is needed for these contracts.
+
+
+# BEGIN support evidence cannot cancel the existing fixed-target finite search.
+@pytest.mark.parametrize("outcomes,collision,expected_solves", [
+    ([False, True], False, 1),
+    ([False, False, True], False, 2),
+    ([False, False, True], True, 2),
+])
+def test_candidate_support_gaps_do_not_early_stop_main_or_recovery(outcomes, collision, expected_solves):
+    native = Native(outcomes, collision=collision)
+    select = native.select_candidate
+    source = problem()
+    source_positions = source.phases[0].reference.poses.copy()
+    def with_support(accepted):
+        candidate, curve, report = select(accepted)
+        gap = 0. if accepted else 100000.
+        report["scene_update_residuals"] = {"rollout:scene_update": gap}
+        report["residuals"]["rollout:process_scene"] = gap
+        return candidate, curve, report
+    native.select_candidate = with_support
+    backend = MotionBackend({}, robot_validator=object())
+    with patch("manipulation.planning._CuroboPlanner", return_value=native), \
+         patch("manipulation.execution_binding.bind_candidate", return_value={"candidate_id": "accepted"}):
+        result = backend.plan(source, Scene())
+    try:
+        assert result.success, result.diagnostics
+        assert native.calls.count("solve") == expected_solves
+        assert result.diagnostics["reference_candidate"]["scene_update_residuals"] == {"rollout:scene_update": 100000.}
+        assert result.diagnostics["scene_update_residuals"] == {"rollout:scene_update": 0.}
+        if expected_solves == 2:
+            assert ("ompl" if collision else "al") in native.calls
+        np.testing.assert_array_equal(source.phases[0].reference.poses, source_positions)
+    finally:
+        backend.close()
+# END only completed hard metrics determine whether a fixed transfer is achieved.
