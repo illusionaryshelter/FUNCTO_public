@@ -36,6 +36,46 @@ def _source_kernel(lookup):
     return kernel
 
 
+# BEGIN source sign provenance is limited to the original physical TSDF box.
+def _mask_source_sign_bounds(bits, *, source_center, source_shape_xyz, source_voxel_size,
+                             query_center, query_voxel_size):
+    """Clear only sign-source bits outside the source grid, in place.
+
+    The native lookup truncates negative continuous indices toward zero;
+    an ESDF centre just below the TSDF box can therefore borrow voxel zero's
+    sign. A larger distance-query grid must not turn that alias into an
+    observation at the queried position. Its propagated nearest-site bit
+    remains valid and is retained, as are all native distance values.
+
+    XYZ source counts and centres describe physical voxel boxes. The exported
+    ESDF shape/centre/spacing independently describe its actual sample lattice.
+    Per-axis slices avoid allocating a full coordinate inventory or 3-D mask.
+    """
+    source_center = np.asarray(source_center, dtype=float)
+    source_shape_xyz = np.asarray(source_shape_xyz)
+    query_center = np.asarray(query_center, dtype=float)
+    if (bits.ndim != 3 or bits.dtype != np.uint8 or min(bits.shape) < 1
+            or source_center.shape != (3,) or query_center.shape != (3,)
+            or source_shape_xyz.shape != (3,) or source_shape_xyz.dtype.kind not in 'iu'
+            or np.any(source_shape_xyz <= 0)
+            or not np.isfinite([*source_center, *query_center, source_voxel_size, query_voxel_size]).all()
+            or source_voxel_size <= 0 or query_voxel_size <= 0):
+        raise ValueError('Source-sign masking needs finite source/query grids and XYZ uint8 bits')
+    half_extent = source_shape_xyz * float(source_voxel_size) / 2
+    lower, upper = source_center-half_extent, source_center+half_extent
+    for axis, count in enumerate(bits.shape):
+        centres = query_center[axis]+(np.arange(count)-(count-1)/2)*float(query_voxel_size)
+        # Native TSDF voxel indices include the lower boundary but exclude
+        # the upper one. Clear both observed-sign and negative-sign flags;
+        # nearest-site provenance is independent of local sign support.
+        outside = (centres < lower[axis]) | (centres >= upper[axis])
+        selection = [slice(None)] * 3
+        selection[axis] = outside
+        bits[tuple(selection)] &= np.uint8(0xff ^ (2 | 4))
+    return bits
+# END numerical query support does not add TSDF observations or free space.
+
+
 def export_source_bits(mapper, config, voxel, *, max_cells=MAX_FINE_CELLS):
     """Return XYZ bits: nearest site (1), observed sign (2), negative sign (4)."""
     if config.enable_static:
@@ -59,4 +99,11 @@ def export_source_bits(mapper, config, voxel, *, max_cells=MAX_FINE_CELLS):
               wp.from_torch(center), float(voxel.voxel_size), float(config.minimum_tsdf_weight),
               shape[1], shape[2], wp.from_torch(bits)], device=str(device),
               stream=wp.stream_from_torch(torch.cuda.current_stream(device)))
-    return np.ascontiguousarray(bits.cpu().numpy().reshape(shape))
+    # BEGIN constrain native sign provenance using the actual two grid frames.
+    exported = np.ascontiguousarray(bits.cpu().numpy().reshape(shape))
+    return _mask_source_sign_bounds(exported,
+        source_center=config.grid_center.detach().cpu().numpy(),
+        source_shape_xyz=config.grid_shape[::-1],
+        source_voxel_size=float(np.float32(config.voxel_size)),
+        query_center=voxel.pose[:3], query_voxel_size=float(voxel.voxel_size))
+    # END the original native nearest-site bits and distance output are unchanged.

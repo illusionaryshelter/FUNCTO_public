@@ -1191,7 +1191,81 @@ def _require_mapping_memory(estimated_bytes, device, *,
 
 
 
-def _map_online_partition(normalized, masks, identity, config, inverse):
+# BEGIN prepare the background's numerical query domain independently of evidence.
+def _background_query_config(config, query_radius_m):
+    """Cover every declared-radius query that can reach this TSDF source.
+
+    Native gather probes a half ESDF cell beyond each sample; represented
+    occupied cells extend another half cell. Native conversion to integer
+    TSDF coordinates truncates toward zero, adding one source cell only on
+    the negative side. These are source-layout bounds, never a motion goal.
+    Integer padding preserves the original ESDF world lattice while the
+    public ``compute_esdf(esdf_origin=...)`` argument moves only its centre.
+    """
+    if (isinstance(query_radius_m, (bool, np.bool_)) or not isinstance(query_radius_m, Real)
+            or not np.isfinite(query_radius_m) or query_radius_m < 0):
+        raise ValueError('Background query support requires a finite nonnegative sphere radius')
+    radius = float(query_radius_m)
+    h_source, h_query = float(config.voxel_size), float(config.esdf_voxel_size)
+    center = config.grid_center.detach().cpu().numpy().astype(float)
+    source_shape = tuple(math.ceil(float(size)/h_source) for size in config.extent_meters_xyz)
+    original_shape = tuple(math.ceil(float(size)/h_query) for size in config.extent_esdf_meters_xyz)
+    source_half = np.asarray(source_shape, dtype=float)*h_source/2
+    source_lower, source_upper = center-source_half, center+source_half
+    original_half = (np.asarray(original_shape, dtype=float)-1)*h_query/2
+    required_lower = source_lower-h_source-h_query-radius
+    required_upper = source_upper+h_query+radius
+    lower_padding = tuple(max(0, math.ceil(float(value)/h_query))
+        for value in center-original_half-required_lower)
+    upper_padding = tuple(max(0, math.ceil(float(value)/h_query))
+        for value in required_upper-(center+original_half))
+    shape = tuple(size+lower+upper for size, lower, upper
+        in zip(original_shape, lower_padding, upper_padding))
+    # Packed native site coordinates admit ten bits per axis. Reject before
+    # constructing any Mapper, including its TSDF and camera allocations.
+    if min(shape) < 2 or max(shape) > 1024:
+        raise ValueError('UNSUPPORTED_MODEL: background query grid requires 2 to 1024 cells per axis')
+    query_center = center+(np.asarray(upper_padding)-np.asarray(lower_padding))*h_query/2
+    # A rounded multiplication can make ceil(extent/h) allocate one extra
+    # cell. Select the interior side of the exact requested cell count, then
+    # verify that the installed Mapper's sizing expression retains it.
+    extent = tuple(float(np.nextafter(size*h_query, 0.)) for size in shape)
+    if tuple(math.ceil(size/h_query) for size in extent) != shape:
+        raise ValueError('UNSUPPORTED_MODEL: background query extent cannot preserve its declared grid shape')
+    derived = replace(config, extent_esdf_meters_xyz=extent)
+    query_half = (np.asarray(shape, dtype=float)-1)*h_query/2
+    report = {
+        'query_radius_m': radius,
+        'radius_scope': 'Declared robot spheres and complete mechanical gripper envelope; later installed payloads are not covered by this preparation',
+        'source_shape_xyz': list(source_shape),
+        'source_lower_m': source_lower.tolist(), 'source_upper_m': source_upper.tolist(),
+        'source_center_m': center.tolist(), 'source_voxel_size_m': h_source,
+        'original_query_shape_xyz': list(original_shape),
+        'padding_lower_voxels': list(lower_padding), 'padding_upper_voxels': list(upper_padding),
+        'query_shape_xyz': list(shape), 'query_center_m': query_center.tolist(),
+        'query_lower_m': (query_center-query_half).tolist(),
+        'query_upper_m': (query_center+query_half).tolist(), 'query_voxel_size_m': h_query,
+        'source': 'Native Mapper TSDF evidence retained; independent ESDF query extent and centre',
+    }
+    return derived, query_center, report
+
+
+def _validate_background_query_support(query, query_radius_m):
+    """Reject incomplete native output instead of masking a support failure.
+
+    The actual exported occupied-cell bounds account for gather and floating
+    point conversion. Their radius-expanded box must fit the actual sampling
+    centres; no tolerance, reduced radius or second map construction repairs
+    a failed preparation contract.
+    """
+    if query.geometry_lower is not None and (
+            np.any(query.geometry_lower-query_radius_m < query.origin)
+            or np.any(query.geometry_upper+query_radius_m > query.upper)):
+        raise ValueError('UNSUPPORTED_MODEL: native background query field does not cover its declared sphere radius')
+# END source observation coverage is never inferred from numerical query extent.
+
+
+def _map_online_partition(normalized, masks, identity, config, inverse, *, esdf_origin=None):
     """Integrate one partition and export its exact finite native distance field."""
     from curobo.perception import Mapper
     from curobo.types import CameraObservation, DeviceCfg, Pose
@@ -1210,7 +1284,9 @@ def _map_online_partition(normalized, masks, identity, config, inverse):
     stats=mapper.get_stats(scan_pool=True)
     if stats['allocation_failures'] or stats['num_allocated'] != stats['active_blocks']+stats['free_count']:
         raise ValueError('UNSUPPORTED_MODEL: native mapping allocation lost observed geometry')
-    voxel=mapper.compute_esdf()
+    # BEGIN use the native independent query centre without moving TSDF evidence.
+    voxel=mapper.compute_esdf(esdf_origin=None if esdf_origin is None else device.to_device(esdf_origin))
+    # END None retains the native source-centred owner query API.
     from .collision_records import MAX_ARRAY_BYTES
     bits=export_source_bits(mapper,config,voxel,max_cells=MAX_ARRAY_BYTES//4)
     values=voxel.feature_tensor.detach().cpu().float().numpy()
@@ -1285,17 +1361,37 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         raise ValueError('Fixed regions must identify an existing physical owner or background')
     for identity,request in requests.items():
         configs[identity]=_fine_mapper_config(configs[identity],request)
+    # BEGIN observation coverage retains the pre-expansion background layout.
+    coverage_cfg = configs[None]
+    background_radius = radius
+    if gripper is not None:
+        # Match PrismaticGripper.spheres' continuous joint-box envelope. The
+        # mechanical limits cover every current or future permitted interval;
+        # a nominal command does not reduce the required numerical support.
+        half = (gripper.joint_limits[:, 1]-gripper.joint_limits[:, 0])/2
+        displacement = np.einsum('ncj,j->nc', np.abs(gripper.sphere_joint_translation), half)
+        hand_radii = gripper.local_spheres[:, 3]+np.linalg.norm(displacement, axis=-1)
+        background_radius = max(background_radius, float(hand_radii.max(initial=0.)))
+    configs[None], background_query_center, background_support = _background_query_config(
+        coverage_cfg, background_radius)
+    # END the existing owner fields keep their original preparation contract.
     estimates={identity:_mapper_memory_bound(config) for identity,config in configs.items()}
     from .collision_records import MAX_ARRAY_BYTES
     for config in configs.values():
         shape=tuple(math.ceil(float(x)/config.esdf_voxel_size) for x in config.extent_esdf_meters_xyz)
+        # BEGIN enforce the native packed-coordinate limit before allocation.
+        if max(shape)>1024:
+            raise ValueError('UNSUPPORTED_MODEL: frozen distance grid exceeds 1024 cells per axis')
+        # END unchanged byte and total-memory admission follows this layout check.
         if min(shape)<2 or math.prod(shape)*4>MAX_ARRAY_BYTES:
             # BEGIN report the common codec limit rather than a stale local cap.
             raise ValueError(f'UNSUPPORTED_MODEL: frozen distance field exceeds the {MAX_ARRAY_BYTES // 1024**2} MiB binary record limit')
             # END allocation still also requires the unchanged total budgets.
     if sum(estimates.values())>max_mapping_bytes:
         raise ValueError('UNSUPPORTED_MODEL: fixed scene exceeds declared mapping allocation')
-    background_cfg=configs[None]
+    # BEGIN distance-query support cannot enlarge observed-free evidence.
+    background_cfg=coverage_cfg
+    # END all ray inputs and the original background coverage grid stay fixed.
     shape=tuple(math.ceil(float(x)/background_cfg.esdf_voxel_size) for x in background_cfg.extent_esdf_meters_xyz)
     center=background_cfg.grid_center.detach().cpu().numpy()
     origin=center-(np.asarray(shape)-1)*background_cfg.esdf_voxel_size/2
@@ -1311,7 +1407,19 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         _require_mapping_memory(estimates[identity],config.device,max_host_rss_bytes=max_host_rss_bytes,
             max_device_used_bytes=max_device_used_bytes)
         inverse=np.eye(4) if identity is None else _inverse(frames[identity][0])
-        queries[identity],reports['observed_background' if identity is None else identity]=_map_online_partition(normalized,masks,identity,config,inverse)
+        # BEGIN only the background uses the independently prepared query centre.
+        queries[identity],reports['observed_background' if identity is None else identity]=_map_online_partition(
+            normalized,masks,identity,config,inverse,
+            esdf_origin=background_query_center if identity is None else None)
+        if identity is None:
+            _validate_background_query_support(queries[None], background_radius)
+            background_support.update(
+                actual_query_lower_m=queries[None].origin.tolist(),
+                actual_query_upper_m=queries[None].upper.tolist(),
+                actual_geometry_lower_m=None if queries[None].geometry_lower is None else queries[None].geometry_lower.tolist(),
+                actual_geometry_upper_m=None if queries[None].geometry_upper is None else queries[None].geometry_upper.tolist())
+            reports['observed_background']['query_support'] = background_support
+        # END an incomplete exported field is rejected, never retried or relaxed.
     owners=[CollisionOwner(identity,queries[identity],PosePath(np.array([0.,1.]),np.stack((pose,pose)),source),
         source,geometry_complete=False) for identity,(pose,source) in frames.items()]
     scene=OnlinePlanningScene(background=queries[None],owners=owners,coverage=coverage,
@@ -1323,6 +1431,11 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     scene.observation_report={'source':'current calibrated owner-partitioned RGB-D','partitions':reports,
         'estimated_mapping_buffers_bytes':sum(estimates.values()),'depth_error_m':float(depth_error_m),
         'known_free_voxels':int(known.sum()),'coverage_voxels':int(known.size),
+        # BEGIN retain the independent free-ray grid beside numerical support.
+        'coverage_grid': {'origin_m': origin.tolist(), 'shape_xyz': list(shape),
+            'voxel_size_m': float(background_cfg.esdf_voxel_size),
+            'source': 'Unchanged pre-query-expansion background grid and ENVIRONMENT free rays'},
+        # END an enlarged ESDF is never recorded as newly observed free space.
         # BEGIN describe the registered online contact model used by this scene.
         'geometry_model':'one frozen signed field per partition; prepared forbidden-region fields and registered native planar contact',
         # END source-cell interpretation is confined to preparation, not online queries.

@@ -822,7 +822,9 @@ class OnlineObservationContractTest(unittest.TestCase):
         from manipulation.planning_observation import _map_online_partition
         cfg=MapperCfg(extent_meters_xyz=(.06,.08,.1),voxel_size=.02,
             extent_esdf_meters_xyz=(.06,.08,.1),esdf_voxel_size=.02,
-            grid_center=torch.tensor([.2,.3,1.]),image_height=96,image_width=96,device='cuda:0')
+            # BEGIN source and query centres are independent native inputs.
+            grid_center=torch.tensor([.25,.35,1.05]),image_height=96,image_width=96,device='cuda:0')
+        # END the mocked output below retains the requested query centre.
         values=torch.tensor(np.broadcast_to(np.array([-.02,0.,.02])[:,None,None],(3,4,5)).copy(),dtype=torch.float16)
         voxel=SimpleNamespace(feature_tensor=values,pose=[.2,.3,1.,1.,0.,0.,0.],voxel_size=.02)
         # BEGIN inspect the exact filtered depth passed to the native Mapper.
@@ -844,7 +846,14 @@ class OnlineObservationContractTest(unittest.TestCase):
              patch('curobo._src.geom.collision.collision_scene.SceneCollision.from_config',side_effect=AssertionError('online map created second collision scene')):
             mapper.return_value.get_stats.return_value={'allocation_failures':0,'num_allocated':0,'active_blocks':0,'free_count':0}
             mapper.return_value.compute_esdf.return_value=voxel
-            query,report=_map_online_partition(normalized,masks,None,cfg,np.eye(4))
+            query,report=_map_online_partition(normalized,masks,None,cfg,np.eye(4),
+                esdf_origin=np.asarray(voxel.pose[:3]))
+        # BEGIN Mapper integration owns the unchanged source centre.
+        self.assertIs(mapper.call_args.args[0],cfg)
+        np.testing.assert_allclose(cfg.grid_center.numpy(),[.25,.35,1.05],atol=1e-7)
+        requested=mapper.return_value.compute_esdf.call_args.kwargs['esdf_origin']
+        np.testing.assert_allclose(np.asarray(requested),voxel.pose[:3],atol=1e-7)
+        # END only the public ESDF query-origin argument moves the output lattice.
         # BEGIN native mapping receives original ENVIRONMENT endpoints only.
         mapped=mapper.return_value.integrate.call_args.kwargs['camera_observation'].depth_image.cpu().numpy()[0]
         expected_depth=record['depth'].copy()
@@ -871,10 +880,15 @@ class OnlineObservationContractTest(unittest.TestCase):
         views['first']['self_filter']['free_ray_depth_m'][10,10]=0.
         # END raw depth stays valid, so using it would violate this evidence.
         captured={}
-        def make(normalized,masks,identity,config,inverse):
+        # BEGIN the mapper fixture honors the native independent query centre.
+        query_centres={}
+        def make(normalized,masks,identity,config,inverse,*,esdf_origin=None):
             captured[identity]=config
             shape=np.ceil(np.asarray(config.extent_esdf_meters_xyz)/config.esdf_voxel_size).astype(int)
-            origin=config.grid_center.numpy()-(shape-1)*config.esdf_voxel_size/2
+            centre=config.grid_center.numpy() if esdf_origin is None else np.asarray(esdf_origin)
+            query_centres[identity]=centre.copy()
+            origin=centre-(shape-1)*config.esdf_voxel_size/2
+            # END output metadata must describe the actual query grid.
             values=np.ones(tuple(shape),dtype=np.float32)
             query=FrozenESDF(values,origin=origin,voxel_size=config.esdf_voxel_size,
                 site_valid=np.zeros_like(values,dtype=bool),observed_sign=np.zeros_like(values,dtype=bool),
@@ -901,11 +915,151 @@ class OnlineObservationContractTest(unittest.TestCase):
         self.assertIsInstance(result,OnlinePlanningScene)
         self.assertEqual(mapper.call_count,2)
         self.assertEqual(captured[None].esdf_voxel_size,.01)
+        # BEGIN expanded collision queries never expand observed-free evidence.
+        np.testing.assert_array_equal(captured[None].extent_meters_xyz,[.2]*3)
+        np.testing.assert_array_equal(captured[None].grid_center.numpy(),[0.,0.,1.])
+        self.assertTrue(np.all(np.asarray(captured[None].extent_esdf_meters_xyz)>.2))
+        self.assertEqual(coverage.call_args.kwargs['shape'],(20,20,20))
+        np.testing.assert_allclose(coverage.call_args.kwargs['origin'],[-.095,-.095,.905],atol=1e-12)
+        self.assertEqual(coverage.call_args.kwargs['voxel_size'],.01)
+        np.testing.assert_array_equal(result.coverage.origin,coverage.call_args.kwargs['origin'])
+        self.assertEqual(result.coverage.known_free.shape,(20,20,20))
+        np.testing.assert_allclose(result.background.origin,
+            query_centres[None]-(np.asarray(result.background.distance.shape)-1)*.01/2,atol=1e-12)
+        # END the requested fine source region stays fixed before adding query support.
         normalized=_views(views,'world',(.1,3.))
         expected=_owner_mapper_config(cfg,normalized,_audit_partition_masks(normalized,frames),'part',frames['part']['T_output_owner'],.005,.003,query_radius_m=.04)
         np.testing.assert_allclose(captured['part'].extent_esdf_meters_xyz,expected.extent_esdf_meters_xyz)
         self.assertFalse(hasattr(result.background,'refinement_source'))
 # END these CPU tests never allocate native mapping or simulator state.
+
+
+# BEGIN generic query-domain preparation reuses native mapping without new evidence.
+class BackgroundQueryDomainTest(unittest.TestCase):
+    def test_query_lattice_preserves_source_config_and_contains_required_domain(self):
+        from copy import deepcopy
+        from curobo.perception import MapperCfg
+        from manipulation.planning_observation import _background_query_config
+        cases = [
+            ((.12,.14,.16), .02, (.12,.14,.16), .02, .033),
+            ((.10,.14,.18), .02, (.125,.175,.225), .025, .041),
+            ((.14,.18,.22), .02, (.12,.15,.18), .015, .052),
+            ((.10,.14,.18), .02, (1.,1.,1.), .025, .02),
+        ]
+        for source_extent,h_source,query_extent,h_query,radius in cases:
+            with self.subTest(source=source_extent,query=query_extent,h=h_query):
+                config=MapperCfg(extent_meters_xyz=source_extent,voxel_size=h_source,
+                    extent_esdf_meters_xyz=query_extent,esdf_voxel_size=h_query,
+                    grid_center=torch.tensor([-.31,.27,1.13]),image_height=96,image_width=96,device='cuda:0')
+                before=deepcopy(config.__dict__)
+                query,centre,report=_background_query_config(config,radius)
+                # Compare every source configuration field, including capacities.
+                self.assertEqual(set(config.__dict__),set(before))
+                for name,value in before.items():
+                    if isinstance(value,torch.Tensor):
+                        torch.testing.assert_close(getattr(config,name),value,rtol=0,atol=0)
+                    else:
+                        self.assertEqual(getattr(config,name),value)
+                self.assertEqual(query.extent_meters_xyz,config.extent_meters_xyz)
+                self.assertEqual(query.voxel_size,config.voxel_size)
+                self.assertEqual(query.truncation_distance,config.truncation_distance)
+                torch.testing.assert_close(query.grid_center,config.grid_center,rtol=0,atol=0)
+                self.assertEqual(query.max_blocks,config.max_blocks)
+                old_n=np.ceil(np.asarray(query_extent)/h_query).astype(int)
+                new_n=np.ceil(np.asarray(query.extent_esdf_meters_xyz)/h_query).astype(int)
+                old_c=config.grid_center.numpy().astype(float)
+                old_lower=old_c-(old_n-1)*h_query/2
+                actual_lower=np.asarray(centre)-(new_n-1)*h_query/2
+                actual_upper=np.asarray(centre)+(new_n-1)*h_query/2
+                lower_steps=(old_lower-actual_lower)/h_query
+                np.testing.assert_allclose(lower_steps,np.rint(lower_steps),atol=1e-10)
+                self.assertTrue(np.all(lower_steps>=0))
+                source_half=np.asarray(config.grid_shape[::-1])*h_source/2
+                required_lower=old_c-source_half-h_source-h_query-radius
+                required_upper=old_c+source_half+h_query+radius
+                self.assertTrue(np.all(actual_lower<=required_lower+1e-12))
+                self.assertTrue(np.all(actual_upper>=required_upper-1e-12))
+                np.testing.assert_array_equal(report['query_shape_xyz'],new_n)
+                np.testing.assert_array_equal(report['padding_lower_voxels'],np.rint(lower_steps).astype(int))
+                self.assertEqual(report['query_radius_m'],radius)
+                if query_extent==(1.,1.,1.):
+                    np.testing.assert_array_equal(new_n,old_n)
+                    np.testing.assert_array_equal(centre,old_c)
+
+    def test_actual_export_support_postcondition_handles_empty_clear_and_insufficient_fields(self):
+        from manipulation.online_geometry import FrozenESDF
+        from manipulation.planning_observation import _validate_background_query_support
+        values=np.ones((7,7,7),np.float32)
+        empty=FrozenESDF(values,origin=[-.3]*3,voxel_size=.1,
+            site_valid=np.zeros_like(values,dtype=bool),observed_sign=np.zeros_like(values,dtype=bool),
+            owner_ids=('background',),source='empty measured geometry')
+        _validate_background_query_support(empty,.2)
+        values[3,3,3]=0.
+        occupied=FrozenESDF(values,origin=[-.3]*3,voxel_size=.1,
+            site_valid=np.ones_like(values,dtype=bool),observed_sign=np.zeros_like(values,dtype=bool),
+            owner_ids=('background',),source='one observed occupied cell')
+        _validate_background_query_support(occupied,.2)
+        with self.assertRaises(ValueError):
+            _validate_background_query_support(occupied,.251)
+        # A nonzero field that reaches its last sample is insufficient even
+        # if its declared preparation formula expected additional padding.
+        values[6,3,3]=0.
+        at_boundary=FrozenESDF(values,origin=[-.3]*3,voxel_size=.1,
+            site_valid=np.ones_like(values,dtype=bool),observed_sign=np.zeros_like(values,dtype=bool),
+            owner_ids=('background',),source='actual export reaches query boundary')
+        with self.assertRaises(ValueError):
+            _validate_background_query_support(at_boundary,.01)
+
+    def test_gripper_mechanical_envelope_controls_background_radius_before_allocation(self):
+        from curobo.perception import MapperCfg
+        from manipulation.planning_observation import _background_query_config,build_scene_from_rgbd
+        from manipulation.planning_scene import PrismaticGripper
+        hand=PrismaticGripper(controller='binary',control_timestep_s=.002,
+            joint_names=('finger',),current_positions=[0.],joint_limits=[[-.1,.1]],
+            joint_bounds=None,coupling_matrix=np.empty((0,1)),coupling_offset=[],
+            sphere_indices=(0,),local_spheres=[[0.,0.,0.,.005]],
+            sphere_joint_translation=[[[.6],[.8],[0.]]],self_collision_pairs=(),commands=(),
+            source='declared affine finger model and full mechanical interval')
+        config=MapperCfg(extent_meters_xyz=(.2,.2,.2),voxel_size=.02,
+            extent_esdf_meters_xyz=(.2,.2,.2),esdf_voxel_size=.02,
+            grid_center=torch.tensor([0.,0.,1.]),image_height=96,image_width=96,device='cuda:0')
+        bodies=[{'body_id':'hand','sphere_indices':[0],'local_spheres':[[0.,0.,0.,.01]],'geometry_names':['finger']}]
+        with patch('manipulation.planning_observation._background_query_config',wraps=_background_query_config) as derive, \
+             patch('manipulation.planning_observation._require_mapping_memory',side_effect=RuntimeError('before native allocation')), \
+             patch('manipulation.planning_observation._map_online_partition') as mapper:
+            with self.assertRaisesRegex(RuntimeError,'before native allocation'):
+                build_scene_from_rgbd({'first':view()}, {},mapper_cfg=config,depth_error_m=.003,
+                    owner_voxel_sizes_m={},reference_frame='world',robot_sphere_materials=(None,),
+                    robot_geometry_source='declared complete hand sphere',gripper=hand,has_gripper=True,
+                    robot_collision_bodies=bodies,max_mapping_bytes=1024**3,
+                    unknown_policy={'conditional_regions':[],'outside_regions':'forbid'})
+        # norm([.6,.8,0] * .1) + .005 = .105, exceeding the entrance sphere.
+        call=derive.call_args
+        actual=call.args[1] if len(call.args)>1 else call.kwargs['query_radius_m']
+        self.assertAlmostEqual(actual,.105)
+        mapper.assert_not_called()
+
+    def test_expanded_query_budget_is_rejected_before_coverage_or_native_allocation(self):
+        from curobo.perception import MapperCfg
+        from manipulation.planning_observation import build_scene_from_rgbd
+        config=MapperCfg(extent_meters_xyz=(.2,.2,.2),voxel_size=.02,
+            extent_esdf_meters_xyz=(.2,.2,.2),esdf_voxel_size=.02,
+            image_height=96,image_width=96,device='cuda:0')
+        old_budget=_mapper_memory_bound(config)
+        bodies=[{'body_id':'link','sphere_indices':[0],'local_spheres':[[0.,0.,0.,.08]],'geometry_names':['body']}]
+        with patch('manipulation.planning_observation._known_free_voxels') as coverage, \
+             patch('manipulation.planning_observation._map_online_partition') as mapper, \
+             patch('manipulation.planning_observation._require_mapping_memory') as admission:
+            with self.assertRaisesRegex(ValueError,'mapping allocation'):
+                build_scene_from_rgbd({'first':view()}, {},mapper_cfg=config,depth_error_m=.003,
+                    owner_voxel_sizes_m={},reference_frame='world',robot_sphere_materials=(None,),
+                    robot_geometry_source='declared native robot',has_gripper=False,
+                    robot_collision_bodies=bodies,max_mapping_bytes=old_budget,
+                    unknown_policy={'conditional_regions':[],'outside_regions':'forbid'})
+        coverage.assert_not_called()
+        mapper.assert_not_called()
+        admission.assert_not_called()
+# END these tests preserve existing observation, collision and resource contracts.
 
 if __name__ == "__main__":
     unittest.main()
