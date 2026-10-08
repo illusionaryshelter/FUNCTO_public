@@ -698,7 +698,9 @@ def run(args):
         budget = PlanningBudget(knots=args.knots, interpolation_buffer_size=args.interpolation_buffer_size,
                                 max_robot_spheres=640, ik_seeds=args.ik_seeds,
                                 trajectory_seeds=args.trajectory_seeds,
-                                ik_iterations=80, trajectory_iterations=100,
+                                # BEGIN recorded requests expose the existing bounded iteration budget.
+                                ik_iterations=80, trajectory_iterations=args.trajectory_iterations,
+                                # END native work and the persisted request ledger use the same value.
                                 max_validation_points=args.max_validation_points,
                                 max_task_anchors=args.max_task_anchors,
                                 max_scene_gpu_workspace_bytes=args.scene_gpu_workspace_mib*1024**2,
@@ -799,6 +801,10 @@ if __name__ == "__main__":
     parser.add_argument("--interpolation-buffer-size", type=int, default=768)
     parser.add_argument("--ik-seeds", type=int, default=4)
     parser.add_argument("--trajectory-seeds", type=int, default=2)
+    # BEGIN a caller can vary work without changing constraints or native internals.
+    parser.add_argument("--trajectory-iterations", type=int, default=100,
+                        help="Trajectory iteration budget; existing PlanningBudget limit is 1..300")
+    # END the default and PlanningBudget admission remain unchanged.
     parser.add_argument("--max-validation-points", type=int, default=2048)
     parser.add_argument("--max-task-anchors", type=int, default=256)
     # BEGIN make the existing request work limits reviewable in run commands.

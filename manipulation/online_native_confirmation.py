@@ -235,8 +235,11 @@ class NativeCollisionConfirmation:
         pairs, stats = [], {'native_pairs': 0, 'coal_queries': 0, 'nearby_cells': 0, 'permitted_cells': 0,
                             'nearby_source_components': 0, 'retained_source_components': 0}
         for target_name, indices in candidates.items():
-            if target_name not in self.targets:
+            # BEGIN native queries consume only the scene's declared world terms.
+            if (target_name not in self.targets or 'collision/robot/'+target_name
+                    not in self.scene.robot_world_collision_components):
                 raise ValueError('Candidate target is absent from this frozen request')
+            # END a target alias can never confer authority over self collision.
             indices = tuple(sorted(set(indices)))
             if any(type(index) not in (int, np.int64, np.int32) or index not in self.sphere_geometry for index in indices):
                 raise ValueError('Candidate must name a registered robot sphere index')
@@ -359,6 +362,11 @@ class OnlineCollisionConfirmation:
         # All candidates were masked for unresolved hand geometry and native
         # exclusions before reaching this boundary. Non-finite costs remain
         # failures; a finite positive candidate is the only confirmable input.
+        # BEGIN the shared inventory bounds authority before any FK or geometry work.
+        confirmable = self.scene.robot_world_collision_components
+        if not set(evidence['targets']) <= confirmable:
+            raise ValueError('Native confirmation requires declared robot/world collision components')
+        # END even a zero or nonfinite foreign term cannot enter this adapter.
         candidates = {}
         for name, value in evidence['targets'].items():
             if not bool((value > 0).any().item()):
@@ -416,8 +424,10 @@ class OnlineCollisionConfirmation:
             self.last_report['states'].append(record)
             for owner in record['cleared_targets']:
                 name = 'collision/robot/'+owner
-                if owner not in by_owner or name not in result:
+                # BEGIN a returned clear must preserve both declaration and query identity.
+                if name not in confirmable or owner not in by_owner or name not in result:
                     raise ValueError('Native confirmation returned an unqueried collision target')
+                # END a checker result cannot enlarge the shared component inventory.
                 if result[name] is costs[name]:
                     result[name] = costs[name].clone()
                 result[name][batch, index] = 0.

@@ -166,11 +166,11 @@ class PhysicalGradientCore(GradientOptCore):
         cost.backward(gradient=self._l_vec, retain_graph=False)
         self._check_request(wait_for_device=True)
         g_x = x_n.grad.detach()
-        # BEGIN retain a feasible sampled candidate from this exact completed query.
+        # BEGIN retain graded candidate evidence from this exact completed query.
         if self._candidate_tracking:
-            feasible, signed, objective = rollout.constraint_manager.optimizer_evidence(trajectories)
+            hard_eligible, sampled_feasible, signed, objective = rollout.constraint_manager.optimizer_evidence(trajectories)
             self._last_functional_signed = signed
-            self._retain_sampled_candidate(x_in, feasible, objective)
+            self._retain_sampled_candidate(x_in, hard_eligible, sampled_feasible, objective)
         # END this performs no FK, scene query, or dense validation.
         return cost, g_x
 
@@ -183,7 +183,7 @@ class PhysicalGradientCore(GradientOptCore):
     # END no native iteration count, line-search arithmetic or budget is relaxed.
 
     # BEGIN fixed-budget inexact PHR continuation and sampled-feasible retention.
-    _candidate_buffers = ("_candidate_action", "_candidate_objective", "_candidate_found")
+    _candidate_buffers = ("_candidate_action", "_candidate_objective", "_candidate_rank")
 
     def _begin_functional_solve(self, action):
         """Declare seed layout before the first evaluation and reset in place.
@@ -205,29 +205,37 @@ class PhysicalGradientCore(GradientOptCore):
         self._functional_constraints.reset()
         self._candidate_action.copy_(action.detach().view_as(self._candidate_action))
         self._candidate_objective.fill_(float("inf"))
-        self._candidate_found.zero_()
+        self._candidate_rank.zero_()
 
     @torch.no_grad()
-    def _retain_sampled_candidate(self, action, feasible, objective):
-        """Keep one action per seed, ordered only by the parameter-free objective.
+    def _retain_sampled_candidate(self, action, hard_eligible, sampled_feasible, objective):
+        """Keep one action per seed, preferring stronger sampled evidence.
 
-        All evaluated line-search particles are eligible, including a feasible
-        point which Wolfe did not select. This is sampled evidence only; the
-        unchanged final ordinary/dense metrics still decide acceptance.
+        Rank 0 has no candidate. Rank 1 satisfies every sampled requirement
+        except robot/world proxy collisions that native solids may clear;
+        rank 2 also satisfies those proxies. Neither rank authorizes execution:
+        ordinary/dense final metrics still decide acceptance. Within one rank,
+        the unchanged parameter-free objective orders all line-search trials,
+        including points which Wolfe did not select. One slot bounds storage.
         """
         count, particles = self.config.num_problems, self.config.num_particles
         actions = action.detach().view(count, particles, self.action_horizon, self.action_dim)
-        valid = feasible.view(count, particles) & torch.isfinite(actions).flatten(2).all(-1)
+        # BEGIN hard evidence gates both ranks, including inconsistent caller flags.
+        valid = hard_eligible.view(count, particles) & torch.isfinite(actions).flatten(2).all(-1)
         values = objective.detach().view(count, particles)
         valid = valid & torch.isfinite(values)
-        ranked = torch.where(valid, values, float("inf"))
+        ranks = torch.where(valid, 1+sampled_feasible.view(count, particles).to(torch.uint8), 0)
+        rank = ranks.amax(-1)
+        ranked = torch.where(valid & (ranks == rank[:, None]), values, float("inf"))
         value, index = ranked.min(-1)
         selected = actions.gather(1, index[:, None, None, None].expand(-1, 1,
                                   self.action_horizon, self.action_dim)).squeeze(1)
-        improved = torch.isfinite(value) & (value < self._candidate_objective)
+        improved = (rank > 0) & ((rank > self._candidate_rank)
+            | ((rank == self._candidate_rank) & (value < self._candidate_objective)))
         self._candidate_action.copy_(torch.where(improved[:, None, None], selected, self._candidate_action))
         self._candidate_objective.copy_(torch.where(improved, value, self._candidate_objective))
-        self._candidate_found.logical_or_(improved)
+        self._candidate_rank.copy_(torch.where(improved, rank, self._candidate_rank))
+        # END a cheaper pending confirmation cannot displace sampled feasibility.
 
     def _finish_functional_block(self, state):
         """Change parameters only between existing blocks, never add a solve.
@@ -398,12 +406,14 @@ class PhysicalGradientCore(GradientOptCore):
         # BEGIN report independent continuation and sampled-only incumbents.
         if self._candidate_tracking:
             duals = self._functional_constraints.snapshot()["seeds"]
-            found = self._candidate_found.detach().cpu().tolist()
+            ranks = self._candidate_rank.detach().cpu().tolist()
             objective = self._candidate_objective.detach().cpu().tolist()
             for index, report in enumerate(reports):
                 report.update(functional_continuation=duals[index],
-                              sampled_feasible_candidate=found[index],
-                              sampled_candidate_objective=objective[index] if found[index] else None)
+                              retained_candidate_rank=ranks[index],
+                              sampled_feasible_candidate=ranks[index] == 2,
+                              pending_collision_confirmation=ranks[index] == 1,
+                              retained_candidate_objective=objective[index] if ranks[index] else None)
         return reports
         # END final ordinary/dense acceptance remains a separate planner report.
 
@@ -560,7 +570,9 @@ class PhysicalGradientCore(GradientOptCore):
         self._candidate_action = torch.zeros_like(self._safe_action)
         self._candidate_objective = torch.full((num_problems,), float("inf"),
             device=self.device_cfg.device, dtype=self.device_cfg.dtype)
-        self._candidate_found = torch.zeros(num_problems, device=self.device_cfg.device, dtype=torch.bool)
+        # BEGIN one byte records evidence strength without another candidate allocation.
+        self._candidate_rank = torch.zeros(num_problems, device=self.device_cfg.device, dtype=torch.uint8)
+        # END graph snapshots and workspace accounting use this same persistent buffer.
         # END resize invalidated captured references before replacing these buffers.
         # END recovery records never leak across differently shaped solves.
         self._line_search_strategy.safe_action = self._safe_action
@@ -605,7 +617,9 @@ class PhysicalGradientCore(GradientOptCore):
         try:
             result = super().optimize(seed_action)
             if self._candidate_tracking:
-                result = torch.where(self._candidate_found[:, None, None], self._candidate_action, result)
+                # BEGIN both evidence ranks remain subject to final candidate validation.
+                result = torch.where(self._candidate_rank[:, None, None] > 0, self._candidate_action, result)
+                # END no extra seed or validation call is introduced here.
             return result
         finally:
             self._al_blocks_remaining = 0

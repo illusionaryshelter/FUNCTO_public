@@ -84,7 +84,7 @@ class NativeComponentTest(unittest.TestCase):
                 source, signed, fixed = rollout.evidence
                 self.assertIs(source, result)
                 feasible = torch.isfinite(signed["event"]) & (signed["event"] <= 0)
-                return feasible, {key: value.detach() for key, value in signed.items()}, fixed.detach()
+                return feasible, feasible, {key: value.detach() for key, value in signed.items()}, fixed.detach()
 
             rollout.evaluate_action = evaluate
             rollout.optimizer_evidence = evidence
@@ -161,9 +161,88 @@ class NativeComponentTest(unittest.TestCase):
         owner.update({"event": torch.tensor([1.])})
         core._compute_cost_constraint_and_gradient(torch.tensor([[[-.25], [.2], [.3]]]))
         torch.testing.assert_close(core._candidate_action, torch.tensor([[[-.25]]]))
+        # BEGIN solve reset and capture warmup preserve the graded slot allocation.
+        pointers = {name: getattr(core, name).data_ptr() for name in core._candidate_buffers}
+        snapshot = core._capture_state()
         core._begin_functional_solve(torch.ones((1, 1, 1)))
-        self.assertFalse(bool(core._candidate_found.any()))
+        self.assertFalse(bool(core._candidate_rank.any()))
+        self.assertEqual(pointers, {name: getattr(core, name).data_ptr() for name in core._candidate_buffers})
         self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
+        core._restore_capture_state(snapshot)
+        self.assertEqual(core._candidate_rank.tolist(), [2])
+        torch.testing.assert_close(core._candidate_action, torch.tensor([[[-.25]]]))
+        # END CUDA capture owns these exact addresses, not replacement tensors.
+
+    # BEGIN candidate evidence ranks cannot exchange safety for a cheaper objective.
+    def test_candidate_rank_precedes_objective_independently_for_each_seed(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        optimizer.update_num_problems(2)
+        core = optimizer._core
+        actions = torch.tensor([.1, .2, .3, .4, .5, .6]).view(6, 1, 1)
+        eligible = torch.ones(6, dtype=torch.bool)
+        core._retain_sampled_candidate(actions, eligible,
+            torch.tensor([False, False, False, False, True, False]),
+            torch.tensor([5., 3., 4., -100., 20., -200.]))
+        self.assertEqual(core._candidate_rank.tolist(), [1, 2])
+        torch.testing.assert_close(core._candidate_action.flatten(), torch.tensor([.2, .5]))
+        # A stronger candidate wins despite its larger fixed objective. The
+        # other seed's cheap pending candidates cannot overwrite its rank 2.
+        core._retain_sampled_candidate(-actions, eligible,
+            torch.tensor([False, True, False, False, False, False]),
+            torch.tensor([-100., 50., -200., -1000., -2000., -3000.]))
+        self.assertEqual(core._candidate_rank.tolist(), [2, 2])
+        torch.testing.assert_close(core._candidate_action.flatten(), torch.tensor([-.2, .5]))
+        core._retain_sampled_candidate(actions, eligible, eligible,
+            torch.tensor([60., 40., 50., 22., 21., 23.]))
+        torch.testing.assert_close(core._candidate_action.flatten(), torch.tensor([.2, .5]))
+        torch.testing.assert_close(core._candidate_objective, torch.tensor([40., 20.]))
+
+    def test_candidate_rank_rejects_nonfinite_values_and_inconsistent_hard_evidence(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, _ = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        optimizer.update_num_problems(2)
+        core = optimizer._core
+        core._retain_sampled_candidate(
+            torch.tensor([float("nan"), .2, .3, .4, .5, .6]).view(6, 1, 1),
+            torch.tensor([True, True, False, True, True, False]),
+            torch.tensor([True, True, True, False, True, True]),
+            torch.tensor([0., float("inf"), -100., 2., float("nan"), -100.]))
+        self.assertEqual(core._candidate_rank.tolist(), [0, 1])
+        torch.testing.assert_close(core._candidate_action[1], torch.tensor([[.4]]))
+        self.assertTrue(bool(torch.isinf(core._candidate_objective[0])))
+
+    def test_native_result_retains_pending_confirmation_without_claiming_feasibility(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        owner = FunctionalAugmentedLagrangian(("event",))
+        self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
+        for rollout in rollouts:
+            original = rollout.optimizer_evidence
+
+            def pending(result, original=original):
+                hard, _, signed, objective = original(result)
+                return hard, torch.zeros_like(hard), signed, objective
+
+            rollout.optimizer_evidence = pending
+        bind_solver_components(solver, domain)
+        optimizer.config.num_iters = optimizer.config.inner_iters
+        seed = torch.full((1, 1, 1), -.5)
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            result = optimizer.optimize(seed)
+        self.assertEqual(tuple(result.shape), tuple(seed.shape))
+        self.assertTrue(bool((result <= 0).all()))
+        torch.testing.assert_close(result, optimizer._core._candidate_action)
+        report = optimizer._core.solve_diagnostics[0]
+        self.assertEqual(report["retained_candidate_rank"], 1)
+        self.assertFalse(report["sampled_feasible_candidate"])
+        self.assertTrue(report["pending_collision_confirmation"])
+        self.assertIsNotNone(report["retained_candidate_objective"])
+        self.assertEqual(report["iterations"], optimizer.config.num_iters)
+        self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
+    # END final native confirmation remains outside every optimizer callback.
 
     def test_block_update_measures_actual_continuation_instead_of_last_trial(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)

@@ -359,6 +359,22 @@ class OnlinePlanningScene:
             # not a general owner material registry and cannot be borrowed here.
             # END arbitrary sphere labels do not establish a planar solid.
 
+    # BEGIN one explicit component inventory identifies native-confirmable proposals.
+    @property
+    def robot_world_collision_components(self):
+        """Exact scene terms that native robot/world confirmation may revisit.
+
+        Membership declares a confirmation path, never a collision-free state.
+        The confirmation engine still validates complete native geometry and
+        sphere ownership before it may clear a positive candidate. Self,
+        contact, unknown-space and other actors' terms retain their own checks.
+        """
+        names = {'collision/robot/background'}
+        names.update(f'collision/robot/{owner.owner_id}' for owner in self.owners)
+        names.discard('collision/robot/self')
+        return frozenset(names)
+    # END optimizer candidate retention and final confirmation share these names.
+
     def bind_online_robot(self, *, robot_sphere_geometry, robot_self_collision_pairs,
                           robot_self_collision_padding=None, robot_geometry_source=None, robot_model=None):
         """Bind calibrated sphere FK and native self pairs once before solving."""

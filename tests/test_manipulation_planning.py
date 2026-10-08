@@ -1680,7 +1680,9 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 scene = costs.values[costs.names.index("process_scene")]
                 gradient = torch.autograd.grad(scene.sum(), fixture.q)[0]
                 results[mode] = (scene.detach().clone(), gradient)
-                self.assertEqual(calls, [mode == "trajectory_metrics"])
+                # BEGIN optimizer eligibility also reads this same query's scalar components.
+                self.assertEqual(calls, [True])
+                # END neither mode adds another geometry evaluation or changes its gradient.
                 if mode == "trajectory_optimizer":
                     self.assertIsNone(fixture.manager._scene_evidence)
                     continue
@@ -1738,7 +1740,8 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 "other": torch.zeros_like(p[..., 0])}
             costs = fixture.manager.compute_costs(fixture.state)
             result = RolloutResult(costs_and_constraints=CostsAndConstraints(constraints=costs))
-            feasible, _, objective = fixture.manager.optimizer_evidence(result)
+            eligible, feasible, _, objective = fixture.manager.optimizer_evidence(result)
+            self.assertFalse(bool(eligible.any()))
             self.assertFalse(bool(feasible.any()))
             self.assertEqual(float(costs.values[costs.names.index("skill_process")].sum()), 0.)
             self.assertTrue(bool((objective > 0).all()))
@@ -1747,7 +1750,8 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "different native query"):
                 fixture.manager.optimizer_evidence(result)
             result = RolloutResult(costs_and_constraints=CostsAndConstraints(constraints=later))
-            feasible, _, fixed = fixture.manager.optimizer_evidence(result)
+            eligible, feasible, _, fixed = fixture.manager.optimizer_evidence(result)
+            self.assertTrue(bool(eligible.all()))
             self.assertTrue(bool(feasible.all()))
             torch.testing.assert_close(fixed, objective)
             # Same-query scene evidence remains hard even though preferences
@@ -1756,6 +1760,31 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             positive_scene = fixture.manager.compute_costs(fixture.state)
             result = RolloutResult(costs_and_constraints=CostsAndConstraints(constraints=positive_scene))
             self.assertFalse(bool(fixture.manager.optimizer_evidence(result)[0].any()))
+    # BEGIN a proposal is retainable only when every nonconfirmable requirement passes.
+    def test_optimizer_retains_pending_world_candidate_and_binds_its_scene_evidence(self):
+        from curobo._src.rollout.metrics import CostsAndConstraints, RolloutResult
+        with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
+            fixture.scene.robot_world_collision_components = frozenset({"collision/robot/background"})
+            calls = []
+            def evaluate(spheres, p, *args, components_out, **kwargs):
+                calls.append(1)
+                components_out["collision/robot/background"] = torch.full_like(p[..., 0], .25)
+                return components_out["collision/robot/background"]
+            fixture.scene.evaluate = evaluate
+            costs = fixture.manager.compute_costs(fixture.state)
+            result = RolloutResult(costs_and_constraints=CostsAndConstraints(constraints=costs))
+            eligible, feasible, _, objective = fixture.manager.optimizer_evidence(result)
+            self.assertEqual(calls, [1])
+            self.assertTrue(bool(eligible.all()))
+            self.assertFalse(bool(feasible.any()))
+            self.assertTrue(bool((objective > 0).all()))
+            # Replacing only the scene tensor must not reuse a different
+            # query's eligibility even if the PHR tensor is still identical.
+            index = costs.names.index("process_scene")
+            costs.values[index] = costs.values[index].clone()
+            with self.assertRaisesRegex(RuntimeError, "different native query"):
+                fixture.manager.optimizer_evidence(result)
+    # END no pending candidate is labelled final-feasible or allowed to skip validation.
     # END the final ordinary/dense validation path is unchanged by this tracker.
     # END these tests exercise the production manager with analytic CPU FK.
 

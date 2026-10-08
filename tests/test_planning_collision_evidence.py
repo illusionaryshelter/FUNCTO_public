@@ -14,6 +14,79 @@ from manipulation.planning import (
 import test_manipulation_planning as _fixtures
 
 
+# BEGIN optimizer proposals require explicit same-query component evidence.
+def candidate_scene_evidence(terms, *, declared=frozenset({"collision/robot/background"})):
+    calls = []
+    def evaluate(spheres, p, r, s, q, names, *, components_out, **kwargs):
+        calls.append(1)
+        components_out.update({name: torch.as_tensor(value, dtype=s.dtype).expand_as(s)
+                               for name, value in terms.items()})
+        return sum((value for name, value in components_out.items()
+                    if not name.startswith("conditional/")), torch.zeros_like(s))
+    scene = SimpleNamespace(required_progress_anchors=(), evaluate=evaluate,
+                            robot_world_collision_components=declared)
+    s = torch.tensor([[0., 1.]])
+    evidence = {}
+    _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),
+        _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
+        torch.zeros(1, 2, 1, 4), torch.zeros(1, 2, 3), torch.zeros(1, 2, 4), s,
+        torch.zeros(1, 2, 1), ("q",), trajectory_time=s, normalized_time=s,
+        scene_evidence_out=evidence, optimizer_candidate_evidence=True)
+    assert calls == [1], "Candidate evidence must use the original single scene evaluation"
+    return evidence
+
+
+def test_pending_robot_world_candidate_requires_exact_declared_component():
+    terms = {"collision/robot/background": 1., "conditional/contact/uncertain": 100.}
+    assert not candidate_scene_evidence(terms)["optimizer_hard_invalid"].any()
+    assert candidate_scene_evidence(terms, declared=frozenset())["optimizer_hard_invalid"].all()
+
+
+@pytest.mark.parametrize("hard", ["collision/robot/self", "collision/payload/background",
+    "collision/robot/undeclared", "scene_update/background/robot", "unsupported/contact/robot/owner",
+    "unknown/forbidden/robot", "contact/required/rule", "contact/material_band/rule", "gripper/controller"])
+def test_huge_confirmable_cost_cannot_hide_tiny_nonconfirmable_violation(hard):
+    # Float32 aggregate-minus-proxy would lose the 1e-30 term entirely.
+    evidence = candidate_scene_evidence({"collision/robot/background": 1e20, hard: 1e-30})
+    assert evidence["optimizer_hard_invalid"].all()
+
+
+@pytest.mark.parametrize("component", ["collision/robot/background", "contact/required/rule"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_proxy_or_hard_component_is_never_pending_eligible(component, bad):
+    assert candidate_scene_evidence({component: [[bad, 0.]]})["optimizer_hard_invalid"].tolist() == [[1., 0.]]
+
+
+def test_candidate_evidence_cannot_cancel_opposite_hard_terms():
+    evidence = candidate_scene_evidence({"unknown/forbidden/robot": 1., "contact/required/rule": -1.})
+    assert evidence["optimizer_hard_invalid"].all()
+
+
+@pytest.mark.parametrize("hard_on_left", [False, True])
+def test_candidate_evidence_retains_a_hard_violation_only_on_one_mode_side(hard_on_left):
+    calls = []
+    def evaluate(spheres, p, r, progress, q, names, *, components_out, **kwargs):
+        calls.append(progress.shape[1])
+        side = progress < .5 if hard_on_left else progress > .5
+        other = progress > .5 if hard_on_left else progress < .5
+        components_out["scene_update/background/robot"] = side.to(progress.dtype)*1e-30
+        components_out["collision/robot/background"] = other.to(progress.dtype)*1e20
+        return sum(components_out.values())
+    scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate,
+        robot_world_collision_components=frozenset({"collision/robot/background"}))
+    s = torch.tensor([[.5]])
+    evidence = {}
+    result = _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),
+        _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
+        torch.zeros(1, 1, 1, 4), torch.zeros(1, 1, 3), torch.zeros(1, 1, 4), s,
+        torch.zeros(1, 1, 1), ("q",), trajectory_time=s, normalized_time=s,
+        scene_evidence_out=evidence, optimizer_candidate_evidence=True)
+    assert calls == [3], "Exact and both mode sides remain a single batched evaluation"
+    assert result.item() == pytest.approx(1e20)
+    assert evidence["optimizer_hard_invalid"].item() == 1.
+# END positive broad-phase evidence may be deferred; no original hard requirement is removed.
+
+
 @pytest.mark.parametrize("category", ["scene_update/background/robot", "unsupported/contact/robot/owner",
     "unknown/forbidden/robot", "contact/required/rule", "gripper/controller",
     "conditional/collision/robot/background"])
@@ -59,12 +132,14 @@ def test_collision_mode_max_does_not_follow_support_max_or_change_its_gradient(d
         result = _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.), mapping,
             torch.zeros(1, 1, 1, 4, dtype=dtype), torch.zeros(1, 1, 3, dtype=dtype),
             torch.zeros(1, 1, 4, dtype=dtype), s, q, ("q",),
-            trajectory_time=s*2, normalized_time=s, scene_evidence_out=evidence)
+            trajectory_time=s*2, normalized_time=s, scene_evidence_out=evidence,
+            optimizer_candidate_evidence=capture)
         results.append((result.detach(), torch.autograd.grad(result.sum(), q)[0]))
         if capture:
             assert evidence["collision"].item() == 2.25  # right-side collision, left-side hard maximum
             # BEGIN each diagnostic channel takes its own boundary-mode maximum.
             assert evidence["scene_update"].item() == 5.
+            assert evidence["optimizer_hard_invalid"].item() == 1.
             assert not evidence["scene_update"].requires_grad
             # END the left support witness cannot hide the right collision witness.
             assert not evidence["collision"].requires_grad

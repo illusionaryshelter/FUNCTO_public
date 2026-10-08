@@ -248,3 +248,53 @@ def test_adapter_finite_state_clear_does_not_erase_nonfinite_neighbor(tmp_path):
     assert result['collision/robot/part'][0, 1] == 0
     assert adapter.last_report['candidate_states'] == 1
 # END the shared adapter never converts absent/nonfinite evidence into clearance.
+
+
+# BEGIN candidate retention and native confirmation share one exact authority set.
+def test_world_component_inventory_excludes_self_even_when_an_owner_uses_that_name(tmp_path):
+    checker, scene = _setup(tmp_path)
+    alias = scene.owners[0].query.clone_for_rollout()
+    alias.owner_ids = frozenset(('self',))
+    scene.owners += (replace(scene.owners[0], owner_id='self', query=alias),)
+    assert scene.robot_world_collision_components == frozenset((
+        'collision/robot/background', 'collision/robot/part'))
+    # The declared name set does not depend on a lazy checker being created,
+    # and the native engine cannot reinterpret a self term as a world target.
+    engine = NativeCollisionConfirmation(checker, scene)
+    with pytest.raises(ValueError, match='Candidate target is absent'):
+        engine.confirm(robot_state=_state(checker), candidates={'self': [0]},
+            owner_poses={'self': np.eye(4)}, effective_contact_rule_ids=())
+
+
+@pytest.mark.parametrize('name,value', [
+    ('collision/robot/self', .01),
+    ('collision/payload/part', .01),
+    ('collision/robot/missing', 0.),
+    ('collision/robot/part/extra', .01),
+    ('conditional/collision/robot/part', .01),
+    ('contact/required/patch', .01),
+])
+def test_adapter_rejects_undeclared_components_before_creating_a_checker(tmp_path, name, value):
+    checker, scene = _setup(tmp_path)
+    adapter = _adapter(checker, scene)
+    evidence = _candidate_evidence([[[value]]])
+    evidence['targets'] = {name: evidence['targets']['collision/robot/part']}
+    with pytest.raises(ValueError, match='declared robot/world collision components'):
+        adapter({name: torch.tensor([[value]], dtype=torch.float64)}, evidence)
+    assert adapter.engine is None
+
+
+@pytest.mark.parametrize('target', ['self', 'background'])
+def test_adapter_cannot_clear_an_undeclared_or_unqueried_component(tmp_path, target):
+    checker, scene = _setup(tmp_path)
+    adapter = _adapter(checker, scene)
+    # The engine response is deliberately invalid: background is declared but
+    # was not queried, while self is never in the confirmation inventory.
+    adapter.engine = SimpleNamespace(confirm=lambda **kwargs: {'cleared_targets': [target]})
+    evidence = _candidate_evidence([[[.01]]])
+    original = torch.tensor([[.01]], dtype=torch.float64)
+    other = torch.tensor([[.02]], dtype=torch.float64)
+    with pytest.raises(ValueError, match='unqueried collision target'):
+        adapter({'collision/robot/part': original, 'collision/robot/'+target: other}, evidence)
+    assert original.item() == .01 and other.item() == .02
+# END neither an input name nor a checker response can enlarge confirmation authority.

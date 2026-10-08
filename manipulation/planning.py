@@ -2490,7 +2490,8 @@ def _native_collision_padding(manager):
 def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion,
                              progress, joint_position, joint_names, *, trajectory_time,
                              normalized_time, query_counts=None, component_diagnostics=None,
-                             native_confirmation=None, scene_evidence_out=None):
+                             native_confirmation=None, scene_evidence_out=None,
+                             optimizer_candidate_evidence=False):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2524,6 +2525,28 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                     scene_evidence_out[category] = sum((term.detach() for name, term in components.items()
                         if name.startswith(category+"/")), torch.zeros_like(value))
                 # END no category changes the original hard aggregate or gradient.
+                # BEGIN pending robot/world proposals cannot erase other hard requirements.
+                if optimizer_candidate_evidence:
+                    # A scene explicitly declares which exact terms have a
+                    # final native-solid confirmation path. Undeclared terms,
+                    # including self and non-robot collisions, remain hard.
+                    confirmable = getattr(scene, "robot_world_collision_components", frozenset())
+                    invalid = ~torch.isfinite(value.detach())
+                    for name, term in components.items():
+                        if name.startswith("conditional/"):
+                            continue
+                        term = term.detach()
+                        invalid = invalid | ~torch.isfinite(term)
+                        if name not in confirmable:
+                            invalid = invalid | (term > 0)
+                    if not components:
+                        # An aggregate-only scene supplies no evidence that
+                        # any positive term is eligible for confirmation.
+                        invalid = invalid | (value.detach() > 0)
+                    # OR each component before reducing modes: subtracting a
+                    # large proxy sum could hide tiny hard violations or NaN.
+                    scene_evidence_out["optimizer_hard_invalid"] = invalid.to(value.dtype)
+                # END candidate eligibility is separate from the unchanged differentiable cost.
             if component_diagnostics is not None:
                 for name, residual in components.items():
                     flat = residual.detach().reshape(-1)
@@ -2768,21 +2791,25 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             return functional_constraints if self._process_mode == "trajectory_optimizer" else None
 
         def optimizer_evidence(self, trajectories):
-            """Read original sampled hard constraints without another rollout.
+            """Read pending-candidate and strict sampled evidence without another rollout.
 
             PHR and centering/command preferences are optimization objectives,
             despite residing in the native constraint collection. Their values
             cannot certify or disqualify feasibility. Original task residuals
-            are retained before that substitution; native/scene constraints
-            still come from the identical forward. Dense validation is separate.
+            are retained before that substitution. ``eligible`` keeps every
+            nonconfirmable hard requirement; ``feasible`` additionally requires
+            zero robot/world proposal cost. Both are sampling-only evidence.
+            Ordinary/dense metrics and native-solid confirmation remain final.
             """
             constraints = trajectories.costs_and_constraints
             collection = constraints.constraints
             if self._optimizer_evidence is None:
                 raise RuntimeError("Optimizer has no same-query hard-constraint evidence")
-            source, feasible, signed = self._optimizer_evidence
+            source, feasible, signed, eligible, scene_source = self._optimizer_evidence
             if ("functional_augmented_lagrangian" not in collection.names
-                    or collection.values[collection.names.index("functional_augmented_lagrangian")] is not source):
+                    or collection.values[collection.names.index("functional_augmented_lagrangian")] is not source
+                    or "process_scene" not in collection.names
+                    or collection.values[collection.names.index("process_scene")] is not scene_source):
                 raise RuntimeError("Optimizer evidence belongs to a different native query")
             objective_names = {"functional_augmented_lagrangian", "skill_pose_equality_preference",
                                "gripper_command_preference", "verification_stop_preference"}
@@ -2792,11 +2819,17 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 for name, value in zip(costs.names, costs.values):
                     detached = value.detach().flatten(1)
                     if hard and name not in objective_names:
-                        feasible = feasible & torch.isfinite(detached).all(-1) & (detached <= 0).all(-1)
+                        valid = torch.isfinite(detached).all(-1) & (detached <= 0).all(-1)
+                        feasible = feasible & valid
+                        # BEGIN only explicitly classified robot/world proposals may remain positive.
+                        if name != "process_scene":
+                            eligible = eligible & valid
+                        # END task, native joint/self and all other constraints keep their original gate.
                     if name != "functional_augmented_lagrangian":
                         fixed_objective = fixed_objective+detached.sum(-1)
             feasible = feasible & torch.isfinite(fixed_objective)
-            return feasible, signed, fixed_objective
+            eligible = eligible & torch.isfinite(fixed_objective)
+            return eligible, feasible, signed, fixed_objective
         # END these tensors preserve query identity and never add a cost term.
 
         # BEGIN bind diagnostics only to the exact completed native metric query.
@@ -2940,9 +2973,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # END metrics retain the complete original hard residual dictionary.
             # BEGIN optimizer and success metrics consume the identical online scene.
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
-            # BEGIN only metrics retain scene evidence; optimizer work is unchanged.
-            scene_evidence_out = {} if self._process_mode == "trajectory_metrics" else None
-            # END no gradients or geometry history are retained for this evidence.
+            # BEGIN candidate retention reads scalar evidence from this same scene query.
+            scene_evidence_out = {} if self._process_mode in ("trajectory_metrics", "trajectory_optimizer") else None
+            # END no extra FK, source query, or geometry history is created.
             scene_value = _scene_boundary_evaluate(active_scene, problem, active_map,
                 spheres, position, quaternion, progress, q, self._joint_names,
                 trajectory_time=trajectory_time, normalized_time=ordered(all_u),
@@ -2950,7 +2983,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 component_diagnostics=None if context is None else context["scene_components"],
                 # BEGIN only the complete candidate boundary runs CPU confirmation.
                 native_confirmation=None if context is None else context.get("native_confirmation"),
-                scene_evidence_out=scene_evidence_out)
+                scene_evidence_out=scene_evidence_out,
+                optimizer_candidate_evidence=self._process_mode == "trajectory_optimizer")
             # END ordinary optimizer and proposal metric calls remain unchanged.
             # END raw residual zero sets are shared; only optimizer weights differ.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
@@ -2976,8 +3010,15 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 feasible = torch.isfinite(original_process).all(-1) & (original_process <= 0).all(-1)
                 for residual in signed.values():
                     feasible = feasible & torch.isfinite(residual.detach()) & (residual.detach() <= 0)
+                # BEGIN preserve all hard scene terms except finite, explicitly confirmable proposals.
+                # Use where for inactive samples; multiplication by zero would
+                # not suppress a nonfinite inactive value. Mode-side reduction
+                # has already retained every active hard violation.
+                hard_invalid = torch.where(active, scene_evidence_out["optimizer_hard_invalid"], 0.)
+                eligible = feasible & (hard_invalid <= 0).all(-1)
                 self._optimizer_evidence = (augmented_cost, feasible,
-                                           {name: value.detach() for name, value in signed.items()})
+                    {name: value.detach() for name, value in signed.items()}, eligible, None)
+                # END the aggregate scene tensor identity is bound below, after folding.
                 # END the core consumes this evidence before any other forward.
                 # END original tolerance and first-arrival identity belong to the problem.
                 # BEGIN retain a gradient toward source-declared pose equalities.
@@ -3009,7 +3050,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # BEGIN retain the unchanged aggregate tensor as the query identity.
                 weighted = (regular+folded).unsqueeze(-1) * budget.constraint_weight
                 collection.add(weighted, name)
-                if name == "process_scene" and scene_evidence_out is not None:
+                if name == "process_scene" and self._process_mode == "trajectory_optimizer":
+                    self._optimizer_evidence = (*self._optimizer_evidence[:-1], weighted)
+                if name == "process_scene" and self._process_mode == "trajectory_metrics":
                     # BEGIN fold each same-query diagnostic category separately.
                     channels = []
                     for category in ("collision", "scene_update"):
