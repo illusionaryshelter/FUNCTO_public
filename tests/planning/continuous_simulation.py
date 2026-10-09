@@ -91,13 +91,20 @@ class ContinuousSimulationSession:
                 or not np.array_equal(self._integration_state(), self._boundary)):
             raise RuntimeError("Native trial/state changed between consecutive skill requests")
 
-    def execute(self, specification):
+    # BEGIN continuous callers retain separate assumption and predicate inputs.
+    def execute(self, specification, *, attachment_assumptions=None, observation_callback=None):
         """Execute one new skill from the same live backend, then grade it.
 
         ``specification`` contains ordinary single-stage runner arguments. It
         cannot replace the native backend. After the first stage, the previous
         full physical outcome must be T. U/F or execution faults stop the test;
         the caller cannot use a new skill identity to bypass them.
+
+        ``attachment_assumptions`` forwards explicit bound-condition sources to
+        the executor. It is never an observation. ``observation_callback`` is
+        the independent predicate-layer interface; a future S3E adapter can
+        supply current image-based estimates through that existing contract.
+        Neither input is inferred from the independent native physics grade.
         """
         spec = deepcopy(_read(specification) if isinstance(specification, (str, Path)) else specification)
         if self.stages and (self._gate is None or self._gate["value"] != "T"):
@@ -114,8 +121,10 @@ class ContinuousSimulationSession:
         report = None
         primary_error = None
         try:
-            report = (run(args, on_simulation_ready=self._adopt) if self.simulation is None else
-                      run(args, simulation=self.simulation, initial_feedback=before))
+            inputs = {"attachment_assumptions": attachment_assumptions,
+                      "observation_callback": observation_callback}
+            report = (run(args, on_simulation_ready=self._adopt, **inputs) if self.simulation is None else
+                      run(args, simulation=self.simulation, initial_feedback=before, **inputs))
         except BaseException as error:
             primary_error = error
         # A failed execution may perform its ordinary abort hold. Keep that
@@ -163,6 +172,7 @@ class ContinuousSimulationSession:
             raise RuntimeError("Continuous stage audit or report persistence failed: " +
                                "; ".join(repr(error) for error in errors)) from errors[0]
         return report
+    # END native continuity and stage-result gates keep their original duties.
 
     def capture(self, destination, *, views, tool_id, result_predicate):
         """Export only synchronized camera measurements and named robot feedback.

@@ -1114,9 +1114,20 @@ or query that frozen world during preflight or physical execution.
 `RobotStateValidator` checks measured joint limits, model/FK identity and the
 registered required native robot/fixed-installation collision pairs only.
 Tracking, event timing, real arrival before close, fresh observations, current
-Holding dependencies and effect requirements remain execution duties. An
-attachment-dependent owner needs current Holding evidence or a current owner
-pose; entrance facts cannot silently persist into later samples. Commanded
+Holding dependencies and effect requirements remain execution duties.
+<!-- BEGIN predicate estimation and declared model assumptions are separate inputs. -->
+The task layer supplies predicate estimates through `observation_callback`;
+the planner does not run a VLM. An attachment-dependent owner uses current
+Holding evidence or a current owner pose. The caller may instead explicitly
+authorize a bound attachment model with `attachment_assumptions`, keyed by
+condition ID with a declared source. The executor derives its scope from the
+accepted binding and records it as a model assumption, never an observation.
+Explicit contrary or unknown predicate evidence cannot be replaced by that
+assumption. It supplies no actual pose-goal witness, release effect or physical
+success. Without this authorization the original evidence requirements apply;
+entrance facts cannot silently persist into later samples.
+<!-- END S3E or another predicate estimator belongs outside the motion planner. -->
+Commanded
 fingers remain separate from measured finger positions. Frozen occupied cells
 and their conservative envelopes cannot establish actual physical contact.
 

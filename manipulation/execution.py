@@ -469,11 +469,16 @@ def continuation_execution_inputs(continuation, finger_targets, execution_limits
 
 
 # BEGIN current Holding dependencies are task evidence, not world geometry.
-def _holding_dependency_violations(scene, progress, observation):
-    """Require fresh explicit evidence while an owner uses an attachment pose.
+def _holding_dependency_violations(scene, progress, observation, *, attachment_assumptions=None):
+    """Validate the declared basis for using an owner's attachment pose.
 
     A currently observed owner pose replaces attachment-based pose inference.
     Otherwise the active attachment needs its declared condition to be true.
+    # BEGIN explicitly authorized models remain separate from observations.
+    A validated assumption permits missing evidence within that attachment's
+    interval only. An explicit False or unknown result still takes precedence.
+    This argument never supplies an effect or an actual pose-goal witness.
+    # END the independent predicate layer owns measured semantic truth.
     The caller supplies only freshness-validated observations (or the exact
     entrance feedback). Frozen owner poses and command intent are never proof.
     """
@@ -489,10 +494,14 @@ def _holding_dependency_violations(scene, progress, observation):
         for relation in owner.get("attachments", ()):
             lower, upper = relation["interval"]
             active = lower <= progress < upper or (progress == upper and relation["release_condition_id"] is None)
-            if active and conditions.get(relation["condition_id"]) is not True:
+            # BEGIN absence can use a declared model; contrary evidence cannot.
+            identity = relation["condition_id"]
+            assumed = identity in (attachment_assumptions or {}) and identity not in conditions
+            if active and conditions.get(identity) is not True and not assumed:
                 failures.append({"kind": "actual_holding_unverified", "name": relation["condition_id"],
                     "owner": owner_id, "progress": float(progress),
                     "reason": "Active owner attachment needs current Holding evidence or a current owner pose"})
+            # END an assumption has exactly the accepted attachment lifetime.
     return failures
 # END a frozen attachment transform cannot supply its own current validity.
 
@@ -648,6 +657,7 @@ class TrajectoryExecutor:
 
     def execute(self, result, *, finger_targets, initial_feedback, execution_limits,
                 output, step_callback=None, observation_callback=None,
+                attachment_assumptions=None,
                 max_physics_steps=30_000, start_position_tolerance=2e-6,
                 start_velocity_tolerance=2e-6, max_hold_steps=250):
         """Follow the exact bound curve within its authorized execution scope.
@@ -663,6 +673,17 @@ class TrajectoryExecutor:
         ``observation_callback(feedback, curve_time)`` supplies current allowed
         scene/effect evidence. A declared dependency ends this finite motion
         block; its actual T/F/U result is retained for a fresh scene binding.
+        # BEGIN predicate estimation is separate from attachment model use.
+        ``attachment_assumptions`` explicitly maps accepted attachment condition
+        IDs to nonempty authorization sources. It allows that bound model to be
+        used when Holding evidence is absent, without manufacturing observations
+        or satisfying actual pose/effect goals. Future visual predicate estimates
+        (for example from S3E) enter through ``observation_callback`` with their
+        own acquisition timestamps and provenance; explicit False/unknown wins.
+        Initial admission precedes that callback: without an assumption, the
+        caller must supply the entrance predicate in ``initial_feedback`` and
+        its matching attachment provenance in the accepted problem binding.
+        # END neither a model assumption nor a close command proves Holding.
         The last native step can finish less than one timestep after the
         barrier's clock time, but its commanded q/dq/progress is clamped to the
         barrier itself. Finger events use the archived reference's original
@@ -708,6 +729,18 @@ class TrajectoryExecutor:
             raise ValueError("Current scene/effect observations require an explicit callable")
         if observation_callback is not None and execution_limits.observation_policy is None:
             raise ValueError("An observation callback needs its declared device cadence and freshness policy")
+        # BEGIN a caller must declare each assumption and its authorization source.
+        if attachment_assumptions is None:
+            attachment_assumptions = {}
+        if (not isinstance(attachment_assumptions, Mapping)
+                or any(not isinstance(identity, str) or not identity.strip()
+                    or not ((isinstance(source, str) and source.strip())
+                            or (isinstance(source, Mapping) and source))
+                    for identity, source in attachment_assumptions.items())):
+            raise ValueError("Attachment assumptions require condition IDs mapped to nonempty sources")
+        attachment_assumptions = deepcopy(dict(attachment_assumptions))
+        assumption_records = []
+        # END no default assumption is inferred from an absent semantic observer.
         backend = self.backend
         # END formal candidate handoff.
         if tuple(trajectory.joint_names) != backend.arm_joint_names:
@@ -1087,8 +1120,17 @@ class TrajectoryExecutor:
             actual[:3, :3] = Rotation.from_quat(np.asarray(relation["quaternion_tool_owner"])[[1, 2, 3, 0]]).as_matrix()
             if not np.allclose(actual, expected, atol=1e-7, rtol=0):
                 raise ValueError("Holding permission and bound attachment transform disagree")
-            if initial_feedback.get("scene_condition_evidence", {}).get(condition_id) is not True:
+            # BEGIN a model assumption can replace absence, never explicit evidence.
+            current_conditions = initial_feedback.get("scene_condition_evidence", {})
+            assumed = condition_id in attachment_assumptions and condition_id not in current_conditions
+            if current_conditions.get(condition_id) is not True and not assumed:
                 raise ValueError("Current feedback must positively verify the Holding condition")
+            if condition_id in attachment_assumptions:
+                assumption_records.append({"kind": "model_assumption", "condition_id": condition_id,
+                    "owner_id": condition["carrier_id"], "interval": [lower, upper],
+                    "release_condition_id": relation["release_condition_id"],
+                    "source": deepcopy(attachment_assumptions[condition_id])})
+            # END original entrance provenance and geometry checks remain mandatory.
             for identity in rule_ids:
                 rule = rules_by_id.get(identity)
                 if (rule is None or rule["actor"] != "robot" or rule["target_owner"] != condition["carrier_id"]
@@ -1103,6 +1145,11 @@ class TrajectoryExecutor:
                     "source": deepcopy(evidence)}
         # END no previous execution latch, proximity or command proves Holding.
         # END false or stale evidence cannot be repaired by a software pair rule.
+        # BEGIN reject declarations that do not name a validated active attachment.
+        if set(attachment_assumptions) != {row["condition_id"] for row in assumption_records}:
+            raise ValueError("Attachment assumptions must identify accepted currently active observed attachments")
+        report["attachment_assumptions"] = assumption_records
+        # END these records are not added to feedback, effects or completed goals.
         for condition in binding["problem"].get("conditions", ()):
             if condition.get("kind") != "grasp_contact_activation":
                 continue
@@ -1865,7 +1912,8 @@ class TrajectoryExecutor:
                 # no later tick can inherit these entrance-only facts.
                 current_evidence = {**initial_feedback, **(observation or {})}
             failures.extend(_holding_dependency_violations(binding["scene"],
-                float(trajectory.sample(curve_time)[3]), current_evidence))
+                float(trajectory.sample(curve_time)[3]), current_evidence,
+                attachment_assumptions=attachment_assumptions))
             contact_check = check_close_arrival(feedback,
                 curve_time=curve_time, physical_elapsed=physical_elapsed, point=point,
                 contact_event=contact_event, failures=failures)

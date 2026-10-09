@@ -156,13 +156,24 @@ class _TrialVideos:
 
 # BEGIN one skill may borrow an already running physical session without reset.
 def run(args, *, simulation=None, initial_feedback=None,
-        observation_callback=None, step_callback=None, on_simulation_ready=None):
+        observation_callback=None, step_callback=None, on_simulation_ready=None,
+        attachment_assumptions=None):
     """Execute one skill from a recorded entrance or an explicit live handoff.
 
     The native physics evaluator remains independent and never authorizes a
     runtime dependency or supplies owner poses. A caller may provide an
     existing proprioceptive or visual observation callback through the same
     contract; the CLI does not create a semantic sensor from simulator truth.
+
+    # BEGIN explicit attachment assumptions remain separate from observations.
+    ``attachment_assumptions`` maps bound attachment condition IDs to explicit
+    authorization sources. The executor validates and records this model
+    assumption without turning it into current predicate or effect evidence.
+    Future S3E estimates belong in ``observation_callback``: current RGB images
+    and bound predicates produce T/F/U with original acquisition provenance.
+    Missing/unmatched VLM answers must remain unknown, not default to true.
+    No VLM is called here and the planner does not own predicate estimation.
+    # END the runner forwards both inputs without modifying robot feedback.
 
     ``simulation`` and ``initial_feedback`` must be supplied together. A live
     handoff uses the complete production proprioception record, retaining its
@@ -215,6 +226,9 @@ def run(args, *, simulation=None, initial_feedback=None,
         "execution_input": "formal_planning_result", "physics_outcome": "not_evaluated",
         # BEGIN distinguish online evidence from the independent offline grade.
         "online_observation_provided": observation_callback is not None,
+        # BEGIN supplied assumptions do not count as an online semantic sensor.
+        "attachment_assumptions_provided": attachment_assumptions is not None,
+        # END validated assumption identities and sources live in the execution report.
         "effect_evidence_scope": ("Caller-supplied observation callback; executor validates current timestamps and provenance"
             if observation_callback is not None else
             "No online semantic observer; offline native physics grading does not resolve execution effects"),
@@ -491,6 +505,9 @@ def run(args, *, simulation=None, initial_feedback=None,
             # BEGIN pass real upstream observations without reading evaluator truth.
             observation_callback=observation_callback,
             # END the production executor owns validation and dependency gates.
+            # BEGIN explicit model assumptions use their own execution input.
+            attachment_assumptions=attachment_assumptions,
+            # END neither offline evaluator truth nor feedback is modified.
             max_physics_steps=args.max_physics_steps,
             start_position_tolerance=args.start_position_tolerance,
             start_velocity_tolerance=args.start_velocity_tolerance)
