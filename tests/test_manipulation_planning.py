@@ -1623,7 +1623,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             result = SimpleNamespace(batch_size=1, num_seeds=1, interpolated_last_tstep=torch.tensor([[21]]),
                 interpolated_trajectory=SimpleNamespace(position=q[:1]),
                 # BEGIN the earlier zero-cost ordinary query has its own layout.
-                metrics=SimpleNamespace(debug=torch.zeros(1, 2, 3),
+                metrics=SimpleNamespace(debug=torch.zeros(1, 2, 4),
                     costs_and_constraints=SimpleNamespace(constraints=
                     SimpleNamespace(names=coarse.names, values=[value[:1] for value in coarse.values]))),
                 # END dense-only geometry cannot fabricate ordinary evidence.
@@ -1676,7 +1676,8 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                     calls.append(components_out is not None)
                     terms = {"collision/robot/background": p[..., 0].square(),
                              "scene_update/background/robot": torch.ones_like(p[..., 0]),
-                             "conditional/collision/robot/background": torch.full_like(p[..., 0], 100.)}
+                             "conditional/collision/robot/background": torch.full_like(p[..., 0], 100.),
+                             "conditional/unknown/robot": torch.full_like(p[..., 0], .04)}
                     if components_out is not None:
                         components_out.update(terms)
                     return terms["collision/robot/background"]+terms["scene_update/background/robot"]
@@ -1699,12 +1700,16 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 # unit support gap in the hard sum, never in collision debug.
                 # BEGIN each weighted/folded channel retains its own evidence.
                 # BEGIN the third diagnostic channel carries only forbidden coverage.
-                self.assertEqual(tuple(metrics.debug.shape), (2, 2, 3))
+                self.assertEqual(tuple(metrics.debug.shape), (2, 2, 4))
                 torch.testing.assert_close(metrics.debug[..., 1:2],
                     torch.tensor([[[777.], [1554.]], [[777.], [1554.]]]), rtol=1e-7, atol=0)
                 torch.testing.assert_close(scene.detach()-metrics.debug[..., :1],
                     metrics.debug[..., 1:2], rtol=1e-7, atol=0)
                 self.assertEqual(int(torch.count_nonzero(metrics.debug[..., 2])), 0)
+                # BEGIN permitted unknown survives metrics without entering the hard aggregate.
+                torch.testing.assert_close(metrics.debug[..., 3:4],
+                    .04*metrics.debug[..., 1:2], rtol=1e-6, atol=0)
+                # END conditional collision above does not leak into unknown evidence.
                 # END absent coverage never inherits a numerical scene-update gap.
                 # END support remains hard but cannot enter collision witnesses.
                 clone = metrics.clone()
@@ -2676,13 +2681,14 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         # BEGIN aggregate values do not serve as implicit collision evidence.
         result.interpolated_metrics.debug = torch.cat((constraints.values[0],
             torch.tensor([100., 200.])[:, None, None].expand(2, 9, 1),
-            torch.zeros_like(constraints.values[0])), dim=-1)
+            torch.zeros_like(constraints.values[0]),
+            torch.tensor([.01, .04])[:, None, None].expand(2, 9, 1)), dim=-1)
         # END explicit same-seed evidence must survive the native top-k gather.
         # BEGIN the ordinary collision evidence has its independent three-point grid.
         ordinary = result.metrics.costs_and_constraints.constraints
         ordinary.names = ["process_scene"]
         ordinary.values = [torch.zeros(2, 3, 1)]
-        result.metrics.debug = torch.zeros(2, 3, 3)
+        result.metrics.debug = torch.zeros(2, 3, 4)
         result.metrics.debug[0, 1, 0] = 10.
         # END another seed's ordinary collision cannot suppress this seed's peak.
         selected = _trajectory_candidate(result, 1)
@@ -2697,6 +2703,9 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         result.interpolated_metrics.debug.zero_()
         self.assertEqual(float(selected.interpolated_metrics.debug[0, 3, 0]), 2.)
         self.assertEqual(float(selected.interpolated_metrics.debug[0, 3, 1]), 200.)
+        # BEGIN selected conditional evidence also survives native scratch reuse.
+        self.assertAlmostEqual(float(selected.interpolated_metrics.debug[0, 3, 3]), .04)
+        # END accepted risk cannot inherit another seed or a cleared scratch buffer.
     # END selected dense evidence survives native scratch-buffer reuse.
 
     # BEGIN locked-joint native result layout: active knots and full robot state.

@@ -2589,7 +2589,8 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                 # BEGIN explicit forbidden coverage can request a different path.
                 for category, prefix in (("collision", "collision/"),
                                          ("scene_update", "scene_update/"),
-                                         ("coverage", "unknown/forbidden/")):
+                                         ("coverage", "unknown/forbidden/"),
+                                         ("conditional_unknown", "conditional/unknown/")):
                     scene_evidence_out[category] = sum((term.detach() for name, term in components.items()
                         if name.startswith(prefix)), torch.zeros_like(value))
                 # END conditional unknown and missing model data are not forbidden space.
@@ -3170,7 +3171,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                     # BEGIN fold each same-query diagnostic category separately.
                     channels = []
                     # BEGIN all recovery categories retain identical sample accounting.
-                    for category in ("collision", "scene_update", "coverage"):
+                    for category in ("collision", "scene_update", "coverage", "conditional_unknown"):
                         evidence = scene_evidence_out[category].gather(1, inverse)
                         regular_evidence = evidence[:, :horizon] * valid
                         folded_evidence = torch.cat((torch.zeros_like(regular_evidence[:, :-1]),
@@ -3178,7 +3179,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                         channels.append(regular_evidence+folded_evidence)
                     self._scene_evidence = (weighted,
                         torch.stack(channels, dim=-1) * budget.constraint_weight)
-                    # END channel order is collision, scene_update, forbidden coverage.
+                    # END channel order is collision, scene_update, forbidden and conditional coverage.
                 # END recovery evidence never adds another cost or constraint.
             return collection
 
@@ -3291,13 +3292,13 @@ def _trajectory_candidate(result, index):
 # END exact native candidate extraction before independent verification.
 
 
-# BEGIN same-query evidence has one strict three-channel layout for all consumers.
+# BEGIN same-query evidence has one strict four-channel layout for all consumers.
 def _scene_metric_channel(metrics, channel):
-    """Read collision (0), scene-update (1), or forbidden coverage (2)."""
+    """Read collision (0), support (1), forbidden (2), or conditional unknown (3)."""
     constraints = metrics.costs_and_constraints.constraints
     scene = constraints.values[constraints.names.index("process_scene")]
-    if metrics.debug is None or metrics.debug.shape != (*scene.shape[:-1], 3):
-        raise RuntimeError("Native scene metrics lack aligned collision/scene-update/coverage evidence")
+    if metrics.debug is None or metrics.debug.shape != (*scene.shape[:-1], 4):
+        raise RuntimeError("Native scene metrics lack aligned collision/scene-update/coverage/conditional-unknown evidence")
     return metrics.debug[..., channel:channel+1]
 
 
@@ -3332,6 +3333,59 @@ def _coverage_metric_residuals(metrics, seed_index=None):
     index = flat.masked_fill(~flat.isfinite(), float("inf")).argmax()
     return {"unknown_forbidden": float(flat[index].item())}
 # END the original aggregate remains the sole hard scene constraint.
+
+
+# BEGIN preserve policy-permitted uncertainty without adding a hard constraint.
+def _conditional_unknown_metric_residuals(metrics, seed_index=None):
+    """Retain the same query's unknown evidence even for native-success curves."""
+    if "process_scene" not in metrics.costs_and_constraints.constraints.names:
+        return {}
+    evidence = _scene_metric_channel(metrics, 3)
+    if seed_index is not None:
+        evidence = evidence[seed_index]
+    flat = evidence.reshape(-1)
+    index = flat.masked_fill(~flat.isfinite(), float("inf")).argmax()
+    return {"conditional_unknown": float(flat[index].item())}
+# END this diagnostic channel contributes no cost and performs no extra query.
+
+
+# BEGIN classify only a completed candidate whose sole hard failure is coverage.
+def _unknown_policy_failure(report, policy):
+    """Choose an explicit policy outcome without declaring all routes infeasible.
+
+    Named scene components establish what caused the aggregate scene residual.
+    Missing evidence, nonfinite results, or any other failed hard requirement
+    preserve the ordinary failure/recovery path.
+    """
+    action = policy["outside_regions"]
+    if action == "allow_attempt":
+        return None
+    components, residuals = report.get("scene_components", {}), report.get("residuals", {})
+    if not components or not residuals:
+        return None
+    coverage_failed = False
+    for name, entry in components.items():
+        value = entry["maximum"]
+        if not np.isfinite(value):
+            return None
+        if name.startswith("conditional/") or value <= 0:
+            continue
+        if not name.startswith("unknown/forbidden/"):
+            return None
+        coverage_failed = True
+    scene_failed = False
+    for name, value in residuals.items():
+        if not np.isfinite(value):
+            return None
+        if value <= 0:
+            continue
+        if name != "scene" and not name.endswith(":process_scene"):
+            return None
+        scene_failed = True
+    if not coverage_failed or not scene_failed:
+        return None
+    return "needs_observation" if action == "require_observation" else "unknown_space_forbidden"
+# END the scope of this verdict is the evaluated state or selected curve only.
 
 
 # BEGIN collision recovery consumes typed evidence, never aggregate name matching.
@@ -4889,6 +4943,7 @@ class _CuroboPlanner:
             scene_update_residuals = _scene_update_metric_residuals(metrics)
             # BEGIN entity confirmation cannot erase an unrelated coverage failure.
             coverage_residuals = _coverage_metric_residuals(metrics)
+            conditional_unknown_residuals = _conditional_unknown_metric_residuals(metrics)
             # END all categories belong to these same completed candidate queries.
             # END a confirmed-clear proxy cannot erase missing scene support.
             # END a confirmed-clear proxy cannot trigger a collision recovery.
@@ -4909,6 +4964,8 @@ class _CuroboPlanner:
             "scene_update_residuals": {f"interpolated:{name}": value for name, value in scene_update_residuals.items()},
             # BEGIN preserve search eligibility after sphere collision confirmation.
             "coverage_residuals": {f"interpolated:{name}": value for name, value in coverage_residuals.items()},
+            "conditional_unknown_residuals": {f"interpolated:{name}": value
+                for name, value in conditional_unknown_residuals.items()},
             # END coverage is never interpreted as an entity intersection.
             # END support evidence does not claim every route lacks support.
             # END the original metrics determine feasibility and severity.
@@ -4972,7 +5029,8 @@ class _CuroboPlanner:
                 # BEGIN both native sampling grids retain the same seed's support gaps.
                 "scene_update_residuals": _scene_update_metric_residuals(metrics, seed_index),
                 # BEGIN both native grids retain the selected seed's coverage evidence.
-                "coverage_residuals": _coverage_metric_residuals(metrics, seed_index)}
+                "coverage_residuals": _coverage_metric_residuals(metrics, seed_index),
+                "conditional_unknown_residuals": _conditional_unknown_metric_residuals(metrics, seed_index)}
                 # END this adds no geometry query or acceptance condition.
                 # END no extra geometry query or request-level verdict is produced.
                 # END diagnostics never affect the original severity calculation.
@@ -5002,6 +5060,8 @@ class _CuroboPlanner:
                       # BEGIN route unknown-space avoidance using its own query evidence.
                       "coverage_residuals": {f"{label}:{name}": value for label in ("rollout", "interpolated")
                           for name, value in metrics.get(label, {}).get("coverage_residuals", {}).items()},
+                      "conditional_unknown_residuals": {f"{label}:{name}": value for label in ("rollout", "interpolated")
+                          for name, value in metrics.get(label, {}).get("conditional_unknown_residuals", {}).items()},
                       # END neither mixed scene totals nor missing fields infer coverage.
                       # END existing feasible candidates still take precedence.
                       "seed_provenance": self.seed_strategies[index],
@@ -5428,7 +5488,10 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         diagnostics["initial_state"] = planner.initial_state_diagnostics()
         check()
         if not diagnostics["initial_state"]["passed"]:
-            diagnostics["failure"] = "initial_state_infeasible"
+            # BEGIN distinguish a policy decision from a measured physical violation.
+            diagnostics["failure"] = (_unknown_policy_failure(diagnostics["initial_state"],
+                scene.unknown_policy) or "initial_state_infeasible")
+            # END no optimization can change the measured entrance.
             return outcome
         # BEGIN seed, block and final candidates share one complete binding boundary.
         def qualify_candidate(trajectory, validation, attempt, *, binding_scene=None):
@@ -5501,8 +5564,16 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     route="candidate_metrics", scene=candidate_scene.describe())
                 outcome.execution_binding["verification_joint_limits"] = deepcopy(diagnostics["verification_joint_limits"])
                 return outcome
+            # BEGIN explicit observation requests stop at the completed reference verdict.
+            policy_failure = _unknown_policy_failure(reference_attempt, candidate_scene.unknown_policy)
+            if policy_failure == "needs_observation":
+                diagnostics.update(failure=policy_failure, reference_candidate=deepcopy(reference_attempt),
+                    diagnostic_trajectory=candidate,
+                    failure_scope="Supplied curve requires observation under the selected policy; other routes were not evaluated")
+                return outcome
+            # END forbidden coverage may still use the existing bounded repair path.
             missing = {name: value for name, value in reference_attempt.get("scene_components", {}).items()
-                if name.startswith(("unknown/forbidden/", "scene_update/"))}
+                if name.startswith("scene_update/") and (not np.isfinite(value["maximum"]) or value["maximum"] > 0)}
             if missing:
                 diagnostics.update(failure="reference_outside_observation_scope", reference_scope_gaps=missing,
                     diagnostic_trajectory=candidate,
@@ -5561,14 +5632,18 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             diagnostics["joint_reference"]["candidate_kind"] = "original_joint_curve" if same else "native_fitted_joint_reference"
         diagnostics["reference_candidate"] = deepcopy(attempt)
         recovery = None
-        if not attempt["accepted"]:
+        # BEGIN observation policy stops only when completed evidence isolates coverage.
+        observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == "needs_observation"
+        if not attempt["accepted"] and not observation_required:
             check("trajectory_solves")
             consumed["trajectory_solves"] += 1
             stage = "main_solve"
             native_result, trajectory, attempt = select_candidate_with_accounting(planner.optimize(seeds))
             diagnostics["attempts"].append(deepcopy(attempt))
             check()
-            if not attempt["accepted"] and consumed["trajectory_solves"]-motion_baseline.get("trajectory_solves", 0) < original_budget.maximum_trajectory_solves:
+            observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == "needs_observation"
+            if (not attempt["accepted"] and not observation_required
+                    and consumed["trajectory_solves"]-motion_baseline.get("trajectory_solves", 0) < original_budget.maximum_trajectory_solves):
                 # BEGIN mixed scene support/contact failures cannot consume collision recovery.
                 collision_failed = any(value > 0 for value in attempt["collision_residuals"].values())
                 # END all original hard residuals still reject the candidate above.
@@ -5607,12 +5682,14 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     native_result, trajectory, attempt = select_candidate_with_accounting(planner.optimize(seeds))
                     diagnostics["attempts"].append(deepcopy(attempt))
                     check()
+        # END mixed failures retain ordinary optimization and recovery.
         diagnostics.update(attempt, route=planner.route, recovery=recovery, used_ompl=recovery in {"ompl", "ompl_failed"})
         if not attempt["accepted"]:
             # BEGIN finite candidate failure is not proof that the fixed target is impossible.
-            diagnostics.update(failure="no_feasible_solution_found", diagnostic_trajectory=trajectory,
-                failure_scope="No evaluated candidate met all constraints within the existing request budget; "
-                    "scene_update_residuals describe the selected failed candidate, not every route to the fixed target")
+            diagnostics.update(failure=(_unknown_policy_failure(attempt, scene.unknown_policy)
+                or "no_feasible_solution_found"), diagnostic_trajectory=trajectory,
+                failure_scope="The selected candidate failed the declared requirements or unknown-space policy; "
+                    "its component evidence does not establish that every route to the fixed target fails")
             # END external recovery receives evidence without changing the transfer target.
             return outcome
         stage = "delivery"

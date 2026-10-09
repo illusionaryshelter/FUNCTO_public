@@ -9,6 +9,7 @@ import torch
 
 from manipulation.planning import (
     _CuroboPlanner, _ProgressMap, _collision_metric_residuals, _coverage_metric_residuals,
+    _conditional_unknown_metric_residuals,
     _dense_collision_witnesses, _scene_boundary_evaluate, _scene_update_metric_residuals, _trajectory_candidate,
 )
 import test_manipulation_planning as _fixtures
@@ -110,6 +111,9 @@ def test_noncollision_components_do_not_generate_collision_evidence(category):
     assert bool((evidence["scene_update"] == int(category.startswith("scene_update/"))).all())
     # BEGIN only the explicit forbidden-space component authorizes coverage search.
     assert bool((evidence["coverage"] == int(category.startswith("unknown/forbidden/"))).all())
+    # BEGIN only conditional unknown enters the fourth evidence channel.
+    assert bool((evidence["conditional_unknown"] == int(category.startswith("conditional/unknown/"))).all())
+    # END contact uncertainty and collision uncertainty are separate evidence.
     # END aggregate scene errors and conditional observations stay distinct.
     # END contact, controller and unknown-space categories remain distinct.
 
@@ -157,8 +161,8 @@ def collision_result():
     constraints = result.metrics.costs_and_constraints.constraints
     constraints.names = ["process_scene", "self_collision", "anchor_self_collision"]
     constraints.values = [torch.ones(2, 9, 1)*100000., torch.zeros(2, 9, 1), torch.zeros(2, 9, 1)]
-    # BEGIN all three channels have explicit seed/time identity.
-    result.metrics.debug = torch.zeros(2, 9, 3)
+    # BEGIN all four channels have explicit seed/time identity.
+    result.metrics.debug = torch.zeros(2, 9, 4)
     result.metrics.debug[..., 1] = 100000.
     # END support is deliberately positive beside zero collision.
     result.interpolated_metrics = result.metrics.clone()
@@ -238,11 +242,12 @@ def test_scene_update_evidence_preserves_both_grid_and_seed_identity():
     # END independent support evidence never becomes collision evidence.
 
 
-@pytest.mark.parametrize("shape", [(2, 9, 1), (2, 9, 2), (1, 9, 3)])
+@pytest.mark.parametrize("shape", [(2, 9, 1), (2, 9, 2), (2, 9, 3), (1, 9, 4)])
 def test_obsolete_or_misaligned_scene_evidence_is_rejected(shape):
     result = collision_result()
     result.metrics.debug = torch.zeros(shape)
-    for reader in (_collision_metric_residuals, _scene_update_metric_residuals, _coverage_metric_residuals):
+    for reader in (_collision_metric_residuals, _scene_update_metric_residuals, _coverage_metric_residuals,
+                   _conditional_unknown_metric_residuals):
         with pytest.raises(RuntimeError, match="scene.*evidence"):
             reader(result.metrics)
 # END no aggregate fallback or legacy single-channel compatibility is permitted.
@@ -288,6 +293,10 @@ def test_coverage_mode_max_preserves_all_actor_terms_without_changing_hard_gradi
     assert evidence["coverage"].item() == 4.5  # exact mode; both robot and payload count
     assert evidence["scene_update"].item() == 5.  # left mode
     assert evidence["collision"].item() == 2.  # right mode
+    # BEGIN permitted uncertainty is retained without hard cost or gradients.
+    assert evidence["conditional_unknown"].item() == 100.
+    assert not evidence["conditional_unknown"].requires_grad
+    # END the hard result below is unchanged despite positive unknown evidence.
     assert result.item() == 6.5  # the original left-mode hard maximum
     assert torch.autograd.grad(result.sum(), q)[0].item() == 3.
     assert not evidence["coverage"].requires_grad
@@ -319,3 +328,33 @@ def test_coverage_metrics_do_not_hide_nonfinite_samples(nonfinite):
         assert actual == nonfinite
     assert _coverage_metric_residuals(result.metrics, 0) == {"unknown_forbidden": 0.}
 # END coverage authorizes only bounded search, never direct acceptance or collision repair.
+
+
+# BEGIN allowed unknown retains its own sampled evidence without collision witnesses.
+def test_conditional_unknown_retains_both_grids_and_selected_seed_copy():
+    result = collision_result()
+    result.metrics.debug[1, 2, 3] = .02
+    result.interpolated_metrics.debug[1, 4, 3] = .04
+    planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    report = planner.native_diagnostics(result, seed_index=1)
+    assert report["rollout"]["conditional_unknown_residuals"]["conditional_unknown"] == pytest.approx(.02)
+    assert report["interpolated"]["conditional_unknown_residuals"]["conditional_unknown"] == pytest.approx(.04)
+    selected = _trajectory_candidate(result, 1)
+    result.metrics.debug.zero_()
+    result.interpolated_metrics.debug.zero_()
+    assert _conditional_unknown_metric_residuals(selected.metrics)["conditional_unknown"] == pytest.approx(.02)
+    assert _conditional_unknown_metric_residuals(selected.interpolated_metrics)["conditional_unknown"] == pytest.approx(.04)
+    assert _dense_collision_witnesses(selected, regular_horizon=9,
+        anchor_parameters=(), capacity=4)["parameters"] == []
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_conditional_unknown_metrics_preserve_invalid_query_evidence(nonfinite):
+    result = collision_result()
+    result.metrics.debug[1, 2, 3] = nonfinite
+    actual = _conditional_unknown_metric_residuals(result.metrics, 1)["conditional_unknown"]
+    assert not np.isfinite(actual)
+    if not np.isnan(nonfinite):
+        assert actual == nonfinite
+    assert _conditional_unknown_metric_residuals(result.metrics, 0) == {"conditional_unknown": 0.}
+# END recording conditional uncertainty does not certify it as observed free space.

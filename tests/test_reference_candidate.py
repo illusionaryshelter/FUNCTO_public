@@ -75,11 +75,45 @@ def test_supplied_curve_passes_without_any_fit_ik_or_optimization():
         backend.close()
 
 
-def test_missing_observation_scope_returns_original_without_spatial_repair():
+# BEGIN supplied curves obey the same explicit policy as native candidate routes.
+def test_require_observation_returns_original_without_spatial_repair():
     gaps = {"unknown/forbidden/robot": {"maximum": .004, "time_s": .71, "progress": .6}}
     native = candidate_fixture(accepted=False, components=gaps)
+    native.scene.unknown_policy = {"outside_regions": "require_observation", "conditional_regions": []}
     reference = supplied_curve()
-    result, backend = run(native, joint_reference=reference)
+    result, backend = run(native, scene=native.scene, joint_reference=reference)
+    try:
+        assert not result.success and result.execution_binding is None
+        assert result.diagnostics["failure"] == "needs_observation"
+        assert result.diagnostics["reference_candidate"]["scene_components"] == gaps
+        assert native.calls == ["candidate"]
+        np.testing.assert_array_equal(result.diagnostics["diagnostic_trajectory"].position, reference.position)
+    finally:
+        backend.close()
+
+
+def test_forbidden_unknown_on_supplied_curve_enters_existing_finite_repair():
+    gaps = {"unknown/forbidden/robot": {"maximum": .004, "time_s": .71, "progress": .6}}
+    native = candidate_fixture(accepted=False, components=gaps, native_outcomes=(False, True))
+    reference = supplied_curve()
+    result, backend = run(native, scene=native.scene, joint_reference=reference)
+    try:
+        assert result.success, result.diagnostics
+        assert native.calls == ["candidate", "seed", "reference", "solve", "export"]
+        assert result.diagnostics["original_reference_candidate"]["scene_components"] == gaps
+        assert not result.diagnostics["original_reference_candidate"]["accepted"]
+        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("mode", ["forbid", "require_observation", "allow_attempt"])
+def test_missing_model_support_still_rejects_supplied_curve_before_spatial_repair(mode):
+    gaps = {"scene_update/robot/background": {"maximum": .004, "time_s": .71, "progress": .6}}
+    native = candidate_fixture(accepted=False, components=gaps)
+    native.scene.unknown_policy = {"outside_regions": mode, "conditional_regions": []}
+    reference = supplied_curve()
+    result, backend = run(native, scene=native.scene, joint_reference=reference)
     try:
         assert not result.success and result.execution_binding is None
         assert result.diagnostics["failure"] == "reference_outside_observation_scope"
@@ -88,6 +122,7 @@ def test_missing_observation_scope_returns_original_without_spatial_repair():
         np.testing.assert_array_equal(result.diagnostics["diagnostic_trajectory"].position, reference.position)
     finally:
         backend.close()
+# END a policy may alter unknown handling but cannot clear missing numerical support.
 
 
 def test_supported_collision_enters_existing_finite_repair_only_after_original_check():

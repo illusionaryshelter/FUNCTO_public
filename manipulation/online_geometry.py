@@ -299,7 +299,7 @@ class FrozenPrimitives(FrozenESDF):
 
 
 class OnlinePlanningScene:
-    """Frozen owners, finite permissions, and explicitly bounded unknown policy."""
+    """Frozen owners, finite permissions, and explicit unknown-space decisions."""
     def __init__(self, *, background, owners, coverage, reference_frame,
                  robot_sphere_materials, robot_geometry_source, contacts=(), gripper=None,
                  has_gripper=True, unknown_policy, robot_collision_bodies=(),
@@ -319,8 +319,12 @@ class OnlinePlanningScene:
         self.gripper, self.has_gripper = gripper, has_gripper
         self.robot_collision_bodies = tuple(deepcopy(robot_collision_bodies))
         self.native_geometry_materials = deepcopy(native_geometry_materials or {})
-        if set(unknown_policy) != {'conditional_regions', 'outside_regions'} or unknown_policy['outside_regions'] != 'forbid':
-            raise ValueError('Unknown policy needs bounded conditional_regions and outside_regions=forbid')
+        # BEGIN observation uncertainty is governed by one explicit scene policy.
+        if (set(unknown_policy) != {'conditional_regions', 'outside_regions'}
+                or unknown_policy['outside_regions'] not in ('forbid', 'require_observation', 'allow_attempt')):
+            raise ValueError('Unknown policy needs bounded conditional_regions and outside_regions '
+                             'in {forbid, require_observation, allow_attempt}')
+        # END permitting an attempt never changes the stored observation evidence.
         self.unknown_policy = deepcopy(unknown_policy)
         for row in self.unknown_policy['conditional_regions']:
             lower, upper = np.asarray(row['lower_m']), np.asarray(row['upper_m'])
@@ -717,13 +721,23 @@ class OnlinePlanningScene:
                 clearance = torch.maximum(clearance, (margin-roundoff).clamp_min(0))
             forbidden = torch.where(radius > 0, torch.relu(radius-clearance), torch.zeros_like(radius))
         # END empty policies still differentiate the original hard certificate.
-        hard = forbidden
+        # BEGIN policy changes admissibility, never the measured coverage gap.
+        # Missing numerical evidence is a failed query under every action.
+        # Check both fields: finite permission clearance cannot conceal an
+        # invalid result from the original observation field.
+        finite = torch.isfinite(unresolved) & torch.isfinite(forbidden)
+        hard = torch.where(torch.isfinite(unresolved), forbidden, unresolved)
         retained = forbidden < unresolved
+        if self.unknown_policy['outside_regions'] == 'allow_attempt':
+            hard = torch.where(finite, 0., hard)
+            retained = retained | finite
         if uncertain is not None:
             # Future hand geometry retains its separate pre-existing policy;
-            # spatial permission alone never erases a positive hard residual.
-            hard = torch.where(uncertain, 0., forbidden)
-            retained = retained | uncertain
+            # neither uncertainty nor spatial permission clears invalid data.
+            permitted_uncertainty = uncertain & finite
+            hard = torch.where(permitted_uncertainty, 0., hard)
+            retained = retained | permitted_uncertainty
+        # END forbid and require_observation keep the same hard spatial boundary.
         # Preserve an upper bound on original observation uncertainty whenever
         # permission helps. A difference of distance residuals is not a physical
         # depth of permitted unknown and must not masquerade as one.
@@ -1207,7 +1221,18 @@ class OnlinePlanningScene:
         status = ('SCENE_UPDATE_REQUIRED' if any(k.startswith('scene_update/') for k in violations) else
                   'UNSUPPORTED_MODEL' if any(k.startswith('unsupported/') for k in violations) else
                   'COLLISION_OR_CONSTRAINT' if violations else 'PASS')
+        # BEGIN a finite unknown-only rejection is not an observed collision.
+        # Mixed failures retain their existing geometric/model classification;
+        # this action describes this queried state, not all possible routes.
+        if violations and all(name.startswith('unknown/forbidden/') and np.isfinite(value)
+                              for name, value in violations.items()):
+            status = ('OBSERVATION_REQUIRED' if self.unknown_policy['outside_regions'] == 'require_observation'
+                      else 'UNKNOWN_POLICY_REJECTED')
+        # END nonfinite evidence still rejects under the ordinary failure status.
         report = {'passed':not violations,'violations':[{'kind':name.split('/')[0],'name':name,'residual':value} for name,value in violations.items()],'components':values,'status':status,
+            # BEGIN keep the assumed policy next to retained uncertainty.
+            'unknown_policy':deepcopy(self.unknown_policy),
+            # END PASS under allow_attempt does not assert observed free space.
             'conditional_unknown':{k:v for k,v in values.items() if k.startswith('conditional/') and v>0}}
         # BEGIN keep the original sphere evidence and native verdict inspectable.
         if native_confirmation is not None:

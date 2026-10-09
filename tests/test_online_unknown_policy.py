@@ -1,4 +1,4 @@
-"""CPU regressions for spatially bounded unknown-space permission.
+"""CPU regressions for explicit unknown-space decisions and finite permissions.
 
 The fixtures separate observed cells, authorized unknown volume and occupied
 geometry. No table, task identity or sensor-specific assumption creates free
@@ -32,7 +32,7 @@ def _half_observed():
     return known
 
 
-def _scene(known, regions, *, occupied=False):
+def _scene(known, regions, *, occupied=False, outside_regions='forbid'):
     coverage = ObservedSpace(known, origin=_ORIGIN, voxel_size=_STEP,
                              observation_ids=('measured-test-view',), reference_frame='world')
     valid = np.full(_SHAPE, occupied, dtype=bool)
@@ -44,7 +44,9 @@ def _scene(known, regions, *, occupied=False):
     result = OnlinePlanningScene(background=background, owners=(), coverage=coverage,
         reference_frame='world', robot_sphere_materials=('body',),
         robot_geometry_source='test sphere geometry', has_gripper=False,
-        unknown_policy={'conditional_regions': regions, 'outside_regions': 'forbid'})
+        # BEGIN fixtures select the same public policy consumed by planning.
+        unknown_policy={'conditional_regions': regions, 'outside_regions': outside_regions})
+        # END task identities and observation masks do not select a policy.
     result.bind_online_robot(robot_sphere_geometry=[{
         'link_name': 'link', 'sphere_indices': [0], 'centers_local': [[0., 0., 0.]],
         'radii': [.04]}], robot_self_collision_pairs=[])
@@ -123,6 +125,89 @@ def test_empty_permission_keeps_original_unknown_residual_and_storage():
     assert hard == scene.coverage.violation(_sphere()).amax()
     assert conditional == 0
     assert scene._permitted_coverage is scene.coverage
+
+
+# BEGIN uncertainty evidence is independent of the explicit admission action.
+@pytest.mark.parametrize('action,status,passed', [
+    ('forbid', 'UNKNOWN_POLICY_REJECTED', False),
+    ('require_observation', 'OBSERVATION_REQUIRED', False),
+    ('allow_attempt', 'PASS', True),
+])
+def test_same_unknown_evidence_has_explicit_policy_decision(action, status, passed):
+    known = _half_observed()
+    scene = _scene(known, [], outside_regions=action)
+    spheres = _sphere().requires_grad_()
+    original = scene.coverage.violation(spheres).amax()
+    assert original > 0
+    hard, conditional = scene._unknown(spheres)
+    assert hard == (0 if passed else original)
+    assert conditional == (original if passed else 0)
+    if passed:
+        hard.backward()
+        assert torch.equal(spheres.grad, torch.zeros_like(spheres))
+    report = scene.query_state(spheres.detach().numpy(), np.eye(4), .5)
+    assert report['passed'] is passed and report['status'] == status
+    assert report['unknown_policy'] == scene.unknown_policy
+    assert bool(report['conditional_unknown']) is passed
+    assert np.array_equal(scene.coverage.known_free, known)
+    assert np.array_equal(scene.coverage._known, known)
+    assert scene._permitted_coverage is scene.coverage
+
+
+@pytest.mark.parametrize('action', ['forbid', 'require_observation', 'allow_attempt'])
+def test_unknown_policy_survives_rollout_clone_and_binding(action):
+    scene = _scene(_half_observed(), [], outside_regions=action)
+    clone = scene.clone_for_rollout()
+    restored = OnlinePlanningScene.from_binding(scene.to_execution_binding())
+    expected = scene.query_state(_sphere().numpy(), np.eye(4), .5)
+    assert clone.query_state(_sphere().numpy(), np.eye(4), .5) == expected
+    assert restored.query_state(_sphere().numpy(), np.eye(4), .5) == expected
+    assert clone.unknown_policy is not scene.unknown_policy
+    assert np.array_equal(restored.coverage.known_free, scene.coverage.known_free)
+
+
+@pytest.mark.parametrize('action', ['forbid', 'require_observation', 'allow_attempt'])
+def test_unknown_policy_does_not_clear_collision_or_mislabel_mixed_failure(action):
+    scene = _scene(_half_observed(), [], occupied=True, outside_regions=action)
+    report = scene.query_state(_sphere().numpy(), np.eye(4), .5)
+    assert not report['passed'] and report['status'] == 'COLLISION_OR_CONSTRAINT'
+    assert report['components']['collision/robot/background'] > 0
+    assert (report['components']['unknown/forbidden/robot'] > 0) == (action != 'allow_attempt')
+    if action == 'allow_attempt':
+        assert report['conditional_unknown']['conditional/unknown/robot'] > 0
+
+
+@pytest.mark.parametrize('action', ['forbid', 'require_observation', 'allow_attempt'])
+@pytest.mark.parametrize('invalid_field,invalid', [
+    ('observation', float('nan')), ('observation', float('inf')),
+    ('permission', float('nan')),
+])
+def test_no_policy_or_future_hand_uncertainty_can_clear_nonfinite_evidence(
+        monkeypatch, action, invalid_field, invalid):
+    scene = _scene(_half_observed(), [_region()], outside_regions=action)
+    spheres = _sphere()
+    # Permission and original observation can fail independently. In the
+    # observation case the box still covers the unknown portion; numerical
+    # success in that second field must not conceal the invalid first query.
+    if invalid_field == 'observation':
+        monkeypatch.setattr(scene.coverage, 'violation',
+                            lambda body: torch.full_like(body[..., 3], invalid))
+    else:
+        monkeypatch.setattr(scene._permitted_coverage, 'clearance',
+                            lambda centre: torch.full_like(centre[..., 0], -invalid))
+    for uncertain in (None, torch.ones_like(spheres[..., 3], dtype=torch.bool)):
+        hard, _ = scene._unknown(spheres, uncertain)
+        assert not torch.isfinite(hard).all()
+    report = scene.query_state(spheres.numpy(), np.eye(4), .5)
+    assert not report['passed']
+    assert report['status'] == 'COLLISION_OR_CONSTRAINT'
+    assert any(not np.isfinite(row['residual']) for row in report['violations'])
+
+
+def test_unknown_policy_rejects_undeclared_action():
+    with pytest.raises(ValueError, match='outside_regions'):
+        _scene(_half_observed(), [], outside_regions='assume_free')
+# END the action cannot manufacture observations or authorize known collisions.
 
 
 def test_known_collision_survives_mixed_unknown_permission():

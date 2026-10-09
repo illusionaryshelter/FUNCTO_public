@@ -984,7 +984,19 @@ use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
 OMPL state validity, entrance checks and final candidate checks can confirm
 registered world-collision sphere proposals against the same frozen source
 solids. Each search branch owns its confirmation context and release history;
-unknown-space, contact and task requirements remain independent hard checks.
+contact and task requirements remain independent hard checks.
+<!-- BEGIN observation coverage and observed collision have separate authority. -->
+Unknown coverage follows the scene's explicit `unknown_policy.outside_regions`:
+`forbid` retains a hard boundary and permits bounded path search;
+`require_observation` returns `needs_observation` when completed candidate evidence
+isolates coverage as its only hard failure; `allow_attempt` removes finite
+coverage deficits from the hard aggregate while preserving conditional evidence.
+Nonfinite queries, known collisions, missing model support and other physical
+requirements remain hard. Conditional native metric summaries are weighted
+diagnostics; `scene_components.maximum` retains the raw physical coverage deficit.
+A policy-permitted plan does not establish that unobserved space is free.
+The execution layer does not rebuild this frozen scene or add another coverage veto.
+<!-- END the existing policy is shared by optimization, search and acceptance. -->
 Native self-collision states use the bound finger clock. Differentiable optimizer
 queries retain their existing sphere costs and do not run CPU confirmation.
 <!-- END source confirmation does not supply observations or contact permissions. -->

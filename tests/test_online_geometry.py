@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from manipulation.online_geometry import FrozenESDF, FrozenPrimitives, OnlinePlanningScene
@@ -24,12 +25,14 @@ def field(distance=None, valid=True, owner='background'):
     # END absent source evidence cannot be manufactured by a numeric zero.
 
 
-def scene(*,conditional=False,background=None):
+def scene(*,conditional=False,background=None,outside_regions='forbid'):
     known=np.zeros((21,21,21),dtype=bool)
     cover=ObservedSpace(known,origin=[-.1,-.1,-.1],voxel_size=.01,
         observation_ids=('A',),reference_frame='world')
-    policy={'outside_regions':'forbid','conditional_regions':(
+    # BEGIN select an explicit unknown-space action independently of geometry.
+    policy={'outside_regions':outside_regions,'conditional_regions':(
         [{'lower_m':[-.08]*3,'upper_m':[.08]*3,'source':'declared finite operation volume'}] if conditional else [])}
+    # END finite region fixtures retain their original bounds and provenance.
     result=OnlinePlanningScene(background=field(valid=False) if background is None else background,
         owners=(),coverage=cover,reference_frame='world',robot_sphere_materials=('body',),
         robot_geometry_source='calibrated robot',unknown_policy=policy,has_gripper=False)
@@ -46,18 +49,25 @@ def test_bounded_unknown_is_conditional_and_empty_local_map_does_not_limit_arm_d
     assert allowed['passed'] and allowed['conditional_unknown']
     assert not scene(conditional=True).coverage.known_free.any()
     outside=scene(conditional=True).query_state(np.array([[.11,0.,0.,.01]]),np.eye(4),0.)
-    assert not outside['passed'] and outside['status']=='COLLISION_OR_CONSTRAINT'
+    # BEGIN lack of observed coverage is not an observed obstacle collision.
+    assert not outside['passed'] and outside['status']=='UNKNOWN_POLICY_REJECTED'
+    # END policy rejection remains distinct from geometric failure.
     assert outside['components']['scene_update/background/robot'] == 0
     assert outside['components']['unknown/forbidden/robot'] > 0
 
 
-def test_outside_centre_with_radius_intersecting_known_local_geometry_still_requires_update():
-    current = scene(conditional=True, background=field(np.zeros((21,21,21),np.float32)))
+# BEGIN every unknown-space policy retains unsupported known-geometry queries.
+@pytest.mark.parametrize('action', ['forbid', 'require_observation', 'allow_attempt'])
+def test_outside_centre_with_radius_intersecting_known_local_geometry_still_requires_update(action):
+    current = scene(conditional=True, background=field(np.zeros((21,21,21),np.float32)),
+                    outside_regions=action)
     overlap = current.query_state(np.array([[.11,0.,0.,.02]]), np.eye(4), .5)
     assert overlap['status'] == 'SCENE_UPDATE_REQUIRED'
     disjoint = current.query_state(np.array([[.14,0.,0.,.02]]), np.eye(4), .5)
     assert disjoint['components']['scene_update/background/robot'] == 0
-    assert disjoint['components']['unknown/forbidden/robot'] > 0
+    assert (disjoint['components']['unknown/forbidden/robot'] > 0) == (action != 'allow_attempt')
+    assert disjoint['passed'] == (action == 'allow_attempt')
+# END outside-map attempts never waive a missing query against represented solids.
 
 
 # BEGIN finite-field boundary regression: missing samples are not zero distances.

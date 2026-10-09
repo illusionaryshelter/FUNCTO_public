@@ -29,6 +29,9 @@ def problem():
 
 class Scene:
     gripper = None
+    # BEGIN every production scene declares its unknown-space policy explicitly.
+    unknown_policy = {"outside_regions": "forbid", "conditional_regions": []}
+    # END orchestration fixtures do not rely on a missing-policy fallback.
     def clone_for_rollout(self):
         return deepcopy(self)
     def describe(self):
@@ -85,7 +88,8 @@ class Native:
                   # BEGIN recovery evidence is distinct from the hard scene aggregate.
                   "collision_residuals": {"rollout:scene_collision": float(self.collision and not accepted)},
                   "scene_update_residuals": {"rollout:scene_update": 0.},
-                  "coverage_residuals": {"rollout:unknown_forbidden": 0.}}
+                  "coverage_residuals": {"rollout:unknown_forbidden": 0.},
+                  "conditional_unknown_residuals": {"rollout:conditional_unknown": 0.}}
                   # END the deterministic fixture supplies explicit query classification.
         return SimpleNamespace(solution=torch.zeros((1, 1, 8, 1))), self.curve, report
     def ompl_seed(self, seed, trajectory):
@@ -109,11 +113,11 @@ class Native:
         self.calls.append("close")
 
 
-def run(native, *, budget=None, **kwargs):
+def run(native, *, budget=None, scene=None, **kwargs):
     backend = MotionBackend({}, robot_validator=object(), budget=budget)
     with patch("manipulation.planning._CuroboPlanner", return_value=native), \
          patch("manipulation.execution_binding.bind_candidate", return_value={"candidate_id": "accepted"}):
-        result = backend.plan(problem(), Scene(), **kwargs)
+        result = backend.plan(problem(), Scene() if scene is None else scene, **kwargs)
     return result, backend
 
 
@@ -236,6 +240,9 @@ def test_forbidden_coverage_uses_one_bounded_search_without_collision_witnesses(
         candidate, curve, report = select(accepted)
         report["residuals"] = {"interpolated:process_scene": 0. if accepted else 4000.}
         report["coverage_residuals"] = {"interpolated:unknown_forbidden": 0. if accepted else 4000.}
+        # BEGIN final policy classification consumes named same-candidate evidence.
+        report["scene_components"] = {} if accepted else {"unknown/forbidden/robot": {"maximum": 4000.}}
+        # END the aggregate coverage channel alone is insufficient for a policy verdict.
         return candidate, curve, report
     native.select_candidate = covered
     native.promote_collision_witnesses = lambda _: pytest.fail("Coverage is not a collision witness")
@@ -253,6 +260,7 @@ def test_forbidden_coverage_uses_one_bounded_search_without_collision_witnesses(
         if not search_succeeds:
             assert result.execution_binding is None and "export" not in native.calls
             assert result.diagnostics["coverage_residuals"]["interpolated:unknown_forbidden"] > 0
+            assert result.diagnostics["failure"] == "unknown_space_forbidden"
     finally:
         backend.close()
 
@@ -297,6 +305,116 @@ def test_other_scene_terms_cannot_masquerade_as_forbidden_coverage(component):
     finally:
         backend.close()
 # END search eligibility leaves the original hard result and request ledger intact.
+
+
+# BEGIN observation policy returns evidence without buying more unproductive motion work.
+@pytest.mark.parametrize("stage", ["initial", "reference", "main"])
+def test_require_observation_stops_at_first_confirmed_coverage_only_candidate(stage):
+    native = Native([False, False])
+    world = Scene()
+    world.unknown_policy = {"outside_regions": "require_observation", "conditional_regions": []}
+    unknown = {"unknown/forbidden/robot": {"maximum": .04},
+               "conditional/unknown/payload": {"maximum": .02}}
+    if stage == "initial":
+        native.initial_state_diagnostics = lambda: {
+            "passed": False, "residuals": {"scene": .04, "position": 0., "velocity": 0.},
+            "scene_components": unknown}
+    else:
+        select = native.select_candidate
+        selections = []
+
+        def confirmed(accepted):
+            candidate, curve, report = select(accepted)
+            selections.append(1)
+            if stage == "reference" or len(selections) == 2:
+                report.update(residuals={"interpolated:process_scene": .04},
+                    coverage_residuals={"interpolated:unknown_forbidden": .04},
+                    scene_components=unknown, native_confirmation={"status": "completed"})
+            return candidate, curve, report
+
+        native.select_candidate = confirmed
+    native.promote_collision_witnesses = lambda _: pytest.fail("Observation need is not a collision witness")
+    result, backend = run(native, scene=world)
+    try:
+        assert not result.success and result.trajectory is None and result.execution_binding is None
+        assert result.diagnostics["failure"] == "needs_observation"
+        assert native.calls == ([] if stage == "initial" else
+            ["seed", "reference"] if stage == "reference" else ["seed", "reference", "solve"])
+        assert result.request_ledger["consumed_planning"]["search_queries"] == 0
+        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == int(stage == "main")
+    finally:
+        backend.close()
+
+
+def test_require_observation_does_not_relabel_a_mixed_collision_failure():
+    native = Native([False, False], ompl=False)
+    world = Scene()
+    world.unknown_policy = {"outside_regions": "require_observation", "conditional_regions": []}
+    select = native.select_candidate
+
+    def mixed(accepted):
+        candidate, curve, report = select(accepted)
+        report.update(residuals={"interpolated:process_scene": .05},
+            coverage_residuals={"interpolated:unknown_forbidden": .04},
+            collision_residuals={"interpolated:scene_collision": .01},
+            scene_components={"unknown/forbidden/robot": {"maximum": .04},
+                              "collision/robot/background": {"maximum": .01}})
+        return candidate, curve, report
+
+    native.select_candidate = mixed
+    result, backend = run(native, scene=world)
+    try:
+        assert not result.success and result.execution_binding is None
+        assert result.diagnostics["failure"] == "no_feasible_solution_found"
+        assert native.calls == ["seed", "reference", "solve", "ompl"]
+    finally:
+        backend.close()
+# END external observation acquisition is not simulated or promised by this status.
+
+
+# BEGIN a policy verdict needs complete named evidence, never residual subtraction.
+@pytest.mark.parametrize("mode,expected", [
+    ("forbid", "unknown_space_forbidden"),
+    ("require_observation", "needs_observation"),
+    ("allow_attempt", None),
+])
+def test_unknown_policy_failure_only_classifies_finite_coverage_evidence(mode, expected):
+    from manipulation.planning import _unknown_policy_failure
+
+    report = {"residuals": {"interpolated:process_scene": .04, "interpolated:skill_process": 0.},
+        "scene_components": {"unknown/forbidden/robot": {"maximum": .04},
+                             "conditional/unknown/payload": {"maximum": .02}}}
+    assert _unknown_policy_failure(report, {"outside_regions": mode, "conditional_regions": []}) == expected
+
+
+@pytest.mark.parametrize("fault", ["missing_components", "aggregate_only", "collision", "support", "contact",
+    "unsupported", "task", "joint", "nan_component", "inf_component", "nan_metric", "inf_metric",
+    "negative_inf_component", "zero_unknown"])
+def test_unknown_policy_failure_cannot_erase_other_failures_or_missing_evidence(fault):
+    from manipulation.planning import _unknown_policy_failure
+
+    report = {"residuals": {"interpolated:process_scene": .04},
+        "scene_components": {"unknown/forbidden/robot": {"maximum": .04}}}
+    other_components = {"collision": "collision/robot/background", "support": "scene_update/robot/background",
+        "contact": "contact/required/rule", "unsupported": "unsupported/contact/robot/owner"}
+    if fault == "missing_components":
+        report.pop("scene_components")
+    elif fault == "aggregate_only":
+        report["scene_components"] = {}
+    elif fault in other_components:
+        # A tiny independent violation remains decisive beside a larger coverage gap.
+        report["scene_components"][other_components[fault]] = {"maximum": 1e-30}
+    elif fault in {"task", "joint"}:
+        report["residuals"]["interpolated:" + ("skill_process" if fault == "task" else "cspace")] = 1e-30
+    elif fault in {"nan_metric", "inf_metric"}:
+        report["residuals"]["interpolated:process_scene"] = float("nan" if fault == "nan_metric" else "inf")
+    else:
+        report["scene_components"]["unknown/forbidden/robot"]["maximum"] = {
+            "nan_component": float("nan"), "inf_component": float("inf"),
+            "negative_inf_component": float("-inf"), "zero_unknown": 0.}[fault]
+    assert _unknown_policy_failure(report,
+        {"outside_regions": "require_observation", "conditional_regions": []}) is None
+# END a selected candidate's policy reason is not a proof about every possible route.
 
 
 # BEGIN collision witnesses consume the original unique second solve.
@@ -350,7 +468,7 @@ def test_sampled_collision_evidence_selects_search_or_missing_time_recovery(alre
         collision = torch.tensor(values, dtype=torch.float32).reshape(1, -1, 1)
         # BEGIN every native fixture supplies the complete current evidence layout.
         return SimpleNamespace(debug=torch.cat((collision, torch.zeros_like(collision),
-                                                torch.zeros_like(collision)), dim=-1),
+                                                torch.zeros_like(collision), torch.zeros_like(collision)), dim=-1),
             costs_and_constraints=SimpleNamespace(constraints=SimpleNamespace(
                 names=["process_scene"], values=[collision])))
         # END coverage never acquires a collision sample through fixture defaults.

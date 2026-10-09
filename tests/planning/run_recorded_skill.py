@@ -843,8 +843,10 @@ if __name__ == "__main__":
     parser.add_argument("--self-filter-padding-scale", type=float, required=True)
     parser.add_argument("--self-filter-source", required=True)
     # END no rendered depth-equality threshold is accepted.
+    # BEGIN the caller declares the unknown-space action explicitly.
     parser.add_argument("--unknown-policy", type=Path, required=True,
-                        help="Explicit bounded conditional unknown regions; outside them unknown is forbidden")
+                        help="Explicit unknown policy: conditional_regions and outside_regions (forbid, require_observation, allow_attempt)")
+    # END observation evidence is separate from the policy that uses it.
     parser.add_argument("--joint-reference", type=Path,
                         help="Optional named recorded q/dq curve; guidance has no execution authorization")
     parser.add_argument("--knots", type=int, default=16)

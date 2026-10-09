@@ -25,7 +25,8 @@ def selection_fixture(*, scene=(.01, .02), task=(0., 0.), flags=(False, False)):
                           for values in (scene, task)]
     # BEGIN same-query diagnostics separate collision, missing field and forbidden coverage.
     result.metrics.debug = torch.cat((constraints.values[0],
-        torch.zeros_like(constraints.values[0]), torch.zeros_like(constraints.values[0])), dim=-1)
+        torch.zeros_like(constraints.values[0]), torch.zeros_like(constraints.values[0]),
+        torch.zeros_like(constraints.values[0])), dim=-1)
     # END the aggregate alone cannot classify any of these independent requirements.
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.scene = object()
@@ -49,6 +50,7 @@ def completed(*, accepted, residual, points):
         "scene_update_residuals": {"interpolated:scene_update": 0.},
         # BEGIN complete-candidate fixtures carry the independent coverage evidence.
         "coverage_residuals": {"interpolated:unknown_forbidden": 0.},
+        "conditional_unknown_residuals": {"interpolated:conditional_unknown": 0.},
         # END proxy confirmation does not imply observed or permitted spatial coverage.
         "native_metrics": {"success": accepted},
         "seed_provenance": "supplied_joint_curve",
@@ -124,8 +126,8 @@ def test_confirmation_success_flag_cannot_override_invalid_residual(value):
 # BEGIN collision diagnostics cannot change the existing severity ordering.
 def test_scene_support_severity_selects_same_seed_despite_opposite_collision_order():
     planner, result = selection_fixture(scene=(.02, .01), task=(.1, .1))
-    # BEGIN retain all three diagnostic channels while testing collision ordering alone.
-    result.metrics.debug = torch.stack((torch.zeros((9, 3)), torch.ones((9, 3))))
+    # BEGIN retain all four diagnostic channels while testing collision ordering alone.
+    result.metrics.debug = torch.stack((torch.zeros((9, 4)), torch.ones((9, 4))))
     # END channel count matches the production metric contract.
     result.metrics.debug[0, :, 1] = 100000.
     _, curve, report = planner.select_candidate(result)
@@ -199,3 +201,34 @@ def test_proxy_clear_keeps_confirmed_coverage_evidence_for_bounded_search():
     planner._candidate_metrics.assert_called_once_with(curve, planner.scene)
     planner.export.assert_not_called()
 # END search evidence never weakens the original hard acceptance or grants an execution binding.
+
+
+# BEGIN every accepted route retains unknown evidence from the selected queries.
+def test_native_feasible_seed_keeps_conditional_unknown_without_confirmation():
+    planner, result = selection_fixture(scene=(.01, 0.), flags=(False, True))
+    result.metrics.debug[0, :, 3] = .08
+    result.metrics.debug[1, :, 3] = .04
+    _, curve, report = planner.select_candidate(result)
+    assert report["accepted"] and curve.seed_index == 1
+    assert report["conditional_unknown_residuals"]["rollout:conditional_unknown"] == pytest.approx(.04)
+    assert report["candidates"][0]["conditional_unknown_residuals"]["rollout:conditional_unknown"] == pytest.approx(.08)
+    planner._candidate_metrics.assert_not_called()
+
+
+def test_native_confirmation_replaces_unknown_evidence_with_same_candidate_queries():
+    planner, result = selection_fixture(scene=(.01, 0.), task=(0., .1))
+    result.metrics.debug[0, :, 3] = .08
+
+    def confirm(curve, scene):
+        report, parameters, points = completed(accepted=True, residual=0., points=4)
+        report["conditional_unknown_residuals"] = {"interpolated:conditional_unknown": .04}
+        return report, parameters, points
+
+    planner._candidate_metrics.side_effect = confirm
+    _, curve, report = planner.select_candidate(result)
+    assert report["accepted"] and curve.seed_index == 0
+    assert report["conditional_unknown_residuals"] == {"interpolated:conditional_unknown": .04}
+    assert report["candidates"][0]["conditional_unknown_residuals"] == report["conditional_unknown_residuals"]
+    assert report["sphere_proposal_metrics"]["rollout"]["conditional_unknown_residuals"]["conditional_unknown"] == pytest.approx(.08)
+    assert report["confirmation_validation_points"] == 4
+# END confirmation may clear a proxy collision while preserving conditional uncertainty.
