@@ -1028,10 +1028,13 @@ queries retain their existing sphere costs and do not run CPU confirmation.
 - `FrozenPrimitives` retains calibrated complete boxes/cylinders and their
   declared transforms. Robot sphere layout and self-collision exclusions are
   bound to the same registered robot model.
-- Unknown-space policy explicitly lists finite regions where conditional
-  attempts are allowed. Known occupied geometry remains active there, and an
-  out-of-field query requires a scene update. Conditional permission never
-  creates observed-free evidence or a successful task fact.
+<!-- BEGIN unknown decisions are explicit and independent of camera coverage. -->
+- Unknown-space policy declares an action outside any finite conditional regions:
+  `forbid`, `require_observation`, or `allow_attempt`. Known occupied geometry
+  remains active under every action. Missing numerical support for an existing
+  geometry query still requires a scene update. Policy permission never creates
+  observed-free evidence or a successful task fact.
+<!-- END finite region permissions are optional policy data, not mandatory coverage. -->
 - `ContactRule` names a finite material feature, target owner, target region,
   interval, normal and gap allowance. Contact subtraction preserves every
   represented cell outside that finite permission, including cells covered by
