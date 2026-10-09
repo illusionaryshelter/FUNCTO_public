@@ -47,9 +47,11 @@ def holding_fixture(*, release=True):
                     quaternion_tool_owner=relation["quaternion_tool_owner"].tolist())
     result.execution_binding["problem"]["conditions"] = [condition]
     result.execution_binding["scene"].update(owners=[{"owner_id": "target", "attachments": [relation]}],
-        contacts=[{"rule_id": "current_holding", "actor": "robot", "target_owner": "target",
-                   "interval": [0., upper], "sphere_indices": [0], "material_id": "held_pad",
-                   "source": "Explicit finite material permission fixture"}])
+        # BEGIN Holding fixtures bind current materials, without a grasp target.
+        holding_contacts=[{"rule_id": "current_holding", "condition_id": "observed_holding", "target_owner": "target",
+                   "interval": [0., upper], "sphere_indices": [0], "material_id": "held_pad", "native_geometry": "pad",
+                   "source": "Explicit current held material fixture"}])
+        # END known material identity never fabricates task evidence.
     refresh_validation(result)
     return simulation, curve, targets, result, ExecutionLimits.from_mapping(_limit_values(simulation, curve))
 
@@ -125,7 +127,7 @@ def test_holding_activation_rejects_stale_false_unknown_or_unsourced_evidence_be
     assert simulation.arm_goals == [] and simulation.sim_time == 1.3
 
 
-@pytest.mark.parametrize("change", ["owner", "interval", "transform", "duplicate", "actor"])
+@pytest.mark.parametrize("change", ["owner", "interval", "transform", "duplicate", "condition"])
 def test_holding_activation_cannot_relabel_a_different_condition_or_attachment(change):
     fixture = holding_fixture()
     binding = fixture[3].execution_binding
@@ -141,7 +143,7 @@ def test_holding_activation_cannot_relabel_a_different_condition_or_attachment(c
     elif change == "duplicate":
         binding["problem"]["conditions"].append(deepcopy(condition))
     else:
-        binding["scene"]["contacts"][0]["actor"] = "another_owner"
+        binding["scene"]["holding_contacts"][0]["condition_id"] = "another_condition"
     refresh_validation(fixture[3])
     with pytest.raises(ValueError):
         execute_fixture(fixture)
@@ -185,8 +187,8 @@ def test_arrival_close_and_later_open_keep_independent_holding_evidence():
     condition["source"]["robot_feedback_id"] = _initial_feedback(simulation)["feedback_id"]
     result.execution_binding["problem"]["conditions"].append(condition)
     result.execution_binding["scene"]["owners"] = holding_result.execution_binding["scene"]["owners"]
-    result.execution_binding["scene"]["contacts"].extend(
-        holding_result.execution_binding["scene"]["contacts"])
+    result.execution_binding["scene"]["holding_contacts"] = deepcopy(
+        holding_result.execution_binding["scene"]["holding_contacts"])
     refresh_validation(result)
     report, _ = execute_fixture(fixture, result_only_goal_ids=[["pose_events", 0]])
     assert report["status"] == "curve_finished"

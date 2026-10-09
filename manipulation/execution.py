@@ -1081,7 +1081,15 @@ class TrajectoryExecutor:
         holding_bindings = {}
         start_progress = float(trajectory.sample(0.)[3])
         # BEGIN retain the accepted attachment and finite-rule identity contract.
-        rules_by_id = {row["rule_id"]: row for row in contact_rows}
+        # BEGIN current Holding has its own material binding, separate from grasp goals.
+        holding_rows = binding['scene'].get('holding_contacts', ())
+        from .holding_contact import HoldingContact
+        for row in holding_rows:
+            HoldingContact(**row)
+        rules_by_id = {row['rule_id']: row for row in holding_rows}
+        if len(rules_by_id) != len(holding_rows):
+            raise ValueError('Holding contacts require unique current material identities')
+        # END no former grasp patch, gap or normal is re-evaluated at this boundary.
         for condition in binding["problem"].get("conditions", ()):
             if condition.get("kind") != "observed_attachment" or "contact_rule_ids" not in condition:
                 continue
@@ -1090,7 +1098,7 @@ class TrajectoryExecutor:
             if (not isinstance(rule_ids, (list, tuple)) or not rule_ids
                     or any(not isinstance(identity, str) or not identity for identity in rule_ids)
                     or len(set(rule_ids)) != len(rule_ids)):
-                raise ValueError("Current Holding needs unique explicit finite contact-rule IDs")
+                raise ValueError("Current Holding needs unique explicit material contact IDs")
             owners = [row for row in binding["scene"].get("owners", ())
                       if row.get("owner_id") == condition["carrier_id"]]
             relations = [row for owner in owners for row in owner.get("attachments", ())
@@ -1133,16 +1141,19 @@ class TrajectoryExecutor:
             # END original entrance provenance and geometry checks remain mandatory.
             for identity in rule_ids:
                 rule = rules_by_id.get(identity)
-                if (rule is None or rule["actor"] != "robot" or rule["target_owner"] != condition["carrier_id"]
+                if (rule is None or rule['condition_id'] != condition_id or rule["target_owner"] != condition["carrier_id"]
                         or tuple(rule["interval"]) != tuple(relation["interval"])
                         or identity in finite_permission_ids):
-                    raise ValueError("Holding must identify unique finite robot material rules on the same attached owner and interval")
+                    raise ValueError("Holding must identify current robot materials on the same attached owner and interval")
                 finite_permission_ids.add(identity)
                 holding_bindings[identity] = {"rule_id": identity, "condition_id": condition_id,
                     "target_owner": condition["carrier_id"], "interval": [lower, upper],
                     "release_condition_id": relation["release_condition_id"],
                     "feedback_id": initial_feedback["feedback_id"], "timestamp_s": float(timestamp),
                     "source": deepcopy(evidence)}
+        # BEGIN unused or relabelled current materials cannot silently acquire Holding.
+        if set(holding_bindings) != set(rules_by_id):
+            raise ValueError('Each Holding material must belong to the accepted current attachment')
         # END no previous execution latch, proximity or command proves Holding.
         # END false or stale evidence cannot be repaired by a software pair rule.
         # BEGIN reject declarations that do not name a validated active attachment.

@@ -1387,7 +1387,7 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
                          max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES,
                          native_geometry_materials=None,robot_owner_permissions=(),
                          fine_regions=None,robot_collision_bodies=(),complete_owners=(),
-                         initial_support_relations=()):
+                         initial_support_relations=(), holding_contacts=()):
     """Build observed fields and admit current complete owners exactly once.
 
     Every view requires ``self_filter`` with uint8 ``labels``, independent
@@ -1568,6 +1568,9 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         contacts=contacts,gripper=gripper,has_gripper=has_gripper,
         # BEGIN bind explicit current support alongside ordinary material rules.
         initial_support_relations=tuple(initial_support_relations),
+        # BEGIN current held materials are passed without former grasp constraints.
+        holding_contacts=tuple(holding_contacts),
+        # END the final scene validates the native robot identities and attachment.
         # END the online scene owns support geometry and acceptance semantics.
         robot_collision_bodies=robot_collision_bodies,native_geometry_materials=native_geometry_materials)
     # BEGIN expose the actual immutable background inputs without changing bindings.

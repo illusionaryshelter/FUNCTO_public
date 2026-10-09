@@ -27,6 +27,9 @@ from .planning_scene import (Attachment, CollisionOwner, ContactRule, CoverageFi
     PlanningScene, PrismaticGripper, _tensor, _local_spheres, _world_spheres,
     _self_pair_sum, _self_pair_chunk_size, grasp_contact_rule_ids, validate_grasp_contact_arrival)
 from .resource_admission import DEFAULT_MAX_HOST_RSS_BYTES, require_host_memory
+# BEGIN current Holding contacts are separate from finite task contact goals.
+from .holding_contact import HoldingContact, validate_holding_materials, validate_holding_conditions
+# END the previous grasp's patch/gap/normal never defines an attachment entry.
 
 
 def _plain(value):
@@ -305,7 +308,7 @@ class OnlinePlanningScene:
                  has_gripper=True, unknown_policy, robot_collision_bodies=(),
                  native_geometry_materials=None, robot_owner_permissions=(),
                  numerical_position_tolerance_m=1e-6, numerical_rotation_tolerance_rad=1e-6,
-                 initial_support_relations=()):
+                 initial_support_relations=(), holding_contacts=()):
         if robot_owner_permissions:
             raise ValueError('Whole robot/owner permissions are not admitted online')
         if not isinstance(background, FrozenESDF) or any(not isinstance(o.query, FrozenESDF) for o in owners):
@@ -319,6 +322,13 @@ class OnlinePlanningScene:
         self.gripper, self.has_gripper = gripper, has_gripper
         self.robot_collision_bodies = tuple(deepcopy(robot_collision_bodies))
         self.native_geometry_materials = deepcopy(native_geometry_materials or {})
+        # BEGIN only explicitly registered Holding materials form internal pairs.
+        self.holding_contacts = tuple(holding_contacts)
+        validate_holding_materials(self.holding_contacts, self.owners, self.robot_sphere_materials,
+                                  self.native_geometry_materials, self.robot_collision_bodies)
+        if {row.rule_id for row in self.holding_contacts} & {row.rule_id for row in self.contacts}:
+            raise ValueError('Holding contacts and task contacts require distinct identities')
+        # END the same materials still collide with every other owner/background.
         # BEGIN observation uncertainty is governed by one explicit scene policy.
         if (set(unknown_policy) != {'conditional_regions', 'outside_regions'}
                 or unknown_policy['outside_regions'] not in ('forbid', 'require_observation', 'allow_attempt')):
@@ -600,26 +610,9 @@ class OnlinePlanningScene:
         if len(conditions)!=sum('condition_id' in row for row in problem.conditions):
             raise ValueError('Online condition identities must be unique')
         condition_ids=set(conditions)
-        by_rule={rule.rule_id:rule for rule in self.contacts}
-        for row in problem.conditions:
-            if row.get('kind')!='observed_attachment':
-                continue
-            ids=row.get('contact_rule_ids')
-            carrier=row.get('carrier_id')
-            relations=[a for owner in self.owners if owner.owner_id==carrier for a in owner.attachments if a.condition_id==row.get('condition_id')]
-            if not isinstance(ids,(list,tuple)) or not ids or len(set(ids))!=len(ids) or len(relations)!=1:
-                raise ValueError('Observed Holding requires explicit finite material IDs and its one current attachment')
-            relation=relations[0]
-            for identity in ids:
-                rule=by_rule.get(identity)
-                if rule is None or rule.actor!='robot' or rule.target_owner!=carrier or rule.interval!=relation.interval:
-                    raise ValueError('Holding material rules must match the exact actor, carrier and attachment interval')
-            observed=np.asarray(row.get('T_carrier_eef'),dtype=float)
-            actual=np.eye(4)
-            actual[:3,3]=relation.position_tool_owner
-            actual[:3,:3]=Rotation.from_quat(np.asarray(relation.quaternion_tool_owner)[[1,2,3,0]]).as_matrix()
-            if observed.shape!=(4,4) or not np.isfinite(observed).all() or not np.allclose(np.linalg.inv(observed),actual,atol=1e-7,rtol=0):
-                raise ValueError('Holding finite permission requires the same current measured attachment transform')
+        # BEGIN Holding binds its current internal materials, not a prior task goal.
+        validate_holding_conditions(self.holding_contacts, self.owners, problem.conditions)
+        # END the attachment's transform below is current geometry consistency only.
         for owner in self.owners:
             for relation in owner.attachments:
                 if relation.condition_id not in condition_ids or (relation.release_condition_id is not None and relation.release_condition_id not in condition_ids):
@@ -1001,6 +994,30 @@ class OnlinePlanningScene:
                     if rule.required:
                         costs[f'contact/required/{rule.rule_id}'] = owner.query.required_contact(rule,policy)*policy['active']
                 values, gap = owner.query.contact_query(local,policies) if policies else (owner.query(local),torch.zeros_like(local[...,3]))
+                # BEGIN a held assembly's established material contacts are internal.
+                # This mask depends on Holding and release, never on an old grasp
+                # target pose or a newly fitted permissive patch. Other materials
+                # on the same hand still query this complete owner normally.
+                if actor == 'robot':
+                    for contact in self.holding_contacts:
+                        if contact.target_owner != owner.owner_id:
+                            continue
+                        relation, = [row for row in owner.attachments
+                                     if row.condition_id == contact.condition_id]
+                        active = ((permission_progress >= contact.interval[0]) &
+                                  (permission_progress <= contact.interval[1]))
+                        if relation.release_condition_id is not None:
+                            active = active & (permission_progress < contact.interval[1])
+                        if active_contact_rule_ids is not None:
+                            active = active & ((condition_evidence or {}).get(contact.condition_id) is True)
+                        selected = torch.zeros(values.shape[-1], dtype=torch.bool, device=values.device)
+                        selected[list(contact.sphere_indices)] = True
+                        internal = active[...,None] & selected
+                        values = torch.where(internal, 0., values)
+                        gap = torch.where(internal, 0., gap)
+                        if collision_paths_out is not None:
+                            pair_modes.append(internal)
+                # END external contacts, unknown space and model-support checks remain.
                 # BEGIN existing support removes only its entrance source subset.
                 # The whole-owner relative height remains a separate constraint;
                 # native confirmation cannot erase it with a collision verdict.
@@ -1150,7 +1167,11 @@ class OnlinePlanningScene:
             # Before robot index selection, one pair's source masks and its
             # selected copies may coexist. Reserve this serial temporary once.
             pair_rule_count = max([0, *(sum(rule.actor == actor and rule.target_owner == target.owner_id
-                for rule in self.contacts) for actor in actor_sizes for target in self.owners)])
+                for rule in self.contacts)+sum(actor == 'robot' and rule.target_owner == target.owner_id
+                for rule in self.holding_contacts) for actor in actor_sizes for target in self.owners)])
+            # BEGIN exact internal material masks participate in path storage admission.
+            mode_bytes += actor_sizes['robot']*len(self.holding_contacts)
+            # END there is no uncounted per-state permission buffer.
             mode_bytes += max(actor_sizes.values())*(2+pair_rule_count)
             path_allocation = collision_path_workspace_allocation(batch, horizon,
                 geometry_spheres=coverage_spheres, path_spheres=path_spheres,
@@ -1275,6 +1296,9 @@ class OnlinePlanningScene:
             'robot_self_collision_pairs':deepcopy(self.robot_self_collision_pairs),
             'robot_self_collision_padding':list(self.robot_self_collision_padding),
             'background':self.background.record(),'owners':owners,'contacts':_plain([asdict(r) for r in self.contacts]),
+            # BEGIN serialize Holding geometry identity separately from task contact laws.
+            'holding_contacts':_plain([asdict(row) for row in self.holding_contacts]),
+            # END restored requests cannot recover this relation from old grasp patches.
             # BEGIN an empty inventory means no current support capability.
             'initial_support_relations':[row.record() for row in self.initial_support_relations],
             'initial_support_preparation':{name:model.record() for name,model in self._initial_support_models.items()},
@@ -1322,6 +1346,7 @@ class OnlinePlanningScene:
         scene=cls(background=FrozenESDF.from_record(row['background']),owners=owners,coverage=coverage,
             reference_frame=row['reference_frame'],robot_sphere_materials=row['robot_sphere_materials'],
             robot_geometry_source=row['robot_geometry_source'],contacts=[ContactRule(**r) for r in row['contacts']],
+            holding_contacts=[HoldingContact(**value) for value in row['holding_contacts']],
             gripper=hand,has_gripper=row['has_gripper'],unknown_policy=row['unknown_policy'],
             robot_collision_bodies=row['robot_collision_bodies'],native_geometry_materials=row['native_geometry_materials'],
             numerical_position_tolerance_m=row['numerical_position_tolerance_m'],
