@@ -2234,6 +2234,12 @@ def _project_allowed_boundary(value, residual, process_count, tolerance, lower, 
     Independent rows are refreshed between bounded native Newton iterations,
     so a satisfied band contributes no fictitious equality. Time is fixed.
     Physical bounds and the original goal thresholds are checked unchanged.
+
+    A reflected native step is tested for strict membership when the native
+    step remains outside. For an active smooth inequality, J*d=-g makes the
+    linearized value at x+2*d equal -g rather than zero. This can cross a
+    floating-point boundary plateau without changing any physical tolerance.
+    Reflection is only a proposal: every original relation must accept it.
     """
     from ompl import base as ob
     from scipy.linalg import qr
@@ -2241,12 +2247,26 @@ def _project_allowed_boundary(value, residual, process_count, tolerance, lower, 
     dimension = len(point)
     if not np.isfinite(point).all() or np.any(point < lower) or np.any(point > upper):
         return None
+
+    # BEGIN a single complete membership predicate owns every projected trial.
+    def allowed(candidate):
+        if (time.monotonic() >= deadline or not np.isfinite(candidate).all()
+                or np.any(candidate < lower) or np.any(candidate > upper)):
+            return False
+        error = np.asarray(residual(candidate, False), float)
+        return (time.monotonic() < deadline and np.isfinite(error).all()
+                and np.all(np.abs(error[:process_count]) <= tolerance)
+                and np.all(error[process_count:] <= 0))
+
+    # END the original callback still bills all trial queries to the request.
     for _ in range(24):
         if time.monotonic() >= deadline:
             return None
         error = np.asarray(residual(point, False), float)
-        if not np.isfinite(error).all():
+        # BEGIN an expensive initial query cannot publish an overdue point.
+        if time.monotonic() >= deadline or not np.isfinite(error).all():
             return None
+        # END subsequent native/reflected trials use the same post-query check.
         if (np.all(np.abs(error[:process_count]) <= tolerance)
                 and np.all(error[process_count:] <= 0)):
             return point if np.all(point >= lower) and np.all(point <= upper) else None
@@ -2282,13 +2302,22 @@ def _project_allowed_boundary(value, residual, process_count, tolerance, lower, 
                 output[:] = result
 
         constraint = AllowedBoundary()
-        # A one-iteration return of False means not yet converged, not an
-        # invalid numeric update. The next iteration verifies every original
-        # residual and selects its current independent rows again.
+        # BEGIN verify the final native update and its reflected interior trial.
+        # A one-iteration False is not convergence evidence either way. Keep
+        # the native point for continuation unless a complete allowed-set
+        # query certifies its reflection. No residual is rounded down to zero.
+        previous = point.copy()
         constraint.project(point)
         point[-1] = value[-1]
         if not np.isfinite(point).all() or np.any(point < lower) or np.any(point > upper):
             return None
+        if allowed(point):
+            return point
+        reflected = previous+2.*(point-previous)
+        reflected[-1] = value[-1]
+        if allowed(reflected):
+            return reflected
+        # END at most 24 native updates; a failed reflection is never retained.
     return None
 # END boundary witnesses remain revisable proposals within the same goal.
 

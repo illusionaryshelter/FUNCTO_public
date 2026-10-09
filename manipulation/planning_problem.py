@@ -1636,7 +1636,13 @@ class PlanningProblem:
             elif collection == "coordinate_events":
                 pieces.append(goal.evaluate(position, quaternion, progress)[..., None])
             else:
-                pieces.append(goal.evaluate(position, quaternion, self.numerical)[..., None])
+                # BEGIN retain independent support directions for Newton projection.
+                # All four nonnegative rows vanish exactly when their former
+                # sum vanished. Summation hid independent active gradients;
+                # it was a reporting scalar, not a system of goal equations.
+                pieces.extend(torch.relu(value)[..., None] for value in
+                    goal.raw_inequalities(position, quaternion, self.numerical).values())
+                # END original thresholds, free tangent and yaw remain unchanged.
         return torch.cat(pieces, -1) if pieces else position[..., :0]
 
     def project_residual(self, position, quaternion, progress, phase_index=None,

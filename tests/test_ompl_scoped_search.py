@@ -435,6 +435,162 @@ class ScopedOmplSearchTest(unittest.TestCase):
         np.testing.assert_allclose(boundary[:2], [.2, .15], atol=1e-12)
         self.assertLessEqual(abs(boundary[2]), .001)
 
+    # BEGIN boundary initialization preserves the independent support requirements.
+    def test_support_goal_rows_preserve_the_allowed_set_and_independent_gradients(self):
+        support = self.support_goal()
+        request = problem(supports=(support,))
+        position = torch.tensor([[.2, .1, .0005], [1.2, .3, .3],
+                                 [.2, .1, -.01], [.2, .1, .0005]],
+                                dtype=torch.float64, requires_grad=True)
+        quaternion = torch.tensor([[1., 0., 0., 0.]]*4, dtype=torch.float64)
+        quaternion[3] = torch.tensor([np.cos(.05), np.sin(.05), 0., 0.])
+        progress = torch.full((4,), support.progress, dtype=torch.float64)
+        residual = request.goal_residual(position, quaternion, progress,
+                                        goal_ids=(("supports", 0),))
+        self.assertEqual(residual.shape, (4, 4))
+        # The existing physical metric still determines membership: splitting
+        # its nonnegative components may not change any original threshold.
+        original = support.evaluate(position, quaternion, request.numerical)
+        torch.testing.assert_close(residual.sum(-1), original, rtol=0., atol=0.)
+        torch.testing.assert_close((residual <= 0).all(-1),
+                                   torch.tensor([True, False, False, False]))
+        self.assertGreater(float(residual[2, 1].detach()), 0.)  # body below plane
+        self.assertGreater(float(residual[3, 3].detach()), 0.)  # tilted material face
+        # Height and finite-region excess are simultaneously active but have
+        # independent correction directions; an aggregate scalar loses these.
+        gap_gradient = torch.autograd.grad(residual[1, 0], position, retain_graph=True)[0][1]
+        footprint_gradient = torch.autograd.grad(residual[1, 2], position)[0][1]
+        torch.testing.assert_close(gap_gradient, torch.tensor([0., 0., 1.], dtype=torch.float64))
+        torch.testing.assert_close(footprint_gradient, torch.tensor([1., 0., 0.], dtype=torch.float64))
+
+    def test_native_support_projection_corrects_two_components_without_moving_free_tangent(self):
+        request = problem()
+        # Binary-exact synthetic boundaries isolate the vector projection from
+        # rounding at a physical robot's float32 FK boundary. Other tests retain
+        # the ordinary tight support gap and the complete search/scene checks.
+        support = replace(self.support_goal(), gap_tolerance=.125,
+                          margin=request.numerical.position_m)
+        request.supports = (support,)
+
+        def residual(values, derivative):
+            point = torch.tensor(values, dtype=torch.float64, requires_grad=derivative)
+            def evaluate(value):
+                return request.goal_residual(value[:3][None], value.new_tensor([[1., 0., 0., 0.]]),
+                    value[-1:], goal_ids=(("supports", 0),)).reshape(-1)
+            answer = torch.autograd.functional.jacobian(evaluate, point) if derivative else evaluate(point)
+            return answer.detach().numpy()
+
+        proposal = np.array([1.25, .375, .5, .5])
+        projected = _project_allowed_boundary(proposal, residual, 0, 1e-6,
+            np.array([-2., -2., -2., 0.]), np.array([2., 2., 2., 1.]), deadline=time.monotonic()+1.)
+        self.assertIsNotNone(projected)
+        self.assertTrue(np.all(residual(projected, False) <= 0))
+        self.assertEqual(projected[1], proposal[1])
+        self.assertEqual(projected[-1], proposal[-1])
+        self.assertLessEqual(projected[0], 1.)
+        self.assertLessEqual(projected[2], support.gap_tolerance)
+    # END actual native projection keeps all unchanged hard membership checks.
+
+    # BEGIN the last admitted Newton update must receive its own strict verdict.
+    def test_boundary_projection_checks_update_24_without_performing_update_25(self):
+        from ompl import base as ob
+
+        for terminal in (0., .25, float("nan"), "expired"):
+            with self.subTest(terminal=terminal):
+                calls, clock = [], [0.]
+
+                class ControlledConstraint:
+                    # A controlled update isolates iteration accounting from
+                    # Newton convergence speed; native projection is exercised
+                    # by the neighboring independent-support regression.
+                    def __init__(self, dimension, rank, tolerance):
+                        pass
+
+                    def setMaxIterations(self, count):
+                        self.asserted_count = count
+
+                    def project(self, point):
+                        self_test.assertEqual(self.asserted_count, 1)
+                        calls.append(point.copy())
+                        # Reflection of these deliberately incomplete updates
+                        # remains infeasible until the final controlled step.
+                        point[0] -= .25
+                        if len(calls) == 24:
+                            point[0] = 0. if terminal == "expired" else terminal
+                            if terminal == "expired":
+                                clock[0] = 2.
+                        return False
+
+                def residual(point, derivative):
+                    return np.array([[1., 0.]]) if derivative else np.array([abs(point[0])])
+
+                self_test = self
+                with patch.object(ob, "Constraint", ControlledConstraint), \
+                     patch("manipulation.planning.time.monotonic", side_effect=lambda: clock[0]):
+                    projected = _project_allowed_boundary(np.array([24., .5]), residual, 0, 1e-6,
+                        np.array([-30., 0.]), np.array([30., 1.]), deadline=1.)
+                self.assertEqual(len(calls), 24)
+                if terminal == 0.:
+                    np.testing.assert_array_equal(projected, [0., .5])
+                else:
+                    self.assertIsNone(projected)
+    # END no positive, nonfinite or expired final state gains acceptance.
+
+    # BEGIN reflected native steps address quantized evaluations without relaxed gates.
+    def test_native_projection_crosses_float32_plateau_with_original_threshold(self):
+        # The strict bound lies just below a representable float32 value.
+        # Repeated tiny Newton corrections remain in the same quantization bin
+        # for all 24 updates; reflection of the initial step enters the set.
+        spacing = 1.-float(np.nextafter(np.float32(1.), np.float32(0.)))
+        bound = 1.-spacing/128.
+        queried = []
+
+        def residual(point, derivative):
+            violation = max(float(np.float32(point[0]))-bound, 0.)
+            if derivative:
+                return np.array([[1. if violation > 0 else 0., 0., 0.]])
+            queried.append(violation)
+            return np.array([violation])
+
+        proposal = np.array([1.+2.**-19, .375, .5])
+        projected = _project_allowed_boundary(proposal, residual, 0, 1e-6,
+            np.array([0., -2., 0.]), np.array([2., 2., 1.]), deadline=time.monotonic()+1.)
+        self.assertIsNotNone(projected)
+        self.assertTrue(any(0. < value < spacing for value in queried))
+        self.assertLessEqual(float(np.float32(projected[0])), bound)
+        np.testing.assert_array_equal(projected[1:], proposal[1:])
+
+    def test_reflection_cannot_accept_a_new_violation_of_another_goal(self):
+        spacing = 1.-float(np.nextafter(np.float32(1.), np.float32(0.)))
+        upper = 1.-spacing/128.
+        # The narrow allowed interval contains the preceding float32 value,
+        # but the reflected initial update jumps below its lower boundary.
+        lower = 1.-2*spacing
+        saw_reflected_violation = []
+
+        def residual(point, derivative):
+            value = float(np.float32(point[0]))
+            high, low = max(value-upper, 0.), max(lower-value, 0.)
+            if derivative:
+                return np.array([[1. if high > 0 else 0., 0., 0.],
+                                 [-1. if low > 0 else 0., 0., 0.]])
+            if high == 0. and low > 0.:
+                saw_reflected_violation.append(point.copy())
+            return np.array([high, low])
+
+        proposal = np.array([1.+2.**-19, .375, .5])
+        projected = _project_allowed_boundary(proposal, residual, 0, 1e-6,
+            np.array([0., -2., 0.]), np.array([2., 2., 1.]), deadline=time.monotonic()+1.)
+        self.assertTrue(saw_reflected_violation)
+        for point in saw_reflected_violation:
+            np.testing.assert_array_equal(point[1:], proposal[1:])
+        # A subsequent valid candidate is allowed, but a reflected overshoot
+        # must never be accepted on the basis of the original active row alone.
+        if projected is not None:
+            self.assertTrue(np.all(residual(projected, False) <= 0))
+            np.testing.assert_array_equal(projected[1:], proposal[1:])
+    # END every component, free coordinate and fixed time survives the extra trial.
+
     # BEGIN a small boundary budget must reach an independently sampled posture.
     def test_two_attempts_sample_a_new_posture_without_bypassing_projection_or_collision(self):
         for block_random in (False, True):
