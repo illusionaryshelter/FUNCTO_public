@@ -960,8 +960,11 @@ finally:
 <!-- BEGIN bounded recovery and shared signed functional-event constraints. -->
 Each request evaluates its initialization candidate first. A feasible candidate
 proceeds directly to delivery. Otherwise it receives one primary solve and at
-most one recovery: add the selected curve's missing collision check times, or
-use bounded OMPL initialization when no new collision times are available.
+most one recovery: add collision check times for dense positive intervals without
+an existing positive sample in the same collision channel, or use bounded OMPL
+initialization when no such interval needs refinement. An already detected
+collision does not claim that additional sampling will remove it. Mixed intervals
+retain refinement for independently missed collisions.
 Functional-multiplier updates use the existing inner iteration blocks; they do
 not create another trajectory solve. Pose, coordinate and finite-support events
 share this signed-inequality mechanism. Support keeps separate gap, body-height,
@@ -976,6 +979,15 @@ say so rather than claiming the original curve was preserved.
 
 The native optimizer, native success metrics and OMPL checks
 use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
+
+<!-- BEGIN non-gradient search preserves the existing source-geometry authority. -->
+OMPL state validity, entrance checks and final candidate checks can confirm
+registered world-collision sphere proposals against the same frozen source
+solids. Each search branch owns its confirmation context and release history;
+unknown-space, contact and task requirements remain independent hard checks.
+Native self-collision states use the bound finger clock. Differentiable optimizer
+queries retain their existing sphere costs and do not run CPU confirmation.
+<!-- END source confirmation does not supply observations or contact permissions. -->
 
 - `FrozenESDF` retains the current Mapper field and source-validity bits.
   <!-- BEGIN direct complete-owner admission without discarded observation maps. -->

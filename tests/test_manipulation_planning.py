@@ -820,7 +820,7 @@ class NativeCubicClockTests(unittest.TestCase):
         planner._orientation_vjp = SimpleNamespace(apply=lambda q, quaternion, jacobian: quaternion)
         planner._native_layout = SimpleNamespace(apply=lambda value: value)
         scene = SimpleNamespace(project_residual=lambda progress, q, names: q[..., :0],
-                                required_progress_anchors=())
+                                required_progress_anchors=(), native_world_collision_components=frozenset())
         scene.clone_for_rollout = lambda: scene
         planner.scene = scene
         # BEGIN this clock-only search fixture declares no functional IK proposals.
@@ -1622,6 +1622,11 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             # END the following optimizer query preserves the original gradient test.
             result = SimpleNamespace(batch_size=1, num_seeds=1, interpolated_last_tstep=torch.tensor([[21]]),
                 interpolated_trajectory=SimpleNamespace(position=q[:1]),
+                # BEGIN the earlier zero-cost ordinary query has its own layout.
+                metrics=SimpleNamespace(debug=torch.zeros(1, 2, 2),
+                    costs_and_constraints=SimpleNamespace(constraints=
+                    SimpleNamespace(names=coarse.names, values=[value[:1] for value in coarse.values]))),
+                # END dense-only geometry cannot fabricate ordinary evidence.
                 interpolated_metrics=SimpleNamespace(debug=collision_evidence,
                     costs_and_constraints=SimpleNamespace(constraints=
                     SimpleNamespace(names=dense.names, values=[value[:1] for value in dense.values]))))
@@ -2640,6 +2645,13 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         result.interpolated_metrics.debug = torch.cat((constraints.values[0],
             torch.tensor([100., 200.])[:, None, None].expand(2, 9, 1)), dim=-1)
         # END explicit same-seed evidence must survive the native top-k gather.
+        # BEGIN the ordinary collision evidence has its independent three-point grid.
+        ordinary = result.metrics.costs_and_constraints.constraints
+        ordinary.names = ["process_scene"]
+        ordinary.values = [torch.zeros(2, 3, 1)]
+        result.metrics.debug = torch.zeros(2, 3, 2)
+        result.metrics.debug[0, 1, 0] = 10.
+        # END another seed's ordinary collision cannot suppress this seed's peak.
         selected = _trajectory_candidate(result, 1)
         copied = selected.interpolated_metrics.costs_and_constraints.constraints.values[0]
         self.assertEqual(tuple(copied.shape), (1, 9, 1))

@@ -3227,7 +3227,7 @@ def _collision_metric_residuals(metrics, seed_index=None):
 
 # BEGIN promote existing selected dense collisions without another geometry pass.
 def _dense_collision_witnesses(result, *, regular_horizon, anchor_parameters, capacity):
-    """Pick one uncovered peak per positive interval and collision component.
+    """Pick peaks only in intervals without an existing collision witness.
 
     Native dense metrics store real samples in a valid prefix. The final
     allocated column also contains folded anchor penalties, so it is never
@@ -3262,19 +3262,55 @@ def _dense_collision_witnesses(result, *, regular_horizon, anchor_parameters, ca
     if "process_scene" in constraints.names:
         measurements.insert(0, ("scene_collision", _scene_metric_channel(result.interpolated_metrics, 0)))
     # END anchor-only self constraints still route recovery but supply no time.
+    # BEGIN ordinary positive evidence distinguishes missed from known collisions.
+    # Both grids belong to this selected seed. A sampled positive interval
+    # already represented by the same ordinary collision channel provides
+    # no evidence that its collision was missed by the ordinary queries.
+    ordinary = getattr(result, "metrics", None)
+    if ordinary is None:
+        raise ValueError("Collision recovery requires selected ordinary metric evidence")
+    ordinary_constraints = ordinary.costs_and_constraints.constraints
+    ordinary_measurements = dict(zip(ordinary_constraints.names, ordinary_constraints.values))
+    if "process_scene" in ordinary_measurements:
+        ordinary_measurements["scene_collision"] = _scene_metric_channel(ordinary, 0)
+    positive_parameters = {}
+    for name, _ in measurements:
+        tensor = ordinary_measurements.get(name)
+        if tensor is None or tensor.shape[:2] != (1, regular_horizon):
+            raise ValueError("Selected ordinary collision metrics changed their sample layout")
+        values = tensor[0].detach().reshape(regular_horizon, -1).amax(-1).cpu().numpy()
+        positive = np.isfinite(values) & (values > 0)
+        # The final ordinary column can fold exact-anchor penalties. Its
+        # positive aggregate cannot identify a collision at physical u == 1.
+        positive[-1] = False
+        positive_parameters[name] = regular_u[positive]
+    # END missing channels are integration errors, never zero-value fallbacks.
     component_peaks = []
     for name, tensor in measurements:
         if tensor.shape[:2] != (1, horizon):
             raise ValueError("Selected native collision metrics changed their sample layout")
         values = tensor[0, :count].detach().reshape(count, -1).amax(-1).cpu().numpy()
         positive = np.isfinite(values) & (values > 0)
+        # BEGIN folded evidence cannot extend a physical positive interval.
+        # When padding exists, the valid prefix's last sample is still real;
+        # only the allocated final column can contain the folded anchor sum.
+        if count == horizon:
+            positive[-1] = False
+        # END remove that column before segmentation, not just peak selection.
         edges = np.flatnonzero(np.diff(np.r_[False, positive, False]))
         peaks = []
         for left, right in edges.reshape(-1, 2):
+            # BEGIN classify each interval independently, including mixed cases.
+            # Real parameter comparisons also support non-nested grids. No
+            # epsilon merges distinct times, and an unrelated earlier positive
+            # cannot suppress a later interval or another collision channel.
+            detected = positive_parameters[name]
+            if np.any((detected >= dense_u[left]) & (detected <= dense_u[right-1])):
+                continue
+            # END this scheduling decision changes no hard acceptance evidence.
             candidates = np.flatnonzero(eligible[left:right])+left
             if len(candidates):
-                # Exclude already evaluated times before maximizing: a large
-                # regular-grid peak must not hide an adjacent off-grid failure.
+                # Existing exact queries cannot be added a second time.
                 index = candidates[np.argmax(values[candidates])]
                 peaks.append((float(values[index]), float(dense_u[index])))
         component_peaks.append([u for _, u in sorted(peaks, key=lambda row: (-row[0], row[1]))])
@@ -4102,6 +4138,9 @@ class _CuroboPlanner:
         A selected prefix supplies its actual release FK to its child scene.
         """
         torch = self.torch
+        # BEGIN discrete search uses the existing registered-solid acceptance.
+        from .online_native_confirmation import OnlineCollisionConfirmation
+        # END differentiable projection equations retain their original costs.
         # BEGIN every required connection consumes the same request deadline.
         search_started = time.monotonic()
         deadline = search_started+self.budget.search_seconds
@@ -4151,12 +4190,18 @@ class _CuroboPlanner:
         def goals_at_time(parameter):
             return tuple(goals_by_time.get(float(parameter), ()))
 
-        def state_parts(values):
+        # BEGIN native confirmation consumes the same search/request deadlines.
+        def check_search():
             self.check_request()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("The shared OMPL time budget was exhausted")
+        # END source geometry queries cannot replenish the search allowance.
+
+        def state_parts(values):
+            check_search()
             count = int(np.prod(values.shape[:-1]))
-            if (time.monotonic() >= deadline
-                    or work["state_queries"]+count > min(self.budget.max_validation_points, _NATIVE_STAGE_POINT_LIMIT)):
-                raise TimeoutError("The shared OMPL time/state-query budget was exhausted")
+            if work["state_queries"]+count > min(self.budget.max_validation_points, _NATIVE_STAGE_POINT_LIMIT):
+                raise TimeoutError("The shared OMPL state-query budget was exhausted")
             work["state_queries"] += count
             joints = values[..., :-1].contiguous()
             zero = torch.zeros_like(joints)
@@ -4205,7 +4250,7 @@ class _CuroboPlanner:
                 return result
             return evaluate
 
-        def valid(values, scene):
+        def valid(values, scene, confirmation):
             with torch.no_grad():
                 values_t = self.device_cfg.to_device(values[None, None])
                 js, state, p, r, progress = state_parts(values_t)
@@ -4216,11 +4261,21 @@ class _CuroboPlanner:
                     "scene": _scene_boundary_evaluate(scene, self.problem, self.progress_map,
                         self.problem.transform_robot_spheres(state.robot_spheres), p, r, progress,
                         js.position, self.joint_names, trajectory_time=clock_time,
-                        normalized_time=values_t[..., -1])}
+                        normalized_time=values_t[..., -1], native_confirmation=confirmation)}
+                # BEGIN self collision consumes the original timed hand model.
+                # Scene evaluation above transforms its own unpadded spheres;
+                # only the native manager receives this separate timed state.
+                native_state = _timed_native_state(
+                    self._RobotState(joint_state=js, cuda_robot_model_state=state),
+                    self.problem, scene, self.joint_names, clock_time,
+                    sphere_padding=_native_collision_padding(self._verification_native))
+                # END never apply native self padding to the scene spheres.
                 # BEGIN OMPL shares the native registered-sphere self-collision contract.
-                native = self._verification_native.compute_costs(
-                    self._RobotState(joint_state=js, cuda_robot_model_state=state))
+                native = self._verification_native.compute_costs(native_state)
                 terms.update({f"native:{name}": value for name, value in zip(native.names, native.values)})
+                # BEGIN expensive confirmation/setup cannot escape the deadline.
+                check_search()
+                # END all task, unknown, contact and unresolved terms remain hard.
                 # BEGIN all existing tensors precede one exact boolean host read.
                 accepted = _ompl_terms_accepted(terms)
                 # END rejected-state diagnostics retain their original order/values.
@@ -4264,9 +4319,18 @@ class _CuroboPlanner:
 
         # An explicit stack permits bounded backtracking without recursive
         # depth or copying all prior path samples into every branch frame.
+        # BEGIN each backtracking frame owns one reusable scene-bound confirmer.
+        # An explicit empty inventory means the scene has no native-confirmable
+        # components; it never grants permission to skip its ordinary checks.
+        def search_frame(begin, branch_scene, parameter):
+            confirmation = (OnlineCollisionConfirmation(self.robot_validator, branch_scene,
+                check_request=check_search) if branch_scene.native_world_collision_components else None)
+            return {"start": begin, "scene": branch_scene, "confirmation": confirmation,
+                    "proposals": proposals(begin, parameter), "attempts": 0, "path": None}
+
         scene = self.scene.clone_for_rollout()
-        frames = [{"start": start, "scene": scene, "proposals": proposals(start, boundaries[1]),
-                   "attempts": 0, "path": None}]
+        frames = [search_frame(start, scene, boundaries[1])]
+        # END siblings cannot inherit a failed branch's release geometry or engine.
         try:
             while frames and time.monotonic() < deadline:
                 stage = len(frames)-1
@@ -4315,7 +4379,7 @@ class _CuroboPlanner:
                 def stage_valid(value):
                     key = np.asarray(value, dtype=float).tobytes()
                     if key not in validity_cache:
-                        validity_cache[key] = valid(value, scene)
+                        validity_cache[key] = valid(value, scene, frame["confirmation"])
                     return validity_cache[key]
                 path, stage_report = _ompl_stage(begin, goal, np.r_[lower, lo], np.r_[upper, hi],
                     stage_valid, constraint, tolerance=tolerance,
@@ -4345,8 +4409,7 @@ class _CuroboPlanner:
                     with torch.no_grad():
                         _, _, p, r, progress = state_parts(self.device_cfg.to_device(goal[None, None]))
                         child_scene = scene.with_release_history(p, r, progress)
-                    frames.append({"start": goal, "scene": child_scene,
-                        "proposals": proposals(goal, boundaries[stage+2]), "attempts": 0, "path": None})
+                    frames.append(search_frame(goal, child_scene, boundaries[stage+2]))
                     continue
                 whole_path = np.concatenate((frames[0]["path"], *(item["path"][1:] for item in frames[1:])))
                 # Local angular goal screening cannot prove winding. Recheck

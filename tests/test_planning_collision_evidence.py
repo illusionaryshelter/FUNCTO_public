@@ -164,7 +164,9 @@ def collision_result():
 
 def test_support_only_dense_peaks_do_not_become_collision_witnesses():
     result = _trajectory_candidate(collision_result(), 0)
-    report = _dense_collision_witnesses(result, regular_horizon=3, anchor_parameters=(), capacity=4)
+    # BEGIN recovery reads this fixture's actual nine ordinary metric samples.
+    report = _dense_collision_witnesses(result, regular_horizon=9, anchor_parameters=(), capacity=4)
+    # END the dense and ordinary layouts are validated independently.
     assert report["parameters"] == [] and report["peak_count"] == 0
     assert _collision_metric_residuals(result.interpolated_metrics) == {
         "scene_collision": 0., "self_collision": 0., "anchor_self_collision": 0.}
@@ -184,7 +186,9 @@ def test_regular_only_collisions_remain_routable_and_do_not_invent_dense_times(c
     assert all(value == 0 for value in native["interpolated"]["collision_residuals"].values())
     selected = _trajectory_candidate(result, 1)
     assert _collision_metric_residuals(selected.metrics)[component] == 2.
-    assert _dense_collision_witnesses(selected, regular_horizon=3, anchor_parameters=(), capacity=4)["parameters"] == []
+    # BEGIN retain the ordinary positive's actual nine-point time layout.
+    assert _dense_collision_witnesses(selected, regular_horizon=9, anchor_parameters=(), capacity=4)["parameters"] == []
+    # END ordinary-only evidence cannot invent a missing dense interval.
     assert all(value == 0 for value in _collision_metric_residuals(_trajectory_candidate(result, 0).metrics).values())
 
 
@@ -225,8 +229,10 @@ def test_scene_update_evidence_preserves_both_grid_and_seed_identity():
     assert _scene_update_metric_residuals(selected.metrics) == {"scene_update": 200000.}
     assert _scene_update_metric_residuals(selected.interpolated_metrics) == {"scene_update": 300000.}
     assert _scene_update_metric_residuals(result.metrics, 0) == {"scene_update": 100000.}
-    assert _dense_collision_witnesses(selected, regular_horizon=3,
+    # BEGIN use the selected native fixture's complete ordinary metric horizon.
+    assert _dense_collision_witnesses(selected, regular_horizon=9,
         anchor_parameters=(), capacity=4)["parameters"] == []
+    # END independent support evidence never becomes collision evidence.
 
 
 @pytest.mark.parametrize("shape", [(2, 9, 1), (2, 9, 3), (1, 9, 2)])

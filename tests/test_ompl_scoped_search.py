@@ -36,6 +36,16 @@ class CartesianSphereScene(OnlinePlanningScene):
     robot pairs enter the same components() query as world geometry; there
     is no independent source-self or source-world acceptance hook.
     """
+    # BEGIN exact synthetic spheres have no separate registered native solids.
+    @property
+    def native_world_collision_components(self):
+        return frozenset()
+
+    @property
+    def native_world_collision_pairs(self):
+        return {}
+    # END explicit fixture contract, not a production-schema fallback.
+
     def __init__(self, source, fixed_self_sphere=None):
         if source.gripper is not None or source.contacts or any(type(query) is not SphereQuery
                 for query in (source.background,*(owner.query for owner in source.owners))):
@@ -137,6 +147,133 @@ class ScopedOmplSearchTest(unittest.TestCase):
     def search(self, planner, curve):
         return planner.ompl_seed(torch.zeros((1, 1, 8, len(planner.joint_names)), dtype=torch.float64),
                                 SimpleNamespace(duration=1., _curve=curve))
+
+    # BEGIN discrete search must honor the existing native-confirmation boundary.
+    def _confirmation_probe(self, planner, curve, *, clear=True, clock=None):
+        """Script narrow-phase answers, retaining real OMPL and scene aggregation.
+
+        Native geometry correctness has independent confirmation tests. Here
+        the synthetic sphere is explicitly a broad-phase proposal, and the
+        controlled callback isolates caller lifetime, scope and deadline use.
+        """
+        instances = []
+        planner.robot_validator = object()
+
+        class Confirmation:
+            def __init__(self, validator, branch_scene, check_request):
+                self.scene, self.check_request, self.calls = branch_scene, check_request, 0
+                self.release_keys = tuple(branch_scene._fixed_release_poses)
+                instances.append(self)
+
+            def __call__(self, costs, evidence):
+                self.calls += 1
+                if clock is not None:
+                    clock[0] = planner.budget.search_seconds+1.
+                self.check_request()
+                result = dict(costs)
+                if clear:
+                    for key in evidence['targets']:
+                        result[key] = torch.zeros_like(costs[key])
+                return result
+
+        inventory = property(lambda scene: frozenset({'collision/robot/background'}))
+        with patch.object(CartesianSphereScene, 'native_world_collision_components', inventory), \
+                patch('manipulation.online_native_confirmation.OnlineCollisionConfirmation', Confirmation):
+            seed, report = self.search(planner, curve)
+        return seed, report, instances
+
+    def test_search_confirms_proxy_collision_but_retains_positive_native_verdict(self):
+        world = scene(background=SphereQuery(('background',), center=(0., 0., 0.), radius=.03))
+        for clear in (True, False):
+            with self.subTest(clear=clear):
+                planner = cartesian_planner(problem(), world)
+                seed, report, instances = self._confirmation_probe(
+                    planner, lambda t: np.array([.2*t, 0., 0.]), clear=clear)
+                self.assertEqual(len(instances), 1)
+                self.assertGreater(instances[0].calls, 0)
+                self.assertIsNot(instances[0].scene, planner.scene)
+                if clear:
+                    self.assertIsNotNone(seed, report)
+                    self.assertGreater(instances[0].calls, 1)
+                else:
+                    self.assertIsNone(seed)
+                    self.assertEqual(report['branches'][0]['boundary'], 'start')
+                    self.assertEqual(report['branches'][0]['failure'], 'boundary_candidate_not_feasible')
+
+    def test_native_clear_does_not_clear_unknown_contact_or_task_terms(self):
+        original_components = OnlinePlanningScene.components
+        for family in ('unknown', 'contact', 'task'):
+            with self.subTest(family=family):
+                request = problem(pose_events=(pose_goal(0., [.5, 0., 0.]),)) if family == 'task' else problem()
+                planner = cartesian_planner(request)
+                if family == 'unknown':
+                    planner.scene._unknown = lambda spheres, uncertain=None: (
+                        spheres.new_ones(spheres.shape[:2]), spheres.new_zeros(spheres.shape[:2]))
+
+                def components(bound_scene, *args, **kwargs):
+                    values = original_components(bound_scene, *args, **kwargs)
+                    if family == 'contact':
+                        # A positive contact requirement remains in the same
+                        # scene sum after the confirmer clears only its keys.
+                        values['contact/gap/test_required_material'] = torch.ones_like(next(iter(values.values())))
+                    return values
+
+                with patch.object(OnlinePlanningScene, 'components', components):
+                    seed, report, _ = self._confirmation_probe(planner, lambda t: np.array([.2*t, 0., 0.]))
+                self.assertIsNone(seed)
+                self.assertEqual(report['branches'][0]['boundary'], 'start')
+
+    def test_confirmation_callback_consumes_original_search_deadline(self):
+        planner, clock = cartesian_planner(problem()), [0.]
+        with patch('manipulation.planning.time', SimpleNamespace(monotonic=lambda: clock[0])):
+            seed, report, instances = self._confirmation_probe(
+                planner, lambda t: np.array([.2*t, 0., 0.]), clock=clock)
+        self.assertIsNone(seed)
+        self.assertEqual(report['branches'][0]['failure'], 'whole_search_time_budget_exhausted')
+        self.assertGreaterEqual(report['elapsed_seconds'], planner.budget.search_seconds)
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].calls, 1)
+
+    def test_confirmation_instances_follow_selected_release_prefix(self):
+        attachment = Attachment((0., .4), [.3, 0., 0.], [1., 0., 0., 0.],
+                                'current holding', 'actual release event')
+        owner = CollisionOwner('payload', SphereQuery(('payload',), center=(0., 0., 0.), radius=.02),
+            pose_path((.3, 0., 0.)), 'observed payload', True,
+            local_spheres=[[0., 0., 0., .02]], attachments=(attachment,))
+        planner = cartesian_planner(problem(pose_events=(pose_goal(.4, [.4, 0., 0.]),)), scene((owner,)))
+        seed, report, instances = self._confirmation_probe(
+            planner, lambda t: np.array([min(t, .8-t), 0., 0.]))
+        self.assertIsNotNone(seed, report)
+        self.assertEqual(len(instances), 2)
+        self.assertFalse(instances[0].release_keys)
+        self.assertTrue(instances[1].release_keys)
+        self.assertIsNot(instances[0].scene, instances[1].scene)
+        self.assertFalse(planner.scene._fixed_release_poses)
+        self.assertTrue(all(value.calls > 1 for value in instances))
+
+    def test_native_cost_receives_timed_state_without_replacing_scene_fk(self):
+        planner = cartesian_planner(problem())
+        times, received = [], []
+
+        def timed(state, request, branch_scene, names, trajectory_time, *, sphere_padding):
+            self.assertIs(request, planner.problem)
+            self.assertEqual(tuple(names), planner.joint_names)
+            times.extend(trajectory_time.reshape(-1).tolist())
+            return SimpleNamespace(timed_marker=True)
+
+        def costs(state):
+            received.append(state.timed_marker)
+            return SimpleNamespace(names=(), values=())
+
+        planner._verification_native.compute_costs = costs
+        with patch('manipulation.planning._timed_native_state', side_effect=timed):
+            seed, report = self.search(planner, lambda t: np.array([.2*t, 0., 0.]))
+        self.assertIsNotNone(seed, report)
+        self.assertTrue(received)
+        self.assertEqual(len(received), len(times))
+        self.assertIn(0., times)
+        self.assertIn(1., times)
+    # END geometry semantics remain owned by the existing production confirmer.
 
     # BEGIN required connections share one deadline without an artificial chart quota.
     def _search_with_charged_clock(self, cost_per_query, *, attempts=1):

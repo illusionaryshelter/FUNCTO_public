@@ -265,6 +265,53 @@ def test_new_dense_witnesses_continue_current_controls_without_search_or_third_s
 # END second-solve rejection remains a finite planning failure.
 
 
+# BEGIN real sampled-collision classification selects the existing recovery branch.
+@pytest.mark.parametrize("already_detected", [True, False])
+def test_sampled_collision_evidence_selects_search_or_missing_time_recovery(already_detected):
+    from manipulation.planning import _dense_collision_witnesses
+
+    native = Native([False, False, True], collision=True)
+    original_select = native.select_candidate
+
+    def metric(values):
+        collision = torch.tensor(values, dtype=torch.float32).reshape(1, -1, 1)
+        return SimpleNamespace(debug=torch.cat((collision, torch.zeros_like(collision)), dim=-1),
+            costs_and_constraints=SimpleNamespace(constraints=SimpleNamespace(
+                names=["process_scene"], values=[collision])))
+
+    def select(accepted):
+        candidate, curve, report = original_select(accepted)
+        # Constant positive evidence has no sampling gap. The alternative
+        # has one collision strictly between ordinary zero-valued samples.
+        candidate.batch_size = candidate.num_seeds = 1
+        candidate.metrics = metric([1., 1., 1.] if already_detected else [0., 0., 0.])
+        candidate.interpolated_metrics = metric([1.]*9 if already_detected else
+                                                [0., 1., 0., 0., 0., 0., 0., 0., 0.])
+        candidate.interpolated_last_tstep = torch.tensor([[9]])
+        candidate.interpolated_trajectory = SimpleNamespace(position=torch.zeros(1, 9, 1))
+        if not accepted:
+            report["collision_residuals"] = {
+                "rollout:scene_collision": float(already_detected), "interpolated:scene_collision": 1.}
+        return candidate, curve, report
+
+    def promote(candidate):
+        report = _dense_collision_witnesses(candidate, regular_horizon=3,
+            anchor_parameters=(0., 1.), capacity=4)
+        return {**report, "changed": bool(report["parameters"])}
+
+    native.select_candidate, native.promote_collision_witnesses = select, promote
+    result, backend = run(native)
+    try:
+        assert result.success
+        assert result.diagnostics["recovery"] == ("ompl" if already_detected else "collision_witnesses")
+        assert native.calls.count("ompl") == int(already_detected)
+        assert native.calls.count("solve") == 2
+        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 2
+    finally:
+        backend.close()
+# END evidence classification neither adds a solve nor bypasses final acceptance.
+
+
 def test_failed_ompl_cannot_spend_an_al_or_second_solve_slot():
     native = Native([False, False], collision=True, ompl=False)
     result, backend = run(native)

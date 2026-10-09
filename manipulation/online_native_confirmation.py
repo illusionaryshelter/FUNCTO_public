@@ -13,7 +13,7 @@ mode. This is a discrete observed-geometry check,
 not a continuous-trajectory, sensor-error or unobserved-space certificate.
 """
 
-# BEGIN bounded native confirmation owned only by planning acceptance.
+# BEGIN bounded native confirmation owned by non-gradient planning decisions.
 from itertools import product
 import math
 from time import perf_counter
@@ -410,8 +410,11 @@ class OnlineCollisionConfirmation:
     """Confirm only positive sphere candidates; preserve every other constraint.
 
     The differentiable rollout never calls this object. Final candidate
-    metrics use this adapter and the frozen observed cells. Physical execution
-    never constructs this planning-only adapter. Native FK is performed only for states needing confirmation.
+    metrics and discrete OMPL state validity use it with the same frozen
+    observed geometry. A search branch owns its scene-bound instance and
+    supplies the original search/request deadline callback. Physical execution
+    never constructs this planning-only adapter. Native FK is performed only
+    for states needing confirmation.
     """
 
     def __init__(self, validator, scene, check_request=None):

@@ -1377,6 +1377,18 @@ class PlanningScene:
     A robot without a gripper must explicitly pass ``has_gripper=False``.
     """
 
+    # BEGIN all scene implementations declare native-confirmation capability.
+    @property
+    def native_world_collision_components(self):
+        """Analytic scene geometry is already its complete collision criterion.
+
+        This scene has no separately registered source-solid confirmation.
+        OnlinePlanningScene overrides the contract with its explicit actor
+        inventory; an empty set never bypasses the analytic scene's checks.
+        """
+        return frozenset()
+    # END capability is explicit, never inferred from absent legacy fields.
+
     def __init__(self, *, background, owners, coverage, reference_frame,
                  robot_sphere_materials, robot_geometry_source,
                  contacts=(), gripper=None, has_gripper=True, robot_coverage=None,
