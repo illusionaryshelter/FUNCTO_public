@@ -75,19 +75,52 @@ def _views(views, reference_frame, depth_range_m):
     return result
 
 
+# BEGIN exact rectangle queries preserve the complete projected voxel footprint.
+def _rectangle_min_depth(depth, lower_xy, upper_xy):
+    """Query inclusive, in-image integer rectangles with bounded image storage.
+
+    For width w take a=2**floor(log2(w)), and similarly b for height h.
+    The four a-by-b blocks anchored inside the rectangle at its corners cover
+    it exactly: a<=w<2a and b<=h<2b. Their minimum is the rectangle minimum,
+    without enlarging its footprint. SciPy owns the sliding-minimum operation;
+    only one block-size image is retained at a time, with no persistent cache.
+    The caller has already checked the full continuous projection's bounds.
+    """
+    result = np.empty(len(lower_xy), dtype=depth.dtype)
+    sizes = upper_xy-lower_xy+1
+    blocks = 2**np.floor(np.log2(sizes)).astype(np.int64)
+    for block in np.unique(blocks, axis=0):
+        selected = (blocks == block).all(1)
+        width, height = map(int, block)
+        # Negative half-size origin makes each value the minimum of the block
+        # starting at that pixel and extending right/down, including size one.
+        filtered = minimum_filter(depth, size=(height, width),
+            origin=(-(height//2), -(width//2)), mode="constant", cval=0.)
+        left, top = lower_xy[selected].T
+        right, bottom = (upper_xy[selected]-block+1).T
+        result[selected] = np.minimum(
+            np.minimum(filtered[top, left], filtered[top, right]),
+            np.minimum(filtered[bottom, left], filtered[bottom, right]))
+        del filtered
+    return result
+# END downward block sizes accelerate an exact query; they never expand rays.
+
+
 # BEGIN callers explicitly select independent free-ray evidence.
 def _known_free_voxels(views, *, ray_depths, origin, shape, voxel_size, depth_error_m):
     """Prove each complete voxel free under the supplied pixel-ray model.
 
-    A ball of half the voxel diagonal encloses the cell. Its full projected
-    footprint must lie on valid admitted rays, and its furthest camera-z point
-    must precede the smallest ray depth in that footprint by depth_error_m.
+    With all camera-z coordinates positive, the perspective projection of a
+    convex combination of corners is a positive depth-weighted combination
+    of their projections. Thus the eight projected corners bound the entire
+    cube, including after camera rotation. The rectangle's minimum ray depth
+    must exceed the furthest corner's camera-z by depth_error_m.
     ``ray_depths`` is mandatory: online callers pass self-filtered free-ray
     evidence; historical audit callers explicitly select original depth.
-    Projection radii are rounded upward to powers of two to bound cached
-    SciPy minimum filters. No interpolated invalid depth or hidden back volume
-    can become observed. Subpixel geometry below the sensor's pixel model is
-    not certified; calibration/depth error belongs to the supplied evidence.
+    Pixel quantization matches observations.backproject: continuous coordinates
+    must lie in [0,W-1]x[0,H-1], then use nearest-pixel np.rint. Missing rays
+    remain zero. Subpixel material and unprovided calibration error are not
+    certified by this discrete sensor model.
     """
     shape = tuple(shape)
     origin = np.asarray(origin, float)
@@ -103,48 +136,62 @@ def _known_free_voxels(views, *, ray_depths, origin, shape, voxel_size, depth_er
         if (rays.shape != view["depth"].shape or not np.isfinite(rays).all()
                 or np.any(rays < 0) or np.any(rays > view["depth"])):
             raise ValueError("Free-ray depths must be aligned finite nonnegative measured prefixes")
-    known = np.zeros(math.prod(shape), bool)
-    radius = math.sqrt(3)*voxel_size/2
+    # BEGIN complete-cube projection replaces the expanded sphere/square test.
+    cells, chunk = math.prod(shape), 65_536
+    # Four float64 image buffers bound the streaming separable SciPy filter;
+    # 256 float64 values per cell cover simultaneous eight-corner geometry,
+    # propagated roundoff, projections, selections and rectangle queries.
+    # Admission precedes the online Mapper's separate allocation boundary.
+    largest_image = max(np.asarray(row['depth']).size for row in views.values())
+    require_host_memory(int(cells+32*largest_image+2048*min(cells, chunk)),
+        pending_existing_bytes=0, max_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES)
+    known = np.zeros(cells, bool)
+    offsets = (np.indices((2, 2, 2)).reshape(3, -1).T-.5)*voxel_size
+    eps = np.finfo(np.float64).eps
     for name, view in views.items():
-        depth, matrix, transform = np.asarray(ray_depths[name]), view["K"], view["T_output_camera"]
+        depth = np.asarray(ray_depths[name], dtype=np.float64)
+        matrix, transform = np.asarray(view['K'], float), np.asarray(view['T_output_camera'], float)
         height, width = depth.shape
-        filtered = {}
-        for start in range(0, len(known), 65_536):
-            indices = np.arange(start, min(start+65_536, len(known)))
+        rotation, translation = transform[:3, :3], transform[:3, 3]
+        for start in range(0, len(known), chunk):
+            indices = np.arange(start, min(start+chunk, len(known)))
             indices = indices[~known[indices]]
             if not len(indices):
                 continue
             z, y, x = np.unravel_index(indices, shape)
-            points = origin+voxel_size*np.column_stack((x, y, z))
-            camera = (points-transform[:3, 3]) @ transform[:3, :3]
-            front = camera[:, 2] > radius+1e-9
-            indices, camera = indices[front], camera[front]
+            lattice = np.column_stack((x, y, z))
+            corners = origin+voxel_size*lattice[:, None, :]+offsets
+            camera = (corners-translation)@rotation
+            # Fixed operation-scale float64 protection includes cancellation
+            # while forming world coordinates, not just the small final point.
+            # This is numerical protection, not a configurable sensor margin.
+            scale = np.abs(origin)+voxel_size*(np.abs(lattice)+.5)+np.abs(translation)
+            camera_error = 64*eps*(scale@np.abs(rotation))
+            front = ((camera[..., 2]-camera_error[:, None, 2] > 1e-9).all(1)
+                     & np.isfinite(camera).all((1, 2)) & np.isfinite(camera_error).all(1))
+            indices, camera, camera_error = indices[front], camera[front], camera_error[front]
             if not len(indices):
                 continue
-            uv = (camera @ matrix.T)[:, :2]/camera[:, 2, None]
-            # |u(X+d)-u(X)| <= r*(f+|u-cx|)/(z-r). Taking the
-            # larger image-axis radius gives a conservative square footprint.
-            projected = radius*(np.diag(matrix)[:2]+np.abs(uv-matrix[:2, 2]))/(camera[:, 2, None]-radius)
-            bound = np.ceil(projected.max(1)+1.)
-            usable = (np.isfinite(uv).all(1) & np.isfinite(bound) & (bound <= min(height, width))
-                      & (uv[:, 0] >= 0) & (uv[:, 0] < width) & (uv[:, 1] >= 0) & (uv[:, 1] < height))
-            indices, camera, uv, bound = indices[usable], camera[usable], uv[usable], bound[usable]
-            if not len(indices):
-                continue
-            pixels = np.rint(uv).astype(np.int64)
-            # Nearest-pixel rounding at the last half pixel can leave the
-            # image. Keep it unknown before indexing any filter result.
-            inside = (pixels[:, 0] < width) & (pixels[:, 1] < height)
-            indices, camera, pixels, bound = indices[inside], camera[inside], pixels[inside], bound[inside]
-            bins = 2**np.ceil(np.log2(bound)).astype(np.int64)
-            for extent in np.unique(bins):
-                extent = int(extent)
-                if extent not in filtered:
-                    filtered[extent] = minimum_filter(depth, size=2*extent+1, mode="constant", cval=0.)
-                selected = bins == extent
-                low = filtered[extent][pixels[selected, 1], pixels[selected, 0]]
-                proved = camera[selected, 2]+radius+depth_error_m < low
-                known[indices[selected][proved]] = True
+            numerator = camera@matrix[:2].T
+            uv = numerator/camera[..., 2, None]
+            numerator_error = (camera_error@np.abs(matrix[:2].T))[:, None, :]
+            numerator_error = numerator_error+16*eps*(np.abs(camera)@np.abs(matrix[:2].T))
+            z_error = camera_error[:, None, 2, None]
+            uv_error = ((numerator_error+np.abs(uv)*z_error)/(camera[..., 2, None]-z_error)
+                        +16*eps*(1+np.abs(uv)))
+            lower = np.nextafter((uv-uv_error).min(1), -np.inf)
+            upper = np.nextafter((uv+uv_error).max(1), np.inf)
+            furthest = np.nextafter((camera[..., 2]+camera_error[:, None, 2]).max(1)+depth_error_m, np.inf)
+            # Check the complete continuous range before quantization; a
+            # negative subpixel coordinate rounding to zero is still outside.
+            inside = (np.isfinite(lower).all(1) & np.isfinite(upper).all(1)
+                      & (lower >= 0).all(1) & (upper <= [width-1, height-1]).all(1)
+                      & np.isfinite(furthest))
+            lower_xy = np.rint(lower[inside]).astype(np.int64)
+            upper_xy = np.rint(upper[inside]).astype(np.int64)
+            low = _rectangle_min_depth(depth, lower_xy, upper_xy)
+            known[indices[inside][furthest[inside] < low]] = True
+    # END no enlarged pixel footprint, clipping, ray restoration or old fallback.
     return known.reshape(shape)
 # END masked endpoints never implicitly become free-ray evidence.
 
