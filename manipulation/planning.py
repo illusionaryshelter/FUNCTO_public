@@ -2544,8 +2544,8 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     # The recovery consumer needs actual collision components, not the mixed
     # process_scene constraint (which also includes missing model support,
     # unknown space, contact requirements and controller violations). Only
-    # requested metric/diagnostic queries retain collision and scene-update
-    # components from this same call; neither can substitute for the other.
+    # requested metric/diagnostic queries retain collision, scene-update and
+    # forbidden-coverage components from this same call, without conflation.
     # BEGIN world path objectives consume the same unreduced geometry query.
     collision_paths = {}
     if optimizer_scene_out is not None and sample_valid is None:
@@ -2586,9 +2586,13 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
             # END each exported world component has exactly one objective owner.
             if scene_evidence_out is not None:
                 # BEGIN retain independent same-query scene failure categories.
-                for category in ("collision", "scene_update"):
+                # BEGIN explicit forbidden coverage can request a different path.
+                for category, prefix in (("collision", "collision/"),
+                                         ("scene_update", "scene_update/"),
+                                         ("coverage", "unknown/forbidden/")):
                     scene_evidence_out[category] = sum((term.detach() for name, term in components.items()
-                        if name.startswith(category+"/")), torch.zeros_like(value))
+                        if name.startswith(prefix)), torch.zeros_like(value))
+                # END conditional unknown and missing model data are not forbidden space.
                 # END no category changes the original hard aggregate or gradient.
                 # BEGIN pending registered-actor proposals preserve other hard requirements.
                 if optimizer_candidate_evidence:
@@ -2939,7 +2943,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 raise RuntimeError("Scene evidence belongs to a different native metric query")
             # BEGIN fixed diagnostic channels survive native metric clone and seed slicing.
             metrics.debug = evidence.detach().clone()
-            # END debug is [batch, sample, collision/scene_update], never a hard cost.
+            # END debug carries collision/scene_update/coverage, never a hard cost.
         # END diagnostics do not enter native costs, feasibility or seed ranking.
 
         def compute_costs(self, state, cost_collection=None, goal=None, **kwargs):
@@ -3165,7 +3169,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 if name == "process_scene" and self._process_mode == "trajectory_metrics":
                     # BEGIN fold each same-query diagnostic category separately.
                     channels = []
-                    for category in ("collision", "scene_update"):
+                    # BEGIN all recovery categories retain identical sample accounting.
+                    for category in ("collision", "scene_update", "coverage"):
                         evidence = scene_evidence_out[category].gather(1, inverse)
                         regular_evidence = evidence[:, :horizon] * valid
                         folded_evidence = torch.cat((torch.zeros_like(regular_evidence[:, :-1]),
@@ -3173,7 +3178,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                         channels.append(regular_evidence+folded_evidence)
                     self._scene_evidence = (weighted,
                         torch.stack(channels, dim=-1) * budget.constraint_weight)
-                    # END the channel order is collision, then scene_update.
+                    # END channel order is collision, scene_update, forbidden coverage.
                 # END recovery evidence never adds another cost or constraint.
             return collection
 
@@ -3286,13 +3291,13 @@ def _trajectory_candidate(result, index):
 # END exact native candidate extraction before independent verification.
 
 
-# BEGIN same-query evidence has one strict two-channel layout for all consumers.
+# BEGIN same-query evidence has one strict three-channel layout for all consumers.
 def _scene_metric_channel(metrics, channel):
-    """Read collision (0) or scene-update (1) without interpreting mixed costs."""
+    """Read collision (0), scene-update (1), or forbidden coverage (2)."""
     constraints = metrics.costs_and_constraints.constraints
     scene = constraints.values[constraints.names.index("process_scene")]
-    if metrics.debug is None or metrics.debug.shape != (*scene.shape[:-1], 2):
-        raise RuntimeError("Native scene metrics lack aligned collision/scene-update evidence")
+    if metrics.debug is None or metrics.debug.shape != (*scene.shape[:-1], 3):
+        raise RuntimeError("Native scene metrics lack aligned collision/scene-update/coverage evidence")
     return metrics.debug[..., channel:channel+1]
 
 
@@ -3309,6 +3314,24 @@ def _scene_update_metric_residuals(metrics, seed_index=None):
     return {"scene_update": float(flat[index].item())}
     # END retain the first non-finite witness, otherwise the ordinary maximum.
 # END these diagnostics cannot authorize execution or terminate candidate search.
+
+
+# BEGIN geometric coverage violations retain a distinct search eligibility signal.
+def _coverage_metric_residuals(metrics, seed_index=None):
+    """Report forbidden-space violations, not collision or missing map data.
+
+    A different path can stay within the same observed/explicitly permitted
+    space. Reporting this category grants no permission to enter unknown space.
+    """
+    if "process_scene" not in metrics.costs_and_constraints.constraints.names:
+        return {}
+    evidence = _scene_metric_channel(metrics, 2)
+    if seed_index is not None:
+        evidence = evidence[seed_index]
+    flat = evidence.reshape(-1)
+    index = flat.masked_fill(~flat.isfinite(), float("inf")).argmax()
+    return {"unknown_forbidden": float(flat[index].item())}
+# END the original aggregate remains the sole hard scene constraint.
 
 
 # BEGIN collision recovery consumes typed evidence, never aggregate name matching.
@@ -4864,6 +4887,9 @@ class _CuroboPlanner:
             collision_residuals = _collision_metric_residuals(metrics)
             # BEGIN confirmed metrics retain support gaps from that same query.
             scene_update_residuals = _scene_update_metric_residuals(metrics)
+            # BEGIN entity confirmation cannot erase an unrelated coverage failure.
+            coverage_residuals = _coverage_metric_residuals(metrics)
+            # END all categories belong to these same completed candidate queries.
             # END a confirmed-clear proxy cannot erase missing scene support.
             # END a confirmed-clear proxy cannot trigger a collision recovery.
             residuals = {f"interpolated:{name}": float(value.max().item())
@@ -4881,6 +4907,9 @@ class _CuroboPlanner:
             "collision_residuals": {f"interpolated:{name}": value for name, value in collision_residuals.items()},
             # BEGIN expose candidate-scoped support evidence beside collision evidence.
             "scene_update_residuals": {f"interpolated:{name}": value for name, value in scene_update_residuals.items()},
+            # BEGIN preserve search eligibility after sphere collision confirmation.
+            "coverage_residuals": {f"interpolated:{name}": value for name, value in coverage_residuals.items()},
+            # END coverage is never interpreted as an entity intersection.
             # END support evidence does not claim every route lacks support.
             # END the original metrics determine feasibility and severity.
             "native_metrics": {"success": feasible, "interpolated": {"constraints": residuals}},
@@ -4941,7 +4970,10 @@ class _CuroboPlanner:
                 # BEGIN typed collision evidence is separate from native constraints.
                 "collision_residuals": _collision_metric_residuals(metrics, seed_index),
                 # BEGIN both native sampling grids retain the same seed's support gaps.
-                "scene_update_residuals": _scene_update_metric_residuals(metrics, seed_index)}
+                "scene_update_residuals": _scene_update_metric_residuals(metrics, seed_index),
+                # BEGIN both native grids retain the selected seed's coverage evidence.
+                "coverage_residuals": _coverage_metric_residuals(metrics, seed_index)}
+                # END this adds no geometry query or acceptance condition.
                 # END no extra geometry query or request-level verdict is produced.
                 # END diagnostics never affect the original severity calculation.
         return report
@@ -4967,6 +4999,10 @@ class _CuroboPlanner:
                       # BEGIN retain selected-candidate support evidence from both grids.
                       "scene_update_residuals": {f"{label}:{name}": value for label in ("rollout", "interpolated")
                           for name, value in metrics.get(label, {}).get("scene_update_residuals", {}).items()},
+                      # BEGIN route unknown-space avoidance using its own query evidence.
+                      "coverage_residuals": {f"{label}:{name}": value for label in ("rollout", "interpolated")
+                          for name, value in metrics.get(label, {}).get("coverage_residuals", {}).items()},
+                      # END neither mixed scene totals nor missing fields infer coverage.
                       # END existing feasible candidates still take precedence.
                       "seed_provenance": self.seed_strategies[index],
                       "optimizer": self.last_optimizer_diagnostics[index] if self.last_optimizer_diagnostics else {}}
@@ -5536,6 +5572,10 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 # BEGIN mixed scene support/contact failures cannot consume collision recovery.
                 collision_failed = any(value > 0 for value in attempt["collision_residuals"].values())
                 # END all original hard residuals still reject the candidate above.
+                # BEGIN forbidden space can be avoided without changing observation policy.
+                coverage_failed = any(np.isfinite(value) and value > 0
+                    for value in attempt["coverage_residuals"].values())
+                # END missing map support/contact/controller terms do not trigger this route.
                 # BEGIN reuse dense collision evidence inside the existing second solve.
                 promoted = (planner.promote_collision_witnesses(native_result) if collision_failed else None)
                 if promoted is not None:
@@ -5544,8 +5584,9 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     recovery, stage = "collision_witnesses", "collision_witness_recovery"
                     seeds = native_result.solution.detach().clone().expand(1, budget.trajectory_seeds, -1, -1).contiguous()
                     planner.seed_strategies = [attempt["seed_provenance"]]*budget.trajectory_seeds
-                # END no new witness leaves the existing bounded OMPL decision intact.
-                elif collision_failed and budget.search_seconds > 0:
+                # END only collision evidence may promote collision witnesses.
+                # BEGIN reuse the same bounded search for either geometric obstruction.
+                elif (collision_failed or coverage_failed) and budget.search_seconds > 0:
                     recovery, stage = "ompl", "bounded_seed_search"
                     search_started = time.monotonic()
                     recovered, report = planner.ompl_seed(seeds, trajectory)
@@ -5557,6 +5598,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                         planner.seed_strategies = ["ompl"]*seeds.shape[1]
                     else:
                         recovery = "ompl_failed"
+                # END no new observations, permissions or request time are granted.
                 # BEGIN functional AL updates consume only the main solve's native blocks.
                 if recovery in {"collision_witnesses", "ompl"}:
                     # END no extra full solve is authorized by task residuals alone.

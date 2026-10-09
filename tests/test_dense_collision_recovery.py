@@ -23,8 +23,10 @@ def selected_result(values, *, collision, count=9, scene_update=None,
         torch.tensor(value, dtype=torch.float32).reshape(1, ordinary_horizon, 1)
         for value in ordinary_values.values()])
     ordinary_collision = ([0.]*ordinary_horizon if ordinary_collision is None else ordinary_collision)
+    # BEGIN explicit zero coverage preserves collision-only witness fixtures.
     ordinary_debug = torch.stack((torch.tensor(ordinary_collision, dtype=torch.float32),
-                                  torch.zeros(ordinary_horizon)), -1)[None]
+                                  torch.zeros(ordinary_horizon), torch.zeros(ordinary_horizon)), -1)[None]
+    # END all native evidence uses the one current three-channel contract.
     # END hard scene totals do not stand in for the collision channel.
     return SimpleNamespace(batch_size=1, num_seeds=1,
         metrics=SimpleNamespace(debug=ordinary_debug,
@@ -34,8 +36,8 @@ def selected_result(values, *, collision, count=9, scene_update=None,
         # BEGIN the fixture declares collision evidence independently of hard totals.
         interpolated_metrics=SimpleNamespace(debug=torch.stack((
             torch.tensor(collision, dtype=torch.float32),
-            torch.zeros(horizon) if scene_update is None else torch.tensor(scene_update, dtype=torch.float32)),
-            dim=-1).reshape(1, horizon, 2),
+            torch.zeros(horizon) if scene_update is None else torch.tensor(scene_update, dtype=torch.float32),
+            torch.zeros(horizon)), dim=-1).reshape(1, horizon, 3),
             costs_and_constraints=SimpleNamespace(constraints=constraints)))
         # END no production fallback from process_scene is exercised by these tests.
 
@@ -137,7 +139,7 @@ def test_missing_or_misaligned_ordinary_evidence_is_an_explicit_error(fault):
         result.metrics.costs_and_constraints.constraints.names = ["skill_process"]
     else:
         result.metrics.costs_and_constraints.constraints.values[0] = torch.zeros(1, 4, 1)
-        result.metrics.debug = torch.zeros(1, 4, 2)
+        result.metrics.debug = torch.zeros(1, 4, 3)
     with pytest.raises(ValueError, match="ordinary.*(evidence|layout)"):
         select(result)
 # END routing classifications never relax nonfinite or positive hard residuals.

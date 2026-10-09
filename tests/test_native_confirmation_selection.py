@@ -23,9 +23,10 @@ def selection_fixture(*, scene=(.01, .02), task=(0., 0.), flags=(False, False)):
     constraints.names = ["process_scene", "skill_process"]
     constraints.values = [torch.tensor(values)[:, None, None].expand(2, 9, 1).clone()
                           for values in (scene, task)]
-    # BEGIN this fixture explicitly models ordinary world collision components.
-    result.metrics.debug = torch.cat((constraints.values[0], torch.zeros_like(constraints.values[0])), dim=-1)
-    # END the aggregate alone is not a collision classifier.
+    # BEGIN same-query diagnostics separate collision, missing field and forbidden coverage.
+    result.metrics.debug = torch.cat((constraints.values[0],
+        torch.zeros_like(constraints.values[0]), torch.zeros_like(constraints.values[0])), dim=-1)
+    # END the aggregate alone cannot classify any of these independent requirements.
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.scene = object()
     planner.seed_strategies = ["reference", "alternate"]
@@ -46,6 +47,9 @@ def completed(*, accepted, residual, points):
         "residuals": {"interpolated:process_scene": residual},
         "collision_residuals": {"interpolated:scene_collision": residual},
         "scene_update_residuals": {"interpolated:scene_update": 0.},
+        # BEGIN complete-candidate fixtures carry the independent coverage evidence.
+        "coverage_residuals": {"interpolated:unknown_forbidden": 0.},
+        # END proxy confirmation does not imply observed or permitted spatial coverage.
         "native_metrics": {"success": accepted},
         "seed_provenance": "supplied_joint_curve",
         "native_confirmation": {"status": "completed"}}
@@ -120,7 +124,9 @@ def test_confirmation_success_flag_cannot_override_invalid_residual(value):
 # BEGIN collision diagnostics cannot change the existing severity ordering.
 def test_scene_support_severity_selects_same_seed_despite_opposite_collision_order():
     planner, result = selection_fixture(scene=(.02, .01), task=(.1, .1))
-    result.metrics.debug = torch.stack((torch.zeros((9, 2)), torch.ones((9, 2))))
+    # BEGIN retain all three diagnostic channels while testing collision ordering alone.
+    result.metrics.debug = torch.stack((torch.zeros((9, 3)), torch.ones((9, 3))))
+    # END channel count matches the production metric contract.
     result.metrics.debug[0, :, 1] = 100000.
     _, curve, report = planner.select_candidate(result)
     assert not report["accepted"] and curve.seed_index == report["selected_seed_index"] == 1
@@ -157,3 +163,39 @@ def test_native_confirmation_report_replaces_same_candidate_support_evidence():
     assert report["scene_update_residuals"] == {"interpolated:scene_update": 1.}
     assert report["sphere_proposal_metrics"]["rollout"]["scene_update_residuals"]["scene_update"] == pytest.approx(.01)
 # END query evidence stays attached to its producer when confirmation replaces a report.
+
+
+# BEGIN clearing a collision proposal must preserve the independent forbidden-space failure.
+def test_proxy_clear_keeps_confirmed_coverage_evidence_for_bounded_search():
+    """Selection must expose the remaining route constraint without calling it collision.
+
+    Raw and confirmed samples can measure different maxima. The complete
+    candidate's coverage therefore replaces its earlier value, while the
+    proposal report remains available to distinguish the two query scopes.
+    The outer routing tests exercise OMPL; here the same selected candidate
+    must retain exactly the typed evidence that makes that routing possible.
+    """
+    planner, result = selection_fixture(scene=(.07, 0.), task=(0., .1))
+    result.metrics.debug[0, :, 0] = .02
+    result.metrics.debug[0, :, 2] = .05
+
+    def confirm(curve, scene):
+        report, parameters, points = completed(accepted=False, residual=.04, points=4)
+        report["collision_residuals"] = {"interpolated:scene_collision": 0.}
+        report["coverage_residuals"] = {"interpolated:unknown_forbidden": .04}
+        return report, parameters, points
+
+    planner._candidate_metrics.side_effect = confirm
+    _, curve, report = planner.select_candidate(result)
+    assert not report["accepted"] and curve.seed_index == report["selected_seed_index"] == 0
+    assert report["collision_residuals"] == {"interpolated:scene_collision": 0.}
+    assert report["scene_update_residuals"] == {"interpolated:scene_update": 0.}
+    assert report["coverage_residuals"] == {"interpolated:unknown_forbidden": .04}
+    assert report["candidates"][0]["coverage_residuals"] == report["coverage_residuals"]
+    proposal = report["sphere_proposal_metrics"]["rollout"]
+    assert proposal["collision_residuals"]["scene_collision"] == pytest.approx(.02)
+    assert proposal["coverage_residuals"]["unknown_forbidden"] == pytest.approx(.05)
+    assert report["confirmation_validation_points"] == 4
+    planner._candidate_metrics.assert_called_once_with(curve, planner.scene)
+    planner.export.assert_not_called()
+# END search evidence never weakens the original hard acceptance or grants an execution binding.

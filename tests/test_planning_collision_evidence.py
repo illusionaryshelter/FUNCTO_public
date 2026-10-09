@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from manipulation.planning import (
-    _CuroboPlanner, _ProgressMap, _collision_metric_residuals,
+    _CuroboPlanner, _ProgressMap, _collision_metric_residuals, _coverage_metric_residuals,
     _dense_collision_witnesses, _scene_boundary_evaluate, _scene_update_metric_residuals, _trajectory_candidate,
 )
 import test_manipulation_planning as _fixtures
@@ -89,7 +89,7 @@ def test_candidate_evidence_retains_a_hard_violation_only_on_one_mode_side(hard_
 
 @pytest.mark.parametrize("category", ["scene_update/background/robot", "unsupported/contact/robot/owner",
     "unknown/forbidden/robot", "contact/required/rule", "gripper/controller",
-    "conditional/collision/robot/background"])
+    "conditional/collision/robot/background", "conditional/unknown/robot", "unknown/other/robot"])
 def test_noncollision_components_do_not_generate_collision_evidence(category):
     calls = []
     def evaluate(spheres, p, r, s, q, names, *, components_out, **kwargs):
@@ -108,6 +108,9 @@ def test_noncollision_components_do_not_generate_collision_evidence(category):
     assert bool((evidence["collision"] == 0).all())
     # BEGIN numerical support is retained without becoming collision evidence.
     assert bool((evidence["scene_update"] == int(category.startswith("scene_update/"))).all())
+    # BEGIN only the explicit forbidden-space component authorizes coverage search.
+    assert bool((evidence["coverage"] == int(category.startswith("unknown/forbidden/"))).all())
+    # END aggregate scene errors and conditional observations stay distinct.
     # END contact, controller and unknown-space categories remain distinct.
 
 
@@ -154,8 +157,8 @@ def collision_result():
     constraints = result.metrics.costs_and_constraints.constraints
     constraints.names = ["process_scene", "self_collision", "anchor_self_collision"]
     constraints.values = [torch.ones(2, 9, 1)*100000., torch.zeros(2, 9, 1), torch.zeros(2, 9, 1)]
-    # BEGIN both channels have explicit seed/time identity.
-    result.metrics.debug = torch.zeros(2, 9, 2)
+    # BEGIN all three channels have explicit seed/time identity.
+    result.metrics.debug = torch.zeros(2, 9, 3)
     result.metrics.debug[..., 1] = 100000.
     # END support is deliberately positive beside zero collision.
     result.interpolated_metrics = result.metrics.clone()
@@ -195,7 +198,7 @@ def test_regular_only_collisions_remain_routable_and_do_not_invent_dense_times(c
 def test_missing_debug_evidence_is_an_error_instead_of_aggregate_fallback():
     result = collision_result()
     result.metrics.debug = None
-    with pytest.raises(RuntimeError, match="collision/scene-update evidence"):
+    with pytest.raises(RuntimeError, match="scene.*evidence"):
         _collision_metric_residuals(result.metrics)
 
 
@@ -235,12 +238,12 @@ def test_scene_update_evidence_preserves_both_grid_and_seed_identity():
     # END independent support evidence never becomes collision evidence.
 
 
-@pytest.mark.parametrize("shape", [(2, 9, 1), (2, 9, 3), (1, 9, 2)])
+@pytest.mark.parametrize("shape", [(2, 9, 1), (2, 9, 2), (1, 9, 3)])
 def test_obsolete_or_misaligned_scene_evidence_is_rejected(shape):
     result = collision_result()
     result.metrics.debug = torch.zeros(shape)
-    for reader in (_collision_metric_residuals, _scene_update_metric_residuals):
-        with pytest.raises(RuntimeError, match="collision/scene-update evidence"):
+    for reader in (_collision_metric_residuals, _scene_update_metric_residuals, _coverage_metric_residuals):
+        with pytest.raises(RuntimeError, match="scene.*evidence"):
             reader(result.metrics)
 # END no aggregate fallback or legacy single-channel compatibility is permitted.
 
@@ -257,3 +260,62 @@ def test_scene_update_metrics_retain_nonfinite_witness(nonfinite):
         assert actual == nonfinite
     assert _scene_update_metric_residuals(result.metrics, 0) == {"scene_update": 0.}
 # END this diagnostic never changes the separate hard acceptance constraint.
+
+
+# BEGIN coverage evidence has its own modes, grids and seed identity.
+def test_coverage_mode_max_preserves_all_actor_terms_without_changing_hard_gradient():
+    s = torch.tensor([[.5]], dtype=torch.float64)
+    calls = []
+    def evaluate(spheres, p, r, progress, q, names, *, components_out, **kwargs):
+        calls.append(progress.shape[1])
+        components_out.update({
+            "collision/robot/owner": 2*(progress > .5).to(q.dtype),
+            "scene_update/robot/owner": 5*(progress < .5).to(q.dtype),
+            "unknown/forbidden/robot": q[..., 0].square()+3*(progress == .5),
+            "unknown/forbidden/payload": .5*q[..., 0].square(),
+            "conditional/unknown/robot": torch.full_like(progress, 100.)})
+        return sum((value for name, value in components_out.items()
+                    if not name.startswith("conditional/")), torch.zeros_like(progress))
+    scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate)
+    mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+    q = torch.ones(1, 1, 1, dtype=torch.float64, requires_grad=True)
+    evidence = {}
+    result = _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.), mapping,
+        torch.zeros(1, 1, 1, 4, dtype=torch.float64), torch.zeros(1, 1, 3, dtype=torch.float64),
+        torch.zeros(1, 1, 4, dtype=torch.float64), s, q, ("q",), trajectory_time=s,
+        normalized_time=s, scene_evidence_out=evidence)
+    assert calls == [3]
+    assert evidence["coverage"].item() == 4.5  # exact mode; both robot and payload count
+    assert evidence["scene_update"].item() == 5.  # left mode
+    assert evidence["collision"].item() == 2.  # right mode
+    assert result.item() == 6.5  # the original left-mode hard maximum
+    assert torch.autograd.grad(result.sum(), q)[0].item() == 3.
+    assert not evidence["coverage"].requires_grad
+
+
+def test_forbidden_coverage_retains_both_grids_and_seeds_without_collision_witnesses():
+    result = collision_result()
+    result.metrics.debug[1, 2, 2] = 2000.
+    result.interpolated_metrics.debug[1, 4, 2] = 3000.
+    planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    report = planner.native_diagnostics(result, seed_index=1)
+    assert report["rollout"]["coverage_residuals"] == {"unknown_forbidden": 2000.}
+    assert report["interpolated"]["coverage_residuals"] == {"unknown_forbidden": 3000.}
+    selected = _trajectory_candidate(result, 1)
+    assert _coverage_metric_residuals(selected.metrics) == {"unknown_forbidden": 2000.}
+    assert _coverage_metric_residuals(selected.interpolated_metrics) == {"unknown_forbidden": 3000.}
+    assert _coverage_metric_residuals(result.metrics, 0) == {"unknown_forbidden": 0.}
+    assert _dense_collision_witnesses(selected, regular_horizon=9,
+        anchor_parameters=(), capacity=4)["parameters"] == []
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_coverage_metrics_do_not_hide_nonfinite_samples(nonfinite):
+    result = collision_result()
+    result.metrics.debug[1, 2, 2] = nonfinite
+    actual = _coverage_metric_residuals(result.metrics, 1)["unknown_forbidden"]
+    assert not np.isfinite(actual)
+    if not np.isnan(nonfinite):
+        assert actual == nonfinite
+    assert _coverage_metric_residuals(result.metrics, 0) == {"unknown_forbidden": 0.}
+# END coverage authorizes only bounded search, never direct acceptance or collision repair.

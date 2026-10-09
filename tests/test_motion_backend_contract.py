@@ -84,7 +84,8 @@ class Native:
                   "residuals": {"process_scene" if self.collision else "skill_process": 0. if accepted else 1.},
                   # BEGIN recovery evidence is distinct from the hard scene aggregate.
                   "collision_residuals": {"rollout:scene_collision": float(self.collision and not accepted)},
-                  "scene_update_residuals": {"rollout:scene_update": 0.}}
+                  "scene_update_residuals": {"rollout:scene_update": 0.},
+                  "coverage_residuals": {"rollout:unknown_forbidden": 0.}}
                   # END the deterministic fixture supplies explicit query classification.
         return SimpleNamespace(solution=torch.zeros((1, 1, 8, 1))), self.curve, report
     def ompl_seed(self, seed, trajectory):
@@ -108,8 +109,8 @@ class Native:
         self.calls.append("close")
 
 
-def run(native, **kwargs):
-    backend = MotionBackend({}, robot_validator=object())
+def run(native, *, budget=None, **kwargs):
+    backend = MotionBackend({}, robot_validator=object(), budget=budget)
     with patch("manipulation.planning._CuroboPlanner", return_value=native), \
          patch("manipulation.execution_binding.bind_candidate", return_value={"candidate_id": "accepted"}):
         result = backend.plan(problem(), Scene(), **kwargs)
@@ -167,7 +168,7 @@ def test_real_candidate_binding_roundtrips_online_geometry_and_rejects_mutation(
 # END accepted evidence names exactly the field record handed to execution.
 
 
-# BEGIN only the existing collision branch may request a second full solve.
+# BEGIN only typed geometric failures may request the bounded second solve.
 def test_failed_main_collision_gets_one_bounded_recovery():
     native = Native([False, False, True], collision=True)
     result, backend = run(native)
@@ -226,6 +227,78 @@ def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_
 # END one rejected exploration candidate does not prove a request-wide scene gap.
 
 
+# BEGIN forbidden coverage searches a new path without inventing collision evidence.
+@pytest.mark.parametrize("search_succeeds", [False, True])
+def test_forbidden_coverage_uses_one_bounded_search_without_collision_witnesses(search_succeeds):
+    native = Native([False, False, True], ompl=search_succeeds)
+    select = native.select_candidate
+    def covered(accepted):
+        candidate, curve, report = select(accepted)
+        report["residuals"] = {"interpolated:process_scene": 0. if accepted else 4000.}
+        report["coverage_residuals"] = {"interpolated:unknown_forbidden": 0. if accepted else 4000.}
+        return candidate, curve, report
+    native.select_candidate = covered
+    native.promote_collision_witnesses = lambda _: pytest.fail("Coverage is not a collision witness")
+    result, backend = run(native)
+    try:
+        assert result.success is search_succeeds
+        assert native.calls.count("ompl") == 1
+        assert native.calls.count("solve") == (2 if search_succeeds else 1)
+        assert result.diagnostics["recovery"] == ("ompl" if search_succeeds else "ompl_failed")
+        ledger = result.request_ledger
+        assert ledger["consumed_planning"]["search_queries"] == 1
+        assert ledger["consumed_planning"]["trajectory_solves"] == (2 if search_succeeds else 1)
+        assert ledger["planning_budget"]["maximum_trajectory_solves"] == 2
+        assert ledger["planning_budget"]["planning_seconds"] == 120.
+        if not search_succeeds:
+            assert result.execution_binding is None and "export" not in native.calls
+            assert result.diagnostics["coverage_residuals"]["interpolated:unknown_forbidden"] > 0
+    finally:
+        backend.close()
+
+
+def test_forbidden_coverage_cannot_replenish_a_zero_search_budget():
+    native = Native([False, False])
+    select = native.select_candidate
+    def forbidden(accepted):
+        candidate, curve, report = select(accepted)
+        report["residuals"] = {"interpolated:process_scene": 1.}
+        report["coverage_residuals"] = {"interpolated:unknown_forbidden": 1.}
+        return candidate, curve, report
+    native.select_candidate = forbidden
+    native.promote_collision_witnesses = lambda _: pytest.fail("Coverage is not a collision witness")
+    result, backend = run(native, budget=PlanningBudget(search_seconds=0.))
+    try:
+        assert not result.success and result.execution_binding is None
+        assert "ompl" not in native.calls and "export" not in native.calls
+        assert native.calls.count("solve") == 1
+        assert result.request_ledger["consumed_planning"]["search_queries"] == 0
+        assert result.request_ledger["planning_budget"]["search_seconds"] == 0.
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("component", ["contact/required/rule", "unsupported/contact/robot/owner"])
+def test_other_scene_terms_cannot_masquerade_as_forbidden_coverage(component):
+    native = Native([False, False])
+    select = native.select_candidate
+    def other_scene_failure(accepted):
+        candidate, curve, report = select(accepted)
+        report["residuals"] = {"interpolated:process_scene": 1.}
+        report["scene_components"] = {component: {"maximum": 1.}}
+        return candidate, curve, report
+    native.select_candidate = other_scene_failure
+    native.promote_collision_witnesses = lambda _: pytest.fail("Unclassified scene failure is not collision")
+    result, backend = run(native)
+    try:
+        assert not result.success and result.execution_binding is None
+        assert "ompl" not in native.calls and "export" not in native.calls
+        assert native.calls.count("solve") == 1
+    finally:
+        backend.close()
+# END search eligibility leaves the original hard result and request ledger intact.
+
+
 # BEGIN collision witnesses consume the original unique second solve.
 @pytest.mark.parametrize("accepted", [False, True])
 def test_new_dense_witnesses_continue_current_controls_without_search_or_third_solve(accepted):
@@ -275,9 +348,12 @@ def test_sampled_collision_evidence_selects_search_or_missing_time_recovery(alre
 
     def metric(values):
         collision = torch.tensor(values, dtype=torch.float32).reshape(1, -1, 1)
-        return SimpleNamespace(debug=torch.cat((collision, torch.zeros_like(collision)), dim=-1),
+        # BEGIN every native fixture supplies the complete current evidence layout.
+        return SimpleNamespace(debug=torch.cat((collision, torch.zeros_like(collision),
+                                                torch.zeros_like(collision)), dim=-1),
             costs_and_constraints=SimpleNamespace(constraints=SimpleNamespace(
                 names=["process_scene"], values=[collision])))
+        # END coverage never acquires a collision sample through fixture defaults.
 
     def select(accepted):
         candidate, curve, report = original_select(accepted)

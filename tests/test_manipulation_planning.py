@@ -1623,7 +1623,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             result = SimpleNamespace(batch_size=1, num_seeds=1, interpolated_last_tstep=torch.tensor([[21]]),
                 interpolated_trajectory=SimpleNamespace(position=q[:1]),
                 # BEGIN the earlier zero-cost ordinary query has its own layout.
-                metrics=SimpleNamespace(debug=torch.zeros(1, 2, 2),
+                metrics=SimpleNamespace(debug=torch.zeros(1, 2, 3),
                     costs_and_constraints=SimpleNamespace(constraints=
                     SimpleNamespace(names=coarse.names, values=[value[:1] for value in coarse.values]))),
                 # END dense-only geometry cannot fabricate ordinary evidence.
@@ -1698,11 +1698,14 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 # Two regular states and one folded anchor each retain their
                 # unit support gap in the hard sum, never in collision debug.
                 # BEGIN each weighted/folded channel retains its own evidence.
-                self.assertEqual(tuple(metrics.debug.shape), (2, 2, 2))
-                torch.testing.assert_close(metrics.debug[..., 1:],
+                # BEGIN the third diagnostic channel carries only forbidden coverage.
+                self.assertEqual(tuple(metrics.debug.shape), (2, 2, 3))
+                torch.testing.assert_close(metrics.debug[..., 1:2],
                     torch.tensor([[[777.], [1554.]], [[777.], [1554.]]]), rtol=1e-7, atol=0)
                 torch.testing.assert_close(scene.detach()-metrics.debug[..., :1],
-                    metrics.debug[..., 1:], rtol=1e-7, atol=0)
+                    metrics.debug[..., 1:2], rtol=1e-7, atol=0)
+                self.assertEqual(int(torch.count_nonzero(metrics.debug[..., 2])), 0)
+                # END absent coverage never inherits a numerical scene-update gap.
                 # END support remains hard but cannot enter collision witnesses.
                 clone = metrics.clone()
                 self.assertNotEqual(clone.debug.data_ptr(), metrics.debug.data_ptr())
@@ -2672,13 +2675,14 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         constraints.values[0][1, 3] = 2.
         # BEGIN aggregate values do not serve as implicit collision evidence.
         result.interpolated_metrics.debug = torch.cat((constraints.values[0],
-            torch.tensor([100., 200.])[:, None, None].expand(2, 9, 1)), dim=-1)
+            torch.tensor([100., 200.])[:, None, None].expand(2, 9, 1),
+            torch.zeros_like(constraints.values[0])), dim=-1)
         # END explicit same-seed evidence must survive the native top-k gather.
         # BEGIN the ordinary collision evidence has its independent three-point grid.
         ordinary = result.metrics.costs_and_constraints.constraints
         ordinary.names = ["process_scene"]
         ordinary.values = [torch.zeros(2, 3, 1)]
-        result.metrics.debug = torch.zeros(2, 3, 2)
+        result.metrics.debug = torch.zeros(2, 3, 3)
         result.metrics.debug[0, 1, 0] = 10.
         # END another seed's ordinary collision cannot suppress this seed's peak.
         selected = _trajectory_candidate(result, 1)
