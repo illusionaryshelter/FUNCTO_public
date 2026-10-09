@@ -1724,7 +1724,13 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
 
     def test_tiny_positive_scene_violation_keeps_linear_gradient_and_skill_square(self):
         with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
-            fixture.scene.evaluate = lambda spheres, p, *args, **kwargs: p[..., 1]+1e-7
+            # BEGIN scene objectives explicitly name every nonworld requirement.
+            def scene_evaluate(spheres, p, *args, components_out, **kwargs):
+                value = p[..., 1]+1e-7
+                components_out["contact/required/test"] = value
+                return value
+            fixture.scene.evaluate = scene_evaluate
+            # END positive aggregates follow the production component protocol.
             fixture.problem.evaluate = lambda p, *args, **kwargs: p[..., 1]+.2
             costs = fixture.manager.compute_costs(fixture.state)
             scene = costs.values[costs.names.index("process_scene")]
@@ -1802,7 +1808,13 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             torch.testing.assert_close(fixed, objective)
             # Same-query scene evidence remains hard even though preferences
             # alone were harmless; an underflow-sized violation is not rounded.
-            fixture.scene.evaluate = lambda spheres, p, *args, **kwargs: torch.full_like(p[..., 0], 1e-20)
+            # BEGIN retain a named hard term under geometric world ownership.
+            def scene_evaluate(spheres, p, *args, components_out, **kwargs):
+                value = torch.full_like(p[..., 0], 1e-20)
+                components_out["contact/required/test"] = value
+                return value
+            fixture.scene.evaluate = scene_evaluate
+            # END neither objective substitution nor rounding can remove it.
             positive_scene = fixture.manager.compute_costs(fixture.state)
             result = RolloutResult(costs_and_constraints=CostsAndConstraints(constraints=positive_scene))
             self.assertFalse(bool(fixture.manager.optimizer_evidence(result)[0].any()))
@@ -2030,6 +2042,12 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 problem.functional_inequalities = lambda *args, **kwargs: ({}, {})
                 problem.residuals = lambda *args, **kwargs: {"synthetic_process": problem.evaluate(*args, **kwargs)}
                 # END an empty AL contribution cannot change native scene ownership.
+                # BEGIN this self-collision oracle follows named scene ownership.
+                def scene_evaluate(spheres, p, *args, components_out, **kwargs):
+                    value = p.square().sum(-1)
+                    components_out["collision/robot/self"] = value
+                    return value
+                # END native self terms keep their original temporal reduction.
                 # BEGIN the synthetic scene explicitly declares no owner contact permissions.
                 scene = SimpleNamespace(gripper=None, contacts=(), owners=(), robot_coverage=object(), robot_owner_permissions=(),
                     required_progress_anchors=(0., 1.),
@@ -2037,7 +2055,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                     # BEGIN nonzero guidance checks the original summed optimizer objective.
                     robot_self_collision_guidance=lambda spheres, p, *args, **kwargs: p.square().sum(-1),
                     # END source metrics never consume this differentiable proxy value.
-                    evaluate=Mock(side_effect=lambda spheres, p, *args, **kwargs: p.square().sum(-1)),
+                    evaluate=Mock(side_effect=scene_evaluate),
                     # BEGIN an explicitly separated source world contributes no proxy gradient.
                     evaluate_source=Mock(side_effect=lambda spheres, p, r, progress, *args, **kwargs: torch.zeros_like(progress)),
                     # END process constraints remain independently differentiable in metrics.
@@ -2378,7 +2396,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         # Distinct full-live/captured peaks catch accidentally duplicating CPU
         # query/packing/dedup scratch in the two CUDA pools. Immutable grids
         # remain shared across both graph pools and all independent scenes.
-        estimator = Mock(side_effect=lambda batch, horizon, *, robot_coverage_horizon:
+        estimator = Mock(side_effect=lambda batch, horizon, *, robot_coverage_horizon, collision_paths:
             {"gpu_retained": 5, "gpu_live": 100 if robot_coverage_horizon else 150,
              "cpu_shared": 17, "cpu_live": 31, "gpu_shared": 23,
              "gpu_graph_live": 60 if robot_coverage_horizon else 90})
@@ -2419,7 +2437,10 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         world.robot_collision_bodies = ()
         # END actual source snapshots are accounted by the same method when bound.
         world.background = None
-        world.owners = tuple(SimpleNamespace(moving=False, owner_id=f"fixed-{i}", query=None) for i in range(4))
+        # BEGIN fixed owners have explicit empty attachment and permission metadata.
+        world.owners = tuple(SimpleNamespace(moving=False, owner_id=f"fixed-{i}", query=None, attachments=()) for i in range(4))
+        world.robot_owner_permissions = ()
+        # END optional path admission cannot assume missing scene identities.
         # BEGIN storage admission follows the squared coverage source contract.
         world.coverage = SimpleNamespace(_distance_squared=SimpleNamespace(numel=lambda: 503840))
         # END only the allocated shape is used in this metadata fixture.
@@ -2437,7 +2458,8 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         world._free_distance = world.coverage._distance_squared
         world._free_mask = world.coverage._distance_squared
         # END this fixture never evaluates a free-distance value.
-        world.contacts = tuple(SimpleNamespace(_feature_edge_normals=np.zeros((4, 3))) for _ in range(2))
+        world.contacts = tuple(SimpleNamespace(_feature_edge_normals=np.zeros((4, 3)),
+            actor='robot', target_owner='fixed-0') for _ in range(2))
         # BEGIN metadata implements the contact model's explicit storage/workspace interface.
         class ContactStorage(SimpleNamespace):
             @property
@@ -2451,8 +2473,12 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                                rotations=np.empty((0, 3, 3)))
         # END changing only complete component inventory still changes shared bytes exactly once.
         world._contact_cells = {"target": cells}
+        # BEGIN this size-only fixture now includes the optional sphere-path graph.
+        # No GPU allocation occurs. The exact required-1 denial below proves
+        # strict admission with raw exports and checkpointed path reductions.
         budget = PlanningBudget(ik_seeds=2, trajectory_seeds=1, knots=16, interpolation_steps=4,
             interpolation_buffer_size=768, max_task_anchors=256, max_validation_points=512)
+        # END production requests retain their original independent budgets.
         metadata = {"active_joint_names": range(7), "links": 13, "spheres": 416}
         cuda_before = torch.cuda.is_initialized()
         empty = _planning_workspace_bytes(world, metadata, budget, 22)
@@ -2467,6 +2493,9 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         self.assertLess(complete.gpu_bytes, budget.max_scene_gpu_workspace_bytes)
         self.assertTrue(any(call.args == (4, 3*(81+22))
                             and call.kwargs["robot_coverage_horizon"] == 81+22
+                            and call.kwargs["collision_paths"] is True
+                            for call in estimate.call_args_list))
+        self.assertTrue(all(call.kwargs['collision_paths'] == (call.kwargs['robot_coverage_horizon'] > 0)
                             for call in estimate.call_args_list))
         with self.assertRaisesRegex(ValueError, "required .* allowed"):
             _planning_workspace_bytes(world, metadata,

@@ -435,9 +435,11 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     # aggregate sphere buffers fit one such reserve. Scalar slots are counted
     # below per state as well, so this split cannot hide many small caches.
     scene_factor = 3 if scene.required_progress_anchors else 1
+    # BEGIN only optimizer rollouts retain differentiable sphere paths.
     allocations = [(copies, scene.estimated_workspace_allocation(batch, scene_factor*length,
-                        robot_coverage_horizon=length if guidance else 0))
+                        robot_coverage_horizon=length if guidance else 0, collision_paths=guidance))
                    for copies, batch, length, guidance in allocation_shapes]
+    # END metric and acceptance queries keep their original allocation.
     # BEGIN CPU residency cannot consume the GPU scene budget or graph pools.
     gpu_eager_bytes = (sum(copies*value["gpu_retained"] for copies, value in allocations)
                        + max(value["gpu_live"] for _, value in allocations)
@@ -2491,7 +2493,8 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                              progress, joint_position, joint_names, *, trajectory_time,
                              normalized_time, query_counts=None, component_diagnostics=None,
                              native_confirmation=None, scene_evidence_out=None,
-                             optimizer_candidate_evidence=False):
+                             optimizer_candidate_evidence=False, optimizer_scene_out=None,
+                             sample_valid=None):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2514,11 +2517,44 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     # unknown space, contact requirements and controller violations). Only
     # requested metric/diagnostic queries retain collision and scene-update
     # components from this same call; neither can substitute for the other.
-    if component_diagnostics is not None or scene_evidence_out is not None:
+    # BEGIN world path objectives consume the same unreduced geometry query.
+    collision_paths = {}
+    if optimizer_scene_out is not None and sample_valid is None:
+        raise ValueError("Collision path objectives require explicit sample validity")
+
+    def finish_optimizer(times, validity, side):
+        if optimizer_scene_out is None:
+            return
+        from .collision_path import collision_path_objective
+        # Keep geometry's exact-first layout for release FK. Sort only its
+        # outputs: equal physical times use left, exact, right mode order.
+        # Move invalid padding behind real vertices so it cannot sever an edge.
+        order = torch.argsort(side, dim=1, stable=True)
+        order = order.gather(1, torch.argsort(times.gather(1, order), dim=1, stable=True))
+        order = order.gather(1, torch.argsort((~validity).gather(1, order).to(torch.int64),
+                                            dim=1, stable=True))
+        # The reducer gathers inside bounded checkpointed sphere blocks.
+        # Keeping full sorted copies for every target would retain a second
+        # large geometry graph until backward, despite sequential forwards.
+        optimizer_scene_out["world_objective"] = collision_path_objective(
+            collision_paths, times, validity, order=order)
+    # END hard residuals below retain the original geometry and max reduction.
+    if (component_diagnostics is not None or scene_evidence_out is not None
+            or optimizer_scene_out is not None):
         base_evaluate = evaluate
         def evaluate(*args, **kwargs):
             components = {}
+            # BEGIN collect per-ball world paths only for trajectory optimization.
+            if optimizer_scene_out is not None:
+                kwargs["collision_paths_out"] = collision_paths
             value = base_evaluate(*args, **kwargs, components_out=components)
+            if optimizer_scene_out is not None:
+                optimizer_scene_out["nonworld_values"] = sum((term for name, term in components.items()
+                    if name not in collision_paths and not name.startswith("conditional/")),
+                    torch.zeros_like(value))
+            # Empty components explicitly mean an empty scene. Every nonzero
+            # scene residual must have a named component under this protocol.
+            # END each exported world component has exactly one objective owner.
             if scene_evidence_out is not None:
                 # BEGIN retain independent same-query scene failure categories.
                 for category in ("collision", "scene_update"):
@@ -2578,6 +2614,7 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                                 evaluated_states=int(progress.numel()))
         result = evaluate(spheres, position, quaternion, progress, joint_position,
                           joint_names, trajectory_time=trajectory_time)
+        finish_optimizer(trajectory_time, sample_valid, torch.zeros_like(progress))
         return result
     left = torch.zeros_like(progress, dtype=torch.bool)
     right = torch.zeros_like(progress, dtype=torch.bool)
@@ -2626,6 +2663,18 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
         expanded_progress, expanded(joint_position), joint_names,
         trajectory_time=expanded(trajectory_time),
         contact_permission_progress=permission_progress)
+    # BEGIN recover temporal order after the one exact-first geometry call.
+    if optimizer_scene_out is not None:
+        side = torch.cat((torch.zeros_like(progress),
+                          -torch.ones_like(progress[:, left_columns]),
+                          torch.ones_like(progress[:, right_columns])), 1)
+        # A compact side column may exist only for another batch row.
+        # Such unchanged exact placeholders must not become side endpoints.
+        path_valid = torch.cat((sample_valid,
+            sample_valid[:, left_columns] & left[:, left_columns],
+            sample_valid[:, right_columns] & right[:, right_columns]), 1)
+        finish_optimizer(expanded(trajectory_time), path_valid, side)
+    # END equal-time modes never create a fictitious physical-motion edge.
     exact_count, left_count = progress.shape[1], left_columns.numel()
     exact_terms = terms[:, :exact_count]
     left_terms = exact_terms.scatter(1, left_columns[None].expand(progress.shape[0], -1),
@@ -2643,6 +2692,16 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
             right_evidence = exact_evidence.scatter(1, right_columns[None].expand(progress.shape[0], -1),
                 evidence[:, exact_count+left_count:])
             scene_evidence_out[category] = torch.stack((exact_evidence, left_evidence, right_evidence)).amax(0)
+    # BEGIN nonworld requirements retain their own original boundary maximum.
+    if optimizer_scene_out is not None:
+        evidence = optimizer_scene_out["nonworld_values"]
+        exact = evidence[:, :exact_count]
+        left_value = exact.scatter(1, left_columns[None].expand(progress.shape[0], -1),
+                                  evidence[:, exact_count:exact_count+left_count])
+        right_value = exact.scatter(1, right_columns[None].expand(progress.shape[0], -1),
+                                   evidence[:, exact_count+left_count:])
+        optimizer_scene_out["nonworld_values"] = torch.stack((exact, left_value, right_value)).amax(0)
+    # END subtracting independently maximized components would be incorrect.
     # END the original three-way aggregate and its max-tie gradient stay below.
     # Reconstruct only these small scalar residuals before max. Its original
     # three-way tie weights matter for gradients: replacing this with a max
@@ -2812,7 +2871,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                     or collection.values[collection.names.index("process_scene")] is not scene_source):
                 raise RuntimeError("Optimizer evidence belongs to a different native query")
             objective_names = {"functional_augmented_lagrangian", "skill_pose_equality_preference",
-                               "gripper_command_preference", "verification_stop_preference"}
+                               "gripper_command_preference", "verification_stop_preference",
+                               # BEGIN raw scene feasibility was recorded before path substitution.
+                               "process_scene"}
+            # END optimizer path values never stand in for hard geometry evidence.
             fixed_objective = source.new_zeros(source.shape[0])
             for costs, hard in ((constraints.costs, False), (collection, True),
                                 (constraints.hybrid_costs_constraints, True)):
@@ -2821,10 +2883,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                     if hard and name not in objective_names:
                         valid = torch.isfinite(detached).all(-1) & (detached <= 0).all(-1)
                         feasible = feasible & valid
-                        # BEGIN only explicitly classified robot/world proposals may remain positive.
-                        if name != "process_scene":
-                            eligible = eligible & valid
-                        # END task, native joint/self and all other constraints keep their original gate.
+                        # BEGIN scene gates were retained from their raw components.
+                        eligible = eligible & valid
+                        # END every remaining native/task hard constraint keeps its gate.
                     if name != "functional_augmented_lagrangian":
                         fixed_objective = fixed_objective+detached.sum(-1)
             feasible = feasible & torch.isfinite(fixed_objective)
@@ -2980,6 +3041,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # BEGIN candidate retention reads scalar evidence from this same scene query.
             scene_evidence_out = {} if self._process_mode in ("trajectory_metrics", "trajectory_optimizer") else None
             # END no extra FK, source query, or geometry history is created.
+            # BEGIN only optimization substitutes a path objective for world time sums.
+            active = ordered(torch.cat((valid, anchor_valid.expand(batch, -1).bool()), 1))
+            optimizer_scene_out = {} if self._process_mode == "trajectory_optimizer" else None
+            # END metric calls retain the original scene computation.
             scene_value = _scene_boundary_evaluate(active_scene, problem, active_map,
                 spheres, position, quaternion, progress, q, self._joint_names,
                 trajectory_time=trajectory_time, normalized_time=ordered(all_u),
@@ -2988,7 +3053,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # BEGIN only the complete candidate boundary runs CPU confirmation.
                 native_confirmation=None if context is None else context.get("native_confirmation"),
                 scene_evidence_out=scene_evidence_out,
-                optimizer_candidate_evidence=self._process_mode == "trajectory_optimizer")
+                optimizer_candidate_evidence=self._process_mode == "trajectory_optimizer",
+                optimizer_scene_out=optimizer_scene_out, sample_valid=active)
             # END ordinary optimizer and proposal metric calls remain unchanged.
             # END raw residual zero sets are shared; only optimizer weights differ.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
@@ -2997,7 +3063,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # second square suppresses their gradient near zero; only the
             # original skill penalty keeps its squared optimizer objective.
             if self._process_mode == "trajectory_optimizer":
-                values = [("skill_process", process_value.square()), ("process_scene", scene_value)]
+                values = [("skill_process", process_value.square()),
+                          ("process_scene", optimizer_scene_out["nonworld_values"])]
                 # END metrics and optimizer retain exactly the same scene zero set.
                 # BEGIN signed inequalities enter PHR directly, never squared twice.
                 signed, _ = problem.functional_inequalities(
@@ -3009,7 +3076,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 augmented_cost = folded_augmented * budget.constraint_weight
                 collection.add(augmented_cost, "functional_augmented_lagrangian")
                 original_process = sum(process_terms.values(), torch.zeros_like(progress))
-                active = ordered(torch.cat((valid, anchor_valid.expand(batch, -1).bool()), 1))
                 original_process = torch.where(active, original_process, 0.).detach()
                 feasible = torch.isfinite(original_process).all(-1) & (original_process <= 0).all(-1)
                 for residual in signed.values():
@@ -3020,6 +3086,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # has already retained every active hard violation.
                 hard_invalid = torch.where(active, scene_evidence_out["optimizer_hard_invalid"], 0.)
                 eligible = feasible & (hard_invalid <= 0).all(-1)
+                # BEGIN strict scene feasibility uses original unweighted hard residuals.
+                raw_scene = torch.where(active, scene_value.detach(), 0.)
+                feasible = feasible & torch.isfinite(raw_scene).all(-1) & (raw_scene <= 0).all(-1)
+                # END permission to confirm proposals remains independent of this strict gate.
                 self._optimizer_evidence = (augmented_cost, feasible,
                     {name: value.detach() for name, value in signed.items()}, eligible, None)
                 # END the aggregate scene tensor identity is bound below, after folding.
@@ -3052,6 +3122,13 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # gradient and makes any anchor violation fail feasibility.
                 folded = torch.cat((torch.zeros_like(regular[:, :-1]), (value[:, horizon:]*anchor_valid).sum(1, keepdim=True)), 1)
                 # BEGIN retain the unchanged aggregate tensor as the query identity.
+                # BEGIN world path cost is already a whole-trajectory scalar.
+                # Add it once after regular/anchor folding, retaining the same
+                # native collection shape and existing common scene weight.
+                if name == "process_scene" and self._process_mode == "trajectory_optimizer":
+                    folded = folded + torch.cat((torch.zeros_like(regular[:, :-1]),
+                        optimizer_scene_out["world_objective"][:, None]), 1)
+                # END no horizon multiplier or duplicate old world time sum remains.
                 weighted = (regular+folded).unsqueeze(-1) * budget.constraint_weight
                 collection.add(weighted, name)
                 if name == "process_scene" and self._process_mode == "trajectory_optimizer":

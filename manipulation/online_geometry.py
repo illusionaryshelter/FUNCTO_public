@@ -18,6 +18,9 @@ from torch.nn import functional as F
 from scipy.spatial.transform import Rotation
 
 from .collision_records import encode_array, decode_array, MAX_ARRAY_BYTES
+# BEGIN same-query sphere trajectories feed the shared optimizer objective.
+from .collision_path import SphereCollisionPath, collision_path_workspace_allocation
+# END execution still consumes only the original reduced hard components.
 from .planning_problem import PosePath, quaternion_conjugate, quaternion_rotate, event_occurrence_key
 from .online_contact import PreparedContactFields, native_material_conditions, require_native_material
 from .planning_scene import (Attachment, CollisionOwner, ContactRule, CoverageField, ObservedSpace,
@@ -333,6 +336,21 @@ class OnlinePlanningScene:
         self._prepare_self_collision_pairs()
         # END the same preparation is repeated only when the binding changes.
         self.robot_self_collision_padding = [0.]*len(self.robot_sphere_materials)
+        # BEGIN objective length scales belong to fixed calibrated geometry.
+        # Empty metadata is an explicit unbound state; runtime FK radii can
+        # contain disabled sentinels and must never supply a length scale.
+        self._collision_path_indices = None
+        self._collision_path_radii = None
+        self._collision_path_device = {}
+        self._owner_collision_path_radii = {}
+        for owner in self.owners:
+            if owner.moving:
+                radii = owner.local_spheres[:, 3] + owner.sphere_cover_error_m
+                if not np.isfinite(radii).all() or np.any(radii <= 0):
+                    raise ValueError('Moving-owner collision paths need finite positive fixed radii')
+                radii.flags.writeable = False
+                self._owner_collision_path_radii[owner.owner_id] = radii
+        # END only bind_online_robot establishes robot objective geometry.
         self.robot_model = {}
         self.required_robot_links = ()
         self.robot_owner_permissions = ()
@@ -472,6 +490,21 @@ class OnlinePlanningScene:
         self.robot_self_collision_padding = padding.tolist()
         self.robot_model = deepcopy(robot_model or {})
         self.required_robot_links = tuple(row['link_name'] for row in robot_sphere_geometry)
+        # BEGIN retain physical sphere radii independently of runtime masks.
+        # The gripper replaces these native slots in every query, so its
+        # calibrated local spheres own their fixed radii. An uncertain hand
+        # envelope may enlarge its runtime spheres but grants no hard cost.
+        path_radii = radii.copy()
+        if self.gripper is not None:
+            path_radii[list(self.gripper.sphere_indices)] = self.gripper.local_spheres[:, 3]
+        if not np.isfinite(path_radii).all():
+            raise ValueError('Calibrated collision path radii must be finite')
+        self._collision_path_indices = np.flatnonzero(path_radii > 0)
+        self._collision_path_radii = path_radii[self._collision_path_indices]
+        self._collision_path_indices.flags.writeable = False
+        self._collision_path_radii.flags.writeable = False
+        self._collision_path_device = {}
+        # END permanently disabled native slots never acquire invented radii.
         self._prepare_contacts(radii)
 
     # BEGIN binding-owned immutable pair partitions; no per-state host filtering.
@@ -697,11 +730,22 @@ class OnlinePlanningScene:
         return hard.amax(-1), torch.where(retained, unresolved, 0.).amax(-1)
     # END continuous certificates retain hard collisions and original known_free.
 
+    # BEGIN expose sphere paths from the existing masked world collision query.
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time=None,
                    active_contact_rule_ids=None, contact_permission_progress=None,
-                   owner_poses=None, condition_evidence=None, native_confirmation=None):
-        """Same nonnegative numerical constraints in solve, final check and runtime."""
+                   owner_poses=None, condition_evidence=None, native_confirmation=None,
+                   collision_paths_out=None):
+        """Return the unchanged hard components and optional sphere trajectories.
+
+        ``collision_paths_out`` is a caller-owned dictionary of world-collision
+        component names to :class:`SphereCollisionPath`. Residuals include
+        every existing material/installation/uncertainty mask; centres use
+        the queried target's local frame (world for background). Both retain
+        their gradients. Fixed positive radii come from bound geometry, and
+        discrete mode keys identify changes of attachment or permission laws.
+        These proposal trajectories never replace hard execution evidence.
+        """
         if robot_spheres.shape[:2] != progress.shape or robot_spheres.shape[-2:] != (len(self.robot_sphere_materials),4):
             raise ValueError('Online scene requires aligned [batch,time,sphere,4] native FK')
         if active_contact_rule_ids is not None and not set(active_contact_rule_ids)<={rule.rule_id for rule in self.contacts}:
@@ -709,6 +753,15 @@ class OnlinePlanningScene:
         permission_progress=progress if contact_permission_progress is None else contact_permission_progress
         if permission_progress.shape!=progress.shape:
             raise ValueError('Finite permission progress must align with the queried states')
+        # BEGIN optional export is explicit and never invokes another query.
+        if collision_paths_out is not None:
+            if not isinstance(collision_paths_out, dict):
+                raise TypeError('Collision path output must be a dictionary')
+            if self._collision_path_indices is None:
+                raise ValueError('Collision paths require bound calibrated robot spheres')
+            if native_confirmation is not None:
+                raise ValueError('Differentiable collision paths cannot include native confirmation')
+        # END acceptance must not mix revised hard costs with proxy trajectories.
         costs, spheres = {}, robot_spheres
         # BEGIN retain broad-phase evidence only for explicit acceptance queries.
         # Optimizer calls keep their differentiable sphere costs and allocate
@@ -744,7 +797,8 @@ class OnlinePlanningScene:
         moving = torch.zeros(spheres.shape[-2], dtype=torch.bool, device=spheres.device)
         moving[uncertain_indices] = True
         uncertain_spheres = uncertain_hand[..., None] & moving
-        def sum_collision(values,name,actor):
+        # BEGIN export each masked sphere before the original scalar reduction.
+        def sum_collision(values,name,actor,centres,runtime_radii,mode_keys):
             if actor=='robot' and uncertain_indices:
                 selected=torch.zeros(values.shape[-1],dtype=torch.bool,device=values.device)
                 selected[uncertain_indices]=True
@@ -753,11 +807,42 @@ class OnlinePlanningScene:
                 costs[name]=torch.where(uncertainty,0.,values).sum(-1)
             else:
                 costs[name]=values.sum(-1)
+            if collision_paths_out is not None:
+                masked = torch.where(uncertain_spheres, 0., values) if actor == 'robot' else values
+                keys = tuple(mode_keys)
+                if actor == 'robot':
+                    # Per-sphere uncertainty preserves known arm motion when
+                    # only a finger becomes conditional at physical t > 0.
+                    keys += (uncertain_spheres,)
+                    cache_key = (values.device, values.dtype)
+                    if cache_key not in self._collision_path_device:
+                        self._collision_path_device[cache_key] = (
+                            torch.tensor(self._collision_path_indices, device=values.device, dtype=torch.long),
+                            torch.tensor(self._collision_path_radii, device=values.device, dtype=values.dtype))
+                    indices, radii = self._collision_path_device[cache_key]
+                    masked = masked.index_select(-1, indices)
+                    centres = centres.index_select(-2, indices)
+                    enabled = runtime_radii.index_select(-1, indices) > 0
+                    keys = tuple(key if key.shape[-1] == 1 else key.index_select(-1, indices)
+                                 for key in keys)
+                else:
+                    cache_key = (actor, values.device, values.dtype)
+                    if cache_key not in self._collision_path_device:
+                        self._collision_path_device[cache_key] = (None, torch.tensor(
+                            self._owner_collision_path_radii[actor], device=values.device, dtype=values.dtype))
+                    _, radii = self._collision_path_device[cache_key]
+                    enabled = runtime_radii > 0
+                keys += (enabled,)
+                # A permanently disabled native array may have no physical
+                # spheres. Its unchanged hard sum is zero and has no path.
+                if radii.numel():
+                    collision_paths_out[name] = SphereCollisionPath(masked, centres, radii, keys)
             # BEGIN preserve per-sphere candidates before reducing to one owner cost.
             if confirmation is not None and name in confirmable:
                 confirmation['targets'][name] = (torch.where(uncertain_spheres, 0., values)
                     if actor == 'robot' else values)
             # END native checks revise only the corresponding registered actor term.
+        # END conditional, contact, self and unknown terms are not path streams.
         def max_constraint(values, name, actor):
             # Numerical gaps of an unresolved future finger remain explicit
             # conditional gaps; known arm/palm gaps remain hard scene updates.
@@ -781,13 +866,27 @@ class OnlinePlanningScene:
             costs['conditional/collision/robot/self'] = costs.get(
                 'conditional/collision/robot/self', torch.zeros_like(progress))+conditional
         poses = {}
+        # BEGIN mode identities follow the same owner-pose branches below.
+        owner_mode_keys = {}
+        # END no motion is reconstructed from end-effector speed.
         for owner in self.owners:
+            if collision_paths_out is not None:
+                owner_mode_keys[owner.owner_id] = ()
             if owner_poses is not None and owner.owner_id in owner_poses:
                 matrix = np.asarray(owner_poses[owner.owner_id], dtype=float)
                 p = _tensor(matrix[:3,3], progress).expand(*progress.shape,3)
                 q = _tensor(Rotation.from_matrix(matrix[:3,:3]).as_quat()[[3,0,1,2]],progress).expand(*progress.shape,4)
                 poses[owner.owner_id] = p,q
                 continue
+            if collision_paths_out is not None:
+                modes = []
+                for relation in owner.attachments:
+                    started = progress >= relation.interval[0]
+                    mode = started.to(torch.long)
+                    if relation.release_condition_id is not None:
+                        mode = torch.where(progress >= relation.interval[1], 2, mode)
+                    modes.append(mode[..., None])
+                owner_mode_keys[owner.owner_id] = tuple(modes)
             releases = []
             for index, relation in enumerate(owner.attachments):
                 key = owner.owner_id,index
@@ -818,6 +917,9 @@ class OnlinePlanningScene:
                 cover[:,3] += owner.sphere_cover_error_m
                 actors[owner.owner_id] = (_world_spheres(cover,*poses[owner.owner_id]),poses[owner.owner_id])
         for actor,(body,actor_pose) in actors.items():
+            # BEGIN background uses the actor's world-frame sphere motion.
+            actor_modes = () if actor == 'robot' or collision_paths_out is None else owner_mode_keys[actor]
+            # END a target-owner query adds its own independent pose mode.
             costs[f'unknown/forbidden/{actor}'], costs[f'conditional/unknown/{actor}'] = self._unknown(
                 body, uncertain_spheres if actor == 'robot' else None)
             # BEGIN numerical support belongs to represented local geometry.
@@ -829,12 +931,18 @@ class OnlinePlanningScene:
                 & ~self.background.supports_centres(body)).to(progress.dtype),
                 f'scene_update/background/{actor}', actor)
             # END a local field never declares grid-exterior space observed free.
-            sum_collision(self.background(body),f'collision/{actor}/background',actor)
+            sum_collision(self.background(body),f'collision/{actor}/background',actor,
+                          body[..., :3],body[..., 3],actor_modes)
             for owner in self.owners:
                 if owner.owner_id == actor:
                     continue
                 local = _local_spheres(body,*poses[owner.owner_id])
                 policies = []
+                # BEGIN mode keys distinguish permission fields without packing bits.
+                pair_modes = list(actor_modes)
+                if collision_paths_out is not None:
+                    pair_modes.extend(owner_mode_keys[owner.owner_id])
+                # END each field selector affects only its declared material spheres.
                 for rule in self.contacts:
                     if rule.actor != actor or rule.target_owner != owner.owner_id:
                         continue
@@ -850,6 +958,10 @@ class OnlinePlanningScene:
                         confirmation['effective_rules'][rule.rule_id] = policy['active']
                     # END interval and geometry/unresolved-hand conditions are preserved.
                     policies.append((rule,policy))
+                    if collision_paths_out is not None:
+                        selected = torch.zeros(body.shape[-2], dtype=torch.bool, device=body.device)
+                        selected[list(rule.sphere_indices)] = True
+                        pair_modes.append(policy['active'][..., None] & selected)
                     costs[f'conditional/finger/{rule.rule_id}'] = uncertainty
                     if rule.required:
                         # A disabled uncertain permission does not satisfy a
@@ -885,6 +997,8 @@ class OnlinePlanningScene:
                     active, residual = model.components(actor_pose, poses[owner.owner_id], progress)
                     costs[f'initial_support/depth/{relation.relation_id}'] = residual
                     values = model.collision_values(local, values, active)
+                    if collision_paths_out is not None:
+                        pair_modes.append(active[..., None])
                     if confirmation is not None:
                         confirmation['effective_initial_supports'][relation.relation_id] = active
                 # END no latch, prescribed lift pose or future material rule enters.
@@ -892,7 +1006,8 @@ class OnlinePlanningScene:
                 if actor == 'robot' and owner.robot_excluded_spheres:
                     values = values.clone()
                     values[...,list(owner.robot_excluded_spheres)] = 0
-                sum_collision(values,f'collision/{actor}/{owner.owner_id}',actor)
+                sum_collision(values,f'collision/{actor}/{owner.owner_id}',actor,
+                              local[..., :3],local[..., 3],pair_modes)
                 # A small owner grid represents only its observed partition.
                 # Outside it the global observation policy still applies. At
                 # its boundary, spheres intersecting its represented AABB need
@@ -905,6 +1020,7 @@ class OnlinePlanningScene:
             costs = native_confirmation(costs, confirmation)
         # END contact, unknown-space and model-support residuals are not replaced.
         return costs
+    # END path export never replaces any hard scene component or acceptance law.
 
     def evaluate(self,*args,**kwargs):
         # BEGIN expose the same completed query for candidate diagnostics.
@@ -916,7 +1032,7 @@ class OnlinePlanningScene:
         hard = [value for name,value in terms.items() if not name.startswith('conditional/')]
         return torch.stack(hard).sum(0)
 
-    def estimated_workspace_allocation(self,batch,horizon,robot_coverage_horizon=0):
+    def estimated_workspace_allocation(self,batch,horizon,robot_coverage_horizon=0,*,collision_paths=False):
         # BEGIN account source arrays separately from both floating cache types.
         # A read-only clone shares its array/cache identity. A distinct field
         # with equal contents still owns separate storage and is counted twice.
@@ -997,6 +1113,39 @@ class OnlinePlanningScene:
             len(owner.local_spheres) for owner in self.owners if owner.moving)
         coverage_states = int(batch)*int(horizon)*coverage_spheres
         cpu_live, gpu_live = live+256*coverage_states, live+128*coverage_states
+        # BEGIN retain every target-relative path and its integration backward.
+        # Each robot sphere queries background and every owner; a moving
+        # owner's own query is skipped. Exported raw arrays and complete input
+        # gradients persist, but the reducer checkpoints its bounded blocks.
+        # Field permission keys are Boolean and belong to their actual pair;
+        # attachment identities broadcast over spheres and share their storage.
+        if collision_paths:
+            actor_sizes = {'robot': len(self.robot_sphere_materials), **{
+                owner.owner_id: len(owner.local_spheres) for owner in self.owners if owner.moving}}
+            robot_paths = actor_sizes['robot']*(1+len(self.owners))
+            path_spheres = robot_paths+sum(size*len(self.owners)
+                for actor, size in actor_sizes.items() if actor != 'robot')
+            # Every path retains enabled; robot paths also retain uncertainty.
+            # Only a rule's own actor/target retains its full-sphere active key.
+            # Initial support uses a single Boolean column, attachment uses
+            # a single int64 column, and both broadcast over physical spheres.
+            mode_bytes = (path_spheres+robot_paths
+                +sum(actor_sizes[rule.actor] for rule in self.contacts)
+                +len(self.initial_support_relations)
+                +8*sum(len(owner.attachments) for owner in self.owners))
+            # Before robot index selection, one pair's source masks and its
+            # selected copies may coexist. Reserve this serial temporary once.
+            pair_rule_count = max([0, *(sum(rule.actor == actor and rule.target_owner == target.owner_id
+                for rule in self.contacts) for actor in actor_sizes for target in self.owners)])
+            mode_bytes += max(actor_sizes.values())*(2+pair_rule_count)
+            path_allocation = collision_path_workspace_allocation(batch, horizon,
+                geometry_spheres=coverage_spheres, path_spheres=path_spheres,
+                max_stream_spheres=max(actor_sizes.values()), mode_bytes_per_state=mode_bytes)
+            cpu_shared += path_allocation['cpu_shared']
+            gpu_shared += path_allocation['gpu_shared']
+            cpu_live += path_allocation['cpu_live']
+            gpu_live += path_allocation['gpu_live']
+        # END no large sphere-path graph hides behind a per-robot-only estimate.
         # BEGIN two differentiable rigid transforms and a minimum inspect the
         # full native support vertex set at every queried batch/time state.
         support_states = int(batch)*int(horizon)*sum(len(model.actor_vertices)
