@@ -1729,6 +1729,47 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             scene.sum().backward()
             torch.testing.assert_close(fixture.q.grad[..., 1], torch.full((2, 2), 2*777.))
 
+    # BEGIN support events have one optimization owner and retain hard acceptance.
+    def test_support_only_request_uses_al_without_old_square_and_still_rejects(self):
+        from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
+        from curobo._src.rollout.metrics import CostsAndConstraints, RolloutResult
+        keys = tuple(f"support:0:{name}" for name in ("gap", "body", "footprint", "normal"))
+        with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
+            # Isolate cost ownership from geometry evaluation, which the
+            # SupportRequirement tests exercise with actual finite surfaces.
+            fixture.problem.residuals = lambda p, *args, **kwargs: {
+                "support:0": p[..., 1]+.2}
+            fixture.problem.functional_constraint_keys = keys
+            def inequalities(p, *args, **kwargs):
+                gap = p[:, 0, 1]+.2
+                return {key: gap if index == 0 else torch.full_like(gap, -1.)
+                        for index, key in enumerate(keys)}, {}
+            fixture.problem.functional_inequalities = inequalities
+            augmented = FunctionalAugmentedLagrangian(keys)
+            fixture.config_type.bind_request(fixture.problem, fixture.scene,
+                _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), (0., 1.),
+                PlanningBudget(constraint_weight=777., max_task_anchors=4), augmented)
+            costs = fixture.manager.compute_costs(fixture.state)
+            old_cost = costs.values[costs.names.index("skill_process")]
+            al_cost = costs.values[costs.names.index("functional_augmented_lagrangian")]
+            self.assertEqual(float(old_cost.detach().sum()), 0.)
+            torch.testing.assert_close(al_cost.sum(), torch.tensor(2*777.*.2**2))
+            al_cost.sum().backward()
+            self.assertGreater(float(fixture.q.grad.abs().sum()), 0.)
+            self.assertTrue(bool(torch.isfinite(fixture.q.grad).all()))
+            result = RolloutResult(costs_and_constraints=CostsAndConstraints(constraints=costs))
+            eligible, feasible, signed, _ = fixture.manager.optimizer_evidence(result)
+            self.assertFalse(bool(eligible.any()))
+            self.assertFalse(bool(feasible.any()))
+            self.assertEqual(set(signed), set(keys))
+            # Metric mode retains the unsquared physical residual, even
+            # though the optimizer no longer owns its former square cost.
+            fixture.manager._process_mode = "trajectory_metrics"
+            metrics = fixture.manager.compute_costs(fixture.state)
+            hard = metrics.values[metrics.names.index("skill_process")]
+            torch.testing.assert_close(hard.sum(), torch.tensor(8*777.*.2))
+    # END a low AL objective or deleted duplicate cannot authorize a failed goal.
+
     # BEGIN optimizer candidate evidence retains hard residuals before PHR substitution.
     def test_optimizer_evidence_rejects_removed_task_term_and_ignores_preferences(self):
         from curobo._src.rollout.metrics import CostsAndConstraints, RolloutResult

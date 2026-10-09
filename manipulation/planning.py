@@ -2963,13 +2963,17 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             spheres = problem.transform_robot_spheres(ordered(spheres))
             q, dq, progress = ordered(q), ordered(dq), ordered(progress)
             trajectory_time = ordered(all_u)*active_clock["duration"]
-            # BEGIN functional point inequalities have exactly one optimizer owner.
+            # BEGIN every supported functional event has exactly one optimizer owner.
             process_terms = problem.residuals(position, quaternion, progress, q, self._joint_names,
                 joint_velocity=dq, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear,
                 tool_angular_velocity=tool_angular)
-            process_value = sum(value for name, value in process_terms.items()
+            process_value = sum((value for name, value in process_terms.items()
                 if self._process_mode != "trajectory_optimizer"
-                or not name.startswith(("function_pose:", "function_coordinate:")))
+                or not name.startswith(("function_pose:", "function_coordinate:", "support:"))),
+                torch.zeros_like(progress))
+            # A support-only request still supplies a tensor after its old
+            # square penalty is removed. Its four signed requirements now
+            # belong to the same AL owner as pose/coordinate events below.
             # END metrics retain the complete original hard residual dictionary.
             # BEGIN optimizer and success metrics consume the identical online scene.
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]

@@ -743,8 +743,14 @@ class SupportRequirement:
         if not isinstance(self.surface, SupportSurface) or not self.source:
             raise ValueError("Support constraints need observed finite geometry and a source")
 
-    def evaluate(self, position, quaternion, numerical):
-        """Return a nonnegative per-pose violation, preserving tangent/yaw freedom."""
+    # BEGIN support acceptance and optimization share the original allowed set.
+    def raw_inequalities(self, position, quaternion, numerical):
+        """Return four signed per-pose requirements, each satisfied at <= 0.
+
+        Lengths remain in metres and the normal error remains a chord length.
+        Keeping feasible-side values lets AL multipliers decrease without
+        inventing a tangent location or yaw target inside this finite support.
+        """
         import torch
         p, q = _compose(position, quaternion, self.tool_from_carrier)
         body = p[..., None, :]+quaternion_rotate(q, _tensor(self.body_points, p).expand(*p.shape[:-1], *self.body_points.shape))
@@ -760,10 +766,33 @@ class SupportRequirement:
         # infinite derivative when a correctly aligned face has dot == 1.
         chord = torch.linalg.vector_norm(outward+normal, dim=-1)
         angular_bound = 2*np.sin(self.normal_tolerance/2)
-        return (torch.relu(gaps.abs().amax(-1)-self.gap_tolerance)
-                + torch.relu(-height.amin(-1)-numerical.position_m)
-                + torch.relu(footprint+self.margin-numerical.position_m)
-                + torch.relu(chord-angular_bound))
+        return {"gap": gaps.abs().amax(-1)-self.gap_tolerance,
+                "body": -height.amin(-1)-numerical.position_m,
+                "footprint": footprint+self.margin-numerical.position_m,
+                "normal": chord-angular_bound}
+
+    def normalized_inequalities(self, position, quaternion, numerical):
+        """Scale units for AL without changing any acceptance right-hand side.
+
+        The three length requirements share the declared gap scale, bounded
+        below by numerical precision. In particular, a tight boundary rounding
+        allowance does not become its own large optimization weight. The same
+        rule uses chord lengths for the normal and supports zero declarations.
+        """
+        length_scale = max(self.gap_tolerance, numerical.position_m)
+        # NumericalTolerance accepts any positive angle; a chord scale uses
+        # the physical angular-distance domain [0, pi], not sine periodicity.
+        normal_scale = max(2*np.sin(self.normal_tolerance/2),
+                           2*np.sin(min(numerical.rotation_rad, np.pi)/2))
+        return {name: value/(normal_scale if name == "normal" else length_scale)
+                for name, value in self.raw_inequalities(position, quaternion, numerical).items()}
+
+    def evaluate(self, position, quaternion, numerical):
+        """Preserve the original nonnegative hard residual in its original units."""
+        import torch
+        return sum(torch.relu(value) for value in
+                   self.raw_inequalities(position, quaternion, numerical).values())
+    # END no centering target, contact permission or physical tolerance is added.
 
 
 @dataclass
@@ -1336,7 +1365,11 @@ class PlanningProblem:
              for component in ("position", "rotation")]
             + [f"function_coordinate:{index}"
                for index, requirement in enumerate(self.coordinate_events)
-               if requirement.progress >= self.start_progress])
+               if requirement.progress >= self.start_progress]
+            + [f"support:{index}:{component}"
+               for index, requirement in enumerate(self.supports)
+               if requirement.progress >= self.start_progress
+               for component in ("gap", "body", "footprint", "normal")])
 
     def functional_inequalities(self, position, quaternion, progress, *, trajectory_time=None):
         """Return signed event residuals and their single physical query masks.
@@ -1345,7 +1378,10 @@ class PlanningProblem:
         ``[batch]`` and Boolean masks have shape ``[batch, horizon]``. A pose
         event supplies separate position-norm and rotation-norm inequalities;
         a coordinate event uses its existing signed/unwrapped history before
-        taking the absolute error. Every value is ``error/original_tolerance-1``.
+        taking the absolute error. Those values are
+        ``error/original_tolerance-1``. A support event instead supplies four
+        signed physical inequalities divided by its shared positive scales;
+        their zero sets remain the original finite-support requirements.
 
         The first actual event instant is used even when progress pauses or an
         exact anchor duplicates a regular sample. A missing required event is
@@ -1375,6 +1411,20 @@ class PlanningProblem:
             mask = _first_event_query(progress, requirement.progress, trajectory_time)
             error = requirement.error(position, quaternion, progress, trajectory_time=trajectory_time)
             add(f"function_coordinate:{index}", error, requirement.tolerance, mask)
+        # BEGIN expand complete support geometry only at its unique event pose.
+        for index, requirement in enumerate(self.supports):
+            if requirement.progress < self.start_progress:
+                continue
+            mask = _first_event_query(progress, requirement.progress, trajectory_time)
+            selected = mask.to(torch.int64).argmax(-1, keepdim=True)
+            event_position = position.gather(-2, selected[..., None].expand(*selected.shape, 3))
+            event_quaternion = quaternion.gather(-2, selected[..., None].expand(*selected.shape, 4))
+            components = requirement.normalized_inequalities(event_position, event_quaternion, self.numerical)
+            for component, value in components.items():
+                key = f"support:{index}:{component}"
+                signed[key] = torch.where(mask.any(-1), value.squeeze(-1), float("nan"))
+                masks[key] = mask
+        # END missing required events cannot masquerade as feasible zero values.
         return signed, masks
     # END these normalized optimizer inequalities do not change hard residuals.
 

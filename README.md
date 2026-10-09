@@ -957,14 +957,22 @@ finally:
     backend.close()
 ```
 
+<!-- BEGIN bounded recovery and shared signed functional-event constraints. -->
 Each request evaluates its initialization candidate first. A feasible candidate
 proceeds directly to delivery. Otherwise it receives one primary solve and at
-most one recovery: OMPL initialization for collision difficulty, or a bounded
-functional-multiplier update for a numerical task residual. There is no
+most one recovery: add the selected curve's missing collision check times, or
+use bounded OMPL initialization when no new collision times are available.
+Functional-multiplier updates use the existing inner iteration blocks; they do
+not create another trajectory solve. Pose, coordinate and finite-support events
+share this signed-inequality mechanism. Support keeps separate gap, body-height,
+footprint and normal requirements, normalized by its declared metric scales;
+normalization never changes their hard allowed set. Support events have no
+duplicate ordinary square penalty and retain free tangent/yaw motion. There is no
 post-feasibility quality stage, per-candidate export validation, witness-driven
 map refinement, or solver reconstruction loop. A recorded joint reference is
 explicit guidance; when native fitting changes its representation, diagnostics
 say so rather than claiming the original curve was preserved.
+<!-- END final acceptance still checks the original physical requirements. -->
 
 The native optimizer, native success metrics and OMPL checks
 use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:

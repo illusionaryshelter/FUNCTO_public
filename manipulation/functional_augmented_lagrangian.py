@@ -1,9 +1,12 @@
+# BEGIN signed allowed-set contract shared by every functional event family.
 """Per-seed PHR parameters for the planner's fixed-budget inner blocks.
 
-The problem supplies ``g = error / original_tolerance - 1 <= 0``. Parameters
-are constant within one native inner block; neither their update nor a small
-augmented objective certifies feasibility. Original metrics own acceptance.
+The problem supplies normalized signed inequalities ``g <= 0``: a positive
+scale changes units, never the original allowed set. Parameters are constant
+within one native inner block; neither their update nor a small augmented
+objective certifies feasibility. Original metrics own acceptance.
 """
+# END this component owns multipliers, not task tolerances or geometry.
 
 # BEGIN independent seed parameters; line-search particles never own dual state.
 import torch
