@@ -76,7 +76,9 @@ class ContinuousSimulationSession:
         _write(self.output / "session-start.json", {
             "trial_id": self.trial_id, "restore_count": 1, "restore": restored,
             "initial_feedback": self.simulation.proprioception(),
-            "stage_result_policy": "Independent simulation outcome gates test stages; geometry and control inputs remain RGB-D and robot feedback",
+            # BEGIN input provenance is owned by the caller's explicit experiment.
+            "stage_result_policy": "Independent simulation outcome gates test stages; geometry/control inputs retain their separately declared sources, and this result gate supplies no geometry",
+            # END a GT-input experiment must not be mislabeled as vision-only.
             "between_stage_timing": "Physics is paused without changing state while perception/planning uses wall time"})
 
     def _integration_state(self):
