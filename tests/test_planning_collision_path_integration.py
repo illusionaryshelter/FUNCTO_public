@@ -23,7 +23,7 @@ def boundary(evaluate, progress, x, *, anchors=(), valid=None):
     quaternion = x.new_zeros((*x.shape, 4))
     quaternion[..., 0] = 1.
     scene = SimpleNamespace(required_progress_anchors=anchors, contacts=(), evaluate=evaluate,
-                            native_world_collision_components=frozenset({WORLD}))
+                            native_collision_components=frozenset({WORLD}))
     objective, evidence = {}, {}
     raw = _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),
         _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), spheres, position, quaternion,
@@ -128,7 +128,7 @@ def native_fixture():
 
 def attach_world_fixture(fixture, *, world_value=1., nonworld_value=.3):
     calls = []
-    fixture.scene.native_world_collision_components = frozenset({WORLD})
+    fixture.scene.native_collision_components = frozenset({WORLD})
     def evaluate(spheres, p, *args, components_out, collision_paths_out=None, **kwargs):
         calls.append(1)
         world = torch.ones_like(p[..., 0]) * world_value

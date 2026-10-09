@@ -60,7 +60,7 @@ def completed(*, accepted, residual, points):
 
 def test_smaller_task_failure_cannot_hide_another_confirmable_sphere_seed():
     planner, result = selection_fixture(scene=(0., .02), task=(.00001, 0.))
-    planner._candidate_metrics.side_effect = lambda curve, scene: completed(
+    planner._candidate_metrics.side_effect = lambda curve, scene, *, native_query: completed(
         accepted=True, residual=0., points=7)
     candidate, curve, report = planner.select_candidate(result)
     assert report["accepted"] and report["selected_seed_index"] == curve.seed_index == 1
@@ -70,7 +70,7 @@ def test_smaller_task_failure_cannot_hide_another_confirmable_sphere_seed():
     assert not report["candidates"][0]["accepted"]
     assert report["seed_provenance"] == "alternate" and report["optimizer"] == {"seed": 1}
     assert report["sphere_proposal_metrics"]["rollout"]["constraints"]["process_scene"] > 0
-    planner._candidate_metrics.assert_called_once_with(curve, planner.scene)
+    planner._candidate_metrics.assert_called_once_with(curve, planner.scene, native_query=True)
     planner.export.assert_not_called()
 
 
@@ -78,7 +78,7 @@ def test_confirmed_real_collisions_remain_rejected_and_charge_every_query():
     planner, result = selection_fixture(scene=(.02, .01))
     confirmed_order = []
 
-    def confirm(curve, scene):
+    def confirm(curve, scene, *, native_query):
         confirmed_order.append(curve.seed_index)
         return completed(accepted=False, residual=.003, points=3 if curve.seed_index == 1 else 5)
 
@@ -114,7 +114,7 @@ def test_nonfinite_raw_scene_metrics_never_become_confirmation_candidates(value)
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), .0001])
 def test_confirmation_success_flag_cannot_override_invalid_residual(value):
     planner, result = selection_fixture(scene=(.01, 0.), task=(0., .1))
-    planner._candidate_metrics.side_effect = lambda curve, scene: completed(
+    planner._candidate_metrics.side_effect = lambda curve, scene, *, native_query: completed(
         accepted=True, residual=value, points=4)
     _, _, report = planner.select_candidate(result)
     assert not report["accepted"], "Confirmation keeps the same finite, nonpositive acceptance rule"
@@ -154,7 +154,7 @@ def test_native_confirmation_report_replaces_same_candidate_support_evidence():
     planner, result = selection_fixture(scene=(.01, 0.), task=(0., .1))
     result.metrics.debug[0, :, 0] = 0.
     result.metrics.debug[0, :, 1] = .01
-    def confirm(curve, scene):
+    def confirm(curve, scene, *, native_query):
         report, parameters, points = completed(accepted=False, residual=1., points=4)
         report["collision_residuals"] = {"interpolated:scene_collision": 0.}
         report["scene_update_residuals"] = {"interpolated:scene_update": 1.}
@@ -181,7 +181,7 @@ def test_proxy_clear_keeps_confirmed_coverage_evidence_for_bounded_search():
     result.metrics.debug[0, :, 0] = .02
     result.metrics.debug[0, :, 2] = .05
 
-    def confirm(curve, scene):
+    def confirm(curve, scene, *, native_query):
         report, parameters, points = completed(accepted=False, residual=.04, points=4)
         report["collision_residuals"] = {"interpolated:scene_collision": 0.}
         report["coverage_residuals"] = {"interpolated:unknown_forbidden": .04}
@@ -198,7 +198,7 @@ def test_proxy_clear_keeps_confirmed_coverage_evidence_for_bounded_search():
     assert proposal["collision_residuals"]["scene_collision"] == pytest.approx(.02)
     assert proposal["coverage_residuals"]["unknown_forbidden"] == pytest.approx(.05)
     assert report["confirmation_validation_points"] == 4
-    planner._candidate_metrics.assert_called_once_with(curve, planner.scene)
+    planner._candidate_metrics.assert_called_once_with(curve, planner.scene, native_query=True)
     planner.export.assert_not_called()
 # END search evidence never weakens the original hard acceptance or grants an execution binding.
 
@@ -219,7 +219,7 @@ def test_native_confirmation_replaces_unknown_evidence_with_same_candidate_queri
     planner, result = selection_fixture(scene=(.01, 0.), task=(0., .1))
     result.metrics.debug[0, :, 3] = .08
 
-    def confirm(curve, scene):
+    def confirm(curve, scene, *, native_query):
         report, parameters, points = completed(accepted=True, residual=0., points=4)
         report["conditional_unknown_residuals"] = {"interpolated:conditional_unknown": .04}
         return report, parameters, points

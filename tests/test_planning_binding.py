@@ -80,10 +80,10 @@ class PlanningBindingTest(unittest.TestCase):
         budget, mapping = _initial_timing(problem, PlanningBudget(knots=16, interpolation_buffer_size=768))
         native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=budget.maximum_trajectory_dt,
             maximum_trajectory_dt=budget.maximum_trajectory_dt, interpolation_dt=budget.interpolation_dt),
-            interpolation_steps=budget.interpolation_steps, action_horizon=budget.knots,
+            interpolation_steps=budget.interpolation_steps, action_horizon=budget.knots+2,
             transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3))
         grid = _formal_native_clock(native)
-        mapping, _ = _progress_for_cubic_boundaries(mapping, budget.knots, problem.start_dq,
+        mapping, _ = _progress_for_cubic_boundaries(mapping, budget.knots,
             stop_progress=problem.stop_progress, anchors=problem.anchors)
         mapping = _bind_event_clock(problem, mapping, grid["duration"], .002)
         seen = []
@@ -138,7 +138,7 @@ class PlanningBindingTest(unittest.TestCase):
         problem.source_timestamps = np.array([3., 4., 5.])
         problem.source_progress = np.array([.4, .7, 1.])
         _, mapping = _initial_timing(problem, PlanningBudget())
-        warped, _ = _progress_for_cubic_boundaries(mapping, 8, [0.], stop_progress=(), anchors=[.4, 1.])
+        warped, _ = _progress_for_cubic_boundaries(mapping, 8, stop_progress=(), anchors=[.4, 1.])
         self.assertEqual(warped.s[0], .4)
         self.assertEqual(warped.s[-1], 1.)
         self.assertFalse(np.any(warped.s < .4))

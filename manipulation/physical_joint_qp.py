@@ -14,6 +14,10 @@ import quadprog
 from scipy.interpolate import BSpline, PPoly
 import torch
 
+# BEGIN one coefficient definition serves CPU programs and tensor rollouts.
+from .cubic_trajectory import CubicBasis
+# END no native CUDA trajectory kernel participates in this representation.
+
 
 def _numpy(value):
     return (value.detach().cpu().numpy().astype(float) if isinstance(value, torch.Tensor)
@@ -38,36 +42,39 @@ def _solve_qp(hessian, linear, rows, lower, upper):
         return None
 
 
-class CubicAffineMap:
-    """cuRobo degree-three coefficients, including its exact boundary layout."""
+class CubicAffineMap(CubicBasis):
+    """Bind measured q0/dq0 to the shared instantaneous-boundary cubic."""
 
-    def __init__(self, prefix, knots, knot_dt):
-        self.knots, self.knot_dt = knots, float(knot_dt)
-        self.knot_vector = np.arange(-3., knots+8.)
-        self.matrix = np.zeros((knots+7, knots))
-        self.matrix[4:4+knots] = np.eye(knots)
-        self.matrix[-3:, -1] = 1.
-        self.prefix = np.zeros((knots+7, prefix.shape[-1]))
-        self.prefix[:4] = _numpy(prefix)
-        self.basis = BSpline(self.knot_vector, self.matrix, 3, extrapolate=False)
-        self.fixed = BSpline(self.knot_vector, self.prefix, 3, extrapolate=False)
+    # BEGIN exactly two measured equalities replace four fixed coefficients.
+    def __init__(self, start_q, start_dq, knots, knot_dt):
+        super().__init__(knots, knot_dt)
+        self.start_q, self.start_dq = _numpy(start_q).reshape(-1), _numpy(start_dq).reshape(-1)
+        if (self.start_q.shape != self.start_dq.shape
+                or not np.isfinite(self.start_q).all() or not np.isfinite(self.start_dq).all()):
+            raise ValueError("Cubic entrance needs matching finite measured q0/dq0")
+
+    def coefficients(self, actions):
+        """Complete coefficients, computed relative to q0 before translation."""
+        actions = _numpy(actions)
+        return (self.start_q + np.einsum("cn,...nj->...cj", self.matrix, actions-self.start_q)
+                + self.velocity_coefficients[:, None]*self.knot_dt*self.start_dq)
 
     def query(self, progress, derivative=0):
-        progress = _numpy(progress)
-        if (progress.ndim != 1 or not np.isfinite(progress).all()
-                or np.any(progress < 0.) or np.any(progress > 1.)
-                or derivative not in (0, 1, 2, 3)):
-            raise ValueError("Cubic queries need finite normalized times and derivative 0..3")
-        times = progress*(self.knots+4)
-        scale = self.knot_dt**derivative
-        return self.basis(times, nu=derivative)/scale, self.fixed(times, nu=derivative)/scale
+        weights, velocity = self.weights(_numpy(progress), derivative)
+        offset = velocity[:, None]*self.start_dq-weights.sum(-1, keepdims=True)*self.start_q
+        if derivative == 0:
+            offset = offset+self.start_q
+        return weights, offset
 
     def evaluate(self, actions, progress, derivative=0):
         actions = _numpy(actions)
-        if actions.shape[-2:] != (self.knots, self.prefix.shape[-1]):
+        if actions.shape[-2:] != (self.knots, len(self.start_q)):
             raise ValueError("Cubic sampling requires the native free-control layout")
-        weights, offset = self.query(progress, derivative)
-        return np.einsum("tn,...nj->...tj", weights, actions)+offset
+        weights, velocity = self.weights(_numpy(progress), derivative)
+        values = (np.einsum("tn,...nj->...tj", weights, actions-self.start_q)
+                  + velocity[:, None]*self.start_dq)
+        return values+self.start_q if derivative == 0 else values
+    # END all derivatives act on relative controls; public actions stay positions.
 
     def extrema_times(self, controls, joint, derivative=0):
         """Return boundaries and extrema of q or dq, in fixed-clock units.
@@ -75,14 +82,31 @@ class CubicAffineMap:
         Query times use knot units. Values use the model's joint coordinates
         and seconds; velocity extrema are roots of the actual acceleration.
         """
-        coefficients = self.prefix[:, joint]+self.matrix@controls
+        # BEGIN form derivatives before adding the absolute entrance angle.
+        coefficients = (self.matrix@(controls-self.start_q[joint])
+                        +self.velocity_coefficients*self.knot_dt*self.start_dq[joint])
         polynomial = PPoly.from_spline(BSpline(self.knot_vector, coefficients, 3))
+        entrance = np.flatnonzero(polynomial.x[:-1] == 0.)
+        polynomial.c[-1, entrance] = 0.
+        polynomial.c[-2, entrance] = self.knot_dt*self.start_dq[joint]
+        # Four identical final coefficients represent an exactly stopped
+        # interval; summing large signed basis terms must not create motion.
+        terminal = polynomial.x[:-1] >= self.intervals-1
+        polynomial.c[:-1, terminal] = 0.
+        polynomial.c[-1, terminal] = controls[-1]-self.start_q[joint]
         if derivative:
             polynomial = polynomial.derivative(derivative)
         roots = polynomial.derivative().roots(extrapolate=False)
-        roots = roots[np.isfinite(roots) & (roots >= 0.) & (roots <= self.knots+4)]
-        times = np.unique(np.r_[np.arange(self.knots+5), roots])
-        return times, polynomial(times)/(self.knot_dt**derivative)
+        roots = roots[np.isfinite(roots) & (roots >= 0.) & (roots <= self.intervals)]
+        times = np.unique(np.r_[np.arange(self.intervals+1), roots])
+        values = polynomial(times)/(self.knot_dt**derivative)
+        if derivative == 0:
+            values = values+self.start_q[joint]
+            values[times == 0.] = self.start_q[joint]
+        elif derivative == 1:
+            values[times == 0.] = self.start_dq[joint]
+        return times, values
+        # END exact boundary states are preserved without a numerical tolerance.
 
     def velocity_extrema(self, controls):
         """Analytic all-time velocity bounds for one [control,joint] action."""
@@ -117,9 +141,10 @@ class CubicAffineMap:
         for iteration in range(24):
             row_parts, lower_parts, upper_parts = [], [], []
             for derivative, (lo_bound, hi_bound) in bounds.items():
-                scale = self.knot_dt**derivative
-                weights = self.basis(times[derivative], nu=derivative)/scale
-                offset = self.fixed(times[derivative], nu=derivative)[:, joint]/scale+weights@origin
+                # BEGIN use the same exact entrance rows as tensor sampling.
+                weights, fixed = self.query(times[derivative]/self.intervals, derivative)
+                offset = fixed[:, joint]+weights@origin
+                # END numerical cancellation cannot fabricate an entrance QP row.
                 margin = roundoff*np.abs(weights).sum(-1)
                 row_parts.append(weights)
                 lower_parts.append(lo_bound-offset+margin)

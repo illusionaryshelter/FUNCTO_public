@@ -22,9 +22,9 @@ class PhysicalJointQPTest(unittest.TestCase):
 
     def velocity_oracle(self, domain, controls):
         coefficients = domain.coefficients(controls[None])[0, :, 0].numpy()
-        velocity = PPoly.from_spline(BSpline(np.arange(-3., 16.), coefficients, 3)).derivative()
+        velocity = PPoly.from_spline(BSpline(np.arange(-3., domain.knots+6.), coefficients, 3)).derivative()
         roots = velocity.derivative().roots(extrapolate=False)
-        times = np.r_[np.arange(13), roots[np.isfinite(roots) & (roots >= 0.) & (roots <= 12.)]]
+        times = np.r_[np.arange(domain.intervals+1), roots[np.isfinite(roots) & (roots >= 0.) & (roots <= domain.intervals)]]
         values = velocity(times)/.2
         return values.min(), values.max()
 
@@ -32,11 +32,11 @@ class PhysicalJointQPTest(unittest.TestCase):
         domain = self.domain(.2, .1)
         controls = torch.linspace(-.3, .5, 8).reshape(1, 8, 1)
         coefficients = domain.coefficients(controls)[0, :, 0].numpy()
-        spline = BSpline(np.arange(-3., 16.), coefficients, 3)
+        spline = BSpline(np.arange(-3., domain.knots+6.), coefficients, 3)
         progress = np.linspace(0., 1., 53)
         for derivative in range(4):
             actual = domain.evaluate(controls, progress, derivative)[0, :, 0]
-            expected = spline(progress*12, nu=derivative)/(.2**derivative)
+            expected = spline(progress*domain.intervals, nu=derivative)/(.2**derivative)
             np.testing.assert_allclose(actual, expected, atol=2e-13, rtol=2e-13)
         np.testing.assert_allclose(domain.evaluate(controls, [0., 1.])[0, :, 0], [.2, .5], atol=1e-8)
         np.testing.assert_allclose(domain.evaluate(controls, [0., 1.], 1)[0, :, 0], [.1, 0.], atol=1e-8)
@@ -56,7 +56,7 @@ class PhysicalJointQPTest(unittest.TestCase):
 
     def test_reference_is_soft_and_fixed_entrance_and_clock_are_retained(self):
         domain = self.domain(.2, .1)
-        original_prefix = domain.prefix.clone()
+        original_q, original_dq = domain._start_q.clone(), domain._start_dq.clone()
         progress = np.linspace(0., 1., 41)
         targets = (2*progress)[:, None]
         fitted, report = domain.fit_reference(progress, targets)
@@ -65,7 +65,8 @@ class PhysicalJointQPTest(unittest.TestCase):
         self.assertGreaterEqual(report["reference_max_error_joint_units"], 1.)
         self.assertGreater(report["fit_contraction_scale"], .99)
         self.assertLessEqual(report["fit_contraction_scale"], 1.)
-        torch.testing.assert_close(domain.prefix, original_prefix)
+        torch.testing.assert_close(domain._start_q, original_q, rtol=0, atol=0)
+        torch.testing.assert_close(domain._start_dq, original_dq, rtol=0, atol=0)
         np.testing.assert_allclose(domain.evaluate(fitted, [0.]), [[.2]], atol=1e-8)
         np.testing.assert_allclose(domain.evaluate(fitted, [0.], 1), [[.1]], atol=1e-8)
 
@@ -126,7 +127,7 @@ class PhysicalJointQPTest(unittest.TestCase):
 
     def test_seed_fit_enforces_continuous_velocity_at_moving_acceleration_roots(self):
         domain = self.domain(.2, .1)
-        original_prefix = domain.prefix.clone()
+        original_q, original_dq = domain._start_q.clone(), domain._start_dq.clone()
         progress = np.linspace(0., 1., 41)
         targets = np.sin(6*np.pi*progress)[:, None]
         velocity_bounds = torch.tensor([[-.5], [.5]])
@@ -140,17 +141,23 @@ class PhysicalJointQPTest(unittest.TestCase):
         self.assertAlmostEqual(report["continuous_max_abs_velocity_joint_units_per_s"][0],
                                max(abs(low), abs(high)), places=13)
         self.assertTrue(bool(domain.feasible(fitted[None]).all()))
-        torch.testing.assert_close(domain.prefix, original_prefix)
+        torch.testing.assert_close(domain._start_q, original_q, rtol=0, atol=0)
+        torch.testing.assert_close(domain._start_dq, original_dq, rtol=0, atol=0)
         np.testing.assert_allclose(domain.evaluate(fitted, [0.], 1), [[.1]], atol=1e-8)
 
     def test_rounding_contraction_constructs_anchor_for_both_position_and_velocity(self):
         domain = self.domain(0., .1)
-        # Constant *free coefficients* do not mean a constant trajectory when
-        # the fixed entrance has nonzero velocity. Its undershoot exceeds the
-        # requested speed, so blindly reusing that q-only anchor is incorrect.
+        # BEGIN a cached position-only anchor is not velocity certification.
+        # The revised entrance can brake a constant proposal immediately.
+        # Use a legal position curve with an independently proved fast hump
+        # to exercise the still-required position+velocity anchor construction.
         velocity_bounds = torch.tensor([[-.11], [.11]])
-        position_anchor = domain._construct_anchor(torch.float32, torch.device("cpu"))[0]
+        domain._anchor = torch.zeros(1, 8, 1)
+        domain._anchor[0, 3, 0] = .1
+        position_anchor = domain._anchor[0]
+        self.assertTrue(bool(domain.feasible(domain._anchor).all()))
         self.assertGreater(max(abs(v) for v in self.velocity_oracle(domain, position_anchor)), .11)
+        # END fitting must not silently weaken its requested velocity bounds.
         fitted, report = domain.fit_reference(np.linspace(0., 1., 16), np.full((16, 1), .5),
                                               velocity_bounds=velocity_bounds)
         self.assertTrue(report["success"], report)
@@ -162,22 +169,24 @@ class PhysicalJointQPTest(unittest.TestCase):
 
     def test_incompatible_fixed_velocity_reports_failure_without_dropping_bound(self):
         domain = self.domain(.2, .1)
-        prefix = domain.prefix.clone()
+        original_q, original_dq = domain._start_q.clone(), domain._start_dq.clone()
         fitted, report = domain.fit_reference(np.linspace(0., 1., 16), np.zeros((16, 1)),
                                               velocity_bounds=np.array([[-.05], [.05]]))
         self.assertIsNone(fitted)
         self.assertFalse(report["success"])
         self.assertTrue(report["velocity_bounds_enforced"])
         self.assertEqual(report["reason"], "fit_initializer_not_constructed")
-        torch.testing.assert_close(domain.prefix, prefix)
+        torch.testing.assert_close(domain._start_q, original_q, rtol=0, atol=0)
+        torch.testing.assert_close(domain._start_dq, original_dq, rtol=0, atol=0)
 
     def test_impossible_fixed_entrance_reports_failed_fit_without_rewriting_it(self):
-        domain = self.domain(.99, .2)
-        original_prefix = domain.prefix.clone()
+        domain = self.domain(1., .2)
+        original_q, original_dq = domain._start_q.clone(), domain._start_dq.clone()
         fitted, report = domain.fit_reference(np.linspace(0., 1., 16), np.zeros((16, 1)))
         self.assertIsNone(fitted)
         self.assertFalse(report["success"])
-        torch.testing.assert_close(domain.prefix, original_prefix)
+        torch.testing.assert_close(domain._start_q, original_q, rtol=0, atol=0)
+        torch.testing.assert_close(domain._start_dq, original_dq, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

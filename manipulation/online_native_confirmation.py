@@ -11,6 +11,10 @@ components. Conservative proposal samples are never reconstructed as solids.
 A primitive target retains its analytic Coal shape outside finite contact
 mode. This is a discrete observed-geometry check,
 not a continuous-trajectory, sensor-error or unobserved-space certificate.
+
+Positive robot-self sphere proposals use the existing registered robot CAD
+and named candidate joints. They never query simulator contacts or hidden
+environment geometry; their confirmation remains separate from world terms.
 """
 
 # BEGIN bounded native confirmation owned by non-gradient planning decisions.
@@ -420,7 +424,74 @@ class OnlineCollisionConfirmation:
     def __init__(self, validator, scene, check_request=None):
         self.validator, self.scene, self.engine = validator, scene, None
         self.check_request = check_request
-        self.last_report = {}
+        # BEGIN one candidate/scene owns every reused self-state decision.
+        # The same q/time occurs in the native regular/anchor terms and in
+        # scene mode-side queries. Exact typed identities reuse one required-
+        # pair query; a different candidate, scene or request constructs a new
+        # adapter. No state survives that owner's lifecycle.
+        self._self_states = {}
+        self.self_report = {
+            'scope': 'Known robot CAD required pairs at positive-proxy candidate states; '
+                     'unmodelled future hand geometry remains explicit; no simulator state queries',
+            'candidate_states': 0, 'states': []}
+        self.last_report = {'self_collision': self.self_report}
+        # END the existing planning point/deadline budgets bound these records.
+
+    # BEGIN self confirmation cannot authorize any other scene component.
+    def confirm_self(self, residual, joint_position, joint_names, trajectory_time, *, source):
+        """Revise finite positive sphere residuals using this exact q/time.
+
+        All arrays use [batch,time], with an extra named-joint dimension on
+        ``joint_position``. Zero proxies keep their certified-cover fast path.
+        Nonfinite proxies remain failures even if another finite self channel
+        at the same state has already passed. The result never aliases a
+        modified caller tensor; analytic hand constraints do not enter here.
+        """
+        import torch
+        if source not in {'collision/robot/self', 'self_collision', 'anchor_self_collision'}:
+            raise ValueError('Self confirmation requires an explicit sphere-proposal identity')
+        if residual.ndim != 2:
+            raise ValueError('Self confirmation requires aligned [batch,time] residuals')
+        positive = torch.isfinite(residual) & (residual > 0)
+        if not bool(positive.any().item()):
+            return residual
+        names = tuple(joint_names or ())
+        if (joint_position is None or trajectory_time is None or not names
+                or joint_position.shape != (*residual.shape, len(names))
+                or trajectory_time.shape != residual.shape):
+            raise ValueError('Self confirmation requires the same named q and physical times as its proxies')
+        joints = joint_position.detach().cpu().numpy()
+        times = trajectory_time.detach().cpu().numpy()
+        raw = residual.detach().cpu().numpy()
+        locations = positive.nonzero(as_tuple=False).detach().cpu().numpy()
+        result = residual
+        for batch, index in locations:
+            if self.check_request is not None:
+                self.check_request()
+            q, time_s = joints[batch, index], times[batch, index]
+            # Preserve float32 endpoint identity for the validator's existing
+            # exact-representation joint-limit and nominal-finger contracts.
+            key = (names, q.dtype.str, q.tobytes(), times.dtype.str, time_s.tobytes())
+            record = self._self_states.get(key)
+            if record is None:
+                checked = self.validator.check_planning_self(q, names,
+                    time_s=time_s, gripper=self.scene.gripper)
+                # A late query cannot publish clearance after its deadline.
+                if self.check_request is not None:
+                    self.check_request()
+                record = {'time_s': float(time_s), 'query_index': [int(batch), int(index)],
+                          'sphere_residuals': {}, **checked}
+                self._self_states[key] = record
+                self.self_report['states'].append(record)
+                self.self_report['candidate_states'] = len(self._self_states)
+            record['sphere_residuals'][source] = max(float(raw[batch, index]),
+                record['sphere_residuals'].get(source, 0.))
+            if (record['passed'] and np.isfinite(record['residual']) and record['residual'] <= 0):
+                if result is residual:
+                    result = residual.clone()
+                result[batch, index] = 0.
+        return result
+    # END only a same-state required-pair result clears its finite sphere proposal.
 
     def __call__(self, costs, evidence):
         # All candidates were masked for unresolved hand geometry and native
@@ -444,7 +515,7 @@ class OnlineCollisionConfirmation:
                 candidates[name] = retained
             # END a NaN beside a positive sphere keeps the original failed term.
         self.last_report = {'scope': 'registered native actor solids against the same frozen observed geometry',
-                            'candidate_states': 0, 'states': []}
+                            'candidate_states': 0, 'states': [], 'self_collision': self.self_report}
         if not candidates:
             return costs
         if self.engine is None:
@@ -517,4 +588,4 @@ class OnlineCollisionConfirmation:
         self.last_report['candidate_states'] = len(locations)
         self.last_report['actor_queries'] = len(self.last_report['states'])
         return result
-# END no contact, coverage, unknown, controller or self-collision term is relaxed.
+# END world confirmation leaves contact, coverage, controller and separate self terms unchanged.

@@ -42,6 +42,12 @@ class CartesianSphereScene(OnlinePlanningScene):
         return frozenset()
 
     @property
+    def native_collision_components(self):
+        # This fixture's robot shapes are the exact spheres themselves;
+        # no separate CAD channel is declared for either self or world.
+        return self.native_world_collision_components
+
+    @property
     def native_world_collision_pairs(self):
         return {}
     # END explicit fixture contract, not a production-schema fallback.

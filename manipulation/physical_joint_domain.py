@@ -1,8 +1,8 @@
 """Physical joint domains for native IK and cubic L-BFGS updates.
 
 The domains restrict numerical iterates, not the demonstration or task goal.
-No position is clipped after optimization. Cubic checks include the fixed
-measured entrance controls and every analytic interior position extremum.
+No position is clipped after optimization. Cubic checks include the measured
+instantaneous entrance and every analytic interior position extremum.
 """
 
 # BEGIN physical-domain step restriction shared by initialization and L-BFGS.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from scipy.interpolate import BSpline, CubicHermiteSpline, PPoly
+from scipy.interpolate import CubicHermiteSpline, PPoly
 from scipy.optimize import linprog
 
 # BEGIN a graph scope records errors without changing any domain arithmetic.
@@ -150,12 +150,12 @@ class JointPositionDomain:
 
 
 class CubicJointDomain(JointPositionDomain):
-    """Exact position domain of cuRobo's cubic, with free terminal controls.
+    """Exact position domain of the shared instantaneous-boundary cubic.
 
-    The prefix follows the installed degree-three boundary kernel with
-    measured q0/dq0 and zero unmeasured acceleration. Three terminal copies
-    match ``use_implicit_goal=False``. Free controls themselves have no
-    invented box: only the represented physical q(t) determines this domain.
+    Only measured q0/dq0 are fixed. Acceleration and jerk remain optimizable
+    immediately; the original three terminal copies retain a stopped end.
+    Free controls themselves have no invented box: only the represented
+    physical q(t) determines this domain.
     """
 
     def __init__(self, lower: torch.Tensor, upper: torch.Tensor, start_q: torch.Tensor,
@@ -164,12 +164,23 @@ class CubicJointDomain(JointPositionDomain):
         self.knots = knots
         q = start_q.detach().reshape(-1).to(torch.float64)
         dq = start_dq.detach().reshape(-1).to(torch.float64)
-        self.prefix = q[None]+q.new_tensor([-1., 0., 1., 2.])[:, None]*dq[None]*knot_dt
         self._anchor = None
-        self._start_q = q
-        # BEGIN one native affine representation for seed sampling and CPU QPs.
-        self._curve_map = CubicAffineMap(self.prefix, knots, knot_dt)
-        # END its fixed coefficients and clock never change during a solve.
+        # BEGIN eliminate only the two measured instantaneous equalities.
+        self._start_q, self._start_dq = q, dq
+        self._curve_map = CubicAffineMap(q, dq, knots, knot_dt)
+        self.intervals = self._curve_map.intervals
+        self._coefficient_matrix = torch.as_tensor(self._curve_map.matrix,
+            device=q.device, dtype=torch.float64)
+        self._velocity_coefficients = torch.as_tensor(self._curve_map.velocity_coefficients,
+            device=q.device, dtype=torch.float64)*knot_dt
+        # At an exact physical boundary an outward measured velocity leaves
+        # the interval immediately for every finite-acceleration cubic. This
+        # necessary tangent condition is algebraic, not a widened q tolerance.
+        self._entrance_valid = (torch.isfinite(q).all() & torch.isfinite(dq).all()
+            & (q >= self.lower).all() & (q <= self.upper).all()
+            & ((q > self.lower) | (dq >= 0)).all()
+            & ((q < self.upper) | (dq <= 0)).all())
+        # END domain, CPU QP and native tensor states share these coefficients.
 
     # BEGIN reference values and cubic coefficients have distinct public APIs.
     def evaluate(self, actions, progress, derivative=0):
@@ -198,19 +209,32 @@ class CubicJointDomain(JointPositionDomain):
     def coefficients(self, action: torch.Tensor) -> torch.Tensor:
         if action.shape[-2:] != (self.knots, len(self.lower)):
             raise ValueError("Physical cubic domain requires the bound native free-control layout")
-        shape = action.shape[:-2]
-        prefix = self.prefix.expand(*shape, *self.prefix.shape)
-        return torch.cat((prefix, action.to(torch.float64),
-                          action[..., -1:, :].to(torch.float64).expand(*shape, 3, len(self.lower))), dim=-2)
+        # BEGIN relative controls avoid subtracting large absolute joint angles.
+        return self._relative_coefficients(action)+self._start_q
+        # END no coefficient clipping or fixed first interval is introduced.
+
+    def _relative_coefficients(self, action):
+        return (torch.matmul(self._coefficient_matrix, action.to(torch.float64)-self._start_q)
+                +self._velocity_coefficients[:, None]*self._start_dq)
 
     def extrema(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Evaluate endpoints and every real derivative root of each cubic."""
-        c = self.coefficients(action)
-        p0, p1, p2, p3 = (c[..., offset:offset+self.knots+4, :] for offset in range(4))
-        a = (-p0+3*p1-3*p2+p3)/6
-        b = (p0-2*p1+p2)/2
-        d = (p2-p0)/2
-        e = (p0+4*p1+p2)/6
+        # BEGIN evaluate polynomial differences before restoring absolute q0.
+        if action.shape[-2:] != (self.knots, len(self.lower)):
+            raise ValueError("Physical cubic domain requires the bound free-control layout")
+        c = self._relative_coefficients(action)
+        p0, p1, p2, p3 = (c[..., offset:offset+self.intervals, :] for offset in range(4))
+        first_diff, second_diff, third_diff = p1-p0, p2-p1, p3-p2
+        a = (third_diff-2*second_diff+first_diff)/6
+        b = (second_diff-first_diff)/2
+        d = (first_diff+second_diff)/2
+        e = p1+(second_diff-first_diff)/6
+        # These are exact identities of the eliminated entrance equations.
+        # They must match the tensor state's exact q0/dq0 rows even when q0
+        # lies on a physical bound and relative coefficients are nonzero.
+        e = torch.cat((torch.zeros_like(e[..., :1, :]), e[..., 1:, :]), dim=-2)
+        initial_d = (self._start_dq*self._curve_map.knot_dt).expand_as(d[..., :1, :])
+        d = torch.cat((initial_d, d[..., 1:, :]), dim=-2)
         quadratic, linear = 3*a, 2*b
         discriminant = linear.square()-4*quadratic*d
         root = torch.sqrt(torch.clamp_min(discriminant, 0))
@@ -227,12 +251,13 @@ class CubicJointDomain(JointPositionDomain):
         first = torch.where(first_valid & (first > 0) & (first < 1), first, torch.zeros_like(first))
         second = torch.where(second_valid & (second > 0) & (second < 1), second, torch.zeros_like(second))
         values = torch.stack((e, a+b+d+e, ((a*first+b)*first+d)*first+e,
-                              ((a*second+b)*second+d)*second+e), dim=-2)
+                              ((a*second+b)*second+d)*second+e), dim=-2)+self._start_q
+        # END no roundoff-sized outward entrance is fabricated or tolerated.
         return values.amin(dim=(-2, -3)), values.amax(dim=(-2, -3))
 
     def feasible(self, action: torch.Tensor) -> torch.Tensor:
         low, high = self.extrema(action)
-        return (torch.isfinite(action).all(dim=(-1, -2)) & torch.isfinite(low).all(-1)
+        return (self._entrance_valid & torch.isfinite(action).all(dim=(-1, -2)) & torch.isfinite(low).all(-1)
                 & torch.isfinite(high).all(-1) & (low >= self.lower).all(-1)
                 & (high <= self.upper).all(-1))
 
@@ -246,19 +271,19 @@ class CubicJointDomain(JointPositionDomain):
         physical interval above.
         """
         constant = self._start_q.to(dtype=dtype, device=device).expand(1, self.knots, -1).clone()
+        if not bool(self._entrance_valid):
+            raise JointDomainInitializationError(
+                "Measured entrance lies outside physical bounds or has an outward boundary velocity")
         if bool(self.feasible(constant).all()):
             return constant
-        # BEGIN share exactly one coefficient map with fitting and recovery.
-        knot_vector, matrix = self._curve_map.knot_vector, self._curve_map.matrix
-        basis, prefix, fixed = self._curve_map.basis, self._curve_map.prefix, self._curve_map.fixed
-        # END the old initializer keeps its existing LP and acceptance rules.
         lower, upper = self.lower.cpu().numpy(), self.upper.cpu().numpy()
         controls = np.empty((self.knots, len(lower)))
         for joint in range(len(lower)):
-            samples = np.linspace(0., self.knots+4., 4*(self.knots+4)+1)
+            samples = np.linspace(0., self.intervals, 4*self.intervals+1)
             solved = False
             for _ in range(24):
-                weights, offset = basis(samples), fixed(samples)[:, joint]
+                weights, fixed = self._curve_map.query(samples/self.intervals)
+                offset = fixed[:, joint]
                 influence = np.minimum(1., np.abs(weights).sum(-1))
                 margin = 32*np.finfo(np.float32).eps*(1+abs(lower[joint])+abs(upper[joint]))*influence
                 result = linprog(np.zeros(self.knots),
@@ -268,12 +293,9 @@ class CubicJointDomain(JointPositionDomain):
                 if not result.success:
                     break
                 candidate = result.x.astype(np.float32).astype(float)
-                coefficients = prefix[:, joint]+matrix@candidate
-                polynomial = PPoly.from_spline(BSpline(knot_vector, coefficients, 3))
-                roots = polynomial.derivative().roots(extrapolate=False)
-                roots = roots[np.isfinite(roots) & (roots >= 0) & (roots <= self.knots+4)]
-                query = np.unique(np.r_[samples, roots])
-                positions = polynomial(query)
+                # BEGIN reuse the exact relative entrance/extrema identities.
+                query, positions = self._curve_map.extrema_times(candidate, joint)
+                # END the LP and tensor limiter describe the same actual curve.
                 bad = (positions < lower[joint]) | (positions > upper[joint])
                 if not np.any(bad):
                     controls[:, joint], solved = candidate, True

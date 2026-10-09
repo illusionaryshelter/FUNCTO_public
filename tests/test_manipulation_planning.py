@@ -108,7 +108,7 @@ def bind_analytic_ik_screening(planner, report_for=None):
         velocity=torch.tensor([[-2.]*dimensions, [2.]*dimensions], dtype=planner.start.position.dtype))
     planner._verification_native = SimpleNamespace(get_cost=lambda name:
         SimpleNamespace(config=SimpleNamespace(joint_limits=limits)))
-    planner.formal_clock = {"knot_dt": .2, "duration": .2*(planner.trajopt.action_horizon+4)}
+    planner.formal_clock = {"knot_dt": .2, "duration": .2*(planner.trajopt.action_horizon+2)}
     if not hasattr(planner.start, "velocity"):
         planner.start.velocity = torch.zeros_like(planner.start.position)
     planner.physical_domain = CubicJointDomain(torch.full((dimensions,), -200.),
@@ -250,7 +250,7 @@ class PlannerCalculusTests(unittest.TestCase):
             with self.subTest(native_dt=native_dt):
                 native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=native_dt,
                     maximum_trajectory_dt=native_dt, interpolation_dt=.025), interpolation_steps=4,
-                    transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3), action_horizon=16)
+                    transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3), action_horizon=18)
                 clock = _formal_native_clock(native)
                 self.assertEqual(clock["valid_count"], count)
                 self.assertEqual(clock["subdivisions"], subdivisions)
@@ -504,15 +504,15 @@ class PlannerCalculusTests(unittest.TestCase):
 
 
 class NativeCubicClockTests(unittest.TestCase):
-    """Check installed cubic boundary layout against SciPy basis functions.
+    """Check shared physical clocks, scalar reference warps and seed queries.
 
-    The independent layout oracle has four prescribed initial coefficients,
-    N free actions and three copies of the last action. Uniform knots expose
-    its real support and Greville times; no native GPU call is used here.
+    The scalar reference oracle has an independently chosen positive initial
+    rate and a stopped end. It never represents the joint action boundary;
+    that separate map is tested in test_cubic_trajectory and physical domains.
     """
 
     @staticmethod
-    def native_cubic(actions, initial=0., initial_velocity=0., dt=1.):
+    def scalar_reference_cubic(actions, initial=0., initial_velocity=0., dt=1.):
         count = len(actions)
         prefix = initial+np.array([-1., 0., 1., 2.])*initial_velocity*dt
         coefficients = np.r_[prefix, actions, np.repeat(actions[-1], 3)]
@@ -610,58 +610,35 @@ class NativeCubicClockTests(unittest.TestCase):
     # END installed native retiming clamp contract.
 
     # BEGIN independent native-basis progress warp and retained-path contracts.
-    def test_source_progress_stays_fixed_on_actual_native_boundary_plateaus(self):
+    # BEGIN zero measured speed no longer manufactures an initial reference pause.
+    def test_source_progress_keeps_source_and_terminal_plateaus_without_entrance_pause(self):
         source = _ProgressMap(np.array([0., .3, .55, .8, 1.]), np.array([0., .6, .6, 1.7, 2.]))
         for count in (6, 8, 12):
             with self.subTest(free_controls=count):
-                curve = self.native_cubic(np.linspace(.1, 1., count))
-                start, finish = curve.t[curve.k], curve.t[-curve.k-1]
-                first_moving, last_moving = curve.t[curve.k+1], curve.t[-curve.k-2]
-                leading = np.linspace(start, first_moving, 7)
+                finish, last_moving = count+4, count+3
+                leading = np.linspace(0., 1., 7)
                 trailing = np.linspace(last_moving, finish, 7)
-                np.testing.assert_allclose(curve(leading), 0., atol=1e-15)
-                np.testing.assert_allclose(curve(trailing), 1., atol=1e-15)
-                np.testing.assert_allclose(curve.derivative()(np.r_[leading, trailing]), 0., atol=1e-15)
                 mapped, warp = _progress_for_cubic_boundaries(
-                    source, count, np.zeros(3), stop_progress=(), anchors=source.s)
-                np.testing.assert_array_equal(np.interp(leading/finish, mapped.u, mapped.s), 0.)
+                    source, count, stop_progress=(), anchors=source.s)
+                self.assertEqual(mapped.anchor_parameters([0.]).shape, (1, 2))
+                self.assertTrue(np.all(np.interp(leading[1:]/finish, mapped.u, mapped.s) > 0.))
                 np.testing.assert_array_equal(np.interp(trailing/finish, mapped.u, mapped.s), 2.)
                 physical_source_times = np.interp(source.u, warp.s, warp.u)
-                physical_source_times[0], physical_source_times[-1] = first_moving/finish, last_moving/finish
+                physical_source_times[0], physical_source_times[-1] = 0., last_moving/finish
                 np.testing.assert_allclose(np.interp(physical_source_times, mapped.u, mapped.s), source.s, atol=1e-14)
                 np.testing.assert_allclose(mapped.anchor_parameters([.6])[:, 0], physical_source_times[[1, 2]], atol=1e-14)
-                # Moving a free final action still changes the final joint
-                # state. Padding the physical clock never fixes that action.
-                shifted = np.linspace(.1, 1., count)
-                shifted[-1] += .02
-                self.assertAlmostEqual(self.native_cubic(shifted)(finish)-curve(finish), .02)
-
-    def test_nonzero_measured_initial_velocity_does_not_get_a_fictitious_pause(self):
-        source = _ProgressMap(np.array([0., .4, 1.]), np.array([0., .8, 2.]))
-        measured = np.array([.27, -.13])
-        curve = self.native_cubic(np.linspace(.2, .8, 8), initial=.1, initial_velocity=measured[0], dt=.2)
-        self.assertAlmostEqual(curve(0.), .1)
-        self.assertAlmostEqual(curve.derivative()(0.)/.2, measured[0])
-        self.assertGreater(curve(.5), curve(0.))
-        mapped, _ = _progress_for_cubic_boundaries(
-            source, 8, measured, stop_progress=(), anchors=source.s)
-        self.assertGreater(np.interp(.5/12., mapped.u, mapped.s), 0.)
-        self.assertEqual(mapped.anchor_parameters([0.]).shape[0], 1)
-        self.assertEqual(mapped.anchor_parameters([2.]).shape[0], 2)
-        np.testing.assert_array_equal(measured, [.27, -.13])
+    # END measured entrance preservation is tested by the actual tensor adapter.
 
     def test_internal_stop_matches_a_feasible_native_cubic_with_bounded_clock_error(self):
-        # An odd number of free controls makes the single central stop exactly
-        # symmetric: six increasing controls, three extra copies of .5, then
-        # six increasing controls. This is an independently specified scalar
-        # problem in the actual native basis, not a sampled robot trajectory.
+        # A positive scalar entrance rate reaches the same central stop;
+        # this is a reference parameter, not a prescribed robot velocity.
         count = 15
-        controls = np.r_[np.arange(1, 7)/12., [.5]*3, .5+np.arange(1, 7)/12.]
-        exact_clock = self.native_cubic(controls)
-        exact_angle = self.native_cubic(.45*np.maximum(2*controls-1., 0.))
+        controls = np.r_[np.arange(3, 9)/16., [.5]*3, .5+np.arange(1, 7)/12.]
+        exact_clock = self.scalar_reference_cubic(controls, initial_velocity=1/16)
+        exact_angle = self.scalar_reference_cubic(.45*np.maximum(2*controls-1., 0.))
         source = _ProgressMap(np.array([0., 1.]), np.array([0., 2.]))
         mapping, warp = _progress_for_cubic_boundaries(
-            source, count, np.zeros(2), stop_progress=(1.,), anchors=(0., 1., 2.))
+            source, count, stop_progress=(1.,), anchors=(0., 1., 2.))
         query = np.linspace(0., 1., 20001)
         exact_parameter = exact_clock(query*(count+4))
         parameter = np.interp(query, warp.u, warp.s)
@@ -692,11 +669,11 @@ class NativeCubicClockTests(unittest.TestCase):
         # reach .5, after which the same genuine four-control stop applies.
         controls = np.r_[np.arange(3, 9)*parameter_velocity, [.5]*3,
                          .5+np.arange(1, 7)/12.]
-        exact = self.native_cubic(controls, initial_velocity=parameter_velocity)
+        exact = self.scalar_reference_cubic(controls, initial_velocity=parameter_velocity)
         source = _ProgressMap(np.array([0., 1.]), np.array([0., 2.]))
         measured = np.array([.27, -.13])
         mapping, warp = _progress_for_cubic_boundaries(
-            source, count, measured, stop_progress=(1.,), anchors=(0., 1., 2.))
+            source, count, stop_progress=(1.,), anchors=(0., 1., 2.))
         query = np.linspace(0., 1., 10001)
         self.assertLessEqual(float(np.max(np.abs(np.interp(query, warp.u, warp.s)
                                                  -exact(query*19)))), 1e-6+1e-14)
@@ -721,7 +698,7 @@ class NativeCubicClockTests(unittest.TestCase):
                               np.array([0., .3, .3, .8, 1.]))
         before = (source.u.copy(), source.s.copy())
         mapping, warp = _progress_for_cubic_boundaries(
-            source, 15, np.zeros(3), stop_progress=(.3,), anchors=problem.anchors)
+            source, 15, stop_progress=(.3,), anchors=problem.anchors)
         pairs = mapping.anchor_parameters(source_progress[1:4])
         np.testing.assert_array_equal(pairs[:, 1], source_progress[1:4])
         np.testing.assert_allclose(np.interp(pairs[:, 0], mapping.u, mapping.s),
@@ -740,48 +717,47 @@ class NativeCubicClockTests(unittest.TestCase):
     def test_stop_count_clock_keys_and_native_precision_fail_with_explicit_bounds(self):
         source = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         with self.assertRaisesRegex(ValueError, "(?i)(stop|control|knot|budget)"):
-            _progress_for_cubic_boundaries(source, 8, np.zeros(1),
+            _progress_for_cubic_boundaries(source, 8,
                                            stop_progress=(.3, .7), anchors=(.3, .7))
         # Retaining all distinct preexisting path vertices is part of the
         # contract. An oversized input may be rejected, never decimated into
         # a different source or OMPL q/s path to fit the fixed key budget.
         crowded = _ProgressMap(np.linspace(0., 1., 16385), np.linspace(0., 1., 16385))
         with self.assertRaisesRegex(ValueError, "(?i)(key|clock|budget)"):
-            _progress_for_cubic_boundaries(crowded, 8, np.zeros(1),
+            _progress_for_cubic_boundaries(crowded, 8,
                                            stop_progress=(), anchors=())
         with self.assertRaisesRegex(ValueError, "(?i)(float32|precision)"):
-            _progress_for_cubic_boundaries(source, 8, np.zeros(1),
+            _progress_for_cubic_boundaries(source, 8,
                                            stop_progress=(), anchors=(.5, .5+1e-10))
 
     def test_native_key_alias_drops_only_redundant_grid_points_and_keeps_exact_anchors(self):
-        # In this native clock's linear interior, z=.3 maps to u=4.4/12.
+        # In this scalar clock's linear interior, z=.3 maps to u=3/12.
         # Forward grid arithmetic and inverse-anchor arithmetic yield nearby
         # float64 values that are the SAME float32 key. The optional grid key
         # can be replaced; the actual source anchor must keep its exact value.
         source = _ProgressMap(np.array([0., .3, .8, 1.]), np.array([0., .6, 1.6, 2.]))
         mapping, warp = _progress_for_cubic_boundaries(
-            source, 8, np.zeros(1), stop_progress=(), anchors=source.s)
+            source, 8, stop_progress=(), anchors=source.s)
         self.assertTrue(np.all(np.diff(warp.u.astype(np.float32)) > 0))
         self.assertTrue(np.all(np.diff(mapping.u.astype(np.float32)) > 0))
         pairs = mapping.anchor_parameters([.6, 1.6])
         np.testing.assert_array_equal(pairs[:, 1], [.6, 1.6])
-        np.testing.assert_allclose(pairs[:, 0], (2+8*np.array([.3, .8]))/12, atol=2e-15)
+        np.testing.assert_allclose(pairs[:, 0], (10*np.array([.3, .8]))/12, atol=2e-15)
         retained = np.searchsorted(warp.u, pairs[:, 0])
         np.testing.assert_array_equal(warp.u[retained], pairs[:, 0])
         np.testing.assert_array_equal(warp.s[retained], [.3, .8])
-        exact = self.native_cubic(np.arange(1, 9)/8.)
+        exact = self.scalar_reference_cubic(np.arange(3, 11)/10., initial_velocity=.1)
         query = np.linspace(0., 1., 20001)
         self.assertLessEqual(float(np.max(np.abs(np.interp(query, warp.u, warp.s)-exact(query*12)))),
                              1e-6+1e-14)
 
-        # Two true anchors can be distinct in the source's float32 clock yet
-        # collide after this compression. They must be rejected together;
-        # choosing either one would discard a required process observation.
+        # These nearby true source anchors remain distinct with the corrected
+        # entrance map; do not preserve the old compression's rejection.
         linear = _ProgressMap(np.array([0., 1.]), np.array([0., 2.]))
         close = np.array([.6, .6+2*float(np.spacing(np.float32(.3)))])
         self.assertEqual(linear.anchor_parameters(close).shape, (2, 2))
-        with self.assertRaisesRegex(ValueError, "(?i)(float32|precision)"):
-            _progress_for_cubic_boundaries(linear, 8, np.zeros(1), stop_progress=(), anchors=close)
+        revised, _ = _progress_for_cubic_boundaries(linear, 8, stop_progress=(), anchors=close)
+        self.assertTrue(np.all(np.diff(revised.anchor_parameters(close)[:, 0].astype(np.float32)) > 0))
 
     # BEGIN a longer spatial route retains the identical binding and plateau time.
     def test_ompl_initializer_preserves_clock_when_q_moves_during_progress_pause(self):
@@ -820,7 +796,7 @@ class NativeCubicClockTests(unittest.TestCase):
         planner._orientation_vjp = SimpleNamespace(apply=lambda q, quaternion, jacobian: quaternion)
         planner._native_layout = SimpleNamespace(apply=lambda value: value)
         scene = SimpleNamespace(project_residual=lambda progress, q, names: q[..., :0],
-                                required_progress_anchors=(), native_world_collision_components=frozenset())
+                                required_progress_anchors=(), native_collision_components=frozenset())
         scene.clone_for_rollout = lambda: scene
         planner.scene = scene
         # BEGIN this clock-only search fixture declares no functional IK proposals.
@@ -849,11 +825,13 @@ class NativeCubicClockTests(unittest.TestCase):
         count = 8
         source = _ProgressMap(np.array([0., .35, .6, 1.]), np.array([0., .7, .7, 2.]))
         mapping, _ = _progress_for_cubic_boundaries(
-            source, count, np.zeros(1), stop_progress=(), anchors=source.s)
-        curve = self.native_cubic(np.linspace(.1, 1., count))
-        free_indices = np.arange(4, 4+count)
+            source, count, stop_progress=(), anchors=source.s)
+        # BEGIN actual joint actions begin at c2, independently of scalar reference controls.
+        curve = BSpline(np.arange(-3., count+6.), np.zeros(count+5), 3)
+        free_indices = np.arange(2, 2+count)
         greville = np.array([curve.t[index+1:index+curve.k+1].mean() for index in free_indices])
         clock = greville/curve.t[-curve.k-1]
+        # END native joint q0 is an eliminated equality, not an IK observation.
         requested, requested_parameters = [], []
 
         def solve_pose(goal, **kwargs):
@@ -925,7 +903,7 @@ class NativeCubicClockTests(unittest.TestCase):
         bind_analytic_ik_screening(planner)
         seeds, success_counts = planner.reference_seeds()
         np.testing.assert_array_equal(requested_parameters,
-            ((np.arange(horizon)+3.)/(horizon+4.)).astype(np.float32).astype(float))
+            ((np.arange(horizon)+1.)/(horizon+2.)).astype(np.float32).astype(float))
         self.assertEqual(helper.call_count, 2)
         self.assertIs(helper.call_args.args[0], measured_q)
         self.assertEqual(helper.call_args.args[1], 1)
@@ -992,7 +970,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         def solve(goal, **kwargs):
             index = len(warm_starts)
             np.testing.assert_array_equal(planner.seed_parameter.numpy(),
-                                          [[(index+3.)/(horizon+4.)]])
+                                          [[(index+1.)/(horizon+2.)]])
             warm_starts.append(kwargs["seed_config"].clone())
             return SimpleNamespace(js_solution=SimpleNamespace(position=torch.tensor(pools[index][None], dtype=torch.float64)),
                                    success=torch.tensor(flags[index][None], dtype=torch.bool))
@@ -1120,7 +1098,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         seeds, success = planner.reference_seeds()
         self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
         np.testing.assert_allclose(planner.reference_ik_chains[0]["joint_positions"], primary, atol=1e-14)
-        rebuilt = planner.physical_domain.evaluate(seeds[0, 0], (np.arange(6)+3.)/10.)
+        rebuilt = planner.physical_domain.evaluate(seeds[0, 0], (np.arange(6)+1.)/8.)
         np.testing.assert_allclose(rebuilt, primary, atol=1e-5)
         self.assertEqual(success, [3]*6)
         self.assertEqual(planner.initial_seed_strategies, ["reference_ik"])
@@ -1214,7 +1192,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
                 {"joint_position": [90., 90., 90.], "report": rejected},
                 {"joint_position": target_postures[1], "report": valid}]}}
         seeds, success = planner.reference_seeds()
-        control_u = (np.arange(6)+3.)/10.
+        control_u = (np.arange(6)+1.)/8.
         self.assertNotIn(.47, control_u)
         before = ordinary.physical_domain.evaluate(baseline[0], np.array([.47]))[:, 0]
         after = planner.physical_domain.evaluate(seeds[0], np.array([.47]))[:, 0]
@@ -1249,7 +1227,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         original_fit = planner.physical_domain.fit_reference
         with patch.object(planner.physical_domain, "fit_reference", wraps=original_fit) as fitting:
             seeds, _ = planner.reference_seeds()
-        control_u = (np.arange(6)+3.)/10.
+        control_u = (np.arange(6)+1.)/8.
         self.assertEqual(int(np.argmin(abs(control_u-.47))), int(np.argmin(abs(control_u-.49))))
         np.testing.assert_array_equal(fitting.call_args.args[0][-2:], [.47, .49])
         self.assertEqual([row["event_u"] for row in planner.goal_ik_fit_hints], [.47, .49])
@@ -1469,7 +1447,9 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         q = torch.tensor([[[-1., 0.], [1., 0.]], [[-1.1, 0.], [.9, 0.]]], requires_grad=True)
         joints = JointState.from_position(q, joint_names=["first_joint", "second_joint"])
         joints.velocity = torch.zeros_like(q)
-        joints.dt = torch.ones(2)
+        # BEGIN the fixture's one sample interval spans its two-second clock.
+        joints.dt = torch.full((2,), 2.)
+        # END timed finger geometry and Hermite queries share physical seconds.
         state = RobotState(joint_state=joints, cuda_robot_model_state=kinematics(joints))
         problem = SimpleNamespace(tool_link="tool", start_progress=0., phase_count=1., end_progress=1., base_pose=np.eye(4),
             mechanisms=(), stop_progress=(), transform_tool_pose=lambda p, r: (p, r),
@@ -1830,7 +1810,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
     def test_optimizer_retains_pending_world_candidate_and_binds_its_scene_evidence(self):
         from curobo._src.rollout.metrics import CostsAndConstraints, RolloutResult
         with self.anchor_self_collision_fixture("trajectory_optimizer", required=(0., 1.), capacity=4) as fixture:
-            fixture.scene.native_world_collision_components = frozenset({"collision/robot/background"})
+            fixture.scene.native_collision_components = frozenset({"collision/robot/background"})
             calls = []
             def evaluate(spheres, p, *args, components_out, **kwargs):
                 calls.append(1)
@@ -2173,7 +2153,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
     def clock(problem):
         return _progress_for_cubic_boundaries(
             _ProgressMap(np.array([0., 1.]), np.array([0., float(problem.phase_count)])),
-            8, problem.start_dq, stop_progress=problem.stop_progress, anchors=problem.anchors)[0]
+            8, stop_progress=problem.stop_progress, anchors=problem.anchors)[0]
 
     @staticmethod
     def robot_metadata():
@@ -2187,12 +2167,17 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         np.testing.assert_array_equal(problem.anchors, [0., 2., 3.])
         mapping = self.clock(problem)
         pairs = mapping.anchor_parameters(problem.anchors)
-        self.assertEqual(len(pairs), 6)
+        # BEGIN zero measured velocity no longer fabricates an entrance hold.
+        # Retain the entrance once, both ends of the explicit release stop,
+        # and both ends of the original constant terminal interval.
+        np.testing.assert_allclose(pairs, [[0., 0.], [.5, 2.], [7/12, 2.],
+                                           [11/12, 3.], [1., 3.]])
         self.assertEqual(_anchor_capacity(mapping, problem.anchors, PlanningBudget()), 256)
-        exact = PlanningBudget(max_task_anchors=6)
-        self.assertEqual(_anchor_capacity(mapping, problem.anchors, exact), 6)
+        exact = PlanningBudget(max_task_anchors=5)
+        self.assertEqual(_anchor_capacity(mapping, problem.anchors, exact), 5)
         with self.assertRaisesRegex(ValueError, "Task anchors"):
-            _anchor_capacity(mapping, problem.anchors, PlanningBudget(max_task_anchors=5))
+            _anchor_capacity(mapping, problem.anchors, PlanningBudget(max_task_anchors=4))
+        # END source release identity/frame and all 319 rows remain untouched.
     # END reference vertices remain source data instead of required IK/validation poses.
 
     def test_true_scene_query_overflow_fails_before_native_construction(self):
@@ -2984,7 +2969,7 @@ class InitialStatePreflightTests(unittest.TestCase):
         cspace = SimpleNamespace(enabled=True, config=SimpleNamespace(joint_limits=limits),
             forward=Mock(side_effect=AssertionError("unknown high derivatives cannot enter STATE cost")))
         collision = SimpleNamespace(enabled=True, config=SimpleNamespace(self_collision_kin_config=SimpleNamespace(sphere_padding=0.)), setup_batch_tensors=Mock(),
-            forward=Mock(return_value=torch.tensor([[native_collision]], dtype=torch.float64)))
+            forward=Mock(return_value=torch.tensor([[[native_collision]]], dtype=torch.float64)))
         planner._verification_native = SimpleNamespace(
             get_cost={"cspace": cspace, "self_collision": collision}.get,
             compute_costs=Mock(side_effect=AssertionError("complete manager would invent missing derivatives")))
@@ -3008,6 +2993,10 @@ class InitialStatePreflightTests(unittest.TestCase):
         planner.robot_validator = SimpleNamespace(joint_names=problem.joint_names,
             tool_frame=problem.tool_link, T_reference_base=base, T_frame_tcp=tool,
             _planning_positions=lambda q, names, **kwargs: (np.asarray(q), ()),
+            # BEGIN this entrance fixture explicitly supplies its independent CAD verdict.
+            check_planning_self=Mock(return_value={"passed": native_collision <= 0.,
+                "residual": float(native_collision > 0.), "unmodelled_geometry_names": []}),
+            # END positive sphere evidence alone is no longer the rejection oracle.
             checker=SimpleNamespace(query=Mock(side_effect=source_fk)),
             _pose_difference=lambda actual, expected: {
                 "translation_m": float(np.linalg.norm(actual[:3, 3]-expected[:3, 3])),

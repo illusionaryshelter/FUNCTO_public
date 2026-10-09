@@ -452,6 +452,19 @@ class OnlinePlanningScene:
         """
         return frozenset(self.native_world_collision_pairs)
 
+    # BEGIN proxy self collisions share the declared candidate-confirmation boundary.
+    @property
+    def native_collision_components(self):
+        """Exact proposal terms that have registered model-solid confirmation.
+
+        The self entry contains sphere overlaps only. The independently
+        computed prismatic-solid residual is deliberately absent, as are
+        contact, support and unknown-space requirements. Membership permits
+        a candidate query; it is never collision-free evidence by itself.
+        """
+        return self.native_world_collision_components | frozenset({'collision/robot/self'})
+    # END world target identities never reinterpret self as an environment owner.
+
     # BEGIN explicit pair identities avoid parsing arbitrary owner names.
     @property
     def native_world_collision_pairs(self):
@@ -867,11 +880,20 @@ class OnlinePlanningScene:
             # END both pair sets and the all-minus-known order are unchanged.
             costs['collision/robot/self']=torch.where(uncertain_hand,known_self,all_self)
             costs['conditional/collision/robot/self']=torch.where(uncertain_hand,(all_self-known_self).clamp_min(0),0.)
+            # BEGIN only the known sphere proposal may be cleared by robot CAD.
+            # Confirm before adding any analytic geometry: a clear sphere
+            # proposal cannot erase a genuine prismatic-solid intersection.
+            if native_confirmation is not None:
+                costs['collision/robot/self'] = native_confirmation.confirm_self(
+                    costs['collision/robot/self'], joint_position, joint_names,
+                    trajectory_time, source='collision/robot/self')
+            # END the caller's actual q/time and unresolved-hand scope are retained.
         if geometry_state is not None and self.gripper.self_collision_model is not None:
             native, conditional = self.gripper.self_collision_model.components(geometry_state)
-            costs['collision/robot/self'] = costs.get('collision/robot/self', torch.zeros_like(progress))+native
-            costs['conditional/collision/robot/self'] = costs.get(
-                'conditional/collision/robot/self', torch.zeros_like(progress))+conditional
+            # BEGIN analytic hand pairs keep their own nonconfirmable hard identity.
+            costs['collision/robot/self_prismatic'] = native
+            costs['conditional/collision/robot/self_prismatic'] = conditional
+            # END an aggregate sphere clear cannot grant a hand-pair permission.
         poses = {}
         # BEGIN mode identities follow the same owner-pose branches below.
         owner_mode_keys = {}

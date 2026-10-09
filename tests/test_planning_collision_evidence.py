@@ -25,7 +25,7 @@ def candidate_scene_evidence(terms, *, declared=frozenset({"collision/robot/back
         return sum((value for name, value in components_out.items()
                     if not name.startswith("conditional/")), torch.zeros_like(s))
     scene = SimpleNamespace(required_progress_anchors=(), evaluate=evaluate,
-                            native_world_collision_components=declared)
+                            native_collision_components=declared)
     s = torch.tensor([[0., 1.]])
     evidence = {}
     _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),
@@ -74,7 +74,7 @@ def test_candidate_evidence_retains_a_hard_violation_only_on_one_mode_side(hard_
         components_out["collision/robot/background"] = other.to(progress.dtype)*1e20
         return sum(components_out.values())
     scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate,
-        native_world_collision_components=frozenset({"collision/robot/background"}))
+        native_collision_components=frozenset({"collision/robot/background"}))
     s = torch.tensor([[.5]])
     evidence = {}
     result = _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),

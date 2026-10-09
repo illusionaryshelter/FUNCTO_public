@@ -21,11 +21,11 @@ class PhysicalJointDomainTest(unittest.TestCase):
 
     def oracle(self, domain, controls):
         coefficients = domain.coefficients(controls).numpy()[0, :, 0]
-        spline = BSpline(np.arange(-3., domain.knots+8.), coefficients, 3)
+        spline = BSpline(np.arange(-3., domain.knots+6.), coefficients, 3)
         polynomial = PPoly.from_spline(spline)
         roots = polynomial.derivative().roots(extrapolate=False)
-        times = np.unique(np.r_[np.arange(domain.knots+5), roots[np.isfinite(roots)
-            & (roots >= 0) & (roots <= domain.knots+4)]])
+        times = np.unique(np.r_[np.arange(domain.intervals+1), roots[np.isfinite(roots)
+            & (roots >= 0) & (roots <= domain.intervals)]])
         return polynomial(times).min(), polynomial(times).max()
 
     def test_analytic_domain_matches_independent_scipy_extrema(self):
@@ -37,24 +37,46 @@ class PhysicalJointDomainTest(unittest.TestCase):
             expected = self.oracle(domain, controls)
             np.testing.assert_allclose([low.item(), high.item()], expected, atol=1e-12, rtol=0.)
 
-    def test_control_box_does_not_hide_nonzero_velocity_prefix_violation(self):
-        domain = self.domain(q=.94, dq=.2)
-        controls = torch.full((1, 8, 1), .94)
+    # BEGIN instantaneous entrance regressions replace fixed-prefix assertions.
+    def test_control_box_does_not_hide_nonzero_velocity_curve_violation(self):
+        domain = self.domain(q=.995, dq=.2)
+        controls = torch.full((1, 8, 1), .995)
         self.assertTrue(bool((controls.abs() <= 1).all()))
         self.assertFalse(bool(domain.feasible(controls).all()))
         initialized = domain.initialize(controls)
         self.assertTrue(bool(domain.feasible(initialized).all()))
         coefficients = domain.coefficients(initialized).numpy()[0, :, 0]
-        curve = BSpline(np.arange(-3., 16.), coefficients, 3)
-        self.assertAlmostEqual(curve(0), float(torch.tensor(.94)), places=12)
+        curve = BSpline(np.arange(-3., 14.), coefficients, 3)
+        self.assertAlmostEqual(curve(0), float(torch.tensor(.995)), places=12)
         self.assertAlmostEqual(curve(0, 1)/.2, float(torch.tensor(.2)), places=12)
 
-    def test_impossible_fixed_prefix_is_reported_without_rewriting_actual(self):
-        domain = self.domain(q=.99, dq=.2)
-        original = domain.prefix.clone()
+    def test_outward_velocity_at_physical_bound_is_reported_without_rewriting_actual(self):
+        domain = self.domain(q=1., dq=.2)
+        original_q, original_dq = domain._start_q.clone(), domain._start_dq.clone()
         with self.assertRaises(JointDomainInitializationError):
             domain.initialize(torch.zeros((1, 8, 1)))
-        torch.testing.assert_close(domain.prefix, original)
+        torch.testing.assert_close(domain._start_q, original_q, rtol=0, atol=0)
+        torch.testing.assert_close(domain._start_dq, original_dq, rtol=0, atol=0)
+
+    def test_near_boundary_can_brake_before_the_old_fixed_interval(self):
+        domain = self.domain(q=.99, dq=.2)
+        control = domain.initialize(torch.zeros((1, 8, 1)))
+        self.assertTrue(bool(domain.feasible(control).all()))
+        q = domain.evaluate(control, [0., .05])[0, :, 0]
+        self.assertEqual(q[0], float(torch.tensor(.99)))
+        self.assertNotEqual(q[1], q[0]+.1*float(torch.tensor(.2)))
+
+    def test_exact_position_boundary_has_no_fabricated_roundoff_violation(self):
+        for q, inward in ((1., -.2), (-1., .2)):
+            for dq in (0., inward):
+                domain = self.domain(q=q, dq=dq)
+                controls = torch.full((1, 8, 1), q)
+                self.assertTrue(bool(domain.feasible(controls).all()))
+                low, high = domain.extrema(controls)
+                self.assertEqual(float(high if q > 0 else low), q)
+                self.assertEqual(domain.evaluate(controls, [0.])[0, 0, 0], q)
+                self.assertEqual(domain.evaluate(controls, [0.], 1)[0, 0, 0], float(torch.tensor(dq)))
+    # END genuine instantaneous infeasibility stays distinct from a fixed-prefix artefact.
 
     def test_every_native_particle_is_legal_and_update_can_move(self):
         domain = self.domain()
