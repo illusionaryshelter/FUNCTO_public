@@ -47,6 +47,32 @@ def owner_voxel_sizes(arguments, owner_ids):
 # END no object name, dataset or extent selects an implicit resolution.
 
 
+# BEGIN persist the production builder's actual semantic partition decision.
+def save_observation_partitions(scene, output):
+    """Save exact fusion masks without reconstructing ownership in the runner.
+
+    The scene builder owns semantic boundary decisions. These arrays describe
+    its fresh background Mapper input; excluded endpoints are not free-space
+    evidence. Original depth and independently measured free rays stay in the
+    observation records rather than being inferred from these masks.
+    """
+    result = {}
+    for name, masks in scene.observation_partition_masks.items():
+        folder = Path(output)/"observations"/name
+        folder.mkdir(parents=True, exist_ok=True)
+        row = {}
+        for key, filename in (("background", "background-mask.npy"),
+                              ("semantic_boundary", "semantic-boundary-mask.npy")):
+            path = folder/filename
+            np.save(path, masks[key])
+            row[f"{key}_mask_path"] = str(path.resolve())
+        row["semantic_boundary"] = deepcopy(scene.observation_report["semantic_boundary"][name])
+        (folder/"partition-report.json").write_text(json.dumps(row, indent=2)+"\n")
+        result[name] = row
+    return result
+# END diagnostics consume one decision, not a second segmentation algorithm.
+
+
 # BEGIN typed initial support is a separate recorded declaration channel.
 def load_contact_bindings(path):
     """Validate recorded contact input and construct independent support facts.
@@ -533,7 +559,10 @@ def run(args):
                                for view in segment["snapshot"]["views"]}}
                 for identity, frame in owner_frames.items()},
             "geometry_path": None if args.owner_geometry is None else str(args.owner_geometry.resolve()),
-            "background_partition": "Every ENVIRONMENT surface outside semantic owners remains in observed background"}
+            # BEGIN only the production partition decision admits background endpoints.
+            "background_partition": "ENVIRONMENT endpoints outside semantic owners and the production semantic boundary mask",
+            "background_rebuild": "Fresh Mapper and scene from original RGB-D for this request; no prior fused background is restored"}
+            # END historical scene bindings are not observation inputs.
         observations = {}
         for view in segment["snapshot"]["views"]:
             calibration = json.loads((root/view["calibration_path"]).read_text())
@@ -573,14 +602,20 @@ def run(args):
                 np.save(resolved_path, visible)
                 owner_masks[identity] = supplied
                 mask_report[identity] = {
+                    # BEGIN distinguish unchanged segmentation from robot-filtered owner input.
                     "semantic_mask_path": str(supplied_masks[identity, view["id"]].resolve()),
                     "collision_mask_path": str(resolved_path.resolve()),
+                    "semantic_mask_role": "Original segmentation input, retained without dilation",
+                    "collision_mask_role": "Original segmentation intersected with ENVIRONMENT; the builder additionally enforces Mapper depth limits. Semantic boundary is never assigned to this owner",
+                    # END the builder changes background admission, not owner identity.
                     "semantic_pixels": int(supplied.sum()),
                     "self_overlap_pixels": int((supplied & (labels == SELF)).sum()),
                     "ambiguous_shadow_overlap_pixels": int((supplied & (labels == AMBIGUOUS_SHADOW)).sum()),
                     "collision_owner_pixels": int(visible.sum())}
             (view_output/"owner-mask-report.json").write_text(json.dumps({
-                "policy": "Only ENVIRONMENT pixels contribute occupied endpoints or free rays; original depth and semantic masks are retained",
+                # BEGIN semantic uncertainty is distinct from robot and ray evidence.
+                "policy": "Owner masks retain ENVIRONMENT endpoints; the builder separately records background and semantic-boundary masks. Free rays retain their independent measured prefixes; original depth and semantic masks are unchanged",
+                # END excluding an endpoint cannot extend its measured free ray.
                 "robot_evidence": str((view_output/"self-filter-report.json").resolve()),
                 "owners": mask_report}, indent=2)+"\n")
             observations[view["id"]] = {
@@ -656,6 +691,9 @@ def run(args):
             max_device_used_bytes=args.max_device_used_mib*1024**2)
             # END module capacity cannot bypass the measured host/device limits.
         report["observation_build"] = scene.observation_report
+        # BEGIN save the exact production masks before fixed-owner scene reconstruction.
+        report["observation_partitions"] = save_observation_partitions(scene, args.output)
+        # END no reconstructed scene needs to retain these diagnostic arrays.
         # BEGIN retain self-filtered installation as complete static collision owners.
         # These primitives use the same calibrated base as FK. They have no
         # moving sphere cover, so a mount extending beyond the observed grid

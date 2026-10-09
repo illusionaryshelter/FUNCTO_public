@@ -981,6 +981,18 @@ use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
   prepared from the observed extent and registered robot sphere radius before
   solving; requests cannot enlarge it after a failed query.
   <!-- END direct complete-owner admission. -->
+  <!-- BEGIN semantic ownership uncertainty is handled before fusion. -->
+  Online background fusion excludes a one-pixel, eight-neighbor outer ring
+  around admitted observed owner pixels. These endpoints have uncertain
+  ownership: they are added to neither an owner mask nor the background.
+  Existing valid measured free-ray prefixes remain independent and unchanged.
+  This bounded image-grid assumption does not repair arbitrary segmentation
+  errors or certify excluded geometry as free; the existing unknown-space
+  policy still applies. Every request builds fresh per-partition Mappers from
+  its RGB-D snapshot. Rebuilding with corrected partitions removes old fusion
+  pollution; restoring an old frozen scene binding does not repair its map.
+  Observation diagnostics retain the actual background and boundary masks.
+  <!-- END no collision-result erasure or object-specific mask growth. -->
 - `FrozenPrimitives` retains calibrated complete boxes/cylinders and their
   declared transforms. Robot sphere layout and self-collision exclusions are
   bound to the same registered robot model.

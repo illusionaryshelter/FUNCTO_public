@@ -17,6 +17,39 @@ from recorded_owner_geometry import bind_box_owner_materials, prepare_box_owner
 from run_recorded_skill import load_contact_bindings, recorded_owner_observation_inputs, require_feedback_identity
 
 
+# BEGIN recorded diagnostics retain the builder's actual decision, including exclusions.
+def test_recorded_partition_files_match_exact_builder_masks_and_current_report(tmp_path):
+    from run_recorded_skill import save_observation_partitions
+    # Deliberately leave an unassigned pixel outside both masks: the recorder
+    # must not guess background as a complement or implement dilation again.
+    background = np.array([[True, False, False], [False, True, False]], dtype=bool)
+    boundary = np.array([[False, True, False], [False, False, True]], dtype=bool)
+    decision = {"background_pixels": 2, "excluded_boundary_pixels": 2,
+                "source": "Current production builder decision"}
+    scene = SimpleNamespace(observation_partition_masks={"current": {
+        "background": background, "semantic_boundary": boundary}},
+        observation_report={"semantic_boundary": {"current": decision}})
+    folder = tmp_path/"observations"/"current"
+    folder.mkdir(parents=True)
+    # An earlier artifact must not make this run retain previously fused input.
+    np.save(folder/"background-mask.npy", np.ones_like(background))
+    rows = save_observation_partitions(scene, tmp_path)
+    for key, expected in (("background", background), ("semantic_boundary", boundary)):
+        actual = np.load(rows["current"][f"{key}_mask_path"], allow_pickle=False)
+        assert actual.dtype == np.bool_
+        np.testing.assert_array_equal(actual, expected)
+    assert not np.load(folder/"background-mask.npy", allow_pickle=False)[1, 0]
+    stored = json.loads((folder/"partition-report.json").read_text())
+    assert stored == rows["current"]
+    assert stored["semantic_boundary"] == decision
+    # Diagnostic output must not retain a mutable alias into the scene report.
+    decision["background_pixels"] = 99
+    assert rows["current"]["semantic_boundary"]["background_pixels"] == 2
+    np.testing.assert_array_equal(background, [[True, False, False], [False, True, False]])
+    np.testing.assert_array_equal(boundary, [[False, True, False], [False, False, True]])
+# END the runner records the result instead of defining semantic ownership.
+
+
 def held_problem():
     initial, attachment = np.eye(4), np.eye(4)
     initial[:3, 3] = [1., 2., 3.]

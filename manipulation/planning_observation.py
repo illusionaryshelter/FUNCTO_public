@@ -19,7 +19,9 @@ import math
 from numbers import Real
 
 import numpy as np
-from scipy.ndimage import minimum_filter
+# BEGIN semantic boundaries use the existing image morphology dependency.
+from scipy.ndimage import binary_dilation, minimum_filter
+# END no separate segmentation dependency or configurable dilation is needed.
 from scipy.spatial.transform import Rotation
 import torch
 
@@ -496,13 +498,20 @@ def _self_filtered_views(views, reference_frame, depth_range_m):
 
 
 def _partition_masks(views, owner_ids):
-    """Keep only environmental endpoints, preserving semantic conflict checks.
+    """Return endpoint partitions and their uncertain semantic boundaries.
 
     Check owner/owner overlap on the supplied masks before self filtering;
     uncertainty is not permission to silently choose a semantic winner.
+    A single eight-neighbour pixel ring around admitted owner endpoints is
+    withheld from background. This minimal raster neighbourhood is not a
+    bound on segmentation error and never enlarges an owner's identity.
+    Semantic uncertainty concerns the endpoint only: measured free-ray
+    prefixes and robot self-filter evidence remain independent and unchanged.
     """
     from .robot_self_filter import ENVIRONMENT, validate_self_filter
-    masks, observed = {}, {identity: 0 for identity in owner_ids}
+    # BEGIN keep boundary decisions explicit instead of claiming every complement as background.
+    masks, boundaries, observed = {}, {}, {identity: 0 for identity in owner_ids}
+    # END caller diagnostics receive the same decisions consumed by the mapper.
     for name, view in views.items():
         image, depth = np.asarray(view["image"]), view["depth"]
         if image.dtype != np.uint8 or image.shape != (*depth.shape, 3):
@@ -525,10 +534,22 @@ def _partition_masks(views, owner_ids):
             occupied |= mask
             masks[name][identity] = mask & environment
             observed[identity] += int(np.count_nonzero(masks[name][identity] & (depth > 0)))
-        masks[name][None] = environment & ~occupied
+        # BEGIN only accepted environmental owner pixels seed a finite boundary.
+        # SELF, shadow and invalid-depth owner labels cannot erase neighbouring
+        # environment. Other explicit owners are never reassigned by this ring.
+        candidate_background = environment & ~occupied
+        boundary = candidate_background & binary_dilation(
+            occupied & environment, structure=np.ones((3, 3), dtype=bool), iterations=1)
+        masks[name][None] = candidate_background & ~boundary
+        boundary.setflags(write=False)
+        masks[name][None].setflags(write=False)
+        boundaries[name] = boundary
+        # END uncertain endpoints are neither owner geometry nor observed free space.
     if any(count == 0 for count in observed.values()):
         raise ValueError("Every explicit collision owner needs current valid depth evidence after self filtering")
-    return masks
+    # BEGIN no compatibility path silently drops the uncertainty decision.
+    return masks, boundaries
+    # END production callers must explicitly consume the new partition contract.
 
 
 def _self_filter_report(views):
@@ -1326,6 +1347,12 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     ``free_ray_depth_m`` and a nonempty ``source``. Only ENVIRONMENT pixels
     contribute measured surface endpoints and free rays. SELF and
     AMBIGUOUS_SHADOW contribute neither; raw depth remains unchanged.
+    # BEGIN semantic identity uncertainty affects only surface admission.
+    One eight-neighbour pixel ring around admitted owner endpoints is withheld
+    from background, without enlarging owners or changing free-ray prefixes.
+    The actual immutable background/boundary masks and counts are exposed as
+    observation diagnostics; older serialized geometry requires rebuilding.
+    # END semantic boundaries never change the robot visibility classification.
 
     ``fine_regions`` now selects a partition's sole field before mapping. It
     never creates a coarse layer, blends resolutions or expands after solving.
@@ -1366,7 +1393,9 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     if set(owner_frames)!=set(owner_voxel_sizes_m) or len(owner_frames)>32:
         raise ValueError('Every selected owner must have exactly one explicit resolution')
     frames={identity:(_pose_array(row['T_output_owner'],'current owner pose'),_text(row['source'],'owner source')) for identity,row in owner_frames.items()}
-    masks=_partition_masks(normalized,frames)
+    # BEGIN freeze semantic boundary exclusion before any background integration.
+    masks,semantic_boundaries=_partition_masks(normalized,frames)
+    # END all map inputs and later diagnostics share one partition decision.
     # BEGIN admit complete geometry before choosing observed map partitions.
     # The semantic owner inventory remains intact: skipping its Mapper must
     # neither turn its pixels into background nor assert its occluded space free.
@@ -1494,6 +1523,23 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         initial_support_relations=tuple(initial_support_relations),
         # END the online scene owns support geometry and acceptance semantics.
         robot_collision_bodies=robot_collision_bodies,native_geometry_materials=native_geometry_materials)
+    # BEGIN expose the actual immutable background inputs without changing bindings.
+    # These diagnostic arrays describe this build, not reusable fused geometry.
+    # Rebuilding creates a new Mapper per partition; loading an older scene
+    # binding does not retroactively remove its previously fused endpoints.
+    scene.observation_partition_masks={name:{
+        'background':masks[name][None], 'semantic_boundary':semantic_boundaries[name],
+    } for name in normalized}
+    semantic_boundary_report={name:{
+        'policy':'One 3x3 eight-neighbour dilation of admitted environmental owner endpoints; '
+                 'unowned environmental neighbours are withheld from background; '
+                 'owner masks and measured free-ray prefixes are unchanged',
+        'map_lifecycle':'Fresh Mapper per partition from all current snapshot views; old scene bindings are not cleaned',
+        'candidate_background_pixels':int(np.count_nonzero(masks[name][None]))+int(np.count_nonzero(semantic_boundaries[name])),
+        'excluded_boundary_pixels':int(np.count_nonzero(semantic_boundaries[name])),
+        'background_pixels':int(np.count_nonzero(masks[name][None])),
+    } for name in normalized}
+    # END reported masks are the ones submitted to background mapping.
     # BEGIN retain the exact self-filter and per-owner exclusion evidence.
     scene.observation_report={'source':'current calibrated owner-partitioned RGB-D','partitions':reports,
         'estimated_mapping_buffers_bytes':sum(estimates.values()),'depth_error_m':float(depth_error_m),
@@ -1512,7 +1558,10 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         'geometry_model':'observed affine TSDF sources and explicitly complete owner geometry; conservative proposal/contact fields and local native-solid confirmation',
         # END source-cell interpretation is confined to preparation, not online queries.
         'unknown_policy':deepcopy(unknown_policy),
-        'self_filter':_self_filter_report(normalized)}
+        'self_filter':_self_filter_report(normalized),
+        # BEGIN endpoint identity uncertainty is separate from robot visibility.
+        'semantic_boundary':semantic_boundary_report}
+        # END original self-filter labels and free-ray evidence remain unchanged.
     # END excluded surfaces remain independently auditable.
     return scene
 # END no old source-world audit, Boolean solver or adaptive refinement is installed.
