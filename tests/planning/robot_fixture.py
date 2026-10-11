@@ -393,9 +393,14 @@ def _hinge_separation_certificate(model, parent, child):
     required = context.mpf(0)
     pair_parameters = []
     for first, second in enabled:
+        # BEGIN MuJoCo 3.5 sums per-geom margins and gaps for dynamic pairs.
+        # Match native contact discovery before certifying a pair as separated;
+        # the former maximum rule can miss contacts inside the summed margin.
+        # The global contact override replaces the margin, but not the gap.
         margin = float(model.opt.o_margin if override else
-                       max(model.geom_margin[first], model.geom_margin[second]))
-        gap = float(max(model.geom_gap[first], model.geom_gap[second]))
+                       model.geom_margin[first] + model.geom_margin[second])
+        gap = float(model.geom_gap[first] + model.geom_gap[second])
+        # END MuJoCo 3.5 dynamic-pair contact parameters.
         include = context.mpf(margin)-context.mpf(gap)
         # Search contacts at margin, not just margin-gap. Recording both also
         # handles a negative gap conservatively instead of hiding its effect.

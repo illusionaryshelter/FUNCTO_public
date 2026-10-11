@@ -175,10 +175,26 @@ class NativeSeparationTest(unittest.TestCase):
     def test_search_margin_is_not_replaced_by_the_smaller_margin_minus_gap(self):
         model = _model(); model.geom_margin[:] = [.04, .07]; model.geom_gap[:] = [.02, .06]
         certificate = self.certificate(model)
-        self.assertAlmostEqual(certificate["required_distance_upper_bound_m"], .070001)
-        self.assertEqual(certificate["native_geom_pair_parameters"][0]["effective_gap_m"], .06)
+        # BEGIN MuJoCo 3.5 applies both geom inflations and both gaps.
+        self.assertAlmostEqual(certificate["required_distance_upper_bound_m"], .110001)
+        self.assertEqual(certificate["native_geom_pair_parameters"][0]["effective_gap_m"], .08)
+        # END native summed parameters remain separate from margin-minus-gap.
         model.geom_margin[0] = .4; model.geom_gap[0] = .4
         self.assertIsNone(self.certificate(model))
+
+    # BEGIN independent native contact counterexample for the old maximum rule.
+    def test_summed_margins_retain_a_pair_that_native_mujoco_contacts(self):
+        model = _model()
+        model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_FILTERPARENT)
+        model.geom_margin[:] = .16
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        # The solids are 0.3 m apart: above each 0.16 m margin, below their sum.
+        self.assertGreater(data.ncon, 0)
+        self.assertTrue(all(contact.dist > .16 for contact in data.contact))
+        self.assertTrue(all(contact.dist < .32 for contact in data.contact))
+        self.assertIsNone(self.certificate(model))
+    # END a certificate must not suppress a real native contact pair.
 
     def test_override_gap_and_native_tolerance_are_complete_distance_conditions(self):
         model = _model()
