@@ -337,7 +337,9 @@ def planning_outcome(report, diagnostics=None):
 
 
 def run(args):
-    """Retain exact prior priority, then try the remaining finite candidate pool."""
+    # BEGIN the generator owns one common order; this runner adds no source priority.
+    """Try scored candidates in order until full planning and region checks accept."""
+    # END the exact prior has the same eligibility as every other candidate.
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     deadline = started + args.search_wall_seconds

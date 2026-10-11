@@ -83,8 +83,8 @@ def _local_priors(prior, seed):
 def generate_grasp_candidates(request, backend, *, seed=0):
     """Return the finite scored pool and explicit angular rejection evidence.
 
-    The exact demonstration candidate is attempted first if admissible. Other
-    candidates are ordered by ``0.65 * quality + 0.35 * prior_similarity``;
+    All admissible candidates, including the exact demonstration, compete by
+    ``0.65 * quality + 0.35 * prior_similarity`` with stable ID ties;
     similarity is a Gaussian of tool-origin displacement / 0.035 m and full
     SO(3) angle / 35 degrees. This is only a documented, global search order,
     never a probability of success or a quality threshold. No physical
@@ -159,7 +159,13 @@ def generate_grasp_candidates(request, backend, *, seed=0):
             rejected.append(record)
         else:
             candidates.append(record)
-    candidates.sort(key=lambda item: (item["source"] != "demo_exact", -item["ranking_score"], item["candidate_id"]))
+    # BEGIN all sources compete under the same demonstration-guided objective.
+    # Keep the exact prior as an ordinary candidate. Its similarity already
+    # encodes the intended preference; a separate source priority would prevent
+    # any higher-scoring alternative from improving a plannable but poor prior.
+    # IDs resolve exact score ties only, without adding a quality threshold.
+    candidates.sort(key=lambda item: (-item["ranking_score"], item["candidate_id"]))
+    # END ranking changes search order, never physical acceptance requirements.
     for rank, candidate in enumerate(candidates):
         candidate["rank"] = rank
     return {
@@ -169,7 +175,7 @@ def generate_grasp_candidates(request, backend, *, seed=0):
             "generated_count": len(grasps), "retained_count": len(candidates),
             "hard_angle_rejected_count": len(rejected),
             "source_counts": {name: labels.count(name) for name in sorted(set(labels))},
-            "ranking": "exact_prior_first_then_0.65_quality_plus_0.35_prior_similarity",
+            "ranking": "all_candidates_0.65_quality_plus_0.35_prior_similarity_then_candidate_id",
             "prior_position_scale_m": .035, "prior_rotation_scale_rad": float(np.deg2rad(35.)),
             "execution_validated": False,
         },

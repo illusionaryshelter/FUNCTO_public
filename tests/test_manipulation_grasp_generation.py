@@ -50,7 +50,7 @@ class Backend:
             raise AssertionError("scoring must use the shared prepared cloud")
         self.scored = grasps.copy()
         values = np.full(len(grasps), self.quality)
-        values[0] = 0.  # Exact demo remains an initializer even with zero score.
+        values[0] = 0.  # A zero-score prior remains a candidate, without priority.
         values[-1] = 1.
         return values
 
@@ -70,10 +70,15 @@ class GraspGenerationTest(unittest.TestCase):
     def test_exact_prior_and_all_three_sources_share_scoring_without_quality_pruning(self):
         backend = Backend(self.generated, binding=self.binding)
         result = generate_grasp_candidates(self.request(), backend, seed=17)
-        first = result["candidates"][0]
-        np.testing.assert_array_equal(first["T_reference_tool"], self.prior)
-        self.assertEqual(first["source"], "demo_exact")
-        self.assertEqual(first["quality"], 0.)
+        # BEGIN preservation is independent of the candidate's search rank.
+        exact = next(row for row in result["candidates"] if row["source"] == "demo_exact")
+        np.testing.assert_array_equal(exact["T_reference_tool"], self.prior)
+        self.assertEqual(exact["quality"], 0.)
+        self.assertGreater(exact["rank"], 0)
+        self.assertGreater(result["candidates"][0]["ranking_score"], exact["ranking_score"])
+        scores = [row["ranking_score"] for row in result["candidates"]]
+        self.assertTrue(all(a >= b for a, b in zip(scores, scores[1:])))
+        # END all sources compete using their existing shared score.
         self.assertEqual(backend.calls, ["prepare", "generate", "score"])
         self.assertEqual(len(backend.scored), 195)
         self.assertEqual(len(result["candidates"]), 195)
@@ -81,6 +86,50 @@ class GraspGenerationTest(unittest.TestCase):
                          {"demo_exact": 1, "demo_local": 192, "diffusion": 1, "obb": 1})
         self.assertFalse(result["diagnostics"]["execution_validated"])
         self.assertEqual(result["rejected_candidates"], [])
+
+    # BEGIN ordinary prior preference and deterministic ties need no source privilege.
+    def test_best_scoring_exact_prior_still_wins_without_a_special_branch(self):
+        class PriorBest(Backend):
+            def score(self, grasps, points, *, seed):
+                values = np.zeros(len(grasps))
+                values[0] = 1.
+                return values
+
+        result = generate_grasp_candidates(self.request(), PriorBest(self.generated, binding=self.binding))
+        self.assertEqual(result["candidates"][0]["source"], "demo_exact")
+        self.assertEqual(result["candidates"][0]["ranking_score"], 1.)
+
+    def test_soft_prior_can_outweigh_a_farther_candidates_higher_model_quality(self):
+        class SoftPreference(Backend):
+            def score(self, grasps, points, *, seed):
+                values = np.zeros(len(grasps))
+                values[0], values[-1] = .8, 1.
+                return values
+
+        far = np.stack((pose((1., 0., 0.)), pose((2., 0., 0.))))
+        request = GraspGenerationRequest(self.points, np.eye(4), np.eye(4))
+        result = generate_grasp_candidates(request, SoftPreference(far))
+        exact = next(row for row in result["candidates"] if row["source"] == "demo_exact")
+        distant = next(row for row in result["candidates"] if row["source"] == "obb")
+        self.assertLess(exact["quality"], distant["quality"])
+        self.assertGreater(exact["ranking_score"], distant["ranking_score"])
+        self.assertLess(exact["rank"], distant["rank"])
+
+    def test_equal_scores_use_stable_ids_and_repeated_seed_keeps_the_order(self):
+        class EqualQuality(Backend):
+            def score(self, grasps, points, *, seed):
+                return np.ones(len(grasps))
+
+        request = GraspGenerationRequest(self.points, np.eye(4), np.eye(4))
+        generated = np.stack((np.eye(4), np.eye(4)))
+        first = generate_grasp_candidates(request, EqualQuality(generated), seed=17)
+        second = generate_grasp_candidates(request, EqualQuality(generated), seed=17)
+        tied = [row for row in first["candidates"] if row["ranking_score"] == 1.]
+        self.assertEqual([row["source"] for row in tied], ["demo_exact", "diffusion", "obb"])
+        self.assertEqual([row["candidate_id"] for row in tied], ["grasp_0000", "grasp_0193", "grasp_0194"])
+        self.assertEqual([row["candidate_id"] for row in first["candidates"]],
+                         [row["candidate_id"] for row in second["candidates"]])
+    # END model quality is a soft ordering input, never an execution certificate.
 
     def test_nontrivial_robot_binding_and_reference_transform_are_applied_once(self):
         result = generate_grasp_candidates(self.request(), Backend(self.generated, binding=self.binding), seed=5)
@@ -148,8 +197,10 @@ class GraspGenerationTest(unittest.TestCase):
         request = self.request(approach_reference=grasp[:3, 2].copy(),
                                hard_max_approach_angle_rad=0.)
         result = generate_grasp_candidates(request, Backend(self.generated, binding=self.binding))
-        self.assertEqual(result["candidates"][0]["source"], "demo_exact")
-        self.assertEqual(result["candidates"][0]["approach_angle_rad"], 0.)
+        # BEGIN exact direction acceptance does not imply unconditional rank zero.
+        exact = next(row for row in result["candidates"] if row["source"] == "demo_exact")
+        self.assertEqual(exact["approach_angle_rad"], 0.)
+        # END the explicit angle gate is independent of the common ranking.
 
     def test_mismatched_robot_binding_fails_before_model_inference(self):
         backend = Backend(self.generated)

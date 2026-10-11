@@ -108,6 +108,25 @@ def rejected(failure="no_feasible_solution_found", error_type=None, **extra):
             "diagnostics": {"failure": failure, "error_type": error_type, **extra}}
 
 
+# BEGIN the generator's common order is authoritative for all candidate sources.
+@pytest.mark.parametrize("reject_first", [False, True])
+def test_higher_ranked_alternative_precedes_prior_and_rejection_uses_same_order(
+        tmp_path, monkeypatch, reject_first):
+    alternative, prior = candidate(1), candidate(0)
+    alternative.update(quality=.9, ranking_score=.8, rank=0)
+    prior.update(quality=.4, ranking_score=.6, rank=1)
+    args, calls, _, _ = prepare_run(tmp_path, monkeypatch, pool=[alternative, prior],
+        outcomes=[rejected(), {}] if reject_first else [{}])
+    assert runner.run(args) == 0
+    result = read_result(args)
+    expected = [alternative, prior] if reject_first else [alternative]
+    assert [row["candidate_id"] for row in result["attempts"]] == [row["candidate_id"] for row in expected]
+    assert result["selected"]["candidate_id"] == expected[-1]["candidate_id"]
+    assert len(calls) == len(expected)
+    assert result["selected"]["actual_holding_verified"] is False
+# END neither preservation of the prior nor its feasibility restores priority.
+
+
 def test_finite_search_failure_continues_and_manifest_keeps_one_current_action(tmp_path, monkeypatch):
     args, calls, _, original = prepare_run(tmp_path, monkeypatch,
         outcomes=[rejected(), {}])
