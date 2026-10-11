@@ -492,3 +492,179 @@ class FingerTrajectory:
             raise ValueError("Saved finger reference must retain every exact original timed event and target")
         return deepcopy(self._bounds_report)
 # END nominal finger references remain separate from measured motion and contact.
+
+
+# BEGIN physical-clock validity belongs to geometry, never command authorization.
+_GEOMETRY_SCOPE = (
+    "Nominal collision geometry only on [0, valid_until_s], including the exact "
+    "typed endpoint. Later contact-dependent fingers remain unknown. This model "
+    "does not predict measured tracking or change command/execution authorization.")
+
+
+@dataclass(frozen=True)
+class NominalFingerGeometry:
+    """An owned finger polynomial with an explicit physical validity prefix.
+
+    A free-motion model reuses the original command polynomial. A held model
+    freezes measured entrance q; its zero derivative describes that geometric
+    assumption, not the measured entrance dq or the executable command curve.
+    Sampling evaluates the polynomial on its full stored clock. Collision
+    consumers must use ``valid_mask`` before claiming geometry at a query.
+    """
+
+    joint_names: tuple[str, ...]
+    times: np.ndarray
+    position: np.ndarray
+    velocity: np.ndarray
+    duration: float
+    valid_until_s: float
+    source: str
+    _curve: CubicHermiteSpline = field(init=False, repr=False)
+    _torch_cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        names = tuple(self.joint_names)
+        if (not names or len(set(names)) != len(names)
+                or any(not isinstance(name, str) or not name.strip() for name in names)):
+            raise ValueError("Nominal finger geometry needs unique named joints")
+        _text(self.source, "Nominal finger geometry source")
+        if (not np.isfinite([self.duration, self.valid_until_s]).all()
+                or self.duration <= 0. or not 0. <= self.valid_until_s <= self.duration):
+            raise ValueError("Nominal finger validity must be a prefix of its original physical clock")
+        times = np.asarray(self.times, dtype=float)
+        if (times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all()
+                or times[0] != 0. or times[-1] != self.duration or np.any(np.diff(times) <= 0.)):
+            raise ValueError("Nominal finger geometry requires the complete ordered polynomial clock")
+        object.__setattr__(self, "joint_names", names)
+        for name, value in (("times", times.copy()),
+                            ("position", _array(self.position, (len(times), len(names)), "Nominal finger q")),
+                            ("velocity", _array(self.velocity, (len(times), len(names)), "Nominal finger dq"))):
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_curve", CubicHermiteSpline(
+            self.times, self.position, self.velocity, axis=0, extrapolate=False))
+
+    def valid_mask(self, times):
+        """Use the same exact typed boundary as the planner's Torch query.
+
+        A float32 endpoint is its declared representation of the binary64
+        source time, even when rounding lies above it. Its next representable
+        value is outside. No epsilon or progress-based entrance is admitted.
+        """
+        query = np.asarray(times)
+        terminal = np.asarray(self.duration, dtype=query.dtype)
+        if (not np.isfinite(query).all() or np.any(query < 0.) or np.any(query > terminal)):
+            raise ValueError("Finger reference queries must stay inside the original trajectory duration")
+        endpoint = np.asarray(self.valid_until_s, dtype=query.dtype)
+        return np.isfinite(query) & (query >= 0.) & (query <= endpoint)
+
+    def valid_mask_torch(self, times):
+        import torch
+        from .optimizer_device_checks import require_tensor
+        message = "Finger reference queries must stay inside the original finite trajectory duration"
+        if not isinstance(times, torch.Tensor) or not times.is_floating_point():
+            raise ValueError(message)
+        admitted = torch.isfinite(times) & (times >= 0.) & (times <= self.duration)
+        require_tensor(admitted.all(), message)
+        return admitted & (times <= self.valid_until_s)
+
+    def sample(self, times):
+        return FingerTrajectory.sample(self, times)
+
+    def sample_torch(self, times):
+        # Reuse the original polynomial evaluator and stable tensor cache.
+        return FingerTrajectory.sample_torch(self, times)
+
+    @property
+    def torch_storage_bytes(self):
+        return FingerTrajectory.torch_storage_bytes.fget(self)
+
+    def describe(self):
+        return {"joint_names": list(self.joint_names), "times": self.times.tolist(),
+                "position": self.position.tolist(), "velocity": self.velocity.tolist(),
+                "duration": self.duration, "valid_until_s": self.valid_until_s,
+                "source": self.source, "scope": _GEOMETRY_SCOPE}
+
+    @classmethod
+    def from_reference(cls, reference, *, valid_until_s, source):
+        """Own the same polynomial under a separately declared geometry scope."""
+        return cls(reference.joint_names, reference.times, reference.position,
+                   reference.velocity, reference.duration, valid_until_s, source)
+
+    @classmethod
+    def from_mapping(cls, value):
+        fields = {name for name, definition in cls.__dataclass_fields__.items() if definition.init}
+        if not isinstance(value, dict) or set(value) != fields | {"scope"}:
+            raise ValueError("Saved nominal geometry needs its polynomial, validity and source")
+        result = cls(**{key: deepcopy(value[key]) for key in fields})
+        if result.describe() != value:
+            raise ValueError("Saved nominal geometry differs from its validated physical-clock contract")
+        return result
+
+
+def bind_nominal_finger_geometry(reference, conditions, event_clock, *, progress_interval):
+    """Declare geometry from existing contact identities and verified Holding.
+
+    ``reference`` remains the original C1 command, including measured dq.
+    ``event_clock`` is the already-bound original occurrence clock; no inverse
+    progress map, replacement event, stop or execution barrier is introduced.
+    Missing consumed contact identities cannot establish a free-motion suffix.
+    """
+    begin, end = np.asarray(progress_interval, dtype=float)
+    if not np.isfinite([begin, end]).all() or begin < 0. or end < begin:
+        raise ValueError("Nominal geometry needs the current bound progress interval")
+    holding = [row for row in conditions if row.get("kind") == "observed_attachment"]
+    boundaries = []
+    if holding:
+        for row in holding:
+            evidence = row["source"]
+            if (evidence.get("verified") is not True
+                    or evidence.get("robot_feedback_id") != reference.feedback_id):
+                raise ValueError("Held nominal geometry requires Holding verified against this measured feedback")
+        # The first original open command or identified release effect ends
+        # this held-shape assumption, regardless of source list ordering.
+        boundaries.extend((row["applied_time_s"], event_occurrence_key(row))
+                          for row in reference.events if row["kind"] == "open" and not row["superseded"])
+        for row in conditions:
+            if row.get("kind") == "predicted_release" and begin <= row["progress"] <= end:
+                # Effect conditions name their source event; actual occurrences
+                # come from the authoritative bound clock, including retries.
+                matched = [(clock["time"], identity) for identity, clock in event_clock.items()
+                           if identity[:2] == (row["skill_id"], row["event_id"])]
+                if not matched:
+                    if row["progress"] == begin:
+                        # A continuation may retain the same progress while
+                        # its already-consumed release is absent from this clock.
+                        boundaries.append((0., (row["skill_id"], row["event_id"])))
+                        continue
+                    raise ValueError("A release inside this motion block requires its original bound event occurrence")
+                boundaries.extend(matched)
+        times = np.array([0., reference.duration])
+        positions = np.tile(reference.position[0], (2, 1))
+        velocities = np.zeros_like(positions)
+        origin = ("Verified Holding; frozen measured entrance q, geometric dq=0 (not measured dq); "
+                  f"feedback={reference.feedback_id}; conditions="
+                  + repr([row["condition_id"] for row in holding]))
+    else:
+        for row in conditions:
+            if row.get("kind") != "grasp_contact_activation":
+                continue
+            if row["interval"][0] > end:
+                # A future block's close is outside this polynomial clock.
+                continue
+            identity = event_occurrence_key(row["activation_event"])
+            if (row["interval"][0] < begin
+                    or row["interval"][0] == begin and identity not in event_clock):
+                boundaries.append((0., identity))
+            elif identity not in event_clock:
+                raise ValueError("Contact activation inside this motion block requires its original bound event occurrence")
+            else:
+                boundaries.append((event_clock[identity]["activation_time_s"], identity))
+        times, positions, velocities = reference.times, reference.position, reference.velocity
+        origin = f"Free-motion original C1 command geometry; feedback={reference.feedback_id}"
+    cutoff = min((time for time, _ in boundaries), default=reference.duration)
+    source = origin + "; original invalidating occurrences=" + repr(
+        [identity for time, identity in boundaries if time == cutoff])
+    return NominalFingerGeometry(reference.joint_names, times, positions, velocities,
+                                 reference.duration, cutoff, source)
+# END nominal scope never shortens or edits the executable command curve.

@@ -1309,6 +1309,10 @@ class OnlinePlanningScene:
                                                      else deepcopy(hand.self_collision_model.geometry))
             hand_record['prepared_self_collision'] = (None if hand.self_collision_model is None
                                                      else hand.self_collision_model.record())
+            # BEGIN production bindings retain declared geometry and its expiry.
+            hand_record['nominal_model'] = (None if hand.nominal_finger_trajectory is None
+                                            else hand.nominal_finger_trajectory.describe())
+            # END command targets remain separate from this optional geometry.
         return {'schema':'online_scene_v3','reference_frame':self.reference_frame,
             'robot_geometry_source':self.robot_geometry_source,'robot_model':deepcopy(self.robot_model),
             'numerical_position_tolerance_m':self.numerical_position_tolerance_m,
@@ -1349,6 +1353,9 @@ class OnlinePlanningScene:
         if row['gripper'] is not None:
             spec=deepcopy(row['gripper'])
             prepared = spec.pop('prepared_self_collision')
+            # BEGIN restore only the explicitly archived physical validity.
+            from .gripper_trajectory import NominalFingerGeometry
+            nominal_record = spec.pop('nominal_model')
             # JSON represents an empty [0,J] coupling matrix as []; restore
             # its declared native joint dimension before ordinary validation.
             spec['coupling_matrix'] = np.asarray(spec['coupling_matrix'], dtype=float).reshape(-1, len(spec['joint_names']))
@@ -1357,6 +1364,13 @@ class OnlinePlanningScene:
             spec['controller']='binary'
             spec['joint_bounds']=None
             hand=PrismaticGripper(**spec)
+            if nominal_record is not None:
+                nominal = NominalFingerGeometry.from_mapping(nominal_record)
+                if (nominal.joint_names != hand.joint_names
+                        or not np.array_equal(nominal.position[0], hand.current_positions)):
+                    raise ValueError('Saved nominal geometry changed the measured named entrance')
+                hand.nominal_finger_trajectory = nominal
+            # END actual execution still supplies measured complete finger joints.
             if (prepared is None) != (hand.self_collision_model is None):
                 raise ValueError('Saved native hand geometry and prepared model must agree')
             if prepared is not None:

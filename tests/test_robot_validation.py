@@ -329,8 +329,11 @@ def test_planning_source_limits_admit_only_exact_active_dtype_endpoints(model, i
 
 def test_planning_active_dtype_cannot_relax_independent_nominal_finger_limits(model):
     gate = validator(model, [PairQuery("first", "second", "mechanical_contact", "explicit source permission")])
-    nominal = SimpleNamespace(joint_names=NAMES[1:], duration=1.,
-        sample=lambda time: (np.array([float(np.float32(-.1))]), np.array([0.])))
+    # BEGIN the fixture explicitly declares nominal geometry, including its scope.
+    from manipulation.gripper_trajectory import NominalFingerGeometry
+    nominal = NominalFingerGeometry(NAMES[1:], [0., 1.], [[float(np.float32(-.1))]]*2,
+                                   [[0.]]*2, 1., 1., "synthetic constant out-of-range hand")
+    # END active-arm dtype cannot alter a separately declared nominal finger.
     result = gate.check_planning_self(np.array([.03], dtype=np.float32), NAMES[:1], time_s=.2,
         gripper=planning_hand(controller="timed_reference", nominal=nominal))
     assert not result["passed"] and result["rounded_limit_representations"] == []
@@ -347,8 +350,11 @@ def test_planning_unknown_future_fingers_never_use_the_control_command(model, co
     future = gate.check_planning_self([.03], NAMES[:1], time_s=.2, gripper=hand)
     assert future["passed"] and future["queried_pairs"] == 0
     assert future["unmodelled_geometry_names"] == ["second"]
-    nominal = SimpleNamespace(joint_names=NAMES[1:], duration=1.,
-        sample=lambda time: (np.array([-.08+.08*time]), np.array([.08])))
+    # BEGIN this synthetic linear model explicitly covers its entire clock.
+    from manipulation.gripper_trajectory import NominalFingerGeometry
+    nominal = NominalFingerGeometry(NAMES[1:], [0., 1.], [[-.08], [0.]], [[.08]]*2,
+                                   1., 1., "synthetic linear hand")
+    # END the unbound command still cannot provide these coordinates.
     hand.nominal_finger_trajectory = nominal
     middle = gate.check_planning_self([.03], NAMES[:1], time_s=.5, gripper=hand)
     assert middle["passed"] and middle["joint_positions"] == [.03, -.04]
@@ -358,15 +364,13 @@ def test_planning_unknown_future_fingers_never_use_the_control_command(model, co
 
 
 def test_planning_nominal_finger_endpoint_preserves_exact_native_time_representation(model):
-    from scipy.interpolate import CubicHermiteSpline
-    from manipulation.gripper_trajectory import FingerTrajectory
+    # BEGIN native endpoint representation belongs to a scoped geometry record.
+    from manipulation.gripper_trajectory import NominalFingerGeometry
 
     duration = 9*float(np.float32(.2))
-    nominal = SimpleNamespace(joint_names=NAMES[1:], duration=duration,
-        _curve=CubicHermiteSpline([0., duration], [[-.08], [-.04]], [[0.], [0.]]))
-    # Use the production sampler's strict physical domain and polynomial;
-    # actuator event generation is independent of this representation check.
-    nominal.sample = lambda time: FingerTrajectory.sample(nominal, time)
+    nominal = NominalFingerGeometry(NAMES[1:], [0., duration], [[-.08], [-.04]], [[0.], [0.]],
+                                   duration, duration, "synthetic complete native clock")
+    # END actuator event generation is independent of this representation check.
     hand = planning_hand(controller="timed_reference", nominal=nominal)
     gate = validator(model)
     endpoint = np.float32(duration)

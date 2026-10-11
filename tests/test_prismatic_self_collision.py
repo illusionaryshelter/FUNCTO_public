@@ -17,13 +17,12 @@ def hand(*, nominal=False):
     initial = np.array([-.05, .05])
     def factory(target):
         def build(duration, mapping):
-            def sample(t):
-                t = np.asarray(t)[..., None]/duration
-                return initial+(np.asarray(target)-initial)*t, np.broadcast_to((np.asarray(target)-initial)/duration, (*t.shape[:-1], 2))
-            def sample_torch(t):
-                change = t.new_tensor(target)-t.new_tensor(initial)
-                return t.new_tensor(initial)+change*t[..., None]/duration, change.expand(*t.shape, 2)/duration
-            return SimpleNamespace(joint_names=('left', 'right'), duration=duration, sample=sample, sample_torch=sample_torch)
+            # BEGIN the synthetic linear geometry declares its complete scope.
+            from manipulation.gripper_trajectory import NominalFingerGeometry
+            return NominalFingerGeometry(('left', 'right'), [0., duration], [initial, target],
+                np.tile((np.asarray(target)-initial)/duration, (2, 1)), duration, duration,
+                'explicit synthetic linear finger fixture')
+            # END command/geometry comparisons still use different targets.
         return build
     vertices = np.asarray(list(product((-.01, .01), (-.1, .1), (-.01, .01))))
     radii = float(np.linalg.norm(vertices[0]))
@@ -38,7 +37,8 @@ def hand(*, nominal=False):
         local_spheres=[[0., 0., 0., radii]]*2, sphere_joint_translation=matrices,
         self_collision_pairs=((0, 1), (0, 2)), commands=(), source='native prismatic test assembly',
         control_timestep_s=.01, finger_trajectory_factory=factory([0., 0.]),
-        nominal_finger_trajectory_factory=factory([-.06, .06]) if nominal else None,
+        nominal_finger_trajectory_factory=(lambda duration, mapping, reference:
+            factory([-.06, .06])(duration, mapping)) if nominal else None,
         self_collision_geometry=geometry)
     result.bind_clock(1., None)
     return result

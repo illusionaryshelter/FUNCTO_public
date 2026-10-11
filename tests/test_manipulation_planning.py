@@ -358,7 +358,11 @@ class PlannerCalculusTests(unittest.TestCase):
             source="analytic timed native-self input")
         hand.finger_trajectory = SimpleNamespace(sample_torch=lambda t: (
             (.04-.02*t)[..., None], torch.full((*t.shape, 1), -.02, dtype=t.dtype)))
-        hand.nominal_finger_trajectory = hand.finger_trajectory
+        # BEGIN the analytic fixture separately declares whole-clock geometry.
+        from manipulation.gripper_trajectory import NominalFingerGeometry
+        hand.nominal_finger_trajectory = NominalFingerGeometry(("finger",), [0., 1.], [[.04], [.02]],
+            [[-.02], [-.02]], 1., 1., "explicit synthetic free finger geometry")
+        # END command sampler identity is not a geometry contract.
         original_state = State()
         replaced = _timed_native_state(original_state, problem, SimpleNamespace(gripper=hand),
                                          problem.joint_names, q.new_tensor([[1.]]))

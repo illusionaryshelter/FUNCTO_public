@@ -117,7 +117,9 @@ class RobotStateValidator:
                     raise ValueError("Independently controlled fingers must not duplicate active arm coordinates")
                 if time_s == 0:
                     fingers = gripper.current_positions
-                elif gripper.nominal_finger_trajectory is not None:
+                # BEGIN CPU geometry admits the same typed prefix as Torch.
+                elif (gripper.nominal_finger_trajectory is not None
+                      and gripper.nominal_finger_trajectory.valid_mask(time_s)):
                     model = gripper.nominal_finger_trajectory
                     if tuple(model.joint_names) != self.finger_joint_names:
                         raise ValueError("Nominal finger geometry changed native joint identity")
@@ -130,11 +132,14 @@ class RobotStateValidator:
                     sample_time = float(time_s)
                     if time_dtype.kind == "f" and time_s == np.asarray(model.duration, dtype=time_dtype):
                         sample_time = float(model.duration)
+                    if time_dtype.kind == "f" and time_s == np.asarray(model.valid_until_s, dtype=time_dtype):
+                        sample_time = float(model.valid_until_s)
                     fingers, _ = model.sample(sample_time)
                     # END all nonendpoint queries retain their original physical time.
                 else:
                     fingers = [sum(self.checker.joint_limits[name])/2 for name in self.finger_joint_names]
                     unmodelled = self.checker.geometry_depending_on(self.finger_joint_names)
+                # END an expired nominal curve cannot restore unknown descendants.
                 fingers = np.asarray(fingers)
                 if (fingers.shape != (len(self.finger_joint_names),) or fingers.dtype.kind not in "iuf"
                         or not np.isfinite(fingers).all()):

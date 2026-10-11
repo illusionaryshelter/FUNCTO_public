@@ -93,9 +93,16 @@ class PlanningBindingTest(unittest.TestCase):
             return JointTrajectory(("finger",), np.array([0., duration]), np.full((2, 1), .04),
                 np.zeros((2, 1)), progress_map.u, progress_map.s, (), (), {})
 
+        # BEGIN geometry explicitly declares this constant fixture's clock scope.
+        def geometry(duration, progress_map, command_reference):
+            from manipulation.gripper_trajectory import NominalFingerGeometry
+            return NominalFingerGeometry.from_reference(command_reference,
+                valid_until_s=duration, source="explicit whole-clock constant fixture")
+        # END matching command times alone do not authorize nominal geometry.
+
         hand = PrismaticGripper(controller="timed_reference", control_timestep_s=.002,
             joint_names=("finger",), current_positions=[.04], joint_limits=[[0., .04]], joint_bounds=None,
-            finger_trajectory_factory=fingers, nominal_finger_trajectory_factory=fingers,
+            finger_trajectory_factory=fingers, nominal_finger_trajectory_factory=geometry,
             coupling_matrix=np.empty((0, 1)), coupling_offset=[], sphere_indices=(0,),
             local_spheres=[[0., 0., 0., .001]], sphere_joint_translation=[[[1.], [0.], [0.]]],
             self_collision_pairs=(), commands=[{"skill_id": "current", "event_id": "close", "occurrence": 0,

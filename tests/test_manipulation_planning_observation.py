@@ -742,20 +742,16 @@ class OnlineObservationContractTest(unittest.TestCase):
         owner[[30, 31, 32], [30, 31, 32]] = True
         record["owner_masks"] = {"part": owner}
         normalized = _self_filtered_views({"camera": record}, "world", (.1, 3.))
-        # BEGIN semantic uncertainty is a distinct output, not background.
-        partitions, boundaries = _partition_masks(normalized, ("part",))
-        masks = partitions["camera"]
-        # END inspect the exact endpoint partitions used online.
+        # BEGIN all accepted endpoints keep their supplied owner or background.
+        masks = _partition_masks(normalized, ("part",))["camera"]
         self.assertEqual(int(masks["part"].sum()), 1)
         self.assertFalse(masks[None][30, 30])
         self.assertFalse(masks[None][31, 31])
-        # BEGIN the accepted owner creates a ring; excluded owner seeds do not.
-        self.assertFalse(masks[None][33, 33])
-        self.assertTrue(boundaries["camera"][33, 33])
+        self.assertTrue(masks[None][33, 33])
         self.assertTrue(masks[None][29, 29])
         self.assertTrue(masks[None][30, 31])
         self.assertTrue(masks[None][34, 34])
-        # END SELF/shadow identities never suppress neighbouring background.
+        # END SELF/shadow and owner masks never suppress adjacent environment.
         report = _self_filter_report(normalized)["camera"]["owners"]["part"]
         self.assertEqual(report["excluded_self_pixels"], 1)
         self.assertEqual(report["excluded_ambiguous_shadow_pixels"], 1)
@@ -771,8 +767,8 @@ class OnlineObservationContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "after self filtering"):
             _partition_masks(normalized, ("part",))
 
-    # BEGIN semantic-boundary counterexamples preserve identity and visibility.
-    def test_semantic_boundary_excludes_single_pixel_leak_without_inventing_an_owner(self):
+    # BEGIN endpoint-conservation counterexamples preserve identity and visibility.
+    def test_unlabelled_adjacent_obstacle_stays_occupied_without_inventing_an_owner(self):
         record = view()
         mask = np.zeros(record['depth'].shape, bool)
         mask[40:43, 40:43] = True
@@ -781,13 +777,11 @@ class OnlineObservationContractTest(unittest.TestCase):
         original_rays = record['self_filter']['free_ray_depth_m'].copy()
         original_labels = record['self_filter']['labels'].copy()
         normalized = _self_filtered_views({'camera': record}, 'world', (.1, 3.))
-        partitions, boundaries = _partition_masks(normalized, ('part',))
-        mapped, boundary = partitions['camera'], boundaries['camera']
+        mapped = _partition_masks(normalized, ('part',))['camera']
         # An unlabelled adjacent endpoint may be leaked object material or a
-        # thin independent obstacle. Neither possibility licenses identity or
-        # free-space invention; both remain endpoint-identity uncertainty.
-        self.assertTrue(boundary[43, 43])
-        self.assertFalse(mapped[None][43, 43])
+        # thin independent obstacle. The planner cannot decide that identity
+        # from adjacency and must retain the measured obstacle in either case.
+        self.assertTrue(mapped[None][43, 43])
         self.assertFalse(mapped['part'][43, 43])
         self.assertTrue(mapped[None][44, 44])
         np.testing.assert_array_equal(mapped['part'], mask)
@@ -795,33 +789,35 @@ class OnlineObservationContractTest(unittest.TestCase):
         np.testing.assert_array_equal(record['self_filter']['free_ray_depth_m'], original_rays)
         np.testing.assert_array_equal(record['self_filter']['labels'], original_labels)
         np.testing.assert_array_equal(normalized['camera']['self_filter']['free_ray_depth_m'], original_rays)
-        self.assertFalse(boundary.flags.writeable)
         self.assertFalse(mapped[None].flags.writeable)
+        np.testing.assert_array_equal(mapped[None] | mapped['part'], np.ones_like(mask))
+        self.assertFalse(np.any(mapped[None] & mapped['part']))
 
-    def test_overlapping_boundary_rings_never_reassign_another_declared_owner(self):
+    def test_adjacent_owners_keep_identity_and_do_not_erase_other_endpoints(self):
         record = view()
         first, second = np.zeros(record['depth'].shape, bool), np.zeros(record['depth'].shape, bool)
         first[40, 40] = True
         second[40, 41] = True
         record['owner_masks'] = {'first': first, 'second': second}
         normalized = _self_filtered_views({'camera': record}, 'world', (.1, 3.))
-        partitions, boundaries = _partition_masks(normalized, ('first', 'second'))
-        mapped, boundary = partitions['camera'], boundaries['camera']
+        mapped = _partition_masks(normalized, ('first', 'second'))['camera']
         np.testing.assert_array_equal(mapped['first'], first)
         np.testing.assert_array_equal(mapped['second'], second)
-        self.assertFalse(boundary[40, 40])
-        self.assertFalse(boundary[40, 41])
-        self.assertTrue(boundary[39, 40])
-        self.assertTrue(boundary[39, 41])
-        self.assertFalse(np.any(boundary & mapped[None]))
+        self.assertFalse(mapped[None][40, 40])
+        self.assertFalse(mapped[None][40, 41])
+        self.assertTrue(mapped[None][39, 40])
+        self.assertTrue(mapped[None][39, 41])
+        # Integer counts prove both endpoint conservation and non-overlap.
+        np.testing.assert_array_equal(sum(mask.astype(int) for mask in mapped.values()),
+                                      np.ones_like(first, dtype=int))
         # Conflicting raw semantic evidence still fails before any uncertainty
         # treatment can hide the overlap.
         record['owner_masks']['second'][40, 40] = True
         with self.assertRaisesRegex(ValueError, 'disjoint'):
             _partition_masks(normalized, ('first', 'second'))
 
-    def test_invalid_depth_and_robot_exclusions_never_seed_or_enter_boundary(self):
-        from manipulation.robot_self_filter import SELF, AMBIGUOUS_SHADOW
+    def test_invalid_depth_and_robot_exclusions_do_not_erase_adjacent_environment(self):
+        from manipulation.robot_self_filter import SELF, AMBIGUOUS_SHADOW, ENVIRONMENT
         record = view()
         record['depth'][20, 20] = 0.
         record['self_filter'] = environment_evidence(record['depth'])
@@ -832,16 +828,15 @@ class OnlineObservationContractTest(unittest.TestCase):
         owner[[20, 30, 40, 50], [20, 30, 40, 50]] = True
         record['owner_masks'] = {'part': owner}
         normalized = _self_filtered_views({'camera': record}, 'world', (.1, 3.))
-        partitions, boundaries = _partition_masks(normalized, ('part',))
-        mapped, boundary = partitions['camera'], boundaries['camera']
+        mapped = _partition_masks(normalized, ('part',))['camera']
         for row in (20, 30, 50):
-            self.assertFalse(boundary[row, row])
             self.assertFalse(mapped[None][row, row])
             self.assertFalse(mapped['part'][row, row])
-            self.assertFalse(boundary[row+1, row+1])
             self.assertTrue(mapped[None][row+1, row+1])
-        self.assertTrue(boundary[41, 41])
-    # END semantic uncertainty changes only admission of background endpoints.
+        self.assertTrue(mapped[None][41, 41])
+        np.testing.assert_array_equal(sum(mask.astype(int) for mask in mapped.values()),
+            (normalized['camera']['self_filter']['labels'] == ENVIRONMENT).astype(int))
+    # END self filtering alone determines which measured endpoints are admitted.
 
     def test_online_evidence_is_required_and_cannot_grant_excluded_rays(self):
         from manipulation.robot_self_filter import AMBIGUOUS_SHADOW
@@ -914,9 +909,8 @@ class OnlineObservationContractTest(unittest.TestCase):
         record['self_filter']['labels'][31,31]=AMBIGUOUS_SHADOW
         record['self_filter']['free_ray_depth_m'][[30,31],[30,31]]=0.
         normalized=_self_filtered_views({'A':record},'world',(.1,3.))
-        # BEGIN production partitions always expose semantic boundaries.
-        masks,boundaries=_partition_masks(normalized,{})
-        self.assertFalse(boundaries['A'].any())
+        # BEGIN no-owner inputs retain all accepted background endpoints.
+        masks=_partition_masks(normalized,{})
         # END no-owner observations retain their original background endpoints.
         exported={'solids':[source.record()], 'field_summary':{'observed_samples':1}}
         with patch('curobo.perception.Mapper') as mapper, \
@@ -947,7 +941,7 @@ class OnlineObservationContractTest(unittest.TestCase):
     # END one source, independent numerical support and unchanged camera evidence.
 
     # BEGIN rebuilding cannot retain the old background's fused endpoint input.
-    def test_background_rebuild_uses_fresh_mapper_and_actual_boundary_exclusion(self):
+    def test_background_rebuild_uses_fresh_mapper_and_only_explicit_owner_exclusion(self):
         from curobo.perception import MapperCfg
         from curobo.types import DeviceCfg
         from manipulation.planning_observation import _map_online_partition
@@ -958,13 +952,19 @@ class OnlineObservationContractTest(unittest.TestCase):
         record = view()
         normalized = _self_filtered_views({'A': record}, 'world', (.1, 3.))
         original_rays = normalized['A']['self_filter']['free_ray_depth_m'].copy()
-        original_masks, _ = _partition_masks(normalized, {})
+        original_masks = _partition_masks(normalized, {})
         mask = np.zeros(record['depth'].shape, bool)
         mask[40, 40] = True
         record['owner_masks'] = {'part': mask}
         rebuilt = _self_filtered_views({'A': record}, 'world', (.1, 3.))
-        rebuilt_masks, boundaries = _partition_masks(rebuilt, ('part',))
-        instances = [MagicMock(), MagicMock()]
+        rebuilt_masks = _partition_masks(rebuilt, ('part',))
+        # An independently corrected visible mask, rather than a planner
+        # dilation, is what removes the other measured owner endpoint.
+        complete_record = {**record, 'owner_masks': {'part': mask.copy()}}
+        complete_record['owner_masks']['part'][41, 41] = True
+        complete = _self_filtered_views({'A': complete_record}, 'world', (.1, 3.))
+        complete_masks = _partition_masks(complete, ('part',))
+        instances = [MagicMock(), MagicMock(), MagicMock()]
         for instance in instances:
             instance.get_stats.return_value = {'allocation_failures': 0, 'num_allocated': 0,
                                                'active_blocks': 0, 'free_count': 0}
@@ -977,20 +977,25 @@ class OnlineObservationContractTest(unittest.TestCase):
              patch('manipulation.tsdf_geometry.build_tsdf_geometry', return_value=exported) as source_export:
             _map_online_partition(normalized, original_masks, None, cfg, np.eye(4))
             _map_online_partition(rebuilt, rebuilt_masks, None, cfg, np.eye(4))
-        self.assertEqual(mapper.call_count, 2)
-        self.assertIs(source_export.call_args_list[0].args[0], instances[0])
-        self.assertIs(source_export.call_args_list[1].args[0], instances[1])
-        for instance in instances:
+            _map_online_partition(complete, complete_masks, None, cfg, np.eye(4))
+        self.assertEqual(mapper.call_count, 3)
+        for call, instance in zip(source_export.call_args_list, instances):
+            self.assertIs(call.args[0], instance)
             instance.integrate.assert_called_once()
-        old_depth, new_depth = [instance.integrate.call_args.kwargs['camera_observation'].depth_image.numpy()[0]
+        old_depth, new_depth, complete_depth = [instance.integrate.call_args.kwargs['camera_observation'].depth_image.numpy()[0]
                                 for instance in instances]
         self.assertGreater(old_depth[41, 41], 0.)
-        self.assertTrue(boundaries['A'][41, 41])
-        self.assertEqual(new_depth[41, 41], 0.)
+        self.assertGreater(new_depth[41, 41], 0.)
         self.assertEqual(new_depth[40, 40], 0.)
         self.assertGreater(new_depth[42, 42], 0.)
+        self.assertEqual(complete_depth[40, 40], 0.)
+        self.assertEqual(complete_depth[41, 41], 0.)
+        self.assertGreater(complete_depth[42, 42], 0.)
         np.testing.assert_array_equal(new_depth, np.where(rebuilt_masks['A'][None], record['depth'], 0.))
+        np.testing.assert_array_equal(complete_depth,
+            np.where(complete_masks['A'][None], complete_record['depth'], 0.))
         np.testing.assert_array_equal(rebuilt['A']['self_filter']['free_ray_depth_m'], original_rays)
+        np.testing.assert_array_equal(complete['A']['self_filter']['free_ray_depth_m'], original_rays)
     # END frozen geometry exports come from the freshly integrated partition.
 
     def test_online_builder_maps_one_selected_field_and_uses_complete_robot_radius(self):
@@ -1119,13 +1124,16 @@ class DirectCompleteOwnerTest(unittest.TestCase):
             decisions = scene.observation_partition_masks[name]
             np.testing.assert_array_equal(decisions['background'], masks[name][None])
             self.assertFalse(decisions['background'].flags.writeable)
-            self.assertFalse(decisions['semantic_boundary'].flags.writeable)
-            report = scene.observation_report['semantic_boundary'][name]
+            self.assertEqual(set(decisions), {'background'})
+            report = scene.observation_report['endpoint_partition'][name]
             self.assertEqual(report['background_pixels'], int(decisions['background'].sum()))
-            self.assertEqual(report['excluded_boundary_pixels'], int(decisions['semantic_boundary'].sum()))
-            self.assertEqual(report['candidate_background_pixels'],
-                             report['background_pixels']+report['excluded_boundary_pixels'])
-            # END serialization need not reconstruct the former complement rule.
+            self.assertEqual(report['owner_pixels'], {'part':int(masks[name]['part'].sum())})
+            self.assertEqual(report['environment_pixels'],
+                             report['background_pixels']+sum(report['owner_pixels'].values()))
+            self.assertTrue(report['all_environment_endpoints_assigned'])
+            np.testing.assert_array_equal(sum(mask.astype(int) for mask in masks[name].values()),
+                (record['self_filter']['labels'] == ENVIRONMENT).astype(int))
+            # END diagnostics describe complete current occupancy independently of rays.
         np.testing.assert_array_equal(scene.coverage.known_free,_known_free_voxels(normalized,**coverage.call_args.kwargs))
 
     def test_invalid_direct_contracts_fail_before_any_coverage_or_map_allocation(self):

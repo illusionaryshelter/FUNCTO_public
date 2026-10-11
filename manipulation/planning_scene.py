@@ -928,7 +928,8 @@ class PrismaticGripper:
 
     ``joint_bounds(progress)`` is the solver tracking contract. Independent
     ``finger_trajectory_factory`` supplies commands;
-    ``nominal_finger_trajectory_factory`` supplies declared future geometry.
+    ``nominal_finger_trajectory_factory(duration, progress_map, command_reference)``
+    supplies declared future geometry from this binding's exact command.
     ``control_timestep_s`` is the explicit native device period shared by
     every command clock; it is not inferred from either trajectory factory.
     Without that geometry, only the actual initial fingers and invariant
@@ -1053,11 +1054,15 @@ class PrismaticGripper:
                 raise ValueError("Finger reference must preserve named measured entrance and formal duration")
             self.finger_trajectory = trajectory
         if self.nominal_finger_trajectory_factory is not None:
-            nominal = self.nominal_finger_trajectory_factory(duration, progress_map)
-            if (tuple(nominal.joint_names) != self.joint_names or nominal.duration != duration
+            nominal = self.nominal_finger_trajectory_factory(duration, progress_map, self.finger_trajectory)
+            # BEGIN future geometry must declare its own physical validity.
+            from .gripper_trajectory import NominalFingerGeometry
+            if (not isinstance(nominal, NominalFingerGeometry)
+                    or tuple(nominal.joint_names) != self.joint_names or nominal.duration != duration
                     or not np.array_equal(nominal.sample(np.array([0.]))[0][0], self.current_positions)):
                 raise ValueError("Nominal hand geometry must preserve measured entrance, names and bound clock")
             self.nominal_finger_trajectory = nominal
+            # END no unscoped command reference can silently become geometry.
 
     def state(self, progress, joint_position, joint_names, *, trajectory_time=None, measured=False):
         expected = (*progress.shape, len(self.joint_names))
@@ -1081,22 +1086,8 @@ class PrismaticGripper:
                                          -tolerance*coupling.abs().sum(-1)).sum(-1)
             return GripperState(coordinates, torch.zeros_like(coordinates), violations, certain)
         # END missing measured coordinates never fall back to commands.
-        if self.nominal_finger_trajectory is not None:
-            if trajectory_time is None or trajectory_time.shape != progress.shape:
-                raise ValueError("Timed finger geometry requires its bound trajectory and actual query time")
-            model = self.nominal_finger_trajectory
-            coordinates, _ = model.sample_torch(trajectory_time)
-            if coordinates.shape != expected:
-                raise ValueError("Named finger samples must align with the scene query")
-            tolerance = self.numerical_joint_tolerance
-            violations = (torch.relu(limits[:, 0]-coordinates-tolerance).sum(-1)
-                          + torch.relu(coordinates-limits[:, 1]-tolerance).sum(-1))
-            if len(self.coupling_matrix):
-                coupling = _tensor(self.coupling_matrix, progress)
-                violations = violations + torch.relu(
-                    (coordinates @ coupling.T-_tensor(self.coupling_offset, progress)).abs()
-                    - tolerance*coupling.abs().sum(-1)).sum(-1)
-            return GripperState(coordinates, torch.zeros_like(coordinates), violations, certain)
+        # BEGIN a mixed batch keeps modeled and contact-dependent times separate.
+        modeled = certain
         if self.controller in {"binary", "timed_reference"}:
             # BEGIN binary progress cannot identify the measured initial instant.
             # Neither a repeated zero-progress sample nor an isolated IK/search
@@ -1113,6 +1104,16 @@ class PrismaticGripper:
                 upper = torch.where(initial[..., None], initial_positions, upper)
             uncertain = (torch.ones_like(progress, dtype=torch.bool) if trajectory_time is None
                          else trajectory_time > 0)
+            if self.nominal_finger_trajectory is not None and trajectory_time is not None:
+                model = self.nominal_finger_trajectory
+                modeled = model.valid_mask_torch(trajectory_time)
+                coordinates, _ = model.sample_torch(torch.where(
+                    modeled, trajectory_time, torch.zeros_like(trajectory_time)))
+                if coordinates.shape != expected:
+                    raise ValueError("Named finger samples must align with the scene query")
+                lower = torch.where(modeled[..., None], coordinates, lower)
+                upper = torch.where(modeled[..., None], coordinates, upper)
+                uncertain = uncertain & ~modeled
             # END time-independent binary envelope.
         else:
             lower, upper = self.joint_bounds(progress)
@@ -1137,7 +1138,8 @@ class PrismaticGripper:
             half = torch.zeros_like(half)
         else:
             coordinates = middle
-        initial = (progress == 0).to(progress.dtype)
+        initial = ((progress == 0) if self.controller == "position_tracking" else
+                   (certain if trajectory_time is None else trajectory_time == 0)).to(progress.dtype)
         violations = violations + initial * (torch.relu(lower - initial_positions - tolerance).sum(-1)
                                              + torch.relu(initial_positions - upper - tolerance).sum(-1))
         if len(self.coupling_matrix) and self.controller == "position_tracking":
@@ -1146,6 +1148,12 @@ class PrismaticGripper:
             violations = violations + torch.relu((coordinates @ coupling.T
                                          - _tensor(self.coupling_offset, progress)).abs()
                                          - coupling_tolerance).sum(-1)
+        elif len(self.coupling_matrix):
+            coupling = _tensor(self.coupling_matrix, progress)
+            violations += modeled.to(progress.dtype) * torch.relu(
+                (coordinates @ coupling.T-_tensor(self.coupling_offset, progress)).abs()
+                - tolerance*coupling.abs().sum(-1)).sum(-1)
+        # END an unbound search query stays unknown even at progress zero.
         return GripperState(coordinates, half, violations, uncertain)
     # END nominal finger geometry never asserts that commands equal actual feedback.
 
@@ -1236,7 +1244,9 @@ def _source_world_binding_key(scene):
         hand.controller, tuple(hand.joint_names), typed(hand.current_positions),
         None if nominal is None else (type(nominal), tuple(nominal.joint_names),
             typed(nominal.duration), typed(nominal.times), typed(nominal.position),
-            typed(nominal.velocity)))
+            # BEGIN cache equality includes the geometry validity contract.
+            typed(nominal.velocity), typed(nominal.valid_until_s), nominal.source))
+            # END identical polynomials with different scopes cannot share claims.
     return (id(scene.robot_validator), id(scene._source_scene_checker),
             tuple(sorted(scene._self_collision_owner_ids)), hand_key)
 
@@ -2453,17 +2463,20 @@ class PlanningScene:
         return result
 
     def full_robot_positions(self, joint_position, joint_names, trajectory_time):
-        """Compose named arm and nominal finger coordinates without guessing."""
+        """Compose FK coordinates; unknown descendants remain explicit placeholders."""
         names = tuple(joint_names)
         values = joint_position
-        if self.gripper is not None and (self.gripper.controller == "timed_reference" or self.gripper.nominal_finger_trajectory is not None):
+        # BEGIN command targets never provide undeclared future FK geometry.
+        if (self.gripper is not None and self.gripper.controller != "position_tracking"
+                and not set(self.gripper.joint_names) <= set(names)):
             hand = self.gripper
             if set(names) & set(hand.joint_names):
                 raise ValueError("Independent finger coordinates must not duplicate active arm coordinates")
-            model = hand.nominal_finger_trajectory or hand.finger_trajectory
-            fingers, _ = model.sample_torch(trajectory_time)
-            values = torch.cat((values, fingers), -1)
+            state = hand.state(torch.zeros_like(trajectory_time), joint_position, joint_names,
+                               trajectory_time=trajectory_time)
+            values = torch.cat((values, state.coordinates), -1)
             names += hand.joint_names
+        # END collision/coverage consumers retain the same per-time unknown mask.
         return names, values
 
     def check_robot_coverage(self, joint_position, joint_names, trajectory_time, *, entrance=False):
@@ -2476,25 +2489,25 @@ class PlanningScene:
         if self.robot_coverage is None:
             return []
         hand = self.gripper
-        independent_unknown = (hand is not None and not set(hand.joint_names) <= set(joint_names)
-                               and hand.nominal_finger_trajectory is None)
-        if independent_unknown:
-            names = tuple(joint_names) + hand.joint_names
-            measured = _tensor(hand.current_positions, joint_position).expand(*joint_position.shape[:-1], len(hand.joint_names))
-            positions = torch.cat((joint_position, measured), -1)
-        else:
-            names, positions = self.full_robot_positions(joint_position, joint_names, trajectory_time)
+        # BEGIN coverage uses precisely the same physical validity as collision.
+        independent = hand is not None and not set(hand.joint_names) <= set(joint_names)
+        unknown = trajectory_time > 0
+        if independent and hand.nominal_finger_trajectory is not None:
+            unknown = unknown & ~hand.nominal_finger_trajectory.valid_mask_torch(trajectory_time)
+        unknown = unknown.detach().cpu().numpy().reshape(-1)
+        names, positions = self.full_robot_positions(joint_position, joint_names, trajectory_time)
         values = positions.detach().cpu().numpy().reshape(-1, len(names))
         times = trajectory_time.detach().cpu().numpy().reshape(-1)
         reports = []
-        for row, time_s in zip(values, times):
-            if independent_unknown and time_s > 0:
+        for row, time_s, unbound in zip(values, times, unknown):
+            if independent and unbound:
                 violations = {name: float(value) for name, value in zip(joint_names, row[:len(joint_names)])
                               if not self.robot_coverage._checker.joint_limits[name][0] <= value <= self.robot_coverage._checker.joint_limits[name][1]}
                 reports.append({"passed": False, "attempt_allowed": not violations,
                                 "failure": "native_joint_limits" if violations else "future_finger_geometry_unbound",
                                 "joint_limit_violations": violations, "scope": "no guessed future finger volume", "trajectory_time": float(time_s)})
                 continue
+            # END a nominal suffix outside its scope is not covered free volume.
             query = row
             representation = None
             # BEGIN preserve unmatched native first samples as ordinary states.
@@ -3336,9 +3349,9 @@ class PlanningScene:
             "sphere_indices": hand.sphere_indices, "local_spheres": hand.local_spheres,
             "sphere_joint_translation": hand.sphere_joint_translation,
             "nominal_model": (None if hand.nominal_finger_trajectory is None else
-                {"times": hand.nominal_finger_trajectory.times,
-                 "position": hand.nominal_finger_trajectory.position,
-                 "velocity": hand.nominal_finger_trajectory.velocity}),
+                # BEGIN preserve the same geometry validity in every archive.
+                hand.nominal_finger_trajectory.describe()),
+                # END serialization cannot promote the complete polynomial to geometry.
             "command_reference": (None if hand.finger_trajectory is None else
                 {"times": hand.finger_trajectory.times, "position": hand.finger_trajectory.position,
                  "velocity": hand.finger_trajectory.velocity})})

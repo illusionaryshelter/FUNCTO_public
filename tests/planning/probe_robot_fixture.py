@@ -182,15 +182,19 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
     acceleration = acceleration[[kin["cspace"]["joint_names"].index(name) for name in fingers]]
     source = "explicit constant nominal finger geometry hypothesis; actual actuator tracking is not certified"
 
-    def nominal(duration, progress_map):
+    def nominal(duration, progress_map, command_reference):
         # This continuous hypothesis has no future command-derived transitions.
         # Any actual command intentions remain in the separate formal event clock.
-        return FingerTrajectory.build(joint_names=fingers, initial_position=current,
+        reference = FingerTrajectory.build(joint_names=fingers, initial_position=current,
             initial_velocity=np.zeros(len(fingers)), commands=(), duration=duration,
             executable_until=duration, timestep=control_timestep_s,
             position_limits=geometry["joint_limits"].T, velocity_limits=np.stack((-speed, speed)),
             acceleration_limits=np.stack((-acceleration, acceleration)), source=source,
             feedback_id="explicit named initial posture for a fixed-geometry probe", timestamp_s=0.)
+        # BEGIN this synthetic fixed shape is explicitly modeled for the full probe.
+        from manipulation.gripper_trajectory import NominalFingerGeometry
+        return NominalFingerGeometry.from_reference(reference, valid_until_s=duration, source=source)
+        # END no default whole-clock geometry contract is inferred for other hands.
 
     hand = PrismaticGripper(controller="binary", joint_names=fingers, current_positions=current,
         joint_limits=geometry["joint_limits"], joint_bounds=None,

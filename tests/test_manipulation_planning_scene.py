@@ -366,20 +366,17 @@ class PlanningSceneTest(unittest.TestCase):
         initial = np.array([.03, -.02])
 
         def factory(duration, mapping):
-            def sample(times):
-                t = np.asarray(times)[..., None]/duration
-                return initial*(1-t), np.broadcast_to(-initial/duration, (*t.shape[:-1], 2))
-
-            def sample_torch(times):
-                q0 = times.new_tensor(initial)
-                return q0*(1-times[..., None]/duration), (-q0/duration).expand(*times.shape, 2)
-
-            return SimpleNamespace(joint_names=("left", "right"), duration=duration,
-                                   sample=sample, sample_torch=sample_torch)
+            # BEGIN synthetic linear geometry has an explicit whole-clock scope.
+            from manipulation.gripper_trajectory import NominalFingerGeometry
+            return NominalFingerGeometry(("left", "right"), [0., duration], [initial, [0., 0.]],
+                np.tile(-initial/duration, (2, 1)), duration, duration, 'synthetic linear finger fixture')
+            # END no production contact-dependent suffix is assumed here.
 
         return PrismaticGripper(controller="timed_reference", control_timestep_s=.002, joint_names=("left", "right"),
             current_positions=initial, joint_limits=[[0, .04], [-.04, 0]], joint_bounds=None,
-            finger_trajectory_factory=factory, nominal_finger_trajectory_factory=factory, coupling_matrix=np.empty((0, 2)), coupling_offset=[],
+            finger_trajectory_factory=factory,
+            nominal_finger_trajectory_factory=lambda duration, mapping, reference: factory(duration, mapping),
+            coupling_matrix=np.empty((0, 2)), coupling_offset=[],
             sphere_indices=(0, 1), local_spheres=[[0, 0, 0, .001], [0, 0, 0, .001]],
             sphere_joint_translation=[[[1, 0], [0, 0], [0, 0]], [[0, 1], [0, 0], [0, 0]]],
             self_collision_pairs=((0, 1),), commands=[{"skill_id": "timed", "event_id": "close", "occurrence": 0,
@@ -402,8 +399,9 @@ class PlanningSceneTest(unittest.TestCase):
         costs = world.components(*args, trajectory_time=times)
         self.assertEqual(costs["collision/robot/background"][0, 0].item(), 0.)
         self.assertGreater(costs["collision/robot/background"][0, 1].item(), 0.)
-        with self.assertRaisesRegex(ValueError, "actual query time"):
-            world.components(*args)
+        # BEGIN an IK/search state without a clock has unknown future fingers.
+        self.assertTrue(hand.state(progress, None, None).uncertain.all().item())
+        # END progress zero does not identify measured time zero.
 
     def test_raw_free_evidence_is_owned_readonly_and_not_filled_from_occupied_cells(self):
         mask = np.ones((4, 4, 4), bool)

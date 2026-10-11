@@ -127,9 +127,12 @@ def build_scene(device, robot, backend, targets, problem):
         velocity_limits={"left_q": 1., "right_q": 1.}, acceleration_limits={"left_q": 1., "right_q": 1.})
     # The fingers remain remote from every contact. This is an explicit free
     # actuator nominal model, separately sourced from the same constant command.
-    def free_finger_model(duration, progress_map):
-        model = factory(duration, progress_map)
-        return replace(model, source="explicit nominal free-finger constant-position model; actual remains independently measured")
+    def free_finger_model(duration, progress_map, command_reference):
+        # BEGIN this remote synthetic hand has an explicit whole-clock scope.
+        from manipulation.gripper_trajectory import NominalFingerGeometry
+        return NominalFingerGeometry.from_reference(command_reference, valid_until_s=duration,
+            source="explicit nominal free-finger constant-position model; actual remains independently measured")
+        # END it remains distinct from the actuator command reference.
     affine = np.zeros((2, 3, 2)); affine[0, 1, 0] = affine[1, 1, 1] = 1.
     hand = PrismaticGripper(controller="timed_reference", joint_names=NAMES[1:],
         current_positions=actual["q"][1:], joint_limits=[[0., .04], [-.04, 0.]], joint_bounds=None,

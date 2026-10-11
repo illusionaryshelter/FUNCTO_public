@@ -378,26 +378,6 @@ def rebind_execution_result(result, *, controller_policy, result_only_goal_ids,
 # END no implicit controller migration or new solver/physical budget.
 
 
-def nominal_finger_sampler(scene_binding):
-    """Reconstruct only a separately supplied nominal geometry polynomial."""
-    from scipy.interpolate import CubicHermiteSpline
-
-    hand = scene_binding.get("gripper")
-    model = None if hand is None else hand.get("nominal_model")
-    if model is None:
-        return None
-    t, q, dq = (np.asarray(model[key], dtype=float) for key in ("times", "position", "velocity"))
-    if (t.ndim != 1 or len(t) < 2 or q.shape != dq.shape
-            or q.shape != (len(t), len(hand["joint_names"]))
-            or not all(np.isfinite(a).all() for a in (t, q, dq))
-            or t[0] != 0 or np.any(np.diff(t) <= 0)):
-        raise ValueError("Independent nominal finger model is incomplete")
-    curve = CubicHermiteSpline(t, q, dq, extrapolate=False)
-
-    def sample(time):
-        if not np.isfinite(time) or not t[0] <= time <= t[-1]:
-            raise ValueError("Nominal geometry query exceeds its bound clock")
-        return curve(time), curve(time, 1)
-
-    return sample
+# BEGIN retired unused unscoped sampler; NominalFingerGeometry owns reconstruction.
+# END no execution helper may erase the nominal model's validity interval.
 # END exact candidate, scene and validation handoff.

@@ -736,11 +736,12 @@ def test_shared_identity_never_merges_changed_raw_state_fields(changed):
     PlanningScene.end_source_world_reuse(dense)
 
 
-@pytest.mark.parametrize("changed", ("checker", "validator", "measured_fingers", "nominal_fingers"))
+# BEGIN reuse must expire when geometry validity or its declaration changes.
+@pytest.mark.parametrize("changed", ("checker", "validator", "measured_fingers", "nominal_fingers", "nominal_scope", "nominal_source"))
 def test_changed_binding_detaches_both_scenes_before_dense_lookup(changed):
     ordinary, dense, calls = paired_recording_scenes()
     nominal = SimpleNamespace(joint_names=("finger",), duration=1., times=np.array([0., 1.]),
-        position=np.array([[.01], [.02]]), velocity=np.zeros((2, 1)))
+        position=np.array([[.01], [.02]]), velocity=np.zeros((2, 1)), valid_until_s=1., source="explicit fixture")
     hand = SimpleNamespace(controller="timed_reference", joint_names=("finger",),
         current_positions=np.array([.01]), nominal_finger_trajectory=nominal)
     ordinary.gripper, dense.gripper = deepcopy(hand), deepcopy(hand)
@@ -755,11 +756,16 @@ def test_changed_binding_detaches_both_scenes_before_dense_lookup(changed):
         dense.robot_validator = SimpleNamespace(check_planning_world=ordinary.robot_validator.check_planning_world)
     elif changed == "measured_fingers":
         dense.gripper.current_positions[0] = .03
-    else:
+    elif changed == "nominal_fingers":
         dense.gripper.nominal_finger_trajectory.position[1, 0] = .03
+    elif changed == "nominal_scope":
+        dense.gripper.nominal_finger_trajectory.valid_until_s = .5
+    else:
+        dense.gripper.nominal_finger_trajectory.source = "changed source"
     dense.check_world_geometry(*args, **kwargs)
     assert len(calls) == 2 and not session._reports
     assert ordinary._source_world_reuse is dense._source_world_reuse is None
+# END identical array values cannot conceal a changed geometry contract.
 
 
 def test_new_candidate_and_rollout_clone_cannot_inherit_reports(scene_factory):

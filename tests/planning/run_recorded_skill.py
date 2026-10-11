@@ -47,26 +47,22 @@ def owner_voxel_sizes(arguments, owner_ids):
 # END no object name, dataset or extent selects an implicit resolution.
 
 
-# BEGIN persist the production builder's actual semantic partition decision.
+# BEGIN persist the production builder's exact occupied endpoint partition.
 def save_observation_partitions(scene, output):
     """Save exact fusion masks without reconstructing ownership in the runner.
 
-    The scene builder owns semantic boundary decisions. These arrays describe
-    its fresh background Mapper input; excluded endpoints are not free-space
-    evidence. Original depth and independently measured free rays stay in the
-    observation records rather than being inferred from these masks.
+    The builder preserves each admitted environment endpoint in an explicit
+    owner or the current background snapshot. Original depth and independent
+    free rays stay in the observation records; this mask does not define them.
     """
     result = {}
     for name, masks in scene.observation_partition_masks.items():
         folder = Path(output)/"observations"/name
         folder.mkdir(parents=True, exist_ok=True)
-        row = {}
-        for key, filename in (("background", "background-mask.npy"),
-                              ("semantic_boundary", "semantic-boundary-mask.npy")):
-            path = folder/filename
-            np.save(path, masks[key])
-            row[f"{key}_mask_path"] = str(path.resolve())
-        row["semantic_boundary"] = deepcopy(scene.observation_report["semantic_boundary"][name])
+        path = folder/"background-mask.npy"
+        np.save(path, masks['background'])
+        row = {'background_mask_path':str(path.resolve()),
+               'endpoint_partition':deepcopy(scene.observation_report['endpoint_partition'][name])}
         (folder/"partition-report.json").write_text(json.dumps(row, indent=2)+"\n")
         result[name] = row
     return result
@@ -211,10 +207,19 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
         raise ValueError("Measured initial fingers violate the shared execution bounds")
     geometry = calibrate_native_hand(robot, feedback, problem, device=device,
                                     position_limits=position_limits, fixture=fixture)
+    # BEGIN geometry uses the already-created command and original bound clock.
+    def nominal_geometry(duration_s, progress_map, command_reference):
+        from manipulation.gripper_trajectory import bind_nominal_finger_geometry
+        if command_reference.duration != duration_s:
+            raise ValueError("Nominal geometry and command must share the original bound duration")
+        return bind_nominal_finger_geometry(command_reference, problem.conditions,
+            progress_map.event_clock, progress_interval=(progress_map.s[0], progress_map.s[-1]))
+    # END measured Holding shape never overwrites the actual command q/dq.
     hand = PrismaticGripper(
         controller="timed_reference", joint_names=finger_names,
         current_positions=geometry["current_positions"], joint_limits=geometry["joint_limits"],
         joint_bounds=None, finger_trajectory_factory=trajectory_factory,
+        nominal_finger_trajectory_factory=nominal_geometry,
         control_timestep_s=trajectory_factory.timestep,
         coupling_matrix=np.empty((0, len(finger_names))), coupling_offset=np.empty(0),
         sphere_indices=geometry["sphere_indices"], local_spheres=geometry["local_spheres"],
@@ -231,7 +236,11 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
         "finger_sphere_indices": list(geometry["sphere_indices"]),
         "current_fingers": geometry["current_positions"].tolist(),
         "mechanical_limits": geometry["joint_limits"].tolist(), "controller": "timed_reference",
-        "geometry_scope": "same-time command reference; actual full named q/dq is separately supervised",
+        # BEGIN report the declared scope without claiming unknown contact motion.
+        "geometry_scope": ("Free-motion C1 geometry until the original contact activation, or verified "
+            "Holding entrance q until original open/release; later fingers remain conditional. "
+            "Held geometric dq=0 is not measured dq; actual full named q/dq remains supervised."),
+        # END the original actuator commands and executable prefix stay unchanged.
         "execution_limits": execution_limits.describe(),
         "enabled_self_collision_pairs": len(geometry["self_collision_pairs"]),
         "contact_permissions": "Bound separately from explicit native material faces and current owner-patch declarations"}
@@ -564,7 +573,9 @@ def run(args):
                 for identity, frame in owner_frames.items()},
             "geometry_path": None if args.owner_geometry is None else str(args.owner_geometry.resolve()),
             # BEGIN only the production partition decision admits background endpoints.
-            "background_partition": "ENVIRONMENT endpoints outside semantic owners and the production semantic boundary mask",
+            # BEGIN the recorded background is the complete admitted owner complement.
+            "background_partition": "All ENVIRONMENT endpoints outside supplied semantic owner masks; fixed current-request snapshot",
+            # END source descriptions match the exact partition submitted to mapping.
             "background_rebuild": "Fresh Mapper and scene from original RGB-D for this request; no prior fused background is restored"}
             # END historical scene bindings are not observation inputs.
         observations = {}
