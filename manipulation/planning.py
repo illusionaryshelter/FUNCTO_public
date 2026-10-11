@@ -5883,8 +5883,16 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         stage = "delivery"
         check()
         trajectory, points = planner.export(native_result, attempt)
-        consumed["validation_passes"] += 1
-        consumed["validation_queries"] += points
+        # BEGIN reused native evidence does not spend another geometry-query pass.
+        # export still checks the exact polynomial's limits and entrance, but
+        # evaluate_candidate(native_report=...) reuses the completed native
+        # geometry verdict and reports zero new queries. Charge a pass only
+        # when actual queries were performed, as in candidate confirmation;
+        # qualify_candidate below still checks the unchanged wall/work budget.
+        if points:
+            consumed["validation_passes"] += 1
+            consumed["validation_queries"] += points
+        # END all physical checks remain required; no capacity is increased.
         qualify_candidate(trajectory, planner.last_validation, attempt)
         diagnostics["returned_candidate"] = deepcopy(attempt)
         limits = planner._verification_native.get_cost("cspace").config.joint_limits
