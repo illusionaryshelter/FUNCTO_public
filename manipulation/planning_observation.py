@@ -75,6 +75,24 @@ def _views(views, reference_frame, depth_range_m):
     return result
 
 
+# BEGIN adapt calibrated integer pixel centres only at the native depth boundary.
+def _mapper_intrinsics(matrix):
+    """Preserve input rays under the Mapper's half-integer pixel convention.
+
+    Input calibration places pixel (u, v) at the integer centre used by
+    backprojection and free-ray evidence. The native depth integrator emits
+    allocation rays at (u+.5, v+.5) and casts positive projected coordinates
+    to integers when reading depth. Adding .5 to both principal coordinates
+    preserves the physical rays and nearest-centre depth selection. The
+    caller's calibration is copied, so geometry outside this Mapper boundary
+    keeps its original coordinates; RGB/feature kernels are not redefined.
+    """
+    native = _intrinsics(matrix).copy()
+    native[:2, 2] += .5
+    return native
+# END this is coordinate conversion, not a depth shift or geometric allowance.
+
+
 # BEGIN exact rectangle queries preserve the complete projected voxel footprint.
 def _rectangle_min_depth(depth, lower_xy, upper_xy):
     """Query inclusive, in-image integer rectangles with bounded image storage.
@@ -795,7 +813,9 @@ def _map_partition(normalized, masks, identity, config, inverse, depth_error_m, 
             name=name, depth_image=config_device.to_device(depth)[None],
             rgb_image=torch.as_tensor(np.asarray(view["image"]).copy(), dtype=torch.uint8,
                                       device=config_device.device)[None],
-            intrinsics=config_device.to_device(view["K"])[None],
+            # BEGIN this audit Mapper uses the same native depth convention.
+            intrinsics=config_device.to_device(_mapper_intrinsics(view["K"]))[None],
+            # END original calibration remains available to independent rays.
             pose=Pose.from_matrix(config_device.to_device(inverse@view["T_output_camera"])[None]),
             resolution=list(depth.shape), depth_to_meter=1.)
         mapper.integrate(camera_observation=observation)
@@ -1340,7 +1360,9 @@ def _map_online_partition(normalized, masks, identity, config, inverse, *, query
         depth = np.where(masks[name][identity], view['depth'], 0.).astype(np.float32)
         observation = CameraObservation(name=name, depth_image=device.to_device(depth)[None],
             rgb_image=torch.as_tensor(np.asarray(view['image']).copy(), dtype=torch.uint8,device=device.device)[None],
-            intrinsics=device.to_device(view['K'])[None],
+            # BEGIN adapt integer-centre input calibration for native depth only.
+            intrinsics=device.to_device(_mapper_intrinsics(view['K']))[None],
+            # END owner and background mapping preserve the same physical rays.
             pose=Pose.from_matrix(device.to_device(inverse@view['T_output_camera'])[None]),
             resolution=list(depth.shape),depth_to_meter=1.)
         mapper.integrate(camera_observation=observation)

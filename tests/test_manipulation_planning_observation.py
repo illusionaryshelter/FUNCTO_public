@@ -13,7 +13,9 @@ from manipulation.planning_observation import (
     _mapper_memory_bound, _owner_mapper_config, _audit_partition_masks, _require_audit_mapping_memory,
     _require_native_voxel_layout, _views,
     build_audit_scene_from_rgbd, observed_audit_space_from_rgbd,
-    _partition_masks, _self_filtered_views, _self_filter_report,
+    # BEGIN native depth uses an explicit pixel-centre coordinate conversion.
+    _partition_masks, _self_filtered_views, _self_filter_report, _mapper_intrinsics,
+    # END calibration remains in its public integer-centre convention.
 )
 from manipulation.planning_scene import ObservedSpace
 
@@ -707,6 +709,12 @@ class NativeVoxelLayoutTest(unittest.TestCase):
             create.assert_called_once()
             query.assert_not_called()
             export.assert_not_called()
+            # BEGIN even the rejected audit build must integrate calibrated rays.
+            submitted = mapper.return_value.integrate.call_args.kwargs['camera_observation']
+            expected = view()['K'].copy()
+            expected[:2, 2] += .5
+            np.testing.assert_allclose(submitted.intrinsics.numpy()[0], expected, rtol=0., atol=1e-6)
+            # END the audit and online builders share one native-depth conversion.
 # END no mismatched native world is silently reinterpreted by its consumers.
 
 
@@ -714,6 +722,27 @@ class NativeVoxelLayoutTest(unittest.TestCase):
 
 # BEGIN production tests admit one fixed model without source reconstruction.
 class OnlineObservationContractTest(unittest.TestCase):
+    # BEGIN a convention counterexample checks rays and pixel reads, not just offsets.
+    def test_mapper_intrinsics_preserves_integer_center_rays_and_nearest_depth_reads(self):
+        matrix = np.array([[701., 0., 319.5], [0., 533., 239.5], [0., 0., 1.]])
+        original = matrix.copy()
+        matrix.setflags(write=False)
+        native = _mapper_intrinsics(matrix)
+        pixels = np.array([[12., 31.], [87., 65.], [318., 239.]])
+        external_rays = np.c_[pixels, np.ones(len(pixels))] @ np.linalg.inv(matrix).T
+        native_rays = np.c_[pixels+.5, np.ones(len(pixels))] @ np.linalg.inv(native).T
+        np.testing.assert_allclose(native_rays, external_rays, rtol=0., atol=1e-15)
+        # Probe both sides of each positive pixel's interior. Casting the
+        # converted native projection must select the external nearest centre.
+        for displacement in (-.49, 0., .49):
+            rays = np.c_[pixels+displacement, np.ones(len(pixels))] @ np.linalg.inv(matrix).T
+            projected = rays @ native.T
+            selected = (projected[:, :2]/projected[:, 2:]).astype(int)
+            np.testing.assert_array_equal(selected, pixels.astype(int))
+        native[0, 2] = 0.
+        np.testing.assert_array_equal(matrix, original)
+    # END no image/depth edit or change to external camera calibration is needed.
+
     # BEGIN three-state mapping counterexamples without a GPU allocation.
     def test_unknown_rays_never_prove_even_the_prefix_free(self):
         from manipulation.robot_self_filter import SELF, AMBIGUOUS_SHADOW
@@ -927,6 +956,13 @@ class OnlineObservationContractTest(unittest.TestCase):
         mapper.return_value.compute_esdf.assert_not_called()
         np.testing.assert_allclose(cfg.grid_center.numpy(),[.25,.35,1.05],atol=1e-7)
         mapped=mapper.return_value.integrate.call_args.kwargs['camera_observation'].depth_image.cpu().numpy()[0]
+        # BEGIN production depth receives the converted native calibration.
+        submitted=mapper.return_value.integrate.call_args.kwargs['camera_observation']
+        expected_intrinsics=record['K'].copy()
+        expected_intrinsics[:2,2]+=.5
+        np.testing.assert_allclose(submitted.intrinsics.numpy()[0],expected_intrinsics,rtol=0.,atol=1e-6)
+        np.testing.assert_array_equal(normalized['A']['K'],record['K'])
+        # END only the native camera record uses half-integer pixel centres.
         expected_depth=record['depth'].copy()
         expected_depth[[30,31],[30,31]]=0.
         np.testing.assert_array_equal(mapped,expected_depth)
@@ -964,7 +1000,9 @@ class OnlineObservationContractTest(unittest.TestCase):
         complete_record['owner_masks']['part'][41, 41] = True
         complete = _self_filtered_views({'A': complete_record}, 'world', (.1, 3.))
         complete_masks = _partition_masks(complete, ('part',))
-        instances = [MagicMock(), MagicMock(), MagicMock()]
+        # BEGIN the same calibration conversion also applies to the owner map.
+        instances = [MagicMock(), MagicMock(), MagicMock(), MagicMock()]
+        # END identity only selects depth and output pose, never pixel convention.
         for instance in instances:
             instance.get_stats.return_value = {'allocation_failures': 0, 'num_allocated': 0,
                                                'active_blocks': 0, 'free_count': 0}
@@ -978,11 +1016,14 @@ class OnlineObservationContractTest(unittest.TestCase):
             _map_online_partition(normalized, original_masks, None, cfg, np.eye(4))
             _map_online_partition(rebuilt, rebuilt_masks, None, cfg, np.eye(4))
             _map_online_partition(complete, complete_masks, None, cfg, np.eye(4))
-        self.assertEqual(mapper.call_count, 3)
+            # BEGIN map the explicit owner through the same production boundary.
+            _map_online_partition(complete, complete_masks, 'part', cfg, np.eye(4))
+            # END its depth complement does not change the camera calibration.
+        self.assertEqual(mapper.call_count, 4)
         for call, instance in zip(source_export.call_args_list, instances):
             self.assertIs(call.args[0], instance)
             instance.integrate.assert_called_once()
-        old_depth, new_depth, complete_depth = [instance.integrate.call_args.kwargs['camera_observation'].depth_image.numpy()[0]
+        old_depth, new_depth, complete_depth, owner_depth = [instance.integrate.call_args.kwargs['camera_observation'].depth_image.numpy()[0]
                                 for instance in instances]
         self.assertGreater(old_depth[41, 41], 0.)
         self.assertGreater(new_depth[41, 41], 0.)
@@ -996,6 +1037,16 @@ class OnlineObservationContractTest(unittest.TestCase):
             np.where(complete_masks['A'][None], complete_record['depth'], 0.))
         np.testing.assert_array_equal(rebuilt['A']['self_filter']['free_ray_depth_m'], original_rays)
         np.testing.assert_array_equal(complete['A']['self_filter']['free_ray_depth_m'], original_rays)
+        # BEGIN background and owner retain complementary endpoints and one ray model.
+        np.testing.assert_array_equal(owner_depth,
+            np.where(complete_masks['A']['part'],complete_record['depth'],0.))
+        expected_intrinsics=record['K'].copy()
+        expected_intrinsics[:2,2]+=.5
+        for instance in instances:
+            observation=instance.integrate.call_args.kwargs['camera_observation']
+            np.testing.assert_allclose(observation.intrinsics.numpy()[0],expected_intrinsics,rtol=0.,atol=1e-6)
+        np.testing.assert_array_equal(complete['A']['K'],record['K'])
+        # END no external intrinsics or independent free rays are modified.
     # END frozen geometry exports come from the freshly integrated partition.
 
     def test_online_builder_maps_one_selected_field_and_uses_complete_robot_radius(self):
