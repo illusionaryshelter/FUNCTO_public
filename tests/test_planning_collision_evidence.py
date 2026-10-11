@@ -358,3 +358,34 @@ def test_conditional_unknown_metrics_preserve_invalid_query_evidence(nonfinite):
         assert actual == nonfinite
     assert _conditional_unknown_metric_residuals(result.metrics, 0) == {"conditional_unknown": 0.}
 # END recording conditional uncertainty does not certify it as observed free space.
+
+
+# BEGIN regression for the original-grasp integer diagnostic overflow.
+@pytest.mark.parametrize('dtype', [torch.int32, torch.int64, torch.bool])
+def test_native_diagnostics_preserve_discrete_metrics_and_seed_selection(dtype):
+    result = collision_result()
+    value = torch.tensor([[1, 1], [0, 0]], dtype=dtype)
+    for metrics in (result.metrics, result.interpolated_metrics):
+        metrics.convergence = SimpleNamespace(names=['goal_index_or_flag'], values=[value])
+    planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    selected = planner.native_diagnostics(result, seed_index=1)
+    combined = planner.native_diagnostics(result)
+    for grid in ('rollout', 'interpolated'):
+        assert selected[grid]['convergence']['goal_index_or_flag'] == 0.
+        assert combined[grid]['convergence']['goal_index_or_flag'] == 1.
+
+
+@pytest.mark.parametrize('nonfinite', [float('nan'), float('inf'), float('-inf')])
+def test_native_diagnostics_still_retain_nonfinite_float_convergence(nonfinite):
+    result = collision_result()
+    for metrics in (result.metrics, result.interpolated_metrics):
+        metrics.convergence = SimpleNamespace(names=['pose_error'],
+            values=[torch.tensor([[0., 0.], [nonfinite, 0.]])])
+    planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    report = planner.native_diagnostics(result, seed_index=1)
+    for grid in ('rollout', 'interpolated'):
+        actual = report[grid]['convergence']['pose_error']
+        assert not np.isfinite(actual)
+        if not np.isnan(nonfinite):
+            assert actual == nonfinite
+# END discrete diagnostics cannot hide or sanitize nonfinite floating evidence.

@@ -5196,6 +5196,13 @@ class _CuroboPlanner:
                 selected = value if seed_index is None else value[seed_index]
                 flat = selected.detach().reshape(-1)
                 import torch
+                # BEGIN native convergence also carries integer IDs/bool flags.
+                # Those dtypes have no NaN/Inf and cannot store an infinity
+                # sentinel. Reduce in their original dtype before reporting;
+                # keep the existing nonfinite witness rule for floating costs.
+                if not flat.is_floating_point():
+                    return float(flat.max().item())
+                # END no float sentinel is constructed for discrete metrics.
                 index = torch.where(torch.isfinite(flat), flat,
                                     torch.full_like(flat, float('inf'))).argmax()
                 return float(flat[index].item())
