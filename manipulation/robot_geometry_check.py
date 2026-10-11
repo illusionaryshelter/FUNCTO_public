@@ -1648,19 +1648,27 @@ def _scene_shape(record, *, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
     return shape, vertices, _pose7(record["pose"])
 
 
-def _feature_region(rule, actor_pose, target_pose, finger_positions):
-    """Express the complete material edge/polygon and target patch in world axes.
+# BEGIN share the native finite-permission law with hypothetical grasp queries.
+def _feature_region_halfspaces(rule, actor_pose, target_pose, finger_positions):
+    """Return the native permission inequalities and their affine q derivative.
 
-    These are the same ContactRule data consumed by generation. This CPU
-    implementation never reads its sphere masks or differentiable residuals.
+    The region is ``A @ x <= b`` in reference axes at the supplied finger q.
+    Rigid prismatic feature translation changes only b: at q + dq the same
+    inequalities have right side ``b + db_dq @ dq``. This is hypothetical
+    known robot geometry, never a prediction of contact-stopped finger q.
+    Both the existing fixed-q native checker and the candidate domain query
+    consume this one finite-feature/patch/gap law.
     """
     from scipy.spatial import ConvexHull
     points = np.asarray(rule["feature_points"], float)
     mapping = rule["feature_joint_translation"]
     if mapping is not None:
         if finger_positions is None:
-            return None, "missing_named_finger_geometry"
+            return None, None, "missing_named_finger_geometry"
         points = points + np.einsum("vcj,j->vc", np.asarray(mapping, float), finger_positions)
+        translation = actor_pose[:3, :3] @ np.asarray(mapping, float)[0]
+    else:
+        translation = np.zeros((3, 0))
     world = _world_vertices(points, actor_pose)
     normal = actor_pose[:3, :3] @ np.asarray(rule["feature_normal"], float)
     axes = target_pose[:3, :3] @ np.asarray(rule["patch_axes"], float)
@@ -1668,13 +1676,13 @@ def _feature_region(rule, actor_pose, target_pose, finger_positions):
     tolerance = float(rule["numerical_position_tolerance_m"])
     angle = np.arctan2(np.linalg.norm(np.cross(normal, axes[:, 2])), -normal @ axes[:, 2])
     if angle > rule["normal_tolerance_rad"] + rule["numerical_angle_tolerance_rad"]:
-        return None, "material_normal_outside_permission"
+        return None, None, "material_normal_outside_permission"
     # BEGIN a larger pad may contact only a finite part of the target patch.
     # Do not demand containment of the whole feature. The complete solid
     # intersection below must lie in every supplied material/patch halfspace.
     # SVD supplies a basis for this supplied planar polygon. ConvexHull in 2D
     # produces all its edge inequalities, including a nonrectangular feature.
-    rows, bounds = [], []
+    rows, bounds, derivatives = [], [], []
     # BEGIN independently reconstruct the true edge's endpoints and lateral equality.
     kind = rule.get("feature_kind", "polygon")
     if kind == "edge":
@@ -1692,6 +1700,7 @@ def _feature_region(rule, actor_pose, target_pose, finger_positions):
         for axis, extent in ((tangent, length), (-tangent, 0.), (lateral, 0.), (-lateral, 0.)):
             rows.append(axis)
             bounds.append(float(axis @ world[0]+extent+tolerance))
+            derivatives.append(axis @ translation)
     elif kind == "polygon":
         basis = np.linalg.svd(world-world[0], full_matrices=True)[2][:2].T
         local = (world-world[0]) @ basis
@@ -1700,6 +1709,7 @@ def _feature_region(rule, actor_pose, target_pose, finger_positions):
             axis = basis @ edge[:2]
             rows.append(axis)
             bounds.append(float(axis @ world[0] - edge[2] + tolerance))
+            derivatives.append(axis @ translation)
     else:
         raise ValueError("Independent contact features support only explicit edges or polygons")
     # END no lateral physical band broadens the native edge into a side-face patch.
@@ -1707,32 +1717,50 @@ def _feature_region(rule, actor_pose, target_pose, finger_positions):
     for axis in (normal, -normal):
         rows.append(axis)
         bounds.append(float(axis @ world[0] + allowance + tolerance))
+        derivatives.append(axis @ translation)
     for column, half in enumerate(rule["patch_half_size"]):
         for sign in (-1., 1.):
             axis = sign * axes[:, column]
             rows.append(axis)
             bounds.append(float(axis @ origin + half + tolerance))
+            derivatives.append(np.zeros(translation.shape[1]))
     # A permitted model overlap must remain in the local target boundary band.
     for sign in (-1., 1.):
         axis = sign * axes[:, 2]
         rows.append(axis)
         bounds.append(float(axis @ origin + allowance + tolerance))
+        derivatives.append(np.zeros(translation.shape[1]))
     # Evaluate gap on the corresponding point projected onto the ACTUAL
     # material plane, rather than on unrelated corners outside the patch.
     # BEGIN an edge uses its line projection; polygons keep the existing plane law.
     if kind == "edge":
         gap_axis = float(axes[:, 2] @ tangent)*tangent
         gap_offset = float((axes[:, 2]-gap_axis) @ world[0]-axes[:, 2] @ origin)
+        gap_derivative = (axes[:, 2]-gap_axis) @ translation
     else:
         height = float(normal @ world[0])
         cosine = float(axes[:, 2] @ normal)
         gap_axis = axes[:, 2]-cosine*normal
         gap_offset = cosine*height-float(axes[:, 2] @ origin)
+        gap_derivative = cosine*normal @ translation
     # END the finite feature guards and complete-solid intersection proof still apply.
     for sign, limit in ((1., rule["gap_bounds"][1]), (-1., -rule["gap_bounds"][0])):
         rows.append(sign*gap_axis)
         bounds.append(float(limit-sign*gap_offset+tolerance))
+        derivatives.append(-sign*gap_derivative)
     region = np.asarray(rows), np.asarray(bounds)
+    return region, np.asarray(derivatives), None
+
+
+def _feature_region(rule, actor_pose, target_pose, finger_positions):
+    """Query the same finite material permission at the supplied fixed q.
+
+    Only inequality construction is shared. This existing native checker
+    retains its fixed-q feasibility query and original result categories.
+    """
+    region, _, reason = _feature_region_halfspaces(rule, actor_pose, target_pose, finger_positions)
+    if reason is not None:
+        return None, reason
     from scipy.optimize import linprog
     feasible = linprog(np.zeros(3), A_ub=region[0], b_ub=region[1], bounds=[(None, None)]*3,
                       method="highs", options={"primal_feasibility_tolerance": 1e-9,
@@ -1743,6 +1771,7 @@ def _feature_region(rule, actor_pose, target_pose, finger_positions):
         return None, "finite_material_patch_region_query_incomplete"
     return region, None
     # END only the finite overlap, not the entire material face, needs permission.
+# END sharing inequalities does not promote permission to actual target contact.
 
 
 # BEGIN required contact needs a complete occupied target in the allowed region.

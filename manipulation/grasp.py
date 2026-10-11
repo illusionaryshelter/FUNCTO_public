@@ -89,6 +89,69 @@ def _gripper_events(value, frames):
     return events
 
 
+# BEGIN generated grasp goals retain their original reference anchor.
+def _grasp_goal(value):
+    """Validate the shared explicit grasp relation and task precision contract."""
+    required = {"T_carrier_eef", "position_tolerance_m", "rotation_tolerance_rad", "source"}
+    if not isinstance(value, dict) or not required <= set(value):
+        raise ValueError("grasp_goal requires explicit T_carrier_eef, task position/rotation tolerances and source")
+    if any(isinstance(value[name], (bool, np.bool_)) for name in
+           ("position_tolerance_m", "rotation_tolerance_rad")):
+        raise ValueError("Grasp task tolerances must be metric numbers, not booleans")
+    position_tolerance, rotation_tolerance = _tolerances(
+        value["position_tolerance_m"], value["rotation_tolerance_rad"])
+    return {"T_carrier_eef": _pose_array(value["T_carrier_eef"], "grasp_goal.T_carrier_eef"),
+            "position_tolerance_m": position_tolerance,
+            "rotation_tolerance_rad": rotation_tolerance,
+            "source": _source(value["source"], "Grasp task goal and allowed set")}
+
+
+def _reference_prior(value):
+    """Read the prior in the same carrier coordinates as the selected goal."""
+    if not isinstance(value, dict) or not {"T_carrier_eef", "source"} <= set(value):
+        raise ValueError("grasp_reference_prior requires T_carrier_eef and source")
+    return {"T_carrier_eef": _pose_array(value["T_carrier_eef"], "grasp_reference_prior.T_carrier_eef"),
+            "source": _source(value["source"], "Original grasp reference anchor")}
+
+
+def bind_grasp_candidate(scene, T_reference_tool, *, source):
+    """Return a scene whose new grasp goal also aligns its complete reference.
+
+    ``T_reference_tool`` uses the scene's ``reference_frame`` and the existing
+    ``tool_frame`` control point, not a generator's gripper base. Its producer
+    must first perform that calibrated frame conversion. This binding only
+    creates an action candidate; it establishes neither clearance nor Holding.
+
+    Keep the original independent goal as ``grasp_reference_prior``. Grounding
+    then moves every ordinary reference sample by the rigid displacement from
+    that prior to the selected goal. An existing prior remains the anchor when
+    another candidate is bound to an already bound scene, so changes never
+    accumulate. The demonstration, functional correspondence, contact domains,
+    current feedback and task tolerances are not altered.
+    """
+    if not isinstance(scene, dict):
+        raise ValueError("A grasp candidate requires a bound scene record")
+    for key in ("reference_frame", "tool_id", "tool_frame"):
+        _name(scene, key)
+    carrier = _pose_array(scene["carrier_pose"], "carrier_pose")
+    target = _pose_array(T_reference_tool, "T_reference_tool")
+    goal = _grasp_goal(scene.get("grasp_goal"))
+    prior = (_reference_prior(scene["grasp_reference_prior"])
+             if "grasp_reference_prior" in scene else
+             {"T_carrier_eef": goal["T_carrier_eef"].copy(), "source": deepcopy(goal["source"])})
+    # An exactly retained prior must not acquire floating-point drift through
+    # inverse/compose. Nearby distinct candidates are never snapped to it.
+    selected = (prior["T_carrier_eef"].copy()
+                if np.array_equal(target, carrier @ prior["T_carrier_eef"])
+                else _inverse(carrier) @ target)
+    result = deepcopy(scene)
+    result["grasp_reference_prior"] = prior
+    result["grasp_goal"] = {**goal, "T_carrier_eef": selected,
+                            "source": _source(source, "Generated grasp candidate")}
+    return result
+# END candidate binding never changes physical functional correspondence.
+
+
 # BEGIN source grasp motion is an initializer, not a protected robot path.
 def ground_grasp(demo, scene):
     """Bind the original same-tool reference and its independent grasp goal.
@@ -102,6 +165,14 @@ def ground_grasp(demo, scene):
     ordinary reference samples and never observed Holding. Numerical solver
     tolerances do not supply missing task precision. ``protected_start_frame``
     retains contact evidence identity only.
+
+    # BEGIN candidate alignment is explicit rather than inferred from a goal change.
+    ``grasp_reference_prior`` opts into a generated candidate's full-reference
+    alignment. For bound source samples D, original goal P and selected goal E
+    in the output frame, the new reference is E @ inverse(P) @ D. This preserves
+    the source's relative deviations even when D[-1] differs from P. Ordinary
+    scenes without this record keep their independent goal/reference contract.
+    # END reference alignment adds no waypoint, contact permission or command.
     """
     for key in ("tool_id", "tool_frame"):
         if _name(demo, key) != _name(scene, key):
@@ -120,23 +191,19 @@ def ground_grasp(demo, scene):
     carrier = _pose_array(scene["carrier_pose"], "carrier_pose")
     _pose_array(scene["eef_pose"], "eef_pose")
     # BEGIN independently bind the current grasp relation and its allowed set.
-    goal = scene.get("grasp_goal")
-    required = {"T_carrier_eef", "position_tolerance_m", "rotation_tolerance_rad", "source"}
-    if not isinstance(goal, dict) or not required <= set(goal):
-        raise ValueError("grasp_goal requires explicit T_carrier_eef, task position/rotation tolerances and source")
-    if any(isinstance(goal[name], (bool, np.bool_)) for name in
-           ("position_tolerance_m", "rotation_tolerance_rad")):
-        raise ValueError("Grasp task tolerances must be metric numbers, not booleans")
-    position_tolerance, rotation_tolerance = _tolerances(
-        goal["position_tolerance_m"], goal["rotation_tolerance_rad"])
-    grasp_goal = {"T_carrier_eef": _pose_array(goal["T_carrier_eef"], "grasp_goal.T_carrier_eef"),
-                  "position_tolerance_m": position_tolerance,
-                  "rotation_tolerance_rad": rotation_tolerance,
-                  "source": _source(goal["source"], "Grasp task goal and allowed set")}
+    grasp_goal = _grasp_goal(scene.get("grasp_goal"))
     # END neither the demonstration endpoint nor engineering epsilon fills this contract.
     mapping = _pose_array(scene["region_transform"], "region_transform")
     bound_relative = mapping @ relative
-    return {
+    # BEGIN relocate the complete ordinary reference around the explicit prior.
+    prior = None
+    if "grasp_reference_prior" in scene:
+        prior = _reference_prior(scene["grasp_reference_prior"])
+        if not np.array_equal(grasp_goal["T_carrier_eef"], prior["T_carrier_eef"]):
+            bound_relative = (grasp_goal["T_carrier_eef"]
+                              @ _inverse(prior["T_carrier_eef"]) @ bound_relative)
+    # END no ordinary source sample is promoted to the candidate target.
+    result = {
         "status": "candidate", "output_type": "eef_trajectory",
         "eef_poses": carrier @ bound_relative, "frame_indices": frames, "timestamps": times,
         "protected_start_frame": int(protected),
@@ -150,6 +217,11 @@ def ground_grasp(demo, scene):
         "pose_convention": "column-vector world_from_eef; metres; 4x4 SE(3)",
         "path_scope": "bound source initialization reference; no path or execution feasibility claim",
     }
+    # BEGIN preserve the anchor provenance in generated reference artifacts.
+    if prior is not None:
+        result["grasp_reference_prior"] = prior
+    return result
+    # END the selected pose remains a candidate, never observed Holding.
 # END source grasp motion is an initializer, not a protected robot path.
 
 

@@ -102,7 +102,8 @@ class ParallelJawToolGeometry:
 
     def __init__(self, model, *, tool_id, tool_frame, native_tool_site,
                  joint_names, collision_roles, pad_names,
-                 open_joint_positions_m, closed_joint_positions_m, asset_path):
+                 open_joint_positions_m, closed_joint_positions_m, asset_path,
+                 native_grasp_body):
         import mujoco
 
         for label, value in (("tool_id", tool_id), ("tool_frame", tool_frame)):
@@ -117,6 +118,11 @@ class ParallelJawToolGeometry:
         self._model = model
         self._data = mujoco.MjData(model)
         self._site = model.site(native_tool_site).id
+        # BEGIN asset-bound grasp base for learned candidate coordinates.
+        # The robot factory declares the rigid base. Generic geometry never
+        # guesses it from a task name, the observed object, or the TCP position.
+        self._grasp_body = model.body(native_grasp_body).id
+        # END asset-bound grasp base.
         self._joint_ids = np.array([model.joint(name).id for name in joint_names])
         if (np.any(model.jnt_type[self._joint_ids] != mujoco.mjtJoint.mjJNT_SLIDE)
                 or not np.all(model.jnt_limited[self._joint_ids])):
@@ -233,6 +239,74 @@ class ParallelJawToolGeometry:
             "signed_gap_m": gap,
         }
 
+    # BEGIN measured standalone sweep conditioning for GraspGenX.
+    def grasp_generation_geometry(self):
+        """Export native geometry in a +X-closing, +Z-approach base frame.
+
+        The factory's grasp body already declares those axis conventions. This
+        method verifies them against the actual pad faces and computes the two
+        inner boxes from their material corners, at fully open and midpoint
+        native joint coordinates. It certifies neither target contact nor a
+        collision-free grasp. The output contains no scene or object evidence.
+        """
+        inverse_tool = self._forward(self.open_joint_positions_m)
+        base = inverse_tool @ _pose(self._data.xpos[self._grasp_body],
+                                    self._data.xmat[self._grasp_body])
+        if not np.allclose(base[:3, 0], self.closing_axis_tool, atol=1e-9, rtol=0):
+            raise ValueError("Declared grasp base +X must match the native closing axis")
+        inverse_base = np.linalg.inv(base)
+
+        def inner_box(q):
+            state = self.at(q)
+            current_base = self._forward(q) @ _pose(
+                self._data.xpos[self._grasp_body], self._data.xmat[self._grasp_body])
+            if not np.allclose(current_base, base, atol=1e-9, rtol=0):
+                raise ValueError("Grasp base must stay rigid relative to the tool site")
+            corners = []
+            for side, pad in enumerate(state["pads"]):
+                transform = inverse_base @ pad["T_tool_pad"]
+                expected_normal = np.array([1. if side == 0 else -1., 0., 0.])
+                if not np.allclose(transform[:3, 2], expected_normal, atol=1e-9, rtol=0):
+                    raise ValueError("Grasp conditioning requires opposing X-normal pads")
+                # AABB conditioning is exact only when both pad tangent axes
+                # coincide with base Y/Z. Do not silently enclose a tilted pad.
+                if not np.allclose(np.sort(np.abs(transform[:3, :2]), axis=0),
+                                   [[0., 0.], [0., 0.], [1., 1.]], atol=1e-9, rtol=0):
+                    raise ValueError("Grasp conditioning requires axis-aligned pad faces")
+                half = pad["half_sizes_xy_m"]
+                local = np.array([[x * half[0], y * half[1], 0.]
+                                  for x in (-1., 1.) for y in (-1., 1.)])
+                corners.append(local @ transform[:3, :3].T + transform[:3, 3])
+            # Both pads must cover the same Y/Z rectangle. The swept inner
+            # volume is not a union that invents contact area on either side.
+            if not (np.allclose(corners[0][:, 1:].min(0), corners[1][:, 1:].min(0), atol=1e-9, rtol=0)
+                    and np.allclose(corners[0][:, 1:].max(0), corners[1][:, 1:].max(0), atol=1e-9, rtol=0)):
+                raise ValueError("Native pads must have the same tangential footprint")
+            points = np.concatenate(corners)
+            lo, hi = points.min(axis=0), points.max(axis=0)
+            if state["signed_gap_m"] <= 0 or np.any(hi - lo <= 0):
+                raise ValueError("Open and midpoint sweep boxes require positive aperture")
+            return hi - lo, (hi + lo) / 2
+
+        opened, open_center = inner_box(self.open_joint_positions_m)
+        middle, mid_center = inner_box(
+            (self.open_joint_positions_m + self.closed_joint_positions_m) / 2)
+        # GraspMoE's depth anchors an OBB surface at the inner pad centre, the
+        # same convention used by the shipped gripper fingertip descriptions.
+        if open_center[2] <= 0:
+            raise ValueError("Declared grasp base must precede the pads along +Z")
+        return {
+            "T_tool_grasp": base.copy(),
+            "sweep_volume_params": {
+                "extents_open": opened, "offset_open": open_center,
+                "extents_mid": middle, "offset_mid": mid_center,
+                "gripper_type": 0, "fingertip_depth": float(open_center[2]),
+            },
+            "source": {"kind": "standalone_native_tool_asset", "asset_path": self.asset_path,
+                       "tool_id": self.tool_id, "tool_frame": self.tool_frame},
+        }
+    # END measured standalone sweep conditioning for GraspGenX.
+
 
 def load_robosuite_panda_tool(*, tool_id, tool_frame):
     """Load the installed Panda hand asset without importing a robot scene.
@@ -261,5 +335,7 @@ def load_robosuite_panda_tool(*, tool_id, tool_frame):
                          ("finger2_pad_collision", "pad")),
         pad_names=("finger1_pad_collision", "finger2_pad_collision"),
         open_joint_positions_m=(.04, -.04), closed_joint_positions_m=(0., 0.),
-        asset_path=asset)
+        # BEGIN bind the native gripper base, not a same-named external model.
+        asset_path=asset, native_grasp_body="right_gripper")
+        # END native gripper base binding.
 # END standalone robot-tool collision geometry and explicit finger FK.
