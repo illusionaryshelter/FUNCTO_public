@@ -1734,7 +1734,7 @@ class TerminalSourceCommandTests(unittest.TestCase):
         problem = SimpleNamespace(events=commands, pose_events=(), coordinate_events=(), supports=(),
             source_time_map={"source_times": [10., 10.1], "progress": [0., 1.]})
         budget, source = _initial_timing(problem, PlanningBudget(knots=6))
-        mapping, _ = _progress_for_cubic_boundaries(source, budget.knots, np.zeros(7),
+        mapping, _ = _progress_for_cubic_boundaries(source, budget.knots,
             stop_progress=(), anchors=np.array([0., 1.]))
         grid = _fixed_spline_grid(intervals=budget.knots+4, native_dt=budget.maximum_trajectory_dt,
             interpolation_steps=budget.interpolation_steps, interpolation_dt=budget.interpolation_dt)

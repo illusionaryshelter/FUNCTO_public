@@ -73,7 +73,7 @@ def run(output):
     # END only the native control capacity varies in this experiment.
     for knots in (8, 12, 16, 24):
         progress_map, _ = _progress_for_cubic_boundaries(
-            _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), knots, np.zeros(9),
+            _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), knots,
             stop_progress=np.array([1.]), anchors=np.linspace(0., 1., 5))
         progress = np.interp(u, progress_map.u, progress_map.s)
         desired = command(torch.tensor(progress, dtype=torch.float64))[0][:, 0].numpy()

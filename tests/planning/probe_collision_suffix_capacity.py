@@ -62,7 +62,7 @@ def run(output):
                                    np.repeat(actions[-1, None], 3, axis=0)))
     curve = BSpline(np.arange(-3., count + 8.), coefficients, 3)
     mapping, warp = _progress_for_cubic_boundaries(
-        _ProgressMap(np.array([0., 1.]), np.array([0., 2.])), count, np.zeros(7),
+        _ProgressMap(np.array([0., 1.]), np.array([0., 2.])), count,
         stop_progress=(), anchors=(0., 1., 2.))
     query = np.linspace(.5, 1., 2001)
     progress = np.interp(query, mapping.u, mapping.s) - 1
