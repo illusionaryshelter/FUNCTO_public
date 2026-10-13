@@ -369,7 +369,7 @@ def keypoint_transfer(subtask, obs_image_reshaped, annotated_image, candidate_ke
                       prompts, waypoint_grid_size=None, debug=False, example_images=None,
                       example_responses=None, loaded_context=None, use_center=False,
                       log_dir=None, suffix='', add_caption=False, grasp=False):
-    """Select a coarse semantic point; SD-DINO performs the existing refinement."""
+    """Select a coarse semantic point; the default MARCO matcher refines it."""
     context = loaded_context
     if context is None:
         context = _request_context([f"Task: {subtask}"], annotated_image, prompts,

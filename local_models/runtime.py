@@ -34,8 +34,10 @@ def run_worker(kind: str, images: list[Image.Image], options: dict) -> dict[str,
     Reclaim unused allocator blocks left by FUNCTO's previous matching stage;
     live tensors are never offloaded or modified by this function.
     """
-    if kind not in {"sam31", "sd_dino"}:
+    # BEGIN MARCO replaces the removed SD-DINO worker, without a fallback.
+    if kind not in {"sam31", "marco"}:
         raise ValueError(f"Unknown local model: {kind}")
+    # END model admission.
     if not images or any(not isinstance(im, Image.Image) for im in images):
         raise TypeError("images must be a nonempty list of PIL images")
     with tempfile.TemporaryDirectory(prefix=f"functo-{kind}-") as directory:
@@ -56,7 +58,7 @@ def run_file_worker(kind: str, paths: list[Path], options: dict) -> dict[str, np
 
     Only the filenames cross the process boundary. This keeps parent memory
     independent of video pixel count, and reclaims the entire tracker before
-    the next SAM/SD-DINO stage starts.
+    the next SAM/MARCO stage starts.
     """
     # BEGIN TAPIP3D uses the same bounded, offline file transport.
     if kind not in {"foundationpose", "tapip3d"}:
@@ -201,11 +203,13 @@ def main() -> None:
             raise ValueError("SAM3.1 expects one image")
         from .sam31 import worker_main
         worker_main(paths[0], output, request["options"]["labels"])
-    elif request["kind"] == "sd_dino":
+    # BEGIN native MARCO feature extraction shares the bounded offline runtime.
+    elif request["kind"] == "marco":
         if len(paths) != 2:
-            raise ValueError("SD-DINO expects a pair of images")
-        from .sd_dino import worker_main
+            raise ValueError("MARCO expects a pair of images")
+        from .marco import worker_main
         worker_main(paths, output)
+    # END MARCO dispatch.
     # BEGIN explicit model-based comparison component.
     elif request["kind"] == "foundationpose":
         from .foundationpose import worker_main

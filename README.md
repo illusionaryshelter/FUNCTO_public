@@ -15,18 +15,22 @@ If you find this work useful, please cite:
 
 ## Local pipeline
 
+<!-- BEGIN default MARCO perception architecture. -->
 This workspace uses one `recovery` Python environment for local **SAM3.1 +
-SD-DINO** perception. Gemini performs semantic keypoint selection and optional
+MARCO** perception. Gemini performs semantic keypoint selection and optional
 pose selection through the existing s3e gateway backend. There are no OWLv2,
-SAM, SD-DINO or LLaVA model servers to start.
+SAM, MARCO or LLaVA model servers to start.
 
 - `local_models/sam31.py`: SAM3.1 text detection and segmentation from the local
   multiplex checkpoint. Boxes and masks always come from the same instance.
-- `local_models/sd_dino.py`: SD v1.3, timestep 0, DINOv2 ViT-B/14 token layer 11,
-  native shared two-image co-PCA (256 dimensions per SD scale), branch L2
-  normalization and equal-weight concatenation. SD960 and DINO840 produce two
-  FP32 `[1,1536,60,60]` descriptors. The old remote feature service's implementation
-  was not provided; this is an explicit local feature definition.
+- `local_models/marco.py`: the local MARCO DINOv2-L backbone, adapters and
+  upsampling head produce two FP32 `[1,1024,240,240]` maps at input resolution
+  840. The original images undergo native longest-side resize and bottom/right
+  padding. CPU matching retains native source sampling and descriptor dot
+  products, then Gaussian local soft-argmax (temperature 10, sigma 7), restricted
+  to the caller's target mask. Output uses native align-corner scaling back to
+  original-image pixels. Invalid support fails; there is no SD-DINO fallback.
+<!-- END default MARCO perception architecture. -->
 
 <!-- BEGIN explicit model-pose adapter. -->
 
@@ -38,7 +42,7 @@ SAM, SD-DINO or LLaVA model servers to start.
 <!-- END explicit model-pose adapter. -->
 
 - `local_models/runtime.py`: sequential, short-lived local worker processes
-  release model RAM, GPU allocations and autocast state before dense matching.
+  release model RAM, GPU allocations and autocast state before CPU matching.
   Network access is disabled inside perception workers; missing weights fail
   explicitly. The worker CUDA allocator is capped at 8 GiB, combined caller and
   worker RSS at 12 GiB, with at least 1.5 GiB host memory kept available.
@@ -55,18 +59,23 @@ SAM, SD-DINO or LLaVA model servers to start.
   candidate indices raise errors instead of using old predictions.
 
 <!-- BEGIN explicit local rigid-pose dependency. -->
-Expected sibling repositories are `sam3`, `sd-dino`, `s3e`, and `FoundationPose`
+Expected sibling repositories are `sam3`, `MARCO`, `s3e`, and `FoundationPose`
 for raw object/part motion tracking. SAM weights live at
-`../models/sam3.1/sam3.1_multiplex.pt`; SD/ODISE/OpenCLIP and DINO use the existing
-local caches checked by the adapter. No entry point installs dependencies or
+`../models/sam3.1/sam3.1_multiplex.pt`; MARCO uses
+`../models/MACRO/marco_ap_spair.pth` and the existing local DINOv2-L cache.
+No entry point installs dependencies or
 downloads weights. The geometry stages require Open3D, SciPy, OpenCV and CasADi
 with IPOPT, in addition to the existing model dependencies.
 <!-- END explicit local rigid-pose dependency. -->
 
-The raw SD path retains the accepted unused-component GPU optimization. It does
-not share the two different CLIP models, change precision, cache pair features,
-or change FUNCTO's interpolation, cosine similarity, mask multiplication or
-global argmax.
+<!-- BEGIN common original-pixel correspondence contract. -->
+`manipulation.grounding.match_points` is the shared MARCO entry point for
+functional queries, object correspondence and the released function/grasp point
+transfer scripts. A region binding extracts one image pair and reuses its CPU
+features for its query windows. Matching batches at most 32 queries and never
+upsamples a full descriptor tensor to every original image pixel. A decoded
+subpixel location outside the supplied mask is rejected without snapping.
+<!-- END common original-pixel correspondence contract. -->
 
 ## Demo
 
@@ -75,8 +84,9 @@ annotations and trajectory, detects the test scene, transfers points and poses,
 then optimizes a trajectory. It does not implement raw human-video preparation
 or robot execution.
 
-The task configuration is `utils_IL/config/config_pour.yaml`. SD-DINO is enabled
-by default. `vp_flag: false` disables only optional pose selection; semantic
+The task configuration is `utils_IL/config/config_pour.yaml`.
+`feature_matching: true` enables the default MARCO refinement; explicitly setting
+it to false selects semantic points alone. `vp_flag: false` disables only optional pose selection; semantic
 function/grasp point selection still uses Gemini.
 
 ```bash
@@ -339,7 +349,7 @@ interaction region, explanatory query pixels and their geometric construction.
 **Current visual input contains owner RGB-D; it requires no current part mask,
 part ID, target query or functional frame.**
 Gemini uses the source evidence to propose coarse search cells; the existing
-SD-DINO matcher searches those windows inside the current owner. One descriptor
+MARCO matcher searches those windows inside the current owner. One descriptor
 pair is reused for the queries. The source/current frames are reconstructed
 independently, so changed part dimensions do not have to pass a rigid-shape fit.
 
@@ -504,7 +514,7 @@ restricted to the original one-metre range or hard-coded camera intrinsics.
 
 <!-- BEGIN TAPIP3D object motion and fixed semantic ownership. -->
 The raw path uses Gemini for role/relationship selection, SAM3.1 for rigid-part
-masks, SD-DINO for cross-instance correspondence and local TAPIP3D for calibrated
+masks, MARCO for cross-instance correspondence and local TAPIP3D for calibrated
 RGB-D material tracks. It samples up to 64 spread, valid-depth points per body,
 tracks carrier and reference together in one bounded GPU worker, and fits
 first-frame-to-current rigid motion with the existing correspondence RANSAC

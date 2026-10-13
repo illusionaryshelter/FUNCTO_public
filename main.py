@@ -1,4 +1,4 @@
-"""Run FUNCTO steps 8--12 with local SAM3.1/SD-DINO and Gemini selection.
+"""Run FUNCTO steps 8--12 with local SAM3.1/MARCO and Gemini selection.
 
 Demonstration annotations are inputs. Every prediction goes into a fresh run
 folder, so the example's bundled historical outputs cannot satisfy a new run.
@@ -137,17 +137,22 @@ def test_processing(config, *, data_root=None, output_dir=None, seed=0):
     output = (Path(output_dir).resolve() if output_dir else
               PROJECT_ROOT / "runs" / f"{task}-{datetime.now():%Y%m%d-%H%M%S-%f}")
     prepare_run(source, output)
+    # BEGIN record the actual default backend independently of semantic-only mode.
     metadata = {"status": "running", "task": task, "seed": seed,
                 "demo": str(demo), "test_input": str(source),
-                "sd_dino": params["sd_dino_flag"], "stages": []}
+                "feature_matching": params["feature_matching"],
+                "feature_backend": "MARCO" if params["feature_matching"] else None, "stages": []}
+    # END no legacy model flag is interpreted as a different backend.
     report = output / "run.json"
     stages = [
         ("segmentation", lambda: demo_test_deteciton(output, tool, target)),
         ("target_frame", lambda: cam_to_target_trans(output)),
+        # BEGIN common default MARCO refinement for both point roles.
         ("function_point", lambda: func_point_transfer(
-            demo, output, tool, target, task, params["num_candidate_keypoints"], params["sd_dino_flag"])),
+            demo, output, tool, target, task, params["num_candidate_keypoints"], params["feature_matching"])),
         ("grasp_point", lambda: grasp_point_transfer(
-            demo, output, tool, target, task, params["num_candidate_keypoints"], params["sd_dino_flag"])),
+            demo, output, tool, target, task, params["num_candidate_keypoints"], params["feature_matching"])),
+        # END explicit point-refinement setting.
         ("tool_pose", lambda: tool_pose_transfer(demo, output, tool, target, task, params["vp_flag"])),
         ("trajectory", lambda: tool_trajectory_transfer(demo, output)),
     ]

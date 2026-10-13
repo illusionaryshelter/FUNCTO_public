@@ -240,7 +240,9 @@ def render_perception(data, output):
     from matplotlib.patches import Patch
 
     # BEGIN label the actual run configuration, including disabled refinement.
-    point_method = "SD-DINO" if data.manifest["sd_dino"] else "Gemini"
+    # BEGIN describe the backend actually declared by this run.
+    point_method = data.manifest["feature_backend"] if data.manifest["feature_matching"] else "Gemini"
+    # END point-method label.
     # END actual point-method label.
     overlay = data.rgb.astype(float).copy()
     mask_colors = {"tool": np.array([0, 210, 230]), "target": np.array([255, 138, 45])}
@@ -452,7 +454,8 @@ def render_diagnostics(data, output):
 def write_index(data, output, diagnostics, fps):
     """Small offline entry page: images and video also work without WebGL."""
     # BEGIN describe the point method actually recorded by main.py.
-    point_method = "SD-DINO 匹配" if data.manifest["sd_dino"] else "Gemini 选点（未启用特征匹配）"
+    point_method = (data.manifest["feature_backend"] + " 匹配" if data.manifest["feature_matching"]
+                    else "Gemini 选点（未启用特征匹配）")
     # END actual method description.
     rows = "".join(f"<tr><td>{escape(name)}</td><td>{info['matched_pixel_xy']}</td>"
                    f"<td>{info['in_tool_mask']}</td><td>{info['depth_m']:.3f} m</td>"

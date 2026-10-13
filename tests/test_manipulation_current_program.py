@@ -1,7 +1,7 @@
 """CPU owner-observation grounding tests with real geometric consumers.
 
 The client and image descriptors are controlled fixtures. They test API,
-coordinate, recipe and numerical contracts, not Gemini/SD-DINO recognition
+coordinate, recipe and numerical contracts, not Gemini/MARCO recognition
 accuracy or successful robot execution.
 """
 
@@ -25,19 +25,20 @@ def pose(x=0., y=0., z=0.):
     return value
 
 
+# BEGIN MARCO-compatible synthetic features retain exact geometry test identities.
 def descriptors(first, second):
-    """Image-coordinate-coded features keep corresponding fixture pixels exact."""
-    values = []
-    for image in (first, second):
-        rgb = np.asarray(image, dtype=np.float32)
-        x, y = rgb[:, :, 0] / 255, rgb[:, :, 1] / 255
-        values.append(np.stack((np.ones_like(x), x, y, x*y))[None])
-    return values
+    from tests.marco_fixtures import labeled_pair
+    return labeled_pair(first, second)
+# END only feature inference is mocked.
 
 
 def evidence():
-    y, x = np.indices((20, 20))
-    image = Image.fromarray(np.stack((x*12, y*12, np.full_like(x, 25)), axis=-1).astype(np.uint8))
+    # BEGIN sparse pixel labels are an explicit synthetic feature-inference fixture.
+    rgb = np.zeros((20, 20, 3), np.uint8)
+    for label, (x, y) in enumerate(((4, 4), (14, 4), (4, 14)), start=1):
+        rgb[y, x, 0] = label
+    image = Image.fromarray(rgb)
+    # END program geometry and known source queries are unchanged.
     mask = np.zeros((20, 20), bool)
     mask[3:6, 3:6] = True
     origin = pose(.04, .04, 1.)
@@ -134,7 +135,7 @@ class CurrentProgramTest(unittest.TestCase):
         self.assertEqual(result["owner_observation_evidence"]["carrier"]["interaction_evidence"]["mask_pixel_count"], 9)
         np.testing.assert_array_equal(owners["carrier"]["owner_mask"], before_owner)
         np.testing.assert_array_equal(templates["grasp"]["query_pixels"], original_queries)
-        # The blue annotation belongs to the VLM panel only, not SD-DINO input.
+        # The blue annotation belongs to the VLM panel only, not MARCO input.
         np.testing.assert_array_equal(extractor.call_args.args[0], templates["grasp"]["image"])
         np.testing.assert_array_equal(extractor.call_args.args[1], owners["carrier"]["image"])
 

@@ -2,7 +2,7 @@
 
 SAM roles and Gemini semantics are supplied at their public boundaries. Image
 matching is replaced with independently known pixel correspondences; this does
-not measure SD-DINO quality. TAPIP3D is supplied at its fixed-query 3D-track
+not measure MARCO quality. TAPIP3D is supplied at its fixed-query 3D-track
 boundary; correspondence fitting, relative-pose conversion, calibrated
 backprojection, cross-scene registration, motion transfer and support goals
 remain real. These checks do not establish real-video tracking accuracy.

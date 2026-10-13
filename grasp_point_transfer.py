@@ -1,21 +1,19 @@
 import os
-import torch
 from PIL import Image
-import torch.nn as nn
 import numpy as np
 import cv2
 import json
-# BEGIN local pair extraction replaces the remote feature serialization client.
+# BEGIN both transfer entry points use the common MARCO correspondence contract.
 from pathlib import Path
-from local_models.sd_dino import extract_pair
-# END local pair extraction imports.
+from manipulation.grounding import match_points
+# END common correspondence import.
 
-from utils_IL.perception_utils import fit_gaussian, map_coordinates_to_resized, map_coordinates_to_original, resize_, convert_to_serializable
+from utils_IL.perception_utils import fit_gaussian, convert_to_serializable
 from utils_IL.vp_utils import propose_candidate_keypoints, annotate_visual_prompts, load_prompts, generate_vertices_and_update, keypoint_transfer
 
 
-# BEGIN local default: standalone callers also use the approved SD-DINO path.
-def grasp_point_transfer(data_path, test_data_path, test_tool_label='mug', test_target_label='bowl', task_label='pour', num_candidate_keypoints=8, sd_dino_flag=True):
+# BEGIN default MARCO refinement; semantic-only mode remains explicit.
+def grasp_point_transfer(data_path, test_data_path, test_tool_label='mug', test_target_label='bowl', task_label='pour', num_candidate_keypoints=8, feature_matching=True):
     # END local default.
     grasp_det_path = os.path.join(data_path, 'grasp_det_output')
     output_path = os.path.join(test_data_path, 'grasp_transfer_output')
@@ -121,69 +119,27 @@ def grasp_point_transfer(data_path, test_data_path, test_tool_label='mug', test_
     print("coarse-grained region proposal done.")
 
     x_offset, y_offset, _, _ = test_tool_box
-    if sd_dino_flag:
-        ############## Fine-grained point transfer ##############
-        # load demo and test images
-        img_size = 480
-        img1, sf1, pd1 = resize_(demo_init_frame_pil_crop.convert('RGB'), target_res=img_size, resize=True, to_pil=True)
-        img2, sf2, pd2 = resize_(test_init_frame_pil_crop.convert('RGB'), target_res=img_size, resize=True, to_pil=True)
-
-        demo_source_x, demo_source_y = map_coordinates_to_resized(demo_grasp_point[0], demo_grasp_point[1], sf1, pd1)
-        demo_source_x, demo_source_y = np.int64(demo_source_x), np.int64(demo_source_y)
-        test_source_x, test_source_y = map_coordinates_to_resized(vp_grasp_point[0], vp_grasp_point[1], sf2, pd2)
-        test_source_x, test_source_y = np.int64(test_source_x), np.int64(test_source_y)
-
-        # create vp mask
-        x = np.arange(0, img_size, 1)
-        y = np.arange(0, img_size, 1)
-        x, y = np.meshgrid(x, y)
-        scale = 0.15
-        rect_width = (img_size -  pd2[1]*2) * scale # Width of the rectangle
-        rect_height = (img_size -  pd2[0]*2) * scale  # Height of the rectangle
-        rect_center_x = test_source_x  # X-coordinate of rectangle center
-        rect_center_y = test_source_y  # Y-coordinate of rectangle center
-        # Calculate rectangle boundaries
-        x_min = rect_center_x - rect_width / 2
-        x_max = rect_center_x + rect_width / 2
-        y_min = rect_center_y - rect_height / 2
-        y_max = rect_center_y + rect_height / 2
-        # Create the rectangle mask
-        vp_mask_normalized = np.where((x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max), 1, 0)
-
-        mask2_raw = Image.fromarray(test_init_frame_mask_crop)
-        mask2, sf_m1, pd_m1 = resize_(mask2_raw, target_res=img_size, resize=True, to_pil=False)
-
-        # BEGIN local SD+DINO: the pair shares its PCA basis. The worker exits
-        # before returning CPU descriptors; the existing dense matching follows.
-        feat1, feat2 = extract_pair(img1, img2)
-        # END local pair extraction.
-        feat1_cuda = torch.tensor(feat1).to('cuda')
-        feat2_cuda = torch.tensor(feat2).to('cuda')
-        ft = torch.cat([feat1_cuda, feat2_cuda], dim=0)
-
-        # compute cosine similarity map
-        num_channel = ft.size(1)
-        cos = nn.CosineSimilarity(dim=1)
-        src_ft = ft[0].unsqueeze(0)  # []
-        src_ft = nn.Upsample(size=(img_size, img_size), mode='bilinear')(src_ft)
-        src_vec = src_ft[0, :, demo_source_y, demo_source_x].view(1, num_channel, 1, 1)  # 1, C, 1, 1
-        trg_ft = nn.Upsample(size=(img_size, img_size), mode='bilinear')(ft[1:]) # 1, C, H, W
-        cos_map = cos(src_vec, trg_ft).cpu().numpy()    # 1, H, W
-        # search correspondence within the test tool mask
-        cos_map = np.multiply(mask2, cos_map)
-        cos_map = np.multiply(vp_mask_normalized, cos_map)  # no vp
-
-        print("fine-grained point transfer done.")
-
-        # compute test grasp point
-        max_yx = np.unravel_index(cos_map[0].argmax(), cos_map[0].shape)
-                
-        # map to the uncropped image
-        original_x, original_y = map_coordinates_to_original(int(max_yx[1]), int(max_yx[0]), sf2, pd2)
-        test_frame_x, test_frame_y = int(original_x + x_offset), int(original_y + y_offset) # VP + SD+DINO
+    # BEGIN native MARCO refinement in original crop pixels, without a second resize.
+    if feature_matching:
+        source_mask = np.asarray(np.load(os.path.join(test_data_path, 'func_point_transfer_output', 'demo_tool_mask_crop.npy'), allow_pickle=False), dtype=bool)
+        target_mask = np.asarray(test_init_frame_mask_crop, dtype=bool)
+        yy, xx = np.indices(target_mask.shape)
+        # Retain the semantic proposal's 15% crop-size window; MARCO searches
+        # only the intersection with the observed object mask.
+        cx, cy = vp_grasp_point
+        candidates = target_mask & (np.abs(xx-cx) <= .075*test_init_frame_pil_crop.width)
+        candidates &= np.abs(yy-cy) <= .075*test_init_frame_pil_crop.height
+        points, diagnostic = match_points(
+            demo_init_frame_pil_crop, test_init_frame_pil_crop,
+            source_mask, candidates, [demo_grasp_point])
+        with open(os.path.join(output_path, 'feature_matching.json'), 'w') as stream:
+            json.dump(diagnostic, stream, indent=2)
+        original_x, original_y = points[0]
     else:
-        test_frame_x, test_frame_y = int(vp_grasp_point[0] + x_offset), int(vp_grasp_point[1] + y_offset)  # no SD+DINO, VP only
-        
+        original_x, original_y = vp_grasp_point
+    test_frame_x, test_frame_y = int(round(original_x + x_offset)), int(round(original_y + y_offset))
+    # END model failure propagates; semantic-only mode is not an error fallback.
+
     cv2.circle(test_init_frame, (test_frame_x, test_frame_y), 3, (0, 0, 255), -1)
     cv2.imwrite(os.path.join(output_path, 'test_init_frame_grasp_point_vis.jpg'), cv2.cvtColor(test_init_frame, cv2.COLOR_BGR2RGB))
 

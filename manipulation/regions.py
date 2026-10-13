@@ -616,7 +616,9 @@ def match_functional_region(demo, current, *, client=None, extractor=None):
         if pair_cache is None:
             actual = extractor
             if actual is None:
-                from local_models.sd_dino import extract_pair
+                # BEGIN shared default MARCO pair features.
+                from local_models.marco import extract_pair
+                # END shared default feature provider.
                 actual = extract_pair
             pair_cache = actual(first_image, second_image)
         return pair_cache

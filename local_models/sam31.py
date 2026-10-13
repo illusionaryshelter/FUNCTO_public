@@ -2,7 +2,7 @@
 
 The public function exchanges only CPU arrays with an isolated worker. SAM's
 CUDA context, BF16 autocast, and model weights therefore cannot leak into the
-FP32 SD-DINO feature stage in the parent process.
+FP32 MARCO feature stage in its separate worker process.
 """
 
 # BEGIN local SAM 3.1 integration: one native multiplex session per input image.

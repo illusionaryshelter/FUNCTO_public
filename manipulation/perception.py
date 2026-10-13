@@ -774,7 +774,9 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
     # END common observation path; destination grounding remains task-specific.
     actual_extractor = extractor
     if actual_extractor is None:
-        from local_models.sd_dino import extract_pair
+        # BEGIN shared default MARCO pair features.
+        from local_models.marco import extract_pair
+        # END shared default feature provider.
         actual_extractor = extract_pair
 
     bindings, evidence = {}, {}

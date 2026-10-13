@@ -1,6 +1,6 @@
 """Ground one manipulation stage without imposing tool/function/grasp points.
 
-Gemini proposes semantic roles; SAM supplies instances; SD-DINO supplies only
+Gemini proposes semantic roles; SAM supplies instances; MARCO supplies only
 two-image correspondences. None of these functions estimates an articulation
 axis, reconstructs hidden geometry, or tracks a rigid pose through a video.
 Models and network clients are imported only when a caller requests their use.
@@ -522,58 +522,14 @@ def propose_query_regions(source_image, current_image, source_owner_mask,
 # END source-evidence query proposals.
 
 
-def _square(image):
-    """Pad before extraction, avoiding different SD/DINO resize-rounding offsets."""
-    size = max(image.size)
-    left, top = (size - image.width) // 2, (size - image.height) // 2
-    square = Image.new("RGB", (size, size), "black")
-    square.paste(image, (left, top))
-    return square, np.array([left, top], dtype=float)
-
-
-# BEGIN dense masked correspondence: bounded descriptor batches replace cell representatives.
-def _sample(features, pixels, size, offset):
-    """Bilinear sampling with pixel centers and align_corners=False coordinates.
-
-    Interpolation and subsequent cosine arithmetic use float64, while the
-    extractor's feature maps stay in their original FP32 storage. Close
-    original-image pixels can have much closer scores than feature-cell centers.
-    Only the current small batch is promoted, never an image-sized feature map.
-    """
-    _, height, width = features.shape
-    locations = (pixels + offset + 0.5) * np.array([width, height]) / size - 0.5
-    locations = np.clip(locations, [0, 0], [width - 1, height - 1])
-    x0, y0 = np.floor(locations).astype(int).T
-    x1, y1 = np.minimum(x0 + 1, width - 1), np.minimum(y0 + 1, height - 1)
-    wx, wy = (locations - np.floor(locations)).T
-    return (
-        features[:, y0, x0].T * ((1 - wx) * (1 - wy))[:, None]
-        + features[:, y0, x1].T * (wx * (1 - wy))[:, None]
-        + features[:, y1, x0].T * ((1 - wx) * wy)[:, None]
-        + features[:, y1, x1].T * (wx * wy)[:, None]
-    )
-
-
+# BEGIN default MARCO correspondence: preserve original image coordinates.
 def match_points(image1, image2, mask1, mask2, pixels1, *, extractor=None):
-    """Transfer optional xy anchors by exhaustive masked original-pixel matching.
+    """Transfer xy queries with MARCO features and its native masked decoder.
 
-    Full images are padded to squares without resizing their original pixels.
-    The existing extractor then applies its unchanged SD/DINO feature profile.
-    Feature (j,i) spans the square under the half-pixel convention; padding is
-    removed only when reporting original-image coordinates. Every original
-    target-mask pixel is bilinearly sampled and considered, including pixels
-    between descriptor-cell centers. This finds the cosine optimum over integer
-    valid pixels, not a claim of subpixel or semantic ground-truth accuracy.
-
-    At most 32 source and 512 target descriptors are sampled per batch. Larger
-    source sets repeat the target scan, retaining that bound; no image-sized
-    C-channel descriptor tensor or full source-by-target score matrix is built.
-    Only mask indices and per-source winners/scores persist across batches.
-
-    Returned diagnostics expose tied scores and many-to-one matches. No greedy
-    reassignment fabricates distinct points. Callers must assess these diagnostics
-    before using correspondences to infer geometry; scores are not probabilities.
-    An empty Nx2 array means no anchors are needed and does not run the extractor.
+    The extractor receives original RGB images; MARCO owns resize and bottom/
+    right padding. Returned subpixel coordinates refer to the original target
+    image. Source support and output mask membership use the same nearest-pixel
+    rule as RGB-D backprojection. Empty query sets do not initialize a model.
     """
     image1, image2 = _image(image1), _image(image2)
     mask1, mask2 = _mask(mask1, image1, "mask1"), _mask(mask2, image2, "mask2")
@@ -584,100 +540,14 @@ def match_points(image1, image2, mask1, mask2, pixels1, *, extractor=None):
     if not np.isfinite(pixels).all() or np.any(pixels < 0) or np.any(
             pixels > [image1.width - 1, image1.height - 1]):
         raise ValueError("Source pixels must be finite and inside image1")
-    # Match observations.backproject: nearest pixel center, with ties to even.
-    # Using floor(x + .5) here would disagree at exact half-pixel boundaries.
     nearest = np.rint(pixels).astype(int)
     if not mask1[nearest[:, 1], nearest[:, 0]].all():
         raise ValueError("Every source pixel must lie inside mask1")
     if not len(pixels):
         return np.empty((0, 2), dtype=float), {"point_count": 0, "extractor_called": False}
-    square1, offset1 = _square(image1)
-    square2, offset2 = _square(image2)
-    if extractor is None:
-        from local_models.sd_dino import extract_pair
+    from local_models.marco import extract_pair, match_features
 
-        extractor = extract_pair
-    pair = extractor(square1, square2)
-    if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-        raise ValueError("Extractor must return a pair of CPU feature arrays")
-    features = []
-    for feature in pair:
-        value = np.asarray(feature)
-        if (value.ndim != 4 or value.shape[0] != 1 or min(value.shape) < 1
-                or value.dtype.kind != "f" or not np.isfinite(value).all()):
-            raise ValueError("Features must be finite floating [1,C,Hf,Wf] arrays")
-        value = value[0].astype(np.float32, copy=False)
-        if not np.isfinite(value).all():
-            raise ValueError("Feature values are not representable in FP32")
-        features.append(value)
-    if features[0].shape[0] != features[1].shape[0]:
-        raise ValueError("Source and target descriptors must have equal channel counts")
-    target_indices = np.flatnonzero(mask2)
-    source_batch_size, target_batch_size = 32, 512
-    best_indices = np.full(len(pixels), -1, dtype=np.int64)
-    best_scores = np.full(len(pixels), -np.inf)
-    runner_up_scores = np.full(len(pixels), -np.inf)
-    candidate_count = 0
-    for source_start in range(0, len(pixels), source_batch_size):
-        source_end = min(source_start + source_batch_size, len(pixels))
-        source = _sample(features[0], pixels[source_start:source_end], square1.width, offset1)
-        norms = np.linalg.norm(source, axis=1)
-        if np.any(norms == 0):
-            index = source_start + int(np.flatnonzero(norms == 0)[0])
-            raise ValueError(f"Source point {index} has a zero descriptor")
-        source /= norms[:, None]
-        best = best_scores[source_start:source_end]
-        second = runner_up_scores[source_start:source_end]
-        indices = best_indices[source_start:source_end]
-        for target_start in range(0, len(target_indices), target_batch_size):
-            flat = target_indices[target_start:target_start + target_batch_size]
-            target_pixels = np.column_stack((flat % image2.width, flat // image2.width))
-            target = _sample(features[1], target_pixels, square2.width, offset2)
-            norms = np.linalg.norm(target, axis=1)
-            valid = norms > 0
-            if source_start == 0:
-                candidate_count += int(valid.sum())
-            if not valid.any():
-                continue
-            flat, target = flat[valid], target[valid]
-            target /= norms[valid, None]
-            similarities = np.clip(source @ target.T, -1.0, 1.0)
-            winners = np.argmax(similarities, axis=1)
-            block_best = similarities[np.arange(len(source)), winners]
-            block_second = (np.partition(similarities, -2, axis=1)[:, -2]
-                            if len(target) > 1 else np.full(len(source), -np.inf))
-            # Merge the two maxima from each disjoint block. Strict improvement
-            # keeps the first row-major pixel on equal scores, including ties
-            # spanning blocks; negative maxima remain eligible throughout.
-            merged = np.column_stack((best, second, block_best, block_second))
-            better = block_best > best
-            indices[better] = flat[winners[better]]
-            best[:] = np.maximum(best, block_best)
-            second[:] = np.partition(merged, -2, axis=1)[:, -2]
-        if np.any(indices < 0):
-            raise ValueError("No target candidate has a nonzero descriptor")
-    scores = best_scores.tolist()
-    second_scores = [float(value) if np.isfinite(value) else None for value in runner_up_scores]
-    margins = [score - second if second is not None else None
-               for score, second in zip(scores, second_scores)]
-    ties = [margin is not None and margin <= 1e-6 for margin in margins]
-    duplicate_groups = [np.flatnonzero(best_indices == index).tolist()
-                        for index in np.unique(best_indices) if np.sum(best_indices == index) > 1]
-    output = np.column_stack((best_indices % image2.width, best_indices // image2.width)).astype(float)
-    diagnostics = {
-        "point_count": len(pixels), "extractor_called": True,
-        "candidate_count": candidate_count, "masked_pixel_count": len(target_indices),
-        "excluded_zero_descriptors": len(target_indices) - candidate_count,
-        "feature_shapes": [list(feature.shape) for feature in features],
-        "padding_xy": [offset1.tolist(), offset2.tolist()],
-        "square_sizes": [square1.width, square2.width],
-        "mapping": "centered-square / half-pixel bilinear / all original mask pixels",
-        "source_batch_size": source_batch_size, "target_batch_size": target_batch_size,
-        "similarity_arithmetic": "float64 interpolation and cosine from stored FP32 features",
-        "scores": scores, "second_scores": second_scores, "margins": margins,
-        "numerical_ties": ties, "nonpositive_scores": [score <= 0 for score in scores],
-        "duplicate_target_groups": duplicate_groups,
-    }
-    return output, diagnostics
-# END dense masked correspondence.
+    extractor = extract_pair if extractor is None else extractor
+    return match_features(extractor(image1, image2), pixels, image1.size, mask2)
+# END default MARCO correspondence.
 # END task-adaptive grounding.

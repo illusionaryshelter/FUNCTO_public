@@ -13,7 +13,6 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import map_coordinates
 
-from manipulation import grounding as grounding_module
 from manipulation.grounding import infer_task, match_points, select_roles
 
 
@@ -133,186 +132,98 @@ class TaskGroundingTest(unittest.TestCase):
 
 
 class PointMatchingTest(unittest.TestCase):
-    # BEGIN exhaustive-pixel regressions, including an independent dense oracle.
-    @staticmethod
-    def dense_sample(features, pixels, image_size):
-        """Independent tiny reference using SciPy's linear image interpolation.
+    # BEGIN native MARCO contracts; synthetic maps require neither CUDA nor weights.
+    def test_native_sampling_logits_and_unmasked_decoder_with_bounded_queries(self):
+        import torch
+        from torch.nn import functional as F
+        from local_models import marco
 
-        Production code must not allocate this dense target descriptor matrix;
-        this helper is limited to the small synthetic fixture below.
-        """
-        width, height = image_size
-        size = max(width, height)
-        pad = np.array([(size-width)//2, (size-height)//2])
-        locations = (pixels + pad + 0.5) / size
-        locations = locations * np.array(features.shape[-2:][::-1]) - 0.5
-        return np.column_stack([
-            map_coordinates(channel.astype(float), locations[:, ::-1].T,
-                            order=1, mode="nearest", prefilter=False)
-            for channel in features[0]
-        ])
-
-    def test_all_pixel_search_matches_independent_dense_cosine_reference(self):
         rng = np.random.default_rng(5823)
-        image1, image2 = Image.new("RGB", (17, 9)), Image.new("RGB", (37, 23))
+        image1, image2 = Image.new("RGB", (420, 210)), Image.new("RGB", (840, 840))
         first = rng.normal(size=(1, 7, 5, 4)).astype(np.float32)
         second = rng.normal(size=(1, 7, 4, 6)).astype(np.float32)
-        pixels = rng.uniform([0, 0], [16, 8], size=(35, 2))
-        mask1 = np.ones((9, 17), bool)
-        mask2 = rng.uniform(size=(23, 37)) > 0.05
-        mask2[:, :4] = False
-        mask2[:, -4:] = False
-        self.assertGreater(mask2.sum(), 512)
-        target_y, target_x = np.nonzero(mask2)
-        target_pixels = np.column_stack((target_x, target_y))
-        source_vectors = self.dense_sample(first, pixels, image1.size)
-        target_vectors = self.dense_sample(second, target_pixels, image2.size)
-        source_vectors /= np.linalg.norm(source_vectors, axis=1, keepdims=True)
-        target_vectors /= np.linalg.norm(target_vectors, axis=1, keepdims=True)
-        dense_scores = np.clip(source_vectors @ target_vectors.T, -1, 1)
-        expected_indices = np.argmax(dense_scores, axis=1)
-        expected_scores = np.max(dense_scores, axis=1)
-        expected_seconds = np.partition(dense_scores, -2, axis=1)[:, -2]
-        with patch("manipulation.grounding._sample", wraps=grounding_module._sample) as sampler:
-            output, diagnostic = match_points(
-                image1, image2, mask1, mask2, pixels,
-                extractor=Mock(return_value=(first, second)),
-            )
-        np.testing.assert_array_equal(output, target_pixels[expected_indices])
-        np.testing.assert_allclose(diagnostic["scores"], expected_scores, atol=2e-14, rtol=0)
-        np.testing.assert_allclose(diagnostic["second_scores"], expected_seconds, atol=2e-14, rtol=0)
-        np.testing.assert_allclose(diagnostic["margins"], expected_scores-expected_seconds,
-                                   atol=3e-14, rtol=0)
-        self.assertEqual(diagnostic["candidate_count"], int(mask2.sum()))
-        self.assertEqual(diagnostic["masked_pixel_count"], int(mask2.sum()))
-        self.assertEqual(diagnostic["excluded_zero_descriptors"], 0)
-        # Both dimensions exceed a batch. Verify the actual sampler calls obey
-        # the promised memory bound, rather than trusting a diagnostic constant.
-        source_counts, target_counts = [], []
-        for call in sampler.call_args_list:
-            if call.args[0].shape[-2:] == (5, 4):
-                source_counts.append(len(call.args[1]))
-            else:
-                target_counts.append(len(call.args[1]))
-        self.assertEqual(source_counts, [32, 3])
-        self.assertGreater(len(target_counts), 2)
-        self.assertLessEqual(max(target_counts), 512)
+        pixels = rng.uniform([0, 0], [419, 209], size=(35, 2))
+        # Independent SciPy interpolation oracle for the native source rule:
+        # rounded image scaling followed by feature-size / inference-size.
+        locations = pixels * [2., 2.] * [4/840, 5/840]
+        vectors = np.column_stack([map_coordinates(channel, locations[:, ::-1].T,
+            order=1, mode="nearest", prefilter=False) for channel in first[0]])
+        logits = vectors @ second[0].reshape(7, -1)
+        native = marco._geometry().kernel_softargmax_get_matches_logits(
+            torch.from_numpy(logits.reshape(1, 35, 4, 6)), 10., 7)
+        expected = marco._geometry().scaling_coordinates(native, (4, 6), (840, 840))[0].numpy()
+        with patch("torch.nn.functional.grid_sample", wraps=F.grid_sample) as sampler:
+            result, diagnostic = match_points(image1, image2, np.ones((210, 420), bool),
+                np.ones((840, 840), bool), pixels, extractor=Mock(return_value=(first, second)))
+        np.testing.assert_allclose(result, expected, atol=2e-4, rtol=0)
+        np.testing.assert_allclose(diagnostic["scores"], logits.max(axis=1), atol=2e-6, rtol=0)
+        self.assertEqual([call.args[1].shape[1] for call in sampler.call_args_list], [32, 3])
+        self.assertEqual(diagnostic["matcher"], "MARCO")
+        self.assertEqual(diagnostic["candidate_count"], 24)
 
-    def test_cosine_peak_between_feature_cell_centers_is_not_discarded(self):
-        image = Image.new("RGB", (9, 9))
-        source = np.ones((1, 2, 2, 2), np.float32)
-        target = np.zeros_like(source)
-        target[0, 0, :, 0] = 1
-        target[0, 1, :, 1] = 1
-        mask2 = np.zeros((9, 9), bool)
-        mask2[4, :] = True
-        output, diagnostic = match_points(
-            image, image, np.ones((9, 9), bool), mask2, [[2, 2]],
-            extractor=Mock(return_value=(source, target)),
-        )
-        # Native cell centers map to x=1.75 and 6.25. Their nearest pixels 2/6
-        # both miss the unique cosine maximum at the central original pixel 4.
-        np.testing.assert_array_equal(output, [[4, 4]])
-        self.assertEqual(diagnostic["candidate_count"], 9)
-        self.assertAlmostEqual(diagnostic["scores"][0], 1, places=13)
-        self.assertFalse(diagnostic["numerical_ties"][0])
-
-    def test_zero_candidates_and_top_two_ties_across_target_batches(self):
-        image = Image.new("RGB", (1025, 1))
-        source = np.array([[[[1]], [[0]]]], dtype=np.float32)
-        target = np.zeros((1, 2, 1, 1025), np.float32)
-        target[0, 0, 0, :] = -1
-        target[0, :, 0, 1:11] = 0
-        target[0, 0, 0, [511, 1024]] = 1
-        mask = np.ones((1, 1025), bool)
-        output, diagnostic = match_points(
-            image, image, mask, mask, [[0, 0], [1024, 0]],
-            extractor=Mock(return_value=(source, target)),
-        )
-        np.testing.assert_array_equal(output, [[511, 0], [511, 0]])
-        self.assertEqual(diagnostic["candidate_count"], 1015)
-        self.assertEqual(diagnostic["excluded_zero_descriptors"], 10)
-        self.assertEqual(diagnostic["scores"], [1., 1.])
-        self.assertEqual(diagnostic["second_scores"], [1., 1.])
-        self.assertEqual(diagnostic["numerical_ties"], [True, True])
-        self.assertEqual(diagnostic["duplicate_target_groups"], [[0, 1]])
-    # END exhaustive-pixel regressions.
-
-    def test_negative_similarity_cannot_choose_outside_mask(self):
-        image = Image.new("RGB", (2, 2))
-        source = np.tile(np.array([1.0, 0.0], dtype=np.float32)[None, :, None, None], (1, 1, 2, 2))
-        target = np.zeros_like(source)
-        target[0, :, :, :] = np.array([1.0, 0.0])[:, None, None]
-        target[0, :, 1, 0], target[0, :, 1, 1] = [-1.0, 0.0], [-0.5, np.sqrt(0.75)]
-        target_mask = np.array([[False, False], [True, True]])
-        result, diagnostic = match_points(image, image, np.ones((2, 2), bool), target_mask,
-                                          [[0, 0]], extractor=Mock(return_value=(source, target)))
-        np.testing.assert_array_equal(result, [[1, 1]])
-        self.assertAlmostEqual(diagnostic["scores"][0], -0.5, places=6)
-        self.assertEqual(diagnostic["nonpositive_scores"], [True])
-
-    def test_nonsquare_images_have_exact_padding_and_single_pixel_candidates(self):
-        image1, image2 = Image.new("RGB", (4, 2), "red"), Image.new("RGB", (2, 4), "blue")
-        source = np.zeros((1, 2, 4, 4), dtype=np.float32)
-        target = np.zeros_like(source)
-        # Original (2,0) becomes square (2,1); target (1,3) becomes (2,3).
-        source[0, :, 1, 2] = [0.6, 0.8]
-        target[0, :, 3, 2] = [0.6, 0.8]
-        mask2 = np.zeros((4, 2), bool)
-        mask2[3, 1] = True
-        extractor = Mock(return_value=(source, target))
-        result, diagnostic = match_points(image1, image2, np.ones((2, 4), bool), mask2,
-                                          [[2, 0]], extractor=extractor)
-        np.testing.assert_array_equal(result, [[1, 3]])
-        self.assertEqual(diagnostic["padding_xy"], [[0.0, 1.0], [1.0, 0.0]])
-        self.assertEqual([im.size for im in extractor.call_args.args], [(4, 4), (4, 4)])
-        self.assertEqual(extractor.call_args.args[0].getpixel((0, 0)), (0, 0, 0))
+    def test_default_provider_is_marco_and_preserves_nonsquare_rgb(self):
+        image1, image2 = Image.new("RGB", (420, 210), "red"), Image.new("RGB", (210, 420), "blue")
+        features = np.ones((1, 2, 4, 4), np.float32)
+        mask = np.zeros((420, 210), bool)
+        mask[280, 140] = True
+        with patch("local_models.marco.extract_pair", return_value=(features, features)) as extractor:
+            result, diagnostic = match_points(image1, image2, np.ones((210, 420), bool), mask, [[100, 30]])
+        # BEGIN native output scaling is FP32, not exact rational arithmetic.
+        np.testing.assert_allclose(result, [[839/6, 839/3]],
+                                   atol=np.spacing(np.float32(840)), rtol=0)
+        # END one resized-coordinate ULP bounds this arithmetic discrepancy.
+        self.assertEqual([image.size for image in extractor.call_args.args], [(420, 210), (210, 420)])
+        self.assertEqual(extractor.call_args.args[0].getpixel((0, 0)), (255, 0, 0))
+        self.assertEqual(diagnostic["candidate_count"], 1)
         self.assertEqual(diagnostic["second_scores"], [None])
 
-    def test_bilinear_source_vector_at_subpixel_location(self):
-        image = Image.new("RGB", (2, 2))
-        source = np.zeros((1, 2, 2, 2), np.float32)
-        source[0, :, :, 0], source[0, :, :, 1] = [[1], [0]], [[0], [1]]
-        target = np.zeros_like(source)
-        target[0, :, 0, 0], target[0, :, 1, 1] = [1, 0], [1, 1]
-        mask = np.eye(2, dtype=bool)
-        result, diagnostic = match_points(image, image, np.ones((2, 2), bool), mask,
-                                          [[0.5, 0]], extractor=Mock(return_value=(source, target)))
-        np.testing.assert_array_equal(result, [[1, 1]])
-        self.assertAlmostEqual(diagnostic["scores"][0], 1, places=6)
+    def test_negative_logits_cannot_choose_a_forbidden_maximum(self):
+        image = Image.new("RGB", (840, 840))
+        first = np.ones((1, 1, 2, 2), np.float32)
+        second = np.full_like(first, 1000.)
+        second[0, 0, 0, 0] = -1.
+        mask = np.zeros((840, 840), bool); mask[0, 0] = True
+        result, diagnostic = match_points(image, image, np.ones_like(mask), mask, [[0, 0]],
+                                          extractor=Mock(return_value=(first, second)))
+        np.testing.assert_array_equal(result, [[0, 0]])
+        self.assertEqual(diagnostic["scores"], [-1.])
+        self.assertEqual(diagnostic["nonpositive_scores"], [True])
 
-    def test_subpixel_mask_lookup_matches_depth_backprojection_rounding(self):
+    def test_unsupported_thin_mask_fails_without_snapping_or_fallback(self):
+        image = Image.new("RGB", (840, 840))
+        features = np.ones((1, 2, 4, 4), np.float32)
+        mask = np.zeros((840, 840), bool); mask[420, 420] = True
+        with self.assertRaisesRegex(ValueError, "No MARCO feature cell"):
+            match_points(image, image, np.ones_like(mask), mask, [[0, 0]],
+                         extractor=Mock(return_value=(features, features)))
+
+    def test_masked_softargmax_in_a_hole_fails_instead_of_inventing_support(self):
+        image = Image.new("RGB", (840, 840))
+        features = np.zeros((1, 2, 2, 2), np.float32)
+        mask = np.eye(840, dtype=bool)
+        mask[1:-1] = False  # Two distant admissible cells; their mean is not observed.
+        with self.assertRaisesRegex(ValueError, "not snapped"):
+            match_points(image, image, np.ones_like(mask), mask, [[0, 0]],
+                         extractor=Mock(return_value=(features, features)))
+
+    def test_duplicate_predictions_and_tied_logits_remain_visible(self):
+        image = Image.new("RGB", (840, 840))
+        features = np.ones((1, 2, 4, 4), np.float32)
+        result, diagnostic = match_points(image, image, np.ones((840, 840), bool),
+            np.ones((840, 840), bool), [[0, 0], [839, 839]], extractor=Mock(return_value=(features, features)))
+        np.testing.assert_array_equal(result[0], result[1])
+        self.assertEqual(diagnostic["numerical_ties"], [True, True])
+        self.assertEqual(diagnostic["duplicate_target_groups"], [[0, 1]])
+
+    def test_source_mask_uses_depth_backprojection_tie_rounding(self):
         image = Image.new("RGB", (2, 2))
-        mask = np.zeros((2, 2), bool)
-        mask[0, 0] = True
+        mask = np.zeros((2, 2), bool); mask[0, 0] = True
         features = np.ones((1, 2, 2, 2), np.float32)
-        # observations.backproject samples depth[0, 0] at the .5 tie; semantic
-        # mask validity must use the same rounding rule before backprojection.
         result, _ = match_points(image, image, mask, mask, [[0.5, 0]],
                                  extractor=Mock(return_value=(features, features)))
         np.testing.assert_array_equal(result, [[0, 0]])
 
-    def test_ambiguity_and_many_to_one_are_reported_without_fake_unique_points(self):
-        image = Image.new("RGB", (2, 2))
-        features = np.ones((1, 2, 2, 2), np.float32)
-        result, diagnostic = match_points(image, image, np.ones((2, 2), bool),
-                                          np.ones((2, 2), bool), [[0, 0], [1, 1]],
-                                          extractor=Mock(return_value=(features, features)))
-        np.testing.assert_array_equal(result, [[0, 0], [0, 0]])
-        self.assertEqual(diagnostic["numerical_ties"], [True, True])
-        self.assertEqual(diagnostic["duplicate_target_groups"], [[0, 1]])
-
-    def test_thin_mask_between_feature_centers_retains_a_real_candidate(self):
-        image = Image.new("RGB", (8, 8))
-        mask = np.zeros((8, 8), bool)
-        mask[0, 7] = True
-        features = np.ones((1, 2, 2, 2), np.float32)
-        result, diagnostic = match_points(image, image, mask, mask, [[7, 0]],
-                                          extractor=Mock(return_value=(features, features)))
-        np.testing.assert_array_equal(result, [[7, 0]])
-        self.assertEqual(diagnostic["candidate_count"], 1)
-
-    def test_invalid_masks_pixels_and_zero_descriptors_fail_explicitly(self):
+    def test_invalid_masks_queries_and_feature_contracts_fail_explicitly(self):
         image, mask = Image.new("RGB", (2, 2)), np.ones((2, 2), bool)
         features = np.ones((1, 2, 2, 2), np.float32)
         extractor = Mock(return_value=(features, features))
@@ -324,8 +235,9 @@ class PointMatchingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mask1"):
             match_points(image, image, np.eye(2, dtype=bool), mask, [[1, 0]], extractor=extractor)
         extractor.assert_not_called()
-        for pair in ((features, np.zeros_like(features)), (np.zeros_like(features), features)):
-            with self.subTest(pair=pair), self.assertRaisesRegex(ValueError, "descriptor"):
+        for pair in ((features.astype(np.float64), features), (features, features*float("nan")),
+                     (features[:, :, :1], features), (features, features[:, :1]), (features,)):
+            with self.subTest(shapes=[x.shape for x in pair]), self.assertRaises(ValueError):
                 match_points(image, image, mask, mask, [[0, 0]], extractor=Mock(return_value=pair))
 
     def test_no_required_anchors_skips_extraction(self):
@@ -334,6 +246,7 @@ class PointMatchingTest(unittest.TestCase):
         self.assertEqual(result.shape, (0, 2))
         self.assertFalse(diagnostic["extractor_called"])
         extractor.assert_not_called()
+    # END native MARCO correspondence contracts.
 
 
 if __name__ == "__main__":

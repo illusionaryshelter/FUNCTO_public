@@ -166,7 +166,7 @@ class FunctionalQueryGroundingTest(unittest.TestCase):
 
     def observations(self):
         source_pixels = np.array([[4, 5], [7, 5], [4, 8], [7, 8]])
-        target_pixels = np.array([[6, 4], [12, 4], [6, 13], [12, 13]])
+        target_pixels = np.array([[6, 4], [12, 4], [6, 12], [12, 12]])
         images = []
         for pixels in (source_pixels, target_pixels):
             rgb = np.zeros((16, 16, 3), np.uint8)
@@ -191,15 +191,12 @@ class FunctionalQueryGroundingTest(unittest.TestCase):
                        T_camera_owner=pose((-.2, .5, -.3), (-.2, .3, .1)))
         return demo, current, target_pixels
 
+    # BEGIN feature fixtures follow MARCO's native resize/sample/decode coordinates.
     @staticmethod
     def descriptors(first, second):
-        # Exact one-hot directions encode query identity; the actual masked
-        # matcher still selects pixels, resolves cosine scores and lifts depth.
-        features = []
-        for image in (first, second):
-            labels = np.asarray(image)[:, :, 0]
-            features.append(np.eye(5, dtype=np.float32)[labels].transpose(2, 0, 1)[None])
-        return features
+        from tests.marco_fixtures import labeled_pair
+        return labeled_pair(first, second)
+    # END learned descriptors alone are injected; matching and geometry are real.
 
     @staticmethod
     def client_for(pixels, size=(16, 16)):
@@ -226,7 +223,9 @@ class FunctionalQueryGroundingTest(unittest.TestCase):
         self.assertEqual(client.chat_json.call_count, 1)
         self.assertEqual(tuple(image.size for image in extractor.call_args.args), ((16, 16), (16, 16)))
         diagnostic = result["diagnostics"]
-        np.testing.assert_array_equal(diagnostic["target_pixels"], target_pixels)
+        # BEGIN MARCO reports subpixel FP32 decoding, including its roundoff.
+        np.testing.assert_allclose(diagnostic["target_pixels"], target_pixels, atol=1e-6, rtol=0)
+        # END the tolerance is in pixels, before metric backprojection.
         np.testing.assert_array_equal(diagnostic["interaction_query_indices"], [0])
         np.testing.assert_array_equal(diagnostic["queries_outside_interaction_mask"], [1, 2, 3])
         self.assertEqual(diagnostic["descriptor_pair_extractions"], 1)
@@ -260,7 +259,7 @@ class FunctionalQueryGroundingTest(unittest.TestCase):
     def test_cropped_nonsquare_owner_context_restores_full_image_pixels(self):
         demo, current, pixels = self.observations()
         # Identical padded canvases have a 16x18 owner-context crop at (4,3).
-        # match_points independently square-pads that crop; its descriptor
+        # MARCO resizes and bottom/right-pads that crop; descriptor
         # coordinates and regions' camera coordinates must both stay correct.
         offsets = (np.array([4, 3]), np.array([7, 5]))
         for record, offset in zip((demo, current), offsets):
@@ -289,7 +288,10 @@ class FunctionalQueryGroundingTest(unittest.TestCase):
         boxes = np.tile([0, 0, 16, 18], (4, 1))
         with patch("manipulation.regions.propose_query_regions", return_value={"boxes": boxes, "diagnostics": {}}) as proposal:
             result = match_functional_region(demo, current, extractor=self.descriptors)
-        np.testing.assert_array_equal(result["diagnostics"]["target_pixels"], pixels+offsets[1])
+        # BEGIN native resized-grid rounding may move a fractional crop pixel.
+        np.testing.assert_allclose(result["diagnostics"]["target_pixels"], pixels+offsets[1],
+                                   atol=.011, rtol=0)
+        # END the integer support and full-image offsets still agree.
         np.testing.assert_array_equal(result["diagnostics"]["crop_offsets_xy"], offsets)
         np.testing.assert_array_equal(proposal.call_args.args[5], demo["query_pixels"]-offsets[0])
         self.assertEqual(proposal.call_args.args[0].size, (16, 16))
@@ -380,8 +382,8 @@ class FunctionalQueryGroundingTest(unittest.TestCase):
 
     def test_candidate_boxes_intersect_owner_and_depth(self):
         demo, current, target = self.observations()
-        # Better-looking copies outside the owner or at invalid depth would win
-        # row-major matching if either required observation constraint vanished.
+        # Equal-score copies outside the owner or at invalid depth would alter
+        # the decoded point if either required observation constraint vanished.
         rgb = np.array(current["image"], copy=True)
         for label, (x, y) in enumerate(target, 1):
             rgb[y-1, x, 0] = label
@@ -390,7 +392,9 @@ class FunctionalQueryGroundingTest(unittest.TestCase):
             current["depth"][y, x-1] = 0
         current["image"] = Image.fromarray(rgb)
         result = self.run_match(demo, current, target)
-        np.testing.assert_array_equal(result["diagnostics"]["target_pixels"], target)
+        # BEGIN retain native FP32 subpixel output while checking valid support.
+        np.testing.assert_allclose(result["diagnostics"]["target_pixels"], target, atol=1e-6, rtol=0)
+        # END nearby invalid-depth and non-owner identities remain excluded.
         empty_scope = np.tile([0, 0, 2, 2], (4, 1))
         current["depth"][:2, :2] = np.nan
         extractor = Mock()

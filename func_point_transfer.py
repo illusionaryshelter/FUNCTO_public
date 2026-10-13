@@ -1,22 +1,19 @@
 
 import os
-import torch
 from PIL import Image
-import torch.nn as nn
 import numpy as np
 import cv2
 import json
-# BEGIN local pair extraction replaces the remote feature serialization client.
+# BEGIN both transfer entry points use the common MARCO correspondence contract.
 from pathlib import Path
-from local_models.sd_dino import extract_pair
-# END local pair extraction imports.
+from manipulation.grounding import match_points
+# END common correspondence import.
 
-from utils_IL.perception_utils import map_coordinates_to_original, map_coordinates_to_resized, resize_
 from utils_IL.perception_utils import convert_to_serializable
 from utils_IL.vp_utils import propose_candidate_keypoints, annotate_visual_prompts, annotate_candidate_keypoints, load_prompts, generate_vertices_and_update, keypoint_transfer
 
-# BEGIN local default: standalone callers also use the approved SD-DINO path.
-def func_point_transfer(data_path, test_data_path, test_tool_label='mug', test_target_label='bowl', task_label='pour', num_candidate_keypoints=8, sd_dino_flag=True):
+# BEGIN default MARCO refinement; semantic-only mode remains explicit.
+def func_point_transfer(data_path, test_data_path, test_tool_label='mug', test_target_label='bowl', task_label='pour', num_candidate_keypoints=8, feature_matching=True):
     # END local default.
     """
     Function point transfer
@@ -149,69 +146,26 @@ def func_point_transfer(data_path, test_data_path, test_tool_label='mug', test_t
     print("coarse-grained region proposal done.")
 
     x_offset, y_offset, _, _ = test_tool_box
-    if sd_dino_flag:
-        ############## Fine-grained point transfer ##############
-        # load demo and test images
-        img_size = 480
-        img1, sf1, pd1 = resize_(demo_init_frame_pil_crop.convert('RGB'), target_res=img_size, resize=True, to_pil=True)
-        img2, sf2, pd2 = resize_(test_init_frame_pil_crop.convert('RGB'), target_res=img_size, resize=True, to_pil=True)
-
-        # load test tool mask
-        mask2_raw = test_init_frame_mask_pil_crop
-        mask2, sf_m1, pd_m1 = resize_(mask2_raw, target_res=img_size, resize=True, to_pil=False)
-
-        demo_source_x, demo_source_y = map_coordinates_to_resized(demo_func_point_2d_init_crop[0], demo_func_point_2d_init_crop[1], sf1, pd1)
-        demo_source_x, demo_source_y = np.int64(demo_source_x), np.int64(demo_source_y)
-        test_source_x, test_source_y = map_coordinates_to_resized(vp_func_point[0], vp_func_point[1], sf2, pd2)
-        test_source_x, test_source_y = np.int64(test_source_x), np.int64(test_source_y)
-
-        # create vp region mask
-        x = np.arange(0, img_size, 1)
-        y = np.arange(0, img_size, 1)
-        x, y = np.meshgrid(x, y)
-        scale = 0.15
-        rect_width = (img_size -  pd2[0]*2) * scale # Width of the rectangle
-        rect_height = (img_size -  pd2[1]*2) * scale  # Height of the rectangle
-        rect_center_x = test_source_x  # X-coordinate of rectangle center
-        rect_center_y = test_source_y  # Y-coordinate of rectangle center
-        # Calculate region boundaries
-        x_min = rect_center_x - rect_width / 2
-        x_max = rect_center_x + rect_width / 2
-        y_min = rect_center_y - rect_height / 2
-        y_max = rect_center_y + rect_height / 2
-        # Create the region mask
-        vp_mask_normalized = np.where((x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max), 1, 0)
-
-        # BEGIN local SD+DINO: the pair shares its PCA basis. The worker exits
-        # before returning CPU descriptors; the existing dense matching follows.
-        feat1, feat2 = extract_pair(img1, img2)
-        # END local pair extraction.
-        feat1_cuda = torch.tensor(feat1).to('cuda')
-        feat2_cuda = torch.tensor(feat2).to('cuda')
-        ft = torch.cat([feat1_cuda, feat2_cuda], dim=0)
-
-        # compute cosine similarity map
-        num_channel = ft.size(1)
-        cos = nn.CosineSimilarity(dim=1)
-        src_ft = ft[0].unsqueeze(0)  # []
-        src_ft = nn.Upsample(size=(img_size, img_size), mode='bilinear')(src_ft)
-        src_vec = src_ft[0, :, demo_source_y, demo_source_x].view(1, num_channel, 1, 1)  # 1, C, 1, 1
-        trg_ft = nn.Upsample(size=(img_size, img_size), mode='bilinear')(ft[1:]) # 1, C, H, W
-        cos_map = cos(src_vec, trg_ft).cpu().numpy()    # 1, H, W
-        # search correspondence within the test tool region mask
-        cos_map = np.multiply(mask2, cos_map)
-        cos_map = np.multiply(vp_mask_normalized, cos_map)  # no vp
-
-        print("fine-grained point transfer done.")
-
-        # compute test function point
-        max_yx = np.unravel_index(cos_map[0].argmax(), cos_map[0].shape)
-                    
-        # test function point visualization
-        original_x, original_y = map_coordinates_to_original(int(max_yx[1]), int(max_yx[0]), sf2, pd2)
-        test_init_frame_x, test_init_frame_y = int(original_x + x_offset), int(original_y + y_offset) # VP + SD+DINO
+    # BEGIN native MARCO refinement in original crop pixels, without a second resize.
+    if feature_matching:
+        source_mask = np.asarray(demo_init_frame_mask_crop, dtype=bool)
+        target_mask = np.asarray(test_init_frame_mask_crop, dtype=bool)
+        yy, xx = np.indices(target_mask.shape)
+        # Retain the semantic proposal's 15% crop-size window; MARCO searches
+        # only the intersection with the observed object mask.
+        cx, cy = vp_func_point
+        candidates = target_mask & (np.abs(xx-cx) <= .075*test_init_frame_pil_crop.width)
+        candidates &= np.abs(yy-cy) <= .075*test_init_frame_pil_crop.height
+        points, diagnostic = match_points(
+            demo_init_frame_pil_crop, test_init_frame_pil_crop,
+            source_mask, candidates, [demo_func_point_2d_init_crop])
+        with open(os.path.join(output_path, 'feature_matching.json'), 'w') as stream:
+            json.dump(diagnostic, stream, indent=2)
+        original_x, original_y = points[0]
     else:
-        test_init_frame_x, test_init_frame_y = int(vp_func_point[0] + x_offset), int(vp_func_point[1] + y_offset)  # no SD+DINO, VP only
+        original_x, original_y = vp_func_point
+    test_init_frame_x, test_init_frame_y = int(round(original_x + x_offset)), int(round(original_y + y_offset))
+    # END model failure propagates; semantic-only mode is not an error fallback.
 
     cv2.circle(test_init_frame, (test_init_frame_x, test_init_frame_y), 3, (0, 0, 255), -1)
     cv2.imwrite(os.path.join(output_path, 'test_init_frame_func_point_vis.jpg'), test_init_frame)
