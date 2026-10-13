@@ -1,0 +1,60 @@
+{
+  "width": 640,
+  "height": 480,
+  "K": [
+    [
+      579.4112465556846,
+      0.0,
+      319.5
+    ],
+    [
+      0.0,
+      579.4112465556846,
+      239.49999999999994
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "T_world_camera_cv": [
+    [
+      0.4569423767094049,
+      -0.7704332678890256,
+      0.44456298102405856,
+      -0.6900088374800999
+    ],
+    [
+      -0.8894962981188625,
+      -0.3957786100624802,
+      0.22837606584283524,
+      -0.35446384522953694
+    ],
+    [
+      -1.3877787807814457e-16,
+      -0.4997918282113549,
+      -0.8661455584676006,
+      1.9933810049059462
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "near_m": 0.01183098675640314,
+  "far_m": 591.5493097230725,
+  "rendering_device": {
+    "renderer": "D3D12 (NVIDIA GeForce RTX 5070 Ti Laptop GPU)",
+    "vendor": "Microsoft Corporation",
+    "depth_buffer_format": "GL_DEPTH24_STENCIL8",
+    "depth_buffer_bits": 24,
+    "allocated_offscreen_samples": 4,
+    "effective_samples": 0
+  },
+  "depth_buffer_format": "GL_DEPTH24_STENCIL8",
+  "depth_precision": "Metric depth is float32. D24/S8 stores 24-bit normalized depth: for optical depth z, one storage step is approximately z*z*(far-near)/(near*far*(2**24-1)) metres; projection and float32 conversion also contribute rounding.",
+  "convention": "T_world_camera_cv maps camera to world; CV camera axes x-right, y-down, z-forward; integer (u,v) identifies pixel centers; RGB is top-left uint8 RGB; depth_m is optical z in metres; seg_geom_id is MjModel geom ID, -1 for non-geom/background."
+}
