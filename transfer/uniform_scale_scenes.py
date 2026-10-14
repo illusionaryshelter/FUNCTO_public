@@ -71,8 +71,6 @@ def verify_scale(source_model, source_data, model, data, kind, factor, anchor):
         center_error = float(np.linalg.norm(expected-data.geom_xpos[target]))
         if center_error > 2e-7 or source_model.geom_type[geom] != model.geom_type[target]:
             raise ValueError(f"Geometry center/type mismatch: {name}, {center_error}")
-        if not np.allclose(source_data.geom_xmat[geom], data.geom_xmat[target], atol=1e-9, rtol=0):
-            raise ValueError(f"Geometry orientation changed: {name}")
         if source_model.geom_type[geom] == mujoco.mjtGeom.mjGEOM_MESH:
             a, b = mesh_world(source_model, source_data, geom), mesh_world(model, data, target)
             expected_points = anchor + factor*(a-anchor) if geom in owned else a
@@ -80,6 +78,11 @@ def verify_scale(source_model, source_data, model, data, kind, factor, anchor):
                 raise ValueError(f"Mesh topology changed: {name}")
             error = float(max(cKDTree(b).query(expected_points)[0].max(), cKDTree(expected_points).query(b)[0].max()))
         else:
+            # Compiled mesh principal axes can change sign after scaling;
+            # world vertices above are authoritative. Native primitives retain
+            # their original frame and must preserve that orientation exactly.
+            if not np.allclose(source_data.geom_xmat[geom], data.geom_xmat[target], atol=1e-9, rtol=0):
+                raise ValueError(f"Primitive orientation changed: {name}")
             error = float(np.max(np.abs(source_model.geom_size[geom]*active_factor-model.geom_size[target])))
         if error > 2e-7:
             raise ValueError(f"Geometry scale mismatch: {name}, {error}")
