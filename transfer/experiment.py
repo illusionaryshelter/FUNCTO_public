@@ -19,6 +19,13 @@ from .features import (extract_pair, native_region_pairs, reciprocal_anchors,
 from .core import fps_indices
 
 
+# BEGIN one physical sampling budget for every method, asset, and demonstration.
+# These values bound observed candidate generation. They are not a placed
+# object's footprint, contact tolerance, collision margin, or learned uncertainty.
+SAMPLING = {"sampling_radius_m": 0.03, "sampling_spacing_m": 0.005, "max_modes": 3}
+# END common experiment sampling budget.
+
+
 def read_archive(path):
     """Load a typed local record, rejecting object arrays and hidden pickle."""
     with np.load(path, allow_pickle=False) as archive:
@@ -108,22 +115,31 @@ def store_pairs(path, pairs):
 
 
 def store_prediction(directory, result, metrics):
-    """Keep diagnostic candidate arrays separate from the acceptance decision."""
+    """Store typed observed modes and their explicit evidence acceptance state."""
+    # BEGIN neighborhood result schema; obsolete copied-patch fields are removed.
     arrays = {key: np.asarray(result[key]) for key in (
-                  "candidate_mask", "candidate_center", "candidate_surface", "src_anchor_idx",
-                  "tgt_anchor_idx", "sim3_scale", "sim3_rotation", "sim3_translation")
+                  "src_anchor_idx", "tgt_anchor_idx", "sim3_scale",
+                  "sim3_rotation", "sim3_translation")
               if result.get(key) is not None}
     arrays["accepted"] = np.asarray(bool(result["accepted"]))
+    arrays["mode_count"] = np.asarray(len(result["modes"]), dtype=np.int64)
+    modes = []
+    for index, mode in enumerate(result["modes"]):
+        for key in ("seed_index", "center", "normal", "mask", "sample_indices"):
+            arrays[f"mode_{index}_{key}"] = np.asarray(mode[key])
+        modes.append({key: value for key, value in mode.items()
+                      if key not in {"mask", "sample_indices"}})
     np.savez_compressed(directory.with_suffix(".npz"), **arrays)
     write_json(directory.with_suffix(".json"), {
         "accepted": bool(result["accepted"]), "reasons": result["reasons"],
-        "diagnostics": result["diagnostics"], "metrics": metrics})
+        "diagnostics": result["diagnostics"], "modes": modes, "metrics": metrics})
+    # END neighborhood result schema.
 
 
 def evaluate_suite(data_root, features_root, output_root, selected=None):
     """Run the five frozen methods on each actual rendered observation pair."""
     from .core import TransferConfig, prepare_anchors, infer_region
-    from .evaluation import (comparison_image, evaluate_prediction,
+    from .evaluation import (comparison_image, evaluate_prediction, evidence_reference_center,
                              native_correspondence_metrics, oracle_correspondences)
 
     data_root, features_root = Path(data_root).resolve(), Path(features_root).resolve()
@@ -160,6 +176,13 @@ def evaluate_suite(data_root, features_root, output_root, selected=None):
         gc.collect()
 
         results = {}
+        # BEGIN signed observed-face evidence and fixed physical sampling size.
+        observation_geometry = {
+            "source_camera_origin": source["T_world_camera_cv"][:3, 3],
+            "target_camera_origin": target["T_world_camera_cv"][:3, 3],
+            "target_pixels": target["pixels"],
+            **SAMPLING,
+        }
         # The numerical core returns geometric rejection as ordinary data.
         # Contract/programming errors must stop this run, not be mislabeled as
         # a failed transfer and silently included in its performance figures.
@@ -167,11 +190,12 @@ def evaluate_suite(data_root, features_root, output_root, selected=None):
                                    anchors["src_anchor_idx"], anchors["tgt_anchor_idx"],
                                    mode="automatic", config=config)
         for name in ("global_sim3", "relation_only", "relational"):
-            results[name] = infer_region(source_region, prepared, method=name)
+            results[name] = infer_region(source_region, prepared, method=name, **observation_geometry)
         local = prepare_anchors(source["xyz"], target["xyz"],
                                 direct["src_anchor_idx"], direct["tgt_anchor_idx"],
                                 mode="direct", config=config)
-        results["direct_local"] = infer_region(source_region, local, method="direct_local")
+        results["direct_local"] = infer_region(source_region, local, method="direct_local", **observation_geometry)
+        # END automatic observed-neighborhood inference; target truth is still absent.
 
         # The target labels become accessible here, after automatic inference.
         target_truth = read_archive(target_directory / "evaluation.npz")
@@ -181,16 +205,19 @@ def evaluate_suite(data_root, features_root, output_root, selected=None):
                             tgt_anchor_idx=oracle_target)
         oracle = prepare_anchors(source["xyz"], target["xyz"], oracle_source, oracle_target,
                                  mode="oracle", config=config)
-        results["oracle_relational"] = infer_region(source_region, oracle, method="oracle_relational")
-        metrics = {name: evaluate_prediction(result, target["xyz"], target_truth)
+        # BEGIN held-out localization reference with the same evidence-center definition.
+        results["oracle_relational"] = infer_region(source_region, oracle, method="oracle_relational", **observation_geometry)
+        reference = evidence_reference_center(source["xyz"], source_region, source_truth, target_truth)
+        metrics = {name: evaluate_prediction(result, target["xyz"], target_truth, reference)
                    for name, result in results.items()}
         for name, result in results.items():
             store_prediction(directory / name, result, metrics[name])
             rows.append({"pair": pair["id"], "group": pair.get("group", ""),
                          "variation": pair.get("variation", ""), "method": name,
-                         **metrics[name], "reasons": "; ".join(result["reasons"])})
+                         **{key: value for key, value in metrics[name].items() if key != "mode_metrics"},
+                         "reasons": "; ".join(result["reasons"])})
         comparison_image(source_directory / "rgb.png", target_directory / "rgb.png",
-                         source, target, source_region, target_truth["region_mask"],
+                         source, target, source_region, target_truth, reference,
                          results, metrics, directory / "comparison.png")
         report = {"pair": pair, "automatic_anchor_pairs": int(len(anchors["src_anchor_idx"])),
                   "direct_raw_matches": native_correspondence_metrics(direct, source_truth, target_truth),
@@ -198,12 +225,17 @@ def evaluate_suite(data_root, features_root, output_root, selected=None):
                   "source_visible_patch_points": int(source_region.sum()),
                   "source_observed_centroid_to_declared_center_m": float(np.linalg.norm(
                       source["xyz"][source_region].mean(0) - source_truth["region_center"])),
+                  "reference_evidence_center": reference,
+                  "reference_definition": "source observed evidence arithmetic mean transported by independent scene geometry",
+                  "reference_to_declared_region_center_m": float(np.linalg.norm(reference - target_truth["region_center"])),
+                  "sampling_budget": SAMPLING,
                   "target_patch_used_by_automatic_inference": False,
                   "provided_entity_segmentation": True,
                   "source_region_visible_area_fraction": float(source_truth["region_visible_area_fraction"]),
                   "target_region_visible_area_fraction": float(target_truth["region_visible_area_fraction"]),
                   "source_region_center_visible": bool(source_truth["region_center_visible"]),
                   "target_region_center_visible": bool(target_truth["region_center_visible"])}
+        # END held-out evaluation; no metric modifies a prediction or its ranking.
         write_json(directory / "report.json", report)
         reports.append(report)
         print(json.dumps({"pair": pair["id"], "methods": metrics}, allow_nan=False), flush=True)

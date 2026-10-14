@@ -1,28 +1,37 @@
-# Independent local-region transfer
+# Independent observed-surface neighborhood transfer
 
-This package studies how a known visible local surface region transfers between
-RGB-D observations. It does not register or call the production perception,
+This package transfers the location preference represented by demonstrated
+interaction pixels between RGB-D observations, then samples nearby observed
+surfaces with an explicit metric budget. It does not register or call the production perception,
 skill-compilation, planning, or robot-execution interfaces. It reuses the existing
 MARCO model and native coordinate operations as standalone feature utilities.
 
-The numerical core accepts source/target visible points, a source region mask,
-and explicit correspondence indices. It does not accept target region labels,
+The numerical core accepts source/target visible points, source evidence pixels,
+target pixel coordinates, camera origins, and explicit correspondence indices.
+It does not accept target region labels,
 container names, joint models, or hidden geometry.
 
 | File | Responsibility |
 |---|---|
-| `core.py` | Validated Sim(3) registration, normalized anchor-distance scores, full-domain ambiguity checks, and visible planar region recovery |
+| `core.py` | Validated Sim(3) registration, location-preference scores, signed surface orientation, and fixed metric observed-neighborhood sampling |
 | `features.py` | Offline MARCO extraction, reciprocal raw-dot anchor matching, and native Gaussian-decoded source-region matches |
 | `scenes.py` | Independent MuJoCo fixtures derived from the permanent `scene/original` layout; observation and evaluation records are separate |
-| `evaluation.py` | Held-out metrics, approximate oracle correspondences, and image overlays |
+| `neighborhood_scenes.py` | Repeated internal shelf levels and real `put_mug_on_shelf` evidence, with independent evaluation annotations |
+| `evaluation.py` | Held-out surface identity, localization and sampling metrics, approximate oracle correspondences, and image overlays |
 | `experiment.py` | Manifest-driven extraction and five-method comparison |
 | `test_core.py` | Mathematical, coordinate-convention, data-contract, and target-label isolation regressions |
 
-The supported source region is a visible, approximately planar, convex patch.
+The supported source evidence is visible and approximately planar; its mask may
+contain holes. Its outline is never copied to the target. Sampling radius and
+minimum sample spacing are physical lengths and are never multiplied by the
+container's estimated scale. Camera-facing normals and observed pixel adjacency
+keep nearby parallel surfaces separate; missing pixels are not filled.
+
 The distance signature is invariant under a shared positive uniform scale,
 rotation, and translation. Nonuniform shape changes are empirical tests, not a
-theoretical guarantee. An accepted output is a region candidate, not a statement
-about collision-free placement, physical support, or robot reachability.
+theoretical guarantee. Output neighborhoods are proposals on visible surfaces.
+Placed-object fit, collision checks, stability, and reachability have separate
+input requirements and are outside this module.
 
 ## Numerical interface
 
@@ -31,15 +40,34 @@ from transfer.core import prepare_anchors, infer_region
 
 # Arrays use metres. Indices must be integral, in range, and one-to-one.
 prepared = prepare_anchors(src_xyz, tgt_xyz, src_idx, tgt_idx, mode="automatic")
-global_result = infer_region(src_region_mask, prepared, method="global_sim3")
-relation_result = infer_region(src_region_mask, prepared, method="relational")
+observation = dict(
+    target_pixels=tgt_pixels,  # integer [N,2], original observed (x,y) coordinates
+    source_camera_origin=src_camera_xyz,
+    target_camera_origin=tgt_camera_xyz,
+    sampling_radius_m=0.03,
+    sampling_spacing_m=0.005,
+    max_modes=3,
+)
+global_result = infer_region(src_region_mask, prepared, method="global_sim3", **observation)
+relation_result = infer_region(src_region_mask, prepared, method="relational", **observation)
 ```
 
-`accepted` and `reasons` are separate from `candidate_center` and
-`candidate_mask`. Rejected candidates are retained only for inspection. Invalid
+`accepted` and `reasons` are separate from `modes`. Each mode contains an observed
+seed, an oriented normal, a point-aligned neighborhood mask, and sampled point
+indices. Scores are ranking evidence, not calibrated probabilities. Uncertain
+surface alternatives remain visible even when the result is rejected. Invalid
 array contracts raise an error; insufficient observed geometry produces an
 explicit rejection. Oracle and source-region-only direct matching use separate
 preparation modes so they cannot silently reuse whole-object automatic anchors.
+Acceptance describes localization evidence, not verified object placement.
+Secondary modes can include non-support edges; inspect their explicit geometry
+and evidence instead of treating every returned mode as a valid support patch.
+
+The five methods are experimental alternatives. The current controlled results
+favor the simpler `direct_local` route (native source-region queries, local
+geometric fitting, and the shared sampler); they show no unique layer-selection
+benefit from the whole-object relation score. This does not establish general
+robustness to occlusion, incorrect segmentation, or unseen assets.
 
 ## Commands
 
@@ -48,9 +76,15 @@ is required. `--out` directories for observations and evaluation must be fresh.
 
 ```bash
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 MUJOCO_GL=egl \
-  /home/shelter/miniforge3/envs/recovery/bin/python -m transfer.scenes --out /tmp/region-data
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  /home/shelter/miniforge3/envs/recovery/bin/python -m transfer.neighborhood_scenes --out /tmp/region-data
 
 PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  /home/shelter/miniforge3/envs/recovery/bin/python \
+  ../sim-version-plans/2026-10-05-witness-feasible-revision/run_recorded_bounded.py \
+  --record-prefix /tmp/region-marco --max-process-rss-mib 8192 --max-device-used-mib 6144 -- \
   /home/shelter/miniforge3/envs/recovery/bin/python -m transfer extract \
   --data /tmp/region-data --out /tmp/region-features
 
@@ -62,13 +96,27 @@ PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 OPENBLAS_NUM_THRE
   /home/shelter/miniforge3/envs/recovery/bin/python -m unittest transfer.test_core -v
 ```
 
+The scene-generation command above builds the 15-pair experiment from existing
+frozen original fixtures and the saved task demonstration; these assets must
+already be present. See the
+[neighborhood protocol](../../sim-version-plans/2026-10-13-local-region-transfer/neighborhood-plan.md)
+and [recorded commands](../../sim-version-plans/2026-10-13-local-region-transfer/neighborhood-commands.md).
+Evaluation expects the new unified physical-surface
+annotations; old frozen result files remain historical evidence.
+
 The model worker uses cached offline weights and caps the Torch allocator at
 6 GiB. Actual model experiments must additionally supervise the full process
-tree and total device use; the [recorded experiment commands](../../sim-version-plans/2026-10-13-local-region-transfer/commands.md) provide that
+tree and total device use; the [recorded experiment commands](../../sim-version-plans/2026-10-13-local-region-transfer/neighborhood-commands.md) provide that
 supervision, including memory outside Torch. Do not run multiple model stages
 concurrently.
 
 ## Experiment evidence
+
+The current [15-pair report](../../sim-version-plans/2026-10-13-local-region-transfer/neighborhood-results.md)
+includes repeated internal shelf levels, recorded `put_mug_on_shelf` evidence,
+the original six cases, fixed parameters, independent reviews and failure
+analysis. The [interactive viewer](../../sim-version-plans/2026-10-13-local-region-transfer/results-neighborhood-001/viewer.html)
+shows frozen images, proposals, acceptance states and held-out measurements.
 
 The supplied [initial proposal](transfer_plan.md) is the research starting point.
 Its claims and prototype rules have been audited and corrected in the
@@ -79,8 +127,9 @@ The experiment uses supplied whole-entity segmentation, real rendered RGB-D and
 pretrained MARCO features. Target local labels are evaluation-only. Scene names
 occur in fixtures and reporting, never in transfer inference.
 
-The [completed experiment report](../../sim-version-plans/2026-10-13-local-region-transfer/results.md)
-contains all six comparisons, candidate acceptance decisions, oracle diagnostics,
-resource measurements, and limitations. The three pose variants were accepted;
-the three nonuniform shape variants were rejected by automatic whole-entity
-methods. This experiment does not establish transfer across different designs.
+The [first experiment report](../../sim-version-plans/2026-10-13-local-region-transfer/results.md)
+preserves the six original comparisons and their limitations. Its source-outline
+reconstruction contract has been removed following the revised task definition:
+demonstration evidence, a placed object's footprint, and admissible placement
+centers are distinct quantities. The current experiment uses one shared physical
+sampling budget across all fixtures and real demonstration inputs.
