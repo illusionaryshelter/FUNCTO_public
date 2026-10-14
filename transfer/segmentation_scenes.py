@@ -210,18 +210,29 @@ def capture_view(output: Path, model, data, kind: str, variant: str, view: str,
     """Render the entire original-derived scene from a fixed external camera."""
     from collect.camera import FixedCamera
 
-    config = (neighborhood.low_camera_config() if view == "low"
-              else json.loads((scenes.ORIGINAL / "view_a/camera.json").read_text()))
+    # BEGIN explicit camera selection: view_b must use its own saved pose;
+    # unknown view names must never silently render view_a under a new label.
+    if view == "low":
+        config = neighborhood.low_camera_config()
+        calibration_view = "view_a"  # The low fixture shares these intrinsics.
+    elif view in scenes.VIEWS:
+        config = json.loads((scenes.ORIGINAL / view / "camera.json").read_text())
+        calibration_view = view
+    else:
+        raise ValueError(f"Unknown fixture camera view: {view}")
+    # END explicit saved-camera selection.
     camera = FixedCamera(model, data, 640, 480, camera_name=None, camera_config=config)
     try:
         frame, calibration, renderer = camera.capture(data), camera.calibration, camera.renderer_info
     finally:
         camera.close()
-    original = json.loads((scenes.ORIGINAL / "view_a/calibration.json").read_text())
+    # BEGIN check the selected camera's calibration, including its own pose.
+    original = json.loads((scenes.ORIGINAL / calibration_view / "calibration.json").read_text())
     if not np.allclose(calibration["K"], original["K"], atol=1e-9, rtol=0):
         raise ValueError("Camera intrinsics changed")
-    if view == "view_a" and not np.allclose(calibration["T_world_camera_cv"], original["T_world_camera_cv"], atol=1e-9, rtol=0):
+    if view in scenes.VIEWS and not np.allclose(calibration["T_world_camera_cv"], original["T_world_camera_cv"], atol=1e-9, rtol=0):
         raise ValueError("Original camera pose changed")
+    # END selected-camera calibration check.
     # BEGIN use the declared scale, independent of fixture naming.
     transform = affine_transform(model, data, kind, np.asarray(scale))
     # END explicit scale for evaluator geometry.
