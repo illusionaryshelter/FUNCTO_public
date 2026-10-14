@@ -181,8 +181,12 @@ def scale_actor(tree: ET.Element, actor: ET.Element, scale: np.ndarray) -> None:
                 mesh = meshes[mesh_name]
                 mesh.set("scale", numbers(np.fromstring(mesh.get("scale", "1 1 1"), sep=" ") * scale))
                 scaled_meshes.add(mesh_name)
+        # BEGIN isotropic scaling preserves native primitives exactly.
+        elif np.all(scale == scale[0]):
+            element.set("size", numbers(np.fromstring(element.get("size", ""), sep=" ") * scale[0]))
         else:
             primitive_affine_mesh(element, assets, scale)
+        # END exact uniform primitive scaling; anisotropic path is unchanged.
 
 
 def build_xml(kind: str, variant: str) -> tuple[ET.Element, dict]:

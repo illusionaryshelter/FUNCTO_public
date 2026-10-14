@@ -111,14 +111,15 @@ def tint_actor(tree: ET.Element, actor: ET.Element) -> list[dict]:
 
 
 def prepare_case(output: Path, kind: str, variant: str, original_model, original_data,
-                 opening: float):
+                 opening: float, params: dict):
     """Build one exclusive container and restore original robot state by name."""
     import mujoco
 
     tree, audit = scenes.build_xml(kind, "source")
     actor = tree.find(f"worldbody/body[@name='{scenes.FIXTURES[kind]['root']}']")
-    params = VARIANTS[variant]
+    # BEGIN explicit fixture parameters allow independently declared interventions.
     scale = np.asarray(params["scale"])
+    # END explicit fixture parameters.
     scenes.scale_actor(tree, actor, scale)
     actor.set("pos", scenes.numbers(np.fromstring(actor.get("pos"), sep=" ")+params["translation"]))
     quat = Rotation.from_euler("z", scenes.FIXTURES[kind]["base_yaw_deg"]+params["yaw_deg"], degrees=True).as_quat()
@@ -205,7 +206,7 @@ def save_view(output: Path, view_id: str, kind: str, frame: dict, calibration: d
 
 
 def capture_view(output: Path, model, data, kind: str, variant: str, view: str,
-                 canonical: np.ndarray, names: tuple[str, ...]) -> tuple[str, dict]:
+                 canonical: np.ndarray, names: tuple[str, ...], scale: np.ndarray) -> tuple[str, dict]:
     """Render the entire original-derived scene from a fixed external camera."""
     from collect.camera import FixedCamera
 
@@ -221,7 +222,9 @@ def capture_view(output: Path, model, data, kind: str, variant: str, view: str,
         raise ValueError("Camera intrinsics changed")
     if view == "view_a" and not np.allclose(calibration["T_world_camera_cv"], original["T_world_camera_cv"], atol=1e-9, rtol=0):
         raise ValueError("Original camera pose changed")
-    transform = affine_transform(model, data, kind, np.asarray(VARIANTS[variant]["scale"]))
+    # BEGIN use the declared scale, independent of fixture naming.
+    transform = affine_transform(model, data, kind, np.asarray(scale))
+    # END explicit scale for evaluator geometry.
     corners = neighborhood.world_supports(canonical, transform)
     truth = truth_images(model, frame, calibration, kind, transform, corners, names)
     view_id = f"{kind}_{variant}_{view}"
@@ -438,7 +441,7 @@ def add_query(output: Path, views: dict, pairs: list, query: str, source: str,
                       "group": group, "variation": variation})
 
 
-def validate(output: Path) -> dict:
+def validate(output: Path, expected_counts: tuple[int, int]) -> dict:
     """Validate saved full images, truth isolation, colors and source provenance."""
     manifest = json.loads((output / "manifest.json").read_text())
     views = manifest["views"]
@@ -548,9 +551,10 @@ def validate(output: Path) -> dict:
             raise ValueError("Saved target visibility diagnostics disagree with RGB-D")
         pair_rows.append({"pair": pair["id"], "target_support_visible_points": int(support.sum()),
                           "reference_center_visible": visible, "source_evidence_projection_visible_fraction": fraction})
-    expected = (2, 1) if manifest["smoke"] else (22, 34)
-    if (len(views), len(manifest["pairs"])) != expected:
+    # BEGIN each experiment declares its frozen matrix before inference.
+    if (len(views), len(manifest["pairs"])) != expected_counts:
         raise ValueError("Frozen view/pair matrix is incomplete")
+    # END experiment-specific cardinality.
     result = {"status": "passed", "views": len(views), "pairs": len(manifest["pairs"]),
               "view_checks": rows, "color_checks": color_rows,
               "recorded_provenance_checks": provenance_rows, "pair_checks": pair_rows,
@@ -590,13 +594,13 @@ def generate(output: Path, smoke: bool = False) -> dict:
     recorded_evidence = {}
     for kind in kinds:
         for variant in variants:
-            model, data = prepare_case(output, kind, variant, original_model, original_data, opening)
+            model, data = prepare_case(output, kind, variant, original_model, original_data, opening, VARIANTS[variant])
             if variant == "source":
                 canonical[kind], support_names[kind] = canonical_supports(model, data, kind)
             camera_views = ("view_a", "low") if kind == "shelf" else ("view_a",)
             for camera_view in camera_views:
                 view_id, record = capture_view(output, model, data, kind, variant, camera_view,
-                                               canonical[kind], support_names[kind])
+                                               canonical[kind], support_names[kind], np.asarray(VARIANTS[variant]["scale"]))
                 views[view_id] = record
             if variant == "source" and kind in ("shelf", "drawer"):
                 query = "demo_mug" if kind == "shelf" else "demo_block"
@@ -635,7 +639,7 @@ def complete_dataset(output: Path, views: dict, recorded_evidence: dict,
         "segmentation_contract": "one full RGB and one literal category prompt; no truth-based instance choice or mask repair",
         "historical_sources": "unaltered scripted MuJoCo recordings; only newly rendered targets enforce exclusive containers"})
     overview(output, views)
-    return validate(output)
+    return validate(output, (2, 1) if smoke else (22, 34))
 # END independent category-segmentation fixtures.
 
 
@@ -645,5 +649,7 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
     arguments = parser.parse_args()
-    result = validate(arguments.out.resolve()) if arguments.validate_only else generate(arguments.out.resolve(), arguments.smoke)
+    # BEGIN validation has the same explicit matrix contract as generation.
+    result = validate(arguments.out.resolve(), (2, 1) if arguments.smoke else (22, 34)) if arguments.validate_only else generate(arguments.out.resolve(), arguments.smoke)
+    # END explicit validation matrix.
     print(json.dumps({key: result[key] for key in ("status", "views", "pairs")}), flush=True)
