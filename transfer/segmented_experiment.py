@@ -163,7 +163,7 @@ def extract_suite(data_root, run_root, arms=ARMS, selected=None):
             extract_pair(directory / "source.png", directory / "target.png", directory / "features.npz")
 
 
-def predict_suite(data_root, run_root, arms=ARMS, selected=None):
+def predict_suite(data_root, run_root, arms=ARMS, selected=None, *, registration_algorithm="ransac"):
     """Freeze every direct prediction without reading target truth or metrics."""
     from .core import prepare_anchors, infer_region, apply_sim3
     from .features import native_region_pairs
@@ -194,7 +194,11 @@ def predict_suite(data_root, run_root, arms=ARMS, selected=None):
             del features
             gc.collect()
             local = prepare_anchors(source["xyz"], target["xyz"], pairs_found["src_anchor_idx"],
-                                    pairs_found["tgt_anchor_idx"], mode="direct")
+                                    pairs_found["tgt_anchor_idx"], mode="direct",
+                                    # BEGIN backend choice shares the same scored pairs.
+                                    registration_algorithm=registration_algorithm,
+                                    correspondence_scores=pairs_found["scores"])
+                                    # END no target truth enters registration.
             # Save all consensus memberships, not only the capped final anchors.
             # This is recomputed from the returned fit and uses no scene labels.
             if local.scale is not None:
@@ -386,13 +390,20 @@ def main():
         sub.add_argument("--pair", action="append")
         if command == "prepare":
             sub.add_argument("--detections", type=Path, required=True)
+        # BEGIN explicit robust Sim(3) backend at the prediction boundary.
+        if command == "predict":
+            sub.add_argument("--registration", choices=("ransac", "prosac_lo", "teaserpp"), default="ransac")
+        # END backend selection.
     args = parser.parse_args()
     if args.command == "segment":
         segment_suite(args.data, args.detections, args.pair)
     elif args.command == "prepare":
         prepare_suite(args.data, args.detections, args.run, args.arm or ARMS, args.pair)
+    elif args.command == "predict":
+        predict_suite(args.data, args.run, args.arm or ARMS, args.pair,
+                      registration_algorithm=args.registration)
     else:
-        {"extract": extract_suite, "predict": predict_suite, "evaluate": evaluate_suite}[args.command](
+        {"extract": extract_suite, "evaluate": evaluate_suite}[args.command](
             args.data, args.run, args.arm or ARMS, args.pair)
 
 

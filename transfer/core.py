@@ -19,6 +19,11 @@ from scipy.spatial import cKDTree
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
+# BEGIN shared Sim(3) mathematics and explicit registration selection.
+from .sim3 import _points, rank as _rank, rms_size, fit_sim3, apply_sim3
+from .registration import register_sim3
+# END shared registration imports.
+
 
 # BEGIN independent visible-region transfer experiment; no production imports.
 @dataclass(frozen=True)
@@ -110,16 +115,6 @@ class PreparedAnchors:
     config: TransferConfig
 
 
-def _points(value, name):
-    raw = np.asarray(value)
-    if raw.ndim != 2 or raw.shape[1] != 3 or raw.dtype.kind not in "fiu":
-        raise ValueError(f"{name} must be a numeric [N,3] array")
-    result = np.asarray(raw, dtype=np.float64)
-    if not np.isfinite(result).all():
-        raise ValueError(f"{name} contains nonfinite coordinates")
-    return result
-
-
 def _indices(value, size, name):
     raw = np.asarray(value)
     if raw.ndim != 1 or raw.dtype.kind not in "iu":
@@ -136,22 +131,6 @@ def _mask(value, size):
     if raw.dtype != np.bool_ or raw.shape != (size,):
         raise ValueError("src_region_mask must be a boolean array with one entry per source point")
     return raw
-
-
-def rms_size(points):
-    """Rotation-equivariant RMS radius, independent of coordinate origin."""
-    return float(np.sqrt(np.mean(np.sum((points - points.mean(0)) ** 2, axis=1))))
-
-
-def _rank(points, tolerance=1e-6):
-    if len(points) < 2:
-        return 0, 0.0
-    singular = np.linalg.svd(points - points.mean(0), compute_uv=False)
-    if not len(singular) or singular[0] <= np.finfo(float).tiny:
-        return 0, 0.0
-    rank = int(np.count_nonzero(singular > tolerance * singular[0]))
-    condition = float(singular[-1] / singular[0]) if len(singular) == 3 else 0.0
-    return rank, condition
 
 
 def fps_indices(points, count):
@@ -182,45 +161,15 @@ def fps_indices(points, count):
     return np.asarray(chosen, dtype=np.int64)
 
 
-def fit_sim3(src, tgt, rank_relative_tolerance=1e-6):
-    """Umeyama fit for ``target = scale * source @ rotation.T + translation``.
-
-    A rank-two triangle identifies a proper similarity transform.  This is
-    distinct from uniqueness of arbitrary 3-D trilateration, which needs rank
-    three or extra evidence from the visible candidate surface.
-    """
-    src, tgt = _points(src, "src"), _points(tgt, "tgt")
-    if src.shape != tgt.shape or len(src) < 3:
-        raise ValueError("Sim3 requires at least three matching 3-D points")
-    if min(_rank(src, rank_relative_tolerance)[0], _rank(tgt, rank_relative_tolerance)[0]) < 2:
-        raise ValueError("Sim3 anchors are coincident or collinear")
-    source_mean, target_mean = src.mean(0), tgt.mean(0)
-    x, y = src - source_mean, tgt - target_mean
-    covariance = y.T @ x / len(x)
-    u, singular, vt = np.linalg.svd(covariance)
-    correction = np.ones(3)
-    correction[-1] = 1.0 if np.linalg.det(u @ vt) >= 0 else -1.0
-    rotation = (u * correction) @ vt
-    variance = float(np.mean(np.sum(x * x, axis=1)))
-    scale = float(singular @ correction / variance)
-    if not np.isfinite(scale) or scale <= np.finfo(float).tiny:
-        raise ValueError("Sim3 must have a finite positive scale")
-    translation = target_mean - scale * (rotation @ source_mean)
-    if not np.isfinite(translation).all():
-        raise ValueError("Sim3 translation is nonfinite")
-    return scale, rotation, translation
-
-
-def apply_sim3(points, scale, rotation, translation):
-    return scale * (np.asarray(points) @ rotation.T) + translation
-
-
 def prepare_anchors(src_xyz, tgt_xyz, src_anchor_idx, tgt_anchor_idx, *,
-                    mode="automatic", config=None):
+                    mode="automatic", config=None, registration_algorithm="ransac",
+                    correspondence_scores=None):
     """Validate and freeze the registration reused across comparison methods.
 
-    ``automatic`` and ``direct`` run exactly the same RANSAC.  They differ only
-    in the supplied correspondence set: all-object versus source-region-only.
+    ``automatic`` and ``direct`` use the same selected registration algorithm.
+    They differ only in the supplied pairs: all-object versus source-region-only.
+    PROSAC additionally consumes match scores aligned with these pairs. The
+    default RANSAC preserves the previous samples, arithmetic and decisions.
     ``oracle`` fits the supplied known pairs without a matching/consensus gate.
     Invalid array contracts raise ValueError; insufficient geometry is recorded
     as a rejected preparation so batch experiments can keep negative results.
@@ -230,6 +179,12 @@ def prepare_anchors(src_xyz, tgt_xyz, src_anchor_idx, tgt_anchor_idx, *,
         raise ValueError("config must be TransferConfig")
     if mode not in {"automatic", "direct", "oracle"}:
         raise ValueError("Unknown anchor preparation mode")
+    # BEGIN algorithm names are explicit and never silently substituted.
+    if registration_algorithm not in {"ransac", "prosac_lo", "teaserpp"}:
+        raise ValueError("Unknown registration algorithm")
+    if mode == "oracle" and registration_algorithm != "ransac":
+        raise ValueError("Oracle mode does not select a robust registration backend")
+    # END registration selection validation.
     ps, pt = _points(src_xyz, "src_xyz"), _points(tgt_xyz, "tgt_xyz")
     ids = _indices(src_anchor_idx, len(ps), "src_anchor_idx")
     idt = _indices(tgt_anchor_idx, len(pt), "tgt_anchor_idx")
@@ -252,45 +207,36 @@ def prepare_anchors(src_xyz, tgt_xyz, src_anchor_idx, tgt_anchor_idx, *,
     tolerance = config.ransac_tolerance_ratio * target_radius
     stats.update(source_rms_radius=source_radius, target_rms_radius=target_radius,
                  ransac_tolerance_m=tolerance)
+    # BEGIN explicit backend dispatch; shared region gates remain unchanged.
     if mode == "oracle":
+        # Oracle fitting bypasses robust estimation exactly as before. Its
+        # correspondences are supplied only by the explicit diagnostic caller.
         keep = np.ones(len(ids), dtype=bool)
-    else:
-        rng = np.random.default_rng(config.seed)
-        keep = None
-        quality = (-1, -np.inf)
-        for _ in range(config.ransac_iterations):
-            sample = rng.choice(len(ids), 3, replace=False)
-            try:
-                scale, rotation, translation = fit_sim3(a[sample], b[sample],
-                                                        config.rank_relative_tolerance)
-            except (ValueError, np.linalg.LinAlgError):
-                continue
-            ratio = scale / (target_radius / source_radius)
-            if not 0.2 <= ratio <= 5.0:
-                continue
-            residual = np.linalg.norm(apply_sim3(a, scale, rotation, translation) - b, axis=1)
-            inlier = residual <= tolerance
-            count = int(inlier.sum())
-            candidate_quality = (count, -float(np.median(residual[inlier])) if count else -np.inf)
-            if candidate_quality > quality:
-                quality, keep = candidate_quality, inlier
-        if keep is None or keep.sum() < required:
-            return failed("weak_correspondence_consensus")
-    # Refit, then recompute residuals against the returned transform.  The old
-    # prototype accidentally reported residuals from the penultimate fit.
-    try:
-        for _ in range(3):
+        try:
             scale, rotation, translation = fit_sim3(a[keep], b[keep], config.rank_relative_tolerance)
             residual = np.linalg.norm(apply_sim3(a, scale, rotation, translation) - b, axis=1)
-            proposed = residual <= tolerance
-            if mode == "oracle" or np.array_equal(proposed, keep) or proposed.sum() < required:
-                break
-            keep = proposed
-        scale, rotation, translation = fit_sim3(a[keep], b[keep], config.rank_relative_tolerance)
-        residual = np.linalg.norm(apply_sim3(a, scale, rotation, translation) - b, axis=1)
-    except (ValueError, np.linalg.LinAlgError):
-        return failed("degenerate_anchors")
-    final_keep = np.ones(len(ids), bool) if mode == "oracle" else residual <= tolerance
+            scale, rotation, translation = fit_sim3(a[keep], b[keep], config.rank_relative_tolerance)
+            residual = np.linalg.norm(apply_sim3(a, scale, rotation, translation) - b, axis=1)
+        except (ValueError, np.linalg.LinAlgError):
+            return failed("degenerate_anchors")
+        final_keep = keep
+    else:
+        registration = register_sim3(a, b, algorithm=registration_algorithm,
+            scores=correspondence_scores, tolerance_m=tolerance,
+            size_ratio=target_radius / source_radius,
+            iterations=config.ransac_iterations, seed=config.seed,
+            rank_relative_tolerance=config.rank_relative_tolerance,
+            min_correspondences=required)
+        # Preserve all default diagnostic values for exact baseline comparison.
+        # Other backends record their actual raw solution and common refit.
+        if registration_algorithm != "ransac":
+            stats["registration"] = registration.diagnostics
+        if registration.reason is not None:
+            return failed(registration.reason)
+        scale, rotation, translation = (registration.scale, registration.rotation,
+                                        registration.translation)
+        residual, final_keep = registration.residuals, registration.inliers
+    # END backend dispatch; final anchor selection and region logic are shared.
     if final_keep.sum() < required:
         return failed("weak_correspondence_consensus")
     stats.update(inliers=int(final_keep.sum()), inlier_ratio=float(final_keep.mean()),
@@ -527,6 +473,19 @@ def sample_neighborhood(points, eligible, normals, local_spacing, seed_index, *,
     """
     points = _points(points, "points")
     pixels = _pixels(target_pixels, len(points))
+    # BEGIN reuse validated coordinates without weakening the public contract.
+    return _sample_neighborhood_validated_coordinates(points, eligible, normals,
+        local_spacing, seed_index, pixels=pixels, sampling_radius_m=sampling_radius_m,
+        sampling_spacing_m=sampling_spacing_m, config=config)
+
+
+def _sample_neighborhood_validated_coordinates(points, eligible, normals, local_spacing,
+        seed_index, *, pixels, sampling_radius_m, sampling_spacing_m, config=None):
+    """Sample with point/pixel arrays already checked by the immediate caller.
+
+    This helper is scoped to the current call, not a cache keyed by array
+    identity. All query-dependent normal, spacing and seed checks remain here.
+    """
     eligible, normals = np.asarray(eligible), np.asarray(normals, dtype=float)
     local_spacing = np.asarray(local_spacing, dtype=float)
     config = TransferConfig() if config is None else config
@@ -589,6 +548,8 @@ def sample_neighborhood(points, eligible, normals, local_spacing, seed_index, *,
                 "sampling_spacing_m": float(sampling_spacing_m),
                 "neighborhood_point_count": int(len(members)), "sample_count": len(chosen),
                 "neighborhood_rank": rank, "neighborhood_condition": condition}}
+
+# END sampling on coordinates validated at the public boundary.
 
 
 def _surface_gap(points, normals, spacings, eligible, scores, best_index, config):
@@ -799,7 +760,8 @@ def infer_region(src_region_mask, prepared, *, target_pixels, source_camera_orig
     remaining = eligible.copy()
     next_seed = center_index
     for mode_number in range(max_modes):
-        mode = sample_neighborhood(pt, eligible, normals, spacings, next_seed, target_pixels=pixels,
+        mode = _sample_neighborhood_validated_coordinates(
+            pt, eligible, normals, spacings, next_seed, pixels=pixels,
             sampling_radius_m=sampling_radius_m, sampling_spacing_m=sampling_spacing_m, config=config)
         mode.update(score=float(selected_cost[next_seed]), relation_score=float(relation[next_seed]),
                     type="primary" if mode_number == 0 else (
@@ -835,11 +797,14 @@ def infer_region(src_region_mask, prepared, *, target_pixels, source_camera_orig
 
 def transfer_region(src_xyz, tgt_xyz, src_region_mask, src_anchor_idx, tgt_anchor_idx,
                     method="relational", config=None, *, target_pixels, source_camera_origin, target_camera_origin,
-                    sampling_radius_m, sampling_spacing_m, max_modes):
+                    sampling_radius_m, sampling_spacing_m, max_modes,
+                    registration_algorithm="ransac", correspondence_scores=None):
     """Convenience entry; source evidence and explicit metric sampling only."""
     mode = "oracle" if method == "oracle_relational" else "direct" if method == "direct_local" else "automatic"
     prepared = prepare_anchors(src_xyz, tgt_xyz, src_anchor_idx, tgt_anchor_idx,
-                               mode=mode, config=config)
+                               mode=mode, config=config,
+                               registration_algorithm=registration_algorithm,
+                               correspondence_scores=correspondence_scores)
     return infer_region(src_region_mask, prepared, method=method,
         target_pixels=target_pixels,
         source_camera_origin=source_camera_origin, target_camera_origin=target_camera_origin,

@@ -13,13 +13,16 @@ container names, joint models, or hidden geometry.
 
 | File | Responsibility |
 |---|---|
-| `core.py` | Validated Sim(3) registration, location-preference scores, signed surface orientation, and fixed metric observed-neighborhood sampling |
+| `core.py` | Registration-to-anchor preparation, location-preference scores, signed surface orientation, and fixed metric observed-neighborhood sampling |
+| `sim3.py` | Shared finite-point validation, rank checks, proper positive-scale Umeyama fitting, and transform application |
+| `registration.py` | Explicit RANSAC, fixed-budget PROSAC with simple local optimization, and optional native TEASER++ backends with common residual/refit rules |
 | `features.py` | Offline MARCO extraction, reciprocal raw-dot anchor matching, and native Gaussian-decoded source-region matches |
 | `scenes.py` | Independent MuJoCo fixtures derived from the permanent `scene/original` layout; observation and evaluation records are separate |
 | `neighborhood_scenes.py` | Repeated internal shelf levels and real `put_mug_on_shelf` evidence, with independent evaluation annotations |
 | `evaluation.py` | Held-out surface identity, localization and sampling metrics, approximate oracle correspondences, and image overlays |
 | `experiment.py` | Manifest-driven extraction and five-method comparison |
 | `test_core.py` | Mathematical, coordinate-convention, data-contract, and target-label isolation regressions |
+| `test_registration.py` | Scalar-baseline equivalence, sampler boundaries, degeneracy, and backend contracts |
 
 The supported source evidence is visible and approximately planar; its mask may
 contain holes. Its outline is never copied to the target. Sampling radius and
@@ -51,6 +54,31 @@ observation = dict(
 global_result = infer_region(src_region_mask, prepared, method="global_sim3", **observation)
 relation_result = infer_region(src_region_mask, prepared, method="relational", **observation)
 ```
+
+<!-- BEGIN explicit interchangeable registration, with no silent fallback. -->
+`prepare_anchors` and `transfer_region` accept `registration_algorithm="ransac"`,
+`"prosac_lo"`, or `"teaserpp"`. For PROSAC, pass
+`correspondence_scores=scores`, a finite vector aligned with `src_idx/tgt_idx`;
+larger scores are sampled earlier, and ties retain the original pair order.
+The scores are matching priorities, not calibrated inlier probabilities.
+`segmented_experiment predict --registration ...` exposes the same choice and
+uses the existing MARCO scores.
+
+The default RANSAC keeps its original random triangles, scalar arithmetic,
+count/median ordering, thresholds, and final bounded consensus refits. It skips
+repeated validation/centering and median calculations for hypotheses whose
+inlier count has already lost. PROSAC uses exact integer growth counts and
+simple all-inlier local optimization with the same hypothesis budget; it does
+not implement the paper's adaptive non-randomness stopping criterion.
+
+TEASER++ requires the native `teaserpp_python` package in the active environment.
+Missing software raises `RegistrationBackendUnavailable`; selecting it never
+runs a replacement algorithm. Scale estimation is enabled. Native solver
+solutions are recorded before the common final refit; every backend's final
+inliers use the same target-frame Euclidean threshold. Alternate estimators can
+change the result, and are not covered by the default RANSAC equivalence claim.
+No solver receives support labels, a known transform, or an object identity.
+<!-- END explicit interchangeable registration. -->
 
 `accepted` and `reasons` are separate from `modes`. Each mode contains an observed
 seed, an oriented normal, a point-aligned neighborhood mask, and sampled point
