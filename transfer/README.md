@@ -174,3 +174,60 @@ reconstruction contract has been removed following the revised task definition:
 demonstration evidence, a placed object's footprint, and admissible placement
 centers are distinct quantities. The current experiment uses one shared physical
 sampling budget across all fixtures and real demonstration inputs.
+
+<!-- BEGIN independent multi-point joint region transfer interface. -->
+## Independent joint region path
+
+`joint_features.source_queries` selects up to 32 demonstration observations and
+32 additional observations strictly inside `entity_member & ~region_mask` from
+one source RGB-D. `appearance_evidence` preserves four separated MARCO response
+peaks plus the native decoder's observed pixel. Response percentiles use the
+fixed allowed entity feature-cell domain before interpolation to depth points.
+They are ordinal evidence, not calibrated correctness probabilities.
+
+`joint_region.infer_joint_region` receives the source/target observation records,
+these appearance arrays and the query provenance mask. New proposals use
+six- and twelve-point distance-consistent sets. An existing native-region
+consensus transform may enter the same candidate pool; it is never a fallback.
+Each proposal has one partial injective linear assignment, one fixed-support
+Sim(3) refit, and the existing minimum-six, non-collinearity and scale checks.
+Every admitted hypothesis scores every target entity point with the complete
+perimeter-normalized triangle graph and fixed missing-node costs. Search is
+exact over this finite set, not over all possible correspondences.
+
+The old oriented-plane, center-projection-distance and observed pixel topology
+requirements govern eligibility. Sampling remains on the frozen seed plane
+with an unscaled physical radius and spacing. The first valid candidate in
+global score order is the unique primary. The best valid competing surface is
+retained as a diagnostic; ambiguity adds a warning. `select_observation` chooses
+the smallest common score across independently solved target views sharing
+exactly the same source query set. No view name grants a score bonus.
+
+```python
+from transfer.joint_features import source_queries, appearance_evidence
+from transfer.joint_region import infer_joint_region, select_observation
+
+query_ids, query_region = source_queries(source)
+evidence = appearance_evidence(
+    source, target, source_feature, target_feature, source_crop, target_crop,
+    query_indices=query_ids,
+)
+result = infer_joint_region(source, target, evidence, query_region=query_region,
+                           sampling_radius_m=0.03, sampling_spacing_m=0.005)
+```
+
+`python -m transfer.joint_experiment --index INDEX.json --output RESULTS`
+freezes the unchanged old RANSAC/PROSAC/TEASER++ comparisons and the new path.
+Its process-local read guard rejects evaluation-only artifacts. The index
+contains `cases` with `id`, `task`, `view`, and `input_dir`; each input directory
+uses the existing segmented experiment's observation/crop/feature contract.
+Evaluation is a separate process after all declared predictions finish.
+The [experiment plan](../../sim-version-plans/2026-10-15-independent-joint-transfer/plan.md)
+defines the fixed comparison matrix and resource limits.
+The [image viewer](../../sim-version-plans/2026-10-15-independent-joint-transfer/index.html)
+retains every outcome, including missing observations and regressions. The
+[frozen failure analysis](../../sim-version-plans/2026-10-15-independent-joint-transfer/failure-analysis.md)
+documents why the current score is not a guarantee of better true localization
+or correct cross-view ordering; this independent path does not replace the
+existing default method.
+<!-- END independent multi-point joint region transfer interface. -->
