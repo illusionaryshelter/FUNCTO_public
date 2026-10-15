@@ -43,7 +43,10 @@ class TransferConfig:
     ransac_iterations: int = 1500
     ransac_tolerance_ratio: float = 0.075
     min_correspondences: int = 6
+    # BEGIN correspondence ratio is a quality warning, not an acceptance gate.
+    # The absolute minimum number of inliers and all geometry gates still apply.
     min_inlier_ratio: float = 0.2
+    # END correspondence ratio warning threshold.
     max_anchors: int = 32
     rank_relative_tolerance: float = 1e-6
     trim_fraction: float = 0.2
@@ -190,8 +193,10 @@ def prepare_anchors(src_xyz, tgt_xyz, src_anchor_idx, tgt_anchor_idx, *,
     idt = _indices(tgt_anchor_idx, len(pt), "tgt_anchor_idx")
     if len(ids) != len(idt):
         raise ValueError("Source and target correspondence counts differ")
+    # BEGIN structured quality warnings survive both success and hard rejection.
     stats = {"anchor_mode": mode, "input_correspondences": len(ids),
-             "configuration": asdict(config)}
+             "configuration": asdict(config), "quality_warnings": []}
+    # END warning initialization; every preparation has an explicit warning list.
 
     def failed(reason):
         return PreparedAnchors(ps, pt, ids[:0], idt[:0], ids, None, None, None,
@@ -244,8 +249,13 @@ def prepare_anchors(src_xyz, tgt_xyz, src_anchor_idx, tgt_anchor_idx, *,
                  maximum_inlier_3d_error_m=float(residual[final_keep].max()),
                  sim3_scale=scale)
     reasons = []
+    # BEGIN only low *proportional* support becomes an advisory quality warning.
+    # Registration already checked sufficient absolute support and a usable fit.
+    # Do not downgrade other uses of weak_correspondence_consensus: those denote
+    # hard failures such as too few inliers or an invalid estimated scale.
     if mode != "oracle" and final_keep.mean() < config.min_inlier_ratio:
-        reasons.append("weak_correspondence_consensus")
+        stats["quality_warnings"].append("low_correspondence_inlier_ratio")
+    # END no change to transforms, anchor selection, or remaining region gates.
     input_ids = ids
     selected = fps_indices(a[final_keep], config.max_anchors)
     ids, idt = ids[final_keep][selected], idt[final_keep][selected]

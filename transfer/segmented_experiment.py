@@ -178,6 +178,9 @@ def predict_suite(data_root, run_root, arms=ARMS, selected=None, *, registration
             if not preparation["prepared"]:
                 write_json(directory / "prediction.json", {
                     "executed": False, "accepted": False, "reasons": preparation["reasons"],
+                    # BEGIN no registration means no correspondence quality assessment.
+                    "quality_warnings": [],
+                    # END quality is distinct from segmentation failure.
                     "stage": "segmentation_preparation", "target_support_or_transform_truth_used": False,
                     "given_target_entity_mask": arm == "gt_mask"})
                 continue
@@ -213,10 +216,16 @@ def predict_suite(data_root, run_root, arms=ARMS, selected=None, *, registration
             store_prediction(directory / "direct_local", result, {})
             write_json(directory / "prediction.json", {
                 "executed": True, "accepted": result["accepted"], "reasons": result["reasons"],
+                # BEGIN expose advisory quality in the compact execution record.
+                "quality_warnings": result["diagnostics"]["quality_warnings"],
+                # END preserve full diagnostics in direct_local.json as before.
                 "stage": "direct_local", "target_support_or_transform_truth_used": False,
                 "given_target_entity_mask": arm == "gt_mask", "sampling_budget": SAMPLING})
             print(json.dumps({"arm": arm, "pair": pair["id"], "accepted": result["accepted"],
-                              "reasons": result["reasons"]}), flush=True)
+                              # BEGIN an accepted result can still carry a quality warning.
+                              "reasons": result["reasons"],
+                              "quality_warnings": result["diagnostics"]["quality_warnings"]}), flush=True)
+                              # END compact warning propagation.
 
 
 def restore_prediction(directory):
@@ -287,6 +296,10 @@ def render_comparison(source_image, target_image, observations, selected_masks, 
     width, height = target_rgb.shape[1], target_rgb.shape[0]
     sheet = Image.new("RGB", (2*width, 2*(height+64)), "white")
     accepted = "accepted" if result["accepted"] else "rejected"
+    # BEGIN retain advisory quality even when exporting a static comparison.
+    if result["diagnostics"]["quality_warnings"]:
+        accepted += " + quality warning"
+    # END warning label does not change observed geometry.
     error = metrics["center_error_m"]
     error_text = "no primary" if error is None else f"reference distance {1000*error:.1f} mm"
     titles = [(f"{arm}: source selection", "Blue: entity mask; red: unchanged given evidence"),
@@ -339,7 +352,10 @@ def evaluate_suite(data_root, run_root, arms=ARMS, selected=None):
             if prediction["executed"]:
                 result = restore_prediction(directory)
             else:
-                result = {"accepted": False, "reasons": prediction["reasons"], "diagnostics": {}, "modes": []}
+                # BEGIN an unexecuted prediction has no registration quality assessment.
+                result = {"accepted": False, "reasons": prediction["reasons"],
+                          "diagnostics": {"quality_warnings": []}, "modes": []}
+                # END explicit empty diagnostics for the failed preparation path.
             if target is None:
                 target_points, labels = np.empty((0, 3)), np.empty(0, dtype=np.int32)
             else:
@@ -358,6 +374,9 @@ def evaluate_suite(data_root, run_root, arms=ARMS, selected=None):
             row = {"mask_source": arm, "pair": pair["id"], "group": pair["group"], "variation": pair["variation"],
                    "prepared": preparation["prepared"], "prediction_executed": prediction["executed"],
                    "reasons": ";".join(prediction["reasons"]),
+                   # BEGIN keep warnings visible in the flat evaluation export.
+                   "quality_warnings": ";".join(prediction["quality_warnings"]),
+                   # END warning export; accepted and all geometry metrics are unchanged.
                    **{key: value for key, value in metrics.items() if key != "mode_metrics"},
                    **{f"{role}_{key}": value for role, record in mask_metrics.items() for key, value in record.items()}}
             rows.append(row)

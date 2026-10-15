@@ -35,7 +35,10 @@ def metric_row(record):
     region = quality["region"]
     transform = quality["true_source_entity_transform"]
     return {"algorithm": record["algorithm"], "accepted": record["accepted"],
-        "reasons": record["reasons"], "object_rmse_mm": None if transform is None else
+        # BEGIN required warnings stay distinct from stored hard rejection reasons.
+        "reasons": record["reasons"], "quality_warnings": diagnostics["quality_warnings"],
+        # END warning presentation does not recalculate historical acceptance.
+        "object_rmse_mm": None if transform is None else
             1000 * transform["source_points_transform_rmse_m"],
         "center_error_mm": None if region["center_error_m"] is None else 1000 * region["center_error_m"],
         "registration_ms": record["registration_and_anchor_preparation_ms"],
@@ -97,8 +100,12 @@ def export_web(manifest, results, destination, comparisons=None):
         for algorithm in ALGORITHMS:
             record = rows[(case["id"], algorithm)]
             prediction = restore_prediction(results / case["id"] / algorithm / "prediction")
-            if prediction["accepted"] != record["accepted"] or prediction["reasons"] != record["reasons"]:
+            # BEGIN reject stale summaries instead of silently losing warnings.
+            if (prediction["accepted"] != record["accepted"]
+                    or prediction["reasons"] != record["reasons"]
+                    or prediction["diagnostics"]["quality_warnings"] != record["diagnostics"]["quality_warnings"]):
                 raise ValueError("Frozen prediction and evaluated summary disagree")
+            # END frozen warning evidence must agree before presentation.
             entries = {target["id"]: [] for target in targets}
             for number, mode in enumerate(prediction["modes"]):
                 mask, pixels = _mode_pixels(mode, domains, len(bank["observation_xyz"]))

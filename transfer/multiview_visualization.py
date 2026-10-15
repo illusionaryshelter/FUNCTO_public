@@ -264,6 +264,11 @@ def _render_case(manifest_path, case, output, rows):
             per_view[algorithm][mode["view_id"]].append((number, mode, mask, samples, color))
         if not prediction["accepted"]:
             rejection_notes.append(f"{algorithm}: " + "; ".join(prediction["reasons"]))
+        # BEGIN warnings remain visible alongside either acceptance or rejection.
+        if prediction["diagnostics"]["quality_warnings"]:
+            rejection_notes.append(f"{algorithm} quality warning: " +
+                                   "; ".join(prediction["diagnostics"]["quality_warnings"]))
+        # END static warning notes.
 
     for target in targets:
         view_id = target["id"]
@@ -282,10 +287,15 @@ def _render_case(manifest_path, case, output, rows):
                 notice = "MISSING: " + "; ".join(target["missing_target_reasons"])
             elif not entries:
                 notice = "NO MODES RETURNED" if not prediction["modes"] else "NO MODES IN THIS VIEW"
+            # BEGIN accepted weak-consensus candidates receive an amber warning badge.
+            has_warning = bool(prediction["diagnostics"]["quality_warnings"])
+            accepted_badge = "ACCEPTED + WARNING" if has_warning else "RUN ACCEPTED"
+            accepted_color = (180, 115, 20) if has_warning else _GREEN
+            # END all rejected or missing results retain their original red status.
             panels.append(_panel(observed, f"{view_id} | {algorithm}", detail,
                 badge=("MISSING" if target["missing_target"] else
-                       "RUN ACCEPTED" if prediction["accepted"] else "REJECTED"),
-                badge_color=_GREEN if prediction["accepted"] and not target["missing_target"] else _RED,
+                       accepted_badge if prediction["accepted"] else "REJECTED"),
+                badge_color=accepted_color if prediction["accepted"] and not target["missing_target"] else _RED,
                 notice=notice))
 
     width = 2 * _MARGIN + 3 * _PANEL_WIDTH + 2 * _GAP

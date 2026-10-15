@@ -279,6 +279,10 @@ def comparison_image(source_image, target_image, source, target, source_region,
     for slot, name in enumerate(names, 2):
         result, record = results[name], metrics[name]
         status = "accepted evidence" if result["accepted"] else "rejected / diagnostic"
+        # BEGIN static exports must also distinguish acceptance with weak evidence.
+        if result["diagnostics"]["quality_warnings"]:
+            status += " + quality warning"
+        # END warning visibility; candidate pixels and metrics are unchanged.
         error = record["center_error_m"]
         error_text = "n/a" if error is None else f"{error*1000:.1f} mm"
         subtitle = f"{status}; center {error_text}; modes {len(result['modes'])}"

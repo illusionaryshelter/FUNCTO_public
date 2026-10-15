@@ -215,7 +215,10 @@ def evaluate_suite(data_root, features_root, output_root, selected=None):
             rows.append({"pair": pair["id"], "group": pair.get("group", ""),
                          "variation": pair.get("variation", ""), "method": name,
                          **{key: value for key, value in metrics[name].items() if key != "mode_metrics"},
-                         "reasons": "; ".join(result["reasons"])})
+                         # BEGIN preserve advisory quality separately from hard rejection.
+                         "reasons": "; ".join(result["reasons"]),
+                         "quality_warnings": "; ".join(result["diagnostics"]["quality_warnings"])})
+                         # END summary warning propagation.
         comparison_image(source_directory / "rgb.png", target_directory / "rgb.png",
                          source, target, source_region, target_truth, reference,
                          results, metrics, directory / "comparison.png")

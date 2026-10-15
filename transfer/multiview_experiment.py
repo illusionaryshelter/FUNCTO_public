@@ -299,12 +299,18 @@ def predict_suite(manifest, output, selected=None, algorithms=ALGORITHMS):
                 "sequential_geometry_total_ms": 1000 * (finished - begin),
                 "fusion_timing": fused["timing"], "fusion_diagnostics": fused["diagnostics"],
                 "accepted": bool(result["accepted"]),
+                # BEGIN quality warnings remain distinct from rejection reasons.
+                "quality_warnings": result["diagnostics"]["quality_warnings"],
+                # END measurement warning propagation.
                 "reasons": result["reasons"], "scale": prepared.scale,
                 "rotation": prepared.rotation, "translation": prepared.translation,
                 "diagnostics": prepared.diagnostics, "grounding_diagnostics": result["diagnostics"]}
             write_json(destination / "measurements.json", measurement)
             print(json.dumps({"case": case["id"], "algorithm": algorithm,
                 "accepted": result["accepted"], "reasons": result["reasons"],
+                # BEGIN do not report accepted low-consensus candidates as unqualified success.
+                "quality_warnings": result["diagnostics"]["quality_warnings"],
+                # END compact warning propagation.
                 "registration_ms": measurement["registration_and_anchor_preparation_ms"]}), flush=True)
         del source, targets, fused, bank
         gc.collect()
@@ -463,6 +469,9 @@ def evaluate_suite(manifest, output):
     for row in rows:
         transform = row["quality"]["transform"] or {}
         flat.append({"case": row["case"], "algorithm": row["algorithm"], "accepted": row["accepted"],
+            # BEGIN structured warnings also appear in the flat result table.
+            "quality_warnings": ";".join(row["diagnostics"]["quality_warnings"]),
+            # END warning export.
             "reasons": ";".join(row["reasons"]), "correspondence_count": row["correspondence_count"],
             "correspondence_near_truth_count": row["quality"]["correspondence"].get("near_truth_count"),
             "transform_rmse_m": transform.get("source_points_transform_rmse_m"),

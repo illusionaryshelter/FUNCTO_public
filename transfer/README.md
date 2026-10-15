@@ -88,6 +88,19 @@ array contracts raise an error; insufficient observed geometry produces an
 explicit rejection. Oracle and source-region-only direct matching use separate
 preparation modes so they cannot silently reuse whole-object automatic anchors.
 Acceptance describes localization evidence, not verified object placement.
+<!-- BEGIN advisory correspondence ratio semantics. -->
+The final correspondence inlier ratio below `min_inlier_ratio` (default 0.2)
+adds `low_correspondence_inlier_ratio` to `diagnostics.quality_warnings` rather
+than rejecting a candidate. The list is present on every prepared/result
+diagnostic record, including failures. `accepted=True` with this warning means
+the candidate passed the remaining checks with weak proportional matching
+support; it does not establish accurate localization. Too few absolute inliers
+(default 6), invalid registration, and every region/surface check still reject.
+Warnings can also coexist with a rejected result. The Euclidean distance
+threshold, solver, refitting, selected anchors, and candidate geometry are
+unaffected. In particular, a wrong position on the same visible plane can pass
+all surface checks; this policy intentionally exposes more uncertain candidates.
+<!-- END advisory correspondence ratio semantics. -->
 Secondary modes can include non-support edges; inspect their explicit geometry
 and evidence instead of treating every returned mode as a valid support patch.
 
