@@ -287,9 +287,12 @@ def infer_joint_region(source, target, evidence, *, query_region,
     if planarity > geo.max_planarity_ratio:
         return reject('source_region_not_approximately_planar')
     view = source_camera-source_center
-    cosine = float(normal@view/max(np.linalg.norm(view), np.finfo(float).tiny))
-    if abs(cosine) < geo.min_view_cosine:
+    # BEGIN retain the original undefined-view rejection even at zero cutoff.
+    view_length = float(np.linalg.norm(view))
+    cosine = float(normal@view/max(view_length, np.finfo(float).tiny))
+    if view_length <= 0 or abs(cosine) < geo.min_view_cosine:
         return reject('source_normal_orientation_unobservable')
+    # END a zero camera-to-point vector cannot supply an oriented normal.
     if cosine < 0:
         normal = -normal
     queries = ps[query_ids]
@@ -315,8 +318,11 @@ def infer_joint_region(source, target, evidence, *, query_region,
     # then apply each hypothesis's signed normal agreement below.
     normals, flatness, _, view_cosines, spacings, _ = _surface_geometry(
         pt, pixels, normal, target_camera, sampling_radius_m, geo)
+    # BEGIN match every view-validity condition from the shared surface helper.
     geometric = ((flatness <= geo.max_planarity_ratio) & (spacings > 0)
-                 & (view_cosines >= geo.min_view_cosine))
+                 & (view_cosines >= geo.min_view_cosine)
+                 & (np.linalg.norm(target_camera-pt, axis=1) > 0))
+    # END only signed agreement remains hypothesis dependent.
     all_scores, eligible_masks, locations = [], [], []
     projection_limit = np.maximum(geo.max_projection_spacing_factor*spacings,
                                  geo.max_projection_sampling_ratio*sampling_radius_m)

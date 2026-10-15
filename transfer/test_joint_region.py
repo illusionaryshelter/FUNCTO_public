@@ -158,6 +158,25 @@ for path in ('/tmp/truth.npz', '/tmp/pair-truth/case.json', '/tmp/evaluation-sce
                                 text=True, env={**os.environ, 'PYTHONNOUSERSITE': '1'})
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_zero_camera_direction_is_invalid_even_with_zero_cosine_cutoff(self):
+        source, target, evidence, query_region = self.fixture()
+        camera = source['T_world_camera_cv'].copy()
+        camera[:3, 3] = source['xyz'][source['region_mask']].mean(0)
+        result = infer_joint_region({**source, 'T_world_camera_cv': camera}, target, evidence,
+            query_region=query_region, geometry_config=TransferConfig(min_view_cosine=0))
+        self.assertFalse(result['accepted'])
+        self.assertIn('source_normal_orientation_unobservable', result['reasons'])
+
+    def test_zero_target_camera_direction_never_supplies_the_seed(self):
+        source, target, evidence, query_region = self.fixture()
+        camera = target['T_world_camera_cv'].copy()
+        camera[:3, 3] = source['xyz'][source['region_mask']].mean(0)
+        result = infer_joint_region(source, {**target, 'T_world_camera_cv': camera}, evidence,
+            query_region=query_region, geometry_config=TransferConfig(min_view_cosine=0),
+            config=JointConfig(proposal_trials=8, max_hypotheses=3))
+        self.assertTrue(result['accepted'], result['reasons'])
+        self.assertGreater(np.linalg.norm(result['modes'][0]['center']-camera[:3, 3]), 0)
+
 
 if __name__ == '__main__':
     unittest.main()
