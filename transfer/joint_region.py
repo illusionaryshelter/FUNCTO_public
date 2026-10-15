@@ -1,7 +1,8 @@
 """Independent multi-point, partial-assignment region transfer.
 
-Every target entity point is scored against every retained correspondence
-hypothesis. The search is exact over that explicitly finite hypothesis set;
+Every target entity point is considered against every retained correspondence
+hypothesis; unchanged hard gates determine which scores need computation.
+The search is exact over that explicitly finite hypothesis set;
 proposal generation is bounded and is not a global correspondence certificate.
 The interface receives observed points, source task evidence and appearance
 costs only. Ground truth, asset names and scene meshes have no input channel.
@@ -40,7 +41,7 @@ class JointConfig:
 
 
 def graph_scores(centers, source_center, source_queries, target_points, assignment,
-                 appearance_cost, *, config=None):
+                 appearance_cost, *, config=None, center_mask=None):
     """Complete fixed-denominator graph score, evaluated in bounded blocks.
 
     Each node weighs 1/Q; every unordered source edge weighs 1/C(Q,2).
@@ -48,16 +49,28 @@ def graph_scores(centers, source_center, source_queries, target_points, assignme
     A matched degenerate target triangle pays maximal error, not a null reward.
     Triangle error is half the L1 distance between perimeter-normalized ordered
     sides [center-to-i, center-to-k, i-to-k]. It lies in [0,1].
+
+    An optional Boolean center_mask applies an already established hard gate:
+    excluded rows return infinity. Original center/edge block boundaries and
+    floating-point reduction layout are preserved for every retained row.
     """
     cfg = JointConfig() if config is None else config
     q = len(source_queries)
     if q < 2:
         raise ValueError('The complete graph needs at least two source queries')
+    # BEGIN apply exact hard gates without changing the graph's validation.
+    if center_mask is not None:
+        center_mask = np.asarray(center_mask)
+        if center_mask.dtype != np.bool_ or center_mask.shape != (len(centers),):
+            raise ValueError('center_mask must be Boolean and center aligned')
+    # END masks only select centers; source nodes and edges remain unchanged.
     assigned = np.asarray(assignment)
     real = assigned >= 0
     unary = np.full(q, cfg.null_cost)
     unary[real] = appearance_cost[np.flatnonzero(real), assigned[real]]
     scores = np.full(len(centers), float(unary.mean()))
+    if center_mask is not None:
+        scores[~center_mask] = np.inf
     i, k = np.triu_indices(q, 1)
     total_edges = len(i)
     active = real[i] & real[k]
@@ -73,10 +86,31 @@ def graph_scores(centers, source_center, source_queries, target_points, assignme
     source_shape = source_sides/source_perimeter[:, None]
     matched = target_points[np.maximum(assigned, 0)]
     bases = np.linalg.norm(matched[i]-matched[k], axis=1)
+    # BEGIN preserve SciPy input validation even when every center is excluded.
+    if center_mask is not None and len(centers):
+        centers = np.asarray(centers)
+        cdist(centers[:0], matched)
+    # END zero rows validate shape/type without computing a distance matrix.
     for begin in range(0, len(centers), cfg.center_chunk):
         end = min(begin+cfg.center_chunk, len(centers))
-        distances = cdist(centers[begin:end], matched)
-        error_sum = np.zeros(end-begin)
+        # BEGIN skip excluded rows while retaining the original reduction path.
+        block = centers[begin:end]
+        selected = None if center_mask is None else np.flatnonzero(center_mask[begin:end])
+        if selected is not None:
+            if not len(selected):
+                continue
+            block = block[selected]
+            if len(selected) == 1 and end-begin > 1:
+                # Advanced column indexing below normally makes a Fortran-
+                # contiguous error matrix. With one row it becomes contiguous
+                # on the reduction axis and NumPy may use pairwise summation.
+                # A duplicate row preserves the old strided-axis arithmetic;
+                # its result is discarded. A genuinely one-row original tail
+                # keeps its original one-row reduction instead.
+                block = np.repeat(block, 2, axis=0)
+        distances = cdist(block, matched)
+        error_sum = np.zeros(len(block))
+        # END only retained rows enter the unchanged edge arithmetic below.
         for edge in range(0, len(i), cfg.edge_chunk):
             stop = min(edge+cfg.edge_chunk, len(i))
             a, b, base = distances[:, i[edge:stop]], distances[:, k[edge:stop]], bases[None, edge:stop]
@@ -87,7 +121,12 @@ def graph_scores(centers, source_center, source_queries, target_points, assignme
                      + np.abs(base/denominator-source_shape[None, edge:stop, 2]))/2
             error[perimeter <= np.finfo(float).tiny] = 1
             error_sum += error.sum(1)
-        scores[begin:end] += error_sum/total_edges
+        # BEGIN write scores back at original indices for stable global ties.
+        if selected is None:
+            scores[begin:end] += error_sum/total_edges
+        else:
+            scores[begin+selected] += error_sum[:len(selected)]/total_edges
+        # END original hypothesis-by-center ordering remains intact.
     return scores
 
 
@@ -157,15 +196,22 @@ def multipoint_proposals(queries, target, peaks, appearance, *, tolerance, size_
         scale = target_dist[first, second]/distance
         if not 0.2 <= scale/size_ratio <= 5:
             continue
-        compatible = np.abs(target_dist-scale*source_dist) <= 2*tolerance
+        # BEGIN evaluate only compatibility rows actually used by this trial.
+        # Every element uses the same dtype and arithmetic as the former full
+        # matrix. No random draw, extension order, fit or admission changes.
+        # Do not cap row accesses: the existing failed-fit `continue` may let
+        # a degenerate size-12 set grow further, and that behavior is retained.
+        def compatible_row(index):
+            return np.abs(target_dist[index]-scale*source_dist[index]) <= 2*tolerance
         chosen = [int(first), int(second)]
-        available = compatible[first] & compatible[second]
+        available = compatible_row(first) & compatible_row(second)
+        # END on-demand rows replace only unused pairwise arithmetic.
         extension_order = np.argsort(priorities+0.05*rng.random(len(priorities)), kind='stable')
         for index in extension_order:
             if not available[index] or rows[index] in rows[chosen] or targets[index] in targets[chosen]:
                 continue
             chosen.append(int(index))
-            available &= compatible[index]
+            available &= compatible_row(index)
             if len(chosen) in (6, 12):
                 try:
                     transform = fit_sim3(queries[rows[chosen]], target[targets[chosen]], geo.rank_relative_tolerance)
@@ -324,22 +370,36 @@ def infer_joint_region(source, target, evidence, *, query_region,
                  & (np.linalg.norm(target_camera-pt, axis=1) > 0))
     # END only signed agreement remains hypothesis dependent.
     all_scores, eligible_masks, locations = [], [], []
+    score_rows_evaluated = 0
     projection_limit = np.maximum(geo.max_projection_spacing_factor*spacings,
                                  geo.max_projection_sampling_ratio*sampling_radius_m)
     for hypothesis in hypotheses:
         transform = hypothesis['transform']
         center = apply_sim3(source_center, *transform)
         eligible = geometric & (normals@(transform[1]@normal) >= geo.normal_min_agreement)
-        scores = graph_scores(pt, source_center, queries, pt, hypothesis['assignment'], appearance, config=cfg)
         location = np.linalg.norm(pt-center, axis=1) <= projection_limit
-        all_scores.append(np.where(eligible & location, scores, np.inf))
+        # BEGIN apply the unchanged hard gates before expensive graph scoring.
+        center_mask = eligible & location
+        scores = graph_scores(pt, source_center, queries, pt, hypothesis['assignment'], appearance,
+                              config=cfg, center_mask=center_mask)
+        all_scores.append(scores)
+        # Count actual center rows, including the duplicate used solely to
+        # preserve singleton floating-point reduction layout.
+        block_starts = np.arange(0, len(pt), cfg.center_chunk)
+        block_counts = np.add.reduceat(center_mask.astype(np.int64), block_starts)
+        block_sizes = np.minimum(cfg.center_chunk, len(pt)-block_starts)
+        score_rows_evaluated += int(center_mask.sum()+np.count_nonzero((block_counts == 1) & (block_sizes > 1)))
+        # END location gates centers only, not the original sampling mask.
         eligible_masks.append(eligible)
         locations.append(center)
     values = np.asarray(all_scores)
     valid_flat = np.flatnonzero(np.isfinite(values.ravel()))
     ordered = valid_flat[np.argsort(values.ravel()[valid_flat], kind='stable')]
-    diagnostic.update(full_graph_scores_computed=int(values.size),
+    # BEGIN distinguish the unchanged full search domain from work performed.
+    diagnostic.update(full_domain_candidate_pairs=int(values.size),
+                      graph_score_rows_evaluated=score_rows_evaluated,
                       surface_and_location_candidates=int(len(ordered)))
+    # END the retired computed-count name no longer misstates execution work.
     if not len(ordered):
         return reject('no_valid_surface_near_supported_mapping')
     primary_plane, primary_tangent = None, None

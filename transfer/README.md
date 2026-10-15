@@ -191,9 +191,19 @@ six- and twelve-point distance-consistent sets. An existing native-region
 consensus transform may enter the same candidate pool; it is never a fallback.
 Each proposal has one partial injective linear assignment, one fixed-support
 Sim(3) refit, and the existing minimum-six, non-collinearity and scale checks.
-Every admitted hypothesis scores every target entity point with the complete
-perimeter-normalized triangle graph and fixed missing-node costs. Search is
-exact over this finite set, not over all possible correspondences.
+<!-- BEGIN exact hard-gate score evaluation and workload accounting. -->
+Every admitted hypothesis considers every target entity point. Points passing
+the unchanged hard geometric gates receive the complete perimeter-normalized
+triangle score and fixed missing-node costs; other entries are infinity.
+Original center/edge blocks and reduction layout preserve floating-point ties.
+Proposal distance compatibility is computed only for rows actually accessed.
+Search remains exact over the same finite set of valid candidates.
+Diagnostics separate `full_domain_candidate_pairs` from the actual
+`graph_score_rows_evaluated`, including duplicate rows needed to preserve the
+original singleton reduction layout. The
+[equivalence and timing report](../../sim-version-plans/2026-10-15-joint-lossless-speedup/report.md)
+records the full prediction comparisons and repeated CPU measurements.
+<!-- END no proposal budget, score, gate or sampling rule changes. -->
 
 The old oriented-plane, center-projection-distance and observed pixel topology
 requirements govern eligibility. Sampling remains on the frozen seed plane

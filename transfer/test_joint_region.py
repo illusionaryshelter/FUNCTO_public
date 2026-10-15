@@ -111,8 +111,96 @@ class JointRegionTests(unittest.TestCase):
         primary = result['modes'][0]
         np.testing.assert_allclose(primary['center'], source['xyz'][source['region_mask']].mean(0), atol=1e-12)
         self.assertTrue(np.allclose(target['xyz'][primary['mask'], 2], 0))
-        self.assertEqual(result['diagnostics']['full_graph_scores_computed'],
+        # BEGIN distinguish exact search-domain coverage from executed rows.
+        self.assertEqual(result['diagnostics']['full_domain_candidate_pairs'],
                          len(target['xyz'])*result['diagnostics']['hypotheses_admitted'])
+        self.assertLessEqual(result['diagnostics']['graph_score_rows_evaluated'],
+                             result['diagnostics']['full_domain_candidate_pairs'])
+        # END optimization changes work counters, not the finite candidate set.
+
+    # BEGIN bit-exact scoring checks for hard-gate computation elimination.
+    def test_masked_graph_scores_preserve_bits_and_stable_order(self):
+        rng = np.random.default_rng(173)
+        for q in (6, 12, 32):
+            queries = rng.normal(size=(q, 3))
+            target = rng.normal(size=(q+3, 3))
+            assignment = np.arange(q)
+            assignment[::4] = -1
+            appearance = rng.random((q, len(target)))
+            for center_chunk in (1, 2, 3, 16, 256):
+                centers = rng.normal(size=(2*center_chunk+1, 3))
+                # Identical centers test exact score ties and original order.
+                centers[1] = centers[0]
+                masks = [np.zeros(len(centers), bool), np.ones(len(centers), bool),
+                         rng.random(len(centers)) < .3,
+                         np.arange(len(centers)) % center_chunk == 0]
+                for edge_chunk in (1, 7, 256):
+                    config = JointConfig(center_chunk=center_chunk, edge_chunk=edge_chunk)
+                    dense = graph_scores(centers, np.zeros(3), queries, target,
+                                         assignment, appearance, config=config)
+                    for mask in masks:
+                        expected = np.where(mask, dense, np.inf)
+                        actual = graph_scores(centers, np.zeros(3), queries, target,
+                            assignment, appearance, config=config, center_mask=mask)
+                        np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                        np.testing.assert_array_equal(np.argsort(actual, kind='stable'),
+                                                      np.argsort(expected, kind='stable'))
+
+    def test_masked_graph_preserves_empty_domain_validation(self):
+        centers = np.ones((3, 3))
+        queries = np.zeros((2, 3))
+        assignment = np.arange(2)
+        appearance = np.zeros((2, 2))
+        for mask in (None, np.zeros(len(centers), bool)):
+            with self.assertRaisesRegex(ValueError, 'degenerate center triangle'):
+                graph_scores(centers, np.zeros(3), queries, queries, assignment,
+                             appearance, center_mask=mask)
+        # With no matched edge the original routine returns unary costs before
+        # validating source triangles. An empty hard domain must preserve this.
+        actual = graph_scores(centers, np.zeros(3), queries, queries,
+                              np.full(2, -1), appearance, center_mask=np.zeros(3, bool))
+        self.assertTrue(np.isposinf(actual).all())
+        with self.assertRaisesRegex(ValueError, 'center aligned'):
+            graph_scores(centers, np.zeros(3), queries, queries, assignment,
+                         appearance, center_mask=np.ones(2, bool))
+        with self.assertRaisesRegex(ValueError, 'center aligned'):
+            graph_scores(centers, np.zeros(3), queries, queries, assignment,
+                         appearance, center_mask=np.ones(3, int))
+
+    def test_masked_graph_degenerate_target_and_unmatched_edges(self):
+        rng = np.random.default_rng(174)
+        queries = rng.normal(size=(12, 3))
+        centers, target = np.zeros((257, 3)), np.zeros((12, 3))
+        appearance = np.full((12, 12), .2)
+        for count in (0, 1, 2, 12):
+            assignment = np.arange(12)
+            assignment[count:] = -1
+            mask = np.zeros(257, bool)
+            mask[[0, 256]] = True
+            dense = graph_scores(centers, np.zeros(3), queries, target, assignment, appearance)
+            actual = graph_scores(centers, np.zeros(3), queries, target, assignment,
+                                  appearance, center_mask=mask)
+            expected = np.where(mask, dense, np.inf)
+            np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+
+    def test_empty_center_mask_preserves_scipy_input_errors(self):
+        rng = np.random.default_rng(175)
+        queries = rng.normal(size=(6, 3))
+        appearance = np.full((6, 6), .2)
+        for centers in (np.ones((3, 2)), np.ones(3), np.ones((3, 3), dtype=complex)):
+            with self.assertRaises(ValueError) as before:
+                graph_scores(centers, np.zeros(3), queries, queries, np.arange(6), appearance)
+            with self.assertRaises(type(before.exception)) as after:
+                graph_scores(centers, np.zeros(3), queries, queries, np.arange(6), appearance,
+                             center_mask=np.zeros(len(centers), bool))
+            self.assertEqual(str(after.exception), str(before.exception))
+        # List inputs accepted by cdist remain accepted on the masked path.
+        centers = [[.1, .2, .3], [.4, .5, .6]]
+        dense = graph_scores(centers, np.zeros(3), queries, queries, np.arange(6), appearance)
+        actual = graph_scores(centers, np.zeros(3), queries, queries, np.arange(6), appearance,
+                              center_mask=np.array([True, False]))
+        np.testing.assert_array_equal(actual, np.array([dense[0], np.inf]))
+    # END no tolerance-based comparison can hide changed score ties.
 
     def test_missing_local_surface_does_not_snap_to_distant_layer(self):
         source, target, evidence, query_region = self.fixture()
