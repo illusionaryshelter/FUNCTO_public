@@ -1,0 +1,62 @@
+{
+  "note": "Synthetic geometric scenes, random correspondence surrogate for MARCO (not actual MARCO), 8 scenarios x 8 seeds = 64 trials. Inference has no GT access.",
+  "success_threshold_m": 0.075,
+  "methods": {
+    "right": {
+      "success_percent": 57.8,
+      "coverage_percent": 100.0,
+      "median_error_mm": 46.1,
+      "median_core_ms": 122.2,
+      "p95_core_ms": 235.7
+    },
+    "left": {
+      "success_percent": 73.4,
+      "coverage_percent": 100.0,
+      "median_error_mm": 32.1,
+      "median_core_ms": 156.1,
+      "p95_core_ms": 225.2
+    },
+    "choose_view": {
+      "success_percent": 93.8,
+      "coverage_percent": 100.0,
+      "median_error_mm": 26.9,
+      "median_core_ms": 168.7,
+      "p95_core_ms": 231.0
+    },
+    "naive_pool": {
+      "success_percent": 92.2,
+      "coverage_percent": 100.0,
+      "median_error_mm": 25.0,
+      "median_core_ms": 255.3,
+      "p95_core_ms": 391.9
+    },
+    "multiview": {
+      "success_percent": 89.1,
+      "coverage_percent": 100.0,
+      "median_error_mm": 24.6,
+      "median_core_ms": 272.2,
+      "p95_core_ms": 404.6
+    },
+    "affine_right": {
+      "success_percent": 60.9,
+      "coverage_percent": 60.9,
+      "median_error_mm": 9.7,
+      "median_core_ms": 12.0,
+      "p95_core_ms": 16.0
+    },
+    "affine_multiview": {
+      "success_percent": 87.5,
+      "coverage_percent": 87.5,
+      "median_error_mm": 9.0,
+      "median_core_ms": 10.2,
+      "p95_core_ms": 12.6
+    },
+    "hybrid_affine_then_distance": {
+      "success_percent": 98.4,
+      "coverage_percent": 100.0,
+      "median_error_mm": 11.8,
+      "median_core_ms": 10.4,
+      "p95_core_ms": 209.8
+    }
+  }
+}
