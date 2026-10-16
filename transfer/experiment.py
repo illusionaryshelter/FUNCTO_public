@@ -136,6 +136,24 @@ def store_prediction(directory, result, metrics):
     # END neighborhood result schema.
 
 
+# BEGIN frozen prediction reader paired with the existing common writer.
+def restore_prediction(path):
+    """Reconstruct observed modes from frozen prediction artifacts only."""
+    path = Path(path)
+    description = json.loads(path.with_suffix(".json").read_text())
+    values = read_archive(path.with_suffix(".npz"))
+    result = {"accepted": description["accepted"], "reasons": description["reasons"],
+              "diagnostics": description["diagnostics"], "modes": []}
+    for index, metadata in enumerate(description["modes"]):
+        mode = dict(metadata)
+        for key in ("seed_index", "center", "normal", "mask", "sample_indices"):
+            mode[key] = values[f"mode_{index}_{key}"]
+        mode["seed_index"] = int(mode["seed_index"])
+        result["modes"].append(mode)
+    return result
+# END reader migration; frozen result fields and numerical values are unchanged.
+
+
 def evaluate_suite(data_root, features_root, output_root, selected=None):
     """Run the five frozen methods on each actual rendered observation pair."""
     from .core import TransferConfig, prepare_anchors, infer_region

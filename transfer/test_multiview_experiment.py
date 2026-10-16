@@ -1,206 +1,181 @@
-"""Small contracts for frozen experiment artifacts and held-out evaluation.
+"""Contracts for cached input identity, frozen evaluation, and local rendering.
 
-These tests use temporary typed arrays, never models, fixture scenes, or real
-experiment results. They verify the boundary that keeps truth out of inference.
+Small synthetic observations exercise missing evidence, unequal image sizes,
+and serialization. No model, simulation scene, or truth-driven tuning is used.
 """
 
 import json
 from pathlib import Path
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
 import numpy as np
+from PIL import Image
 
-from transfer import multiview_experiment as experiment, multiview_registration_cases as fixture
+from . import multiview_experiment as experiment
+from .multiview_geometry import build_target_surface
+from .multiview_visualization import joint_region_picture
 
 
-# BEGIN independent experiment artifact and truth-isolation contracts.
+# BEGIN replacement contracts for joint-surface experiment artifacts.
 class MultiviewExperimentTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = TemporaryDirectory(prefix="multiview-experiment-test-")
-        self.folder = Path(self.temporary.name)
-        self.manifest = self.folder / "manifest.json"
-        self.case = {"id": "sample", "source_input_dir": "missing-input",
-            "source_observation_dir": "missing-observation",
-            "targets": [{"id": view, "input_dir": "missing-input", "observation_dir": "missing-observation",
-                         "missing_target": False, "missing_target_reasons": [], "missing_target_stage": None}
-                        for view in ("A", "B")],
-            "evaluation": {"source_truth": "DO-NOT-OPEN-source.npz", "pair_truth": "DO-NOT-OPEN-pair.json",
-                           "target_truth": {"A": "DO-NOT-OPEN-a.npz", "B": "DO-NOT-OPEN-b.npz"}}}
-        self.write_manifest()
+        self.temporary = TemporaryDirectory(prefix='joint-surface-experiment-')
+        self.root = Path(self.temporary.name)
+        self.data, self.cache = self.root / 'data', self.root / 'cache'
+        self.data.mkdir()
+        self.cache.mkdir()
+        self.index = self.root / 'cases.json'
+        self.calibration = {'K': np.eye(3).tolist(), 'T_world_camera_cv': np.eye(4).tolist()}
+        frames = {}
+        for name, shape in (('source', (3, 3)), ('left', (3, 3)), ('right', (2, 4))):
+            folder = self.data / name
+            folder.mkdir()
+            np.save(folder / 'depth_m.npy', np.ones(shape))
+            (folder / 'calibration.json').write_text(json.dumps(self.calibration))
+            Image.new('RGB', shape[::-1], (20, 30, 40)).save(folder / 'rgb.png')
+            frames[name] = {'path': name}
+        (self.data / 'manifest.json').write_text(json.dumps({'views': frames}))
+        y, x = np.indices((3, 3))
+        pixels = np.column_stack((x.ravel(), y.ravel())).astype(np.int64)
+        region = np.zeros((3, 3), bool)
+        region[0, :2] = True
+        np.save(self.data / 'demonstration.npy', region)
+        self.source = {'xyz': np.c_[pixels, np.ones(len(pixels))], 'pixels': pixels,
+            'object_mask': np.ones((3, 3), bool), 'entity_member': np.ones(len(pixels), bool),
+            'region_mask': region.ravel(), 'evidence_only': np.zeros(len(pixels), bool),
+            'K': np.eye(3), 'T_world_camera_cv': np.eye(4)}
+        self.target = {key: (value[:2] if key in ('xyz', 'pixels', 'entity_member', 'region_mask', 'evidence_only') else value.copy())
+                       for key, value in self.source.items()}
+        self.evidence = {'query_indices': np.array([0, 3]), 'query_region': np.array([True, False]),
+            'appearance_cost': np.array([[.1, 1.], [.2, 1.]], dtype=np.float32),
+            'peak_indices': np.array([[0, -1], [0, -1]]), 'supported_target': np.array([True, False]),
+            'allowed_feature_cells': np.asarray(1)}
+        cases = []
+        # Reverse manifest order deliberately: all core indices must still use
+        # canonical camera identity order after loading.
+        for view, frame, prepared in (('B', 'right', False), ('A', 'left', True)):
+            identifier = f'one_task_{view}'
+            folder = self.root / identifier
+            folder.mkdir()
+            cached = self.cache / identifier
+            cached.mkdir()
+            np.savez(folder / 'source_observation.npz', **self.source)
+            Image.new('RGB', (3, 3), (20, 30, 40)).save(folder / 'source.png')
+            (folder / 'inputs.json').write_text(json.dumps({'source_crop_xyxy': [0, 0, 3, 3]}))
+            (folder / 'preparation.json').write_text(json.dumps({'prepared': prepared,
+                'source': {'prepared': True, 'reasons': []},
+                'target': {'prepared': prepared, 'reasons': [] if prepared else ['no_entity_observation']}}))
+            if prepared:
+                np.savez(folder / 'target_observation.npz', **self.target)
+                np.savez(cached / 'joint_evidence.npz', **self.evidence)
+                (cached / 'frozen.json').write_text(json.dumps({'complete': True, 'target_truth_used': False}))
+            cases.append({'id': identifier, 'task': 'one_task', 'view': view, 'source': 'source',
+                          'target': frame, 'evidence': 'demonstration.npy', 'input_dir': str(folder),
+                          'pair_truth': f'pair-truth/{identifier}.json'})
+        self.description = {'data': str(self.data), 'cases': cases}
+        self.index.write_text(json.dumps(self.description))
 
     def tearDown(self):
         self.temporary.cleanup()
 
-    def write_manifest(self):
-        self.manifest.write_text(json.dumps({"schema": "multiview_grounding_v1", "cases": [self.case]}))
+    def task(self):
+        return experiment.read_manifest(self.index)[1]['tasks'][0]
 
-    def test_manifest_does_not_open_declared_truth(self):
-        with mock.patch.object(experiment, "archive", side_effect=AssertionError("must not read truth")):
-            path, description = experiment.read_manifest(self.manifest)
-        self.assertEqual(path, self.manifest)
-        self.assertEqual(description["cases"][0]["id"], "sample")
+    def loaded(self):
+        return experiment.load_inputs(self.index, self.task(), self.cache)
 
-    def test_evaluation_waits_for_complete_prediction_matrix(self):
-        with mock.patch.object(experiment, "archive", side_effect=AssertionError("truth read before barrier")):
-            with self.assertRaisesRegex(FileNotFoundError, "Finish every declared prediction"):
-                experiment.evaluate_suite(self.manifest, self.folder / "results")
+    def test_manifest_only_groups_explicit_records_without_truth(self):
+        with mock.patch.object(experiment, 'read_archive', side_effect=AssertionError('array read forbidden')):
+            _, description = experiment.read_manifest(self.index)
+        self.assertEqual([task['id'] for task in description['tasks']], ['one_task'])
 
     def test_duplicate_view_identity_is_rejected(self):
-        self.case["targets"][1]["id"] = "A"
-        self.write_manifest()
-        with self.assertRaisesRegex(ValueError, "unique"):
-            experiment.read_manifest(self.manifest)
+        self.description['cases'][1]['view'] = 'B'
+        self.index.write_text(json.dumps(self.description))
+        with self.assertRaisesRegex(ValueError, 'unique view'):
+            experiment.read_manifest(self.index)
 
-    def test_fusion_array_and_provenance_roundtrip(self):
-        result = {"bank": {"xyz": np.arange(9.).reshape(3, 3), "view_ids": ["A", "B"],
-                           "view_offsets": np.array([0, 2, 4])},
-            "src_anchor_idx": np.array([1, 2]), "tgt_anchor_idx": np.array([0, 2]),
-            "scores": np.array([.2, .5]), "raw_reasons": np.array(["ok", "no_support"]),
-            "diagnostics": {"method": "test"}}
-        experiment._save_fusion(self.folder, result, {"fusion_ms": 0.})
-        restored = experiment.load_fusion(self.folder)
-        for key in ("src_anchor_idx", "tgt_anchor_idx", "scores", "raw_reasons"):
-            np.testing.assert_array_equal(restored[key], result[key])
-        np.testing.assert_array_equal(restored["bank"]["xyz"], result["bank"]["xyz"])
-        np.testing.assert_array_equal(restored["bank"]["view_offsets"], result["bank"]["view_offsets"])
-        self.assertEqual(restored["bank"]["view_ids"], ["A", "B"])
-        self.assertTrue(restored["frozen"])
-        self.assertIs(restored["target_truth_used"], False)
+    def test_missing_entity_keeps_full_depth_and_canonical_camera_order(self):
+        loaded = self.loaded()
+        self.assertEqual([view['id'] for view in loaded['views']], ['A', 'B'])
+        missing = loaded['views'][1]
+        self.assertIsNone(missing['observation'])
+        self.assertIsNone(missing['evidence'])
+        self.assertEqual(missing['depth_m'].shape, (2, 4))
+        self.assertEqual(missing['missing_reasons'], ['no_entity_observation'])
+        np.testing.assert_array_equal(loaded['query_indices'], [0, 3])
+        self.assertEqual(float(loaded['views'][0]['evidence']['appearance_cost'][0, 1]), 1.)
+        self.assertFalse(loaded['views'][0]['evidence']['supported_target'][1])
 
-    def test_nonuniform_truth_reports_mapping_error_without_false_scale(self):
-        points = np.array([[0., 0., 0.], [1., 2., 3.]])
-        mapping = np.diag([1.2, .8, 1., 1.])
-        metrics = experiment.transform_metrics(1., np.eye(3), np.zeros(3), points, mapping, False)
-        self.assertIsNone(metrics["scale_relative_error"])
-        self.assertIsNone(metrics["rotation_error_deg"])
-        self.assertIsNone(metrics["translation_parameter_error_m"])
-        self.assertGreater(metrics["source_points_transform_rmse_m"], 0.)
-
-    def test_transform_metrics_accepts_frozen_json_arrays_without_refitting(self):
-        points = np.array([[0., 0., 0.], [1., 2., 3.], [.3, -.2, .7]])
-        rotation = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
-        translation = np.array([.2, -.3, .4])
-        mapping = np.eye(4)
-        mapping[:3, :3] = 1.25 * rotation
-        mapping[:3, 3] = translation
-        frozen = json.loads(json.dumps({"scale": 1.25, "rotation": rotation.tolist(), "translation": translation.tolist()}))
-        with mock.patch("transfer.core.prepare_anchors", side_effect=AssertionError("evaluation must not refit")):
-            metrics = experiment.transform_metrics(frozen["scale"], frozen["rotation"], frozen["translation"], points, mapping, True)
-        self.assertLess(metrics["source_points_transform_rmse_m"], 1e-12)
-        self.assertLess(metrics["scale_relative_error"], 1e-12)
-        self.assertLess(metrics["rotation_error_deg"], 1e-12)
-        self.assertLess(metrics["translation_parameter_error_m"], 1e-12)
-
-    def test_depth_artifact_mismatch_is_rejected_without_snapping(self):
-        depth = np.ones((3, 3))
-        observation = {"pixels": np.array([[1, 1]]), "xyz": np.array([[1., 1., 1.]]),
-                       "K": np.eye(3), "T_world_camera_cv": np.eye(4)}
-        experiment._check_observed_depth(observation, depth)
-        different = depth.copy()
-        different[1, 1] = 2.
+    def test_stale_depth_is_rejected_without_snapping(self):
+        np.save(self.data / 'left' / 'depth_m.npy', np.full((3, 3), 2.))
         with self.assertRaises(AssertionError):
-            experiment._check_observed_depth(observation, different)
+            self.loaded()
 
-    def _missing_target_inputs(self):
-        """Write one observed view plus one explicit segmentation failure."""
-        mask = np.array([[True, False], [False, False]])
-        observation = {"xyz": np.array([[0., 0., 1.]]), "pixels": np.array([[0, 0]]),
-            "object_mask": mask, "entity_member": np.ones(1, dtype=bool),
-            "region_mask": np.ones(1, dtype=bool), "evidence_only": np.zeros(1, dtype=bool),
-            "K": np.eye(3), "T_world_camera_cv": np.eye(4)}
-        full_source = self.folder / "source-rgbd"
-        full_source.mkdir()
-        np.save(full_source / "depth_m.npy", np.ones((2, 2)))
-        calibration = {"K": np.eye(3).tolist(), "T_world_camera_cv": np.eye(4).tolist()}
-        (full_source / "calibration.json").write_text(json.dumps(calibration))
-        self.case["source_observation_dir"] = str(full_source)
-        for view_index, target in enumerate(self.case["targets"]):
-            directory, full = self.folder / f"inputs-{target['id']}", self.folder / f"rgbd-{target['id']}"
-            directory.mkdir()
-            full.mkdir()
-            np.save(full / "depth_m.npy", np.ones((2, 2)))
-            pose = np.eye(4)
-            pose[0, 3] = view_index * .2
-            (full / "calibration.json").write_text(json.dumps({"K": np.eye(3).tolist(), "T_world_camera_cv": pose.tolist()}))
-            target.update(input_dir=str(directory), observation_dir=str(full))
-            missing = view_index == 1
-            target.update(missing_target=missing, missing_target_reasons=["no_sam_detections"] if missing else [],
-                          missing_target_stage="segmentation_preparation" if missing else None)
-            prepared = {"prepared": not missing, "source": {"prepared": True, "reasons": []},
-                "target": {"prepared": not missing, "reasons": target["missing_target_reasons"]}}
-            (directory / "preparation.json").write_text(json.dumps(prepared))
-            metadata = {"source_crop_xyxy": [0, 0, 2, 2]}
-            np.savez(directory / "source_observation.npz", **observation)
-            if not missing:
-                self.case["source_input_dir"] = str(directory)
-                metadata["target_crop_xyxy"] = [0, 0, 2, 2]
-                np.savez(directory / "target_observation.npz", **observation)
-                np.save(directory / "target_selected_mask.npy", mask)
-                np.savez(directory / "features.npz", feature1=np.ones((1, 1, 2, 2), dtype=np.float32),
-                         feature2=np.ones((1, 1, 2, 2), dtype=np.float32))
-            (directory / "inputs.json").write_text(json.dumps(metadata))
-        self.write_manifest()
+    def test_changed_source_crop_is_rejected(self):
+        folder = Path(self.description['cases'][0]['input_dir'])
+        (folder / 'inputs.json').write_text(json.dumps({'source_crop_xyxy': [0, 0, 2, 3]}))
+        with self.assertRaisesRegex(ValueError, 'identical source'):
+            self.loaded()
 
-    def test_explicit_missing_target_retains_empty_view_and_original_camera(self):
-        self._missing_target_inputs()
-        path, description = experiment.read_manifest(self.manifest)
-        source, feature, crop, targets = experiment.load_inputs(path, description["cases"][0], features=True)
-        missing = targets[1]
-        self.assertEqual(missing["id"], "B")
-        self.assertTrue(missing["missing_target"])
-        self.assertEqual(missing["missing_target_reasons"], ["no_sam_detections"])
-        self.assertEqual(missing["observation"]["xyz"].shape, (0, 3))
-        self.assertEqual(missing["observation"]["pixels"].shape, (0, 2))
-        self.assertFalse(missing["selected_mask"].any())
-        self.assertEqual(missing["selected_mask"].shape, (2, 2))
-        self.assertIsNone(missing["feature"])
-        self.assertIsNone(missing["crop_xyxy"])
-        self.assertEqual(missing["observation"]["T_world_camera_cv"][0, 3], .2)
-        np.testing.assert_array_equal(missing["depth_m"], np.ones((2, 2)))
-        self.assertEqual(len(source["xyz"]), 1)
-        self.assertIsNotNone(feature)
+    def test_surface_roundtrip_keeps_provenance_and_unequal_image_shapes(self):
+        loaded = self.loaded()
+        original = build_target_surface(loaded['views'])
+        experiment.save_surface(self.root, original)
+        restored = experiment.load_surface(self.root, loaded['views'])
+        for key, value in original.items():
+            if isinstance(value, np.ndarray):
+                np.testing.assert_array_equal(restored[key], value, err_msg=key)
+            elif key not in ('adjacency', 'pixel_to_observation', 'depth_m'):
+                self.assertEqual(restored[key], value)
+        self.assertEqual((restored['adjacency'] != original['adjacency']).nnz, 0)
+        self.assertEqual([depth.shape for depth in restored['depth_m']], [(3, 3), (2, 4)])
+        for actual, expected in zip(restored['pixel_to_observation'], original['pixel_to_observation']):
+            np.testing.assert_array_equal(actual, expected)
 
-    def test_missing_target_requires_matching_preparation_declaration(self):
-        self._missing_target_inputs()
-        self.case["targets"][1].update(missing_target=False, missing_target_reasons=[], missing_target_stage=None)
-        with self.assertRaisesRegex(ValueError, "disagrees with its frozen preparation"):
-            experiment.load_inputs(self.manifest, self.case)
+    def test_native_proposal_does_not_require_old_region_acceptance(self):
+        loaded = self.loaded()
+        np.savez(self.cache / 'one_task_A' / 'old_teaserpp.npz', accepted=np.asarray(False),
+                 sim3_scale=np.asarray(1.), sim3_rotation=np.eye(3), sim3_translation=np.zeros(3))
+        proposals, states = experiment.initial_proposals(loaded['views'], 'teaserpp')
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]['view_index'], 0)
+        self.assertEqual(proposals[0]['origin'], 'native_teaserpp')
+        self.assertTrue(states[0]['available'])
+        self.assertFalse(states[1]['available'])
 
-    def test_missing_target_does_not_hide_a_missing_source_artifact(self):
-        self._missing_target_inputs()
-        (Path(self.case["targets"][1]["input_dir"]) / "source_observation.npz").unlink()
-        with self.assertRaises(FileNotFoundError):
-            experiment.load_inputs(self.manifest, self.case)
+    def test_evaluation_requires_frozen_matrix_before_truth_reads(self):
+        with mock.patch.object(experiment, 'read_archive', side_effect=AssertionError('truth read before barrier')):
+            with self.assertRaisesRegex(FileNotFoundError, 'Finish every declared prediction'):
+                experiment.evaluate_suite(self.root / 'unstarted')
 
-    def test_source_preparation_is_independent_of_its_paired_target_status(self):
-        self._missing_target_inputs()
-        self.case["source_input_dir"] = self.case["targets"][1]["input_dir"]
-        source, feature, _, targets = experiment.load_inputs(self.manifest, self.case)
-        self.assertEqual(len(source["xyz"]), 1)
-        self.assertIsNone(feature)
-        self.assertTrue(targets[1]["missing_target"])
-        # There is no feature cache at this explicit source path. The loader
-        # must report that fact rather than silently switch to another pair.
-        with self.assertRaises(FileNotFoundError):
-            experiment.load_inputs(self.manifest, self.case, features=True)
+    def test_prediction_process_guard_blocks_truth(self):
+        script = ('from transfer.multiview_experiment import block_evaluation_reads; '
+                  'block_evaluation_reads(); open("pair-truth/held-out.json")')
+        result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Evaluation-only artifact requested', result.stderr)
 
-    def test_missing_target_feature_stage_records_skip_without_model_call(self):
-        supplement = self.folder / "cabinet_b"
-        directory = supplement / "inputs/sam31/cabinet_yaw_a_to_b"
-        directory.mkdir(parents=True)
-        (directory / "preparation.json").write_text(json.dumps({"prepared": False,
-            "source": {"prepared": True}, "target": {"prepared": False, "reasons": ["no_sam_detections"]}}))
-        with mock.patch("transfer.segmented_experiment.extract_suite", side_effect=AssertionError("must not call MARCO")):
-            fixture.extract_features(self.folder, self.folder)
-        record = json.loads((supplement / "marco-timing.json").read_text())
-        self.assertEqual(record["status"], "skipped_no_target_observation")
-        self.assertEqual(record["model_calls"], 0)
-        self.assertEqual(record["fresh_pair_call_ms"], 0.)
-        self.assertFalse((directory / "features.npz").exists())
+    def test_occluded_sample_is_not_painted_in_another_camera(self):
+        loaded = self.loaded()
+        surface = build_target_surface(loaded['views'])
+        seed = int(np.flatnonzero(surface['entity_member'])[0])
+        mask = np.zeros(len(surface['xyz']), bool)
+        mask[seed] = True
+        mode = {'mask': mask, 'sample_indices': np.array([seed]), 'center': surface['xyz'][seed]}
+        hidden = {'supported': np.array([False]), 'conflict': np.array([False]),
+                  'unknown': np.array([True]), 'pixels': np.array([[1., 1.]])}
+        with mock.patch('transfer.multiview_visualization.project_observations', return_value=hidden):
+            image, counts = joint_region_picture(np.zeros((2, 4, 3), np.uint8), surface, mode, 1)
+        self.assertEqual(counts['visible_samples'], 0)
+        self.assertEqual(counts['unknown_samples'], 1)
+        self.assertFalse(np.any(np.all(np.asarray(image) == [255, 237, 100], axis=2)))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
-# END independent experiment artifact and truth-isolation contracts.
+# END replacement experiment contracts.

@@ -1,249 +1,223 @@
-"""Small CPU regressions for exact observed identities and surface association.
+"""CPU contracts for two calibrated depth observations and one surface graph.
 
-The fixtures construct only calibrated RGB-D arrays. No image model, renderer,
-ground-truth object geometry, GPU allocation, or repository dataset is needed.
+The fixtures are small analytic RGB-D arrays, not model outputs or repository
+datasets. Geometry exists independently of an entity mask or appearance cache.
 """
 
+import copy
 import unittest
-from unittest import mock
 
 import numpy as np
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial.distance import pdist
+from scipy.spatial.transform import Rotation
 
-from transfer.core import TransferConfig, _pixel_components
-from transfer.multiview_geometry import (associate_view, build_candidate_bank,
-                                         _association_planes)
+from transfer.core import TransferConfig
+from transfer.multiview_geometry import (build_target_surface, check_points,
+                                         project_observations, sample_region)
 
 
-# BEGIN independent multiview geometry regressions.
-def _target(view_id, depth=None, *, mask=None, K=None, T=None):
-    """Backproject exact pixel identities using the production camera convention."""
-    depth = np.ones((9, 9), dtype=float) if depth is None else np.asarray(depth)
+def calibrated_view(view_id, depth=None, *, mask=None, K=None, T=None,
+                    observation_available=True):
+    """Provide full depth plus a separately indexed optional entity observation."""
+    depth = np.ones((9, 9), dtype=float) if depth is None else np.asarray(depth, dtype=float)
     height, width = depth.shape
-    mask = np.ones(depth.shape, bool) if mask is None else np.asarray(mask)
-    K = (np.array([[1000., 0., (width - 1) / 2],
-                   [0., 1000., (height - 1) / 2], [0., 0., 1.]])
-         if K is None else np.asarray(K))
-    T = np.eye(4) if T is None else np.asarray(T)
-    y, x = np.nonzero(mask & np.isfinite(depth) & (depth > 0))
-    pixels = np.column_stack((x, y)).astype(np.int64)
-    rays = np.column_stack((pixels, np.ones(len(pixels)))) @ np.linalg.inv(K).T
-    xyz = (rays * depth[y, x, None]) @ T[:3, :3].T + T[:3, 3]
-    return {"id": view_id, "observation": {"xyz": xyz, "pixels": pixels,
-            "K": K, "T_world_camera_cv": T, "object_mask": mask.copy()},
-            "depth_m": depth, "selected_mask": mask.copy(),
-            "crop_xyxy": np.array([0, 0, width, height])}
+    valid = np.isfinite(depth) & (depth > 0)
+    mask = valid.copy() if mask is None else np.asarray(mask, dtype=bool).copy()
+    K = (np.array([[500., 0., (width-1)/2], [0., 500., (height-1)/2], [0., 0., 1.]])
+         if K is None else np.asarray(K, dtype=float))
+    T = np.eye(4) if T is None else np.asarray(T, dtype=float)
+    observation = None
+    if observation_available:
+        y, x = np.nonzero(mask & valid)
+        pixels = np.column_stack((x, y)).astype(np.int64)
+        rays = np.column_stack((pixels, np.ones(len(pixels)))) @ np.linalg.inv(K).T
+        xyz = (rays * depth[y, x, None]) @ T[:3, :3].T + T[:3, 3]
+        observation = {'xyz': xyz, 'pixels': pixels, 'K': K.copy(),
+                       'T_world_camera_cv': T.copy(), 'object_mask': mask,
+                       'entity_member': np.ones(len(pixels), bool),
+                       'region_mask': np.zeros(len(pixels), bool),
+                       'evidence_only': np.zeros(len(pixels), bool)}
+    return {'id': view_id, 'K': K.copy(), 'T_world_camera_cv': T.copy(),
+            'depth_m': depth.copy(), 'observation': observation, 'evidence': None}
 
 
-def _point_target(view_id, xyz):
-    """Observe a chosen world point at the center of a different calibrated view."""
-    transform = np.eye(4)
-    transform[:3, 3] = np.asarray(xyz) - [0., 0., 1.]
-    target = _target(view_id, np.ones((1, 1)), T=transform)
-    # Preserve the supplied observed world coordinate exactly: no arithmetic
-    # rounding is allowed to merge or move candidates in the test bank.
-    target["observation"]["xyz"] = np.asarray(xyz, dtype=float)[None].copy()
-    return target
+def plane_depth(shape, K, T, point, normal):
+    """Intersect calibrated world rays with an analytic plane for the fixture."""
+    yy, xx = np.indices(shape)
+    pixels = np.column_stack((xx.ravel(), yy.ravel(), np.ones(xx.size)))
+    rays = (pixels @ np.linalg.inv(K).T) @ T[:3, :3].T
+    numerator = np.dot(np.asarray(point)-T[:3, 3], normal)
+    return (numerator/(rays @ normal)).reshape(shape)
 
 
-def _foreign_candidate(target, xyz, *, radius=.03):
-    other = _point_target("z_foreign", xyz)
-    bank = build_candidate_bank([other, target])
-    candidate = int(bank["observation_candidate_index"][-1])
-    association = associate_view(bank, target, sampling_radius_m=radius)
-    return bank, candidate, association, other
+def element_at(surface, view_index, x, y):
+    """Resolve a known raw pixel through the public provenance arrays."""
+    observation = int(surface['pixel_to_observation'][view_index][y, x])
+    if observation < 0:
+        raise AssertionError('The fixture requested an invalid depth pixel')
+    return int(surface['observation_to_element'][observation])
 
 
-def _state(association, index):
-    return association["state_names"][int(association["state"][index])]
-
-
-class TestCandidateBank(unittest.TestCase):
-    def test_canonical_view_order_exact_union_and_all_provenance(self):
-        a = _target("a", np.array([[1., 1.1]]))
-        b = _target("b", np.array([[1., 1.2]]))
-        first = build_candidate_bank([b, a])
-        second = build_candidate_bank([a, b])
-        for key in first:
-            if key == "view_ids":
-                self.assertEqual(first[key], ["a", "b"])
-            else:
-                np.testing.assert_array_equal(first[key], second[key])
-        self.assertEqual(len(first["xyz"]), 3)
-        np.testing.assert_array_equal(first["view_offsets"], [0, 2, 4])
-        np.testing.assert_array_equal(first["observation_view_index"], [0, 0, 1, 1])
-        np.testing.assert_array_equal(first["observation_local_index"], [0, 1, 0, 1])
-        np.testing.assert_array_equal(first["xyz"][first["observation_candidate_index"]],
-                                      first["observation_xyz"])
-        np.testing.assert_array_equal(first["observation_xyz"][first["candidate_first_observation_index"]],
-                                      first["xyz"])
-        shared = first["observation_candidate_index"][0]
-        self.assertEqual(shared, first["observation_candidate_index"][2])
-        for target in (a, b):
-            association = associate_view(first, target)
-            self.assertTrue(association["owner"][shared])
-            self.assertTrue(association["supported"][shared])
-
-    def test_no_rounding_or_same_pixel_cross_camera_identity(self):
-        a = _point_target("a", [0., 0., 1.])
-        b = _point_target("b", [0., 0., np.nextafter(1., 2.)])
-        bank = build_candidate_bank([a, b])
-        self.assertEqual(len(bank["xyz"]), 2)
-        np.testing.assert_array_equal(a["observation"]["pixels"], b["observation"]["pixels"])
-        np.testing.assert_array_equal(bank["observation_view_index"], [0, 1])
-        self.assertNotEqual(bank["observation_candidate_index"][0],
-                            bank["observation_candidate_index"][1])
-
-    def test_empty_observations_and_invalid_identity_contract(self):
-        a = _target("a", np.full((2, 2), np.nan))
-        b = _target("b", np.full((2, 2), np.nan))
-        bank = build_candidate_bank([a, b])
-        self.assertEqual(bank["xyz"].shape, (0, 3))
-        result = associate_view(bank, a)
-        self.assertEqual(result["pixels"].shape, (0, 2))
-        self.assertEqual(result["diagnostics"]["candidate_count"], 0)
-        for targets in ([a], [a, a], [a, b, a]):
-            with self.assertRaises(ValueError):
-                build_candidate_bank(targets)
-        malformed = _target("c")
-        malformed["observation"]["pixels"][1] = malformed["observation"]["pixels"][0]
-        with self.assertRaises(ValueError):
-            build_candidate_bank([a, malformed])
-
-
-class TestViewAssociation(unittest.TestCase):
-    def test_owner_nonidentity_calibration_roundtrip_and_no_plane_requirement(self):
-        K = np.array([[700., 13., 3.25], [0., 450., 4.75], [0., 0., 1.]])
-        T = np.array([[0., -1., 0., .3], [1., 0., 0., -.2],
-                      [0., 0., 1., .5], [0., 0., 0., 1.]])
-        # A single measured point cannot define a plane, but remains directly
-        # supported in its owner camera, including at the image border.
+class TestTargetSurface(unittest.TestCase):
+    def test_full_depth_survives_small_or_missing_entity_observations(self):
         mask = np.zeros((9, 9), bool)
-        mask[0, 0] = True
-        target = _target("a", mask=mask, K=K, T=T)
-        other = _point_target("b", [4., 2., 1.])
-        bank = build_candidate_bank([target, other])
-        index = int(bank["observation_candidate_index"][0])
-        with mock.patch("transfer.multiview_geometry._association_planes", wraps=_association_planes) as planes:
-            result = associate_view(bank, target)
-        self.assertTrue(result["owner"][index])
-        self.assertTrue(result["supported"][index])
-        self.assertEqual(_state(result, index), "owner_observed")
-        np.testing.assert_array_equal(result["pixels"][index], [0., 0.])
-        self.assertEqual(planes.call_count, 0)
+        mask[3:6, 3:6] = True
+        a = calibrated_view('a', mask=mask)
+        b = calibrated_view('b', observation_available=False)
+        original = copy.deepcopy((a, b))
+        surface = build_target_surface([b, a])
+        self.assertEqual(surface['view_ids'], ['a', 'b'])
+        self.assertEqual(len(surface['observation_xyz']), 162)
+        self.assertEqual(surface['view_offsets'].tolist(), [0, 81, 162])
+        expected_entity = np.zeros(len(surface['xyz']), bool)
+        for x, y in a['observation']['pixels']:
+            expected_entity[element_at(surface, 0, x, y)] = True
+        np.testing.assert_array_equal(surface['entity_member'], expected_entity)
+        self.assertTrue(np.any(~surface['entity_member']))
+        for before, after in zip(original, (a, b)):
+            np.testing.assert_array_equal(before['depth_m'], after['depth_m'])
+        self.assertEqual(len(surface['observation_to_element']), 162)
 
-    def test_slanted_plane_uses_plane_distance_not_nearest_optical_depth(self):
-        base = _target("a")
-        K = base["observation"]["K"]
-        normal = np.array([1., 0., .055])
-        normal /= np.linalg.norm(normal)
-        yy, xx = np.indices((9, 9))
-        rays = np.stack(((xx - 4) / 1000, (yy - 4) / 1000, np.ones((9, 9))), axis=-1)
-        depth = normal[2] / (rays @ normal)
-        target = _target("a", depth, K=K)
-        pixel = np.array([4.4, 4.3])
-        ray = np.linalg.inv(K) @ np.r_[pixel, 1.]
-        q = ray * (normal[2] / (ray @ normal))
-        bank, index, result, _ = _foreign_candidate(target, q)
-        self.assertFalse(result["owner"][index])
-        self.assertTrue(result["supported"][index])
-        self.assertEqual(_state(result, index), "co_observed")
-        np.testing.assert_allclose(result["pixels"][index], pixel, atol=1e-12, rtol=0)
-        points, _, spacing, _, lookup = _association_planes(
-            depth, target["selected_mask"], K, np.eye(4), .03, TransferConfig())
-        nearest = lookup[4, 4]
-        h = TransferConfig().surface_height_spacing_factor * spacing[nearest]
-        self.assertGreater(abs(q[2] - points[nearest, 2]), h)
-        np.testing.assert_array_equal(bank["xyz"][index], q)
+    def test_groups_have_at_most_one_member_from_each_view_and_real_representatives(self):
+        a, b = calibrated_view('a'), calibrated_view('b')
+        surface = build_target_surface([a, b])
+        count = np.bincount(surface['observation_to_element'], minlength=len(surface['xyz']))
+        self.assertTrue(np.any(count == 2))
+        self.assertTrue(np.all((count >= 1) & (count <= 2)))
+        for index in range(2):
+            own = surface['observation_view_index'] == index
+            per_view = np.bincount(surface['observation_to_element'][own], minlength=len(count))
+            self.assertTrue(np.all(per_view <= 1))
+            np.testing.assert_array_equal(surface['member_views'][:, index], per_view == 1)
+        np.testing.assert_array_equal(surface['xyz'],
+            surface['observation_xyz'][surface['representative_observation']])
+        reverse = build_target_surface([b, a])
+        for key in ('xyz', 'observation_to_element', 'representative_observation', 'member_views', 'entity_member'):
+            np.testing.assert_array_equal(surface[key], reverse[key])
+        self.assertEqual((surface['adjacency'] != reverse['adjacency']).nnz, 0)
 
-    def test_all_four_corners_require_depth_and_sam_support(self):
-        q = np.array([.0004, .0004, 1.])  # projection (4.4, 4.4), nearest (4,4)
-        for defect, expected in (("depth", "invalid_depth"),
-                                 ("sam", "outside_selected_mask")):
-            with self.subTest(defect=defect):
-                depth = np.ones((9, 9))
-                mask = np.ones((9, 9), bool)
-                if defect == "depth":
-                    depth[5, 5] = np.nan
-                else:
-                    mask[5, 5] = False
-                target = _target("a", depth, mask=mask)
-                bank, index, result, other = _foreign_candidate(target, q)
-                self.assertFalse(result["supported"][index])
-                self.assertEqual(_state(result, index), expected)
-                self.assertTrue(associate_view(bank, other)["supported"][index])
+    def test_observed_by_both_is_distinct_from_having_a_paired_member(self):
+        a = calibrated_view('a')
+        K = a['K'].copy()
+        K[:2, :2] *= .5
+        b = calibrated_view('b', K=K)
+        surface = build_target_surface([a, b])
+        both_visible = np.all(surface['observed_views'], axis=1)
+        single_member = surface['member_views'].sum(axis=1) == 1
+        self.assertTrue(np.any(both_visible & single_member))
+        self.assertTrue(np.all(np.bincount(surface['observation_to_element']) <= 2))
 
-    def test_depth_edge_cannot_extend_nearest_pixel_plane(self):
+    def test_opposite_sides_and_distinct_parallel_layers_do_not_merge(self):
+        a = calibrated_view('a')
+        opposite = np.diag([1., -1., -1., 1.])
+        opposite[2, 3] = 2.
+        alternatives = (calibrated_view('b', T=opposite),
+                        calibrated_view('b', depth=np.full((9, 9), 1.02)))
+        for b in alternatives:
+            with self.subTest(camera=b['T_world_camera_cv'].tolist()):
+                surface = build_target_surface([a, b])
+                self.assertTrue(np.all(np.bincount(surface['observation_to_element']) == 1))
+                self.assertEqual(len(surface['xyz']), 162)
+
+    def test_missing_depth_gap_stays_disconnected_until_another_view_observes_it(self):
         depth = np.ones((9, 9))
-        depth[:, 5:] = 1.1
-        target = _target("a", depth)
-        q = np.array([.0004, .0004, 1.])
-        _, index, result, _ = _foreign_candidate(target, q)
-        self.assertFalse(result["supported"][index])
-        self.assertEqual(_state(result, index), "corner_surface_mismatch")
+        depth[4] = np.nan
+        a = calibrated_view('a', depth)
+        separated = build_target_surface([a, calibrated_view('b', depth)])
+        self.assertEqual(connected_components(separated['adjacency'], directed=False)[0], 2)
+        completed = build_target_surface([a, calibrated_view('b')])
+        self.assertEqual(connected_components(completed['adjacency'], directed=False)[0], 1)
+        b_only = completed['member_views'][:, 1] & ~completed['member_views'][:, 0]
+        self.assertTrue(np.any(b_only))
 
-    def test_front_and_occluded_surface_conflicts_never_remove_owner(self):
-        target = _target("a")
-        for depth, expected in ((.99, "front_of_observed_surface"),
-                                 (1.01, "behind_observed_surface")):
-            with self.subTest(depth=depth):
-                bank, index, result, other = _foreign_candidate(target, [0., 0., depth])
-                self.assertFalse(result["supported"][index])
-                self.assertEqual(_state(result, index), expected)
-                self.assertFalse(result["diagnostics"]["hard_free_space_veto"])
-                self.assertTrue(associate_view(bank, other)["supported"][index])
-
-    def test_subresolution_offset_is_explicitly_associated_and_radius_is_bounded(self):
-        target = _target("a")
-        _, index, result, _ = _foreign_candidate(target, [0., 0., 1.001])
-        self.assertEqual(_state(result, index), "co_observed")
-        _, index, result, _ = _foreign_candidate(target, [0., 0., 1.04])
-        self.assertEqual(_state(result, index), "outside_local_radius")
-
-    def test_outside_and_behind_camera_are_neutral(self):
-        target = _target("a")
-        for xyz, expected in (([1., 0., 1.], "outside_image"),
-                               ([0., 0., -1.], "behind_camera"),
-                               ([0., 0., 0.], "invalid_projection")):
-            with self.subTest(xyz=xyz):
-                bank, index, result, other = _foreign_candidate(target, xyz)
-                self.assertFalse(result["supported"][index])
-                self.assertEqual(_state(result, index), expected)
-                self.assertTrue(associate_view(bank, other)["supported"][index])
-
-    def test_full_depth_neighbors_survive_sam_computation_crop(self):
-        mask = np.zeros((9, 9), bool)
-        mask[4:6, 4:6] = True
-        target = _target("a", mask=mask)
-        _, index, result, _ = _foreign_candidate(target, [.0004, .0004, 1.])
-        self.assertEqual(_state(result, index), "co_observed")
-        # Four SAM points alone cannot meet the inherited six-point support
-        # gate. Passing proves surrounding non-SAM depth remains available.
-        self.assertGreater(result["diagnostics"]["plane_computation_point_count"], int(mask.sum()))
-
-    def test_collinear_local_observation_is_unknown(self):
+    def test_collinear_or_invalid_depth_is_retained_without_valid_surface_claim(self):
         depth = np.full((9, 9), np.nan)
         depth[4] = 1.
-        target = _target("a", depth)
-        _, index, result, _ = _foreign_candidate(target, [.0004, 0., 1.])
-        self.assertFalse(result["supported"][index])
-        self.assertEqual(_state(result, index), "invalid_local_plane")
+        surface = build_target_surface([calibrated_view('a', depth), calibrated_view('b', depth)])
+        self.assertEqual(len(surface['observation_xyz']), 18)
+        self.assertFalse(np.any(surface['valid']))
+        empty = np.array([[np.nan, 0., -1., np.inf]])
+        surface = build_target_surface([calibrated_view('a', empty), calibrated_view('b', empty)])
+        self.assertEqual(surface['xyz'].shape, (0, 3))
+        self.assertEqual(surface['adjacency'].shape, (0, 0))
 
-    def test_observation_gap_preserves_native_per_view_connectivity(self):
+    def test_arbitrary_rigid_world_coordinates_preserve_observation_membership(self):
+        a, b = calibrated_view('a'), calibrated_view('b')
+        original = build_target_surface([a, b])
+        rigid = np.eye(4)
+        rigid[:3, :3] = Rotation.from_rotvec([.35, -.4, .2]).as_matrix()
+        rigid[:3, 3] = [.2, -.3, .4]
+        moved = build_target_surface([calibrated_view('a', T=rigid), calibrated_view('b', T=rigid)])
+        np.testing.assert_array_equal(original['observation_to_element'], moved['observation_to_element'])
+        np.testing.assert_allclose(moved['xyz'], original['xyz'] @ rigid[:3, :3].T + rigid[:3, 3],
+                                   rtol=0, atol=1e-12)
+        np.testing.assert_array_equal(original['entity_member'], moved['entity_member'])
+
+
+class TestProjectionAndSampling(unittest.TestCase):
+    def test_surface_support_free_space_and_occlusion_remain_distinct(self):
+        surface = build_target_surface([calibrated_view('a'), calibrated_view('b')])
+        points = np.array([[0., 0., 1.], [0., 0., .98], [0., 0., 1.02],
+                           [1., 0., 1.], [0., 0., -1.]])
+        projected = project_observations(surface, points, 0)
+        np.testing.assert_array_equal(projected['supported'], [True, False, False, False, False])
+        np.testing.assert_array_equal(projected['conflict'], [False, True, False, False, False])
+        np.testing.assert_array_equal(projected['unknown'], [False, False, True, True, True])
+        checked = check_points(surface, points, tolerance_m=0)
+        np.testing.assert_array_equal(checked['support'], projected['supported'])
+        np.testing.assert_array_equal(checked['conflict'], projected['conflict'])
+        np.testing.assert_array_equal(checked['unknown'], projected['unknown'])
+
+    def test_four_corner_depth_gap_is_unknown_but_entity_mask_gap_is_not(self):
+        pixel = np.array([4.4, 4.4])
+        base = calibrated_view('a')
+        point = (np.linalg.inv(base['K']) @ np.r_[pixel, 1.])[None]
         mask = np.ones((9, 9), bool)
-        mask[4] = False
-        target = _target("a", mask=mask)
-        other = _target("b", mask=mask)
-        other["observation"]["xyz"] = other["observation"]["xyz"] + [1., 0., 0.]
-        bank = build_candidate_bank([other, target])
-        for view_index, view in enumerate((target, other)):
-            ids = bank["observation_view_index"] == view_index
-            np.testing.assert_array_equal(bank["observation_local_index"][ids],
-                                          np.arange(len(view["observation"]["xyz"])))
-            components = _pixel_components(view["observation"]["pixels"])
-            self.assertEqual(len(np.unique(components)), 2)
-        self.assertEqual(len(bank["xyz"]), 2 * len(target["observation"]["xyz"]))
+        mask[5, 5] = False
+        surface = build_target_surface([calibrated_view('a', mask=mask), calibrated_view('b')])
+        self.assertTrue(project_observations(surface, point, 0)['supported'][0])
+        depth = np.ones((9, 9))
+        depth[5, 5] = np.nan
+        surface = build_target_surface([calibrated_view('a', depth), calibrated_view('b')])
+        projected = project_observations(surface, point, 0)
+        self.assertFalse(projected['supported'][0])
+        self.assertFalse(projected['conflict'][0])
+        self.assertTrue(projected['unknown'][0])
+
+    def test_slanted_plane_support_uses_plane_distance(self):
+        K = np.array([[1000., 0., 4.], [0., 1000., 4.], [0., 0., 1.]])
+        normal = np.array([1., 0., .055])
+        normal /= np.linalg.norm(normal)
+        depth = plane_depth((9, 9), K, np.eye(4), [0., 0., 1.], normal)
+        a = calibrated_view('a', depth, K=K)
+        surface = build_target_surface([a, calibrated_view('b', depth, K=K)])
+        pixel = np.array([4.4, 4.3])
+        ray = np.linalg.inv(K) @ np.r_[pixel, 1.]
+        point = ray * (normal[2]/np.dot(ray, normal))
+        projected = project_observations(surface, point[None], 0)
+        self.assertTrue(projected['supported'][0])
+        np.testing.assert_allclose(projected['pixels'][0], pixel, rtol=0, atol=1e-12)
+
+    def test_sampling_keeps_fixed_metric_radius_and_actual_representatives(self):
+        K = np.array([[250., 0., 10.], [0., 250., 10.], [0., 0., 1.]])
+        depth = np.ones((21, 21))
+        surface = build_target_surface([calibrated_view('a', depth, K=K),
+                                        calibrated_view('b', depth, K=K)])
+        seed = element_at(surface, 0, 10, 10)
+        mode = sample_region(surface, surface['valid'] & surface['entity_member'], seed,
+                             sampling_radius_m=.012, sampling_spacing_m=.005,
+                             config=TransferConfig())
+        members = surface['xyz'][mode['mask']]
+        self.assertTrue(mode['mask'][seed])
+        self.assertTrue(np.all(np.linalg.norm(members-surface['xyz'][seed], axis=1) <= .012*(1+1e-12)))
+        samples = np.asarray(mode['sample_indices'])
+        self.assertTrue(np.all(mode['mask'][samples]))
+        self.assertGreater(len(samples), 1)
+        self.assertGreaterEqual(pdist(surface['xyz'][samples]).min(), .005*(1-1e-12))
+        np.testing.assert_array_equal(surface['xyz'][samples],
+            surface['observation_xyz'][surface['representative_observation'][samples]])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
-# END independent multiview geometry regressions.

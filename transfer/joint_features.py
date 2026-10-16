@@ -9,8 +9,10 @@ import numpy as np
 
 from .core import fps_indices
 from .experiment import feature_observation
-from .features import sample_descriptors
-from .multiview_features import centered_rank_maps, rank_sampling_plan, sample_rank_maps
+# BEGIN single-view evidence reads its unchanged shared primitives directly.
+from .features import (sample_descriptors, centered_rank_maps,
+                       rank_sampling_plan, sample_rank_maps)
+# END no single-view dependence on the dual-view fusion module.
 
 
 def source_queries(source, region_count=32, context_count=32):

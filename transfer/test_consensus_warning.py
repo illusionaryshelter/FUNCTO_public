@@ -202,32 +202,34 @@ class TestConsensusWarningPolicy(unittest.TestCase):
                     self.assertEqual(restored["diagnostics"]["quality_warnings"], [WARNING])
                     self.assertEqual(restored["diagnostics"]["inlier_ratio"], 0.18)
 
-    # BEGIN multiview consumer preserves warning and hard-rejection semantics.
-    def test_multiview_preserves_warning_without_erasing_a_hard_rejection(self):
-        from dataclasses import replace
+    # BEGIN reconstructed dual-view warning and ambiguity integration.
+    def test_multiview_preserves_missing_view_warning_and_ambiguous_region_rejection(self):
         from transfer.multiview_grounding import infer_multiview_region
-        from transfer.test_multiview_grounding import _observation, _prepared, _targets
+        from transfer.test_multiview_fusion import calibrated_pipeline_fixture
 
-        source = _observation()
-        targets = _targets(_observation(), _observation())
-        bank, prepared = _prepared(source, targets)
-        # This consumer test injects only the quality metadata of an already
-        # prepared result. Low-ratio creation and actual solving are covered
-        # above; multiview inference must neither reinterpret that warning as
-        # rejection nor erase an independently supplied hard rejection reason.
-        prepared = replace(prepared, diagnostics={**prepared.diagnostics,
-                                                  "quality_warnings": [WARNING]})
-        for reasons in ((), ("weak_correspondence_consensus",)):
-            with self.subTest(reasons=reasons):
-                supplied = replace(prepared, reasons=reasons)
-                result = infer_multiview_region(source, targets, supplied, bank)
-                self.assertEqual(result["accepted"], not reasons)
-                self.assertEqual(result["reasons"], list(reasons))
-                self.assertEqual(result["diagnostics"]["quality_warnings"], [WARNING])
-                self.assertTrue(result["modes"])
-                np.testing.assert_array_equal(result["sim3_translation"], prepared.translation)
-        self.assertEqual(prepared.diagnostics["quality_warnings"], [WARNING])
-    # END multiview consumer warning and hard-rejection regression.
+        # Missing common-view appearance is quality metadata. Real geometric
+        # candidates determine whether one region or two incompatible regions
+        # survive; no accepted state, transform, or warning is injected here.
+        for competing in (False, True):
+            with self.subTest(competing_regions=competing):
+                source, surface, evidence = calibrated_pipeline_fixture(competing_regions=competing)
+                result = infer_multiview_region(source, surface, evidence)
+                self.assertEqual(result['accepted'], not competing)
+                self.assertIn('empty_common_appearance_domain:B', result['diagnostics']['quality_warnings'])
+                if competing:
+                    self.assertEqual(result['reasons'], ['ambiguous_nondominated_regions'])
+                    self.assertIsNone(result['sim3_scale'])
+                    self.assertIsNone(result['sim3_rotation'])
+                    self.assertIsNone(result['sim3_translation'])
+                    self.assertEqual(len(result['src_anchor_idx']), 0)
+                    self.assertFalse(any(mode['type'] == 'primary' for mode in result['modes']))
+                    competing_centers = np.unique([mode['center'] for mode in result['modes']
+                        if mode['type'] == 'nondominated_competitor'], axis=0)
+                    np.testing.assert_array_equal(competing_centers, [[-.0625, 0., 1.], [.0625, 0., 1.]])
+                else:
+                    self.assertEqual(result['reasons'], [])
+                    self.assertEqual(result['modes'][0]['type'], 'primary')
+    # END reconstructed dual-view warning and ambiguity integration.
 
 
 class TestActualLowConsensusGeometry(unittest.TestCase):

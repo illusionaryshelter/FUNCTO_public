@@ -1,107 +1,115 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light"><title>双视角融合 · 实验结果</title>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>联合目标表面 · 区域迁移验证</title>
 <style>
-:root{--ink:#182d38;--muted:#627681;--line:#dce5e8;--paper:#f3f6f5;--green:#087d61;--red:#b73545;--amber:#94601d;--blue:#3676a0}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:var(--paper);font:15px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}button,select,input{font:inherit}button,a,select{touch-action:manipulation}a{color:var(--green)}button,select{cursor:pointer}button:focus-visible,a:focus-visible,select:focus-visible{outline:3px solid #38bda0;outline-offset:3px}header{background:#16352e;color:#f0f6f1;padding:38px max(24px,calc((100vw - 1320px)/2)) 32px}.eyebrow{font:12px/1.6 ui-monospace,monospace;letter-spacing:2px;color:#a2c9b8}h1{font-size:clamp(28px,3.2vw,44px);line-height:1.2;letter-spacing:-1px;margin:12px 0 18px}header p{max-width:950px;color:#d4e2d9;margin:8px 0}nav{display:flex;gap:22px;flex-wrap:wrap;margin-top:22px}nav a{color:#cde3d6;text-decoration:none;font-size:14px}main{max-width:1372px;margin:auto;padding:0 26px 40px}.controls{position:sticky;top:0;z-index:5;background:#f3f6f5f5;backdrop-filter:blur(12px);padding:18px 0;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap}.tabs{display:flex;gap:7px;flex-wrap:wrap}button{border:1px solid #cbd8d6;background:white;border-radius:7px;padding:9px 15px;color:var(--ink)}button.active{background:var(--green);color:white;border-color:var(--green)}select{padding:8px 30px 8px 12px;border:1px solid #cbd8d6;border-radius:6px;background:white;color:var(--ink)}label.control-label{font-size:13px;color:var(--muted);display:flex;gap:10px;align-items:center}.section{margin:32px 0;scroll-margin-top:108px}.section-head{display:flex;align-items:end;justify-content:space-between;gap:18px;margin-bottom:15px;flex-wrap:wrap}h2{font-size:23px;letter-spacing:-.4px;line-height:1.3;margin:0}h3{font-size:17px;margin:0}.kicker{color:var(--green);font:12px ui-monospace,monospace;letter-spacing:1px;margin-bottom:7px}.small{font-size:13px;color:var(--muted)}p{margin:10px 0}.notice{padding:14px 18px;background:#fff3de;border-left:4px solid #c58b33;margin:18px 0;border-radius:0 6px 6px 0}.notice.good{background:#eaf5ef;border-color:var(--green)}.notice.bad{background:#fbebed;border-color:var(--red)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}.metric{background:white;border:1px solid var(--line);padding:18px 20px;border-radius:9px}.metric .value{font-size:29px;line-height:1.3;font-weight:650;letter-spacing:-1px;font-variant-numeric:tabular-nums}.metric .unit{font-size:13px;font-weight:400;color:var(--muted);letter-spacing:0;margin-left:6px}.metric .label{font-size:13px;color:var(--muted);margin-bottom:9px}.metric .foot{font-size:12px;color:var(--muted);margin-top:8px}.image-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:15px}.output-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.image-card{margin:0;background:white;border:1px solid var(--line);border-radius:9px;overflow:hidden;min-width:0}.image-title{padding:13px 16px;display:flex;gap:10px;justify-content:space-between;align-items:center}.image-title strong{font-weight:600}.zoom-trigger{border:0;padding:0;border-radius:0;width:100%;display:block;background:#dce5df;line-height:0}.zoom-trigger img{display:block;width:100%;height:auto;aspect-ratio:4/3;object-fit:contain}.zoom-trigger:hover img{filter:brightness(1.025)}figcaption{padding:12px 16px;color:var(--muted);font-size:13px;min-height:63px}.badge{display:inline-block;font-size:12px;line-height:1.5;border-radius:4px;padding:3px 8px;white-space:nowrap;background:#edf2f4;color:#536874}.badge.ok{background:#e0f2e9;color:var(--green)}.badge.reject{background:#fbe7ea;color:var(--red)}.badge.missing{background:#fff0d7;color:var(--amber)}.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin-top:14px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}.surface{background:white;border:1px solid var(--line);border-radius:9px;padding:22px}.matching{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}.match-title{font-size:13px;color:var(--muted)}.match-number{font-size:26px;font-weight:650;margin:6px 0 10px;font-variant-numeric:tabular-nums}.track{height:9px;border-radius:8px;background:#edf2f0;overflow:hidden}.track span{display:block;height:100%;background:var(--green);border-radius:8px}.match-extra{margin-top:18px;border-top:1px solid var(--line);padding-top:14px;font-size:13px;color:var(--muted)}.chart-row{display:grid;grid-template-columns:180px minmax(0,1fr) 95px 85px;gap:12px;align-items:center;margin:13px 0;font-size:13px}.bar-track{height:19px;background:#f4f6f7;border-radius:3px;overflow:hidden}.bar{height:100%;min-width:1px;background:var(--green)}.bar.original-a{background:#9caeb6}.bar.original-b{background:#8c84a3}.bar.rejected{background-image:repeating-linear-gradient(135deg,transparent,transparent 5px,#ffffff5e 5px,#ffffff5e 8px)}.chart-row.selected{font-weight:700}.chart-value{text-align:right;font-variant-numeric:tabular-nums}.chart-label span{display:block;font-size:11px;font-weight:400;color:var(--muted)}.chart-axis{display:flex;justify-content:space-between;color:var(--muted);font-size:11px;margin:0 192px 0 192px}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:11px 13px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}th{font-size:12px;color:var(--muted);font-weight:500;background:#f4f7f6}tbody tr:hover{background:#f3f8f5}tbody tr.current{background:#eaf5ef}td.number{font-variant-numeric:tabular-nums;text-align:right}.table-note{font-size:13px;color:var(--muted);padding:13px 0 0}.meta-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}.definition{margin:0}.definition dt{font-weight:600;margin-top:15px}.definition dd{margin:5px 0;color:var(--muted);font-size:14px}.code{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}details summary{cursor:pointer;font-weight:600}.resources{display:flex;gap:15px;flex-wrap:wrap;margin-top:20px}footer{border-top:1px solid var(--line);padding-top:18px;color:var(--muted);font-size:12px}dialog{width:min(1400px,96vw);max-height:95vh;padding:0;border:0;border-radius:10px;box-shadow:0 25px 100px #0005}dialog::backdrop{background:#102020c9}.modal-toolbar{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;gap:14px;background:white;position:sticky;top:0;z-index:1}.modal-toolbar span{font-size:13px}.modal-body{overflow:auto;max-height:80vh;background:#dae1df;text-align:center;padding:12px}.modal-body img{height:auto;max-width:none;display:inline-block}#error{padding:20px;background:#fce7eb;color:var(--red)}[hidden]{display:none!important}@media(max-width:850px){.metrics{grid-template-columns:repeat(2,1fr)}.image-grid{grid-template-columns:1fr}.output-grid,.meta-grid{grid-template-columns:1fr}.image-grid .zoom-trigger img{max-height:440px}.controls{position:static}.section{scroll-margin-top:20px}.chart-row{grid-template-columns:110px minmax(0,1fr) 70px 67px;gap:8px}.chart-axis{margin-left:118px;margin-right:153px}.matching{gap:12px}.tabs button{font-size:12px;padding:8px}.surface{padding:15px}main{padding:0 16px 30px}}@media print{.controls,dialog,.resources{display:none}.section{break-inside:avoid}header{color:black;background:white}header p,nav a{color:#333}.zoom-trigger{pointer-events:none}}
-/* BEGIN accepted warnings use amber without changing rejection colors. */
-.badge.warning{background:#fff0d7;color:var(--amber)}
-/* END advisory state color. */
-</style></head>
+:root{color-scheme:light;--ink:#183143;--muted:#5b6c79;--line:#d8e1e6;--paper:#f3f6f8;--accent:#086e83}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{background:#183143;color:white;padding:30px max(24px,calc((100vw - 1440px)/2));border-bottom:5px solid #55c1b1}
+h1{font-size:29px;line-height:1.25;margin:0 0 12px}header p{max-width:1000px;color:#d9e8ef;margin:8px 0}
+main{max-width:1488px;margin:auto;padding:24px}.toolbar{display:flex;flex-wrap:wrap;gap:14px;align-items:end;padding:18px;border:1px solid var(--line);border-radius:12px;background:white}
+label{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}select,input{font:inherit;padding:8px 10px;border:1px solid #b9c9d3;border-radius:6px;background:white;color:var(--ink)}
+input[type=search]{min-width:250px}.check{flex-direction:row;align-items:center;padding-bottom:8px}.summary{margin:16px 0;color:var(--muted)}
+.card{border:1px solid var(--line);border-radius:12px;background:white;padding:22px;margin:22px 0;box-shadow:0 3px 16px #17384e08}
+.card h2{font-size:21px;overflow-wrap:anywhere;margin:0 0 10px}.heading{display:flex;justify-content:space-between;align-items:start;gap:16px}
+.badge{display:inline-block;white-space:nowrap;padding:3px 9px;border-radius:5px;font-size:13px;background:#edf1f5;color:#425768}
+.accepted{background:#d9f3e4;color:#075c34}.rejected,.failed{background:#fde0df;color:#8c2020}.missing_input,.not_run{background:#edf1f5;color:#425768}.warning{background:#fff0c7;color:#805800}
+.note{font-size:13px;color:var(--muted);margin:8px 0}.warningline{padding:9px 12px;border-left:3px solid #d29c22;background:#fff9e9;overflow-wrap:anywhere}
+.reason{padding:9px 12px;border-left:3px solid #d47772;background:#fff3f2;overflow-wrap:anywhere}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+figure{margin:0;min-width:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#fafcfd}
+figure button{display:block;border:0;background:#152e3c;padding:0;width:100%;cursor:zoom-in}figure img{display:block;width:100%;height:auto}
+figcaption{font-size:12px;color:#485f70;padding:9px 11px;overflow-wrap:anywhere}.mode-tools{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:16px 0 10px}
+details{margin-top:17px;border-top:1px solid var(--line);padding-top:12px}summary{cursor:pointer;font-weight:600;color:var(--accent)}
+.baselines{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:14px 0}.baseline{border:1px solid var(--line);padding:12px;border-radius:8px}.baseline h3{margin:0 0 9px;font-size:15px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f4f6;border-radius:7px;padding:14px;font-size:12px;max-height:520px;overflow:auto}
+a{color:var(--accent)}.links{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;margin-top:16px}
+table{width:100%;border-collapse:collapse;font-size:12px;margin:12px 0}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}.scroll{overflow:auto}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;margin:12px 0}.swatch{display:inline-block;width:11px;height:11px;margin-right:5px;border-radius:2px}
+.empty{padding:45px;text-align:center;color:var(--muted)}
+dialog{width:96vw;height:94vh;max-width:none;max-height:none;padding:0;border:1px solid #8da2ad;border-radius:10px;background:#102731;color:white}
+dialog::backdrop{background:#071a25c9}.zoom-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 16px;background:#183843}
+.zoom-bar button{cursor:pointer;border:1px solid #7895a4;border-radius:5px;background:#244f61;color:white;padding:6px 11px}.zoom-title{flex:1;min-width:150px;font-size:13px}.zoom-scroll{height:calc(100% - 64px);overflow:auto;text-align:center;padding:15px}
+#zoom-image{max-width:none;height:auto;display:inline-block;vertical-align:top}
+@media(max-width:950px){.grid{grid-template-columns:1fr}.pair,.baselines{grid-template-columns:1fr}main{padding:14px}.card{padding:15px}header{padding:24px 18px}h1{font-size:24px}}
+</style>
+</head>
 <body>
-<!-- BEGIN current policy introduction. -->
-<header><div class="eyebrow">LOCAL EXPERIMENT REVIEW / MULTIVIEW GROUNDING</div><h1>双视角融合实验</h1><p id="overview">正在读取内嵌实验记录…</p><p class="small" style="color:#a2c9b8">冻结预测 · 本轮内点比例不足仅作质量警告 · 其他必要条件保持拒绝 · 图像与数据均可离线查看</p><nav><a href="#observations">观察与输出</a><a href="#matches">匹配质量</a><a href="#comparison">原路径对照</a><a href="#matrix">全部实验</a><a href="#definitions">指标与证据</a></nav></header>
-<!-- END current policy introduction. -->
-<main><noscript><p class="notice">此本地网页需要浏览器启用 JavaScript；所有数据已经内嵌，不需要联网。</p></noscript><div id="error" hidden role="alert"></div>
-<div class="controls"><div id="case-tabs" class="tabs" aria-label="选择案例"></div><label class="control-label">配准算法<select id="algorithm" aria-label="配准算法"><option value="ransac">RANSAC</option><option value="prosac_lo">PROSAC + LO</option><option value="teaserpp">TEASER++</option></select></label></div>
-<section class="section" id="observations"><div class="section-head"><div><div class="kicker">01 / OBSERVED EVIDENCE</div><h2 id="case-title"></h2></div><span id="case-status"></span></div><div id="case-notice" class="notice"></div><div id="metrics" class="metrics"></div><div id="inputs" class="image-grid"></div>
-<div class="section-head" style="margin-top:25px"><div><h3>真实观测中的邻域输出</h3><div class="small">每个邻域只画在记录它的相机中。点击任意图片可放大。</div></div><div id="view-tabs" class="tabs" aria-label="选择输出相机"><button data-view="both" class="active" aria-pressed="true">A / B 并排</button><button data-view="A" aria-pressed="false">仅 A</button><button data-view="B" aria-pressed="false">仅 B</button></div></div><div id="outputs" class="output-grid"></div><div class="legend"><span><i class="dot" style="background:#d62d39"></i>源示教区域</span><span><i class="dot" style="background:#00b0d3"></i>SAM选中掩码</span><span><i class="dot" style="background:#23b969"></i>首选邻域</span><span><i class="dot" style="background:#3377e6"></i>其他邻域（蓝 / 紫）</span><span>白心点：实际采样像素；图中不绘制真值。</span></div></section>
-<section class="section" id="matches"><div class="section-head"><div><div class="kicker">02 / CORRESPONDENCE</div><h2>融合保留了多少近真值对应？</h2></div><span id="match-tau" class="small"></span></div><div class="surface"><div id="matching" class="matching"></div><div id="match-extra" class="match-extra"></div></div><p class="small">仅A、仅B：在同一合并三维候选集上，分别只读取该视角的秩分数。它们是冻结响应的诊断，不是原单视角解码实验。近真值计数只用于事后评价。</p></section>
-<!-- BEGIN frozen comparison acceptance. -->
-<section class="section" id="comparison"><div class="section-head"><div><div class="kicker">03 / COMPARISON</div><h2>与原 A / B 路径比较</h2></div><label class="control-label">显示指标<select id="chart-metric"><option value="object_rmse_mm">物体点映射 RMSE / mm</option><option value="center_error_mm">首选中心误差 / mm</option><option value="registration_ms">配准准备耗时 / ms</option><option value="region_ms">邻域生成耗时 / ms</option></select></label></div><div class="surface"><div id="chart"></div><div class="legend"><span><i class="dot" style="background:#9caeb6"></i>原 A→A</span><span><i class="dot" style="background:#8c84a3"></i>原 A→B</span><span><i class="dot" style="background:#087d61"></i>本轮</span><span>斜纹：被拒绝的诊断结果；无邻域不记作零误差。</span></div></div><p class="small">原路径对照保留所提供记录中的接受状态，不按本轮警告规则重新判定。新路径同时改变了匹配规则与可用观测；Cabinet仅A有效时，不能将改善归于双视角。耗时为单次记录，未预热，不代表稳定速度排名。</p></section>
-<!-- END frozen comparison acceptance. -->
-<!-- BEGIN warning and rejection table heading. -->
-<section class="section" id="matrix"><div class="section-head"><div><div class="kicker">04 / COMPLETE MATRIX</div><h2>全部实验结果</h2></div><span class="small">点击一行切换到对应案例与算法</span></div><div class="surface table-wrap" style="padding:0"><table><thead><tr><th>案例</th><th>有效视角</th><th>算法</th><th>结果</th><th>物体 RMSE / mm</th><th>中心误差 / mm</th><th>内点 / 对应</th><th>配准 / ms</th><th>邻域 / ms</th><th>拒绝原因 / 质量警告</th></tr></thead><tbody id="matrix-body"></tbody></table></div></section>
-<!-- END warning and rejection table heading. -->
-<section class="section" id="definitions"><div class="section-head"><div><div class="kicker">05 / DEFINITIONS & RECORDS</div><h2>如何阅读这些结果</h2></div></div><div class="surface meta-grid"><dl class="definition"><dt>接受</dt><!-- BEGIN current acceptance and advisory policy. --><dd>本轮通过必要配准和局部表面检查即可接受。内点比例低于配置门限（默认20%）仅记录质量警告，接受伴警告显示黄色；绝对内点数量、几何退化与表面检查仍可拒绝。接受不等于全物体变换精确，也不表示已验证放置、碰撞或机器人可达性。</dd><!-- END current acceptance policy. --><dt>物体点映射 RMSE</dt><dd>对源观测中由独立真值确认属于物体的点，比较估计变换与真实映射后的三维位置，计算均方根距离。</dd><dt>首选中心误差</dt><dd>第一个真实观测邻域的中心，与真实映射后的示教区域均值之间的距离。没有邻域时显示“无邻域”。</dd><dt>几何内点 / 近真值对应</dt><dd>内点符合当前估计变换；近真值对应符合独立真实物体映射。两者不是同一指标。</dd></dl><div><dl class="definition"><dt>固定双视角融合</dt><dd>原始MARCO点积 → 各自允许格上的并列中位秩 → 三维候选处插值 → 两项相加除以2。未观察到的一项为零；排名分数不是概率。</dd><dt>缺失目标观测</dt><dd>保留原相机与缺失理由，空点集和空特征不产生匹配证据。缺失不意味着相机图像不存在，也不会复制另一视角冒充观测。</dd><dt>尺度与真实形变</dt><dd id="scale-note"></dd></dl><details style="margin-top:20px"><summary>当前选择的数值记录</summary><pre id="detail" class="code" style="white-space:pre-wrap;max-height:400px;overflow:auto"></pre></details></div></div><div id="resources" class="resources"></div></section>
-<footer>本地静态结果页。图像与交互数据已内嵌；不请求网络，不调用模型或配准算法。原始报告链接用于在当前工作目录中追溯。</footer></main>
-<dialog id="zoom-dialog" aria-label="放大观察图"><div class="modal-toolbar"><span id="zoom-title"></span><label class="control-label">放大<input id="zoom-scale" type="range" min="1" max="3" step="0.25" value="1" aria-label="图片缩放"></label><button id="zoom-close">关闭</button></div><div class="modal-body"><img id="zoom-image" alt="放大观察图"></div></dialog>
-<script id="evidence" type="application/json">__EVIDENCE_JSON__</script>
+<header>
+<h1>联合目标表面 · 区域迁移验证</h1>
+<p>一个源示教与同一目标状态的两路 RGB-D。优先检查真实仿真图像上的区域与实际采样，再查看冻结证据和评价指标。</p>
+<p>旧方案是 MARCO 加稳健配准；新单视角方案增加 6/12 点提案。此页的联合表面方法将两路观测用于同一目标表面。历史基线保持原有接受、警告和拒绝状态。</p>
+</header>
+<main>
+<div class="toolbar">
+<label>任务查找<input id="search" type="search" placeholder="输入任务 ID 或描述"></label>
+<label>结果状态<select id="status"><option value="all">全部状态</option><option value="accepted">接受</option><option value="rejected">拒绝／歧义</option><option value="failed">执行失败</option><option value="missing_input">输入缺失</option><option value="not_run">未运行</option></select></label>
+<label>组别<select id="group"><option value="all">全部组别</option></select></label>
+<label class="check"><input type="checkbox" id="warnings">仅看有警告的结果</label>
+<label class="check"><input type="checkbox" id="samples" checked>显示查询／采样点</label>
+</div>
+<div id="summary" class="summary" aria-live="polite"></div>
+<div class="legend"><span><i class="swatch" style="background:#30d077"></i>两视角有几何支持的区域</span><span><i class="swatch" style="background:#f49e41"></i>仅第一视角有几何支持</span><span><i class="swatch" style="background:#b170f1"></i>仅第二视角有几何支持</span><span><i class="swatch" style="background:#ffed64"></i>当前相机可见的实际采样点</span><span>白十字：区域中心</span></div>
+<p class="note">“仅某视角支持”依据冻结深度投影规则，不等于物理真值证明。采样在另一相机遮挡、图外或未知时不绘制；两张图中标记数量可以不同。点击任意图片可放大并缩放。</p>
+<p class="note">非支配候选表示：没有另一候选在各项证据上都不差、并至少有一项更好。本次仅在这些候选的中心距离不超过采样间距、法向兼容且区域互含中心时提供主区域；仍有不同区域解释时保留诊断并报告歧义。</p>
+<div id="cards"></div>
+<div id="artifact-links" class="links"></div>
+</main>
+<dialog id="zoom"><div class="zoom-bar"><span id="zoom-title" class="zoom-title"></span><button id="zoom-out" type="button" aria-label="缩小">−</button><button id="zoom-reset" type="button">100%</button><button id="zoom-in" type="button" aria-label="放大">＋</button><button id="zoom-close" type="button">关闭</button></div><div class="zoom-scroll"><img id="zoom-image" alt=""></div></dialog>
+<script type="application/json" id="data">__PAYLOAD__</script>
 <script>
-/* BEGIN browser-only presentation. All values come from frozen JSON records. */
-var MultiviewReport = (() => {
-  const names={ransac:'RANSAC',prosac_lo:'PROSAC + LO',teaserpp:'TEASER++'};
-  const reasonNames={no_valid_oriented_surface:'无合格有向表面',weak_correspondence_consensus:'对应点共识不足',surface_ambiguity:'不同表面之间存在歧义',predicted_center_without_nearby_surface:'估计中心附近无合格观测表面'};
-  // BEGIN distinguish advisory evidence from hard rejection reasons.
-  const warningNames={low_correspondence_inlier_ratio:'对应点内点比例低于质量警告门限'};
-  // END warning labels do not reinterpret stored acceptance.
-  const esc=v=>String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  const fmt=(v,d=2)=>v===null||v===undefined?'—':Number(v).toFixed(d);
-  const reason=r=>r.reasons.map(v=>reasonNames[v]||v).join('；');
-  const activeViews=c=>c.views.filter(v=>!v.missing);
-  function overview(data){const rows=data.cases.flatMap(c=>c.predictions);const dual=data.cases.filter(c=>activeViews(c).length===2).flatMap(c=>c.predictions);const partial=data.cases.filter(c=>activeViews(c).length<2).flatMap(c=>c.predictions);return {total:rows.length,accepted:rows.filter(r=>r.accepted).length,dual:dual.length,dualAccepted:dual.filter(r=>r.accepted).length,partialAccepted:partial.filter(r=>r.accepted).length};}
-  function comparisonRows(data,c){const result=[];for(const [i,group] of data.comparisons.entries())for(const r of group.rows)if(r.case===c.id)result.push({...r,group:group.label,style:i===0?'original-a':'original-b'});return result.concat(c.predictions.map(r=>({...r,group:'本轮',style:'current'})));}
-  function matchingRows(c,r){return c.views.map(v=>({label:'仅 '+v.id+' 秩分数',missing:v.missing,...r.single_view_quality[v.id]})).concat([{label:'双视角固定均值',missing:false,...r.raw_quality}]);}
-  function init(){
-    const data=JSON.parse(document.getElementById('evidence').textContent),$=id=>document.getElementById(id);
-    let caseIndex=0,algorithm='ransac',viewFilter='both';
-    const aggregate=overview(data);
-    $('overview').textContent=`${data.cases.length}个案例，${aggregate.total}组预测，${aggregate.accepted}组接受。其中两个视角均有效的${aggregate.dual}组有${aggregate.dualAccepted}组接受；另有${aggregate.partialAccepted}组接受来自目标观测不完整的案例。`;
-    $('resources').innerHTML=data.links.map(x=>`<a href="${esc(x.href)}" target="_blank" rel="noopener">${esc(x.label)} ↗</a>`).join('');
-    $('case-tabs').innerHTML=data.cases.map((c,i)=>`<button data-case="${i}">${esc(c.id)}</button>`).join('');
-    // BEGIN accepted results with advisory evidence remain visibly amber.
-    function badge(r){return `<span class="badge ${r.accepted?(r.quality_warnings.length?'warning':'ok'):'reject'}">${r.accepted?(r.quality_warnings.length?'接受 · 有警告':'运行接受'):(r.quality_warnings.length?'拒绝 · 有警告':'拒绝')}</span>`;}
-    // END badge color never changes the saved accepted value.
-    function imageCard(title,image,caption,status){return `<figure class="image-card"><div class="image-title"><strong>${esc(title)}</strong>${status}</div><button class="zoom-trigger" data-zoom="true" aria-label="放大：${esc(title)}"><img src="${image}" alt="${esc(title)}" loading="eager"></button><figcaption>${esc(caption)}</figcaption></figure>`;}
-    function metric(label,value,unit,foot){return `<div class="metric"><div class="label">${label}</div><div class="value">${value}<span class="unit">${unit}</span></div><div class="foot">${foot}</div></div>`;}
-    function renderChart(c){
-      const key=$('chart-metric').value,rows=comparisonRows(data,c),max=Math.max(1,...rows.map(r=>r[key]===null?0:r[key]));
-      const order=Object.keys(names);rows.sort((a,b)=>order.indexOf(a.algorithm)-order.indexOf(b.algorithm));
-      $('chart').innerHTML=`<div class="chart-axis"><span>0</span><span>${fmt(max)} ${key.endsWith('_mm')?'mm':'ms'}</span></div>`+rows.map(r=>`<div class="chart-row ${r.algorithm===algorithm?'selected':''}"><div class="chart-label">${esc(names[r.algorithm])}<span>${esc(r.group)}</span></div><div class="bar-track"><div class="bar ${r.style} ${r.accepted?'':'rejected'}" style="width:${r[key]===null?0:Math.max(0,r[key]/max*100)}%;${r[key]===null?'display:none':''}"></div></div><div class="chart-value">${r[key]===null?(key==='center_error_mm'?'无邻域':'—'):fmt(r[key])}</div>${badge(r)}</div>`).join('');
-      if(data.comparisons.some(g=>!g.rows.some(r=>r.case===c.id)))$('chart').innerHTML+='<p class="small">部分原路径未执行此案例，图中不补零值。</p>';
-    }
-    function render(){
-      const c=data.cases[caseIndex],r=c.predictions.find(x=>x.algorithm===algorithm),available=activeViews(c),missing=c.views.filter(v=>v.missing);
-      for(const b of $('case-tabs').querySelectorAll('button')){const active=Number(b.dataset.case)===caseIndex;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active));}
-      $('algorithm').value=algorithm;$('case-title').textContent=c.id;$('case-status').innerHTML=badge(r);
-      let message=missing.length?`目标 ${missing.map(v=>v.id).join(' / ')} 没有有效观测（${missing.map(v=>v.reasons.join('、')).join('；')}）。当前仅 ${available.map(v=>v.id).join(' / ')||'无'} 提供匹配证据，不能将接受或改善算作双视角收益。 `:'';
-      // BEGIN warnings coexist with rejection reasons and never bypass other checks.
-      message+=r.accepted?'当前运行通过必要检查；全物体变换误差仍需单独判断。':`当前运行被拒绝：${reason(r)}。显示的变换与邻域仅供诊断。`;
-      if(r.quality_warnings.length)message+=` 质量警告：${r.quality_warnings.map(v=>warningNames[v]||v).join('；')}；此警告不直接拒绝，也不放宽其他判定。`;
-      $('case-notice').textContent=message;$('case-notice').className='notice '+(!r.accepted?'bad':missing.length||r.quality_warnings.length?'':'good');
-      // END acceptance with warning uses the default amber notice.
-      // BEGIN advisory inlier ratio threshold.
-      $('metrics').innerHTML=metric('物体点映射 RMSE',fmt(r.object_rmse_mm),'mm','全物体位置误差，越小越好')+metric('首选中心误差',r.center_error_mm===null?'无邻域':fmt(r.center_error_mm),r.center_error_mm===null?'':'mm','局部参考位置，不替代整体映射')+metric('几何内点',`${r.inliers}<span style="font-size:17px;font-weight:400"> / ${r.correspondences}</span>`,'',`比例 ${fmt(r.inliers/r.correspondences*100)}%；质量警告门限 ${fmt(r.minimum_inlier_ratio*100,0)}%`)+metric('有效目标视角',String(available.length),' / 2',`${available.map(v=>v.id).join(' + ')||'无'}；融合分母始终为2`);
-      // END advisory inlier ratio threshold.
-      $('inputs').innerHTML=imageCard('源 A · 示教区域',c.source,`${c.source_points}个有效深度示教点。红色为源证据。`,'<span class="badge">输入</span>')+c.views.map(v=>imageCard(`目标 ${v.id} · SAM`,v.input,v.missing?`无目标检测：${v.reasons.join('；')}。保留原始相机图像。`:`${v.points.toLocaleString()}个实际目标点。青色为SAM选中掩码。`,`<span class="badge ${v.missing?'missing':''}">${v.missing?'目标缺失':'输入'}</span>`)).join('');
-      const selected=c.views.filter(v=>viewFilter==='both'||v.id===viewFilter);
-      $('outputs').style.gridTemplateColumns=selected.length===1?'minmax(0,1fr)':'';
-      $('outputs').innerHTML=selected.map(v=>{const output=r.views[v.id];const modeText=output.modes.map(m=>`邻域${m.number}（${m.primary?'首选':'其他'}）：${m.points}点 / ${m.samples}采样`).join('；');const caption=v.missing?`无目标观测，未在此视角生成邻域。${v.reasons.join('；')}`:modeText||(r.mode_count?'此相机没有返回邻域；其他相机的邻域不投影复制到此处。':'没有合格邻域。');return imageCard(`目标 ${v.id} · ${names[algorithm]}`,output.image,caption,v.missing?'<span class="badge missing">目标缺失</span>':badge(r));}).join('');
-      $('match-tau').textContent=`共同评价距离门限 τ = ${fmt(r.tau_mm,3)} mm`;
-      $('matching').innerHTML=matchingRows(c,r).map(m=>`<div><div class="match-title">${esc(m.label)}</div><div class="match-number">${m.missing||!m.count?'无有效响应':`${m.near_truth_count} <span class="small">/ ${m.count}</span>`}</div><div class="track"><span style="width:${m.missing||!m.count?0:m.near_truth_count/m.count*100}%"></span></div></div>`).join('');
-      const q=r.correspondence_quality;$('match-extra').textContent=`重复目标去重后 ${q.count} 对唯一拟合对应，其中 ${q.near_truth_count} 对近真值；真实对应误差中位数 ${fmt(q.median_error_m*1000,3)} mm。${c.diagnostics.retained_supported_by_both_views}/${c.diagnostics.retained_count} 对同时得到两视角表面支持。看见同一表面不证明它对应当前源查询。`;
-      renderChart(c);
-      // BEGIN display both rejection and quality warnings.
-      $('matrix-body').innerHTML=data.cases.flatMap((item,i)=>item.predictions.map(p=>`<tr data-case="${i}" data-algorithm="${p.algorithm}" tabindex="0" role="button" aria-label="查看${esc(item.id)} ${esc(names[p.algorithm])}" class="${i===caseIndex&&p.algorithm===algorithm?'current':''}"><td>${esc(item.id)}</td><td>${esc(activeViews(item).map(v=>v.id).join(' + '))}</td><td>${esc(names[p.algorithm])}</td><td>${badge(p)}</td><td class="number">${fmt(p.object_rmse_mm)}</td><td class="number">${p.center_error_mm===null?'无邻域':fmt(p.center_error_mm)}</td><td>${p.inliers} / ${p.correspondences}</td><td class="number">${fmt(p.registration_ms)}</td><td class="number">${fmt(p.region_ms)}</td><td>${esc(reason(p))||'—'}${p.quality_warnings.length?`<br><span class="badge warning">质量警告：${esc(p.quality_warnings.map(v=>warningNames[v]||v).join('；'))}</span>`:''}</td></tr>`)).join('');
-      // END display both rejection and quality warnings.
-      $('scale-note').textContent=c.truth_mapping_type==='Sim(3)'?`本例真实统一尺度 ${fmt(c.true_scale,4)}；当前估计 ${fmt(r.scale,6)}，旋转误差 ${fmt(r.rotation_error_deg,3)}°。`:`本例真实映射包含非均匀形变；当前估计统一尺度 ${fmt(r.scale,6)}。不存在可供比较的唯一真实尺度，点映射误差包含模型表达限制。`;
-      // BEGIN preserve warning codes in visible numeric evidence.
-      const detail={case:c.id,algorithm,accepted:r.accepted,reasons:r.reasons,quality_warnings:r.quality_warnings,estimated_scale:r.scale,rotation_error_deg:r.rotation_error_deg,tau_mm:r.tau_mm,mode_count:r.mode_count,primary_samples:r.samples,primary_sample_support_purity:r.sample_purity,candidate_count:c.diagnostics.candidate_count,fusion_ms:c.fusion_ms,matching_rule:c.diagnostics.matching_rule};$('detail').textContent=JSON.stringify(detail,null,2);
-      // END preserve warning codes in visible numeric evidence.
-    }
-    $('case-tabs').addEventListener('click',e=>{const b=e.target.closest('[data-case]');if(b){caseIndex=Number(b.dataset.case);render();}});
-    $('algorithm').addEventListener('change',e=>{algorithm=e.target.value;render();});
-    $('chart-metric').addEventListener('change',()=>renderChart(data.cases[caseIndex]));
-    $('view-tabs').addEventListener('click',e=>{const b=e.target.closest('[data-view]');if(!b)return;viewFilter=b.dataset.view;for(const x of $('view-tabs').querySelectorAll('button')){const on=x.dataset.view===viewFilter;x.classList.toggle('active',on);x.setAttribute('aria-pressed',String(on));}render();});
-    function chooseRow(e){const row=e.target.closest('tr[data-case]');if(row){caseIndex=Number(row.dataset.case);algorithm=row.dataset.algorithm;render();$('observations').scrollIntoView({behavior:'smooth',block:'start'});}}
-    $('matrix-body').addEventListener('click',chooseRow);$('matrix-body').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();chooseRow(e);}});
-    function scaleImage(){$('zoom-image').style.width=`${Math.round(100*Number($('zoom-scale').value))}%`;}
-    document.addEventListener('click',e=>{const trigger=e.target.closest('[data-zoom]');if(!trigger)return;const img=trigger.querySelector('img');$('zoom-image').src=img.src;$('zoom-image').alt=img.alt;$('zoom-title').textContent=img.alt;$('zoom-scale').value='1';scaleImage();$('zoom-dialog').showModal();});
-    $('zoom-scale').addEventListener('input',scaleImage);$('zoom-close').addEventListener('click',()=>$('zoom-dialog').close());
-    render();
-  }
-  return {overview,comparisonRows,matchingRows,fmt,init};
-})();
-if(typeof document!=='undefined'){try{MultiviewReport.init();}catch(error){const box=document.getElementById('error');box.hidden=false;box.textContent='页面读取失败：'+error.message;throw error;}}
-/* END frozen result presentation. */
-</script></body></html>
+"use strict";
+const data=JSON.parse(document.getElementById("data").textContent);
+const statusNames={accepted:"接受",rejected:"拒绝／歧义",failed:"执行失败",missing_input:"输入缺失",not_run:"未运行",completed:"完成"};
+const byId=id=>document.getElementById(id);
+function element(tag,text,className){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(className)e.className=className;return e;}
+function statusOf(record){return record.status==="completed"?(record.accepted?"accepted":"rejected"):record.status;}
+function badge(record){const s=statusOf(record);return element("span",statusNames[s]||s,"badge "+s);}
+function reasons(container,record){if(record.reasons&&record.reasons.length)container.append(element("p","原因："+record.reasons.join("；"),"reason"));if(record.warnings&&record.warnings.length)container.append(element("p","警告："+record.warnings.join("；"),"warningline"));}
+let zoomScale=1;
+function resizeZoom(){byId("zoom-image").style.width=Math.round((byId("zoom-image").naturalWidth||640)*zoomScale)+"px";byId("zoom-reset").textContent=Math.round(zoomScale*100)+"%";}
+function openZoom(picture){byId("zoom-image").src=picture.src;byId("zoom-image").alt=picture.caption;byId("zoom-title").textContent=picture.caption;zoomScale=1;resizeZoom();byId("zoom").showModal();}
+function figure(picture){const f=element("figure");const button=element("button");button.type="button";button.setAttribute("aria-label","放大："+picture.caption);const img=element("img");img.src=picture.src;img.alt=picture.caption;img.loading="lazy";button.append(img);button.addEventListener("click",()=>openZoom(picture));f.append(button,element("figcaption",picture.caption));return f;}
+function metricText(metrics,accepted){if(!metrics||metrics.center_error_m===null||metrics.center_error_m===undefined)return "中心误差：缺失";const hit=metrics.top1_preferred_support_hit?"正确参考面":"非参考面";return (accepted?"首选":"诊断")+"中心误差："+(metrics.center_error_m*1000).toFixed(2)+" mm · "+hit;}
+function link(path,label){const a=element("a",label);a.href=path;return a;}
+function availabilityText(items){return items.map(v=>v.view+"：几何"+(v.geometry?"可用":"缺失")+"，实体"+(v.entity?"可用":"缺失")+"，外观"+(v.appearance?"可用":"缺失")+(v.reasons.length?"（"+v.reasons.join("；")+"）":"")).join(" ｜ ");}
+function modeTitle(mode){const label=mode.executable?"可执行主区域":mode.type==="nondominated_competitor"?"非支配竞争区域":"已被支配的诊断区域";return label+" "+(mode.index+1)+" · "+mode.region_elements+" 个表面元素 / "+mode.sample_count+" 个采样";}
+function modePanel(card,mode){const grid=element("div",undefined,"grid"),points=byId("samples").checked;grid.append(figure(points?card.source:card.source_region));for(const picture of (mode?(points?mode.images:mode.region_images):card.raw_views))grid.append(figure(picture));return grid;}
+function hypothesisTable(diagnostics){const box=element("div",undefined,"scroll"),table=element("table"),head=element("tr");for(const name of ["提案","最终允许边来源","最终几何可见来源","非支配","评分坐标"])head.append(element("th",name));table.append(head);for(const h of diagnostics.hypotheses||[]){const row=element("tr");row.append(element("td",String(h.origin||"")+" / "+String(h.proposal_support??"native")),element("td",JSON.stringify(h.final_edge_sources||{})),element("td",JSON.stringify(h.final_observed_view_counts||{})),element("td",h.nondominated?"是":"否"),element("td",JSON.stringify(h.score_vector||[])));table.append(row);}box.append(table);return box;}
+function cardElement(card){
+ const root=element("article",undefined,"card"),heading=element("div",undefined,"heading");heading.append(element("h2",card.id),badge(card));root.append(heading);
+ const evaluation=card.evaluation&&card.evaluation.primary_metrics;root.append(element("p",(card.accepted?metricText(evaluation,true):"没有可执行主区域；逐诊断区域误差保存在评价 JSON")+" · 推理与冻结 "+(card.elapsed_ms/1000).toFixed(2)+" s","note"));
+ root.append(element("p",availabilityText(card.input_availability),"note"));reasons(root,card);
+ if(card.visualization_error)root.append(element("p","输入图像核验："+card.visualization_error,"reason"));
+ const controls=element("div",undefined,"mode-tools"),choice=element("select");
+ if(card.modes.length){for(const mode of card.modes){const option=element("option",modeTitle(mode));option.value=String(mode.index);choice.append(option);}controls.append(choice);if(!card.accepted)controls.append(element("span","以下区域用于诊断，不是可执行输出。","badge warning"));}
+ else controls.append(element("span","没有区域输出；保留源示教与目标原图。","note"));
+ const initial=card.modes.find(m=>m.executable)||card.modes.find(m=>m.type==="nondominated_competitor")||card.modes[0];if(initial)choice.value=String(initial.index);
+ root.append(controls);let panel=modePanel(card,initial);root.append(panel);
+ choice.addEventListener("change",()=>{const next=modePanel(card,card.modes[Number(choice.value)]);panel.replaceWith(next);panel=next;});
+ const raw=element("details");raw.append(element("summary","目标原图（不叠加区域）"));const rawGrid=element("div",undefined,"pair");for(const picture of card.raw_views)rawGrid.append(figure(picture));raw.append(rawGrid);root.append(raw);
+ const historical=element("details");historical.append(element("summary","历史旧方案／新单视角方案对照"));const methods=element("div",undefined,"baselines");
+ for(const b of card.baselines){const item=element("section",undefined,"baseline");item.append(element("h3",b.label+" · "+b.view),badge(b),element("p",metricText(b.metrics,b.accepted),"note"));reasons(item,b);item.append(figure(b.image));methods.append(item);}historical.append(methods);root.append(historical);
+ const diagnostic=element("details");diagnostic.append(element("summary","对应来源、竞争区域与冻结诊断"));diagnostic.append(hypothesisTable(card.diagnostics));diagnostic.append(element("pre",JSON.stringify({surface:card.surface_diagnostics||{},visibility:card.modes.map(m=>({mode:m.index,views:m.visibility})),inference:card.diagnostics},null,2)));root.append(diagnostic);
+ const links=element("div",undefined,"links");links.append(link(card.state_link,"执行状态 JSON"));if(card.prediction_link)links.append(link(card.prediction_link,"冻结预测 JSON"));root.append(links);return root;
+}
+function render(){
+ const search=byId("search").value.trim().toLowerCase(),status=byId("status").value,group=byId("group").value,warnings=byId("warnings").checked;
+ const filtered=data.cards.filter(c=>(status==="all"||statusOf(c)===status)&&(group==="all"||c.group===group)&&(!warnings||c.warnings.length>0)&&(!search||[c.id,c.group,c.layer,c.variation].join(" ").toLowerCase().includes(search)));
+ byId("cards").replaceChildren();for(const card of filtered)byId("cards").append(cardElement(card));if(!filtered.length)byId("cards").append(element("div","没有符合当前筛选条件的任务。","empty"));
+ const counts={};for(const c of data.cards){const s=statusOf(c);counts[s]=(counts[s]||0)+1;}byId("summary").textContent="显示 "+filtered.length+" / "+data.cards.length+" 项任务 · "+Object.entries(counts).map(([s,n])=>(statusNames[s]||s)+" "+n).join(" · ")+" · 原生初始提案："+data.native_backend+"（读取冻结变换）";
+}
+for(const group of [...new Set(data.cards.map(c=>c.group).filter(Boolean))].sort()){const option=element("option",group);option.value=group;byId("group").append(option);}
+for(const id of ["search","status","group","warnings","samples"])byId(id).addEventListener(id==="search"?"input":"change",render);
+byId("zoom-close").addEventListener("click",()=>byId("zoom").close());
+byId("zoom-in").addEventListener("click",()=>{zoomScale=Math.min(4,zoomScale+.25);resizeZoom();});
+byId("zoom-out").addEventListener("click",()=>{zoomScale=Math.max(.25,zoomScale-.25);resizeZoom();});
+byId("zoom-reset").addEventListener("click",()=>{zoomScale=1;resizeZoom();});
+byId("zoom-image").addEventListener("load",resizeZoom);
+byId("artifact-links").append(link(data.prediction_link,"完整预测索引"));if(data.evaluation_link)byId("artifact-links").append(link(data.evaluation_link,"冻结后评价 JSON"));
+render();
+</script>
+</body>
+</html>

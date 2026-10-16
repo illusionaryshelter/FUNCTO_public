@@ -1,509 +1,420 @@
-"""Freeze multiview matches, run fixed registration backends, then evaluate.
+"""Freeze joint-surface predictions from existing, observed RGB-D evidence.
 
-The manifest declares observations separately from held-out evaluation files.
-Neither input loading nor fusion/registration opens those evaluation files.
-Every case's fused correspondences are written once and shared by all solvers.
+Prediction reads the explicit pair index, original camera observations, and
+cached single-view MARCO costs/peaks. It never runs a model or a baseline.
+Evaluation is a separate command which opens truth only after every declared
+task has a terminal frozen record. Task/category names are display metadata.
 """
 
 import argparse
-import csv
-import gc
 import json
 from pathlib import Path
+import sys
 from time import perf_counter
 
 import numpy as np
+from scipy.sparse import csr_matrix
 
+from .experiment import read_archive, restore_prediction, store_prediction
 from .features import write_json
-from .segmented_experiment import archive, SAMPLING
 
 
-# BEGIN independent multiview experiment; single-view experiment APIs are intact.
-ALGORITHMS = ("ransac", "prosac_lo", "teaserpp")
+# BEGIN joint-surface experiment contract; the retired fusion schema is removed.
+BASELINES = ('old_ransac', 'old_prosac_lo', 'old_teaserpp', 'joint')
+SAMPLING = {'sampling_radius_m': .03, 'sampling_spacing_m': .005}
 
 
-def _name(value, label):
-    """Names become directory components; paths belong in separate fields."""
-    if not isinstance(value, str) or not value or value in (".", "..") or Path(value).name != value:
-        raise ValueError(f"{label} must be a nonempty single path component")
+def _identifier(value, label):
+    """Identifiers name local output folders, never filesystem traversal."""
+    if not isinstance(value, str) or not value or Path(value).name != value or value in ('.', '..'):
+        raise ValueError(f'{label} must be one nonempty directory name')
     return value
 
 
-def read_manifest(path):
-    """Validate input declarations without opening any evaluation-only file."""
-    path = Path(path).resolve()
+def _path(base, value):
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (Path(base) / path).resolve()
+
+
+def read_manifest(index):
+    """Read an explicit paired-observation index without opening truth paths."""
+    path = Path(index).resolve()
     description = json.loads(path.read_text())
-    if description.get("schema") != "multiview_grounding_v1":
-        raise ValueError("Require a multiview_grounding_v1 manifest")
-    cases = description.get("cases")
+    cases = description['cases']
     if not isinstance(cases, list) or not cases:
-        raise ValueError("The manifest must declare at least one case")
-    names = []
+        raise ValueError('The index requires a nonempty cases list')
+    ids, groups = set(), {}
     for case in cases:
-        names.append(_name(case["id"], "Case ID"))
-        for key in ("source_input_dir", "source_observation_dir"):
-            if not isinstance(case.get(key), str) or not case[key]:
-                raise ValueError(f"Missing {key}")
-        targets = case.get("targets")
-        if not isinstance(targets, list) or len(targets) != 2:
-            raise ValueError("This experiment requires exactly two target observations")
-        ids = [_name(target["id"], "View ID") for target in targets]
-        if len(set(ids)) != len(ids):
-            raise ValueError("Target view IDs must be unique")
-        for target in targets:
-            for key in ("input_dir", "observation_dir"):
-                if not isinstance(target.get(key), str) or not target[key]:
-                    raise ValueError(f"Target declaration requires {key}")
-            if type(target.get("missing_target")) is not bool:
-                raise ValueError("Every target must explicitly declare Boolean missing_target")
-            reasons = target.get("missing_target_reasons")
-            if not isinstance(reasons, list) or any(not isinstance(reason, str) or not reason for reason in reasons):
-                raise ValueError("Missing-target reasons must be an explicit list of strings")
-            if target["missing_target"]:
-                if not reasons or target.get("missing_target_stage") != "segmentation_preparation":
-                    raise ValueError("Missing targets require recorded segmentation-preparation reasons")
-            elif reasons or target.get("missing_target_stage") is not None:
-                raise ValueError("Prepared targets cannot carry missing-target failure declarations")
-        # Evaluation references are checked structurally only. Existence and
-        # contents are intentionally unavailable to all prediction stages.
-        evaluation = case.get("evaluation")
-        if (not isinstance(evaluation, dict) or not isinstance(evaluation.get("target_truth"), dict)
-                or set(evaluation["target_truth"]) != set(ids)
-                or not isinstance(evaluation.get("source_truth"), str)
-                or not isinstance(evaluation.get("pair_truth"), str)):
-            raise ValueError("Evaluation references must separately cover source, pair, and target views")
-    if len(set(names)) != len(names):
-        raise ValueError("Case IDs must be unique")
+        identifier = _identifier(case['id'], 'Case ID')
+        task = _identifier(case['task'], 'Task ID')
+        _identifier(case['view'], 'View ID')
+        if identifier in ids:
+            raise ValueError('Case IDs must be unique')
+        ids.add(identifier)
+        for key in ('source', 'target', 'input_dir', 'evidence'):
+            if not isinstance(case[key], str) or not case[key]:
+                raise ValueError(f'Case requires {key}')
+        groups.setdefault(task, []).append(case)
+    for task, members in groups.items():
+        if len(members) != 2 or len({case['view'] for case in members}) != 2:
+            raise ValueError(f'Task {task} requires two unique view identities')
+        if len({case['source'] for case in members}) != 1 or len({case['evidence'] for case in members}) != 1:
+            raise ValueError('Paired views must declare the same source and demonstration')
+        if len({case['target'] for case in members}) != 2:
+            raise ValueError('Paired views must reference two distinct frames')
+    description['data'] = str(_path(path.parent, description['data']))
+    description['tasks'] = [{'id': task, 'cases': members} for task, members in groups.items()]
     return path, description
 
 
-def _path(manifest_path, value):
-    path = Path(value)
-    return path.resolve() if path.is_absolute() else (manifest_path.parent / path).resolve()
-
-
-def selected_cases(description, selected=None):
-    """Choose an explicit subset without changing the declared evaluation set."""
-    if selected is None:
-        return description["cases"]
-    unknown = set(selected) - {case["id"] for case in description["cases"]}
-    if unknown:
-        raise ValueError(f"Unknown case IDs: {sorted(unknown)}")
-    return [case for case in description["cases"] if case["id"] in selected]
-
-
-def _check_observation_calibration(observation, folder):
-    """Bind point-bank calibration to the full RGB-D observation declaration."""
-    calibration = json.loads((folder / "calibration.json").read_text())
-    for key in ("K", "T_world_camera_cv"):
-        np.testing.assert_array_equal(observation[key], np.asarray(calibration[key]))
-
-
-def _check_observed_depth(observation, depth):
-    """Verify saved world points are backprojections of this exact depth image.
-
-    This checks artifact identity at floating-point roundoff, not a physical
-    sensor noise bound. No point is moved or accepted by a nearest match.
-    """
-    pixels = np.asarray(observation["pixels"])
-    if (pixels.ndim != 2 or pixels.shape[1] != 2 or pixels.dtype.kind not in "iu"
-            or np.any(pixels < 0) or np.any(pixels[:, 0] >= depth.shape[1])
-            or np.any(pixels[:, 1] >= depth.shape[0])):
-        raise ValueError("Saved observation pixels are outside their full depth image")
+def _check_observation(observation, depth, calibration):
+    """Reject stale pixel/XYZ or camera bindings instead of snapping points."""
+    k, pose = np.asarray(calibration['K']), np.asarray(calibration['T_world_camera_cv'])
+    np.testing.assert_array_equal(observation['K'], k)
+    np.testing.assert_array_equal(observation['T_world_camera_cv'], pose)
+    pixels = np.asarray(observation['pixels'])
+    if (pixels.ndim != 2 or pixels.shape[1] != 2 or pixels.dtype.kind not in 'iu'
+            or np.any(pixels < 0) or np.any(pixels >= np.asarray(depth.shape[::-1]))):
+        raise ValueError('Observation pixels must index their original depth image')
     values = depth[pixels[:, 1], pixels[:, 0]]
-    if not np.all(np.isfinite(values) & (values > 0)):
-        raise ValueError("Saved observation includes invalid depth pixels")
-    rays = np.column_stack((pixels, np.ones(len(pixels)))) @ np.linalg.inv(observation["K"]).T
-    transform = observation["T_world_camera_cv"]
-    expected = (rays * values[:, None]) @ transform[:3, :3].T + transform[:3, 3]
-    np.testing.assert_allclose(observation["xyz"], expected, rtol=1e-12, atol=1e-12)
+    if not np.isfinite(values).all() or np.any(values <= 0):
+        raise ValueError('Entity observations require positive finite original depth')
+    rays = np.c_[pixels, np.ones(len(pixels))] @ np.linalg.inv(k).T
+    xyz = (rays * values[:, None]) @ pose[:3, :3].T + pose[:3, 3]
+    np.testing.assert_allclose(observation['xyz'], xyz, rtol=0, atol=1e-8)
 
 
-def load_inputs(manifest_path, case, *, features=False):
-    """Load prepared point identities and original depth, never simulator truth.
+def _read_frame(data, record):
+    folder = _path(data, record['path'])
+    depth = np.load(folder / 'depth_m.npy', allow_pickle=False)
+    calibration = json.loads((folder / 'calibration.json').read_text())
+    if depth.ndim != 2:
+        raise ValueError('Full depth must be a two-dimensional optical-axis image')
+    if not (folder / 'rgb.png').is_file():
+        raise FileNotFoundError(folder / 'rgb.png')
+    return folder, depth, calibration
 
-    Feature maps are opened sequentially. Only one source map and the two
-    target maps survive loading; duplicate source maps are checked then freed.
+
+def _check_evidence(evidence, source, target):
+    """Cached row identities and target columns remain the original point IDs."""
+    query = np.asarray(evidence['query_indices'])
+    region = np.asarray(evidence['query_region'])
+    cost = np.asarray(evidence['appearance_cost'])
+    peaks = np.asarray(evidence['peak_indices'])
+    supported = np.asarray(evidence['supported_target'])
+    if (query.ndim != 1 or query.dtype.kind not in 'iu' or len(np.unique(query)) != len(query)
+            or np.any(query < 0) or np.any(query >= len(source['xyz']))):
+        raise ValueError('Cached queries must be distinct original source indices')
+    if region.dtype != np.bool_ or region.shape != query.shape:
+        raise ValueError('Cached query_region must be Boolean and query aligned')
+    np.testing.assert_array_equal(region, source['region_mask'][query])
+    if cost.shape != (len(query), len(target['xyz'])) or not np.isfinite(cost).all() or np.any((cost < 0) | (cost > 1)):
+        raise ValueError('Appearance cost must be finite and source-query/target-point aligned')
+    if supported.dtype != np.bool_ or supported.shape != (len(target['xyz']),):
+        raise ValueError('supported_target must retain the cached interpolation domain')
+    if (peaks.ndim != 2 or peaks.shape[0] != len(query) or peaks.dtype.kind not in 'iu'
+            or np.any(peaks < -1) or np.any(peaks >= len(target['xyz']))):
+        raise ValueError('Cached peaks must index the original target entity observation')
+
+
+def load_inputs(index, task, cache_root):
+    """Load one declared pair, retaining full depth when entity evidence is absent.
+
+    Missing entity preparation is an explicit input state. A prepared entity
+    with a missing/corrupt cache is an execution error, not an invented empty
+    view. A source and fixed query identities are shared across both views.
     """
-    source_dir = _path(manifest_path, case["source_input_dir"])
-    preparation = json.loads((source_dir / "preparation.json").read_text())
-    if not preparation["source"]["prepared"]:
-        raise ValueError("Declared source input has not been prepared")
-    source = archive(source_dir / "source_observation.npz")
-    source_metadata = json.loads((source_dir / "inputs.json").read_text())
-    source_crop = source_metadata["source_crop_xyxy"]
-    source_full = _path(manifest_path, case["source_observation_dir"])
-    _check_observation_calibration(source, source_full)
-    source_depth = np.load(source_full / "depth_m.npy", allow_pickle=False)
-    if source_depth.shape != source["object_mask"].shape:
-        raise ValueError("Source full depth does not match its observation image")
-    _check_observed_depth(source, source_depth)
-    del source_depth
-    source_feature = None
-    if features:
-        with np.load(source_dir / "features.npz", allow_pickle=False) as values:
-            source_feature = values["feature1"]
-    targets = []
-    for target in sorted(case["targets"], key=lambda item: item["id"]):
-        directory = _path(manifest_path, target["input_dir"])
-        full = _path(manifest_path, target["observation_dir"])
-        prepared = json.loads((directory / "preparation.json").read_text())
-        if not prepared["source"]["prepared"]:
-            raise ValueError("Every target pairing must preserve the prepared source observation")
-        missing = target["missing_target"]
-        if (missing != (not prepared["target"]["prepared"])
-                or bool(prepared["prepared"]) != (not missing)
-                or (missing and target["missing_target_reasons"] != prepared["target"]["reasons"])):
-            raise ValueError("Explicit target declaration disagrees with its frozen preparation record")
-        metadata = json.loads((directory / "inputs.json").read_text())
-        candidate_source = archive(directory / "source_observation.npz")
-        if candidate_source.keys() != source.keys() or metadata["source_crop_xyxy"] != source_crop:
-            raise ValueError("All views must share exactly the same source observation and crop")
-        for key in source:
-            np.testing.assert_array_equal(candidate_source[key], source[key])
-        del candidate_source
-        depth = np.load(full / "depth_m.npy", allow_pickle=False)
-        if depth.ndim != 2 or depth.dtype.kind not in "fiu" or min(depth.shape) < 1:
-            raise ValueError("Target full depth must remain a nonempty numeric image")
-        if missing:
-            # Only an explicit preparation failure creates empty evidence.
-            # Unknown file/shape/model errors still raise; no exception is
-            # converted into a missing camera or replaced by another view.
-            if (directory / "target_observation.npz").exists() or (directory / "features.npz").exists():
-                raise ValueError("Missing target conflicts with a saved target/model artifact")
-            from .segmentation import _calibration
-            calibration = json.loads((full / "calibration.json").read_text())
-            K, transform = _calibration(calibration["K"], calibration["T_world_camera_cv"])
-            mask = np.zeros(depth.shape, dtype=bool)
-            observation = {"xyz": np.empty((0, 3), dtype=float), "pixels": np.empty((0, 2), dtype=np.int64),
-                "object_mask": mask, "entity_member": np.empty(0, dtype=bool),
-                "region_mask": np.empty(0, dtype=bool), "evidence_only": np.empty(0, dtype=bool),
-                "K": K, "T_world_camera_cv": transform}
-            targets.append({"id": target["id"], "observation": observation, "depth_m": depth,
-                "selected_mask": mask, "crop_xyxy": None, "feature": None,
-                "missing_target": True, "missing_target_reasons": list(target["missing_target_reasons"]),
-                "missing_target_stage": target["missing_target_stage"]})
-            continue
-        observation = archive(directory / "target_observation.npz")
-        _check_observation_calibration(observation, full)
-        mask = np.load(directory / "target_selected_mask.npy", allow_pickle=False)
-        if depth.shape != observation["object_mask"].shape or mask.dtype != np.bool_:
-            raise ValueError("Full depth and selected mask must align with the point-bank image")
-        np.testing.assert_array_equal(mask, observation["object_mask"])
-        _check_observed_depth(observation, depth)
-        record = {"id": target["id"], "observation": observation,
-                  "depth_m": depth, "selected_mask": mask, "crop_xyxy": metadata["target_crop_xyxy"],
-                  "missing_target": False, "missing_target_reasons": [], "missing_target_stage": None}
-        if features:
-            with np.load(directory / "features.npz", allow_pickle=False) as values:
-                np.testing.assert_array_equal(values["feature1"], source_feature)
-                record["feature"] = values["feature2"]
-        targets.append(record)
-    return source, source_feature, source_crop, targets
-
-
-def _save_fusion(directory, result, timing):
-    """Separate typed arrays from metadata, including the candidate provenance."""
-    arrays, metadata = {}, {}
-    for key, value in result.items():
-        if key == "bank":
-            metadata["bank"] = {}
-            for name, item in value.items():
-                if isinstance(item, np.ndarray):
-                    arrays[f"bank__{name}"] = item
-                else:
-                    metadata["bank"][name] = item
-        elif isinstance(value, np.ndarray):
-            arrays[key] = value
+    path, description = read_manifest(index)
+    data, cache_root = Path(description['data']), Path(cache_root).resolve()
+    frame_manifest = json.loads((data / 'manifest.json').read_text())
+    source, source_signature, queries, query_region, views = None, None, None, None, []
+    source_folder = None
+    for case in sorted(task['cases'], key=lambda member: member['view']):
+        folder = _path(path.parent, case['input_dir'])
+        prepared = json.loads((folder / 'preparation.json').read_text())
+        chart = json.loads((folder / 'inputs.json').read_text())
+        current = read_archive(folder / 'source_observation.npz')
+        current_source_folder, source_depth, source_camera = _read_frame(data, frame_manifest['views'][case['source']])
+        _check_observation(current, source_depth, source_camera)
+        supplied_region = np.load(_path(data, case['evidence']), allow_pickle=False)
+        xy = current['pixels']
+        np.testing.assert_array_equal(current['region_mask'], supplied_region[xy[:, 1], xy[:, 0]])
+        signature = (chart['source_crop_xyxy'], (folder / 'source.png').read_bytes())
+        if source is None:
+            source, source_signature, source_folder = current, signature, current_source_folder
         else:
-            metadata[key] = value
-    np.savez_compressed(directory / "fusion.npz", **arrays)
-    metadata.update(timing=timing, frozen=True, target_truth_used=False)
-    write_json(directory / "fusion.json", metadata)
+            if source.keys() != current.keys() or signature != source_signature:
+                raise ValueError('Paired target views require one identical source observation and crop')
+            for key in source:
+                np.testing.assert_array_equal(source[key], current[key])
+        target_folder, depth, camera = _read_frame(data, frame_manifest['views'][case['target']])
+        available = bool(prepared['target']['prepared'])
+        reasons = list(prepared['target']['reasons'])
+        observation, evidence = None, None
+        cache_folder = cache_root / case['id']
+        if available:
+            frozen = json.loads((cache_folder / 'frozen.json').read_text())
+            if frozen.get('complete') is not True or frozen.get('target_truth_used') is not False:
+                raise ValueError('Cached appearance requires a complete, truth-free prediction record')
+            observation = read_archive(folder / 'target_observation.npz')
+            _check_observation(observation, depth, camera)
+            evidence = read_archive(cache_folder / 'joint_evidence.npz')
+            _check_evidence(evidence, source, observation)
+            if queries is None:
+                queries, query_region = evidence['query_indices'], evidence['query_region']
+            else:
+                np.testing.assert_array_equal(queries, evidence['query_indices'])
+                np.testing.assert_array_equal(query_region, evidence['query_region'])
+        elif not reasons:
+            raise ValueError('Unavailable target entity preparation must state its reason')
+        views.append({'id': case['view'], 'K': np.asarray(camera['K'], dtype=float),
+            'T_world_camera_cv': np.asarray(camera['T_world_camera_cv'], dtype=float),
+            'depth_m': depth, 'observation': observation, 'evidence': evidence,
+            'missing_reasons': reasons, 'rgb_path': str(target_folder / 'rgb.png'),
+            'frame_dir': str(target_folder), 'case': case, 'cache_dir': str(cache_folder)})
+    return {'source': source, 'source_rgb': str(source_folder / 'rgb.png'), 'views': views,
+            'query_indices': queries, 'query_region': query_region, 'task': task}
 
 
-def load_fusion(directory):
-    """Reload frozen matching output without calling any image model or matcher."""
+def initial_proposals(views, backend):
+    """Reuse frozen native transforms even when their old region was rejected."""
+    proposals, records = [], []
+    for view_index, view in enumerate(views):
+        path = Path(view['cache_dir']) / f'old_{backend}.npz'
+        state = {'view': view['id'], 'backend': backend, 'available': False}
+        if path.is_file():
+            values = read_archive(path)
+            names = ('sim3_scale', 'sim3_rotation', 'sim3_translation')
+            if all(name in values for name in names):
+                transform = (float(values[names[0]]), values[names[1]], values[names[2]])
+                proposals.append({'transform': transform, 'origin': f'native_{backend}', 'view_index': view_index})
+                state['available'] = True
+            else:
+                state['reason'] = 'frozen_native_transform_unavailable'
+        else:
+            state['reason'] = 'frozen_native_prediction_unavailable'
+        records.append(state)
+    return proposals, records
+
+
+def save_surface(directory, surface):
+    """Freeze element/provenance arrays; full images remain in their input files."""
     directory = Path(directory)
-    metadata = json.loads((directory / "fusion.json").read_text())
-    if not metadata.get("frozen") or metadata.get("target_truth_used") is not False:
-        raise ValueError("Fusion must be a frozen prediction made without target truth")
-    result = dict(metadata)
-    result["bank"] = dict(metadata.get("bank", {}))
-    for key, value in archive(directory / "fusion.npz").items():
-        if key.startswith("bank__"):
-            result["bank"][key.removeprefix("bank__")] = value
-        else:
-            result[key] = value
-    return result
+    omitted = {'depth_m', 'K', 'T_world_camera_cv', 'pixel_to_observation', 'adjacency'}
+    arrays = {key: value for key, value in surface.items()
+              if isinstance(value, np.ndarray) and key not in omitted}
+    adjacency = surface['adjacency'].tocsr()
+    arrays.update(adjacency_data=adjacency.data, adjacency_indices=adjacency.indices,
+                  adjacency_indptr=adjacency.indptr, adjacency_shape=np.asarray(adjacency.shape))
+    np.savez_compressed(directory / 'surface.npz', **arrays)
+    metadata = {key: value for key, value in surface.items()
+                if key not in omitted and not isinstance(value, np.ndarray)}
+    write_json(directory / 'surface.json', metadata)
 
 
-def fuse_suite(manifest, output, selected=None):
-    """Compute each selected case's complete fusion field exactly once."""
-    from .multiview_features import fuse_correspondences
+def load_surface(directory, views):
+    """Restore a frozen surface and bind original depth to its saved view IDs."""
+    directory = Path(directory)
+    surface = read_archive(directory / 'surface.npz')
+    surface.update(json.loads((directory / 'surface.json').read_text()))
+    if list(surface['view_ids']) != [view['id'] for view in views]:
+        raise ValueError('Surface provenance does not match the declared view order')
+    shape = tuple(surface.pop('adjacency_shape'))
+    surface['adjacency'] = csr_matrix((surface.pop('adjacency_data'), surface.pop('adjacency_indices'),
+                                      surface.pop('adjacency_indptr')), shape=shape)
+    surface['K'] = np.asarray([view['K'] for view in views])
+    surface['T_world_camera_cv'] = np.asarray([view['T_world_camera_cv'] for view in views])
+    surface['depth_m'] = [view['depth_m'] for view in views]
+    maps = []
+    for view_index, view in enumerate(views):
+        mapping = np.full(view['depth_m'].shape, -1, dtype=np.int64)
+        ids = np.flatnonzero(surface['observation_view_index'] == view_index)
+        pixels = surface['observation_pixels'][ids]
+        mapping[pixels[:, 1], pixels[:, 0]] = ids
+        maps.append(mapping)
+    surface['pixel_to_observation'] = maps
+    return surface
 
-    path, description = read_manifest(manifest)
-    for case in selected_cases(description, selected):
-        destination = Path(output) / "fusion" / case["id"]
-        destination.mkdir(parents=True, exist_ok=False)
-        begin = perf_counter()
-        source, source_feature, source_crop, targets = load_inputs(path, case, features=True)
-        loaded = perf_counter()
-        found = fuse_correspondences(source, source_feature, source_crop, targets,
-                                    sampling_radius_m=SAMPLING["sampling_radius_m"], count=160)
-        finished = perf_counter()
-        timing = {"input_and_feature_load_ms": 1000 * (loaded - begin),
-                  "fusion_ms": 1000 * (finished - loaded),
-                  "model_provenance": case.get("model_timing", {}), "fresh_model_calls": 0}
-        _save_fusion(destination, found, timing)
-        print(json.dumps({"case": case["id"], "stage": "fused",
-            "correspondences": len(found["src_anchor_idx"]), "fusion_ms": timing["fusion_ms"]}), flush=True)
-        del source, source_feature, targets, found
-        gc.collect()
+
+def _save_candidate_evidence(directory, evidence):
+    """Preserve typed candidate records separately from original model caches."""
+    arrays = {key: value for key, value in evidence.items() if isinstance(value, np.ndarray)}
+    np.savez_compressed(Path(directory) / 'candidates.npz', **arrays)
+    write_json(Path(directory) / 'candidates.json', {
+        key: value for key, value in evidence.items() if not isinstance(value, np.ndarray)})
 
 
-def predict_suite(manifest, output, selected=None, algorithms=ALGORITHMS):
-    """One solver call per requested matrix cell, with no warmups or retries."""
-    from . import core
-    from .experiment import store_prediction
+def block_evaluation_reads():
+    """Install a process-local truth barrier for the prediction CLI only."""
+    forbidden_names = {'truth.npz', 'evaluation.npz', 'evaluation.json', 'evaluation-audit.json',
+                       'state-checks.json', 'intervention-checks.json', 'summary.json', 'metrics.csv'}
+    def audit(event, args):
+        if event != 'open' or not isinstance(args[0], (str, bytes, Path)):
+            return
+        path = Path(args[0].decode() if isinstance(args[0], bytes) else args[0])
+        if (path.name in forbidden_names or path.name.endswith('_evaluation.json')
+                or 'pair-truth' in path.parts or 'evaluation-scenes' in path.parts):
+            raise PermissionError(f'Evaluation-only artifact requested during prediction: {path}')
+    sys.addaudithook(audit)
+
+
+def predict_suite(index, cache_root, output, selected=None, backend='teaserpp'):
+    """Run each task serially and freeze failures as well as accepted results."""
+    from .multiview_geometry import build_target_surface
+    from .multiview_features import build_correspondence_candidates
     from .multiview_grounding import infer_multiview_region
-
-    if not algorithms or len(set(algorithms)) != len(algorithms) or not set(algorithms) <= set(ALGORITHMS):
-        raise ValueError("Algorithms must be a distinct subset of the three declared backends")
-    if "teaserpp" in algorithms:
-        import teaserpp_python  # Native import is deliberately outside solver timings.
-    path, description = read_manifest(manifest)
-    for case in selected_cases(description, selected):
-        source, _, _, targets = load_inputs(path, case)
-        fused = load_fusion(Path(output) / "fusion" / case["id"])
-        bank = fused["bank"]
-        for algorithm in algorithms:
-            destination = Path(output) / case["id"] / algorithm
-            destination.mkdir(parents=True, exist_ok=False)
-            begin = perf_counter()
-            prepared = core.prepare_anchors(source["xyz"], bank["xyz"],
-                fused["src_anchor_idx"], fused["tgt_anchor_idx"], mode="direct",
-                registration_algorithm=algorithm, correspondence_scores=fused["scores"])
-            registered = perf_counter()
-            result = infer_multiview_region(source, targets, prepared, bank, **SAMPLING)
-            finished = perf_counter()
-            store_prediction(destination / "prediction", result, {})
-            measurement = {"case": case["id"], "algorithm": algorithm, "status": "completed",
-                "seed": 0, "requested_prediction_calls": 1, "actual_prediction_calls": 1,
-                "warmup_calls": 0, "target_truth_used_by_prediction": False,
-                "correspondence_count": len(fused["src_anchor_idx"]),
-                "unique_source_count": len(np.unique(fused["src_anchor_idx"])),
-                "unique_target_count": len(np.unique(fused["tgt_anchor_idx"])),
-                "registration_and_anchor_preparation_ms": 1000 * (registered - begin),
-                "region_generation_ms": 1000 * (finished - registered),
-                "sequential_geometry_total_ms": 1000 * (finished - begin),
-                "fusion_timing": fused["timing"], "fusion_diagnostics": fused["diagnostics"],
-                "accepted": bool(result["accepted"]),
-                # BEGIN quality warnings remain distinct from rejection reasons.
-                "quality_warnings": result["diagnostics"]["quality_warnings"],
-                # END measurement warning propagation.
-                "reasons": result["reasons"], "scale": prepared.scale,
-                "rotation": prepared.rotation, "translation": prepared.translation,
-                "diagnostics": prepared.diagnostics, "grounding_diagnostics": result["diagnostics"]}
-            write_json(destination / "measurements.json", measurement)
-            print(json.dumps({"case": case["id"], "algorithm": algorithm,
-                "accepted": result["accepted"], "reasons": result["reasons"],
-                # BEGIN do not report accepted low-consensus candidates as unqualified success.
-                "quality_warnings": result["diagnostics"]["quality_warnings"],
-                # END compact warning propagation.
-                "registration_ms": measurement["registration_and_anchor_preparation_ms"]}), flush=True)
-        del source, targets, fused, bank
-        gc.collect()
-
-
-def restore_prediction(path):
-    """Reconstruct observed modes from frozen prediction artifacts only."""
-    path = Path(path)
-    description = json.loads(path.with_suffix(".json").read_text())
-    values = archive(path.with_suffix(".npz"))
-    result = {"accepted": description["accepted"], "reasons": description["reasons"],
-              "diagnostics": description["diagnostics"], "modes": []}
-    for index, metadata in enumerate(description["modes"]):
-        mode = dict(metadata)
-        for key in ("seed_index", "center", "normal", "mask", "sample_indices"):
-            mode[key] = values[f"mode_{index}_{key}"]
-        mode["seed_index"] = int(mode["seed_index"])
-        result["modes"].append(mode)
-    return result
+    if backend not in ('teaserpp', 'ransac'):
+        raise ValueError('Native proposal backend must be teaserpp or ransac')
+    path, description = read_manifest(index)
+    tasks = description['tasks']
+    if selected:
+        if not set(selected) <= {task['id'] for task in tasks}:
+            raise ValueError('Unknown selected task')
+        tasks = [task for task in tasks if task['id'] in selected]
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    record = {'frozen': False, 'target_truth_used': False, 'index': str(path),
+              'cache_root': str(Path(cache_root).resolve()), 'native_backend': backend,
+              'sampling': dict(SAMPLING), 'tasks': []}
+    for task in tasks:
+        directory = output / task['id']
+        directory.mkdir()
+        state = {'id': task['id'], 'cases': task['cases'], 'status': 'not_run',
+                 'accepted': False, 'reasons': [], 'warnings': []}
+        record['tasks'].append(state)
+        write_json(output / 'predictions.json', record)
+        stage, started = 'load_observations', perf_counter()
+        try:
+            loaded = load_inputs(path, task, cache_root)
+            state['input_availability'] = [{'view': view['id'], 'geometry': True,
+                'entity': view['observation'] is not None, 'appearance': view['evidence'] is not None,
+                'reasons': view['missing_reasons']} for view in loaded['views']]
+            if loaded['query_indices'] is None:
+                state.update(status='missing_input', reasons=['no_cached_appearance_queries'])
+            else:
+                stage = 'build_joint_surface'
+                surface = build_target_surface(loaded['views'], sampling_radius_m=SAMPLING['sampling_radius_m'])
+                stage = 'build_correspondence_candidates'
+                evidence = build_correspondence_candidates(loaded['source'], loaded['views'], surface,
+                    query_indices=loaded['query_indices'], query_region=loaded['query_region'])
+                initial, native_records = initial_proposals(loaded['views'], backend)
+                stage = 'infer_joint_region'
+                result = infer_multiview_region(loaded['source'], surface, evidence,
+                                               initial_transforms=initial, **SAMPLING)
+                result['diagnostics'].update(target_truth_used=False, native_proposals=native_records,
+                    prediction_ms=1000 * (perf_counter() - started))
+                stage = 'freeze_artifacts'
+                save_surface(directory, surface)
+                _save_candidate_evidence(directory, evidence)
+                store_prediction(directory / 'prediction', result, {})
+                state.update(status='completed', accepted=bool(result['accepted']), reasons=result['reasons'],
+                             warnings=result['diagnostics'].get('quality_warnings', []))
+        except Exception as error:
+            state.update(status='failed', reasons=[str(error)], failure_stage=stage,
+                         exception_type=type(error).__name__)
+        state['elapsed_ms'] = 1000 * (perf_counter() - started)
+        state['target_truth_used'] = False
+        write_json(directory / 'frozen.json', state)
+        write_json(output / 'predictions.json', record)
+        print(json.dumps({key: state[key] for key in ('id', 'status', 'accepted', 'reasons')}, ensure_ascii=False), flush=True)
+    record['frozen'] = True
+    write_json(output / 'predictions.json', record)
+    return record
 
 
-def transform_metrics(scale, rotation, translation, source, mapping, is_similarity):
-    """Use point-mapping error for arbitrary affine truth, never a false scale."""
-    from .core import apply_sim3
-    if scale is None or not len(source):
-        return None
-    # BEGIN restore numeric arrays at the frozen JSON evaluation boundary.
-    rotation, translation = np.asarray(rotation, dtype=float), np.asarray(translation, dtype=float)
-    # END serialization changes types, never the saved transform values.
-    predicted = apply_sim3(source, scale, rotation, translation)
-    expected = source @ mapping[:3, :3].T + mapping[:3, 3]
-    result = {"source_points_transform_rmse_m": float(np.sqrt(np.mean(np.sum((predicted - expected) ** 2, axis=1)))),
-              "scale_relative_error": None, "rotation_error_deg": None, "translation_parameter_error_m": None}
-    if is_similarity:
-        true_scale = float(np.cbrt(np.linalg.det(mapping[:3, :3])))
-        true_rotation = mapping[:3, :3] / true_scale
-        cosine = np.clip((np.trace(np.asarray(rotation) @ true_rotation.T) - 1) / 2, -1, 1)
-        result.update(scale_relative_error=abs(scale / true_scale - 1),
-            rotation_error_deg=float(np.degrees(np.arccos(cosine))),
-            translation_parameter_error_m=float(np.linalg.norm(np.asarray(translation) - mapping[:3, 3])))
-    return result
-
-
-def _error_summary(errors, tolerance):
-    errors = np.asarray(errors)
-    return {"count": len(errors), "median_error_m": float(np.median(errors)) if len(errors) else None,
-            "p90_error_m": float(np.quantile(errors, .9)) if len(errors) else None,
-            "near_truth_count": int(np.count_nonzero(errors <= tolerance)), "threshold_m": tolerance}
-
-
-def evaluate_suite(manifest, output):
-    """Open target truth only after every declared case/backend artifact exists."""
-    from .evaluation import evaluate_prediction, evidence_reference_center
-
-    path, description = read_manifest(manifest)
+def frozen_index(output):
+    """Validate the entire terminal matrix before any evaluator opens truth."""
     output = Path(output)
-    # This barrier also checks the native call record, rather than treating an
-    # empty output directory as evidence that the requested prediction ran.
-    for case in description["cases"]:
-        for algorithm in ALGORITHMS:
-            destination = output / case["id"] / algorithm
-            for filename in ("prediction.json", "prediction.npz", "measurements.json"):
-                if not (destination / filename).is_file():
-                    raise FileNotFoundError("Finish every declared prediction before evaluating target truth: " + str(destination / filename))
-            record = json.loads((destination / "measurements.json").read_text())
-            if record["actual_prediction_calls"] != 1 or record["target_truth_used_by_prediction"]:
-                raise ValueError("Evaluation requires exactly one truth-free prediction per matrix cell")
-    rows, ground_truth = [], {}
-    for case in description["cases"]:
-        source, _, _, targets = load_inputs(path, case)
-        fused = load_fusion(output / "fusion" / case["id"])
-        bank, evaluation = fused["bank"], case["evaluation"]
-        source_truth = archive(_path(path, evaluation["source_truth"]))
-        pair_truth = json.loads(_path(path, evaluation["pair_truth"]).read_text())
-        truths = {view_id: archive(_path(path, filename)) for view_id, filename in evaluation["target_truth"].items()}
-        view_ids = list(bank["view_ids"])
-        if view_ids != [target["id"] for target in targets]:
-            raise ValueError("Frozen candidate observation order disagrees with the manifest")
-        first_truth = truths[view_ids[0]]
-        mapping = first_truth["canonical_to_world"] @ source_truth["world_to_canonical"]
-        for truth in truths.values():
-            np.testing.assert_allclose(truth["canonical_to_world"], first_truth["canonical_to_world"], atol=1e-12, rtol=0)
-        singular = np.linalg.svd(mapping[:3, :3], compute_uv=False)
-        similarity = bool(np.linalg.det(mapping[:3, :3]) > 0 and np.allclose(singular, singular[0], rtol=1e-10, atol=1e-12))
-        reference = np.asarray(pair_truth["target_reference_evidence_center_world"])
-        np.testing.assert_allclose(evidence_reference_center(source["xyz"], source["region_mask"], source_truth, first_truth),
-                                   reference, rtol=0, atol=1e-9)
-        support, owner_target = [], []
-        for target in targets:
-            px = target["observation"]["pixels"]
-            truth = truths[target["id"]]
-            support.append(truth["support_id_image"][px[:, 1], px[:, 0]])
-            owner_target.append(truth["entity_mask"][px[:, 1], px[:, 0]])
-        support, owner_target = np.concatenate(support), np.concatenate(owner_target)
-        if len(support) != len(bank["observation_xyz"]):
-            raise ValueError("Evaluation labels do not align with frozen observed target points")
-        sx = source["pixels"]
-        owner_source = source_truth["entity_mask"][sx[:, 1], sx[:, 0]]
-        source_ids, target_ids = fused["src_anchor_idx"], fused["tgt_anchor_idx"]
-        expected = source["xyz"][source_ids] @ mapping[:3, :3].T + mapping[:3, 3]
-        errors = np.linalg.norm(bank["xyz"][target_ids] - expected, axis=1)
-        ground_truth[case["id"]] = {"mapping_type": "Sim(3)" if similarity else "nonuniform_affine",
-            "matrix": mapping, "singular_values": singular, "true_scale": float(singular[0]) if similarity else None,
-            "target_reference_center_world": reference}
-        for algorithm in ALGORITHMS:
-            destination = output / case["id"] / algorithm
-            row = json.loads((destination / "measurements.json").read_text())
-            result = restore_prediction(destination / "prediction")
-            tolerance = row["diagnostics"].get("ransac_tolerance_m")
-            # Empty matching inputs can reject before a fitting tolerance is
-            # needed. Report no threshold rather than fabricate a noise bound.
-            correspondence = _error_summary(errors, tolerance) if tolerance is not None else {"count": len(errors), "threshold_m": None}
-            observation_ids = bank["candidate_first_observation_index"][target_ids]
-            correspondence.update(source_entity_count=int(owner_source[source_ids].sum()),
-                                  target_entity_count=int(owner_target[observation_ids].sum()))
-            row["quality"] = {"correspondence": correspondence,
-                "transform": transform_metrics(row["scale"], row["rotation"], row["translation"], source["xyz"], mapping, similarity),
-                "source_entity_fraction": float(owner_source.mean()),
-                "true_source_entity_transform": transform_metrics(row["scale"], row["rotation"], row["translation"], source["xyz"][owner_source], mapping, similarity),
-                "region": evaluate_prediction(result, bank["observation_xyz"],
-                    {"support_id": support, "preferred_support_id": np.asarray(pair_truth["preferred_support_id"], dtype=np.int32)}, reference)}
-            if all(key in fused for key in ("raw_source_idx", "raw_target_idx", "raw_valid")) and tolerance is not None:
-                valid = fused["raw_valid"]
-                raw_source = source["xyz"][fused["raw_source_idx"][valid]]
-                raw_expected = raw_source @ mapping[:3, :3].T + mapping[:3, 3]
-                row["quality"]["raw_correspondence"] = _error_summary(np.linalg.norm(
-                    bank["xyz"][fused["raw_target_idx"][valid]] - raw_expected, axis=1), tolerance)
-            # These are diagnostics from the already frozen matching fields,
-            # not extra registrations, model calls, or alternative seed runs.
-            if "per_view_best_candidate_idx" in fused and tolerance is not None:
-                single_view = {}
-                for view_index, view_id in enumerate(view_ids):
-                    candidate_ids = fused["per_view_best_candidate_idx"][:, view_index]
-                    valid = candidate_ids >= 0
-                    raw_source = source["xyz"][fused["raw_source_idx"][valid]]
-                    expected_view = raw_source @ mapping[:3, :3].T + mapping[:3, 3]
-                    single_view[view_id] = _error_summary(np.linalg.norm(
-                        bank["xyz"][candidate_ids[valid]] - expected_view, axis=1), tolerance)
-                row["quality"]["single_view_rank_correspondence"] = single_view
-            if "raw_view_supported" in fused and "raw_retained" in fused:
-                support_counts = fused["raw_view_supported"][fused["raw_retained"]].sum(axis=1)
-                row["retained_match_view_support"] = {"single_view": int(np.count_nonzero(support_counts == 1)),
-                    "both_views": int(np.count_nonzero(support_counts == 2)),
-                    "both_view_fraction": float(np.mean(support_counts == 2)) if len(support_counts) else None}
-            write_json(destination / "measurements.json", row)
-            rows.append(row)
-        del source, targets, fused, bank, truths
-        gc.collect()
-    summary = {"rows": rows, "ground_truth": ground_truth, "protocol": {
-        "predictions_per_case_algorithm": 1, "warmup_solver_calls": 0, "algorithm_order": ALGORITHMS,
-        "case_order": [case["id"] for case in description["cases"]], "truth_loaded_after_all_predictions": True,
-        "repeated_timing_or_seed_sweep": False, "model_inference_during_prediction": False,
-        "geometry_timing_excludes": ["models", "fusion", "file_io", "evaluation", "plotting"]}}
-    write_json(output / "summary.json", summary)
-    flat = []
-    for row in rows:
-        transform = row["quality"]["transform"] or {}
-        flat.append({"case": row["case"], "algorithm": row["algorithm"], "accepted": row["accepted"],
-            # BEGIN structured warnings also appear in the flat result table.
-            "quality_warnings": ";".join(row["diagnostics"]["quality_warnings"]),
-            # END warning export.
-            "reasons": ";".join(row["reasons"]), "correspondence_count": row["correspondence_count"],
-            "correspondence_near_truth_count": row["quality"]["correspondence"].get("near_truth_count"),
-            "transform_rmse_m": transform.get("source_points_transform_rmse_m"),
-            "registration_ms": row["registration_and_anchor_preparation_ms"],
-            "region_generation_ms": row["region_generation_ms"],
-            **{key: value for key, value in row["quality"]["region"].items() if key != "mode_metrics"}})
-    with (output / "summary.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(flat[0]))
-        writer.writeheader()
-        writer.writerows(flat)
-    print(json.dumps({"evaluated": len(rows), "accepted": sum(row["accepted"] for row in rows)}), flush=True)
+    path = output / 'predictions.json'
+    if not path.is_file():
+        raise FileNotFoundError('Finish every declared prediction before evaluation')
+    record = json.loads(path.read_text())
+    if record.get('frozen') is not True or record.get('target_truth_used') is not False or not record.get('tasks'):
+        raise ValueError('Evaluation requires a complete truth-free frozen prediction index')
+    for state in record['tasks']:
+        frozen = json.loads((output / state['id'] / 'frozen.json').read_text())
+        if (state['status'] not in ('completed', 'failed', 'missing_input') or frozen != state
+                or frozen.get('target_truth_used') is not False):
+            raise ValueError('Every declared task must have a matching terminal frozen record')
+        if state['status'] == 'completed':
+            for name in ('prediction.json', 'prediction.npz', 'surface.json', 'surface.npz'):
+                if not (output / state['id'] / name).is_file():
+                    raise FileNotFoundError(output / state['id'] / name)
+    return record
+
+
+def evaluate_suite(output):
+    """Evaluate union representatives using held-out original-pixel identities."""
+    from .evaluation import evaluate_prediction
+    output = Path(output).resolve()
+    record = frozen_index(output)
+    rows = []
+    for state in record['tasks']:
+        row = {key: state[key] for key in ('id', 'status', 'accepted', 'reasons', 'warnings')}
+        row.update(primary_metrics=None, diagnostic_first_mode_metrics=None, mode_metrics=[])
+        if state['status'] == 'completed':
+            task = {'id': state['id'], 'cases': state['cases']}
+            loaded = load_inputs(record['index'], task, record['cache_root'])
+            surface = load_surface(output / state['id'], loaded['views'])
+            result = restore_prediction(output / state['id'] / 'prediction')
+            _, description = read_manifest(record['index'])
+            references, preferred_ids, support_images = [], [], []
+            for view in loaded['views']:
+                truth = read_archive(Path(view['frame_dir']) / 'truth.npz')
+                pair = json.loads(_path(description['data'], view['case']['pair_truth']).read_text())
+                support_images.append(truth['support_id_image'])
+                references.append(np.asarray(pair['target_reference_evidence_center_world']))
+                preferred_ids.append(int(pair['preferred_support_id']))
+            if len(set(preferred_ids)) != 1:
+                raise ValueError('Paired evaluation annotations disagree on the preferred surface')
+            for reference in references[1:]:
+                np.testing.assert_allclose(reference, references[0], rtol=0, atol=1e-10)
+            observation_support = np.empty(len(surface['observation_xyz']), dtype=np.int64)
+            for view_index, support_image in enumerate(support_images):
+                ids = np.flatnonzero(surface['observation_view_index'] == view_index)
+                pixels = surface['observation_pixels'][ids]
+                observation_support[ids] = support_image[pixels[:, 1], pixels[:, 0]]
+            support = observation_support[surface['representative_observation']]
+            measurements = evaluate_prediction(result, surface['xyz'],
+                {'support_id': support, 'preferred_support_id': np.asarray(preferred_ids[0])}, references[0])
+            row['mode_metrics'] = measurements['mode_metrics']
+            if result['accepted']:
+                row['primary_metrics'] = {key: value for key, value in measurements.items() if key != 'mode_metrics'}
+            elif measurements['mode_metrics']:
+                # An ambiguous/rejected result has no executable primary. Its
+                # first saved diagnostic is not promoted by the evaluator.
+                row['diagnostic_first_mode_metrics'] = measurements['mode_metrics'][0]
+            mapped = surface['observation_to_element']
+            valid = mapped >= 0
+            row['association_truth_disagreements'] = int(np.count_nonzero(
+                observation_support[valid] != support[mapped[valid]]))
+            row['reference_center'] = references[0].tolist()
+        rows.append(row)
+    evaluation = {'prediction_index': str(output / 'predictions.json'),
+                  'read_after_all_predictions_frozen': True, 'tasks': rows}
+    write_json(output / 'evaluation.json', evaluation)
+    return evaluation
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("fuse", "predict", "evaluate"))
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--cases", help="Optional comma-separated case IDs; evaluation always requires the full matrix")
-    parser.add_argument("--algorithms", default=",".join(ALGORITHMS), help="Prediction-only backend subset")
+    commands = parser.add_subparsers(dest='stage', required=True)
+    prediction = commands.add_parser('predict')
+    prediction.add_argument('--index', type=Path, required=True)
+    prediction.add_argument('--cache-root', type=Path, required=True)
+    prediction.add_argument('--output', type=Path, required=True)
+    prediction.add_argument('--task', action='append')
+    prediction.add_argument('--native-backend', choices=('teaserpp', 'ransac'), default='teaserpp')
+    evaluation = commands.add_parser('evaluate')
+    evaluation.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    selected = args.cases.split(",") if args.cases else None
-    if args.stage == "fuse":
-        fuse_suite(args.manifest, args.output, selected)
-    elif args.stage == "predict":
-        predict_suite(args.manifest, args.output, selected, tuple(args.algorithms.split(",")))
+    if args.stage == 'predict':
+        block_evaluation_reads()
+        predict_suite(args.index, args.cache_root, args.output, args.task, args.native_backend)
     else:
-        if selected is not None:
-            raise ValueError("Evaluation must include every manifest case and all three backends")
-        evaluate_suite(args.manifest, args.output)
+        evaluate_suite(args.output)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-# END independent multiview experiment.
+# END joint-surface experiment contract.

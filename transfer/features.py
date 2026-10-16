@@ -15,6 +15,9 @@ import subprocess
 import sys
 
 import numpy as np
+# BEGIN shared response ranking uses the existing SciPy implementation.
+from scipy.stats import rankdata
+# END ranking dependency shared by single-view and dual-view evidence.
 
 from .core import fps_indices
 
@@ -98,6 +101,83 @@ def sample_descriptors(feature, pixels, image_size):
     if not np.isfinite(descriptors).all():
         raise ValueError("Non-finite MARCO descriptors")
     return descriptors
+
+
+# BEGIN shared rank/interpolation primitives moved without numerical changes.
+def centered_rank_maps(logits, allowed):
+    """Return tie-aware centered empirical ranks on a fixed feature-grid domain.
+
+    Forbidden cells are zero placeholders, always excluded by the interpolation
+    mask. Constant allowed responses have exactly zero evidence, even when the
+    constant raw dot product is positive or negative. Ranks are unchanged by a
+    strictly increasing transformation of the allowed raw responses.
+    """
+    values, mask = np.asarray(logits), np.asarray(allowed)
+    if (values.ndim != 3 or values.dtype.kind not in 'fiu'
+            or mask.dtype != np.bool_ or mask.shape != values.shape[1:]):
+        raise ValueError('Require numeric [Q,Hf,Wf] responses and a Boolean [Hf,Wf] domain')
+    if not np.isfinite(values).all():
+        raise ValueError('MARCO responses must be finite')
+    output = np.zeros(values.shape, dtype=np.float64)
+    count = int(mask.sum())
+    if count:
+        ranks = rankdata(values[:, mask], method='average', axis=1)
+        output[:, mask] = 2.0 * ((ranks - 0.5) / count) - 1.0
+    return output
+
+
+def rank_sampling_plan(feature_xy, allowed):
+    """Precompute allowed-neighbor bilinear weights without clamping predictions.
+
+    A prediction outside the closed feature-grid rectangle has no support.
+    Safe clipped indices below are used only to gather arrays; their weights
+    remain zero outside that rectangle or outside the fixed allowed domain.
+    No nearest allowed cell replaces a missing interpolation neighborhood.
+    """
+    points, mask = np.asarray(feature_xy, dtype=float), np.asarray(allowed)
+    if points.ndim != 2 or points.shape[1] != 2 or mask.ndim != 2 or mask.dtype != np.bool_:
+        raise ValueError('Require feature [N,2] coordinates and a Boolean grid')
+    height, width = mask.shape
+    if min(height, width) < 2:
+        raise ValueError('Feature grid must have at least two cells on each axis')
+    finite = np.isfinite(points).all(axis=1)
+    inside = finite & np.all(points >= 0, axis=1) & np.all(points <= [width-1, height-1], axis=1)
+    safe = np.where(inside[:, None], points, 0.0)
+    lower = np.floor(safe).astype(np.int64)
+    fraction = safe - lower
+    indices, weights = [], []
+    for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        x, y = lower[:, 0] + dx, lower[:, 1] + dy
+        valid = inside & (x < width) & (y < height)
+        x, y = np.minimum(x, width-1), np.minimum(y, height-1)
+        weight = (fraction[:, 0] if dx else 1-fraction[:, 0])
+        weight = weight * (fraction[:, 1] if dy else 1-fraction[:, 1])
+        weight = weight * (valid & mask[y, x])
+        indices.append(y*width+x)
+        weights.append(weight)
+    indices, weights = np.stack(indices, axis=1), np.stack(weights, axis=1)
+    denominator = weights.sum(axis=1)
+    supported = denominator > 0
+    weights = np.divide(weights, denominator[:, None], out=np.zeros_like(weights),
+                        where=supported[:, None])
+    return {'indices': indices, 'weights': weights, 'supported': supported,
+            'grid_shape': mask.shape}
+
+
+def sample_rank_maps(ranks, plan):
+    """Interpolate ranked evidence, retaining zero evidence for unknown points."""
+    values = np.asarray(ranks, dtype=float)
+    if values.ndim != 3 or values.shape[1:] != tuple(plan['grid_shape']):
+        raise ValueError('Rank map shape differs from its interpolation plan')
+    if not np.isfinite(values).all():
+        raise ValueError('Rank evidence must be finite')
+    flat = values.reshape(len(values), -1)
+    # Accumulate one neighbor at a time instead of allocating [Q,N,4].
+    output = np.zeros((len(values), len(plan['indices'])), dtype=np.float64)
+    for corner in range(4):
+        output += flat[:, plan['indices'][:, corner]] * plan['weights'][None, :, corner]
+    return output
+# END shared primitives; view fusion and candidate selection remain separate.
 
 
 def reciprocal_anchors(source, target, feature_pair, source_count=450, target_count=1400):

@@ -1,160 +1,177 @@
-"""Export evaluated two-view results to one offline, interactive HTML file.
+"""Export an offline, image-first viewer of frozen joint-surface predictions.
 
-This presentation step reads frozen results and reuses the existing original-
-pixel renderer. It never loads feature tensors, fits a transform, or opens
-evaluation truth. Optional comparison rows must explicitly use the current
-case IDs; dataset-specific naming belongs in that supplied data, not here.
+This module reads saved inference and evaluation artifacts only. Historical
+single-view baselines are rendered from their unchanged observations/results.
+No model, matching, registration or region inference is called by the viewer.
 """
 
 import argparse
-import base64
-from io import BytesIO
 import json
 import os
 from pathlib import Path
 
 import numpy as np
 
-from .multiview_experiment import (ALGORITHMS, _path, load_fusion, load_inputs,
-                                    read_manifest, restore_prediction)
-from .multiview_visualization import (_read_rgb, _overlay, _draw_modes,
-    _observation_domains, _mode_pixels, _summary_rows, _RED, _SAM, _GREEN, _SECONDARY)
+from .experiment import read_archive, restore_prediction
+from .features import write_json
+from .multiview_experiment import (BASELINES, _path, frozen_index, load_inputs,
+                                  load_surface, read_manifest)
+from .multiview_visualization import (joint_region_picture, read_rgb, save_picture,
+                                     single_view_picture, source_picture)
 
 
-# BEGIN offline presentation; all inference and evaluation artifacts stay frozen.
-def image_uri(image):
-    """Embed actual observed imagery so file:// browsing requires no server."""
-    stream = BytesIO()
-    image.save(stream, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode("ascii")
+# BEGIN frozen joint-surface viewer; old mean-fusion payload is retired.
+BASELINE_LABELS = {'old_ransac': '旧方案 · RANSAC',
+                   'old_prosac_lo': '旧方案 · PROSAC + LO',
+                   'old_teaserpp': '旧方案 · TEASER++',
+                   'joint': '新单视角方案 · 6/12 点提案'}
 
 
-def metric_row(record):
-    """Keep absent metrics null; rejected outputs retain their diagnostic values."""
-    quality, diagnostics = record["quality"], record["diagnostics"]
-    region = quality["region"]
-    transform = quality["true_source_entity_transform"]
-    return {"algorithm": record["algorithm"], "accepted": record["accepted"],
-        # BEGIN required warnings stay distinct from stored hard rejection reasons.
-        "reasons": record["reasons"], "quality_warnings": diagnostics["quality_warnings"],
-        # END warning presentation does not recalculate historical acceptance.
-        "object_rmse_mm": None if transform is None else
-            1000 * transform["source_points_transform_rmse_m"],
-        "center_error_mm": None if region["center_error_m"] is None else 1000 * region["center_error_m"],
-        "registration_ms": record["registration_and_anchor_preparation_ms"],
-        "region_ms": record["region_generation_ms"], "scale": record["scale"],
-        "rotation_error_deg": None if transform is None else transform["rotation_error_deg"],
-        "inliers": diagnostics.get("inliers", 0), "correspondences": record["correspondence_count"],
-        "minimum_inlier_ratio": diagnostics["configuration"]["min_inlier_ratio"],
-        "tau_mm": 1000 * diagnostics["ransac_tolerance_m"],
-        "mode_count": region["mode_count"], "samples": region["top1_sample_count"],
-        "sample_purity": region["top1_sample_preferred_support_fraction"],
-        "grounding": record.get("grounding_diagnostics"),
-        "correspondence_quality": quality.get("correspondence"),
-        "raw_quality": quality.get("raw_correspondence"),
-        "single_view_quality": quality.get("single_view_rank_correspondence")}
+def _relative(path, destination):
+    return Path(os.path.relpath(Path(path).resolve(), Path(destination).parent.resolve())).as_posix()
 
 
-def export_web(manifest, results, destination, comparisons=None):
-    """Build a self-contained page from a completed matrix and explicit inputs."""
-    manifest_path, description = read_manifest(manifest)
+def _picture(image, path, destination, caption):
+    save_picture(image, path)
+    return {'src': _relative(path, destination), 'caption': caption}
+
+
+def _historical(view, rgb, assets, destination):
+    """Read exact old/new single-view decisions, including rejected modes."""
+    records = []
+    folder = Path(view['cache_dir'])
+    for method in BASELINES:
+        record = {'method': method, 'label': BASELINE_LABELS[method], 'view': view['id'],
+                  'accepted': False, 'warnings': [], 'reasons': [], 'metrics': None}
+        missing = folder / 'missing.json'
+        if missing.is_file():
+            stored = json.loads(missing.read_text())
+            result = {'accepted': False, 'reasons': stored['reasons'],
+                      'diagnostics': {'quality_warnings': []}, 'modes': []}
+            record.update(status='missing_input', reasons=stored['reasons'])
+        elif (folder / f'{method}.json').is_file() and (folder / f'{method}.npz').is_file():
+            result = restore_prediction(folder / method)
+            record.update(status='completed', accepted=result['accepted'], reasons=result['reasons'],
+                          warnings=result['diagnostics'].get('quality_warnings', []))
+            evaluation = folder / f'{method}_evaluation.json'
+            if evaluation.is_file():
+                record['metrics'] = json.loads(evaluation.read_text())['metrics']
+        else:
+            result = {'accepted': False, 'reasons': ['historical_artifact_unavailable'],
+                      'diagnostics': {'quality_warnings': []}, 'modes': []}
+            record.update(status='not_run', reasons=result['reasons'])
+        caption = f'{record["label"]} · {view["id"]} · 历史冻结结果'
+        image = single_view_picture(rgb, view['observation'], result)
+        record['image'] = _picture(image, assets / f'{view["case"]["id"]}_{method}.png', destination, caption)
+        records.append(record)
+    return records
+
+
+def export_web(results, destination):
+    """Build one local HTML and PNG folder without modifying frozen evidence."""
     results, destination = Path(results).resolve(), Path(destination).resolve()
-    if destination.exists():
-        raise FileExistsError(destination)
-    summary = json.loads((results / "summary.json").read_text())
-    rows = _summary_rows(summary, description["cases"])
-    comparison_groups = [] if comparisons is None else json.loads(Path(comparisons).read_text())
-    case_ids = {case["id"] for case in description["cases"]}
-    for group in comparison_groups:
-        if not isinstance(group["label"], str):
-            raise ValueError("Comparison labels must be explicit strings")
-        seen = set()
-        for record in group["rows"]:
-            key = (record["case"], record["algorithm"])
-            if key in seen or key[0] not in case_ids or key[1] not in ALGORITHMS:
-                raise ValueError("Comparison rows need unique declared case/algorithm identities")
-            seen.add(key)
-        group["rows"] = [{"case": record["case"], **metric_row(record)} for record in group["rows"]]
-
-    cases = []
-    for case in description["cases"]:
-        source, _, _, targets = load_inputs(manifest_path, case)
-        fused = load_fusion(results / "fusion" / case["id"])
-        bank, diagnostics = fused["bank"], fused["diagnostics"]
-        domains = _observation_domains(bank, targets)
-        source_rgb = _read_rgb(_path(manifest_path, case["source_observation_dir"]) / "rgb.png")
-        evidence = np.load(_path(manifest_path, case["source_input_dir"]) / "source_evidence_mask.npy",
-                           allow_pickle=False)
-        source_pixels = source["pixels"]
-        np.testing.assert_array_equal(evidence[source_pixels[:, 1], source_pixels[:, 0]], source["region_mask"])
-        target_declarations = {record["id"]: record for record in case["targets"]}
-        original_images, view_records = {}, []
-        for target in targets:
-            view_id = target["id"]
-            original_images[view_id] = _read_rgb(_path(manifest_path,
-                target_declarations[view_id]["observation_dir"]) / "rgb.png")
-            view_records.append({"id": view_id, "points": len(target["observation"]["xyz"]),
-                "missing": target["missing_target"], "reasons": target["missing_target_reasons"],
-                "input": image_uri(_overlay(original_images[view_id], target["selected_mask"], _SAM, 70))})
-        predictions = []
-        for algorithm in ALGORITHMS:
-            record = rows[(case["id"], algorithm)]
-            prediction = restore_prediction(results / case["id"] / algorithm / "prediction")
-            # BEGIN reject stale summaries instead of silently losing warnings.
-            if (prediction["accepted"] != record["accepted"]
-                    or prediction["reasons"] != record["reasons"]
-                    or prediction["diagnostics"]["quality_warnings"] != record["diagnostics"]["quality_warnings"]):
-                raise ValueError("Frozen prediction and evaluated summary disagree")
-            # END frozen warning evidence must agree before presentation.
-            entries = {target["id"]: [] for target in targets}
-            for number, mode in enumerate(prediction["modes"]):
-                mask, pixels = _mode_pixels(mode, domains, len(bank["observation_xyz"]))
-                color = _GREEN if mode["type"] == "primary" else _SECONDARY[(number - 1) % 2]
-                entries[mode["view_id"]].append((number, mode, mask, pixels, color))
-            observed_views = {}
-            for view_id, items in entries.items():
-                observed_views[view_id] = {"image": image_uri(_draw_modes(original_images[view_id], items)),
-                    "modes": [{"number": number + 1, "primary": mode["type"] == "primary",
-                        "points": int(mask.sum()), "samples": len(pixels)}
-                        for number, mode, mask, pixels, _ in items]}
-            predictions.append({**metric_row(record), "views": observed_views})
-        cases.append({"id": case["id"], "source": image_uri(_overlay(source_rgb, evidence, _RED, 130)),
-            "source_points": int(source["region_mask"].sum()), "views": view_records,
-            "diagnostics": diagnostics, "predictions": predictions,
-            "truth_mapping_type": summary["ground_truth"][case["id"]]["mapping_type"],
-            "true_scale": summary["ground_truth"][case["id"]]["true_scale"],
-            "fusion_ms": rows[(case["id"], ALGORITHMS[0])]["fusion_timing"]["fusion_ms"]})
-
-    # Links remain relative for in-workspace provenance; all interactive data
-    # and images are embedded and still work if this single HTML is copied.
-    links = [{"label": label, "href": os.path.relpath(path, destination.parent)}
-        for label, path in (("完整报告", results.parent / "results.md"),
-                            ("独立审核", results.parent / "independent-audit.md"),
-                            ("九组 JSON", results / "summary.json"), ("九组 CSV", results / "summary.csv"))]
-    data = {"cases": cases, "comparisons": comparison_groups, "links": links,
-        "protocol": summary["protocol"]}
-    template = Path(__file__).with_suffix(".html").read_text()
-    # JSON is data, not executable interpolation. Escaping '<' also protects
-    # against a future observation label containing an HTML script end tag.
-    payload = json.dumps(data, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c")
-    if template.count("__EVIDENCE_JSON__") != 1:
-        raise ValueError("The local template must contain exactly one evidence placeholder")
+    record = frozen_index(results)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(template.replace("__EVIDENCE_JSON__", payload))
-    print(json.dumps({"html": str(destination), "cases": len(cases), "predictions": len(rows),
-        "bytes": destination.stat().st_size, "self_contained": True, "inference_calls": 0}), flush=True)
+    assets = destination.parent / f'{destination.stem}-assets'
+    assets.mkdir(exist_ok=True)
+    _, description = read_manifest(record['index'])
+    data = Path(description['data'])
+    frame_manifest = json.loads((data / 'manifest.json').read_text())
+    evaluation_path = results / 'evaluation.json'
+    evaluation = json.loads(evaluation_path.read_text()) if evaluation_path.is_file() else None
+    if evaluation is not None and evaluation.get('read_after_all_predictions_frozen') is not True:
+        raise ValueError('Viewer evaluation must come after the frozen prediction barrier')
+    metrics = {} if evaluation is None else {row['id']: row for row in evaluation['tasks']}
+    cards = []
+    for state in record['tasks']:
+        task = {'id': state['id'], 'cases': state['cases']}
+        first = task['cases'][0]
+        source_folder = _path(data, frame_manifest['views'][first['source']]['path'])
+        source_rgb = read_rgb(source_folder / 'rgb.png')
+        supplied_region = np.load(_path(data, first['evidence']), allow_pickle=False)
+        card = {key: state[key] for key in ('id', 'status', 'accepted', 'reasons', 'warnings')}
+        card.update(group=first.get('group', ''), layer=first.get('layer', ''),
+                    variation=first.get('variation', ''), input_availability=state.get('input_availability', []),
+                    elapsed_ms=state['elapsed_ms'], evaluation=metrics.get(state['id']),
+                    source=None, source_region=None, raw_views=[], modes=[], baselines=[], diagnostics={})
+        loaded = None
+        try:
+            loaded = load_inputs(record['index'], task, record['cache_root'])
+        except Exception as error:
+            # A failed input remains a visible task. Original RGB/demonstration
+            # is still useful even when a stale entity/cache cannot be restored.
+            card['visualization_error'] = f'{type(error).__name__}: {error}'
+        card['source'] = _picture(source_picture(source_rgb, supplied_region,
+            None if loaded is None else loaded['source'],
+            None if loaded is None else loaded['query_indices'],
+            None if loaded is None else loaded['query_region']),
+            assets / f'{task["id"]}_source.png', destination,
+            '源示教区域（红）；区域查询（黄）／同实体上下文查询（青）')
+        card['source_region'] = _picture(source_picture(source_rgb, supplied_region),
+            assets / f'{task["id"]}_source_region.png', destination, '源示教区域（红）；查询点已隐藏')
+        if loaded is not None:
+            views = loaded['views']
+            rgbs = [read_rgb(view['rgb_path']) for view in views]
+        else:
+            views, rgbs = [], []
+            for case in task['cases']:
+                folder = _path(data, frame_manifest['views'][case['target']]['path'])
+                rgbs.append(read_rgb(folder / 'rgb.png'))
+                views.append({'id': case['view'], 'case': case, 'observation': None,
+                              'cache_dir': str(Path(record['cache_root']) / case['id'])})
+        for view, rgb in zip(views, rgbs):
+            card['raw_views'].append(_picture(source_picture(rgb, np.zeros(rgb.shape[:2], bool)),
+                assets / f'{view["case"]["id"]}_raw.png', destination, f'目标 {view["id"]} 原始 RGB'))
+            card['baselines'].extend(_historical(view, rgb, assets, destination))
+        if state['status'] == 'completed':
+            if loaded is None:
+                raise ValueError(f'Completed prediction cannot restore its input identity: {state["id"]}')
+            surface = load_surface(results / task['id'], views)
+            result = restore_prediction(results / task['id'] / 'prediction')
+            if (result['accepted'] != state['accepted'] or result['reasons'] != state['reasons']
+                    or result['diagnostics'].get('quality_warnings', []) != state['warnings']):
+                raise ValueError('Viewer state disagrees with its frozen prediction')
+            card['diagnostics'] = result['diagnostics']
+            card['surface_diagnostics'] = surface.get('diagnostics', {})
+            for mode_index, mode in enumerate(result['modes']):
+                item = {'index': mode_index, 'type': mode['type'],
+                        'executable': bool(result['accepted'] and mode['type'] == 'primary'),
+                        'region_elements': int(np.sum(mode['mask'])), 'sample_count': int(len(mode['sample_indices'])),
+                        'images': [], 'region_images': [], 'visibility': []}
+                for view_index, (view, rgb) in enumerate(zip(views, rgbs)):
+                    image, counts = joint_region_picture(rgb, surface, mode, view_index)
+                    caption = (f'联合区域 · {view["id"]} · '
+                               f'可见实际采样 {counts["visible_samples"]}/{counts["sample_count"]}')
+                    item['images'].append(_picture(image,
+                        assets / f'{task["id"]}_region_{mode_index}_{view_index}.png', destination, caption))
+                    region_image, _ = joint_region_picture(rgb, surface, mode, view_index, show_samples=False)
+                    item['region_images'].append(_picture(region_image,
+                        assets / f'{task["id"]}_region_only_{mode_index}_{view_index}.png', destination,
+                        f'联合区域 · {view["id"]} · 采样点已隐藏'))
+                    item['visibility'].append({'view': view['id'], **counts})
+                card['modes'].append(item)
+            card['prediction_link'] = _relative(results / task['id'] / 'prediction.json', destination)
+        card['state_link'] = _relative(results / task['id'] / 'frozen.json', destination)
+        cards.append(card)
+    payload = {'title': '联合目标表面 · 区域迁移验证', 'frozen': record['frozen'],
+               'native_backend': record['native_backend'], 'sampling': record['sampling'],
+               'cards': cards, 'prediction_link': _relative(results / 'predictions.json', destination),
+               'evaluation_link': _relative(evaluation_path, destination) if evaluation is not None else None}
+    write_json(destination.with_suffix('.json'), payload)
+    template = Path(__file__).with_suffix('.html').read_text()
+    encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False).replace('<', '\\u003c')
+    destination.write_text(template.replace('__PAYLOAD__', encoded))
+    return payload
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--results", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True, help="New standalone HTML file")
-    parser.add_argument("--comparisons", type=Path, help="Explicitly case-aligned evaluated comparison rows")
+    parser.add_argument('--results', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    export_web(args.manifest, args.results, args.output, args.comparisons)
+    export_web(args.results, args.output)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-# END offline presentation.
+# END frozen joint-surface viewer.

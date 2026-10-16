@@ -16,11 +16,11 @@ container names, joint models, or hidden geometry.
 | `core.py` | Registration-to-anchor preparation, location-preference scores, signed surface orientation, and fixed metric observed-neighborhood sampling |
 | `sim3.py` | Shared finite-point validation, rank checks, proper positive-scale Umeyama fitting, and transform application |
 | `registration.py` | Explicit RANSAC, fixed-budget PROSAC with simple local optimization, and optional native TEASER++ backends with common residual/refit rules |
-| `features.py` | Offline MARCO extraction, reciprocal raw-dot anchor matching, and native Gaussian-decoded source-region matches |
+| `features.py` | Offline MARCO extraction, native matchers, and shared percentile/interpolation primitives |
 | `scenes.py` | Independent MuJoCo fixtures derived from the permanent `scene/original` layout; observation and evaluation records are separate |
 | `neighborhood_scenes.py` | Repeated internal shelf levels and real `put_mug_on_shelf` evidence, with independent evaluation annotations |
 | `evaluation.py` | Held-out surface identity, localization and sampling metrics, approximate oracle correspondences, and image overlays |
-| `experiment.py` | Manifest-driven extraction and five-method comparison |
+| `experiment.py` | Manifest-driven extraction, five-method comparison, and shared frozen prediction reading/writing |
 | `test_core.py` | Mathematical, coordinate-convention, data-contract, and target-label isolation regressions |
 | `test_registration.py` | Scalar-baseline equivalence, sampler boundaries, degeneracy, and backend contracts |
 
@@ -241,3 +241,108 @@ documents why the current score is not a guarantee of better true localization
 or correct cross-view ordering; this independent path does not replace the
 existing default method.
 <!-- END independent multi-point joint region transfer interface. -->
+
+<!-- BEGIN reconstructed two-view observed-surface interface. -->
+## Joint surface from two target views
+
+This route reconstructs the complete valid depth of two calibrated target
+images before forming correspondences. It is separate from the single-view
+`joint_region` method above. No production robot interface imports this path.
+
+| Module | Input and output |
+|---|---|
+| `multiview_geometry.py` | Two full depth images and K/T camera calibration → actual surface elements, original observation provenance, oriented local planes, and original pixel adjacency |
+| `multiview_features.py` | Frozen per-view multi-peak appearance records → allowed source-query/element edges and separate per-camera costs |
+| `multiview_grounding.py` | Joint surface and candidate edges → finite transform hypotheses, partial injective assignments, observed regions, or explicit ambiguity |
+| `multiview_experiment.py` | Explicit paired case index and existing caches → frozen predictions; separate evaluation command |
+| `multiview_visualization.py`, `multiview_web.py` | Frozen predictions and original RGB → local HTML with observed regions, actual samples, states and historical comparisons |
+
+An element contains at most one actual pixel measurement from each camera.
+Cross-view pairing requires mutual nearest measurements, agreeing oriented
+planes and bidirectional full-depth footprint support. The representative is
+one actual measurement; it is never an average. `member_views` records the
+cameras supplying element members. `observed_views` records geometric surface
+support from each camera. Unpaired points can still describe the same physical
+surface; their discrete redundancy is retained. Entity segmentation labels
+existing geometry rather than determining which scene surfaces exist.
+
+Each source query retains its own allowed edges from both cameras. Assignment
+columns are surface-element identities, while appearance has two independent
+coordinates. Missing appearance is NaN with an explicit unavailable mask;
+unsupported cached placeholders cannot supply edges or costs. A camera cost is
+read from that element's unique original member, or from one deterministic,
+geometrically supported projected original pixel. There is no cross-view cost
+mean or favorable-neighbor search.
+
+Growth and new-fit budgets are each 256, split 85/85/86 among the two individual
+edge pools and their union. At most 32 hypotheses enter assignment, including
+at most one supplied native transform per camera. For a fixed proposal, the
+assignment first maximizes allowed support inside its fixed residual tolerance,
+then minimizes normalized residual. It fits that support once and removes
+correspondences that exceed the same tolerance afterward. The tolerance is
+0.075 times source-entity RMS radius times the initial proposal's scale; scale
+must lie in [0.2, 5]. These are frozen engineering assumptions, not uncertainty
+estimates from the target image.
+
+Each admitted hypothesis produces one sampleable observed region. Coverage,
+fit, triangle geometry, fixed non-fitting source-point checks and separate
+appearance costs form a vector of evidence. Appearance uses a common query
+domain fixed across the admitted hypothesis pool for each camera. Empty camera
+domains are omitted with a warning. A candidate dominates another only when it
+is no worse on every retained coordinate and better on at least one. All
+non-dominated regions must agree pairwise at the physical sampling resolution
+before a primary can be returned; otherwise the result is rejected as
+ambiguous and its regions remain diagnostic. This does not alter the existing
+single-view primary-selection policy.
+
+Sampling uses original-pixel graph connectivity from both images, restricted
+to one fixed seed plane, signed normal, entity and metric radius. It adds no
+hidden points. Full-depth checks separately report support, front-of-plane
+model conflicts and unknown states, including occlusion. Support and conflict
+may coexist when the cameras disagree. They are not a calibrated free-space
+or placement certificate.
+
+The inherited slab thickness is twice the local observed point spacing.
+Distinct same-facing parallel layers closer than that model resolution can
+still be associated or connected. Signed normals separate opposite visible
+sides, but do not resolve every arbitrarily thin same-facing layer. The finite
+proposal pool likewise has no exhaustive-recall guarantee.
+The one-region-per-hypothesis policy keeps the first sampleable center in
+geometric-score order, using stable element order for exact score ties. It can
+omit a second, inequivalent region tied within the same hypothesis. Therefore
+the final ambiguity decision concerns the retained finite hypothesis/region
+pool, not every physically possible region.
+
+```python
+from transfer.multiview_geometry import build_target_surface
+from transfer.multiview_features import build_correspondence_candidates
+from transfer.multiview_grounding import infer_multiview_region
+
+surface = build_target_surface(views, sampling_radius_m=0.03)
+candidates = build_correspondence_candidates(
+    source, views, surface, query_indices=query_ids, query_region=query_region,
+)
+result = infer_multiview_region(
+    source, surface, candidates, initial_transforms=native_proposals,
+    sampling_radius_m=0.03, sampling_spacing_m=0.005,
+)
+```
+
+Each view supplies `id`, full `depth_m`, `K`, `T_world_camera_cv`, and optional
+`observation`/cached `evidence`. Missing entity or appearance records do not
+remove depth. Surface masks, seeds and samples index `surface['xyz']`;
+assignment columns index `candidates['candidate_indices']`. Both index domains
+are saved explicitly. Commands are `python -m transfer.multiview_experiment
+predict --index INDEX --cache-root CACHE --output RESULTS`, then the separate
+`evaluate --output RESULTS`, followed by `python -m transfer.multiview_web
+--results RESULTS --output VIEWER.html`. Native initial proposals reuse the
+explicit `--native-backend teaserpp` (default) or `ransac` frozen result; absence
+does not switch algorithms.
+
+The previous fixed-mean/single-peak fusion API and its old experiment schema
+have been removed. Historical RGB, predictions and HTML remain immutable.
+`multiview_registration_cases.py` is a historical three-case fixture preparer;
+`multiview_grounding_validation/` is an independent synthetic study. Neither
+is the new general input interface. Historical scripts that import the retired
+API require their corresponding earlier code revision for exact replay.
+<!-- END reconstructed two-view observed-surface interface. -->
