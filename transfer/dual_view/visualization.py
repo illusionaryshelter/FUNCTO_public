@@ -5,10 +5,85 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+# BEGIN evaluation-only GT layer uses the existing Pillow morphology tools.
+from PIL import Image, ImageDraw, ImageFilter
+# END evaluation-only GT layer imports.
 
 from ..multiview_visualization import overlay, REGION_COLOR, VIEW_COLORS
 from .geometry import project_oriented
+
+
+# BEGIN held-out GT overlay, composited after every prediction marker.
+GT_COLOR = (255, 64, 207, 255)
+
+
+def ground_truth_layer(support_mask, reference, intrinsic, world_camera, *, center_visible):
+    """Return one reusable RGBA layer for a calibrated target camera.
+
+    The contour denotes the *visible complete support surface*, not a guessed
+    local transfer patch. The ring denotes the saved transformed demonstration
+    mean. Visibility comes from the held-out pair annotation; an occluded
+    center is deliberately drawn as a dashed projection and labelled hidden.
+    No predicted region, sample, fit, or acceptance decision enters this layer.
+    """
+    mask = np.asarray(support_mask)
+    if mask.ndim != 2 or mask.dtype != np.bool_:
+        raise ValueError('GT support mask must be a full-image Boolean array')
+    height, width = mask.shape
+    layer = Image.new('RGBA', (width, height))
+    mask_image = Image.fromarray(mask.astype(np.uint8)*255)
+    # Keep the colored contour inside actual visible support pixels. A narrow
+    # dark halo provides contrast against both light furniture and yellow dots.
+    edge = mask & ~np.asarray(mask_image.filter(ImageFilter.MinFilter(5)), dtype=bool)
+    halo = Image.fromarray(edge.astype(np.uint8)*255).filter(ImageFilter.MaxFilter(3))
+    layer.paste((15, 18, 29, 255), mask=halo)
+    layer.paste(GT_COLOR, mask=Image.fromarray(edge.astype(np.uint8)*255))
+
+    reference = np.asarray(reference, dtype=float)
+    intrinsic, world_camera = np.asarray(intrinsic), np.asarray(world_camera)
+    if (reference.shape != (3,) or intrinsic.shape != (3, 3)
+            or world_camera.shape != (4, 4) or not np.isfinite(reference).all()
+            or not np.isfinite(intrinsic).all() or not np.isfinite(world_camera).all()):
+        raise ValueError('GT projection requires a finite world point and calibrated camera')
+    camera = (reference-world_camera[:3, 3]) @ world_camera[:3, :3]
+    projected = camera @ intrinsic.T
+    uv = projected[:2]/projected[2] if camera[2] > 0 and projected[2] > 0 else None
+    inside = uv is not None and 0 <= uv[0] < width and 0 <= uv[1] < height
+    state = ('visible' if center_visible else 'occluded') if inside else (
+        'behind_camera' if uv is None else 'outside_image')
+    if inside:
+        x, y = uv
+        draw = ImageDraw.Draw(layer)
+        bounds = (x-10, y-10, x+10, y+10)
+        arcs = [(0, 360)] if center_visible else [(a, a+36) for a in range(0, 360, 60)]
+        for start, end in arcs:
+            # Opaque outer stroke, white separator and magenta inner stroke
+            # remain legible even when the prediction center coincides exactly.
+            draw.arc((x-12, y-12, x+12, y+12), start, end, fill='#10121d', width=7)
+            draw.arc((x-11, y-11, x+11, y+11), start, end, fill='white', width=5)
+            draw.arc(bounds, start, end, fill=GT_COLOR, width=3)
+        draw.ellipse((x-2, y-2, x+2, y+2), fill=GT_COLOR, outline='#10121d')
+        label = 'GT' if center_visible else 'GT hidden'
+        text_box = draw.textbbox((0, 0), label)
+        text_width, text_height = text_box[2]-text_box[0], text_box[3]-text_box[1]
+        left = min(max(int(x+15), 2), width-text_width-6)
+        top = min(max(int(y-19), 2), height-text_height-6)
+        draw.rectangle((left-2, top-2, left+text_width+3, top+text_height+3), fill='#10121d')
+        draw.text((left-text_box[0], top-text_box[1]), label, fill=GT_COLOR)
+    return layer, {'support_visible_pixels': int(mask.sum()),
+        'reference_world': reference.tolist(), 'reference_pixel': None if uv is None else uv.tolist(),
+        'reference_visible': bool(center_visible), 'reference_display': state,
+        'contour_definition': 'visible_complete_preferred_support',
+        'center_definition': 'held_out_transformed_source_demonstration_mean',
+        'color': '#ff40cf', 'draw_order': 'after_prediction_regions_samples_and_center'}
+
+
+def with_ground_truth(picture, layer):
+    """Composite GT last; never let yellow samples overwrite its opaque marks."""
+    if picture.size != layer.size or layer.mode != 'RGBA':
+        raise ValueError('GT layer must share the original target image coordinates')
+    return Image.alpha_composite(picture.convert('RGBA'), layer).convert('RGB')
+# END held-out GT overlay.
 
 
 def region_picture(rgb, surface, mode, view_index):
@@ -113,8 +188,13 @@ dialog::backdrop{background:#000b}#toolbar{position:sticky;top:0;padding:8px;bac
 </style><header><h1>双视角迁移：旧方案 / 新方案 / 独立双视角方案</h1>
 <p>同批源示教与真实仿真 RGB-D；旧方案、新方案均读取固定输出。两种原生配准后端分别比较，不按目标真值调参。</p>
 <p>黄色圆点为真实采样位置，白色十字为区域中心。双视角区域颜色表示实际测量来源：绿为 A/B 测量配对，橙为 A，紫为 B；颜色不表示两路外观均有效。拒绝结果中的区域仅供诊断，不能视为已接受结果。</p>
+<!-- BEGIN held-out GT legend: the surface contour and local reference are distinct. -->
+<p><strong style="color:#b50085">洋红色 GT：轮廓为真值支持面的可见边界（完整支持面，不是局部迁移区域）；圆环与中心点为源示教区域经真值变换后的中心。</strong>GT 最后绘制并加黑白描边，不会被黄色采样点遮住。虚线圆环及 “GT hidden” 表示中心被遮挡，仅标注其投影；支持面不可见时不绘制虚构轮廓。各图说明保留可见状态，所有方案及诊断区域使用同一份 GT。</p>
+<!-- END held-out GT legend. -->
 <p>每张图可点击或按 Enter 放大，再用 50%–400% 缩放并滚动比较。双视角使用同一世界位置的两路有效原始点积，未知查询保留模型区间；有限搜索完成不代表连续全局最优。</p>
-<p><a href="evaluation.json">完整评价</a> · <a href="summary.json">汇总数据</a> · <a href="../plan.md">冻结计划</a></p>
+<!-- BEGIN GT provenance link; target truth is consumed only by evaluation. -->
+<p><a href="evaluation.json">完整评价</a> · <a href="summary.json">汇总数据</a> · <a href="ground-truth.json">GT 来源与逐图覆盖记录</a> · <a href="../plan.md">冻结计划</a></p>
+<!-- END GT provenance link. -->
 <div style="overflow:auto"><table><thead><tr><th>方案 / 配准后端</th><th>视角</th><th>接受/全部</th><th>正确面</th><th>错误面</th><th>拒绝</th><th>缺失</th><th>失败</th><th>搜索未完成</th><th>接受误差中位数 mm</th></tr></thead><tbody>SUMMARY</tbody></table></div></header>
 <main><div class="controls"><label>任务 <input id="taskFilter" placeholder="输入名称筛选"></label><label>显示 <select id="schemeFilter"><option value="all">全部三方案</option><option value="dual">双视角方案</option><option value="old">旧方案</option><option value="new">新方案</option></select></label><span id="count"></span></div>CARDS</main>
 <dialog id="viewer"><div id="toolbar"><button id="close">关闭</button><label>缩放 <select id="zoom"><option>50</option><option selected>100</option><option>150</option><option>200</option><option>300</option><option>400</option></select>%</label><span id="caption"></span></div><div id="zoomArea"><img id="zoomImage" alt="放大图"></div></dialog>

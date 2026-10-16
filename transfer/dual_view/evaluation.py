@@ -18,7 +18,9 @@ from ..features import write_json
 from ..multiview_experiment import _path, load_surface, read_manifest
 from ..multiview_visualization import read_rgb, single_view_picture, source_picture
 from .io import load_observations
-from .visualization import region_picture, write_html
+# BEGIN shared GT overlay for all three frozen schemes.
+from .visualization import ground_truth_layer, region_picture, with_ground_truth, write_html
+# END shared GT overlay import.
 
 
 def frozen_index(output):
@@ -104,9 +106,14 @@ def evaluate(output, destination, *, old_results, new_results):
     output, destination = Path(output).resolve(), Path(destination).resolve()
     record = frozen_index(output)
     _, description = read_manifest(record['index'])
-    destination.mkdir(parents=True, exist_ok=False)
+    # BEGIN in-place regeneration of derived evaluation/web artifacts only.
+    # Frozen prediction directories are opened read-only. Rendering always
+    # starts from raw RGB, so repeated refreshes cannot accumulate GT strokes.
+    destination.mkdir(parents=True, exist_ok=True)
     assets = destination / 'assets'
-    assets.mkdir()
+    assets.mkdir(exist_ok=True)
+    ground_truth = []
+    # END in-place report regeneration.
     rows, cards, visibility, rejection_counts = [], [], [], Counter()
     for state in record['tasks']:
         task = {'id': state['id'], 'cases': state['cases']}
@@ -136,10 +143,15 @@ def evaluate(output, destination, *, old_results, new_results):
                        loaded['query_indices'], loaded['query_region']).save(assets / source_name)
         card = {'id': task['id'], 'source': 'assets/'+source_name, 'methods': []}
         cards.append(card)
-        truths, references, preferred, rgbs = [], [], [], []
+        # BEGIN retain already-read pair annotations for the shared GT layers.
+        truths, references, preferred, rgbs, pairs = [], [], [], [], []
+        # END pair reuse.
         for view in loaded['views']:
             truth = read_archive(Path(view['frame_dir']) / 'truth.npz')
             pair = json.loads(_path(description['data'], view['case']['pair_truth']).read_text())
+            # BEGIN reuse the same annotation for metrics and visual truth.
+            pairs.append(pair)
+            # END annotation reuse.
             truths.append(truth['support_id_image'])
             references.append(np.asarray(pair['target_reference_evidence_center_world']))
             preferred.append(int(pair['preferred_support_id']))
@@ -147,6 +159,27 @@ def evaluate(output, destination, *, old_results, new_results):
         if len(set(preferred)) != 1:
             raise ValueError('Target views disagree on preferred support identity')
         np.testing.assert_allclose(references[0], references[1], rtol=0, atol=1e-10)
+
+        # BEGIN one held-out GT layer per camera, reused across every method/mode.
+        gt_layers, gt_captions, gt_records = [], [], []
+        for v, view in enumerate(loaded['views']):
+            pair_path = _path(description['data'], view['case']['pair_truth'])
+            pair = pairs[v]
+            layer, details = ground_truth_layer(truths[v] == preferred[v], references[v],
+                view['K'], view['T_world_camera_cv'],
+                center_visible=pair['target_reference_center_visible'])
+            caption = {'visible': 'GT 中心可见（实线）', 'occluded': 'GT 中心被遮挡（虚线投影）',
+                       'outside_image': 'GT 中心在画面外', 'behind_camera': 'GT 中心在相机后方'}[
+                           details['reference_display']]
+            caption += f'；GT 支持面可见 {details["support_visible_pixels"]} 像素'
+            gt_layers.append(layer)
+            gt_captions.append(caption)
+            gt_records.append({'task': task['id'], 'view': view['id'], **details,
+                'preferred_support_id': preferred[v],
+                'truth_file': str(Path(view['frame_dir']) / 'truth.npz'),
+                'pair_truth_file': str(pair_path), 'images': []})
+        ground_truth.extend(gt_records)
+        # END GT layers, which never participate in prediction or ranking.
 
         # Single-view methods retain their own target point domains. Their A/B
         # outputs are displayed independently, never GT-selected as a joint run.
@@ -173,9 +206,15 @@ def evaluate(output, destination, *, old_results, new_results):
                     row = _row(task['id'], scheme, backend, view['id'], status, result, metrics)
                     rows.append(row)
                     name = f'{task["id"]}_{scheme}_{backend}_{view["id"]}.png'
-                    single_view_picture(rgbs[v], view['observation'], result).save(assets / name)
+                    # BEGIN GT is the final layer, including failed/missing predictions.
+                    picture = single_view_picture(rgbs[v], view['observation'], result)
+                    with_ground_truth(picture, gt_layers[v]).save(assets / name)
+                    gt_records[v]['images'].append('assets/'+name)
+                    # END old/new GT display; frozen result and metrics remain unchanged.
                     method['panels'].append({**row, 'images': [{'path': 'assets/'+name,
-                        'caption': f'{view["id"]} · {row["display_status"]}'}],
+                        # BEGIN per-image GT visibility remains available when zoomed.
+                        'caption': f'{view["id"]} · {row["display_status"]} · {gt_captions[v]}'}],
+                        # END per-image GT visibility.
                         'search': {'frozen_prediction': str(stem),
                                    'selected_origin': result['diagnostics'].get('selected_origin')}})
 
@@ -221,9 +260,15 @@ def evaluate(output, destination, *, old_results, new_results):
                         picture, counts = region_picture(rgbs[v], surface, mode, v)
                         visibility.append({'task': task['id'], 'backend': backend,
                                            'view': view['id'], 'mode': rank, **counts})
-                    picture.save(assets / name)
+                    # BEGIN identical final GT layer for accepted and diagnostic modes.
+                    with_ground_truth(picture, gt_layers[v]).save(assets / name)
+                    gt_records[v]['images'].append('assets/'+name)
+                    # END dual-view GT display.
                     role = '接受区域' if result['accepted'] else ('诊断区域' if mode is not None else '无可展示区域')
-                    images.append({'path': 'assets/'+name, 'caption': f'{view["id"]} · {role} {rank+1}'})
+                    # BEGIN visibility caption for every retained mode in both cameras.
+                    images.append({'path': 'assets/'+name,
+                                   'caption': f'{view["id"]} · {role} {rank+1} · {gt_captions[v]}'})
+                    # END dual-view GT caption.
             card['methods'].append({'scheme': 'dual', 'label': f'双视角方案：共同变换与区间判定 / {backend}',
                                     'panels': [{**row, 'images': images, 'search': search}]})
     summary = _summary(rows)
@@ -232,6 +277,10 @@ def evaluate(output, destination, *, old_results, new_results):
         'old_results': str(Path(old_results).resolve()), 'new_results': str(Path(new_results).resolve())})
     write_json(destination / 'summary.json', {'methods': summary,
         'dual_rejection_counts': dict(rejection_counts), 'sample_visibility': visibility})
+    # BEGIN evaluation-only provenance and exhaustive target-image coverage.
+    write_json(destination / 'ground-truth.json', {'read_after_all_predictions_frozen': True,
+        'prediction_index': str(output / 'predictions.json'), 'views': ground_truth})
+    # END GT provenance; existing prediction/evaluation metrics keep their meanings.
     write_html(destination / 'index.html', cards, summary)
     return summary
 
