@@ -17,9 +17,6 @@ from .refinement import partial_refits
 # BEGIN local-region decision and observed-support objective revision.
 SCHEME = 'dual_view_observed_partial'
 DISPLAY_DIAGNOSTIC_LIMIT = 6
-# BEGIN bounded, full-Sim(3) polishing experiment; no axis-specific update.
-POLISH_ROUNDS = 3
-# END one frozen computation budget, independent of task identities or truth.
 
 
 def _finite_list(value):
@@ -82,7 +79,7 @@ def infer(source_pack, surface, appearance, *, initial_transforms=(),
             or check_region.shape != (len(source_pack['check_xyz']),)):
         raise ValueError('Fixed source coordinates, roles, normals and check roles must align')
     sampling = dict(sampling_radius_m=sampling_radius_m, sampling_spacing_m=sampling_spacing_m)
-    timing = {name: 0. for name in ('proposals', 'partial_refinement', 'polish_refinement', 'candidate_evaluation',
+    timing = {name: 0. for name in ('proposals', 'partial_refinement', 'candidate_evaluation',
         'query_sampling', 'independent_geometry', 'capacity_assignment',
         'region_construction', 'decision_and_display')}
     diagnostic = {'method': SCHEME, 'scheme': SCHEME, 'target_truth_used': False,
@@ -101,8 +98,6 @@ def infer(source_pack, surface, appearance, *, initial_transforms=(),
         'sampling_scale_applied': False, 'hypotheses': [], 'refinement_records': [],
         'output_meaning': 'finite observed-evidence region with an estimated transform',
         'refit_attempts': 0, 'refit_retained_count': 0, 'refit_unavailable_count': 0,
-        'polishing': {'round_budget': POLISH_ROUNDS, 'rounds': [],
-                      'stop_reason': 'not_started', 'target_truth_used': False},
         'display_diagnostic_limit': DISPLAY_DIAGNOSTIC_LIMIT,
         'display_limit_does_not_restrict_inference': True, 'timing_seconds': timing}
     result = {'scheme': SCHEME, 'status': 'not_started', 'accepted': False,
@@ -235,57 +230,6 @@ def infer(source_pack, surface, appearance, *, initial_transforms=(),
             diagnostic['refit_unavailable_count'] += int(not refined)
             for candidate in refined:
                 evaluate(candidate['transform'], candidate['origins'], domain)
-        # BEGIN bounded iterative proposals from the unique observed-score winner.
-        # The original finite pool is preserved. Repeating the same seed would
-        # repeat an identical assignment, so only a strict score improvement
-        # permits another round. Ties are left to the unchanged region decision.
-        # No physical rotation axis, truth error or task identity enters here.
-        polishing = diagnostic['polishing']
-        polishing['stop_reason'] = 'round_budget_exhausted'
-        for iteration in range(POLISH_ROUNDS):
-            admitted = [h for h in hypotheses if h['summary']['admitted_to_H']]
-            if not admitted:
-                polishing['stop_reason'] = 'no_admitted_seed'
-                break
-            before = max(h['summary']['score'] for h in admitted)
-            seeds = [h for h in admitted if h['summary']['score'] == before]
-            if len(seeds) != 1:
-                polishing['stop_reason'] = 'best_seed_not_unique'
-                break
-            seed = seeds[0]
-            if not seed['summary']['output_available']:
-                polishing['stop_reason'] = 'seed_region_unavailable'
-                break
-            parent_id = seed['summary']['hypothesis_id']
-            part = perf_counter()
-            refined, report = partial_refits(source_pack, surface, domain,
-                {'transform': seed['transform'], 'proposal_id': parent_id})
-            timing['polish_refinement'] += perf_counter()-part
-            # The single-assignment fitter accepts a proposal identity. At this
-            # boundary its seed is a scored hypothesis, so provenance must use
-            # that domain rather than pretending it is an original proposal.
-            report.pop('parent_proposal_id', None)
-            report.update(parent_hypothesis_id=parent_id, round=iteration+1,
-                          score_before=before, candidate_hypothesis_ids=[])
-            count_before = len(hypotheses)
-            for candidate in refined:
-                for origin in candidate['origins']:
-                    origin.pop('parent_proposal_id', None)
-                    origin.update(origin=origin['origin'].replace('one_partial_', 'polish_partial_', 1),
-                                  parent_hypothesis_id=parent_id, polishing_round=iteration+1)
-                evaluate(candidate['transform'], candidate['origins'], domain)
-                report['candidate_hypothesis_ids'].append(seen[transform_key(candidate['transform'])])
-            after = max(h['summary']['score'] for h in hypotheses if h['summary']['admitted_to_H'])
-            report.update(score_after=after, newly_evaluated_count=len(hypotheses)-count_before)
-            polishing['rounds'].append(report)
-            if not after > before:
-                polishing['stop_reason'] = 'no_strict_score_improvement'
-                break
-            if sum(h['summary']['admitted_to_H'] and h['summary']['score'] == after
-                   for h in hypotheses) != 1:
-                polishing['stop_reason'] = 'best_seed_not_unique'
-                break
-        # END iterative proposals; final acceptance uses the same full pool and J.
         part = perf_counter()
         admitted = [h for h in hypotheses if h['summary']['admitted_to_H']]
         diagnostic.update(search_stage='observed_region_decision',

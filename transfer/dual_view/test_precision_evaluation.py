@@ -12,8 +12,8 @@ import numpy as np
 from PIL import Image
 
 from .evaluation import _row
-from .precision_evaluation import (_comparison_inputs, _decision, evaluate,
-                                   precision_summary, render)
+from .precision_evaluation import (_comparison_inputs, _decision, _distribution,
+                                   evaluate, precision_summary, refresh_summary, render)
 
 
 def _dump(path, value):
@@ -55,10 +55,16 @@ class PrecisionTests(unittest.TestCase):
             rows.append({'task': task, 'scheme': 'trial', 'backend': 'ransac', 'status': 'completed',
                          'decision_status': 'accepted' if accepted else 'rejected', 'accepted': accepted,
                          'primary_metrics': {'center_error_m': .045, 'center_error_radius_ratio': 1.5,
+                                             'top1_best_sample_reference_distance_m': .002,
                                              'top1_preferred_support_hit': True} if accepted else None,
                          'diagnostic_first_mode_metrics': {'center_error_m': .000001},
                          'transform_metrics': {'reference': {'truth_is_sim3': is_sim3},
-                                               'primary_estimate': {'rotation_vs_polar_deg': error} if accepted else None}})
+                                               'primary_estimate': {'rotation_vs_polar_deg': error,
+                                                   'scale_absolute_error_percent': .5 if is_sim3 else None,
+                                                   'normal_error_deg': error/2,
+                                                   'local_mapping_rmse_mm': error+1,
+                                                   'context_mapping_rmse_mm': error+2,
+                                                   'mapped_center_error_mm': error+3} if accepted else None}})
         result = precision_summary(rows)[0]
         self.assertEqual(result['total'], 3)
         self.assertEqual(result['accepted'], 2)
@@ -67,6 +73,26 @@ class PrecisionTests(unittest.TestCase):
         self.assertEqual(result['rotation_anisotropic_polar_deg']['median'], 40)
         self.assertEqual(result['center_error_mm']['median'], 45)
         self.assertEqual(result['ratio_above_one'], 2)
+        # BEGIN all-domain distributions retain errors excluded from scale's
+        # mathematically defined domain, while rejected diagnostics stay out.
+        self.assertEqual(result['rotation_all_polar_deg']['count'], 2)
+        self.assertEqual(result['rotation_all_polar_deg']['mean'], 22)
+        self.assertEqual(result['scale_absolute_error_percent']['count'], 1)
+        self.assertEqual(result['scale_absolute_error_percent']['mean'], .5)
+        self.assertEqual(result['normal_error_deg']['mean'], 11)
+        self.assertEqual(result['local_mapping_rmse_mm']['mean'], 23)
+        self.assertEqual(result['context_mapping_rmse_mm']['mean'], 24)
+        self.assertEqual(result['mapped_center_error_mm']['mean'], 25)
+        self.assertEqual(result['best_sample_reference_distance_mm']['mean'], 2)
+        self.assertEqual(result['center_error_mm']['mean'], 45)
+        # END no favorable-domain substitution.
+
+    def test_missing_distributions_do_not_become_zero_error(self):
+        result = _distribution([])
+        self.assertEqual(result['count'], 0)
+        self.assertTrue(all(result[key] is None for key in ('mean', 'median', 'p90', 'maximum')))
+        with self.assertRaises(ValueError):
+            _distribution([float('nan')])
 
     def test_invalid_decision_cannot_mislabel_trial(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -85,6 +111,7 @@ class PrecisionTests(unittest.TestCase):
             trial.mkdir()
             states, prior_rows, loaded = [], {}, {}
             metric = {'center_error_m': .045, 'top1_preferred_support_hit': True,
+                      'top1_best_sample_reference_distance_m': .002,
                       'mode_metrics': [{'center_error_m': .045, 'preferred_support_hit': True}]}
             result = {'accepted': True, 'reasons': [], 'modes': [{'hypothesis_indices': [0]}],
                       'diagnostics': {'hypotheses': [], 'timing_seconds': {'scoring': .25},
@@ -143,15 +170,42 @@ class PrecisionTests(unittest.TestCase):
             self.assertNotIn('data-scheme="old"', html)
             self.assertNotIn('value="dual_original"', html)
             self.assertIn('误差/采样半径 1.500', html)
+            self.assertIn('最近采样点至 GT 中心 2.000 mm', html)
+            self.assertIn('class="all-precision-metrics"', html)
+            self.assertIn('class="rotation-domain-metrics"', html)
+            self.assertIn('data-metric="scale_absolute_error_percent"', html)
+            self.assertIn('data-metric="context_mapping_rmse_mm"', html)
+            self.assertIn('data-metric="mapped_center_error_mm"', html)
+            self.assertIn('不等于局部 GT 区域覆盖率', html)
             snapshots = {path.name: path.read_bytes() for path in (destination/'assets').iterdir()}
+            evaluation_before = (destination/'evaluation.json').read_bytes()
+            html_before = (destination/'index.html').read_bytes()
+            # Summary refresh consumes the complete saved row metrics and has
+            # no authority to reread GT, rerender images or change decisions.
+            _dump(destination/'precision-summary.json', {'deliberately': 'stale derived summary'})
+            with patch(module+'read_archive', side_effect=AssertionError('Refresh must not read GT')), \
+                 patch(module+'load_observations', side_effect=AssertionError('Refresh must not load input')):
+                refreshed = refresh_summary(destination)
+            self.assertEqual(refreshed[0]['center_error_mm']['mean'], 45)
+            self.assertEqual(refreshed[0]['best_sample_reference_distance_mm']['mean'], 2)
+            self.assertEqual((destination/'evaluation.json').read_bytes(), evaluation_before)
+            self.assertEqual((destination/'index.html').read_bytes(), html_before)
             decision = root/'decision.json'
             _dump(decision, {'status': 'not_adopted', 'reason': '固定旋转门槛未通过。'})
+            historical = root/'historical-roi.json'
+            _dump(historical, {'status': 'adopted', 'reason': '历史规则通过。'})
+            historical_before = historical.read_bytes()
+            review = root/'global-review.md'
+            review.write_text('A complete review preserves both gains and regressions.')
             with patch(module+'read_archive', side_effect=AssertionError('Render-only must not read GT')), \
                  patch(module+'load_observations', side_effect=AssertionError('Render-only must not load input')):
-                render(destination, decision_json=decision)
+                render(destination, decision_json=decision, historical_pages=(historical, review))
                 render(destination)
             self.assertIn('未采用试验', (destination/'index.html').read_text())
+            self.assertIn('href="../historical-roi.json"', (destination/'index.html').read_text())
+            self.assertIn('href="../global-review.md"', (destination/'index.html').read_text())
             self.assertEqual(json.loads((destination/'decision.json').read_text())['status'], 'not_adopted')
+            self.assertEqual(historical.read_bytes(), historical_before)
             self.assertEqual(snapshots, {path.name: path.read_bytes() for path in (destination/'assets').iterdir()})
 
 

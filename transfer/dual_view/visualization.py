@@ -252,6 +252,10 @@ def write_html(path, cards, summary, *, runtime=None, baseline_link=None, precis
                     ratio = metric['center_error_radius_ratio']
                     detail += (f"；误差/采样半径 {ratio:.3f}（{100*ratio:.1f}%）"
                                f"，固定半径 {metric['sampling_radius_m']*1000:.1f} mm")
+                # BEGIN keep nearest-sample distance distinct from region center.
+                if metric and metric.get('top1_best_sample_reference_distance_m') is not None:
+                    detail += f"；最近采样点至 GT 中心 {metric['top1_best_sample_reference_distance_m']*1000:.3f} mm"
+                # END separate actual-sample diagnostic.
                 reasons = '; '.join(panel.get('reasons', []))
                 warning = '; '.join(panel.get('warnings', []))
                 pictures = '<div class="image-pair">' + ''.join(
@@ -331,24 +335,53 @@ document.querySelectorAll('figure img').forEach(im=>{im.onclick=()=>openImage(im
                        'not_adopted': '未采用试验'}[decision['status']]
         links = ' · '.join(f'<a href="{escape(item["href"])}">{escape(item["label"])}</a>'
                            for item in precision['historical_links'])
-        def stats(record, key):
-            item = record[key]
-            return '—' if not item['count'] else f"{item['median']:.3f} / {item['p90']:.3f} / {item['maximum']:.3f}"
-        extra_rows = []
-        for item in precision['metrics']:
-            values = (('当前双视角基线' if item['scheme'] == 'baseline' else trial_label)+' / '+item['backend'],
-                      item['center_error_mm']['count'], stats(item, 'center_error_mm'),
-                      stats(item, 'center_error_radius_ratio'),
-                      item['rotation_true_sim3_deg']['count'], stats(item, 'rotation_true_sim3_deg'),
-                      item['rotation_anisotropic_polar_deg']['count'], stats(item, 'rotation_anisotropic_polar_deg'))
-            extra_rows.append('<tr>'+''.join(f'<td>{escape(str(value))}</td>' for value in values)+'</tr>')
-        extra = ('<h2>完整旋转与最终区域中心</h2><p>每组数字按中位数 / P90 / 最大值排列。'
-                 'P90 使用全部指定域内接受主结果的线性分位数；两配准后端分别计数，同一任务不算两份独立证据。'
-                 '真 Sim(3) 表示真值恰为统一尺度乘三维旋转；各向异性形变的 polar(A) 只是全局仿射旋转参照，'
-                 '可与局部点集最佳相似变换旋转不同。</p><div style="overflow:auto"><table><thead><tr>'
-                 '<th>方案 / 后端</th><th>中心 n</th><th>最终中心 mm</th><th>误差/半径</th>'
-                 '<th>真 Sim(3) n</th><th>完整旋转 °</th><th>各向异性 n</th><th>相对 polar(A) °</th>'
-                 '</tr></thead><tbody>'+''.join(extra_rows)+'</tbody></table></div>')
+        # BEGIN show the complete metric vector before any model-domain split.
+        # There is no composite score or favored task subset. Counts always
+        # retain the full task denominator, including undefined measurements.
+        def metric_table(specifications, table_class):
+            headings = ['指标']+[(('当前双视角基线' if item['scheme'] == 'baseline' else trial_label)
+                                 +' / '+item['backend']) for item in precision['metrics']]
+            header = '<thead><tr>'+''.join(f'<th>{escape(value)}</th>' for value in headings)+'</tr></thead>'
+            body = []
+            for key, label in specifications:
+                cells = [f'<th>{escape(label)}</th>']
+                for item in precision['metrics']:
+                    metric = item[key]
+                    values = '不定义或缺失' if not metric['count'] else ' / '.join(
+                        f'{metric[name]:.3f}' for name in ('mean', 'median', 'p90', 'maximum'))
+                    cells.append(f'<td><b>{metric["count"]}/{item["total"]}</b><br>{escape(values)}</td>')
+                body.append(f'<tr data-metric="{key}">'+''.join(cells)+'</tr>')
+            return f'<div style="overflow:auto"><table class="{table_class}">'+header+'<tbody>'+''.join(body)+'</tbody></table></div>'
+        all_metrics = metric_table((
+            ('center_error_mm', '最终观测区域中心距离 mm'),
+            ('center_error_radius_ratio', '最终区域中心距离 / 固定采样半径'),
+            ('best_sample_reference_distance_mm', '最近实际采样点至 GT 中心 mm'),
+            ('rotation_all_polar_deg', '全部任务：完整旋转相对 polar(A) °'),
+            ('scale_absolute_error_percent', '统一尺度绝对相对误差 %（定义域内）'),
+            ('normal_error_deg', '映射源法向角误差 °'),
+            ('local_mapping_rmse_mm', '源局部点映射 RMS mm'),
+            ('context_mapping_rmse_mm', '源实体上下文点映射 RMS mm'),
+            ('mapped_center_error_mm', '变换映射源中心距离 mm'),
+        ), 'all-precision-metrics')
+        rotation_domains = metric_table((
+            ('rotation_all_polar_deg', '全部任务：完整旋转相对 polar(A) °'),
+            ('rotation_true_sim3_deg', '真 Sim(3) 任务：完整旋转误差 °'),
+            ('rotation_anisotropic_polar_deg', '各向异性任务：完整旋转相对 polar(A) °'),
+        ), 'rotation-domain-metrics')
+        extra = ('<p><strong>全域评价同时保留尺度、完整旋转、法向、映射误差、最终区域中心与实际采样点距离。'
+                 '改善和退步逐项呈现，不合成为一个总分。</strong>正确支持面及采样支持面纯度描述点落在哪个完整支持面，'
+                 '不等于局部 GT 区域覆盖率。最终观测区域中心与变换映射的源中心分别评价。</p>'
+                 '<details class="precision-metrics"><summary>展开全部主指标及旋转分域：有效数量/全部任务、均值、中位数、P90、最大值</summary>'
+                 '<p>每格首行是有效数量/全部任务；第二行依次为均值 / 中位数 / P90 / 最大值。'
+                 '失败、拒绝和未定义数值保留在分母，不补成零。只统计接受的主结果；两后端分别显示，同一任务不计为两份独立证据。'
+                 'P90 使用线性分位数。主区域的中心与采样点误差直接使用最终实际输出；其余变换指标用于诊断保存的主相似变换。</p>'
+                 '<h2>全部任务的主指标</h2>'+all_metrics+
+                 '<h2>完整旋转：全域与模型分域并列</h2>'+rotation_domains+
+                 '<p>真 Sim(3) 表示真值为统一尺度乘三维旋转；其尺度误差有定义。各向异性形变没有唯一真统一尺度，'
+                 '但仍计入全域旋转、映射 RMS、区域中心及采样点评价。polar(A) 是真值仿射线性部分的极分解旋转；'
+                 '局部最佳相似变换可与它不同，该解释不消除实际映射误差或尾部退步。法向角比较估计旋转映射的源法向与真值逆转置映射的源法向，'
+                 '不是最终表面种子的法向误差。</p></details>')
+        # END complete metric vector and equal-prominence rotation domains.
         html = html.replace('双视角迁移 · 修订与冻结结果对照', '双视角迁移 · 完整旋转与区域中心精度')
         html = html.replace('双视角迁移：修订结果与原始冻结结果', '双视角迁移：当前基线与'+trial_label)
         html = html.replace('同批源示教与真实仿真 RGB-D；旧方案、新方案均读取固定输出。两种原生配准后端分别比较，不按目标真值调参。',

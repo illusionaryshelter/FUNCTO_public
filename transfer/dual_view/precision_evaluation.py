@@ -35,13 +35,16 @@ def _distribution(values):
     if not np.isfinite(values).all():
         raise ValueError('Precision summaries require finite measured errors')
     return {'count': len(values),
+            # BEGIN all reported distributions retain both average and tails.
+            'mean': float(np.mean(values)) if len(values) else None,
+            # END complete distribution summary.
             'median': float(np.median(values)) if len(values) else None,
             'p90': float(np.percentile(values, 90)) if len(values) else None,
             'maximum': float(np.max(values)) if len(values) else None}
 
 
 def precision_summary(rows):
-    """Separate full rotation on true Sim(3) from affine-polar diagnostics.
+    """Report every primary metric over the complete declared task domain.
 
     Each native backend keeps its own task denominator. Accepted primary
     regions alone contribute errors; rejected candidates stay in row-level
@@ -57,6 +60,13 @@ def precision_summary(rows):
                       and row['transform_metrics']['primary_estimate'] is not None]
         rotations = lambda flag: [row['primary_estimate']['rotation_vs_polar_deg'] for row in transforms
                                   if flag is None or row['reference']['truth_is_sim3'] == flag]
+        # BEGIN scalar scale error is undefined for an affine truth that is not
+        # a Sim(3). Other primary mapping/rotation measurements still retain
+        # those tasks. Null values never become fabricated zero-error samples.
+        def transform_values(key):
+            return [row['primary_estimate'][key] for row in transforms
+                    if row['primary_estimate'][key] is not None]
+
         answer.append({'scheme': scheme, 'backend': backend, 'total': len(values),
             'accepted': len(accepted),
             'correct_surface': sum(row['top1_preferred_support_hit'] for row in centers),
@@ -64,11 +74,49 @@ def precision_summary(rows):
             'decision_counts': dict(Counter(row['decision_status'] for row in values)),
             'center_error_mm': _distribution([row['center_error_m']*1000 for row in centers]),
             'center_error_radius_ratio': _distribution([row['center_error_radius_ratio'] for row in centers]),
+            'best_sample_reference_distance_mm': _distribution([
+                row['top1_best_sample_reference_distance_m']*1000 for row in centers
+                if row['top1_best_sample_reference_distance_m'] is not None]),
             'rotation_true_sim3_deg': _distribution(rotations(True)),
             'rotation_anisotropic_polar_deg': _distribution(rotations(False)),
             'rotation_all_polar_deg': _distribution(rotations(None)),
+            'scale_absolute_error_percent': _distribution(transform_values('scale_absolute_error_percent')),
+            'normal_error_deg': _distribution(transform_values('normal_error_deg')),
+            'local_mapping_rmse_mm': _distribution(transform_values('local_mapping_rmse_mm')),
+            'context_mapping_rmse_mm': _distribution(transform_values('context_mapping_rmse_mm')),
+            'mapped_center_error_mm': _distribution(transform_values('mapped_center_error_mm')),
             'ratio_above_one': sum(row['center_error_radius_ratio'] > 1 for row in centers)})
+        # END full-domain precision measurements with explicit valid counts.
     return answer
+
+
+# BEGIN refreshing derived statistics never reopens predictions, images or GT.
+def _write_precision_summary(destination, metrics):
+    """Use one explicit current summary schema for evaluation and refresh."""
+    write_json(destination/'precision-summary.json', {'methods': metrics,
+        'percentile_method': 'numpy percentile linear',
+        'center_definition': 'final mode0.center versus held-out demonstration center',
+        'radius_source': 'frozen prediction index sampling.sampling_radius_m',
+        'radius_ratio_is_acceptance_gate': False, 'backends_are_independent_samples': False,
+        'valid_metric_count_denominator': 'Each metric count is shown against all declared tasks; undefined or missing values are not zero.',
+        'sampling_support_purity_is_local_gt_coverage': False})
+
+
+def refresh_summary(destination):
+    """Recompute statistics from the saved complete evaluation, without GT I/O."""
+    destination = Path(destination).resolve()
+    evaluation = json.loads((destination/'evaluation.json').read_text())
+    report = json.loads((destination/'report-view.json').read_text())
+    if (evaluation['comparison'] != 'dual_view_precision'
+            or report['comparison'] != 'dual_view_precision'
+            or evaluation['read_after_all_predictions_frozen'] is not True):
+        raise ValueError('Summary refresh requires an existing frozen precision evaluation')
+    metrics = precision_summary(evaluation['rows'])
+    _write_precision_summary(destination, metrics)
+    report['precision_metrics'] = metrics
+    write_json(destination/'report-view.json', report)
+    return metrics
+# END saved-evaluation statistics refresh.
 
 
 def _comparison_inputs(output, baseline, baseline_web):
@@ -108,7 +156,7 @@ def _decision(path):
     return result
 
 
-def render(destination, *, decision_json=None):
+def render(destination, *, decision_json=None, historical_pages=()):
     """Refresh decision labels using saved evaluation/cards, without rereading GT."""
     destination = Path(destination).resolve()
     report = json.loads((destination/'report-view.json').read_text())
@@ -128,6 +176,19 @@ def render(destination, *, decision_json=None):
     for item in summary:
         if item['scheme'] == 'trial':
             item['label'] = f'{trial_label} / {item["backend"]}'
+    # BEGIN explicit review records supplement the preserved comparison links.
+    # Relative links are saved in the report so subsequent render-only calls
+    # retain the same named documents without a recursive history search.
+    for page in historical_pages:
+        page = Path(page).resolve()
+        if not page.is_file():
+            raise FileNotFoundError(page)
+        link = {'href': os.path.relpath(page, destination), 'label': f'审查记录：{page.name}'}
+        if not any(item['href'] == link['href'] for item in report['historical_links']):
+            report['historical_links'].append(link)
+    if historical_pages:
+        write_json(destination/'report-view.json', report)
+    # END explicit immutable review links.
     write_json(destination/'decision.json', decision)
     write_html(destination/'index.html', cards, summary, runtime=report['runtime'], precision={
         'decision': decision, 'historical_links': report['historical_links'],
@@ -289,10 +350,7 @@ def evaluate(output, destination, *, baseline_results, baseline_web,
     write_json(destination/'summary.json', {'methods': summary, 'prediction_runtime': runtime,
         'sample_visibility': visibility, 'trial_rejection_counts': dict(Counter(reason for row in rows
             if row['scheme'] == 'trial' for reason in row['reasons']))})
-    write_json(destination/'precision-summary.json', {'methods': metrics, 'percentile_method': 'numpy percentile linear',
-        'center_definition': 'final mode0.center versus held-out demonstration center',
-        'radius_source': 'frozen prediction index sampling.sampling_radius_m',
-        'radius_ratio_is_acceptance_gate': False, 'backends_are_independent_samples': False})
+    _write_precision_summary(destination, metrics)
     write_json(destination/'ground-truth.json', {'read_after_all_predictions_frozen': True,
         'prediction_index': str(output/'predictions.json'), 'views': gt_records})
     write_json(destination/'report-view.json', {'comparison': 'dual_view_precision', 'cards': cards,
@@ -310,13 +368,20 @@ def main():
     parser.add_argument('--baseline-prediction-resources', type=Path)
     parser.add_argument('--decision-json', type=Path)
     parser.add_argument('--historical-page', type=Path, action='append', default=[])
-    parser.add_argument('--render-only', action='store_true')
+    # BEGIN mutually exclusive derived-artifact actions require no inference.
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument('--render-only', action='store_true')
+    actions.add_argument('--refresh-summary-only', action='store_true')
+    # END explicit derived-only actions.
     args = parser.parse_args()
-    if args.render_only:
-        answer = render(args.destination, decision_json=args.decision_json)
+    if args.refresh_summary_only:
+        answer = refresh_summary(args.destination)
+    elif args.render_only:
+        answer = render(args.destination, decision_json=args.decision_json,
+                        historical_pages=args.historical_page)
     else:
         if any(value is None for value in (args.output, args.baseline_results, args.baseline_web)):
-            parser.error('--output, --baseline-results and --baseline-web are required unless --render-only')
+            parser.error('--output, --baseline-results and --baseline-web are required unless a derived-only action is selected')
         answer = evaluate(args.output, args.destination, baseline_results=args.baseline_results,
             baseline_web=args.baseline_web, prediction_resources=args.prediction_resources,
             baseline_prediction_resources=args.baseline_prediction_resources,
