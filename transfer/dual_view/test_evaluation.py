@@ -14,7 +14,7 @@ from contextlib import ExitStack
 import numpy as np
 from PIL import Image
 
-from .evaluation import (_row, _summary, _dual_region_metrics, _runtime_summary,
+from .evaluation import (_row, _summary, _dual_region_metrics, _center_radius_metric, _runtime_summary,
                          _supervisor_metrics, evaluate, frozen_index)
 from .visualization import write_html
 # BEGIN held-out transform metric test imports.
@@ -265,13 +265,36 @@ class TransformMetricsTests(unittest.TestCase):
                   'mask': np.array([i in (seed, seed+1) for i in range(4)]),
                   'sample_indices': np.array([seed, seed+1])} for seed in (0, 2)]
         metrics = _dual_region_metrics({'accepted': True, 'modes': modes}, points,
-            {'support_id': np.array([-1, -1, 5, 5]), 'preferred_support_id': np.asarray(5)}, points[2])
+            {'support_id': np.array([-1, -1, 5, 5]), 'preferred_support_id': np.asarray(5)}, points[2],
+            sampling_radius_m=.03)
         self.assertFalse(metrics['accepted_topk_preferred_support_hit'])
         self.assertEqual(metrics['mode_count'], 1)
         self.assertEqual(metrics['all_modes_unique_samples'], 2)
         self.assertEqual(metrics['aggregate_scope'], 'primary_mode_only')
         self.assertTrue(metrics['mode_metrics'][1]['preferred_support_hit'])
         self.assertEqual(metrics['mode_metrics'][1]['role'], 'competitor_diagnostic')
+
+    # BEGIN the recorded physical radius is a descriptive denominator only.
+    def test_center_ratio_does_not_change_acceptance_or_include_rejected_primary(self):
+        metric = _center_radius_metric({'center_error_m': .045, 'accepted': True}, .03)
+        self.assertAlmostEqual(metric['center_error_radius_ratio'], 1.5)
+        self.assertTrue(metric['accepted'])
+        self.assertIsNone(_center_radius_metric(None, .03))
+        self.assertIsNone(_center_radius_metric({'center_error_m': None}, .03)['center_error_radius_ratio'])
+        result = {'accepted': False, 'reasons': [], 'diagnostics': {}, 'modes': [{}]}
+        row = _row('rejected', 'dual', 'ransac', 'A+B', 'completed', result,
+                   {**metric, 'mode_metrics': [metric]})
+        self.assertIsNone(row['primary_metrics'])
+        self.assertAlmostEqual(row['diagnostic_first_mode_metrics']['center_error_radius_ratio'], 1.5)
+
+    def test_center_ratio_rejects_invalid_radius_and_error(self):
+        for radius in (0, -.03, float('nan'), float('inf')):
+            with self.subTest(radius=radius), self.assertRaises(ValueError):
+                _center_radius_metric({'center_error_m': .001}, radius)
+        for error in (-.01, float('nan'), float('inf')):
+            with self.subTest(error=error), self.assertRaises(ValueError):
+                _center_radius_metric({'center_error_m': error}, .03)
+    # END physical-radius semantics.
 
     def test_task_total_and_supervisor_wall_do_not_double_count_shared_preparation(self):
         record = {'backends': ['ransac', 'teaserpp'], 'tasks': [{'seconds': 10.,
@@ -326,7 +349,8 @@ class TransformMetricsTests(unittest.TestCase):
             metric = {'center_error_m': .001, 'top1_preferred_support_hit': True,
                       'mode_metrics': [{'center_error_m': .001, 'preferred_support_hit': True}]}
             result = {'accepted': True, 'reasons': [], 'modes': [{'hypothesis_indices': [0]}],
-                      'diagnostics': {'hypotheses': [], 'timing_seconds': {'scoring': .25}}}
+                      'diagnostics': {'hypotheses': [], 'timing_seconds': {'scoring': .25},
+                                      'sampling_radius_m': .03}}
             for task in ('one', 'two'):
                 (baseline/task).mkdir(parents=True)
                 (output/task).mkdir()
@@ -357,7 +381,8 @@ class TransformMetricsTests(unittest.TestCase):
                 loaded_by_task[task] = {'source': {}, 'source_rgb': root/'unused.png',
                     'query_indices': [], 'query_region': [], 'views': views}
             record = {'backends': ['ransac'], 'index': str(root/'index.json'),
-                      'cache_root': str(root/'cache'), 'tasks': states}
+                      'cache_root': str(root/'cache'), 'tasks': states,
+                      'sampling': {'sampling_radius_m': .03}}
             surface = {'xyz': np.array([[0., 0., 1.]]), 'observation_xyz': np.zeros((2, 3)),
                 'observation_view_index': np.array([0, 1]), 'observation_pixels': np.zeros((2, 2), int),
                 'representative_observation': np.array([0])}

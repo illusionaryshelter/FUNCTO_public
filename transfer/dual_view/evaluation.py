@@ -90,7 +90,8 @@ def _row(task, scheme, backend, view, status, result, metrics):
 
 def _summary(rows):
     # BEGIN original dual stays a separate denominator from its revision.
-    labels = {'old': '旧方案', 'new': '新方案', 'dual_original': '原双视角', 'dual': '修订双视角'}
+    labels = {'old': '旧方案', 'new': '新方案', 'dual_original': '原双视角', 'dual': '修订双视角',
+              'baseline': '当前双视角基线', 'trial': '精度试验'}
     # END explicit comparison labels.
     answer = []
     for key in dict.fromkeys((row['scheme'], row['backend'], row['view']) for row in rows):
@@ -112,7 +113,26 @@ def _summary(rows):
 
 
 # BEGIN held-out transform/performance comparison against immutable original dual.
-def _dual_region_metrics(result, points, truth, reference):
+def _center_radius_metric(metric, sampling_radius_m):
+    """Normalize the final observed-region center error by the recorded radius.
+
+    This is a held-out evaluation ratio, never an acceptance threshold. The
+    radius is a physical task input and must not be multiplied by fitted scale.
+    Millimeters and percentages are display conversions of these two fields.
+    """
+    radius = float(sampling_radius_m)
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError('Center normalization requires a finite positive recorded sampling radius')
+    if metric is None:
+        return None
+    error = metric.get('center_error_m')
+    if error is not None and (not np.isfinite(error) or error < 0):
+        raise ValueError('Final region center error must be finite and nonnegative when present')
+    return {**metric, 'sampling_radius_m': radius,
+            'center_error_radius_ratio': None if error is None else float(error/radius)}
+
+
+def _dual_region_metrics(result, points, truth, reference, *, sampling_radius_m):
     """Keep accepted top-k/sample aggregates limited to the one primary region.
 
     The shared evaluator treats every mode as an output. Revised dual modes
@@ -123,9 +143,11 @@ def _dual_region_metrics(result, points, truth, reference):
     all_metrics = evaluate_prediction(result, points, truth, reference)
     primary = (evaluate_prediction({**result, 'modes': result['modes'][:1]}, points, truth, reference)
                if result['accepted'] and len(result['modes']) > 1 else all_metrics)
-    primary = dict(primary)
+    primary = _center_radius_metric(primary, sampling_radius_m)
     primary['aggregate_scope'] = 'primary_mode_only' if result['accepted'] else 'rejected_diagnostics_only'
-    primary['mode_metrics'] = [{**record, 'role': 'primary' if result['accepted'] and index == 0
+    primary['center_error_definition'] = 'final_observed_region_center_to_held_out_demonstration_center_3d'
+    primary['mode_metrics'] = [{**_center_radius_metric(record, sampling_radius_m),
+                               'role': 'primary' if result['accepted'] and index == 0
                                else 'competitor_diagnostic' if result['accepted'] else 'rejected_diagnostic'}
                               for index, record in enumerate(all_metrics['mode_metrics'])]
     return primary
@@ -382,6 +404,11 @@ def evaluate(output, destination, *, old_results, new_results,
                 original.update(scheme='dual_original', region_metric_scope='historical_frozen_mode_semantics')
                 original_stem = baseline_dual_results / task['id'] / backend
                 original_prediction = json.loads(original_stem.with_suffix('.json').read_text()) if original['status'] == 'completed' else None
+                if original_prediction is not None:
+                    radius = original_prediction['diagnostics']['sampling_radius_m']
+                    for key in ('primary_metrics', 'diagnostic_first_mode_metrics'):
+                        original[key] = _center_radius_metric(original[key], radius)
+                    original['mode_metrics'] = [_center_radius_metric(metric, radius) for metric in original['mode_metrics']]
                 original['transform_metrics'] = (_transform_evaluation(original_stem, original_prediction, pairs[0])
                     if original_prediction is not None else None)
                 original_state = original_tasks[task['id']]
@@ -414,7 +441,8 @@ def evaluate(output, destination, *, old_results, new_results,
             metrics = None
             if surface is not None:
                 metrics = _dual_region_metrics(result, surface['xyz'],
-                    {'support_id': support, 'preferred_support_id': np.asarray(preferred[0])}, references[0])
+                    {'support_id': support, 'preferred_support_id': np.asarray(preferred[0])}, references[0],
+                    sampling_radius_m=record['sampling']['sampling_radius_m'])
             row = _row(task['id'], 'dual', backend, 'A+B', status, result, metrics)
             row['transform_metrics'] = (_transform_evaluation(stem, result, pairs[0])
                 if status == 'completed' else None)

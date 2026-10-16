@@ -152,13 +152,17 @@ def _transform_panel(metrics):
              if reference['truth_is_sim3'] else 'GT 为非均匀形变，没有唯一真统一尺度，尺度误差不定义；')
     role = ('接受区域相关变换' if metrics['displayed_candidate_role'] == 'accepted_region_candidates'
             else '拒绝结果的诊断变换，不是成功结果')
+    # BEGIN physical sampling radius comes from the frozen prediction record.
+    radius = metrics.get('sampling_radius_m')
+    radius_text = '采样半径未记录' if radius is None else f'采样半径固定为 {radius*1000:.1f} mm'
+    # END recorded-radius display.
     return ('<div class="transform"><b>尺度与完整旋转 · 仅事后 GT 评价</b>'
         f'<p>{escape(role)}。{escape(truth)}旋转角相对于真值极分解旋转，法向角单独评价。'
         '局部/上下文 RMS 比较固定源点经过估计与真值映射后的三维位置。</p>'
         '<div style="overflow:auto"><table><thead><tr><th>估计</th><th>尺度 s</th><th>尺度误差 %</th>'
         '<th>完整旋转 °</th><th>法向 °</th><th>局部 RMS mm</th><th>上下文 RMS mm</th>'
         '</tr></thead><tbody>'+''.join(body)+'</tbody></table></div>'
-        '<p class="warn">采样半径固定为 3 cm，不随估计尺度改变。区域接受及有限候选唯一都不证明完整变换可识别。'
+        f'<p class="warn">{radius_text}，不随估计尺度改变。区域接受及有限候选唯一都不证明完整变换可识别。'
         '有限候选范围不是置信区间。</p>'
         '<details><summary>全部展示候选的误差与范围</summary><pre>'+
         escape(json.dumps(metrics, ensure_ascii=False, indent=2))+'</pre></details></div>')
@@ -181,17 +185,19 @@ def _runtime_panel(runtime):
     return ('<p>'+escape(detail)+'</p><details><summary>记录的阶段耗时（秒）</summary><pre>'+
             escape(json.dumps(stages, ensure_ascii=False, indent=2))+
             '</pre><p>这些记录有父子包含关系：task 包含共同准备和配准算法；backend 包含原生配准、推理及保存；'
-            '推理 total 包含 proposals、partial_refinement、candidate_evaluation、decision_and_display；'
+            '推理 total 包含 proposals、partial_refinement、polish_refinement（若执行）、candidate_evaluation、decision_and_display；'
             'candidate_evaluation 又包含 query_sampling、independent_geometry、capacity_assignment 和 region_construction。'
             '父项与子项不得再次相加。</p>'+shared+'</details>')
 
 
-def _runtime_comparison(runtime):
+def _runtime_comparison(runtime, *, precision=False):
     """Show measured cached-run times, including all recorded task outcomes."""
     if not runtime:
         return ''
     rows = []
-    for key, label in (('original_dual', '原双视角'), ('revision', '修订双视角')):
+    labels = ((('baseline', '当前双视角基线'), ('trial', '精度试验')) if precision else
+              (('original_dual', '原双视角'), ('revision', '修订双视角')))
+    for key, label in labels:
         record = runtime.get(key)
         if record is None:
             continue
@@ -213,7 +219,7 @@ def _runtime_comparison(runtime):
 
 
 # BEGIN revised report preserves images first and explicitly distinguishes pose metrics.
-def write_html(path, cards, summary, *, runtime=None, baseline_link=None):
+def write_html(path, cards, summary, *, runtime=None, baseline_link=None, precision=None):
     """Standalone local report with original image zoom and method filtering."""
     def image(filename, caption):
         return (f'<figure><img loading="lazy" src="{escape(filename)}" alt="{escape(caption)}" '
@@ -236,12 +242,16 @@ def write_html(path, cards, summary, *, runtime=None, baseline_link=None):
                 metric = panel.get('primary_metrics')
                 detail = ''
                 if metric:
-                    detail = (f"中心误差 {metric['center_error_m']*1000:.2f} mm；"
+                    detail = (f"最终区域中心误差 {metric['center_error_m']*1000:.2f} mm；"
                               f"正确支持面 {metric['top1_preferred_support_hit']}")
                 elif panel.get('diagnostic_first_mode_metrics'):
                     metric = panel['diagnostic_first_mode_metrics']
-                    detail = (f"仅诊断区域：中心误差 {metric['center_error_m']*1000:.2f} mm；"
+                    detail = (f"仅诊断区域：区域中心误差 {metric['center_error_m']*1000:.2f} mm；"
                               f"正确支持面 {metric['preferred_support_hit']}；不可执行")
+                if metric and metric.get('center_error_radius_ratio') is not None:
+                    ratio = metric['center_error_radius_ratio']
+                    detail += (f"；误差/采样半径 {ratio:.3f}（{100*ratio:.1f}%）"
+                               f"，固定半径 {metric['sampling_radius_m']*1000:.1f} mm")
                 reasons = '; '.join(panel.get('reasons', []))
                 warning = '; '.join(panel.get('warnings', []))
                 pictures = '<div class="image-pair">' + ''.join(
@@ -265,8 +275,8 @@ def write_html(path, cards, summary, *, runtime=None, baseline_link=None):
         while index < len(methods):
             current = card['methods'][index]
             following = card['methods'][index+1] if index+1 < len(methods) else None
-            pair = (following is not None and current['scheme'] == 'dual_original'
-                    and following['scheme'] == 'dual'
+            pair = (following is not None and (current['scheme'], following['scheme']) in
+                    (('dual_original', 'dual'), ('baseline', 'trial'))
                     and current['panels'][0].get('backend') == following['panels'][0].get('backend'))
             if pair:
                 compared.append('<div class="dual-comparison">'+methods[index]+methods[index+1]+'</div>')
@@ -291,6 +301,7 @@ dialog::backdrop{background:#000b}#toolbar{position:sticky;top:0;padding:8px;bac
 </style><header><h1>双视角迁移：修订结果与原始冻结结果</h1>
 <p>同批源示教与真实仿真 RGB-D；旧方案、新方案均读取固定输出。两种原生配准后端分别比较，不按目标真值调参。</p>
 <p>黄色圆点为真实采样位置，白色十字为区域中心。双视角区域颜色表示实际测量来源：绿为 A/B 测量配对，橙为 A，紫为 B；颜色不表示两路外观均有效。拒绝结果中的区域仅供诊断，不能视为已接受结果。</p>
+<p>区域中心指标比较最终输出的真实观测区域中心与 GT 示教中心的三维距离；误差/半径超过 1 仅表示该距离超过固定采样半径，不是新的接受或拒绝条件，也不是区域覆盖率。映射源中心误差另作变换诊断。</p>
 <!-- BEGIN held-out GT legend: the surface contour and local reference are distinct. -->
 <p><strong style="color:#b50085">洋红色 GT：轮廓为真值支持面的可见边界（完整支持面，不是局部迁移区域）；圆环与中心点为源示教区域经真值变换后的中心。</strong>GT 最后绘制并加黑白描边，不会被黄色采样点遮住。虚线圆环及 “GT hidden” 表示中心被遮挡，仅标注其投影；支持面不可见时不绘制虚构轮廓。各图说明保留可见状态，所有方案及诊断区域使用同一份 GT。</p>
 <!-- END held-out GT legend. -->
@@ -311,7 +322,43 @@ function scale(){large.style.width=(large.naturalWidth*Number(zoom.value)/100)+'
 function openImage(im){large.onload=scale;large.src=im.src;document.querySelector('#caption').textContent=im.alt;dialog.showModal();}
 document.querySelectorAll('figure img').forEach(im=>{im.onclick=()=>openImage(im);im.onkeydown=e=>{if(e.key==='Enter')openImage(im);};});zoom.onchange=scale;document.querySelector('#close').onclick=()=>dialog.close();
 </script></html>'''.replace('SUMMARY', ''.join(rows)).replace('CARDS', ''.join(sections)).replace(
-        'RUNTIME', _runtime_comparison(runtime)).replace('BASELINE_LINK', '' if baseline_link is None else
+        'RUNTIME', _runtime_comparison(runtime, precision=precision is not None)).replace('BASELINE_LINK', '' if baseline_link is None else
         f'<p><a href="{escape(baseline_link)}">打开原双视角完整网页</a>；本页原双视角图像直接引用原资产，没有复制或重写。</p>')
+    # BEGIN explicit two-run precision report; historical schemas are not guessed.
+    if precision is not None:
+        decision = precision['decision']
+        trial_label = {'pending': '待评估试验', 'adopted': '已采用试验',
+                       'not_adopted': '未采用试验'}[decision['status']]
+        links = ' · '.join(f'<a href="{escape(item["href"])}">{escape(item["label"])}</a>'
+                           for item in precision['historical_links'])
+        def stats(record, key):
+            item = record[key]
+            return '—' if not item['count'] else f"{item['median']:.3f} / {item['p90']:.3f} / {item['maximum']:.3f}"
+        extra_rows = []
+        for item in precision['metrics']:
+            values = (('当前双视角基线' if item['scheme'] == 'baseline' else trial_label)+' / '+item['backend'],
+                      item['center_error_mm']['count'], stats(item, 'center_error_mm'),
+                      stats(item, 'center_error_radius_ratio'),
+                      item['rotation_true_sim3_deg']['count'], stats(item, 'rotation_true_sim3_deg'),
+                      item['rotation_anisotropic_polar_deg']['count'], stats(item, 'rotation_anisotropic_polar_deg'))
+            extra_rows.append('<tr>'+''.join(f'<td>{escape(str(value))}</td>' for value in values)+'</tr>')
+        extra = ('<h2>完整旋转与最终区域中心</h2><p>每组数字按中位数 / P90 / 最大值排列。'
+                 'P90 使用全部指定域内接受主结果的线性分位数；两配准后端分别计数，同一任务不算两份独立证据。'
+                 '真 Sim(3) 表示真值恰为统一尺度乘三维旋转；各向异性形变的 polar(A) 只是全局仿射旋转参照，'
+                 '可与局部点集最佳相似变换旋转不同。</p><div style="overflow:auto"><table><thead><tr>'
+                 '<th>方案 / 后端</th><th>中心 n</th><th>最终中心 mm</th><th>误差/半径</th>'
+                 '<th>真 Sim(3) n</th><th>完整旋转 °</th><th>各向异性 n</th><th>相对 polar(A) °</th>'
+                 '</tr></thead><tbody>'+''.join(extra_rows)+'</tbody></table></div>')
+        html = html.replace('双视角迁移 · 修订与冻结结果对照', '双视角迁移 · 完整旋转与区域中心精度')
+        html = html.replace('双视角迁移：修订结果与原始冻结结果', '双视角迁移：当前基线与'+trial_label)
+        html = html.replace('同批源示教与真实仿真 RGB-D；旧方案、新方案均读取固定输出。两种原生配准后端分别比较，不按目标真值调参。',
+            '同批源示教与真实仿真 RGB-D；当前基线与试验均先冻结预测，再读取 GT。两种原生配准后端分别比较。'
+            f'<strong>{escape(trial_label)}：{escape(decision["reason"])}</strong><br>{links}')
+        html = html.replace('<option value="dual">修订双视角</option><option value="dual_original">原双视角</option><option value="old">旧方案</option><option value="new">新方案</option>',
+                            f'<option value="baseline">当前双视角基线</option><option value="trial">{escape(trial_label)}</option>')
+        html = html.replace('<a href="../revision-plan.md">修订冻结计划</a>',
+                            '<a href="../rotation-center-roi-review.md">冻结收益门槛与指标说明</a> · <a href="precision-summary.json">精度汇总</a> · <a href="decision.json">试验决定</a>')
+        html = html.replace('</header>', extra+'</header>')
+    # END independent precision report presentation.
     Path(path).write_text(html)
 # END revised report rendering.

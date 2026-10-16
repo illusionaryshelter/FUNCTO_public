@@ -220,6 +220,46 @@ class InferenceTests(unittest.TestCase):
         self.assertTrue(all(len(h['scores'])==12 for h in result['diagnostic_hypotheses']))
         self.assertGreater(result['diagnostics']['refit_retained_count'],0)
 
+    # BEGIN bounded polishing checks use real plane geometry and observed scores.
+    def test_polishing_improves_full_pool_without_replacing_original_candidates(self):
+        appearance = AnalyticAppearance(self.source,self.surface)
+        domain = rank_domain(self.source,self.surface,appearance)[4]
+        shifts = [(1.,np.eye(3),np.array([step/256,0.,0.])) for step in (3,2,1,0)]
+        proposal = dict(transform=shifts[0], origins=[{'origin':'test_native'}], proposal_id=0)
+        calls = []
+        def refinements(source,surface,prepared,seed):
+            calls.append(seed)
+            if len(calls) == 1:  # The original, noniterative refit finds no update.
+                return [], {}
+            candidate = dict(transform=shifts[len(calls)-1], origins=[{
+                'origin':'one_partial_all_refit', 'parent_proposal_id':seed['proposal_id']}])
+            return [candidate], {'parent_proposal_id':seed['proposal_id']}
+        with patch.object(inference,'build_proposals',return_value=([proposal],{},domain)), \
+             patch.object(inference,'partial_refits',side_effect=refinements):
+            result = inference.infer(self.source,self.surface,appearance,prepared_domain=domain)
+        self.assertTrue(result['accepted'])
+        rounds = result['diagnostics']['polishing']['rounds']
+        self.assertEqual(len(rounds),3)
+        self.assertTrue(all(r['score_after'] > r['score_before'] for r in rounds))
+        self.assertEqual(len(result['diagnostic_hypotheses']),4)
+        self.assertEqual(result['diagnostic_hypotheses'][0]['origins'][0]['origin'],'test_native')
+        np.testing.assert_array_equal(result['sim3_translation'],np.zeros(3))
+        for h in result['diagnostic_hypotheses'][1:]:
+            origin = h['origins'][0]
+            self.assertEqual(origin['origin'],'polish_partial_all_refit')
+            self.assertIn('parent_hypothesis_id',origin)
+            self.assertNotIn('parent_proposal_id',origin)
+
+    def test_polishing_stops_without_score_improvement_and_does_not_seed_ties(self):
+        identity = self.run_candidates(IDENTITY)
+        self.assertEqual(len(identity['diagnostics']['polishing']['rounds']),1)
+        self.assertEqual(identity['diagnostics']['polishing']['stop_reason'],
+                         'no_strict_score_improvement')
+        tied = self.run_candidates(IDENTITY,(1.,np.eye(3),np.array([1/256,0.,0.])),paired_ties=True)
+        self.assertEqual(tied['diagnostics']['polishing']['rounds'],[])
+        self.assertEqual(tied['diagnostics']['polishing']['stop_reason'],'best_seed_not_unique')
+    # END bounded polishing experiment checks.
+
 
 if __name__ == '__main__':
     unittest.main()
