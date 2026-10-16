@@ -151,16 +151,8 @@ def target_surface(loaded, cached_directory=None):
     return surface
 
 
-def layernorm_parameters(checkpoint):
-    """Read the real output LayerNorm; do not guess descriptor norm limits."""
-    import torch
-    state = torch.load(checkpoint, map_location='cpu', weights_only=True, mmap=True)['model']
-    gamma = state['upscale.1.norm.weight'].detach().numpy().copy()
-    beta = state['upscale.1.norm.bias'].detach().numpy().copy()
-    return gamma, beta
-
-
-def appearance_field(loaded, surface, gamma, beta):
+# BEGIN observed-support revision: model bounds are no longer the objective.
+def appearance_field(loaded, surface):
     """Convert one cached feature tensor at a time into compact response maps."""
     from .features import ResponseField, prepare_view, source_descriptors
     available = [view for view in loaded['views'] if view['observation'] is not None]
@@ -178,7 +170,8 @@ def appearance_field(loaded, surface, gamma, beta):
         with np.load(Path(view['input_dir']) / 'features.npz', allow_pickle=False) as archive:
             prepared.append(prepare_view(queries, archive['feature2'],
                 crop_xyxy=view['crop_xyxy'], observation=view['observation'], view_id=view['id']))
-    return ResponseField(surface, queries, prepared, gamma, beta)
+    return ResponseField(surface, queries, prepared)
+# END observed-support response construction.
 
 
 def native_transforms(loaded, backend):

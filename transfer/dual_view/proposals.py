@@ -6,15 +6,23 @@ indices supply votes in the final continuous-world-query score. The two initial
 pairs estimate scale only; a transform is never fitted from fewer than six pairs.
 """
 
+from time import perf_counter
+
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.spatial.distance import cdist
 
 from ..sim3 import fit_sim3
+from .features import EmpiricalSupport
 
 
 # BEGIN independent dual-view finite proposal implementation.
-GROWTH_BUDGET = 256
+# BEGIN align prefix exploration with the two fits available per growth.
+# Every growth may fit both six and twelve pairs. Half as many growths as
+# fits guarantees the full-domain final prefix is reached before fit exhaustion.
+GROWTH_BUDGET = 128
 FIT_BUDGET = 256
+# END fixed finite coverage budget; no additional fitting budget is introduced.
 SEED = 0
 MINIMUM_SCALE = .2
 MAXIMUM_SCALE = 5.
@@ -55,10 +63,12 @@ def rank_domain(source_pack, surface, appearance, *, chunk_size=4096):
     """Scan all valid entity representatives, retaining every known raw score.
 
     A block-sized sample avoids materializing per-view Q-by-N intermediates.
-    Scores are released after sorting. Integer inverse ranks support exact
-    prefix membership during spatial compatibility queries; no top-k or peak
-    restriction is applied. Stable sorting resolves equal scores by surface ID.
+    Scores calibrate one fixed empirical reference distribution per source row.
+    Their utility is retained as float32 for bounded-neighborhood refits, so a
+    proposal never resamples the complete field. Integer inverse ranks support
+    exact prefix membership; stable ties use ascending surface IDs.
     """
+    started = perf_counter()
     rows = len(source_pack['query_xyz'])
     ids = np.flatnonzero(surface['valid'] & surface['entity_member'])
     if len(ids) >= np.iinfo(np.int32).max:
@@ -100,7 +110,23 @@ def rank_domain(source_pack, surface, appearance, *, chunk_size=4096):
         ranked = np.argsort(-scores[row], kind='stable')[:known_counts[row]].astype(np.int32)
         order.append(ranked)
         inverse[row, ranked] = np.arange(len(ranked), dtype=np.int32)
-    return ids, order, inverse, {
+    # BEGIN one shared observed reference domain for proposals and inference.
+    known = np.isfinite(scores)
+    empirical = EmpiricalSupport(scores, known)
+    utility = np.zeros(scores.shape, dtype=np.float32)
+    for row in range(rows):
+        # Preserve unknown raw entries through calibration; zero here stores
+        # no positive support edge and does not invent a raw feature response.
+        utility[row] = np.where(known[row], empirical.utility(
+            scores[row], query_rows=row), 0.)
+    target = np.asarray(surface['xyz'][ids], dtype=float)
+    domain = {'surface_ids': ids, 'xyz': target, 'order': order,
+              'inverse': inverse, 'utility': utility,
+              'empirical_support': empirical,
+              'max_spacing_m': float(np.max(surface['spacing'][ids], initial=0.)),
+              'tree': cKDTree(target) if len(target) else None}
+    # END reuse fixed scores without per-transform target resampling.
+    diagnostic = {
         'ranking_complete': True, 'ranking_blocks_completed': blocks,
         'ranking_query_count': rows, 'representative_count': len(ids),
         'known_representative_counts': known_counts.tolist(),
@@ -110,16 +136,27 @@ def rank_domain(source_pack, surface, appearance, *, chunk_size=4096):
         'ranking_view_state_count_unit': 'representative_point_per_view',
         'ranking_unknown_pair_count_unit': 'source_query_representative_pair',
         'ranking_tie_break': 'ascending_surface_id',
+        'ranking_seconds': perf_counter() - started,
+        'ranking_work_qn': int(rows * len(ids)),
+        'retained_domain_array_bytes': int(target.nbytes + inverse.nbytes
+            + utility.nbytes + ids.nbytes + sum(row.nbytes for row in order)
+            + sum(row.nbytes for row in empirical.references)),
     }
+    domain.update(ranking_diagnostics=diagnostic,
+                  input_binding=(source_pack, surface, appearance))
+    return ids, order, inverse, diagnostic, domain
 
 
-def build_proposals(source_pack, surface, appearance, *, initial_transforms=()):
+def build_proposals(source_pack, surface, appearance, *, initial_transforms=(),
+                    prepared_domain=None):
     """Retain native transforms and execute the one declared finite seed plan.
 
     Every growth attempt and every six/twelve-pair fitting call consumes its
     own budget, including failed attempts. Exact repeated transforms retain all
     provenance but need only one final score. Normal budget exhaustion is a
     completed finite estimator, never a continuous global-optimality claim.
+    ``prepared_domain`` may be shared by native backends only while the exact
+    prepared source, surface and appearance objects remain unchanged.
     """
     queries = np.asarray(source_pack['query_xyz'], dtype=float)
     region_rows = np.flatnonzero(source_pack['query_region'])
@@ -135,6 +172,7 @@ def build_proposals(source_pack, surface, appearance, *, initial_transforms=()):
                    'minimum_fit_pairs': 6, 'maximum_fit_pairs': 12,
                    'scale_domain': [MINIMUM_SCALE, MAXIMUM_SCALE],
                    'compatibility_ratio': COMPATIBILITY_RATIO,
+                   'full_domain_prefix_reached': False,
                    'global_optimality_certified': False}
 
     def retain(transform, provenance):
@@ -160,12 +198,30 @@ def build_proposals(source_pack, surface, appearance, *, initial_transforms=()):
         else:
             diagnostics['native_invalid_count'] += 1
 
-    ids, order, inverse, ranking = rank_domain(source_pack, surface, appearance)
+    # BEGIN reuse only a domain bound to these exact immutable prepared inputs.
+    # A task may evaluate two native backends on the same observations. Their
+    # reference ranking is identical; a different task's domain is an error.
+    if prepared_domain is None:
+        ids, order, inverse, ranking, domain = rank_domain(source_pack, surface, appearance)
+        ranking = dict(ranking, ranking_reused=False)
+    else:
+        binding = prepared_domain.get('input_binding', ())
+        if len(binding) != 3 or not all(actual is expected for actual, expected in
+                zip(binding, (source_pack, surface, appearance))):
+            raise ValueError('prepared_domain belongs to different prepared inputs')
+        domain = prepared_domain
+        ids, order, inverse = domain['surface_ids'], domain['order'], domain['inverse']
+        ranking = dict(domain['ranking_diagnostics'], ranking_reused=True,
+            ranking_seconds=0.,
+            shared_ranking_seconds=domain['ranking_diagnostics']['ranking_seconds'])
+    # END task-local reuse; no feature or geometry result is recomputed here.
     diagnostics.update(ranking)
-    target = np.asarray(surface['xyz'][ids], dtype=float)
-    tree = cKDTree(target) if len(target) else None
+    target, tree = domain['xyz'], domain['tree']
+    proposal_started = perf_counter()
     rng = np.random.default_rng(SEED)
     all_rows = np.arange(len(queries))
+    # Source distances are independent of every grown target correspondence.
+    source_distances = cdist(queries, queries)
     for attempt in range(GROWTH_BUDGET):
         if diagnostics['proposal_fit_attempts'] >= FIT_BUDGET:
             break
@@ -175,12 +231,15 @@ def build_proposals(source_pack, surface, appearance, *, initial_transforms=()):
         first = int(region_rows[attempt % len(region_rows)])
         second = int(rng.choice(all_rows[all_rows != first]))
         prefixes = np.asarray([prefix_length(len(row), attempt) for row in order])
+        if attempt == GROWTH_BUDGET - 1:
+            diagnostics['full_domain_prefix_reached'] = bool(
+                np.array_equal(prefixes, [len(row) for row in order]))
         if not prefixes[first] or not prefixes[second]:
             continue
         columns = [int(order[first][rng.integers(prefixes[first])]),
                    int(order[second][rng.integers(prefixes[second])])]
         selected_rows = [first, second]
-        source_distance = float(np.linalg.norm(queries[first] - queries[second]))
+        source_distance = float(source_distances[first, second])
         target_distance = float(np.linalg.norm(target[columns[0]] - target[columns[1]]))
         if columns[0] == columns[1] or min(source_distance, target_distance) <= 0:
             continue
@@ -194,7 +253,7 @@ def build_proposals(source_pack, surface, appearance, *, initial_transforms=()):
             # Search an enclosing ball around the first chosen target, then
             # enforce every annulus exactly. nextafter prevents tree boundary
             # rounding from removing a point that passes the explicit test.
-            expected = pair_scale * np.linalg.norm(queries[row] - queries[first])
+            expected = pair_scale * source_distances[row, first]
             outer = np.nextafter(expected + 2 * tolerance, np.inf)
             candidates = np.asarray(tree.query_ball_point(target[columns[0]], outer,
                                     workers=1), dtype=np.int64)
@@ -204,7 +263,7 @@ def build_proposals(source_pack, surface, appearance, *, initial_transforms=()):
                 continue
             compatible = ~np.isin(candidates, columns)
             for anchor_row, anchor_column in zip(selected_rows, columns):
-                desired = pair_scale * np.linalg.norm(queries[row] - queries[anchor_row])
+                desired = pair_scale * source_distances[row, anchor_row]
                 distance = np.linalg.norm(target[candidates] - target[anchor_column], axis=1)
                 compatible &= np.abs(distance - desired) <= 2 * tolerance
             candidates = candidates[compatible]
@@ -228,8 +287,9 @@ def build_proposals(source_pack, surface, appearance, *, initial_transforms=()):
             if len(selected_rows) == 12 or diagnostics['proposal_fit_attempts'] >= FIT_BUDGET:
                 break
     diagnostics.update(proposal_count=len(proposals),
+        proposal_seconds=perf_counter() - proposal_started,
         proposal_search_complete=True,
         proposal_stop=('fit_budget_reached' if diagnostics['proposal_fit_attempts'] == FIT_BUDGET
                        else 'growth_budget_reached'))
-    return proposals, diagnostics
+    return proposals, diagnostics, domain
 # END independent dual-view finite proposal implementation.

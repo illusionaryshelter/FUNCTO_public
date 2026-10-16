@@ -1,14 +1,16 @@
-"""Raw MARCO responses for the independent two-view transfer scheme.
+"""Raw MARCO responses and observed support for two-view region transfer.
 
 Every score belongs to one fixed source descriptor and one continuous world
 location. Geometry and complete interpolation support determine availability;
-missing evidence remains NaN. This module neither ranks responses nor decodes
-each camera into a separate match. The existing single-view modules are only
-read for their native source-coordinate sampler.
+missing evidence remains NaN. A frozen target-domain empirical reference turns
+measured responses into nonnegative support; one-to-one measurement capacity
+prevents repeated use of the same target element. This is an observed-support
+objective, not a bound on unobserved raw responses or a match probability.
 """
 
 import numpy as np
 from scipy.ndimage import binary_propagation
+from scipy.optimize import linear_sum_assignment
 
 from ..features import sample_descriptors
 from .geometry import project_oriented
@@ -58,25 +60,139 @@ def source_descriptors(source, query_indices, source_feature, source_crop):
     return sample_descriptors(source_feature, local, tuple(size))
 
 
-def model_bounds(queries, gamma, beta):
-    """Sharp real-arithmetic bound from the final affine LayerNorm.
+# BEGIN fixed-domain observed support replaces latent LayerNorm intervals.
+class EmpiricalSupport:
+    """Freeze each source row's measured target-domain response distribution.
 
-    A normalized D-vector y has zero mean and norm at most sqrt(D). Writing
-    a=q*gamma gives q.f=q.beta+(a-mean(a)).y, so Cauchy--Schwarz yields the
-    returned interval. Convex bilinear interpolation and valid-view max retain
-    it. Outward endpoint rounding is only CPU arithmetic care; it does not
-    certify the previously executed GPU LayerNorm or semantic correctness.
+    The reference domain must be constructed before evaluating transforms.
+    Mid-CDF ranks handle ties symmetrically. Taking the positive part of the
+    centered rank retains only support above the reference median. No latent
+    score is imputed, and constant responses at their reference value carry
+    no appearance support. Query rows with an empty reference stay unknown.
     """
-    q = np.asarray(_queries(queries), dtype=np.float64)
-    gamma, beta = np.asarray(gamma, dtype=np.float64), np.asarray(beta, dtype=np.float64)
-    if (gamma.shape != (q.shape[1],) or beta.shape != gamma.shape
-            or not np.isfinite(gamma).all() or not np.isfinite(beta).all()):
-        raise ValueError("LayerNorm affine parameters must be finite descriptor-sized vectors")
-    product = q * gamma
-    centered = product - product.mean(axis=1, keepdims=True)
-    radius = np.sqrt(q.shape[1]) * np.linalg.norm(centered, axis=1)
-    bias = q @ beta
-    return np.nextafter(bias-radius, -np.inf), np.nextafter(bias+radius, np.inf)
+
+    def __init__(self, reference_scores, known):
+        scores, known = np.asarray(reference_scores), np.asarray(known)
+        if (scores.ndim != 2 or not scores.shape[0] or scores.dtype.kind not in "fiu"
+                or known.shape != scores.shape or known.dtype != np.bool_
+                or not np.isfinite(scores[known]).all()):
+            raise ValueError("Reference scores and Boolean availability must be aligned [Q,N]")
+        self.references = tuple(np.sort(scores[row, mask])
+                                for row, mask in enumerate(known))
+        for reference in self.references:
+            reference.flags.writeable = False
+        self.diagnostics = {
+            "definition": "positive_centered_mid_cdf_on_fixed_observed_target_domain",
+            "query_count": len(self.references),
+            "reference_counts": [len(row) for row in self.references],
+            "constant_rows": [i for i, row in enumerate(self.references)
+                              if len(row) and row[0] == row[-1]],
+            "empty_rows": [i for i, row in enumerate(self.references) if not len(row)],
+            "is_match_probability": False,
+        }
+
+    def utility(self, scores, query_rows):
+        """Return support in [0,1], preserving unknown responses as NaN.
+
+        ``query_rows`` broadcasts to ``scores.shape``; for a [Q,N] response
+        matrix use ``arange(Q)[:,None]``. Nonfinite score sentinels and empty
+        reference rows have no observed support value. Neither becomes a
+        finite raw response. Search-sorted ranks equal the mean of the strict
+        and weak empirical CDFs without constructing a response-size copy.
+        """
+        values, rows = np.asarray(scores, dtype=float), np.asarray(query_rows)
+        if rows.dtype.kind not in "iu":
+            raise ValueError("query_rows must contain integer source identities")
+        try:
+            rows = np.broadcast_to(rows, values.shape)
+        except ValueError as error:
+            raise ValueError("query_rows must broadcast to the response shape") from error
+        if np.any(rows < 0) or np.any(rows >= len(self.references)):
+            raise ValueError("query_rows contains an unknown source identity")
+        output = np.full(values.shape, np.nan)
+        if not values.size:
+            return output
+
+        def evaluate_row(reference, measured):
+            """Vectorized lookup; no Python loop visits a target element."""
+            left = np.searchsorted(reference, measured, side="left")
+            right = np.searchsorted(reference, measured, side="right")
+            return np.maximum((left + right) / len(reference) - 1., 0.)
+
+        # The complete Q-by-N reference scan and the final Q-by-V scores use
+        # one broadcast source identity per row. Keep these common paths O(QN)
+        # and never expand the broadcast row IDs into a second Q-by-N array.
+        if rows.ndim >= 2 and all(stride == 0 for stride in rows.strides[1:]):
+            for first in range(len(values)):
+                reference = self.references[int(rows[(first,) + (0,) * (rows.ndim - 1)])]
+                if not len(reference):
+                    continue
+                finite = np.isfinite(values[first])
+                output[first][finite] = evaluate_row(reference, values[first][finite])
+            return output
+        flat_values, flat_rows, flat_output = values.ravel(), rows.ravel(), output.ravel()
+        finite = np.isfinite(flat_values)
+        for row in np.unique(flat_rows[finite]):
+            reference = self.references[int(row)]
+            if not len(reference):
+                continue
+            selected = np.flatnonzero(finite & (flat_rows == row))
+            flat_output[selected] = evaluate_row(reference, flat_values[selected])
+        return output
+
+
+def capacity_score(view_utilities, view_element_ids):
+    """Maximize fixed-Q observed support with capacity one per surface element.
+
+    Each row is one fixed source query, each column in the input is a camera.
+    An edge uses that camera's own utility and actual measurement element ID.
+    Duplicate camera observations of the same row/element keep their maximum
+    utility. Positive real edges have cost 1-u; Q dummy columns have cost 1.
+    Zero-support real edges are omitted so numerical ties with dummies cannot
+    create apparent evidence or anchor correspondences.
+
+    Hiding edges only shrinks the matching feasible set, so it cannot improve
+    the score with frozen references and other edges held fixed. This does not
+    prove a scale or rotation correct: distinct pixels can still be ambiguous.
+    """
+    utility, elements = np.asarray(view_utilities, dtype=float), np.asarray(view_element_ids)
+    if (utility.ndim != 2 or not utility.shape[0] or not utility.shape[1]
+            or elements.shape != utility.shape or elements.dtype.kind not in "iu"
+            or np.any(elements < -1) or np.isinf(utility).any()
+            or np.any(np.isfinite(utility) & ((utility < 0) | (utility > 1)))
+            or np.any(np.isfinite(utility) & (elements < 0))):
+        raise ValueError("Require [Q,V] utilities in [0,1]/NaN and valid measurement element IDs")
+    positive = np.isfinite(utility) & (utility > 0) & (elements >= 0)
+    domain = np.unique(elements[positive])
+    q = len(utility)
+    costs = np.full((q, len(domain) + q), np.inf)
+    costs[:, len(domain):] = 1.
+    edge_views = np.full((q, len(domain)), -1, dtype=np.int64)
+    for row, view in zip(*np.nonzero(positive)):
+        column = int(np.searchsorted(domain, elements[row, view]))
+        cost = 1. - utility[row, view]
+        # Stable camera order resolves equal utilities without changing J.
+        if cost < costs[row, column]:
+            costs[row, column], edge_views[row, column] = cost, view
+    rows, columns = linear_sum_assignment(costs)
+    real = columns < len(domain)
+    matched_rows, matched_columns = rows[real], columns[real]
+    row_utilities = np.zeros(q)
+    selected_view = np.full(q, -1, dtype=np.int64)
+    selected_elements = np.full(q, -1, dtype=np.int64)
+    selected_view[matched_rows] = edge_views[matched_rows, matched_columns]
+    selected_elements[matched_rows] = domain[matched_columns]
+    row_utilities[matched_rows] = utility[matched_rows, selected_view[matched_rows]]
+    matched = selected_view >= 0
+    positive_row_count = int(positive.any(axis=1).sum())
+    return {"score": float(row_utilities.sum() / q),
+            "row_utilities": row_utilities, "matched": matched,
+            "selected_view": selected_view, "element_ids": selected_elements,
+            "matched_count": int(matched.sum()),
+            "positive_row_count": positive_row_count,
+            "capacity_lost_count": positive_row_count - int(matched.sum()),
+            "fixed_query_denominator": q}
+# END fixed-domain observed support and measurement capacity.
 
 
 def prepare_view(queries, feature, *, crop_xyxy, observation, view_id):
@@ -108,23 +224,6 @@ def prepare_view(queries, feature, *, crop_xyxy, observation, view_id):
         response.reshape(len(q), -1)[:, start:start+4096] = q @ block
     record["response"] = response
     return record
-
-
-def interval_score(scores, known, lower, upper):
-    """Average fixed source rows: measured scores or their unknown model bounds."""
-    scores, known = np.asarray(scores, dtype=float), np.asarray(known)
-    lower, upper = np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)
-    if (scores.ndim != 1 or not len(scores) or known.dtype != np.bool_
-            or known.shape != scores.shape or lower.shape != scores.shape
-            or upper.shape != scores.shape or not np.isfinite(lower).all()
-            or not np.isfinite(upper).all() or np.any(lower > upper)
-            or not np.isfinite(scores[known]).all()):
-        raise ValueError("Scores, known mask and finite bounds must share fixed Q rows")
-    if np.any(known & ((scores < lower) | (scores > upper))):
-        raise ValueError("Measured raw score violates the declared LayerNorm model bound")
-    return {"lower": float(np.where(known, scores, lower).mean()),
-            "upper": float(np.where(known, scores, upper).mean()),
-            "coverage": float(known.mean())}
 
 
 def _sampling_corners(feature_xy, shape):
@@ -266,11 +365,11 @@ def _footprint_support(surface, view_index, references, corner_pixels, positive)
 class ResponseField:
     """Two prepared raw response maps with geometry-qualified world sampling."""
 
-    def __init__(self, surface, queries, views, gamma, beta):
+    # BEGIN response sampling no longer depends on latent model-score bounds.
+    def __init__(self, surface, queries, views):
         from local_models.marco import resize_scales
 
         self.surface, self.queries = surface, _queries(queries)
-        self.lower, self.upper = model_bounds(self.queries, gamma, beta)
         views = list(views)
         if len(views) != 2 or [v["id"] for v in views] != list(surface["view_ids"]):
             raise ValueError("Prepared views must match the two canonical surface identities in order")
@@ -297,6 +396,7 @@ class ResponseField:
                               resize_scale=resize_scales(crop[2:]-crop[:2]))
             record["missing_reason"] = reason
             self.views.append(record)
+    # END measured raw responses need no LayerNorm affine parameters.
 
     def sample(self, points, normals, query_rows=None):
         """Return all Q-by-N or selected-row scores at exactly these world points.
@@ -318,7 +418,7 @@ class ResponseField:
         shape = (len(self.queries), len(points)) if rows is None else (len(points),)
         view_scores = np.full((*shape, 2), np.nan)
         view_valid = np.zeros((len(points), 2), bool)
-        states, geometry, counts = [], [], []
+        states, geometry, counts, orientation_known = [], [], [], []
         for index, view in enumerate(self.views):
             projection = project_oriented(self.surface, points, normals, index)
             geometry.append(projection)
@@ -331,10 +431,16 @@ class ResponseField:
             oriented = np.asarray(projection["oriented_supported"], dtype=bool)
             normal_known = np.asarray(projection["query_normal_valid"], dtype=bool)
             state[position & ~plane] = "invalid_local_plane"
-            state[position & plane & ~normal_known] = "missing_query_normal"
+            # BEGIN separate measured RGB availability from source orientation.
+            # Missing source normals cannot certify oriented geometry, but a
+            # real target plane with complete RGB support is still observable.
+            # Known reversed normals remain disallowed; no direction is filled.
             state[position & plane & normal_known & ~oriented] = "opposite_query_normal"
-            state[position & plane & oriented & ~projection["entity_supported"]] = "outside_entity_footprint"
-            valid = np.asarray(projection["supported"], dtype=bool).copy()
+            orientation_eligible = oriented | ~normal_known
+            state[position & plane & orientation_eligible & ~projection["entity_supported"]] = "outside_entity_footprint"
+            valid = position & plane & orientation_eligible & projection["entity_supported"]
+            orientation_known.append(normal_known)
+            # END RGB eligibility does not change the geometry support record.
             state[valid] = "appearance_pending"
             if view["missing_reason"] is not None:
                 state[valid] = view["missing_reason"]
@@ -383,7 +489,10 @@ class ResponseField:
                             view_scores[:, chosen, index] = values
                         else:
                             view_scores[chosen, index] = values
-                        state[chosen] = "appearance_valid"
+                        # BEGIN preserve unknown source orientation explicitly.
+                        state[chosen] = np.where(normal_known[chosen], "appearance_valid",
+                                                 "appearance_valid_orientation_unknown")
+                        # END appearance-only support is distinguishable.
             view_valid[:, index] = valid
             states.append(state)
             unique, number = np.unique(state, return_counts=True)
@@ -392,12 +501,10 @@ class ResponseField:
         known = np.broadcast_to(known_points, shape).copy()
         scores = np.max(np.where(np.isfinite(view_scores), view_scores, -np.inf), axis=-1)
         scores = np.where(known, scores, np.nan)
-        low = self.lower[:, None] if rows is None else self.lower[rows]
-        high = self.upper[:, None] if rows is None else self.upper[rows]
-        if np.any(np.isfinite(view_scores) & ((view_scores < low[..., None])
-                                             | (view_scores > high[..., None]))):
-            raise ValueError("Measured raw score violates the declared LayerNorm model bound")
+        # BEGIN return measured responses and orientation provenance directly.
         return {"scores": scores, "known": known, "view_scores": view_scores,
                 "view_valid": view_valid, "view_state": np.stack(states, axis=1),
+                "view_orientation_known": np.stack(orientation_known, axis=1),
                 "reason_counts": dict(zip(self.surface["view_ids"], counts)),
                 "geometry": geometry}
+        # END missing raw scores remain NaN; the fixed-domain objective is separate.

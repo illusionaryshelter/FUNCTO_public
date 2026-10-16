@@ -125,6 +125,11 @@ def prepare_source(source, depth_m, *, query_indices, query_region,
         query_xyz=points[query_ids].copy(), query_normals=source_normals[query_ids],
         query_normal_valid=source_valid[query_ids].copy(),
         check_indices=check_ids, check_xyz=points[check_ids].copy(),
+        # BEGIN local-region contract: preserve each independent check's role.
+        # This mask comes only from the supplied source demonstration. It is
+        # never reconstructed from target visibility or a candidate transform.
+        check_region=region[check_ids].copy(),
+        # END fixed independent-check roles.
         check_normals=source_normals[check_ids],
         check_normal_valid=source_valid[check_ids].copy(),
         center=center, normal=normal, size=float(size),
@@ -177,6 +182,19 @@ def project_oriented(surface, points, normals, view_index):
 def geometry_support(surface, points, normals):
     """Keep both cameras' evidence; support and conflict may coexist."""
     views = [project_oriented(surface, points, normals, i) for i in range(2)]
+    return combine_support(views)
+
+
+# BEGIN reuse original depth projections already computed by feature sampling.
+def combine_support(views):
+    """Aggregate two existing projection records without projecting again.
+
+    Feature availability may also admit unknown source orientation; geometric
+    support deliberately reads the original oriented ``supported`` field.
+    Consequently sharing these records does not weaken a local geometry gate.
+    """
+    if len(views) != 2:
+        raise ValueError('Two original camera projection records are required')
     view_support = np.column_stack([view["supported"] for view in views])
     view_conflict = np.column_stack([view["conflict"] for view in views])
     support, conflict = view_support.any(1), view_conflict.any(1)
@@ -184,6 +202,7 @@ def geometry_support(surface, points, normals):
         view_support=view_support, view_conflict=view_conflict, views=views,
         view_states=np.column_stack([view["states"] for view in views]),
         state_names=list(STATE_NAMES))
+# END projection reuse without changing the per-camera geometry calculation.
 
 
 def _sampleable(mode, config):
@@ -209,13 +228,50 @@ def _same_tied_patch(surface, eligible, tied, config):
     return bool(np.all(tie_labels == tie_labels[0]))
 
 
+# BEGIN exact spatial bounds avoid repeated full-entity region scans.
+def _sample_bounded_region(surface, domain, normal, seed, *, sampling_radius_m,
+                           sampling_spacing_m, config):
+    """Run the existing sampler on a provably enclosing induced subgraph.
+
+    The original sampler requires |height| <= slab and tangent <= radius.
+    Therefore every member is within sqrt(slab**2 + radius**2) of the seed,
+    even for the sampler's clipped squared-tangent arithmetic. This ball only
+    accelerates enumeration: all original normal, slab, tangent, connectivity
+    and farthest-sampling operations still run unchanged on its sorted IDs.
+    """
+    thickness = config.surface_height_spacing_factor * surface["spacing"][seed]
+    tangent_limit = sampling_radius_m * (1 + 1e-12)
+    # Outward arithmetic guard enlarges only the query superset. It does not
+    # relax the original sampler's slab/radius membership predicates.
+    radius = np.nextafter(np.hypot(tangent_limit, thickness)
+                          * (1 + 8*np.finfo(float).eps), np.inf)
+    columns = domain["tree"].query_ball_point(surface["xyz"][seed], radius, workers=1)
+    members = np.sort(domain["surface_ids"][np.asarray(columns, dtype=np.int64)])
+    local_seed = int(np.searchsorted(members, seed))
+    if local_seed == len(members) or members[local_seed] != seed:
+        raise RuntimeError("The enclosing region query lost its own seed")
+    bounded = {key: surface[key][members]
+               for key in ("xyz", "normals", "spacing", "valid", "entity_member")}
+    bounded["adjacency"] = surface["adjacency"][members][:, members]
+    eligible = bounded["normals"] @ normal >= config.normal_min_agreement
+    mode = sample_region(bounded, eligible, local_seed,
+        sampling_radius_m=sampling_radius_m, sampling_spacing_m=sampling_spacing_m,
+        config=config)
+    mask = np.zeros(len(surface["xyz"]), bool)
+    mask[members[mode["mask"]]] = True
+    mode.update(seed_index=int(members[mode["seed_index"]]), mask=mask,
+                sample_indices=members[mode["sample_indices"]])
+    return mode
+
+
 def region_for_transform(surface, source_pack, transform, *, sampling_radius_m=.03,
-                         sampling_spacing_m=.005, config=None):
+                         sampling_spacing_m=.005, config=None, prepared_domain=None):
     """Project a supported mapped center once, then sample its nearest real seed.
 
     A farther seed is never tried to rescue an unsampleable nearest point. Exact
-    distance ties across unproven support patches remain an explicit ambiguity;
-    the inference module must retain that transform's competing score interval.
+    distance ties across unproven support patches remain an explicit ambiguity.
+    An optional already prepared entity tree changes only candidate enumeration;
+    it preserves the full-scan result, exact tied seeds and sample ordering.
     """
     geo = _config(config)
     _sampling_parameters(sampling_radius_m, sampling_spacing_m)
@@ -226,33 +282,63 @@ def region_for_transform(surface, source_pack, transform, *, sampling_radius_m=.
         return None, "center_geometry_model_conflict"
     if not support["support"][0]:
         return None, "mapped_center_without_oriented_entity_support"
-    eligible = surface["valid"] & surface["entity_member"]
-    eligible = eligible & (surface["normals"] @ normal >= geo.normal_min_agreement)
-    projection_limit = np.maximum(geo.max_projection_spacing_factor * surface["spacing"],
-        geo.max_projection_sampling_ratio * sampling_radius_m)
-    distance2 = np.sum((surface["xyz"] - center) ** 2, axis=1)
-    candidates = np.flatnonzero(eligible)
+    if prepared_domain is None:
+        eligible = surface["valid"] & surface["entity_member"]
+        eligible &= surface["normals"] @ normal >= geo.normal_min_agreement
+        candidates = np.flatnonzero(eligible)
+    elif prepared_domain["tree"] is None:
+        candidates = np.empty(0, dtype=np.int64)
+    else:
+        largest_limit = max(geo.max_projection_spacing_factor * prepared_domain["max_spacing_m"],
+                            geo.max_projection_sampling_ratio * sampling_radius_m)
+        outer = np.nextafter(largest_limit * (1 + 8*np.finfo(float).eps), np.inf)
+        columns = prepared_domain["tree"].query_ball_point(center, outer, workers=1)
+        candidates = np.sort(prepared_domain["surface_ids"][np.asarray(columns, dtype=np.int64)])
+        candidates = candidates[surface["normals"][candidates] @ normal >= geo.normal_min_agreement]
+        if not len(candidates):
+            # A candidate outside the largest per-point limit cannot be used.
+            # Only this rare failure branch scans all normals to preserve the
+            # original distinction between absent and too-distant support.
+            domain_ids = prepared_domain["surface_ids"]
+            if np.any(surface["normals"][domain_ids] @ normal >= geo.normal_min_agreement):
+                return None, "center_projection_exceeds_observed_limit"
     if not len(candidates):
         return None, "no_valid_surface_near_supported_mapping"
-    nearest_distance2 = distance2[candidates].min()
-    tied = candidates[distance2[candidates] == nearest_distance2]
+    distance2 = np.sum((surface["xyz"][candidates] - center) ** 2, axis=1)
+    nearest_distance2 = distance2.min()
+    tied = candidates[distance2 == nearest_distance2]
     # Apply the displacement gate to the nearest observations, rather than
     # admitting a farther, coarser observation with a more permissive slab.
-    tied = tied[nearest_distance2 <= projection_limit[tied] ** 2]
+    projection_limit = np.maximum(geo.max_projection_spacing_factor * surface["spacing"][tied],
+        geo.max_projection_sampling_ratio * sampling_radius_m)
+    passes = nearest_distance2 <= projection_limit ** 2
+    tied, projection_limit = tied[passes], projection_limit[passes]
     if not len(tied):
         return None, "center_projection_exceeds_observed_limit"
-    if not _same_tied_patch(surface, eligible, tied, geo):
-        return None, "center_projection_ambiguous"
+    if len(tied) > 1:
+        # Tie connectivity has no local-radius cutoff in the original rule.
+        # Keep that global proof, since a valid path can travel around a hole.
+        if prepared_domain is not None:
+            eligible = surface["valid"] & surface["entity_member"]
+            eligible &= surface["normals"] @ normal >= geo.normal_min_agreement
+        if not _same_tied_patch(surface, eligible, tied, geo):
+            return None, "center_projection_ambiguous"
     seed = int(tied[0])
-    mode = sample_region(surface, eligible, seed, sampling_radius_m=sampling_radius_m,
-        sampling_spacing_m=sampling_spacing_m, config=geo)
+    if prepared_domain is None:
+        mode = sample_region(surface, eligible, seed, sampling_radius_m=sampling_radius_m,
+            sampling_spacing_m=sampling_spacing_m, config=geo)
+    else:
+        mode = _sample_bounded_region(surface, prepared_domain, normal, seed,
+            sampling_radius_m=sampling_radius_m,
+            sampling_spacing_m=sampling_spacing_m, config=geo)
     if not _sampleable(mode, geo):
         return None, "little_visible_target_support"
     mode.update(mapped_center=center, mapped_normal=normal)
     mode["diagnostics"].update(center_projection_distance_m=float(np.sqrt(nearest_distance2)),
-        center_projection_limit_m=float(projection_limit[seed]),
+        center_projection_limit_m=float(projection_limit[0]),
         nearest_seed_exact_tie_count=len(tied))
     return mode, None
+# END exact entity-tree acceleration; all membership rules remain unchanged.
 
 
 def consensus_region(surface, modes, centers, normals, *, sampling_radius_m=.03,

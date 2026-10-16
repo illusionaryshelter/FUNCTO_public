@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import numpy as np
 from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
 
 from .geometry import (build_target_surface, consensus_region, geometry_support,
                        prepare_source, project_oriented, region_for_transform)
@@ -171,6 +172,69 @@ class RegionTests(unittest.TestCase):
             np.array([[0, 0, 1]]), np.array([[0, 0, -1]]))
         self.assertIsNone(mode)
         self.assertEqual(reason, "common_region_not_sampleable")
+
+    # BEGIN equivalence checks for the entity-tree enumeration accelerator.
+    def assert_bounded_matches_full(self, surface, source_pack):
+        ids = np.flatnonzero(surface["valid"] & surface["entity_member"])
+        domain = dict(surface_ids=ids,
+            tree=cKDTree(surface["xyz"][ids]) if len(ids) else None,
+            max_spacing_m=float(np.max(surface["spacing"][ids], initial=0.)))
+        original, original_reason = region_for_transform(surface, source_pack, self.transform)
+        bounded, bounded_reason = region_for_transform(surface, source_pack, self.transform,
+                                                       prepared_domain=domain)
+        self.assertEqual(bounded_reason, original_reason)
+        if original is None:
+            self.assertIsNone(bounded)
+            return bounded_reason
+        self.assertEqual(bounded.keys(), original.keys())
+        for key in original:
+            if isinstance(original[key], np.ndarray):
+                np.testing.assert_array_equal(bounded[key], original[key], err_msg=key)
+            else:
+                self.assertEqual(bounded[key], original[key], key)
+        return None
+
+    def test_bounded_sampling_preserves_tilt_holes_and_original_graph(self):
+        yy, xx = np.mgrid[:41, :41]
+        cases = [np.ones((41, 41)), 1/(1+.3*(xx-6)/256-.2*(yy-6)/256)]
+        with_hole = np.ones((41, 41))
+        with_hole[3:10, 9] = 0
+        cases.append(with_hole)
+        for depth in cases:
+            with self.subTest(tilted=bool(np.any((depth > 0) & (depth != 1))),
+                              hole=bool(np.any(depth == 0))):
+                surface = _surface(depth)
+                element = surface["observation_to_element"][surface["pixel_to_observation"][0][6, 6]]
+                pack = dict(center=np.array([0., 0., 1.]), normal=surface["normals"][element])
+                self.assertIsNone(self.assert_bounded_matches_full(surface, pack))
+                # Remove all original graph edges crossing one vertical cut.
+                # The spatial accelerator must not invent a metric connection.
+                graph = surface["adjacency"].tocoo()
+                side = surface["xyz"][:, 0] > 2/256
+                retained = side[graph.row] == side[graph.col]
+                surface["adjacency"] = csr_matrix((graph.data[retained],
+                    (graph.row[retained], graph.col[retained])), shape=graph.shape)
+                self.assertIsNone(self.assert_bounded_matches_full(surface, pack))
+
+    def test_bounded_center_preserves_exact_ties_and_failure_reasons(self):
+        self.source_pack["center"] = np.array([.5/256, 0., 1.])
+        self.assertIsNone(self.assert_bounded_matches_full(self.surface, self.source_pack))
+        n = len(self.surface["xyz"])
+        disconnected = deepcopy(self.surface)
+        disconnected["adjacency"] = csr_matrix((n, n), dtype=bool)
+        self.assertEqual(self.assert_bounded_matches_full(disconnected, self.source_pack),
+                         "center_projection_ambiguous")
+        # Keep original camera depth support and move only the enumerated
+        # representative domain. Both paths must name the same distance failure.
+        far = deepcopy(self.surface)
+        far["xyz"][:, 0] += 1.
+        self.assertEqual(self.assert_bounded_matches_full(far, self.source_pack),
+                         "center_projection_exceeds_observed_limit")
+        empty = deepcopy(self.surface)
+        empty["valid"][:] = False
+        self.assertEqual(self.assert_bounded_matches_full(empty, self.source_pack),
+                         "no_valid_surface_near_supported_mapping")
+    # END complete masks, deterministic sample order, metadata and states agree.
 
 
 if __name__ == "__main__":

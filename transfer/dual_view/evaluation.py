@@ -1,4 +1,4 @@
-"""Evaluate frozen dual-view predictions and display three separate schemes.
+"""Evaluate frozen revised dual-view predictions against immutable comparisons.
 
 This entry point is intentionally separate from prediction: only this process
 opens target truth. Historical outputs are read, never reoptimized or edited.
@@ -7,6 +7,9 @@ opens target truth. Historical outputs are read, never reoptimized or edited.
 import argparse
 from collections import Counter
 import json
+# BEGIN relative historical asset paths and held-out transform metrics.
+import os
+# END evaluation-only import.
 from pathlib import Path
 
 import numpy as np
@@ -18,16 +21,20 @@ from ..features import write_json
 from ..multiview_experiment import _path, load_surface, read_manifest
 from ..multiview_visualization import read_rgb, single_view_picture, source_picture
 from .io import load_observations
+# BEGIN transform evaluator is never imported by prediction.
+from .transform_metrics import evaluate_transforms
+# END held-out metric import.
 # BEGIN shared GT overlay for all three frozen schemes.
 from .visualization import ground_truth_layer, region_picture, with_ground_truth, write_html
 # END shared GT overlay import.
 
 
+# BEGIN current revised freeze validation excludes the historical schema.
 def frozen_index(output):
     """Require every declared prediction to have a matching terminal record."""
     output = Path(output)
     record = json.loads((output / 'predictions.json').read_text())
-    if (record.get('scheme') != 'dual_view_continuous' or record.get('frozen') is not True
+    if (record.get('scheme') != 'dual_view_observed_partial' or record.get('frozen') is not True
             or record.get('target_truth_used') is not False):
         raise ValueError('Evaluation requires a complete truth-free dual-view run')
     ids = [state['id'] for state in record['tasks']]
@@ -50,11 +57,12 @@ def frozen_index(output):
                             raise FileNotFoundError(f'{state["id"]}/{backend}{suffix}')
                     result = json.loads((output / state['id'] / (backend+'.json')).read_text())
                     diagnostics = result['diagnostics']
-                    if (diagnostics.get('scheme') != 'dual_view_continuous'
+                    if (diagnostics.get('scheme') != 'dual_view_observed_partial'
                             or diagnostics.get('native_backend') != backend
                             or diagnostics.get('target_truth_used') is not False):
                         raise ValueError('Frozen prediction scheme/backend/provenance mismatch')
     return record
+# END revised-only freeze validation.
 
 
 def _empty(reasons):
@@ -81,7 +89,9 @@ def _row(task, scheme, backend, view, status, result, metrics):
 
 
 def _summary(rows):
-    labels = {'old': '旧方案', 'new': '新方案', 'dual': '双视角方案'}
+    # BEGIN original dual stays a separate denominator from its revision.
+    labels = {'old': '旧方案', 'new': '新方案', 'dual_original': '原双视角', 'dual': '修订双视角'}
+    # END explicit comparison labels.
     answer = []
     for key in dict.fromkeys((row['scheme'], row['backend'], row['view']) for row in rows):
         values = [row for row in rows if (row['scheme'], row['backend'], row['view']) == key]
@@ -101,10 +111,134 @@ def _summary(rows):
     return answer
 
 
-def evaluate(output, destination, *, old_results, new_results):
+# BEGIN held-out transform/performance comparison against immutable original dual.
+def _dual_region_metrics(result, points, truth, reference):
+    """Keep accepted top-k/sample aggregates limited to the one primary region.
+
+    The shared evaluator treats every mode as an output. Revised dual modes
+    after index zero are diagnostic witnesses, so their good GT outcome must
+    never improve accepted top-k hits, sample quality, or geometric bounds.
+    Their individual measurements remain explicitly labelled diagnostics.
+    """
+    all_metrics = evaluate_prediction(result, points, truth, reference)
+    primary = (evaluate_prediction({**result, 'modes': result['modes'][:1]}, points, truth, reference)
+               if result['accepted'] and len(result['modes']) > 1 else all_metrics)
+    primary = dict(primary)
+    primary['aggregate_scope'] = 'primary_mode_only' if result['accepted'] else 'rejected_diagnostics_only'
+    primary['mode_metrics'] = [{**record, 'role': 'primary' if result['accepted'] and index == 0
+                               else 'competitor_diagnostic' if result['accepted'] else 'rejected_diagnostic'}
+                              for index, record in enumerate(all_metrics['mode_metrics'])]
+    return primary
+
+
+def _source_transform_points(folder):
+    """Read only the frozen small source rows, never feature maps or target GT."""
+    with np.load(Path(folder) / 'source_queries.npz', allow_pickle=False) as archive:
+        source = {key: archive[key] for key in ('query_xyz', 'check_xyz', 'query_region',
+                                               'center', 'normal')}
+    description = json.loads((Path(folder) / 'source_geometry.json').read_text())
+    source['check_query_region'] = description['diagnostics']['check_query_region']
+    return source
+
+
+def _transform_evaluation(stem, result, pair):
+    """Only this post-freeze evaluator opens affine GT and the saved estimate."""
+    source = _source_transform_points(Path(stem).parent)
+    with np.load(Path(stem).with_suffix('.npz'), allow_pickle=False) as archive:
+        keys = ('sim3_scale', 'sim3_rotation', 'sim3_translation')
+        present = [key in archive for key in keys]
+        if any(present) and not all(present):
+            raise ValueError('Frozen estimate has only part of its Sim(3) parameters')
+        primary = tuple(archive[key] for key in keys) if all(present) else None
+    return evaluate_transforms(result, source, pair['true_affine_transform'],
+                               primary_transform=primary)
+
+
+def _original_dual(results, web, *, old_results=None, new_results=None):
+    """Read the explicitly requested historical schema and its original assets.
+
+    The current freeze validator accepts only the revised scheme. This reader
+    has the separate purpose of evaluating the named immutable prior run; it
+    never admits a historical run as a current prediction.
+    """
+    record = json.loads((results / 'predictions.json').read_text())
+    evaluation = json.loads((web / 'evaluation.json').read_text())
+    if (record.get('scheme') != 'dual_view_continuous' or record.get('frozen') is not True
+            or record.get('target_truth_used') is not False
+            or Path(evaluation['prediction_index']).resolve() != (results / 'predictions.json').resolve()
+            or evaluation.get('read_after_all_predictions_frozen') is not True):
+        raise ValueError('Original dual comparison must name its frozen run and matching evaluation')
+    for key, expected in (('old_results', old_results), ('new_results', new_results)):
+        if expected is not None and Path(evaluation[key]).resolve() != Path(expected).resolve():
+            raise ValueError('Reused single-view images must match the named frozen single-view result directories')
+    rows = {(row['task'], row['backend']): row for row in evaluation['rows'] if row['scheme'] == 'dual'}
+    return record, rows
+
+
+def _supervisor_metrics(path, output):
+    """Bind an optional supervisor record to this exact prediction directory."""
+    if path is None:
+        return None
+    report = json.loads(Path(path).read_text())
+    command = report['command']
+    if '--output' not in command or Path(command[command.index('--output')+1]).resolve() != Path(output).resolve():
+        raise ValueError('Supervisor timings must correspond to the named prediction output')
+    return {'record_file': str(Path(path).resolve()), 'wall_seconds': float(report['elapsed_s']),
+            'status': report['status'], 'returncode': report.get('returncode'),
+            'peak_process_tree_rss_mib': report.get('peak_process_tree_rss_mib'),
+            'scope': 'Supervisor wall time includes process startup and shutdown; distinct from sum of task timers.'}
+
+
+def _runtime_summary(record, supervisor=None):
+    """Actual recorded serial times; never extrapolate an unmeasured stage."""
+    tasks = record['tasks']
+    times = [float(state['seconds']) for state in tasks if 'seconds' in state]
+    backend = {}
+    for name in record['backends']:
+        values = [float(state['backends'][name]['seconds']) for state in tasks
+                  if name in state.get('backends', {}) and 'seconds' in state['backends'][name]]
+        backend[name] = {'recorded_tasks': len(values), 'sum_seconds': sum(values),
+            'median_seconds': float(np.median(values)) if values else None,
+            'minimum_seconds': min(values) if values else None,
+            'maximum_seconds': max(values) if values else None}
+    preparation_stages = {}
+    for state in tasks:
+        for name, value in state.get('stage_seconds', {}).items():
+            preparation_stages[name] = preparation_stages.get(name, 0.)+float(value)
+    return {'recorded_tasks': len(times), 'sum_task_seconds': sum(times),
+            'median_task_seconds': float(np.median(times)) if times else None,
+            'minimum_task_seconds': min(times) if times else None,
+            'maximum_task_seconds': max(times) if times else None,
+            'backends': backend,
+            'recorded_preparation_stage_sums_seconds': preparation_stages,
+            'supervisor': supervisor,
+            'scope': 'Recorded cached prediction only; excludes SAM/MARCO extraction and creation of reused target surface caches.'}
+
+
+def evaluate(output, destination, *, old_results, new_results,
+             baseline_dual_results=None, baseline_dual_web=None,
+             prediction_resources=None, baseline_prediction_resources=None):
     """Render frozen modes on original RGB, with no selection from target truth."""
     output, destination = Path(output).resolve(), Path(destination).resolve()
     record = frozen_index(output)
+    if (baseline_dual_results is None) != (baseline_dual_web is None):
+        raise ValueError('Original dual results and its rendered web directory must be supplied together')
+    baseline_record, baseline_rows = None, {}
+    if baseline_dual_results is not None:
+        baseline_dual_results, baseline_dual_web = Path(baseline_dual_results).resolve(), Path(baseline_dual_web).resolve()
+        if destination == baseline_dual_web or output == baseline_dual_results:
+            raise ValueError('Revised evaluation must not overwrite the original frozen comparison')
+        baseline_record, baseline_rows = _original_dual(baseline_dual_results, baseline_dual_web,
+            old_results=old_results, new_results=new_results)
+        original_tasks = {item['id']: item for item in baseline_record['tasks']}
+        for state in record['tasks']:
+            if state['id'] not in original_tasks or state['cases'] != original_tasks[state['id']]['cases']:
+                raise ValueError('Reused original images require identical declared source/target cases')
+    if baseline_prediction_resources is not None and baseline_record is None:
+        raise ValueError('Historical supervisor timings require the historical prediction input')
+    runtime = {'revision': _runtime_summary(record, _supervisor_metrics(prediction_resources, output)),
+               'original_dual': None if baseline_record is None else _runtime_summary(baseline_record,
+                   _supervisor_metrics(baseline_prediction_resources, baseline_dual_results))}
     _, description = read_manifest(record['index'])
     # BEGIN in-place regeneration of derived evaluation/web artifacts only.
     # Frozen prediction directories are opened read-only. Rendering always
@@ -125,10 +259,10 @@ def evaluate(output, destination, *, old_results, new_results):
             card = {'id': task['id'], 'source': None, 'methods': []}
             cards.append(card)
             reason = f'evaluation_observation_binding_failed:{type(error).__name__}:{error}'
-            for scheme in ('old', 'new', 'dual'):
+            for scheme in (('old', 'new', 'dual_original', 'dual') if baseline_record else ('old', 'new', 'dual')):
                 for backend in record['backends']:
                     method = {'scheme': scheme, 'label': f'{scheme} / {backend}', 'panels': []}
-                    for view_id in (['A+B'] if scheme == 'dual' else
+                    for view_id in (['A+B'] if scheme in ('dual', 'dual_original') else
                                     [case['view'] for case in sorted(task['cases'], key=lambda c: c['view'])]):
                         row = _row(task['id'], scheme, backend, view_id, 'failed', _empty([reason]), None)
                         row['prediction_task_status'] = state['status']
@@ -139,9 +273,16 @@ def evaluate(output, destination, *, old_results, new_results):
         source = loaded['source']
         demo = np.load(_path(description['data'], task['cases'][0]['evidence']), allow_pickle=False)
         source_name = f'{task["id"]}_source.png'
-        source_picture(read_rgb(loaded['source_rgb']), demo, source,
-                       loaded['query_indices'], loaded['query_region']).save(assets / source_name)
-        card = {'id': task['id'], 'source': 'assets/'+source_name, 'methods': []}
+        if baseline_record is None:
+            source_picture(read_rgb(loaded['source_rgb']), demo, source,
+                           loaded['query_indices'], loaded['query_region']).save(assets / source_name)
+            source_asset = 'assets/'+source_name
+        else:
+            original_source = baseline_dual_web / 'assets' / source_name
+            if not original_source.is_file():
+                raise FileNotFoundError(f'Original source comparison image is missing: {original_source}')
+            source_asset = os.path.relpath(original_source, destination)
+        card = {'id': task['id'], 'source': source_asset, 'methods': []}
         cards.append(card)
         # BEGIN retain already-read pair annotations for the shared GT layers.
         truths, references, preferred, rgbs, pairs = [], [], [], [], []
@@ -159,6 +300,7 @@ def evaluate(output, destination, *, old_results, new_results):
         if len(set(preferred)) != 1:
             raise ValueError('Target views disagree on preferred support identity')
         np.testing.assert_allclose(references[0], references[1], rtol=0, atol=1e-10)
+        np.testing.assert_allclose(pairs[0]['true_affine_transform'], pairs[1]['true_affine_transform'], rtol=0, atol=1e-10)
 
         # BEGIN one held-out GT layer per camera, reused across every method/mode.
         gt_layers, gt_captions, gt_records = [], [], []
@@ -207,11 +349,18 @@ def evaluate(output, destination, *, old_results, new_results):
                     rows.append(row)
                     name = f'{task["id"]}_{scheme}_{backend}_{view["id"]}.png'
                     # BEGIN GT is the final layer, including failed/missing predictions.
-                    picture = single_view_picture(rgbs[v], view['observation'], result)
-                    with_ground_truth(picture, gt_layers[v]).save(assets / name)
-                    gt_records[v]['images'].append('assets/'+name)
+                    if baseline_record is None:
+                        picture = single_view_picture(rgbs[v], view['observation'], result)
+                        with_ground_truth(picture, gt_layers[v]).save(assets / name)
+                        comparison_asset = 'assets/'+name
+                    else:
+                        original_asset = baseline_dual_web / 'assets' / name
+                        if not original_asset.is_file():
+                            raise FileNotFoundError(f'Original single-view comparison image is missing: {original_asset}')
+                        comparison_asset = os.path.relpath(original_asset, destination)
+                    gt_records[v]['images'].append(comparison_asset)
                     # END old/new GT display; frozen result and metrics remain unchanged.
-                    method['panels'].append({**row, 'images': [{'path': 'assets/'+name,
+                    method['panels'].append({**row, 'images': [{'path': comparison_asset,
                         # BEGIN per-image GT visibility remains available when zoomed.
                         'caption': f'{view["id"]} · {row["display_status"]} · {gt_captions[v]}'}],
                         # END per-image GT visibility.
@@ -228,6 +377,35 @@ def evaluate(output, destination, *, old_results, new_results):
                 observation_support[ids] = truths[v][xy[:, 1], xy[:, 0]]
             support = observation_support[surface['representative_observation']]
         for backend in record['backends']:
+            if baseline_record is not None:
+                original = dict(baseline_rows[(task['id'], backend)])
+                original.update(scheme='dual_original', region_metric_scope='historical_frozen_mode_semantics')
+                original_stem = baseline_dual_results / task['id'] / backend
+                original_prediction = json.loads(original_stem.with_suffix('.json').read_text()) if original['status'] == 'completed' else None
+                original['transform_metrics'] = (_transform_evaluation(original_stem, original_prediction, pairs[0])
+                    if original_prediction is not None else None)
+                original_state = original_tasks[task['id']]
+                original['runtime'] = {'task_seconds': original_state.get('seconds'),
+                    'preparation_seconds': original_state.get('preparation_seconds'),
+                    'preparation_stage_seconds': original_state.get('stage_seconds', {}),
+                    'backend_seconds': original_state.get('backends', {}).get(backend, {}).get('seconds'),
+                    'native_registration_seconds': None if original_prediction is None else original_prediction['diagnostics'].get('native_seconds'),
+                    'timing_seconds': {} if original_prediction is None else original_prediction['diagnostics'].get('timing_seconds', {})}
+                rows.append(original)
+                baseline_images = []
+                mode_count = max(1, len(original_prediction['modes'])) if original_prediction else 1
+                for rank in range(mode_count):
+                    for v, view in enumerate(loaded['views']):
+                        asset = baseline_dual_web / 'assets' / f'{task["id"]}_dual_{backend}_{view["id"]}_mode{rank}.png'
+                        if not asset.is_file():
+                            raise FileNotFoundError(f'Original dual comparison image is missing: {asset}')
+                        baseline_images.append({'path': os.path.relpath(asset, destination),
+                            'caption': f'{view["id"]} · 原双视角冻结输出 · {original["display_status"]} · 区域 {rank+1}'})
+                        gt_records[v]['images'].append(os.path.relpath(asset, destination))
+                card['methods'].append({'scheme': 'dual_original', 'label': f'原双视角 / {backend}',
+                    'panels': [{**original, 'images': baseline_images, 'search': {
+                        'full_prediction': str(original_stem.with_suffix('.json')),
+                        'historical_assets_reused_without_copy': True}}]})
             backend_state = state['backends'].get(backend, state)
             status = backend_state['status']
             stem = output / task['id'] / backend
@@ -235,9 +413,17 @@ def evaluate(output, destination, *, old_results, new_results):
                       _empty(backend_state.get('reasons', [backend_state.get('error', status)])))
             metrics = None
             if surface is not None:
-                metrics = evaluate_prediction(result, surface['xyz'],
+                metrics = _dual_region_metrics(result, surface['xyz'],
                     {'support_id': support, 'preferred_support_id': np.asarray(preferred[0])}, references[0])
             row = _row(task['id'], 'dual', backend, 'A+B', status, result, metrics)
+            row['transform_metrics'] = (_transform_evaluation(stem, result, pairs[0])
+                if status == 'completed' else None)
+            row['runtime'] = {'task_seconds': state.get('seconds'),
+                'preparation_seconds': state.get('preparation_seconds'),
+                'preparation_stage_seconds': state.get('stage_seconds', {}),
+                'backend_seconds': backend_state.get('seconds'),
+                'native_registration_seconds': result['diagnostics'].get('native_seconds'),
+                'timing_seconds': result['diagnostics'].get('timing_seconds', {})}
             rows.append(row)
             rejection_counts.update(row['reasons'])
             diag = result['diagnostics']
@@ -245,7 +431,8 @@ def evaluate(output, destination, *, old_results, new_results):
             search = {key: diag.get(key) for key in ('search_status', 'decision_status',
                 'fixed_query_denominator', 'evaluated_transform_count', 'hypotheses_admitted',
                 'potential_winner_count', 'potential_winner_ids', 'region_identified',
-                'transform_identified', 'best_lower')}
+                'finite_candidate_unique', 'transform_certified',
+                'best_score', 'competing_regions', 'appearance_reference', 'timing_seconds')}
             search.update(candidate_rejection_counts=dict(Counter(reason for h in candidates
                 for reason in h.get('reasons', h.get('rejections', [])))),
                 full_prediction=str(stem.with_suffix('.json')))
@@ -264,25 +451,35 @@ def evaluate(output, destination, *, old_results, new_results):
                     with_ground_truth(picture, gt_layers[v]).save(assets / name)
                     gt_records[v]['images'].append('assets/'+name)
                     # END dual-view GT display.
-                    role = '接受区域' if result['accepted'] else ('诊断区域' if mode is not None else '无可展示区域')
+                    if result['accepted']:
+                        role = '接受的主区域' if rank == 0 else '竞争诊断区域（非主输出）'
+                    else:
+                        role = '诊断区域' if mode is not None else '无可展示区域'
                     # BEGIN visibility caption for every retained mode in both cameras.
                     images.append({'path': 'assets/'+name,
                                    'caption': f'{view["id"]} · {role} {rank+1} · {gt_captions[v]}'})
                     # END dual-view GT caption.
-            card['methods'].append({'scheme': 'dual', 'label': f'双视角方案：共同变换与区间判定 / {backend}',
+            card['methods'].append({'scheme': 'dual', 'label': f'修订双视角：局部区域与观测支持 / {backend}',
                                     'panels': [{**row, 'images': images, 'search': search}]})
     summary = _summary(rows)
     write_json(destination / 'evaluation.json', {'read_after_all_predictions_frozen': True,
         'prediction_index': str(output / 'predictions.json'), 'rows': rows,
-        'old_results': str(Path(old_results).resolve()), 'new_results': str(Path(new_results).resolve())})
+        'old_results': str(Path(old_results).resolve()), 'new_results': str(Path(new_results).resolve()),
+        'baseline_dual_results': None if baseline_dual_results is None else str(baseline_dual_results),
+        'baseline_dual_web': None if baseline_dual_web is None else str(baseline_dual_web)})
     write_json(destination / 'summary.json', {'methods': summary,
-        'dual_rejection_counts': dict(rejection_counts), 'sample_visibility': visibility})
+        'dual_rejection_counts': dict(rejection_counts), 'sample_visibility': visibility,
+        'prediction_runtime': runtime['revision'],
+        'original_dual_runtime': runtime['original_dual']})
     # BEGIN evaluation-only provenance and exhaustive target-image coverage.
     write_json(destination / 'ground-truth.json', {'read_after_all_predictions_frozen': True,
         'prediction_index': str(output / 'predictions.json'), 'views': ground_truth})
     # END GT provenance; existing prediction/evaluation metrics keep their meanings.
-    write_html(destination / 'index.html', cards, summary)
+    write_html(destination / 'index.html', cards, summary,
+        runtime=runtime,
+        baseline_link=None if baseline_dual_web is None else os.path.relpath(baseline_dual_web / 'index.html', destination))
     return summary
+# END held-out transform/performance comparison.
 
 
 def main():
@@ -291,9 +488,19 @@ def main():
     parser.add_argument('--destination', type=Path, required=True)
     parser.add_argument('--old-results', type=Path, required=True)
     parser.add_argument('--new-results', type=Path, required=True)
+    # BEGIN original assets are an explicit read-only comparison input.
+    parser.add_argument('--baseline-dual-results', type=Path)
+    parser.add_argument('--baseline-dual-web', type=Path)
+    parser.add_argument('--prediction-resources', type=Path)
+    parser.add_argument('--baseline-prediction-resources', type=Path)
     args = parser.parse_args()
     print(json.dumps(evaluate(args.output, args.destination, old_results=args.old_results,
-                             new_results=args.new_results), ensure_ascii=False, indent=2))
+                             new_results=args.new_results,
+                             baseline_dual_results=args.baseline_dual_results,
+                             baseline_dual_web=args.baseline_dual_web,
+                             prediction_resources=args.prediction_resources,
+                             baseline_prediction_resources=args.baseline_prediction_resources), ensure_ascii=False, indent=2))
+    # END comparison arguments.
 
 
 if __name__ == '__main__':
