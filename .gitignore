@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 runs/
+# BEGIN local dual-view extension products; native sources remain tracked.
+transfer/dual_view/_build_jacobi/
+transfer/dual_view/build-cuda-proposals/
+transfer/dual_view/build-cuda-evidence/
+# END generated extension products.

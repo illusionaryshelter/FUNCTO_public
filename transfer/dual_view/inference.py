@@ -8,23 +8,38 @@ winner supplies an estimated transform, never a physical pose certificate.
 from time import perf_counter
 import numpy as np
 from ..core import TransferConfig, _sampling_parameters
-from ..sim3 import apply_sim3, rank
+from ..sim3 import rank
 from . import geometry
 from .features import capacity_score
 from .proposals import build_proposals, transform_key
-from .refinement import partial_refits
 
 # BEGIN local-region decision and observed-support objective revision.
 SCHEME = 'dual_view_observed_partial'
 DISPLAY_DIAGNOSTIC_LIMIT = 6
 
 
+# BEGIN array-wise finite output conversion.
 def _finite_list(value):
-    """Keep unknown measurements null instead of inventing finite raw scores."""
+    """Convert real numeric arrays without scalar Python recursion.
+
+    Current callers supply FP64 measured-response arrays. Each finite value
+    becomes a Python float, including the original sign of zero; each NaN or
+    infinity becomes None. No reduction, score arithmetic or sorting occurs.
+    The scalar branch is retained because the private helper also accepts a
+    scalar; it is the original scalar expression, not a fallback algorithm.
+    """
     value = np.asarray(value)
     if value.ndim == 0:
         return float(value) if np.isfinite(value) else None
-    return [_finite_list(row) for row in value]
+    # Preserve the original zero-dimensional float conversion even for real
+    # extended precision and invalid complex/date input. astype(float) would
+    # introduce overflow warnings/np.seterr failures for finite longdouble.
+    finite = np.isfinite(value)
+    result = np.full(value.shape, None, dtype=object)
+    result[finite] = [float(np.asarray(item)) for item in value[finite]]
+    return result.tolist()
+
+# END exact float/null values and signed zeros.
 
 
 def _support_summary(support):
@@ -42,23 +57,11 @@ def _region_summary(mode):
         'diagnostics': mode['diagnostics']}
 
 
-def _capacity_inputs(surface, sampled, calibrated):
-    """Bind each camera score to that same camera's measured surface element."""
-    raw = np.asarray(sampled['view_scores'], dtype=float)
-    available = np.asarray(sampled['view_valid'], dtype=bool)
-    if raw.ndim != 2 or raw.shape[1] != 2 or available.shape != raw.shape:
-        raise ValueError('Paired scoring requires [Q,2] original-view evidence')
-    utility = calibrated.utility(raw, np.arange(len(raw))[:, None])
-    ids = np.full(raw.shape, -1, dtype=np.int64)
-    for v, projection in enumerate(sampled['geometry']):
-        observation = np.asarray(projection['observation_indices'])
-        valid = available[:, v] & (observation >= 0)
-        ids[valid, v] = surface['observation_to_element'][observation[valid]]
-    return np.where(available & (ids >= 0), utility, np.nan), ids
 
-
-def infer(source_pack, surface, appearance, *, initial_transforms=(),
-          prepared_domain=None, sampling_radius_m=.03, sampling_spacing_m=.005):
+# BEGIN selected CUDA evidence with explicit per-inference work ownership.
+def _infer(source_pack, surface, appearance, *, initial_transforms=(),
+          prepared_domain=None, sampling_radius_m=.03, sampling_spacing_m=.005,
+          region_scope, work_stats):
     """Evaluate every native, grown and fixed-partial-fit finite candidate.
 
     A fixed empirical response reference and fixed query denominator make
@@ -66,6 +69,8 @@ def infer(source_pack, surface, appearance, *, initial_transforms=(),
     This fact does not establish descriptor identity or scale/rotation accuracy.
     """
     started = perf_counter()
+    from .candidate_events import candidate_events, validate_appearance
+    batch_stats = work_stats['batch']
     _sampling_parameters(sampling_radius_m, sampling_spacing_m)
     queries = np.asarray(source_pack['query_xyz'], dtype=float)
     regional = np.asarray(source_pack['query_region'], dtype=bool)
@@ -118,30 +123,29 @@ def infer(source_pack, surface, appearance, *, initial_transforms=(),
         timing['total'] = perf_counter()-started
         return result
     diagnostic['source_model_applicable'] = True
+    validate_appearance(appearance, surface)
     hypotheses, seen = [], {}
 
-    def evaluate(transform, origins, domain):
+    def evaluate(transform, origins, domain, prepared):
         key = transform_key(transform)
         if key in seen:
             hypotheses[seen[key]]['summary']['origins'].extend(origins)
             return
         begin = perf_counter()
-        mapped, oriented = apply_sim3(queries, *transform), normals @ transform[1].T
+        mapped, oriented = prepared['query_points'], prepared['query_normals']
         part = perf_counter()
-        sampled = appearance.sample(mapped, oriented, query_rows=np.arange(q))
+        sampled = prepared['sampled']
         # Feature sampling already performed the exact original-depth checks.
         # Reusing them preserves oriented geometry even for RGB-only rows.
         support = geometry.combine_support(sampled['geometry'])
         timing['query_sampling'] += perf_counter()-part
         part = perf_counter()
-        checks = geometry.geometry_support(surface,
-            apply_sim3(source_pack['check_xyz'], *transform),
-            np.asarray(source_pack['check_normals']) @ transform[1].T)
-        center, normal = apply_sim3(source_pack['center'], *transform), transform[1] @ source_pack['normal']
-        center_support = geometry.geometry_support(surface, center[None], normal[None])
+        checks = geometry.combine_support(prepared['check_projection'])
+        center, normal = prepared['center'], prepared['normal']
+        center_support = geometry.combine_support(prepared['center_projection'])
         timing['independent_geometry'] += perf_counter()-part
         part = perf_counter()
-        utilities, element_ids = _capacity_inputs(surface, sampled, domain['empirical_support'])
+        utilities, element_ids = prepared['utilities'], prepared['elements']
         evidence = capacity_score(utilities, element_ids)
         timing['capacity_assignment'] += perf_counter()-part
         local_rows = np.flatnonzero(regional & support['support'])
@@ -157,8 +161,8 @@ def infer(source_pack, surface, appearance, *, initial_transforms=(),
             (rank(queries[local_rows])[0] < 2, 'supported_region_rank_below_two'),
             (not local_evidence, 'no_positive_region_appearance')) if violated]
         part = perf_counter()
-        mode, reason = geometry.region_for_transform(surface, source_pack, transform,
-            prepared_domain=domain, **sampling)
+        mode, reason = geometry._region_from_supported_center(surface, center, normal, center_support,
+            prepared_domain=domain, region_scope=region_scope, **sampling)
         timing['region_construction'] += perf_counter()-part
         ambiguous = reason == 'center_projection_ambiguous'
         if reason is not None and not ambiguous:
@@ -204,7 +208,7 @@ def infer(source_pack, surface, appearance, *, initial_transforms=(),
 
     def reconstruct(h, domain, kind):
         mode, reason = geometry.region_for_transform(surface, source_pack, h['transform'],
-            prepared_domain=domain, **sampling)
+            prepared_domain=domain, region_scope=region_scope, **sampling)
         if reason is not None:
             raise RuntimeError('Frozen candidate region could not be reconstructed')
         mode.update(type=kind, hypothesis_index=h['summary']['hypothesis_id'], score=h['summary']['score'])
@@ -214,22 +218,26 @@ def infer(source_pack, surface, appearance, *, initial_transforms=(),
         diagnostic.update(search_stage='target_domain_and_finite_proposals', search_status='running')
         part = perf_counter()
         proposals, proposal_report, domain = build_proposals(source_pack, surface, appearance,
-            initial_transforms=initial_transforms, prepared_domain=prepared_domain)
+            initial_transforms=initial_transforms, prepared_domain=prepared_domain,
+            work_stats=work_stats['proposals'])
         timing['proposals'] = perf_counter()-part
         diagnostic['proposals'] = proposal_report
         diagnostic['appearance_reference'] = domain['empirical_support'].diagnostics
         diagnostic['search_stage'] = 'local_geometry_observed_score_and_partial_refits'
-        for proposal in proposals:
-            evaluate(proposal['transform'], proposal['origins'], domain)
-            part = perf_counter()
-            refined, report = partial_refits(source_pack, surface, domain, proposal)
-            timing['partial_refinement'] += perf_counter()-part
-            diagnostic['refinement_records'].append(report)
-            diagnostic['refit_attempts'] += 1
-            diagnostic['refit_retained_count'] += len(refined)
-            diagnostic['refit_unavailable_count'] += int(not refined)
-            for candidate in refined:
-                evaluate(candidate['transform'], candidate['origins'], domain)
+        # BEGIN commit the same parent/refit events after bounded CUDA work.
+        for event in candidate_events(proposals, source_pack, surface, domain, seen,
+                                      appearance, batch_stats, work_stats['evidence']):
+            if event['kind'] == 'evaluate':
+                evaluate(event['transform'], event['origins'], domain, event['prepared'])
+            elif event['kind'] == 'refinement':
+                timing['partial_refinement'] += event['seconds']
+                diagnostic['refinement_records'].append(event['report'])
+                diagnostic['refit_attempts'] += 1
+                diagnostic['refit_retained_count'] += event['retained']
+                diagnostic['refit_unavailable_count'] += int(not event['retained'])
+            else:
+                raise event['error']
+        # END candidate scores, decisions and diagnostic order are unchanged.
         part = perf_counter()
         admitted = [h for h in hypotheses if h['summary']['admitted_to_H']]
         diagnostic.update(search_stage='observed_region_decision',
@@ -327,4 +335,31 @@ def infer(source_pack, surface, appearance, *, initial_transforms=(),
     timing['total'] = perf_counter()-started
     diagnostic['decision_status'] = result['status']
     return result
+# END selected evaluator; original decision, warnings and interruption semantics.
 # END local-region observed-evidence decision; no retired latent-score path.
+
+
+# BEGIN one synchronous inference owns all mutable region/projection work.
+def infer(source_pack, surface, appearance, *, initial_transforms=(),
+          prepared_domain=None, sampling_radius_m=.03, sampling_spacing_m=.005,
+          work_stats=None):
+    """Run the selected CUDA/CPU estimator, retaining explicit failure states.
+
+    The optional work mapping receives counters only; it supplies no cached
+    prediction. Region subsets are released before this call returns.
+    """
+    from .region_scope import RegionScope
+    work = dict(proposals={}, batch=[], evidence={}, region={})
+    scope = RegionScope(geometry.sample_region)
+    try:
+        return _infer(source_pack, surface, appearance,
+            initial_transforms=initial_transforms, prepared_domain=prepared_domain,
+            sampling_radius_m=sampling_radius_m, sampling_spacing_m=sampling_spacing_m,
+            region_scope=scope, work_stats=work)
+    finally:
+        work['region'] = dict(scope.counts)
+        scope.close()
+        if work_stats is not None:
+            work_stats.clear()
+            work_stats.update(work)
+# END no inference-local geometry or response survives in module globals.

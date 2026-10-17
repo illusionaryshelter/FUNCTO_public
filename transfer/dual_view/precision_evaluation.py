@@ -125,14 +125,31 @@ def _comparison_inputs(output, baseline, baseline_web):
     for key in ('declared_task_ids', 'backends', 'sampling'):
         if trial[key] != previous[key]:
             raise ValueError(f'Precision comparison requires identical {key}')
-    for key in ('index', 'cache_root'):
+    # BEGIN current inference has observed inputs, not a prediction cache root.
+    for key in ('index',):
         if Path(trial[key]).resolve() != Path(previous[key]).resolve():
             raise ValueError(f'Precision comparison requires identical {key}')
     previous_tasks = {state['id']: state for state in previous['tasks']}
     for state in trial['tasks']:
         other = previous_tasks[state['id']]
-        if state['cases'] != other['cases'] or state.get('surface_directory') != other.get('surface_directory'):
-            raise ValueError('Precision comparison requires identical camera cases and target surface cache')
+        if state['cases'] != other['cases']:
+            raise ValueError('Precision comparison requires identical camera cases')
+        left, right = state.get('surface_directory'), other.get('surface_directory')
+        if left != right:
+            if left is None or right is None:
+                raise ValueError('Precision comparison requires the same available target surface')
+            left, right = Path(left), Path(right)
+            if json.loads((left/'surface.json').read_text()) != json.loads((right/'surface.json').read_text()):
+                raise ValueError('Precision comparison requires identical surface metadata')
+            with np.load(left/'surface.npz', allow_pickle=False) as a, \
+                 np.load(right/'surface.npz', allow_pickle=False) as b:
+                if set(a.files) != set(b.files):
+                    raise ValueError('Precision comparison requires identical surface arrays')
+                for name in a.files:
+                    x, y = a[name], b[name]
+                    if x.dtype != y.dtype or x.shape != y.shape or x.tobytes() != y.tobytes():
+                        raise ValueError('Precision comparison changed target surface: '+name)
+    # END separately saved surfaces must contain exactly the same measurements.
     evaluation = json.loads((baseline_web/'evaluation.json').read_text())
     if (Path(evaluation['prediction_index']).resolve() != baseline/'predictions.json'
             or evaluation.get('read_after_all_predictions_frozen') is not True):
@@ -227,7 +244,9 @@ def evaluate(output, destination, *, baseline_results, baseline_web,
         card = {'id': state['id'], 'source': None, 'methods': []}
         cards.append(card)
         try:
-            loaded = load_observations(record['index'], task, record['cache_root'])
+            # BEGIN current observations do not require historical prediction caches.
+            loaded = load_observations(record['index'], task)
+            # END observation-only loading.
         except Exception as error:
             # Broken observation bindings cannot silently shrink the comparison.
             reason = f'evaluation_observation_binding_failed:{type(error).__name__}:{error}'

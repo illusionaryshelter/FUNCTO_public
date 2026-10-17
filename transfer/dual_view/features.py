@@ -168,12 +168,15 @@ def capacity_score(view_utilities, view_element_ids):
     costs = np.full((q, len(domain) + q), np.inf)
     costs[:, len(domain):] = 1.
     edge_views = np.full((q, len(domain)), -1, dtype=np.int64)
-    for row, view in zip(*np.nonzero(positive)):
-        column = int(np.searchsorted(domain, elements[row, view]))
-        cost = 1. - utility[row, view]
-        # Stable camera order resolves equal utilities without changing J.
-        if cost < costs[row, column]:
-            costs[row, column], edge_views[row, column] = cost, view
+    # BEGIN independent row writes with original first-camera tie ownership.
+    for view in range(utility.shape[1]):
+        rows = np.flatnonzero(positive[:, view])
+        columns = np.searchsorted(domain, elements[rows, view])
+        values = 1. - utility[rows, view]
+        replace = values < costs[rows, columns]
+        costs[rows[replace], columns[replace]] = values[replace]
+        edge_views[rows[replace], columns[replace]] = view
+    # END no floating reduction or LAP column order changes.
     rows, columns = linear_sum_assignment(costs)
     real = columns < len(domain)
     matched_rows, matched_columns = rows[real], columns[real]

@@ -1,16 +1,18 @@
-"""Synthetic integration checks for local validity and observed-support choice.
+"""Finite-proposal coverage and CPU decision tests at the candidate-event API.
 
-These tests use real RGB-D plane projection and region sampling. Mock proposal
-lists isolate decisions from stochastic recall; the final test executes actual
-finite proposals and partial fitting. No fixture names or evaluation truth enter.
+ProposalTests retains the actual CUDA proposal path. InferenceTests explicitly
+supplies prepared CPU test evidence at candidate_events, while exercising real
+capacity assignment, geometry gates, region reconstruction and final decisions.
+This test boundary is not a production backend or a CUDA failure substitute.
 """
 import unittest
 from unittest.mock import patch
 import numpy as np
-from . import geometry, inference
+from . import candidate_events, geometry, inference
+from .features import ResponseField
 from .proposals import (FIT_BUDGET, GROWTH_BUDGET, build_proposals,
                         prefix_length, rank_domain)
-from .test_geometry import _surface
+from .test_geometry import _observation, _surface
 
 IDENTITY = (1., np.eye(3), np.zeros(3))
 
@@ -63,6 +65,60 @@ class AnalyticAppearance:
             view_valid=valid, view_state=states, reason_counts=reasons, geometry=projections)
 
 
+# BEGIN explicit fixtures for the prepared-event decision boundary.
+def _decision_surface():
+    """Build a small CPU reference plane without invoking the selected backend.
+
+    The old geometry implementation is used solely to construct test inputs.
+    No production function is patched to fall back after a device error.
+    """
+    from ..multiview_geometry import build_target_surface as reference_surface
+    views = []
+    for name in ('A', 'B'):
+        depth = np.ones((13, 13))
+        observed = _observation(depth)
+        views.append(dict(id=name, depth_m=depth, K=observed['K'],
+            T_world_camera_cv=observed['T_world_camera_cv'], observation=observed))
+    return reference_surface(views)
+
+
+def _response_field(surface, count):
+    """Keep the real sampling contract; event fixtures supply measured values.
+
+    Its sample method is never overridden. The analytic test oracle below is
+    deliberately separate and is not passed to the production CUDA evaluator.
+    """
+    queries = np.eye(count, dtype=np.float32)
+    observed = _observation(np.ones((13, 13)))
+    records = [dict(id=name, response=np.zeros((count, 2, 2), np.float32),
+        crop_xyxy=np.array([0, 0, 13, 13]), observation=observed,
+        query_descriptors=queries) for name in surface['view_ids']]
+    return ResponseField(surface, queries, records)
+
+
+def _prepared_decision_event(source, surface, oracle, domain, transform):
+    """Create input facts only; the actual infer still owns all decisions."""
+    prepared = candidate_events._mapped_candidate(source, transform)
+    count = len(source['query_xyz'])
+    sampled = oracle.sample(prepared['query_points'], prepared['query_normals'],
+                            query_rows=np.arange(count))
+    utilities = domain['empirical_support'].utility(sampled['view_scores'], np.arange(count)[:, None])
+    elements = np.full((count, 2), -1, dtype=np.int64)
+    for view, projection in enumerate(sampled['geometry']):
+        ids = projection['observation_indices']
+        valid = sampled['view_valid'][:, view] & (ids >= 0)
+        elements[valid, view] = surface['observation_to_element'][ids[valid]]
+    utilities = np.where(sampled['view_valid'] & (elements >= 0), utilities, np.nan)
+    for role, points, normals in (
+            ('check', prepared['check_points'], prepared['check_normals']),
+            ('center', prepared['center'][None], prepared['normal'][None])):
+        prepared[role+'_projection'] = [geometry.project_oriented(surface, points, normals, view)
+                                        for view in range(2)]
+    prepared.update(sampled=sampled, utilities=utilities, elements=elements)
+    return prepared
+# END no test-only evaluator is reachable from the production pipeline.
+
+
 class ProposalTests(unittest.TestCase):
     def setUp(self):
         self.surface = _surface()
@@ -104,16 +160,36 @@ class ProposalTests(unittest.TestCase):
 
 class InferenceTests(unittest.TestCase):
     def setUp(self):
-        self.surface = _surface()
+        self.surface = _decision_surface()
         self.source = _source(self.surface)
 
-    def run_candidates(self, *transforms, **appearance_options):
-        appearance = AnalyticAppearance(self.source,self.surface,**appearance_options)
-        domain = rank_domain(self.source,self.surface,appearance)[4]
+    def run_candidates(self, *transforms, children=(), event_error=None, **appearance_options):
+        oracle = AnalyticAppearance(self.source,self.surface,**appearance_options)
+        appearance = _response_field(self.surface, len(self.source['query_xyz']))
+        domain = rank_domain(self.source,self.surface,oracle)[4]
+        domain['input_binding'] = self.source, self.surface, appearance
         proposals = [dict(transform=t, origins=[{'origin':'test_native'}], proposal_id=i)
                      for i,t in enumerate(transforms)]
+
+        def events(proposals_arg, source, surface, domain_arg, seen, field, stats, evidence_stats):
+            self.assertIs(field, appearance)
+            self.assertIs(domain_arg, domain)
+            for index, proposal in enumerate(proposals_arg):
+                yield dict(kind='evaluate', transform=proposal['transform'], origins=proposal['origins'],
+                    prepared=_prepared_decision_event(source, surface, oracle, domain, proposal['transform']))
+                if event_error is not None:
+                    yield dict(kind='error', error=event_error)
+                    return
+                refined = children if index == 0 else ()
+                yield dict(kind='refinement', report={'parent_proposal_id': index},
+                           seconds=0., retained=len(refined))
+                for transform in refined:
+                    yield dict(kind='evaluate', transform=transform,
+                        origins=[{'origin': 'test_refit', 'parent_proposal_id': index}],
+                        prepared=_prepared_decision_event(source, surface, oracle, domain, transform))
+
         with patch.object(inference,'build_proposals',return_value=(proposals,{},domain)), \
-             patch.object(inference,'partial_refits',return_value=([],{})):
+             patch.object(candidate_events,'candidate_events',side_effect=events):
             return inference.infer(self.source,self.surface,appearance,prepared_domain=domain)
 
     def test_single_finite_winner_is_an_estimate_not_a_pose_certificate(self):
@@ -187,12 +263,12 @@ class InferenceTests(unittest.TestCase):
 
     def test_equal_best_ambiguous_center_remains_unresolved(self):
         moved = (1.,np.eye(3),np.array([1/256,0.,0.]))
-        original = geometry.region_for_transform
-        def ambiguous(surface,source,transform,**kwargs):
-            if transform[2][0] != 0:
+        original = geometry._region_from_supported_center
+        def ambiguous(surface,center,normal,support,**kwargs):
+            if center[0] != 0:
                 return None,'center_projection_ambiguous'
-            return original(surface,source,transform,**kwargs)
-        with patch.object(geometry,'region_for_transform',side_effect=ambiguous):
+            return original(surface,center,normal,support,**kwargs)
+        with patch.object(geometry,'_region_from_supported_center',side_effect=ambiguous):
             result = self.run_candidates(IDENTITY,moved,paired_ties=True)
         self.assertFalse(result['accepted'])
         self.assertIn('center_projection_ambiguous',result['reasons'])
@@ -206,19 +282,46 @@ class InferenceTests(unittest.TestCase):
     def test_interruption_never_inherits_acceptance(self):
         with patch.object(inference,'build_proposals',side_effect=InterruptedError('test')):
             result = inference.infer(self.source,self.surface,
-                AnalyticAppearance(self.source,self.surface))
+                _response_field(self.surface, len(self.source['query_xyz'])))
         self.assertFalse(result['accepted'])
         self.assertEqual(result['status'],'search_incomplete')
 
-    def test_end_to_end_records_all_original_and_partial_fit_candidates(self):
-        result = inference.infer(self.source,self.surface,AnalyticAppearance(self.source,self.surface),
-            initial_transforms=[dict(transform=IDENTITY,origin='native_test',view_index=0)])
+    def test_event_interruption_keeps_completed_prefix_without_acceptance(self):
+        for error in (MemoryError('device resource boundary'), InterruptedError('event interruption')):
+            with self.subTest(error=type(error).__name__):
+                result = self.run_candidates(IDENTITY, event_error=error)
+                self.assertEqual(len(result['diagnostic_hypotheses']), 1)
+                self.assertFalse(result['accepted'])
+                self.assertEqual(result['status'], 'search_incomplete')
+                self.assertEqual(result['modes'], [])
+                self.assertIsNone(result['sim3_scale'])
+                self.assertEqual(result['diagnostics']['refit_attempts'], 0)
+
+    def test_parent_refit_and_duplicate_events_preserve_bookkeeping(self):
+        right = (1.,np.eye(3),np.array([1/1024,0.,0.]))
+        left = (1.,np.eye(3),np.array([-1/1024,0.,0.]))
+        result = self.run_candidates(IDENTITY, children=(right, left, IDENTITY))
         self.assertEqual(result['diagnostics']['search_status'],'finite_domain_complete')
         self.assertTrue(result['accepted'])
-        self.assertEqual(result['diagnostics']['evaluated_transform_count'],
-                         len(result['diagnostic_hypotheses']))
+        self.assertEqual(result['diagnostics']['evaluated_transform_count'], 3)
+        self.assertEqual(len(result['diagnostic_hypotheses']), 3)
         self.assertTrue(all(len(h['scores'])==12 for h in result['diagnostic_hypotheses']))
-        self.assertGreater(result['diagnostics']['refit_retained_count'],0)
+        self.assertEqual(result['diagnostics']['refit_retained_count'], 3)
+        self.assertEqual(result['diagnostics']['refit_attempts'], 1)
+        self.assertEqual([row['origin'] for row in result['diagnostic_hypotheses'][0]['origins']],
+                         ['test_native', 'test_refit'])
+
+    def test_custom_sampler_is_not_silently_used_as_a_cuda_contract(self):
+        with self.assertRaisesRegex(ValueError, 'unmodified bound ResponseField'):
+            inference.infer(self.source, self.surface, AnalyticAppearance(self.source, self.surface))
+
+    def test_missing_source_exits_before_candidate_sampling(self):
+        self.source['reasons'] = ['missing_source_test']
+        with patch.object(candidate_events, 'candidate_events') as events:
+            result = inference.infer(self.source, self.surface, None)
+        events.assert_not_called()
+        self.assertEqual(result['status'], 'missing_input')
+        self.assertEqual(result['reasons'], ['missing_source_test'])
 
 
 if __name__ == '__main__':

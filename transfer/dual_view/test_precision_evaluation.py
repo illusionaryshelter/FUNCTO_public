@@ -30,7 +30,7 @@ class PrecisionTests(unittest.TestCase):
             web.mkdir()
             record = {'declared_task_ids': ['one'], 'backends': ['ransac'],
                       'sampling': {'sampling_radius_m': .03}, 'index': str(root/'index'),
-                      'cache_root': str(root/'cache'), 'tasks': [{'id': 'one', 'cases': ['camera'],
+                      'tasks': [{'id': 'one', 'cases': ['camera'],
                                                                'surface_directory': 'fixed'}]}
             _dump(web/'evaluation.json', {'prediction_index': str(baseline/'predictions.json'),
                 'read_after_all_predictions_frozen': True,
@@ -39,7 +39,7 @@ class PrecisionTests(unittest.TestCase):
                 _comparison_inputs(root/'trial', baseline, web)
             self.assertEqual(freeze.call_count, 2)
             for field, changed in (('declared_task_ids', ['another']), ('backends', ['teaserpp']),
-                                   ('sampling', {'sampling_radius_m': .06}), ('cache_root', 'different'),
+                                   ('sampling', {'sampling_radius_m': .06}), ('index', 'different'),
                                    ('tasks', [{'id': 'one', 'cases': ['other'], 'surface_directory': 'fixed'}])):
                 old = copy.deepcopy(record)
                 old[field] = changed
@@ -47,6 +47,31 @@ class PrecisionTests(unittest.TestCase):
                      patch(module+'read_archive', side_effect=AssertionError('Truth must not open')), \
                      self.assertRaises(ValueError):
                     _comparison_inputs(root/'trial', baseline, web)
+
+    # BEGIN fresh-output surface identity, independent of directory identity.
+    def test_separately_saved_surfaces_require_exact_array_identity(self):
+        module = 'transfer.dual_view.precision_evaluation.'
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            left, right, web = root/'left', root/'right', root/'web'
+            for path in (left, right, web):
+                path.mkdir()
+            for path in (left, right):
+                _dump(path/'surface.json', {'view_ids': ['A', 'B']})
+                np.savez_compressed(path/'surface.npz', xyz=np.array([[0., 0., 1.]]))
+            record = dict(declared_task_ids=['one'], backends=['teaserpp'], sampling={},
+                index=str(root/'index'), tasks=[dict(id='one', cases=['camera'], surface_directory=str(left))])
+            other = copy.deepcopy(record)
+            other['tasks'][0]['surface_directory'] = str(right)
+            _dump(web/'evaluation.json', dict(prediction_index=str(right/'predictions.json'),
+                read_after_all_predictions_frozen=True,
+                rows=[dict(scheme='dual', task='one', backend='teaserpp')]))
+            with patch(module+'frozen_index', side_effect=[record, other]):
+                _comparison_inputs(left, right, web)
+            np.savez_compressed(right/'surface.npz', xyz=np.array([[0., 0., 1.000001]]))
+            with patch(module+'frozen_index', side_effect=[record, other]), self.assertRaises(ValueError):
+                _comparison_inputs(left, right, web)
+    # END no approximate surface comparison is admitted before truth reads.
 
     def test_rejected_diagnostic_and_affine_rotation_do_not_enter_sim3_success_domain(self):
         rows = []
@@ -154,7 +179,9 @@ class PrecisionTests(unittest.TestCase):
                 }.items():
                     stack.enter_context(patch(module+name, return_value=value))
                 stack.enter_context(patch('transfer.dual_view.evaluation.evaluate_prediction', return_value=metric))
-                stack.enter_context(patch(module+'load_observations', side_effect=lambda _, task, __: loaded[task['id']]))
+                # BEGIN observation-only loader no longer takes a prediction cache.
+                stack.enter_context(patch(module+'load_observations', side_effect=lambda _, task: loaded[task['id']]))
+                # END preserve the same two-task observation fixture.
                 source = stack.enter_context(patch(module+'source_picture', return_value=Image.new('RGB', (4, 4))))
                 answer = evaluate(trial, destination, baseline_results=baseline, baseline_web=web)
             self.assertEqual(source.call_count, 2)

@@ -1,12 +1,13 @@
-"""Observed inputs for the third, independent dual-view transfer scheme.
+"""Observed inputs for the selected TEASER++ dual-view transfer scheme.
 
 An index supplies frame/crop/cache paths; no task identity changes computation.
-Historical single-view results supply frozen correspondence IDs only. Their
-acceptance decisions, target annotations and ranked costs are never consulted.
+Correspondences are calculated from current features by the numerical pipeline;
+historical predictions and target annotations are not required inputs.
 """
 
 import json
 from pathlib import Path
+import zipfile
 
 import numpy as np
 
@@ -15,10 +16,12 @@ from ..experiment import read_archive
 from ..joint_features import source_queries
 from ..multiview_experiment import (_check_observation, _path, _read_frame,
                                     load_surface, read_manifest)
-from ..multiview_geometry import _view_arrays, build_target_surface
+from ..multiview_geometry import _view_arrays
+from .surface import build_target_surface
 
 
-def load_observations(index, task, cache_root):
+# BEGIN current observation loading, independent of historical prediction caches.
+def load_observations(index, task):
     """Bind two target observations to one unchanged source demonstration."""
     path, description = read_manifest(index)
     data = Path(description['data'])
@@ -56,28 +59,17 @@ def load_observations(index, task, cache_root):
         elif not reasons:
             raise ValueError('Missing target preparation must state its reason')
         views.append({'id': case['view'], 'case': case, 'input_dir': str(folder),
-            'cache_dir': str(Path(cache_root).resolve() / case['id']),
             'K': np.asarray(calibration['K']),
             'T_world_camera_cv': np.asarray(calibration['T_world_camera_cv']),
             'depth_m': depth, 'observation': target, 'missing_reasons': reasons,
             'crop_xyxy': chart.get('target_crop_xyxy'), 'frame_dir': str(target_dir),
             'rgb_path': str(target_dir / 'rgb.png')})
     query, region = source_queries(source)
-    # Assert equality with the previously frozen row identities without loading
-    # the old cost matrix. Both current target views must use this same Q.
-    for view in views:
-        if view['observation'] is None:
-            continue
-        cache = Path(view['cache_dir'])
-        frozen = json.loads((cache / 'frozen.json').read_text())
-        if frozen.get('complete') is not True or frozen.get('target_truth_used') is not False:
-            raise ValueError('Correspondence cache is not a completed truth-free prediction')
-        with np.load(cache / 'joint_evidence.npz', allow_pickle=False) as archive:
-            np.testing.assert_array_equal(query, archive['query_indices'])
-            np.testing.assert_array_equal(region, archive['query_region'])
+    # Both target views share these identities derived from the actual source.
     return {'source': source, 'source_depth': source_depth, 'source_rgb': source_rgb,
             'source_crop': source_crop, 'query_indices': query, 'query_region': region,
             'views': views, 'task': task}
+# END source equality is checked on arrays, crop and RGB before query selection.
 
 
 def target_surface(loaded, cached_directory=None):
@@ -152,32 +144,47 @@ def target_surface(loaded, cached_directory=None):
 
 
 # BEGIN observed-support revision: model bounds are no longer the objective.
-def appearance_field(loaded, surface):
-    """Convert one cached feature tensor at a time into compact response maps."""
+def load_feature_pairs(loaded):
+    """Read current feature pairs with an explicit decompressed allocation cap."""
+    pairs = {}
+    for view in loaded['views']:
+        if view['observation'] is None:
+            continue
+        path = Path(view['input_dir']) / 'features.npz'
+        with zipfile.ZipFile(path) as archive:
+            size = sum(archive.getinfo(name+'.npy').file_size
+                       for name in ('feature1', 'feature2'))
+            if size > 512*1024**2:
+                raise MemoryError('One feature pair exceeds the 512 MiB input budget')
+        with np.load(path, allow_pickle=False) as archive:
+            pairs[view['id']] = (archive['feature1'], archive['feature2'])
+    return pairs
+
+
+def appearance_field(loaded, surface, feature_pairs):
+    """Convert this call's resident feature pairs into compact response maps."""
     from .features import ResponseField, prepare_view, source_descriptors
     available = [view for view in loaded['views'] if view['observation'] is not None]
     if not available:
         raise ValueError('No prepared feature pair supplies the fixed source descriptors')
-    with np.load(Path(available[0]['input_dir']) / 'features.npz', allow_pickle=False) as archive:
-        queries = source_descriptors(loaded['source'], loaded['query_indices'],
-                                     archive['feature1'], loaded['source_crop'])
+    queries = source_descriptors(loaded['source'], loaded['query_indices'],
+                                 feature_pairs[available[0]['id']][0], loaded['source_crop'])
     prepared = []
     for view in loaded['views']:
         if view['observation'] is None:
             prepared.append(prepare_view(queries, None, crop_xyxy=None,
                                          observation=None, view_id=view['id']))
             continue
-        with np.load(Path(view['input_dir']) / 'features.npz', allow_pickle=False) as archive:
-            prepared.append(prepare_view(queries, archive['feature2'],
-                crop_xyxy=view['crop_xyxy'], observation=view['observation'], view_id=view['id']))
+        prepared.append(prepare_view(queries, feature_pairs[view['id']][1],
+            crop_xyxy=view['crop_xyxy'], observation=view['observation'], view_id=view['id']))
     return ResponseField(surface, queries, prepared)
 # END observed-support response construction.
 
 
-def native_transforms(loaded, backend):
-    """Compute native proposals from frozen raw pairs, including rejected regions."""
-    if backend not in ('teaserpp', 'ransac'):
-        raise ValueError('Native backend must be teaserpp or ransac')
+# BEGIN fixed TEASER++ registration from newly computed native pairs.
+def native_transforms(loaded, native_pairs):
+    """Compute TEASER++ proposals from this call's actual matching outputs."""
+    backend = 'teaserpp'
     proposals, records = [], []
     for view_index, view in enumerate(loaded['views']):
         record = {'view': view['id'], 'backend': backend, 'available': False}
@@ -185,15 +192,16 @@ def native_transforms(loaded, backend):
         if view['observation'] is None:
             record['reasons'] = list(view['missing_reasons'])
             continue
-        pairs = read_archive(Path(view['cache_dir']) / 'native_pairs.npz')
+        pairs = native_pairs[view['id']]
         anchors = prepare_anchors(loaded['source']['xyz'], view['observation']['xyz'],
             pairs['src_anchor_idx'], pairs['tgt_anchor_idx'], mode='direct',
             registration_algorithm=backend, correspondence_scores=pairs['scores'])
         record.update(reasons=list(anchors.reasons), diagnostics=anchors.diagnostics)
-        # The third scheme validates this transform again against all Q. A
-        # historical anchor/region quality decision must not delete a legal T.
+        # The dual-view estimator validates this transform again against all Q.
+        # An anchor quality decision must not delete a legal native transform.
         if anchors.scale is not None:
             proposals.append({'transform': (anchors.scale, anchors.rotation, anchors.translation),
                               'origin': f'native_{backend}', 'view_index': view_index})
             record['available'] = True
     return proposals, records
+# END unavailable views retain their reasons and never change the backend.

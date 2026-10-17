@@ -274,7 +274,9 @@ def evaluate(output, destination, *, old_results, new_results,
     for state in record['tasks']:
         task = {'id': state['id'], 'cases': state['cases']}
         try:
-            loaded = load_observations(record['index'], task, record['cache_root'])
+            # BEGIN current observations do not require historical prediction caches.
+            loaded = load_observations(record['index'], task)
+            # END observation-only loading.
         except Exception as error:
             # A broken input/cache binding must not remove this task from the
             # report denominator or prevent unrelated tasks from being shown.

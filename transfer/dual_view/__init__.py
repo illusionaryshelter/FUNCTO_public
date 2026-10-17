@@ -1,6 +1,6 @@
-"""Independent two-target-view transfer; old and joint single-view paths stay intact.
+"""TEASER++ dual-view observed-region transfer.
 
-This package owns the continuous-world-query, raw-score fusion experiment.
-It reuses read-only geometry and native registration primitives, but never
-dispatches to an old/new region solver as an acceptance fallback.
+``pipeline.prepare`` loads the installed native runtime. ``pipeline.run``
+accepts current resident observations and features, then computes the selected
+CUDA/CPU estimator without historical prediction inputs.
 """

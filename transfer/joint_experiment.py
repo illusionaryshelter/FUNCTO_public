@@ -1,4 +1,4 @@
-"""Freeze old and independent joint predictions from prepared observed inputs.
+"""Freeze single-view TEASER++ plus six/twelve-point joint predictions.
 
 The JSON index declares pair directories and grouping for cross-view selection.
 This stage never opens evaluation files. Evaluation and HTML belong in a
@@ -14,7 +14,7 @@ from time import perf_counter
 
 import numpy as np
 
-from .core import infer_region, prepare_anchors
+from .core import prepare_anchors
 from .experiment import feature_observation, store_pairs, store_prediction
 from .features import native_region_pairs, write_json
 from .joint_features import appearance_evidence, source_queries
@@ -41,7 +41,7 @@ def block_evaluation_reads():
 
 
 def predict_pair(input_dir, output_dir):
-    """Run fixed old backends and one new matcher on exactly the same RGB-D."""
+    """Run the selected single-view estimator on prepared observed RGB-D."""
     folder, output = Path(input_dir), Path(output_dir)
     output.mkdir(parents=True, exist_ok=False)
     prepared = json.loads((folder/'preparation.json').read_text())
@@ -59,21 +59,18 @@ def predict_pair(input_dir, output_dir):
         (features['feature1'], features['feature2']))
     native_ms = 1000*(perf_counter()-begin)
     store_pairs(output/'native_pairs.npz', native)
-    controls = {**SAMPLING, 'target_pixels': target['pixels'],
-                'source_camera_origin': source['T_world_camera_cv'][:3, 3],
-                'target_camera_origin': target['T_world_camera_cv'][:3, 3]}
+    # BEGIN selected native proposal: TEASER++ shares the 6/12 candidate pool.
+    # Preserve the existing admission condition; no rejected native proposal
+    # can trigger a different registration backend or replace the joint search.
     initial = []
-    for algorithm in ('ransac', 'prosac_lo', 'teaserpp'):
-        start = perf_counter()
-        anchors = prepare_anchors(source['xyz'], target['xyz'], native['src_anchor_idx'],
-            native['tgt_anchor_idx'], mode='direct', registration_algorithm=algorithm,
-            correspondence_scores=native['scores'])
-        result = infer_region(source['region_mask'], anchors, method='direct_local', **controls)
-        result['diagnostics'].update(prediction_ms=1000*(perf_counter()-start),
-                                     native_matching_ms=native_ms, target_truth_used=False)
-        store_prediction(output/f'old_{algorithm}', result, {})
-        if algorithm == 'ransac' and anchors.scale is not None and not anchors.reasons:
-            initial.append((anchors.scale, anchors.rotation, anchors.translation))
+    start = perf_counter()
+    anchors = prepare_anchors(source['xyz'], target['xyz'], native['src_anchor_idx'],
+        native['tgt_anchor_idx'], mode='direct', registration_algorithm='teaserpp',
+        correspondence_scores=native['scores'])
+    native_registration_ms = 1000*(perf_counter()-start)
+    if anchors.scale is not None and not anchors.reasons:
+        initial.append((anchors.scale, anchors.rotation, anchors.translation))
+    # END six/twelve-point generation and the joint decision remain unchanged.
     begin = perf_counter()
     ids, query_region = source_queries(source)
     evidence = appearance_evidence(source, target, features['feature1'], features['feature2'],
@@ -87,10 +84,12 @@ def predict_pair(input_dir, output_dir):
         initial_transforms=initial, sampling_radius_m=SAMPLING['sampling_radius_m'],
         sampling_spacing_m=SAMPLING['sampling_spacing_m'])
     result['diagnostics'].update(prediction_ms=1000*(perf_counter()-begin), matching_ms=matching_ms,
-        native_matching_ms=native_ms, initial_native_consensus_count=len(initial))
+        native_matching_ms=native_ms, initial_native_consensus_count=len(initial),
+        native_backend='teaserpp', native_registration_ms=native_registration_ms,
+        native_registration_reasons=list(anchors.reasons), target_truth_used=False)
     store_prediction(output/'joint', result, {})
     write_json(output/'frozen.json', {'complete': True, 'target_truth_used': False,
-        'algorithms': ['old_ransac', 'old_prosac_lo', 'old_teaserpp', 'joint']})
+        'algorithms': ['joint'], 'native_backend': 'teaserpp'})
     print(json.dumps({'pair': output.name, 'accepted': result['accepted'],
         'reasons': result['reasons'], 'matching_ms': matching_ms,
         'prediction_ms': result['diagnostics']['prediction_ms']}), flush=True)

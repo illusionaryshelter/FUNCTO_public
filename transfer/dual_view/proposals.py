@@ -10,7 +10,6 @@ from time import perf_counter
 
 import numpy as np
 from scipy.spatial import cKDTree
-from scipy.spatial.distance import cdist
 
 from ..sim3 import fit_sim3
 from .features import EmpiricalSupport
@@ -148,7 +147,7 @@ def rank_domain(source_pack, surface, appearance, *, chunk_size=4096):
 
 
 def build_proposals(source_pack, surface, appearance, *, initial_transforms=(),
-                    prepared_domain=None):
+                    prepared_domain=None, work_stats=None):
     """Retain native transforms and execute the one declared finite seed plan.
 
     Every growth attempt and every six/twelve-pair fitting call consumes its
@@ -218,74 +217,11 @@ def build_proposals(source_pack, surface, appearance, *, initial_transforms=(),
     diagnostics.update(ranking)
     target, tree = domain['xyz'], domain['tree']
     proposal_started = perf_counter()
-    rng = np.random.default_rng(SEED)
-    all_rows = np.arange(len(queries))
-    # Source distances are independent of every grown target correspondence.
-    source_distances = cdist(queries, queries)
-    for attempt in range(GROWTH_BUDGET):
-        if diagnostics['proposal_fit_attempts'] >= FIT_BUDGET:
-            break
-        diagnostics['growth_attempts'] += 1
-        if not len(region_rows) or len(queries) < 6 or tree is None:
-            continue
-        first = int(region_rows[attempt % len(region_rows)])
-        second = int(rng.choice(all_rows[all_rows != first]))
-        prefixes = np.asarray([prefix_length(len(row), attempt) for row in order])
-        if attempt == GROWTH_BUDGET - 1:
-            diagnostics['full_domain_prefix_reached'] = bool(
-                np.array_equal(prefixes, [len(row) for row in order]))
-        if not prefixes[first] or not prefixes[second]:
-            continue
-        columns = [int(order[first][rng.integers(prefixes[first])]),
-                   int(order[second][rng.integers(prefixes[second])])]
-        selected_rows = [first, second]
-        source_distance = float(source_distances[first, second])
-        target_distance = float(np.linalg.norm(target[columns[0]] - target[columns[1]]))
-        if columns[0] == columns[1] or min(source_distance, target_distance) <= 0:
-            continue
-        pair_scale = target_distance / source_distance
-        if not MINIMUM_SCALE <= pair_scale <= MAXIMUM_SCALE:
-            continue
-        tolerance = COMPATIBILITY_RATIO * source_size * pair_scale
-        for row in rng.permutation(all_rows[(all_rows != first) & (all_rows != second)]):
-            if not prefixes[row]:
-                continue
-            # Search an enclosing ball around the first chosen target, then
-            # enforce every annulus exactly. nextafter prevents tree boundary
-            # rounding from removing a point that passes the explicit test.
-            expected = pair_scale * source_distances[row, first]
-            outer = np.nextafter(expected + 2 * tolerance, np.inf)
-            candidates = np.asarray(tree.query_ball_point(target[columns[0]], outer,
-                                    workers=1), dtype=np.int64)
-            ranks = inverse[row, candidates]
-            candidates = candidates[(ranks >= 0) & (ranks < prefixes[row])]
-            if not len(candidates):
-                continue
-            compatible = ~np.isin(candidates, columns)
-            for anchor_row, anchor_column in zip(selected_rows, columns):
-                desired = pair_scale * source_distances[row, anchor_row]
-                distance = np.linalg.norm(target[candidates] - target[anchor_column], axis=1)
-                compatible &= np.abs(distance - desired) <= 2 * tolerance
-            candidates = candidates[compatible]
-            if not len(candidates):
-                continue
-            chosen = int(candidates[np.argmin(inverse[row, candidates])])
-            selected_rows.append(int(row))
-            columns.append(chosen)
-            if len(selected_rows) in (6, 12):
-                diagnostics['proposal_fit_attempts'] += 1
-                try:
-                    transform = fit_sim3(queries[selected_rows], target[columns])
-                except (ValueError, np.linalg.LinAlgError):
-                    transform = None
-                if transform is None or not valid_transform(transform):
-                    diagnostics['proposal_fit_failures'] += 1
-                else:
-                    retain(transform, {'origin': f'unified_{len(selected_rows)}_point',
-                        'growth_attempt': attempt, 'query_rows': list(selected_rows),
-                        'surface_ids': ids[columns].tolist(), 'pair_scale': pair_scale})
-            if len(selected_rows) == 12 or diagnostics['proposal_fit_attempts'] >= FIT_BUDGET:
-                break
+    # BEGIN selected exact CUDA growth with original CPU RNG and Sim(3) fits.
+    from .cuda_proposals import execute
+    execute(queries, region_rows, source_size, ids, order, inverse, target, tree,
+            diagnostics, retain, fit_sim3, valid_transform, work_stats)
+    # END all fits and retained provenance keep the original attempt order.
     diagnostics.update(proposal_count=len(proposals),
         proposal_seconds=perf_counter() - proposal_started,
         proposal_search_complete=True,

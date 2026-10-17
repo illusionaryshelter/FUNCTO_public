@@ -1,6 +1,6 @@
-"""Geometry contract for the independent third (dual-view) transfer method.
+"""Observed geometry contract for the selected dual-view transfer method.
 
-The old and joint single-view methods are read-only dependencies.  Complete
+Shared single-view numerical primitives remain read-only dependencies. Complete
 depth provides position evidence, including contradictions; entity masks and
 oriented local planes determine whether a view supports a query.  Missing
 normals never remove a frozen source query or hide a depth contradiction.
@@ -10,7 +10,10 @@ import numpy as np
 from scipy.sparse.csgraph import connected_components
 
 from ..core import (TransferConfig, _indices, _mask, _plane, _same_seed_plane,
-                    _sampling_parameters, _surface_geometry, fps_indices)
+                    _sampling_parameters, fps_indices)
+# BEGIN selected CUDA image geometry; camera projection below remains explicit CPU.
+from .image_geometry import surface_geometry as _surface_geometry
+# END source normals use the same selected Jacobi implementation as target normals.
 from ..multiview_geometry import (STATE_NAMES, _view_arrays, build_target_surface,
                                   project_observations, sample_region)
 from ..sim3 import _points, apply_sim3, rms_size
@@ -229,43 +232,20 @@ def _same_tied_patch(surface, eligible, tied, config):
 
 
 # BEGIN exact spatial bounds avoid repeated full-entity region scans.
+# BEGIN explicit scope ownership for bounded region sampling.
 def _sample_bounded_region(surface, domain, normal, seed, *, sampling_radius_m,
-                           sampling_spacing_m, config):
-    """Run the existing sampler on a provably enclosing induced subgraph.
-
-    The original sampler requires |height| <= slab and tangent <= radius.
-    Therefore every member is within sqrt(slab**2 + radius**2) of the seed,
-    even for the sampler's clipped squared-tangent arithmetic. This ball only
-    accelerates enumeration: all original normal, slab, tangent, connectivity
-    and farthest-sampling operations still run unchanged on its sorted IDs.
-    """
-    thickness = config.surface_height_spacing_factor * surface["spacing"][seed]
-    tangent_limit = sampling_radius_m * (1 + 1e-12)
-    # Outward arithmetic guard enlarges only the query superset. It does not
-    # relax the original sampler's slab/radius membership predicates.
-    radius = np.nextafter(np.hypot(tangent_limit, thickness)
-                          * (1 + 8*np.finfo(float).eps), np.inf)
-    columns = domain["tree"].query_ball_point(surface["xyz"][seed], radius, workers=1)
-    members = np.sort(domain["surface_ids"][np.asarray(columns, dtype=np.int64)])
-    local_seed = int(np.searchsorted(members, seed))
-    if local_seed == len(members) or members[local_seed] != seed:
-        raise RuntimeError("The enclosing region query lost its own seed")
-    bounded = {key: surface[key][members]
-               for key in ("xyz", "normals", "spacing", "valid", "entity_member")}
-    bounded["adjacency"] = surface["adjacency"][members][:, members]
-    eligible = bounded["normals"] @ normal >= config.normal_min_agreement
-    mode = sample_region(bounded, eligible, local_seed,
+                           sampling_spacing_m, config, region_scope=None):
+    """Sample the exact enclosing subgraph, optionally sharing call-local work."""
+    from .region_scope import RegionScope
+    scope = RegionScope(sample_region) if region_scope is None else region_scope
+    return scope.sample(surface, domain, normal, seed,
         sampling_radius_m=sampling_radius_m, sampling_spacing_m=sampling_spacing_m,
         config=config)
-    mask = np.zeros(len(surface["xyz"]), bool)
-    mask[members[mode["mask"]]] = True
-    mode.update(seed_index=int(members[mode["seed_index"]]), mask=mask,
-                sample_indices=members[mode["sample_indices"]])
-    return mode
+# END no module-level or cross-inference geometry cache.
 
 
 def region_for_transform(surface, source_pack, transform, *, sampling_radius_m=.03,
-                         sampling_spacing_m=.005, config=None, prepared_domain=None):
+                         sampling_spacing_m=.005, config=None, prepared_domain=None, region_scope=None):
     """Project a supported mapped center once, then sample its nearest real seed.
 
     A farther seed is never tried to rescue an unsampleable nearest point. Exact
@@ -278,6 +258,17 @@ def region_for_transform(surface, source_pack, transform, *, sampling_radius_m=.
     center = apply_sim3(source_pack["center"], *transform)
     normal = np.asarray(transform[1]) @ source_pack["normal"]
     support = geometry_support(surface, center[None], normal[None])
+    return _region_from_supported_center(surface, center, normal, support,
+        sampling_radius_m=sampling_radius_m, sampling_spacing_m=sampling_spacing_m,
+        config=geo, prepared_domain=prepared_domain, region_scope=region_scope)
+
+
+def _region_from_supported_center(surface, center, normal, support, *,
+        sampling_radius_m=.03, sampling_spacing_m=.005, config=None,
+        prepared_domain=None, region_scope=None):
+    """Use this candidate's already computed center and original-depth support."""
+    geo = _config(config)
+    _sampling_parameters(sampling_radius_m, sampling_spacing_m)
     if support["conflict"][0]:
         return None, "center_geometry_model_conflict"
     if not support["support"][0]:
@@ -330,7 +321,7 @@ def region_for_transform(surface, source_pack, transform, *, sampling_radius_m=.
     else:
         mode = _sample_bounded_region(surface, prepared_domain, normal, seed,
             sampling_radius_m=sampling_radius_m,
-            sampling_spacing_m=sampling_spacing_m, config=geo)
+            sampling_spacing_m=sampling_spacing_m, config=geo, region_scope=region_scope)
     if not _sampleable(mode, geo):
         return None, "little_visible_target_support"
     mode.update(mapped_center=center, mapped_normal=normal)
