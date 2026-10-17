@@ -11,6 +11,10 @@ estimator. Plane slabs are a discrete association model based on pixel spacing,
 not calibrated sensor uncertainty or a free-space certificate.
 """
 
+# BEGIN scalar nextafter handles an overflowing bound without NumPy warnings.
+import math
+# END floating-point bound dependency.
+
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -192,6 +196,34 @@ def _adjacency(surface, config):
     return graph
 
 
+# BEGIN radius-bounded exact search with the original nearest-neighbor tie rule.
+def _nearest_within_radius(tree, points, radius):
+    """Return eligible nearest measurements without searching distant regions.
+
+    SciPy squares a Euclidean query bound and compares squared distances
+    strictly, whereas pairing tests the returned square root with ``<=``.
+    A normal-range squared floor prevents underflow from rejecting coincident
+    points. Two outward floating-point steps cover square-root and bound-square
+    rounding; the caller still applies the unchanged physical radius.
+
+    Pruning can reorder equal-distance KD-tree nodes. Querying two neighbors
+    detects an ambiguous minimum; only those eligible queries repeat the
+    original unbounded k=1 search on the same tree to preserve its chosen index.
+    Equal rounded square roots conservatively trigger the same treatment even
+    when the internal squared distances differ. Outside-radius measurements
+    need no index identity because they cannot participate in a paired element.
+    """
+    base = max(float(radius), math.sqrt(np.finfo(float).tiny))
+    upper = math.nextafter(math.nextafter(base, math.inf), math.inf)
+    distances, indices = tree.query(points, k=2, distance_upper_bound=upper, workers=1)
+    distance, nearest = distances[:, 0], indices[:, 0]
+    ambiguous = (distance <= radius) & (distance == distances[:, 1])
+    if np.any(ambiguous):
+        distance[ambiguous], nearest[ambiguous] = tree.query(points[ambiguous], workers=1)
+    return distance, nearest
+# END bounded search; no point, physical threshold, or tie rule is replaced.
+
+
 def build_target_surface(views, *, sampling_radius_m=.03, config=None):
     """Construct geometry from two complete depth frames, independent of features.
 
@@ -244,9 +276,15 @@ def build_target_surface(views, *, sampling_radius_m=.03, config=None):
     pair_a, pair_b = np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
     if np.all(sizes > 0):
         a, b = xyz[:offsets[1]], xyz[offsets[1]:]
-        distance, nearest_b = cKDTree(b).query(a, workers=1)
-        nearest_a = cKDTree(a).query(b, workers=1)[1]
-        pair_a = np.flatnonzero((nearest_a[nearest_b] == np.arange(len(a))) & (distance <= sampling_radius_m))
+        # BEGIN use the existing pairing radius during both exact searches.
+        distance, nearest_b = _nearest_within_radius(cKDTree(b), a, sampling_radius_m)
+        nearest_a = _nearest_within_radius(cKDTree(a), b, sampling_radius_m)[1]
+        # Missing bounded neighbors use the tree size as an index sentinel.
+        # Exclude them before indexing the reverse map; preserve ascending A
+        # order and the original <= gate before checking mutual selection.
+        pair_a = np.flatnonzero((nearest_b < len(b)) & (distance <= sampling_radius_m))
+        pair_a = pair_a[nearest_a[nearest_b[pair_a]] == pair_a]
+        # END bounded association; all later plane/projection gates are unchanged.
         pair_b = offsets[1] + nearest_b[pair_a]
         delta = xyz[pair_b] - xyz[pair_a]
         thickness = config.surface_height_spacing_factor * np.minimum(spacing[pair_a], spacing[pair_b])
