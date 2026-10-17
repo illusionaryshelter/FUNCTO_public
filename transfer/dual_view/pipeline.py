@@ -32,6 +32,11 @@ def prepare():
     import teaserpp_python
     from .cuda_proposals import load_extension
     from .cuda_evidence import prepare as prepare_evidence
+    # BEGIN resolve inference-only modules before the first online call. Their
+    # local imports inside infer then use Python's loaded modules, so source
+    # file reads cannot become an unreported part of the online timer.
+    from . import candidate_events, region_scope
+    # END these imports do not execute inference or allocate observation data.
     if not torch.cuda.is_available():
         raise RuntimeError('The selected dual-view implementation requires CUDA')
     torch.set_num_threads(1)
@@ -44,6 +49,11 @@ def prepare():
     surface.prepare()
     load_extension()
     prepare_evidence()
+    # BEGIN load system-library discovery before resident inference;
+    # its first discovery may open /dev/null while consulting the local linker.
+    with threadpool_limits(limits=1, user_api='blas'):
+        pass
+    # END run still sets and restores its own BLAS limit explicitly.
     return dict(gpu=device.name, gpu_total_bytes=device.total_memory,
                 gpu_allocator_cap_bytes=cap, native_backend='teaserpp')
 
