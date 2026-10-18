@@ -1,0 +1,53 @@
+{
+  "source_case": "generalization",
+  "case": "drawer_generalization",
+  "kept_body": "white_cabinet_1_main",
+  "removed_body": "wooden_shelf_1_main",
+  "furniture_root_position_m": [
+    0.0,
+    0.0,
+    0.905
+  ],
+  "table_center_xy_m": [
+    0.0,
+    0.0
+  ],
+  "physics_steps": 0,
+  "state_transfer": "Surviving named joint q/dq, actuator ctrl, mocap and time; new integration state",
+  "sim_time_s": 1.0000000000000007,
+  "views": {
+    "view_a": {
+      "valid_depth_pixels": 307200,
+      "renderer": {
+        "renderer": "llvmpipe (LLVM 15.0.7, 256 bits)",
+        "vendor": "Mesa",
+        "depth_buffer_format": "GL_DEPTH32F_STENCIL8",
+        "depth_buffer_bits": 32,
+        "allocated_offscreen_samples": 4,
+        "effective_samples": 0
+      }
+    },
+    "view_b": {
+      "valid_depth_pixels": 307200,
+      "renderer": {
+        "renderer": "llvmpipe (LLVM 15.0.7, 256 bits)",
+        "vendor": "Mesa",
+        "depth_buffer_format": "GL_DEPTH32F_STENCIL8",
+        "depth_buffer_bits": 32,
+        "allocated_offscreen_samples": 4,
+        "effective_samples": 0
+      }
+    },
+    "top": {
+      "valid_depth_pixels": 307200,
+      "renderer": {
+        "renderer": "llvmpipe (LLVM 15.0.7, 256 bits)",
+        "vendor": "Mesa",
+        "depth_buffer_format": "GL_DEPTH32F_STENCIL8",
+        "depth_buffer_bits": 32,
+        "allocated_offscreen_samples": 4,
+        "effective_samples": 0
+      }
+    }
+  }
+}

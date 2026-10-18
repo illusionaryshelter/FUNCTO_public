@@ -43,6 +43,17 @@ def extract_pair(source_image, target_image, output):
     tree RSS. This worker also sets a 6 GiB Torch allocator cap, instead of
     changing the shared model runtime's broader limits.
     """
+    # BEGIN shared isolated extraction for real single images and image pairs.
+    _extract_images([source_image, target_image], output)
+
+
+def extract_image(image, output):
+    """Save one native FP32 source/target map without constructing a fake pair."""
+    _extract_images([image], output)
+
+
+def _extract_images(paths, output):
+    """Run the selected image count with the existing bounded offline worker."""
     output = Path(output)
     if output.exists():
         raise FileExistsError(f"Feature evidence already exists: {output}")
@@ -51,13 +62,12 @@ def extract_pair(source_image, target_image, output):
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                OMP_NUM_THREADS="2", OPENBLAS_NUM_THREADS="2", MKL_NUM_THREADS="2")
     command = [sys.executable, "-m", "transfer.features", "worker",
-               str(Path(source_image).resolve()), str(Path(target_image).resolve()),
-               str(output.resolve())]
+               *[str(Path(path).resolve()) for path in paths], str(output.resolve())]
     subprocess.run(command, cwd=Path(__file__).resolve().parents[1], env=env,
                    check=True, timeout=1800)
 
 
-def _worker(source, target, output):
+def _worker(paths, output):
     """Use the cached official model; never download missing model assets."""
     from local_models.runtime import _block_network
     _block_network()
@@ -69,7 +79,8 @@ def _worker(source, target, output):
     torch.set_num_threads(2)
     total = torch.cuda.get_device_properties(0).total_memory
     torch.cuda.set_per_process_memory_fraction(min(0.5, 6 * 2**30 / total))
-    worker_main([Path(source), Path(target)], Path(output))
+    worker_main([Path(path) for path in paths], Path(output))
+# END no third-party model or preprocessing implementation is changed.
 
 
 def sample_descriptors(feature, pixels, image_size):
@@ -282,11 +293,14 @@ def native_region_pairs(source, target, source_region_mask, feature_pair, count=
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["worker"])
-    parser.add_argument("source")
-    parser.add_argument("target")
+    # BEGIN exactly one real image or one real pair enters the same worker.
+    parser.add_argument("images", nargs="+")
     parser.add_argument("output")
     args = parser.parse_args()
-    _worker(args.source, args.target, args.output)
+    if len(args.images) not in (1, 2):
+        parser.error("Provide one image or a pair of images")
+    _worker(args.images, args.output)
+    # END existing pair commands keep their original input/output ordering.
 
 
 if __name__ == "__main__":

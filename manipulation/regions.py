@@ -76,6 +76,48 @@ def function_frame(origin, axis, plane_normal):
     return pose
 
 
+# BEGIN fixed source frame from supplied region, without semantic query points.
+def source_region_frame(*, T_world_body, T_world_camera, points_world=None,
+                        T_world_function=None, interaction_point_world=None):
+    """Bind one supplied source frame, or construct it from the source region.
+
+    All inputs belong to the region-image timestamp.  A supplied interaction
+    point from another time must first be transported with its owning body.
+    The fitted normal faces the source camera; the longer projected camera x/y
+    axis fixes the tangent (x wins ties).  These axes are a coordinate convention,
+    not an inferred approach direction or a task orientation constraint.
+    """
+    body = _pose_array(T_world_body, "T_world_body")
+    camera = _pose_array(T_world_camera, "T_world_camera")
+    if T_world_function is not None:
+        frame = _pose_array(T_world_function, "T_world_function")
+        details = {"origin_source": "provided_frame", "axes_source": "provided_frame"}
+    else:
+        points = _points(points_world, "source region points", minimum=3)
+        center = points.mean(axis=0)
+        _, singular, vectors = np.linalg.svd(points-center, full_matrices=False)
+        if singular[1] <= np.finfo(float).eps * max(1., singular[0]):
+            raise ValueError("Source region cannot determine a plane normal from collinear points")
+        normal = vectors[-1]
+        facing = float(normal @ (camera[:3, 3]-center))
+        if abs(facing) <= np.finfo(float).eps:
+            raise ValueError("Source camera lies on the fitted plane; normal sign is unobserved")
+        if facing < 0:
+            normal = -normal
+        axes = camera[:3, :2]
+        projected = axes - normal[:, None] * (normal @ axes)[None]
+        lengths = np.linalg.norm(projected, axis=0)
+        selected = 0 if lengths[0] >= lengths[1] else 1
+        origin = center if interaction_point_world is None else _vector(interaction_point_world, "interaction point")
+        frame = function_frame(origin, projected[:, selected]/lengths[selected], normal)
+        details = {"origin_source": "region_mean" if interaction_point_world is None else "provided_interaction_point",
+                   "axes_source": "camera_axis_projection", "camera_axis": "xy"[selected],
+                   "plane_rms_m": float(np.sqrt(np.mean(((points-center) @ normal)**2)))}
+    return {"T_world_function": frame, "L_body_region": _inverse(body) @ frame,
+            "T_world_body_at_image": body, "details": details}
+# END fixed source frame from supplied region.
+
+
 def align_axis(preferred_rotation, local_axis, target_axis, *, antiparallel_axis=None):
     """Choose the rotation nearest a preference that maps one signed axis.
 

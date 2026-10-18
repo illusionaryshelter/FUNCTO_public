@@ -12,8 +12,7 @@ from copy import deepcopy
 
 import numpy as np
 
-from .grasp import (attached_eef_reference, ground_grasp, retreat_from_release,
-                    validate_timeline)
+from .grasp import attached_eef_reference, ground_grasp, validate_timeline
 from .motion import (MotionModel, _errors, _inverse, _pose_array, _poses_array,
                      _tolerances, transfer_motion)
 from .regions import ground_relation, relation_error
@@ -208,7 +207,7 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
     Native prismatic intervals between hard events retain the source's scalar
     progress profile while adapting its displacement to the new endpoints.
     The unanchored suffix after the final event retains source metric increments;
-    this does not rescale release motion or the separately consumed hand retreat.
+    this does not rescale the final controlled object motion before release.
     """
     knots = [(0, start)] + [(index, goal) for index, goal in goals if index != 0]
     if goals and goals[0][0] == 0 and not np.allclose(goals[0][1], start, atol=1e-8, rtol=0):
@@ -355,8 +354,8 @@ def _joint_source(value, name):
 def _joint_reference(demo, scene, frames, last_held, task, initial):
     """Bind measured source coordinates and explicit current coordinate goals.
 
-    Source ``motion_coordinates`` cover every original observation, including
-    release/retreat observations; their evidence is in
+    Source ``motion_coordinates`` cover every original observation; only their
+    controlled prefix through release generates a reference. Their evidence is in
     ``motion_coordinates_source``. Every event declares ``joint_coordinate``,
     ``coordinate_value`` at its original source frame and a positive
     ``coordinate_tolerance``. The current binding declares
@@ -381,9 +380,8 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
     a reference pose does not observe the actual turn count. Original target
     origins and fresh current lifted coordinates remain independent inputs.
     Functional goals are evaluated directly by current FK, without a reference-owner
-    functional frame. ``scene.carrier_mapping`` explicitly maps source carrier
-    coordinates into current carrier coordinates for the existing released-hand
-    reference; it is never inferred from names or silently set to identity.
+    functional frame or source/current body correspondence. Source hand motion
+    and body poses are not inputs to this explicitly scalar route.
     """
     if task.get("relation") != "articulation":
         raise ValueError("Joint-coordinate functional events require an articulation relation")
@@ -401,10 +399,6 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
             or not np.isfinite(raw).all()):
         raise ValueError("motion_coordinates must be finite N or N-by-1 values on the original timeline")
     source_coordinates = raw.astype(float, copy=True)
-    if "carrier_mapping" not in scene:
-        raise ValueError("Joint-coordinate grounding requires an explicit carrier_mapping")
-    mapping = _pose_array(scene["carrier_mapping"], "Current carrier_mapping")
-    mapping_source = _joint_source(scene.get("carrier_mapping_source"), "carrier_mapping_source")
     initial_coordinates = _current_initial_coordinates(spec, model, initial, require_lift=True)
     coordinates = source_coordinates-source_coordinates[0]+initial_coordinates
     reference = model.poses(coordinates)
@@ -505,7 +499,6 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
                           coordinate_unit="m" if model.kind == "prismatic" else "rad",
                           position_error_m=float(p[0]), rotation_error_rad=float(r[0]))
     diagnostics.update(source_coordinates_source=source_evidence,
-                       carrier_mapping_source=mapping_source,
                        source_initial_coordinates=source_coordinates[0].copy(),
                        current_initial_coordinates=initial_coordinates.copy(),
                        initial_coordinate_convention=(
@@ -524,7 +517,7 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
                            "source unwrapped angular coordinates shifted to observed current start; "
                            "explicit winding is retained, with current functional targets enforced"))
                        # END explicit native coordinate-transfer semantics.
-    return objects, checks, diagnostics, reference, {"carrier_binding": mapping}
+    return objects, checks, diagnostics
 
 
 def _check_entry_corridor(objects, scene, margin, motion_checks):
@@ -658,7 +651,7 @@ def _functional_events(demo, scene, frames, poses, last_held, task, initial):
     return output
 
 
-def _object_reference(demo, scene, frames, source, last_held, task, initial):
+def _object_reference(demo, scene, frames, last_held, task, initial):
     """Shared function/region consumer for object and complete EEF outputs."""
     if task.get("relation") not in {"transfer", "on", "inside", "articulation", "tool_use"}:
         raise ValueError("Unsupported functional relation")
@@ -678,6 +671,11 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
         _check_entry_corridor(result[0], scene, margin, result[2])
         return result
     # END joint-coordinate goals use FK directly, never surrogate region frames.
+    # BEGIN only frame-defined references consume source body pose tracks.
+    source = _poses_array(demo["T_reference_carrier"], "T_reference_carrier")
+    if len(source) != len(frames):
+        raise ValueError("Object function motion must cover the original timeline")
+    # END scalar coordinates do not require an unused cabinet/body registration.
     events = _functional_events(demo, scene, frames, source, last_held, task, initial)
     # Full-frame relations use the first functional correspondence. For on,
     # reference_binding is instead the initial-state source-coordinate map;
@@ -810,7 +808,7 @@ def _object_reference(demo, scene, frames, source, last_held, task, initial):
     # require new observations and are not included in this geometry check.
     _check_entry_corridor(objects, scene, margin, motion_checks)
     # END share unchanged corridor semantics with direct joint-coordinate goals.
-    return objects, checks, motion_checks, reference, first
+    return objects, checks, motion_checks
 
 
 def ground_object_program(program, scene):
@@ -830,18 +828,16 @@ def ground_object_program(program, scene):
         raise ValueError("Function carrier and reference must be distinct")
     demo = program["demo"]
     frames, times = validate_timeline(demo["frame_indices"], demo["timestamps"])
-    source = _poses_array(demo["T_reference_carrier"], "T_reference_carrier")
-    if len(source) != len(frames):
-        raise ValueError("Object function motion must cover the original timeline")
     last = len(frames) - 1 if demo.get("release_frame") is None else _index(
         demo["release_frame"], frames, "release_frame")
     initial = _pose_array(scene["initial_pose"], "Current carrier pose")
-    objects, checks, motion_checks, _, _ = _object_reference(
-        demo, scene, frames, source, last, program["task"], initial)
+    objects, checks, motion_checks = _object_reference(
+        demo, scene, frames, last, program["task"], initial)
     result = {"status": "candidate", "output_type": "object_trajectory",
               "carrier_id": scene["carrier_id"], "reference_id": scene["reference_id"],
               "reference_frame": scene["reference_frame"], "poses": objects,
               "frame_indices": frames[:last + 1], "timestamps": times[:last + 1],
+              "source_frame_indices": frames, "source_timestamps": times,
               "task": program["task"], "function_checks": checks,
               "motion_checks": motion_checks,
               "pose_convention": "column-vector reference_from_fixed_body; metres; 4x4 SE(3)",
@@ -880,9 +876,8 @@ def ground_program(program, scene):
     already bound ``scene.motion_model``. These are absolute unless explicitly
     marked ``coordinate_mode=entry_delta`` with preserved ``entry_coordinates``
     and ``entry_source`` from the original request entrance.
-    No reference pose or surrogate region
-    frame is needed. ``scene.carrier_mapping`` / ``carrier_mapping_source``
-    explicitly transport source body-local hand geometry through release.
+    No reference pose, source body-pose sequence, surrogate region frame or
+    source/current body correspondence is needed for this scalar route.
 
     An ``on`` relation instead supplies finite ``scene.support`` in the output
     frame and, per event, ``carrier_mapping`` (current-carrier-from-source-
@@ -896,9 +891,11 @@ def ground_program(program, scene):
     Manipulation additionally requires caller-verified ``scene.holding`` with
     measured ``T_carrier_eef`` and its evidence source, plus synchronized
     ``initial_pose`` and ``eef_pose``. ``release_frame`` is an observed source
-    phase boundary, independent of the opening command and function event. A
-    future release cannot already be observed: the returned retreat is anchored
-    to its predicted boundary and must be rebound to actual feedback at runtime.
+    phase boundary, independent of the opening command and function event. The
+    object and EEF references stop at this boundary. Complete source times and
+    commands remain separate evidence; released-hand motion is not generated.
+    Only the current tool identity and calibrated frame are required for held
+    manipulation, because the actual attachment supplies its tool relation.
 
     Grasp source frames only initialize the current single-skill plan. Its
     bound terminal grasp relation is a goal; no approach frame is a waypoint.
@@ -916,19 +913,16 @@ def ground_program(program, scene):
     # END ground complete source references without an independent approach contract.
     if kind != "manipulation":
         raise ValueError("skill_kind must be grasp or manipulation")
+    # BEGIN actual holding replaces obsolete source-hand/tool prerequisites.
     for key in ("tool_id", "tool_frame"):
-        if not isinstance(demo.get(key), str) or not demo[key] or demo[key] != scene.get(key):
-            raise ValueError(f"Manipulation requires the same demonstrated/current {key}")
+        if not isinstance(scene.get(key), str) or not scene[key]:
+            raise ValueError(f"Manipulation requires a nonempty current {key}")
     for key in ("carrier_id", "reference_id"):
         if not isinstance(scene.get(key), str) or not scene[key]:
             raise ValueError(f"Current manipulation needs a nonempty {key}")
     if scene["carrier_id"] == scene["reference_id"]:
         raise ValueError("Carrier and reference must be distinct rigid entities")
     frames, times = validate_timeline(demo["frame_indices"], demo["timestamps"])
-    source = _poses_array(demo["T_reference_carrier"], "T_reference_carrier")
-    source_eef = _poses_array(demo["T_carrier_eef"], "T_carrier_eef")
-    if len(source) != len(frames) or len(source_eef) != len(frames):
-        raise ValueError("Both source trajectories must cover the original observation timeline")
     commands = _intentions(demo["gripper_events"], frames)
     release = demo.get("release_frame")
     last_held = len(frames) - 1 if release is None else _index(release, frames, "release_frame")
@@ -937,6 +931,10 @@ def ground_program(program, scene):
     if release is not None and not any(event["command"] == "open" and event["frame_index"] <= release
                                       for event in commands):
         raise ValueError("The released phase needs an explicit opening intention before its boundary")
+    if any(event["frame_index"] > frames[last_held]
+           and any(event.get(field) for field in ("timing", "requires_evidence", "stop"))
+           for event in commands):
+        raise ValueError("A gripper requirement lies after release, outside current controlled motion")
     holding = scene.get("holding", {})
     if holding.get("verified") is not True or not holding.get("source"):
         raise ValueError("Manipulation requires caller-verified actual holding, not a grasp candidate")
@@ -948,26 +946,26 @@ def ground_program(program, scene):
     task = program["task"]
     if task.get("relation") not in {"transfer", "on", "inside", "articulation", "tool_use"}:
         raise ValueError("Unsupported functional relation")
-    objects, checks, motion_checks, reference, first = _object_reference(
-        demo, scene, frames, source, last_held, task, initial)
-    eef = np.empty_like(source_eef)
-    eef[:last_held + 1] = attached_eef_reference(objects, actual)
-    if last_held < len(frames) - 1:
-        # After release, the hand moves independently of the object. Do not
-        # move a placed body to repair a hand join, or extrapolate an attachment.
-        bound_hand = reference[last_held:] @ first["carrier_binding"] @ source_eef[last_held:]
-        eef[last_held:] = retreat_from_release(bound_hand, eef[last_held])
+    objects, checks, motion_checks = _object_reference(
+        demo, scene, frames, last_held, task, initial)
+    eef = attached_eef_reference(objects, actual)
+    # Preserve the original command metadata even when its recording extends
+    # beyond this skill's holding interval. A later source command is not an
+    # executable event of the current controlled motion.
+    controlled_commands = [event for event in commands if event["frame_index"] <= frames[last_held]]
+    # END no source-hand dependence or automatic released-hand phase remains.
     return {"status": "candidate", "skill_kind": kind, "output_type": "interaction_trajectory",
             "reference_frame": frame_name, "carrier_id": scene["carrier_id"],
             "reference_id": scene["reference_id"], "task": task,
             "object_poses": objects, "object_frame_indices": frames[:last_held + 1],
-            "eef_poses": eef, "frame_indices": frames, "timestamps": times,
-            "gripper_events": commands, "release_frame": release,
+            "eef_poses": eef, "frame_indices": frames[:last_held + 1], "timestamps": times[:last_held + 1],
+            "source_frame_indices": frames, "source_timestamps": times,
+            "source_gripper_events": commands,
+            "gripper_events": controlled_commands, "release_frame": release,
             "function_checks": checks, "motion_checks": motion_checks,
-            "tool_id": demo["tool_id"], "tool_frame": demo["tool_frame"],
+            "tool_id": scene["tool_id"], "tool_frame": scene["tool_frame"],
             "holding_source": holding["source"],
             "released_object_state": "requires_observation" if release is not None else "still_attached_reference",
-            "retreat_anchor": "predicted_release_eef; rebind from actual release feedback" if release is not None else None,
             "pose_convention": "column-vector reference_from_body/eef; metres; 4x4 SE(3)",
             "path_scope": "geometry reference; robot IK, collision, forces and timing remain external"}
 # END public joint-coordinate input documentation; holding/release logic stays shared.

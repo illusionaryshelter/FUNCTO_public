@@ -12,8 +12,7 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from manipulation.grasp import (attached_eef_reference, ground_grasp,
-                                retreat_from_release, validate_timeline)
+from manipulation.grasp import attached_eef_reference, ground_grasp, validate_timeline
 from manipulation.pipeline import serializable
 
 
@@ -182,7 +181,7 @@ class GraspGeometryTest(unittest.TestCase):
                                    first["eef_poses"], atol=1e-11)
         np.testing.assert_allclose(ground_grasp(changed_demo, changed)["goal_pose"], first["goal_pose"], atol=1e-11)
 
-    def test_actual_attachment_controls_holding_and_release_is_independent(self):
+    def test_actual_attachment_controls_holding(self):
         carrier = np.repeat(pose((.2, .1, .3))[None], 5, axis=0)
         carrier[:, 0, 3] += np.linspace(0., .2, len(carrier))
         actual = pose((.03, -.01, .04), (0., .4, .1))
@@ -192,16 +191,6 @@ class GraspGeometryTest(unittest.TestCase):
         changed_actual = actual.copy()
         changed_actual[0, 3] += .02
         self.assertFalse(np.allclose(eef, attached_eef_reference(carrier, changed_actual)))
-        retreat = np.repeat(pose((.5, .3, .4), (.2, -.1, .3))[None], 4, axis=0)
-        retreat[:, 2, 3] += np.linspace(0., .12, len(retreat))
-        result = retreat_from_release(retreat, eef[-1])
-        np.testing.assert_array_equal(result[0], eef[-1])
-        np.testing.assert_allclose(np.linalg.inv(result[0]) @ result,
-                                   np.linalg.inv(retreat[0]) @ retreat, atol=1e-12)
-        self.assertGreater(np.linalg.norm(result[-1, :3, 3] - result[0, :3, 3]), .119)
-        world = pose((.1, -.3, .4), (.4, .1, -.2))
-        np.testing.assert_allclose(retreat_from_release(world @ retreat, world @ eef[-1]),
-                                   world @ result, atol=1e-12)
 
     def test_timeline_rejects_ambiguous_ids_and_times(self):
         for frames, times in (([1., 2.], [0., 1.]), ([True, False], [0., 1.]),

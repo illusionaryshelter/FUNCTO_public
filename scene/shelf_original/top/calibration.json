@@ -1,0 +1,61 @@
+{
+  "width": 640,
+  "height": 480,
+  "K": [
+    [
+      579.4112547920254,
+      0.0,
+      319.5
+    ],
+    [
+      0.0,
+      579.4112582890816,
+      239.5
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "T_world_camera_cv": [
+    [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      -1.0,
+      0.0,
+      -0.2
+    ],
+    [
+      0.0,
+      0.0,
+      -1.0,
+      3.6
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "near_m": 0.01183098675640314,
+  "far_m": 591.5493097230725,
+  "rendering_device": {
+    "renderer": "llvmpipe (LLVM 15.0.7, 256 bits)",
+    "vendor": "Mesa",
+    "depth_buffer_format": "GL_DEPTH32F_STENCIL8",
+    "depth_buffer_bits": 32,
+    "allocated_offscreen_samples": 4,
+    "effective_samples": 0
+  },
+  "depth_buffer_format": "GL_DEPTH32F_STENCIL8",
+  "depth_precision": "Metric depth is float32 from the native floating-point depth buffer.",
+  "convention": "T_world_camera_cv maps camera to world; CV camera axes x-right, y-down, z-forward; integer (u,v) identifies pixel centers; RGB is top-left uint8 RGB; depth_m is optical z in metres; seg_geom_id is MjModel geom ID, -1 for non-geom/background.",
+  "timestamp_s": 1.0000000000000007
+}

@@ -1,6 +1,6 @@
 """Canonical simulation scenes with the confirmed centered Franka base.
 
-These are experiment fixtures, not task-specific manipulation policies. Both
+These are experiment fixtures, not task-specific manipulation policies. Named
 cases load the same way; their XML and recorded initial state own the layout.
 The loader never searches dated experiments or substitutes another scene.
 """
@@ -10,9 +10,15 @@ from pathlib import Path
 
 def scene_directory(case: str) -> Path:
     """Locate an explicitly named permanent scene, independent of the CWD."""
-    if case not in ("original", "generalization"):
-        raise ValueError("Scene must be 'original' or 'generalization'")
-    return Path(__file__).resolve().parent / case
+    # BEGIN explicit scene directories also cover the single-furniture fixtures.
+    root = Path(__file__).resolve().parent
+    if not isinstance(case, str) or not case or Path(case).name != case:
+        raise ValueError("Scene must name one direct child directory")
+    directory = root / case
+    if not (directory / "scene.xml").is_file():
+        raise ValueError(f"Unknown scene: {case}")
+    return directory
+    # END explicit scene directories.
 
 
 def load_scene(case: str):

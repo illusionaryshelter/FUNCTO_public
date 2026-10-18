@@ -205,8 +205,10 @@ def main() -> None:
         worker_main(paths[0], output, request["options"]["labels"])
     # BEGIN native MARCO feature extraction shares the bounded offline runtime.
     elif request["kind"] == "marco":
-        if len(paths) != 2:
-            raise ValueError("MARCO expects a pair of images")
+        # BEGIN one-source-image extraction uses the same isolated lifecycle.
+        if len(paths) not in (1, 2):
+            raise ValueError("MARCO expects one image or a pair of images")
+        # END no extra model process or duplicated source image is required.
         from .marco import worker_main
         worker_main(paths, output)
     # END MARCO dispatch.

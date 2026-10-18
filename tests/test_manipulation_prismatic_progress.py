@@ -105,21 +105,23 @@ class PrismaticSourceProgressTest(unittest.TestCase):
         np.testing.assert_array_equal(actual < 0, source < 0)
         np.testing.assert_allclose(actual, source * (.05 / .16), atol=1e-13, rtol=0)
 
-    def test_final_event_metric_settling_and_release_retreat_do_not_scale(self):
+    def test_final_event_metric_settling_is_retained_only_through_release(self):
         program, scene = fixture(.05)
         result = ground_program(program, scene)
         q, demo = coordinates(result), program["demo"]
         np.testing.assert_allclose(q[6:] - q[6], [0., .000004, .000006], atol=1e-13, rtol=0)
-        self.assertEqual(len(result["eef_poses"]), 12)
+        self.assertEqual(len(result["eef_poses"]), 9)
         self.assertEqual(len(result["object_poses"]), 9)
         self.assertEqual(result["release_frame"], 108)
         self.assertEqual(result["released_object_state"], "requires_observation")
-        np.testing.assert_array_equal(result["frame_indices"], demo["frame_indices"])
-        np.testing.assert_array_equal(result["timestamps"], demo["timestamps"])
+        np.testing.assert_array_equal(result["frame_indices"], demo["frame_indices"][:9])
+        np.testing.assert_array_equal(result["timestamps"], demo["timestamps"][:9])
+        np.testing.assert_array_equal(result["source_frame_indices"], demo["frame_indices"])
+        np.testing.assert_array_equal(result["source_timestamps"], demo["timestamps"])
         self.assertEqual(result["gripper_events"], demo["gripper_events"])
         np.testing.assert_allclose(result["eef_poses"][:9],
                                    result["object_poses"] @ scene["holding"]["T_carrier_eef"], atol=1e-13)
-        expected_last = result["eef_poses"][8] @ pose((.03, 0., .07), (.12, 0., 0.))
+        expected_last = result["object_poses"][-1] @ scene["holding"]["T_carrier_eef"]
         np.testing.assert_allclose(result["eef_poses"][-1], expected_last, atol=1e-13)
 
     def test_multiple_function_events_scale_each_source_interval(self):
@@ -215,9 +217,10 @@ class PrismaticSourceProgressTest(unittest.TestCase):
         np.testing.assert_array_equal(coordinates(actual), expected_q[:9])
         np.testing.assert_array_equal(actual["object_poses"], expected_objects)
         np.testing.assert_array_equal(actual["eef_poses"][:9], expected_objects @ attachment)
-        np.testing.assert_array_equal(actual["frame_indices"], demo["frame_indices"])
+        np.testing.assert_array_equal(actual["frame_indices"], demo["frame_indices"][:9])
         np.testing.assert_array_equal(actual["object_frame_indices"], demo["frame_indices"][:9])
-        np.testing.assert_array_equal(actual["timestamps"], demo["timestamps"])
+        np.testing.assert_array_equal(actual["timestamps"], demo["timestamps"][:9])
+        np.testing.assert_array_equal(actual["source_timestamps"], demo["timestamps"])
         self.assertEqual(actual["gripper_events"], demo["gripper_events"])
         self.assertEqual(actual["release_frame"], demo["release_frame"])
         self.assertEqual(coordinates(actual)[1], coordinates(actual)[2])
@@ -225,8 +228,7 @@ class PrismaticSourceProgressTest(unittest.TestCase):
         interval = actual["motion_checks"]["coordinate_transfer"]["intervals"][0]
         self.assertEqual(interval["method"], "source_metric_increments_preserved")
         self.assertEqual(interval["progress_scale"], 1.)
-        expected_last = (expected_objects[-1] @ attachment
-                         @ pose((.03, 0., .07), (.12, 0., 0.)))
+        expected_last = expected_objects[-1] @ attachment
         np.testing.assert_allclose(actual["eef_poses"][-1], expected_last, atol=1e-13, rtol=0)
 
 

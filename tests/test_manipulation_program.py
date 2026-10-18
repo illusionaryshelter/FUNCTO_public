@@ -102,14 +102,15 @@ class ProgramTest(unittest.TestCase):
         result = ground_program(program, scene)
         self.assertEqual(result["status"], "candidate")
         self.assertEqual(len(result["object_poses"]), 8)
-        self.assertEqual(len(result["eef_poses"]), 11)
+        self.assertEqual(len(result["eef_poses"]), 8)
         self.assertAlmostEqual(result["object_poses"][5, 0, 3], .08)
         np.testing.assert_allclose(result["object_poses"][5:], np.repeat(pose(x=.08)[None], 3, axis=0), atol=1e-9)
         self.assertAlmostEqual(result["eef_poses"][7, 2, 3], .03)
-        self.assertAlmostEqual(result["eef_poses"][-1, 2, 3], .06)
+        self.assertAlmostEqual(result["eef_poses"][-1, 2, 3], .03)
         self.assertEqual(result["released_object_state"], "requires_observation")
         self.assertEqual(result["gripper_events"][0]["frame_index"], 106)
-        np.testing.assert_array_equal(result["timestamps"], program["demo"]["timestamps"])
+        np.testing.assert_array_equal(result["timestamps"], program["demo"]["timestamps"][:8])
+        np.testing.assert_array_equal(result["source_timestamps"], program["demo"]["timestamps"])
 
     def test_actual_grasp_changes_hand_not_function_effect(self):
         program, scene = fixture()
@@ -226,7 +227,7 @@ class ProgramTest(unittest.TestCase):
         np.testing.assert_allclose(result["function_checks"][0]["goal_pose"], pose(x=.05, y=.02))
         # END task feasibility is assessed against actual members downstream.
 
-    def test_last_internal_event_at_release_remains_exact_and_has_a_retreat(self):
+    def test_last_internal_event_at_release_remains_exact_without_a_retreat(self):
         program, scene = fixture()
         final = deepcopy(program["demo"]["functional_events"][0])
         final.update(event_id="at_release", frame_index=107)
@@ -239,10 +240,10 @@ class ProgramTest(unittest.TestCase):
         self.assertAlmostEqual(result["object_poses"][7, 0, 3], .07)
         np.testing.assert_allclose(result["eef_poses"][7],
                                    result["object_poses"][7] @ scene["holding"]["T_carrier_eef"], atol=1e-9)
-        self.assertGreater(np.linalg.norm(result["eef_poses"][-1, :3, 3]
-                                         - result["eef_poses"][7, :3, 3]), .029)
+        self.assertEqual(len(result["eef_poses"]), 8)
+        self.assertNotIn("retreat_anchor", result)
 
-    def test_actual_rotated_grasp_controls_held_phase_and_release_local_increments(self):
+    def test_actual_rotated_grasp_controls_only_the_held_phase(self):
         program, scene = fixture()
         actual = pose(x=.01, y=-.02, z=.04)
         actual[:3, :3] = Rotation.from_euler("xyz", [.2, -.1, .7]).as_matrix()
@@ -250,9 +251,34 @@ class ProgramTest(unittest.TestCase):
         scene["eef_pose"] = scene["initial_pose"] @ actual
         result = ground_program(program, scene)
         np.testing.assert_allclose(result["eef_poses"][:8], result["object_poses"] @ actual, atol=1e-10)
-        demo_hand = program["demo"]["T_reference_carrier"] @ program["demo"]["T_carrier_eef"]
-        np.testing.assert_allclose(np.linalg.inv(result["eef_poses"][7]) @ result["eef_poses"][7:],
-                                   np.linalg.inv(demo_hand[7]) @ demo_hand[7:], atol=1e-10)
+        self.assertEqual(result["frame_indices"][-1], program["demo"]["release_frame"])
+
+    # BEGIN held geometry depends on current feedback, not source hand data.
+    def test_held_reference_needs_no_source_eef_or_matching_source_tool(self):
+        program, scene = fixture()
+        expected = ground_program(program, scene)
+        program["demo"].pop("T_carrier_eef")
+        program["demo"].update(tool_id="human_hand", tool_frame="unrelated_source_landmark")
+        actual = ground_program(program, scene)
+        np.testing.assert_allclose(actual["eef_poses"], expected["eef_poses"], atol=1e-12)
+        self.assertEqual(actual["tool_id"], scene["tool_id"])
+        self.assertEqual(actual["tool_frame"], scene["tool_frame"])
+        program["demo"].pop("tool_id")
+        program["demo"].pop("tool_frame")
+        np.testing.assert_allclose(ground_program(program, scene)["eef_poses"], expected["eef_poses"], atol=1e-12)
+
+    def test_source_commands_after_release_remain_evidence_only(self):
+        program, scene = fixture()
+        later = {"event_id": "later_source_close", "frame_index": 109, "command": "close",
+                 "source": {"recording": "original human demonstration", "value": [1.]}}
+        program["demo"]["gripper_events"].append(later)
+        result = ground_program(program, scene)
+        self.assertEqual(result["gripper_events"], program["demo"]["gripper_events"][:1])
+        self.assertEqual(result["source_gripper_events"], program["demo"]["gripper_events"])
+        later["source"]["value"][0] = 2.
+        self.assertEqual(result["source_gripper_events"][-1]["source"]["value"], [1.])
+        np.testing.assert_array_equal(result["source_frame_indices"], program["demo"]["frame_indices"])
+    # END source evidence is preserved without manufacturing post-release action.
 
     def test_on_consumes_the_declared_contact_face_in_addition_to_whole_body(self):
         program, scene = on_fixture()
@@ -440,7 +466,7 @@ class UnorderedSupportProgramTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same carrier_mapping"):
             ground_program(program, scene)
 
-    def test_independent_source_and_current_carrier_gauges_preserve_physical_eef_and_retreat(self):
+    def test_independent_source_and_current_carrier_gauges_preserve_held_eef(self):
         program, scene = on_fixture()
         phase = np.linspace(0., 1., len(program["demo"]["frame_indices"]))
         source = program["demo"]["T_reference_carrier"]
@@ -484,14 +510,14 @@ class UnorderedSupportProgramTest(unittest.TestCase):
         face = binding["on_geometry"]
         face["carrier_region_points"] = face["carrier_region_points"] @ inverse[:3, :3].T + inverse[:3, 3]
         face["carrier_outward_normal"] = inverse[:3, :3] @ face["carrier_outward_normal"]
-        # Physical robot feedback and world support are unchanged. Every EEF
-        # node, including the independent release suffix, must remain the same.
+        # Physical robot feedback and world support are unchanged. Every held
+        # EEF node must remain the same under the coordinate re-expression.
         current_result = ground_program(program, changed)
         np.testing.assert_allclose(current_result["object_poses"], original["object_poses"] @ current_gauge, atol=1e-9)
         np.testing.assert_allclose(current_result["eef_poses"], original["eef_poses"], atol=1e-9)
-        self.assertGreater(np.linalg.norm(original["eef_poses"][-1, :3, 3] - original["eef_poses"][7, :3, 3]), .02)
+        self.assertEqual(len(original["eef_poses"]), 8)
 
-    def test_full_273_node_timeline_keeps_internal_effect_release_and_independent_retreat(self):
+    def test_full_source_timeline_is_retained_while_reference_stops_at_release(self):
         program, scene = on_fixture()
         frames = np.arange(197, 470)
         times = frames.astype(float) / 20.
@@ -514,18 +540,17 @@ class UnorderedSupportProgramTest(unittest.TestCase):
         scene["holding"]["T_carrier_eef"] = actual
         scene["eef_pose"] = scene["initial_pose"] @ actual
         result = ground_program(program, scene)
-        np.testing.assert_array_equal(result["frame_indices"], frames)
-        np.testing.assert_array_equal(result["timestamps"], times)
+        np.testing.assert_array_equal(result["frame_indices"], frames[:release + 1])
+        np.testing.assert_array_equal(result["timestamps"], times[:release + 1])
+        np.testing.assert_array_equal(result["source_frame_indices"], frames)
+        np.testing.assert_array_equal(result["source_timestamps"], times)
         self.assertEqual(result["object_poses"].shape, (209, 4, 4))
-        self.assertEqual(result["eef_poses"].shape, (273, 4, 4))
+        self.assertEqual(result["eef_poses"].shape, (209, 4, 4))
         self.assertEqual(result["function_checks"][0]["frame_index"], 402)
         self.assertEqual(result["release_frame"], 405)
         self.assertEqual(result["gripper_events"][0]["frame_index"], 403)
         np.testing.assert_allclose(result["eef_poses"][:release + 1], result["object_poses"] @ actual, atol=1e-9)
-        source_eef = source @ source_hand
-        np.testing.assert_allclose(np.linalg.inv(result["eef_poses"][release]) @ result["eef_poses"][release:],
-                                   np.linalg.inv(source_eef[release]) @ source_eef[release:], atol=1e-9)
-        self.assertGreater(np.linalg.norm(result["eef_poses"][-1, :3, 3] - result["eef_poses"][release, :3, 3]), .08)
+        self.assertEqual(result["frame_indices"][-1], result["release_frame"])
         self.assertEqual(result["released_object_state"], "requires_observation")
 # END partial on geometry and complete phase regressions.
 

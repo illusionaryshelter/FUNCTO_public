@@ -1,0 +1,17 @@
+{
+  "position_world_m": [
+    0.7659304374800999,
+    -0.35446384522953694,
+    1.9933810049059462
+  ],
+  "quaternion_world_camera_gl_wxyz": [
+    0.7791920904775138,
+    0.3227519353814525,
+    0.20561566226055747,
+    0.4964001146030901
+  ],
+  "frustum_center_over_near": 0.0,
+  "frustum_bottom_over_near": -0.41421356838805296,
+  "frustum_top_over_near": 0.41421356838805273,
+  "frustum_halfwidth_over_near": 0.5522847578507372
+}

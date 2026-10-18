@@ -157,24 +157,25 @@ class JointCoordinateGoalTest(unittest.TestCase):
     def test_full_timeline_distinguishes_function_opening_and_release(self):
         program, scene = fixture()
         result = ground_program(program, scene)
-        self.assertEqual(len(result["eef_poses"]), 176)
+        self.assertEqual(len(result["eef_poses"]), 133)
         self.assertEqual(len(result["object_poses"]), 133)
         self.assertEqual(result["release_frame"], 787)
-        np.testing.assert_array_equal(result["frame_indices"], program["demo"]["frame_indices"])
-        np.testing.assert_array_equal(result["timestamps"], program["demo"]["timestamps"])
+        np.testing.assert_array_equal(result["frame_indices"], program["demo"]["frame_indices"][:133])
+        np.testing.assert_array_equal(result["timestamps"], program["demo"]["timestamps"][:133])
+        np.testing.assert_array_equal(result["source_frame_indices"], program["demo"]["frame_indices"])
+        np.testing.assert_array_equal(result["source_timestamps"], program["demo"]["timestamps"])
         np.testing.assert_array_equal(result["object_frame_indices"], np.arange(655, 788))
         self.assertEqual(result["gripper_events"], program["demo"]["gripper_events"])
         self.assertEqual(result["function_checks"][0]["frame_index"], 784)
         self.assertEqual(result["released_object_state"], "requires_observation")
 
-    def test_actual_holding_drives_eef_and_retreat_is_free_after_release(self):
+    def test_actual_holding_drives_eef_until_release(self):
         program, scene = fixture()
         first = ground_program(program, scene)
         np.testing.assert_allclose(first["eef_poses"][:133],
                                    first["object_poses"] @ scene["holding"]["T_carrier_eef"], atol=1e-10)
         np.testing.assert_allclose(first["eef_poses"][0], scene["eef_pose"], atol=1e-10)
-        expected_retreat = first["eef_poses"][132] @ transform((0., 0., .08), (.12, 0., 0.))
-        np.testing.assert_allclose(first["eef_poses"][-1], expected_retreat, atol=1e-10)
+        self.assertEqual(len(first["eef_poses"]), 133)
         # A measured different attachment changes the hand but must not move
         # the object's function goal or substitute a new grasp stage.
         changed = deepcopy(scene)
@@ -197,7 +198,7 @@ class JointCoordinateGoalTest(unittest.TestCase):
         self.assertNotIn("eef_poses", actual)
         self.assertEqual(actual["output_type"], "object_trajectory")
 
-    def test_world_frame_change_preserves_held_and_released_motion(self):
+    def test_world_frame_change_preserves_held_motion(self):
         program, scene = fixture()
         expected = ground_program(program, scene)
         H = transform((-.3, .17, .22), (.41, -.32, .28))
@@ -210,28 +211,24 @@ class JointCoordinateGoalTest(unittest.TestCase):
         np.testing.assert_allclose(actual["object_poses"], H @ expected["object_poses"], atol=1e-10)
         np.testing.assert_allclose(actual["eef_poses"], H @ expected["eef_poses"], atol=1e-10)
 
-    def test_source_carrier_gauge_requires_the_explicit_mapping_and_preserves_retreat(self):
+    def test_scalar_reference_needs_no_source_body_hand_or_correspondence(self):
         program, scene = fixture()
         expected = ground_program(program, scene)
-        Q = transform((.04, -.03, .02), (.3, .2, -.1))
-        changed_program, changed_scene = deepcopy(program), deepcopy(scene)
-        # Q maps old source carrier coordinates to the new source gauge.
-        changed_program["demo"]["T_reference_carrier"] = program["demo"]["T_reference_carrier"] @ np.linalg.inv(Q)
-        changed_program["demo"]["T_carrier_eef"] = Q @ program["demo"]["T_carrier_eef"]
-        changed_scene["carrier_mapping"] = scene["carrier_mapping"] @ np.linalg.inv(Q)
-        actual = ground_program(changed_program, changed_scene)
+        for name in ("T_reference_carrier", "T_carrier_eef", "tool_id", "tool_frame"):
+            program["demo"].pop(name)
+        for name in ("carrier_mapping", "carrier_mapping_source"):
+            scene.pop(name)
+        actual = ground_program(program, scene)
         np.testing.assert_allclose(actual["object_poses"], expected["object_poses"], atol=1e-10)
         np.testing.assert_allclose(actual["eef_poses"], expected["eef_poses"], atol=1e-10)
+        np.testing.assert_allclose(ground_object_program(program, scene)["poses"], expected["object_poses"], atol=1e-10)
 
-    def test_missing_coordinate_mapping_or_evidence_never_falls_back_to_full_frames(self):
+    def test_missing_coordinates_or_evidence_never_fall_back_to_full_frames(self):
         changes = [
             lambda p, s: p["demo"].pop("motion_coordinates"),
             lambda p, s: p["demo"].pop("motion_coordinates_source"),
             lambda p, s: p["demo"].update(motion_coordinates_source=""),
             lambda p, s: p["demo"]["functional_events"][0].pop("source"),
-            lambda p, s: s.pop("carrier_mapping"),
-            lambda p, s: s.pop("carrier_mapping_source"),
-            lambda p, s: s.update(carrier_mapping_source=""),
             lambda p, s: s["functional_bindings"]["demonstrated_open_extent"].pop("source"),
             lambda p, s: s["motion_model"].pop("source"),
             lambda p, s: s.pop("motion_model"),

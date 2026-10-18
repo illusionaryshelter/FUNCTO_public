@@ -95,6 +95,11 @@ class PosePath:
     A mechanism path interpolates its signed/unwrapped coordinates and then
     evaluates FK. It never interpolates a hinge as Cartesian chord segments.
     ``attachment`` maps the path body to the requested tool, if applicable.
+    # BEGIN composed reference paths share one normalized physical-time span.
+    An optional ``parent`` maps this path's reference frame into the final
+    reference frame. Both paths sample the same progress before composition;
+    a changing parent is supplied geometry, not a prediction of external motion.
+    # END fixed left/right transforms remain ordinary path special cases.
     """
     progress: np.ndarray
     poses: np.ndarray
@@ -102,6 +107,9 @@ class PosePath:
     motion_model: MotionModel | None = None
     coordinates: np.ndarray | None = None
     attachment: np.ndarray = field(default_factory=lambda: np.eye(4))
+    # BEGIN retain the parent relation instead of interpolating composed knots.
+    parent: PosePath | None = None
+    # END reference composition reuses the same pose/FK interpolation below.
 
     def __post_init__(self):
         self.progress = np.asarray(self.progress, float).copy()
@@ -111,6 +119,13 @@ class PosePath:
                 or np.any(np.diff(self.progress) <= 0) or self.progress[0] != 0
                 or (len(self.progress) > 1 and self.progress[-1] != 1) or not self.source):
             raise ValueError("A pose path needs evidenced, ordered progress covering [0,1]")
+        # BEGIN expose every parent knot through this path's existing progress.
+        if self.parent is not None:
+            if not isinstance(self.parent, PosePath):
+                raise TypeError("A reference parent must be a PosePath on the same normalized time span")
+            if not np.isin(self.parent.progress, self.progress).all():
+                raise ValueError("A composed path must include every parent progress knot")
+        # END process anchors cannot silently omit a component's breakpoints.
         if self.motion_model is not None:
             if self.motion_model.kind == "free":
                 raise ValueError("Use pose interpolation for free motion, not principal rotvec coordinates")
@@ -156,8 +171,15 @@ class PosePath:
             else:
                 position = base_p + coordinate[..., :2] @ _tensor(model.basis[:, :2].T, progress)
         offset = _tensor(self.attachment[:3, 3], progress).expand(*progress.shape, 3)
-        return (position + quaternion_rotate(quaternion, offset),
-                quaternion_multiply(quaternion, _tensor(_quaternion(self.attachment), progress)))
+        # BEGIN compose sampled relations, never linearly interpolate a product.
+        position = position + quaternion_rotate(quaternion, offset)
+        quaternion = quaternion_multiply(quaternion, _tensor(_quaternion(self.attachment), progress))
+        if self.parent is not None:
+            parent_position, parent_quaternion = self.parent.sample(progress)
+            position = parent_position + quaternion_rotate(parent_quaternion, position)
+            quaternion = quaternion_multiply(parent_quaternion, quaternion)
+        return position, quaternion
+        # END autograd retains both parent motion and the rotating right offset.
 
     def sample_numpy(self, progress):
         import torch
@@ -200,6 +222,54 @@ class MotionPhase:
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("A reference phase needs a nonempty name")
+
+
+# BEGIN fixed-frame references enter the existing planner without new goals.
+def reference_phase(reference, *, skill_id, source):
+    """Adapt a generated geometric reference to the existing tool PosePath.
+
+    ``reference`` is the result of representation.generate_reference. Reuse
+    its explicit eef_path, including the separately sampled parent, body
+    correspondence and attachment. Rebuilding a path from composed EEF or
+    object knots would cut rotating offsets and change intermediate poses.
+
+    The returned MotionPhase is reference data only. It declares neither a
+    task goal nor a physical attachment/collision permission. The caller must
+    independently supply real robot state, typed requirements and scene
+    evidence to PlanningProblem and the existing planning-scene binder. Pass
+    metadata['reference_timestamps'] and phase.reference.progress to that
+    problem's source_timestamps/source_progress for a multi-sample phase. A
+    single observation has no duration to supply as a timed motion interval.
+    Original observed frame IDs/times and events remain separate from inserted
+    event-time knots.
+    """
+    from .grasp import validate_timeline
+
+    if not isinstance(skill_id, str) or not skill_id or not source:
+        raise ValueError("A reference phase needs a skill identity and source evidence")
+    frames, original_times = validate_timeline(reference["frame_indices"], reference["timestamps"])
+    if "eef_poses" not in reference or "eef_timestamps" not in reference:
+        raise ValueError("A tool reference needs eef_poses and eef_timestamps; object motion alone is insufficient")
+    path = reference.get("eef_path")
+    if not isinstance(path, PosePath):
+        raise ValueError("A tool reference needs its explicit composed eef_path")
+    poses = _poses_array(reference["eef_poses"], "EEF reference poses")
+    times = np.asarray(reference["eef_timestamps"], float)
+    if (times.shape != (len(poses),) or not np.isfinite(times).all()
+            or np.any(np.diff(times) <= 0)
+            or times[0] < original_times[0] or times[-1] > original_times[-1]):
+        raise ValueError("EEF reference times must increase within the original observed timeline")
+    progress = np.zeros(1) if len(times) == 1 else (times-times[0])/(times[-1]-times[0])
+    if (not np.array_equal(path.progress, progress)
+            or not np.allclose(path.sample_numpy(progress), poses, atol=1e-7, rtol=0)):
+        raise ValueError("The EEF path and reported samples must share the same timeline and poses")
+    return MotionPhase(skill_id, path, metadata={
+        "skill_id": skill_id, "reference_source": deepcopy(source), "reference_timestamps": times.copy(),
+        "source_frame_indices": frames, "source_timestamps": original_times,
+        "source_events": deepcopy(reference.get("events", [])),
+        "scope": "Geometric reference only; task requirements and scene permissions are independent",
+    })
+# END no source knot becomes a required waypoint or inferred tolerance.
 
 
 @dataclass
@@ -1831,10 +1901,13 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
     frames, times = validate_timeline(demo["frame_indices"], demo["timestamps"])
     if len(frames) < 2:
         raise ValueError("A robot planning request requires a source interval with positive duration")
-    identity = (demo.get("tool_id"), demo.get("tool_frame"))
-    if (any(not isinstance(value, str) or not value for value in identity)
-            or identity != (scene.get("tool_id"), scene.get("tool_frame"))):
-        raise ValueError("The current skill requires the same demonstrated/current tool_id and tool_frame")
+    # BEGIN held manipulation uses its actual current attachment/tool frame.
+    identity = (scene.get("tool_id"), scene.get("tool_frame"))
+    if any(not isinstance(value, str) or not value for value in identity):
+        raise ValueError("The current skill requires current tool_id and tool_frame")
+    if program["skill_kind"] == "grasp" and identity != (demo.get("tool_id"), demo.get("tool_frame")):
+        raise ValueError("Grasp requires the same demonstrated/current tool_id and tool_frame")
+    # END source hand calibration remains necessary only for the grasp route.
     if scene.get("reference_frame") != reference_frame:
         raise ValueError("Grounding and collision queries must share one explicit reference frame")
     carrier = scene.get("carrier_id")
@@ -1844,8 +1917,16 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
     initial = _pose_array(scene[initial_key], "current skill carrier pose")
     scene[initial_key] = initial
     source = {"skill_id": skill_id, "frame_indices": frames.tolist(),
-              "timestamps": times.tolist(), "kind": "current_binding_and_original_source"}
+              "timestamps": times.tolist(), "gripper_events": deepcopy(demo.get("gripper_events", [])),
+              "kind": "current_binding_and_original_source"}
     grounded = ground_program(program, scene)
+    # BEGIN compile only the reference interval where holding is valid.
+    # The original source clock above remains provenance. A source recording
+    # after release cannot create another robot phase or extend the attachment.
+    frames, times = validate_timeline(grounded["frame_indices"], grounded["timestamps"])
+    if len(frames) < 2:
+        raise ValueError("A robot planning request requires a controlled source interval with positive duration")
+    # END a single boundary observation does not manufacture a motion interval.
     phases, events, conditions, supports, interiors, pose_events, coordinate_events, mechanisms = [], [], [], [], [], [], [], []
     frame_progress = {}
 
@@ -1919,7 +2000,7 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
                 "source": deepcopy(arrival_source)})
         # END source close identity/progress and the complete skill clock stay intact.
     elif program["skill_kind"] == "manipulation":
-        objects, eef = grounded["object_poses"], grounded["eef_poses"]
+        objects = grounded["object_poses"]
         attachment = _pose_array(scene["holding"]["T_carrier_eef"], "actual attachment")
         attachment_id = f"{skill_id}:actual_holding"
         last_held = len(objects)-1
@@ -1949,10 +2030,6 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             {"mode": "held", "attachment": attachment.tolist(), "conditional": False,
              "attachment_condition_id": attachment_id, "attachment_interval": [0., held_end],
              "release_condition_id": release_id})
-        if last_held < len(frames)-1:
-            append_interval(last_held, len(frames)-1,
-                _path_from_rows(eef[last_held:], source, timestamps=times[last_held:]),
-                {"mode": "released_retreat", "release_progress": held_end})
         for event in demo["functional_events"]:
             progress = frame_progress[int(event["frame_index"])]
             binding = scene["functional_bindings"][event["event_id"]]
@@ -2016,7 +2093,7 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
     for event in deepcopy(spec.get("execution_events", ())):
         frame = event["frame_index"]
         if frame not in frame_progress:
-            raise ValueError("An execution event must name an original source frame")
+            raise ValueError("An execution event must lie within the current controlled skill interval")
         events.append(PlanningEvent(event["event_id"], skill_id, frame_progress[frame], int(frame),
             event["kind"], event["source"], event.get("requires_evidence"), event.get("stop", False),
             event.get("occurrence", 0), tuple(event.get("timing", ()))))
@@ -2028,14 +2105,14 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
         directions = []
         for row in direction_specs:
             if row["start_frame"] not in frame_progress or row["end_frame"] not in frame_progress:
-                raise ValueError("A coordinate direction must name original source scope frames")
+                raise ValueError("A coordinate direction must lie within the controlled mechanism scope")
             # BEGIN initial compilation binds both scope ends to controlled motion.
             # Continuations retain original direction history, so this check
             # belongs here rather than changing MechanismRequirement rebinding.
             if not (mechanisms[0].start <= frame_progress[row["start_frame"]]
                     < frame_progress[row["end_frame"]] <= mechanisms[0].end):
                 raise ValueError("A coordinate direction must lie within the controlled mechanism scope")
-            # END a released retreat cannot inherit a held mechanism direction.
+            # END an event after release cannot inherit a held mechanism scope.
             directions.append(CoordinateDirectionRequirement(frame_progress[row["start_frame"]],
                 frame_progress[row["end_frame"]], row["coordinate_index"], row["kind"], row["sign"],
                 row["minimum"], row["tolerance"], row["source"], row.get("origin_coordinate"), row.get("origin_source")))

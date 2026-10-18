@@ -232,26 +232,14 @@ def attached_eef_reference(carrier_poses, actual_T_carrier_eef):
     T_world_eef`` from synchronized current evidence after checking stability.
     This function only composes geometry; passing a matrix is not evidence that
     the object is held. Stop using it when that relation is no longer valid,
-    and never extend it through the released retreat phase.
+    and never extrapolate it after release.
     """
     carrier = _poses_array(carrier_poses, "carrier_poses")
     actual = _pose_array(actual_T_carrier_eef, "actual_T_carrier_eef")
     return carrier @ actual
 
 
-def retreat_from_release(demo_eef_poses, actual_release_pose):
-    """Continue a free retreat from actual release using release-local motion.
-
-    For the already bound independent retreat D, preserve each relative pose
-    ``inverse(D[0]) @ D[t]`` and apply it at the actual release EEF A. Thus the
-    first output is exactly A even if the actual grasp differed from the demo.
-    This changes only the free retreat; no earlier object/function event is
-    moved to make the join work. Geometry is continuous at release but must
-    still pass the external robot backend's collision and timing checks.
-    """
-    demo = _poses_array(demo_eef_poses, "demo_eef_poses")
-    actual = _pose_array(actual_release_pose, "actual_release_pose")
-    output = actual @ _inverse(demo[0]) @ demo
-    output[0] = actual
-    return output
+# BEGIN released-hand continuation is not part of the current held skill.
+# No generic retreat helper remains; a later skill starts from new feedback.
+# END attachment geometry stops when its observed relation ceases to apply.
 # END independent grasp and measured-holding geometry consumers.

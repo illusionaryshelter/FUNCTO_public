@@ -509,6 +509,13 @@ class CollisionOwner:
             raise ValueError("An owner query must contain precisely that physical owner")
         if not callable(getattr(self.pose_path, "sample", None)):
             raise TypeError("Owner motion needs a differentiable PosePath")
+        # BEGIN composed tool references do not widen collision-owner evidence.
+        # Owner stationarity checks and execution-binding serialization require
+        # one world-frame path. They cannot certify or restore a parent chain;
+        # accepting it here would silently discard motion at that boundary.
+        if isinstance(self.pose_path, PosePath) and self.pose_path.parent is not None:
+            raise ValueError("Collision owners require a single world-frame path; composed parent paths are reference-only")
+        # END ordinary world-frame owners retain their existing scene contract.
         self.pose_interval = _valid_interval(self.pose_interval)
         if type(self.geometry_complete) is not bool or type(self.moving) is not bool:
             raise ValueError("Geometry coverage and motion must be explicitly declared")
@@ -1702,8 +1709,10 @@ class PlanningScene:
         for index, phase in enumerate(problem.phases):
             meta = phase.metadata
             carrier = meta.get("carrier_id")
-            if meta.get("mode") in {"grasp", "held", "released_retreat"} and not carrier:
-                raise ValueError("A grasp/held/released phase requires its physical carrier owner")
+            # BEGIN only actual grasp/holding phases bind the current carrier.
+            if meta.get("mode") in {"grasp", "held"} and not carrier:
+                raise ValueError("A grasp/held phase requires its physical carrier owner")
+            # END released observations do not create another reference phase.
             if carrier is None:
                 continue
             if carrier not in by_id or carrier in background_ids:

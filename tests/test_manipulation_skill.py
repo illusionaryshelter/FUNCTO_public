@@ -1,249 +1,197 @@
-"""Offline-artifact routing contracts, independent of models and simulator GT."""
-
-# BEGIN actual file loading and object/component separation regressions.
-from copy import deepcopy
+"""Version-2 portable bundles and semantic instance observation."""
+# BEGIN production/consumption replaces the obsolete query-recipe bundle.
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import Mock
-
 import numpy as np
 from PIL import Image
-
-from manipulation.skill import load_grounding_skill, observe_interaction_reference
-
-
-def write_json(path, value):
-    path.write_text(json.dumps(value), encoding="utf-8")
+from manipulation.representation import build_representation
+from manipulation.skill import save_grounding_skill, load_grounding_skill, observe_interaction_reference
 
 
-def bundle(root, *, scope="object", geometry_kind="query_frame"):
-    """Small portable artifact with distinct owner and recorded contact masks."""
-    manifest = {
-        "schema": "functo.grounding_skill.1", "owner_role": "carrier",
-        "geometry_kind": geometry_kind,
-        "files": {"semantic": "semantic.json", "template": "template.json",
-                  "program": "program.json", "observations": "observations.npz", "image": "rgb.png"},
-        "provenance": {"source_episode": "/unavailable/offline/episode.h5"},
-    }
-    semantic = {
-        "object_description": "container", "interaction_part_description": "outer grasping region",
-        "interaction_reference": {"text": "container" if scope == "object" else "container handle",
-                                  "scope": scope},
-        "description": "Establish the demonstrated grasp of the container.",
-        "reason": "The chosen observation makes the demonstrated region distinguishable.",
-    }
-    template = {"owner_id": "source_owner", "region_id": "recorded_contact"}
-    if geometry_kind == "query_frame":
-        template.update(query_pixels=[[2, 2], [3, 3], [4, 2]],
-                        query_descriptions=["contact anchor", "axis witness", "plane witness"],
-                        frame_recipe={"kind": "frame", "origin_weights": [1, 0, 0],
-                                      "axis_weights": [-1, 1, 0], "plane_weights": [-1, 0, 1]})
-    if geometry_kind == "protruding_line":
-        manifest["files"]["geometry"] = "geometry.json"
-        write_json(root / "geometry.json", {"anchor_pixel": [3, 3], "source_frame": np.eye(4).tolist()})
-    contact = np.zeros((10, 12), bool)
-    contact[3:5, 3:5] = True
-    owner = np.zeros_like(contact)
+def source_inputs(scope="object", contact=True):
+    owner = np.zeros((10, 12), bool)
     owner[1:9, 1:11] = True
-    arrays = {"mask": contact, "owner_mask": owner, "depth": np.full((10, 12), 1., np.float32),
-              "K": np.array([[10., 0., 6.], [0., 10., 5.], [0., 0., 1.]]),
-              "T_camera_owner": np.eye(4)}
-    if geometry_kind == "protruding_line":
-        arrays["front_mask"] = contact.copy()
-    np.savez(root / "observations.npz", **arrays)
-    Image.new("RGB", (12, 10), (25, 50, 100)).save(root / "rgb.png")
-    program = {"skill_kind": "grasp", "demo": {
-        "carrier_id": "source_owner", "T_carrier_eef": [np.eye(4).tolist()],
-        "source": {"trajectory_file": "/unavailable/offline/trajectories.h5"}}}
-    for filename, value in (("skill.json", manifest), ("semantic.json", semantic),
-                            ("template.json", template), ("program.json", program)):
-        write_json(root / filename, value)
-    return semantic, arrays, program
+    region = np.zeros_like(owner)
+    if contact:
+        region[3:5, 3:5] = True
+    y, x = np.nonzero(owner)
+    pixels = np.column_stack((x, y))
+    K = np.array([[10., 0., 6.], [0., 10., 5.], [0., 0., 1.]])
+    xyz = np.column_stack((pixels, np.ones(len(x)))) @ np.linalg.inv(K).T
+    bank = dict(xyz=xyz, pixels=pixels, object_mask=owner, entity_member=np.ones(len(x), bool),
+                region_mask=region[y, x], evidence_only=np.zeros(len(x), bool), K=K, T_world_camera_cv=np.eye(4))
+    source = dict(image=Image.new("RGB", (12, 10), (25, 50, 100)), observation=bank,
+                  depth_m=np.ones((10, 12), np.float32), crop_xyxy=np.array([0, 0, 12, 10]),
+                  timestamp_s=4., frame_index=17, owner_id="source_body", T_world_body_at_image=np.eye(4))
+    if contact:
+        source.update(region_image_mask=region, L_body_region=np.eye(4))
+    semantic = dict(object_description="container", interaction_part_description="outer grasp region" if contact else "",
+        interaction_reference=dict(text="container" if scope == "object" else "container handle", scope=scope),
+        description="Use this demonstrated object relation.", reason="Recorded source visual evidence.")
+    metadata = dict(skill_id="recorded_segment", owner_role="carrier", semantic=semantic,
+        roles={"master": {"entity": "container", "body": "source_body"}, "slave": "gripper"},
+        provenance={"recording": "/unavailable/original/recording.h5"}, task={})
+    body = np.repeat(np.eye(4)[None], 3, axis=0)
+    eef = body.copy()
+    eef[:, 2, 3] = [.2, .1, .0]
+    rep = build_representation(kind="grasp", frame_indices=[17, 20, 25], timestamps=[4., 4.5, 5.],
+        T_world_carrier=body, T_world_eef=eef, L_G=np.eye(4), approach_time=4., interaction_time=5.)
+    return metadata, source, rep
+
+
+def bundle(root, **kwargs):
+    meta, source, rep = source_inputs(**kwargs)
+    save_grounding_skill(root, metadata=meta, source=source, representation=rep)
+    return meta, source, rep
 
 
 def detection(label):
     mask = np.zeros((10, 12), bool)
     mask[2:8, 2:10] = True
-    return {"label": label, "candidate_id": 17, "score": .6, "bbox": [2, 2, 10, 8], "mask": mask}
+    return dict(label=label, candidate_id=17, score=.6, bbox=[2, 2, 10, 8], mask=mask)
 
 
 class GroundingSkillTest(unittest.TestCase):
-    def test_offline_semantics_drive_same_runtime_entry_for_object_and_component(self):
-        for scope, kind in (("object", "query_frame"), ("object", "vertices"),
-                            ("part", "protruding_line")):
-            with self.subTest(scope=scope, kind=kind), tempfile.TemporaryDirectory() as directory:
-                semantic, arrays, program = bundle(Path(directory), scope=scope, geometry_kind=kind)
-                skill = load_grounding_skill(directory)
-                # Loading is complete despite intentionally nonexistent provenance paths.
-                self.assertEqual(skill["program"], program)
-                self.assertEqual(skill["semantic"], semantic)
-                self.assertEqual(skill["source_template"]["description"], semantic["description"])
-                for key, array in arrays.items():
-                    np.testing.assert_array_equal(skill["source_template"][key], array)
-                if kind != "query_frame":
-                    self.assertNotIn("query_descriptions", skill["source_template"])
-                row = detection(semantic["interaction_reference"]["text"])
+    def test_self_contained_roundtrip_retains_point_identity_motion_and_missing_feature(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original, copied = Path(directory)/"original", Path(directory)/"copy"
+            meta, source, rep = bundle(original)
+            shutil.copytree(original, copied)
+            shutil.rmtree(original)
+            skill = load_grounding_skill(copied)
+            self.assertEqual(skill["metadata"], meta)
+            for name, value in source["observation"].items():
+                np.testing.assert_array_equal(skill["source"]["observation"][name], value)
+            np.testing.assert_array_equal(skill["representation"]["H_g"], rep["H_g"])
+            np.testing.assert_array_equal(skill["representation"]["timestamps"], [4., 4.5, 5.])
+            self.assertIn("feature", skill["source"]["missing"])
+            self.assertNotIn("source_template", skill)
+            self.assertNotIn("program", skill)
+
+    def test_saved_feature_and_source_frame_are_bundle_owned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            meta, source, rep = source_inputs()
+            source.update(feature=np.arange(48, dtype=np.float32).reshape(1, 3, 4, 4),
+                          feature_model={"name": "fixture spatial extractor", "resolution": 4})
+            root = Path(directory)/"skill"
+            save_grounding_skill(root, metadata=meta, source=source, representation=rep)
+            loaded = load_grounding_skill(root)
+            np.testing.assert_array_equal(loaded["source"]["feature"], source["feature"])
+            np.testing.assert_array_equal(loaded["source"]["L_body_region"], source["L_body_region"])
+
+    def test_offline_semantics_drive_object_and_part_selection(self):
+        for scope in ("object", "part"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)/"skill"
+                meta, _, _ = bundle(root, scope=scope)
+                phrase = meta["semantic"]["interaction_reference"]["text"]
+                row = detection(phrase)
                 detector = Mock(return_value=[row])
                 client = Mock(chat_json=Mock(return_value={"views": {"camera": {
-                    "candidate_ids": [17], "reason": "This visible instance matches the current request."}}}))
-                current = Image.new("RGB", (12, 10), (80, 120, 40))
-                result = observe_interaction_reference(
-                    skill, "Use the right instance", {"camera": {"image": current}},
-                    detector=detector, client=client)
-                self.assertEqual(detector.call_args.args[1], [semantic["interaction_reference"]["text"]])
-                expected_scope = "owner" if scope == "object" else "interaction_reference"
-                self.assertEqual(result["selection_scope"], expected_scope)
+                    "candidate_ids": [17], "reason": "This instance satisfies the current request."}}}))
+                client.chat_json.return_value.update(same_entity=True, same_entity_reason="One selected view only")
+                result = observe_interaction_reference(load_grounding_skill(root), "Use the right instance",
+                    {"camera": {"image": Image.new("RGB", (12, 10))}}, detector=detector, client=client)
+                self.assertEqual(detector.call_args.args[1], [phrase])
+                self.assertEqual(result["selection_scope"], "entity" if scope == "object" else "interaction_reference")
                 context = json.loads(client.chat_json.call_args.args[0].split("\nInput data:\n", 1)[1])
                 self.assertEqual(context["current_instruction"], "Use the right instance")
-                self.assertEqual(context["source_evidence"]["interaction_reference"], semantic["interaction_reference"])
-                self.assertEqual(context["source_evidence"]["description"], semantic["description"])
-                self.assertNotIn("source_owner", client.chat_json.call_args.args[0])
-                selected = result["selection"]["views"]["camera"]["regions"][0]
-                np.testing.assert_array_equal(selected["mask"], row["mask"])
-                # A selected component remains a component; neither the caller's
-                # source masks nor the returned candidate gain an owner mask.
-                self.assertNotIn("owner_mask", selected)
-                self.assertNotIn("owner_mask", result)
+                self.assertNotIn("source_body", client.chat_json.call_args.args[0])
+                np.testing.assert_array_equal(result["selection"]["views"]["camera"]["regions"][0]["mask"], row["mask"])
 
-    def test_part_reference_needs_no_current_whole_owner_and_does_not_force_selection(self):
+    def test_contact_free_does_not_create_contact_region(self):
         with tempfile.TemporaryDirectory() as directory:
-            bundle(Path(directory), scope="part", geometry_kind="protruding_line")
-            skill = load_grounding_skill(directory)
-            views = {"occluded": {"image": Image.new("RGB", (12, 10))}}
-            client = Mock()
-            result = observe_interaction_reference(skill, "Use this instance", views,
-                                                   detector=Mock(return_value=[]), client=client)
-            self.assertEqual(result["selection"]["views"]["occluded"]["status"], "no_candidates")
-            client.chat_json.assert_not_called()
-            client.chat_json.return_value = {"views": {"occluded": {
-                "candidate_ids": None, "reason": "The owning instance is obscured."}}}
-            result = observe_interaction_reference(
-                skill, "Use this instance", views,
-                detector=Mock(return_value=[detection("container handle")]), client=client)
-            self.assertEqual(result["selection"]["views"]["occluded"]["status"], "unresolved")
-            self.assertEqual(result["selection"]["views"]["occluded"]["regions"], [])
-
-    def test_wrong_query_result_is_rejected_before_semantic_selection(self):
-        with tempfile.TemporaryDirectory() as directory:
-            bundle(Path(directory))
-            skill = load_grounding_skill(directory)
-            client = Mock()
-            with self.assertRaisesRegex(ValueError, "unrequested label"):
-                observe_interaction_reference(
-                    skill, "Use this instance", {"camera": {"image": Image.new("RGB", (12, 10))}},
-                    detector=Mock(return_value=[detection("caller override")]), client=client)
-            client.chat_json.assert_not_called()
-
-    def test_component_selection_accepts_separate_current_owner_context(self):
-        with tempfile.TemporaryDirectory() as directory:
-            bundle(Path(directory), scope="part", geometry_kind="protruding_line")
-            skill = load_grounding_skill(directory)
-            owner_mask = np.zeros((10, 12), bool)
-            owner_mask[1:9, 1:11] = True
-            selected_owner = {"owner_id": "current_instance", "mask": owner_mask,
-                              "description": "Observed selected container", "source": "Current image detection"}
+            root = Path(directory)/"skill"
+            bundle(root, contact=False)
+            skill = load_grounding_skill(root)
             client = Mock(chat_json=Mock(return_value={"views": {"camera": {
-                "candidate_ids": [17], "reason": "This component belongs to the selected green owner."}}}))
-            row = detection("container handle")
-            result = observe_interaction_reference(
-                skill, "Use this container", {"camera": {
-                    "image": Image.new("RGB", (12, 10)), "selected_owner": selected_owner}},
-                detector=Mock(return_value=[row]), client=client)
-            context = json.loads(client.chat_json.call_args.args[0].split("\nInput data:\n", 1)[1])
-            self.assertEqual(context["views"]["camera"]["selected_owner"]["owner_id"], "current_instance")
-            self.assertIn("mask overlap", client.chat_json.call_args.args[0])
-            np.testing.assert_array_equal(result["selection"]["views"]["camera"]["regions"][0]["mask"], row["mask"])
-            np.testing.assert_array_equal(selected_owner["mask"], owner_mask)
+                "candidate_ids": [17], "reason": "One visible reference entity."}}}))
+            client.chat_json.return_value.update(same_entity=True, same_entity_reason="One selected view only")
+            result = observe_interaction_reference(skill, "Use this reference",
+                {"camera": {"image": Image.new("RGB", (12, 10))}},
+                detector=Mock(return_value=[detection("container")]), client=client)
+            self.assertEqual(result["selection_scope"], "entity")
+            prompt = client.chat_json.call_args.args[0]
+            self.assertIn("several independently moving rigid bodies", prompt)
+            self.assertIn("no contact region supplied", prompt)
+            self.assertNotIn("region_image_mask", skill["source"])
+            self.assertFalse(skill["source"]["observation"]["region_mask"].any())
 
-    def test_geometry_metadata_cannot_silently_override_offline_semantics(self):
+    def test_part_can_be_missing_without_object_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            bundle(root)
-            template = json.loads((root / "template.json").read_text())
-            template["description"] = "An obsolete handwritten semantic request."
-            write_json(root / "template.json", template)
-            with self.assertRaisesRegex(ValueError, "duplicates semantics"):
-                load_grounding_skill(root)
+            root = Path(directory)/"skill"
+            bundle(root, scope="part")
+            client = Mock()
+            result = observe_interaction_reference(load_grounding_skill(root), "Use this instance",
+                {"camera": {"image": Image.new("RGB", (12, 10))}}, detector=Mock(return_value=[]), client=client)
+            self.assertEqual(result["selection"]["views"]["camera"]["status"], "no_candidates")
+            self.assertIsNone(result["selection"]["same_entity"])
+            client.chat_json.assert_not_called()
 
-    def test_payload_cannot_turn_object_reference_into_another_query_or_asset_id(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for text in ("another object", "container_1", "container\nnew instruction"):
-                semantic, _, _ = bundle(root)
-                semantic["interaction_reference"]["text"] = text
-                write_json(root / "semantic.json", semantic)
-                with self.subTest(text=text), self.assertRaises(ValueError):
-                    load_grounding_skill(root)
-            for text in ("container_handle", "container\nhandle"):
-                semantic, _, _ = bundle(root, scope="part", geometry_kind="protruding_line")
-                semantic["interaction_reference"]["text"] = text
-                write_json(root / "semantic.json", semantic)
-                with self.subTest(text=text), self.assertRaisesRegex(ValueError, "natural noun phrase"):
-                    load_grounding_skill(root)
+    # BEGIN component identity needs the same joint evidence as entity identity.
+    def test_joint_selection_preserves_uncertain_entity_or_component_identity(self):
+        for scope in ("object", "part"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)/"skill"
+                bundle(root, scope=scope)
+                skill = load_grounding_skill(root)
+                phrase = skill["metadata"]["semantic"]["interaction_reference"]["text"]
+                views = {name: {"image": Image.new("RGB", (12, 10))} for name in ("a", "b")}
+                for same in (True, False, None):
+                    client = Mock(chat_json=Mock(return_value={
+                        "views": {name: {"candidate_ids": [17], "reason": "Selected reference in this view"} for name in views},
+                        "same_entity": same, "same_entity_reason": "Recorded cross-view visual evidence or uncertainty"}))
+                    result = observe_interaction_reference(skill, "Use the intended container", views,
+                        detector=Mock(return_value=[detection(phrase)]), client=client)
+                    self.assertIs(result["selection"]["same_entity"], same)
+                    self.assertEqual(result["selection"]["association_scope"], "cross_view")
+                    self.assertEqual(client.chat_json.call_count, 1)
+                    self.assertIn("same particular component instance", client.chat_json.call_args.args[0])
 
-    def test_protruding_attachment_cannot_hide_missing_or_unrelated_source_geometry(self):
+    def test_component_selection_cannot_omit_its_instance_association(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for failure in ("missing_front", "nonbinary_front", "unrelated_front", "bad_anchor", "bad_frame"):
-                _, arrays, _ = bundle(root, scope="part", geometry_kind="protruding_line")
-                geometry = json.loads((root / "geometry.json").read_text())
-                if failure == "missing_front":
-                    del arrays["front_mask"]
-                elif failure == "nonbinary_front":
-                    arrays["front_mask"] = arrays["front_mask"].astype(np.uint8)
-                elif failure == "unrelated_front":
-                    arrays["front_mask"][0, 0] = True
-                elif failure == "bad_anchor":
-                    geometry["anchor_pixel"] = [100, 100]
+            root = Path(directory)/"skill"
+            bundle(root, scope="part")
+            client = Mock(chat_json=Mock(return_value={"views": {"camera": {
+                "candidate_ids": [17], "reason": "A matching component name is visible."}}}))
+            with self.assertRaises(ValueError):
+                observe_interaction_reference(load_grounding_skill(root), "Use the component",
+                    {"camera": {"image": Image.new("RGB", (12, 10))}},
+                    detector=Mock(return_value=[detection("container handle")]), client=client)
+    # END no selected component receives a fabricated cross-view instance ID.
+
+    def test_old_schema_and_external_payload_are_rejected(self):
+        for bad in ("schema", "path"):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)/"skill"
+                bundle(root)
+                manifest = json.loads((root/"skill.json").read_text())
+                if bad == "schema":
+                    manifest["schema"] = "functo.grounding_skill.1"
                 else:
-                    geometry["source_frame"] = np.zeros((4, 4)).tolist()
-                np.savez(root / "observations.npz", **arrays)
-                write_json(root / "geometry.json", geometry)
-                with self.subTest(failure=failure), self.assertRaises(ValueError):
+                    manifest["files"]["motion"] = "../outside.npz"
+                (root/"skill.json").write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
                     load_grounding_skill(root)
 
-    def test_vertices_cannot_reintroduce_discarded_three_point_roles(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            bundle(root, geometry_kind="vertices")
-            template = json.loads((root / "template.json").read_text())
-            template["query_descriptions"] = ["obsolete fixed point"]
-            write_json(root / "template.json", template)
-            with self.assertRaisesRegex(ValueError, "obsolete query-frame"):
-                load_grounding_skill(root)
-
-    def test_bundle_cannot_read_external_payloads_and_cannot_guess_missing_semantics(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            bundle(root)
-            manifest = json.loads((root / "skill.json").read_text())
-            manifest["files"]["program"] = "../outside.json"
-            write_json(root / "skill.json", manifest)
-            with self.assertRaisesRegex(ValueError, "missing or escapes"):
-                load_grounding_skill(root)
-            bundle(root)
-            semantic = json.loads((root / "semantic.json").read_text())
-            del semantic["interaction_reference"]
-            write_json(root / "semantic.json", semantic)
-            with self.assertRaisesRegex(ValueError, "complete offline"):
-                load_grounding_skill(root)
-
-    def test_in_memory_template_cannot_bypass_the_offline_semantic_record(self):
-        with tempfile.TemporaryDirectory() as directory:
-            bundle(Path(directory))
-            skill = load_grounding_skill(directory)
-            changed = deepcopy(skill)
-            changed["source_template"]["description"] = "Use another interaction"
-            detector = Mock()
-            with self.assertRaisesRegex(ValueError, "differs from its offline artifact"):
-                observe_interaction_reference(
-                    changed, "Use this instance", {"camera": {"image": Image.new("RGB", (12, 10))}},
-                    detector=detector, client=Mock())
-            detector.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()
-# END portable dataflow and distinct object/component observation contracts.
+    def test_source_time_pixel_identity_frame_and_body_must_agree_with_motion(self):
+        for bad in ("time", "region", "frame", "body", "role"):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
+                meta, source, rep = source_inputs()
+                if bad == "time":
+                    source["timestamp_s"] = 4.2
+                elif bad == "region":
+                    source["observation"]["region_mask"] = np.roll(source["observation"]["region_mask"], 1)
+                elif bad == "frame":
+                    source["L_body_region"][0, 3] = .02
+                elif bad == "body":
+                    source["T_world_body_at_image"][0, 3] = .02
+                else:
+                    meta["owner_role"] = "reference"
+                with self.assertRaises(ValueError):
+                    save_grounding_skill(Path(directory)/"skill", metadata=meta, source=source, representation=rep)
+# END new portable bundle tests.

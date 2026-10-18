@@ -31,6 +31,16 @@ _SELECTION_INSTRUCTION = (
     "a whole object is not a precise interaction-region mask. Source query descriptions "
     "can mention surrounding geometry used for directions: these are contextual "
     "witnesses, not additional interaction targets and need not fit inside the red mask.\n"
+    # BEGIN semantic entities do not imply a single independently moving body.
+    "entity means the task-selected semantic object described by object_description. "
+    "It may be an assembly containing several independently moving rigid bodies. "
+    "The green source entity evidence can be partial; when supplied, a red source "
+    "region explains the interaction but is not the entity's complete boundary. "
+    "Select the requested entity instance without requiring all its visible parts "
+    "to move rigidly together. Region-to-body ownership is a later geometric input, "
+    "not a reason to reject a semantically correct assembly mask. If no red region "
+    "is provided, do not invent a functional contact region.\n"
+    # END existing owner scopes still require one physical rigid owner.
     # BEGIN offline-selected detection references are distinct from contact masks.
     "interaction_reference means the functional COMPONENT named in "
     "source_evidence.interaction_reference.text. The red source contact evidence "
@@ -62,7 +72,7 @@ _SELECTION_INSTRUCTION = (
     "provided IDs within that view; equal IDs in different views do not establish "
     "physical correspondence. Images from other supplied views may provide context, "
     "but do not invent a mask in a view without a candidate.\n"
-    "For owner, interaction_region or interaction_reference, return candidate_ids as: one ID for a uniquely supported match; "
+    "For entity, owner, interaction_region or interaction_reference, return candidate_ids as: one ID for a uniquely supported match; "
     "multiple IDs only if EVERY listed candidate independently satisfies the current "
     "semantic request, so choosing any is allowed; [] when no supplied candidate "
     "matches; null when evidence cannot resolve which candidate meets the request. "
@@ -110,6 +120,26 @@ _SELECTED_OWNER_INSTRUCTION = (
     "them nor clip a part mask to the owner. Views without selected_owner retain "
     "the ordinary instruction-conditioned selection rules.\n"
 )
+
+# BEGIN one shared request associates selected views of an entity or component.
+_REFERENCE_ASSOCIATION_INSTRUCTION = (
+    "\nFor selection_scope=entity or interaction_reference, return exactly views, "
+    "same_entity, and same_entity_reason. "
+    "Each views record still has only candidate_ids and reason. same_entity is true "
+    "only when the unique selected candidate in each selected view depicts the SAME "
+    "physical instance of the current semantic task target. For interaction_reference, "
+    "this means the same particular component instance, not merely similarly named "
+    "components or different components belonging to one enclosing object. This does not assert "
+    "that its parts form one rigid body or that it remained still. Return false "
+    "if selected views depict different instances, and null if instance identity "
+    "cannot be established. A view with alternative candidate IDs is unresolved "
+    "for this association; do not pick among those alternatives to force agreement. "
+    "If only one view has a unique selected candidate, true means only a single "
+    "selected instance in that view, not cross-view verification. If no view has "
+    "a unique selected candidate, same_entity must be null. same_entity_reason "
+    "must explain the actual visual association or its missing evidence.\n"
+)
+# END association is semantic evidence, not tracking or rigid-owner certification.
 
 
 def _selected_owner(record, image, selection_scope):
@@ -176,13 +206,16 @@ def _panels(image, candidates):
 def _prepare(source, instruction, views, selection_scope):
     """Allowlist semantic evidence; source poses and simulator IDs are not sent."""
     # BEGIN component references retain a scope distinct from exact contacts.
-    if selection_scope not in {"owner", "interaction_region", "interaction_reference", "owner_evidence"}:
-        raise ValueError("selection_scope must be owner, interaction_region, interaction_reference or owner_evidence")
+    if selection_scope not in {"entity", "owner", "interaction_region", "interaction_reference", "owner_evidence"}:
+        raise ValueError("Unknown semantic selection scope")
     # END declared detection-reference selection scope.
     if not isinstance(instruction, str) or not instruction.strip():
         raise ValueError("A current instruction is required")
-    if not isinstance(source, dict) or not {"image", "mask", "description"} <= source.keys():
-        raise ValueError("Source requires image, mask and description")
+    # BEGIN an entity can be selected without a functional-contact region.
+    required_source = {"image", "description", "owner_mask" if selection_scope == "entity" else "mask"}
+    if not isinstance(source, dict) or not required_source <= source.keys():
+        raise ValueError("Source requires image, description and evidence for its selected scope")
+    # END no contact region is manufactured for a contact-free reference.
     description = source["description"]
     queries = source.get("query_descriptions", [])
     if not isinstance(description, str) or not description.strip():
@@ -197,8 +230,11 @@ def _prepare(source, instruction, views, selection_scope):
         if not semantic_fields <= source.keys():
             raise ValueError("Offline interaction semantics require object, part and detection reference")
         for key in semantic_fields - {"interaction_reference"}:
-            if not isinstance(source[key], str) or not source[key].strip():
+            # BEGIN contact-free entity evidence has no required contact-part name.
+            empty_part_allowed = selection_scope in {"entity", "owner_evidence"} and key == "interaction_part_description"
+            if not isinstance(source[key], str) or (not empty_part_allowed and not source[key].strip()):
                 raise ValueError(f"Source {key} must be a nonempty string")
+            # END entity identity remains mandatory; no part description is invented.
         reference = source["interaction_reference"]
         if (not isinstance(reference, dict) or set(reference) != {"text", "scope"}
                 or reference["scope"] not in {"object", "part"}
@@ -211,9 +247,12 @@ def _prepare(source, instruction, views, selection_scope):
     # END offline semantic input; poses and provenance are not model inputs.
     source_image = _image(source["image"])
     # BEGIN evidence-only sources need no manufactured interaction/owner mask.
-    evidence_scope = selection_scope == "owner_evidence"
-    source_region = _mask(source["mask"], source_image,
+    # BEGIN source entity masks and region-owner poses have separate meanings.
+    entity_scope = selection_scope == "entity"
+    evidence_scope = selection_scope == "owner_evidence" or (entity_scope and "mask" not in source)
+    source_region = _mask(source["owner_mask"] if entity_scope and "mask" not in source else source["mask"], source_image,
                           "Source owner evidence mask" if evidence_scope else "Source interaction mask")
+    # END original owner scopes keep their former evidence requirements.
     owner = None
     if "owner_mask" in source:
         owner = _mask(source["owner_mask"], source_image, "Source owner mask")
@@ -230,6 +269,11 @@ def _prepare(source, instruction, views, selection_scope):
                     if evidence_scope else
                     "source scene: red interaction region, green owner bounds when available"),
                    "source detail: same annotation, enlarged existing pixels"]
+    # BEGIN display semantic-object evidence without declaring physical rigidity.
+    if entity_scope:
+        image_order[0] = ("source scene: green semantic entity evidence; no contact region supplied"
+                          if evidence_scope else "source scene: red supplied region, green semantic entity context")
+    # END physical region ownership is never inferred from this green mask.
     # END scope-specific source annotation; current candidate masks stay separate.
     if not isinstance(views, dict) or not views:
         raise ValueError("views must be a nonempty view-ID mapping")
@@ -286,6 +330,8 @@ def _prepare(source, instruction, views, selection_scope):
     # BEGIN absent current-owner context leaves the original request unchanged.
     prompt = (_SELECTION_INSTRUCTION
               + (_SELECTED_OWNER_INSTRUCTION if has_selected_owner else "")
+              + (_REFERENCE_ASSOCIATION_INSTRUCTION
+                 if selection_scope in {"entity", "interaction_reference"} else "")
               + "\nInput data:\n" + json.dumps(context, ensure_ascii=False))
     # END optional contextual selection, without skill-name prompt branches.
     return prompt, images, prepared
@@ -293,6 +339,11 @@ def _prepare(source, instruction, views, selection_scope):
 
 def select_grounding_candidates(source, instruction, views, *, selection_scope, client=None):
     """Select semantic candidates using a fixed, automatically assembled prompt.
+
+    ``entity`` selects a semantic object instance, which may contain multiple
+    physical bodies. It requires source owner_mask as visible entity context;
+    a source contact mask is optional. This scope does not bind a region to a
+    body and does not replace the existing physical owner selection scopes.
 
     ``source`` consumes existing ``image``, interaction ``mask``, ``description``
     and optional ``query_descriptions``. ``selection_scope='owner'`` additionally
@@ -319,8 +370,12 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
     Each ``views[view_id]`` contains an image and detector candidates. Explicit
     positive integer candidate IDs are preserved; otherwise the input index
     starting at one is used. A normal single-view call supplies one mapping
-    entry. Multiple supplied views share semantic context only: their IDs and
-    masks are not fused into a physical or geometric association.
+    entry. For ``entity`` and ``interaction_reference``, the same request also
+    reports ``same_entity`` as true, false or unknown for the uniquely selected
+    instances across views. Component references must identify the same actual
+    component, not merely components of one owner. This explicit semantic
+    assertion does not establish rigidity or geometric registration. Other
+    scopes share context only; their local IDs establish no association.
 
     For ``interaction_region`` or ``interaction_reference``, a view may supply ``selected_owner`` with
     exactly owner_id, mask, description and source. That actual current mask is
@@ -338,8 +393,9 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
 
     Owner-evidence selections use ``selected`` for one or several masks, carry
     the semantic ``same_owner`` assertion, and never merge their pixels or
-    upgrade them to a complete ``owner_mask``. Other scopes retain their
-    existing response schema and multi-target ``alternatives`` status.
+    upgrade them to a complete ``owner_mask``. Entity/component-reference
+    selections retain ``alternatives`` but must report unknown association
+    when any view offers interchangeable targets instead of one instance.
     """
     prompt, images, candidates = _prepare(source, instruction, views, selection_scope)
     called = any(candidates.values())
@@ -348,12 +404,16 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
     else:
         response = {"views": {name: {"candidate_ids": [], "reason": "No detector candidates were supplied."}
                               for name in candidates}}
+        if selection_scope in {"entity", "interaction_reference"}:
+            response.update(same_entity=None, same_entity_reason="No observed candidates to associate")
         # BEGIN the no-candidate fast path obeys the same evidence schema.
         if selection_scope == "owner_evidence":
             for decision in response["views"].values():
                 decision["same_owner"] = None
         # END local empty decision, with no fabricated membership assertion.
-    if (not isinstance(response, dict) or set(response) != {"views"}
+    response_fields = ({"views", "same_entity", "same_entity_reason"}
+                       if selection_scope in {"entity", "interaction_reference"} else {"views"})
+    if (not isinstance(response, dict) or set(response) != response_fields
             or not isinstance(response["views"], dict) or set(response["views"]) != set(candidates)):
         raise ValueError("Selection must return exactly the supplied view IDs")
     result = {}
@@ -390,5 +450,19 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
         if evidence_scope:
             result[name]["same_owner"] = decision["same_owner"]
         # END same-owner evidence; legacy scopes keep their independent alternatives.
-    return {"selection_scope": selection_scope, "views": result, "vlm_used": called}
+    output = {"selection_scope": selection_scope, "views": result, "vlm_used": called}
+    # BEGIN preserve cross-view entity evidence instead of assigning a shared ID.
+    if selection_scope in {"entity", "interaction_reference"}:
+        association, reason = response["same_entity"], response["same_entity_reason"]
+        unique = [name for name, row in result.items() if row["status"] == "selected"]
+        ambiguous = any(row["status"] == "alternatives" for row in result.values())
+        if ((association is not None and type(association) is not bool)
+                or not isinstance(reason, str) or not reason.strip()
+                or ((not unique or ambiguous) and association is not None)):
+            raise ValueError("Entity association needs bool/null evidence for uniquely selected candidates")
+        output.update(same_entity=association, same_entity_reason=reason,
+                      association_scope="cross_view" if len(unique) > 1 else "single_selected_view" if unique else "no_unique_selection",
+                      associated_views=unique)
+    # END uncertain associations stay explicit; their masks are never merged.
+    return output
 # END generic grounding selection.

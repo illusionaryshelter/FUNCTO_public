@@ -166,13 +166,37 @@ class RequirementConsumptionTest(unittest.TestCase):
             with self.subTest(target=target), self.assertRaisesRegex(ValueError, "uncompiled"):
                 compile_inputs(skill)
 
-    def test_mechanism_direction_cannot_extend_into_released_retreat(self):
+    def test_mechanism_direction_cannot_extend_after_release(self):
         skill = prismatic_input()
         skill["coordinate_directions"] = [{"start_frame": 106, "end_frame": 112,
             "coordinate_index": 0, "kind": "net", "sign": 1, "minimum": .04,
             "tolerance": 1e-8, "source": "declared scoped opening"}]
         with self.assertRaisesRegex(ValueError, "controlled mechanism scope"):
             compile_inputs(skill)
+
+    # BEGIN requirements after release must not disappear into source metadata.
+    def test_explicit_execution_requirement_after_release_is_rejected(self):
+        skill = manipulation_input()
+        skill["execution_events"] = [{"event_id": "later_check", "frame_index": 112,
+            "kind": "prerequisite", "source": "explicit current task", "requires_evidence": "next_observation"}]
+        with self.assertRaisesRegex(ValueError, "current controlled skill interval"):
+            compile_inputs(skill)
+
+    def test_later_source_command_is_retained_but_its_declared_requirement_cannot_be_ignored(self):
+        for requirement in ({"stop": True}, {"requires_evidence": "current_release_check"},
+                            {"timing": [{"check_target": "activation", "window_s": [0., 1.],
+                              "time_basis": "request_physical", "origin_time_s": 0., "source": "current task deadline"}]}):
+            skill = manipulation_input()
+            later = {"event_id": "source_later_close", "frame_index": 112, "command": "close",
+                     "source": {"recording": "unchanged original", "raw_value": [1.]}}
+            skill["program"]["demo"]["gripper_events"].append(later)
+            compiled = compile_inputs(skill)
+            self.assertNotIn("source_later_close", [event.event_id for event in compiled.events])
+            self.assertEqual(compiled.phases[0].reference.source["gripper_events"][-1], later)
+            later.update(requirement)
+            with self.subTest(requirement=requirement), self.assertRaisesRegex(ValueError, "after release"):
+                compile_inputs(skill)
+    # END source annotations cannot hide an unconsumed current task obligation.
 
     def test_direction_source_and_consumption_records_do_not_alias_input(self):
         skill = prismatic_input()
