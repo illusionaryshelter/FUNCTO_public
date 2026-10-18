@@ -1,0 +1,26 @@
+{
+  "mujoco_online": {
+    "tracker": "trackon",
+    "register": "svd_residual_outlier",
+    "use_key_frame_graph": false,
+    "use_segmenter": false
+  },
+  "mujoco_offline": {
+    "tracker": "trackon",
+    "register": "svd_cluster_ransac",
+    "use_key_frame_graph": true,
+    "use_segmenter": false
+  },
+  "realsense_online": {
+    "tracker": "trackon",
+    "register": "svd_residual_outlier",
+    "use_key_frame_graph": false,
+    "use_segmenter": false
+  },
+  "realsense_offline": {
+    "tracker": "trackon",
+    "register": "svd_cluster_ransac",
+    "use_key_frame_graph": true,
+    "use_segmenter": false
+  }
+}

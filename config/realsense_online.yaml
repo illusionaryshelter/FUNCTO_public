@@ -1,0 +1,169 @@
+# Point2Pose + Track-On-R + externally provided SAM 3.1 masks
+# Profile: realsense_online | Small/medium rigid objects, 640x480 RGB-D
+# This is a pipeline PROFILE, not a MuJoCo/RealSense driver.
+# Offline uses precomputed masks; online passes masks through Frame.mask.
+# CHANGE checkpoint_path, camera metadata, max_num_obj before real use.
+# 16 GB GPU: run SAM 3.1 in a separate process for offline.
+# For large (>0.4 m) drawers/doors, see README SDF scale guidance.
+
+realsense:
+  params:
+    rs_serial: REPLACE_WITH_DEVICE_SERIAL
+pipeline:
+  type: modular
+  params:
+    max_num_obj: 1
+    estimate_init_pose: true
+    frame_reg_mode: f2m
+    use_segmenter: false
+    min_depth: 0.12
+    max_depth: 3.5
+    fill_missing_depth: false
+    use_depth_estimate: false
+    device: cuda
+    use_key_frame_graph: false
+    use_local_graph: false
+    kf_gating: false
+    debug_level: 0
+    debug_dir: ./runs/realsense_online/debug
+    save_pose: true
+    pose_save_path: ./runs/realsense_online/poses
+    save_key_points: false
+    save_meta_data: false
+    save_cropped_pcd: false
+    sdf_mesh_save_every: 0
+    map_growth_max_mean_residual: 0.009
+    anchor_min_inliers: 5
+    anchor_min_inlier_ratio: 0.2
+    max_rel_translation: 0.15
+    max_rel_rotation_deg: 35
+    pose_jump_guard_enable: true
+    pose_jump_guard_trans_thres: 0.15
+    pose_jump_guard_rot_deg_thres: 35
+    pose_jump_guard_min_inliers: 5
+    pose_jump_guard_single_cluster_min_inliers: 5
+    pose_jump_guard_relax_when_lost: true
+    max_lost_frames: 5
+    pose_jump_guard_lost_min_inliers: 8
+    pose_jump_guard_lost_min_inlier_ratio: 0.25
+reconstructor:
+  type: sdf_builder
+  params:
+    build_sdf_after_global_opt: false
+    sdf_use_gpu: true
+    sdf_backend: python_tsdf
+    sdf_voxel_size: 0.007
+    sdf_bounds_padding: 0.07
+    sdf_min_points: 300
+    sdf_filter_max_radius: 0.4
+    sdf_filter_keep_percentile: 98.0
+    sdf_fuse_color: false
+    bbox_sdf_refine_enable: false
+    bbox_sdf_min_integrations: 4
+    bbox_sdf_refine_every: 3
+    bbox_sdf_min_weight: 2.0
+    bbox_sdf_surface_band: 0.5
+    bbox_sdf_open_iters: 1
+    bbox_sdf_keep_component_ratio: 1.0
+    bbox_sdf_min_component_voxels: 32
+    bbox_sdf_trim_percentile: 99.5
+    bbox_sdf_min_voxels: 64
+    bbox_sdf_oriented: true
+    bbox_sdf_max_rel_extent_change: 2.0
+    bbox_sdf_smooth_alpha: 0.2
+register:
+  type: svd_residual_outlier
+  params:
+    remove_outside_mask: true
+    mask_border_margin_px: 3
+    debug_level: 0
+    max_iter: 5
+    threshold_method: mad
+    inlier_thres: 0.012
+    thres_reduce_factor: 0.005
+    mad_scale: 1.0
+    min_inliers: 4
+    residual_thres: 0.009
+segmenter:
+  type: dummy
+  params: {}
+tracker:
+  type: trackon
+  params:
+    device: cuda
+    checkpoint_path: /home/shelter/recovery/models/track_on_r.pt
+    vit_backbone: dinov3_s_plus
+    input_size:
+    - 384
+    - 512
+    visible_threshold: 0.8
+    memory_size: 24
+    inference_memory_size: 72
+sampler:
+  type: super_point_balanced
+  params:
+    num_points: 20
+    density_per_kpx: -1
+    fps_oversample_factor: 3
+    min_points: 5
+    max_points: 40
+    edge_margin_px: 6
+    remove_convex_hull: false
+    inflate_points: false
+    cell_size: -1
+    crop_to_mask: true
+    crop_pad_px: 4
+    super_point_max_num_keypoints: 512
+    enable_depth_filter: true
+    depth_fallback_to_unfiltered: false
+    avoid_existing_points: true
+    nms_radius_px: 3.0
+    min_separation_px: 4.0
+    debug_level: 0
+criterion:
+  type: rotation_threshold_and_min_num
+  params:
+    min_num_pts: 12
+    min_mask_area: 100
+    max_angle_deg: 15
+    update_per_iter: 1000000
+local_optimizer:
+  type: lm_graph
+  params:
+    local_graph_max_num_frames: -1
+    max_iterations: 15
+    relative_error_tol: 1.0e-05
+    absolute_error_tol: 1.0e-05
+    prior_noise_param:
+    - 0.1
+    - 0.1
+    - 0.1
+    - 0.1
+    - 0.1
+    - 0.1
+global_optimizer:
+  type: lm_graph
+  params:
+    relinearize_threshold: 0.1
+    relinearize_skip: 1
+    relative_error_tol: 1.0e-05
+    absolute_error_tol: 1.0e-05
+    prior_noise_param:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    uncertainty_thres: 0.3
+    uncertainty_min: 0.01
+    use_between_factor: true
+    landmark_sigma_scale_by: residual
+    landmark_sigma_min: 0.001
+    landmark_huber_k: 1.0
+visualization:
+  params:
+    visualize_points: false
+    points_vis_method: frame_id
+    save_images: false
+    output_image_dir: ./runs/realsense_online/images

@@ -1,0 +1,196 @@
+# Point2Pose + Track-On-R / SAM 3.1：四套最终工程 Profile
+
+适配目标：MuJoCo 3.5.0 或 RealSense RGB-D；在线 / 离线；RTX 5070 Ti 16 GiB；小/中型机器人操作对象。此包依据 Point2Pose upstream main（2026-10-10 检索）、MuJoCo 3.5 的 API/源码设计。**仅完成配置结构检查、Python 编译与数据结构单元测试；未在你的设备、MuJoCo 场景或完整 Point2Pose 依赖上执行端到端运行。** 所有阈值均为起始配置，非已标定的最优值。
+
+## 文件
+
+| 文件 | 场景 | 匹配/位姿求解 | 优化 |
+|---|---|---|---|
+| `mujoco_online.yaml` | MuJoCo 在线仿真 RGB-D | `svd_residual_outlier` | 无全局/局部图优化 |
+| `mujoco_offline.yaml` | MuJoCo 离线 RGB-D | `svd_cluster_ransac` + SDF refine | 全局 + 局部图 |
+| `realsense_online.yaml` | RealSense 在线 RGB-D | `svd_residual_outlier` | 无全局/局部图优化 |
+| `realsense_offline.yaml` | RealSense 离线 RGB-D | `svd_cluster_ransac` + SDF refine | 全局 + 局部图 |
+| `rgbd_bridge.py` | 两种输入源 + `Frame` 桥 | `RGBDPacket`, `make_frame`, `MuJoCoRGBD`, `RealSenseRGBD` | 不装载 SAM |
+| `run_offline.py` | 离线预处理序列的执行入口 | 直接调用 `ModularPipeline.step()` | 需 Point2Pose 全套依赖 |
+| `validate_profiles.py` | profile 和 RGB-D 数据契约自检 | 不需 GPU | 静态校验 |
+
+### 主要约定
+
+1. 四份 YAML 都有 `pipeline.params.use_segmenter: false`。**必须每帧传入 `Frame.mask`，不能直接运行原始 SAM2 点击交互的 RealSense 示例。** 原样 demo 会向 dummy segmenter 发送 prompt，接口不匹配。在线模式由你已有的 SAM 3.1 provider 实时生成 mask；离线模式单独运行 SAM 3.1 并落盘后读取。
+2. `segmenter.type: dummy` 用于保留 Point2Pose 配置结构，并**不负责**提供 mask。首帧应有至少一个非空实例 mask，后续被遮挡可传空 mask，但实例索引必须稳定。
+3. `tracker.type: trackon` + 本地 `track_on_r.pt` + `vit_backbone: dinov3_s_plus`。DINOv3 已下载到 `~/recovery/models/dinov3_s_plus`，需按你先前的本地模型加载方式修改 Track-On-R 的 DINOv3 adapter（或者让 Hugging Face 缓存可用）。
+4. `sampler.type: super_point_balanced` 在 Point2Pose 中**只使用 SuperPoint 特征检测**；不额外构建 LightGlue matcher。SuperPoint 权重须已经缓存。
+5. MuJoCo 的 `mujoco.params` 仅供 **你自己的 `MuJoCoRGBD` 接入层**读取，不是 Point2Pose 原生数据源；RealSense 的 `realsense.params.rs_serial` 是原生 demo 的序列号元数据，也需替换。四份 YAML 是 Point2Pose **计算管线**参数，不自动启动摄像头或 SAM。
+6. 当前源码实际的全局图优化开关是 `pipeline.params.use_key_frame_graph`，不是旧示例 `use_graph_optimization`；`frame_reg_mode` 有效值是 `f2f` 或 `f2m`，不支持 `hybrid`。
+
+## 一、安装与路径
+
+- 复制四份 YAML 到你的 `point-to-pose/configs/custom/`。
+- 把 `rgbd_bridge.py`、`run_offline.py`、`validate_profiles.py` 放入 `point-to-pose/tools/custom/`（路径可以自定）。
+- 修改所有四个 YAML 的 `tracker.params.checkpoint_path`，当前默认 `/home/shelter/recovery/models/track_on_r.pt` 只是此前交谈中可能的路径；**按实际文件路径修正**。
+- 运行：
+
+```bash
+python tools/custom/validate_profiles.py configs/custom/*.yaml
+```
+
+需要原生 Point2Pose、Track-On 源码、其 CUDA/MMCV 依赖、LightGlue SuperPoint、PyCUDA/TSDF 依赖。MuJoCo 3.5.0 和 RealSense SDK 依需要安装。
+
+## 二、输入：统一的 `RGBDPacket` 和 Point2Pose `Frame`
+
+- `rgb`: `[H,W,3] uint8`, **RGB 通道顺序**，不应 RGB/BGR 交换两次。
+- `depth_m`: `[H,W] float32`，**米**，光轴正深度（Z depth），缺失置 0。
+- `K`: `[3,3] float64`，与 RGB 和 depth **同分辨率/像素坐标系**；像素采样必须遵守当前相机内参和畸变校正的一致性。
+- `mask`: `[N,H,W]` 二值实例 mask，`N=pipeline.params.max_num_obj`；通过 `make_frame` 变成 GPU 上的 `[N,1,H,W]` Bool Tensor。
+- `timestamp_s`: 秒；离线保留真实帧时间而不随处理速度变化。
+- `depth_factor=1.0`：数据在进入 Point2Pose **之前已经转换为米**。
+- 多物体：按独立刚体固定实例索引，遮挡时给原索引空 mask，不能重排或把整个铰链柜体当单一刚体。
+
+MuJoCo 原生 `Renderer.enable_depth_rendering()` 返回已经线性化的相机光轴深度（米），**不要再从非线性 Z-buffer 换算**，也不要重复上下翻转。相机坐标为右、上、后（视线方向 -Z），转换为 OpenCV 右、下、前：
+
+```python
+R_world_cv = R_world_mujoco @ np.diag([1.0, -1.0, -1.0])
+```
+
+若相机只设置透视 `fovy`：`f = H/(2*tan(fovy/2))`, `fx=fy=f, cx=W/2, cy=H/2`。这里 `fovy` 表示纵向视场角，`H`/`W` 是输出图像像素高/宽。若 MJCF 通过 `sensorsize`、`focal`、`principal` 设置内参，应使用项目中的 `MuJoCoRGBD._compute_K()`（采用 MuJoCo `mju_camIntrinsics` 公式）；不支持正交相机。
+
+RealSense：使用 `rs.align(rs.stream.color)` 同步 depth 至彩色相机，并利用 `first_depth_sensor().get_depth_scale()`：
+
+```python
+depth_m = depth_raw.astype(np.float32) * depth_scale_m
+```
+
+`depth_raw` 是深度相机读取的原生像素值，`depth_scale_m` 是每单位对应的米数。**不要写死 /1000**。彩色相机如果仍有镜头畸变，需要保证颜色、深度和 mask 在同一个校正后的 pinhole 坐标系；不能只单独 undistort RGB 而不同时转换 depth/K/masks。
+
+### 数据源示范（在线 MuJoCo）
+
+```python
+# 放入你已有的仿真循环，而不是复制成一个新的 step 循环
+from omegaconf import OmegaConf
+from point2pose.pipeline.modular_pipeline import ModularPipeline
+from rgbd_bridge import MuJoCoRGBD, make_frame
+
+cfg = OmegaConf.load('configs/custom/mujoco_online.yaml')
+camera = MuJoCoRGBD(model, data, camera_name='tracking_camera', width=640, height=480)
+pipe = ModularPipeline(cfg)
+for frame_id in range(1000):
+    # mj_step(model, data) 通常由你自己的仿真/控制器完成
+    packet = camera.capture()  # rgb + depth + K + T_world_cam_cv
+    masks = your_sam31_provider(packet.rgb)  # 用户接口，输出 [N,H,W] 二值 mask
+    frame = make_frame(packet, masks, frame_id,
+                       max_num_obj=cfg.pipeline.params.max_num_obj)
+    pose_array = pipe.step(frame)
+    # pose_array[i] 对应物体相对于起始相机坐标系的相对 Pose
+camera.close()
+```
+
+在线 RealSense 将上例 `camera` 改为 `RealSenseRGBD(serial='你的序列号')`；`make_frame` 和 `ModularPipeline` **完全共用**。
+
+### 相机运动与世界 Pose
+
+Point2Pose 的 `obj.pose` 表示从首帧地图（首相机）到当前相机的物体变换（初始化为单位矩阵），而 `obj.init_pose` 还定义可视化/物体局部坐标。MuJoCo 尤其是腕部相机运动时，不要把 `obj.pose` 直接当世界位姿；应保留每帧 `packet.T_world_cam_cv` 并结合 object frame：
+
+```python
+T_world_object = packet.T_world_cam_cv @ (pipe.objects[i].pose @ pipe.objects[i].init_pose)
+```
+
+上述计算的是 Point2Pose 定义的**物体局部帧**在 MuJoCo 世界中的估计变换，不一定直接等于 MuJoCo MJCF `body` 的原点。若需和模拟 `body_xpos` / `body_xmat` 比较，须先标定固定的 object-local 到 body-local 坐标转换。对 RealSense 移动相机，如果没有外部相机位姿（机器人 FK、SLAM、标定），只能得到相对相机位姿，不能直接声称为世界位姿。
+
+## 三、离线：预计算分割、单独运行 Point2Pose
+
+建议**两个独立 GPU 进程**：先 SAM 3.1 整段视频分割，把 mask 与实例 ID 写入 CPU/磁盘，释放其显存；再 Track-On-R + SuperPoint + Pose。离线推理不必要把全部视频帧、全部 SAM 状态同时留在 RTX 5070 Ti 的显存。若 SAM 视频分割支持流式输出并将状态/视频 offload 到 CPU，启用它。
+
+`run_offline.py` 接受以下统一的数据布局：
+
+```text
+sequence_001/
+├── camera.json             # {"K": [[fx,0,cx],[0,fy,cy],[0,0,1]], "fps": 30}
+├── rgb/
+│   ├── 000000.png
+│   ├── 000001.png
+│   └── ...
+├── depth/
+│   ├── 000000.npy          # float32, meters (Z-depth), already RGB-aligned
+│   ├── 000001.npy
+│   └── ...
+└── masks/
+    └── obj_0/
+        ├── 000000.png      # 0 / 255 mask; same resolution; stable ID
+        ├── 000001.png
+        └── ...
+```
+
+多物体扩展 `masks/obj_1/`、`obj_2/`，同步修改四份配置中的 `max_num_obj` 或本次运行所选配置。
+
+`camera.json` 内的 K 字段按下式定义：
+
+```json
+{"K": [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]], "fps": 30}
+```
+
+**上面的 K 是占位格式演示，不是你实际 MuJoCo 或 RealSense 的标定值；必须用对应数据采集时的真实 K 替换。** `run_offline.py` 默认使用固定 K 与均匀 fps，但额外支持 `camera.json` 中的 `timestamps_s`（与 RGB 帧数量相同的秒数组）、`intrinsics/<frame>.npy`（每帧 3×3 K）和 `camera_poses/<frame>.npy`（每帧 4×4 `T_world_cam_cv`，用于移动相机）。若视频时间戳不均匀，应提供 `timestamps_s`；如果摄像机运动且希望世界位姿，应提供 `camera_poses/`，否则相对 Pose 不能凭空转换为世界 Pose。
+
+```bash
+# 从 Point2Pose 项目根目录启动；仍然需要实际的 PyTorch/MMCV/GTSAM 等依赖
+python tools/custom/run_offline.py \
+  --config configs/custom/mujoco_offline.yaml \
+  --sequence /absolute/path/sequence_001
+```
+
+RealSense 离线序列改用 `realsense_offline.yaml` 即可，不要用实时 RealSense demo 回放离线视频。runner 额外输出 `runs/<profile>/poses/estimated_poses_by_frame.npz`，其中含 `pose`、`frame_name`、`timestamp_s`；如果每帧都提供 `camera_poses`，还包含 `T_world_obj_local`，用于世界坐标系评价。上游 `.txt` Pose logger 采用运行时墙钟时间，在离线场景不应代替原视频时间戳。
+
+## 在线 SDF 取舍
+
+在线两份 Profile **默认关闭 TSDF 重建**（`reconstructor.params.build_sdf_after_global_opt: false`），避免在 16GB GPU 上与 SAM 3.1、Track-On-R 竞争显存并引入关键帧耗时峰值。Point2Pose 的 `f2m` 稀疏点地图仍可正常做位姿注册；关闭的是 dense TSDF 重建，不是 f2m 特征点地图。上游初始化时可能出现 “Failed to integrate keyframe” 提示，因明确禁用 TSDF 而触发，不意味着跟踪失败。需要在线增量重建时可以设回 `true`，但应增加显存预警并监测体素尺寸。离线两份仍开启 SDF 与 SDF refine。
+
+## 四、关键参数与调节策略
+
+初始参数（根据 Point2Pose real-time config、HO3D experiment，针对 16GB VRAM 和 640×480 小/中型刚体做工程折中，不是经验证的最优值）：
+
+| 参数 | MuJoCo 在线 | MuJoCo 离线 | RealSense 在线 | RealSense 离线 |
+|---|---:|---:|---:|---:|
+| 单次采样点数 | 20 | 32 | 20 | 30 |
+| SuperPoint 最大候选点 | 512 | 1024 | 512 | 1024 |
+| 最少可见点触发补样 | 12 | 18 | 12 | 18 |
+| 注册类型 | 残差迭代 SVD | 多假设 RANSAC + SDF | 残差迭代 SVD | 多假设 RANSAC + SDF |
+| 注册恢复残差（米） | .005 | .005 | .009 | .009 |
+| TSDF voxel（米） | .007 | .004 | .007 | .005 |
+| TSDF padding（米） | .06 | .06 | .07 | .07 |
+| TSDF 重建 | 关闭 | 开启 | 关闭 | 开启 |
+| Global graph | 关闭 | 开启 | 关闭 | 开启 |
+| Local graph | 关闭 | 开启 | 关闭 | 开启 |
+
+**实际调节顺序：**
+
+1. 实测 `registration_stats.txt` 或已记录的内点数与 3D 残差，按**跟踪像素误差 + 深度噪声**而不是仅按深度传感器精度设置 `register.residual_thres` 与 `map_growth_max_mean_residual`。默认 MuJoCo 阈值虽较 RealSense 紧，但 Track-On-R 并非仿真真值点追踪器，阈值过小会长期处于 lost。
+2. 小物体/工具的首选分辨率维持 Track-On-R `384×512`。不要在 16GB 显存紧张时一开始就牺牲输入分辨率；先运行 SAM 的离线单独 Pass，监测查询点数以及 TSDF 内存。
+3. **柜门/大抽屉面板**：默认的 `sdf_filter_max_radius=0.40m` 和毫米级 TSDF voxel 只面向小/中型目标。长宽约 0.8–1.2m 的面板，按尺寸将 radius 调到 `.7`–`1.0`，同时 voxel 放粗到 `.008`–`.012`m；需要防止 SDF dense grid 爆内存。即使不追求重建，也不能把柜体+门板合成一个刚体。
+4. 如 Pose 因抓取遮挡暂时失效，检查 Track-On-R 的重检测与 `pose_jump_guard_relax_when_lost`，并与 mask ID 一致性配合；不建议只放宽单个滤波阈值来掩盖错误匹配。
+5. 模型选择是速度/精度取舍，不是仅靠 `offline` YAML 就能让 Track-On-R 自动执行双向 smoothing 或全片回溯。真正的离线**双向优化**需要另外做后处理；当前两份离线 Profile 仅启用仓库已有的多假设注册和关键帧图优化，不承诺全局最优解。
+
+### 重要的源码限制
+
+- `bbox_sdf_refine_enable` 四份配置均默认关闭（它提升 3D 框估计，不直接提升物体位姿），需要 3D bbox 再单独开启。
+- `sdf_max_voxels` 和 `sdf_max_extent_m` 出现在某些官方 YAML 中，但目前的 `SDFBuilder` 并不读取这两个键，因此本包**不设置假的显存上限**。安全的做法是统计目标 AABB 和 voxels 预估、控制 `sdf_voxel_size`、`sdf_bounds_padding`、对象大小，并在 TSDFVolume 分配前增加硬性检查。
+- MuJoCo 的 `Renderer` RGB + depth 需要在**同一仿真状态**连续渲染；不能先取 RGB、`mj_step` 后再取 depth。RGB/深度图不会自行绑定 mask，对象 mask 的来源由独立 SAM 3.1 实现决定。
+- 上游原生 RealSense demo 以 SAM2 的 point-prompt 点击流程启动，**不能配合 `use_segmenter: false` 直接运行**；你需要使用 `rgbd_bridge.py` 接收 SAM 3.1 的 mask 再调用 Point2Pose。
+- Point2Pose Pose 定义为独立刚体；含滑动关节的抽屉、带铰链的柜门属于多个刚体，每个刚体单独跟踪。可进一步在 Pose 后端加入铰链角/滑动距离/SE(2) 的运动学约束，当前官方 YAML 不包含此类约束模块。
+- 如果你希望对比 MuJoCo GT 与视觉估计，请用 `T_world_cam_cv` 转到世界系，注意 object origin 固定偏置，勿将坐标系不一致的误差当模型误差。
+
+## 五、上线前验收
+
+1. `validate_profiles.py` 校验 4 份 YAML：组件字段、互斥选项、权重路径格式、在线/离线开关和 TSDF 初始体素大小。
+2. 对 `rgbd_bridge.py` 的 `MuJoCoRGBD` 用一个已知位置 3D 点做单像素投影与深度回投误差测试；误差明显大于像素精度时不要开始 Pose 调参。
+3. 用 Point2Pose 当前环境运行 30 帧 smoke test：固定物体、无遮挡 → 单体移动 → 单手遮挡 → 完全移出视角 → 恢复。检查 mask 顺序、追踪点、注册内点与 lost 转移。
+4. 分别运行 MuJoCo 在线和离线同一段视频，记录位置/角度误差；RealSense 使用不同距离与手部遮挡验证。最后才调整 pose-jump guard 和点数。
+5. 测 5070 Ti `torch.cuda.mem_get_info()`，额外结合 `nvidia-smi` 查看 PyCUDA 和 MuJoCo EGL 的**非 PyTorch 显存**。离线尽量使用 SAM 进程先退出再运行 Point2Pose。
+
+## Source references
+
+- Point2Pose default: https://github.com/tzuyuan/point-to-pose/blob/main/configs/realsense/default.yaml
+- Point2Pose HO3D: https://github.com/tzuyuan/point-to-pose/blob/main/configs/ho3d_exp/eccv_final.yaml
+- Point2Pose pipeline: https://github.com/tzuyuan/point-to-pose/blob/main/point2pose/pipeline/modular_pipeline.py
+- Point2Pose Frame: https://github.com/tzuyuan/point-to-pose/blob/main/point2pose/data_types/frame.py
+- MuJoCo renderer/camera: https://mujoco.readthedocs.io/en/stable/programming/visualization.html
+- MuJoCo Python rendering: https://mujoco.readthedocs.io/en/stable/python.html
+- MuJoCo camera projection helper: https://github.com/google-deepmind/mujoco/blob/main/src/engine/engine_support.c
