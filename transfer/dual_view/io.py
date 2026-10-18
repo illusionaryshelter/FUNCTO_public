@@ -21,8 +21,12 @@ from .surface import build_target_surface
 
 
 # BEGIN current observation loading, independent of historical prediction caches.
-def load_observations(index, task):
+def load_observations(index, task, *, region_geometry):
     """Bind two target observations to one unchanged source demonstration."""
+    # BEGIN geometry is an explicit caller declaration, never a task-name guess.
+    if region_geometry not in ('planar', 'surface'):
+        raise ValueError('region_geometry must be planar or surface')
+    # END explicit observation geometry contract.
     path, description = read_manifest(index)
     data = Path(description['data'])
     frames = json.loads((data / 'manifest.json').read_text())['views']
@@ -66,9 +70,12 @@ def load_observations(index, task):
             'rgb_path': str(target_dir / 'rgb.png')})
     query, region = source_queries(source)
     # Both target views share these identities derived from the actual source.
-    return {'source': source, 'source_depth': source_depth, 'source_rgb': source_rgb,
+    # BEGIN propagate the declared geometry with the immutable observed input.
+    return {'region_geometry': region_geometry,
+            'source': source, 'source_depth': source_depth, 'source_rgb': source_rgb,
             'source_crop': source_crop, 'query_indices': query, 'query_region': region,
             'views': views, 'task': task}
+    # END explicit geometry propagation.
 # END source equality is checked on arrays, crop and RGB before query selection.
 
 
@@ -80,12 +87,26 @@ def target_surface(loaded, cached_directory=None):
     entity labels are compared, including observations outside either entity.
     """
     views = loaded['views']
+    # BEGIN: the caller's declaration selects geometry and cache validation.
+    geometry = loaded['region_geometry']
+    if geometry not in ('planar', 'surface'):
+        raise ValueError('region_geometry must be planar or surface')
     if cached_directory is None:
+        if geometry == 'surface':
+            from .curved_geometry import build_target_surface as build_curved
+            return build_curved(views, sampling_radius_m=.03)
         return build_target_surface(views, sampling_radius_m=.03)
     surface = load_surface(cached_directory, views)
-    for name, value in (('sampling_radius_m', .03),
-                        ('surface_height_spacing_factor', 2.),
-                        ('normal_min_agreement', .65)):
+    if (surface.get('region_geometry') == 'surface') != (geometry == 'surface'):
+        raise ValueError('Frozen geometry disagrees with the explicit geometry declaration')
+    parameters = [('sampling_radius_m', .03)]
+    if geometry == 'surface':
+        from .curved_geometry import ObservationModel
+        if surface['observation_model'] != ObservationModel():
+            raise ValueError('Frozen curved geometry uses a different observation model')
+    else:
+        parameters += [('surface_height_spacing_factor', 2.), ('normal_min_agreement', .65)]
+    for name, value in parameters:
         if surface[name] != value:
             raise ValueError(f'Frozen geometry uses a different {name}')
     for view_index, view in enumerate(views):
@@ -94,6 +115,13 @@ def target_surface(loaded, cached_directory=None):
         np.testing.assert_array_equal(surface['observation_pixels'][ids], pixels)
         np.testing.assert_allclose(surface['observation_xyz'][ids], xyz, rtol=0, atol=1e-10)
         np.testing.assert_array_equal(surface['observation_entity_member'][ids], entity)
+        # BEGIN curve uncertainty belongs to these actual calibrated rays.
+        if geometry == 'surface':
+            rays = np.column_stack((pixels, np.ones(len(pixels)))) @ np.linalg.inv(view['K']).T
+            expected_error = surface['observation_model'].depth_error_m*np.linalg.norm(rays, axis=1)
+            np.testing.assert_allclose(surface['observation_position_error_m'][ids], expected_error,
+                                       rtol=0, atol=1e-15)
+        # END stale error arrays cannot change a restored association budget.
     # BEGIN independent dual-view cache structural/provenance validation.
     # Matching the raw RGB-D observations is necessary but insufficient: a
     # stale representative index could otherwise point the new world sampler
@@ -115,6 +143,9 @@ def target_surface(loaded, cached_directory=None):
         if len(observation_values) != observation_count:
             raise ValueError(f'Frozen observation_{name} is not observation aligned')
         np.testing.assert_array_equal(surface[name], observation_values[representative])
+    if geometry == 'surface':
+        np.testing.assert_array_equal(surface['position_error_m'],
+                                      surface['observation_position_error_m'][representative])
     for name, size in (('valid', element_count), ('entity_member', element_count),
                        ('observation_valid', observation_count),
                        ('observation_entity_member', observation_count)):
@@ -125,10 +156,15 @@ def target_surface(loaded, cached_directory=None):
     spacing = np.asarray(surface['observation_spacing'])
     valid = surface['observation_valid']
     if (normal.shape != (observation_count, 3) or spacing.shape != (observation_count,)
-            or not np.isfinite(normal[valid]).all() or not np.isfinite(spacing[valid]).all()
-            or np.any(spacing[valid] <= 0)
-            or not np.allclose(np.linalg.norm(normal[valid], axis=1), 1, rtol=0, atol=1e-6)):
-        raise ValueError('Frozen valid observations need unit normals and positive spacing')
+            or not np.isfinite(spacing[valid]).all() or np.any(spacing[valid] <= 0)):
+        raise ValueError('Frozen observations need aligned normals and positive spacing')
+    if geometry == 'planar':
+        if (not np.isfinite(normal[valid]).all()
+                or not np.allclose(np.linalg.norm(normal[valid], axis=1), 1, rtol=0, atol=1e-6)):
+            raise ValueError('Frozen planar observations need unit normals')
+    elif not np.isnan(normal).all():
+        raise ValueError('Curved position-only observations must retain unknown normals')
+    # END: geometry-specific validity; the index/provenance checks are shared.
     member_counts = np.bincount(mapping.astype(np.int64) * 2 + observation_view.astype(np.int64),
                                minlength=2 * element_count).reshape(element_count, 2)
     if np.any(member_counts > 1):
@@ -139,6 +175,12 @@ def target_surface(loaded, cached_directory=None):
     np.testing.assert_array_equal(surface['entity_member'], entity)
     if surface['adjacency'].shape != (element_count, element_count):
         raise ValueError('Frozen adjacency must use the complete surface-element domain')
+    if geometry == 'surface':
+        for name in ('observation_adjacency', 'depth_adjacency'):
+            graph = surface[name]
+            if (graph.shape != (observation_count, observation_count)
+                    or not np.isfinite(graph.data).all() or np.any(graph.data <= 0)):
+                raise ValueError('Frozen curved graph must use valid observed distances')
     # END independent dual-view cache structural/provenance validation.
     return surface
 
@@ -177,7 +219,16 @@ def appearance_field(loaded, surface, feature_pairs):
             continue
         prepared.append(prepare_view(queries, feature_pairs[view['id']][1],
             crop_xyxy=view['crop_xyxy'], observation=view['observation'], view_id=view['id']))
+    # BEGIN model-specific geometry qualification; descriptor arithmetic and
+    # response preparation above are shared without changing planar results.
+    geometry = loaded['region_geometry']
+    if geometry == 'surface':
+        from .curved_features import SurfaceResponseField
+        return SurfaceResponseField(surface, queries, prepared)
+    if geometry != 'planar':
+        raise ValueError('region_geometry must be planar or surface')
     return ResponseField(surface, queries, prepared)
+    # END no automatic model selection or runtime fallback.
 # END observed-support response construction.
 
 

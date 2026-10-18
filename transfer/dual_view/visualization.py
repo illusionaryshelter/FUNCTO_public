@@ -111,14 +111,29 @@ def region_picture(rgb, surface, mode, view_index):
     image = Image.fromarray(painted)
     samples = np.asarray(mode['sample_indices'])
     points = surface['xyz'][samples]
-    normals = np.broadcast_to(mode['normal'], points.shape)
-    projection = project_oriented(surface, points, normals, view_index)
+    # BEGIN: curved markers use stored measurements; normal-free positions
+    # must not be sent to the planar oriented projection predicate.
+    curved = surface.get('region_geometry') == 'surface'
+    if curved:
+        from .curved_geometry import project_measurements
+        representative = surface['representative_observation'][samples]
+        projection = project_measurements(surface, points, view_index,
+            query_position_error_m=surface['observation_position_error_m'][representative])
+    else:
+        normals = np.broadcast_to(mode['normal'], points.shape)
+        projection = project_oriented(surface, points, normals, view_index)
     visible = projection['supported'] & ~projection['conflict']
     draw = ImageDraw.Draw(image)
     for x, y in projection['pixels'][visible]:
         draw.ellipse((x-2.5, y-2.5, x+2.5, y+2.5), fill='#ffed64', outline='#172222')
-    center = project_oriented(surface, np.asarray(mode['center'])[None],
-                              np.asarray(mode['normal'])[None], view_index)
+    if curved:
+        seed = surface['representative_observation'][mode['seed_index']]
+        center = project_measurements(surface, np.asarray(mode['center'])[None], view_index,
+            query_position_error_m=surface['observation_position_error_m'][seed])
+    else:
+        center = project_oriented(surface, np.asarray(mode['center'])[None],
+                                  np.asarray(mode['normal'])[None], view_index)
+    # END: model-specific marker qualification; RGB region pixels are shared.
     if center['supported'][0] and not center['conflict'][0]:
         x, y = center['pixels'][0]
         draw.line((x-7, y, x+7, y), fill='white', width=2)

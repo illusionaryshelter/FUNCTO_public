@@ -68,10 +68,17 @@ def partial_refits(source_pack, surface, domain, proposal):
     known = domain['inverse'][:, columns] >= 0
     cost = 1. - utility + distance / tolerance
     feasible = known & (distance <= tolerance) & (cost < 1.)
-    normals = np.asarray(source_pack['query_normals'], dtype=float) @ transform[1].T
-    normal_valid = np.asarray(source_pack['query_normal_valid'], dtype=bool)
-    agreement = normals @ np.asarray(surface['normals'][target_ids], dtype=float).T
-    feasible &= ~normal_valid[:, None] | (agreement >= surface['normal_min_agreement'])
+    # BEGIN geometry-specific evidence: curved correspondences do not require
+    # normals. The planar arithmetic/order below remains exactly unchanged.
+    geometry = source_pack['region_geometry']
+    if geometry == 'planar':
+        normals = np.asarray(source_pack['query_normals'], dtype=float) @ transform[1].T
+        normal_valid = np.asarray(source_pack['query_normal_valid'], dtype=bool)
+        agreement = normals @ np.asarray(surface['normals'][target_ids], dtype=float).T
+        feasible &= ~normal_valid[:, None] | (agreement >= surface['normal_min_agreement'])
+    elif geometry != 'surface':
+        raise ValueError('Unknown source region_geometry')
+    # END no invented normal or failure fallback for the curved path.
     cost[~feasible] = np.inf
     diagnostics['feasible_edge_count'] = int(feasible.sum())
 

@@ -98,11 +98,12 @@ def write_reference_html(directory, skill, views, transfer, reference, report):
 <h1>技能区域迁移与参考轨迹</h1>
 <p class="status">流程：RUN_STATUS · 区域：REGION_STATUS · 参考：REFERENCE_STATUS。尚未进行轨迹优化或物理执行。</p>
 FAILURE_SUMMARY
+REGION_WARNINGS
 <p>真实源图与当前双视角图并排显示。区域色块与黄色采样点来自本次计算；拒绝时仍保留诊断区域。源区域是已有输入，当前区域没有使用目标区域真值。</p>
 <div class="controls"><label>图像放大 <input id="zoom" type="range" min="1" max="4" value="1" step=".25"></label><label>参考时间 <input id="progress" type="range" min="0" max="1000" value="0"></label><span id="time"></span></div>
 <p class="legend">坐标轴：红 x、绿 y、蓝 z（显示长度 4 cm）。青色为物体原点轨迹，橙色为末端原点轨迹。滑块选择原始参考时间；圆点表示该时间之前最近的真实参考采样。</p>
 <div class="grid">CARDS</div><details open><summary>本次状态、输入来源与缺项</summary><pre>DETAILS</pre></details>
-<p><a href="report.json">完整运行记录</a>REFERENCE_LINK</p>
+<p><a href="report.json">完整运行记录</a>REFERENCE_LINK REGION_LINK</p>
 <script>const panels=DATA;const images={};let ready=0;const slider=document.getElementById('progress');
 const allTimes=panels.flatMap(p=>Object.values(p.paths).flatMap(v=>v.times));const begin=allTimes.length?Math.min(...allTimes):0,end=allTimes.length?Math.max(...allTimes):0;
 function dot(ctx,p,color,r){if(!p)return;ctx.fillStyle=color;ctx.beginPath();ctx.arc(p[0],p[1],r,0,2*Math.PI);ctx.fill()}
@@ -114,6 +115,13 @@ for(const p of panels){const im=new Image();images[p.id]=im;im.onload=()=>draw()
     failure = (f'<p class="status">失败步骤：{escape(str(report["failed_stage"]))}；'
                f'{escape(str(report.get("error", "")))}</p>' if "failed_stage" in report else "")
     html = html.replace("FAILURE_SUMMARY", failure)
+    # BEGIN accepted curved regions retain every native quality warning.
+    warnings = report.get('region_warnings', [])
+    warning_text = ('<p class="status">区域警告：'+escape('；'.join(warnings))+'</p>') if warnings else ''
+    html = html.replace('REGION_WARNINGS', warning_text)
+    html = html.replace('REGION_LINK', ' · <a href="region.json">区域候选与观测诊断</a>'
+                        if (directory/'region.json').is_file() else '')
+    # END warnings are visible beside the region and reference decisions.
     # END preserve the native status without presenting missing as rejection.
     html = html.replace("REFERENCE_STATUS", escape(str(reference.get("status", "missing") if reference else "missing")))
     html = html.replace("REFERENCE_LINK", ' · <a href="reference.npz">参考数值</a>'

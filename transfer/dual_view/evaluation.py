@@ -275,7 +275,9 @@ def evaluate(output, destination, *, old_results, new_results,
         task = {'id': state['id'], 'cases': state['cases']}
         try:
             # BEGIN current observations do not require historical prediction caches.
-            loaded = load_observations(record['index'], task)
+            # BEGIN evaluate the existing planar experiment without model changes.
+            loaded = load_observations(record['index'], task, region_geometry='planar')
+            # END explicit planar observation loading.
             # END observation-only loading.
         except Exception as error:
             # A broken input/cache binding must not remove this task from the

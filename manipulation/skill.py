@@ -80,11 +80,15 @@ def _metadata(value):
 
 def _source(value):
     """Check source identities and calibrated array dimensions, not task success."""
+    # BEGIN region geometry is source evidence, explicitly declared by callers.
     required = {"image", "observation", "depth_m", "crop_xyxy", "timestamp_s", "frame_index",
-                "owner_id", "T_world_body_at_image"}
+                "owner_id", "T_world_body_at_image", "region_geometry"}
     if not isinstance(value, dict) or not required <= value.keys():
         raise ValueError("Source requires one calibrated image, point bank, time and fixed-body pose")
     result = dict(value)
+    if value['region_geometry'] not in ('planar', 'surface'):
+        raise ValueError('Source region_geometry must be planar or surface')
+    # END no task-name inference or old-bundle geometry fallback.
     image = value["image"]
     if not isinstance(image, Image.Image):
         array = np.asarray(image)
@@ -211,7 +215,8 @@ def save_grounding_skill(directory, *, metadata, source, representation):
     ``metadata`` includes skill_id, owner_role, semantic and roles, and may carry
     independent task conditions, provenance and missing inputs. ``source`` is
     one actual image plus its native observation point bank, calibrated depth,
-    crop, timestamp_s/frame_index, owner_id and T_world_body_at_image. Optional
+    crop, timestamp_s/frame_index, owner_id, T_world_body_at_image and explicit
+    region_geometry (planar or surface). Optional
     L_body_region and region_image_mask describe the supplied source region;
     optional feature/feature_model record its spatial MARCO map. No source
     directory is opened. ``representation`` is build_representation's result.

@@ -83,7 +83,14 @@ def rank_domain(source_pack, surface, appearance, *, chunk_size=4096):
     blocks = 0
     for begin in range(0, len(ids), chunk_size):
         chosen = ids[begin:begin + chunk_size]
-        sampled = appearance.sample(surface['xyz'][chosen], surface['normals'][chosen])
+        # BEGIN measured curved representatives retain their owner's error;
+        # arbitrary candidate points receive their source error at evaluation.
+        if source_pack['region_geometry'] == 'surface':
+            sampled = appearance.sample(surface['xyz'][chosen], surface['normals'][chosen],
+                query_position_error_m=surface['position_error_m'][chosen])
+        else:
+            sampled = appearance.sample(surface['xyz'][chosen], surface['normals'][chosen])
+        # END the planar call and its numeric arguments are unchanged.
         known = np.asarray(sampled['known'], dtype=bool)
         values = np.asarray(sampled['scores'], dtype=float)
         if known.shape != (rows, len(chosen)) or values.shape != known.shape:

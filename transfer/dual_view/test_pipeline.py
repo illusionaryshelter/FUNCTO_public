@@ -18,13 +18,15 @@ class PipelineTests(unittest.TestCase):
         observation = dict(xyz=np.array([[0., 0., 1.]]), pixels=np.array([[0, 0]]),
                            object_mask=np.ones((2, 2), bool))
         source = dict(observation, region_mask=np.array([True]))
-        self.loaded = dict(source=source, source_depth=np.ones((2, 2)),
+        # BEGIN the original planar route remains explicit in orchestration tests.
+        self.loaded = dict(region_geometry='planar', source=source, source_depth=np.ones((2, 2)),
             source_crop=np.array([0, 0, 2, 2]), query_indices=np.array([0]),
             query_region=np.array([True]), views=[
                 dict(id='A', observation=observation, crop_xyxy=np.array([0, 0, 2, 2]),
                      missing_reasons=[]),
                 dict(id='B', observation=None, crop_xyxy=None,
                      missing_reasons=['missing_entity_observation'])])
+        # END explicit planar routing fixture.
         self.features = {'A': (object(), object())}
         self.surface, self.source = {'fixture': 'target'}, {'reasons': []}
         self.appearance, self.domain = object(), {'fixture': 'fixed-domain'}

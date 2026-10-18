@@ -175,7 +175,11 @@ result = import_point2pose_skill(
 )
 ```
 
-`visual_source` 使用技能包现有的 image、observation 点库、depth_m、crop_xyxy、frame_index、timestamp_s、owner_id、region_image_mask 等视觉字段，禁止传入旧 `T_world_body_at_image`、`L_body_region` 或 `frame_construction`。适配器从对应原始帧的真实 `T_world_B` 重建物体位姿，调用现有 `source_region_frame()` 在同一个 Point2Pose 固定 `B` 下重新计算 `L`；不能沿用仿真 body 坐标下的旧 `L`。可选 `function_frame={T_world_function, frame_index, timestamp_s, source}` 显式提供同一源图像时刻的世界区域坐标；省略时从给定区域的测量点和相机坐标构造。
+<!-- BEGIN explicit source-region geometry contract. -->
+`visual_source` 必须显式提供 `region_geometry="planar" | "surface"`，并使用技能包现有的 image、observation 点库、depth_m、crop_xyxy、frame_index、timestamp_s、owner_id、region_image_mask 等视觉字段。`planar` 使用原平面规则；`surface` 使用实际 RGB-D 点关联与观测图邻域。入口不按任务名选择模式，也不在拒绝后自动切换。collect 导入 CLI 对应必填 `--region-geometry planar|surface`。
+
+禁止传入旧 `T_world_body_at_image`、`L_body_region` 或 `frame_construction`。适配器从对应原始帧的真实 `T_world_B` 重建物体位姿，调用现有 `source_region_frame()` 在同一个 Point2Pose 固定 `B` 下重新计算 `L`；不能沿用仿真 body 坐标下的旧 `L`。可选 `function_frame={T_world_function, frame_index, timestamp_s, source}` 显式提供同一源图像时刻的世界区域坐标；省略时从给定区域的测量点和相机坐标构造。迁移区域的采样种子不会改写已提供的功能坐标系 F。
+<!-- END explicit geometry declaration and unchanged frame semantics. -->
 
 `owner_bindings` 显式绑定 carrier/reference 实例，操作表示要求 reference 轨迹，且源区域必须属于对应 reference。EEF 若提供，必须已经与全部原始帧号、采集秒数、世界坐标对齐；这里不做插值或标定。`approach_time`、`interaction_time`、`release_time` 和 `events` 均是显式原时间，提供任何事件时必须同时提供 `event_source`。构造 `H_g` 或 `C_D` 需要 EEF；`H_m` 允许缺 EEF，并保留 `C_D` 不可用。没有 interaction_time 的短区间可保存为观测表示包，但交互位姿和接近方向仍明确缺失，不能称为完整技能。
 

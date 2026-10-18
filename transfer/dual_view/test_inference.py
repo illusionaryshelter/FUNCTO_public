@@ -22,12 +22,14 @@ def _source(surface):
     xy = [(4,4),(6,4),(8,4),(4,6),(8,6),(4,8),(6,8),(8,8),
           (2,2),(10,2),(2,10),(10,10)]
     ids = np.array([y*13+x for x,y in xy])
-    return dict(query_xyz=surface['xyz'][ids].copy(), query_indices=ids,
+    # BEGIN explicit geometry declaration for the unchanged planar fixture.
+    return dict(region_geometry='planar', query_xyz=surface['xyz'][ids].copy(), query_indices=ids,
         query_normals=np.tile([0.,0.,-1.], (12,1)), query_normal_valid=np.ones(12,bool),
         query_region=np.arange(12)<8, check_xyz=np.empty((0,3)),
         check_normals=np.empty((0,3)), check_indices=np.empty(0,np.int64),
         check_region=np.empty(0,bool), center=np.array([0.,0.,1.]),
         normal=np.array([0.,0.,-1.]), size=.02, reasons=[], diagnostics={})
+    # END explicit planar inference fixture.
 
 
 class AnalyticAppearance:

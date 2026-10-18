@@ -74,10 +74,12 @@ class RegionTransferTests(unittest.TestCase):
         for key in ("xyz", "pixels", "entity_member", "region_mask", "evidence_only"):
             observation[key] = observation[key][order]
         feature = np.arange(24, dtype=np.float32).reshape(1, 2, 3, 4)
-        self.source = dict(observation=observation, depth_m=depth, crop_xyxy=prepared["crop_xyxy"],
+        # BEGIN planar input fixture explicitly selects its original model.
+        self.source = dict(region_geometry='planar', observation=observation, depth_m=depth, crop_xyxy=prepared["crop_xyxy"],
             feature=feature, timestamp_s=12., frame_index=120, owner_id="source_part",
             T_world_body_at_image=pose((.1, .2, .3), (.4, -.5, .6)),
             L_body_region=pose((-.2, .1, .4), (.03, .02, -.01)))
+        # END explicit fixture geometry.
         target = prepare_selected_observation(rgb, depth, K, np.eye(4), detection)
         self.views = [dict(id=name, entity_id="chosen_cabinet", timestamp_s=20.+index,
             depth_m=depth, K=K, T_world_camera_cv=np.eye(4), observation=target["observation"],

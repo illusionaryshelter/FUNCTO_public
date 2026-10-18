@@ -44,11 +44,13 @@ def recorded(tmp_path):
     pixels = np.column_stack((x.ravel(), y.ravel()))
     xyz = np.column_stack((pixels, np.ones(len(pixels)))) @ np.linalg.inv(K).T
     region = np.ones((4, 6), bool)
-    source = dict(image=np.zeros((4, 6, 3), np.uint8), depth_m=np.ones((4, 6), np.float32),
+    # BEGIN recorded fixture has a declared planar observed region.
+    source = dict(region_geometry='planar', image=np.zeros((4, 6, 3), np.uint8), depth_m=np.ones((4, 6), np.float32),
         crop_xyxy=np.array([0, 0, 6, 4]), frame_index=19, timestamp_s=2.1, owner_id="tracked_part",
         region_image_mask=region, provenance={"region_source": "Given image mask; no tracking role"},
         observation=dict(xyz=xyz, pixels=pixels, object_mask=region, entity_member=np.ones(len(pixels), bool),
             region_mask=np.ones(len(pixels), bool), evidence_only=np.zeros(len(pixels), bool), K=K, T_world_camera_cv=np.eye(4)))
+    # END explicit geometry declaration.
     metadata = dict(skill_id="recorded_interval", owner_role="carrier", roles={"object": "supplied semantic role"},
         semantic=dict(object_description="container", interaction_part_description="outer surface",
             interaction_reference=dict(text="container", scope="object"), description="Given observed interval.",

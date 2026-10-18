@@ -24,9 +24,11 @@ def source_inputs(scope="object", contact=True):
     xyz = np.column_stack((pixels, np.ones(len(x)))) @ np.linalg.inv(K).T
     bank = dict(xyz=xyz, pixels=pixels, object_mask=owner, entity_member=np.ones(len(x), bool),
                 region_mask=region[y, x], evidence_only=np.zeros(len(x), bool), K=K, T_world_camera_cv=np.eye(4))
-    source = dict(image=Image.new("RGB", (12, 10), (25, 50, 100)), observation=bank,
+    # BEGIN this synthetic planar fixture declares geometry independently of kind.
+    source = dict(region_geometry='planar', image=Image.new("RGB", (12, 10), (25, 50, 100)), observation=bank,
                   depth_m=np.ones((10, 12), np.float32), crop_xyxy=np.array([0, 0, 12, 10]),
                   timestamp_s=4., frame_index=17, owner_id="source_body", T_world_body_at_image=np.eye(4))
+    # END explicit fixture geometry.
     if contact:
         source.update(region_image_mask=region, L_body_region=np.eye(4))
     semantic = dict(object_description="container", interaction_part_description="outer grasp region" if contact else "",

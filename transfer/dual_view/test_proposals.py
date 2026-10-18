@@ -24,7 +24,9 @@ class _Appearance:
 
 def _fixture():
     xyz = np.array([[x, y, 0.] for y in (0., .01, .02) for x in (0., .01, .02, .03)])
-    source = {'query_xyz': xyz, 'query_region': np.arange(len(xyz)) < 6, 'size': .02}
+    # BEGIN explicit geometry declaration for the unchanged planar fixture.
+    source = {'region_geometry': 'planar', 'query_xyz': xyz, 'query_region': np.arange(len(xyz)) < 6, 'size': .02}
+    # END planar ranking fixture.
     surface = {'xyz': xyz.copy(), 'valid': np.ones(len(xyz), bool),
         'entity_member': np.ones(len(xyz), bool),
         'spacing': np.full(len(xyz), .001),

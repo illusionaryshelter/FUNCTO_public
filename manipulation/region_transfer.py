@@ -94,6 +94,11 @@ def prepare_inputs(source, views, *, same_state_source):
     state_source = _text(same_state_source, "same_state_source")
     if not isinstance(source, dict):
         raise ValueError("source must be the loaded skill's single source record")
+    # BEGIN select geometry from the declared source region, never skill names.
+    geometry = source.get('region_geometry')
+    if geometry not in ('planar', 'surface'):
+        raise ValueError('source.region_geometry must explicitly be planar or surface')
+    # END input declaration; original observations and F remain unchanged.
     missing = [f"missing_source_{name}" for name in (
         "observation", "depth_m", "feature", "crop_xyxy", "L_body_region",
         "T_world_body_at_image") if source.get(name) is None]
@@ -153,12 +158,14 @@ def prepare_inputs(source, views, *, same_state_source):
     if not feature_pairs:
         raise RegionInputMissing(["no_current_entity_feature_observation"])
     query_indices, query_region = source_queries(observation)
-    loaded = {"source": observation, "source_depth": depth,
+    # BEGIN carry the geometry declaration through the numerical boundary.
+    loaded = {"region_geometry": geometry, "source": observation, "source_depth": depth,
               "source_crop": source["crop_xyxy"], "source_rgb": source.get("image"),
               "query_indices": query_indices, "query_region": query_region,
               "views": prepared, "same_state_source": state_source,
               "source_timestamp_s": source["timestamp_s"],
               "target_entity_id": next(iter(identities))}
+    # END no source-row or target-observation substitution.
     return loaded, feature_pairs
 
 

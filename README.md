@@ -239,11 +239,11 @@ robot commands.
 <!-- END native articulation coordinate goals. -->
 
 <!-- BEGIN offline interaction references drive runtime semantic observation. -->
-Compiled grounding skills live under `../collect/skills/<episode>/<segment>/`.
-They contain the demonstrated program, calibrated source evidence, reviewed
-functional geometry and the actual offline VLM semantic record. The runtime
-entry reads its SAM query from that record; experiment scripts do not choose a
-different object/part phrase or rewrite the skill description.
+Portable grounding skills use `functo.grounding_skill.2`. Each bundle contains
+its calibrated source RGB-D, original point identities, fixed functional frame,
+relative motion and offline semantic record. Loading does not open provenance
+directories or rerun extraction. The runtime SAM query comes from the stored
+semantic record.
 
 ```python
 from manipulation.skill import load_grounding_skill, observe_interaction_reference
@@ -255,18 +255,17 @@ observation = observe_interaction_reference(
 )
 decision = observation["selection"]["views"]["camera"]
 # Preserve unresolved/alternative decisions. Pass selected masks to the
-# existing geometry consumer declared by skill["manifest"]["geometry_kind"].
+# dual-view geometry declared by skill["source"]["region_geometry"].
 ```
 
-`skill.json` uses schema `functo.grounding_skill.1`, `owner_role` (`carrier` or
-`reference`), and `geometry_kind` (`query_frame`, `vertices` or
-`protruding_line`). Its `files` mapping names bundle-relative `semantic`,
-`template`, `program`, `observations` and `image` files. `protruding_line` also
-requires a `geometry` JSON attachment; its observed source front-surface mask
-can be stored in the NPZ observations. All payloads stay inside the bundle.
-Provenance paths are retained as records and are never opened by this loader.
+`skill.json` maps bundle-relative `metadata`, `source`, `observations`, `image`,
+`representation` and `motion` files. Metadata contains `owner_role` (`carrier`
+or `reference`), physical/semantic roles and the original semantic record.
+Source JSON declares `region_geometry="planar"` or `"surface"`; missing or
+unknown declarations are rejected. The geometry model is not inferred from a
+skill name or selected after another model fails.
 
-`semantic.json` is the corresponding offline owner's unmodified record:
+The metadata's `semantic` object is the corresponding offline owner's record:
 `object_description`, `interaction_part_description`, `description`, `reason`
 and `interaction_reference={"text": noun_phrase, "scope": "object" | "part"}`.
 Object scope selects an owner mask. Part scope selects a functional component
@@ -275,14 +274,27 @@ the demonstrated contact patch and does not become an owner mask. Current
 owner evidence remains a separate observation when a later consumer needs it.
 No missing part detection triggers an automatic object-query substitution.
 
-`load_grounding_skill` returns `manifest`, `semantic`, `program`,
-`source_template` and `geometry` (or `None`). It injects offline semantics into
-the in-memory source template and rejects duplicate handwritten semantics in
-the geometry file. Only query-frame geometry retains reviewed query pixels,
-their descriptions and the frame recipe. Vertex and protruding-line consumers
-must not inherit discarded three-point roles. The demonstrated grasp poses,
-timeline and numerical geometry consumers are unchanged. This integration does
-not claim that reviewed geometric annotations have become automatic extraction.
+`load_grounding_skill` returns `manifest`, `metadata`, `source` and
+`representation`. `manipulation.region_transfer` preserves the source point
+bank and passes the declared geometry to `transfer.dual_view.pipeline`.
+The planar path retains its plane and oriented-support rules. The surface path
+uses actual RGB-D associations and an observed pixel graph; missing normals
+remain unknown and do not invalidate measured positions. Both share MARCO,
+TEASER++, point-only Sim(3) proposals and fixed-denominator capacity scoring.
+
+For surface geometry, output radius means at most 3 cm of accumulated edge
+length in the fixed target observation graph. Actual target samples have at
+least 5 mm spacing. These target lengths do not scale with the estimated Sim(3).
+Depth cuts, missing pixels and uncertain cross-view associations do not create
+new graph edges. The explicit depth/slope model is an observation assumption,
+not a certificate of continuous surface topology or a calibrated probability.
+
+The functional frame F is independent of the sampling seed: its origin maps
+by `s R o_F + t`, its axes by `R R_F`. Relative action displacements retain
+their original metre units. Region acceptance, finite pose uniqueness,
+reference generation and physical execution have separate statuses. Numeric
+archives retain unknown normals as JSON null and never require pickle; HTML
+shows real image regions, actual samples and quality warnings.
 <!-- END offline artifact to runtime observation contract. -->
 
 <!-- BEGIN generic semantic selection before geometric binding. -->

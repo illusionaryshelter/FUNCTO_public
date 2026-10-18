@@ -128,8 +128,10 @@ def import_point2pose_skill(tracking_directory, output, *, metadata, source, kin
         raise ValueError("Explicit carrier/reference owner bindings are required for this representation")
     bindings = {role: _text(owner, "bound owner ID") for role, owner in owner_bindings.items()}
     _text(binding_source, "binding_source")
-    allowed = {"image", "observation", "depth_m", "crop_xyxy", "timestamp_s", "frame_index", "owner_id",
+    # BEGIN retain explicit visual-region geometry through the tracking import.
+    allowed = {"image", "observation", "depth_m", "crop_xyxy", "timestamp_s", "frame_index", "owner_id", "region_geometry",
                "region_image_mask", "feature", "feature_model", "provenance", "missing"}
+    # END no tracking pose determines a region's geometric model.
     if not isinstance(source, dict) or not set(source) <= allowed:
         raise ValueError("Source must contain only visual fields; old body poses, L and frame construction are forbidden")
     if source["owner_id"] != bindings[expected_role]:

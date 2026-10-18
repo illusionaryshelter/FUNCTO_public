@@ -46,7 +46,9 @@ def predict(index, output, *, tasks=None):
         started, stage = perf_counter(), 'load_observations'
         loaded = features = returned = result = source = None
         try:
-            loaded = load_observations(path, task)
+            # BEGIN this existing planar experiment declares its original model.
+            loaded = load_observations(path, task, region_geometry='planar')
+            # END explicit experimental model selection.
             state['input_availability'] = [dict(view=v['id'], geometry=True,
                 entity=v['observation'] is not None, reasons=v['missing_reasons'])
                 for v in loaded['views']]

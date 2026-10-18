@@ -245,7 +245,9 @@ def evaluate(output, destination, *, baseline_results, baseline_web,
         cards.append(card)
         try:
             # BEGIN current observations do not require historical prediction caches.
-            loaded = load_observations(record['index'], task)
+            # BEGIN this evaluator consumes the existing planar benchmark.
+            loaded = load_observations(record['index'], task, region_geometry='planar')
+            # END explicit geometry declaration.
             # END observation-only loading.
         except Exception as error:
             # Broken observation bindings cannot silently shrink the comparison.

@@ -136,6 +136,10 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
         record.update(region_status=transfer["status"], region_reasons=transfer["reasons"])
         outputs = transfer.get("outputs")
         if outputs is not None:
+            # BEGIN preserve model warnings in the formal entry and its HTML.
+            record['region_geometry'] = skill['source']['region_geometry']
+            record['region_warnings'] = list(outputs['result']['diagnostics'].get('quality_warnings', []))
+            # END an accepted region may still have incomplete pose evidence.
             from transfer.experiment import store_prediction
             from transfer.multiview_experiment import save_surface
             save_surface(output, outputs["surface"])

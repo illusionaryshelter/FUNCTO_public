@@ -124,7 +124,8 @@ def prepare_source(source, depth_m, *, query_indices, query_region,
         full_depth_point_count=len(xyz), source_entity_rms_m=float(size),
         fixed_query_denominator=len(query_ids), normal_domain="complete_source_depth",
         quality_warnings=[] if len(check_ids) else ["no_independent_source_check_points"])
-    return dict(query_indices=query_ids, query_region=query_region,
+    # BEGIN explicit geometry identity; planar numerical arrays are unchanged.
+    return dict(region_geometry='planar', query_indices=query_ids, query_region=query_region,
         query_xyz=points[query_ids].copy(), query_normals=source_normals[query_ids],
         query_normal_valid=source_valid[query_ids].copy(),
         check_indices=check_ids, check_xyz=points[check_ids].copy(),
@@ -137,6 +138,7 @@ def prepare_source(source, depth_m, *, query_indices, query_region,
         check_normal_valid=source_valid[check_ids].copy(),
         center=center, normal=normal, size=float(size),
         diagnostics=diagnostics, reasons=reasons)
+    # END planar geometry identity.
 
 
 def project_oriented(surface, points, normals, view_index):

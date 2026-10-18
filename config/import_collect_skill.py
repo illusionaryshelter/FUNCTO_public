@@ -29,7 +29,7 @@ def _json(path):
 
 def extract_recorded_skill(prepared, exported_segment, *, region_id, source_frame,
                            approach_frame, interaction_time, semantic,
-                           frame_template=None):
+                           region_geometry, frame_template=None):
     """Extract a selected existing region and its synchronized fixed-body track.
 
     ``exported_segment`` is produced by the unchanged collect.export_functo.
@@ -38,6 +38,10 @@ def extract_recorded_skill(prepared, exported_segment, *, region_id, source_fram
     The offline owner mask is recorded simulator evidence, never presented as
     a SAM prediction. Current-scene inference uses actual selected detections.
     """
+    # BEGIN geometry is a required region declaration, independent of grasp/place.
+    if region_geometry not in ('planar', 'surface'):
+        raise ValueError('region_geometry must be planar or surface')
+    # END explicit caller choice.
     prepared, exported_segment = Path(prepared).resolve(), Path(exported_segment).resolve()
     manifest = _json(prepared / "manifest.json")
     episode = Path(manifest["source_episode"])
@@ -148,12 +152,15 @@ def extract_recorded_skill(prepared, exported_segment, *, region_id, source_fram
                     tool_frame=evidence["tool_frame"], provenance=provenance,
                     task={"semantic_effect_candidates": evidence["semantic_effect_candidates"],
                           "missing": {"numeric_conditions": "Recorded descriptions do not define current task tolerances"}})
-    source = dict(image=Image.fromarray(rgb), depth_m=depth, observation=observation,
+    # BEGIN persist only the geometry declaration; all recorded arrays stay exact.
+    source = dict(region_geometry=region_geometry,
+                  image=Image.fromarray(rgb), depth_m=depth, observation=observation,
                   crop_xyxy=_crop(entity_mask | region_mask, .15),
                   timestamp_s=float(times[local_row]), frame_index=int(source_frame),
                   owner_id=owner_id, T_world_body_at_image=body_at_image,
                   L_body_region=L, region_image_mask=region_mask, provenance=provenance,
                   frame_construction=geometry["details"])
+    # END recorded source geometry metadata.
     return dict(metadata=metadata, source=source, representation=representation)
 
 
@@ -162,6 +169,9 @@ def main():
     parser.add_argument("--prepared", type=Path, required=True)
     parser.add_argument("--exported-segment", type=Path, required=True)
     parser.add_argument("--region", required=True)
+    # BEGIN require callers to choose the geometric model for this source region.
+    parser.add_argument('--region-geometry', choices=('planar', 'surface'), required=True)
+    # END explicit CLI declaration.
     parser.add_argument("--source-frame", type=int, required=True)
     parser.add_argument("--approach-frame", type=int, required=True)
     parser.add_argument("--interaction-time", type=float, required=True)
@@ -173,7 +183,9 @@ def main():
     skill = extract_recorded_skill(args.prepared, args.exported_segment, region_id=args.region,
                                   source_frame=args.source_frame, approach_frame=args.approach_frame,
                                   interaction_time=args.interaction_time, semantic=_json(args.semantic),
-                                  frame_template=args.frame_template)
+                                  # BEGIN propagate the CLI region declaration.
+                                  region_geometry=args.region_geometry, frame_template=args.frame_template)
+                                  # END declared model propagation.
     if args.extract_feature:
         from local_models.marco import extract_image, FEATURE_SHAPE
         source = skill["source"]

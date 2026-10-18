@@ -201,14 +201,25 @@ def save_surface(directory, surface):
     """Freeze element/provenance arrays; full images remain in their input files."""
     directory = Path(directory)
     omitted = {'depth_m', 'K', 'T_world_camera_cv', 'pixel_to_observation', 'adjacency'}
+    # BEGIN: curved caches retain both raw-depth and entity-qualified graphs.
+    curved = surface.get('region_geometry') == 'surface'
+    graphs = ('adjacency', 'observation_adjacency', 'depth_adjacency') if curved else ('adjacency',)
+    omitted.update(graphs)
+    if curved:
+        omitted.add('observation_model')
+    # END: explicit graph schema; private spatial indices are rebuilt on load.
     arrays = {key: value for key, value in surface.items()
-              if isinstance(value, np.ndarray) and key not in omitted}
-    adjacency = surface['adjacency'].tocsr()
-    arrays.update(adjacency_data=adjacency.data, adjacency_indices=adjacency.indices,
-                  adjacency_indptr=adjacency.indptr, adjacency_shape=np.asarray(adjacency.shape))
+              if isinstance(value, np.ndarray) and key not in omitted and not key.startswith('_')}
+    for name in graphs:
+        adjacency = surface[name].tocsr()
+        arrays.update({name+'_data': adjacency.data, name+'_indices': adjacency.indices,
+                       name+'_indptr': adjacency.indptr, name+'_shape': np.asarray(adjacency.shape)})
     np.savez_compressed(directory / 'surface.npz', **arrays)
     metadata = {key: value for key, value in surface.items()
-                if key not in omitted and not isinstance(value, np.ndarray)}
+                if key not in omitted and not isinstance(value, np.ndarray) and not key.startswith('_')}
+    if curved:
+        from dataclasses import asdict
+        metadata['observation_model'] = asdict(surface['observation_model'])
     write_json(directory / 'surface.json', metadata)
 
 
@@ -219,9 +230,23 @@ def load_surface(directory, views):
     surface.update(json.loads((directory / 'surface.json').read_text()))
     if list(surface['view_ids']) != [view['id'] for view in views]:
         raise ValueError('Surface provenance does not match the declared view order')
-    shape = tuple(surface.pop('adjacency_shape'))
-    surface['adjacency'] = csr_matrix((surface.pop('adjacency_data'), surface.pop('adjacency_indices'),
-                                      surface.pop('adjacency_indptr')), shape=shape)
+    # BEGIN: restore declared curved graph domains without manufacturing normals.
+    curved = surface.get('region_geometry') == 'surface'
+    graphs = ('adjacency', 'observation_adjacency', 'depth_adjacency') if curved else ('adjacency',)
+    for name in graphs:
+        shape = tuple(surface.pop(name+'_shape'))
+        surface[name] = csr_matrix((surface.pop(name+'_data'), surface.pop(name+'_indices'),
+                                    surface.pop(name+'_indptr')), shape=shape)
+    if curved:
+        from scipy.spatial import cKDTree
+        from .dual_view.curved_geometry import ObservationModel
+        surface['observation_model'] = ObservationModel(**surface['observation_model'])
+        for prefix, points, membership in (('_entity_', 'xyz', 'entity_member'),
+                ('_observation_entity_', 'observation_xyz', 'observation_entity_member')):
+            ids = np.flatnonzero(surface[membership])
+            surface[prefix+'ids'] = ids
+            surface[prefix+'tree'] = cKDTree(surface[points][ids]) if len(ids) else None
+    # END: cached measurement identity and explicit observation model.
     surface['K'] = np.asarray([view['K'] for view in views])
     surface['T_world_camera_cv'] = np.asarray([view['T_world_camera_cv'] for view in views])
     surface['depth_m'] = [view['depth_m'] for view in views]

@@ -126,13 +126,20 @@ def store_prediction(directory, result, metrics):
     modes = []
     for index, mode in enumerate(result["modes"]):
         for key in ("seed_index", "center", "normal", "mask", "sample_indices"):
-            arrays[f"mode_{index}_{key}"] = np.asarray(mode[key])
+            # BEGIN unknown curved normals stay JSON null, never pickle arrays.
+            if mode[key] is not None:
+                arrays[f"mode_{index}_{key}"] = np.asarray(mode[key])
+            # END numeric archives remain readable with allow_pickle=False.
         modes.append({key: value for key, value in mode.items()
                       if key not in {"mask", "sample_indices"}})
     np.savez_compressed(directory.with_suffix(".npz"), **arrays)
-    write_json(directory.with_suffix(".json"), {
+    # BEGIN preserve explicit decision fields needed by a restored reference.
+    decisions = {key: result[key] for key in ('status', 'scheme', 'region_geometry',
+        'region_identified', 'finite_candidate_unique', 'transform_certified') if key in result}
+    write_json(directory.with_suffix(".json"), {**decisions,
         "accepted": bool(result["accepted"]), "reasons": result["reasons"],
         "diagnostics": result["diagnostics"], "modes": modes, "metrics": metrics})
+    # END decision metadata does not alter any numerical prediction.
     # END neighborhood result schema.
 
 
@@ -144,12 +151,21 @@ def restore_prediction(path):
     values = read_archive(path.with_suffix(".npz"))
     result = {"accepted": description["accepted"], "reasons": description["reasons"],
               "diagnostics": description["diagnostics"], "modes": []}
+    # BEGIN restore explicit model decisions and available numeric transforms.
+    result.update({key: description[key] for key in ('status', 'scheme', 'region_geometry',
+        'region_identified', 'finite_candidate_unique', 'transform_certified') if key in description})
+    result.update({key: values[key] for key in ('src_anchor_idx', 'tgt_anchor_idx',
+        'sim3_scale', 'sim3_rotation', 'sim3_translation') if key in values})
     for index, metadata in enumerate(description["modes"]):
         mode = dict(metadata)
         for key in ("seed_index", "center", "normal", "mask", "sample_indices"):
-            mode[key] = values[f"mode_{index}_{key}"]
+            if key == 'normal' and metadata['normal'] is None:
+                mode[key] = None
+            else:
+                mode[key] = values[f"mode_{index}_{key}"]
         mode["seed_index"] = int(mode["seed_index"])
         result["modes"].append(mode)
+    # END absent normals remain unknown without object-array deserialization.
     return result
 # END reader migration; frozen result fields and numerical values are unchanged.
 

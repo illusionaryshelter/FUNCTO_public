@@ -14,9 +14,11 @@ class SurfaceCacheTests(unittest.TestCase):
     def setUp(self):
         depth = np.ones((13, 13))
         observation = _observation(depth)
-        self.loaded = {'views': [dict(id=name, depth_m=depth,
+        # BEGIN explicit model declaration for the existing planar cache tests.
+        self.loaded = {'region_geometry': 'planar', 'views': [dict(id=name, depth_m=depth,
             K=observation['K'], T_world_camera_cv=observation['T_world_camera_cv'],
             observation=observation) for name in ('A', 'B')]}
+        # END planar cache fixture declaration.
 
     def test_complete_binding_preserves_actual_representative(self):
         original = _surface()

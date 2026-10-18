@@ -13,7 +13,9 @@ def _fixture():
     q = len(xyz)
     source = dict(query_xyz=xyz, query_region=np.arange(q) < 6,
         query_normals=np.tile([0., 0., 1.], (q, 1)),
-        query_normal_valid=np.ones(q, bool), size=1.)
+        # BEGIN fixture declares its original planar geometry explicitly.
+        query_normal_valid=np.ones(q, bool), size=1., region_geometry='planar')
+        # END explicit fixture geometry.
     surface = dict(xyz=xyz.copy(), normals=np.tile([0., 0., 1.], (q, 1)),
                    normal_min_agreement=.65)
     domain = dict(surface_ids=np.arange(q), xyz=surface['xyz'],

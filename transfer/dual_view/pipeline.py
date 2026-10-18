@@ -16,7 +16,7 @@ from .proposals import rank_domain
 
 
 class InsufficientSource(ValueError):
-    """Observed source inputs cannot instantiate the declared planar model."""
+    """Observed source inputs cannot instantiate the explicitly declared model."""
     def __init__(self, reasons):
         self.reasons = list(reasons)
         super().__init__(';'.join(self.reasons))
@@ -67,20 +67,34 @@ def run(loaded, feature_pairs, *, sampling_radius_m=.03, sampling_spacing_m=.005
     outputs support persistence and strict validation; they are never taken
     from a previous prediction. ``prepare`` must have completed first.
     """
+    # BEGIN explicit geometry dispatch. The planar functions and argument
+    # values remain the original numerical path; curve failures never reroute.
+    geometry = loaded['region_geometry']
+    if geometry == 'planar':
+        build_target, build_source, infer_region = surface.build_target_surface, prepare_source, infer
+    elif geometry == 'surface':
+        from .curved_geometry import build_target_surface as build_target
+        from .curved_geometry import prepare_source as build_source
+        from .curved_inference import infer as infer_region
+    else:
+        raise ValueError('region_geometry must be planar or surface')
+    # END geometry dispatch; matching and response preparation remain shared.
     stages, native_pairs, surface_work, work = {}, {}, {}, {}
     with threadpool_limits(limits=1, user_api='blas'):
         torch.set_num_threads(1)
         torch.cuda.synchronize()
         started = perf_counter()
         mark = perf_counter()
-        target = surface.build_target_surface(loaded['views'],
+        # BEGIN call the selected geometry implementation with unchanged units.
+        target = build_target(loaded['views'],
             sampling_radius_m=sampling_radius_m, stats=surface_work)
         torch.cuda.synchronize()
         stages['target_surface'] = perf_counter()-mark
         mark = perf_counter()
-        source = prepare_source(loaded['source'], loaded['source_depth'],
+        source = build_source(loaded['source'], loaded['source_depth'],
             query_indices=loaded['query_indices'], query_region=loaded['query_region'],
             sampling_radius_m=sampling_radius_m)
+        # END no global-plane gate is reached by the surface path.
         stages['source_geometry'] = perf_counter()-mark
         if source['reasons']:
             raise InsufficientSource(source['reasons'])
@@ -107,15 +121,20 @@ def run(loaded, feature_pairs, *, sampling_radius_m=.03, sampling_spacing_m=.005
         native, native_records = native_transforms(loaded, native_pairs)
         stages['native_registration'] = perf_counter()-mark
         mark = perf_counter()
-        result = infer(source, target, appearance, initial_transforms=native,
+        # BEGIN each model evaluates its own observation predicates.
+        result = infer_region(source, target, appearance, initial_transforms=native,
             prepared_domain=domain, sampling_radius_m=sampling_radius_m,
             sampling_spacing_m=sampling_spacing_m, work_stats=work)
+        # END the point-only proposal plan and score definition stay shared.
         torch.cuda.synchronize()
         stages['candidate_inference'] = perf_counter()-mark
-        result['diagnostics'].update(scheme='dual_view_observed_partial',
+        # BEGIN preserve each explicit model's result identity.
+        result['diagnostics'].update(
+            scheme=('dual_view_observed_surface' if geometry == 'surface' else 'dual_view_observed_partial'),
             native_backend='teaserpp', native_proposals=native_records,
             native_seconds=stages['native_registration'], target_truth_used=False,
             input_missing_views=[v['id'] for v in loaded['views'] if v['observation'] is None])
+        # END original planar metadata values remain unchanged.
         torch.cuda.synchronize()
         elapsed = perf_counter()-started
     return dict(result=result, surface=target, source=source, native_pairs=native_pairs,
