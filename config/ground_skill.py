@@ -73,6 +73,9 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
         # the supplied mapping order. Recording here preserves candidates even
         # if the following remote semantic request raises a transport error.
         from local_models.sam31 import detect
+        from local_models.gemini import Gemini
+        semantic_client = Gemini()
+        record["semantic_model"] = {"model": semantic_client.model, "base_url": semantic_client.base_url}
         detection_views = iter(views)
 
         def recorded_detection(image, labels):
@@ -84,7 +87,7 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
 
         observed = observe_interaction_reference(skill, instruction,
             {view["id"]: {"image": view["image"]} for view in views},
-            detector=recorded_detection)
+            detector=recorded_detection, client=semantic_client)
         # END evidence logging changes no detection or selection decision.
         selection_record = {"sam_queries": observed["sam_queries"],
                             "selection_scope": observed["selection_scope"], "views": {}}

@@ -9,7 +9,6 @@ Physical camera execution and rendering have not been run in this environment.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -21,7 +20,9 @@ class RGBDPacket:
     rgb: np.ndarray             # H,W,3 uint8, RGB channel order
     depth_m: np.ndarray         # H,W float32, optical z depth, meters; 0=invalid
     K: np.ndarray               # 3x3 float64, same coordinate frame as rgb+depth
-    timestamp_s: float
+    # BEGIN unknown acquisition time stays missing; processing time is unrelated.
+    timestamp_s: Optional[float]
+    # END no frame-rate default creates an observation timestamp.
     T_world_cam_cv: Optional[np.ndarray] = None  # world<-camera (OpenCV axes)
 
 
@@ -48,13 +49,26 @@ def make_frame(packet: RGBDPacket, binary_masks, frame_id: int,
         raise ValueError('K must be a finite 3x3 matrix')
     if min(float(K[0, 0]), float(K[1, 1])) <= 0:
         raise ValueError('Camera fx/fy must be positive')
+    # BEGIN match the actual Point2Pose pinhole/depth input convention.
+    if (not np.allclose(K[2], [0., 0., 1.], atol=1e-12, rtol=0)
+            or K[0, 1] != 0 or K[1, 0] != 0):
+        raise ValueError('Point2Pose requires a zero-skew pinhole K on the observed pixel grid')
+    if (isinstance(frame_id, (bool, np.bool_)) or not isinstance(frame_id, (int, np.integer))
+            or frame_id < 0):
+        raise ValueError('frame_id must be a nonnegative tracker frame index')
+    if packet.timestamp_s is not None and (isinstance(packet.timestamp_s, (bool, np.bool_))
+            or not np.isscalar(packet.timestamp_s) or not np.isfinite(packet.timestamp_s)):
+        raise ValueError('timestamp_s must be finite original acquisition seconds or None')
+    # END input identity and calibration are not inferred from array dimensions.
     masks = np.asarray(binary_masks)
     if masks.ndim == 2:
         masks = masks[None]
     if masks.shape != (max_num_obj, h, w):
         raise ValueError(f'masks must be [{max_num_obj},{h},{w}], got {masks.shape}')
-    if masks.dtype.kind == 'f' and (np.any(masks < 0) or np.any(masks > 1)):
-        raise ValueError('Mask logits detected; threshold to binary before make_frame')
+    # BEGIN a positive probability is not an already selected binary instance.
+    if not np.isin(masks, [0, 1, 255]).all():
+        raise ValueError('Threshold masks to binary values before make_frame')
+    # END retain the supplied foreground pixels without a new threshold.
     if np.any(np.sum(masks > 0, axis=0) > 1):
         raise ValueError('Overlapping instance masks: resolve IDs first')
     mask_t = torch.from_numpy(np.ascontiguousarray(masks > 0)).unsqueeze(1).to(device)
@@ -62,13 +76,15 @@ def make_frame(packet: RGBDPacket, binary_masks, frame_id: int,
     return Frame(id=int(frame_id), rgb=np.ascontiguousarray(rgb),
                  depth=np.ascontiguousarray(depth), mask=mask_t,
                  intrinsics=K, depth_factor=1.0,
-                 timestamp=float(packet.timestamp_s))
+                 # BEGIN missing source time remains absent in the native Frame.
+                 timestamp=None if packet.timestamp_s is None else float(packet.timestamp_s))
+                 # END processing wall time never substitutes for acquisition time.
 
 
 class MuJoCoRGBD:
     """Perspective camera renderer (no simulator stepping is done inside capture)."""
     def __init__(self, model, data, camera_name: str,
-                 width: int = 640, height: int = 480):
+                 width: int = 640, height: int = 480, *, K):
         import mujoco
         if not mujoco.__version__.startswith('3.5.'):
             raise RuntimeError(f'Expected MuJoCo 3.5.x, got {mujoco.__version__}')
@@ -82,25 +98,18 @@ class MuJoCoRGBD:
         self.cam_id = cam_id
         if int(model.cam_projection[cam_id]) != int(mujoco.mjtProjection.mjPROJ_PERSPECTIVE):
             raise ValueError('Point2Pose uses a pinhole model: orthographic camera unsupported')
+        # BEGIN use the capture calibration, including its pixel-center convention.
+        # Inferring W/2,H/2 here disagrees with this project's verified integer
+        # pixel centers. The caller supplies the K measured for these renders;
+        # this bridge does not maintain another renderer calibration formula.
+        self.K = np.asarray(K, dtype=np.float64).copy()
+        if (self.K.shape != (3, 3) or not np.isfinite(self.K).all()
+                or min(self.K[0, 0], self.K[1, 1]) <= 0
+                or not np.allclose(self.K[2], [0., 0., 1.], atol=1e-12, rtol=0)
+                or self.K[0, 1] != 0 or self.K[1, 0] != 0):
+            raise ValueError('K must be the observed zero-skew pinhole calibration')
+        # END the exact supplied principal point is preserved in every packet.
         self.renderer = mujoco.Renderer(model, height=self.height, width=self.width)
-        self.K = self._compute_K()
-
-    def _compute_K(self):
-        i = self.cam_id
-        w, h = self.width, self.height
-        sensor = np.asarray(self.model.cam_sensorsize[i], dtype=float)
-        intrinsic = np.asarray(self.model.cam_intrinsic[i], dtype=float)
-        if np.all(sensor > 0):
-            fx = intrinsic[0] / sensor[0] * w
-            fy = intrinsic[1] / sensor[1] * h
-            cx = intrinsic[2] / sensor[0] * w
-            cy = intrinsic[3] / sensor[1] * h
-        else:
-            fy = fx = .5 * h / math.tan(math.radians(float(self.model.cam_fovy[i])) / 2)
-            cx, cy = w / 2., h / 2.
-        if fx <= 0 or fy <= 0:
-            raise ValueError('Invalid perspective camera intrinsics')
-        return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
 
     def capture(self) -> RGBDPacket:
         """Do not call mj_step between RGB and depth render calls."""

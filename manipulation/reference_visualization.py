@@ -10,7 +10,7 @@ from html import escape
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from transfer.multiview_visualization import overlay, REGION_COLOR
 from transfer.dual_view.visualization import region_picture
@@ -38,7 +38,16 @@ def write_reference_html(directory, skill, views, transfer, reference, report):
     original = np.asarray(source["image"])
     region_mask = source.get("region_image_mask", np.zeros(original.shape[:2], bool))
     source_picture = overlay(original, region_mask, REGION_COLOR)
-    Image.fromarray(source_picture).save(directory / "source-region.png")
+    # BEGIN show the actual source-region query pixels from the native sampler.
+    from transfer.joint_features import source_queries
+    source_image = Image.fromarray(source_picture)
+    if np.any(source["observation"]["region_mask"]):
+        indices, membership = source_queries(source["observation"])
+        draw = ImageDraw.Draw(source_image)
+        for x, y in np.asarray(source["observation"]["pixels"])[indices[membership]]:
+            draw.ellipse((x-1, y-1, x+1, y+1), fill=(255, 218, 70))
+    source_image.save(directory / "source-region.png")
+    # END these are source queries, not invented current correspondences.
     source_frame = (source["T_world_body_at_image"] @ source["L_body_region"]
                     if "L_body_region" in source else None)
     panels = [dict(id="source", title="源单视角：已给区域", image="source-region.png",

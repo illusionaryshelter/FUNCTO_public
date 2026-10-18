@@ -12,6 +12,7 @@
 | `realsense_offline.yaml` | RealSense 离线 RGB-D | `svd_cluster_ransac` + SDF refine | 全局 + 局部图 |
 | `rgbd_bridge.py` | 两种输入源 + `Frame` 桥 | `RGBDPacket`, `make_frame`, `MuJoCoRGBD`, `RealSenseRGBD` | 不装载 SAM |
 | `run_offline.py` | 离线预处理序列的执行入口 | 直接调用 `ModularPipeline.step()` | 需 Point2Pose 全套依赖 |
+| `import_point2pose_skill.py` | 已记录的 Point2Pose 估计转版本 2 技能包 | 复用 `source_region_frame`、`build_representation`、`save_grounding_skill` | 不运行模型 |
 | `validate_profiles.py` | profile 和 RGB-D 数据契约自检 | 不需 GPU | 静态校验 |
 
 ### 主要约定
@@ -25,13 +26,13 @@
 
 ## 一、安装与路径
 
-- 复制四份 YAML 到你的 `point-to-pose/configs/custom/`。
-- 把 `rgbd_bridge.py`、`run_offline.py`、`validate_profiles.py` 放入 `point-to-pose/tools/custom/`（路径可以自定）。
+- 四份 YAML 可作为独立配置读取；本地已验证的 Point2Pose profile 也可直接传给 runner。
+- `rgbd_bridge.py`、`run_offline.py`、`validate_profiles.py` 保留在 FUNCTO 的 `config/` 下。runner 复用 FUNCTO 的时间线及刚体矩阵校验，从已有 Point2Pose 仓库根目录启动。
 - 修改所有四个 YAML 的 `tracker.params.checkpoint_path`，当前默认 `/home/shelter/recovery/models/track_on_r.pt` 只是此前交谈中可能的路径；**按实际文件路径修正**。
 - 运行：
 
 ```bash
-python tools/custom/validate_profiles.py configs/custom/*.yaml
+PYTHONNOUSERSITE=1 /home/shelter/miniforge3/envs/recovery/bin/python /home/shelter/recovery/FUNCTO_public/config/validate_profiles.py
 ```
 
 需要原生 Point2Pose、Track-On 源码、其 CUDA/MMCV 依赖、LightGlue SuperPoint、PyCUDA/TSDF 依赖。MuJoCo 3.5.0 和 RealSense SDK 依需要安装。
@@ -42,7 +43,7 @@ python tools/custom/validate_profiles.py configs/custom/*.yaml
 - `depth_m`: `[H,W] float32`，**米**，光轴正深度（Z depth），缺失置 0。
 - `K`: `[3,3] float64`，与 RGB 和 depth **同分辨率/像素坐标系**；像素采样必须遵守当前相机内参和畸变校正的一致性。
 - `mask`: `[N,H,W]` 二值实例 mask，`N=pipeline.params.max_num_obj`；通过 `make_frame` 变成 GPU 上的 `[N,1,H,W]` Bool Tensor。
-- `timestamp_s`: 秒；离线保留真实帧时间而不随处理速度变化。
+- `timestamp_s`: 原始采集秒数；缺失时为 `None`，不按默认帧率或处理墙钟补造。
 - `depth_factor=1.0`：数据在进入 Point2Pose **之前已经转换为米**。
 - 多物体：按独立刚体固定实例索引，遮挡时给原索引空 mask，不能重排或把整个铰链柜体当单一刚体。
 
@@ -52,7 +53,7 @@ MuJoCo 原生 `Renderer.enable_depth_rendering()` 返回已经线性化的相机
 R_world_cv = R_world_mujoco @ np.diag([1.0, -1.0, -1.0])
 ```
 
-若相机只设置透视 `fovy`：`f = H/(2*tan(fovy/2))`, `fx=fy=f, cx=W/2, cy=H/2`。这里 `fovy` 表示纵向视场角，`H`/`W` 是输出图像像素高/宽。若 MJCF 通过 `sensorsize`、`focal`、`principal` 设置内参，应使用项目中的 `MuJoCoRGBD._compute_K()`（采用 MuJoCo `mju_camIntrinsics` 公式）；不支持正交相机。
+`MuJoCoRGBD` 必须显式接收实际采集使用的 `K`；不在桥接层按图像尺寸或视场角重新推导主点。当前 collect 渲染采用整数像素中心，主点为 `((W-1)/2, (H-1)/2)`，因此误用 `(W/2,H/2)` 会引入半像素偏差。`K` 必须与当前 RGB、深度和 mask 的像素网格一致，Point2Pose 接口要求零 skew 的透视内参；不支持正交相机。
 
 RealSense：使用 `rs.align(rs.stream.color)` 同步 depth 至彩色相机，并利用 `first_depth_sensor().get_depth_scale()`：
 
@@ -68,10 +69,11 @@ depth_m = depth_raw.astype(np.float32) * depth_scale_m
 # 放入你已有的仿真循环，而不是复制成一个新的 step 循环
 from omegaconf import OmegaConf
 from point2pose.pipeline.modular_pipeline import ModularPipeline
-from rgbd_bridge import MuJoCoRGBD, make_frame
+from config.rgbd_bridge import MuJoCoRGBD, make_frame
 
 cfg = OmegaConf.load('configs/custom/mujoco_online.yaml')
-camera = MuJoCoRGBD(model, data, camera_name='tracking_camera', width=640, height=480)
+camera = MuJoCoRGBD(model, data, camera_name='tracking_camera', width=640, height=480,
+                    K=capture_K)  # 当前渲染输出实际使用的 3×3 相机内参
 pipe = ModularPipeline(cfg)
 for frame_id in range(1000):
     # mj_step(model, data) 通常由你自己的仿真/控制器完成
@@ -104,7 +106,7 @@ T_world_object = packet.T_world_cam_cv @ (pipe.objects[i].pose @ pipe.objects[i]
 
 ```text
 sequence_001/
-├── camera.json             # {"K": [[fx,0,cx],[0,fy,cy],[0,0,1]], "fps": 30}
+├── camera.json             # 实例 ID、原始帧号、采集时间、K、可选固定相机外参
 ├── rgb/
 │   ├── 000000.png
 │   ├── 000001.png
@@ -120,24 +122,64 @@ sequence_001/
         └── ...
 ```
 
-多物体扩展 `masks/obj_1/`、`obj_2/`，同步修改四份配置中的 `max_num_obj` 或本次运行所选配置。
+多物体扩展 `masks/obj_1/`、`obj_2/`，其顺序必须始终对应 `object_ids`。runner 根据该列表设置原生 `max_num_obj`，并使用 `use_segmenter: false` 接收已经计算好的 mask；跟踪、注册、图优化、SDF 参数全部保留所传 profile 的原值。
 
 `camera.json` 内的 K 字段按下式定义：
 
 ```json
-{"K": [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]], "fps": 30}
+{
+  "K": [[600.0, 0.0, 319.5], [0.0, 600.0, 239.5], [0.0, 0.0, 1.0]],
+  "object_ids": ["rigid_part"],
+  "frame_indices": [10, 17, 24],
+  "timestamps_s": [1.2, 1.21, 1.43],
+  "T_world_camera_cv": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
+}
 ```
 
-**上面的 K 是占位格式演示，不是你实际 MuJoCo 或 RealSense 的标定值；必须用对应数据采集时的真实 K 替换。** `run_offline.py` 默认使用固定 K 与均匀 fps，但额外支持 `camera.json` 中的 `timestamps_s`（与 RGB 帧数量相同的秒数组）、`intrinsics/<frame>.npy`（每帧 3×3 K）和 `camera_poses/<frame>.npy`（每帧 4×4 `T_world_cam_cv`，用于移动相机）。若视频时间戳不均匀，应提供 `timestamps_s`；如果摄像机运动且希望世界位姿，应提供 `camera_poses/`，否则相对 Pose 不能凭空转换为世界 Pose。
+**上面的内参和单位外参均为格式演示，必须替换为实际采集标定；未知外参应省略。** `frame_indices` 与 `timestamps_s` 按 RGB PNG 文件名字典序对齐，保留原始值；原始帧号可以不连续。Point2Pose 内部单独使用从零连续编号，输出同时保存两套编号的映射。`timestamps_s` 缺失时只保留几何估计，不能据此编译需要真实时序的完整技能包。
+
+支持 `intrinsics/<frame>.npy`（每帧 3×3 K）和 `camera_poses/<frame>.npy`（每帧 4×4 `T_world_camera_cv`）；存在时覆盖显式提供的固定相机参数。两处都没有外参的帧保持世界位姿缺失，绝不使用单位矩阵代替。RGB、深度和外参必须来自同一采集状态。
 
 ```bash
 # 从 Point2Pose 项目根目录启动；仍然需要实际的 PyTorch/MMCV/GTSAM 等依赖
-python tools/custom/run_offline.py \
-  --config configs/custom/mujoco_offline.yaml \
-  --sequence /absolute/path/sequence_001
+PYTHONNOUSERSITE=1 /home/shelter/miniforge3/envs/recovery/bin/python \
+  /home/shelter/recovery/FUNCTO_public/config/run_offline.py \
+  --config configs/local/trackon_sam31.yaml \
+  --sequence /absolute/path/sequence_001 \
+  --output /absolute/path/new_recording_directory
 ```
 
-RealSense 离线序列改用 `realsense_offline.yaml` 即可，不要用实时 RealSense demo 回放离线视频。runner 额外输出 `runs/<profile>/poses/estimated_poses_by_frame.npz`，其中含 `pose`、`frame_name`、`timestamp_s`；如果每帧都提供 `camera_poses`，还包含 `T_world_obj_local`，用于世界坐标系评价。上游 `.txt` Pose logger 采用运行时墙钟时间，在离线场景不应代替原视频时间戳。
+RealSense 离线序列同样使用离线入口和相应已有 profile。`--output` 必须是新目录，记录文件不覆盖既有实验：
+
+- `estimated_poses_by_frame.npz` 保存 `object_ids`、`frame_indices`、`tracker_frame_ids`、`frame_names`、`timestamp_s`、逐帧 `K` / `T_world_camera_cv`，以及 `T_camera_B` / `T_world_B`。缺失时间或外参以 NaN 加独立可用性布尔数组明确表达。
+- `T_initial_camera_B` 是首帧的 `obj.init_pose`，在整段序列冻结并逐帧核对；`T_camera_initial_map` 是原生 `obj.pose`。每帧按 `T_camera_B = T_camera_initial_map @ T_initial_camera_B`、`T_world_B = T_world_camera_cv @ T_camera_B` 组合。物体局部坐标 `B` 不是仿真 MJCF body 真值坐标，不能跳过两者之间的固定标定。
+- `tracking_evidence.json` 保存原生注册残差、内点、有效点索引、`lost` / `lost_streak`、跳变拒绝信息与所用原生残差阈值。标签区分初始化、缺失当前前端结果、沿用旧估计、原生证据有警告、满足原生残差条件。最后一种标签不证明跟踪正确，也不等于执行成功。
+- 运行异常会保存已处理帧、失败原始帧号和 `error.txt`；不把异常截断的结果标成完整序列。原生墙钟 `.txt` 日志单独保存在 `native-wall-time-poses/`，不能替代采集时间。
+
+Point2Pose 在没有有效注册或拒绝跳变时仍可能返回 4×4 矩阵，静止物体有效注册时也可能返回相同矩阵。因此 runner 通过透传 `frontend.step` 的原始返回对象记录注册证据，不根据矩阵是否变化判断新观测，不改动任何注册阈值。
+
+`import_point2pose_skill.import_point2pose_skill()` 正式消费上述记录，调用同一个 `build_representation()` 和 `save_grounding_skill()` 保存版本 2 包。`import_collect_skill.py` 则保留 collect 仿真 body/EEF 真值入口，二者的运动来源明确区分。
+
+```python
+from config.import_point2pose_skill import import_point2pose_skill
+
+result = import_point2pose_skill(
+    tracking_directory, new_bundle_directory,
+    metadata=metadata, source=visual_source, kind="grasp",
+    owner_bindings={"carrier": "rigid_part"},
+    binding_source="已给定的刚体实例与 mask 顺序记录",
+    eef={"frame_indices": original_frame_ids, "timestamps": acquisition_seconds,
+         "T_world_eef": measured_eef_poses,
+         "source": "同步机器人记录中的工具位姿",
+         "world_alignment_source": "该工具观测与相机世界坐标的已有标定"},
+)
+```
+
+`visual_source` 使用技能包现有的 image、observation 点库、depth_m、crop_xyxy、frame_index、timestamp_s、owner_id、region_image_mask 等视觉字段，禁止传入旧 `T_world_body_at_image`、`L_body_region` 或 `frame_construction`。适配器从对应原始帧的真实 `T_world_B` 重建物体位姿，调用现有 `source_region_frame()` 在同一个 Point2Pose 固定 `B` 下重新计算 `L`；不能沿用仿真 body 坐标下的旧 `L`。可选 `function_frame={T_world_function, frame_index, timestamp_s, source}` 显式提供同一源图像时刻的世界区域坐标；省略时从给定区域的测量点和相机坐标构造。
+
+`owner_bindings` 显式绑定 carrier/reference 实例，操作表示要求 reference 轨迹，且源区域必须属于对应 reference。EEF 若提供，必须已经与全部原始帧号、采集秒数、世界坐标对齐；这里不做插值或标定。`approach_time`、`interaction_time`、`release_time` 和 `events` 均是显式原时间，提供任何事件时必须同时提供 `event_source`。构造 `H_g` 或 `C_D` 需要 EEF；`H_m` 允许缺 EEF，并保留 `C_D` 不可用。没有 interaction_time 的短区间可保存为观测表示包，但交互位姿和接近方向仍明确缺失，不能称为完整技能。
+
+整个原始区间逐帧核对 NPZ 与跟踪证据。失败记录、缺时间/world，或任一已绑定实例含 stale/missing/未知状态，返回 `status="missing_source_observations"` 与具体缺项，不写包、不跳帧。warning 候选可保留，完整逐帧原始证据随包保存；正常写入返回 `status="saved_observation_segment"`，该状态只表示保存成功，不表示追踪准确或执行成功。包来源分别标明 Point2Pose 估计运动、已给视觉区域和同步 EEF 记录。
 
 ## 在线 SDF 取舍
 
