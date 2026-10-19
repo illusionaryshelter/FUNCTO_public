@@ -3,7 +3,7 @@
 Every source entity measurement is checked under the same proposed Sim(3).
 Missing/occluded measurements stay unknown. These full-entity counts describe
 source measurement rows; they are not independent correspondence votes.
-Query correspondence capacity belongs to the separate multiscale module.
+Query correspondence capacity belongs to the separate scoring module.
 """
 
 import numpy as np

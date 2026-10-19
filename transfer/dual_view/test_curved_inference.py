@@ -1,7 +1,7 @@
 """CPU end-to-end curved evidence tests with actual depth and response maps.
 
 Only interruption and sampling-unavailability injections replace a stage. The ordinary graph, per-camera
-feature footprint, geometric assignment and relation
+feature footprint, geometric assignment and weighted evidence
 score execute on small observations; selection is never mocked into success.
 """
 
@@ -41,18 +41,19 @@ class CurvedInferenceTests(unittest.TestCase):
         prepared = [prepare_view(queries, feature, crop_xyxy=[0, 0, 25, 25],
             observation=raw, view_id=name) for name in ('a', 'b')]
         self.field = SurfaceResponseField(self.surface, queries, prepared)
-        # BEGIN surface inference needs only candidate-local raw appearance.
+        # BEGIN the evaluator prepares fixed per-view references from this field.
         self.proposals = [dict(transform=(1., np.eye(3), np.zeros(3)),
                                origins=[dict(origin='measured_identity_fixture')])]
-        # END no empirical appearance ranking is prepared by this fixture.
+        # END proposals remain geometry-only and independent of response ranks.
 
-    # BEGIN surface selection ranks the unchanged observed-support score.
+    # BEGIN surface selection ranks the new weighted evidence score.
     def test_real_depth_geometry_assignment_accepts_without_normals_or_refits(self):
         result = evaluate_candidates(self.source, self.surface, self.field, self.proposals)
         self.assertTrue(result['accepted'], result['reasons'])
         self.assertTrue(result['region_identified'])
         self.assertFalse(result['transform_certified'])
-        self.assertEqual(result['diagnostics']['fixed_query_denominator'], 6)
+        self.assertEqual(result['diagnostics']['query_count'], 6)
+        self.assertAlmostEqual(result['diagnostics']['source_weight_sum'], 1.)
         first = result['diagnostics']['hypotheses'][0]
         self.assertEqual(first['geometry_region_matched_count'], 6)
         self.assertEqual(len(set(first['regional_assignment_observation_indices'])), 6)
@@ -87,8 +88,8 @@ class CurvedInferenceTests(unittest.TestCase):
         self.assertTrue(first['selected'])
         self.assertFalse(second['selected'])
         self.assertGreater(first['score'], second['score'])
-        self.assertLess(second['multiscale_structure']['upper_bound'],
-            first['multiscale_structure']['lower_bound'])
+        self.assertGreater(first['score_components']['geometry_score'],
+            second['score_components']['geometry_score'])
         self.assertEqual(result['diagnostics']['ranked_hypothesis_ids'], [0, 1])
         self.assertEqual(result['diagnostics']['top_score_hypothesis_ids'], [0])
         self.assertFalse(result['finite_candidate_unique'])
@@ -102,12 +103,10 @@ class CurvedInferenceTests(unittest.TestCase):
         np.testing.assert_array_equal(expected['rotation'], actual['rotation'])
         np.testing.assert_array_equal(expected['translation'], actual['translation'])
 
-    def test_overlapping_missing_relation_intervals_do_not_veto_higher_score(self):
-        # Nine frozen regional rows leave eight independent correspondences
-        # when one real target depth pixel is missing. The shifted candidate
-        # sees all nine rows and has a higher visible-contribution score. Its
-        # greater coverage supplies more positive score, without turning the
-        # identity's unobserved edges into depth-conflict evidence.
+    def test_missing_correspondence_keeps_its_source_weight_in_the_denominator(self):
+        # Nine frozen rows leave eight correspondences when a real depth pixel
+        # is missing. The score retains that missing ninth rather than taking
+        # a mean over only the eight visible rows. No feature is fabricated.
         pixels = np.array([[x, y] for y in (9, 12, 15) for x in (9, 12, 15)])
         region = np.zeros((25, 25), bool)
         region[pixels[:, 1], pixels[:, 0]] = True
@@ -123,24 +122,38 @@ class CurvedInferenceTests(unittest.TestCase):
         prepared = [prepare_view(descriptors, None, crop_xyxy=[0, 0, 25, 25],
             observation=target_observation, view_id=name) for name in ('a', 'b')]
         field = SurfaceResponseField(surface, descriptors, prepared)
-        other = dict(transform=(1.1, np.eye(3), np.array([.006, 0., -.06])),
-            origins=[dict(origin='higher_coverage_shifted_sheet')])
-        result = evaluate_candidates(source, surface, field, self.proposals+[other])
-        self.assertEqual(len(result['diagnostics']['hypotheses']), 2)
-        first, second = result['diagnostics']['hypotheses']
+        result = evaluate_candidates(source, surface, field, self.proposals)
+        first = result['diagnostics']['hypotheses'][0]
         self.assertTrue(first['admitted_to_H'], first['rejections'])
-        self.assertTrue(second['admitted_to_H'], second['rejections'])
         self.assertEqual(len(first['regional_assignment_query_rows']), 8)
-        self.assertEqual(len(second['regional_assignment_query_rows']), 9)
-        self.assertGreater(second['score'], first['score'])
-        self.assertGreaterEqual(first['multiscale_structure']['upper_bound'],
-            second['multiscale_structure']['lower_bound'])
-        self.assertFalse(first['selected'])
-        self.assertTrue(second['selected'])
-        self.assertGreater(first['multiscale_structure']['scales'][0]['unknown_relation_count'], 0)
-        self.assertEqual(result['diagnostics']['ranked_hypothesis_ids'], [1, 0])
+        self.assertAlmostEqual(first['score_components']['geometry_score'], 8./9.)
+        self.assertAlmostEqual(first['score'], (2./3.)*(8./9.))
+        self.assertEqual(first['assigned_appearance_unknown_count'], 9)
+        self.assertIn('selected_estimate_has_unknown_appearance',
+            result['diagnostics']['quality_warnings'])
+        self.assertTrue(first['selected'])
         self.assertEqual(result['status'], 'accepted_observed_region')
         self.assertTrue(result['accepted'], result['reasons'])
+
+    def test_unrelated_candidate_does_not_change_existing_scores_or_source_weights(self):
+        single = evaluate_candidates(self.source, self.surface, self.field, self.proposals)
+        extra = dict(transform=(1.15, np.eye(3), np.array([.006, 0., -.09])),
+            origins=[dict(origin='additional_finite_candidate')])
+        expanded = evaluate_candidates(self.source, self.surface, self.field, [extra]+self.proposals)
+        before = single['diagnostics']['hypotheses'][0]
+        after = expanded['diagnostics']['hypotheses'][1]
+        self.assertEqual(before['score_components'], after['score_components'])
+        self.assertEqual(single['diagnostics']['appearance_reference'],
+            expanded['diagnostics']['appearance_reference'])
+
+    def test_reference_preparation_interruption_publishes_no_candidate(self):
+        with patch.object(self.field, 'prepare_support', side_effect=MemoryError('interrupted reference')):
+            result = evaluate_candidates(self.source, self.surface, self.field, self.proposals)
+        self.assertEqual(result['status'], 'search_incomplete')
+        self.assertEqual(result['diagnostics']['search_stage'], 'appearance_reference_preparation')
+        self.assertEqual(result['diagnostics']['hypotheses'], [])
+        self.assertEqual(result['modes'], [])
+        self.assertIsNone(select_reference_transform(result))
 
     def test_highest_score_missing_region_does_not_promote_available_runner_up(self):
         other = dict(transform=(1.15, np.eye(3), np.array([.006, 0., -.09])),
@@ -239,7 +252,7 @@ class CurvedInferenceTests(unittest.TestCase):
             result = infer(self.source, self.surface, self.field)
         self.assertEqual(result['status'], 'search_incomplete')
         self.assertEqual(result['diagnostics']['search_stage'], 'proposal_generation')
-        self.assertEqual(result['diagnostics']['fixed_query_denominator'], 6)
+        self.assertEqual(result['diagnostics']['query_count'], 6)
         self.assertIn('declared_finite_search_interrupted', result['diagnostics']['quality_warnings'])
         self.assertFalse(result['accepted'])
 

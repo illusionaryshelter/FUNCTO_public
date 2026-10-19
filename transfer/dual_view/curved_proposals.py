@@ -3,9 +3,9 @@
 Four sensor-derived voxel resolutions and eight fixed seeds allocate exactly
 32 terminal slots before fitting. A slot is one Open3D FPFH/RANSAC initializer
 followed by one Open3D Sim(3) ICP update; only its final pose is a candidate.
-Neither native fitting nor descriptor resolution is the final multiscale
-identity score. Actual RGB-D support, negative evidence and source-fixed
-relations remain the responsibility of ``curved_inference``.
+Neither native fitting nor descriptor resolution is the final weighted
+identity score. Actual RGB-D support, negative evidence, absolute geometry
+and assigned-measurement appearance belong to ``curved_inference``.
 
 No feature-response field, target annotation, previous pose or mesh is an
 input. View-local estimated normals and voxel centroids are proposal data,

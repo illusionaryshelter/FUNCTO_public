@@ -465,13 +465,19 @@ def evaluate(output, destination, *, old_results, new_results,
                 'potential_winner_count', 'potential_winner_ids', 'region_identified',
                 # BEGIN surface selection is distinct from planar tied-score regions.
                 'ranked_hypothesis_ids', 'top_score_hypothesis_ids', 'selected_hypothesis_id',
-                'selected_score', 'selection_rule',
+                'selected_score', 'selection_rule', 'score_definition',
+                'source_query_weights', 'source_weight_sum', 'source_support_scopes', 'source_weighting',
                 # END report each model's native decision, without conversion.
                 'finite_candidate_unique', 'transform_certified',
                 'best_score', 'competing_regions', 'appearance_reference', 'timing_seconds')}
             search.update(candidate_rejection_counts=dict(Counter(reason for h in candidates
                 for reason in h.get('reasons', h.get('rejections', [])))),
                 full_prediction=str(stem.with_suffix('.json')))
+            # BEGIN the HTML exposes the same score decomposition used to rank.
+            search['candidate_scores'] = [{key: h.get(key) for key in (
+                'hypothesis_id', 'score', 'selected', 'admitted_to_H', 'score_components')}
+                for h in candidates]
+            # END missing planar components are not fabricated as surface scores.
             images = []
             modes = result['modes'] or [None]
             for rank, mode in enumerate(modes):

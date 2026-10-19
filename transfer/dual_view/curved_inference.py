@@ -1,7 +1,7 @@
 """Finite point-correspondence inference with explicit curved observations.
 
-Measured three-scale relations rank the finite candidate set, while complete
-observed-entity depth can refute a candidate. The highest observed-support score
+Absolute-position and same-measurement appearance support rank the finite set,
+while complete observed-entity depth can refute a candidate. The highest score
 selects one estimate; missing sampling output cannot promote another estimate.
 """
 
@@ -17,7 +17,10 @@ from .proposals import COMPATIBILITY_RATIO, transform_key, valid_transform
 from .curved_proposals import CANDIDATE_BUDGET, build_proposals
 # BEGIN: surface-only structural evidence; the planar evaluator is unchanged.
 from .curved_structure import entity_evidence
-from .curved_multiscale import prepare_multiscale, geometry_correspondences, score_multiscale
+# BEGIN one source-weighted geometry/appearance objective, without pair votes.
+from .curved_scoring import (prepare_scoring, geometry_correspondences,
+                             assigned_appearance, score_candidate)
+# END appearance and geometry share one capacity-constrained correspondence.
 # END: independent observed-entity module.
 
 
@@ -112,8 +115,8 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
                         sampling_radius_m=.03, sampling_spacing_m=.005):
     """Evaluate each supplied pose once, without candidate/refit expansion.
 
-    Geometric association, multiscale relations and full-entity refutation use
-    actual observed points. Appearance and score intervals remain diagnostics.
+    Geometric association, position scoring and full-entity refutation use
+    actual observed points. Appearance uses fixed per-view reference domains.
     The fixed-denominator score ranks measured positive support; it is not a
     probability or a claim that missing evidence uniquely determines a pose.
     """
@@ -130,12 +133,14 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
     diagnostics = dict(method='dual_view_observed_surface', scheme='dual_view_observed_surface',
         region_geometry='surface', target_truth_used=False, source=source['diagnostics'],
         query_indices=source['query_indices'].tolist(), query_region=regional.tolist(),
-        fixed_query_denominator=q, query_count=q, region_query_count=int(regional.sum()),
+        query_count=q, region_query_count=int(regional.sum()),
         context_query_count=int((~regional).sum()), quality_warnings=warnings,
         view_ids=list(surface['view_ids']), point_index_domain='surface.xyz',
-        score_definition='three_scale_fixed_denominator_observed_relation_geometric_mean',
-        interval_role='diagnostic_only_not_candidate_selection',
-        appearance_diagnostic_definition='raw_responses_at_candidate_query_positions_not_used_for_ranking',
+        # BEGIN the score is changed, not just its final selection rule.
+        score_definition='source_scope_weighted_absolute_geometry_and_empirical_appearance',
+        appearance_score_definition='assigned_measurement_own_view_positive_centered_mid_cdf',
+        raw_appearance_diagnostic_definition='per_view_native_dot_responses_and_maximum_for_display',
+        # END raw maxima are diagnostic and never borrowed by the scorer.
         observation_model=surface['diagnostics']['observation_model'],
         local_geometry_contract='actual_region_and_complete_observed_entity_measurements',
         sampling_metric='observed_graph_path_length', sampling_radius_m=sampling_radius_m,
@@ -155,9 +160,9 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
         diagnostics.update(search_status='not_started', decision_status=result['status'])
         return result
     # BEGIN freeze source-only domains once for this entire finite evaluation.
-    multiscale_context = prepare_multiscale(source)
+    scoring_context = prepare_scoring(source)
     records, seen = [], {}
-    # END no candidate can change the support domains or relation denominators.
+    # END no candidate can change the source scopes or query weights.
 
     def evaluate(transform, origins):
         key = transform_key(transform)
@@ -192,8 +197,11 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
         region_observations = assigned['observation_indices'][region_rows]
         correspondence = _correspondence_geometry(source['query_xyz'][region_rows],
             assigned['target_xyz'][region_rows], transform)
-        multiscale = score_multiscale(multiscale_context, transform, assigned,
-            registration_error_m=registration_error)
+        # BEGIN only the assigned observation may contribute appearance.
+        assigned_features = assigned_appearance(sampled, assigned, supports)
+        scored = score_candidate(scoring_context, transform, assigned,
+            assigned_features['utilities'], registration_error_m=registration_error)
+        # END geometry does not depend on feature availability or response rank.
         # END unknown feature footprints cannot delete real geometric evidence.
         local_rows = np.flatnonzero(regional & support['support'])
         rejections = []
@@ -248,7 +256,12 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
         hypothesis_id = len(records)
         summary = dict(hypothesis_id=hypothesis_id, origins=origins,
             transform=[float(transform[0]), transform[1].tolist(), transform[2].tolist()],
-            score=multiscale['score'], multiscale_structure=multiscale,
+            # BEGIN expose every input and weighted contribution of the new score.
+            score=scored['score'], score_components=scored,
+            assigned_appearance_responses=_finite_list(assigned_features['raw_responses']),
+            assigned_appearance_known_count=int(np.isfinite(assigned_features['utilities']).sum()),
+            assigned_appearance_unknown_count=int((~np.isfinite(assigned_features['utilities'])).sum()),
+            # END per-view raw diagnostics below have their original meaning.
             appearance_scores=_finite_list(sampled['scores']),
             appearance_known=sampled['known'].tolist(), appearance_known_count=int(sampled['known'].sum()),
             appearance_unknown_count=int((~sampled['known']).sum()),
@@ -283,12 +296,22 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
         seen[key] = hypothesis_id
 
     try:
+        # BEGIN build candidate-independent reference distributions once.
+        diagnostics['search_stage'] = 'appearance_reference_preparation'
+        supports, reference_records = appearance.prepare_support()
+        diagnostics.update(appearance_reference=reference_records,
+            source_query_weights=scoring_context['query_weights'].tolist(),
+            source_weight_sum=float(scoring_context['query_weights'].sum()),
+            source_support_scopes=scoring_context['scope_aliases'],
+            source_weighting=scoring_context['weighting_definition'])
+        diagnostics['search_stage'] = 'candidate_evaluation'
+        # END interruption cannot publish a candidate with a partial reference.
         for proposal in proposals:
             evaluate(proposal['transform'], list(proposal['origins']))
         admitted = [r for r in records if r['summary']['admitted_to_H']]
         diagnostics.update(evaluated_transform_count=len(records), hypotheses_admitted=len(admitted))
-        # BEGIN select by the unchanged measured-support score, without an
-        # interval or cross-candidate agreement gate. Missing relations supply
+        # BEGIN select by the weighted geometry/appearance score, without an
+        # interval or cross-candidate agreement gate. Missing observations supply
         # no positive score, but remain unknown rather than depth conflicts.
         # Stable sorting preserves proposal order for exact numerical ties;
         # there is no task-specific tie key, near-tie threshold or fallback.
@@ -311,7 +334,7 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
                 finite_candidate_unique_scope='only_one_geometrically_admitted_finite_candidate',
                 ranked_candidate_pose_differences=_pose_differences(ranked),
                 selected_hypothesis_id=selected['summary']['hypothesis_id'],
-                selection_rule='highest_observed_support_score_stable_proposal_order')
+                selection_rule='highest_weighted_evidence_score_stable_proposal_order')
             if len(top) > 1:
                 warnings.append('exact_top_score_tie_resolved_by_proposal_order')
             result.update(region_identified=True, finite_candidate_unique=unique)
@@ -334,7 +357,7 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
                     tgt_anchor_idx=np.asarray(chosen['paired_surface_indices'], np.int64))
                 if chosen['entity_structure']['unknown_count']:
                     warnings.append('entity_transform_not_fully_supported')
-                if chosen['appearance_unknown_count']:
+                if chosen['assigned_appearance_unknown_count']:
                     warnings.append('selected_estimate_has_unknown_appearance')
         # END the chosen score estimate alone supplies the actionable region.
         if not result['accepted']:
@@ -344,7 +367,7 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
                 hypothesis_index=r['summary']['hypothesis_id'], score=r['summary']['score']) for r in available[:6]]
         diagnostics.update(search_status='finite_domain_complete', search_stage='complete')
     except (MemoryError, InterruptedError) as error:
-        _incomplete_result(result, error, 'candidate_evaluation')
+        _incomplete_result(result, error, diagnostics['search_stage'])
     diagnostics.update(decision_status=result['status'], total_seconds=perf_counter()-started)
     return result
 
@@ -356,8 +379,8 @@ def infer(source, surface, appearance, *, sampling_radius_m=.03,
 
     The proposer replaces its own coarse estimate with its refined estimate
     in each slot. Neither native MARCO initializers nor partial-refit branches
-    can add poses here. The appearance field supplies raw diagnostics only,
-    so no all-target empirical ranking is prepared for this geometry model.
+    can add poses here. The evaluator freezes per-view appearance references
+    and source weights once before scoring these same terminal candidates.
     """
     if source['reasons']:
         return evaluate_candidates(source, surface, appearance, (),
@@ -366,7 +389,7 @@ def infer(source, surface, appearance, *, sampling_radius_m=.03,
         proposals, report = build_proposals(source, surface)
     except (MemoryError, InterruptedError) as error:
         failed = dict(diagnostics=dict(region_geometry='surface',
-            fixed_query_denominator=len(source['query_xyz']), source=source['diagnostics'],
+            query_count=len(source['query_xyz']), source=source['diagnostics'],
             query_indices=source['query_indices'].tolist(),
             query_region=source['query_region'].tolist(), candidate_budget=CANDIDATE_BUDGET,
             quality_warnings=['declared_finite_search_interrupted']))

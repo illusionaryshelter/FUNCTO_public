@@ -36,25 +36,40 @@ remain independent requirements of `PlanningProblem`; geometric boundaries
 alone do not certify robot feasibility or physical execution.
 <!-- END one adapted reference entry, without a rigid-only compatibility mode. -->
 
-<!-- BEGIN observed-surface grounding uses the existing score directly. -->
+<!-- BEGIN observed-surface grounding combines geometry and appearance. -->
 For an explicitly declared `surface` region, `transfer.dual_view.curved_inference`
 retains its observed-depth conflicts, correspondence capacity/rank checks and
-complete observed-entity evidence, then ranks admitted candidates by the existing
-three-scale score from `curved_multiscale.score_multiscale`. Each scale is the
-sum of measured relation similarities divided by its fixed source relation
-count; their geometric mean is the final score. It rewards observed coverage
-and geometric agreement, not calibrated pose probability or physical uniqueness.
-Missing relations contribute no positive score and remain explicitly unknown.
+complete observed-entity evidence, then ranks admitted candidates using
+`curved_scoring.score_candidate`. Absolute position support is
+`g_i = 1/(1+(||y_i-T*x_i||/tau)^2)` for each assigned real measurement, with the
+existing single-point registration scale `tau`. This captures common position
+offsets as well as relative shape; the former pair-relation score is removed.
+
+`SurfaceResponseField.prepare_support` freezes a separate empirical MARCO
+response distribution for each source query and target camera, using that
+camera's actual entity measurements and complete interpolation footprints.
+Only the camera/measurement selected by geometric assignment supplies the
+candidate's appearance support `a_i`; a different camera's higher response
+cannot be borrowed. The existing positive centered mid-CDF is an operational
+support value, not a calibrated match probability.
+
+Each distinct source scope (region, neighborhood, entity) receives equal total
+query weight: `w_i = mean_D(1[i in D]/|D|)`. Identical scopes count once, and all
+weights are fixed before candidate evaluation. `G = sum(w_i*g_i)`,
+`A = sum(w_i*a_i)`, and `score = (2*G+A)/3`. The coefficients are a predeclared
+geometry-first design preference, not learned reliability or an optimality
+claim. Missing evidence adds no positive contribution, remains explicitly
+unknown, and never changes the denominator or invokes a different scorer.
 
 The highest score selects one reference estimate. Exact ties preserve proposal
 order and are reported in `top_score_hypothesis_ids` with a warning; no score-gap
-threshold is used. Score intervals remain diagnostics and do not veto selection.
+threshold is used. No score interval or cross-candidate agreement gate applies.
 The selected candidate must have an available observed sampling region; missing
 output does not promote a lower-ranked candidate. `finite_candidate_unique`
 means only one candidate passed geometric admission, while transformation and
 global-optimality certification remain false. Current target truth is excluded
 from grounding; any truth-based evaluation reads frozen outputs separately.
-<!-- END score selection has no interval-consensus or retry compatibility mode. -->
+<!-- END one weighted scoring path, without pair-score or retry compatibility. -->
 
 <!-- BEGIN default MARCO perception architecture. -->
 This workspace uses one `recovery` Python environment for local **SAM3.1 +

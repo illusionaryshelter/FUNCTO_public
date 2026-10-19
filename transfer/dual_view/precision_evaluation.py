@@ -362,10 +362,16 @@ def evaluate(output, destination, *, baseline_results, baseline_web,
                 'potential_winner_count', 'potential_winner_ids', 'region_identified', 'finite_candidate_unique',
                 # BEGIN expose the native surface score decision in evaluation.
                 'ranked_hypothesis_ids', 'top_score_hypothesis_ids', 'selected_hypothesis_id',
-                'selected_score', 'selection_rule',
+                'selected_score', 'selection_rule', 'score_definition',
+                'source_query_weights', 'source_weight_sum', 'source_support_scopes', 'source_weighting',
                 # END no interval-survivor compatibility fields are fabricated.
                 'transform_certified', 'best_score', 'competing_regions', 'appearance_reference', 'polishing')}
             search['full_prediction'] = str(stem.with_suffix('.json'))
+            # BEGIN retain actual weighted components in the precision webpage.
+            search['candidate_scores'] = [{key: h.get(key) for key in (
+                'hypothesis_id', 'score', 'selected', 'admitted_to_H', 'score_components')}
+                for h in result['diagnostics'].get('hypotheses', [])]
+            # END observation-score diagnostics do not use evaluation truth.
             card['methods'].append({'scheme': 'trial', 'label': f'精度试验 / {backend}',
                                     'panels': [{**row, 'images': images, 'search': search}]})
     summary, metrics = _summary(rows), precision_summary(rows)

@@ -2,7 +2,7 @@
 
 Both models share observed geometry and raw response preparation. Planar uses
 its fixed ranking/TEASER path; surface uses bounded native geometric slots and
-three-scale measured relations. No file reads, model
+source-weighted absolute geometry and appearance support. No file reads, model
 calls or historical predictions occur inside ``run``. Use in a serial process.
 """
 from time import perf_counter
@@ -82,7 +82,7 @@ def run(loaded, feature_pairs, *, sampling_radius_m=.03, sampling_spacing_m=.005
         from .curved_inference import infer as infer_region
     else:
         raise ValueError('region_geometry must be planar or surface')
-    # END geometry dispatch; raw appearance responses remain shared diagnostics.
+    # END geometry dispatch; each model owns its appearance scoring contract.
     stages, native_pairs, surface_work, work = {}, {}, {}, {}
     with threadpool_limits(limits=1, user_api='blas'):
         torch.set_num_threads(1)
@@ -141,7 +141,7 @@ def run(loaded, feature_pairs, *, sampling_radius_m=.03, sampling_spacing_m=.005
             result = infer_region(source, target, appearance, initial_transforms=native,
                 prepared_domain=domain, sampling_radius_m=sampling_radius_m,
                 sampling_spacing_m=sampling_spacing_m, work_stats=work)
-        # END raw surface responses need no Q-by-target ranking or calibration.
+        # END the surface evaluator freezes its own per-view response references.
         if geometry == 'planar':
             torch.cuda.synchronize()
         stages['candidate_inference'] = perf_counter()-mark

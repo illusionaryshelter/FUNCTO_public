@@ -8,7 +8,7 @@ raw dot products are shared. An unknown corner is never dropped/renormalized.
 import numpy as np
 
 from .curved_geometry import bounded_members, project_measurements
-from .features import ResponseField, _sampling_corners
+from .features import EmpiricalSupport, ResponseField, _sampling_corners
 
 
 class SurfaceResponseField(ResponseField):
@@ -55,6 +55,121 @@ class SurfaceResponseField(ResponseField):
             result[row, columns] = np.isin(ids, members, assume_unique=False)
         return result
 
+    # BEGIN candidates and frozen appearance references share native sampling.
+    def _sample_observations(self, view_index, observation_ids, rows=None):
+        """Sample actual measurements in one camera with complete RGB support.
+
+        Callers supply only actual observation identities belonging to this
+        camera. Candidate geometry has already qualified those identities;
+        references use the camera's entire observed entity domain directly.
+        Both paths therefore use identical original pixels, resize metadata,
+        unrenormalized bilinear weights and positive-corner graph predicates.
+        """
+        from local_models.marco import RESOLUTION
+
+        view = self.views[view_index]
+        shape = (len(self.queries), len(observation_ids)) if rows is None else (len(observation_ids),)
+        values = np.full(shape, np.nan)
+        valid = np.ones(len(observation_ids), bool)
+        state = np.full(len(observation_ids), 'appearance_pending', object)
+        if view['missing_reason'] is not None:
+            state[:] = view['missing_reason']
+            valid[:] = False
+            return values, valid, state
+
+        response, crop = view['response'], view['crop_xyxy']
+        pixel = self.surface['observation_pixels'][observation_ids]
+        local = pixel-crop[:2]
+        inside = np.all(local >= 0, axis=1) & np.all(local <= crop[2:]-crop[:2]-1, axis=1)
+        state[~inside] = 'outside_feature_crop'
+        valid &= inside
+        grid = local*view['resize_scale']*(np.array(response.shape[:0:-1])-1)/(RESOLUTION-1)
+        inside, corners, weights = _sampling_corners(grid, response.shape[-2:])
+        state[valid & ~inside] = 'outside_feature_grid'
+        valid &= inside
+        active = np.flatnonzero(valid)
+        if len(active):
+            positive = weights[active] > 0
+            pixel_corners = np.rint(corners[active]*(RESOLUTION-1)
+                /(np.array(response.shape[:0:-1])-1)/view['resize_scale']+crop[:2]).astype(np.int64)
+            corner_inside = np.all(pixel_corners >= crop[:2], axis=-1)
+            corner_inside &= np.all(pixel_corners < crop[2:], axis=-1)
+            connected = self._footprint(view_index, observation_ids[active], pixel_corners, positive)
+            supported = connected & corner_inside
+            complete = np.all(~positive | supported, axis=1)
+            any_support = np.any(positive & supported, axis=1)
+            state[active[~complete & any_support]] = 'partial_feature_support'
+            state[active[~complete & ~any_support]] = 'no_feature_support'
+            valid[active[~complete]] = False
+            chosen = active[complete]
+            if len(chosen):
+                # Rewrite the same bilinear sum as base + sum(w*(value-base)).
+                # A strictly positive, already supported corner supplies base;
+                # casting it before subtraction keeps arithmetic in float64.
+                # This preserves nonzero constants exactly, so empirical ranks
+                # cannot turn summation roundoff into appearance support. No
+                # corner is dropped and the original weights are unchanged.
+                first = np.argmax(weights[chosen] > 0, axis=1)
+                base_xy = corners[chosen, first]
+                if rows is None:
+                    base = response[:, base_xy[:, 1], base_xy[:, 0]].astype(float)
+                else:
+                    base = response[rows[chosen], base_xy[:, 1], base_xy[:, 0]].astype(float)
+                sampled = base.copy()
+                for corner in range(4):
+                    weight = weights[chosen, corner]
+                    positive_here = weight > 0
+                    ids = chosen[positive_here]
+                    xy = corners[ids, corner]
+                    if rows is None:
+                        delta = response[:, xy[:, 1], xy[:, 0]]-base[:, positive_here]
+                        sampled[:, positive_here] += delta*weight[positive_here]
+                    else:
+                        delta = response[rows[ids], xy[:, 1], xy[:, 0]]-base[positive_here]
+                        sampled[positive_here] += delta*weight[positive_here]
+                if rows is None:
+                    values[:, chosen] = sampled
+                else:
+                    values[chosen] = sampled
+                state[chosen] = 'appearance_valid_orientation_unknown'
+        return values, valid, state
+
+    def prepare_support(self):
+        """Freeze separate empirical appearance references for both cameras.
+
+        Each camera contributes every actual entity observation once. Only
+        measurements with complete native feature footprints enter its sorted
+        reference distributions. A missing camera stays empty; responses from
+        the other camera are never borrowed. References are built before the
+        candidate loop, so their domain cannot depend on a candidate's score.
+        The fixed block size limits temporary interpolation arrays without
+        subsampling or changing the reference domain.
+        """
+        supports, diagnostics = [], []
+        for view_index, view_id in enumerate(self.surface['view_ids']):
+            ids = np.flatnonzero(self.surface['observation_entity_member']
+                & (self.surface['observation_view_index'] == view_index))
+            reference = np.full((len(self.queries), len(ids)), np.nan)
+            known = np.zeros(len(ids), bool)
+            counts = {}
+            for start in range(0, len(ids), 256):
+                stop = min(start+256, len(ids))
+                values, valid, state = self._sample_observations(view_index, ids[start:stop])
+                reference[:, start:stop] = values
+                known[start:stop] = valid
+                names, number = np.unique(state, return_counts=True)
+                for name, count in zip(names.tolist(), number.tolist()):
+                    counts[name] = counts.get(name, 0)+count
+            support = EmpiricalSupport(reference, np.broadcast_to(known, reference.shape))
+            supports.append(support)
+            diagnostics.append(dict(view_id=view_id, observation_count=len(ids),
+                reason_counts=counts, **support.diagnostics))
+            # EmpiricalSupport owns sorted rows. Release the unsorted Q-by-N
+            # array before allocating the next camera's complete reference.
+            del reference
+        return tuple(supports), diagnostics
+    # END one sampling convention governs candidate and reference appearance.
+
     def sample(self, points, normals, query_rows=None, *, registration_error_m=0.,
                query_position_error_m=0.):
         """Return fixed-Q scores and independent per-view position evidence.
@@ -64,8 +179,6 @@ class SurfaceResponseField(ResponseField):
         Registration error is zero for target reference-domain measurements
         and is explicitly supplied when evaluating a fitted transform.
         """
-        from local_models.marco import RESOLUTION
-
         points, normals = np.asarray(points, float), np.asarray(normals, float)
         if points.ndim != 2 or points.shape[1:] != (3,) or normals.shape != points.shape:
             raise ValueError('World positions and optional normal records must align [N,3]')
@@ -77,59 +190,26 @@ class SurfaceResponseField(ResponseField):
         values = np.full((*shape, 2), np.nan)
         valid_views = np.zeros((len(points), 2), bool)
         states, projections, counts = [], [], []
-        for view_index, view in enumerate(self.views):
+        for view_index in range(len(self.views)):
             projection = project_measurements(self.surface, points, view_index,
                 registration_error_m=registration_error_m,
                 query_position_error_m=query_position_error_m)
             projections.append(projection)
             state = np.asarray(projection['state_names'], object)[projection['states']].copy()
             valid = projection['supported'].copy()
-            if view['missing_reason'] is not None:
-                state[valid] = view['missing_reason']
-                valid[:] = False
-            elif valid.any():
-                response, crop = view['response'], view['crop_xyxy']
-                observation_ids = projection['observation_indices']
-                pixel = self.surface['observation_pixels'][np.maximum(observation_ids, 0)]
-                local = pixel-crop[:2]
-                inside = np.all(local >= 0, axis=1) & np.all(local <= crop[2:]-crop[:2]-1, axis=1)
-                state[valid & ~inside] = 'outside_feature_crop'
-                valid &= inside
-                grid = local*view['resize_scale']*(np.array(response.shape[:0:-1])-1)/(RESOLUTION-1)
-                inside, corners, weights = _sampling_corners(grid, response.shape[-2:])
-                state[valid & ~inside] = 'outside_feature_grid'
-                valid &= inside
-                active = np.flatnonzero(valid)
-                if len(active):
-                    positive = weights[active] > 0
-                    pixel_corners = np.rint(corners[active]*(RESOLUTION-1)
-                        /(np.array(response.shape[:0:-1])-1)/view['resize_scale']+crop[:2]).astype(np.int64)
-                    corner_inside = np.all(pixel_corners >= crop[:2], axis=-1)
-                    corner_inside &= np.all(pixel_corners < crop[2:], axis=-1)
-                    connected = self._footprint(view_index, observation_ids[active], pixel_corners, positive)
-                    supported = connected & corner_inside
-                    complete = np.all(~positive | supported, axis=1)
-                    any_support = np.any(positive & supported, axis=1)
-                    state[active[~complete & any_support]] = 'partial_feature_support'
-                    state[active[~complete & ~any_support]] = 'no_feature_support'
-                    valid[active[~complete]] = False
-                    chosen = active[complete]
-                    if len(chosen):
-                        sampled = np.zeros((len(self.queries), len(chosen))) if rows is None else np.zeros(len(chosen))
-                        for corner in range(4):
-                            weight = weights[chosen, corner]
-                            positive_here = weight > 0
-                            ids = chosen[positive_here]
-                            xy = corners[ids, corner]
-                            if rows is None:
-                                sampled[:, positive_here] += response[:, xy[:, 1], xy[:, 0]]*weight[positive_here]
-                            else:
-                                sampled[positive_here] += response[rows[ids], xy[:, 1], xy[:, 0]]*weight[positive_here]
-                        if rows is None:
-                            values[:, chosen, view_index] = sampled
-                        else:
-                            values[chosen, view_index] = sampled
-                        state[chosen] = 'appearance_valid_orientation_unknown'
+            # BEGIN geometry chooses measurements; the shared helper samples RGB.
+            active = np.flatnonzero(valid)
+            if len(active):
+                selected_rows = None if rows is None else rows[active]
+                sampled, observed, appearance_state = self._sample_observations(
+                    view_index, projection['observation_indices'][active], selected_rows)
+                if rows is None:
+                    values[:, active, view_index] = sampled
+                else:
+                    values[active, view_index] = sampled
+                valid[active] = observed
+                state[active] = appearance_state
+            # END unsupported geometry retains its original diagnostic state.
             valid_views[:, view_index] = valid
             unique, number = np.unique(state, return_counts=True)
             counts.append(dict(zip(unique.tolist(), number.tolist())))

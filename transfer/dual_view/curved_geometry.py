@@ -114,7 +114,9 @@ def prepare_source(source, depth_m, *, query_indices, query_region,
         observation_model=asdict(model),
         position_error_definition='depth_error_times_calibrated_source_ray_norm',
         region_query_count=int(regional.sum()), context_query_count=int((~regional).sum()),
-        fixed_query_denominator=len(ids), query_normal_valid_count=0,
+        # BEGIN query count is a measurement budget, not a uniform score weight.
+        query_normal_valid_count=0,
+        # END the scorer reports its separate normalized source weights.
         check_point_count=len(check_ids), check_region_count=int(region[check_ids].sum()),
         check_context_count=int((~region[check_ids]).sum()), check_normal_valid_count=0,
         source_region_points=len(region_ids), full_depth_point_count=len(full),

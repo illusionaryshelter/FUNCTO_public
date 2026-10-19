@@ -55,9 +55,9 @@ class CurvedStructureTests(unittest.TestCase):
         target_observation = observation(depth, fixture.K)
         prepared = [dict(record, observation=target_observation) for record in fixture.field.views]
         field = SurfaceResponseField(surface, fixture.field.queries, prepared)
-        # BEGIN raw candidate appearance is independent of a full-domain rank.
+        # BEGIN fixed references are built from these actual measurements.
         return surface, field
-        # END only the actual target measurements and response field are needed.
+        # END no candidate or truth data chooses the appearance reference domain.
 
     # BEGIN entity counts describe measured source rows, not correspondence capacity.
     def test_full_entity_counts_rows_once_without_context_queries(self):
@@ -75,7 +75,7 @@ class CurvedStructureTests(unittest.TestCase):
         self.assertEqual(evidence['support_count_unit'],
             'source_measurement_rows_not_independent_correspondences')
         # Identical cameras do not duplicate a source measurement count.
-        # Independent query capacity is tested in test_curved_multiscale.
+        # Independent query capacity is tested in test_curved_scoring.
     # END no second matching contract remains in the entity refutation module.
 
     def test_unqueried_context_conflict_refutes_identity_and_labels_entity(self):
@@ -119,14 +119,14 @@ class CurvedStructureTests(unittest.TestCase):
         first = result['diagnostics']['hypotheses'][0]
         self.assertEqual(first['geometry_region_matched_count'], 6)
         self.assertEqual(first['entity_structure']['context_support_count'], 0)
-        self.assertEqual(first['multiscale_structure']['unique_support_domain_count'], 1)
+        self.assertEqual(first['score_components']['unique_support_domain_count'], 1)
         self.assertTrue(first['admitted_to_H'], first['rejections'])
         self.assertTrue(result['region_identified'])
         self.assertTrue(result['accepted'], result['reasons'])
     # END absent external context is not a known structural contradiction.
 
-    # BEGIN exact score ties select a reference without a uniqueness claim.
-    def test_repeated_geometry_exact_score_tie_preserves_proposal_order(self):
+    # BEGIN appearance now participates in repeated-geometry selection.
+    def test_repeated_geometry_is_ranked_by_assigned_appearance(self):
         fixture = self.fixture
         shifted = dict(transform=(1., np.eye(3), np.array([.0045, 0., 0.])),
                        origins=[dict(origin='translated_measured_sheet')])
@@ -139,6 +139,33 @@ class CurvedStructureTests(unittest.TestCase):
         self.assertTrue(first['admitted_to_H'], first['rejections'])
         self.assertTrue(other['admitted_to_H'], other['rejections'])
         self.assertNotEqual(first['appearance_scores'], other['appearance_scores'])
+        self.assertEqual(first['score_components']['geometry_score'],
+            other['score_components']['geometry_score'])
+        self.assertGreater(first['score_components']['appearance_score'],
+            other['score_components']['appearance_score'])
+        self.assertGreater(first['score'], other['score'])
+        self.assertEqual(result['diagnostics']['top_score_hypothesis_ids'], [0])
+        reversed_result = evaluate_candidates(fixture.source, fixture.surface, fixture.field,
+            [shifted]+fixture.proposals)
+        self.assertEqual(reversed_result['diagnostics']['selected_hypothesis_id'], 1)
+        np.testing.assert_array_equal(reversed_result['sim3_translation'], np.zeros(3))
+
+    def test_equal_geometry_and_constant_appearance_keep_explicit_exact_tie(self):
+        fixture = self.fixture
+        shifted = dict(transform=(1., np.eye(3), np.array([.0045, 0., 0.])),
+                       origins=[dict(origin='translated_measured_sheet')])
+        # Nonzero constant responses have no discriminatory support. This
+        # creates an actual tie through the normal sampler and empirical CDF.
+        prepared = [dict(view, response=np.full_like(view['response'], 3.5))
+            for view in fixture.field.views]
+        field = SurfaceResponseField(fixture.surface, fixture.field.queries, prepared)
+        result = evaluate_candidates(fixture.source, fixture.surface, field,
+            fixture.proposals + [shifted])
+        first, other = result['diagnostics']['hypotheses']
+        self.assertTrue(first['admitted_to_H'], first['rejections'])
+        self.assertTrue(other['admitted_to_H'], other['rejections'])
+        self.assertEqual(first['score_components']['appearance_score'], 0.)
+        self.assertEqual(other['score_components']['appearance_score'], 0.)
         self.assertEqual(first['score'], other['score'])
         self.assertEqual(result['diagnostics']['top_score_hypothesis_ids'], [0, 1])
         self.assertEqual(result['diagnostics']['selected_hypothesis_id'], 0)
@@ -149,12 +176,12 @@ class CurvedStructureTests(unittest.TestCase):
         self.assertFalse(result['finite_candidate_unique'])
         self.assertFalse(result['transform_certified'])
         np.testing.assert_array_equal(result['sim3_translation'], np.zeros(3))
-        reversed_result = evaluate_candidates(fixture.source, fixture.surface, fixture.field,
+        reversed_result = evaluate_candidates(fixture.source, fixture.surface, field,
             [shifted]+fixture.proposals)
         self.assertTrue(reversed_result['accepted'], reversed_result['reasons'])
         self.assertEqual(reversed_result['diagnostics']['selected_hypothesis_id'], 0)
         np.testing.assert_array_equal(reversed_result['sim3_translation'], shifted['transform'][2])
-    # END a stable estimate does not resolve physical repeated-structure identity.
+    # END neither a stable tie choice nor appearance ranking proves uniqueness.
 
     def test_sampling_anchor_failure_preserves_identity_without_actionable_output(self):
         fixture = self.fixture
