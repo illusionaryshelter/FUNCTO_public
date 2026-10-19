@@ -192,7 +192,7 @@ def test_arrival_close_and_later_open_keep_independent_holding_evidence():
     refresh_validation(result)
     report, _ = execute_fixture(fixture, result_only_goal_ids=[["pose_events", 0]])
     assert report["status"] == "curve_finished"
-    assert report["grasp_contact_gate_checks"][-1]["control_applied"]
+    assert report["grasp_command_checks"][-1]["control_applied"]
     assert report["observed_attachment_bindings"][0]["condition_id"] == "observed_holding"
     assert "grasp_contact_permission_changes" not in report
     assert "active_contact_rule_ids" not in report

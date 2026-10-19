@@ -1210,8 +1210,16 @@ scene for authorization and provenance. `TrajectoryExecutor` does not rebuild
 or query that frozen world during preflight or physical execution.
 `RobotStateValidator` checks measured joint limits, model/FK identity and the
 registered required native robot/fixed-installation collision pairs only.
-Tracking, event timing, real arrival before close, fresh observations, current
+<!-- BEGIN target-relative accuracy is exclusively simulation posthoc evidence. -->
+Robot joint/reference tracking, command timing, fresh observations, current
 Holding dependencies and effect requirements remain execution duties.
+Target-relative TCP position/orientation error is **never an online rejection
+criterion**, including before close. Encoder FK versus a frozen predicted goal
+does not observe the real tool-to-target relation. Pose errors, unavailable
+target truth, and timing that depends on pose arrival cannot stop execution or
+force replanning. Nominal planning constraints keep their original tolerances;
+the independent simulation evaluator retains actual pose errors and T/F/U.
+<!-- END posthoc diagnostics cannot become control or continuation gates. -->
 <!-- BEGIN predicate estimation and declared model assumptions are separate inputs. -->
 The task layer supplies predicate estimates through `observation_callback`;
 the planner does not run a VLM. An attachment-dependent owner uses current

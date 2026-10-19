@@ -267,11 +267,11 @@ def validate_controller_policy(value, *, joint_names):
 
 
 def validate_result_only_goal_ids(binding, trajectory, values):
-    """Select terminal result obligations without weakening online consumers.
+    """Validate explicit result roles without weakening online consumers.
 
     Every selected goal keeps its original identity and mathematical allowed
-    set. Only a goal at the final skill progress can be a result-only goal;
-    an explicit actual-arrival window always remains an online obligation.
+    set. Pose goals are exclusively posthoc, at every progress including close.
+    Non-pose selections require terminal progress and no actual-arrival window.
     Process, current-feedback and effect-dependency checks are separate and
     are never disabled by this list.
     """
@@ -288,12 +288,6 @@ def validate_result_only_goal_ids(binding, trajectory, values):
         indexes = identities.get(value[0], [])
         if identity in selected:
             raise ValueError("Result-only goal identities must be unique and belong to this original binding")
-        # BEGIN a contact-activation arrival always remains an online gate.
-        if any(row.get("kind") == "grasp_contact_activation"
-               and row.get("arrival_goal_id") == identity
-               for row in binding["problem"].get("conditions", ())):
-            raise ValueError("A gripper contact-activation arrival cannot be result-only")
-        # END terminal progress or an old completion cannot waive this check.
         # A continuation keeps the full immutable policy even after verified
         # original goals have been removed from its remaining requirement list.
         if identity in binding.get("completed_goal_ids", []):
@@ -304,6 +298,13 @@ def validate_result_only_goal_ids(binding, trajectory, values):
         requirements = binding["problem"].get(value[0], [])
         if len(requirements) != len(indexes):
             raise ValueError("Result-only goal identities must retain their complete bound requirements")
+        # BEGIN pose errors are always posthoc, including pre-close arrivals.
+        # A declaration here selects a result role; it cannot enable/disable an
+        # online pose gate because production execution has no such gate.
+        if value[0] == "pose_events":
+            selected.append(identity)
+            continue
+        # END other typed goal scopes retain their existing restrictions.
         requirement = requirements[indexes.index(value[1])]
         if requirement.get("progress") != float(trajectory.progress_s[-1]):
             raise ValueError("Only a terminal goal without a remaining progress suffix can be result-only")

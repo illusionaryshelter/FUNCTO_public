@@ -1286,10 +1286,12 @@ class PlanningProblem:
                          if hasattr(requirement, "progress") else
                          (requirement.start, requirement.end) if hasattr(requirement, "start")
                          else (self.start_progress, float(self.phase_count)))
-                consumers = (("PlanningProblem.residuals", "execution._actual_pose_goal")
+                # BEGIN pose accuracy is a simulation result, never an online gate.
+                consumers = (("PlanningProblem.residuals", "simulation_posthoc_pose_evaluation")
                              if name == "pose_events" else ("PlanningProblem.residuals",))
-                categories = ((category, "actual_evidence_obligation")
+                categories = ((category, "simulation_posthoc_obligation")
                               if name == "pose_events" else (category,))
+                # END nominal optimization retains its original allowed set.
                 add((name, index), categories, consumers,
                     scope, requirement.source)
                 if name == "mechanisms":
@@ -2070,7 +2072,11 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             "effect_requirement": "stable_grasp_from_current_synchronized_evidence"})
         events.append(PlanningEvent("__stable_holding__", skill_id, 1., int(frames[-1]), "effect", source))
         # END no effect association is inferred from its name or clock value.
-        # BEGIN each original close requires arrival before its contact permission.
+        # BEGIN each close retains a nominal planning anchor at its predicted target.
+        # This constrains the planned trajectory only. The executor must never
+        # compare measured-joint FK with this frozen target to veto close; the
+        # real tool-to-target relation is unavailable online. Simulation pose
+        # errors remain independent posthoc evidence at the original threshold.
         # Keep the terminal owner-relative task result at index zero. These
         # additional point goals instead compare measured robot FK with the
         # frozen perception-bound command target; they neither claim a fresh
@@ -2087,7 +2093,7 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
             arrival_source = {**source, "kind": "frozen_perception_grasp_arrival",
                 "carrier_id": carrier, "binding_source": deepcopy(grasp_goal["source"]),
                 "activation_event": deepcopy(activation),
-                "semantics": "Robot FK arrival at the frozen perception-bound interaction target before close; not a current owner observation or Holding evidence"}
+                "semantics": "Nominal planning anchor at the perception-bound interaction target; actual target-relative error is simulation posthoc only and cannot gate close"}
             arrival_id = ["pose_events", len(pose_events)]
             pose_events.append(PoseEventRequirement(begin, np.eye(4), grounded["goal_pose"],
                 grasp_goal["position_tolerance_m"], grasp_goal["rotation_tolerance_rad"],

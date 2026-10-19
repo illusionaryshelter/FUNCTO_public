@@ -156,22 +156,19 @@ def finite_execution_fixture(*, reopen=False, zero_tick=False):
 
 
 @pytest.mark.parametrize("arrived", [False, True])
-def test_executor_preserves_current_arrival_without_world_geometry_permissions(arrived):
+def test_target_error_does_not_veto_close_or_grant_world_geometry_permissions(arrived):
     fixture = finite_execution_fixture(zero_tick=True)
     if not arrived:
         fixture[0].scripted_tcp_estimate_offset[0] = .002
-    report, checker = execution_tests.GraspContactActivationTests.run_trial(fixture, rejects=not arrived)
-    # BEGIN execution retains the actual command gate, not geometric latches.
+    report, checker = execution_tests.GraspContactActivationTests.run_trial(fixture)
+    # BEGIN target accuracy is posthoc; command timing creates no contact facts.
     assert "active_robot_owner_permissions" not in report
     assert "active_contact_rule_ids" not in report
     assert all("active_contact_rule_ids" not in row for row in checker.states)
-    if arrived:
-        assert report["status"] == "curve_finished"
-        assert report["grasp_contact_gate_checks"][-1]["control_applied"]
-    else:
-        assert checker.states == [] and report["events"] == []
-        assert report["feedback_failure"]["violations"][0]["kind"] == "grasp_contact_arrival_rejected"
-    # END a missing arrival still prevents the actual actuator command.
+    assert report["status"] == "curve_finished"
+    assert report["grasp_command_checks"][-1]["control_applied"]
+    assert report["completed_goal_ids"] == []
+    # END a target estimate miss must still reach the actual close command.
 
 
 def test_open_after_close_does_not_create_runtime_geometry_permission():
@@ -179,7 +176,7 @@ def test_open_after_close_does_not_create_runtime_geometry_permission():
     assert report["status"] == "curve_finished"
     assert "active_contact_rule_ids" not in report
     assert all("active_contact_rule_ids" not in row for row in checker.states)
-    assert report["grasp_contact_gate_checks"][-1]["control_applied"]
+    assert report["grasp_command_checks"][-1]["control_applied"]
     assert [row["kind"] for row in report["events"]] == ["open", "close", "open"]
 
 

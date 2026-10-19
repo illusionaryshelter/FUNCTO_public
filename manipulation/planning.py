@@ -957,6 +957,19 @@ def _validate_bound_event_times(problem, progress_map, duration, origin_s=0., hi
     goal_identities = ({name: list(range(len(getattr(problem, name))))
                        for name in ("pose_events", "coordinate_events", "supports")}
                       if goal_identities is None else goal_identities)
+    # BEGIN past target-pose timing cannot require unavailable online truth.
+    # Future nominal anchors still obey their planned windows. Once an anchor
+    # is outside the remaining plan, its actual arrival and any dependent time
+    # origin belong only to simulation grading; they cannot reject a rebind.
+    history = [row for row in history if not (row.get("check_target") == "arrival"
+        and (row.get("goal_id") or [None])[0] == "pose_events")]
+
+    def past_pose_timing(constraint):
+        identities = [constraint.goal_id if constraint.check_target == "arrival" else None,
+                      (constraint.origin_event or {}).get("goal_id")]
+        return any(identity and identity[0] == "pose_events"
+                   and identity[1] not in goal_identities["pose_events"] for identity in identities)
+    # END retained pose-arrival labels never become actual planning witnesses.
     current = {event_occurrence_key(event): event for event in problem.events}
     all_events = {event_occurrence_key(row): PlanningEvent(**row) for row in timing_events}
     all_events.update(current)
@@ -984,6 +997,8 @@ def _validate_bound_event_times(problem, progress_map, duration, origin_s=0., hi
             if (condition.get("skill_id"), condition.get("event_id")) == key[:2] and condition.get("effect_requirement"):
                 candidate_fact(key, "effect", record["time"], condition_id=condition["condition_id"])
         for constraint in event.timing:
+            if past_pose_timing(constraint):
+                continue
             if constraint.check_target == "activation":
                 value = record.get("activation_time_s")
                 if value is None:
@@ -1005,6 +1020,10 @@ def _validate_bound_event_times(problem, progress_map, duration, origin_s=0., hi
         if key[2] != latest[key[:2]]:
             continue
         for constraint in event.timing:
+            if past_pose_timing(constraint):
+                checks.append({"event": key, "check_target": constraint.check_target,
+                               "status": "simulation_posthoc_only"})
+                continue
             facts = [row for row in history if event_occurrence_key(row) == key and row.get("value") == "T"
                 and row.get("check_target") == constraint.check_target
                 and (constraint.goal_id is None or tuple(row.get("goal_id", ())) == constraint.goal_id)
@@ -1205,6 +1224,11 @@ def _request_work_ledger(problem, budget, previous=None, continuation=None):
         # not promoted to currently applicable scene evidence in a new binding.
         for name in ("history", "timing_checks", "goal_evidence", "completed_goal_ids", "completed_direction_ids", "direction_evidence", "effect_history"):
             for row in continuation.get(name, ()):
+                # BEGIN simulation pose labels never become trusted online facts.
+                if ((name == "completed_goal_ids" and row[0] == "pose_events")
+                        or (name == "goal_evidence" and row["identity"][0] == "pose_events")):
+                    continue
+                # END non-pose completion keeps its validated actual evidence.
                 if row not in ledger[name]:
                     ledger[name].append(deepcopy(row))
         for name in ("applied_events", "superseded_events", "evaluated_events", "stopped_events", "reached_events", "verified_events"):
@@ -1237,20 +1261,14 @@ def _check_work_budget(budget, consumed, *, started, initial_seconds, stage=None
 
 # BEGIN completion evidence is checked before removing any original goal.
 def _verified_completed_goals(continuation, original, all_goals, *, elapsed,
-                              curve_elapsed, timestep, progress_map):
-    """Consume concrete actual-goal records, never a bare completion label.
+                              curve_elapsed):
+    """Verify non-pose goal evidence without importing simulation pose metrics.
 
-    The frozen execution binding owns each goal's geometry and physical clock.
-    A freshly rebound target can move, so current observations cannot rewrite
-    a previous candidate's proof. Previously accepted proofs remain in the
-    request ledger; new pose proofs additionally retain their actual poses and
-    metric errors, which are recomputed against the original allowed set here.
+    Target-pose accuracy is exclusively posthoc. Neither a previous pose label
+    nor its error may gate continuation or certify physical task completion.
+    Past nominal pose anchors leave the remaining plan by progress, retaining
+    their original requirements in the request ledger for simulation grading.
     """
-    from .motion import _pose_array
-    from .planning_problem import EventTimeConstraint, PoseEventRequirement, resolve_event_window, TimeBindingError
-    from .gripper_trajectory import _activation
-    from .execution import _actual_pose_goal
-
     def identities(rows):
         if (not isinstance(rows, (tuple, list)) or any(
                 not isinstance(row, (tuple, list)) or len(row) != 2
@@ -1260,7 +1278,7 @@ def _verified_completed_goals(continuation, original, all_goals, *, elapsed,
         values = {tuple(row) for row in rows}
         if not values <= all_goals:
             raise ContinuationBindingError("Completed goal identity does not belong to the original request")
-        return values
+        return {identity for identity in values if identity[0] != "pose_events"}
 
     previous = identities(original.get("completed_goal_ids", []))
     claimed = identities(continuation.get("completed_goal_ids", []))
@@ -1282,11 +1300,6 @@ def _verified_completed_goals(continuation, original, all_goals, *, elapsed,
             or not np.isfinite(timestamp)):
         raise ContinuationBindingError("Goal completion needs synchronized actual continuation time")
     origin = float(timestamp)-elapsed
-    active_events = {}
-    for event in (*ledger["timing_events"], *original["curve"].get("events", ())):
-        event_id = event_occurrence_key(event)
-        if event_id[:2] not in active_events or event_id[2] >= event_occurrence_key(active_events[event_id[:2]])[2]:
-            active_events[event_id[:2]] = event
     for identity in new:
         proofs = [row for row in continuation.get("goal_evidence", ())
                   if isinstance(row, dict) and tuple(row.get("identity", ())) == identity]
@@ -1312,118 +1325,12 @@ def _verified_completed_goals(continuation, original, all_goals, *, elapsed,
             requirement = goals[indices.index(identity[1])]
             if row.get("requirement") != requirement or not row.get("measurement_sources"):
                 continue
-            if identity[0] == "pose_events":
-                scheduled = row.get("scheduled_curve_time_s")
-                expected = float(progress_map.anchor_parameters([requirement["progress"]])[0, 0]
-                                 * original["curve"]["duration"])
-                if (not isinstance(scheduled, (float, int)) or not np.isfinite(scheduled)
-                        or abs(scheduled-expected) > 1e-8
-                        or row.get("device_due_time_s") != _activation(scheduled, timestep)[1]):
-                    continue
-                # An explicit arrival window permits an observed member at
-                # any original physical time in that window. Without one,
-                # only the first native acquisition of the bound point counts.
-                arrivals = [item for event in active_events.values() for item in event.get("timing", ())
-                            if item["check_target"] == "arrival" and tuple(item["goal_id"]) == identity]
-                if arrivals:
-                    try:
-                        windows = [resolve_event_window(EventTimeConstraint(**item),
-                            continuation.get("history", ())) for item in arrivals]
-                    except (TypeError, ValueError, TimeBindingError):
-                        continue
-                    lower = max((value for value, _ in windows if value is not None), default=None)
-                    upper = min((value for _, value in windows if value is not None), default=None)
-                    request_time = float(original.get("request_time_origin_s", 0.))+physical
-                    if (row.get("evaluation_window_s") != [lower, upper]
-                            or (lower is not None and request_time < lower-1e-9)
-                            or (upper is not None and request_time > upper+1e-9)):
-                        continue
-                else:
-                    native_due = _activation(scheduled, timestep)[1]
-                    # BEGIN a passed dependency extends the same frozen curve.
-                    # executable_until is its initial prerequisite prefix, not
-                    # a permanent end: actual T may authorize later intervals.
-                    # U/F ends this execution after a hold, so the acquisition
-                    # still uses the original native tick and final curve cap.
-                    first_tick = min(native_due, original["curve"]["duration"])
-                    if (row.get("evaluation_window_s") is not None
-                            or abs(curve_time-first_tick) > 1e-8 or abs(physical-native_due) > 1e-8):
-                        continue
-                    # END no initial-prefix clamp discards a later actual goal proof.
-                try:
-                    # Reconstruct the original raw measurements, so two
-                    # mutually consistent but shifted result poses cannot
-                    # override a fixed target or fabricate an owner pose.
-                    sources = row["measurement_sources"]
-                    if not isinstance(sources, list) or not all(isinstance(item, dict) for item in sources):
-                        continue
-                    measured_feedback = {"timestamp_s": acquired, "feedback_id": row["feedback_id"]}
-                    observation = {"scene_owner_poses": {}, "scene_condition_evidence": {}}
-                    for item in sources:
-                        if not isinstance(item.get("source"), str) or not item["source"].strip():
-                            raise ValueError("Raw actual measurements require provenance")
-                        when = float(item["timestamp_s"])
-                        if not np.isfinite(when):
-                            raise ValueError("Raw actual measurement timestamps must be finite")
-                        if item["kind"] == "actual_robot_tcp":
-                            if abs(when-acquired) > 1e-8 or item["feedback_id"] != row["feedback_id"]:
-                                raise ValueError("Actual TCP measurement uses another feedback sample")
-                            pose = _pose_array(item["pose"], "Measured TCP pose").tolist()
-                            if "tool_pose" in measured_feedback and measured_feedback["tool_pose"] != pose:
-                                raise ValueError("Actual TCP measurements disagree")
-                            # BEGIN continuation preserves the original TCP estimate provenance.
-                            measured_feedback.update(tool_pose=pose, source=item["source"],
-                                tool_pose_source=item["pose_source"],
-                                tool_pose_is_independent_observation=item["independent_observation"])
-                            # END replay cannot relabel model FK as an independent observation.
-                        elif item["kind"] in ("current_owner_pose", "current_verified_attachment"):
-                            policy = original["execution_limits"]["observation_policy"]
-                            # BEGIN current-state freshness matches the executor's observation policy.
-                            # A still-current owner/holding sample may predate
-                            # this binding; only event/effect occurrence proof
-                            # has a separate binding-origin eligibility rule.
-                            if (policy is None or when > acquired+1e-8
-                                    or acquired-when > policy["maximum_age_s"]+1e-8):
-                                raise ValueError("Current owner/attachment evidence is not applicable")
-                            # END future or expired state observations remain inadmissible.
-                            if ("timestamp_s" in observation and
-                                    (observation["timestamp_s"] != when or observation["source"] != item["source"])):
-                                raise ValueError("Current owner measurements lack one synchronized observation")
-                            observation.update(timestamp_s=when, source=item["source"])
-                            if item["kind"] == "current_owner_pose":
-                                pose = _pose_array(item["pose"], "Measured owner pose").tolist()
-                                previous_pose = observation["scene_owner_poses"].get(item["owner_id"])
-                                if previous_pose is not None and previous_pose != pose:
-                                    raise ValueError("Current owner measurements disagree")
-                                observation["scene_owner_poses"][item["owner_id"]] = pose
-                            else:
-                                if item["value"] is not True:
-                                    raise ValueError("Attachment observation is not verified")
-                                observation["scene_condition_evidence"][item["condition_id"]] = True
-                        else:
-                            raise ValueError("Pose evidence contains an unsupported measurement source")
-                    actual_check = _actual_pose_goal(PoseEventRequirement(**requirement), measured_feedback,
-                        observation if "timestamp_s" in observation else None)
-                    if actual_check["value"] != "T":
-                        continue
-                    if any(not np.allclose(_pose_array(row.get(key), key), actual_check[key], atol=1e-10, rtol=0)
-                           for key in ("actual_function_pose", "actual_target_pose")):
-                        continue
-                    position, rotation = actual_check["position_error_m"], actual_check["rotation_error_rad"]
-                    recorded = np.asarray([row.get("position_error_m"), row.get("rotation_error_rad")], float)
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if (not np.isfinite(recorded).all()
-                        or not np.allclose(recorded, [position, rotation], atol=1e-10, rtol=0)
-                        or position > requirement["position_tolerance_m"]
-                        or rotation > requirement["rotation_tolerance_rad"]):
-                    continue
             verified = True
             break
         if not verified:
             raise ContinuationBindingError("Goal completion needs actual allowed-set T evidence from this executed candidate")
     return previous | claimed
-# END effect success and source progress cannot erase a distinct task goal.
+# END non-pose observations retain their original evidence checks.
 
 
 def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
@@ -1595,12 +1502,12 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
         due = row.get("activation_time_s") if row.get("activation_time_s") is not None else row["time"]
         if due < elapsed and rebind is None:
             raise ContinuationBindingError(f"Unconsumed event {identity} is overdue on the frozen schedule; an explicit rebind is required")
-    # BEGIN consumed goals require the executor's actual allowance/time proof.
+    # BEGIN non-pose goals require evidence; pose accuracy cannot gate continuation.
     all_goals = {(name, index) for name in ("pose_events", "coordinate_events", "supports")
                  for index in range(len(getattr(problem, name)))}
     completed_goals = _verified_completed_goals(continuation, original, all_goals,
-        elapsed=elapsed, curve_elapsed=curve_elapsed, timestep=float(timestep), progress_map=original_map)
-    # END an ID, progress traversal, or observed effect cannot consume a pose goal.
+        elapsed=elapsed, curve_elapsed=curve_elapsed)
+    # END no posthoc pose error or completion claim becomes a control dependency.
     # Actual direction completion is not implied by traversing source progress.
     all_directions = {(index, column) for index, mechanism in enumerate(problem.mechanisms)
                       for column in range(len(mechanism.directions))}
@@ -1668,7 +1575,9 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
                            if event_occurrence_key(row)[:2] == identity)
         selected_events[identity] = replace(current_events[identity], occurrence=max(occurrences, default=0)+1)
     remaining_goal_ids = {(name, index) for name in ("pose_events", "coordinate_events", "supports")
-        for index in range(len(getattr(problem, name))) if (name, index) not in completed_goals or (name, index) in retry_goals}
+        for index, goal in enumerate(getattr(problem, name))
+        if ((name, index) not in completed_goals and (name != "pose_events" or goal.progress >= start_progress))
+        or (name, index) in retry_goals}
     if rebind is not None:
         required_progress = [event.progress for event in selected_events.values()]
         required_progress += [getattr(problem, name)[index].progress for name, index in remaining_goal_ids]
@@ -1683,8 +1592,11 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
     # END original frame/progress associations remain unchanged across occurrences.
     for collection in ("pose_events", "coordinate_events", "supports"):
         for index, requirement in enumerate(getattr(problem, collection)):
-            if rebind is None and requirement.progress < start_progress and (collection, index) not in completed_goals:
+            # BEGIN a passed nominal pose anchor is not an unverified online goal.
+            if (collection != "pose_events" and rebind is None
+                    and requirement.progress < start_progress and (collection, index) not in completed_goals):
                 raise ContinuationBindingError(f"Past goal {collection}:{index} needs actual completion evidence")
+            # END the ledger retains the pose requirement for independent grading.
     for index, requirement in enumerate(problem.mechanisms):
         for column, direction in enumerate(requirement.directions):
             if (direction.end < start_progress and (index, column) not in completed_directions

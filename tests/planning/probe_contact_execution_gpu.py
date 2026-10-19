@@ -169,7 +169,7 @@ def build_scene(device, robot, backend, targets, problem):
 # BEGIN native contact truth is an output-only sample, never an observer value.
 def _record_contact_truth(model, data, record, *, pad_id, slab_id, goal, contact_log):
     """Append an independent result diagnostic and deliberately return no evidence."""
-    from manipulation.execution import _actual_pose_goal
+    from recorded_skill_evaluation import _actual_pose_goal
 
     force_peak = 0.
     for index in range(data.ncon):

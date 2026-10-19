@@ -808,9 +808,9 @@ class RobotOwnerContactPermission:
     Native names and sphere indices are the same selected robot solids in the
     independent and planning models. This record supplies no material contact,
     attachment, Holding evidence, or simulator collision-filter changes.
-    Actual authorization requires either the executor's current arrival latch
-    or its verified entrance Holding binding. A nominal rollout only uses the
-    declared conditional interval; neither branch creates physical evidence.
+    This pair-level record belongs to scene analysis. Production execution
+    rejects pair exemptions and never creates a target-arrival latch. A nominal
+    rollout uses the declared conditional interval without physical evidence.
     """
 
     rule_id: str
@@ -1550,7 +1550,7 @@ class PlanningScene:
         anchors.extend(x for rule in self.contacts for x in rule.interval)
         # BEGIN pair policy shares the same sampled progress boundaries.
         anchors.extend(x for rule in self.robot_owner_permissions for x in rule.interval)
-        # END actual activation still requires measured arrival evidence.
+        # END these are nominal scene-query boundaries, never online pose gates.
         if gripper is not None:
             anchors.extend(float(event["progress"]) for event in gripper.commands)
         self.required_progress_anchors = tuple(sorted(set(anchors)))
@@ -3380,10 +3380,10 @@ class PlanningScene:
                 "owners": owners, "contacts": plain([asdict(rule) for rule in self.contacts]),
                 # BEGIN keep the exact conditional pair policy in every formal archive.
                 "robot_owner_permissions": plain([asdict(rule) for rule in self.robot_owner_permissions]),
-                # BEGIN actual finite permission requires the archived arrival binding.
+                # BEGIN the archive retains the nominal close/target association.
                 "grasp_contact_activations": plain(self.grasp_contact_activations),
-                # END the executor supplies fresh activation evidence separately.
-                # END execution must bind this snapshot before receiving actual latches.
+                # END target-relative error is evaluated only by the simulation sink.
+                # END execution validates identity without creating contact latches.
                 # BEGIN records distinguish observed TSDF material from explicit native boxes.
                 "contact_query_models": {identity: {"complete_components": (value.layer_cell_counts if hasattr(value, "layers") else len(value.centres)),
                     "query_gaps": list(value.gaps), "cell_half_diagonal_m": value.cell_half_diagonal_m,

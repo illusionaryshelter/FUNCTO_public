@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from collect.preprocess.segmentation import (
     DEFAULT_SETTINGS, _bridge_gaps, _first_stable_grasp, _resolve_actor, _runs,
 )
-from manipulation.execution import _actual_pose_goal, pose_goal_schedule
+from manipulation.execution import pose_goal_schedule
 # BEGIN explicit evaluator roles reuse the existing execution-scope validator.
 from manipulation.execution_binding import validate_result_only_goal_ids
 # END result-only execution scope alone does not change a goal's grading role.
@@ -42,21 +42,95 @@ from manipulation.planning_problem import (
 # END the independent evaluator consumes the same serialized requirement contract.
 
 
+# BEGIN simulation-only pose metrics never feed an execution decision.
+def _actual_pose_goal(requirement, feedback, observation):
+    """Evaluate an original pose allowed set in the independent simulation sink.
+
+    NEVER call this from the production executor. A robot FK estimate compared
+    with a frozen predicted target is not a measured physical tool-to-target
+    relation. Target-relative error (including missing target truth) can only
+    grade the recorded simulation; it must not veto close, abort, or replan.
+    The evaluator supplies native poses with provenance and keeps the original
+    tolerances. Its result is never returned as an online control observation.
+    """
+    measured = {"value": "U", "source": "Independent simulation posthoc pose evaluation",
+        "actual_function_pose": None, "actual_target_pose": None,
+        "position_error_m": None, "rotation_error_rad": None, "measurement_sources": []}
+    relation = requirement.actual_relation
+    poses = {} if observation is None else observation.get("scene_owner_poses", {})
+    conditions = {} if observation is None else observation.get("scene_condition_evidence", {})
+    missing = []
+
+    def owner_pose(identity):
+        if identity not in poses:
+            missing.append(f"No current observed pose for owner {identity}")
+            return None
+        pose = _pose_array(poses[identity], f"Current observed owner pose {identity}")
+        measured["measurement_sources"].append({"kind": "current_owner_pose", "owner_id": identity,
+            "source": observation["source"], "timestamp_s": float(observation["timestamp_s"]), "pose": pose.tolist()})
+        return pose
+
+    def actual_tool():
+        # BEGIN retain the estimator provenance alongside the actual joint clock.
+        pose = _pose_array(feedback["tool_pose"], "Robot TCP estimate from measured joints")
+        measured["measurement_sources"].append({"kind": "actual_robot_tcp", "source": feedback["source"],
+            "pose_source": feedback["tool_pose_source"],
+            "independent_observation": feedback["tool_pose_is_independent_observation"],
+            "timestamp_s": float(feedback["timestamp_s"]), "feedback_id": feedback["feedback_id"], "pose": pose.tolist()})
+        # END FK agreement alone never supplies a Cartesian sensor measurement.
+        return pose
+
+    if relation is not None and "function_owner_id" in relation:
+        if relation["function_owner_id"] in poses:
+            function = owner_pose(relation["function_owner_id"]) @ np.asarray(relation["T_owner_function"])
+        elif (relation.get("attachment_condition_id") is not None
+              and conditions.get(relation["attachment_condition_id"]) is True):
+            function = actual_tool() @ requirement.tool_from_function
+            measured["measurement_sources"].append({"kind": "current_verified_attachment",
+                "condition_id": relation["attachment_condition_id"], "source": observation["source"],
+                "timestamp_s": float(observation["timestamp_s"]), "value": True})
+        else:
+            function = None
+            missing.append("No current owner pose or verified actual holding relation for the material function frame")
+    else:
+        function = actual_tool() @ requirement.tool_from_function
+    if relation is not None and "target_owner_id" in relation:
+        owner = owner_pose(relation["target_owner_id"])
+        target = None if owner is None else owner @ np.asarray(relation["T_owner_target"])
+    else:
+        target = requirement.target
+    measured["actual_function_pose"] = None if function is None else function.tolist()
+    measured["actual_target_pose"] = None if target is None else target.tolist()
+    if missing:
+        measured["reason"] = "; ".join(missing)
+        return measured
+    position = float(np.linalg.norm(function[:3, 3]-target[:3, 3]))
+    rotation = float(Rotation.from_matrix(target[:3, :3].T @ function[:3, :3]).magnitude())
+    measured.update(position_error_m=position, rotation_error_rad=rotation,
+        value="T" if position <= requirement.position_tolerance_m and rotation <= requirement.rotation_tolerance_rad else "F")
+    return measured
+# END these metrics remain simulation evidence, never online prerequisites.
+
 # BEGIN explicitly diagnostic goals retain measurements without vetoing skill effects.
 def validate_diagnostic_goal_ids(binding, trajectory, values):
     """Validate an explicit grading role without changing execution obligations.
 
     Result-only means that the executor does not wait for a goal; it does not
     mean that the goal is optional for success. A diagnostic goal must be named
-    separately and already belong to that result-only policy. Reuse the same
-    terminal/arrival/contact checks, and reject a goal used as a subsequent
-    event's time origin. Process and effect predicates cannot be selected here.
+    separately; non-pose goals must already belong to that result-only policy. Reuse the same
+    identity checks. Pose goals always belong to posthoc evaluation; other
+    goal kinds retain terminal/dependency restrictions. Process and effect
+    predicates cannot be selected here.
     """
-    # A previous completion must not bypass the shared arrival/terminal checks
-    # when assigning a grading role. The binding itself remains untouched.
+    # Validate against the complete current identities instead of borrowing a
+    # previous completion label. The binding itself remains untouched.
     selected = validate_result_only_goal_ids({**binding, "completed_goal_ids": []}, trajectory, values)
     declared = binding.get("device_policy", {}).get("result_only_goal_ids", [])
     for identity in selected:
+        # BEGIN every pose goal is posthoc; its grading role is still explicit.
+        if identity[0] == "pose_events":
+            continue
+        # END online non-pose evidence retains its declared dependency contract.
         if identity not in declared:
             raise ValueError("A diagnostic goal must already be an explicit result-only goal")
         for event in (*trajectory.events, *binding.get("timing_events", ())):

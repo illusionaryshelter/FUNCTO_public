@@ -235,7 +235,7 @@ def test_unselected_result_only_goal_remains_a_required_functional_goal():
 
 @pytest.mark.parametrize("violation", ["undeclared", "midcurve", "arrival", "contact_gate",
                                      "successor_origin", "process", "unknown", "duplicate", "completed_arrival"])
-def test_diagnostic_role_rejects_online_or_unbound_obligations(violation):
+def test_diagnostic_role_accepts_all_pose_scopes_but_rejects_invalid_identities(violation):
     _, result, *_ = _fixture()
     binding, selected = result.execution_binding, [["pose_events", 7]]
     if violation == "undeclared":
@@ -258,8 +258,13 @@ def test_diagnostic_role_rejects_online_or_unbound_obligations(violation):
         selected = [["pose_events", 99]]
     elif violation == "duplicate":
         selected *= 2
-    with pytest.raises(ValueError):
-        validate_diagnostic_goal_ids(binding, result.trajectory, selected)
+    # BEGIN no terminal/contact/arrival switch can restore an online pose gate.
+    if violation in ("process", "unknown", "duplicate"):
+        with pytest.raises(ValueError):
+            validate_diagnostic_goal_ids(binding, result.trajectory, selected)
+    else:
+        assert validate_diagnostic_goal_ids(binding, result.trajectory, selected) == selected
+    # END evaluator roles remain explicit; original metrics are not erased.
 
 
 @pytest.mark.parametrize("corruption", ["candidate", "missing_goal", "duplicate_goal"])

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import resource
@@ -29,7 +29,7 @@ from .motion import _pose_array
 # END an original name alone never identifies a retried action.
 
 
-# BEGIN shared functional clock for runtime evidence and independent result grading.
+# BEGIN original functional clock for independent simulation result grading.
 def pose_goal_schedule(trajectory, progress, timestep):
     """Return the first original progress time and its strict native due tick.
 
@@ -44,7 +44,7 @@ def pose_goal_schedule(trajectory, progress, timestep):
     scheduled = (first_u*trajectory.duration
                  if progress <= float(trajectory.progress_s[-1])+1e-12 else float("inf"))
     return scheduled, (_activation(scheduled, timestep)[1] if np.isfinite(scheduled) else float("inf"))
-# END both consumers keep the original first-arrival clock without sharing observations.
+# END an evaluation clock never proves online target arrival.
 
 
 def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condition_id=None):
@@ -56,6 +56,8 @@ def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condit
     """
     checks = []
     for index, value in enumerate(event.get("timing", ())):
+        if _posthoc_pose_timing(value):
+            continue
         constraint = value if isinstance(value, EventTimeConstraint) else EventTimeConstraint(**value)
         if (constraint.check_target != check_target
                 or (check_target == "arrival" and tuple(constraint.goal_id) != tuple(goal_id or ()))
@@ -74,79 +76,23 @@ def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condit
     return checks
 
 
-# BEGIN actual task accuracy is independent of engineering reference tracking.
-def _actual_pose_goal(requirement, feedback, observation):
-    """Measure one original functional allowed set from applicable actual poses.
+# BEGIN target-pose errors are exclusively simulation posthoc evidence.
+# Do not reintroduce an FK-versus-predicted-target arrival gate here. Encoder
+# FK does not observe the real tool-to-target relation; target truth is absent
+# at runtime. Such an error must NEVER veto close, stop playback, or request
+# replanning, including through missing-pose or arrival-time-window checks.
+# Nominal planning pose constraints remain unchanged. Robot joint feedback,
+# robot-model collision checks and independent effect observations keep their
+# own execution duties. The simulation evaluator alone computes pose errors.
+def _posthoc_pose_timing(value):
+    """Identify timing whose witness or origin requires a target-pose result."""
+    row = asdict(value) if isinstance(value, EventTimeConstraint) else value
+    goal = row.get("goal_id") or ()
+    origin_goal = (row.get("origin_event") or {}).get("goal_id") or ()
+    return bool((row.get("check_target") == "arrival" and goal and goal[0] == "pose_events")
+                or (origin_goal and origin_goal[0] == "pose_events"))
+# END neither a reference clock nor missing target truth is an arrival sensor.
 
-    # BEGIN robot FK estimates are not independent Cartesian measurements.
-    A declared fixed tool/world goal can use the robot TCP estimate from
-    measured joints and the bound robot model/calibration. This does not
-    certify physical Cartesian accuracy or replace a current owner observation.
-    # END the original functional tolerances remain unchanged.
-    An owner-relative target instead needs the current owner's
-    observation. A carried material frame needs either its observed owner pose
-    or a currently verified holding relation. Neither a frozen owner model nor
-    a candidate attachment supplies a missing runtime measurement.
-    """
-    # BEGIN provenance separates joint-derived estimates from owner observations.
-    measured = {"value": "U", "source": "Executor compares applicable current robot FK estimates and supplied owner observations with the original task allowed set",
-        "actual_function_pose": None, "actual_target_pose": None,
-        "position_error_m": None, "rotation_error_rad": None, "measurement_sources": []}
-    # END this comparison does not claim independent Cartesian sensing.
-    relation = requirement.actual_relation
-    poses = {} if observation is None else observation.get("scene_owner_poses", {})
-    conditions = {} if observation is None else observation.get("scene_condition_evidence", {})
-    missing = []
-
-    def owner_pose(identity):
-        if identity not in poses:
-            missing.append(f"No current observed pose for owner {identity}")
-            return None
-        pose = _pose_array(poses[identity], f"Current observed owner pose {identity}")
-        measured["measurement_sources"].append({"kind": "current_owner_pose", "owner_id": identity,
-            "source": observation["source"], "timestamp_s": float(observation["timestamp_s"]), "pose": pose.tolist()})
-        return pose
-
-    def actual_tool():
-        # BEGIN retain the estimator provenance alongside the actual joint clock.
-        pose = _pose_array(feedback["tool_pose"], "Robot TCP estimate from measured joints")
-        measured["measurement_sources"].append({"kind": "actual_robot_tcp", "source": feedback["source"],
-            "pose_source": feedback["tool_pose_source"],
-            "independent_observation": feedback["tool_pose_is_independent_observation"],
-            "timestamp_s": float(feedback["timestamp_s"]), "feedback_id": feedback["feedback_id"], "pose": pose.tolist()})
-        # END FK agreement alone never supplies a Cartesian sensor measurement.
-        return pose
-
-    if relation is not None and "function_owner_id" in relation:
-        if relation["function_owner_id"] in poses:
-            function = owner_pose(relation["function_owner_id"]) @ np.asarray(relation["T_owner_function"])
-        elif (relation.get("attachment_condition_id") is not None
-              and conditions.get(relation["attachment_condition_id"]) is True):
-            function = actual_tool() @ requirement.tool_from_function
-            measured["measurement_sources"].append({"kind": "current_verified_attachment",
-                "condition_id": relation["attachment_condition_id"], "source": observation["source"],
-                "timestamp_s": float(observation["timestamp_s"]), "value": True})
-        else:
-            function = None
-            missing.append("No current owner pose or verified actual holding relation for the material function frame")
-    else:
-        function = actual_tool() @ requirement.tool_from_function
-    if relation is not None and "target_owner_id" in relation:
-        owner = owner_pose(relation["target_owner_id"])
-        target = None if owner is None else owner @ np.asarray(relation["T_owner_target"])
-    else:
-        target = requirement.target
-    measured["actual_function_pose"] = None if function is None else function.tolist()
-    measured["actual_target_pose"] = None if target is None else target.tolist()
-    if missing:
-        measured["reason"] = "; ".join(missing)
-        return measured
-    position = float(np.linalg.norm(function[:3, 3]-target[:3, 3]))
-    rotation = float(Rotation.from_matrix(target[:3, :3].T @ function[:3, :3]).magnitude())
-    measured.update(position_error_m=position, rotation_error_rad=rotation,
-        value="T" if position <= requirement.position_tolerance_m and rotation <= requirement.rotation_tolerance_rad else "F")
-    return measured
-# END a completion label cannot replace these original metric comparisons.
 
 # BEGIN independent named finger targets bound to the exported event clock.
 @dataclass(frozen=True)
@@ -646,12 +592,17 @@ class TrajectoryExecutor:
         for index in np.flatnonzero(np.abs(dq[narm:]) > finger_speed):
             add("actual_finger_velocity", backend.finger_joint_names[index], float(dq[narm+index]),
                 maximum_absolute=float(finger_speed[index]))
+        # BEGIN robot-model tracking uses measured q versus commanded q only.
+        # Both TCP transforms use the same calibrated robot FK. This detects
+        # deviation from the robot command, not physical target accuracy. Never
+        # replace reference_tcp with a perceived/GT target or a pose-event goal.
         position_error = float(np.linalg.norm(pose[:3, 3]-reference_tcp[:3, 3]))
         rotation_error = float(Rotation.from_matrix(reference_tcp[:3, :3].T @ pose[:3, :3]).magnitude())
         for field, error, bound in (("tcp_position_m", position_error, limits.tcp_position_error_m),
                                     ("tcp_rotation_rad", rotation_error, limits.tcp_rotation_error_rad)):
             if error > bound:
                 add("tcp_tracking", field, error, maximum_error=bound)
+        # END target-relative position/orientation remains simulation posthoc only.
         return failures
 
 
@@ -772,8 +723,7 @@ class TrajectoryExecutor:
         if (declared_controller != actual_controller
                 or declared_controller["native_timestep_s"] != float(backend.timestep)):
             raise ValueError("The bound controller policy differs from the actual backend mode, gains or clock")
-        result_goal_ids = {tuple(identity) for identity in validate_result_only_goal_ids(
-            binding, trajectory, policy["result_only_goal_ids"])}
+        validate_result_only_goal_ids(binding, trajectory, policy["result_only_goal_ids"])
         # END there is no implicit q-only migration or global optional-check switch.
         original_targets = FixedFingerTargets.from_mapping(policy["finger_targets"])
         original_limits = ExecutionLimits.from_mapping(policy["execution_limits"])
@@ -952,8 +902,12 @@ class TrajectoryExecutor:
             feedback_failure=None, event_gate_checks=[], abort_hold=None,
             dependency_hold=None, verified_events=[], dependency_outcomes=[], extended_preflights=[],
             evaluated_events=[], stopped_events=[], reached_events=[],
-            completed_goal_ids=deepcopy(binding.get("completed_goal_ids", [])),
-            goal_evidence=deepcopy(binding.get("goal_evidence", [])))
+            # BEGIN archived pose labels cannot acquire online completion authority.
+            completed_goal_ids=[deepcopy(row) for row in binding.get("completed_goal_ids", [])
+                                if row[0] != "pose_events"],
+            goal_evidence=[deepcopy(row) for row in binding.get("goal_evidence", [])
+                           if row["identity"][0] != "pose_events"])
+            # END the independent evaluator retains pose results outside this ledger.
         # BEGIN one local allowance covers normal commands and both hold paths.
         normal_accounting = {"charged_steps": 0, "physical_steps": 0,
                              "step_accounting_exact": True}
@@ -1049,21 +1003,17 @@ class TrajectoryExecutor:
         pose_goal_ids = binding.get("goal_identities", {}).get("pose_events", [])
         if len(pose_goals) != len(pose_goal_ids):
             raise ValueError("Actual pose goals require every original collection/index identity")
-        pose_requirements, pose_goal_times, pose_goal_device_times = {}, {}, {}
+        pose_requirements = {}
         for row, index in zip(pose_goals, pose_goal_ids):
             identity = ("pose_events", index)
             if type(index) is not int or index < 0 or identity in pose_requirements:
                 raise ValueError("Actual pose goals require unique original nonnegative indexes")
             requirement = PoseEventRequirement(**deepcopy(row))
             pose_requirements[identity] = requirement
-            pose_goal_times[identity], pose_goal_device_times[identity] = pose_goal_schedule(
-                trajectory, requirement.progress, backend.timestep)
-        pose_goal_queries, evaluated_result_goals = set(), set()
-        report["pose_goal_checks"] = []
         # BEGIN retain declared close-arrival identity and observed attachment provenance.
         # These records are part of the already validated formal scene/problem;
         # neither a task name nor a close command invents a target or a pair.
-        contact_gates = {}
+        contact_bindings = {}
         if binding["scene"].get("robot_owner_permissions"):
             raise ValueError("Online execution requires finite material rules, not robot-owner pair exemptions")
         # BEGIN finite material gates share the frozen problem/scene binding.
@@ -1170,7 +1120,7 @@ class TrajectoryExecutor:
             requirement = pose_requirements.get(arrival)
             commands = [event for event in command_events
                         if event_occurrence_key(event) == identity and event["kind"] == "close"]
-            # BEGIN explicit finite rules use the same actual-arrival gate.
+            # BEGIN finite rules retain their nominal planned arrival identity.
             rule_ids = grasp_contact_rule_ids(condition, contact_rows)
             if requirement is None or len(commands) != 1:
                 raise ValueError("Finite grasp continuation requires a fresh arrival/close binding; a prior latch is not reusable")
@@ -1179,25 +1129,23 @@ class TrajectoryExecutor:
                 raise ValueError("Finite contact rule identities must belong to one current activation only")
             finite_permission_ids.update(rule_ids)
             # END no finite declaration additionally activates a robot/owner pair.
-            if (activation.get("kind") != "close" or identity in contact_gates
+            if (activation.get("kind") != "close" or identity in contact_bindings
                     or len(commands) != 1
                     or requirement is None or requirement.actual_relation is not None
-                    or arrival in result_goal_ids
                     or requirement.progress != float(commands[0]["progress"])
                     or float(condition["interval"][0]) != float(commands[0]["progress"])):
                 raise ValueError("A contact activation needs one unchanged close, fixed perceived arrival and matching scene permission")
-            contact_gates[identity] = {"condition": deepcopy(condition),
+            contact_bindings[identity] = {"condition": deepcopy(condition),
                 "rule_ids": rule_ids, "requirement": requirement}
-        # BEGIN close-arrival checks carry no world-collision permission latch.
-        report["grasp_contact_gate_checks"] = []
+        # BEGIN close-command checks carry no target-pose gate or world permission.
+        report["grasp_command_checks"] = []
         report["observed_attachment_bindings"] = list(holding_bindings.values())
         # END attachment provenance is evidence, not inferred contact success.
-        # BEGIN retain the distinction between FK estimates and physical accuracy.
-        report["pose_goal_scope"] = (
-            "Original functional allowed sets evaluated from robot TCP FK estimates and explicitly required current owner/holding observations; "
-            "scheduled first-arrival native sample or declared actual-arrival window. Explicit result-only goals record T/F/U without an online dependency; reference tracking and effect observations remain separate.")
-        # END unchanged task tolerances do not become a Cartesian sensor claim.
-        # END a source-progress crossing selects evaluation but cannot prove attainment.
+        # BEGIN no target-relative metric is evaluated by the executor.
+        report["pose_goal_evaluation"] = "simulation_posthoc_only"
+        # Original requirements stay in the binding for the independent sink;
+        # playback completion does not claim their physical attainment.
+        # END missing target truth cannot create a control dependency.
         # BEGIN direction obligations retain original scope identities and actual evidence.
         report["completed_direction_ids"] = deepcopy(binding.get("completed_direction_ids", []))
         report["direction_evidence"] = deepcopy(binding.get("direction_evidence", []))
@@ -1497,6 +1445,8 @@ class TrajectoryExecutor:
                     continue
                 event = events[event_occurrence_key(pending)]
                 constraint = event["timing"][pending["constraint_index"]]
+                if _posthoc_pose_timing(constraint):
+                    continue
                 facts = [row for row in report["history"]
                     if event_occurrence_key(row) == event_occurrence_key(event) and row["value"] == "T"
                     and row["check_target"] == constraint["check_target"]
@@ -1521,6 +1471,8 @@ class TrajectoryExecutor:
             now = request_origin+float(elapsed)
             for event in active_timing_events.values():
                 for index, item in enumerate(event.get("timing", ())):
+                    if _posthoc_pose_timing(item):
+                        continue
                     constraint = EventTimeConstraint(**item)
                     try:
                         window = resolve_event_window(constraint, report["history"])
@@ -1574,101 +1526,6 @@ class TrajectoryExecutor:
                     if evidence["value"] == "T":
                         reject_timing(feedback, elapsed, checks, event=event)
         # END no predicted origin or elapsed reference node proves actual completion.
-
-        # BEGIN actual functional goals consume their own geometry and evaluation time.
-        def check_pose_goals(observation, feedback, curve_time, elapsed):
-            """Evaluate original pose sets without accepting observer T labels.
-
-            Without a declared arrival window, the first native observation at
-            the original functional clock is the evaluation opportunity. Only
-            execution obligations require that result to be T before advancing;
-            explicitly result-only goals keep F/U without stopping the tail.
-            An explicit arrival
-            window instead permits a later actual witness inside that window;
-            intermediate misses do not erase the remaining opportunity. No
-            native step, source clock, sensor effect, or engineering tracking
-            band can itself establish this task-accuracy result.
-            """
-            now = request_origin+float(feedback["timestamp_s"])-sim_start
-            failures = []
-            for identity, requirement in pose_requirements.items():
-                if list(identity) in report["completed_goal_ids"] or identity in evaluated_result_goals:
-                    continue
-                scheduled = pose_goal_times[identity]
-                arrivals = [(event, item) for event in active_timing_events.values()
-                    for item in event.get("timing", ()) if item["check_target"] == "arrival"
-                    and tuple(item["goal_id"]) == identity]
-                windows, unresolved = [], []
-                for event, item in arrivals:
-                    try:
-                        windows.append(resolve_event_window(EventTimeConstraint(**item), report["history"]))
-                    except TimeBindingError as error:
-                        unresolved.append(str(error))
-                if arrivals:
-                    lower = max((bounds[0] for bounds in windows if bounds[0] is not None), default=None)
-                    upper = min((bounds[1] for bounds in windows if bounds[1] is not None), default=None)
-                    if lower is not None and now < lower-1e-9:
-                        continue
-                    if unresolved and curve_time < scheduled-1e-12:
-                        continue
-                    required = ((upper is not None and now >= upper-1e-9)
-                                or curve_time >= trajectory.duration-1e-12)
-                    in_window = not unresolved and (upper is None or now <= upper+1e-9)
-                else:
-                    # Use the same strict native activation map as commands
-                    # and continuation proof. Even a one-ULP future clock
-                    # cannot borrow the preceding tick through an epsilon.
-                    if float(elapsed) < pose_goal_device_times[identity]:
-                        continue
-                    required, in_window, lower, upper = True, True, None, None
-                query = (identity, float(feedback["timestamp_s"]))
-                if query in pose_goal_queries:
-                    continue
-                pose_goal_queries.add(query)
-                measured = _actual_pose_goal(requirement, feedback, observation)
-                raw = pose_goals[pose_goal_ids.index(identity[1])]
-                evidence = {**measured, "identity": list(identity), "candidate_id": binding["candidate_id"],
-                    "feedback_id": feedback["feedback_id"], "timestamp_s": float(feedback["timestamp_s"]),
-                    "evaluated_curve_time_s": float(curve_time), "physical_elapsed_s": float(elapsed),
-                    "scheduled_curve_time_s": scheduled, "device_due_time_s": pose_goal_device_times[identity],
-                    "requirement": deepcopy(raw),
-                    "completion_verified": False, "evaluation_window_s": [lower, upper] if arrivals else None,
-                    "evaluation_scope": "result" if identity in result_goal_ids else "execution"}
-                evidence["time_value"] = "U" if unresolved else "T" if in_window else "F"
-                if unresolved:
-                    evidence["time_reason"] = "; ".join(unresolved)
-                evidence["completion_verified"] = evidence["value"] == "T" and in_window
-                # Retain even a real late geometric T before the time guard
-                # rejects it. A missed window does not make that geometry false.
-                report["goal_evidence"].append(deepcopy(evidence))
-                check = {"identity": list(identity), "value": evidence["value"], "required_now": required,
-                    "required_for_execution": identity not in result_goal_ids,
-                    "curve_time_s": float(curve_time), "physical_elapsed_s": float(elapsed),
-                    "completion_verified": evidence["completion_verified"], "evidence": deepcopy(evidence)}
-                report["pose_goal_checks"].append(check)
-                if evidence["value"] == "T" and not unresolved:
-                    for event in {event_occurrence_key(row[0]): row[0] for row in arrivals}.values():
-                        checks = timed_witness(event, "arrival", now, "T", evidence["source"],
-                            goal_id=list(identity), feedback_id=feedback["feedback_id"],
-                            timestamp_s=feedback["timestamp_s"])
-                        reject_timing(feedback, elapsed, checks, event=event)
-                if evidence["completion_verified"]:
-                    report["completed_goal_ids"].append(list(identity))
-                # BEGIN result evaluation cannot invent a dependency on missing terminal owner feedback.
-                if identity in result_goal_ids:
-                    evaluated_result_goals.add(identity)
-                if required and identity not in result_goal_ids and not evidence["completion_verified"]:
-                    failures.append({"kind": "actual_pose_goal_violated" if evidence["value"] == "F"
-                                     else "actual_pose_goal_unverified", "name": "/".join(map(str, identity)),
-                                     "evidence": check})
-                # END explicit online/arrival obligations retain the original rejection path.
-            if failures:
-                report["status"] = "feedback_rejected"
-                report["feedback_failure"] = {"point": "actual_pose_goal", "curve_time_s": float(curve_time),
-                    "physical_elapsed_s": float(elapsed), "actual_feedback": deepcopy(feedback),
-                    "violations": failures, "last_applied_finger_goal": target_positions.tolist(), "rejected_event": None}
-                raise ExecutionGuardError("Actual functional pose is outside its original allowed set or lacks current evidence")
-        # END once-goal evaluation does not impose a new trajectory-wide pose path.
 
         # BEGIN bounded multi-rate observation consumption without timestamp rewriting.
         def observation_at(feedback, curve_time, elapsed):
@@ -1801,19 +1658,18 @@ class TrajectoryExecutor:
                     "geometry_check": None,
                     "progress": float(progress), "gripper_command": command}
 
-        # BEGIN prove actual arrival before the original close command is written.
-        def check_close_arrival(feedback, *, curve_time, physical_elapsed, point,
+        # BEGIN validate only the declared command identity and execution clock.
+        def check_close_binding(feedback, *, curve_time, physical_elapsed, point,
                                 contact_event, failures):
-            """Check the declared target with this sample's measured-joint FK.
+            """Keep command timing without claiming actual target arrival.
 
-            This proves robot arrival and event timing only. It neither grants
-            a world-collision exemption nor claims actual contact or Holding.
+            Never compare TCP and predicted target here: there is no current
+            target truth. A close command neither proves contact nor Holding.
             """
             contact_check = None
             if not failures and contact_event is not None:
-                gate = contact_gates[event_occurrence_key(contact_event)]
+                gate = contact_bindings[event_occurrence_key(contact_event)]
                 condition, rule_ids = gate["condition"], gate["rule_ids"]
-                measured = _actual_pose_goal(gate["requirement"], feedback, None)
                 current_progress = float(trajectory.sample(curve_time)[3])
                 in_interval = (float(condition["interval"][0]) <= current_progress
                                <= float(condition["interval"][1]))
@@ -1825,17 +1681,17 @@ class TrajectoryExecutor:
                     "candidate_id": binding["candidate_id"], "feedback_id": feedback["feedback_id"],
                     "timestamp_s": float(feedback["timestamp_s"]), "actual_q": np.asarray(feedback["q"]).tolist(),
                     "point": point, "curve_time_s": float(curve_time),
-                    "physical_elapsed_s": float(physical_elapsed), "measurement": measured,
+                    "physical_elapsed_s": float(physical_elapsed),
                     "within_bound_interval": in_interval, "activation_due": due_now,
-                    "passed": measured["value"] == "T" and in_interval and due_now,
+                    "passed": in_interval and due_now,
                     "control_applied": False,
-                    "source": "Declared perceived target and this sample's measured-joint FK; robot arrival only, not current owner observation or Holding"}
-                report["grasp_contact_gate_checks"].append(contact_check)
+                    "source": "Bound close command identity and clock only; no target-pose acceptance"}
+                report["grasp_command_checks"].append(contact_check)
                 if not contact_check["passed"]:
-                    failures.append({"kind": "grasp_contact_arrival_rejected",
+                    failures.append({"kind": "grasp_command_time_rejected",
                         "name": condition["condition_id"], "evidence": deepcopy(contact_check)})
             return contact_check
-        # END elapsed time selects a gate; only this measured pose can satisfy it.
+        # END robot feedback guards remain independent of target-pose diagnostics.
 
         # BEGIN reject measured violations before changing an event's command.
         def guard(feedback, *, curve_time, physical_elapsed, point, event=None, sample=None,
@@ -1870,9 +1726,8 @@ class TrajectoryExecutor:
                     if key not in previous:
                         if identity[1] not in indexes:
                             raise ValueError("Completed goal identity does not belong to this original request")
-                    # BEGIN pose completion always uses the actual functional calculation.
-                    # The observer may report its own label for diagnostics,
-                    # but it cannot bypass the original pose set or clock.
+                    # BEGIN pose labels cannot become online target-arrival evidence.
+                    # Pose accuracy belongs to the independent simulation sink.
                     if identity[0] == "pose_events":
                         continue
                     # END other typed goal observers retain their explicit provenance.
@@ -1925,10 +1780,10 @@ class TrajectoryExecutor:
             failures.extend(_holding_dependency_violations(binding["scene"],
                 float(trajectory.sample(curve_time)[3]), current_evidence,
                 attachment_assumptions=attachment_assumptions))
-            contact_check = check_close_arrival(feedback,
+            contact_check = check_close_binding(feedback,
                 curve_time=curve_time, physical_elapsed=physical_elapsed, point=point,
                 contact_event=contact_event, failures=failures)
-            # END elapsed time merely selects a gate; it cannot satisfy it.
+            # END command timing never certifies physical target arrival.
             geometry = None
             if not failures:
                 geometry = self._geometry_result("check_state", deepcopy(feedback),
@@ -1955,10 +1810,9 @@ class TrajectoryExecutor:
                     "last_applied_finger_goal": target_positions.tolist(),
                     "rejected_event": None if event is None else deepcopy(event)}
                 raise ExecutionGuardError(f"Actual feedback violates {point}: {failures[0]['kind']} / {failures[0]['name']}")
-            # BEGIN only independently valid measured feedback can prove a task pose.
-            check_pose_goals(observation, feedback, curve_time, physical_elapsed)
+            # BEGIN command/effect deadlines do not consume target-pose truth.
             check_deadlines(feedback, physical_elapsed)
-            # END original task accuracy is checked before another native command.
+            # END pose-arrival timing is evaluated only by the simulation sink.
             return contact_check
         # END reject measured violations before changing an event's command.
 
@@ -2103,19 +1957,19 @@ class TrajectoryExecutor:
             # BEGIN retain one initial sample even when preflight later rejects.
             emit_independent_evidence(samples[-1], "initial_state")
             # END the runner must not separately duplicate this initial exposure.
-            # BEGIN a close due at entry needs current arrival evidence before control.
+            # BEGIN a close due at entry keeps robot checks and command timing.
             # Select the same last command as the zero-tick loop without consuming it.
             preflight_feedback = initial_feedback
             entry_commands = [event for event in command_events if event["activation_step"] == 0]
             entry_close = (entry_commands[-1] if entry_commands and entry_commands[-1]["kind"] == "close"
-                and event_occurrence_key(entry_commands[-1]) in contact_gates else None)
+                and event_occurrence_key(entry_commands[-1]) in contact_bindings else None)
             if entry_close is not None:
                 preflight_feedback = samples[-1]["feedback"]
                 reference_tcp = backend.reference_tool_pose(q)
                 failures = self._execution_violations(preflight_feedback, q, dq, reference_tcp,
                     limits=execution_limits, binding=limit_binding, finger_state=finger_state,
                     expected_sim_time=sim_start, require_stop=bool(entry_close.get("stop", False)))
-                check_close_arrival(preflight_feedback,
+                check_close_binding(preflight_feedback,
                     curve_time=0., physical_elapsed=0., point="initial_contact_gate",
                     contact_event=entry_close, failures=failures)
                 if failures:
@@ -2165,9 +2019,9 @@ class TrajectoryExecutor:
                 while event_index < len(command_events) and command_events[event_index]["activation_step"] <= index:
                     due.append(command_events[event_index])
                     event_index += 1
-                # BEGIN check arrival before entering the pending close mode.
+                # BEGIN check robot feedback and command clock before close.
                 pending_close = (due[-1] if due and due[-1]["kind"] == "close"
-                    and event_occurrence_key(due[-1]) in contact_gates else None)
+                    and event_occurrence_key(due[-1]) in contact_bindings else None)
                 contact_check = guard(before,
                     curve_time=min(elapsed, stop), physical_elapsed=elapsed, point="before_step",
                     contact_event=pending_close)
@@ -2179,7 +2033,7 @@ class TrajectoryExecutor:
                     # Distinct source events can fall in one native interval.
                     # Retain every identity, and never label overwritten goals
                     # as applied to a physical step.
-                    # BEGIN command timing and measured arrival share the activation tick.
+                    # BEGIN command timing retains its actual activation tick.
                     guard(before, curve_time=float(due[-1]["applied_time_s"]), physical_elapsed=elapsed,
                           point="command_event", event=due[-1])
                     checks = _timing_checks(due[-1], "activation", request_origin+elapsed, report["history"])
@@ -2231,19 +2085,17 @@ class TrajectoryExecutor:
                 # Preserve the completed physical sample, including independent
                 # evaluator contacts, before rejecting its measured feedback.
                 try:
-                    # BEGIN the arrival tick is checked before its next control write.
-                    # A close due at this completed tick needs actual FK
-                    # arrival. The next iteration re-reads and rechecks it
-                    # before actuator dispatch; no completed-goal label can
-                    # substitute for that new feedback sample.
+                    # BEGIN each completed tick keeps independent robot guards.
+                    # The pending close retains its bound command clock; no
+                    # current or predicted target pose enters this decision.
                     upcoming = [event for event in command_events[event_index:]
                                 if event["activation_step"] <= index+1]
                     upcoming_close = (upcoming[-1] if upcoming and upcoming[-1]["kind"] == "close"
-                        and event_occurrence_key(upcoming[-1]) in contact_gates else None)
+                        and event_occurrence_key(upcoming[-1]) in contact_bindings else None)
                     guard(current["feedback"], curve_time=min(next_time, stop),
                           physical_elapsed=next_time, point="after_step", sample=current,
                           contact_event=upcoming_close)
-                    # END only an explicit pending close requests this arrival check.
+                    # END a pose error can never veto this next control write.
                 finally:
                     # BEGIN post-step evaluation cannot mask or create a guard failure.
                     emit_independent_evidence(current, "after_step")
@@ -2364,6 +2216,8 @@ class TrajectoryExecutor:
             timing_values = []
             for event in active_timing_events.values():
                 for index, constraint in enumerate(event.get("timing", ())):
+                    if _posthoc_pose_timing(constraint):
+                        continue
                     checks = [row for row in report["timing_checks"]
                               if event_occurrence_key(row) == event_occurrence_key(event)
                               and row["constraint_index"] == index]
@@ -2380,20 +2234,6 @@ class TrajectoryExecutor:
                             "reason": "Execution ended without an applicable actual witness"})
             report["timing_result"] = (None if not timing_values else "F" if "F" in timing_values
                 else "T" if all(value == "T" for value in timing_values) else "U")
-            # BEGIN report actual task accuracy separately from effects and tracking.
-            pose_values = ["T" if list(identity) in report["completed_goal_ids"] else
-                "F" if any(tuple(row["identity"]) == identity and row["required_now"] and row["value"] == "F"
-                           for row in report["pose_goal_checks"]) else "U" for identity in pose_requirements]
-            report["pose_goal_result"] = (None if not pose_values else "F" if "F" in pose_values
-                else "T" if all(value == "T" for value in pose_values) else "U")
-            # END an effect predicate cannot replace a missing owner pose.
-            # BEGIN only online pose obligations can require another execution binding.
-            execution_pose_values = [value for identity, value in zip(pose_requirements, pose_values)
-                                     if identity not in result_goal_ids]
-            report["execution_pose_goal_result"] = (None if not execution_pose_values else
-                "F" if "F" in execution_pose_values else
-                "T" if all(value == "T" for value in execution_pose_values) else "U")
-            # END result-only U remains visible without authorizing a fake completion or forcing a new run.
             # BEGIN direction completion is an independent actual-evidence verdict.
             direction_values = ["T" if list(identity) in report["completed_direction_ids"] else
                 "F" if any(tuple(row["identity"]) == identity and row["value"] == "F"
@@ -2454,8 +2294,7 @@ class TrajectoryExecutor:
                 "requires_rebind": (final_feedback is None or not accounting["step_accounting_exact"]
                     or report["status"] != "curve_finished"
                     or report["timing_result"] not in (None, "T")
-                    or report["direction_result"] not in (None, "T")
-                    or report["execution_pose_goal_result"] not in (None, "T")),
+                    or report["direction_result"] not in (None, "T")),
                 "reason": "Remaining obligations require current actual/scene binding; applied events and original hard clock cannot be reset",
                 # BEGIN budget charges and confirmed time have distinct contracts.
                 "consumed_physics_steps": accounting["charged_steps"],

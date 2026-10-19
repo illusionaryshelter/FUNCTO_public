@@ -1979,110 +1979,58 @@ class ActualPoseGoalTests(unittest.TestCase):
                 initial_feedback=_initial_feedback(simulation), execution_limits=limits, output=output,
                 observation_callback=observe, step_callback=step_callback)
 
-    def test_two_mm_actual_miss_fails_one_mm_goal_inside_five_mm_tracking_band(self):
+    # BEGIN target-pose diagnostics must never control production execution.
+    def test_target_error_and_missing_owner_never_veto_or_certify_execution(self):
+        for kind in ("predicted_target_miss", "fk_estimate_miss", "missing_owner"):
+            relation = ({"target_owner_id": "unavailable_target", "T_owner_target": np.eye(4).tolist()}
+                        if kind == "missing_owner" else None)
+            fixture = self.fixture(actual_relation=relation)
+            if kind == "fk_estimate_miss":
+                fixture[0].scripted_tcp_estimate_offset[0] = .002
+            elif kind == "predicted_target_miss":
+                binding = fixture[3].execution_binding
+                binding["problem"]["pose_events"][0]["target"][0][3] = .5
+                binding["validation"]["inputs"]["problem"] = deepcopy(binding["problem"])
+            def observe(feedback, curve_time):
+                return {"source": "An observer label cannot certify target accuracy",
+                    "timestamp_s": feedback["timestamp_s"], "completed_goal_ids": [["pose_events", 7]]}
+            with self.subTest(kind=kind), patch("recorded_skill_evaluation._actual_pose_goal",
+                    side_effect=AssertionError("Production must not invoke simulation pose evaluation")):
+                report = self.run_trial(fixture, observe=observe)
+            self.assertEqual(report["status"], "curve_finished")
+            self.assertEqual(report["executed_steps"], 6)
+            self.assertEqual(report["completed_goal_ids"], [])
+            self.assertEqual(report["goal_evidence"], [])
+            self.assertEqual(report["pose_goal_evaluation"], "simulation_posthoc_only")
+            self.assertFalse(report["continuation"]["requires_rebind"])
+            self.assertIn("close", [row["kind"] for row in report["events"]])
+
+    def test_robot_reference_tracking_violation_still_stops_execution(self):
         fixture = self.fixture()
-        fixture[0].scripted_tcp_estimate_offset[0] = .002
-        def observer(feedback, curve_time):
-            return {"source": "An untrusted pose-completion label cannot replace measurement",
-                "timestamp_s": feedback["timestamp_s"], "completed_goal_ids": [["pose_events", 7]]}
-        report = self.run_trial(fixture, observe=observer, rejects=True)
-        self.assertEqual(report["pose_goal_result"], "F")
-        self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "actual_pose_goal_violated")
-        self.assertEqual(report["completed_goal_ids"], [])
-        proof = report["goal_evidence"][-1]
-        self.assertAlmostEqual(proof["position_error_m"], .002)
-        self.assertEqual(proof["requirement"]["position_tolerance_m"], .001)
-        self.assertAlmostEqual(proof["evaluated_curve_time_s"], .006)
+        fixture[0].scripted_tcp_estimate_offset[0] = .006
+        report = self.run_trial(fixture, rejects=True)
+        self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "tcp_tracking")
         self.assertTrue(report["abort_hold"]["native_ctrl_written"])
 
-    def test_within_original_tolerance_completes_once_with_original_identity(self):
-        fixture = self.fixture()
-        simulation = fixture[0]
-        simulation.scripted_tcp_estimate_offset[0] = .0005
-        def after_step(model, data, row):
-            # The once-goal has already been measured at .006 s. A later
-            # departure inside the engineering band adds no invented hold goal.
-            if row["elapsed"] >= .008:
-                simulation.scripted_tcp_estimate_offset[0] = .003
-        report = self.run_trial(fixture, step_callback=after_step)
-        self.assertEqual(report["status"], "curve_finished")
-        self.assertEqual(report["pose_goal_result"], "T")
-        self.assertEqual(report["completed_goal_ids"], [["pose_events", 7]])
-        self.assertEqual(len(report["pose_goal_checks"]), 1)
-        proof = report["goal_evidence"][-1]
-        self.assertTrue(proof["completion_verified"])
-        self.assertAlmostEqual(proof["position_error_m"], .0005)
-        self.assertEqual(proof["candidate_id"], fixture[3].execution_binding["candidate_id"])
-        self.assertEqual(report["continuation"]["completed_goal_ids"], [["pose_events", 7]])
-
-    def test_owner_relative_goal_without_current_owner_is_unknown_only_when_due(self):
-        fixture = self.fixture(actual_relation={"target_owner_id": "current_part", "T_owner_target": np.eye(4).tolist()})
-        report = self.run_trial(fixture, rejects=True)
-        self.assertEqual(report["pose_goal_result"], "U")
-        self.assertEqual(report["executed_steps"], 3)
-        self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "actual_pose_goal_unverified")
-        self.assertIsNone(report["goal_evidence"][-1]["actual_target_pose"])
-        self.assertIn("current_part", report["goal_evidence"][-1]["reason"])
-        self.assertTrue(report["continuation"]["requires_rebind"])
-
-    def test_current_owner_pose_changes_relative_result_without_changing_frozen_world_target(self):
-        for shift, expected in ((.0004, "T"), (.002, "F")):
-            fixture = self.fixture(actual_relation={"target_owner_id": "current_part", "T_owner_target": np.eye(4).tolist()})
-            current = np.eye(4)
-            current[0, 3] = shift
-            def observe(feedback, curve_time):
-                return {"source": "Explicit current calibrated owner observation", "timestamp_s": feedback["timestamp_s"],
-                    "scene_owner_poses": {"current_part": current.tolist()}}
-            with self.subTest(shift=shift):
-                report = self.run_trial(fixture, observe=observe, rejects=expected == "F")
-                self.assertEqual(report["pose_goal_result"], expected)
-                self.assertAlmostEqual(report["goal_evidence"][-1]["position_error_m"], shift)
-
-    def test_functional_time_uses_first_nonzero_plateau_entrance(self):
-        fixture = self.fixture()
-        simulation, curve, _, result, _ = fixture
+    def test_posthoc_schedule_preserves_first_plateau_and_strict_native_tick(self):
+        from manipulation.execution import pose_goal_schedule
+        curve = self.fixture()[1]
         curve.progress_u = np.asarray([0., .4, .7, 1.])
         curve.progress_s = np.asarray([0., .5, .5, 1.])
-        from manipulation.execution_binding import curve_snapshot
-        result.execution_binding["curve"] = curve_snapshot(curve)
-        simulation.scripted_tcp_estimate_offset[0] = .0005
-        report = self.run_trial(fixture)
-        proof = report["goal_evidence"][-1]
-        self.assertAlmostEqual(proof["scheduled_curve_time_s"], .0048)
-        self.assertAlmostEqual(proof["evaluated_curve_time_s"], .006)
-        self.assertEqual(proof["identity"], ["pose_events", 7])
-
-    def test_one_ulp_future_functional_time_never_uses_the_earlier_native_tick(self):
-        scheduled = .010000000000000002
-        fixture = self.fixture(progress=scheduled/.012)
-        report = self.run_trial(fixture)
-        proof = report["goal_evidence"][-1]
-        self.assertEqual(proof["scheduled_curve_time_s"], scheduled)
-        self.assertEqual(proof["device_due_time_s"], .012)
-        self.assertEqual(proof["physical_elapsed_s"], .012)
-        self.assertEqual(proof["evaluated_curve_time_s"], .012)
-
-    def test_terminal_actual_tick_preserves_the_clipped_original_curve_time(self):
-        fixture = self.fixture(progress=1.)
-        simulation, old, targets, result, limits = fixture
-        duration = .011
-        q, dq = old.sample(0.)[:2]
-        curve = JointTrajectory(old.joint_names, np.asarray([0., duration]),
-            np.stack((q, q+dq*duration)), np.stack((dq, dq)), old.progress_u, old.progress_s,
-            old.events, old.conditions, {})
-        _bind_fingers(simulation, curve, targets)
-        result.trajectory = curve
-        from manipulation.execution_binding import curve_snapshot
-        result.execution_binding["curve"] = curve_snapshot(curve)
-        report = self.run_trial((simulation, curve, targets, result, limits))
-        proof = report["goal_evidence"][-1]
-        self.assertEqual(proof["scheduled_curve_time_s"], duration)
-        self.assertEqual(proof["device_due_time_s"], .012)
-        self.assertEqual(proof["physical_elapsed_s"], .012)
-        self.assertEqual(proof["evaluated_curve_time_s"], duration)
+        scheduled, due = pose_goal_schedule(curve, .5, .002)
+        self.assertAlmostEqual(scheduled, .0048)
+        self.assertEqual(due, .006)
+        curve.progress_u = curve.progress_s = np.asarray([0., 1.])
+        scheduled, due = pose_goal_schedule(curve, .010000000000000002/.012, .002)
+        self.assertEqual(scheduled, .010000000000000002)
+        self.assertEqual(due, .012)
+        curve.times[-1] = .011
+        scheduled, due = pose_goal_schedule(curve, 1., .002)
+        self.assertEqual((scheduled, due), (.011, .012))
+    # END the evaluator retains accuracy and original timing without controlling motion.
 
     def test_held_function_needs_current_relation_and_consumes_full_material_transform(self):
-        from manipulation.execution import _actual_pose_goal
+        from recorded_skill_evaluation import _actual_pose_goal
         from manipulation.planning_problem import PoseEventRequirement
         tool_from_function = np.eye(4)
         tool_from_function[0, 3] = .1
@@ -2194,8 +2142,8 @@ class GraspContactActivationTests(unittest.TestCase):
                 return executor.last_execution_report, checker
             return run(), checker
 
-    # BEGIN zero-tick entry proves arrival without world permission state.
-    def test_zero_tick_arrival_is_checked_before_robot_preflight_and_close(self):
+    # BEGIN zero-tick command timing does not claim actual target arrival.
+    def test_zero_tick_command_keeps_robot_preflight_and_original_close_clock(self):
         fixture = self.fixture(zero_tick=True)
         simulation = fixture[0]
         simulation.scripted_tcp_estimate_offset[0] = .0005
@@ -2204,61 +2152,49 @@ class GraspContactActivationTests(unittest.TestCase):
         self.assertFalse(report["world_collision_checked"])
         self.assertNotIn("active_contact_rule_ids", report)
         np.testing.assert_array_equal(checker.preflight_inputs[0]["q"], checker.states[0]["feedback"]["q"])
-        checks = report["grasp_contact_gate_checks"]
+        checks = report["grasp_command_checks"]
         self.assertEqual([row["point"] for row in checks], ["initial_contact_gate", "before_step"])
-        self.assertEqual([row["measurement"]["value"] for row in checks], ["T", "T"])
+        self.assertTrue(all("measurement" not in row for row in checks))
         self.assertEqual([row["control_applied"] for row in checks], [False, True])
         self.assertEqual(report["events"][0]["kind"], "close")
         self.assertEqual(report["events"][0]["applied_at_s"], 0.)
 
-    def test_zero_tick_missed_arrival_rejects_before_geometry_or_close_control(self):
+    def test_zero_tick_target_error_allows_close_without_claiming_arrival(self):
         fixture = self.fixture(zero_tick=True)
-        simulation = fixture[0]
-        simulation.scripted_tcp_estimate_offset[0] = .002
-        initial_control = simulation.finger_control.copy()
-        checker = _GeometryChecker(simulation.joint_names, preflight_passed=False)
-        report, _ = self.run_trial(fixture, checker=checker, rejects=True)
-        self.assertEqual(report["feedback_failure"]["point"], "initial_contact_gate")
-        self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "grasp_contact_arrival_rejected")
-        self.assertEqual(report["executed_steps"], 0)
-        self.assertEqual(report["events"], [])
-        self.assertNotIn("active_contact_rule_ids", report)
-        self.assertNotIn("grasp_contact_permission_changes", report)
-        self.assertEqual(checker.preflight_inputs, [])
-        self.assertEqual(checker.states, [])
-        self.assertEqual([row["measurement"]["value"] for row in report["grasp_contact_gate_checks"]], ["F"])
-        self.assertFalse(report["grasp_contact_gate_checks"][0]["control_applied"])
-        self.assertTrue(report["abort_hold"]["native_ctrl_written"])
-        np.testing.assert_array_equal(simulation.finger_control, initial_control)
-    # END entry permissions remain provisional, and a miss preserves the old finger goal.
+        fixture[0].scripted_tcp_estimate_offset[0] = .002
+        report, checker = self.run_trial(fixture)
+        self.assertEqual(report["status"], "curve_finished")
+        self.assertTrue(checker.preflight_inputs)
+        self.assertEqual(report["events"][0]["kind"], "close")
+        self.assertEqual(report["completed_goal_ids"], [])
+        self.assertTrue(report["grasp_command_checks"][-1]["control_applied"])
+        self.assertTrue(all("measurement" not in row for row in report["grasp_command_checks"]))
+    # END nominal target disagreement never blocks the commanded close.
 
-    def test_due_clock_and_old_completed_goal_cannot_close_without_current_arrival(self):
-        fixture = self.fixture()
-        simulation, curve, _, result, _ = fixture
-        simulation.scripted_tcp_estimate_offset[0] = .002
-        result.execution_binding["completed_goal_ids"] = [["pose_events", 1]]
-        report, checker = self.run_trial(fixture, rejects=True)
-        self.assertEqual(report["executed_steps"], 2)
-        self.assertNotIn("active_contact_rule_ids", report)
-        self.assertEqual([row["kind"] for row in report["events"]], ["open"])
-        self.assertEqual(report["grasp_contact_gate_checks"][-1]["measurement"]["value"], "F")
-        self.assertFalse(report["grasp_contact_gate_checks"][-1]["control_applied"])
-        self.assertTrue(all("active_contact_rule_ids" not in row for row in checker.states))
-        np.testing.assert_array_equal(simulation.finger_control, curve.finger_trajectory.sample(.004)[0])
+    def test_close_needs_neither_current_target_truth_nor_a_pose_completion_label(self):
+        for labelled in (False, True):
+            fixture = self.fixture()
+            fixture[0].scripted_tcp_estimate_offset[0] = .002
+            if labelled:
+                fixture[3].execution_binding["completed_goal_ids"] = [["pose_events", 1]]
+            with self.subTest(labelled=labelled):
+                report, checker = self.run_trial(fixture)
+            self.assertEqual(report["status"], "curve_finished")
+            self.assertEqual([row["kind"] for row in report["events"]], ["open", "close", "hold"])
+            self.assertTrue(report["grasp_command_checks"][-1]["control_applied"])
+            self.assertTrue(all("active_contact_rule_ids" not in row for row in checker.states))
 
-    def test_same_tick_arrival_is_provisional_and_rechecked_before_close(self):
+    def test_same_tick_estimated_pose_drift_does_not_restore_the_close_gate(self):
         fixture = self.fixture()
-        simulation = fixture[0]
         def drift(model, data, row):
             if row["elapsed"] == .004:
-                simulation.scripted_tcp_estimate_offset[0] = .002
-        report, _ = self.run_trial(fixture, callback=drift, rejects=True)
-        self.assertEqual([row["measurement"]["value"] for row in report["grasp_contact_gate_checks"]], ["T", "F"])
-        self.assertIn(["pose_events", 1], report["completed_goal_ids"])
-        self.assertNotIn("active_contact_rule_ids", report)
-        self.assertFalse(any(row["kind"] == "close" for row in report["events"]))
+                fixture[0].scripted_tcp_estimate_offset[0] = .002
+        report, _ = self.run_trial(fixture, callback=drift)
+        self.assertEqual(report["status"], "curve_finished")
+        self.assertTrue(any(row["kind"] == "close" for row in report["events"]))
+        self.assertEqual(report["completed_goal_ids"], [])
 
-    def test_valid_arrival_allows_its_contact_mode_without_adding_a_pose_hold_goal(self):
+    def test_close_clock_does_not_create_contact_permissions_or_pose_hold_goals(self):
         fixture = self.fixture()
         simulation = fixture[0]
         def later_departure(model, data, row):
@@ -2268,8 +2204,8 @@ class GraspContactActivationTests(unittest.TestCase):
         report, _ = self.run_trial(fixture, checker=checker, callback=later_departure)
         self.assertEqual(report["status"], "curve_finished")
         self.assertNotIn("active_contact_rule_ids", report)
-        self.assertEqual(sum(row["control_applied"] for row in report["grasp_contact_gate_checks"]), 1)
-        self.assertTrue(all(row["passed"] for row in report["grasp_contact_gate_checks"]))
+        self.assertEqual(sum(row["control_applied"] for row in report["grasp_command_checks"]), 1)
+        self.assertTrue(all(row["passed"] for row in report["grasp_command_checks"]))
         self.assertFalse(report["evidence_passed"])
         self.assertNotIn(["pose_events", 0], report["completed_goal_ids"])
         self.assertTrue(all("active_contact_rule_ids" not in row for row in checker.states))
@@ -2279,8 +2215,8 @@ class GraspContactActivationTests(unittest.TestCase):
         checker = _GeometryChecker(fixture[0].joint_names, rejected_stage="command_event", rejected_time=.004)
         report, _ = self.run_trial(fixture, checker=checker, rejects=True)
         self.assertEqual(report["feedback_failure"]["point"], "command_event")
-        self.assertTrue(report["grasp_contact_gate_checks"][-1]["passed"])
-        self.assertFalse(report["grasp_contact_gate_checks"][-1]["control_applied"])
+        self.assertTrue(report["grasp_command_checks"][-1]["passed"])
+        self.assertFalse(report["grasp_command_checks"][-1]["control_applied"])
         self.assertNotIn("active_contact_rule_ids", report)
         self.assertNotIn("active_contact_rule_ids", checker.states[-1])
         self.assertFalse(any(row["kind"] == "close" for row in report["events"]))
@@ -2292,13 +2228,13 @@ class GraspContactActivationTests(unittest.TestCase):
         self.assertNotIn("grasp_contact_permission_changes", report)
         self.assertEqual([row["kind"] for row in report["events"]], ["open", "close", "open"])
 
-    def test_contact_arrival_cannot_be_result_only_or_mismatched_to_another_owner(self):
+    def test_contact_pose_is_posthoc_but_nominal_owner_binding_must_match(self):
         from manipulation.execution_binding import rebind_execution_result
         simulation, _, targets, result, limits = self.fixture()
-        with self.assertRaisesRegex(ValueError, "contact-activation arrival cannot be result-only"):
-            rebind_execution_result(result, controller_policy=simulation.describe()["controller_policy"],
-                result_only_goal_ids=[["pose_events", 1]], finger_targets=FixedFingerTargets.from_mapping(targets),
-                execution_limits=limits, source="Explicit synthetic forbidden result-only request")
+        rebound = rebind_execution_result(result, controller_policy=simulation.describe()["controller_policy"],
+            result_only_goal_ids=[["pose_events", 1]], finger_targets=FixedFingerTargets.from_mapping(targets),
+            execution_limits=limits, source="Explicit posthoc pose grading role")
+        self.assertEqual(rebound.execution_binding["device_policy"]["result_only_goal_ids"], [["pose_events", 1]])
         result.execution_binding["scene"]["contacts"][0]["target_owner"] = "another_part"
         result.execution_binding["validation"]["inputs"]["scene"] = deepcopy(result.execution_binding["scene"])
         with TemporaryDirectory() as temporary, self.assertRaisesRegex(ValueError, "exact activation interval"):
@@ -2333,15 +2269,15 @@ class PhysicalEventTimingTests(unittest.TestCase):
         self.assertEqual(report["timing_result"], "U")
         self.assertTrue(report["abort_hold"]["native_ctrl_written"])
 
-    def test_actual_arrival_is_checked_on_original_request_time_not_reference_progress(self):
-        for upper, accepted in ((20.005, True), (20.003, False)):
+    def test_pose_arrival_deadline_cannot_indirectly_stop_execution(self):
+        for upper in (20.005, 20.003):
             simulation, curve, targets = _fixture()
             curve.events[2].update(kind="function", requires_evidence=None, stop=False,
                 timing=[self.window("arrival", 20.003, upper, goal_id=["pose_events", 0])])
             _bind_fingers(simulation, curve, targets)
             result = _result(curve)
             result.execution_binding.update(request_time_origin_s=20., goal_identities={"pose_events": [0]})
-            # BEGIN the executor independently measures the original pose set.
+            # BEGIN original pose timing remains available only for simulation grading.
             result.execution_binding["problem"]["pose_events"] = [{"progress": 1.,
                 "tool_from_function": np.eye(4).tolist(), "target": np.eye(4).tolist(),
                 "position_tolerance_m": .001, "rotation_tolerance_rad": .01,
@@ -2354,21 +2290,41 @@ class PhysicalEventTimingTests(unittest.TestCase):
                     "completed_goal_ids": [["pose_events", 0]] if curve_time >= .004 else []}
             with self.subTest(upper=upper), TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
                 output = Path(temporary)/"trial"
-                if accepted:
-                    report = _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
-                        initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
-                        output=output, observation_callback=observe)
-                else:
-                    with self.assertRaises(ExecutionGuardError):
-                        _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
-                            initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
-                            output=output, observation_callback=observe)
-                    report = json.loads((output/"execution-report.json").read_text())
-            self.assertEqual(report["timing_result"], "T" if accepted else "F")
-            arrival = next(row for row in report["history"] if row["check_target"] == "arrival")
-            self.assertAlmostEqual(arrival["time_s"], 20.004)
-            self.assertEqual(arrival["value"], "T")
-            self.assertEqual(report["completed_goal_ids"], [["pose_events", 0]] if accepted else [])
+                report = _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                    initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                    output=output, observation_callback=observe)
+            self.assertEqual(report["status"], "curve_finished")
+            self.assertIsNone(report["timing_result"])
+            self.assertFalse(any(row["check_target"] == "arrival" for row in report["history"]))
+            self.assertEqual(report["completed_goal_ids"], [])
+            self.assertFalse(report["continuation"]["requires_rebind"])
+
+    # BEGIN a clock derived from unavailable target arrival is also posthoc.
+    def test_pose_arrival_as_command_time_origin_cannot_indirectly_veto_close(self):
+        simulation, curve, targets = _fixture()
+        curve.events[2].update(kind="function", requires_evidence=None, stop=False)
+        origin = {"skill_id": curve.events[2]["skill_id"], "event_id": curve.events[2]["event_id"],
+            "occurrence": 0, "check_target": "arrival", "goal_id": ["pose_events", 0]}
+        curve.events[1]["timing"] = [self.window("activation", .001, .002,
+            origin_time_s=None, origin_event=origin)]
+        _bind_fingers(simulation, curve, targets)
+        result = _result(curve)
+        binding = result.execution_binding
+        binding["goal_identities"] = {"pose_events": [0]}
+        binding["problem"]["pose_events"] = [{"progress": 1.,
+            "tool_from_function": np.eye(4).tolist(), "target": np.eye(4).tolist(),
+            "position_tolerance_m": .001, "rotation_tolerance_rad": .01,
+            "source": "Posthoc arrival target", "actual_relation": None}]
+        binding["validation"]["inputs"]["problem"] = deepcopy(binding["problem"])
+        with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
+            report = _execute_bound(_executor(simulation), result, finger_targets=FixedFingerTargets.from_mapping(targets),
+                initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
+                output=Path(temporary)/"trial")
+        self.assertEqual(report["status"], "curve_finished")
+        self.assertIsNone(report["timing_result"])
+        self.assertFalse(report["continuation"]["requires_rebind"])
+        self.assertIn("close", [row["kind"] for row in report["events"]])
+    # END independent command/effect clocks retain the rejection tests below.
 
     def test_effect_window_uses_new_acquisition_and_preserves_old_false_true_history(self):
         for fresh in (False, True):
@@ -2741,16 +2697,13 @@ class TrajectoryDeviceBindingTests(unittest.TestCase):
                     execution_limits=limits, initial_feedback=_initial_feedback(simulation), output=Path(temporary)/"trial")
             self.assertEqual(report["status"], "curve_finished")
             self.assertEqual(report["executed_steps"], 6)
-            self.assertEqual(report["pose_goal_result"], "U" if kind == "missing_owner" else "F")
-            self.assertIsNone(report["execution_pose_goal_result"])
+            self.assertEqual(report["pose_goal_evaluation"], "simulation_posthoc_only")
             self.assertEqual(report["completed_goal_ids"], [])
-            self.assertEqual(len(report["pose_goal_checks"]), 1)
-            self.assertEqual(report["pose_goal_checks"][0]["physical_elapsed_s"], .006)
-            self.assertFalse(report["pose_goal_checks"][0]["required_for_execution"])
+            self.assertEqual(report["goal_evidence"], [])
             self.assertFalse(report["continuation"]["requires_rebind"])
             self.assertEqual(report["continuation"]["device_policy"], result.execution_binding["device_policy"])
 
-    def test_result_only_selection_cannot_remove_nonterminal_or_arrival_obligations(self):
+    def test_pose_result_roles_allow_nonterminal_arrival_but_validate_identity(self):
         for kind in ("nonterminal", "arrival", "unknown", "duplicate"):
             simulation, curve, targets, result, limits = ActualPoseGoalTests.fixture(progress=.5 if kind == "nonterminal" else 1.)
             selected = [["pose_events", 7]]
@@ -2762,8 +2715,12 @@ class TrajectoryDeviceBindingTests(unittest.TestCase):
                 selected = [["pose_events", 8]]
             elif kind == "duplicate":
                 selected *= 2
-            with self.subTest(kind=kind), self.assertRaises(ValueError):
-                self.bind(simulation, result, targets, limits, selected)
+            with self.subTest(kind=kind):
+                if kind in ("unknown", "duplicate"):
+                    with self.assertRaises(ValueError):
+                        self.bind(simulation, result, targets, limits, selected)
+                else:
+                    self.bind(simulation, result, targets, limits, selected)
             self.assertEqual(simulation.arm_goals, [])
 
     def test_result_only_goal_does_not_release_an_independent_unknown_effect_dependency(self):
@@ -2781,7 +2738,7 @@ class TrajectoryDeviceBindingTests(unittest.TestCase):
                 execution_limits=limits, initial_feedback=_initial_feedback(simulation), output=Path(temporary)/"trial")
         self.assertEqual(report["status"], "stopped_for_evidence")
         self.assertEqual(report["executed_steps"], 4)
-        self.assertEqual(report["pose_goal_result"], "U")
+        self.assertEqual(report["pose_goal_evaluation"], "simulation_posthoc_only")
         self.assertTrue(report["dependency_hold"]["native_ctrl_written"])
         self.assertNotIn("hold-later", [row["event_id"] for row in report["events"]])
         self.assertEqual(report["completed_goal_ids"], [])
@@ -2818,7 +2775,7 @@ class TaskToleranceRebindingTests(unittest.TestCase):
 
     def test_selected_task_goals_change_while_old_proof_curve_and_limits_remain(self):
         from manipulation.execution_binding import check_result, relax_pose_goal_tolerances
-        from manipulation.execution import _actual_pose_goal
+        from recorded_skill_evaluation import _actual_pose_goal
         from manipulation.planning_problem import PoseEventRequirement
 
         _, source, _ = self.source_result()
