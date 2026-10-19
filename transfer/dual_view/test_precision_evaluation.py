@@ -179,8 +179,8 @@ class PrecisionTests(unittest.TestCase):
                 }.items():
                     stack.enter_context(patch(module+name, return_value=value))
                 stack.enter_context(patch('transfer.dual_view.evaluation.evaluate_prediction', return_value=metric))
-                # BEGIN observation-only loader no longer takes a prediction cache.
-                stack.enter_context(patch(module+'load_observations', side_effect=lambda _, task: loaded[task['id']]))
+                # BEGIN the observation fixture accepts the explicit planar model selector.
+                stack.enter_context(patch(module+'load_observations', side_effect=lambda _, task, *, region_geometry: loaded[task['id']]))
                 # END preserve the same two-task observation fixture.
                 source = stack.enter_context(patch(module+'source_picture', return_value=Image.new('RGB', (4, 4))))
                 answer = evaluate(trial, destination, baseline_results=baseline, baseline_web=web)

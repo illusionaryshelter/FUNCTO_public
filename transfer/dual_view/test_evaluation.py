@@ -397,8 +397,8 @@ class TransformMetricsTests(unittest.TestCase):
                 }
                 for name, value in replacements.items():
                     stack.enter_context(patch(module+name, return_value=value))
-                # BEGIN observation-only loader no longer takes a prediction cache.
-                stack.enter_context(patch(module+'load_observations', side_effect=lambda _, task: loaded_by_task[task['id']]))
+                # BEGIN the observation fixture accepts the explicit planar model selector.
+                stack.enter_context(patch(module+'load_observations', side_effect=lambda _, task, *, region_geometry: loaded_by_task[task['id']]))
                 # END preserve the same two-task observation fixture.
                 source_draw = stack.enter_context(patch(module+'source_picture', side_effect=AssertionError('Historical source must be reused')))
                 single_draw = stack.enter_context(patch(module+'single_view_picture', side_effect=AssertionError('Historical target must be reused')))

@@ -35,7 +35,9 @@ def predict(index, output, *, tasks=None):
         online_excludes=['model', 'observation and crop preparation', 'source query selection',
                          'native code preparation', 'file reads and writes', 'evaluation'])
     write_json(output/'predictions.json', record)
-    record['runtime'] = prepare()
+    # BEGIN this recorded benchmark explicitly uses the planar estimator.
+    record['runtime'] = prepare('planar')
+    # END explicit backend preparation matches load_observations below.
     for task in declared:
         folder = output/task['id']
         folder.mkdir()

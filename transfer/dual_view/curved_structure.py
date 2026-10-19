@@ -1,27 +1,26 @@
 """Observed entity evidence for the explicitly selected surface model.
 
 Every source entity measurement is checked under the same proposed Sim(3).
-Missing/occluded measurements stay unknown. A sparse maximum-cardinality
-matching prevents many source measurements from manufacturing independent
-support at one target element. Neither its count nor finite-pool agreement is
-a proof that unobserved structure or a functional identity is correct.
+Missing/occluded measurements stay unknown. These full-entity counts describe
+source measurement rows; they are not independent correspondence votes.
+Query correspondence capacity belongs to the separate multiscale module.
 """
 
 import numpy as np
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import maximum_bipartite_matching
 
 from ..sim3 import apply_sim3
 from .curved_geometry import project_measurements
 
 
+# BEGIN full-entity evidence supplies refutation and visibility, not another fit.
 def entity_evidence(source, surface, transform, registration_error_m):
-    """Check the entire observed source entity, with O(N) association storage.
+    """Summarize every observed source row under the same proposed transform.
 
-    There are at most two supported edges per source row, one per camera.
-    Fusion already defines the target element capacity. Sparse matching only
-    selects among these measured edges; it never searches for another point,
-    fills a missing correspondence, or uses an appearance threshold.
+    Support in either camera counts a source row once, even when both cameras
+    see it. A conflict in either camera remains a conflict despite support in
+    the other. Unknown means neither support nor conflict. Supported rows may
+    share target measurements, so their number does not supply independent
+    evidence or a fitting gate. No appearance threshold or matching is used.
     """
     mapped = apply_sim3(source['entity_xyz'], *transform)
     projections = [project_measurements(surface, mapped, view,
@@ -31,43 +30,17 @@ def entity_evidence(source, surface, transform, registration_error_m):
     support = np.column_stack([p['supported'] for p in projections])
     conflict = np.column_stack([p['conflict'] for p in projections]).any(1)
     known = support.any(1)
-    context_rows = np.flatnonzero(~source['entity_region'])
-    edge_rows, edge_views = np.nonzero(support[context_rows])
-    observations = np.array([projections[view]['observation_indices'][context_rows[row]]
-        for row, view in zip(edge_rows, edge_views)], np.int64)
-    elements = surface['observation_to_element'][observations]
-    domain, columns = np.unique(elements, return_inverse=True)
-    graph = coo_matrix((np.ones(len(columns)), (edge_rows, columns)),
-        shape=(len(context_rows), len(domain))).tocsr()
-    assignment = maximum_bipartite_matching(graph, perm_type='column')
-    selected_rows = np.flatnonzero(assignment >= 0)
-    selected_observations, selected_views = [], []
-    # Each row has at most two choices. The first declared camera owns an
-    # exact element tie, consistently with the ordinary appearance assignment.
-    row_edges = {}
-    for row, column, observation, view in zip(edge_rows, columns, observations, edge_views):
-        row_edges.setdefault((int(row), int(column)), (int(observation), int(view)))
-    for row in selected_rows:
-        observation, view = row_edges[(int(row), int(assignment[row]))]
-        selected_observations.append(observation)
-        selected_views.append(view)
-    matched_rows = context_rows[selected_rows]
-    matched_observations = np.asarray(selected_observations, np.int64)
     context = ~source['entity_region']
-    summary = dict(status='evaluated', source_entity_count=len(mapped),
+    return dict(status='evaluated', source_entity_count=len(mapped),
         source_context_count=int(context.sum()), support_count=int(known.sum()),
         conflict_count=int(conflict.sum()), unknown_count=int((~(known | conflict)).sum()),
         context_support_count=int(np.count_nonzero(known & context)),
         context_conflict_count=int(np.count_nonzero(conflict & context)),
         context_unknown_count=int(np.count_nonzero(~(known | conflict) & context)),
-        distinct_context_correspondence_count=len(matched_rows),
-        matching='sparse_maximum_cardinality_actual_observation_edges',
-        context_source_indices=source['entity_indices'][matched_rows].tolist(),
-        context_observation_indices=matched_observations.tolist(),
-        context_view_indices=selected_views,
+        support_count_unit='source_measurement_rows_not_independent_correspondences',
         contradicted_source_indices=source['entity_indices'][conflict].tolist(),
-        minimum_evidence_is_identity_certificate=False)
-    return summary, source['entity_xyz'][matched_rows], surface['observation_xyz'][matched_observations]
+        support_and_conflict_count=int(np.count_nonzero(known & conflict)))
+# END original source identities survive without a redundant context assignment.
 
 
 def compare_transforms(source, records):

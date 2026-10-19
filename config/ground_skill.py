@@ -129,7 +129,9 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
         record["stages"].append(stage)
         stage = "dual_view_region"
         from transfer.dual_view.pipeline import prepare
-        record["runtime"] = prepare()
+        # BEGIN initialize only the explicitly declared region model.
+        record["runtime"] = prepare(skill["source"]["region_geometry"])
+        # END surface no longer compiles unused planar CUDA proposal kernels.
         same_state = ("Both RGB-D views and robot feedback were exported from one frozen scene "
                       f"at simulation time {layout['sim_time_s']}; scene preparation took zero physics steps.")
         transfer = run_region_transfer(skill["source"], views, same_state_source=same_state)

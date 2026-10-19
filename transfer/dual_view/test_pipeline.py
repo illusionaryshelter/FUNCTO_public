@@ -111,13 +111,43 @@ class PipelineTests(unittest.TestCase):
         self.appearance_call.assert_not_called()
         self.infer_call.assert_not_called()
 
+    # BEGIN surface orchestration must not retain unused planar work.
+    def test_surface_calls_no_native_initializers_ranking_or_cuda(self):
+        loaded = dict(self.loaded, region_geometry='surface')
+        with patch('transfer.dual_view.curved_geometry.build_target_surface', return_value=self.surface), \
+             patch('transfer.dual_view.curved_geometry.prepare_source', return_value=self.source), \
+             patch('transfer.dual_view.curved_inference.infer', return_value=self.result) as curved:
+            returned = pipeline.run(loaded, self.features)
+        self.pairs_call.assert_not_called()
+        self.ranking_call.assert_not_called()
+        self.registration_call.assert_not_called()
+        self.synchronize.assert_not_called()
+        self.infer_call.assert_not_called()
+        curved.assert_called_once()
+        self.assertNotIn('initial_transforms', curved.call_args.kwargs)
+        self.assertNotIn('prepared_domain', curved.call_args.kwargs)
+        self.assertNotIn('domain', returned)
+        self.assertEqual(returned['result']['diagnostics']['native_backend'], 'open3d')
+    # END final geometric proposals have one owner and one evaluation path.
+
 
 class RuntimeContractTests(unittest.TestCase):
+    # BEGIN CPU-native surface preparation is independent of CUDA availability.
+    def test_surface_runtime_does_not_probe_or_initialize_cuda(self):
+        with patch.object(pipeline.torch.cuda, 'is_available') as available, \
+             patch.object(pipeline.surface, 'prepare') as planar_prepare:
+            runtime = pipeline.prepare('surface')
+        available.assert_not_called()
+        planar_prepare.assert_not_called()
+        self.assertFalse(runtime['cuda_used'])
+        self.assertEqual(runtime['native_backend'], 'open3d')
+    # END explicit model selection, without runtime fallback.
+
     def test_unavailable_cuda_raises_without_selecting_another_backend(self):
         with patch.object(pipeline.torch.cuda, 'is_available', return_value=False), \
              patch.object(pipeline.surface, 'prepare') as surface_prepare:
             with self.assertRaisesRegex(RuntimeError, 'requires CUDA'):
-                pipeline.prepare()
+                pipeline.prepare('planar')
         surface_prepare.assert_not_called()
 
 

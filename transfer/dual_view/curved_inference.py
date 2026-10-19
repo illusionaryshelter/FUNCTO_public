@@ -1,7 +1,7 @@
 """Finite point-correspondence inference with explicit curved observations.
 
-The shared appearance proposals and score are retained, but surface admission
-also checks the complete observed entity. Identity, finite-pool disagreement,
+Measured three-scale relations rank the finite candidate set, while complete
+observed-entity depth can refute a candidate. Identity, finite-pool disagreement
 and availability of the frozen sampling anchor have separate decisions.
 """
 
@@ -12,12 +12,12 @@ import numpy as np
 from ..sim3 import apply_sim3, rank
 from . import curved_geometry as geometry
 from .curved_features import SurfaceResponseField
-from .features import capacity_score
 from .inference import _finite_list, _support_summary
-from .proposals import COMPATIBILITY_RATIO, build_proposals, transform_key, valid_transform
-from .refinement import partial_refits
+from .proposals import COMPATIBILITY_RATIO, transform_key, valid_transform
+from .curved_proposals import CANDIDATE_BUDGET, build_proposals
 # BEGIN: surface-only structural evidence; the planar evaluator is unchanged.
 from .curved_structure import entity_evidence, compare_transforms
+from .curved_multiscale import prepare_multiscale, geometry_correspondences, score_multiscale
 # END: independent observed-entity module.
 
 
@@ -108,20 +108,18 @@ def _incomplete_result(result, error, stage):
     return result
 
 
-def evaluate_candidates(source, surface, appearance, proposals, domain, *,
+def evaluate_candidates(source, surface, appearance, proposals, *,
                         sampling_radius_m=.03, sampling_spacing_m=.005):
-    """Evaluate an explicit finite proposal list and its existing partial refits.
+    """Evaluate each supplied pose once, without candidate/refit expansion.
 
-    This numerical boundary also supports a transparent native-candidate-only
-    experiment. It does not claim to have generated proposals itself. ``infer``
-    below supplies the complete shared 128-growth/256-fit proposal stream.
+    Geometric association, multiscale relations and full-entity refutation use
+    actual observed points. Appearance remains a separate diagnostic. Interval
+    dominance removes a pose only when its structural upper bound is below
+    another admitted pose's lower bound; spatial disagreement remains explicit.
     """
     if (source.get('region_geometry') != 'surface' or surface.get('region_geometry') != 'surface'
             or not isinstance(appearance, SurfaceResponseField) or appearance.surface is not surface):
         raise ValueError('Curved evaluation requires the explicit curved source, surface and response field')
-    binding = domain.get('input_binding', ())
-    if len(binding) != 3 or not all(a is b for a, b in zip(binding, (source, surface, appearance))):
-        raise ValueError('Prepared response domain belongs to different observed inputs')
     started = perf_counter()
     q = len(source['query_xyz'])
     regional = np.asarray(source['query_region'], bool)
@@ -135,15 +133,15 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
         fixed_query_denominator=q, query_count=q, region_query_count=int(regional.sum()),
         context_query_count=int((~regional).sum()), quality_warnings=warnings,
         view_ids=list(surface['view_ids']), point_index_domain='surface.xyz',
-        score_definition='fixed_Q_capacity_one_positive_centered_target_domain_mid_cdf',
-        appearance_reference=domain['empirical_support'].diagnostics,
+        score_definition='three_scale_fixed_relation_geometric_mean_with_missing_bounds',
+        appearance_diagnostic_definition='raw_responses_at_candidate_query_positions_not_used_for_ranking',
         observation_model=surface['diagnostics']['observation_model'],
         local_geometry_contract='actual_region_and_complete_observed_entity_measurements',
         sampling_metric='observed_graph_path_length', sampling_radius_m=sampling_radius_m,
         sampling_spacing_m=sampling_spacing_m, sampling_scale_applied=False,
         global_optimality_certified=False, transform_certified=False,
         region_identified=False, finite_candidate_unique=False,
-        proposal_scope='explicit_caller_supplied_candidates', hypotheses=[], refinement_records=[],
+        proposal_scope='explicit_caller_supplied_candidates', hypotheses=[],
         search_status='running', search_stage='candidate_evaluation')
     result = dict(scheme='dual_view_observed_surface', region_geometry='surface', accepted=False,
         status='not_started', reasons=[], modes=[], diagnostics=diagnostics,
@@ -155,7 +153,10 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
         result.update(status='missing_input', reasons=list(source['reasons']))
         diagnostics.update(search_status='not_started', decision_status=result['status'])
         return result
+    # BEGIN freeze source-only domains once for this entire finite evaluation.
+    multiscale_context = prepare_multiscale(source)
     records, seen = [], {}
+    # END no candidate can change the support domains or relation denominators.
 
     def evaluate(transform, origins):
         key = transform_key(transform)
@@ -177,29 +178,22 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
         checks = combine_support([geometry.project_measurements(surface, check_points, i,
             registration_error_m=registration_error,
             query_position_error_m=transform[0]*source['check_position_error_m']) for i in range(2)])
-        utility = domain['empirical_support'].utility(sampled['view_scores'], np.arange(q)[:, None])
-        elements = np.full((q, 2), -1, np.int64)
-        for view in range(2):
-            ids = sampled['geometry'][view]['observation_indices']
-            usable = np.isfinite(utility[:, view]) & (ids >= 0)
-            elements[usable, view] = surface['observation_to_element'][ids[usable]]
-        evidence = capacity_score(utility, elements)
-        rows = np.flatnonzero(evidence['matched'])
-        matched_views = evidence['selected_view'][rows]
-        actual_ids = np.array([sampled['geometry'][view]['observation_indices'][row]
-                              for row, view in zip(rows, matched_views)], np.int64)
-        # BEGIN: local admission uses a separate regional capacity assignment.
-        # A tie with an entity-context row in the fixed-Q scoring assignment
-        # must not remove a valid regional correspondence from the rank gate.
-        regional_rows = np.flatnonzero(regional)
-        region_evidence = capacity_score(utility[regional], elements[regional])
-        region_rows = regional_rows[region_evidence['matched']]
-        region_views = region_evidence['selected_view'][region_evidence['matched']]
-        region_observations = np.array([sampled['geometry'][view]['observation_indices'][row]
-            for row, view in zip(region_rows, region_views)], np.int64)
+        # BEGIN one appearance-independent assignment drives every geometry use.
+        # Region rows have lexicographic capacity priority, followed by total
+        # matched count and actual residual. A second assignment could reuse a
+        # target element and make admission disagree with the scored evidence.
+        assigned = geometry_correspondences(surface, sampled['geometry'], regional)
+        rows = np.flatnonzero(assigned['matched'])
+        matched_views = assigned['selected_view'][rows]
+        actual_ids = assigned['observation_indices'][rows]
+        region_rows = np.flatnonzero(regional & assigned['matched'])
+        region_views = assigned['selected_view'][region_rows]
+        region_observations = assigned['observation_indices'][region_rows]
         correspondence = _correspondence_geometry(source['query_xyz'][region_rows],
-            surface['observation_xyz'][region_observations], transform)
-        # END: regional admission assignment; the full fixed-Q score is unchanged.
+            assigned['target_xyz'][region_rows], transform)
+        multiscale = score_multiscale(multiscale_context, transform, assigned,
+            registration_error_m=registration_error)
+        # END unknown feature footprints cannot delete real geometric evidence.
         local_rows = np.flatnonzero(regional & support['support'])
         rejections = []
         if np.any(support['conflict'] & regional):
@@ -221,22 +215,14 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
             rejections.append('context_check_depth_model_conflict')
         structure = dict(status='not_evaluated_after_query_or_check_rejection')
         if not rejections:
-            structure, context_source, context_target = entity_evidence(
+            structure = entity_evidence(
                 source, surface, transform, registration_error)
-            structure['correspondence_geometry'] = _correspondence_geometry(
-                context_source, context_target, transform)
             if structure['conflict_count']:
                 rejections.append('observed_entity_depth_model_conflict')
-            if len(context_source) < 6:
-                rejections.append('fewer_than_six_distinct_context_measurements')
-            context_geometry = structure['correspondence_geometry']
-            if min(context_geometry['source_rank'], context_geometry['target_rank']) < 2:
-                rejections.append('context_correspondence_rank_below_two')
-            if not context_geometry['rotation_algebraically_identifiable']:
-                rejections.append('context_correspondence_rotation_not_identifiable')
-        # The six-point rule is the existing minimum fitting evidence, now
-        # also required outside the region. It is not an identity certificate.
-        # END: unknown entity rows neither refute nor supply positive matches.
+        # A demonstration may cover the entire observed entity. Independent
+        # region capacity/rank still apply; requiring extra outside-region
+        # points would reject that valid input solely because of its annotation.
+        # END unknown entity rows neither refute nor supply positive matches.
         mode, region_reason = geometry.region_for_transform(surface, source, transform,
             registration_error_m=registration_error, sampling_radius_m=sampling_radius_m,
             sampling_spacing_m=sampling_spacing_m)
@@ -261,18 +247,21 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
         hypothesis_id = len(records)
         summary = dict(hypothesis_id=hypothesis_id, origins=origins,
             transform=[float(transform[0]), transform[1].tolist(), transform[2].tolist()],
-            score=float(evidence['score']), scores=_finite_list(sampled['scores']),
-            known=sampled['known'].tolist(), known_count=int(sampled['known'].sum()),
-            unknown_count=int((~sampled['known']).sum()),
-            view_scores=_finite_list(sampled['view_scores']), view_utilities=_finite_list(utility),
-            view_valid=sampled['view_valid'].tolist(), appearance_view_states=sampled['view_state'].tolist(),
+            score=multiscale['score'], multiscale_structure=multiscale,
+            appearance_scores=_finite_list(sampled['scores']),
+            appearance_known=sampled['known'].tolist(), appearance_known_count=int(sampled['known'].sum()),
+            appearance_unknown_count=int((~sampled['known']).sum()),
+            appearance_view_scores=_finite_list(sampled['view_scores']),
+            appearance_view_valid=sampled['view_valid'].tolist(), appearance_view_states=sampled['view_state'].tolist(),
             appearance_reason_counts=sampled['reason_counts'],
-            row_utilities=evidence['row_utilities'].tolist(), matched_count=len(rows),
-            positive_region_matched_count=len(region_rows), capacity_lost_count=evidence['capacity_lost_count'],
+            geometry_region_matched_count=len(region_rows),
+            geometry_capacity_lost_count=assigned['capacity_lost_count'],
+            geometry_matched_count=assigned['matched_count'],
+            geometry_unassigned_count=assigned['unknown_count'],
             regional_assignment_query_rows=region_rows.tolist(),
             regional_assignment_observation_indices=region_observations.tolist(),
             regional_assignment_view_indices=region_views.tolist(),
-            paired_query_rows=rows.tolist(), paired_surface_indices=evidence['element_ids'][rows].tolist(),
+            paired_query_rows=rows.tolist(), paired_surface_indices=assigned['element_ids'][rows].tolist(),
             paired_observation_indices=actual_ids.tolist(), paired_view_indices=matched_views.tolist(),
             correspondence_geometry=correspondence, registration_error_budget_m=float(registration_error),
             geometry=_support_summary(support), checks=_support_summary(checks),
@@ -293,40 +282,44 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
         seen[key] = hypothesis_id
 
     try:
-        for number, proposal in enumerate(proposals):
-            proposal = dict(proposal, proposal_id=number)
+        for proposal in proposals:
             evaluate(proposal['transform'], list(proposal['origins']))
-            refined, record = partial_refits(source, surface, domain, proposal)
-            diagnostics['refinement_records'].append(record)
-            for item in refined:
-                evaluate(item['transform'], list(item['origins']))
         admitted = [r for r in records if r['summary']['admitted_to_H']]
         diagnostics.update(evaluated_transform_count=len(records), hypotheses_admitted=len(admitted))
-        # BEGIN: all structurally admitted estimates remain plausible. An
-        # uncalibrated appearance score orders representatives; even an exact
-        # highest score cannot dismiss a spatially incompatible structure.
+        # BEGIN structural interval dominance is the final ranking criterion.
+        # Missing relations retain [0,1]; a high observed contribution alone
+        # cannot dismiss a less visible candidate whose interval still overlaps.
+        # These bounds concern this fixed association, not global pose truth.
         if not admitted:
             result.update(status='rejected_no_supported_structure',
                           reasons=['no_structurally_supported_hypothesis_in_declared_search'])
         else:
-            winners = sorted(admitted, key=lambda r: (-r['summary']['score'], r['summary']['hypothesis_id']))
+            best_lower = max(r['summary']['multiscale_structure']['lower_bound'] for r in admitted)
+            for item in admitted:
+                item['summary']['structural_interval_dominated'] = (
+                    item['summary']['multiscale_structure']['upper_bound'] < best_lower)
+            winners = sorted((r for r in admitted if not r['summary']['structural_interval_dominated']),
+                key=lambda r: (-r['summary']['multiscale_structure']['lower_bound'],
+                    -r['summary']['score'], r['summary']['hypothesis_id']))
             selected = winners[0]
             best = selected['summary']['score']
-            for item in admitted:
+            for item in winners:
                 item['summary']['potential_winner'] = True
             ids = [r['summary']['hypothesis_id'] for r in winners]
             agreement = compare_transforms(source, winners)
-            diagnostics.update(best_score=best, potential_winner_ids=ids,
+            diagnostics.update(selected_score=best, best_structural_lower_bound=best_lower,
+                interval_dominated_hypothesis_ids=[r['summary']['hypothesis_id'] for r in admitted
+                    if r['summary']['structural_interval_dominated']], potential_winner_ids=ids,
                 potential_winner_count=len(winners), finite_candidate_unique=len(winners) == 1,
-                admitted_candidate_pose_differences=_pose_differences(winners),
+                surviving_candidate_pose_differences=_pose_differences(winners),
                 finite_structure_agreement=agreement,
                 structure_hypothesis_ids=ids,
                 selected_hypothesis_id=selected['summary']['hypothesis_id'],
-                selection_rule='highest_fixed_Q_score_only_after_all_admitted_structures_agree')
+                selection_rule='structural_interval_survivors_must_agree_then_highest_lower_bound')
             primary = None
             if not agreement['agree']:
                 result.update(status='rejected_ambiguous_structure',
-                    reasons=['admitted_entity_transforms_disagree_beyond_declared_budgets'])
+                    reasons=['structural_interval_survivors_disagree_beyond_declared_budgets'])
             else:
                 result.update(region_identified=True, finite_candidate_unique=len(winners) == 1)
                 diagnostics['region_identified'] = True
@@ -366,7 +359,7 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
                     tgt_anchor_idx=np.asarray(chosen['paired_surface_indices'], np.int64))
                 if any(r['summary']['entity_structure']['unknown_count'] for r in winners):
                     warnings.append('entity_transform_not_fully_supported')
-                if any(r['summary']['unknown_count'] for r in winners):
+                if any(r['summary']['appearance_unknown_count'] for r in winners):
                     warnings.append('selected_estimate_has_unknown_appearance')
         # END: an unavailable anchor never promotes another identity estimate.
         if not result['accepted']:
@@ -381,30 +374,35 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
     return result
 
 
-def infer(source, surface, appearance, *, initial_transforms=(), prepared_domain=None,
-          sampling_radius_m=.03, sampling_spacing_m=.005, work_stats=None):
-    """Use the same finite point-only CUDA proposal plan, then CPU geometry."""
-    work = {}
+# BEGIN one bounded native global-to-local surface candidate path.
+def infer(source, surface, appearance, *, sampling_radius_m=.03,
+          sampling_spacing_m=.005, work_stats=None):
+    """Generate at most 32 terminal poses, then run the measured evaluator.
+
+    The proposer replaces its own coarse estimate with its refined estimate
+    in each slot. Neither native MARCO initializers nor partial-refit branches
+    can add poses here. The appearance field supplies raw diagnostics only,
+    so no all-target empirical ranking is prepared for this geometry model.
+    """
+    if source['reasons']:
+        return evaluate_candidates(source, surface, appearance, (),
+            sampling_radius_m=sampling_radius_m, sampling_spacing_m=sampling_spacing_m)
     try:
-        proposals, report, domain = build_proposals(source, surface, appearance,
-            initial_transforms=initial_transforms, prepared_domain=prepared_domain, work_stats=work)
+        proposals, report = build_proposals(source, surface)
     except (MemoryError, InterruptedError) as error:
-        if work_stats is not None:
-            work_stats.update(proposals=work, geometry_backend='numpy_scipy')
-        # Preserve fixed input identity for result writers even if allocation
-        # fails before a proposal/domain exists; no hypothetical scores appear.
         failed = dict(diagnostics=dict(region_geometry='surface',
             fixed_query_denominator=len(source['query_xyz']), source=source['diagnostics'],
             query_indices=source['query_indices'].tolist(),
-            query_region=source['query_region'].tolist(),
+            query_region=source['query_region'].tolist(), candidate_budget=CANDIDATE_BUDGET,
             quality_warnings=['declared_finite_search_interrupted']))
         return _incomplete_result(failed, error, 'proposal_generation')
-    result = evaluate_candidates(source, surface, appearance, proposals, domain,
+    result = evaluate_candidates(source, surface, appearance, proposals,
         sampling_radius_m=sampling_radius_m, sampling_spacing_m=sampling_spacing_m)
-    result['diagnostics'].update(proposals=report,
-        proposal_scope='shared_complete_128_growth_256_fit_plan_and_partial_refits')
+    result['diagnostics'].update(proposals=report, candidate_budget=CANDIDATE_BUDGET,
+        proposal_scope='bounded_native_global_to_local_terminal_slots')
     if work_stats is not None:
-        work_stats.update(proposals=work, geometry_backend='numpy_scipy',
+        work_stats.update(proposals=report, geometry_backend='numpy_scipy',
             observation_footprint_cache_entries=len(appearance._footprint_cache),
             observation_footprint_cache_bytes=appearance._footprint_cache_bytes)
     return result
+# END the finite candidate budget includes every complete evaluated pose.

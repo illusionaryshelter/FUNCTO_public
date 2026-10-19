@@ -1,7 +1,8 @@
 """Selected dual-view inference from resident observed inputs and MARCO features.
 
-Stages: full-depth surface, source geometry, native pairs, response maps, fixed
-target ranking, TEASER++ and finite candidate inference. No file reads, model
+Both models share observed geometry and raw response preparation. Planar uses
+its fixed ranking/TEASER path; surface uses bounded native geometric slots and
+three-scale measured relations. No file reads, model
 calls or historical predictions occur inside ``run``. Use in a serial process.
 """
 from time import perf_counter
@@ -22,40 +23,43 @@ class InsufficientSource(ValueError):
         super().__init__(';'.join(self.reasons))
 
 
-def prepare():
-    """Load installed native code and configure the selected serial runtime.
+# BEGIN explicit model runtime: surface registration is entirely CPU-native.
+def prepare(region_geometry):
+    """Load only the explicitly selected model's native numerical runtime.
 
-    Call before measuring online computation. Missing native packages, CUDA
-    or toolchain components raise directly; no backend is substituted. Builds
-    use the existing environment and one compiler worker.
+    This preparation precedes online timing. It never chooses a different
+    model after a runtime failure. Planar retains its CUDA/TEASER kernels;
+    surface needs only the installed Open3D and NumPy/SciPy CPU operations.
     """
-    import teaserpp_python
-    from .cuda_proposals import load_extension
-    from .cuda_evidence import prepare as prepare_evidence
-    # BEGIN resolve inference-only modules before the first online call. Their
-    # local imports inside infer then use Python's loaded modules, so source
-    # file reads cannot become an unreported part of the online timer.
-    from . import candidate_events, region_scope
-    # END these imports do not execute inference or allocate observation data.
-    if not torch.cuda.is_available():
-        raise RuntimeError('The selected dual-view implementation requires CUDA')
     torch.set_num_threads(1)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    device = torch.cuda.get_device_properties(0)
-    cap = min(6*1024**3, device.total_memory//2)
-    torch.cuda.set_per_process_memory_fraction(cap/device.total_memory)
-    pairs.prepare()
-    surface.prepare()
-    load_extension()
-    prepare_evidence()
-    # BEGIN load system-library discovery before resident inference;
-    # its first discovery may open /dev/null while consulting the local linker.
+    if region_geometry == 'surface':
+        from . import curved_proposals, curved_inference
+        runtime = dict(native_backend='open3d', geometry_backend='numpy_scipy', cuda_used=False)
+    elif region_geometry == 'planar':
+        import teaserpp_python
+        from .cuda_proposals import load_extension
+        from .cuda_evidence import prepare as prepare_evidence
+        from . import candidate_events, region_scope
+        if not torch.cuda.is_available():
+            raise RuntimeError('The selected dual-view implementation requires CUDA')
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        device = torch.cuda.get_device_properties(0)
+        cap = min(6*1024**3, device.total_memory//2)
+        torch.cuda.set_per_process_memory_fraction(cap/device.total_memory)
+        pairs.prepare()
+        surface.prepare()
+        load_extension()
+        prepare_evidence()
+        runtime = dict(gpu=device.name, gpu_total_bytes=device.total_memory,
+            gpu_allocator_cap_bytes=cap, native_backend='teaserpp', cuda_used=True)
+    else:
+        raise ValueError('region_geometry must be planar or surface')
+    # Resolve BLAS discovery before timing; run still scopes/restores its limit.
     with threadpool_limits(limits=1, user_api='blas'):
         pass
-    # END run still sets and restores its own BLAS limit explicitly.
-    return dict(gpu=device.name, gpu_total_bytes=device.total_memory,
-                gpu_allocator_cap_bytes=cap, native_backend='teaserpp')
+    return runtime
+# END the selected model has one runtime, without automatic fallback.
 
 
 def run(loaded, feature_pairs, *, sampling_radius_m=.03, sampling_spacing_m=.005):
@@ -78,17 +82,19 @@ def run(loaded, feature_pairs, *, sampling_radius_m=.03, sampling_spacing_m=.005
         from .curved_inference import infer as infer_region
     else:
         raise ValueError('region_geometry must be planar or surface')
-    # END geometry dispatch; matching and response preparation remain shared.
+    # END geometry dispatch; raw appearance responses remain shared diagnostics.
     stages, native_pairs, surface_work, work = {}, {}, {}, {}
     with threadpool_limits(limits=1, user_api='blas'):
         torch.set_num_threads(1)
-        torch.cuda.synchronize()
+        if geometry == 'planar':
+            torch.cuda.synchronize()
         started = perf_counter()
         mark = perf_counter()
         # BEGIN call the selected geometry implementation with unchanged units.
         target = build_target(loaded['views'],
             sampling_radius_m=sampling_radius_m, stats=surface_work)
-        torch.cuda.synchronize()
+        if geometry == 'planar':
+            torch.cuda.synchronize()
         stages['target_surface'] = perf_counter()-mark
         mark = perf_counter()
         source = build_source(loaded['source'], loaded['source_depth'],
@@ -98,45 +104,61 @@ def run(loaded, feature_pairs, *, sampling_radius_m=.03, sampling_spacing_m=.005
         stages['source_geometry'] = perf_counter()-mark
         if source['reasons']:
             raise InsufficientSource(source['reasons'])
-        mark = perf_counter()
-        torch.set_num_threads(8)
-        try:
-            for view in loaded['views']:
-                if view['observation'] is None:
-                    continue
-                native_pairs[view['id']] = pairs.native_region_pairs(
-                    feature_observation(loaded['source'], loaded['source_crop']),
-                    feature_observation(view['observation'], view['crop_xyxy']),
-                    loaded['source']['region_mask'], feature_pairs[view['id']])
-        finally:
-            torch.set_num_threads(1)
-        stages['native_pairs'] = perf_counter()-mark
+        # BEGIN planar-only initializers; the surface proposer owns all slots.
+        if geometry == 'planar':
+            mark = perf_counter()
+            torch.set_num_threads(8)
+            try:
+                for view in loaded['views']:
+                    if view['observation'] is None:
+                        continue
+                    native_pairs[view['id']] = pairs.native_region_pairs(
+                        feature_observation(loaded['source'], loaded['source_crop']),
+                        feature_observation(view['observation'], view['crop_xyxy']),
+                        loaded['source']['region_mask'], feature_pairs[view['id']])
+            finally:
+                torch.set_num_threads(1)
+            stages['native_pairs'] = perf_counter()-mark
+        # END no extra surface candidates exist outside its bounded proposer.
+
         mark = perf_counter()
         appearance = appearance_field(loaded, target, feature_pairs)
         stages['response_maps'] = perf_counter()-mark
+        # BEGIN each model prepares only the evidence its decision consumes.
+        if geometry == 'planar':
+            mark = perf_counter()
+            domain = rank_domain(source, target, appearance)[4]
+            stages['ranking'] = perf_counter()-mark
+            mark = perf_counter()
+            native, native_records = native_transforms(loaded, native_pairs)
+            stages['native_registration'] = perf_counter()-mark
         mark = perf_counter()
-        domain = rank_domain(source, target, appearance)[4]
-        stages['ranking'] = perf_counter()-mark
-        mark = perf_counter()
-        native, native_records = native_transforms(loaded, native_pairs)
-        stages['native_registration'] = perf_counter()-mark
-        mark = perf_counter()
-        # BEGIN each model evaluates its own observation predicates.
-        result = infer_region(source, target, appearance, initial_transforms=native,
-            prepared_domain=domain, sampling_radius_m=sampling_radius_m,
-            sampling_spacing_m=sampling_spacing_m, work_stats=work)
-        # END the point-only proposal plan and score definition stay shared.
-        torch.cuda.synchronize()
+        if geometry == 'surface':
+            result = infer_region(source, target, appearance,
+                sampling_radius_m=sampling_radius_m,
+                sampling_spacing_m=sampling_spacing_m, work_stats=work)
+        else:
+            result = infer_region(source, target, appearance, initial_transforms=native,
+                prepared_domain=domain, sampling_radius_m=sampling_radius_m,
+                sampling_spacing_m=sampling_spacing_m, work_stats=work)
+        # END raw surface responses need no Q-by-target ranking or calibration.
+        if geometry == 'planar':
+            torch.cuda.synchronize()
         stages['candidate_inference'] = perf_counter()-mark
         # BEGIN preserve each explicit model's result identity.
         result['diagnostics'].update(
             scheme=('dual_view_observed_surface' if geometry == 'surface' else 'dual_view_observed_partial'),
-            native_backend='teaserpp', native_proposals=native_records,
-            native_seconds=stages['native_registration'], target_truth_used=False,
+            native_backend='open3d' if geometry == 'surface' else 'teaserpp', target_truth_used=False,
             input_missing_views=[v['id'] for v in loaded['views'] if v['observation'] is None])
+        if geometry == 'planar':
+            result['diagnostics'].update(native_proposals=native_records,
+                native_seconds=stages['native_registration'])
         # END original planar metadata values remain unchanged.
-        torch.cuda.synchronize()
+        if geometry == 'planar':
+            torch.cuda.synchronize()
         elapsed = perf_counter()-started
-    return dict(result=result, surface=target, source=source, native_pairs=native_pairs,
-        native_transforms=native, appearance=appearance, domain=domain,
+    outputs = dict(result=result, surface=target, source=source, appearance=appearance,
         stages_seconds=stages, continuous_seconds=elapsed, surface_work=surface_work, work=work)
+    if geometry == 'planar':
+        outputs.update(native_pairs=native_pairs, native_transforms=native, domain=domain)
+    return outputs

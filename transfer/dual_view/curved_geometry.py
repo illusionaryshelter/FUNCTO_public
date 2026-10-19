@@ -123,11 +123,18 @@ def prepare_source(source, depth_m, *, query_indices, query_region,
         anchor_definition='squared_distance_medoid_set_exact_ties_retained',
         normal_domain='not_required_for_position', quality_warnings=[])
     # BEGIN explicit structural inputs are independent of sampling anchors/F.
+    # BEGIN proposal descriptors retain every demonstrated point, including
+    # legal region observations outside the selected entity segmentation.
+    proposal_ids = np.flatnonzero(entity | region)
+    # END this union is separate from full-entity refutation and query FPS.
     return dict(region_geometry='surface', query_indices=ids, query_region=regional,
         entity_indices=entity_ids, entity_xyz=points[entity_ids].copy(),
         entity_position_error_m=position_error[entity_ids], entity_region=region[entity_ids].copy(),
         entity_pixel_pitch_m=entity_pixel_pitch,
         source_camera_position_world=camera_pose[:3, 3].copy(),
+        # BEGIN actual source points/pixels for view-local proposal normals.
+        proposal_xyz=points[proposal_ids].copy(), proposal_pixels=pixels[proposal_ids].copy(),
+        # END estimated proposal normals never enter measured geometry.
         query_xyz=points[ids].copy(), query_normals=np.full((len(ids), 3), np.nan),
         query_position_error_m=position_error[ids],
         query_normal_valid=np.zeros(len(ids), bool), check_indices=check_ids,
