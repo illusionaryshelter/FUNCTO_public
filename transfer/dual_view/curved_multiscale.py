@@ -169,4 +169,3 @@ def score_multiscale(context, transform, correspondence, *, registration_error_m
         is_probability=False, independent_scale_evidence=False)
 
 # END surface-only multiscale relation objective and uncertainty bounds.
-
