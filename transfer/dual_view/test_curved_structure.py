@@ -2,7 +2,7 @@
 
 The cases distinguish unseen geometry from refuting measurements, prevent
 duplicate camera views from manufacturing independent support, and exercise
-finite-candidate ambiguity independently of exact appearance-score equality.
+finite-candidate non-uniqueness independently of appearance-score equality.
 No learned model, simulator, ground truth, or GPU is required.
 """
 
@@ -14,7 +14,7 @@ import numpy as np
 from . import curved_geometry as geometry
 from .curved_features import SurfaceResponseField
 from .curved_inference import evaluate_candidates
-from .curved_structure import compare_transforms, entity_evidence
+from .curved_structure import entity_evidence
 from .test_curved_geometry import observation, views
 from . import test_curved_inference as inference_fixture
 
@@ -125,23 +125,8 @@ class CurvedStructureTests(unittest.TestCase):
         self.assertTrue(result['accepted'], result['reasons'])
     # END absent external context is not a known structural contradiction.
 
-    def test_all_candidate_pairs_are_checked_when_reference_agreement_is_nontransitive(self):
-        source = dict(self.fixture.source)
-        source['entity_position_error_m'] = np.zeros(len(source['entity_xyz']))
-        records = []
-        # Both extremes agree with the center at a 2 mm pair budget, but they
-        # disagree with one another by 3 mm. Reference-only clustering fails.
-        for index, translation in enumerate((.0015, 0., .003)):
-            records.append(dict(transform=(1., np.eye(3), np.array([translation, 0., 0.])),
-                summary=dict(hypothesis_id=index, registration_error_budget_m=.001,
-                             score=1. - index * 1e-12)))
-        comparison = compare_transforms(source, records)
-        self.assertFalse(comparison['agree'])
-        self.assertEqual(comparison['compared_pair_count'], 3)
-        self.assertEqual([item['hypothesis_ids'] for item in comparison['disagreements']], [[1, 2]])
-
-    # BEGIN score-interval ambiguity remains independent of appearance ranking.
-    def test_unequal_appearance_scores_do_not_hide_supported_pose_disagreement(self):
+    # BEGIN exact score ties select a reference without a uniqueness claim.
+    def test_repeated_geometry_exact_score_tie_preserves_proposal_order(self):
         fixture = self.fixture
         shifted = dict(transform=(1., np.eye(3), np.array([.0045, 0., 0.])),
                        origins=[dict(origin='translated_measured_sheet')])
@@ -154,12 +139,22 @@ class CurvedStructureTests(unittest.TestCase):
         self.assertTrue(first['admitted_to_H'], first['rejections'])
         self.assertTrue(other['admitted_to_H'], other['rejections'])
         self.assertNotEqual(first['appearance_scores'], other['appearance_scores'])
-        self.assertAlmostEqual(first['score'], other['score'])
-        self.assertEqual(result['status'], 'rejected_ambiguous_structure')
-        self.assertFalse(result['accepted'])
-        self.assertFalse(result['region_identified'])
-        self.assertIsNone(result['sim3_rotation'])
-    # END identical measured relations at repeated positions remain ambiguous.
+        self.assertEqual(first['score'], other['score'])
+        self.assertEqual(result['diagnostics']['top_score_hypothesis_ids'], [0, 1])
+        self.assertEqual(result['diagnostics']['selected_hypothesis_id'], 0)
+        self.assertIn('exact_top_score_tie_resolved_by_proposal_order',
+                      result['diagnostics']['quality_warnings'])
+        self.assertTrue(result['accepted'], result['reasons'])
+        self.assertTrue(result['region_identified'])
+        self.assertFalse(result['finite_candidate_unique'])
+        self.assertFalse(result['transform_certified'])
+        np.testing.assert_array_equal(result['sim3_translation'], np.zeros(3))
+        reversed_result = evaluate_candidates(fixture.source, fixture.surface, fixture.field,
+            [shifted]+fixture.proposals)
+        self.assertTrue(reversed_result['accepted'], reversed_result['reasons'])
+        self.assertEqual(reversed_result['diagnostics']['selected_hypothesis_id'], 0)
+        np.testing.assert_array_equal(reversed_result['sim3_translation'], shifted['transform'][2])
+    # END a stable estimate does not resolve physical repeated-structure identity.
 
     def test_sampling_anchor_failure_preserves_identity_without_actionable_output(self):
         fixture = self.fixture

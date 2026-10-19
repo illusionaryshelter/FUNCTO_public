@@ -36,6 +36,26 @@ remain independent requirements of `PlanningProblem`; geometric boundaries
 alone do not certify robot feasibility or physical execution.
 <!-- END one adapted reference entry, without a rigid-only compatibility mode. -->
 
+<!-- BEGIN observed-surface grounding uses the existing score directly. -->
+For an explicitly declared `surface` region, `transfer.dual_view.curved_inference`
+retains its observed-depth conflicts, correspondence capacity/rank checks and
+complete observed-entity evidence, then ranks admitted candidates by the existing
+three-scale score from `curved_multiscale.score_multiscale`. Each scale is the
+sum of measured relation similarities divided by its fixed source relation
+count; their geometric mean is the final score. It rewards observed coverage
+and geometric agreement, not calibrated pose probability or physical uniqueness.
+Missing relations contribute no positive score and remain explicitly unknown.
+
+The highest score selects one reference estimate. Exact ties preserve proposal
+order and are reported in `top_score_hypothesis_ids` with a warning; no score-gap
+threshold is used. Score intervals remain diagnostics and do not veto selection.
+The selected candidate must have an available observed sampling region; missing
+output does not promote a lower-ranked candidate. `finite_candidate_unique`
+means only one candidate passed geometric admission, while transformation and
+global-optimality certification remain false. Current target truth is excluded
+from grounding; any truth-based evaluation reads frozen outputs separately.
+<!-- END score selection has no interval-consensus or retry compatibility mode. -->
+
 <!-- BEGIN default MARCO perception architecture. -->
 This workspace uses one `recovery` Python environment for local **SAM3.1 +
 MARCO** perception. Gemini performs semantic keypoint selection and optional

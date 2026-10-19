@@ -360,6 +360,10 @@ def evaluate(output, destination, *, baseline_results, baseline_web,
             search = {key: result['diagnostics'].get(key) for key in ('search_status', 'decision_status',
                 'fixed_query_denominator', 'evaluated_transform_count', 'hypotheses_admitted',
                 'potential_winner_count', 'potential_winner_ids', 'region_identified', 'finite_candidate_unique',
+                # BEGIN expose the native surface score decision in evaluation.
+                'ranked_hypothesis_ids', 'top_score_hypothesis_ids', 'selected_hypothesis_id',
+                'selected_score', 'selection_rule',
+                # END no interval-survivor compatibility fields are fabricated.
                 'transform_certified', 'best_score', 'competing_regions', 'appearance_reference', 'polishing')}
             search['full_prediction'] = str(stem.with_suffix('.json'))
             card['methods'].append({'scheme': 'trial', 'label': f'精度试验 / {backend}',

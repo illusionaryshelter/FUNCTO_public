@@ -1,8 +1,8 @@
 """Finite point-correspondence inference with explicit curved observations.
 
 Measured three-scale relations rank the finite candidate set, while complete
-observed-entity depth can refute a candidate. Identity, finite-pool disagreement
-and availability of the frozen sampling anchor have separate decisions.
+observed-entity depth can refute a candidate. The highest observed-support score
+selects one estimate; missing sampling output cannot promote another estimate.
 """
 
 from time import perf_counter
@@ -16,7 +16,7 @@ from .inference import _finite_list, _support_summary
 from .proposals import COMPATIBILITY_RATIO, transform_key, valid_transform
 from .curved_proposals import CANDIDATE_BUDGET, build_proposals
 # BEGIN: surface-only structural evidence; the planar evaluator is unchanged.
-from .curved_structure import entity_evidence, compare_transforms
+from .curved_structure import entity_evidence
 from .curved_multiscale import prepare_multiscale, geometry_correspondences, score_multiscale
 # END: independent observed-entity module.
 
@@ -75,11 +75,11 @@ def _region_summary(mode):
         sample_indices=mode['sample_indices'].tolist(), diagnostics=dict(mode['diagnostics']))
 
 
-def _pose_differences(winners):
-    """Report every finite best candidate's rotation relative to the first."""
-    reference = winners[0]['transform']
+def _pose_differences(ranked):
+    """Report raw differences from the selected estimate, without a gate."""
+    reference = ranked[0]['transform']
     records = []
-    for item in winners:
+    for item in ranked:
         scale, rotation, translation = item['transform']
         relative = rotation@reference[1].T
         angle = np.degrees(np.arccos(np.clip((np.trace(relative)-1)/2, -1., 1.)))
@@ -101,10 +101,10 @@ def _incomplete_result(result, error, stage):
     diagnostics.update(search_status='search_incomplete', search_stage=stage,
         decision_status='search_incomplete', interruption=str(error),
         region_identified=False, finite_candidate_unique=False, transform_certified=False,
-        potential_winner_ids=[], potential_winner_count=0)
+        ranked_hypothesis_ids=[], top_score_hypothesis_ids=[], selected_hypothesis_id=None)
     result['diagnostic_hypotheses'] = diagnostics.setdefault('hypotheses', [])
     for hypothesis in result['diagnostic_hypotheses']:
-        hypothesis['potential_winner'] = False
+        hypothesis['selected'] = False
     return result
 
 
@@ -113,9 +113,9 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
     """Evaluate each supplied pose once, without candidate/refit expansion.
 
     Geometric association, multiscale relations and full-entity refutation use
-    actual observed points. Appearance remains a separate diagnostic. Interval
-    dominance removes a pose only when its structural upper bound is below
-    another admitted pose's lower bound; spatial disagreement remains explicit.
+    actual observed points. Appearance and score intervals remain diagnostics.
+    The fixed-denominator score ranks measured positive support; it is not a
+    probability or a claim that missing evidence uniquely determines a pose.
     """
     if (source.get('region_geometry') != 'surface' or surface.get('region_geometry') != 'surface'
             or not isinstance(appearance, SurfaceResponseField) or appearance.surface is not surface):
@@ -133,7 +133,8 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
         fixed_query_denominator=q, query_count=q, region_query_count=int(regional.sum()),
         context_query_count=int((~regional).sum()), quality_warnings=warnings,
         view_ids=list(surface['view_ids']), point_index_domain='surface.xyz',
-        score_definition='three_scale_fixed_relation_geometric_mean_with_missing_bounds',
+        score_definition='three_scale_fixed_denominator_observed_relation_geometric_mean',
+        interval_role='diagnostic_only_not_candidate_selection',
         appearance_diagnostic_definition='raw_responses_at_candidate_query_positions_not_used_for_ranking',
         observation_model=surface['diagnostics']['observation_model'],
         local_geometry_contract='actual_region_and_complete_observed_entity_measurements',
@@ -276,7 +277,7 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
             entity_structure=structure,
             admitted_to_H=not rejections, rejections=rejections,
             output_available=mode is not None and region_reason is None,
-            output_reason=region_reason, potential_winner=False, region=_region_summary(mode))
+            output_reason=region_reason, selected=False, region=_region_summary(mode))
         records.append(dict(transform=transform, summary=summary, mode=mode))
         diagnostics['hypotheses'].append(summary)
         seen[key] = hypothesis_id
@@ -286,82 +287,56 @@ def evaluate_candidates(source, surface, appearance, proposals, *,
             evaluate(proposal['transform'], list(proposal['origins']))
         admitted = [r for r in records if r['summary']['admitted_to_H']]
         diagnostics.update(evaluated_transform_count=len(records), hypotheses_admitted=len(admitted))
-        # BEGIN structural interval dominance is the final ranking criterion.
-        # Missing relations retain [0,1]; a high observed contribution alone
-        # cannot dismiss a less visible candidate whose interval still overlaps.
-        # These bounds concern this fixed association, not global pose truth.
+        # BEGIN select by the unchanged measured-support score, without an
+        # interval or cross-candidate agreement gate. Missing relations supply
+        # no positive score, but remain unknown rather than depth conflicts.
+        # Stable sorting preserves proposal order for exact numerical ties;
+        # there is no task-specific tie key, near-tie threshold or fallback.
         if not admitted:
             result.update(status='rejected_no_supported_structure',
                           reasons=['no_structurally_supported_hypothesis_in_declared_search'])
         else:
-            best_lower = max(r['summary']['multiscale_structure']['lower_bound'] for r in admitted)
-            for item in admitted:
-                item['summary']['structural_interval_dominated'] = (
-                    item['summary']['multiscale_structure']['upper_bound'] < best_lower)
-            winners = sorted((r for r in admitted if not r['summary']['structural_interval_dominated']),
-                key=lambda r: (-r['summary']['multiscale_structure']['lower_bound'],
-                    -r['summary']['score'], r['summary']['hypothesis_id']))
-            selected = winners[0]
+            ranked = sorted(admitted, key=lambda r: -r['summary']['score'])
+            selected = ranked[0]
             best = selected['summary']['score']
-            for item in winners:
-                item['summary']['potential_winner'] = True
-            ids = [r['summary']['hypothesis_id'] for r in winners]
-            agreement = compare_transforms(source, winners)
-            diagnostics.update(selected_score=best, best_structural_lower_bound=best_lower,
-                interval_dominated_hypothesis_ids=[r['summary']['hypothesis_id'] for r in admitted
-                    if r['summary']['structural_interval_dominated']], potential_winner_ids=ids,
-                potential_winner_count=len(winners), finite_candidate_unique=len(winners) == 1,
-                surviving_candidate_pose_differences=_pose_differences(winners),
-                finite_structure_agreement=agreement,
-                structure_hypothesis_ids=ids,
+            top = [r['summary']['hypothesis_id'] for r in ranked if r['summary']['score'] == best]
+            selected['summary']['selected'] = True
+            # This flag describes the entire geometrically admitted pool,
+            # not just the number of exact score maximizers. Neither meaning
+            # would establish uniqueness outside this finite search.
+            unique = len(admitted) == 1
+            diagnostics.update(selected_score=best,
+                ranked_hypothesis_ids=[r['summary']['hypothesis_id'] for r in ranked],
+                top_score_hypothesis_ids=top, finite_candidate_unique=unique,
+                finite_candidate_unique_scope='only_one_geometrically_admitted_finite_candidate',
+                ranked_candidate_pose_differences=_pose_differences(ranked),
                 selected_hypothesis_id=selected['summary']['hypothesis_id'],
-                selection_rule='structural_interval_survivors_must_agree_then_highest_lower_bound')
+                selection_rule='highest_observed_support_score_stable_proposal_order')
+            if len(top) > 1:
+                warnings.append('exact_top_score_tie_resolved_by_proposal_order')
+            result.update(region_identified=True, finite_candidate_unique=unique)
+            diagnostics['region_identified'] = True
             primary = None
-            if not agreement['agree']:
-                result.update(status='rejected_ambiguous_structure',
-                    reasons=['structural_interval_survivors_disagree_beyond_declared_budgets'])
+            if selected['summary']['output_available']:
+                primary = dict(selected['mode'])
             else:
-                result.update(region_identified=True, finite_candidate_unique=len(winners) == 1)
-                diagnostics['region_identified'] = True
-                if selected['summary']['output_available']:
-                    primary = dict(selected['mode'])
-                    available = [r for r in winners if r['summary']['output_available']]
-                    diagnostics['sampling_alternatives'] = [dict(
-                        hypothesis_id=r['summary']['hypothesis_id'],
-                        available=r['summary']['output_available'],
-                        reason=r['summary']['output_reason'],
-                        seed_index=None if r['mode'] is None else r['mode']['seed_index']) for r in winners]
-                    # Spatial agreement is not graph connectivity. Another
-                    # available estimate on a disconnected measured patch
-                    # preserves identity but prevents an actionable sampling
-                    # choice. Missing anchors supply no alternative support.
-                    if any(not primary['mask'][r['mode']['seed_index']]
-                           or not r['mode']['mask'][primary['seed_index']] for r in available):
-                        primary = None
-                        result.update(status='identified_region_sampling_ambiguous',
-                            reasons=['consistent_structures_have_disconnected_observed_anchor_regions'])
-                    elif len(available) < len(winners):
-                        warnings.append('some_consistent_estimates_have_unobserved_sampling_anchors')
-                else:
-                    result.update(status='identified_region_sampling_unavailable',
-                        reasons=[selected['summary']['output_reason'] or 'observed_region_unavailable'])
-                if len(winners) > 1:
-                    warnings.append('multiple_estimates_agree_within_declared_spatial_budget')
+                result.update(status='identified_region_sampling_unavailable',
+                    reasons=[selected['summary']['output_reason'] or 'observed_region_unavailable'])
             if primary is not None:
                 primary.update(type='primary', score=best,
                     hypothesis_indices=[selected['summary']['hypothesis_id']],
                     hypothesis_index=selected['summary']['hypothesis_id'])
                 result.update(accepted=True, status='accepted_observed_region', modes=[primary],
-                    region_identified=True, finite_candidate_unique=len(winners) == 1)
+                    region_identified=True, finite_candidate_unique=unique)
                 chosen, transform = selected['summary'], selected['transform']
                 result.update(sim3_scale=transform[0], sim3_rotation=transform[1], sim3_translation=transform[2],
                     src_anchor_idx=source['query_indices'][chosen['paired_query_rows']],
                     tgt_anchor_idx=np.asarray(chosen['paired_surface_indices'], np.int64))
-                if any(r['summary']['entity_structure']['unknown_count'] for r in winners):
+                if chosen['entity_structure']['unknown_count']:
                     warnings.append('entity_transform_not_fully_supported')
-                if any(r['summary']['appearance_unknown_count'] for r in winners):
+                if chosen['appearance_unknown_count']:
                     warnings.append('selected_estimate_has_unknown_appearance')
-        # END: an unavailable anchor never promotes another identity estimate.
+        # END the chosen score estimate alone supplies the actionable region.
         if not result['accepted']:
             available = sorted((r for r in records if r['mode'] is not None),
                 key=lambda r: (not r['summary']['admitted_to_H'], -r['summary']['score'], r['summary']['hypothesis_id']))

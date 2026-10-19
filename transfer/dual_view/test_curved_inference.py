@@ -1,6 +1,6 @@
 """CPU end-to-end curved evidence tests with actual depth and response maps.
 
-Only interruption injection replaces a stage. The ordinary graph, per-camera
+Only interruption and sampling-unavailability injections replace a stage. The ordinary graph, per-camera
 feature footprint, geometric assignment and relation
 score execute on small observations; selection is never mocked into success.
 """
@@ -46,7 +46,7 @@ class CurvedInferenceTests(unittest.TestCase):
                                origins=[dict(origin='measured_identity_fixture')])]
         # END no empirical appearance ranking is prepared by this fixture.
 
-    # BEGIN surface selection uses geometry and fixed multiscale score intervals.
+    # BEGIN surface selection ranks the unchanged observed-support score.
     def test_real_depth_geometry_assignment_accepts_without_normals_or_refits(self):
         result = evaluate_candidates(self.source, self.surface, self.field, self.proposals)
         self.assertTrue(result['accepted'], result['reasons'])
@@ -71,11 +71,11 @@ class CurvedInferenceTests(unittest.TestCase):
         self.assertTrue(first['admitted_to_H'], first['rejections'])
         self.assertTrue(result['accepted'], result['reasons'])
 
-    def test_multiscale_interval_excludes_an_incompatible_lower_scoring_candidate(self):
+    def test_higher_score_selects_same_transform_when_candidate_order_changes(self):
         # The second legal similarity keeps this entire measured sheet at
         # z=.6 m. Its six query positions are supported, but the discrete target
-        # relations do not match its 15% scale change. A 6 mm translation also
-        # makes it disagree with identity beyond the existing pair budget.
+        # relations do not match its 15% scale change. Its 6 mm translation
+        # also provides a distinct pose without introducing a selection gate.
         other = dict(transform=(1.15, np.eye(3), np.array([.006, 0., -.09])),
             origins=[dict(origin='supported_but_wrong_relative_geometry')])
         result = evaluate_candidates(self.source, self.surface, self.field,
@@ -84,20 +84,30 @@ class CurvedInferenceTests(unittest.TestCase):
         first, second = result['diagnostics']['hypotheses']
         self.assertTrue(first['admitted_to_H'], first['rejections'])
         self.assertTrue(second['admitted_to_H'], second['rejections'])
-        self.assertTrue(first['potential_winner'])
-        self.assertFalse(second['potential_winner'])
+        self.assertTrue(first['selected'])
+        self.assertFalse(second['selected'])
+        self.assertGreater(first['score'], second['score'])
         self.assertLess(second['multiscale_structure']['upper_bound'],
             first['multiscale_structure']['lower_bound'])
-        self.assertTrue(second['structural_interval_dominated'])
-        self.assertEqual(result['diagnostics']['potential_winner_ids'], [0])
-        self.assertEqual(result['diagnostics']['interval_dominated_hypothesis_ids'], [1])
+        self.assertEqual(result['diagnostics']['ranked_hypothesis_ids'], [0, 1])
+        self.assertEqual(result['diagnostics']['top_score_hypothesis_ids'], [0])
+        self.assertFalse(result['finite_candidate_unique'])
         self.assertTrue(result['accepted'], result['reasons'])
+        reordered = evaluate_candidates(self.source, self.surface, self.field,
+            [other]+self.proposals)
+        self.assertTrue(reordered['accepted'], reordered['reasons'])
+        self.assertEqual(reordered['diagnostics']['selected_hypothesis_id'], 1)
+        expected, actual = select_reference_transform(result), select_reference_transform(reordered)
+        self.assertEqual(expected['scale'], actual['scale'])
+        np.testing.assert_array_equal(expected['rotation'], actual['rotation'])
+        np.testing.assert_array_equal(expected['translation'], actual['translation'])
 
-    def test_missing_relation_interval_keeps_lower_coverage_candidate_plausible(self):
+    def test_overlapping_missing_relation_intervals_do_not_veto_higher_score(self):
         # Nine frozen regional rows leave eight independent correspondences
         # when one real target depth pixel is missing. The shifted candidate
         # sees all nine rows and has a higher visible-contribution score. Its
-        # greater coverage must not turn identity's unobserved edges negative.
+        # greater coverage supplies more positive score, without turning the
+        # identity's unobserved edges into depth-conflict evidence.
         pixels = np.array([[x, y] for y in (9, 12, 15) for x in (9, 12, 15)])
         region = np.zeros((25, 25), bool)
         region[pixels[:, 1], pixels[:, 0]] = True
@@ -125,12 +135,38 @@ class CurvedInferenceTests(unittest.TestCase):
         self.assertGreater(second['score'], first['score'])
         self.assertGreaterEqual(first['multiscale_structure']['upper_bound'],
             second['multiscale_structure']['lower_bound'])
-        self.assertTrue(first['potential_winner'])
-        self.assertTrue(second['potential_winner'])
-        self.assertFalse(first['structural_interval_dominated'])
-        self.assertFalse(second['structural_interval_dominated'])
-        self.assertEqual(result['status'], 'rejected_ambiguous_structure')
+        self.assertFalse(first['selected'])
+        self.assertTrue(second['selected'])
+        self.assertGreater(first['multiscale_structure']['scales'][0]['unknown_relation_count'], 0)
+        self.assertEqual(result['diagnostics']['ranked_hypothesis_ids'], [1, 0])
+        self.assertEqual(result['status'], 'accepted_observed_region')
+        self.assertTrue(result['accepted'], result['reasons'])
+
+    def test_highest_score_missing_region_does_not_promote_available_runner_up(self):
+        other = dict(transform=(1.15, np.eye(3), np.array([.006, 0., -.09])),
+            origins=[dict(origin='lower_score_available_output')])
+        actual_region = geometry.region_for_transform
+
+        def selected_anchor_missing(surface, source, transform, **kwargs):
+            if np.array_equal(transform[2], np.zeros(3)):
+                return None, 'source_anchor_observation_unavailable'
+            return actual_region(surface, source, transform, **kwargs)
+
+        # Only sampling availability is injected. Real depth, assignment and
+        # scoring determine the winner, which must remain selected but missing.
+        with patch('transfer.dual_view.curved_inference.geometry.region_for_transform',
+                   side_effect=selected_anchor_missing):
+            result = evaluate_candidates(self.source, self.surface, self.field,
+                self.proposals+[other])
+        first, second = result['diagnostics']['hypotheses']
+        self.assertGreater(first['score'], second['score'])
+        self.assertTrue(second['admitted_to_H'])
+        self.assertTrue(second['output_available'])
+        self.assertEqual(result['diagnostics']['selected_hypothesis_id'], 0)
+        self.assertTrue(result['region_identified'])
+        self.assertEqual(result['status'], 'identified_region_sampling_unavailable')
         self.assertFalse(result['accepted'])
+        self.assertIsNone(select_reference_transform(result))
 
     def test_explicit_candidates_are_evaluated_once_without_appended_refits(self):
         proposals = [dict(transform=(1., np.eye(3), np.array([shift, 0., 0.])),
@@ -143,7 +179,7 @@ class CurvedInferenceTests(unittest.TestCase):
         self.assertNotIn('refinement_records', result['diagnostics'])
         self.assertEqual([item['origins'] for item in hypotheses],
             [item['origins'] for item in proposals])
-    # END interval selection and evidence availability are tested with real RGB-D.
+    # END score selection and evidence availability are tested with real RGB-D.
 
     def test_footprint_cache_budget_changes_reuse_but_not_scores(self):
         points = self.source['query_xyz']

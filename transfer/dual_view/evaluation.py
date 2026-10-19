@@ -463,6 +463,10 @@ def evaluate(output, destination, *, old_results, new_results,
             search = {key: diag.get(key) for key in ('search_status', 'decision_status',
                 'fixed_query_denominator', 'evaluated_transform_count', 'hypotheses_admitted',
                 'potential_winner_count', 'potential_winner_ids', 'region_identified',
+                # BEGIN surface selection is distinct from planar tied-score regions.
+                'ranked_hypothesis_ids', 'top_score_hypothesis_ids', 'selected_hypothesis_id',
+                'selected_score', 'selection_rule',
+                # END report each model's native decision, without conversion.
                 'finite_candidate_unique', 'transform_certified',
                 'best_score', 'competing_regions', 'appearance_reference', 'timing_seconds')}
             search.update(candidate_rejection_counts=dict(Counter(reason for h in candidates

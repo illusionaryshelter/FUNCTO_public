@@ -113,6 +113,13 @@ def score_multiscale(context, transform, correspondence, *, registration_error_m
     valid score interval. Tau is the existing registration/model allowance;
     it normalizes the objective and is never included in measurement eta.
 
+    # BEGIN score semantics for direct ranking; the arithmetic is unchanged.
+    The point score counts measured positive support over the fixed source
+    denominator: coverage times mean measured similarity. Missing relations
+    add no positive contribution, but are not geometric conflicts. Higher
+    coverage can outweigh a smaller residual; this is not pose probability.
+    # END intervals below remain diagnostic rather than candidate selection.
+
     Both missing and capacity-unresolved edges have [0,1]. Every scale uses
     its original edge count, and the geometric mean is monotone in its three
     inputs. Bounds are conditional on the frozen candidate and assignment:

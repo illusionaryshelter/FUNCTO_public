@@ -41,40 +41,5 @@ def entity_evidence(source, surface, transform, registration_error_m):
         contradicted_source_indices=source['entity_indices'][conflict].tolist(),
         support_and_conflict_count=int(np.count_nonzero(known & conflict)))
 # END original source identities survive without a redundant context assignment.
-
-
-def compare_transforms(source, records):
-    """Compare all admitted finite estimates on the same source entity rows.
-
-    The triangle inequality motivates adding two declared registration bounds
-    and their scaled source measurement bounds. These bounds describe this
-    estimator's admissible spatial disagreement, not calibrated pose errors.
-    Pairwise checks are necessary: agreement with one reference alone is not
-    transitive. A small score gap, a shared graph seed, and an unseen source
-    point cannot erase a disagreeing finite estimate.
-    """
-    disagreements, largest_ratio = [], 0.
-    for left in range(len(records)):
-        mapped_left = apply_sim3(source['entity_xyz'], *records[left]['transform'])
-        for right in range(left+1, len(records)):
-            a, b = records[left], records[right]
-            bounds = (a['summary']['registration_error_budget_m']
-                + b['summary']['registration_error_budget_m']
-                + (a['transform'][0]+b['transform'][0])*source['entity_position_error_m'])
-            mapped_right = apply_sim3(source['entity_xyz'], *b['transform'])
-            distance = np.linalg.norm(mapped_left-mapped_right, axis=1)
-            ratio = np.divide(distance, bounds, out=np.full_like(distance, np.inf), where=bounds > 0)
-            ratio[(bounds == 0) & (distance == 0)] = 0.
-            largest_ratio = max(largest_ratio, float(ratio.max(initial=0)))
-            if np.any(distance > np.nextafter(bounds, np.inf)):
-                row = int(np.argmax(ratio))
-                disagreements.append(dict(
-                    hypothesis_ids=[a['summary']['hypothesis_id'], b['summary']['hypothesis_id']],
-                    maximum_disagreement_m=float(distance.max(initial=0)),
-                    worst_source_index=int(source['entity_indices'][row]),
-                    worst_distance_m=float(distance[row]), declared_bound_m=float(bounds[row])))
-    return dict(agree=not disagreements, compared_candidate_count=len(records),
-        compared_pair_count=len(records)*(len(records)-1)//2,
-        maximum_disagreement_to_declared_bound=largest_ratio,
-        disagreements=disagreements, comparison_domain='all_actual_source_entity_measurements',
-        agreement_is_calibrated_confidence=False, global_uniqueness_certified=False)
+# The former pair-budget comparison was removed: score selection has no
+# cross-candidate error allowance. Raw pose differences are diagnostics only.

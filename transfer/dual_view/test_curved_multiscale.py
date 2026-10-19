@@ -46,7 +46,8 @@ class CurvedMultiscaleTests(unittest.TestCase):
         self.assertLess(shifted['scales'][2]['upper_bound'], 1.)
         self.assertLess(shifted['upper_bound'], correct['lower_bound'])
 
-    def test_partial_truth_is_not_eliminated_by_wrong_complete_coverage(self):
+    # BEGIN keep the coverage-score limitation explicit under direct ranking.
+    def test_complete_imperfect_relations_can_outscore_partial_exact_relations(self):
         known = np.arange(len(self.source['query_xyz'])) % 2 == 0
         correct = self.score(self.source['query_xyz'], known=known)
         wrong_xyz = self.source['query_xyz'].copy()
@@ -55,6 +56,7 @@ class CurvedMultiscaleTests(unittest.TestCase):
         self.assertGreater(wrong['score'], correct['score'])
         self.assertGreaterEqual(correct['upper_bound'], wrong['lower_bound'])
         self.assertEqual(correct['upper_bound'], 1.)
+    # END interval overlap is diagnostic, not a point-score ranking guarantee.
 
     def test_hiding_any_measurement_only_widens_interval(self):
         target = self.source['query_xyz'].copy()
@@ -64,6 +66,9 @@ class CurvedMultiscaleTests(unittest.TestCase):
             known = np.ones(len(target), bool)
             known[row] = False
             hidden = self.score(target, known=known, error=.001)
+            # BEGIN fixed-assignment missing evidence cannot add positive score.
+            self.assertLessEqual(hidden['score'], full['score'])
+            # END no score normalization by the candidate's visible count.
             self.assertLessEqual(hidden['lower_bound'], full['lower_bound'])
             self.assertGreaterEqual(hidden['upper_bound'], full['upper_bound'])
 
