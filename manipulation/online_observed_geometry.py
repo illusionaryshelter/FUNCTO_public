@@ -4,7 +4,8 @@ The source consists of affine zero sections, negative convex pieces and full
 negative sample-centre cells. A numerical field conservatively encloses that
 source; its zero samples are never reconstructed as physical obstacle cubes.
 Only local source components requested by native confirmation become Coal
-shapes. There is no global surface BVH, world-pose cache or second scene query.
+shapes. Prepared native slots retain these immutable local transforms, without
+a global surface BVH, world-pose cache or second scene query.
 """
 
 # BEGIN shared observed components replace ESDF-seed obstacle material.
@@ -79,8 +80,8 @@ class FrozenObservedGeometry:
         self._upper = np.ascontiguousarray(np.concatenate(upper) if upper else np.empty((0, 3)))
         self.bounds = ((_readonly(self._lower.min(0)), _readonly(self._upper.max(0)))
                        if count else None)
-        # Reuse only the existing tree's closed AABB overlap operation. Its
-        # distance-bound traversal and prepared-component table are unnecessary.
+        # Reuse the existing tree's closed AABB overlap operation. The separate
+        # prepared table below stores local shapes, never distance bounds.
         from ._coal_scene_batch import ComponentAABBTree
         self._index = ComponentAABBTree(self._lower, self._upper, np.ones(count, dtype=bool))
         arrays = (self.origin, self.shape_xyz, self.surface_vertices, self.surface_offsets,
@@ -100,6 +101,27 @@ class FrozenObservedGeometry:
         self._rule_bits = {}
         self._removed_by_rule = _readonly(np.zeros(count, dtype=np.uint16))
         self._regions = {}
+        # BEGIN one frozen source owns the existing native batch's local slots.
+        # Include the table and prepared-slot capacity before lazy allocation;
+        # neither trajectory length nor the number of rollout clones multiplies it.
+        self._prepared_capacity_bytes = 8192+1024*count
+        self._base_storage_bytes += self._prepared_capacity_bytes
+        self._prepared_components = None
+        # END no candidate, rule or measured distance enters this shared state.
+
+    def prepared_components(self):
+        """Borrow immutable target-local slots for the installed batch API."""
+        if self._prepared_components is None:
+            from ._coal_scene_batch import ComponentTable, PreparedComponents
+            require_host_memory(self._prepared_capacity_bytes,
+                pending_existing_bytes=self.pending_cache_bytes,
+                max_rss_bytes=self.max_host_rss_bytes)
+            table = ComponentTable(self.component_count)
+            prepared = PreparedComponents(table)
+            if table.storage_nbytes+prepared.storage_nbytes > self._prepared_capacity_bytes:
+                raise RuntimeError('Native component slots exceed their admitted source capacity')
+            self._prepared_components = prepared
+        return self._prepared_components
 
     @property
     def storage_nbytes(self):

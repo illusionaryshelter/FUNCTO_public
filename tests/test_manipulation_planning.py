@@ -82,7 +82,7 @@ def bind_analytic_ik_screening(planner, report_for=None):
     from manipulation.planning_ik import rank_ik_candidates
     from manipulation.physical_joint_domain import CubicJointDomain
 
-    def rank(candidates, success, previous, parameter, goal_ids=()):
+    def rank(candidates, success, previous, parameter, goal_ids=(), *, require_pose_success=False):
         reports = []
         for row, flag in zip(candidates, success):
             evidence = {"task_satisfied": True, "model_valid": bool(np.isfinite(row).all()),
@@ -2393,7 +2393,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         # Distinct full-live/captured peaks catch accidentally duplicating CPU
         # query/packing/dedup scratch in the two CUDA pools. Immutable grids
         # remain shared across both graph pools and all independent scenes.
-        estimator = Mock(side_effect=lambda batch, horizon, *, robot_coverage_horizon, collision_paths:
+        estimator = Mock(side_effect=lambda batch, horizon, *, robot_coverage_horizon, native_joint_count:
             {"gpu_retained": 5, "gpu_live": 100 if robot_coverage_horizon else 150,
              "cpu_shared": 17, "cpu_live": 31, "gpu_shared": 23,
              "gpu_graph_live": 60 if robot_coverage_horizon else 90})
@@ -2490,9 +2490,6 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         self.assertLess(complete.gpu_bytes, budget.max_scene_gpu_workspace_bytes)
         self.assertTrue(any(call.args == (4, 3*(81+22))
                             and call.kwargs["robot_coverage_horizon"] == 81+22
-                            and call.kwargs["collision_paths"] is True
-                            for call in estimate.call_args_list))
-        self.assertTrue(all(call.kwargs['collision_paths'] == (call.kwargs['robot_coverage_horizon'] > 0)
                             for call in estimate.call_args_list))
         with self.assertRaisesRegex(ValueError, "required .* allowed"):
             _planning_workspace_bytes(world, metadata,

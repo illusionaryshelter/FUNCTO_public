@@ -211,7 +211,9 @@ def _static_planner(monkeypatch, *, self_failure=False, online_failure=False):
         residuals=lambda p, r, progress, *args, **kwargs: {"process": torch.zeros_like(progress),
             # A static candidate cannot reject the trajectory's stop dynamics.
             "stop:test": torch.ones_like(progress)})
-    planner.scene = SimpleNamespace(gripper=None)
+    # BEGIN the fixture declares the production scene capability explicitly.
+    planner.scene = SimpleNamespace(gripper=None, native_collision_components=frozenset())
+    # END no absent attribute is interpreted as geometry clearance.
     calls = {"online": [], "native": []}
 
     def forward(js):
@@ -230,7 +232,7 @@ def _static_planner(monkeypatch, *, self_failure=False, online_failure=False):
     planner._verification_native = SimpleNamespace(get_cost=lambda _: None, compute_costs=native)
 
     def online(scene, problem, progress_map, spheres, p, r, progress, q, names, *,
-               trajectory_time, normalized_time, component_diagnostics):
+               trajectory_time, normalized_time, component_diagnostics, native_confirmation):
         calls["online"].append((float(trajectory_time.item()), float(normalized_time.item())))
         rejected = online_failure and float(q[0, 0, 0]) > .5
         # BEGIN the same-call fixture distinguishes support from collision.
@@ -242,6 +244,18 @@ def _static_planner(monkeypatch, *, self_failure=False, online_failure=False):
 
     monkeypatch.setattr(planning, "_scene_boundary_evaluate", online)
     return planner, calls
+
+
+# BEGIN failed nominal references do not consume FK; functional sets still do.
+def test_failed_reference_ik_is_reported_without_static_geometry(monkeypatch):
+    planner, calls = _static_planner(monkeypatch)
+    _, reports = planner._rank_ik_candidates(
+        [[.1, 0., 0.], [.7, 0., 0.]], [True, False], [[0., 0., 0.]], .4,
+        require_pose_success=True)
+    assert len(calls['online']) == len(calls['native']) == 1
+    assert reports[1]['qualification_skipped'] == 'failed_native_reference_ik'
+    assert not reports[1]['task_satisfied'] and not reports[1]['model_valid']
+# END the existing functional-set test exercises the opposite admissibility rule.
 
 
 def test_actual_task_and_online_checks_rank_reference_ik_without_hardening_its_pose(monkeypatch):

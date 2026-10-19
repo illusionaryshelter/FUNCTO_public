@@ -62,6 +62,7 @@ class Native:
         self.route = "constrained"
         self.functional_constraints = SimpleNamespace(keys=("event",))
         self.reference_ik_distinct_counts = self.reference_ik_queries = self.reference_ik_chains = []
+        self.goal_ik_candidates = {}  # Explicit zero functional IK calls in this orchestration fixture.
         self.reference_seed_fits = self.goal_ik_fit_hints = []
         self.joint_reference_report = None
         self.initial_seed_strategies = self.seed_strategies = ["test", "test"]

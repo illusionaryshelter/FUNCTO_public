@@ -17,7 +17,7 @@ and named candidate joints. They never query simulator contacts or hidden
 environment geometry; their confirmation remains separate from world terms.
 """
 
-# BEGIN bounded native confirmation owned by non-gradient planning decisions.
+# BEGIN bounded native queries shared by planning costs and acceptance.
 from itertools import product
 import math
 from time import perf_counter
@@ -72,6 +72,56 @@ def _bounds(vertices, shape, pose):
     return _solid_axis_bounds(vertices, shape, pose)
 
 
+# BEGIN reuse the installed native source-component batch in target coordinates.
+def _observed_distance_minima(geometry, ids, actor, transform, boundary, check_request):
+    """Yield each bounded block's true minimum, consuming every native result.
+
+    Targets retain their own local coordinates, so immutable prepared shapes
+    and transforms can serve every actor pose. Permissions have already
+    selected ``ids``; no distance or clear verdict survives this call.
+    The existing C++ batch creates a fresh Coal solver per component. Its
+    prefix interface returns separated minima and individual near results;
+    consuming all prefixes keeps the global minimum, including penetrations.
+    """
+    if not len(ids):
+        return
+    prepared = geometry.prepared_components()
+    request = coal.DistanceRequest()
+    request.enable_signed_distance = True
+    for offset in range(0, len(ids), 4096):
+        if check_request is not None:
+            check_request()
+        selected = np.asarray(ids[offset:offset+4096], dtype=np.intp)
+        missing = prepared.missing(selected)
+        if len(missing):
+            components = [geometry.collision_component(int(index)) for index in missing]
+            prepared.register(missing, [row[2] for row in components],
+                              np.asarray([row[3] for row in components], dtype=np.float64))
+        batch = prepared.scan(actor, transform, selected, request, 1)
+        start, best, best_id = 0, None, None
+        while start < len(batch):
+            count, minimum, result, near, near_result = batch.prefix(start, boundary)
+            for index, value in ((minimum, result), (near, near_result)):
+                if index >= 0 and (best is None or value.min_distance < best.min_distance):
+                    best, best_id = value, int(selected[start+index])
+            start += int(count)+int(near >= 0)
+        if check_request is not None:
+            check_request()
+        kind, index, *_ = geometry.collision_component(best_id)
+        yield best, dict(source_component_id=best_id, source_component_kind=kind,
+                         source_component_index=index), int(batch.physical_query_count)
+# END sequential blocks bound scratch and preserve original ordered tie breaking.
+
+
+def _direct_distances(actor, transform, obstacles):
+    """Calibrated primitives keep fresh independent scalar Coal queries."""
+    for other, pose, identity in obstacles:
+        target = (coal.Transform3s(np.eye(3), pose) if pose.shape == (3,)
+                  else coal.Transform3s(pose[:3, :3], pose[:3, 3]))
+        request, result = coal.DistanceRequest(), coal.DistanceResult()
+        request.enable_signed_distance = True
+        coal.distance(actor, transform, other, target, request, result)
+        yield result, identity, 1
 
 
 
@@ -257,7 +307,8 @@ class NativeCollisionConfirmation:
         ``robot_state`` is RobotGeometryChecker.query output for robot candidates;
         owner candidates use owner_poses and their registered local primitives.
         Unsupported/numerical-boundary results remain unresolved and cannot
-        erase the original candidate. Finite collisions stop their pair early.
+        erase the original candidate. Every overlapping source component is
+        queried, so the minimum and its witness define one body/target cost.
         ``check_request`` may reuse the caller's existing deadline/cancellation
         check. Its exception aborts this call without publishing partial clears.
         """
@@ -324,6 +375,7 @@ class NativeCollisionConfirmation:
                     record.update(status='unresolved', reason='native_solid_support_bounds_unavailable')
                     continue
                 actor_transform = coal.Transform3s(actor_pose[:3, :3], actor_pose[:3, 3])
+                distances = None
                 if target['primitives'] and not rules:
                     obstacles = []
                     for index, (other, other_vertices, other_pose) in enumerate(target['primitives']):
@@ -363,41 +415,47 @@ class NativeCollisionConfirmation:
                                   nearby_component_count=len(nearby),
                                   permitted_component_count=len(nearby)-len(ids))
 
-                    def source_obstacles():
-                        for index in ids:
-                            kind, component, other, local_pose, _ = observed.collision_component(int(index))
-                            yield other, local_pose, {'source_component_id': int(index),
-                                'source_component_kind': kind, 'source_component_index': int(component)}
-
-                    obstacles = source_obstacles()
+                    distances = _observed_distance_minima(observed, ids, shape,
+                        actor_transform, self.boundary, check_request)
                     # END only whole components with this body's effective permission disappear.
-                for other, other_pose, identity in obstacles:
+                if distances is None:
+                    distances = _direct_distances(shape, actor_transform, obstacles)
+                for distance, identity, query_count in distances:
                     if check_request is not None and record['coal_queries'] % 64 == 0:
                         check_request()
-                    if other_pose.shape == (3,):
-                        other_transform = coal.Transform3s(np.eye(3), other_pose)
-                    else:
-                        other_transform = coal.Transform3s(other_pose[:3, :3], other_pose[:3, 3])
-                    # Fresh requests/results avoid carrying simplex or witness
-                    # state between unrelated source cells and robot solids.
-                    request, distance = coal.DistanceRequest(), coal.DistanceResult()
-                    request.enable_signed_distance = True
-                    coal.distance(shape, actor_transform, other, other_transform, request, distance)
                     value = float(distance.min_distance)
-                    stats['coal_queries'] += 1
-                    record['coal_queries'] += 1
+                    stats['coal_queries'] += query_count
+                    record['coal_queries'] += query_count
                     if not np.isfinite(value):
                         record.update(status='unresolved', reason='nonfinite_native_distance', **identity)
                         break
                     if record['minimum_queried_distance_m'] is None or value < record['minimum_queried_distance_m']:
-                        record['minimum_queried_distance_m'] = value
-                    if value <= self.boundary:
-                        record.update(status='collision' if value < -self.boundary else 'unresolved',
-                            reason='native_solid_intersection' if value < -self.boundary else 'coal_numerical_boundary',
+                        # BEGIN retain the active native feature, not the first collision.
+                        record.update(minimum_queried_distance_m=value,
                             witness_native=np.asarray(distance.getNearestPoint1()).tolist(),
                             witness_target=np.asarray(distance.getNearestPoint2()).tolist(),
+                            normal_actor_to_target=np.asarray(distance.normal).tolist(),
                             witness_frame=target_name, **identity)
-                        break
+                        # END AABB-excluded components cannot have negative distance.
+                if record['status'] != 'unresolved':
+                    value = record['minimum_queried_distance_m']
+                    # BEGIN native derivatives require a finite, consistent feature.
+                    # Only the selected penetrating feature supplies a derivative.
+                    # Test its length identity in metres using the existing Coal
+                    # numerical boundary; this grants no extra contact tolerance.
+                    if value is not None and value < -self.boundary:
+                        first = np.asarray(record['witness_native'])
+                        second = np.asarray(record['witness_target'])
+                        normal = np.asarray(record['normal_actor_to_target'])
+                        finite = all(np.isfinite(v).all() for v in (first, second, normal))
+                        if (not finite or np.linalg.norm(second-first-value*normal) > self.boundary
+                                or abs(value)*(abs(np.linalg.norm(normal)-1)) > self.boundary):
+                            record.update(status='unresolved', reason='invalid_native_distance_feature')
+                            continue
+                    # END invalid witnesses retain the positive hard proposal.
+                    if value is not None and value <= self.boundary:
+                        record.update(status='collision' if value < -self.boundary else 'unresolved',
+                            reason='native_solid_intersection' if value < -self.boundary else 'coal_numerical_boundary')
         statuses = {name: [row['status'] for row in pairs if row['target_owner'] == name] for name in candidates}
         stats['elapsed_seconds'] = perf_counter() - start
         return {'pairs': pairs,
@@ -413,17 +471,18 @@ class NativeCollisionConfirmation:
 class OnlineCollisionConfirmation:
     """Confirm only positive sphere candidates; preserve every other constraint.
 
-    The differentiable rollout never calls this object. Final candidate
-    metrics and discrete OMPL state validity use it with the same frozen
+    Differentiable rollout, final candidate metrics and discrete OMPL state
+    validity use the same frozen
     observed geometry. A search branch owns its scene-bound instance and
     supplies the original search/request deadline callback. Physical execution
     never constructs this planning-only adapter. Native FK is performed only
     for states needing confirmation.
     """
 
-    def __init__(self, validator, scene, check_request=None):
+    def __init__(self, validator, scene, check_request=None, *, retain_evidence=True):
         self.validator, self.scene, self.engine = validator, scene, None
         self.check_request = check_request
+        self.retain_evidence = retain_evidence
         # BEGIN one candidate/scene owns every reused self-state decision.
         # The same q/time occurs in the native regular/anchor terms and in
         # scene mode-side queries. Exact typed identities reuse one required-
@@ -435,7 +494,21 @@ class OnlineCollisionConfirmation:
                      'unmodelled future hand geometry remains explicit; no simulator state queries',
             'candidate_states': 0, 'states': []}
         self.last_report = {'self_collision': self.self_report}
+        # BEGIN aggregate native work survives per-forward evidence disposal.
+        self.work = dict(scope='Completed actor queries; interrupted final actor excluded',
+                         completed_actor_queries=0, completed_native_pairs=0,
+                         completed_coal_queries=0, completed_elapsed_seconds=0.)
+        # END a new request constructs a new adapter and new counters.
         # END the existing planning point/deadline budgets bound these records.
+
+    # BEGIN repeated optimizer forwards retain no previous-state evidence.
+    def begin_query(self):
+        """Keep prepared immutable geometry; release the previous query trace."""
+        self._self_states.clear()
+        self.self_report['states'].clear()
+        self.self_report['candidate_states'] = 0
+        self.last_report = {'self_collision': self.self_report}
+    # END ordinary/anchor/mode-side calls within this forward can still share.
 
     # BEGIN self confirmation cannot authorize any other scene component.
     def confirm_self(self, residual, joint_position, joint_names, trajectory_time, *, source):
@@ -537,6 +610,7 @@ class OnlineCollisionConfirmation:
         locations = np.argwhere(np.logical_or.reduce([np.any(value > 0, axis=-1)
                                                        for value in candidates.values()]))
         result = dict(costs)
+        actor_queries = 0
         for batch, index in locations:
             # BEGIN group this state's candidates by their explicit registered actor.
             by_actor = {}
@@ -572,11 +646,29 @@ class OnlineCollisionConfirmation:
                     # END a successful confirmation clears collision terms only.
                     check_request=self.check_request)
                 record['actor'] = actor
+                if any(owner not in by_owner or f'collision/{actor}/{owner}' not in confirmable
+                       for owner in record['cleared_targets']):
+                    raise ValueError('Native confirmation returned an unqueried collision target')
+                # BEGIN count completed native work without retaining old records.
+                self.work['completed_actor_queries'] += 1
+                for key in ('native_pairs', 'coal_queries', 'elapsed_seconds'):
+                    self.work['completed_'+key] += record['statistics'][key]
+                # END timeout reporting reads these counters without a new query.
                 record['query_index'] = [int(batch), int(index)]
                 record['sphere_residuals'] = {name: float(costs[name][batch, index].item())
                     for name in candidates if pair_names[name][0] == actor and pair_names[name][1] in by_owner}
-                self.last_report['states'].append(record)
-                for owner in record['cleared_targets']:
+                # BEGIN native rollout consumers use costs and aggregate work only.
+                # Full per-state witnesses remain available to explicit candidate
+                # validation; unused optimizer traces need not survive a forward.
+                actor_queries += 1
+                if self.retain_evidence:
+                    self.last_report['states'].append(record)
+                # END no gradient or acceptance input depends on trace retention.
+                # BEGIN one native body/target residual and its matching derivative.
+                from .native_collision_gradient import confirmed_world_costs
+                revised = confirmed_world_costs(record, robot, evidence, owner_poses,
+                    self.validator, batch, index, costs)
+                for owner, residual in revised.items():
                     name = f'collision/{actor}/{owner}'
                     # BEGIN a returned clear preserves actor, target and query identity.
                     if name not in confirmable or owner not in by_owner or name not in result:
@@ -584,8 +676,9 @@ class OnlineCollisionConfirmation:
                     # END a checker result cannot enlarge the shared component inventory.
                     if result[name] is costs[name]:
                         result[name] = costs[name].clone()
-                    result[name][batch, index] = 0.
+                    result[name][batch, index] = residual
+                # END unresolved pairs retain their explicit positive hard proposal.
         self.last_report['candidate_states'] = len(locations)
-        self.last_report['actor_queries'] = len(self.last_report['states'])
+        self.last_report['actor_queries'] = actor_queries
         return result
 # END world confirmation leaves contact, coverage, controller and separate self terms unchanged.

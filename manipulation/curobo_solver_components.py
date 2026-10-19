@@ -87,6 +87,8 @@ class PhysicalGradientCore(GradientOptCore):
         self._candidate_tracking = False
         self._al_blocks_remaining = 0
         self._last_functional_signed = None
+        self._evaluation_counts = {'forward': 0, 'backward': 0, 'initial': 0}
+        self._solve_completed = False
         # END independent seeds never inherit another solve's dual variables.
         # END no third-party optimizer or process-wide callback is replaced.
         super().__init__(*args, **kwargs)
@@ -138,34 +140,41 @@ class PhysicalGradientCore(GradientOptCore):
         # Native reinitialize bypasses _dispatch and the preparation wrapper;
         # this hook covers both initialization entrances with their real cost.
         self._check_request()
+        self._evaluation_counts['initial'] += 1
         result = super()._run_initial_evaluation(iteration_state)
         self._check_request(wait_for_device=True)
         return result
 
-    def _cost_and_gradient_with_guard(self, x, rollout):
-        """Keep native cost/backward arithmetic, checking their host boundary.
+    # BEGIN one forward implementation serves gradients and AL residual queries.
+    def _evaluate_cost(self, x, rollout, *, backward):
+        """Evaluate once and retain evidence only after the requested work ends.
 
-        cuRobo's two cost callbacks have no before-backward hook. This owned
-        implementation retains their detach, reshape, reduction, backward
-        vector and return tensors. The only added operation is the same
-        request check before forward, before backward and after backward.
+        Block updates need the actual exploration base's residual, not its
+        gradient. Disabling autograd there avoids both recording a graph and
+        a discarded backward pass. Ordinary native callbacks preserve their
+        exact reduction, backward vector and candidate-retention semantics.
         """
         from curobo._src.util.logging import log_and_raise
         self._check_request()
-        x_n = x.detach().requires_grad_(True)
-        x_in = x_n.view(self.config.num_problems * self.config.num_particles,
-                       self.action_horizon, self.action_dim)
-        trajectories = rollout.evaluate_action(x_in, use_cuda_graph=False)
-        costs = trajectories.costs_and_constraints.get_sum_cost_and_constraint(sum_horizon=True)
+        self._evaluation_counts['forward'] += 1
+        x_n = x.detach().requires_grad_(backward)
+        with torch.set_grad_enabled(backward):
+            x_in = x_n.view(self.config.num_problems * self.config.num_particles,
+                           self.action_horizon, self.action_dim)
+            trajectories = rollout.evaluate_action(x_in, use_cuda_graph=False)
+            costs = trajectories.costs_and_constraints.get_sum_cost_and_constraint(sum_horizon=True)
         if costs.shape != (self.config.num_problems * self.config.num_particles,):
             log_and_raise(f"costs.shape != (num_problems*num_particles,): {costs.shape}")
         cost = costs.view(self.config.num_problems, self.config.num_particles, 1)
         # A forward evaluation that consumes the deadline must not initiate
         # another expensive backward pass or publish its partial candidate.
         self._check_request(wait_for_device=True)
-        cost.backward(gradient=self._l_vec, retain_graph=False)
-        self._check_request(wait_for_device=True)
-        g_x = x_n.grad.detach()
+        g_x = None
+        if backward:
+            self._evaluation_counts['backward'] += 1
+            cost.backward(gradient=self._l_vec, retain_graph=False)
+            self._check_request(wait_for_device=True)
+            g_x = x_n.grad.detach()
         # BEGIN retain graded candidate evidence from this exact completed query.
         if self._candidate_tracking:
             hard_eligible, sampled_feasible, signed, objective = rollout.constraint_manager.optimizer_evidence(trajectories)
@@ -175,11 +184,12 @@ class PhysicalGradientCore(GradientOptCore):
         return cost, g_x
 
     def _compute_cost_constraint_and_gradient(self, x):
-        return self._cost_and_gradient_with_guard(x, self.rollout_fn)
+        return self._evaluate_cost(x, self.rollout_fn, backward=True)
 
     def _compute_cost_constraint_and_gradient_initial(self, x):
         rollout = self._rollout_list[1] if len(self._rollout_list) > 1 else self._rollout_list[0]
-        return self._cost_and_gradient_with_guard(x, rollout)
+        return self._evaluate_cost(x, rollout, backward=True)
+    # END residual-only queries still publish the same completed-query evidence.
     # END no native iteration count, line-search arithmetic or budget is relaxed.
 
     # BEGIN fixed-budget inexact PHR continuation and sampled-feasible retention.
@@ -255,7 +265,9 @@ class PhysicalGradientCore(GradientOptCore):
         count, particles = self.config.num_problems, self.config.num_particles
         base = state.exploration_action.detach().clone()
         repeated = base[:, None].expand(-1, particles, -1, -1).contiguous().view(count, particles, self.opt_dim)
-        self._compute_cost_constraint_and_gradient(repeated)
+        # BEGIN the first evaluation supplies residuals; only updated costs need a gradient.
+        self._evaluate_cost(repeated, self.rollout_fn, backward=False)
+        # END never use the last Wolfe trial as the continuation base.
         signed = {name: value.view(count, particles)[:, 0]
                   for name, value in self._last_functional_signed.items()}
         changed = owner.update(signed)
@@ -398,11 +410,18 @@ class PhysicalGradientCore(GradientOptCore):
                  "last_displacement": values["_last_displacement"][index],
                  "last_curvature": values["_last_curvature"][index],
                  "exhausted": values["_exhausted"][index],
-                 "stop_reason": "recovery_without_descent" if values["_exhausted"][index] else "iteration_budget",
+                 "stop_reason": ("recovery_without_descent" if values["_exhausted"][index] else
+                                 "iteration_budget" if self._solve_completed else "incomplete"),
                  "recovery_attempts": len(self._recovery_reports[index]),
                  "recovery_accepted": sum(row["accepted"] for row in self._recovery_reports[index]),
                  "recoveries": list(self._recovery_reports[index])}
                 for index in range(self.config.num_problems)]
+        # BEGIN these are shared batch calls, not per-seed multiplied work.
+        for report in reports:
+            report['batch_evaluation_calls'] = dict(self._evaluation_counts)
+            report['solve_completed'] = self._solve_completed
+            report['native_opt_seconds'] = self.opt_dt if self._solve_completed else None
+        # END native timing and explicit call counts require no extra rollout.
         # BEGIN report independent continuation and sampled-only incumbents.
         if self._candidate_tracking:
             duals = self._functional_constraints.snapshot()["seeds"]
@@ -588,34 +607,32 @@ class PhysicalGradientCore(GradientOptCore):
         self._safe_action.copy_(action.detach())
 
     def reinitialize(self, action, mask=None, clear_optimizer_state=True, reset_num_iters=False):
+        # BEGIN this is the single owner of per-solve initialization.
+        # Native solvers call reinitialize before optimize. A direct optimize
+        # call enters here too; it must not reset PHR or evaluate a prepared
+        # seed for a second time. Previous completed solves own no pending state.
         self._prepare_solve(action)
+        self._solve_completed = False
+        self._evaluation_counts = {'forward': 0, 'backward': 0, 'initial': 0}
         self._reset_progress()
         self._begin_functional_solve(action)
         result = super().reinitialize(action, mask=mask,
             clear_optimizer_state=clear_optimizer_state, reset_num_iters=reset_num_iters)
-        # BEGIN native reinitialize bypasses the graph dispatch initializer.
         return result
-        # END the seed has its actual goal and physical clock before observation.
+        # END the initialized cost, gradient and incumbent share one objective.
 
     def optimize(self, seed_action):
-        # BEGIN every solve starts with fresh curvature and current objective values.
-        self._iteration_state = None
-        if self._on_reinitialize is not None:
-            self._on_reinitialize(None)
-        # END an AL recovery never retains the old scalar-cost ordering.
-        self._prepare_solve(seed_action)
-        self._reset_progress()
-        # BEGIN a new solve must not pair its seed with the previous PHR cost.
-        # Native callers commonly invoke reinitialize first, but optimize is
-        # also a complete owned entry point. Clear the tracker in place here:
-        # block-boundary changes deliberately preserve these cumulative clocks.
-        self._best.clear()
-        # END this full-solve reset is never called by _finish_functional_block.
+        # BEGIN consume native prepared state once, or initialize a fresh solve.
+        action = seed_action.view(self.config.num_problems, self.action_horizon, self.action_dim)
+        self.domain.validate(action)
+        if self._iteration_state is None or not torch.equal(action, self._safe_action):
+            self.reinitialize(action)
+        # END different seeds cannot reuse another seed's cost or dual variables.
         # BEGIN run AL inside the original loop and retain one candidate per seed.
-        self._begin_functional_solve(seed_action)
         self._al_blocks_remaining = self.outer_iters
         try:
             result = super().optimize(seed_action)
+            self._solve_completed = True
             if self._candidate_tracking:
                 # BEGIN both evidence ranks remain subject to final candidate validation.
                 result = torch.where(self._candidate_rank[:, None, None] > 0, self._candidate_action, result)

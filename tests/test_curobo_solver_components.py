@@ -63,6 +63,45 @@ class NativeComponentTest(unittest.TestCase):
             optimizers=[optimizer], goal_registry_manager=GoalManager(self.device)))
         return solver, optimizer, rollouts
 
+    # BEGIN native initialization is consumed exactly once per independent solve.
+    def test_prepared_seed_is_reused_but_changed_seed_or_objective_is_fresh(self):
+        domain = JointPositionDomain(-torch.ones(1)*10, torch.ones(1)*10)
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        seed = torch.zeros((1, 1, 1))
+        with patch('curobo._src.runtime.cuda_event_timers', False), \
+             patch.object(core, '_run_initial_evaluation', wraps=core._run_initial_evaluation) as initial:
+            optimizer.reinitialize(seed)
+            optimizer.optimize(seed)
+            self.assertEqual(initial.call_count, 1)
+            for rollout in rollouts:
+                rollout.offset = 100.
+            optimizer.optimize(seed)
+            self.assertEqual(initial.call_count, 2)
+            self.assertGreaterEqual(float(core._best.cost[0]), 100.)
+            optimizer.reinitialize(seed)
+            optimizer.optimize(seed+1.)
+            self.assertEqual(initial.call_count, 4)
+
+    def test_al_residual_only_forward_keeps_candidate_without_backward(self):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        owner = FunctionalAugmentedLagrangian(('event',))
+        self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
+        bind_solver_components(solver, domain)
+        core = optimizer._core
+        core._begin_functional_solve(torch.zeros((1, 1, 1)))
+        action = torch.tensor([[[-.5], [.1], [.2]]])
+        with patch.object(torch.Tensor, 'backward', side_effect=AssertionError('unused backward')):
+            cost, gradient = core._evaluate_cost(action, rollouts[0], backward=False)
+        self.assertIsNone(gradient)
+        self.assertFalse(cost.requires_grad)
+        self.assertEqual(core._candidate_rank.tolist(), [2])
+        torch.testing.assert_close(core._candidate_action, torch.tensor([[[-.5]]]))
+        torch.testing.assert_close(core._last_functional_signed['event'], action.flatten())
+    # END within-solve continuation retains its existing per-row regression cases.
+
     # BEGIN block updates exercise the real CPU native optimizer, not a fake loop.
     def attach_functional_objective(self, rollouts, owner, residual):
         for rollout in rollouts:

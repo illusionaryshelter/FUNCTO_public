@@ -1290,6 +1290,47 @@ class RobotGeometryChecker:
                 "geometry_sources": {name: value[2] for name, value in self._geometries.items()},
                 "numerics": dict(self.numerics), "pairs": rows}
 
+    # BEGIN native collision witnesses use the same named robot and reference frame.
+    def geometry_point_jacobians(self, robot_state, points, T_reference_base):
+        """Return world point Jacobians in the query's named joint order.
+
+        ``points`` contains (geometry name, world point) pairs from a completed
+        native query. Pinocchio's LOCAL_WORLD_ALIGNED Jacobian is the velocity
+        of the *frame origin*, expressed in base axes. Shift its linear rows
+        to the witness, then rotate into the external reference axes. All
+        witnesses share one computeJointJacobians call and named q mapping.
+        This operation grants no collision permission or joint-limit waiver.
+        """
+        names = tuple(robot_state['joint_names'])
+        values = np.asarray(robot_state['joint_positions'], dtype=float)
+        if (len(names) != len(set(names)) or set(names) != set(self.joint_names)
+                or values.shape != (len(names),) or not np.isfinite(values).all()):
+            raise ValueError('Point Jacobians require the complete finite native joint query')
+        transform = _rigid_pose(T_reference_base)
+        q = pin.neutral(self.model)
+        for name, value in zip(names, values):
+            q[self._q_columns[name]] = value
+        pin.computeJointJacobians(self.model, self._data, q)
+        pin.updateFramePlacements(self.model, self._data)
+        columns = [self.model.joints[self.model.getJointId(name)].idx_v for name in names]
+        frame_jacobians, result = {}, []
+        for geometry, point in points:
+            frame = self._geometries[geometry][0]
+            frame_id = self._frame_id(frame)
+            if frame not in frame_jacobians:
+                frame_jacobians[frame] = pin.getFrameJacobian(
+                    self.model, self._data, frame_id, pin.LOCAL_WORLD_ALIGNED).reshape(6, self.model.nv).copy()
+            jacobian = frame_jacobians[frame]
+            point = np.asarray(point, dtype=float)
+            if point.shape != (3,) or not np.isfinite(point).all():
+                raise ValueError('A native witness must be a finite world point')
+            base_point = transform[:3, :3].T @ (point-transform[:3, 3])
+            offset = base_point-self._data.oMf[frame_id].translation
+            shifted = jacobian[:3]+np.cross(jacobian[3:].T, offset).T
+            result.append(transform[:3, :3] @ shifted[:, columns])
+        return result
+    # END no finite differences, FK approximation or scene-specific transform.
+
     # BEGIN bounded native many-pair queries with explicitly pristine history.
     def _native_pair_distances(self, pairs, poses):
         """Yield original-order results without retaining warm solver state.

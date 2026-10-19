@@ -326,7 +326,7 @@ class ScopedOmplSearchTest(unittest.TestCase):
         self.assertGreater(report["branches"][0]["elapsed_seconds"], .75)
 
     def test_expired_global_deadline_stops_later_charts_and_attempts(self):
-        seed, report, calls, elapsed = self._search_with_charged_clock(.8, attempts=2)
+        seed, report, calls, elapsed = self._search_with_charged_clock(.8, attempts=1)
         self.assertIsNone(seed)
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(report["branches"]), 1)
@@ -338,6 +338,17 @@ class ScopedOmplSearchTest(unittest.TestCase):
         self.assertEqual(report["branches"][0]["allocated_seconds"], 3.)
         self.assertEqual(report["branches"][0]["elapsed_seconds"], elapsed)
         self.assertEqual(report["branches"][0]["failure"], "whole_search_time_budget_exhausted")
+
+    # BEGIN a failed first connection cannot starve its admitted alternative.
+    def test_first_attempt_leaves_time_for_an_alternative_boundary(self):
+        seed, report, calls, elapsed = self._search_with_charged_clock(.8, attempts=2)
+        self.assertIsNotNone(seed, report)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(report['branches'][0]['proposal_source'], 'candidate_curve')
+        self.assertEqual(report['branches'][1]['proposal_source'], 'joint_box_random')
+        self.assertLess(report['branches'][0]['allocated_seconds'], 3.)
+        self.assertLess(elapsed, 3.)
+    # END the global deadline remains independently enforced above.
     # END existing state-query and alternative-proposal caps remain independently tested.
 
     # BEGIN failed alternative IK cannot consume the only qualified boundary attempt.

@@ -49,7 +49,8 @@ def test_boundary_compaction_keeps_batched_plateaus_release_witness_and_tie_grad
         trajectory_time=u*4, normalized_time=u, query_counts=counts)
     gradient = torch.autograd.grad(actual.sum(), q)[0]
     assert len(seen) == 1
-    assert counts == {'exact_states': 10, 'left_states': 4, 'right_states': 2, 'evaluated_states': 16}
+    last = {'exact_states': 10, 'left_states': 4, 'right_states': 2, 'evaluated_states': 16}
+    assert counts == {**last, 'query_calls': 1, **{'total_'+key: value for key, value in last.items()}}
     compact_s, compact_q, compact_time, compact_permission = seen[0]
     columns = torch.tensor([0, 1, 2, 3, 4, 1, 2, 3])
     torch.testing.assert_close(compact_q, q.detach().index_select(1, columns), rtol=0, atol=0)
@@ -87,6 +88,18 @@ def test_declared_boundary_absent_from_samples_adds_no_side_geometry():
     assert called == [2]
     torch.testing.assert_close(actual, q[..., 0].square())
     torch.testing.assert_close(torch.autograd.grad(actual.sum(), q)[0], 2*q)
+
+
+def test_query_totals_accumulate_across_different_batch_layouts():
+    counts = {}
+    scene = SimpleNamespace(required_progress_anchors=(), evaluate=lambda *args, **kwargs: args[3]*0.)
+    for batch, horizon in ((1, 3), (2, 4)):
+        s = torch.zeros((batch, horizon))
+        _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),
+            None, None, None, None, s, None, (), trajectory_time=s, normalized_time=s, query_counts=counts)
+    assert counts['query_calls'] == 2
+    assert counts['evaluated_states'] == 8
+    assert counts['total_evaluated_states'] == counts['total_exact_states'] == 11
 # END only geometry work shrinks; task witnesses and scalar max semantics remain.
 
 

@@ -2544,8 +2544,7 @@ class PlanningScene:
     # END reference volume verification never asserts controller tracking.
 
     # BEGIN distinguish retained native buffers from one live query/backward.
-    def estimated_workspace_allocation(self, batch, horizon, *, robot_coverage_horizon,
-                                       collision_paths=False):
+    def estimated_workspace_allocation(self, batch, horizon, *, robot_coverage_horizon, native_joint_count=0):
         """Return separate CPU/GPU storage and live work for one scene rollout.
 
         Native buffers persist per semantic key at the latest shape. Graph
@@ -2554,9 +2553,6 @@ class PlanningScene:
         graphs. Coverage guidance uses its own original FK horizon, without
         the scene's exact/left/right material-mode expansion. Robot/solver/FK
         storage remains additional to these geometry-query allocations.
-        ``collision_paths`` reserves the common per-sphere optimizer graph;
-        this arithmetic admission does not declare support for the online
-        scene's separate query/export protocol.
         """
         if type(batch) is not int or type(horizon) is not int or min(batch, horizon) <= 0:
             raise ValueError("Workspace estimation needs positive batch/horizon sizes")
@@ -2742,28 +2738,6 @@ class PlanningScene:
         host_snapshot_bytes = source_input_bytes if source_transfer_bytes else 0
         cpu_live_bytes = (contact_cpu_bytes+contact_tensor_bytes+source_query_bytes
                           +source_dedup_bytes+host_snapshot_bytes)
-        # BEGIN the common budget interface admits optional sphere-path work.
-        if collision_paths:
-            from .collision_path import collision_path_workspace_allocation
-            path_spheres = sum(size for actor, size in actors.items() for target in targets if actor != target)
-            # Budget the analytic backend's own layer and pair-permission
-            # identities without pretending it supports online query export.
-            mode_bytes = (2*path_spheres+len(self.robot_sphere_materials)*len(targets)
-                +sum(actors[rule.actor] for rule in self.contacts)
-                +len(self.robot_sphere_materials)*len(self.robot_owner_permissions)
-                +8*sum(len(owner.attachments) for owner in self.owners))
-            pair_rule_count = max([0, *(sum(rule.actor == actor and rule.target_owner == target
-                for rule in self.contacts) for actor in actors for target in targets)])
-            mode_bytes += max(actors.values())*(2+pair_rule_count+len(self.robot_owner_permissions))
-            path_allocation = collision_path_workspace_allocation(batch, horizon,
-                geometry_spheres=sum(actors.values()), mode_bytes_per_state=mode_bytes,
-                path_spheres=path_spheres, max_stream_spheres=max(actors.values()))
-            shared_cpu_bytes += path_allocation['cpu_shared']
-            shared_gpu_bytes += path_allocation['gpu_shared']
-            cpu_live_bytes += path_allocation['cpu_live']
-            gpu_live_bytes += path_allocation['gpu_live']
-            graph_live_bytes += path_allocation['gpu_live']
-        # END source geometry storage and hard-query behavior are unchanged.
         return {"gpu_retained": int(retained_bytes), "gpu_live": int(gpu_live_bytes),
                 "cpu_shared": int(shared_cpu_bytes), "gpu_shared": int(shared_gpu_bytes),
                 "cpu_live": int(cpu_live_bytes), "gpu_graph_live": int(graph_live_bytes)}
