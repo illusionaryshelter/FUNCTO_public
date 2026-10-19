@@ -230,23 +230,6 @@ def test_clearance_includes_only_required_native_installation_pairs(urdf, policy
         assert clearance["minimum_recorded_distance_m"] is None
 
 
-def test_whole_pair_permission_excludes_separated_pairs_without_a_contact_row(urdf):
-    from dataclasses import asdict
-    from test_independent_scene_validation import binding, query as scene_query
-    from manipulation.planning_scene import RobotOwnerContactPermission
-    model = binding()
-    model["owners"][0]["geometry"]["solids"][0]["pose"][2] = -.06
-    model["robot_owner_permissions"] = [asdict(RobotOwnerContactPermission(
-        rule_id="arrival", target_owner="target", native_geometry_names=("pad",),
-        sphere_indices=(0,), interval=(.5, .9), arrival_goal_id=("pose_events", 0),
-        activation_event={"skill_id": "test", "event_id": "close", "occurrence": 0, "kind": "close"},
-        source="explicit arriving pad permission"))]
-    result = scene_query(_clearance_checker(urdf), model, kind="nominal")
-    assert result["passed"] and result["pairs"][0]["permission"] is None
-    assert result["unpermitted_clearance"]["measured_count"] == 0
-    assert result["unpermitted_clearance"]["minimum_recorded_distance_m"] is None
-
-
 def test_early_rejection_and_query_gaps_cannot_claim_complete_clearance(urdf):
     from manipulation.tsdf_geometry import tsdf_geometry_from_samples
     from test_independent_scene_validation import binding, query as scene_query

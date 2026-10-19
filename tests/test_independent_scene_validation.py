@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from manipulation.tsdf_geometry import tsdf_geometry_from_samples
-from manipulation.planning_scene import ContactRule
 from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChecker
 from test_robot_geometry_check import URDF
 
@@ -29,7 +28,8 @@ def rule(**changes):
         gap_bounds=(-.002, .002), normal_tolerance_rad=.01, modeling_allowance_m=.003,
         geometry_error_m=.003, minimum_thickness_m=.1, source="calibrated finite pad and patch")
     args.update(changes)
-    return asdict(ContactRule(**args))
+    return {'required':False, 'feature_joint_translation':None, 'feature_kind':'polygon',
+            'numerical_position_tolerance_m':1e-6, 'numerical_angle_tolerance_rad':1e-6, **args}
 
 
 def binding(contacts=()):

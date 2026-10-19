@@ -46,13 +46,28 @@ def test_role_evidence_cannot_be_missing_or_self_referential(scene):
 # END no native map, simulation, planner or CUDA allocation is required.
 
 
+# BEGIN both recorded-input command entry points must resolve the shared defaults.
+@pytest.mark.parametrize('module_name', ['run_recorded_skill', 'probe_recorded_grasp_feasibility'])
+def test_recorded_entry_help_resolves_current_mapping_api(module_name, monkeypatch, capsys):
+    """Catch missing live imports before starting an expensive native request."""
+    import importlib
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent/'planning'))
+    module = importlib.import_module(module_name)
+    monkeypatch.setattr(sys, 'argv', [module_name, '--help'])
+    with pytest.raises(SystemExit) as stopped:
+        module.parse_args()
+    assert stopped.value.code == 0
+    assert '--voxel-size' in capsys.readouterr().out
+# END help exercises the real parser without reading inputs or allocating CUDA.
+
+
 # BEGIN the native scene boundary enforces the same rule before allocation.
 @pytest.mark.parametrize('identity, spacing', [('part', .0005), (None, .0015)])
 def test_roi_cannot_escape_task_or_environment_precision(identity, spacing):
     from unittest.mock import patch
-    from test_manipulation_planning_observation import PlanningObservationTest
+    from test_manipulation_planning_observation import observed_owner_fixture
     from manipulation.planning_observation import build_scene_from_rgbd
-    views, frames, cfg = PlanningObservationTest.refined_owner_fixture()
+    views, frames, cfg = observed_owner_fixture()
     region = {'center_m': [0., 0., 0.], 'extent_m': [.01, .01, .01],
         'voxel_size_m': spacing, 'measurement_allowance_m': .003,
         'measurement_evidence': 'Explicit synthetic bound', 'source': 'Bounded synthetic ROI'}
@@ -62,8 +77,7 @@ def test_roi_cannot_escape_task_or_environment_precision(identity, spacing):
             build_scene_from_rgbd(views, frames, mapper_cfg=cfg, depth_error_m=.003,
                 task_owner_ids=('part',), reference_frame='world', robot_sphere_materials=(None,),
                 robot_geometry_source='Declared test robot', has_gripper=False,
-                fine_regions={identity: region}, max_mapping_bytes=1024**3,
-                unknown_policy={'conditional_regions': [], 'outside_regions': 'forbid'})
+                fine_regions={identity: region}, max_mapping_bytes=1024**3)
         mapper.assert_not_called()
         coverage.assert_not_called()
 # END no resource failure can turn into a lower-precision task field.

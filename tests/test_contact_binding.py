@@ -34,7 +34,8 @@ _FACES = [dict(material_id="left_inner", native_geometry="left_pad", face_axis=0
 class ContactBindingTests(unittest.TestCase):
     # BEGIN finite binding must be explicit and cannot partially mutate inputs.
     def test_finite_grasp_binding_is_explicit_atomic_and_independent(self):
-        from test_manipulation_planning_scene import contact_rule
+        from manipulation.planning_scene import ContactRule
+        contact_rule = lambda: ContactRule("contact", "robot", "surface", (0., 1.), (0,), "bound test material")
 
         condition = {"kind": "grasp_contact_activation", "condition_id": "grasp:close:0",
             "carrier_id": "surface", "interval": [0., 1.], "arrival_goal_id": ["pose_events", 0],
@@ -53,7 +54,8 @@ class ContactBindingTests(unittest.TestCase):
         self.assertNotIn("contact_rule_ids", condition)
 
     def test_finite_grasp_binding_cannot_reuse_one_rule_for_two_close_events(self):
-        from test_manipulation_planning_scene import contact_rule
+        from manipulation.planning_scene import ContactRule
+        contact_rule = lambda: ContactRule("contact", "robot", "surface", (0., 1.), (0,), "bound test material")
 
         def condition(identity):
             return {"kind": "grasp_contact_activation", "condition_id": identity,
@@ -105,19 +107,13 @@ class ContactBindingTests(unittest.TestCase):
             self.assertEqual(binding["robot_sphere_materials"], ["right_inner"]*4+["left_inner"]*4)
             self.assertEqual(binding["materials"]["left_inner"]["sphere_indices"], [4, 5, 6, 7])
             self.assertEqual(binding["native_geometry_materials"], {"left_pad": "left_inner", "right_pad": "right_inner"})
-            declaration = dict(rule_id="local", material_id="left_inner", target_owner="observed",
-                interval=(0., 1.), patch_origin=[0., 0., 0.], patch_axes=np.eye(3), patch_half_size=[.01, .01],
-                gap_bounds=(-.001, .001), normal_tolerance_rad=.01, modeling_allowance_m=.001,
-                geometry_error_m=.001, minimum_thickness_m=.008, source="explicit observed test patch")
+            declaration = dict(rule_id="local", actor="robot", material_id="left_inner", target_owner="observed",
+                interval=(0., 1.), source="explicit observed interaction")
             rule, = build_material_contact_rules(binding, [declaration])
             self.assertEqual(asdict(rule)["sphere_indices"], (4, 5, 6, 7))
-            # BEGIN source geometry, thickness and exact runtime part stay bound.
-            self.assertEqual(rule.online_material["kind"], "native_planar_extrusion_v1")
-            self.assertEqual(rule.online_material["native_geometry"], "left_pad")
-            self.assertEqual(rule.online_material["sphere_indices"], [4, 5, 6, 7])
-            self.assertAlmostEqual(rule.online_material["thickness_m"], .008)
-            self.assertEqual(rule.online_material["sphere_binding_source"], records[0]["certificate_path"])
-            # END the task declaration cannot fabricate the online solid model.
+            self.assertEqual(set(asdict(rule)), {"rule_id", "actor", "target_owner", "interval", "sphere_indices", "source"})
+            with self.assertRaisesRegex(ValueError, "Interaction declarations"):
+                build_material_contact_rules(binding, [{**declaration, "gap_bounds": [-.001, .001]}])
             spheres["left"][0]["radius"] += .001
             with self.assertRaisesRegex(ValueError, "sphere cover"):
                 bind_fixture_contact_materials(fixture, robot, ordering, feedback, _FACES)

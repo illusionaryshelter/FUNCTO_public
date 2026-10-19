@@ -146,27 +146,27 @@ class CoordinateDirectionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             replace(direction("net"), origin_coordinate=.2)
 
-    def test_export_rejects_instantaneous_reverse_rate_between_positive_positions(self):
-        from manipulation.planning import _ProgressMap
+    def test_reverse_nominal_direction_is_cost_without_an_export_gate(self):
+        from manipulation.planning import _ProgressMap, _nominal_task_cost
         from tests.test_manipulation_planning import cartesian_problem, constant_path, export_fixture
         request = cartesian_problem((MotionPhase("free reference", constant_path()),))
         request.mechanisms = (mechanism([direction("local_rate", start=.25, end=.75)]),)
         planner, native = export_fixture(request, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
             [[0., 0., 0.], [.2, 0., 0.], [.4, 0., 0.]],
             [[0., 0., 0.], [-.1, 0., 0.], [0., 0., 0.]], 1.)
-        original_fk = planner._verification_fk.compute_kinematics
-        def fk(state):
-            result = original_fk(state)
-            jacobian = state.position.new_zeros((*state.position.shape[:2], 1, 6, 3))
-            jacobian[..., 0, :3, :] = torch.eye(3, dtype=state.position.dtype)
-            result.tool_jacobians = jacobian
-            return result
-        planner._verification_fk.compute_kinematics = fk
-        curve, _ = planner.export(native)
-        self.assertAlmostEqual(curve.residuals["mechanism:0:direction:0:local_rate"], .1)
-        report = planner.last_validation["coordinate_direction_resolution"]
-        self.assertGreater(report["query_count"], 3)
-        self.assertIn("no continuous-time", report["scope"])
+        curve, _ = planner.export(native, {"accepted": True, "residuals": {}})
+        self.assertNotIn("mechanism:0:direction:0:local_rate", curve.residuals)
+        positions = torch.tensor(curve.position[None], dtype=torch.float64, requires_grad=True)
+        rotation = torch.zeros((1, 3, 4), dtype=torch.float64); rotation[..., 0] = 1.
+        progress = torch.tensor([[0., .5, 1.]], dtype=torch.float64)
+        velocity = torch.tensor(curve.velocity[None], dtype=torch.float64)
+        cost = _nominal_task_cost(request, positions, rotation, progress, positions,
+            request.joint_names, velocity, trajectory_time=progress*2,
+            tool_linear_velocity=velocity, tool_angular_velocity=torch.zeros_like(velocity))
+        self.assertGreater(float(cost.detach().max()), 0.)
+        cost.sum().backward()
+        self.assertTrue(bool(torch.isfinite(positions.grad).all()))
+
 
     def test_delta_target_keeps_original_origin_and_compiler_evidence(self):
         skill = prismatic_input()
@@ -198,7 +198,7 @@ class CoordinateDirectionTest(unittest.TestCase):
         self.assertAlmostEqual(value.origin_coordinate, .1)
         self.assertEqual(compile_inputs(prismatic_input()).mechanisms[0].directions, ())
 
-    def test_optimizer_direction_scale_uses_same_relative_accuracy_without_relaxing_gate(self):
+    def test_nominal_motion_cost_uses_physical_error_without_precision_multipliers(self):
         preferences = []
         for minimum, tolerance in ((.1, .01), (.001, .0001)):
             item = mechanism([direction("net", minimum=minimum, tolerance=tolerance)])
@@ -208,7 +208,8 @@ class CoordinateDirectionTest(unittest.TestCase):
             raw = request.residuals(p, q, progress, trajectory_time=times)
             self.assertAlmostEqual(float(raw["mechanism:0:direction:0:net"].max()), tolerance)
             preferences.append(float(request.optimizer_preferences(p, q, progress, trajectory_time=times).sum()))
-        np.testing.assert_allclose(preferences, [4., 4.], atol=1e-12)
+        self.assertTrue(all(np.isfinite(preferences)))
+        self.assertGreater(preferences[0], preferences[1])
 
     def test_observed_actual_lift_is_preserved_separately_from_entry_delta_origin(self):
         skill = revolute_input()

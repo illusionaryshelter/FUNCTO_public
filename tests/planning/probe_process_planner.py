@@ -37,8 +37,7 @@ def no_obstacle_scene(sphere_count, *, hand, installation_owners, geometry_sourc
         reference_frame="robot_base", observation_ids=("declared synthetic empty box",))
     return OnlinePlanningScene(background=empty_background(coverage), owners=installation_owners,
         coverage=coverage, reference_frame="robot_base", robot_sphere_materials=(None,)*sphere_count,
-        robot_geometry_source=geometry_source, gripper=hand,
-        unknown_policy={"outside_regions": "forbid", "conditional_regions": []})
+        robot_geometry_source=geometry_source, gripper=hand)
 # END there is no partial mock of the changing planner/scene interface.
 
 

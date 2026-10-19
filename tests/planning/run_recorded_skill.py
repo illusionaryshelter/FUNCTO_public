@@ -1,6 +1,6 @@
 """Plan one observed skill with a resident backend and fixed online geometry.
 
-All task, camera, contact and unknown-region inputs come from the caller.
+All task, camera and interaction inputs come from the caller.
 The saved accepted curve is executed separately against actual robot feedback.
 """
 
@@ -502,7 +502,7 @@ def run_prepared(args, *, problem, provenance):
         from recorded_owner_geometry import bind_box_owner_materials
         activations = [row for row in problem.conditions
                        if row.get("kind") in {"grasp_contact_activation", "observed_attachment"}]
-        contacts, pair_permissions, initial_support_relations, holding_contacts = (), (), (), ()
+        contacts, initial_support_relations, holding_contacts = (), (), ()
         material_binding = {"robot_sphere_materials": [None]*sphere_count,
                             "native_geometry_materials": {}, "materials": {}, "owner_materials": {}}
         prepared = None if args.owner_geometry is None else json.loads(args.owner_geometry.read_text())
@@ -542,11 +542,11 @@ def run_prepared(args, *, problem, provenance):
                 from manipulation.holding_contact import bind_holding_contacts
                 holding_contacts = bind_holding_contacts(problem, material_binding,
                     contact_inputs.get("holding_contacts"), source=contact_inputs['source'])
-                # END support and active grasp ContactRules keep their original tolerances.
+                # END current attachment identity grants no task-success evidence.
             elif contact_inputs.get("holding_contacts"):
                 raise ValueError("Holding materials require current attachment obligations")
             # END a finite patch cannot silently become an ungated grasp rule.
-            report["contact_binding"]["policies"].append("explicit_finite_material_contacts")
+            report["contact_binding"]["policies"].append("explicit_local_interaction_permissions")
             # BEGIN diagnostics distinguish initial support from exact materials.
             if initial_support_relations:
                 report["contact_binding"]["policies"].append("explicit_initial_planar_support")
@@ -672,8 +672,7 @@ def run_prepared(args, *, problem, provenance):
         complete_owners = ()
         if prepared is not None:
             from recorded_owner_geometry import create_box_owner
-            complete_owners = (create_box_owner(
-                prepared, contact_voxel_size_m=owner_resolutions[prepared["owner_id"]]),)
+            complete_owners = (create_box_owner(prepared),)
             report["complete_carrier_geometry"] = prepared["provenance"]
         # END primitive geometry, native registration and attachments stay unchanged.
         scene = build_scene_from_rgbd(
@@ -690,13 +689,9 @@ def run_prepared(args, *, problem, provenance):
             # END no recorded adapter substitutes a future placement ContactRule.
             # END owner-actor and robot-actor rules share the same validated scene.
             native_geometry_materials=material_binding["native_geometry_materials"],
-            # BEGIN both independent and planner models retain the exact pair policy.
-            robot_owner_permissions=pair_permissions,
-            # END a current measured arrival is still required by execution.
             # BEGIN distinct physical owners share one total resource envelope.
             task_owner_ids=task_owners,
             fine_regions=fine_regions, robot_collision_bodies=collision_bodies,
-            unknown_policy=json.loads(args.unknown_policy.read_text()),
             max_mapping_bytes=args.mapping_memory_mib*1024**2,
             max_host_rss_bytes=args.max_host_rss_mib*1024**2,
             max_device_used_bytes=args.max_device_used_mib*1024**2)
@@ -718,7 +713,7 @@ def run_prepared(args, *, problem, provenance):
             observed_report = scene.observation_report
             scene = type(scene)(
                 background=scene.background, owners=(*scene.owners, *fixed_owners), coverage=scene.coverage,
-                reference_frame=scene.reference_frame, unknown_policy=scene.unknown_policy,
+                reference_frame=scene.reference_frame,
                 robot_sphere_materials=scene.robot_sphere_materials,
                 robot_collision_bodies=scene.robot_collision_bodies,
                 robot_geometry_source=scene.robot_geometry_source, gripper=hand, contacts=scene.contacts,
@@ -729,13 +724,7 @@ def run_prepared(args, *, problem, provenance):
                 initial_support_relations=scene.initial_support_relations,
                 # END reconstructing a scene cannot discard its support contract.
                 # BEGIN native identity survives fixed-installation augmentation.
-                native_geometry_materials=scene.native_geometry_materials,
-                # BEGIN fixed installation cannot drop the bound hand/owner permission.
-                robot_owner_permissions=scene.robot_owner_permissions,
-                # END all installation checks remain separately active.
-                # END both geometry checkers retain identical material bindings.
-                numerical_position_tolerance_m=scene.numerical_position_tolerance_m,
-                numerical_rotation_tolerance_rad=scene.numerical_rotation_tolerance_rad)
+                native_geometry_materials=scene.native_geometry_materials)
             scene.observation_report = observed_report
         report["fixed_robot_installation"] = fixed_report
         # END fixed installation remains independently collision checked.
@@ -743,8 +732,8 @@ def run_prepared(args, *, problem, provenance):
         np.savez_compressed(args.output/"observed-free.npz", known_free=scene.coverage.known_free,
             origin=scene.coverage.origin, voxel_size=np.asarray(scene.coverage.voxel_size),
             observation_ids=np.asarray(scene.coverage.observation_ids))
-        report["unknown_policy"] = scene.unknown_policy
-        # END conditional unknown permission is distinct from observed freedom.
+        report["observation_coverage_scope"] = "Diagnostic observation evidence; unknown is not a known obstacle or proof of free space"
+        # END coverage does not veto a bounded motion attempt.
         scene.validate_problem(problem)
         # Only native measured data is available here. The planner owns the
         # single entrance verdict after binding the formal finger clock.
@@ -887,10 +876,6 @@ def parse_args(argv=None):
     parser.add_argument("--self-filter-padding-scale", type=float, required=True)
     parser.add_argument("--self-filter-source", required=True)
     # END no rendered depth-equality threshold is accepted.
-    # BEGIN the caller declares the unknown-space action explicitly.
-    parser.add_argument("--unknown-policy", type=Path, required=True,
-                        help="Explicit unknown policy: conditional_regions and outside_regions (forbid, require_observation, allow_attempt)")
-    # END observation evidence is separate from the policy that uses it.
     parser.add_argument("--joint-reference", type=Path,
                         help="Optional named recorded q/dq curve; guidance has no execution authorization")
     parser.add_argument("--knots", type=int, default=16)
@@ -915,8 +900,10 @@ def parse_args(argv=None):
     parser.add_argument("--scene-gpu-workspace-mib", type=int, choices=(1024, 2048, 3072, 6144), default=1024)
     # END this separate capacity is not the physical device-used limit.
     # BEGIN request-level physical limits remain explicit in standalone runs.
-    parser.add_argument("--max-host-rss-mib", type=int, choices=(8192, 10240, 12288), default=8192)
-    parser.add_argument("--max-device-used-mib", type=int, choices=(6144, 8192), default=6144)
+    # BEGIN defaults fit the external decimal 8 GB / 6 GB resource monitor.
+    parser.add_argument("--max-host-rss-mib", type=int, default=8_000_000_000//1024**2)
+    parser.add_argument("--max-device-used-mib", type=int, default=6_000_000_000//1024**2)
+    # END existing production admission validates any explicit resource limits.
     parser.add_argument("--mapping-memory-mib", type=int, default=1024,
                         help="Explicit combined map-buffer estimate cap, also checked against total live host/device budgets")
     parser.add_argument("--host-process-root-pid", type=int,

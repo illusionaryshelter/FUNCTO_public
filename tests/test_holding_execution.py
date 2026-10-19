@@ -1,6 +1,6 @@
-"""CPU Holding-permission contracts; mocked clocks never certify physical Holding."""
+"""Current attachment evidence remains independent of simplified collision rules."""
 
-# BEGIN observed Holding and arrival/close permissions have independent lifetimes.
+# BEGIN preserve execution evidence regressions after removing old pair permissions.
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
@@ -9,24 +9,12 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
-import torch
-import test_manipulation_planning_scene as scene_tests
 import test_recorded_simulation as recorded_tests
 
 from manipulation.execution import ExecutionGuardError, ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
-from manipulation.planning_scene import Attachment, CollisionOwner
-from test_independent_scene_validation import checker
-from test_manipulation_planning_scene import SphereQuery, inputs, pose_path, scene
+from manipulation.planning_scene import Attachment
 from test_recorded_simulation import (_GeometryChecker, _bind_fingers, _execute_bound, _fixture,
     _initial_feedback, _limit_values, _result)
-from test_robot_owner_permission import model_binding, native_query, permission
-
-
-def holding_rule(**changes):
-    values = dict(rule_id="current_holding", holding_condition_id="observed_holding",
-        arrival_goal_id=(), activation_event={}, interval=(0., 1.))
-    values.update(changes)
-    return permission(**values)
 
 
 def holding_fixture(*, release=True):
@@ -198,69 +186,4 @@ def test_arrival_close_and_later_open_keep_independent_holding_evidence():
     assert "active_contact_rule_ids" not in report
 
 
-@pytest.mark.parametrize("change", [None, "kind", "owner", "interval", "transform"])
-def test_planning_scene_requires_exact_observed_attachment_for_holding_permission(change):
-    original, problem = scene_tests.PlanningSceneTest().bound_payload()
-    condition = problem.conditions[0]
-    condition["T_carrier_eef"] = np.eye(4).tolist()
-    condition["T_carrier_eef"][0][3] = -.3
-    world = scene(original.owners, robot_owner_permissions=(holding_rule(target_owner="payload"),))
-    if change == "kind":
-        condition["kind"] = "candidate_attachment"
-    elif change == "owner":
-        condition["carrier_id"] = "different_owner"
-    elif change == "interval":
-        world.robot_owner_permissions[0].interval = (0., .5)
-    elif change == "transform":
-        condition["T_carrier_eef"][0][3] = -.2
-    if change is None:
-        world.validate_problem(problem)
-    else:
-        with pytest.raises(ValueError, match="Holding permission"):
-            world.validate_problem(problem)
-
-
-def test_holding_rule_has_no_fake_arrival_or_close_and_old_archive_stays_arrival_based():
-    for changes in ({"arrival_goal_id": ("pose_events", 0)}, {"activation_event": {"kind": "close"}},
-                    {"holding_condition_id": ""}):
-        with pytest.raises(ValueError):
-            holding_rule(**changes)
-    legacy = asdict(permission())
-    legacy.pop("holding_condition_id")
-    assert type(permission())(**legacy).holding_condition_id is None
-
-
-@pytest.mark.parametrize("release", [False, True])
-def test_nominal_holding_permission_ends_at_real_release_and_keeps_other_spheres(release):
-    relation = Attachment((0., 1.), [0., 0., 0.], [1., 0., 0., 0.], "observed_holding",
-                          "declared_release" if release else None)
-    owner = CollisionOwner("target", SphereQuery(("target",), center=(0., 0., 0.)), pose_path(),
-        "observed target", True, local_spheres=[[0., 0., 0., .1]], attachments=(relation,))
-    world = scene((owner,), materials=(None, None), robot_owner_permissions=(holding_rule(),))
-    terms = world.components(*inputs(progress=(.5, 1.), sphere_rows=[[[0., 0., 0., .1]]*2]*2))
-    torch.testing.assert_close(terms["collision/robot/target"],
-        torch.tensor([[.2, .4 if release else .2]], dtype=torch.float64))
-
-
-def test_native_holding_permission_keeps_false_conditions_unknown_geometry_and_release_boundary(checker):
-    model = model_binding(holding_condition_id="observed_holding", arrival_goal_id=(), activation_event={}, interval=(0., 1.))
-    model["owners"][0]["attachments"] = [asdict(Attachment((0., 1.), [0., 0., 0.], [1., 0., 0., 0.],
-        "observed_holding", "declared_release"))]
-    checker.bind_scene(model)
-    robot = checker.query(joint_names=checker.joint_names, joint_positions=[0., 0.], T_reference_base=np.eye(4), pairs=())
-    result = checker.query_scene(robot, tool_pose=np.eye(4), progress=.5, finger_positions=[0., 0.],
-        state_kind="actual", condition_evidence={"observed_holding": False},
-        active_robot_owner_permissions={"arrived_close"})
-    assert not result["passed"]
-    assert any(row["kind"] == "current_scene_binding_invalid" for row in result["violations"])
-    assert result["pairs"][0]["permission"] == "arrived_close"
-    assert result["pairs"][0]["permission_authorization"] == "current_execution_holding_binding"
-    # Nominal and actual geometry reject a stale active set at the real release;
-    # a current owner pose supplies geometry without satisfying a release effect.
-    for kind in ("actual", "nominal"):
-        result = checker.query_scene(robot, tool_pose=np.eye(4), progress=1., finger_positions=[0., 0.],
-            state_kind=kind, owner_poses={"target": np.eye(4)}, active_robot_owner_permissions={"arrived_close"})
-        assert not result["passed"] and result["pairs"][0]["permission"] is None
-    model["owners"][0]["geometry"]["query_gaps"] = [{"reason": "explicit unsupported target primitive"}]
-    assert not native_query(checker, model, active={"arrived_close"})["passed"]
-# END all physical truth remains outside these CPU contract fixtures.
+# END these synthetic observations test evidence rules, not physical grasp success.

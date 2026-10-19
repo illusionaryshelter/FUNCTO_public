@@ -513,17 +513,15 @@ def bench_case(backend, curve, case, fingers, limits, protection, materials, led
         return value
 
     def guard(feedback, elapsed, *, hold=False):
-        q, dq, _ = arm_reference(curve, case, min(elapsed, fingers.duration))
         index = 0 if elapsed <= fingers.duration/2 else 1
         failures = TrajectoryExecutor._execution_violations(SimpleNamespace(backend=backend),
-            feedback, q, dq, backend.reference_tool_pose(q), limits=limits,
+            feedback, limits=limits,
             binding=safety, finger_state=protection[active_kind if hold else case["order"][index]],
             expected_sim_time=begin_time+elapsed)
-        if hold:
-            # Stopping intentionally changes the arm reference. Native state,
-            # clock, identity, speed and actual finger protections still apply.
-            failures = [row for row in failures if row["kind"] not in
-                        ("arm_position_tracking", "arm_velocity_tracking", "tcp_tracking")]
+        # BEGIN a hold and normal execution share physical feedback guards.
+        # Tracking quality is diagnostic in both phases, without a special
+        # exemption for this probe's hold command.
+        # END the same named hardware and finger limits remain active.
         return failures
 
     def capture(advanced, before, after):

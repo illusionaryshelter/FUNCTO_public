@@ -108,7 +108,7 @@ def run(output, knots=8, *, fixture_path):
         # BEGIN the hand hypothesis and physical installation survive scene construction.
         hand, owners, hand_report = fixed_probe_hand(fixture, robot, problem, device=config,
                                                     full_current_positions=full_positions)
-        scene = OnlinePlanningScene(unknown_policy={"outside_regions": "forbid", "conditional_regions": []}, background=background, owners=owners, coverage=coverage, reference_frame="robot_base",
+        scene = OnlinePlanningScene(background=background, owners=owners, coverage=coverage, reference_frame="robot_base",
             robot_sphere_materials=(None,)*kinematics.total_spheres,
             robot_geometry_source=fixture["robot_geometry_source"], gripper=hand)
         report["fixed_hand_hypothesis"] = hand_report

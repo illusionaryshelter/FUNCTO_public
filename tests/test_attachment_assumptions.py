@@ -10,7 +10,7 @@ import pytest
 from manipulation.execution import (ExecutionGuardError, FixedFingerTargets,
     TrajectoryExecutor, _feedback_json, _holding_dependency_violations)
 from manipulation.execution_binding import rebind_execution_result
-from test_holding_owner_permission import holding_fixture, refresh_validation
+from test_holding_execution import holding_fixture, refresh_validation
 from test_recorded_simulation import _GeometryChecker, _initial_feedback
 
 

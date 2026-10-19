@@ -65,7 +65,6 @@ def run(output):
             robot_sphere_materials=(None,), robot_geometry_source="synthetic probe sphere",
             # BEGIN this geometry-only probe declares no functional task owner.
             has_gripper=False, task_owner_ids=(),
-            unknown_policy={'conditional_regions': [], 'outside_regions': 'forbid'},
             max_mapping_bytes=256*1024**2,
             max_host_rss_bytes=8*1024**3, max_device_used_bytes=6*1024**3)
             # END the analytic patch is an environment surface by explicit role.

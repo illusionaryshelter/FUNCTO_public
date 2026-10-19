@@ -221,13 +221,12 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
 def empty_background(coverage):
     """No observed occupied sites inside this explicitly declared free fixture."""
     from manipulation.online_geometry import FrozenESDF
-    # BEGIN the synthetic free fixture explicitly supplies no observed material.
-    from manipulation.online_observed_geometry import FrozenObservedGeometry
-    from manipulation.tsdf_geometry import tsdf_geometry_from_samples
-    empty = tsdf_geometry_from_samples(np.ones((1, 1, 1), np.float32), np.zeros((1, 1, 1), bool),
-        origin=coverage.origin, voxel_size=coverage.voxel_size, name='empty', source='synthetic empty source')
-    return FrozenESDF.from_source(FrozenObservedGeometry(empty['solids'][0]),
-        origin=coverage.origin, shape=coverage.known_free.shape, voxel_size=coverage.voxel_size, owner_ids=(),
+    # BEGIN this synthetic fixture explicitly declares an empty finite model.
+    # The finite distance cap exceeds the fixture's full grid diagonal. It is
+    # a constructed test input, not a claim inferred from missing observations.
+    distance = 2*np.linalg.norm(np.asarray(coverage.known_free.shape)*coverage.voxel_size)
+    return FrozenESDF(np.full(coverage.known_free.shape, distance, dtype=np.float32),
+        origin=coverage.origin, voxel_size=coverage.voxel_size, owner_ids=('synthetic_background',),
         source="declared synthetic empty background; no recorded observation claim")
-    # END neither an arbitrary field value nor coverage mask creates a solid.
+    # END no parallel source-solid world is needed to test native planning.
 # END physical unknown-space policy remains the separate finite coverage grid.

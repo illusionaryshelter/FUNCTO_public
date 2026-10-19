@@ -85,13 +85,13 @@ def export(args):
     if scene.contacts or any(owner.moving for owner in scene.owners):
         raise ValueError('This frozen grasp review requires static owners and no contact permissions')
     # BEGIN source geometry is host-admitted before the native FK allocation.
-    allocation = scene.estimated_workspace_allocation(8, 1, robot_coverage_horizon=1)
+    allocation = scene.estimated_workspace_allocation(8, 1)
     workspace = _PlanningWorkspace(allocation['cpu_shared'], allocation['cpu_live'],
-        sum(allocation[name] for name in ('gpu_retained', 'gpu_live', 'gpu_shared')), 0, 0, False)
+        sum(allocation[name] for name in ('gpu_retained', 'gpu_live', 'gpu_shared')), 0)
     if workspace.gpu_bytes > 1024**3:
         raise ValueError('Static queries exceed the existing 1 GiB GPU workspace budget')
     budget = prepared['budget']
-    _require_planning_host_memory(workspace, max_host_rss_bytes=budget.max_host_rss_bytes)
+    _require_planning_host_memory(workspace.cpu_live_bytes, max_host_rss_bytes=budget.max_host_rss_bytes)
     device = DeviceCfg('cuda:0')
     _require_planning_memory(torch, device.device, workspace, max_device_used_bytes=budget.max_device_used_bytes)
     # END CPU shape residency never enters the GPU workspace comparison.

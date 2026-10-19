@@ -88,7 +88,7 @@ def test_real_binding_and_cpu_scene_roundtrip_keep_candidate_and_consumed_depend
     from manipulation.online_geometry import OnlinePlanningScene
     from test_online_geometry import scene
     from test_motion_backend_contract import problem
-    original = scene(conditional=True)
+    original = scene()
     curve = JointTrajectory(("q",), np.array([0., 1.]), np.zeros((2, 1)), np.zeros((2, 1)),
         np.array([0., 1.]), np.array([0., 1.]),
         ({"event_id": "observed", "skill_id": "s", "time": 0., "progress": 0., "requires_evidence": "held"},), (), {},

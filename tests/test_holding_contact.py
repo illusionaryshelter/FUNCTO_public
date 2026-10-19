@@ -17,7 +17,7 @@ from test_online_geometry import scene as empty_scene
 
 
 def setup(*, release=True, other_owner=False, self_collision=False, angle=0.):
-    original = empty_scene(outside_regions='allow_attempt')
+    original = empty_scene()
     pose = np.eye(4)
     pose[:3,:3] = Rotation.from_euler('z',angle,degrees=True).as_matrix()
     attachment = Attachment((0.,.75),[0.,0.,0.],
@@ -41,7 +41,7 @@ def setup(*, release=True, other_owner=False, self_collision=False, angle=0.):
     # END owner aliases are a separate schema and cannot stand in for bodies.
     current = OnlinePlanningScene(background=original.background,owners=owners,coverage=original.coverage,
         reference_frame='world',robot_sphere_materials=('pad',None),robot_geometry_source='calibrated test robot',
-        unknown_policy=original.unknown_policy,holding_contacts=(contact,),robot_collision_bodies=bodies,
+        holding_contacts=(contact,),robot_collision_bodies=bodies,
         native_geometry_materials={'native-pad':'pad'},has_gripper=False)
     current.bind_online_robot(robot_sphere_geometry=[{'link_name':'pad','sphere_indices':[0],
         'centers_local':[[0.,0.,0.]],'radii':[.005]}, {'link_name':'arm','sphere_indices':[1],

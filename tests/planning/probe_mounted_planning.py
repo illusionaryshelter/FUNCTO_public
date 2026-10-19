@@ -194,16 +194,15 @@ def run(args):
         report["fixed_hand_hypothesis"] = hand_report
         # END independently measured q/dq remain the separate execution contract.
         # The box is specified by this synthetic experiment, not inferred from
-        # an RGB-D image or filled around a failed candidate. Its finite border
-        # still uses the production whole-sphere unknown-space constraint.
+        # an RGB-D image or filled around a failed candidate. The finite border
+        # records observed coverage separately from ordinary collision costs.
         origin = problem.base_pose[:3, 3] - 2.
         coverage = ObservedSpace(np.ones((81, 81, 81), bool), origin=origin, voxel_size=.05,
             observation_ids=("explicit synthetic known box; no recorded observation evidence",),
             reference_frame=problem.reference_frame)
         scene = OnlinePlanningScene(background=empty_background(coverage), owners=owners, coverage=coverage,
             reference_frame=problem.reference_frame, robot_sphere_materials=(None,) * sphere_count,
-            robot_geometry_source=fixture["robot_geometry_source"], gripper=hand,
-            unknown_policy={"outside_regions": "forbid", "conditional_regions": []})
+            robot_geometry_source=fixture["robot_geometry_source"], gripper=hand)
         scene.observation_report = {"scope": scope, "synthetic_known_box_origin_m": origin.tolist(),
                                     "synthetic_known_box_shape_zyx": [81, 81, 81], "voxel_size_m": .05}
         with torch.no_grad():

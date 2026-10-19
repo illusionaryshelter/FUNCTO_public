@@ -61,7 +61,7 @@ def scene(current_hand, *, distance=1.):
     coverage = ObservedSpace(valid, origin=[-1.]*3, voxel_size=.2, observation_ids=('A',), reference_frame='world')
     result = OnlinePlanningScene(background=background, owners=(), coverage=coverage,
         reference_frame='world', robot_sphere_materials=(None,)*3, robot_geometry_source='test native geometry',
-        gripper=current_hand, unknown_policy={'outside_regions': 'forbid', 'conditional_regions': []})
+        gripper=current_hand)
     radius = current_hand.local_spheres[0, 3]
     result.bind_online_robot(robot_sphere_geometry=[{'link_name': f'link_{i}', 'sphere_indices': [i],
         'centers_local': [[0., 0., 0.]], 'radii': [radius if i < 2 else .01]} for i in range(3)],

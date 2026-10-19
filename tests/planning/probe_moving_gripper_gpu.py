@@ -190,7 +190,7 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
         # END planning and execution serialize this same field.
         coverage = ObservedSpace(np.ones((81, 81, 81), bool), origin=[-2., -2., -2.], voxel_size=.05,
                                  observation_ids=("explicit synthetic known-space grid",), reference_frame="robot_base")
-        scene = OnlinePlanningScene(unknown_policy={"outside_regions": "forbid", "conditional_regions": []}, background=background, owners=installations, coverage=coverage, reference_frame="robot_base",
+        scene = OnlinePlanningScene(background=background, owners=installations, coverage=coverage, reference_frame="robot_base",
                               robot_sphere_materials=(None,)*kinematics.total_spheres,
                               robot_geometry_source=fixture["robot_geometry_source"],
                               gripper=hand)
@@ -228,9 +228,9 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
         original_export = planner_module._CuroboPlanner.export
         report["candidate_scene_components"] = []
 
-        def measured_export(planner, native_result):
+        def measured_export(planner, native_result, native_report):
             """Inspect the one accepted export without changing its result."""
-            curve, count = original_export(planner, native_result)
+            curve, count = original_export(planner, native_result, native_report)
             times = np.linspace(0., curve.duration, 401)
             # BEGIN the joint sample exposes acceleration before progress.
             coordinates, _, _, progress = curve.sample(times)
@@ -241,7 +241,7 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
                 state = kinematics.compute_kinematics(JointState.from_position(native_q, joint_names=list(names)))
                 tool_p, tool_r = problem.transform_tool_pose(state.tool_poses.position[:, :, tool_index],
                                                             state.tool_poses.quaternion[:, :, tool_index])
-                terms = planner._verification_scene.components(problem.transform_robot_spheres(state.robot_spheres),
+                terms = planner.scene.components(problem.transform_robot_spheres(state.robot_spheres),
                     tool_p, tool_r, native_s, native_q, names, trajectory_time=device.to_device(times)[None])
                 expected = bounds(native_s)[0]
                 report["candidate_scene_components"].append({

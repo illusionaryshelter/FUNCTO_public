@@ -307,12 +307,12 @@ def probe(args, prepared, targets, report):
     problem, scene, budget = prepared["problem"], prepared["scene"], prepared["budget"]
     robot, metadata = _bounded_robot_configuration(prepared["robot"], problem, scene, budget)
     # BEGIN the standalone single-state query has the same CPU/GPU ownership.
-    allocation = scene.estimated_workspace_allocation(args.ik_seeds, 1, robot_coverage_horizon=1)
+    allocation = scene.estimated_workspace_allocation(args.ik_seeds, 1)
     workspace = _PlanningWorkspace(allocation["cpu_shared"], allocation["cpu_live"],
-        sum(allocation[name] for name in ("gpu_retained", "gpu_live", "gpu_shared")), 0, 0, False)
+        sum(allocation[name] for name in ("gpu_retained", "gpu_live", "gpu_shared")), 0)
     if workspace.gpu_bytes > args.scene_gpu_workspace_mib*1024**2:
         raise ValueError("Actual single-state GPU scene queries exceed the declared workspace budget")
-    _require_planning_host_memory(workspace, max_host_rss_bytes=budget.max_host_rss_bytes)
+    _require_planning_host_memory(workspace.cpu_live_bytes, max_host_rss_bytes=budget.max_host_rss_bytes)
     # END source geometry is never passed to the CUDA preflight as device bytes.
     device = DeviceCfg("cuda:0")
     report["resources"].update(estimated_scene_query_bytes=workspace.total_bytes,
@@ -502,7 +502,6 @@ def parse_args():
                         help="One original source frame per target; repeat for at most three targets")
     parser.add_argument("--owner-mask", nargs=3, action="append", required=True,
                         metavar=("OWNER_ID", "VIEW_ID", "MASK_PATH"))
-    parser.add_argument("--unknown-policy", type=Path, required=True)
     parser.add_argument("--fine-regions", type=Path)
     parser.add_argument("--contact-bindings", type=Path)
     parser.add_argument("--mapping-memory-mib", type=int, default=1024)
