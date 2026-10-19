@@ -70,6 +70,30 @@ class CurvedGeometryTests(unittest.TestCase):
         self.assertGreater(mode['diagnostics']['sample_count'], 6)
         self.assertIsNone(mode['normal'])
 
+    # BEGIN complete source structure remains distinct from sparse query roles.
+    def test_structural_source_keeps_actual_entity_rows_and_calibrated_pitch(self):
+        depth = np.full((25, 25), .6)
+        region = (self.xx >= 10) & (self.xx <= 14) & (self.yy >= 10) & (self.yy <= 14)
+        pose = np.eye(4)
+        pose[:3, 3] = [1., -2., .3]
+        source = observation(depth, self.K, pose=pose, region=region)
+        source['entity_member'] = source['pixels'][:, 0] >= 4
+        region_ids = np.flatnonzero(source['region_mask'])
+        ids = region_ids[[0, 4, 10, 14, 20, 24]]
+        pack = curved.prepare_source(source, depth, query_indices=ids, query_region=np.ones(6, bool))
+        actual_ids = np.flatnonzero(source['entity_member'])
+        self.assertGreater(len(pack['entity_indices']), len(pack['query_indices']))
+        np.testing.assert_array_equal(pack['entity_indices'], actual_ids)
+        np.testing.assert_array_equal(pack['entity_xyz'], source['xyz'][actual_ids])
+        np.testing.assert_array_equal(pack['entity_region'], source['region_mask'][actual_ids])
+        np.testing.assert_allclose(pack['entity_pixel_pitch_m'], .0015, rtol=0, atol=1e-15)
+        np.testing.assert_array_equal(pack['source_camera_position_world'], pose[:3, 3])
+        self.assertTrue(np.all(pack['entity_position_error_m'] >= .0001))
+        frozen = pack['entity_xyz'].copy()
+        source['xyz'][:] = 0.
+        np.testing.assert_array_equal(pack['entity_xyz'], frozen)
+    # END original entity identity is not inferred from a query sampling budget.
+
     def test_step_edges_do_not_join_the_existing_8mm_or_40mm_counterexamples(self):
         for jump in (.008, .04):
             with self.subTest(jump=jump):
@@ -118,6 +142,81 @@ class CurvedGeometryTests(unittest.TestCase):
         record = curved.project_measurements(surface, np.array([[.5*.6/400, 0, .6]]), 0)
         self.assertFalse(record['supported'][0])
         self.assertEqual(record['state_names'][record['states'][0]], 'pixel_association_ambiguous')
+
+    # BEGIN actual-point support at depth boundaries without bridging surfaces.
+    def test_direct_position_support_survives_a_cut_without_borrowing_pixel_allowance(self):
+        surface = self.surface(np.where(self.xx < 12, .6, .64))
+        point = np.array([[(11.2-12)*.6/400, 0, .6]])
+        direct = curved.project_measurements(surface, point, 0, registration_error_m=.00025)
+        self.assertTrue(direct['supported'][0])
+        self.assertEqual(direct['support_kind'][0], 'direct_measurement')
+        self.assertLess(direct['residual_m'][0], direct['direct_association_bound_m'][0])
+        self.assertEqual(direct['association_bound_m'][0], direct['direct_association_bound_m'][0])
+        selected = surface['pixel_to_observation'][0][12, 11]
+        self.assertEqual(direct['observation_indices'][0], selected)
+
+        # With no registration budget the same actual point is too far away.
+        # A slope-derived rounding allowance cannot make the cut continuous.
+        unresolved = curved.project_measurements(surface, point, 0)
+        self.assertGreater(unresolved['residual_m'][0], unresolved['direct_association_bound_m'][0])
+        self.assertLess(unresolved['residual_m'][0], unresolved['association_bound_m'][0])
+        self.assertTrue(unresolved['unknown'][0])
+        self.assertEqual(unresolved['support_kind'][0], 'none')
+
+        across = surface['pixel_to_observation'][0][12, 12]
+        self.assertEqual(surface['depth_adjacency'][selected, across], 0)
+        members, _ = curved.bounded_members(surface, int(selected), .03, view_index=0)
+        self.assertNotIn(across, members)
+
+    def test_direct_position_support_does_not_fabricate_feature_corner_support(self):
+        from .curved_features import SurfaceResponseField
+
+        depth = np.where(self.xx < 12, .6, .64)
+        declared = views(depth, self.K)
+        surface = curved.build_target_surface(declared)
+        queries = np.ones((1, 1), dtype=np.float32)
+        # The coarse feature cell around pixel (11,12) has positive corners on
+        # both sides of the cut. Position compatibility must not join them.
+        prepared = [dict(id=view['id'], query_descriptors=queries,
+            observation=view['observation'], response=np.ones((1, 3, 3), dtype=np.float32),
+            crop_xyxy=[0, 0, 25, 25]) for view in declared]
+        field = SurfaceResponseField(surface, queries, prepared)
+        point = np.array([[(11.2-12)*.6/400, 0, .6]])
+        result = field.sample(point, np.full_like(point, np.nan), registration_error_m=.00025)
+        self.assertTrue(all(record['supported'][0] for record in result['geometry']))
+        self.assertFalse(result['known'].any())
+        self.assertTrue(np.all(result['view_state'] == 'partial_feature_support'))
+
+    def test_continuous_pixel_model_remains_distinct_from_direct_support(self):
+        surface = self.surface(np.full((25, 25), .6))
+        point = np.array([[.2*.6/400, 0, .6]])
+        result = curved.project_measurements(surface, point, 0)
+        self.assertTrue(result['supported'][0])
+        self.assertEqual(result['support_kind'][0], 'continuous_pixel_model')
+        self.assertGreater(result['residual_m'][0], result['direct_association_bound_m'][0])
+
+    def test_direct_budget_does_not_resolve_an_exact_half_pixel_tie(self):
+        surface = self.surface(np.full((25, 25), .6))
+        point = np.array([[.5*.6/400, 0, .6]])
+        result = curved.project_measurements(surface, point, 0, registration_error_m=.002)
+        self.assertLess(result['residual_m'][0], result['direct_association_bound_m'][0])
+        self.assertEqual(result['state_names'][result['states'][0]], 'pixel_association_ambiguous')
+        self.assertEqual(result['support_kind'][0], 'none')
+        self.assertTrue(result['unknown'][0])
+
+    def test_direct_budget_cannot_replace_a_missing_original_pixel(self):
+        depth = np.full((25, 25), .6)
+        depth[:, 12] = 0.
+        surface = self.surface(depth)
+        point = np.array([[(11.8-12)*.6/400, 0, .6]])
+        # Pixel 11 has a nearby measured point inside this uncertainty bound;
+        # pixel 12 is the fixed association and has no measurement to support.
+        result = curved.project_measurements(surface, point, 0, registration_error_m=.002)
+        self.assertEqual(result['state_names'][result['states'][0]], 'invalid_depth')
+        self.assertEqual(result['observation_indices'][0], -1)
+        self.assertEqual(result['support_kind'][0], 'none')
+        self.assertTrue(result['unknown'][0])
+    # END direct support changes no graph, feature footprint or tie convention.
 
     def test_axial_conflict_is_not_overridden_by_wider_world_distance_bound(self):
         surface = self.surface(np.full((25, 25), .6))

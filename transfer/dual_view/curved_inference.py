@@ -1,9 +1,8 @@
 """Finite point-correspondence inference with explicit curved observations.
 
-The existing proposal generator, partial one-to-one refits and fixed-Q
-empirical score are shared. This CPU geometry evaluator never calls a planar
-projector, never treats an unknown normal as a measured direction, and keeps
-region identification separate from the uniqueness of an estimated frame.
+The shared appearance proposals and score are retained, but surface admission
+also checks the complete observed entity. Identity, finite-pool disagreement,
+and availability of the frozen sampling anchor have separate decisions.
 """
 
 from time import perf_counter
@@ -17,6 +16,9 @@ from .features import capacity_score
 from .inference import _finite_list, _support_summary
 from .proposals import COMPATIBILITY_RATIO, build_proposals, transform_key, valid_transform
 from .refinement import partial_refits
+# BEGIN: surface-only structural evidence; the planar evaluator is unchanged.
+from .curved_structure import entity_evidence, compare_transforms
+# END: independent observed-entity module.
 
 
 def combine_support(projections):
@@ -136,7 +138,7 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
         score_definition='fixed_Q_capacity_one_positive_centered_target_domain_mid_cdf',
         appearance_reference=domain['empirical_support'].diagnostics,
         observation_model=surface['diagnostics']['observation_model'],
-        local_geometry_contract='actual_region_measurements_and_independent_checks',
+        local_geometry_contract='actual_region_and_complete_observed_entity_measurements',
         sampling_metric='observed_graph_path_length', sampling_radius_m=sampling_radius_m,
         sampling_spacing_m=sampling_spacing_m, sampling_scale_applied=False,
         global_optimality_certified=False, transform_certified=False,
@@ -212,19 +214,50 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
             rejections.append('supported_correspondence_rank_below_two')
         if not correspondence['rotation_algebraically_identifiable']:
             rejections.append('correspondence_rotation_not_identifiable')
+        # BEGIN: entity refutation is part of identity, not a quality warning.
+        if np.any(support['conflict'] & ~regional):
+            rejections.append('context_query_depth_model_conflict')
+        if np.any(checks['conflict'] & ~source['check_region']):
+            rejections.append('context_check_depth_model_conflict')
+        structure = dict(status='not_evaluated_after_query_or_check_rejection')
+        if not rejections:
+            structure, context_source, context_target = entity_evidence(
+                source, surface, transform, registration_error)
+            structure['correspondence_geometry'] = _correspondence_geometry(
+                context_source, context_target, transform)
+            if structure['conflict_count']:
+                rejections.append('observed_entity_depth_model_conflict')
+            if len(context_source) < 6:
+                rejections.append('fewer_than_six_distinct_context_measurements')
+            context_geometry = structure['correspondence_geometry']
+            if min(context_geometry['source_rank'], context_geometry['target_rank']) < 2:
+                rejections.append('context_correspondence_rank_below_two')
+            if not context_geometry['rotation_algebraically_identifiable']:
+                rejections.append('context_correspondence_rotation_not_identifiable')
+        # The six-point rule is the existing minimum fitting evidence, now
+        # also required outside the region. It is not an identity certificate.
+        # END: unknown entity rows neither refute nor supply positive matches.
         mode, region_reason = geometry.region_for_transform(surface, source, transform,
             registration_error_m=registration_error, sampling_radius_m=sampling_radius_m,
             sampling_spacing_m=sampling_spacing_m)
-        if region_reason:
-            rejections.append(region_reason)
+        # BEGIN: output availability must not reorder identity candidates.
         if mode is not None and (int(mode['mask'].sum()) < 6 or rank(surface['xyz'][mode['mask']])[0] < 2):
-            rejections.append('insufficient_observed_region_geometry')
+            region_reason = region_reason or 'insufficient_observed_region_geometry'
+        # END: the chosen estimate's sampling gate is applied after selection.
         context_conflict = int(np.count_nonzero(support['conflict'] & ~regional))
         context_check_conflict = int(np.count_nonzero(checks['conflict'] & ~source['check_region']))
         context_unknown = int(np.count_nonzero(support['unknown'] & ~regional))
         context_check_unknown = int(np.count_nonzero(checks['unknown'] & ~source['check_region']))
-        entity_state = ('observed_conflict' if context_conflict or context_check_conflict else
-                        'partially_observed' if context_unknown or context_check_unknown else 'observed_consistent')
+        # BEGIN full-entity diagnostics supersede the sparse context summary.
+        # A conflict or unknown measurement outside the query/check samples is
+        # still evidence about this entity; do not label that result consistent.
+        if structure['status'] == 'evaluated':
+            entity_state = ('observed_conflict' if structure['conflict_count'] else
+                            'partially_observed' if structure['unknown_count'] else 'observed_consistent')
+        else:
+            entity_state = ('observed_conflict' if context_conflict or context_check_conflict else
+                            'partially_observed' if context_unknown or context_check_unknown else 'observed_consistent')
+        # END preserve the sparse summary only when complete geometry was skipped.
         hypothesis_id = len(records)
         summary = dict(hypothesis_id=hypothesis_id, origins=origins,
             transform=[float(transform[0]), transform[1].tolist(), transform[2].tolist()],
@@ -251,7 +284,9 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
             context_query_unknown_count=context_unknown, context_check_unknown_count=context_check_unknown,
             orientation_state='unknown', mapped_center=apply_sim3(source['center'], *transform).tolist(),
             mapped_normal=None, center_used_as_contact_measurement=False,
-            admitted_to_H=not rejections, rejections=rejections, output_available=mode is not None,
+            entity_structure=structure,
+            admitted_to_H=not rejections, rejections=rejections,
+            output_available=mode is not None and region_reason is None,
             output_reason=region_reason, potential_winner=False, region=_region_summary(mode))
         records.append(dict(transform=transform, summary=summary, mode=mode))
         diagnostics['hypotheses'].append(summary)
@@ -267,66 +302,73 @@ def evaluate_candidates(source, surface, appearance, proposals, domain, *,
                 evaluate(item['transform'], list(item['origins']))
         admitted = [r for r in records if r['summary']['admitted_to_H']]
         diagnostics.update(evaluated_transform_count=len(records), hypotheses_admitted=len(admitted))
+        # BEGIN: all structurally admitted estimates remain plausible. An
+        # uncalibrated appearance score orders representatives; even an exact
+        # highest score cannot dismiss a spatially incompatible structure.
         if not admitted:
-            result.update(status='rejected_no_supported_region',
-                          reasons=['no_locally_supported_hypothesis_in_declared_search'])
+            result.update(status='rejected_no_supported_structure',
+                          reasons=['no_structurally_supported_hypothesis_in_declared_search'])
         else:
-            best = max(r['summary']['score'] for r in admitted)
-            winners = [r for r in admitted if r['summary']['score'] == best]
-            for item in winners:
+            winners = sorted(admitted, key=lambda r: (-r['summary']['score'], r['summary']['hypothesis_id']))
+            selected = winners[0]
+            best = selected['summary']['score']
+            for item in admitted:
                 item['summary']['potential_winner'] = True
             ids = [r['summary']['hypothesis_id'] for r in winners]
+            agreement = compare_transforms(source, winners)
             diagnostics.update(best_score=best, potential_winner_ids=ids,
                 potential_winner_count=len(winners), finite_candidate_unique=len(winners) == 1,
-                best_candidate_pose_differences=_pose_differences(winners))
-            primary = dict(winners[0]['mode'])
-            if len(winners) > 1:
-                common = np.logical_and.reduce([r['mode']['mask'] for r in winners])
-                seeds = [r['mode']['seed_index'] for r in winners]
-                if not common[seeds].all():
-                    primary = None
-                    result.update(status='rejected_ambiguous_region', reasons=['best_candidates_have_distinct_observed_regions'])
-                else:
-                    primary = geometry.sample_members(surface, np.flatnonzero(common), seeds[0],
-                        sampling_radius_m=sampling_radius_m, sampling_spacing_m=sampling_spacing_m)
-                    if (not primary['mask'][seeds].all() or primary['mask'].sum() < 6
-                            or rank(surface['xyz'][primary['mask']])[0] < 2):
+                admitted_candidate_pose_differences=_pose_differences(winners),
+                finite_structure_agreement=agreement,
+                structure_hypothesis_ids=ids,
+                selected_hypothesis_id=selected['summary']['hypothesis_id'],
+                selection_rule='highest_fixed_Q_score_only_after_all_admitted_structures_agree')
+            primary = None
+            if not agreement['agree']:
+                result.update(status='rejected_ambiguous_structure',
+                    reasons=['admitted_entity_transforms_disagree_beyond_declared_budgets'])
+            else:
+                result.update(region_identified=True, finite_candidate_unique=len(winners) == 1)
+                diagnostics['region_identified'] = True
+                if selected['summary']['output_available']:
+                    primary = dict(selected['mode'])
+                    available = [r for r in winners if r['summary']['output_available']]
+                    diagnostics['sampling_alternatives'] = [dict(
+                        hypothesis_id=r['summary']['hypothesis_id'],
+                        available=r['summary']['output_available'],
+                        reason=r['summary']['output_reason'],
+                        seed_index=None if r['mode'] is None else r['mode']['seed_index']) for r in winners]
+                    # Spatial agreement is not graph connectivity. Another
+                    # available estimate on a disconnected measured patch
+                    # preserves identity but prevents an actionable sampling
+                    # choice. Missing anchors supply no alternative support.
+                    if any(not primary['mask'][r['mode']['seed_index']]
+                           or not r['mode']['mask'][primary['seed_index']] for r in available):
                         primary = None
-                        result.update(status='rejected_ambiguous_region',
-                            reasons=['best_candidates_common_region_has_insufficient_connected_geometry'])
-                    else:
-                        warnings.append('tied_estimates_common_region_only')
+                        result.update(status='identified_region_sampling_ambiguous',
+                            reasons=['consistent_structures_have_disconnected_observed_anchor_regions'])
+                    elif len(available) < len(winners):
+                        warnings.append('some_consistent_estimates_have_unobserved_sampling_anchors')
+                else:
+                    result.update(status='identified_region_sampling_unavailable',
+                        reasons=[selected['summary']['output_reason'] or 'observed_region_unavailable'])
+                if len(winners) > 1:
+                    warnings.append('multiple_estimates_agree_within_declared_spatial_budget')
             if primary is not None:
-                primary.update(type='primary', score=best, hypothesis_indices=ids,
-                               hypothesis_index=ids[0])
+                primary.update(type='primary', score=best,
+                    hypothesis_indices=[selected['summary']['hypothesis_id']],
+                    hypothesis_index=selected['summary']['hypothesis_id'])
                 result.update(accepted=True, status='accepted_observed_region', modes=[primary],
                     region_identified=True, finite_candidate_unique=len(winners) == 1)
-                diagnostics['region_identified'] = True
-                if len(winners) == 1:
-                    chosen, transform = winners[0]['summary'], winners[0]['transform']
-                    result.update(sim3_scale=transform[0], sim3_rotation=transform[1], sim3_translation=transform[2],
-                        src_anchor_idx=source['query_indices'][chosen['paired_query_rows']],
-                        tgt_anchor_idx=np.asarray(chosen['paired_surface_indices'], np.int64))
-                if any(r['summary']['entity_model_status'] != 'observed_consistent' for r in winners):
+                chosen, transform = selected['summary'], selected['transform']
+                result.update(sim3_scale=transform[0], sim3_rotation=transform[1], sim3_translation=transform[2],
+                    src_anchor_idx=source['query_indices'][chosen['paired_query_rows']],
+                    tgt_anchor_idx=np.asarray(chosen['paired_surface_indices'], np.int64))
+                if any(r['summary']['entity_structure']['unknown_count'] for r in winners):
                     warnings.append('entity_transform_not_fully_supported')
                 if any(r['summary']['unknown_count'] for r in winners):
                     warnings.append('selected_estimate_has_unknown_appearance')
-                # Preserve the strongest observed competitor rather than
-                # claiming a tuned score gap is a probability of correctness.
-                alternatives = sorted((r for r in admitted if r['summary']['hypothesis_id'] not in ids),
-                    key=lambda r: (-r['summary']['score'], r['summary']['hypothesis_id']))
-                diagnostics['competing_regions'] = []
-                for candidate in alternatives:
-                    mode = candidate['mode']
-                    if not primary['mask'][mode['seed_index']] or not mode['mask'][primary['seed_index']]:
-                        summary = candidate['summary']
-                        other = dict(mode, type='competitor_distinct_observed_region',
-                            hypothesis_index=summary['hypothesis_id'], score=summary['score'])
-                        result['modes'].append(other)
-                        diagnostics['competing_regions'].append(dict(hypothesis_id=summary['hypothesis_id'],
-                            score=summary['score'], score_gap=best-summary['score'], is_confidence_bound=False))
-                        warnings.append('other_observed_regions_compete')
-                        break
+        # END: an unavailable anchor never promotes another identity estimate.
         if not result['accepted']:
             available = sorted((r for r in records if r['mode'] is not None),
                 key=lambda r: (not r['summary']['admitted_to_H'], -r['summary']['score'], r['summary']['hypothesis_id']))

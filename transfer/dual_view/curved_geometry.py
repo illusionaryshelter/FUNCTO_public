@@ -50,6 +50,7 @@ STATE_NAMES = ('measurement_supported', 'behind_camera', 'outside_image',
 _STATE = {name: i for i, name in enumerate(STATE_NAMES)}
 
 
+# BEGIN preserve complete measured source structure alongside local evidence.
 def prepare_source(source, depth_m, *, query_indices, query_region,
                    sampling_radius_m=.03, model=None):
     """Freeze the existing queries/checks and actual source sampling anchors.
@@ -70,7 +71,7 @@ def prepare_source(source, depth_m, *, query_indices, query_region,
         raise ValueError('Query provenance disagrees with source region/entity')
     # Validate the complete calibrated depth against the supplied point bank;
     # no local-plane validity mask participates in this position check.
-    full, _, _, lookup, _, _, _ = _view_arrays(dict(depth_m=depth_m,
+    full, _, _, lookup, intrinsic, camera_pose, depth = _view_arrays(dict(depth_m=depth_m,
         K=source['K'], T_world_camera_cv=source['T_world_camera_cv'], observation=source))
     pixels = np.asarray(source['pixels'])
     model = ObservationModel() if model is None else model
@@ -80,6 +81,16 @@ def prepare_source(source, depth_m, *, query_indices, query_region,
     position_error = model.depth_error_m*np.linalg.norm(rays, axis=1)
     if np.any(lookup[pixels[:, 1], pixels[:, 0]] < 0):
         raise ValueError('Every source point must name an actual depth measurement')
+    # BEGIN retain the complete observed entity for structural proposals.
+    # Query/check FPS is an evaluation budget, not a replacement for the source
+    # object's geometry. Keep original row identities and actual measurements;
+    # estimated descriptor normals never become measured source directions.
+    entity_ids = np.flatnonzero(entity)
+    inverse_intrinsic = np.linalg.inv(intrinsic)
+    transverse_ray_pitch = min(np.linalg.norm(inverse_intrinsic[:, 0]),
+                               np.linalg.norm(inverse_intrinsic[:, 1]))
+    entity_pixel_pitch = depth[pixels[entity_ids, 1], pixels[entity_ids, 0]]*transverse_ray_pitch
+    # END complete observed source entity and calibrated descriptor scale.
     unused = entity.copy()
     unused[ids] = False
     checks = []
@@ -107,10 +118,16 @@ def prepare_source(source, depth_m, *, query_indices, query_region,
         check_point_count=len(check_ids), check_region_count=int(region[check_ids].sum()),
         check_context_count=int((~region[check_ids]).sum()), check_normal_valid_count=0,
         source_region_points=len(region_ids), full_depth_point_count=len(full),
+        source_entity_point_count=len(entity_ids),
         source_entity_rms_m=float(size), source_anchor_indices=anchors.tolist(),
         anchor_definition='squared_distance_medoid_set_exact_ties_retained',
         normal_domain='not_required_for_position', quality_warnings=[])
+    # BEGIN explicit structural inputs are independent of sampling anchors/F.
     return dict(region_geometry='surface', query_indices=ids, query_region=regional,
+        entity_indices=entity_ids, entity_xyz=points[entity_ids].copy(),
+        entity_position_error_m=position_error[entity_ids], entity_region=region[entity_ids].copy(),
+        entity_pixel_pitch_m=entity_pixel_pitch,
+        source_camera_position_world=camera_pose[:3, 3].copy(),
         query_xyz=points[ids].copy(), query_normals=np.full((len(ids), 3), np.nan),
         query_position_error_m=position_error[ids],
         query_normal_valid=np.zeros(len(ids), bool), check_indices=check_ids,
@@ -121,6 +138,8 @@ def prepare_source(source, depth_m, *, query_indices, query_region,
         normal=None, anchor_indices=anchors, anchor_xyz=points[anchors].copy(),
         anchor_position_error_m=position_error[anchors],
         size=float(size), diagnostics=diagnostics, reasons=reasons)
+    # END actual source geometry remains separate from observed target evidence.
+# END measured source preparation for the explicit curved branch.
 
 
 def _pixel_edges(xyz, pixels, entity, lookup, K, pose, depth, model):
@@ -339,15 +358,22 @@ def _conflict_footprint_continuous(surface, camera, pixels, errors, view_index):
     return result
 
 
+# BEGIN direct measured-point and continuous-pixel support remain distinct.
 def project_measurements(surface, points, view_index, *, registration_error_m=0.,
                          query_position_error_m=0.):
     """Associate a query with the deterministic nearest original pixel only.
 
     No favorable point/feature search or continuous-depth interpolation occurs.
-    The pixel-rounding allowance comes from the declared depth-slope model.
-    A nearer-than-observed query exceeding that same model is a model conflict,
-    not an unconditional free-space certificate. Behind-first-return queries
-    stay unknown/occluded. Exact half-pixel association ties remain unknown.
+    Direct support uses only the registration/source/target measurement bounds;
+    it needs no continuous pixel cell. Additional pixel-rounding allowance uses
+    the declared depth-slope model and requires that cell's observed continuity.
+    A nearer-than-observed query exceeding that model is a model conflict, not
+    an unconditional free-space certificate. Behind-first-return queries stay
+    unknown/occluded. Exact half-pixel association ties remain unknown.
+    ``support_kind`` names the final position-support evidence (including an
+    actual nonentity measurement); all unknown/conflicting rows remain ``none``.
+    ``association_bound_m`` uses the strict direct bound whenever that evidence
+    supports the position; it must not report a discarded pixel allowance.
     """
     points = _points(points, 'curved projection points')
     if view_index not in (0, 1):
@@ -377,6 +403,10 @@ def project_measurements(surface, points, view_index, *, registration_error_m=0.
     residual = np.full(len(points), np.nan)
     allowance = np.full(len(points), np.nan)
     depth_residual = np.full(len(points), np.nan)
+    # BEGIN distinguish actual-point support from a continuous-cell allowance.
+    support_kind = np.full(len(points), 'none', dtype='<U22')
+    direct_allowance = np.full(len(points), np.nan)
+    # END support provenance does not change the measurement association.
     active = np.flatnonzero(inside)
     xy = np.rint(pixels[active]).astype(np.int64)
     near = lookup[xy[:, 1], xy[:, 0]]
@@ -397,6 +427,17 @@ def project_measurements(surface, points, view_index, *, registration_error_m=0.
         delta_z = camera[active, 2]-z
         axial_bound = (registration_error_m+query_error[active]+model.depth_error_m
                        +model.max_depth_slope*transverse)
+        # BEGIN a measured point can support a query without interpolating the
+        # adjacent depth cell. These strict bounds contain no transverse-pixel
+        # or slope allowance, so a cut/missing neighboring pixel supplies no
+        # invented geometry. The axial condition also preserves the stronger
+        # depth restriction for off-axis rays with a wider world error bound.
+        direct_bound = registration_error_m+measurement
+        direct_axial_bound = registration_error_m+query_error[active]+model.depth_error_m
+        direct = ((distance <= np.nextafter(direct_bound, np.inf))
+                  & (np.abs(delta_z) <= direct_axial_bound))
+        direct_allowance[active] = direct_bound
+        # END direct support uses this same deterministic nearest original pixel.
         conflict = delta_z < -axial_bound
         behind = delta_z > axial_bound
         supported = (distance <= np.nextafter(bound, np.inf)) & ~(conflict | behind)
@@ -414,10 +455,10 @@ def project_measurements(surface, points, view_index, *, registration_error_m=0.
         state[active[conflict_rows[~continuous_error]]] = _STATE['association_unresolved']
         # END: an uncertain footprint across a depth cut supplies no conflict.
         ties = np.any(np.abs(np.abs(pixels[active]-xy)-.5) <= numeric, axis=1)
-        # BEGIN: a subpixel depth comparison needs the original cell's complete
-        # connected depth observations. Across a missing/cut side the nearest
-        # pixel may lie on another surface, so neither support nor conflict is
-        # established. This checks observations; it does not interpolate depth.
+        # BEGIN: any support that borrows the slope/pixel-rounding allowance
+        # needs complete connected depth observations. Direct measured-point
+        # support does not borrow that allowance and survives a neighboring
+        # cut. Negative evidence keeps the original complete-cell restriction.
         lower, upper = np.floor(pixels[active]).astype(int), np.ceil(pixels[active]).astype(int)
         cell = np.column_stack((lookup[lower[:, 1], lower[:, 0]], lookup[lower[:, 1], upper[:, 0]],
                                 lookup[upper[:, 1], lower[:, 0]], lookup[upper[:, 1], upper[:, 0]]))
@@ -426,10 +467,19 @@ def project_measurements(surface, points, view_index, *, registration_error_m=0.
         for left, right in ((0, 1), (0, 2), (1, 3), (2, 3)):
             connected = np.asarray(surface['depth_adjacency'][safe[:, left], safe[:, right]]).ravel() > 0
             continuous &= (safe[:, left] == safe[:, right]) | connected
-        state[active[~continuous]] = _STATE['association_unresolved']
+        state[active[~continuous & ~direct]] = _STATE['association_unresolved']
         # END: subpixel depth evidence qualification.
         state[active[ties]] = _STATE['pixel_association_ambiguous']
-        residual[active], allowance[active], depth_residual[active] = distance, bound, delta_z
+        # BEGIN attach support provenance only after all final state gates.
+        position_supported = ((state[active] == _STATE['measurement_supported'])
+                              | (state[active] == _STATE['outside_entity']))
+        support_kind[active[position_supported & direct]] = 'direct_measurement'
+        support_kind[active[position_supported & ~direct]] = 'continuous_pixel_model'
+        # END ties, missing observations and conflicts never acquire provenance.
+        # BEGIN report the bound that actually supplies the position evidence.
+        effective_bound = np.where(position_supported & direct, direct_bound, bound)
+        residual[active], allowance[active], depth_residual[active] = distance, effective_bound, delta_z
+        # END unsupported rows retain the diagnostic pixel-model bound only.
     supported = state == _STATE['measurement_supported']
     position = supported | (state == _STATE['outside_entity'])
     conflict = state == _STATE['depth_model_conflict']
@@ -437,8 +487,10 @@ def project_measurements(surface, points, view_index, *, registration_error_m=0.
         unknown=~(supported | conflict), entity_supported=supported,
         pixels=pixels, observation_indices=ids, states=state, state_names=list(STATE_NAMES),
         residual_m=residual, association_bound_m=allowance, camera_z_residual_m=depth_residual,
+        support_kind=support_kind, direct_association_bound_m=direct_allowance,
         orientation_state=np.full(len(points), 'unknown'),
         query_normal_valid=np.zeros(len(points), bool))
+# END curved measurement support; planar projection is independent and unchanged.
 
 
 def bounded_members(surface, seed, radius, *, view_index=None):
