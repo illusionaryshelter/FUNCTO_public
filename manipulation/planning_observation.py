@@ -724,6 +724,57 @@ def _require_native_voxel_layout(voxel, native):
 
 
 # BEGIN independently bounded owner resolution on the same current RGB-D input.
+# BEGIN task ownership, rather than experiment flags, selects map precision.
+TASK_VOXEL_SIZE_M = 0.002
+DEFAULT_ENVIRONMENT_VOXEL_SIZE_M = 0.01
+
+
+def scene_task_owner_ids(scene):
+    """Read the manipulated body and functional reference from a bound scene.
+
+    These are semantic identities already established by task grounding. An
+    additional collision owner, including an initial support surface, is an
+    environment owner unless it is also the current functional reference.
+    No object name, dataset, geometry size or observed success selects a role.
+    """
+    if not isinstance(scene, Mapping):
+        raise ValueError('Task ownership requires a bound scene mapping')
+    carrier = _text(scene.get('carrier_id'), 'task carrier identity')
+    reference = scene.get('reference_id')
+    if reference is None:
+        return (carrier,)
+    reference = _text(reference, 'task functional reference identity')
+    if reference == carrier:
+        raise ValueError('Carrier and functional reference must be distinct owners')
+    return (carrier, reference)
+
+
+def observation_resolutions(owner_ids, *, task_owner_ids, environment_voxel_size):
+    """Resolve the common 2 mm task / coarser environment mapping contract.
+
+    All task identities must be present, even for invisible or completely
+    modelled bodies. A complete body avoids allocating a redundant RGB-D map;
+    it still uses this spacing for its registered contact query. Resource
+    admission may reject a request but cannot silently coarsen a task owner.
+    """
+    if isinstance(owner_ids, (str, bytes)) or isinstance(task_owner_ids, (str, bytes)):
+        raise ValueError('Owner identities must be explicit collections')
+    owners, task = tuple(owner_ids), tuple(task_owner_ids)
+    for identity in (*owners, *task):
+        _text(identity, 'observation owner identity')
+    if (len(set(owners)) != len(owners) or len(set(task)) != len(task)
+            or not set(task) <= set(owners)):
+        raise ValueError('Task owners must be distinct registered observation owners')
+    if (isinstance(environment_voxel_size, (bool, np.bool_))
+            or not isinstance(environment_voxel_size, Real)
+            or not np.isfinite(environment_voxel_size)
+            or environment_voxel_size <= TASK_VOXEL_SIZE_M):
+        raise ValueError('Environment grid spacing must be finite and coarser than 2 mm')
+    return {identity: TASK_VOXEL_SIZE_M if identity in task else float(environment_voxel_size)
+            for identity in owners}
+# END one library policy applies before any mapping or native allocation.
+
+
 def _owner_mapper_config(config, views, masks, owner_id, pose, voxel_size, depth_error_m, query_radius_m=0.):
     """Enclose every labelled depth sample in a finite owner-local grid.
 
@@ -1393,7 +1444,7 @@ def _map_online_partition(normalized, masks, identity, config, inverse, *, query
         'proposal_model':'Conservative component-AABB distance bound; values are not source occupancy or penetration'}
 
 
-def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_voxel_sizes_m,
+def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,task_owner_ids,
                          reference_frame,robot_sphere_materials,robot_geometry_source,
                          unknown_policy,gripper=None,has_gripper=True,contacts=(),
                          max_mapping_bytes=256*1024**2,max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
@@ -1424,8 +1475,11 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     ``complete_owners`` supplies existing CollisionOwner geometry in the same
     current owner frames. Their semantic masks still exclude those pixels
     from background mapping, and their measured rays still bound coverage.
-    Only the remaining partitions allocate a Mapper. The supplied resolution
-    must match each complete query's registered contact/field spacing; its
+    Only the remaining partitions allocate a Mapper. Task owners (the carrier
+    and functional reference) use 2 mm grids; other owners use the coarser
+    environment spacing from mapper_cfg. Task identities are required inputs,
+    not names inferred from masks. The resolved resolution must match each
+    complete query's registered contact/field spacing; its
     geometry and native material registration are validated by the final scene.
     # BEGIN initial support remains a separate current-state relation.
     ``initial_support_relations`` describes finite support already present at
@@ -1452,8 +1506,13 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     # END depth limits cannot restore excluded endpoints or free rays.
     if any(view['depth'].shape!=(mapper_cfg.image_height,mapper_cfg.image_width) for view in normalized.values()):
         raise ValueError('Snapshot image dimensions must match the allocated camera buffer')
-    if set(owner_frames)!=set(owner_voxel_sizes_m) or len(owner_frames)>32:
-        raise ValueError('Every selected owner must have exactly one explicit resolution')
+    # BEGIN the production path owns precision for every current request.
+    if len(owner_frames)>32:
+        raise ValueError('At most 32 observed owners are supported')
+    task_owner_ids = tuple(task_owner_ids) if not isinstance(task_owner_ids, (str, bytes)) else task_owner_ids
+    owner_voxel_sizes_m = observation_resolutions(owner_frames,
+        task_owner_ids=task_owner_ids, environment_voxel_size=mapper_cfg.voxel_size)
+    # END callers cannot downgrade a functional reference to save memory.
     frames={identity:(_pose_array(row['T_output_owner'],'current owner pose'),_text(row['source'],'owner source')) for identity,row in owner_frames.items()}
     # BEGIN consume only the complete owner/background endpoint partition.
     masks=_partition_masks(normalized,frames)
@@ -1511,6 +1570,14 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
         raise ValueError('Fixed regions must identify an observed mapped owner or background')
     for identity,request in requests.items():
         configs[identity]=_fine_mapper_config(configs[identity],request)
+        # BEGIN a bounded ROI cannot bypass the task/environment precision rule.
+        spacing = configs[identity].voxel_size
+        if identity in task_owner_ids:
+            if not .001 <= spacing <= TASK_VOXEL_SIZE_M:
+                raise ValueError('A task-owner ROI must retain 1–2 mm grid spacing')
+        elif spacing <= TASK_VOXEL_SIZE_M:
+            raise ValueError('An environment ROI must remain coarser than 2 mm')
+        # END ROI bounds and measurement evidence retain their existing checks.
     # BEGIN observation coverage retains the pre-expansion background layout.
     coverage_cfg = configs[None]
     background_radius = radius
@@ -1613,6 +1680,14 @@ def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,owner_vo
     # END reported background masks are the ones submitted to mapping.
     # BEGIN retain the exact self-filter and per-owner exclusion evidence.
     scene.observation_report={'source':'current calibrated owner-partitioned RGB-D','partitions':reports,
+        # BEGIN record the library decision together with actual allocated grids.
+        'resolution_policy': {'task_owner_ids': list(task_owner_ids),
+            'task_voxel_size_m': TASK_VOXEL_SIZE_M,
+            'environment_voxel_size_m': float(mapper_cfg.voxel_size),
+            'owner_voxel_sizes_m': {identity: (float(configs[identity].voxel_size)
+                if identity in configs else owner_voxel_sizes_m[identity]) for identity in frames},
+            'source': 'Library task-owner mapping policy; explicit grounded carrier/functional reference identities'},
+        # END complete geometry and observed maps share the same role inventory.
         'estimated_mapping_buffers_bytes':sum(estimates.values()),'depth_error_m':float(depth_error_m),
         # BEGIN distinguish native/complete geometry from allocated RGB-D fields.
         'mapped_partition_estimates_bytes':{('observed_background' if identity is None else identity):value for identity,value in estimates.items()},

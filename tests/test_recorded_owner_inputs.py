@@ -257,7 +257,7 @@ def test_complete_payload_enters_initial_scene_with_native_contacts_and_current_
     contacts = build_material_contact_rules(
         dict(materials={}, owner_materials={"payload": binding["materials"]}), [contact_declaration()])
     prepared["sphere_materials"] = binding["sphere_materials"]
-    owner = create_box_owner(prepared, contact_voxel_size_m=.0015)
+    owner = create_box_owner(prepared, contact_voxel_size_m=.002)
     record = view()
     identities = ("payload", "reference", "initial_support")
     masks = {identity: np.zeros(record["depth"].shape, bool) for identity in identities}
@@ -291,12 +291,16 @@ def test_complete_payload_enters_initial_scene_with_native_contacts_and_current_
          patch("manipulation.planning_observation._require_mapping_memory"), \
          patch("torch.cuda.mem_get_info", side_effect=AssertionError("CPU contract touched CUDA")):
         result = build_scene_from_rgbd({"current": record}, frames, mapper_cfg=cfg,
-            depth_error_m=.003, owner_voxel_sizes_m={"payload": .0015, "reference": .005, "initial_support": .01},
+            depth_error_m=.003, task_owner_ids=("payload", "reference"),
             reference_frame="world", robot_sphere_materials=(None,), robot_geometry_source="Native test robot",
             complete_owners=(owner,), contacts=contacts, native_geometry_materials=binding["native_geometry_materials"],
             has_gripper=False, unknown_policy=policy, max_mapping_bytes=1024**3)
     assert set(mapped) == {None, "reference", "initial_support"}
-    assert result.owners[0] is owner and owner.query.contact_voxel_size_m == .0015
+    # BEGIN complete payload and observed functional reference share task precision.
+    assert result.owners[0] is owner and owner.query.contact_voxel_size_m == .002
+    assert result.observation_report['resolution_policy']['owner_voxel_sizes_m'] == {
+        'payload': .002, 'reference': .002, 'initial_support': .01}
+    # END the environment plane keeps its separate coarse field.
     assert result.owners[1].query is mapped["reference"]
     assert result.owners[2].query is mapped["initial_support"]
     assert result.background is mapped[None] and result.coverage.observation_ids == ("current",)

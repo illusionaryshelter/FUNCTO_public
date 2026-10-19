@@ -1081,7 +1081,7 @@ class OnlineObservationContractTest(unittest.TestCase):
              patch('manipulation.planning_observation._known_free_voxels',wraps=_known_free_voxels) as coverage, \
              patch('torch.cuda.mem_get_info',side_effect=AssertionError('CPU contract touched CUDA')):
             result=build_scene_from_rgbd(views,frames,mapper_cfg=cfg,depth_error_m=.003,
-                owner_voxel_sizes_m={'part':.005},reference_frame='world',robot_sphere_materials=(None,),
+                task_owner_ids=('part',),reference_frame='world',robot_sphere_materials=(None,),
                 robot_geometry_source='declared native robot',has_gripper=False,max_mapping_bytes=1024**3,
                 fine_regions=fine,robot_collision_bodies=body,
                 unknown_policy={'conditional_regions':[],'outside_regions':'forbid'})
@@ -1107,7 +1107,10 @@ class OnlineObservationContractTest(unittest.TestCase):
             query_centres[None]-(np.asarray(result.background.distance.shape)-1)*.01/2,atol=1e-12)
         # END the requested fine source region stays fixed before adding query support.
         normalized=_views(views,'world',(.1,3.))
-        expected=_owner_mapper_config(cfg,normalized,_audit_partition_masks(normalized,frames),'part',frames['part']['T_output_owner'],.005,.003,query_radius_m=.04)
+        # BEGIN task identity fixes the native field at the common 2 mm spacing.
+        expected=_owner_mapper_config(cfg,normalized,_audit_partition_masks(normalized,frames),'part',frames['part']['T_output_owner'],.002,.003,query_radius_m=.04)
+        self.assertEqual(result.observation_report['resolution_policy']['owner_voxel_sizes_m'], {'part': .002})
+        # END the original extent/coverage assertions still apply to that field.
         np.testing.assert_allclose(captured['part'].extent_esdf_meters_xyz,expected.extent_esdf_meters_xyz)
         self.assertFalse(hasattr(result.background,'refinement_source'))
 # END these CPU tests never allocate native mapping or simulator state.
@@ -1123,10 +1126,10 @@ class DirectCompleteOwnerTest(unittest.TestCase):
         views,frames,cfg=PlanningObservationTest.refined_owner_fixture()
         pose=frames['part']['T_output_owner']
         query=FrozenPrimitives(primitives=[{'kind':'cuboid','dimensions':[.03,.04,.05]}],
-            owner_ids=('part',),source='complete calibrated primitive',contact_voxel_size_m=.005)
+            owner_ids=('part',),source='complete calibrated primitive',contact_voxel_size_m=.002)
         owner=CollisionOwner('part',query,PosePath(np.array([0.,1.]),np.stack((pose,pose)),
             'current pose'),source='complete calibrated primitive',geometry_complete=True)
-        options=dict(mapper_cfg=cfg,depth_error_m=.003,owner_voxel_sizes_m={'part':.005},
+        options=dict(mapper_cfg=cfg,depth_error_m=.003,task_owner_ids=('part',),
             reference_frame='world',robot_sphere_materials=(None,),robot_geometry_source='declared robot',
             has_gripper=False,max_mapping_bytes=1024**3,
             unknown_policy={'conditional_regions':[],'outside_regions':'forbid'},complete_owners=(owner,))
@@ -1204,9 +1207,10 @@ class DirectCompleteOwnerTest(unittest.TestCase):
                     frames['part']['T_output_owner']=frames['part']['T_output_owner'].copy()
                     frames['part']['T_output_owner'][0,3]+=.01
                 elif case=='resolution':
-                    options['owner_voxel_sizes_m']['part']=.01
+                    owner.query.contact_voxel_size_m=.01
+                    owner.query.voxel_size=.01
                 elif case=='invalid_resolution':
-                    options['owner_voxel_sizes_m']['part']=True
+                    options['task_owner_ids']=('unregistered',)
                 elif case=='fine_region':
                     options['fine_regions']={'part':{}}
                 elif case=='missing_mask':
@@ -1222,7 +1226,6 @@ class DirectCompleteOwnerTest(unittest.TestCase):
         from manipulation.planning_observation import build_scene_from_rgbd
         views,frames,owner,options=self.inputs()
         frames['fixture']={'T_output_owner':np.eye(4),'source':'independent observed fixture'}
-        options['owner_voxel_sizes_m']['fixture']=.01
         for record in views.values():
             record['owner_masks']['fixture']=np.zeros(record['depth'].shape,dtype=bool)
             record['owner_masks']['fixture'][60:63,60:63]=True
@@ -1233,7 +1236,7 @@ class DirectCompleteOwnerTest(unittest.TestCase):
         self.assertEqual(config.call_count,1)
         self.assertEqual(config.call_args.args[3],'fixture')
         self.assertEqual([call.args[2] for call in mapper.call_args_list],[None,'fixture'])
-        self.assertEqual(mapper.call_args_list[1].args[3].voxel_size,.01)
+        self.assertEqual(mapper.call_args_list[1].args[3].voxel_size,options['mapper_cfg'].voxel_size)
         self.assertIs(scene.owners[0],owner)
         self.assertFalse(scene.owners[1].geometry_complete)
         self.assertEqual(set(scene.observation_report['partitions']),{'observed_background','fixture'})
@@ -1328,7 +1331,7 @@ class BackgroundQueryDomainTest(unittest.TestCase):
              patch('manipulation.planning_observation._map_online_partition') as mapper:
             with self.assertRaisesRegex(RuntimeError,'before native allocation'):
                 build_scene_from_rgbd({'first':view()}, {},mapper_cfg=config,depth_error_m=.003,
-                    owner_voxel_sizes_m={},reference_frame='world',robot_sphere_materials=(None,),
+                    task_owner_ids=(),reference_frame='world',robot_sphere_materials=(None,),
                     robot_geometry_source='declared complete hand sphere',gripper=hand,has_gripper=True,
                     robot_collision_bodies=bodies,max_mapping_bytes=1024**3,
                     unknown_policy={'conditional_regions':[],'outside_regions':'forbid'})
@@ -1351,7 +1354,7 @@ class BackgroundQueryDomainTest(unittest.TestCase):
              patch('manipulation.planning_observation._require_mapping_memory') as admission:
             with self.assertRaisesRegex(ValueError,'mapping allocation'):
                 build_scene_from_rgbd({'first':view()}, {},mapper_cfg=config,depth_error_m=.003,
-                    owner_voxel_sizes_m={},reference_frame='world',robot_sphere_materials=(None,),
+                    task_owner_ids=(),reference_frame='world',robot_sphere_materials=(None,),
                     robot_geometry_source='declared native robot',has_gripper=False,
                     robot_collision_bodies=bodies,max_mapping_bytes=old_budget,
                     unknown_policy={'conditional_regions':[],'outside_regions':'forbid'})

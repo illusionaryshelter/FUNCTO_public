@@ -1051,8 +1051,8 @@ queries retain their existing sphere costs and do not run CPU confirmation.
   `complete_owners`; it retains its current frame, native materials and semantic
   mask partition without allocating an observation field that would be discarded.
   Its RGB-D rays still contribute only their original observed-free evidence.
-  Per-owner resolution remains explicit, including the complete owner's contact
-  grid spacing. Owner support is
+  The library resolves task/environment precision, including the complete
+  owner's contact grid spacing, from current task identities. Owner support is
   prepared from the observed extent and registered robot sphere radius before
   solving; requests cannot enlarge it after a failed query.
   <!-- END direct complete-owner admission. -->
@@ -1136,6 +1136,25 @@ field, and workspace admission includes both field and vertex-query memory.
 <!-- END current support does not redefine grasp or placement success. -->
 
 `planning_observation.build_scene_from_rgbd` creates this production model.
+<!-- BEGIN common task/environment mapping precision. -->
+`planning_observation.scene_task_owner_ids` reads the grounded `carrier_id`
+(manipulated body) and optional `reference_id` (functional target). These
+identities are passed as `task_owner_ids` to `build_scene_from_rgbd`.
+The library's `observation_resolutions` assigns **2 mm** grids to both task
+owners. Other observed owners and the background use the environment grid;
+the shared recorded runner defaults to **10 mm**. An initial support surface
+belongs to the environment unless it is also the current functional target.
+This rule depends on task roles, never dataset names, object names or sizes.
+
+Production experiments cannot supply per-owner resolution overrides. Complete
+geometry retains its exact solids and uses the same resolved contact-query
+spacing without allocating a redundant RGB-D field. Explicit task-owner ROIs
+must retain 1–2 mm spacing. The scene report records the task identities and
+actual field spacings. Memory admission remains independent: insufficient
+capacity rejects the request instead of silently coarsening a task object,
+dropping observed surfaces or relaxing contact/placement tolerances.
+<!-- END task precision is a library contract shared by experiments. -->
+
 `build_audit_scene_from_rgbd`, source TSDF geometry, complete-volume coverage
 and detailed source-scene component checkers are separate audit tools. The
 bounded native confirmation above queries only local source components for

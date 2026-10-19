@@ -25,28 +25,6 @@ PROJECT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT))
 
 
-# BEGIN each observed owner has an explicit CLI resolution, without aliases.
-def owner_voxel_sizes(arguments, owner_ids):
-    """Parse repeated owner/spacing pairs without silently replacing duplicates.
-
-    The scene adapter repeats the strict mapping check for non-CLI callers.
-    Resolving identities here also rejects mistakes before creating a CUDA
-    hand model, so a missing or misspelled owner cannot incur GPU work.
-    """
-    result = {}
-    for identity, raw_value in arguments:
-        if identity in result:
-            raise ValueError(f"Duplicate owner voxel size for {identity!r}")
-        value = float(raw_value)
-        if not np.isfinite(value) or value <= 0:
-            raise ValueError("Each owner voxel size must be a finite positive metre value")
-        result[identity] = value
-    if set(result) != set(owner_ids):
-        raise ValueError("Owner voxel sizes must name every observed owner exactly once")
-    return result
-# END no object name, dataset or extent selects an implicit resolution.
-
-
 # BEGIN persist the production builder's exact occupied endpoint partition.
 def save_observation_partitions(scene, output):
     """Save exact fusion masks without reconstructing ownership in the runner.
@@ -334,7 +312,8 @@ def run_prepared(args, *, problem, provenance):
     from manipulation.execution import ExecutionLimits, FixedFingerTargets
     # END production execution contract.
     from manipulation.planning import MotionBackend, PlanningBudget
-    from manipulation.planning_observation import build_scene_from_rgbd
+    from manipulation.planning_observation import (
+        build_scene_from_rgbd, scene_task_owner_ids, observation_resolutions)
     from curobo.perception import MapperCfg
     from curobo.types import DeviceCfg
     import torch
@@ -430,7 +409,9 @@ def run_prepared(args, *, problem, provenance):
         owner_frames, supplied_masks = recorded_owner_observation_inputs(
             problem, scene_input, segment["snapshot"]["views"], args.owner_mask,
             source=str(root/candidate["scene_path"]))
-        owner_resolutions = owner_voxel_sizes(args.owner_voxel_size, owner_frames)
+        task_owners = scene_task_owner_ids(scene_input)
+        owner_resolutions = observation_resolutions(owner_frames,
+            task_owner_ids=task_owners, environment_voxel_size=args.voxel_size)
         # END subsequent masks, map configurations and reports share these IDs.
         robot = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
         # BEGIN verify the physical policy and separation certificates before GPU use.
@@ -713,7 +694,7 @@ def run_prepared(args, *, problem, provenance):
             robot_owner_permissions=pair_permissions,
             # END a current measured arrival is still required by execution.
             # BEGIN distinct physical owners share one total resource envelope.
-            owner_voxel_sizes_m=owner_resolutions,
+            task_owner_ids=task_owners,
             fine_regions=fine_regions, robot_collision_bodies=collision_bodies,
             unknown_policy=json.loads(args.unknown_policy.read_text()),
             max_mapping_bytes=args.mapping_memory_mib*1024**2,
@@ -890,11 +871,11 @@ def parse_args(argv=None):
     parser.add_argument("--owner-geometry", type=Path)
     parser.add_argument("--center", type=float, nargs=3, required=True)
     parser.add_argument("--extent", type=float, nargs=3, required=True)
-    parser.add_argument("--voxel-size", type=float, required=True)
-    # BEGIN current owner precision is declared before a planning result exists.
-    parser.add_argument("--owner-voxel-size", nargs=2, action="append", required=True,
-                        metavar=("OWNER_ID", "METRES"),
-                        help="Repeat exactly once for each observed owner; no shared owner resolution")
+    # BEGIN only the coarser environment spacing remains an experiment input.
+    from manipulation.planning_observation import DEFAULT_ENVIRONMENT_VOXEL_SIZE_M
+    parser.add_argument("--voxel-size", type=float, default=DEFAULT_ENVIRONMENT_VOXEL_SIZE_M,
+                        help="Environment grid spacing in metres; task owners use the library's 2 mm policy")
+    # END no per-owner CLI override can silently coarsen a task object.
     # BEGIN freeze reviewed local bounds, resolution and measurement evidence.
     parser.add_argument("--fine-regions", type=Path,
                         help="JSON array of owner_id (null for background), local bounds and measured-allowance evidence")

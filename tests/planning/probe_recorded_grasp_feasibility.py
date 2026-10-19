@@ -502,8 +502,6 @@ def parse_args():
                         help="One original source frame per target; repeat for at most three targets")
     parser.add_argument("--owner-mask", nargs=3, action="append", required=True,
                         metavar=("OWNER_ID", "VIEW_ID", "MASK_PATH"))
-    parser.add_argument("--owner-voxel-size", nargs=2, action="append", required=True,
-                        metavar=("OWNER_ID", "METRES"))
     parser.add_argument("--unknown-policy", type=Path, required=True)
     parser.add_argument("--fine-regions", type=Path)
     parser.add_argument("--contact-bindings", type=Path)
@@ -511,7 +509,10 @@ def parse_args():
     parser.add_argument("--owner-geometry", type=Path)
     parser.add_argument("--center", type=float, nargs=3, required=True)
     parser.add_argument("--extent", type=float, nargs=3, required=True)
-    parser.add_argument("--voxel-size", type=float, required=True)
+    # BEGIN source-backed probes share the production environment default.
+    from manipulation.planning_observation import DEFAULT_ENVIRONMENT_VOXEL_SIZE_M
+    parser.add_argument("--voxel-size", type=float, default=DEFAULT_ENVIRONMENT_VOXEL_SIZE_M)
+    # END task-owner precision belongs to the common library, not this probe.
     parser.add_argument("--depth-error", type=float, required=True)
     # BEGIN same three-state observation contract as the production runner.
     parser.add_argument("--self-filter-padding-offset-m", type=float, required=True)
