@@ -1,8 +1,7 @@
-"""Necessary counterexamples for native hand pairs and shared state meaning."""
-# BEGIN convex replacement is exact in scope, while other collisions remain.
+"""Native hand geometry shares the ordinary complete robot collision model."""
+# BEGIN complete URDF solids replace the deleted hand-only separating-axis path.
 from copy import deepcopy
 from itertools import product
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,63 +9,87 @@ from scipy.spatial.transform import Rotation
 import torch
 
 from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
-from manipulation.planning_scene import GripperState, ObservedSpace, PrismaticGripper, _self_pair_sum
+from manipulation.planning_scene import ObservedSpace, PrismaticGripper
+
+
+URDF = '''<robot name="two_prismatic_materials">
+  <link name="base"/><link name="left_link"/><link name="right_link"/>
+  <joint name="left" type="prismatic"><parent link="base"/><child link="left_link"/>
+    <axis xyz="1 0 0"/><limit lower="-.2" upper=".2" effort="10" velocity="1"/></joint>
+  <joint name="right" type="prismatic"><parent link="base"/><child link="right_link"/>
+    <axis xyz="1 0 0"/><limit lower="-.2" upper=".2" effort="10" velocity="1"/></joint>
+</robot>'''
 
 
 def hand(*, nominal=False):
+    """Keep the existing command/nominal helper used by finger-clock tests."""
     initial = np.array([-.05, .05])
     def factory(target):
         def build(duration, mapping):
-            # BEGIN the synthetic linear geometry declares its complete scope.
             from manipulation.gripper_trajectory import NominalFingerGeometry
             return NominalFingerGeometry(('left', 'right'), [0., duration], [initial, target],
                 np.tile((np.asarray(target)-initial)/duration, (2, 1)), duration, duration,
                 'explicit synthetic linear finger fixture')
-            # END command/geometry comparisons still use different targets.
         return build
-    vertices = np.asarray(list(product((-.01, .01), (-.1, .1), (-.01, .01))))
-    radii = float(np.linalg.norm(vertices[0]))
+    radii = float(np.linalg.norm([.01, .1, .01]))
     matrices = np.zeros((2, 3, 2))
     matrices[0, 0, 0] = matrices[1, 0, 1] = 1.
-    geometry = [{'geometry_id': f'native_{index}', 'sphere_indices': [index],
-                 'vertices': vertices.tolist(), 'joint_translation': matrices[index].tolist(),
-                 'source': 'complete native box with its one enclosing sphere'} for index in range(2)]
     result = PrismaticGripper(controller='timed_reference', joint_names=('left', 'right'),
         current_positions=initial, joint_limits=[[-.2, .2], [-.2, .2]], joint_bounds=None,
         coupling_matrix=np.empty((0, 2)), coupling_offset=[], sphere_indices=(0, 1),
         local_spheres=[[0., 0., 0., radii]]*2, sphere_joint_translation=matrices,
-        self_collision_pairs=((0, 1), (0, 2)), commands=(), source='native prismatic test assembly',
+        commands=(), source='native prismatic test assembly',
         control_timestep_s=.01, finger_trajectory_factory=factory([0., 0.]),
         nominal_finger_trajectory_factory=(lambda duration, mapping, reference:
-            factory([-.06, .06])(duration, mapping)) if nominal else None,
-        self_collision_geometry=geometry)
+            factory([-.06, .06])(duration, mapping)) if nominal else None)
     result.bind_clock(1., None)
     return result
 
 
-def state(hand, values, uncertain=False, half=None):
-    values = torch.tensor([values], dtype=torch.float64)
-    return GripperState(values, torch.zeros_like(values) if half is None else torch.tensor([half], dtype=torch.float64),
-                        values.new_zeros(values.shape[:-1]), torch.full(values.shape[:-1], uncertain))
-
-
-def scene(current_hand, *, distance=1.):
+def scene(current_hand, *, distance=1., external_position=(.5, .5, .5), base=None):
+    """Bind all finger and external self geometry through the ordinary API."""
     values = np.full((11, 11, 11), distance, np.float32)
-    valid = np.ones_like(values, bool)
-    # BEGIN synthetic source values define material before proposal construction.
-    from observed_geometry_fixtures import field_from_samples
-    background = field_from_samples(values, origin=[-1.]*3, voxel_size=.2, observed=valid,
+    background = FrozenESDF(values, origin=[-1.]*3, voxel_size=.2,
         owner_ids=('background',), source='bounded observed test source')
-    # END collision proposals cannot replace source evidence.
-    coverage = ObservedSpace(valid, origin=[-1.]*3, voxel_size=.2, observation_ids=('A',), reference_frame='world')
+    coverage = ObservedSpace(np.ones_like(values, bool), origin=[-1.]*3, voxel_size=.2,
+        observation_ids=('A',), reference_frame='world')
+    radius = current_hand.local_spheres[0, 3]
+    frames = ('left_link', 'right_link', 'base')
+    centres, radii = [[0.]*3, [0.]*3, list(external_position)], [radius, radius, .01]
+    bodies = [{'body_id': f'body_{i}', 'frame': frame, 'geometry_names': [f'native_{i}'],
+        'sphere_indices': [i], 'local_spheres': [[*centres[i], radii[i]]],
+        'source': 'explicit complete registered component'} for i, frame in enumerate(frames)]
     result = OnlinePlanningScene(background=background, owners=(), coverage=coverage,
         reference_frame='world', robot_sphere_materials=(None,)*3, robot_geometry_source='test native geometry',
-        gripper=current_hand)
-    radius = current_hand.local_spheres[0, 3]
-    result.bind_online_robot(robot_sphere_geometry=[{'link_name': f'link_{i}', 'sphere_indices': [i],
-        'centers_local': [[0., 0., 0.]], 'radii': [radius if i < 2 else .01]} for i in range(3)],
-        robot_self_collision_pairs=[[0, 1], [0, 2]])
+        gripper=current_hand, robot_collision_bodies=bodies)
+    vertices = np.asarray(list(product((-.01, .01), (-.1, .1), (-.01, .01))))
+    geometry = [dict(name=f'native_{i}', frame=frames[i], kind='convex',
+                     vertices_frame=vertices.tolist(), source='complete native finger convex') for i in range(2)]
+    pose = np.eye(4)
+    pose[:3, 3] = external_position
+    geometry.append(dict(name='native_2', frame='base', kind='box', dimensions=[.02]*3,
+                         T_frame_geometry=pose.tolist(), source='external native robot component'))
+    result.bind_online_robot(robot_sphere_geometry=[
+        {'link_name': frame, 'sphere_indices': [i], 'centers_local': [centres[i]], 'radii': [radii[i]]}
+        for i, frame in enumerate(frames)],
+        native_robot_model={'urdf_xml': URDF, 'geometries': geometry},
+        native_joint_names=('left', 'right'), native_self_pairs=[
+            {'first': 'native_0', 'second': 'native_1', 'margin': 0.},
+            {'first': 'native_0', 'second': 'native_2', 'margin': 0.}],
+        robot_model={'T_reference_base': (np.eye(4) if base is None else base).tolist()})
     return result
+
+
+def measured_components(current, q, *, base=None):
+    transform = np.eye(4) if base is None else base
+    progress = q.new_full(q.shape[:2], .5)
+    position = q.new_tensor(transform[:3, 3]).expand(*q.shape[:2], 3)
+    quaternion = q.new_tensor(Rotation.from_matrix(transform[:3, :3]).as_quat()[[3, 0, 1, 2]]).expand(*q.shape[:2], 4)
+    balls = q.new_zeros((*q.shape[:2], 3, 4))
+    balls[..., 2, :3] = q.new_tensor([.5, .5, .5])
+    balls[..., 2, 3] = .01
+    return current.components(balls, position, quaternion, progress, q, ('left', 'right'),
+        trajectory_time=progress, active_contact_rule_ids=())
 
 
 def test_shared_state_distinguishes_command_nominal_and_measured():
@@ -89,55 +112,48 @@ def test_shared_state_distinguishes_command_nominal_and_measured():
         nominal.state(progress, None, None, trajectory_time=time, measured=True)
 
 
-def test_native_convex_pair_replaces_false_sphere_overlap_and_keeps_real_collision_gradient():
-    current = hand(nominal=True)
-    q = state(current, [[-.05, .05]])
-    model = current.self_collision_model
-    for rot, translation in [(np.eye(3), np.zeros(3)), (Rotation.from_rotvec([.4, -.2, .3]).as_matrix(), np.array([.2, -.3, .5]))]:
-        p = torch.tensor(translation, dtype=torch.float64).reshape(1, 1, 3)
-        r = torch.tensor(Rotation.from_matrix(rot).as_quat()[[3, 0, 1, 2]], dtype=torch.float64).reshape(1, 1, 4)
-        balls = current.spheres(torch.zeros((1, 1, 3, 4), dtype=torch.float64), p, r, q.coordinates, q.half)
-        assert _self_pair_sum(balls, np.array([[0, 1]])).item() > .1
-        assert model.components(q)[0].item() == 0.
-    collision = state(current, [[-.002, .003]])
-    collision.coordinates.requires_grad_()
-    hard, conditional = model.components(collision)
-    assert hard.item() == pytest.approx(.015)
-    assert conditional.item() == 0.
+@pytest.mark.parametrize('rotated', [False, True])
+def test_native_fingers_remove_proxy_overlap_and_keep_real_collision_gradient(rotated):
+    base = np.eye(4)
+    if rotated:
+        base[:3, :3] = Rotation.from_rotvec([.4, -.2, .3]).as_matrix()
+        base[:3, 3] = [.2, -.3, .5]
+    current = scene(hand(nominal=True), base=base)
+    clear = torch.tensor([[[-.05, .05]]], dtype=torch.float64, requires_grad=True)
+    assert 2*current.gripper.local_spheres[0, 3]-.1 > .1
+    terms = measured_components(current, clear, base=base)
+    assert terms['collision/robot/self'].item() == 0.
+    collision = torch.tensor([[[-.002, .003]]], dtype=torch.float64, requires_grad=True)
+    hard = measured_components(current, collision, base=base)['collision/robot/self']
+    assert hard.item() == pytest.approx(.015, abs=2e-8)
     hard.sum().backward()
-    np.testing.assert_allclose(collision.coordinates.grad, [[[1., -1.]]], atol=2e-15, rtol=0)
-    unresolved = state(current, [[0., 0.]], uncertain=True, half=[[.2, .2]])
-    assert model.components(unresolved)[0].item() == 0.
-    assert model.components(unresolved)[1].item() > 0.
+    torch.testing.assert_close(collision.grad, collision.new_tensor([[[1., -1.]]]), rtol=0, atol=2e-8)
 
 
-def test_external_self_pairs_and_world_collisions_survive_exact_hand_replacement():
-    current = hand(nominal=True)
-    world = scene(current)
-    assert world.native_self_collision_pairs == [[0, 2]]
-    balls = np.array([[-.05, 0, 0, .102], [.05, 0, 0, .102], [-.05, 0, 0, .01]])
-    result = world.query_state(balls, np.eye(4), .5, joint_position=[-.05, .05],
-                               joint_names=('left', 'right'), trajectory_time=.5)
-    assert result['components']['collision/robot/self'] > 0
-    balls[2, :3] = [.5, .5, .5]
-    assert scene(current, distance=0.).query_state(balls, np.eye(4), .5,
-        joint_position=[-.05, .05], joint_names=('left', 'right'), trajectory_time=.5)['components']['collision/robot/background'] > 0
+def test_external_self_pairs_and_observed_fields_remain_checked():
+    q = torch.tensor([[[-.05, .05]]], dtype=torch.float64)
+    external = scene(hand(nominal=True), external_position=(-.04, 0., 0.))
+    assert measured_components(external, q)['collision/robot/self'].item() == pytest.approx(.01, abs=2e-8)
+    observed = scene(hand(nominal=True), distance=0.)
+    terms = measured_components(observed, q)
+    assert terms['collision/robot/self'].item() == 0.
+    assert terms['collision/robot/background'].item() > .2
 
 
-def test_binding_roundtrip_reuses_same_actual_geometry_and_rejects_incomplete_pair_identity():
+def test_binding_roundtrip_retains_the_complete_native_model_and_measured_values():
     original = scene(hand(nominal=True))
     binding = original.to_execution_binding()
     restored = OnlinePlanningScene.from_binding(binding)
-    balls = np.array([[-.05, 0, 0, .102], [.05, 0, 0, .102], [.5, .5, .5, .01]])
-    for q in ([-.05, .05], [-.002, .003]):
-        args = dict(joint_position=q, joint_names=('left', 'right'), trajectory_time=.5)
-        assert original.query_state(balls, np.eye(4), .5, **args) == restored.query_state(balls, np.eye(4), .5, **args)
+    assert restored.native_robot_model == original.native_robot_model
+    assert restored.native_self_pairs == original.native_self_pairs
+    assert 'prepared_self_collision' not in binding['gripper']
+    for coordinates in ([-.05, .05], [-.002, .003]):
+        q = torch.tensor([[coordinates]], dtype=torch.float64)
+        actual = measured_components(restored, q)
+        for name, value in measured_components(original, q).items():
+            torch.testing.assert_close(value, actual[name], rtol=0, atol=0)
     corrupt = deepcopy(binding)
-    corrupt['gripper']['prepared_self_collision']['replaced_pairs'] = []
-    with pytest.raises(ValueError, match='Serialized prismatic'):
+    corrupt['native_self_pairs'][0]['first'] = 'absent_component'
+    with pytest.raises(ValueError, match='registered solids'):
         OnlinePlanningScene.from_binding(corrupt)
-    corrupt = deepcopy(binding)
-    corrupt['robot_self_collision_pairs'] = [[0, 2]]
-    with pytest.raises(ValueError, match='runtime self-pair policy'):
-        OnlinePlanningScene.from_binding(corrupt)
-# END no test grants permission to a complete finger or scene owner.
+# END nominal commands and measured execution share one registered robot model.

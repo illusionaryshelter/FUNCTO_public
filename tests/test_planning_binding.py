@@ -13,7 +13,7 @@ import torch
 from manipulation.planning import (PlanningBudget, _CuroboPlanner, _ProgressMap,
     ContinuationBindingError, _bind_event_clock, _initial_timing,
     _prepare_continuation, _continuation_timing, _fixed_spline_grid,
-    _ompl_stage, _known_scene_cost, _timed_native_state,
+    _ompl_stage, _known_scene_cost,
     _progress_for_cubic_boundaries)
 from manipulation.planning_problem import (MotionPhase, PlanningEvent, PlanningProblem,
                                           PosePath, PoseEventRequirement)
@@ -101,7 +101,7 @@ class PlanningBindingTest(unittest.TestCase):
             finger_trajectory_factory=fingers, nominal_finger_trajectory_factory=geometry,
             coupling_matrix=np.empty((0, 1)), coupling_offset=[], sphere_indices=(0,),
             local_spheres=[[0., 0., 0., .001]], sphere_joint_translation=[[[1.], [0.], [0.]]],
-            self_collision_pairs=(), commands=[{"skill_id": "current", "event_id": "close", "occurrence": 0,
+            commands=[{"skill_id": "current", "event_id": "close", "occurrence": 0,
                 "command": "close", "progress": .8}], source="explicit CPU clock contract")
         hand.bind_clock(grid["duration"], mapping)
         self.assertTrue(all(duration == grid["duration"] and actual_map is mapping for duration, actual_map in seen))
@@ -400,32 +400,6 @@ class PlanningBindingTest(unittest.TestCase):
         torch.testing.assert_close(components.call_args.args[3], progress)
         torch.testing.assert_close(value, torch.zeros_like(progress))
 
-
-    def test_unknown_finger_model_keeps_actual_entrance_palm_and_arm_native_pairs(self):
-        problem = self.problem()
-        spheres = torch.zeros((1, 2, 3, 4)); spheres[..., 3] = .02
-        quaternion = torch.zeros((1, 2, 1, 4)); quaternion[..., 0] = 1.
-        native = SimpleNamespace(robot_spheres=spheres,
-            tool_jacobians=torch.zeros((1, 2, 1, 6, 1)))
-        state = SimpleNamespace(joint_state=SimpleNamespace(position=torch.zeros((1, 2, 1))),
-            cuda_robot_model_state=native, robot_spheres=spheres,
-            tool_poses=SimpleNamespace(tool_frames=["tool"], position=torch.zeros((1, 2, 1, 3)),
-                                       quaternion=quaternion))
-        hand = SimpleNamespace(controller="timed_reference", nominal_finger_trajectory=None,
-            sphere_indices=(0, 1), sphere_joint_translation=np.array([[[0., 0., 0.]], [[1., 0., 0.]]]),
-            state=lambda *args, **kwargs: SimpleNamespace(coordinates=None, half=None,
-                uncertain=kwargs["trajectory_time"] > 0), spheres=lambda values, *args: values)
-        with patch("manipulation.planning._native_gradient_layout_type",
-                   return_value=SimpleNamespace(apply=lambda value: value)), \
-             patch("manipulation.planning._orientation_vjp_type",
-                   return_value=SimpleNamespace(apply=lambda q, r, jac: r)):
-            result = _timed_native_state(state, problem, SimpleNamespace(gripper=hand), ("q",),
-                                        torch.tensor([[0., .1]]), sphere_padding=.05)
-        radii = result.cuda_robot_model_state.robot_spheres[..., 3]
-        torch.testing.assert_close(radii[:, 0], spheres[:, 0, :, 3], rtol=0., atol=0.)
-        self.assertLess(float(radii[0, 1, 1]+.05), 0.)
-        torch.testing.assert_close(radii[:, 1, [0, 2]], spheres[:, 1, [0, 2], 3], rtol=0., atol=0.)
-        torch.testing.assert_close(state.cuda_robot_model_state.robot_spheres, spheres, rtol=0., atol=0.)
 
 
 if __name__ == '__main__':

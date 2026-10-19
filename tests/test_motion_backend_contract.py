@@ -146,8 +146,10 @@ def test_real_candidate_binding_roundtrips_online_geometry_and_rejects_mutation(
     scene = OnlinePlanningScene(background=field, owners=(), coverage=coverage,
         reference_frame="world", robot_sphere_materials=("body",),
         robot_geometry_source="native test spheres", has_gripper=False)
-    scene.bind_online_robot(robot_sphere_geometry=[{"link_name": "tool", "sphere_indices": [0],
-        "centers_local": [[0., 0., 0.]], "radii": [.01]}], robot_self_collision_pairs=[])
+    # BEGIN explicit native fixture for the saved collision contract.
+    from native_scene_fixtures import bind_fixed_robot
+    bind_fixed_robot(scene)
+    # END no robot geometry is inferred from query-time cover spheres.
     native = Native([True])
     backend = MotionBackend({}, robot_validator=object())
     try:

@@ -1,9 +1,9 @@
-"""Frozen approximate collision models for bounded motion attempts.
+"""Frozen entity and observed-field collision models for motion attempts.
 
-One native Mapper ESDF or analytic primitive represents each observed owner.
-Pair-scoped interaction masks allow ordinary contact without proving task
-success. Observation gaps remain diagnostics; no source-solid confirmation,
-contact field bank or complete-volume coverage certificate is constructed.
+Registered complete solids use one native distance model. A Mapper ESDF is
+an explicitly approximate observed field and retains sphere queries. Local
+interaction masks allow contact without proving task success. Observation
+gaps remain diagnostics; no source-component proof chain is constructed.
 """
 # BEGIN bounded motion scene replaces complete contact/coverage certification.
 from copy import copy, deepcopy
@@ -19,8 +19,8 @@ from .collision_records import encode_array, decode_array, MAX_ARRAY_BYTES
 from .planning_problem import (PosePath, quaternion_conjugate, quaternion_rotate,
     quaternion_multiply)
 from .planning_scene import (Attachment, CollisionOwner, ContactRule, ObservedSpace,
-    PrismaticGripper, _tensor, _local_spheres, _world_spheres, _self_pair_sum,
-    _self_pair_chunk_size, grasp_contact_rule_ids, validate_grasp_contact_arrival,
+    PrismaticGripper, _tensor, _local_spheres, _world_spheres,
+    grasp_contact_rule_ids, validate_grasp_contact_arrival,
     _validate_contact_and_gripper_inputs)
 from .holding_contact import HoldingContact, validate_holding_materials, validate_holding_conditions
 from .optimizer_device_checks import constant_tensor
@@ -207,10 +207,14 @@ class OnlinePlanningScene:
                                   self.native_geometry_materials, self.robot_collision_bodies)
         if {r.rule_id for r in self.contacts} & {r.rule_id for r in self.holding_contacts}:
             raise ValueError('Holding and attempted interaction rules need distinct identities')
-        self.robot_sphere_geometry, self.robot_self_collision_pairs = [], []
-        self.native_self_collision_pairs = []
-        self._prepare_self_collision_pairs()
-        self.robot_self_collision_padding = [0.]*len(self.robot_sphere_materials)
+        # BEGIN complete native solids own self/world collision decisions.
+        self.robot_sphere_geometry = []
+        self.native_collision_model = None
+        self.native_robot_model, self.native_joint_names, self.native_self_pairs = {}, (), []
+        self._uncertain_sphere_indices = (() if gripper is None else tuple(
+            index for index, mapping in zip(gripper.sphere_indices, gripper.sphere_joint_translation)
+            if np.any(mapping != 0)))
+        # END proxy spheres remain only for observed fields and component identity.
         self.robot_model = {}
         self.required_robot_links = ()
         self.grasp_contact_activations = ()
@@ -231,6 +235,12 @@ class OnlinePlanningScene:
         owners = {o.owner_id: o for o in self.owners}
         if any(r.actor not in owners or r.target_owner not in owners for r in relations):
             raise ValueError('Initial support must identify present scene owners')
+        # BEGIN an entrance sphere subset is not a complete native permission.
+        for relation in relations:
+            if isinstance(owners[relation.target_owner].query, FrozenPrimitives):
+                raise ValueError(f'Initial support {relation.relation_id} requires an observed ESDF target; '
+                                 'its entrance sphere subset does not define a complete native component permission')
+        # END the existing observed-plane relation keeps its original sphere scope.
         if records is not None and set(records) != {r.relation_id for r in relations}:
             raise ValueError('Initial support binding must retain the same relations')
         self.initial_support_relations = relations
@@ -240,9 +250,17 @@ class OnlinePlanningScene:
         self.required_progress_anchors = tuple(sorted(set(self.required_progress_anchors) |
             {v for r in relations for v in r.interval}))
 
-    def bind_online_robot(self, *, robot_sphere_geometry, robot_self_collision_pairs,
-                          robot_self_collision_padding=None, robot_geometry_source=None, robot_model=None):
-        """Bind calibrated sphere FK and native self pairs once before solving."""
+    # BEGIN one native model binds source solids, policies and complete permissions.
+    def bind_online_robot(self, *, robot_sphere_geometry, native_robot_model,
+                          native_joint_names, native_self_pairs, robot_model,
+                          robot_geometry_source=None):
+        """Compile complete native geometry once; keep proxies for ESDF queries.
+
+        Native self-pair policies come from the independent robot validator.
+        No sphere collision policy survives as a second rejection criterion.
+        Full source geometry and its URDF are saved with the scene, so a
+        restored request constructs exactly this same entity-distance model.
+        """
         if robot_geometry_source is not None and robot_geometry_source != self.robot_geometry_source:
             raise ValueError('Online sphere calibration source disagrees with scene')
         indices, radii = [], np.zeros(len(self.robot_sphere_materials))
@@ -255,56 +273,160 @@ class OnlinePlanningScene:
             radii[ids] = sizes
         if sorted(indices) != list(range(len(radii))):
             raise ValueError('Every native sphere must occur once in online FK binding')
-        pairs = np.asarray(robot_self_collision_pairs, dtype=np.int64).reshape(-1, 2)
-        if pairs.size and (pairs.min() < 0 or pairs.max() >= len(radii) or np.any(pairs[:, 0] == pairs[:, 1])):
-            raise ValueError('Native self pairs must index different bound spheres')
-        padding = np.zeros(len(radii)) if robot_self_collision_padding is None else np.asarray(robot_self_collision_padding).reshape(-1)
-        if padding.shape != radii.shape or not np.isfinite(padding).all():
-            raise ValueError('Native self padding must align with every bound sphere')
         self.robot_sphere_geometry = deepcopy(robot_sphere_geometry)
-        self.robot_self_collision_pairs = pairs.tolist()
-        # BEGIN every backend consumes the same precise native-pair replacement.
-        self.native_self_collision_pairs = (self.gripper.self_collision_model.filter_pairs(pairs, padding)
-            if self.gripper is not None and self.gripper.self_collision_model is not None else pairs.tolist())
-        # END no entire finger, link, or owner collision class is disabled.
-        # BEGIN compile fixed pair identities before any state query.
-        self._prepare_self_collision_pairs()
-        # END a rebind replaces this scene's arrays and device-cache dictionary.
-        self.robot_self_collision_padding = padding.tolist()
-        self.robot_model = deepcopy(robot_model or {})
+        self.robot_model = deepcopy(robot_model)
+        self.native_robot_model = deepcopy(native_robot_model)
+        self.native_joint_names = tuple(native_joint_names)
+        self.native_self_pairs = deepcopy(native_self_pairs)
         self.required_robot_links = tuple(row['link_name'] for row in robot_sphere_geometry)
-
-    def _prepare_self_collision_pairs(self):
-        """Preserve pair order while separating pairs without moving fingers.
-
-        Whether a finger is currently uncertain remains a state-dependent
-        Torch selection. Only its possible motion and pair membership belong
-        to this fixed robot binding. Replacing the dictionary, rather than
-        clearing it, leaves existing rollout clones on their original model.
-        """
+        from .native_collision import NativeCollisionModel
+        native_owners = {owner.owner_id: owner.query.primitives for owner in self.owners
+                         if isinstance(owner.query, FrozenPrimitives)}
+        if isinstance(self.background, FrozenPrimitives):
+            native_owners = {'background': self.background.primitives, **native_owners}
+        aliases = {owner.owner_id: tuple(owner.native_geometry_names) for owner in self.owners
+                   if owner.native_geometry_names}
+        self.native_collision_model = NativeCollisionModel(
+            robot_model=self.native_robot_model, joint_names=self.native_joint_names,
+            T_reference_base=self.robot_model['T_reference_base'], self_pairs=self.native_self_pairs,
+            owners=native_owners,
+            moving_owners=tuple(owner.owner_id for owner in self.owners
+                                if owner.moving and owner.owner_id in native_owners),
+            owner_aliases=aliases)
         self._uncertain_sphere_indices = (() if self.gripper is None else tuple(
             index for index, mapping in zip(self.gripper.sphere_indices, self.gripper.sphere_joint_translation)
             if np.any(mapping != 0)))
-        pairs = np.asarray(self.native_self_collision_pairs, dtype=np.int64).reshape(-1, 2)
-        moving = np.zeros(len(self.robot_sphere_materials), dtype=bool)
-        moving[list(self._uncertain_sphere_indices)] = True
-        known = pairs[~moving[pairs].any(axis=1)]
-        self._self_collision_pair_arrays = (pairs, known)
-        for value in self._self_collision_pair_arrays:
-            value.flags.writeable = False
-        self._self_collision_pair_device = {}
+        self._bind_native_permissions(native_owners)
 
-    def _self_collision_pair_tensors(self, spheres):
-        """Upload each immutable int64 partition once per binding and device."""
-        key = spheres.device
-        if key not in self._self_collision_pair_device:
-            # Own writable staging memory instead of exposing a Torch alias
-            # to the read-only source arrays. Integer indices have one dtype
-            # regardless of the query's floating-point dtype.
-            self._self_collision_pair_device[key] = tuple(torch.as_tensor(
-                np.array(value, copy=True), device=key, dtype=torch.long)
-                for value in self._self_collision_pair_arrays)
-        return self._self_collision_pair_device[key]
+    def _bind_native_permissions(self, native_owners):
+        """Map sphere declarations to complete source components exactly once.
+
+        A rule selecting only part of a component cannot exempt its complete
+        solid. The error names that rule and component instead of silently
+        widening the permission or reverting to the conservative proxy.
+        """
+        geometry = {row['name'] for row in self.native_robot_model['geometries']}
+        # BEGIN a component map is consumed only by declared local permissions.
+        # Complete source solids and self policies already define collision
+        # queries without a sphere-to-material table. Validate the groups
+        # actually supplied; complete_components below checks each selected
+        # rule/exclusion instead of demanding an unused global partition.
+        sphere_ids = set(range(len(self.robot_sphere_materials)))
+        robot_components, seen_spheres = {}, set()
+        for body in self.robot_collision_bodies:
+            indices, names = frozenset(body['sphere_indices']), tuple(body['geometry_names'])
+            if (not indices <= sphere_ids or len(indices) != len(body['sphere_indices'])
+                    or seen_spheres & indices or len(set(names)) != len(names)
+                    or any(name not in geometry or name in robot_components for name in names)):
+                raise ValueError('Native robot component/sphere identity must be a unique registered partition')
+            seen_spheres.update(indices)
+            robot_components.update((name, indices) for name in names)
+        # END absent mapping does not remove any native collision pair.
+        components = {'robot': robot_components}
+        for owner in self.owners:
+            if owner.owner_id in native_owners and owner.moving:
+                components[owner.owner_id] = {
+                    row['native_binding']['geometry_name']: frozenset(row['native_binding']['sphere_indices'])
+                    for row in owner.query.primitives if 'native_binding' in row}
+
+        def complete_components(actor, indices, identity):
+            selected, complete, covered = set(indices), set(), set()
+            for name, members in components[actor].items():
+                if selected & members:
+                    if not members <= selected:
+                        raise ValueError(f'Native permission {identity} selects only part of component {actor}/{name}')
+                    complete.add(name)
+                    covered.update(members)
+            if covered != selected:
+                raise ValueError(f'Native permission {identity} has spheres without a complete registered {actor} component')
+            return complete
+
+        pairs = self.native_collision_model.pairs
+        def pair_indices(actor, target, names):
+            return tuple(index for index, pair in enumerate(pairs)
+                         if pair['first_owner'] == actor and pair['second_owner'] == target
+                         and pair['first_geometry'] in names)
+
+        self._native_rule_pairs = {}
+        for rule in self.contacts:
+            if rule.target_owner in native_owners and rule.actor in components:
+                names = complete_components(rule.actor, rule.sphere_indices, rule.rule_id)
+                self._native_rule_pairs[rule.rule_id] = pair_indices(rule.actor, rule.target_owner, names)
+        self._native_holding_pairs = {}
+        for contact in self.holding_contacts:
+            if contact.target_owner in native_owners:
+                names = complete_components('robot', contact.sphere_indices, contact.rule_id)
+                self._native_holding_pairs[contact.rule_id] = pair_indices('robot', contact.target_owner, names)
+        excluded = []
+        for owner in self.owners:
+            # BEGIN native aliases already transfer their robot pairs to self policy.
+            # An old world exclusion with no remaining world pair has nothing
+            # to mask. A compound owner with extra components still has pairs
+            # and must supply the same complete component mapping as any rule.
+            has_robot_pair = any(pair['first_owner'] == 'robot' and pair['second_owner'] == owner.owner_id
+                                 for pair in pairs)
+            if owner.owner_id in native_owners and owner.robot_excluded_spheres and has_robot_pair:
+                names = complete_components('robot', owner.robot_excluded_spheres,
+                                            f'robot exclusion for {owner.owner_id}')
+                excluded.extend(pair_indices('robot', owner.owner_id, names))
+            # END pair existence, not an owner name, controls this unused conversion.
+        self._native_excluded_pairs = tuple(excluded)
+        # Native motion dependencies belong to the same URDF as its FK;
+        # TCP-relative sphere translations only own the separate ESDF mask.
+        uncertain = set(self.native_collision_model.geometry_depending_on(
+            () if self.gripper is None else self.gripper.joint_names))
+        self._native_uncertain_pairs = tuple(index for index, pair in enumerate(pairs)
+            if (pair['first_owner'] == 'robot' and pair['first_geometry'] in uncertain)
+            or (pair['second_owner'] == 'robot' and pair['second_geometry'] in uncertain))
+    # END permission and uncertainty identities never depend on a queried collision.
+
+    # BEGIN native distances consume the same named joint and owner poses as ESDF.
+    def _native_components(self, joint_position, joint_names, state, poses, progress,
+                           uncertain_hand, active_rules, active_holding):
+        model = self.native_collision_model
+        if model is None:
+            raise ValueError('Scene collision queries require a bound complete native robot model')
+        named = {}
+        if joint_position is not None:
+            names = tuple(joint_names or ())
+            if (len(set(names)) != len(names)
+                    or joint_position.shape != (*progress.shape, len(names))):
+                raise ValueError('Native collision requires aligned complete named robot coordinates')
+            named.update((name, joint_position[..., index]) for index, name in enumerate(names))
+        if state is not None:
+            named.update((name, state.coordinates[..., index])
+                         for index, name in enumerate(self.gripper.joint_names))
+        if set(named) != set(model.joint_names):
+            raise ValueError('Native collision cannot fill absent robot coordinates with defaults')
+        coordinates = (torch.stack([named[name] for name in model.joint_names], -1)
+                       if model.joint_names else progress.new_empty((*progress.shape, 0)))
+        transforms = []
+        for identity in model.owner_ids:
+            if identity == 'background':
+                transforms.append(torch.eye(4, device=progress.device, dtype=progress.dtype)
+                                  .expand(*progress.shape, 4, 4))
+                continue
+            position, quaternion = poses[identity]
+            # Rotating the basis vectors gives columns of world-from-owner;
+            # concatenate without detach so attachment/release motion keeps
+            # the same Torch derivative as the complete robot coordinates.
+            basis = torch.eye(3, device=progress.device, dtype=progress.dtype)
+            rotation = quaternion_rotate(quaternion[..., None, :], basis).transpose(-1, -2)
+            top = torch.cat((rotation, position[..., None]), -1)
+            bottom = progress.new_tensor([0., 0., 0., 1.]).expand(*progress.shape, 1, 4)
+            transforms.append(torch.cat((top, bottom), -2))
+        owner_matrices = (torch.stack(transforms, -3) if transforms
+                          else progress.new_empty((*progress.shape, 0, 4, 4)))
+        enabled = torch.ones((*progress.shape, len(model.pairs)), dtype=torch.bool, device=progress.device)
+        enabled[..., list(self._native_excluded_pairs)] = False
+        enabled[..., list(self._native_uncertain_pairs)] &= ~uncertain_hand[..., None]
+        for identity, indices in self._native_rule_pairs.items():
+            enabled[..., list(indices)] &= ~active_rules[identity][..., None]
+        for identity, indices in self._native_holding_pairs.items():
+            enabled[..., list(indices)] &= ~active_holding[identity][..., None]
+        values = model(coordinates, owner_matrices, enabled)
+        return {name: values[..., index] for index, name in enumerate(model.groups)}
+    # END no native proxy residual or separate hand checker participates.
 
     def clone_for_rollout(self):
         result = copy(self)
@@ -466,15 +588,6 @@ class OnlinePlanningScene:
                 values = torch.where(uncertain_spheres, 0., values)
             terms[name] = values.sum(-1)
 
-        if self.native_self_collision_pairs:
-            padded = spheres.clone()
-            padded[..., 3] = padded[..., 3]+_tensor(self.robot_self_collision_padding, spheres)
-            pairs, known_pairs = self._self_collision_pair_tensors(spheres)
-            terms['collision/robot/self'] = torch.where(uncertain_hand,
-                _self_pair_sum(padded, known_pairs), _self_pair_sum(padded, pairs))
-        if state is not None and self.gripper.self_collision_model is not None:
-            known, _ = self.gripper.self_collision_model.components(state)
-            terms['collision/robot/self_prismatic'] = known
         poses = {}
         for owner in self.owners:
             if owner_poses is not None and owner.owner_id in owner_poses:
@@ -500,6 +613,29 @@ class OnlinePlanningScene:
                     terms[f'unsupported/release_anchor/{owner.owner_id}/{index}'] = (
                         (progress >= relation.interval[1]) & ~found[:, None]).to(progress.dtype)
             poses[owner.owner_id] = owner.pose(position, quaternion, progress, releases)
+        # BEGIN complete solids and observed fields consume identical permission clocks.
+        active_rules = {}
+        for rule in self.contacts:
+            clock = permission_progress if rule.actor == 'robot' else progress
+            active = (clock >= rule.interval[0]) & (clock <= rule.interval[1])
+            if active_contact_rule_ids is not None:
+                active = active & (rule.rule_id in active_contact_rule_ids)
+            active_rules[rule.rule_id] = active
+        active_holding = {}
+        owners = {owner.owner_id: owner for owner in self.owners}
+        for contact in self.holding_contacts:
+            relation, = [relation for relation in owners[contact.target_owner].attachments
+                         if relation.condition_id == contact.condition_id]
+            active = (permission_progress >= contact.interval[0]) & (permission_progress <= contact.interval[1])
+            if relation.release_condition_id is not None:
+                active &= permission_progress < contact.interval[1]
+            if condition_evidence is not None:
+                active &= condition_evidence.get(contact.condition_id) is True
+            active_holding[contact.rule_id] = active
+        terms.update(self._native_components(joint_position, joint_names, state, poses, progress,
+                                            uncertain_hand, active_rules, active_holding))
+        native_actors = {'robot', *self.native_collision_model.owner_ids}
+        # END an exact pair has one residual; sphere overlap cannot add a second veto.
         actors = {'robot': spheres}
         for owner in self.owners:
             if owner.moving:
@@ -507,35 +643,28 @@ class OnlinePlanningScene:
                 cover[:, 3] += owner.sphere_cover_error_m
                 actors[owner.owner_id] = _world_spheres(cover, *poses[owner.owner_id])
         for actor, body in actors.items():
-            add_collision(self.background(body), f'collision/{actor}/background', actor)
+            if not (actor in native_actors and isinstance(self.background, FrozenPrimitives)):
+                add_collision(self.background(body), f'collision/{actor}/background', actor)
             for owner in self.owners:
                 if actor == owner.owner_id:
+                    continue
+                if actor in native_actors and isinstance(owner.query, FrozenPrimitives):
                     continue
                 local = _local_spheres(body, *poses[owner.owner_id])
                 values = owner.query(local)
                 for rule in self.contacts:
                     if rule.actor != actor or rule.target_owner != owner.owner_id:
                         continue
-                    clock = permission_progress if actor == 'robot' else progress
-                    active = (clock >= rule.interval[0]) & (clock <= rule.interval[1])
-                    if active_contact_rule_ids is not None:
-                        active = active & (rule.rule_id in active_contact_rule_ids)
                     selected = torch.zeros(values.shape[-1], dtype=torch.bool, device=values.device)
                     selected[list(rule.sphere_indices)] = True
-                    values = torch.where(active[..., None] & selected, 0., values)
+                    values = torch.where(active_rules[rule.rule_id][..., None] & selected, 0., values)
                 if actor == 'robot':
                     for contact in self.holding_contacts:
                         if contact.target_owner != owner.owner_id:
                             continue
-                        relation, = [r for r in owner.attachments if r.condition_id == contact.condition_id]
-                        active = (permission_progress >= contact.interval[0]) & (permission_progress <= contact.interval[1])
-                        if relation.release_condition_id is not None:
-                            active = active & (permission_progress < contact.interval[1])
-                        if condition_evidence is not None:
-                            active = active & (condition_evidence.get(contact.condition_id) is True)
                         selected = torch.zeros(values.shape[-1], dtype=torch.bool, device=values.device)
                         selected[list(contact.sphere_indices)] = True
-                        values = torch.where(active[..., None] & selected, 0., values)
+                        values = torch.where(active_holding[contact.rule_id][..., None] & selected, 0., values)
                 for support in self._initial_support_models.values():
                     if support.relation.actor == actor and support.relation.target_owner == owner.owner_id:
                         values = support.collision_values(values, progress)
@@ -553,11 +682,12 @@ class OnlinePlanningScene:
         return torch.stack(tuple(terms.values())).sum(0)
 
     def estimated_workspace_allocation(self, batch, horizon):
-        """Bound only the model tensors actually used by ordinary field queries.
+        """Account for observed-field tensors and the native group Jacobians.
 
-        Source component trees, contact banks, native Jacobians and coverage
-        proofs no longer exist in this request and must not reserve memory.
-        Both host/device dtype caches are bounded; pair expansion is chunked.
+        Native derivatives are stored once per output group, not as a
+        pair-by-owner tensor. The double-precision bound covers both CPU
+        query arrays and their Torch backward copies for either input dtype.
+        Source component trees and duplicate sphere self-pairs do not exist.
         """
         fields = {id(q.distance): q for q in (self.background, *(o.query for o in self.owners))}
         cells = sum(q.distance.size for q in fields.values())
@@ -566,21 +696,24 @@ class OnlinePlanningScene:
         if self.coverage._known_free is not None:
             source += self.coverage._known_free.nbytes
         source += sum(o.local_spheres.nbytes for o in self.owners if o.local_spheres is not None)
-        pairs = max((len(v) for v in self._self_collision_pair_arrays), default=0)
-        if not self.robot_sphere_geometry:
-            n = len(self.robot_sphere_materials)
-            pairs = n*(n-1)//2
-        pair_bytes = pairs*2*8*2
         spheres = len(self.robot_sphere_materials)+sum(len(o.local_spheres) for o in self.owners if o.moving)
         states = int(batch)*int(horizon)
-        live = states*spheres*512 + states*_self_pair_chunk_size(states, pairs)*24*8
-        if self.gripper is not None and self.gripper.self_collision_model is not None:
-            source += self.gripper.self_collision_model.storage_nbytes*4
-            live += states*len(self.gripper.self_collision_model.axis_pairs)*48
-        return {'cpu_shared': int(source+cells*12+pair_bytes*2),
-                'gpu_shared': int(cells*12+pair_bytes),
-                'cpu_live': int(live+max((q.distance.nbytes for q in fields.values()), default=0)),
-                'gpu_live': int(live), 'gpu_retained': 0, 'gpu_graph_live': int(live)}
+        live = states*spheres*512
+        native_cpu, native_gpu = 0, 0
+        if self.native_collision_model is not None:
+            model = self.native_collision_model
+            columns = len(model.joint_names)+16*len(model.owner_ids)
+            native_cpu = states*(len(model.groups)*(1+columns)+columns)*8
+            native_gpu = states*len(model.groups)*columns*8
+            # Complete source vertices and fixed pair tables are immutable;
+            # Coal/Pinocchio storage is owned by the same bound CPU model.
+            source += sum(np.asarray(row.get('vertices_frame', row.get('dimensions', ()))).nbytes
+                          for row in self.native_robot_model['geometries'])
+            source += len(model.pairs)*4*8
+        return {'cpu_shared': int(source+cells*12), 'gpu_shared': int(cells*12),
+                'cpu_live': int(live+native_cpu+max((q.distance.nbytes for q in fields.values()), default=0)),
+                'gpu_live': int(live+native_gpu), 'gpu_retained': 0,
+                'gpu_graph_live': int(live+native_gpu)}
 
     def query_state(self, spheres, tool_pose, progress, *, joint_position=None, joint_names=None,
                     trajectory_time=0., active_contact_rule_ids=None, owner_poses=None, condition_evidence=None):
@@ -607,10 +740,10 @@ class OnlinePlanningScene:
                                for name, value in violations.items()],
                 'status': 'COLLISION_OR_CONSTRAINT' if violations else 'PASS',
                 'observation': observation,
-                'scope': 'Known approximate model only; observation gaps are unresolved and task success is unverified'}
+                'scope': 'Registered solid distances and approximate observed ESDF; observation gaps and task success remain unverified'}
 
     def describe(self):
-        return {'model': 'frozen_motion_scene_v4', 'reference_frame': self.reference_frame,
+        return {'model': 'frozen_motion_scene_v5', 'reference_frame': self.reference_frame,
                 'robot_geometry_source': self.robot_geometry_source,
                 'owners': [o.owner_id for o in self.owners],
                 'required_progress_anchors': self.required_progress_anchors,
@@ -632,21 +765,20 @@ class OnlinePlanningScene:
         hand = self.gripper
         hand_record = None
         if hand is not None:
-            hand_record = {key:_plain(getattr(hand,key)) for key in ('controller','joint_names','current_positions','joint_limits','coupling_matrix','coupling_offset','sphere_indices','local_spheres','sphere_joint_translation','self_collision_pairs','commands','source','control_timestep_s','numerical_joint_tolerance')}
-            hand_record['self_collision_geometry'] = ([] if hand.self_collision_model is None
-                                                     else deepcopy(hand.self_collision_model.geometry))
-            hand_record['prepared_self_collision'] = (None if hand.self_collision_model is None
-                                                     else hand.self_collision_model.record())
+            hand_record = {key:_plain(getattr(hand,key)) for key in ('controller','joint_names','current_positions','joint_limits','coupling_matrix','coupling_offset','sphere_indices','local_spheres','sphere_joint_translation','commands','source','control_timestep_s','numerical_joint_tolerance')}
             # BEGIN production bindings retain declared geometry and its expiry.
             hand_record['nominal_model'] = (None if hand.nominal_finger_trajectory is None
                                             else hand.nominal_finger_trajectory.describe())
             # END command targets remain separate from this optional geometry.
-        return {'schema':'online_scene_v4','reference_frame':self.reference_frame,
+        return {'schema':'online_scene_v5','reference_frame':self.reference_frame,
             'robot_geometry_source':self.robot_geometry_source,'robot_model':deepcopy(self.robot_model),
             'robot_sphere_materials':list(self.robot_sphere_materials),
             'robot_sphere_geometry':deepcopy(self.robot_sphere_geometry),
-            'robot_self_collision_pairs':deepcopy(self.robot_self_collision_pairs),
-            'robot_self_collision_padding':list(self.robot_self_collision_padding),
+            # BEGIN current native source/policy records restore the sole solid model.
+            'native_robot_model':deepcopy(self.native_robot_model),
+            'native_joint_names':list(self.native_joint_names),
+            'native_self_pairs':deepcopy(self.native_self_pairs),
+            # END no archived sphere rejection criterion survives restoration.
             'background':self.background.record(),'owners':owners,'contacts':_plain([asdict(r) for r in self.contacts]),
             # BEGIN serialize Holding geometry identity separately from task contact laws.
             'holding_contacts':_plain([asdict(row) for row in self.holding_contacts]),
@@ -664,7 +796,7 @@ class OnlinePlanningScene:
 
     @classmethod
     def from_binding(cls,row):
-        if row.get('schema')!='online_scene_v4':
+        if row.get('schema')!='online_scene_v5':
             raise ValueError('Online scene binding schema is required')
         owners=[]
         for record in row['owners']:
@@ -676,7 +808,6 @@ class OnlinePlanningScene:
         hand=None
         if row['gripper'] is not None:
             spec=deepcopy(row['gripper'])
-            prepared = spec.pop('prepared_self_collision')
             # BEGIN restore only the explicitly archived physical validity.
             from .gripper_trajectory import NominalFingerGeometry
             nominal_record = spec.pop('nominal_model')
@@ -695,10 +826,6 @@ class OnlinePlanningScene:
                     raise ValueError('Saved nominal geometry changed the measured named entrance')
                 hand.nominal_finger_trajectory = nominal
             # END actual execution still supplies measured complete finger joints.
-            if (prepared is None) != (hand.self_collision_model is None):
-                raise ValueError('Saved native hand geometry and prepared model must agree')
-            if prepared is not None:
-                hand.self_collision_model.validate_record(prepared)
         cover=row['coverage']
         known=decode_array(cover['known'])
         coverage=ObservedSpace(known,origin=cover['origin'],voxel_size=cover['voxel_size'],
@@ -716,7 +843,8 @@ class OnlinePlanningScene:
         scene._bind_initial_supports(initial, row['initial_support_preparation'])
         # END ordinary scenes legitimately carry an empty support inventory.
         scene.bind_online_robot(robot_sphere_geometry=row['robot_sphere_geometry'],
-            robot_self_collision_pairs=row['robot_self_collision_pairs'],robot_self_collision_padding=row['robot_self_collision_padding'],
+            native_robot_model=row['native_robot_model'], native_joint_names=row['native_joint_names'],
+            native_self_pairs=row['native_self_pairs'],
             robot_model=row['robot_model'])
         scene.grasp_contact_activations=tuple(deepcopy(row['grasp_contact_activations']))
         scene.observation_report=deepcopy(row['observation_report'])

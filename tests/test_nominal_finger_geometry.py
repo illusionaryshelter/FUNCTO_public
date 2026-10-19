@@ -52,7 +52,7 @@ def hand(model, *, command_factory=None, nominal_factory=None):
         coupling_matrix=np.empty((0, 2)), coupling_offset=[], sphere_indices=(0, 1),
         local_spheres=[[0., 0., 0., .001]]*2,
         sphere_joint_translation=[[[1., 0.], [0., 0.], [0., 0.]], [[0., 1.], [0., 0.], [0., 0.]]],
-        self_collision_pairs=(), commands=(), source="explicit CPU hand", control_timestep_s=.002,
+        commands=(), source="explicit CPU hand", control_timestep_s=.002,
         finger_trajectory_factory=command_factory, nominal_finger_trajectory_factory=nominal_factory)
     if nominal_factory is None:
         result.nominal_finger_trajectory = model

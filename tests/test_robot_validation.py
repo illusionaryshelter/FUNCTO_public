@@ -344,7 +344,13 @@ def online_binding(gate, *, distance=1., supported=True):
         robot_collision_bodies=bodies)
     scene.bind_online_robot(robot_sphere_geometry=[
         {"link_name": link, "sphere_indices": [index], "centers_local": [centers[index]], "radii": [radius]}
-        for index, link in enumerate(("left", "right"))], robot_self_collision_pairs=[],
+        for index, link in enumerate(("left", "right"))],
+        # BEGIN bind the same native solids and mechanical pair policy.
+        native_robot_model=gate.checker.model_record(), native_joint_names=gate.joint_names,
+        native_self_pairs=[{"first": pair.first, "second": pair.second,
+            "margin": max(gate.checker.numerics["gjk_tolerance"], gate.checker.numerics["epa_tolerance"])}
+            for pair in gate.required_pairs],
+        # END observed field queries remain separate scene components.
         robot_model={"urdf_path": str(gate.checker.urdf_path), "base_frame": gate.checker.base_frame,
             "tool_frame": gate.tool_frame, "T_reference_base": gate.T_reference_base.tolist(),
             "T_frame_tcp": gate.T_frame_tcp.tolist()})

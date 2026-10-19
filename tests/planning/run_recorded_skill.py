@@ -202,12 +202,10 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
         coupling_matrix=np.empty((0, len(finger_names))), coupling_offset=np.empty(0),
         sphere_indices=geometry["sphere_indices"], local_spheres=geometry["local_spheres"],
         sphere_joint_translation=geometry["sphere_joint_translation"],
-        self_collision_pairs=geometry["self_collision_pairs"],
         commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id,
                         "occurrence": event.occurrence, "command": event.kind, "progress": event.progress}
                        for event in execution_events if event.kind in {"open", "close", "hold"}),
-        source=f"Native robot FK and synchronous independent position reference: {execution_limits.source}",
-        self_collision_geometry=geometry['self_collision_geometry'])
+        source=f"Native robot FK and synchronous independent position reference: {execution_limits.source}")
     report = {"affine_fk_max_error_m": geometry["affine_fk_max_error_m"],
         "native_geometry_binding": geometry['native_geometry_binding'],
         "native_sphere_count": len(geometry["robot_spheres"]),
@@ -220,7 +218,6 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
             "Held geometric dq=0 is not measured dq; actual full named q/dq remains supervised."),
         # END the original actuator commands and executable prefix stay unchanged.
         "execution_limits": execution_limits.describe(),
-        "enabled_self_collision_pairs": len(geometry["self_collision_pairs"]),
         "contact_permissions": "Bound separately from explicit native material faces and current owner-patch declarations"}
     return hand, report, {key: geometry[key] for key in
         ("robot_spheres", "tool_position", "tool_quaternion", "sphere_indices_by_link")}

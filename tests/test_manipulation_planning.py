@@ -27,7 +27,6 @@ from manipulation.planning import (
     _ProgressMap,
     _formal_native_clock,
     _fixed_spline_grid,
-    _timed_native_state,
     _anchor_capacity,
     _planning_workspace_bytes,
     _PlanningWorkspace,
@@ -197,54 +196,6 @@ class PlannerCalculusTests(unittest.TestCase):
         np.testing.assert_allclose(exported.sample([0.])[1][0], dq0, rtol=0, atol=1e-14)
         self.assertEqual(exported.duration, 40*grid["native_dt"])
 
-
-    def test_native_self_collision_receives_timed_spheres_without_mutating_fk(self):
-        from manipulation.planning_scene import PrismaticGripper
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        q = torch.tensor([[[.3, .1, 0.]]], dtype=torch.float64, requires_grad=True)
-        quaternion = q.new_tensor([[[[1., 0., 0., 0.]]]])
-        original = torch.cat((q[:, :, None]+q.new_tensor([.04, 0., 0.]),
-                              q.new_full((1, 1, 1, 1), .001)), -1)
-        kinematics = SimpleNamespace(robot_spheres=original,
-            tool_poses=SimpleNamespace(tool_frames=[problem.tool_link], position=q[:, :, None], quaternion=quaternion),
-            tool_jacobians=q.new_zeros((1, 1, 1, 6, 3)))
-
-        class State:
-            def __init__(self):
-                self.joint_state = SimpleNamespace(position=q)
-                self.cuda_robot_model_state = kinematics
-
-            @property
-            def robot_spheres(self):
-                return self.cuda_robot_model_state.robot_spheres
-
-            @property
-            def tool_poses(self):
-                return self.cuda_robot_model_state.tool_poses
-
-        hand = PrismaticGripper(controller="timed_reference", control_timestep_s=.002, joint_names=("finger",),
-            current_positions=[.04], joint_limits=[[0, .04]], joint_bounds=None,
-            finger_trajectory_factory=lambda *_: None, coupling_matrix=np.empty((0, 1)), coupling_offset=[],
-            sphere_indices=(0,), local_spheres=[[0, 0, 0, .001]],
-            sphere_joint_translation=[[[1], [0], [0]]], self_collision_pairs=(),
-            commands=[{"skill_id": "test", "event_id": "close", "occurrence": 0, "command": "close", "progress": 0.}],
-            source="analytic timed native-self input")
-        hand.finger_trajectory = SimpleNamespace(sample_torch=lambda t: (
-            (.04-.02*t)[..., None], torch.full((*t.shape, 1), -.02, dtype=t.dtype)))
-        from manipulation.gripper_trajectory import NominalFingerGeometry
-        hand.nominal_finger_trajectory = NominalFingerGeometry(("finger",), [0., 1.], [[.04], [.02]],
-            [[-.02], [-.02]], 1., 1., "explicit synthetic free finger geometry")
-        original_state = State()
-        replaced = _timed_native_state(original_state, problem, SimpleNamespace(gripper=hand),
-                                         problem.joint_names, q.new_tensor([[1.]]))
-        self.assertIsNot(replaced.cuda_robot_model_state, original_state.cuda_robot_model_state)
-        self.assertAlmostEqual(original_state.robot_spheres[0, 0, 0, 0].item(), .34)
-        self.assertAlmostEqual(replaced.robot_spheres[0, 0, 0, 0].item(), .32)
-        # The process manager wraps the returned sphere tensor again before
-        # concatenating anchors. This layout identity remains idempotent.
-        wrapped = _native_gradient_layout_type().apply(replaced.robot_spheres)
-        gradient = torch.autograd.grad(wrapped[..., 0].sum(), q)[0]
-        torch.testing.assert_close(gradient, q.new_tensor([[[1., 0., 0.]]]), rtol=0, atol=0)
 
 
     def test_native_backward_receives_contiguous_gradients_after_batched_anchor_views(self):

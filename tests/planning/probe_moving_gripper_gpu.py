@@ -136,14 +136,14 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
             {"joint_names": names, "start_q": initial.cpu().numpy(),
              "finger_joint_names": finger_names, "finger_link_names": fixture["finger_link_names"]},
             frame_problem, device=device, position_limits=fixture["position_limits"], fixture=fixture)
-        sphere_indices, self_pairs = geometry["sphere_indices"], geometry["self_collision_pairs"]
+        sphere_indices = geometry["sphere_indices"]
         local_spheres, affine = geometry["local_spheres"], geometry["sphere_joint_translation"]
         installations, installation_report = create_fixed_installation_owners(fixture,
             device_cfg=device, T_output_base=np.eye(4),
             sphere_indices_by_link=geometry["sphere_indices_by_link"])
         report["native_hand"] = {
             "active_joint_names": list(names), "finger_joint_names": list(finger_names),
-            "finger_sphere_indices": list(sphere_indices), "enabled_self_collision_pairs": len(self_pairs),
+            "finger_sphere_indices": list(sphere_indices),
             "joint_limits_m": limits.tolist(), "affine_native_fk_max_error_m": geometry["affine_fk_max_error_m"],
             "drive_coupling_matrix": coupling.tolist(), "drive_coupling_offset": coupling_offset.tolist(),
             "drive_contract": "explicit synthetic equal fraction of the signed mechanical opening ranges",
@@ -178,11 +178,10 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
             current_positions=initial[finger_columns].cpu().numpy(), joint_limits=limits,
             joint_bounds=bounds, coupling_matrix=coupling, coupling_offset=coupling_offset,
             sphere_indices=sphere_indices, local_spheres=local_spheres,
-            sphere_joint_translation=affine, self_collision_pairs=self_pairs,
+            sphere_joint_translation=affine,
             commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id, "occurrence": event.occurrence,
                             "command": event.kind, "progress": event.progress} for event in events),
-            source="explicit synthetic position-tracking drive; geometry calibrated against native source FK",
-            self_collision_geometry=geometry['self_collision_geometry'])
+            source="explicit synthetic position-tracking drive; geometry calibrated against native source FK")
         # BEGIN fixed analytic distance field for the declared distant cuboid.
         background = FrozenPrimitives(primitives=[{"kind": "cuboid", "pose": [0., 0., -1., 1., 0., 0., 0.],
             "dimensions": [.1, .1, .1]}], owner_ids=("synthetic_far_obstacle",),

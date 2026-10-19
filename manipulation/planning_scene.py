@@ -1,14 +1,14 @@
 """Shared robot/owner identities and ordinary interaction-scene records.
 
 All poses and spheres use the declared robot/world planning frame, metres, and
-scalar-first quaternions. FK belongs to cuRobo: this module consumes its actual
-robot spheres and tool poses without reconstructing a robot from task names.
+scalar-first quaternions. This module consumes cuRobo sphere/tool poses and
+declares owner, permission and actuator inputs without task-name inference.
 An owner query contains geometry in that owner's local frame. A background
 query contains only the explicitly separated static background.
 
-The queries are sphere-proxy collision models, not complete contact physics or
-continuous-curve certificates. Observation coverage, material contact features,
-controller capabilities and conservative sphere coverage are explicit inputs.
+OnlinePlanningScene binds registered solids to the native entity model and
+uses sphere proxies for observed fields. Observation coverage, material contact
+features, controller capabilities and sphere coverage are explicit inputs.
 """
 
 # BEGIN observed scene, moving-owner queries and bounded contact permissions.
@@ -22,7 +22,6 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-from torch.utils.checkpoint import checkpoint
 
 from .planning_problem import (
     PosePath, quaternion_conjugate, quaternion_multiply, quaternion_rotate,
@@ -79,61 +78,6 @@ def _world_spheres(spheres, position, quaternion):
     points = _world_points(local[..., :3], position, quaternion)
     radii = local[..., 3:4].expand(*points.shape[:-1], 1)
     return torch.cat((points, radii), dim=-1)
-
-
-# BEGIN bounded batched hand-pair penalties with unchanged sum and derivatives.
-# BEGIN size pair batches by live tensor elements instead of a tiny pair cap.
-_SELF_PAIR_STATE_ELEMENTS = 1_048_576
-
-
-def _self_pair_chunk_size(states, pairs):
-    """Bound expansion while evaluating every declared pair exactly once.
-
-    Larger chunks change floating sum grouping, not the nonnegative pair
-    terms or their mathematical zero set. One pair is the irreducible chunk
-    when the state batch itself exceeds the element target.
-    """
-    return min(pairs, max(1, _SELF_PAIR_STATE_ELEMENTS // states)) if pairs else 0
-# END no pair is discarded and checkpointing still bounds backward scratch.
-
-
-def _pair_penetration(spheres, pairs):
-    """Sum the original positive linear penetrations of these explicit pairs.
-
-    Native cuRobo self-collision differentiates a maximum over pairs; it cannot
-    replace this sum without changing the optimizer objective. Torch's norm
-    preserves its zero-distance derivative, without artificial clearance.
-    """
-    first = spheres.index_select(-2, pairs[:, 0])
-    second = spheres.index_select(-2, pairs[:, 1])
-    distance = torch.linalg.vector_norm(first[..., :3] - second[..., :3], dim=-1)
-    return torch.relu(first[..., 3] + second[..., 3] - distance).sum(-1)
-
-
-def _self_pair_sum(spheres, pair_indices):
-    """Evaluate every pair in bounded chunks, recomputing saved intermediates.
-
-    Non-reentrant checkpointing uses Torch's own derivatives while avoiding
-    one retained [B,H,P,3] graph for every chunk. Inputs are immutable during
-    native backward; pair indices are explicit arguments, not loop closures.
-    All costs are nonnegative, so a zero sum means every declared pair passed.
-    """
-    total = spheres.new_zeros(spheres.shape[:2])
-    if not len(pair_indices):
-        return total
-    # BEGIN keep the original integer pair order without repeated host copies.
-    pairs = constant_tensor(pair_indices, spheres, dtype=torch.long)
-    # END the declared pair order is preserved within memory-bounded chunks.
-    step = _self_pair_chunk_size(math.prod(spheres.shape[:2]), len(pairs))
-    gradients = torch.is_grad_enabled() and spheres.requires_grad
-    for begin in range(0, len(pairs), step):
-        selected = pairs[begin:begin+step]
-        value = (checkpoint(_pair_penetration, spheres, selected,
-                            use_reentrant=False, preserve_rng_state=False)
-                 if gradients else _pair_penetration(spheres, selected))
-        total = total + value
-    return total
-# END bounded batched hand-pair penalties with unchanged sum and derivatives.
 
 
 class CuroboSphereQuery:
@@ -553,16 +497,14 @@ class PrismaticGripper:
     robot components contribute hard collision claims. Actual execution always
     checks the measured complete state. ``coupling_matrix`` and
     ``coupling_offset`` describe the native A q = b drive constraint.
-    ``self_collision_pairs`` is the robot's explicit geometric pair policy,
-    never object-contact permission.
+    Registered solid pair policies belong to the scene's native robot model.
     """
 
     def __init__(self, *, controller, joint_names, current_positions, joint_limits,
                  joint_bounds, coupling_matrix, coupling_offset, sphere_indices,
-                 local_spheres, sphere_joint_translation, self_collision_pairs,
+                 local_spheres, sphere_joint_translation,
                  commands, source, control_timestep_s, numerical_joint_tolerance=1e-5,
-                 finger_trajectory_factory=None, nominal_finger_trajectory_factory=None,
-                 self_collision_geometry=()):
+                 finger_trajectory_factory=None, nominal_finger_trajectory_factory=None):
         # BEGIN independent position-control intervals without solver fingers.
         if controller not in {"position_tracking", "timed_reference", "binary"}:
             raise ValueError("Controller must declare solver tracking, a timed reference or binary intentions")
@@ -623,24 +565,9 @@ class PrismaticGripper:
             raise ValueError("Gripper proxy radii must be positive")
         self.sphere_joint_translation = _array(sphere_joint_translation,
                                               (len(self.sphere_indices), 3, count), "prismatic proxy Jacobian")
-        self.self_collision_pairs = tuple(tuple(pair) for pair in self_collision_pairs)
-        for pair in self.self_collision_pairs:
-            if (len(pair) != 2 or pair[0] == pair[1] or any(type(i) is not int or i < 0 for i in pair)
-                    or not set(pair) & set(self.sphere_indices)):
-                raise ValueError("Envelope self-collision pairs must involve the gripper")
-        # BEGIN reject duplicate declarations before batched summation.
-        if len(set(self.self_collision_pairs)) != len(self.self_collision_pairs):
-            raise ValueError("Self-collision pair declarations must be unique")
-        self._self_pair_indices = np.asarray(self.self_collision_pairs, dtype=np.int64).reshape(-1, 2)
-        # END reject duplicate declarations before batched summation.
-        # BEGIN complete native prismatic solids may replace their proxy pairs.
-        from .prismatic_self_collision import PreparedPrismaticSelfCollision
-        self.self_collision_model = (PreparedPrismaticSelfCollision(
-            self_collision_geometry, joint_names=self.joint_names,
-            sphere_indices=self.sphere_indices, local_spheres=self.local_spheres,
-            sphere_joint_translation=self.sphere_joint_translation,
-            collision_pairs=self._self_pair_indices) if self_collision_geometry else None)
-        # END no source solid means the existing sphere model remains explicit.
+        # BEGIN native self geometry belongs to OnlinePlanningScene.
+        # PrismaticGripper supplies coordinates and observed-field proxies only.
+        # END no hand-only collision model duplicates registered robot solids.
         # BEGIN own each bound occurrence so later retry input cannot alter this scene.
         self.commands = tuple(deepcopy(commands))
         # BEGIN arm-only planning still binds measured fingers without issuing a command.
@@ -798,7 +725,7 @@ def _validate_contact_and_gripper_inputs(owner_materials, robot_materials, conta
     if not has_gripper and gripper is not None:
         raise ValueError('Gripper declaration and geometry disagree')
     if gripper is not None:
-        indices = list(gripper.sphere_indices)+[i for pair in gripper.self_collision_pairs for i in pair]
+        indices = list(gripper.sphere_indices)
         if indices and max(indices) >= len(robot_materials):
             raise ValueError('Gripper indices must belong to the declared robot spheres')
     contacts = tuple(contacts)

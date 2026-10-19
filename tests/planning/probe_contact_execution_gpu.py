@@ -137,7 +137,7 @@ def build_scene(device, robot, backend, targets, problem):
         current_positions=actual["q"][1:], joint_limits=[[0., .04], [-.04, 0.]], joint_bounds=None,
         coupling_matrix=np.empty((0, 2)), coupling_offset=[], sphere_indices=finger_ids,
         local_spheres=[[0., .15, .15, np.sqrt(3)*.01], [0., -.15, .15, np.sqrt(3)*.01]],
-        sphere_joint_translation=affine, self_collision_pairs=tuple(combinations(range(3), 2)),
+        sphere_joint_translation=affine,
         commands=({"skill_id": "press_fixture", "event_id": "hold", "occurrence": 0, "command": "hold", "progress": 0.},),
         source="explicit independent free finger actuators", control_timestep_s=DT,
         finger_trajectory_factory=factory, nominal_finger_trajectory_factory=free_finger_model)

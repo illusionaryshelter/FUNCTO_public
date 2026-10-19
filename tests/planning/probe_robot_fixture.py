@@ -63,7 +63,7 @@ def calibrate_native_hand(robot, feedback, problem, *, device, position_limits, 
     import torch
     from curobo.kinematics import Kinematics, KinematicsCfg
     from curobo.types import JointState
-    from robot_fixture import bind_fixture_gripper_geometry, bind_fixture_prismatic_self_geometry
+    from robot_fixture import bind_fixture_gripper_geometry, bind_fixture_prismatic_proxies
 
     unlocked = deepcopy(robot)
     unlocked["robot_cfg"]["kinematics"]["lock_joints"] = None
@@ -119,17 +119,14 @@ def calibrate_native_hand(robot, feedback, problem, *, device, position_limits, 
     error = float(np.max(np.abs(current_local-predicted)))
     if error > 2e-6:
         raise ValueError(f"Native finger geometry is not affine in the declared TCP: {error} m")
-    pairs = native.get_self_collision_config().collision_pairs.cpu().numpy()
-    self_pairs = tuple(tuple(int(i) for i in pair) for pair in pairs if set(pair)&set(indices))
     result = {"joint_names": names, "finger_joint_names": finger_names,
         "current_positions": initial[columns], "joint_limits": limits,
         "sphere_indices": indices, "local_spheres": local_spheres,
-        "sphere_joint_translation": affine, "self_collision_pairs": self_pairs,
+        "sphere_joint_translation": affine,
         "affine_fk_max_error_m": error, "robot_spheres": current,
         "tool_position": p, "tool_quaternion": q,
         "sphere_indices_by_link": indices_by_link}
-    binding = bind_fixture_prismatic_self_geometry(fixture, robot, result, feedback)
-    result['self_collision_geometry'] = binding['geometry']
+    binding = bind_fixture_prismatic_proxies(fixture, robot, result, feedback)
     result['local_spheres'] = binding['local_spheres']
     result['sphere_joint_translation'] = binding['sphere_joint_translation']
     result['native_geometry_binding'] = binding['audit']
@@ -201,9 +198,8 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
         coupling_matrix=np.empty((0, len(fingers))), coupling_offset=np.empty(0),
         sphere_indices=geometry["sphere_indices"], local_spheres=geometry["local_spheres"],
         sphere_joint_translation=geometry["sphere_joint_translation"],
-        self_collision_pairs=geometry["self_collision_pairs"], commands=commands,
-        source=source, control_timestep_s=control_timestep_s, nominal_finger_trajectory_factory=nominal,
-        self_collision_geometry=geometry['self_collision_geometry'])
+        commands=commands,
+        source=source, control_timestep_s=control_timestep_s, nominal_finger_trajectory_factory=nominal)
     original_links = {row["link"] for row in fixture["collision_geometries"]}
     owners, owner_report = create_fixed_installation_owners(fixture, device_cfg=device,
         T_output_base=problem.base_pose, sphere_indices_by_link={name: indices for name, indices in
