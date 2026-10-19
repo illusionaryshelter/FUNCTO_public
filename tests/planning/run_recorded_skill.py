@@ -319,8 +319,14 @@ def recorded_owner_observation_inputs(problem, scene_input, views, mask_rows, *,
 # END input identities never supply simulated object geometry or contact truth.
 
 
-def run(args):
-    from prepare_recorded_task import prepare_candidate
+# BEGIN execution consumes an explicitly prepared current problem.
+def run_prepared(args, *, problem, provenance):
+    """Run the existing scene/solver pipeline on the supplied continuous path.
+
+    Problem construction belongs to the caller. The actual feedback is checked
+    again here, so an offline reference cannot replace current robot state.
+    This function never reconstructs or resamples the supplied reference.
+    """
     from recorded_observation import classify_robot_observation
     from manipulation.robot_self_filter import SELF, ENVIRONMENT, AMBIGUOUS_SHADOW
     from recorded_task_planning import plan_and_record, _write_diagnostic_json
@@ -371,7 +377,6 @@ def run(args):
         root = Path(manifest["workspace_root"])
         segment = next(s for s in manifest["segments"] if s["id"] == args.segment)
         candidate = next(c for c in segment["grounding"]["candidates"] if c["id"] == args.candidate)
-        program = json.loads((root/segment["program_path"]).read_text())
         scene_input = json.loads((root/candidate["scene_path"]).read_text())
         fixture = json.loads(args.robot_fixture.read_text())
         feedback = json.loads(args.feedback.read_text())
@@ -402,10 +407,20 @@ def run(args):
         planning_feedback = {**feedback, "joint_names": list(active),
                              "start_q": [measured[name] for name in active],
                              "start_dq": [velocities[name] for name in active]}
-        # BEGIN bind true goals without a reference waypoint.
-        problem, provenance = prepare_candidate(
-            program, scene_input, planning_feedback, args.segment)
-        # END reference stages do not impose an approach boundary.
+        # BEGIN prepared requests must retain this snapshot's exact entrance.
+        if (tuple(problem.joint_names) != active
+                or not np.array_equal(problem.start_q, planning_feedback["start_q"])
+                or not np.array_equal(problem.start_dq, planning_feedback["start_dq"])):
+            raise ValueError("Prepared problem differs from current named robot q/dq")
+        for field in ("tool_link", "reference_frame"):
+            if getattr(problem, field) != feedback[field]:
+                raise ValueError(f"Prepared problem disagrees with feedback {field}")
+        for field in ("base_pose", "tool_transform"):
+            if not np.allclose(getattr(problem, field), feedback[field], atol=1e-10, rtol=0):
+                raise ValueError(f"Prepared problem disagrees with calibrated {field}")
+        if {phase.metadata.get("skill_id") for phase in problem.phases} != {args.segment}:
+            raise ValueError("Prepared problem must identify this current skill")
+        # END the caller's exact PosePath object reaches plan_and_record.
         # The supplied camera calibration is explicitly world-from-camera.
         # Another output frame needs its real calibrated transform, never a
         # relabelled world observation at this narrow recorded-test boundary.
@@ -822,7 +837,37 @@ def run(args):
         _write_diagnostic_json(args.output/"run-report.json", report)
 
 
-if __name__ == "__main__":
+def run(args):
+    """Compile recorded program/scene inputs once, then run the shared request."""
+    from prepare_recorded_task import prepare_candidate
+    from recorded_task_planning import _write_diagnostic_json
+    try:
+        manifest = json.loads(args.manifest.read_text())
+        root = Path(manifest["workspace_root"])
+        segment = next(row for row in manifest["segments"] if row["id"] == args.segment)
+        candidate = next(row for row in segment["grounding"]["candidates"] if row["id"] == args.candidate)
+        feedback = json.loads(args.feedback.read_text())
+        q = dict(zip(feedback["joint_names"], feedback["start_q"]))
+        dq = dict(zip(feedback["joint_names"], feedback["start_dq"]))
+        active = feedback["arm_joint_names"]
+        selected = {**feedback, "joint_names": active,
+                    "start_q": [q[name] for name in active], "start_dq": [dq[name] for name in active]}
+        problem, provenance = prepare_candidate(
+            json.loads((root/segment["program_path"]).read_text()),
+            json.loads((root/candidate["scene_path"]).read_text()), selected, args.segment)
+    except Exception as error:
+        args.output.mkdir(parents=True, exist_ok=False)
+        _write_diagnostic_json(args.output/"run-report.json", dict(status="error",
+            planning_called=False, failed_stage="compile_recorded_problem",
+            error=f"{type(error).__name__}: {error}"))
+        (args.output/"exception.txt").write_text(traceback.format_exc())
+        raise
+    return run_prepared(args, problem=problem, provenance=provenance)
+# END both input producers use the same scene, planner and result writer.
+
+
+def parse_args(argv=None):
+    """Share the existing resource/scene CLI without a second option schema."""
     parser = argparse.ArgumentParser(description=__doc__)
     # BEGIN grasp permission comes from arrival/close, with local contacts separately explicit.
     for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "finger-targets", "output"):
@@ -900,7 +945,11 @@ if __name__ == "__main__":
     # BEGIN opt-in host profiling covers preparation, planning and persistence.
     parser.add_argument("--profile-runtime", action="store_true",
                         help="Record host function timings under output/runtime-profile; disabled by default")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = parse_args()
     from manipulation.runtime_profiling import run_with_optional_profile
     run_with_optional_profile(run, args, enabled=args.profile_runtime,
                               output=args.output/"runtime-profile")
