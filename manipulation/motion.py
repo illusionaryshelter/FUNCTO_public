@@ -414,6 +414,36 @@ def fit_motion(
     return selected
 
 
+# BEGIN one free-motion boundary definition for array and continuous consumers.
+def free_transfer_parameters(reference_start, initial_pose, reference_goal=None, goal_pose=None):
+    """Bind one free-motion interval without sampling or inventing a clock.
+
+    The reference is evaluated at the caller's fixed material frame. ``right``
+    attaches its observed entrance to the actual entrance. The two terminal
+    corrections are subsequently weighted by the caller's explicit interval
+    progress. A suffix without another goal uses only ``right``; retaining a
+    previous interval's terminal correction would change its local motion.
+    These are geometric boundary parameters, not robot task constraints.
+    """
+    reference_start = _pose_array(reference_start, "reference_start")
+    initial = _pose_array(initial_pose, "initial_pose")
+    if (reference_goal is None) != (goal_pose is None):
+        raise ValueError("A terminal correction needs both reference_goal and goal_pose")
+    # Exact identity preserves an already matching suffix without roundoff
+    # from multiplying a rigid transform by its numerical inverse.
+    right = np.eye(4) if np.array_equal(reference_start, initial) else _inverse(reference_start) @ initial
+    translation, rotation = np.zeros(3), np.eye(3)
+    if goal_pose is not None:
+        reference_goal = _pose_array(reference_goal, "reference_goal")
+        goal = _pose_array(goal_pose, "goal_pose")
+        mapped_goal = reference_goal @ right
+        translation = goal[:3, 3] - mapped_goal[:3, 3]
+        rotation = goal[:3, :3] @ mapped_goal[:3, :3].T
+    return {"right": right, "translation_correction": translation, "rotation_correction": rotation}
+# END the sampling backend does not own a second boundary algorithm.
+
+
+# BEGIN array transfer uses the explicit phase and shared free boundaries.
 def transfer_motion(
     demo_poses: Any,
     initial_pose: Any,
@@ -422,6 +452,8 @@ def transfer_motion(
     goal_pose: Any | None = None,
     position_tolerance: float = 0.005,
     rotation_tolerance: float = 0.035,
+    *,
+    progress: Any,
 ) -> dict[str, Any]:
     """Transfer object motion, preserving the initial pose and reachable goal.
 
@@ -430,24 +462,38 @@ def transfer_motion(
     The supplied mapping is an input assumption; it is not evidence that an
     unseen mechanism shares the demonstration axis or shape.
 
-    A terminal correction is distributed uniformly over the sample phase in
+    A terminal correction follows explicitly supplied normalized progress in
     model coordinates.  For free motion, translation uses an additive world
     correction and orientation uses a left-multiplied Slerp correction.  For
     constrained motion no incompatible terminal pose is silently projected.
+    ``progress`` must cover [0,1] and align with every pose (a single pose uses
+    [0]). Callers with recorded times normalize those times; untimed geometric
+    callers explicitly declare their geometric phase. Inserting a sample at
+    an existing phase therefore does not redistribute the boundary correction.
     No physical timestamps or end-effector control are inferred.
     """
     demo = _poses_array(demo_poses, "demo_poses")
     initial = _pose_array(initial_pose, "initial_pose")
     transform = _pose_array(reference_transform, "reference_transform")
     goal = None if goal_pose is None else _pose_array(goal_pose, "goal_pose")
-    mapped = transform @ demo @ _inverse(demo[0]) @ _inverse(transform) @ initial
+    # BEGIN phase is an input contract, never an implicit sample-index clock.
+    phase = np.asarray(progress, dtype=float)
+    if (phase.shape != (len(demo),) or not np.isfinite(phase).all()
+            or phase[0] != 0 or np.any(np.diff(phase) <= 0)
+            or (len(phase) > 1 and phase[-1] != 1)):
+        raise ValueError("progress must increase across [0,1] and align with every pose")
+    reference = transform @ demo
+    boundary = free_transfer_parameters(reference[0], initial,
+        None if goal is None else reference[-1], goal)
+    mapped = reference @ boundary["right"]
+    # END a continuous consumer obtains these same right/terminal parameters.
     mapped[0] = initial
     model = fit_motion(mapped, kind, position_tolerance, rotation_tolerance)
     coordinates = model.coordinates.copy()
     diagnostics: dict[str, Any] = {
         "reference_transform": transform.tolist(),
         "goal_supplied": goal is not None,
-        "phase": "uniform sample index; no physical timing inferred",
+        "phase": "explicit normalized progress; no physical timing inferred",
         "pose_semantics": "object/part pose, not end-effector trajectory",
     }
 
@@ -456,14 +502,16 @@ def transfer_motion(
             p_error, r_error = _errors(initial[None], goal[None])
             if max(p_error[0], r_error[0]) > _ENDPOINT_TOLERANCE:
                 raise ValueError("A one-node trajectory cannot preserve different initial and goal poses")
-        phase = np.linspace(0, 1, len(demo))
         if model.kind == "free":
-            output = model.poses(coordinates)
-            output[:, :3, 3] += phase[:, None] * (goal[:3, 3] - output[-1, :3, 3])
-            correction = goal[:3, :3] @ output[-1, :3, :3].T
-            rotations = Slerp([0, 1], Rotation.from_matrix(np.stack((np.eye(3), correction))))(phase)
+            # BEGIN use the shared geometric parameters without fitting a
+            # second endpoint from a reconstructed model-coordinate sample.
+            output = mapped.copy()
+            output[:, :3, 3] += phase[:, None] * boundary["translation_correction"]
+            rotations = Slerp([0, 1], Rotation.from_matrix(
+                np.stack((np.eye(3), boundary["rotation_correction"]))))(phase)
             output[:, :3, :3] = rotations.as_matrix() @ output[:, :3, :3]
             coordinates = model.coordinates_of(output)
+            # END only the numeric sampling backend differs from PosePath.
         else:
             goal_coordinates = model.coordinates_of(goal[None])[0]
             angular_column = 0 if model.kind == "revolute" else 2 if model.kind == "planar" else None
@@ -492,3 +540,4 @@ def transfer_motion(
     model.coordinates = coordinates
     diagnostics["model_fit"] = model.diagnostics
     return {"poses": output, "model": model, "diagnostics": diagnostics}
+# END no sample-count change silently redistributes a terminal correction.

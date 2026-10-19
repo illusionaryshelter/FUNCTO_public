@@ -23,7 +23,10 @@ def inputs(directory):
     save_grounding_skill(package, metadata=metadata, source=source, representation=representation)
     scene = directory / "scene"
     scene.mkdir()
-    (scene / "robot_feedback.json").write_text(json.dumps({"tool_id": "observed_tool", "tool_frame": "control_frame"}))
+    # BEGIN current entry evidence accompanies the tool identity in real input.
+    (scene / "robot_feedback.json").write_text(json.dumps({"tool_id": "observed_tool",
+        "tool_frame": "control_frame", "eef_pose": np.eye(4).tolist()}))
+    # END fixture uses the same feedback contract as the frozen scene.
     (scene / "layout.json").write_text(json.dumps({"sim_time_s": 4.}))
     for name in ("view_a", "view_b"):
         view = scene / name
@@ -74,3 +77,52 @@ def test_unconfirmed_two_view_identity_never_enters_region_registration(tmp_path
     assert report["selection"]["same_entity"] is False
     feature.assert_not_called()
     registration.assert_not_called()
+
+
+# BEGIN reject an explicitly contradictory attachment before expensive work.
+def test_current_attachment_tool_identity_cannot_conflict_with_feedback(tmp_path, monkeypatch):
+    package, scene = inputs(tmp_path)
+    detector = Mock(side_effect=AssertionError("Invalid current coordinates must fail before detection"))
+    monkeypatch.setattr("local_models.sam31.detect", detector)
+    report = ground_skill(package, scene, tmp_path / "conflicting", instruction="Use the observed container",
+        relations={"A": np.eye(4).tolist(), "A_source": "measured current attachment",
+                   "A_context": {"tool_frame": "different_control_frame"}})
+    assert report["status"] == "failed" and report["failed_stage"] == "validate_current_relations"
+    assert "A_context.tool_frame" in report["error"]
+    detector.assert_not_called()
+# END the test requires no additional observations or model calls.
+
+
+# BEGIN the formal command must pass real entry evidence into the new consumer.
+def test_successful_entry_uses_actual_feedback_and_preserves_independent_goal(tmp_path, monkeypatch):
+    from scipy.spatial.transform import Rotation
+    package, scene = inputs(tmp_path)
+    actual, function = np.eye(4), np.eye(4)
+    actual[:3, 3], function[:3, 3] = [-.2, .1, .6], [.4, -.3, .8]
+    actual[:3, :3] = Rotation.from_euler("y", .4).as_matrix()
+    function[:3, :3] = Rotation.from_euler("z", -.3).as_matrix()
+    feedback = json.loads((scene / "robot_feedback.json").read_text())
+    feedback["eef_pose"] = actual.tolist()
+    (scene / "robot_feedback.json").write_text(json.dumps(feedback))
+    monkeypatch.setattr("local_models.sam31.detect", Mock(return_value=[detection("container")]))
+    selection = {"views": {name: {"candidate_ids": [17], "reason": "Same observed fixture"}
+                             for name in ("view_a", "view_b")},
+                 "same_entity": True, "same_entity_reason": "Shared fixture identity"}
+    monkeypatch.setattr("local_models.gemini.Gemini.chat_json", Mock(return_value=selection))
+    monkeypatch.setattr("local_models.marco.extract_image", Mock(return_value=np.ones((1, 3, 4, 4))))
+    monkeypatch.setattr("transfer.dual_view.pipeline.prepare", Mock(return_value={"scope": "CPU fixture"}))
+    monkeypatch.setattr("config.ground_skill.run_region_transfer", Mock(return_value={
+        "status": "accepted_observed_region", "reasons": [],
+        "reference_frame": {"T_world_region": function}, "outputs": None}))
+    output = tmp_path / "success"
+    report = ground_skill(package, scene, output, instruction="Use the observed container")
+    assert report["status"] == "completed" and report["reference_status"] == "reference"
+    with np.load(output / "reference.npz", allow_pickle=False) as saved:
+        np.testing.assert_allclose(saved["eef_poses"][0], actual, atol=1e-12)
+        np.testing.assert_allclose(saved["eef_poses"][-1], function, atol=1e-12)
+        assert np.linalg.norm(saved["bound_eef_poses"][0] - actual) > .1
+    assert report["reference_boundary_checks"]["eef"]["status"] == "passed"
+    np.testing.assert_allclose(np.load(output / "planner-reference-samples.npy")[0], actual, atol=1e-12)
+    html = (output / "index.html").read_text()
+    assert '"kind": "actual_start"' in html and '"kind": "nominal_goal"' in html
+# END a complete image pipeline cannot silently drop current robot feedback.

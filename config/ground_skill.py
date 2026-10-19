@@ -66,8 +66,21 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
                   status="running", region_status="missing", reference_status="missing",
                   target_region_truth_used=False, executed=False, scene_layout=layout,
                   current_robot_feedback=feedback, stages=[])
-    transfer, reference, stage = None, None, "select_current_entity"
+    transfer, reference, stage = None, None, "validate_current_relations"
     try:
+        # BEGIN validate already-declared coordinate identities before models.
+        relations = relations or {}
+        for field in ("J", "A"):
+            if field in relations and not relations.get(field + "_source"):
+                raise ValueError(f"Current {field} requires its explicit source")
+        if "A" in relations:
+            context = relations.get("A_context", {})
+            for field in ("tool_id", "tool_frame", "reference_frame"):
+                if field in context and context[field] != feedback.get(field):
+                    raise ValueError(f"Current A_context.{field} conflicts with robot feedback")
+        record["stages"].append(stage)
+        stage = "select_current_entity"
+        # END no new context fields or duplicate observations are required.
         # BEGIN persist each real detector result before the semantic request.
         # observe_interaction_reference calls the detector once per view, in
         # the supplied mapping order. Recording here preserves candidates even
@@ -151,21 +164,24 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
             record["functional_frame"] = _plain(transfer["reference_frame"])
         record["stages"].append(stage)
         stage = "generate_reference"
-        relations = relations or {}
-        for field in ("J", "A"):
-            if field in relations and not relations.get(field + "_source"):
-                raise ValueError(f"Current {field} requires its explicit source")
         if skill["representation"]["kind"] == "grasp":
             if any(feedback[field] != skill["metadata"][field] for field in ("tool_id", "tool_frame")):
                 raise ValueError("Grasp reference needs an explicit source/current tool-frame calibration")
         frame = transfer.get("reference_frame")
+        # BEGIN bind the actual observed entry to the sole reference consumer.
+        # The saved tool pose and current A already determine the held body;
+        # requiring another body observation would duplicate existing evidence.
         reference = generate_reference(skill["representation"],
             T_world_function=None if frame is None else frame["T_world_region"],
-            J=relations.get("J"), A=relations.get("A"))
+            J=relations.get("J"), A=relations.get("A"),
+            T_world_eef=feedback.get("eef_pose"))
         arrays = {key: value for key, value in reference.items() if isinstance(value, np.ndarray)}
         np.savez_compressed(output / "reference.npz", **arrays)
         record.update(reference_status=reference["status"], reference_missing=reference["missing"],
-                      reference_summaries=_plain(reference["summaries"]), relations=_plain(relations))
+                      reference_summaries=_plain(reference["summaries"]), relations=_plain(relations),
+                      reference_boundary_checks=_plain(reference["boundary_checks"]),
+                      reference_scope=reference["scope"], reference_method=reference.get("method"))
+        # END only checked two-boundary paths can enter the planner adapter.
         if "eef_poses" in reference:
             from manipulation.planning_problem import reference_phase
             phase = reference_phase(reference, skill_id=skill["metadata"]["skill_id"],

@@ -126,7 +126,12 @@ def run_stage(observation):
     observed_structure = analyze_motion(demo)
     observed_structure["pose_frame"] = "demonstration_reference_from_fixed_body"
     # END observed candidate diagnostics.
-    options = {"kind": motion_kind(task), "reference_transform": transform}
+    # BEGIN this geometry-only input declares its sample phase explicitly.
+    # run_stage has no timestamp contract. Uniform geometric progress does not
+    # claim a physical recording or execution clock, unlike compiled programs.
+    options = {"kind": motion_kind(task), "reference_transform": transform,
+               "progress": np.linspace(0., 1., len(demo))}
+    # END both preliminary and goal-bound transfers consume the same phase.
     preliminary = transfer_motion(demo, start, **options)
     if relation == "articulation" and preliminary["model"].kind not in {"prismatic", "revolute"}:
         raise ValueError("Articulation observations do not establish a supported fixed-axis/direction model")

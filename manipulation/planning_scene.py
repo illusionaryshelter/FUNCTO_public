@@ -509,12 +509,15 @@ class CollisionOwner:
             raise ValueError("An owner query must contain precisely that physical owner")
         if not callable(getattr(self.pose_path, "sample", None)):
             raise TypeError("Owner motion needs a differentiable PosePath")
-        # BEGIN composed tool references do not widen collision-owner evidence.
+        # BEGIN only completely serializable native paths bind collision owners.
         # Owner stationarity checks and execution-binding serialization require
-        # one world-frame path. They cannot certify or restore a parent chain;
-        # accepting it here would silently discard motion at that boundary.
-        if isinstance(self.pose_path, PosePath) and self.pose_path.parent is not None:
-            raise ValueError("Collision owners require a single world-frame path; composed parent paths are reference-only")
+        # one world-frame path. They store PosePath's declared fields, not an
+        # arbitrary subclass's continuous evaluation rule. In particular, a
+        # TransferredPosePath contains boundary corrections that its sampled
+        # poses cannot reconstruct. Reject it even when parent is None rather
+        # than silently replacing its rotating offsets with straight chords.
+        if type(self.pose_path) is not PosePath or self.pose_path.parent is not None:
+            raise ValueError("Collision owners require a single world-frame path with native PosePath serialization; composed and derived paths are reference-only")
         # END ordinary world-frame owners retain their existing scene contract.
         self.pose_interval = _valid_interval(self.pose_interval)
         if type(self.geometry_complete) is not bool or type(self.moving) is not bool:

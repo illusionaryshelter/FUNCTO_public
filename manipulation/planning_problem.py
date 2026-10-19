@@ -16,7 +16,9 @@ from copy import deepcopy
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from .motion import MotionModel, _inverse, _pose_array, _poses_array
+# BEGIN array and continuous paths share one free boundary parameter owner.
+from .motion import MotionModel, _inverse, _pose_array, _poses_array, free_transfer_parameters
+# END only the evaluation backend is different.
 
 
 def _tensor(value, like):
@@ -63,17 +65,30 @@ def _quaternion(pose):
     return Rotation.from_matrix(np.asarray(pose)[..., :3, :3]).as_quat()[..., [3, 0, 1, 2]]
 
 
+# BEGIN exact small-angle Slerp preserves the curve under sample refinement.
 def _slerp(a, b, fraction):
+    """Shortest-arc interpolation with finite identity first derivatives.
+
+    A normalized linear blend is only an approximation to Slerp and changes
+    angular progress when another sample splits a short segment. The chord
+    half-angle identity avoids acos near one, and sinc weights evaluate the
+    same spherical formula at zero without a small-angle alternate curve.
+    """
     import torch
+    a = a / torch.linalg.vector_norm(a, dim=-1, keepdim=True).clamp_min(1e-15)
+    b = b / torch.linalg.vector_norm(b, dim=-1, keepdim=True).clamp_min(1e-15)
     dot = (a * b).sum(-1, keepdim=True)
     b = torch.where(dot < 0, -b, b)
-    dot = dot.abs().clamp(max=1. - 1e-7)
-    angle = torch.acos(dot)
+    angle = 2*torch.atan2(torch.linalg.vector_norm(b-a, dim=-1, keepdim=True),
+                         torch.linalg.vector_norm(b+a, dim=-1, keepdim=True))
     fraction = fraction[..., None]
-    spherical = (torch.sin((1-fraction)*angle)*a + torch.sin(fraction*angle)*b) / torch.sin(angle)
-    linear = (1-fraction)*a + fraction*b
-    result = torch.where(dot > .9995, linear, spherical)
+    normalized_angle = angle/torch.pi
+    denominator = torch.sinc(normalized_angle)
+    first = (1-fraction)*torch.sinc((1-fraction)*normalized_angle)/denominator
+    second = fraction*torch.sinc(fraction*normalized_angle)/denominator
+    result = first*a + second*b
     return result / torch.linalg.vector_norm(result, dim=-1, keepdim=True).clamp_min(1e-15)
+# END no threshold changes the interpolation law or its physical-time progress.
 
 
 def _interpolate(knots, values, progress):
@@ -190,6 +205,90 @@ class PosePath:
         output[..., :3, :3] = Rotation.from_quat(
             quaternion.detach().numpy().reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix().reshape(*values.shape, 3, 3)
         return output
+
+
+# BEGIN continuous free-reference adaptation with actual entrance and event goals.
+class TransferredPosePath(PosePath):
+    """Adapt one material-frame path without interpolating composed outputs.
+
+    ``reference`` already owns its physical interpolation frame and normalized
+    time/phase map. ``goals`` contains explicit ``progress``/``pose`` records;
+    their nominal poses are geometry boundaries, not new robot task equalities.
+    Each interval uses motion.free_transfer_parameters, exactly as the array
+    transfer kernel does. Source and goal breakpoints remain visible to all
+    PosePath consumers, while arbitrary queries evaluate the original composed
+    reference followed by the analytic correction. After the last event, a new
+    entrance-only attachment preserves the remaining local reference motion.
+    An explicit event already satisfied at progress zero leaves this suffix
+    valid; absence of any event is not silently interpreted as that condition.
+    """
+
+    def __init__(self, reference, initial_pose, goals, source):
+        if not isinstance(reference, PosePath) or len(reference.progress) < 2:
+            raise ValueError("A transferred path needs a PosePath with a positive phase span")
+        if not source or not isinstance(goals, (list, tuple)) or not goals:
+            raise ValueError("A transferred path needs source evidence and explicit event goals")
+        initial = _pose_array(initial_pose, "actual initial pose")
+        normalized = []
+        for goal in goals:
+            if not isinstance(goal, dict):
+                raise ValueError("Each transfer goal needs progress and pose")
+            key = goal.get("progress")
+            if (isinstance(key, (bool, np.bool_)) or not isinstance(key, (int, float, np.number))
+                    or not np.isfinite(key) or not 0 <= key <= 1):
+                raise ValueError("Transfer goal progress must lie in [0,1]")
+            pose = _pose_array(goal["pose"], "transfer goal pose")
+            if float(key) == 0.:
+                if not np.allclose(pose, initial, atol=1e-8, rtol=0):
+                    raise ValueError("The initial transfer event conflicts with the actual entrance")
+            else:
+                normalized.append((float(key), pose))
+        normalized.sort(key=lambda item: item[0])
+        if any(a[0] == b[0] for a, b in zip(normalized, normalized[1:])):
+            raise ValueError("Transfer needs distinct positive-progress event goals")
+
+        self._reference = reference
+        starts, ends, parameters = [], [], []
+        begin, entrance = 0., initial
+        for end, goal in normalized:
+            starts.append(begin)
+            ends.append(end)
+            parameters.append(free_transfer_parameters(reference.sample_numpy(begin), entrance,
+                reference.sample_numpy(end), goal))
+            begin, entrance = end, goal
+        if begin < 1.:
+            starts.append(begin)
+            ends.append(1.)
+            parameters.append(free_transfer_parameters(reference.sample_numpy(begin), entrance))
+        self._interval_starts = np.asarray(starts)
+        self._interval_spans = np.asarray(ends) - self._interval_starts
+        self._right_positions = np.stack([item["right"][:3, 3] for item in parameters])
+        self._right_quaternions = np.stack([_quaternion(item["right"]) for item in parameters])
+        self._translations = np.stack([item["translation_correction"] for item in parameters])
+        corrections = np.repeat(np.eye(4)[None], len(parameters), axis=0)
+        corrections[:, :3, :3] = np.stack([item["rotation_correction"] for item in parameters])
+        self._correction_quaternions = _quaternion(corrections)
+        keys = np.unique(np.r_[reference.progress, [key for key, _ in normalized]])
+        # The stored poses are honest samples for existing diagnostics. They
+        # never become interpolation data for this subclass's sample method.
+        poses = self.sample_numpy(keys)
+        super().__init__(keys, poses, source=source)
+
+    def sample(self, progress):
+        """Evaluate the same boundary parameters with Torch progress gradients."""
+        import torch
+
+        keys = _tensor(self._interval_starts, progress)
+        index = (torch.searchsorted(keys, progress.contiguous(), right=True)-1).clamp(0, len(keys)-1)
+        weight = ((progress-keys[index])/_tensor(self._interval_spans, progress)[index]).clamp(0, 1)
+        position, quaternion = self._reference.sample(progress)
+        position = position + quaternion_rotate(quaternion, _tensor(self._right_positions, progress)[index])
+        quaternion = quaternion_multiply(quaternion, _tensor(self._right_quaternions, progress)[index])
+        position = position + weight[..., None]*_tensor(self._translations, progress)[index]
+        identity = _tensor([1., 0., 0., 0.], progress).expand(*progress.shape, 4)
+        correction = _slerp(identity, _tensor(self._correction_quaternions, progress)[index], weight)
+        return position, quaternion_multiply(correction, quaternion)
+# END references remain continuously composed before and after every event.
 
 
 @dataclass(frozen=True)

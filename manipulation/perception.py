@@ -821,7 +821,11 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
     # Noisy image bindings produce an estimated pose, not an exact six-DoF
     # semantic command. For constrained motion, make any within-tolerance model
     # projection explicit; incompatible binding remains an error.
-    fitted = transfer_motion(demo_poses, initial_pose, reference_transform=reference, kind=motion_kind(task))
+    # BEGIN the pose-only perception fit declares geometric sampling explicitly.
+    # No physical timestamps are available or fabricated in this shape query.
+    fitted = transfer_motion(demo_poses, initial_pose, reference_transform=reference,
+                             kind=motion_kind(task), progress=np.linspace(0., 1., len(demo_poses)))
+    # END fitting a geometric mechanism does not bind execution timing.
     if fitted["model"].kind != "free":
         coordinates = fitted["model"].coordinates_of(goal[None])
         projected = fitted["model"].poses(coordinates)[0]

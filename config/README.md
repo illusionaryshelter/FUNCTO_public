@@ -185,6 +185,12 @@ result = import_point2pose_skill(
 
 整个原始区间逐帧核对 NPZ 与跟踪证据。失败记录、缺时间/world，或任一已绑定实例含 stale/missing/未知状态，返回 `status="missing_source_observations"` 与具体缺项，不写包、不跳帧。warning 候选可保留，完整逐帧原始证据随包保存；正常写入返回 `status="saved_observation_segment"`，该状态只表示保存成功，不表示追踪准确或执行成功。包来源分别标明 Point2Pose 估计运动、已给视觉区域和同步 EEF 记录。
 
+<!-- BEGIN the grounding command consumes actual robot entry evidence. -->
+`ground_skill.py` 从当前场景的 `robot_feedback.json` 读取 `eef_pose`（世界坐标下工具控制坐标的位姿），传入 `generate_reference`。抓取参考使用该实际末端入口；持物操作结合当前 `A`（物体局部坐标到工具坐标的固定变换）得到实际物体入口。`A_context` 已声明的工具或世界坐标名称若与反馈冲突，在模型调用前拒绝；不要求增加重复观测。
+
+参考成功要求实际入口与源 `interaction_time` 所绑定的名义交互位姿同时通过。`reference.npz` 中 `object_poses/eef_poses` 是已适配且止于释放的参考，`bound_*` 仅为适配前诊断，原 `frame_indices/timestamps/H_m` 保留源证据。报告保存 `reference_boundary_checks`；网页显示实际末端、适配首点与独立目标。无 `interaction_time` 的观测包可以保存，但不能生成两端约束参考。完整机器人规划仍须提供真实关节状态、独立任务条件和场景证据。
+<!-- END field presence alone cannot establish a valid current reference. -->
+
 ## 在线 SDF 取舍
 
 在线两份 Profile **默认关闭 TSDF 重建**（`reconstructor.params.build_sdf_after_global_opt: false`），避免在 16GB GPU 上与 SAM 3.1、Track-On-R 竞争显存并引入关键帧耗时峰值。Point2Pose 的 `f2m` 稀疏点地图仍可正常做位姿注册；关闭的是 dense TSDF 重建，不是 f2m 特征点地图。上游初始化时可能出现 “Failed to integrate keyframe” 提示，因明确禁用 TSDF 而触发，不意味着跟踪失败。需要在线增量重建时可以设回 `true`，但应增加显存预警并监测体素尺寸。离线两份仍开启 SDF 与 SDF refine。

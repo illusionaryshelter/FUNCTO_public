@@ -54,7 +54,9 @@ class ReferencePlanningHandoffTest(unittest.TestCase):
             T_world_carrier=np.repeat(np.eye(4)[None], 3, axis=0),
             T_world_eef=np.array([pose(z=.3), pose(z=.2), pose(z=.05)]),
             L_G=pose(.1), interaction_time=5.7, events=[event])
-        reference = generate_reference(rep, T_world_function=pose(.7, .2))
+        # BEGIN an actual tool entrance is independent of source-reference samples.
+        reference = generate_reference(rep, T_world_function=pose(.7, .2), T_world_eef=pose(.4, -.1, .6, .2))
+        # END planner handoff preserves the adapted path and independent task goals.
         phase = reference_phase(reference, skill_id="analytic_grasp", source="observed transformed reference")
         empty = problem(phase)
         self.assertIsNone(empty.terminal_pose_target)
@@ -81,9 +83,12 @@ class ReferencePlanningHandoffTest(unittest.TestCase):
     def held_reference(self):
         rep = build_representation(kind="manipulation", frame_indices=[5, 40], timestamps=[5., 7.],
             T_world_carrier=np.array([pose(), pose(angle=np.pi/2)]),
-            T_world_reference=np.repeat(np.eye(4)[None], 2, axis=0), L_R=np.eye(4), release_time=6.5)
+            T_world_reference=np.repeat(np.eye(4)[None], 2, axis=0), L_R=np.eye(4),
+            interaction_time=6., release_time=6.5)
         A = pose(-.2, .05, .1, -.2)
-        return generate_reference(rep, T_world_function=np.eye(4), J=np.eye(4), A=A), A
+        # BEGIN explicit matching entry keeps this fixture focused on the arm arc.
+        return generate_reference(rep, T_world_function=np.eye(4), J=np.eye(4), A=A, T_world_body=np.eye(4)), A
+        # END a missing current entrance can no longer create a production phase.
 
     def test_held_reference_rotates_tool_arm_and_ends_at_release(self):
         reference, A = self.held_reference()
@@ -108,17 +113,20 @@ class ReferencePlanningHandoffTest(unittest.TestCase):
         model = MotionModel("revolute", np.array([[0.], [np.pi]]), pose(.4),
                             np.eye(3), np.zeros(3), 1e-4, 1e-4, {})
         rep = build_representation(kind="manipulation", frame_indices=[8, 20], timestamps=[1., 3.],
-                                   release_time=2.5)
+                                   interaction_time=2., release_time=2.5)
         A = pose(-.15, .03, .1)
         reference = generate_reference(rep, motion_model=model, source_coordinates=[.1, .1+np.pi],
                                        current_coordinates=.2, A=A)
         phase = reference_phase(reference, skill_id="analytic_hinge", source="observed scalar mechanism")
         compiled = problem(phase)
-        self.assertIs(phase.reference.motion_model, model)
+        # BEGIN verify actual scalar FK through the composed production tool path.
+        # The tool's fixed attachment is now a separate parent composition;
+        # the physical midpoint, rather than object layout, is the contract.
         angle = .2+.375*np.pi
         expected = model.poses([[angle]])[0] @ _inverse(A)
         np.testing.assert_allclose(sample(compiled, .5), expected, atol=1e-12)
         np.testing.assert_allclose(compiled.progress_to_source_time(.5), 1.75)
+        # END a Cartesian chord cannot satisfy this independent hinge midpoint.
 
     def test_missing_or_inconsistent_inputs_do_not_create_a_tool_reference(self):
         reference, A = self.held_reference()

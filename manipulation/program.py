@@ -189,7 +189,7 @@ def _current_initial_coordinates(model_spec, model, pose, *, require_lift=False)
 
 # BEGIN native coordinate events share the existing constrained transfer kernel.
 def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
-                    coordinate_reference=None, coordinate_goals=None):
+                    timestamps, coordinate_reference=None, coordinate_goals=None):
     """Transfer in a physical function frame, preserving every internal event.
 
     Free intervals reuse the existing SE(3) transfer kernel on a material
@@ -208,12 +208,24 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
     progress profile while adapting its displacement to the new endpoints.
     The unanchored suffix after the final event retains source metric increments;
     this does not rescale the final controlled object motion before release.
+
+    Endpoint corrections use the recorded timestamp fraction within each
+    interval. Source sample density cannot redefine that fraction. Native
+    prismatic progress scaling remains a source-coordinate operation, not a
+    time correction; its pauses and reversals must retain their own meaning.
     """
+    # BEGIN every time-weighted interval consumes the actual source timeline.
+    _, times = validate_timeline(np.arange(len(reference)), timestamps)
+
+    def interval_progress(begin, end):
+        part = times[begin:end+1]
+        return np.zeros(1) if begin == end else (part-part[0])/(part[-1]-part[0])
+    # END a single-state suffix has no invented duration.
     knots = [(0, start)] + [(index, goal) for index, goal in goals if index != 0]
     if goals and goals[0][0] == 0 and not np.allclose(goals[0][1], start, atol=1e-8, rtol=0):
         raise ReferenceGenerationError("The nominal initial reference event differs from the actual entry member")
     output = np.empty_like(reference)
-    diagnostics = {"phase": "source sample index; physical timestamps retained separately"}
+    diagnostics = {"phase": "recorded timestamp fraction within each functional interval; no execution timing inferred"}
     native = coordinate_reference is not None
     if native != (coordinate_goals is not None) or (native and model_spec is None):
         raise ValueError("Native coordinate reference/goals require one current mechanism model")
@@ -225,7 +237,8 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
         for position, (begin, initial) in enumerate(knots):
             end, goal = knots[position + 1] if position + 1 < len(knots) else (len(reference) - 1, None)
             result = transfer_motion(function_reference[begin:end + 1], initial @ frame,
-                                     goal_pose=None if goal is None else goal @ frame)
+                                     goal_pose=None if goal is None else goal @ frame,
+                                     progress=interval_progress(begin, end))
             output[begin:end + 1] = result["poses"] @ _inverse(frame)
         diagnostics["model"] = {"kind": "free", "origin": "material functional frame"}
     else:
@@ -315,9 +328,9 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
                     })
                 else:
                     # The revolute branch keeps its existing explicit unwrapped
-                    # coordinate and winding contract. This distance-progress
+                    # coordinate and winding contract. This timestamp-fraction
                     # correction introduces no modulo-angle reinterpretation.
-                    part += np.linspace(0, 1, len(part))[:, None] * (goal_q - part[-1])
+                    part += interval_progress(begin, end)[:, None] * (goal_q - part[-1])
                 # END native prismatic source-progress endpoint retargeting.
             values[begin:end + 1] = part
         if limits is not None and (np.any(values < limits[:, 0] - 1e-9)
@@ -480,6 +493,9 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
     try:
         objects, diagnostics = _event_transfer(
             reference[:last_held+1], initial, goals, None, spec,
+            # BEGIN phase weights come from these exact controlled source times.
+            timestamps=demo["timestamps"][:last_held+1],
+            # END no goal, release or inserted frame creates another clock.
             coordinate_reference=coordinates[:last_held+1], coordinate_goals=unique_goals)
     except ReferenceGenerationError as error:
         objects, diagnostics = _unfitted_reference(
@@ -744,7 +760,9 @@ def _object_reference(demo, scene, frames, last_held, task, initial):
     else:
         try:
             objects, motion_checks = _event_transfer(reference[:last_held + 1], initial,
-                                                     goal_pairs, function_frame, model_spec)
+                # BEGIN the generic frame route shares the recorded-time phase.
+                goal_pairs, function_frame, model_spec, timestamps=demo["timestamps"][:last_held+1])
+                # END each functional interval normalizes its own original seconds.
         except ReferenceGenerationError as error:
             objects, motion_checks = _unfitted_reference(reference[:last_held+1], bound_model, error)
     # END goals/model are authoritative; source-profile fitting is optional.

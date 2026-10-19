@@ -84,10 +84,25 @@ def write_reference_html(directory, skill, views, transfer, reference, report):
                 # END display and planning never reconstruct separate paths.
                 paths[name] = dict(pixels=_project(poses[:, :3, 3], view),
                                    times=times.tolist())
+        # BEGIN actual entry and independent goal remain visible beside curves.
+        # Diagnostic bound samples are deliberately separate from production
+        # paths: their first pose may fail the actual robot entry boundary.
+        bound = None
+        markers = []
+        if reference and "bound_eef_poses" in reference:
+            bound = _project(reference["bound_eef_poses"][:, :3, 3], view)
+        check = reference.get("boundary_checks", {}).get("eef") if reference else None
+        if check:
+            for key, label, color in (("actual_start", "实际末端", "#ffffff"),
+                                      ("adapted_start", "参考首点", "#62ff9b"),
+                                      ("nominal_goal", "名义交互目标", "#ff75df")):
+                point = _project(np.asarray(check[key])[None, :3, 3], view)[0]
+                markers.append(dict(kind=key, label=label, color=color, pixel=point))
         panels.append(dict(id=view["id"], title="当前 " + view["id"] + "：区域与采样点",
                            image=filename, width=image.shape[1], height=image.shape[0],
                            axes=_axes(frame["T_world_region"] if frame else None, view),
-                           paths=paths))
+                           paths=paths, bound_eef=bound, markers=markers))
+        # END the viewer cannot hide an entrance error behind E A = B alone.
     details = json.dumps(report, ensure_ascii=False, indent=2)
     cards = "".join(f'<article><h2>{escape(panel["title"])}</h2>'
                     f'<div class="viewport"><canvas id="{panel["id"]}" width="{panel["width"]}" height="{panel["height"]}"></canvas></div>'
@@ -101,13 +116,16 @@ FAILURE_SUMMARY
 REGION_WARNINGS
 <p>真实源图与当前双视角图并排显示。区域色块与黄色采样点来自本次计算；拒绝时仍保留诊断区域。源区域是已有输入，当前区域没有使用目标区域真值。</p>
 <div class="controls"><label>图像放大 <input id="zoom" type="range" min="1" max="4" value="1" step=".25"></label><label>参考时间 <input id="progress" type="range" min="0" max="1000" value="0"></label><span id="time"></span></div>
-<p class="legend">坐标轴：红 x、绿 y、蓝 z（显示长度 4 cm）。青色为物体原点轨迹，橙色为末端原点轨迹。滑块选择原始参考时间；圆点表示该时间之前最近的真实参考采样。</p>
+<p class="legend">坐标轴：红 x、绿 y、蓝 z（显示长度 4 cm）。青色为物体轨迹，橙色为末端轨迹；灰色虚线为未适配起点的绑定诊断。白色十字为实际末端，绿色圆环为参考首点，粉色菱形为独立名义交互目标。滑块选择源示教时间；圆点表示该时间之前最近的曲线采样。几何边界通过不等于机器人可执行。</p>
 <div class="grid">CARDS</div><details open><summary>本次状态、输入来源与缺项</summary><pre>DETAILS</pre></details>
 <p><a href="report.json">完整运行记录</a>REFERENCE_LINK REGION_LINK</p>
 <script>const panels=DATA;const images={};let ready=0;const slider=document.getElementById('progress');
 const allTimes=panels.flatMap(p=>Object.values(p.paths).flatMap(v=>v.times));const begin=allTimes.length?Math.min(...allTimes):0,end=allTimes.length?Math.max(...allTimes):0;
 function dot(ctx,p,color,r){if(!p)return;ctx.fillStyle=color;ctx.beginPath();ctx.arc(p[0],p[1],r,0,2*Math.PI);ctx.fill()}
-function draw(){const time=begin+(end-begin)*Number(slider.value)/1000;document.getElementById('time').textContent=allTimes.length?time.toFixed(3)+' s':'没有可用参考';for(const p of panels){const c=document.getElementById(p.id),ctx=c.getContext('2d');if(!images[p.id].complete)continue;ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(images[p.id],0,0);for(const [name,path]of Object.entries(p.paths)){ctx.strokeStyle=name==='object'?'#40e2ed':'#ff9e38';ctx.lineWidth=2;ctx.beginPath();let connected=false;for(const point of path.pixels){if(!point){connected=false;continue}if(connected)ctx.lineTo(...point);else ctx.moveTo(...point);connected=true}ctx.stroke();let i=0;while(i+1<path.times.length&&path.times[i+1]<=time)i++;if(time<=path.times[path.times.length-1])dot(ctx,path.pixels[i],ctx.strokeStyle,5)}if(p.axes&&p.axes[0]){for(let i=1;i<4;i++){if(!p.axes[i])continue;ctx.strokeStyle=['','#ff554e','#4de07b','#559bff'][i];ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(...p.axes[0]);ctx.lineTo(...p.axes[i]);ctx.stroke()}}}}
+// BEGIN visibly compare actual entry, adapted entry and unadapted diagnostic.
+function boundaries(ctx,p){if(p.bound_eef){ctx.strokeStyle='#acb4c0';ctx.lineWidth=1.5;ctx.setLineDash([5,4]);ctx.beginPath();let joined=false;for(const q of p.bound_eef){if(!q){joined=false;continue}if(joined)ctx.lineTo(...q);else ctx.moveTo(...q);joined=true}ctx.stroke();ctx.setLineDash([])}for(const m of p.markers||[]){if(!m.pixel)continue;const [x,y]=m.pixel;ctx.strokeStyle=m.color;ctx.lineWidth=2;ctx.beginPath();if(m.kind==='actual_start'){ctx.moveTo(x-7,y);ctx.lineTo(x+7,y);ctx.moveTo(x,y-7);ctx.lineTo(x,y+7)}else if(m.kind==='adapted_start'){ctx.arc(x,y,9,0,2*Math.PI)}else{ctx.moveTo(x,y-8);ctx.lineTo(x+8,y);ctx.lineTo(x,y+8);ctx.lineTo(x-8,y);ctx.closePath()}ctx.stroke();ctx.fillStyle=m.color;ctx.font='12px sans-serif';ctx.fillText(m.label,x+12,y+(m.kind==='adapted_start'?18:-12))}}
+// END markers are projected from independently recorded world poses.
+function draw(){const time=begin+(end-begin)*Number(slider.value)/1000;document.getElementById('time').textContent=allTimes.length?time.toFixed(3)+' s':'没有可用参考';for(const p of panels){const c=document.getElementById(p.id),ctx=c.getContext('2d');if(!images[p.id].complete)continue;ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(images[p.id],0,0);boundaries(ctx,p);for(const [name,path]of Object.entries(p.paths)){ctx.strokeStyle=name==='object'?'#40e2ed':'#ff9e38';ctx.lineWidth=2;ctx.beginPath();let connected=false;for(const point of path.pixels){if(!point){connected=false;continue}if(connected)ctx.lineTo(...point);else ctx.moveTo(...point);connected=true}ctx.stroke();let i=0;while(i+1<path.times.length&&path.times[i+1]<=time)i++;if(time<=path.times[path.times.length-1])dot(ctx,path.pixels[i],ctx.strokeStyle,5)}if(p.axes&&p.axes[0]){for(let i=1;i<4;i++){if(!p.axes[i])continue;ctx.strokeStyle=['','#ff554e','#4de07b','#559bff'][i];ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(...p.axes[0]);ctx.lineTo(...p.axes[i]);ctx.stroke()}}}}
 for(const p of panels){const im=new Image();images[p.id]=im;im.onload=()=>draw();im.src=p.image}slider.oninput=draw;document.getElementById('zoom').oninput=e=>document.querySelectorAll('canvas').forEach(c=>c.style.width=(100*Number(e.target.value))+'%');</script>"""
     html = html.replace("REGION_STATUS", escape(str(report.get("region_status", report.get("status")))))
     # BEGIN transport/computation failures are distinct from region rejection.

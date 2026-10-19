@@ -256,9 +256,13 @@ def alternative_placement(skill, goal=None):
              @ skill["program"]["demo"]["functional_events"][0]["carrier_frame"])
     attachment = skill["scene"]["holding"]["T_carrier_eef"]
     goal = pose((.12, .08, 0.), (0., 0., .7)) if goal is None else goal
+    # BEGIN the independent candidate uses the same recorded interval times.
+    times = np.asarray(grounded["timestamps"])
     first = transfer_motion(objects[:4] @ frame, objects[0] @ frame,
-                            goal_pose=goal @ frame)["poses"] @ np.linalg.inv(frame)
-    second = transfer_motion(objects[3:] @ frame, goal @ frame)["poses"] @ np.linalg.inv(frame)
+        goal_pose=goal @ frame, progress=(times[:4]-times[0])/(times[3]-times[0]))["poses"] @ np.linalg.inv(frame)
+    second = transfer_motion(objects[3:] @ frame, goal @ frame,
+        progress=(times[3:]-times[3])/(times[-1]-times[3]))["poses"] @ np.linalg.inv(frame)
+    # END a sparse phase change cannot silently redistribute event correction.
     held = np.concatenate((first, second[1:])) @ attachment
     return held
 
@@ -680,6 +684,44 @@ class PlanningProcessTest(unittest.TestCase):
 
 
 class PlanningBuilderTest(unittest.TestCase):
+    # BEGIN event fitting follows original seconds, not the source row count.
+    def test_free_event_correction_uses_nonuniform_recorded_times(self):
+        skill = manipulation_input()
+        program, scene = skill["program"], skill["scene"]
+        program["demo"]["timestamps"] = np.array([5., 5.02, 5.05, 5.5, 5.7, 5.8, 6.1])
+        scene["initial_pose"] = pose((-.2, 0., 0.))
+        scene["eef_pose"] = scene["initial_pose"] @ scene["holding"]["T_carrier_eef"]
+        grounded = ground_program(program, scene)
+        # At t=5.02 only four percent of the entrance mismatch may be
+        # corrected; a row-index rule would incorrectly use one third.
+        self.assertAlmostEqual(grounded["object_poses"][1, 0, 3], .01-.2+.04*.2, places=12)
+        self.assertAlmostEqual(grounded["object_poses"][2, 0, 3], .03-.2+.1*.2, places=12)
+        np.testing.assert_allclose(grounded["object_poses"][0], scene["initial_pose"], atol=1e-12)
+        np.testing.assert_allclose(grounded["object_poses"][3:, 0, 3], .04, atol=1e-12)
+        np.testing.assert_array_equal(grounded["timestamps"], program["demo"]["timestamps"][:6])
+
+    def test_native_revolute_event_uses_time_without_erasing_winding(self):
+        skill = revolute_input()
+        program, scene = skill["program"], skill["scene"]
+        program["demo"]["timestamps"] = np.array([5., 5.02, 5.05, 5.5, 5.7, 5.8, 6.1])
+        scene["functional_bindings"]["function"]["current_coordinates"] = [2*np.pi+.3]
+        grounded = ground_program(program, scene)
+        angles = np.asarray(grounded["motion_checks"]["model"]["coordinates"])[:, 0]
+        self.assertAlmostEqual(angles[1], np.pi/2+.04*.3, places=12)
+        self.assertAlmostEqual(angles[2], np.pi+.1*.3, places=12)
+        np.testing.assert_allclose(angles[3:], 2*np.pi+.3, atol=1e-12)
+
+    def test_native_prismatic_progress_scaling_is_independent_of_sample_clock(self):
+        skill = prismatic_input()
+        program, scene = skill["program"], skill["scene"]
+        scene["functional_bindings"]["function"]["current_coordinates"] = [.18]
+        first = ground_program(program, scene)
+        program["demo"]["timestamps"] = np.array([5., 5.02, 5.05, 5.5, 5.7, 5.8, 6.1])
+        second = ground_program(program, scene)
+        np.testing.assert_allclose(first["object_poses"], second["object_poses"], atol=1e-12)
+        np.testing.assert_allclose(second["object_poses"][:, 0, 3], [.1, .12, .16, .18, .18, .18], atol=1e-12)
+    # END signed coordinate profiles and timestamp corrections remain distinct.
+
     def test_no_pregrasp_or_automatic_stop_and_source_map_keeps_irregular_seconds(self):
         skill = grasp_input()
         skill["program"]["demo"]["timestamps"] = np.array([2., 2.02, 2.03, 2.5, 2.7, 3.])

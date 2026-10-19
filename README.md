@@ -15,6 +15,27 @@ If you find this work useful, please cite:
 
 ## Local pipeline
 
+<!-- BEGIN actual-entry and interaction reference contract. -->
+`manipulation.representation.build_representation` stores source motion and
+original event times. `generate_reference` binds the nominal interaction pose
+from that evidence, then adapts the motion to both that pose and the actual
+current entry. A rigidly relocated source trajectory alone is a diagnostic.
+
+Robot feedback supplies the actual tool pose. For held objects, the confirmed
+body-to-tool relation `A` determines the current body pose, and one continuous
+adapted body path determines the tool path throughout holding. Free adaptation
+uses `motion.free_transfer_parameters` through `TransferredPosePath`, shared
+with the existing array transfer kernel. Corrections use explicit time/phase;
+scalar mechanisms retain their current model and measured coordinate.
+
+Missing entry or interaction evidence yields no production path. Production
+paths end at release; full source evidence and unadapted diagnostics stay
+separate. `reference_phase` passes the continuous path to the planner's
+`MotionPhase`. Robot state, physical task conditions and collision evidence
+remain independent requirements of `PlanningProblem`; geometric boundaries
+alone do not certify robot feasibility or physical execution.
+<!-- END one adapted reference entry, without a rigid-only compatibility mode. -->
+
 <!-- BEGIN default MARCO perception architecture. -->
 This workspace uses one `recovery` Python environment for local **SAM3.1 +
 MARCO** perception. Gemini performs semantic keypoint selection and optional
