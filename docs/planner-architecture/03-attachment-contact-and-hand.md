@@ -1,65 +1,41 @@
-# 附着、接触与夹爪
+# 附着、接触与手指
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。本组件定义被操作物体与工具的名义刚体关系、任务允许接触的几何区域，以及手指指令和规划几何在时间上的对应。
+代码基线：`__IMPLEMENTATION_COMMIT__`。
 
-## 1. 物体与附着的数据结构
+## 1. 实体观测与固定关系
 
-`CollisionOwner` 表示一个具有明确身份、局部碰撞查询和位姿路径的场景对象。`owner_id` 连接任务、观测分区与接触规则；`query` 保存局部几何；`pose_path` 给出对象坐标在共同参考坐标中的位姿。`geometry_complete` 是调用者对完整物体模型的声明。`moving`、`local_spheres`、`sphere_materials` 和 `sphere_cover_error_m` 共同定义作为运动查询作用方时使用的球覆盖。
+`CollisionOwner` 包含实体身份、局部原始观测场、世界坐标 `PosePath`、来源、运动声明和有序 `Attachment`。位姿路径描述关系建立前的实体位置；场的局部样本始终保留。
 
-`Attachment` 保存生效进度区间、工具中的 owner 平移与四元数、声明条件身份，以及可选释放条件身份。记工具世界位姿为 `E(s)`，把物体表示坐标中的点变换到工具坐标的固定变换为 `A=T_tool_owner`，则活动附着内的对象位姿为
+设 C 为观测表示坐标，`C_pre=T_W_C` 为关系建立前的表示位姿，`E_g=T_W_E` 为声明生效事件处的规划工具/TCP位姿。以连杆 FK 表达时，`E_g=T_W_base·T_base_link(q_g)·T_link_tool`，其中 `q_g` 是该事件处的具名关节反馈，左右两项分别为基座和工具标定。固定关系为 `A=E_g⁻¹C_pre`。候选状态产生 `E(t)` 后，实体位姿为 `C(t)=E(t)A`。该运算沿用已有模型，当前实体可见性不参与。
 
-```text
-T_world_owner(s) = E(s) A .
-```
+`Attachment` 保存区间、`position_tool_owner`、`quaternion_tool_owner`、条件身份与可选释放身份。`CollisionOwner.pose` 对关系生效区间应用同一固定变换。释放后使用该候选第一个释放锚点的预测位姿；没有释放声明时关系延续。`with_release_history` 为搜索分支保留已选前缀的释放位姿，未来释放仍为变量。
 
-`CollisionOwner.pose(position, quaternion, progress, released_poses)` 对每个查询进度选择位姿路径、活动附着或释放后冻结位姿，返回位置与四元数。`predicted_pose` 查询对象原位姿路径。释放边界通过场景 `_release_pose` 读取同一候选曲线在该进度的位姿；`with_release_history` 保留已经计算的释放结果，供后续局部状态查询使用。
+源任务坐标到 C 的关系记为 `M_D`。任务点通过 `M_D` 重表达，法线使用其旋转部分；`generate_reference` 使用 `J=M_D⁻¹`。源轨迹、功能区域、任务点和原事件仍承担技能表示职责。
 
-`scene.holding.T_carrier_eef` 将工具点变到 carrier 坐标，它是上述 `A` 的逆变换。任务编译保存此关系，场景构造时转换为 `Attachment`。`HoldingContact` 引用相同声明条件和区间，使碰撞许可与名义运动使用同一对象关系。
+## 2. 有限接触定义
 
-当前 `CollisionOwner` 对运动作用方要求有限球覆盖；`OnlinePlanningScene` 对 `geometry_complete=False` 的运动物体产生 `unsupported/payload` 分项。`native_world_collision_pairs` 登记机器人和具备完整基本体注册的运动对象。这个类型范围决定当前对象参与距离复核的方式。
+`ContactRule` 保存原始任务特征点、法线、边或多边形类型、目标区域坐标、活动区间、间隙和法向要求。机器人特征明确指向 `robot_body`，点在零手指位移时的 TCP 坐标中表达；`feature_joint_translation` 将具名棱柱关节坐标映入该坐标。普通实体特征在其自身坐标中表达。
 
-## 2. 有限接触区域的几何含义
+`OnlinePlanningScene._permission` 将当前特征和目标区域转成目标坐标中的有限半空间，并计算法向残差。调用方将许可转到世界坐标，以 `PairPermission` 交给同一原始场查询。许可要求两侧点分别落在各自明确区域中；区域外的实体部分继续检查通常距离。特征点描述任务接触位置，不定义实体占据。
 
-`ContactRule` 描述一个作用方的指定材料区域与目标对象的有限区域之间的允许关系。这里“材料”指模型中具有固定位置和法线的表面或边缘；作用方可以是机器人，也可以是另一个对象。规则包含 `actor`、`target_owner`、`material_id`、`sphere_indices`、作用区间、目标局部区域、作用方局部材料几何、法线、间隙/方向容差、建模余量、是否要求接触及来源。
+required 接触调用 `query_region_intersection`，寻找有限区域内受支持的零表面。原始零样本或同一完整支持单元中的可靠异号线段证明零表面存在；严格负值内部不足以证明表面接触。法向、活动区间和手指名义状态另行计算。缺少零表面与数值未决分别记录。
 
-`build_material_contact_rules(material_binding, declarations)` 将具名材料记录与规则声明合并，返回 `ContactRule` 元组。机器人材料通常由 `bind_fixture_contact_materials` 与 `calibrate_box_material_features` 提供，包含工具坐标中的材料几何及其随手指关节移动的仿射关系。完整对象材料由 `bind_box_owner_materials` 提供，连接到同一长方体实体及其覆盖球。
+`bind_grasp_contact_rules` 将规则身份绑定到既有抓取条件。`validate_grasp_contact_arrival` 校验名义目标与 close 事件的共同身份和进度。执行按事件应用许可；末端相对预测目标的误差由事后评价消费。
 
-`bind_grasp_contact_rules(problem, contacts, activations)` 把已声明规则身份连接到 `grasp_contact_activation` 的 close 事件与区间。`validate_grasp_contact_arrival` 检查名义抓取要求的身份、目标对象和容差关系。实际激活使用原 close 身份和已绑定模型；执行中的几何目标误差进入事后评价。
+`build_material_contact_rules` 将材料记录中的原任务特征和 `robot_body` 与声明的目标区域组合。`grasp_region.check_grasp_region_compatibility` 在明确手指关节区间中求共同的假设位置，使每个材料特征与至少一个目标许可区域相交。其线性规划使用世界坐标半空间及对手指坐标的仿射导数；原点集各自的法向高度范围完整保留。该输入描述任务许可，实体是否实际具有受支持零表面仍由场景接触查询计算。
 
-`require_native_material` 接受当前实现支持的完整平面挤出材料或原生盒边缘材料。`bind_native_owner_geometry` 验证完整长方体集合、原生实体身份及球覆盖所属关系，返回原生几何字典、球到实体对应和实体球组。`check_native_owner_material` 检查规则材料与该实体表面的对应。非机器人 `ContactRule` 在场景构造时消费这些记录。
+## 3. 声明附着内部接触
 
-## 3. 接触准备与运行计算
+`HoldingContact` 将一个明确 `robot_body` 与实体及附着区间关联。`bind_holding_contacts` 消费材料身份表与原声明关系；`validate_holding_conditions` 比较实体身份、固定变换和区间。许可仅覆盖登记的实体对。观测缺失的指垫不会扩大为整个手指的豁免。
 
-`PreparedContactFields.prepare` 输入目标候选场、TSDF 源几何或基本体接触几何、规则集合、球最大半径及网格参数。它枚举实际可能出现的规则子集，为相应允许区域准备固定字段，同时保留需要接触时可用的源表面见证。返回对象包含 `regions`、查询通道、球组和来源，之后由目标 query 持有。查询通道保存对应允许区域组合的候选距离数组，接触见证保留同一源几何中可供要求接触条件使用的表面点；两者分别服务碰撞许可与接触要求。
+## 4. 初始支撑
 
-对于 TSDF 目标，`FrozenObservedGeometry.prepare_rules` 将完整源组件与各许可区域对应；`component_indices(..., active_rule_ids)` 使用同一组件身份选择保留集合。`PreparedContactFields.query(spheres, policies, ordinary, intersects_geometry)` 消费当前局部球、规则是否激活、几何变换及普通候选值，返回接触模式下的碰撞值和表示缺口。`required_contact` 计算明确要求接触时的联合条件。
+`PreparedInitialSupport` 消费两个原始场、入口关系和已声明平面。入口明确返回 intersection 的原支撑单元进入 `selected_cells`，未决单元单列。`PairPermission.excluded_second_cells` 仅排除该实体对中这些原始单元；邻接单元继续检查通常距离。
 
-`OnlinePlanningScene._permission` 根据作用方和目标位姿、手指坐标、进度及规则材料生成当前几何策略。`native_material_conditions` 在目标坐标中计算完整材料的有限支持关系：平面材料检查间隙、侧边和背面，盒边缘材料使用其两个相邻面定义的法向范围。可选接触的法向条件在可能接触时生效；`required=True` 的规则在整个声明活动区间内承担接触条件。
+`query_minimum_height` 为整个已表示实体相对支撑平面求高度区间。后续高度下界高于入口基线上界减数值容差时确认满足；后续上界低于入口下界减容差时报告下降违反量和局部梯度，其余为未决。基线两端截断到不大于零。活动区间采用左闭右开，记录类型为 `initial_observed_support_v2`。
 
-`ContactCellGeometry`、`ObservedContactGeometry` 和 `LayeredContactCellGeometry` 还提供源几何接触计算 API。前者消费完整有限盒集合，中者消费 TSDF 表面/体积组件，后者消费已经选择的粗细层。`make_contact_geometry` 根据实际数据契约选择实现。它们的结果分别服务相应查询或审计流程；生产固定接触字段的热路径由 `PreparedContactFields.query` 执行。
+## 5. 指令、名义几何与反馈
 
-## 4. 声明持物内部接触
+`PrismaticGripper` 负责具名关节、控制能力、耦合、事件和时钟。位置跟踪消费求解关节；定时或二值控制消费独立手指曲线。`bind_clock` 绑定与正式轨迹一致的物理时间；`state` 返回坐标、不确定状态和关节残差。完整机器人 FK 再将这些坐标转换为连杆场位姿。
 
-`HoldingContact` 连接一个机器人材料实体、附着对象、对应 `condition_id`、区间和完整球索引。`bind_holding_contacts` 消费 `PlanningProblem`、机器人材料绑定和声明记录，返回与已有附着一致的接触对象。`validate_holding_materials` 检查机器人实体和球身份，`validate_holding_conditions` 检查对象、附着矩阵和生效区间。
-
-场景查询时，已绑定材料与被持对象之间的内部接触在声明区间内生效；同一材料对其他对象及背景继续执行普通查询。该处理描述名义刚体模型的内部关系。实际持物效果由独立观察器或事后评价记录，和这份模型声明分别保存。
-
-## 5. 初始支撑关系
-
-`InitialSupportRelation` 表示请求入口已声明存在的物体与独立观测支撑层关系。输入包括作用物体、目标支撑 owner、从入口开始的区间、目标坐标中的平面原点和法线，以及观测身份和支撑假设来源。它与功能事件上的最终 `SupportRequirement` 分别构造。
-
-`PreparedInitialSupport` 当前接收完整运动基本体及静态 TSDF 支撑目标。构造时，将物体所有原生顶点放入目标坐标，计算其相对平面的最小高度 `h0`，并令基准 `b=min(0,h0)`。`_select_components` 用入口实体和 Coal 查询选出该支撑层中实际与入口模型相交的有限源组件身份。字段准备与实体复核都使用这组固定身份。
-
-`components(actor_pose, target_pose, progress)` 重新计算整物体最低高度 `h(s)`，返回活动掩码与 `relu(b−h(s)−numerical_tolerance)`。`collision_values` 在活动时使用扣除上述入口组件后的候选场，在区间外使用普通场。`record` 保存关系、入口高度、基准、选中组件和准备后的字段，恢复时对应原关系。
-
-## 6. 手指指令、名义几何与实际反馈
-
-`FixedFingerTargets` 保存 `joint_names`、`source` 和 `events`。每条目标事件以 `skill_id`、`event_id`、`kind`、`positions` 指定具名手指位置。`bind` 按技能与事件身份匹配轨迹中的命令，核对其发生次数身份和控制范围，再取得本次曲线中的物理时间。`FingerTrajectory.build` 输入具名手指的入口位置/速度、命令列表、总时长、可执行终点、控制步长以及位置/速度/加速度范围，生成分段三次 Hermite 指令曲线。
-
-`FingerTrajectory.sample/sample_torch` 在任意共享物理时间返回指令位置与速度。`describe/from_mapping` 保存和恢复原曲线；`validate_execution` 将保存结果与实际入口、指令身份、控制步长和设备范围相互核对。`_segment` 为一次指令寻找符合明确运动范围、且终点落在设备控制网格上的坡段；`_extrema` 检查其位置、速度与加速度极值。
-
-`NominalFingerGeometry` 保存规划碰撞使用的手指位置预测及其有效前缀。`bind_nominal_finger_geometry` 在自由运动分支使用命令多项式，几何有效性延续到首次 close；在 `declared_attachment` 分支将入口测量位置冻结为名义持物几何，并令几何速度为零，有效性延续到首次 open 或具名释放。`valid_mask` 给出指定物理时刻的有效性，`sample` 按上述分支返回名义位置。实际下发的 `FingerTrajectory` 仍从测得的入口位置与速度连续构造；命令曲线和几何预测分别序列化。
-
-`PrismaticGripper` 保存独立手指控制类型、具名坐标、机械范围、耦合关系、局部球、每球对各手指关节的平移矩阵、碰撞对与命令。`bind_clock` 将其指令和名义几何绑定到本次机械臂时钟。`state` 根据查询类型选择当前测量、名义指令或机械范围，输出 `GripperState`：中心坐标、半范围、控制残差与不确定标记。`spheres` 把局部手指球放置到工具/世界坐标，并按尚未确定的关节范围形成对应包络。
-
-`PrismaticSelfCollision` 使用明确的手指实体及运动关系计算当前手部实体碰撞。`build_post_grasp_robot_config` 将已测量手指坐标写入独立手指关节配置，并返回机械臂活动关节入口；其前置数据为具名机器人反馈。运动学树、工具标定和手指所属实体由机器人 fixture 提供。
+`FingerTrajectory` 产生实际指令，`NominalFingerGeometry` 表达规划中声明的未来手指坐标。未来几何缺失的手指相关查询记录为 conditional；实际执行使用具名关节反馈检查模型。指令位置与名义接触状态分别保存。

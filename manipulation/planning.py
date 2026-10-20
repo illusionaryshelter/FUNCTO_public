@@ -440,11 +440,10 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     # aggregate sphere buffers fit one such reserve. Scalar slots are counted
     # below per state as well, so this split cannot hide many small caches.
     scene_factor = 3 if scene.required_progress_anchors else 1
-    # BEGIN only optimizer rollouts retain differentiable sphere paths.
-    allocations = [(copies, scene.estimated_workspace_allocation(batch, scene_factor*length,
-                        robot_coverage_horizon=length if guidance else 0, collision_paths=guidance))
-                   for copies, batch, length, guidance in allocation_shapes]
-    # END metric and acceptance queries keep their original allocation.
+    # BEGIN the same observed-field workspace applies to each query layout.
+    allocations = [(copies, scene.estimated_workspace_allocation(batch, scene_factor*length))
+                   for copies, batch, length, _ in allocation_shapes]
+    # END shared immutable fields and per-state witness storage are distinct.
     # BEGIN CPU residency cannot consume the GPU scene budget or graph pools.
     gpu_eager_bytes = (sum(copies*value["gpu_retained"] for copies, value in allocations)
                        + max(value["gpu_live"] for _, value in allocations)
@@ -499,7 +498,7 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
 
 
 def _require_planning_host_memory(cpu_live_bytes, *, encoded_record_bytes_upper, max_host_rss_bytes):
-    """Reserve new CPU work, candidate records and still-lazy shared shapes.
+    """Reserve new CPU work and candidate records.
 
     Three encoded payloads conservatively cover the new validation record,
     its candidate snapshot and serialization copy. Earlier candidates and
@@ -507,11 +506,9 @@ def _require_planning_host_memory(cpu_live_bytes, *, encoded_record_bytes_upper,
     each export therefore accounts for accumulated history without charging
     the same existing map or previous record as a fresh allocation.
     """
-    from .tsdf_geometry import ObservedTsdfGeometry
-
     # BEGIN record retention participates in the same total host admission.
     require_host_memory(cpu_live_bytes+3*encoded_record_bytes_upper,
-        pending_existing_bytes=ObservedTsdfGeometry.pending_storage_total_nbytes(),
+        pending_existing_bytes=0,
         max_rss_bytes=max_host_rss_bytes)
     # END the independent encoded-record and process-tensor bounds still apply.
 
@@ -555,132 +552,38 @@ def _require_planning_memory(torch, device, workspace, *, max_device_used_bytes)
 
 
 def _bounded_robot_configuration(robot, problem, scene, budget):
-    """Check the actual robot layout before native tensor/solver allocation.
+    """Admit a pure named-joint tree before native allocation.
 
-    The installed native full configuration loader is not CPU-only: locked
-    joints and even URDF inertial metadata invoke CUDA internally.  Reuse its
-    existing ``yourdfpy`` metadata parser without meshes or FK instead.  Only
-    selected link/joint names and sphere counts are inspected here; native
-    cuRobo still constructs all transforms and performs every FK/IK operation.
+    The native solvers own joint-domain constraints and tool FK. Registered
+    observation fields own all entity collision geometry in the scene.
     """
     from pathlib import Path
-    import yourdfpy
-    from curobo.content import get_assets_path, get_robot_configs_path
-    from curobo._src.util.config_io import load_yaml, join_path
-
-    def bounded_file(path):
-        # A small robot description must not cause an unbounded CPU parse
-        # before its declared joint/link/sphere sizes can be inspected.
-        if Path(path).stat().st_size > 4*1024**2:
-            raise ValueError("Robot description files must fit the four-MiB metadata budget")
-        return str(path)
-
-    data = robot if isinstance(robot, dict) else load_yaml(
-        bounded_file(join_path(get_robot_configs_path(), robot)))
+    from curobo._src.util.config_io import load_yaml
+    from .observed_robot import pure_kinematics
+    data = deepcopy(robot if isinstance(robot, dict) else load_yaml(str(robot)))
     kinematics = data["robot_cfg"]["kinematics"]
-    if (kinematics.get("num_envs", 1) != 1 or kinematics.get("load_meshes", False)
-            or kinematics.get("load_tool_frames_with_mesh", False)):
-        raise ValueError("Planning requires one robot environment and its requested tool frame without mesh allocation")
-    if not kinematics.get("load_collision_spheres", True):
-        raise ValueError("Complete robot collision spheres are required for planning")
-    collision_links = kinematics.get("collision_link_names", [])
-    extra_links = kinematics.get("extra_links") or {}
-    if (len(collision_links) > budget.max_robot_links or len(extra_links) > budget.max_robot_links
-            or len(set(collision_links)) != len(collision_links)):
-        raise ValueError("Declared robot links exceed the bounded model or contain duplicate collision links")
-    if any(not isinstance(value, dict) for value in extra_links.values()):
-        raise ValueError("Robot configuration must contain YAML-style extra-link dictionaries")
-    cspace = kinematics.get("cspace") or {}
-    if not isinstance(cspace, dict):
-        raise ValueError("Robot configuration must contain a YAML-style cspace dictionary")
-    for value in cspace.values():
-        if isinstance(value, (list, tuple, np.ndarray)) and (
-                len(value) > budget.max_robot_dof or np.asarray(value).ndim != 1):
-            raise ValueError("Robot cspace arrays exceed the bounded independent-joint layout")
-
-    spheres = kinematics.get("collision_spheres")
-    if isinstance(spheres, str):
-        spheres = load_yaml(bounded_file(join_path(get_robot_configs_path(), spheres)))["collision_spheres"]
-    if not isinstance(spheres, dict):
-        raise ValueError("Planning requires an explicit native robot sphere dictionary")
-    extra_spheres = kinematics.get("extra_collision_spheres") or {}
-    if (sum(len(value) for value in spheres.values()) > budget.max_robot_spheres
-            or any(type(count) is not int or count < 0 or count > budget.max_robot_spheres
-                   for count in extra_spheres.values())):
-        raise ValueError("Robot collision geometry exceeds the declared sphere budget before native allocation")
-    # Native extra_collision_spheres replaces that link's list, including
-    # inactive attachment slots.  Count its real allocation, not positive
-    # radii only, before native self-collision constructs an S-by-S table.
-    counts = {name: len(value) for name, value in spheres.items()}
-    counts.update(extra_spheres)
-    if sum(counts.values()) > budget.max_robot_spheres:
-        raise ValueError("Robot attachment sphere slots exceed the declared sphere budget")
-    if any(name not in counts for name in collision_links):
-        raise ValueError("Every native collision link requires an explicit sphere model")
-    sphere_count = sum(counts[name] for name in collision_links)
-    if not 0 < sphere_count <= budget.max_robot_spheres:
-        raise ValueError("Robot collision model must fit the declared nonempty sphere budget")
-    if len(scene.robot_sphere_materials) != sphere_count:
-        raise ValueError("Scene robot-sphere material identities must match the complete native sphere layout")
-
-    asset_root = kinematics.get("external_asset_path") or get_assets_path()
-    urdf_path = bounded_file(join_path(asset_root, kinematics["urdf_path"]))
-    parsed = yourdfpy.URDF.load(urdf_path, load_meshes=False, load_collision_meshes=False,
-                                build_scene_graph=False, build_collision_scene_graph=False)
-    parents = {joint.child: joint.parent for joint in parsed.joint_map.values()}
-    driven = {}
-    for joint in parsed.joint_map.values():
-        if joint.type not in ("fixed", "prismatic", "revolute", "continuous"):
-            raise ValueError("Robot joints must use the native one-coordinate kinematic types")
-        if joint.type != "fixed":
-            driven[joint.child] = joint.name if joint.mimic is None else joint.mimic.joint
-    for name, link in extra_links.items():
-        parents[name] = link["parent_link_name"]
-        if link.get("child_link_name") is not None:
-            parents[link["child_link_name"]] = name
-        if link["joint_type"] != "FIXED":
-            driven[name] = link["joint_name"]
-
-    base = kinematics["base_link"]
-    if base not in parsed.link_map and base not in extra_links:
-        raise ValueError("The declared robot base is absent from its URDF and extra links")
-    selected = {base}
-    # Match the native model's selected tree: requested tool, collision links,
-    # and all explicit extra links. This checks metadata connectivity only.
-    for target in [problem.tool_link, *collision_links, *extra_links]:
-        link, chain = target, set()
-        while link != base:
-            if link in chain or link not in parents:
-                raise ValueError("A selected robot link has no acyclic chain to its declared base")
-            chain.add(link)
-            selected.add(link)
-            if len(selected) > budget.max_robot_links:
-                raise ValueError("Native robot link workspaces exceed the declared link budget")
-            link = parents[link]
-    unlocked = {driven[link] for link in selected if link != base and link in driven}
-    # Current occupied-volume evidence may request extra link poses, but it
-    # may not enlarge the already bounded planning model to obtain them.
-    required_links = scene.required_robot_links
-    if (len(required_links) > budget.max_robot_links or len(set(required_links)) != len(required_links)
-            or not set(required_links) <= selected):
-        raise ValueError("Occupied robot evidence links must belong to the bounded planning model")
-    if len(unlocked) > budget.max_robot_dof:
-        # Native locking evaluates the complete unlocked tree once, so bound
-        # that intermediate model as well as the final active joint set.
-        raise ValueError("Native unlocked-joint workspaces exceed the declared DOF budget")
-    locked = kinematics.get("lock_joints") or {}
-    active = unlocked-set(locked)
-    if active != set(problem.joint_names):
-        raise ValueError("Robot active joints must equal the provided feedback joints; configure locked or driven gripper joints explicitly")
-
-    configuration = deepcopy(data)
-    configuration["robot_cfg"]["kinematics"]["tool_frames"] = [problem.tool_link]
-    # Resolve the already checked geometry once, preserving native extra-slot
-    # semantics and avoiding a second unbounded file read inside the solver.
-    configuration["robot_cfg"]["kinematics"]["collision_spheres"] = deepcopy(spheres)
-    metadata = {"active_joint_names": sorted(active), "unlocked_dof": len(unlocked),
-                "links": len(selected), "selected_link_names": sorted(selected), "spheres": sphere_count}
-    return configuration, metadata
+    path = Path(kinematics["urdf_path"])
+    if path.stat().st_size > 4*1024**2:
+        raise ValueError("Kinematic description exceeds its metadata budget")
+    tree = pure_kinematics(path)
+    links = {row.attrib["name"] for row in tree.findall("link")}
+    joints = {row.attrib["name"] for row in tree.findall("joint") if row.attrib["type"] != "fixed"}
+    locks = kinematics.get("lock_joints") or {}
+    if (len(links) > budget.max_robot_links or len(joints) > budget.max_robot_dof
+            or not set(scene.required_robot_links) <= links or problem.tool_link not in links
+            or joints-set(locks) != set(problem.joint_names)):
+        raise ValueError("Pure robot tree must fit the named joint/link planning contract")
+    if kinematics.get("extra_links") or kinematics.get("add_object_link", False):
+        raise ValueError("Observed robot kinematics uses the supplied tree without extra links")
+    # The maintained native configuration parser requires an explicit empty
+    # sphere dictionary even when sphere loading is disabled. It allocates
+    # no physical collision primitives; fields remain the sole scene model.
+    kinematics.update(load_meshes=False, load_collision_spheres=False,
+        collision_spheres={}, collision_link_names=[], extra_collision_spheres={},
+        self_collision_ignore={}, self_collision_buffer={},
+        tool_frames=[problem.tool_link])
+    return data, {"active_joint_names": sorted(joints-set(locks)), "unlocked_dof": len(joints),
+                  "links": len(links), "selected_link_names": sorted(links), "spheres": 0}
 
 
 @dataclass(frozen=True)
@@ -762,29 +665,6 @@ def _candidate_sample_times(trajectory, budget):
 
 
 # BEGIN confirmation retains the original regular and dense query times.
-def _candidate_confirmation_times(trajectory, budget, *, regular_count, regular_dt, dense_count, dense_dt):
-    """Retain source pieces and both physical grids in the existing buffer.
-
-    Physical metric samples occur at integer multiples of their stored dt.
-    Computing float32 normalized phase and then multiplying by duration can
-    move a sample by an ULP and invent a distinct query. The exact dyadic
-    native clock retains its stored native and output dt exactly; each
-    endpoint must name the same candidate duration.
-    No float32 roundtrip changes the original source polynomial's times.
-    """
-    queries = [_candidate_sample_times(trajectory, budget)]
-    for count, dt in ((regular_count, regular_dt), (dense_count, dense_dt)):
-        if type(count) is not int or count < 2:
-            raise ValueError('Candidate confirmation requires explicit native query counts')
-        if not np.isfinite(dt) or dt <= 0 or (count-1)*dt != trajectory.duration:
-            raise MotionPlanningError('unsupported_model', 'Native confirmation grid changed the candidate clock')
-        queries.append(np.arange(count, dtype=float)*dt)
-    times = np.unique(np.concatenate(queries))
-    if (np.any(np.diff(times) <= 0) or np.any(times < 0) or np.any(times > trajectory.duration)):
-        raise MotionPlanningError('unsupported_model', 'Native confirmation times do not name this finite curve')
-    if len(times) > min(budget.max_validation_points, budget.interpolation_buffer_size):
-        raise MotionPlanningError('capacity_exceeded', 'Both original metric grids exceed the admitted confirmation buffer')
-    return times
 # END no extra grid density, retiming, or expanded capacity is introduced.
 
 
@@ -2338,92 +2218,12 @@ def _joint_state_sample_times(joint_state, counts):
 
 
 
-def _timed_native_state(state, problem, scene, joint_names, trajectory_time, *, sphere_padding=0.):
-    """Replace only timed finger spheres before the unchanged native costs.
-
-    cuRobo still owns the arm FK and all native collision pairs. A shallow
-    state copy keeps its buffers immutable while the ordinary Torch graph
-    carries finger geometry derivatives through the same actual TCP pose.
-    """
-    hand = scene.gripper
-    if hand is None or hand.controller not in {"timed_reference", "binary"}:
-        return state
-    import torch
-    from .optimizer_device_checks import constant_tensor
-    q = state.joint_state.position
-    tool = state.tool_poses
-    index = tool.tool_frames.index(problem.tool_link)
-    layout = _native_gradient_layout_type()
-    r = _orientation_vjp_type().apply(q, tool.quaternion.detach(),
-                                     state.cuda_robot_model_state.tool_jacobians[..., 3:, :].detach())
-    p, r = problem.transform_tool_pose(layout.apply(tool.position)[:, :, index], r[:, :, index])
-    spheres = problem.transform_robot_spheres(layout.apply(state.robot_spheres))
-    progress = torch.zeros_like(trajectory_time)  # Timed state depends exclusively on elapsed time.
-    geometry_state = hand.state(progress, q, joint_names, trajectory_time=trajectory_time)
-    spheres = hand.spheres(spheres, p, r, geometry_state.coordinates, geometry_state.half)
-    # BEGIN native self collision shares the scene's scoped uncertainty policy.
-    # The backend explicitly ignores pairs containing a negative padded radius.
-    # Only moving finger proxies after t=0 lack a physical model; fixed palm,
-    # arm and every measured entrance sphere retain all native collision pairs.
-    moving = np.zeros(spheres.shape[-2], dtype=bool)
-    for sphere_index, translation in zip(hand.sphere_indices, hand.sphere_joint_translation):
-        moving[sphere_index] = bool(np.any(translation != 0))
-    uncertain = (geometry_state.uncertain[..., None]
-                 & constant_tensor(moving, spheres, dtype=torch.bool)[None, None])
-    padding = constant_tensor(sphere_padding, spheres)
-    radius = torch.where(uncertain, -1.-padding.abs(), spheres[..., 3])
-    spheres = torch.cat((spheres[..., :3], radius[..., None]), -1)
-    # END command completion is never treated as actual finger penetration.
-    # BEGIN model pose conversion is cached without changing its input or dtype.
-    base = constant_tensor(problem.base_pose, q)
-    # END the original inverse rotation still evaluates in the same order.
-    spheres = torch.cat(((spheres[..., :3]-base[:3, 3])@base[:3, :3], spheres[..., 3:4]), -1)
-    result = copy(state)
-    result.cuda_robot_model_state = copy(state.cuda_robot_model_state)
-    result.cuda_robot_model_state.robot_spheres = spheres.contiguous()
-    return result
-# END extra FK changes neither the optimizer variables nor its single IK target.
-
-
-# BEGIN use each native manager's own effective sphere padding.
-def _native_collision_padding(manager):
-    cost = manager.get_cost("self_collision")
-    return 0. if cost is None or not cost.enabled else cost.config.self_collision_kin_config.sphere_padding
-# END a disabled moving proxy remains negative after native padding is added.
-
-
-# BEGIN every discrete native self gate uses the same registered CAD checker.
-def _confirm_native_self_collection(collection, confirmation, joint_position, joint_names, trajectory_time):
-    """Replace only finite self sphere proposals before native feasibility.
-
-    Regular collections contain [batch,time,1] self residuals. Exact anchors
-    are confirmed before their separate fold, so no folded index is treated
-    as a physical time. Rebinding one value leaves all other constraints and
-    the native caller's original sphere tensor unchanged.
-    """
-    # An undeclared scene capability keeps the original native hard gate.
-    # It does not authorize clearing even a finite positive sphere residual.
-    if confirmation is None:
-        return collection
-    for index, name in enumerate(collection.names):
-        if name != 'self_collision':
-            continue
-        value = collection.values[index]
-        if value.shape != (*joint_position.shape[:2], 1):
-            raise ValueError('Native self confirmation requires one scalar per actual q/time')
-        collection.values[index] = confirmation.confirm_self(value[..., 0], joint_position,
-            joint_names, trajectory_time, source='self_collision')[..., None]
-    return collection
-# END task, joint, analytic hand and world constraints retain their original owners.
-
-
 # BEGIN scene switches share q/t while querying distinct adjacent modes.
 def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion,
                              progress, joint_position, joint_names, *, trajectory_time,
                              normalized_time, query_counts=None, component_diagnostics=None,
-                             native_confirmation=None, scene_evidence_out=None,
-                             optimizer_candidate_evidence=False, optimizer_scene_out=None,
-                             sample_valid=None):
+                             query_role="acceptance", scene_evidence_out=None,
+                             optimizer_candidate_evidence=False):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2434,56 +2234,20 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     """
     import torch
     from .optimizer_device_checks import constant_tensor
-    evaluate = scene.evaluate
-    # BEGIN final acceptance can confirm sphere candidates using native solids.
-    if native_confirmation is not None:
-        def evaluate(*args, **kwargs):
-            return scene.evaluate(*args, **kwargs, native_confirmation=native_confirmation)
-    # END differentiable optimizer queries retain their sphere proposal costs.
+    def evaluate(*args, **kwargs):
+        return scene.evaluate(*args, **kwargs, query_role=query_role)
     # BEGIN classify scene evidence without changing the hard scene sum.
     # The recovery consumer needs actual collision components, not the mixed
     # process_scene constraint (which also includes missing model support,
     # unknown space, contact requirements and controller violations). Only
     # requested metric/diagnostic queries retain collision, scene-update and
     # forbidden-coverage components from this same call, without conflation.
-    # BEGIN world path objectives consume the same unreduced geometry query.
-    collision_paths = {}
-    if optimizer_scene_out is not None and sample_valid is None:
-        raise ValueError("Collision path objectives require explicit sample validity")
-
-    def finish_optimizer(times, validity, side):
-        if optimizer_scene_out is None:
-            return
-        from .collision_path import collision_path_objective
-        # Keep geometry's exact-first layout for release FK. Sort only its
-        # outputs: equal physical times use left, exact, right mode order.
-        # Move invalid padding behind real vertices so it cannot sever an edge.
-        order = torch.argsort(side, dim=1, stable=True)
-        order = order.gather(1, torch.argsort(times.gather(1, order), dim=1, stable=True))
-        order = order.gather(1, torch.argsort((~validity).gather(1, order).to(torch.int64),
-                                            dim=1, stable=True))
-        # The reducer gathers inside bounded checkpointed sphere blocks.
-        # Keeping full sorted copies for every target would retain a second
-        # large geometry graph until backward, despite sequential forwards.
-        optimizer_scene_out["world_objective"] = collision_path_objective(
-            collision_paths, times, validity, order=order)
-    # END hard residuals below retain the original geometry and max reduction.
-    if (component_diagnostics is not None or scene_evidence_out is not None
-            or optimizer_scene_out is not None):
+    # BEGIN diagnostics reuse the same observed-field component calculation.
+    if component_diagnostics is not None or scene_evidence_out is not None:
         base_evaluate = evaluate
         def evaluate(*args, **kwargs):
             components = {}
-            # BEGIN collect per-ball world paths only for trajectory optimization.
-            if optimizer_scene_out is not None:
-                kwargs["collision_paths_out"] = collision_paths
             value = base_evaluate(*args, **kwargs, components_out=components)
-            if optimizer_scene_out is not None:
-                optimizer_scene_out["nonworld_values"] = sum((term for name, term in components.items()
-                    if name not in collision_paths and not name.startswith("conditional/")),
-                    torch.zeros_like(value))
-            # Empty components explicitly mean an empty scene. Every nonzero
-            # scene residual must have a named component under this protocol.
-            # END each exported world component has exactly one objective owner.
             if scene_evidence_out is not None:
                 # BEGIN retain independent same-query scene failure categories.
                 # BEGIN explicit forbidden coverage can request a different path.
@@ -2497,24 +2261,20 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                 # END no category changes the original hard aggregate or gradient.
                 # BEGIN pending registered-actor proposals preserve other hard requirements.
                 if optimizer_candidate_evidence:
-                    # A scene explicitly declares which exact terms have a
-                    # final model-solid confirmation path. Analytic hand and
-                    # unregistered-owner collisions remain independent hard terms.
-                    confirmable = getattr(scene, "native_collision_components", frozenset())
+                    # Every observed-model component retains its own hard
+                    # verdict before aggregation or optimizer preferences.
                     invalid = ~torch.isfinite(value.detach())
                     for name, term in components.items():
                         if name.startswith("conditional/"):
                             continue
                         term = term.detach()
                         invalid = invalid | ~torch.isfinite(term)
-                        if name not in confirmable:
-                            invalid = invalid | (term > 0)
+                        invalid = invalid | (term > 0)
                     if not components:
-                        # An aggregate-only scene supplies no evidence that
-                        # any positive term is eligible for confirmation.
+                        # An aggregate-only scene still supplies its hard value.
                         invalid = invalid | (value.detach() > 0)
-                    # OR each component before reducing modes: subtracting a
-                    # large proxy sum could hide tiny hard violations or NaN.
+                    # Evaluate each component before reducing modes so small
+                    # violations remain visible beside large residuals.
                     scene_evidence_out["optimizer_hard_invalid"] = invalid.to(value.dtype)
                 # END candidate eligibility is separate from the unchanged differentiable cost.
             if component_diagnostics is not None:
@@ -2548,7 +2308,6 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                                 evaluated_states=int(progress.numel()))
         result = evaluate(spheres, position, quaternion, progress, joint_position,
                           joint_names, trajectory_time=trajectory_time)
-        finish_optimizer(trajectory_time, sample_valid, torch.zeros_like(progress))
         return result
     left = torch.zeros_like(progress, dtype=torch.bool)
     right = torch.zeros_like(progress, dtype=torch.bool)
@@ -2597,18 +2356,6 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
         expanded_progress, expanded(joint_position), joint_names,
         trajectory_time=expanded(trajectory_time),
         contact_permission_progress=permission_progress)
-    # BEGIN recover temporal order after the one exact-first geometry call.
-    if optimizer_scene_out is not None:
-        side = torch.cat((torch.zeros_like(progress),
-                          -torch.ones_like(progress[:, left_columns]),
-                          torch.ones_like(progress[:, right_columns])), 1)
-        # A compact side column may exist only for another batch row.
-        # Such unchanged exact placeholders must not become side endpoints.
-        path_valid = torch.cat((sample_valid,
-            sample_valid[:, left_columns] & left[:, left_columns],
-            sample_valid[:, right_columns] & right[:, right_columns]), 1)
-        finish_optimizer(expanded(trajectory_time), path_valid, side)
-    # END equal-time modes never create a fictitious physical-motion edge.
     exact_count, left_count = progress.shape[1], left_columns.numel()
     exact_terms = terms[:, :exact_count]
     left_terms = exact_terms.scatter(1, left_columns[None].expand(progress.shape[0], -1),
@@ -2626,17 +2373,6 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
             right_evidence = exact_evidence.scatter(1, right_columns[None].expand(progress.shape[0], -1),
                 evidence[:, exact_count+left_count:])
             scene_evidence_out[category] = torch.stack((exact_evidence, left_evidence, right_evidence)).amax(0)
-    # BEGIN nonworld requirements retain their own original boundary maximum.
-    if optimizer_scene_out is not None:
-        evidence = optimizer_scene_out["nonworld_values"]
-        exact = evidence[:, :exact_count]
-        left_value = exact.scatter(1, left_columns[None].expand(progress.shape[0], -1),
-                                  evidence[:, exact_count:exact_count+left_count])
-        right_value = exact.scatter(1, right_columns[None].expand(progress.shape[0], -1),
-                                   evidence[:, exact_count+left_count:])
-        optimizer_scene_out["nonworld_values"] = torch.stack((exact, left_value, right_value)).amax(0)
-    # END subtracting independently maximized components would be incorrect.
-    # END the original three-way aggregate and its max-tie gradient stay below.
     # Reconstruct only these small scalar residuals before max. Its original
     # three-way tie weights matter for gradients: replacing this with a max
     # over the compact query would change derivatives at equal-cost modes.
@@ -2662,7 +2398,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
     from curobo._src.rollout.cost_manager.cost_manager_robot import RobotCostManager
     from curobo._src.rollout.cost_manager.cost_manager_robot_cfg import RobotCostManagerCfg
     # BEGIN exact-anchor collision checks use the same native implementation.
-    from curobo._src.cost.cost_self_collision import SelfCollisionCost
     from curobo._src.state.state_robot import RobotState
     # END no separate collision formula or policy is introduced.
     orientation_vjp = _orientation_vjp_type()
@@ -2727,14 +2462,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # A separate native FK instance owns the anchor buffers.  Reusing
             # the main rollout FK would overwrite values needed by backward.
             self._anchor_fk = Kinematics(transition_model.robot_model.config, compute_jacobian=True)
-            # BEGIN every added task/refinement time also checks self collision.
-            # The main cost owns mutable CUDA forward/backward buffers. A
-            # separate instance preserves both graphs, while copying its
-            # already-normalized config avoids dividing the weight twice.
-            native_self = self.get_cost("self_collision")
-            self._anchor_self_collision = (None if native_self is None else
-                SelfCollisionCost(deepcopy(native_self.config)))
-            # END ordinary reference IK creates no additional check buffers.
 
         def bind_request_data(self):
             """Replace request values in fixed-capacity native manager buffers."""
@@ -2794,15 +2521,11 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             return functional_constraints if self._process_mode == "trajectory_optimizer" else None
 
         def optimizer_evidence(self, trajectories):
-            """Read pending-candidate and strict sampled evidence without another rollout.
+            """Read hard evidence and objective from this same rollout.
 
-            PHR and centering/command preferences are optimization objectives,
-            despite residing in the native constraint collection. Their values
-            cannot certify or disqualify feasibility. Original task residuals
-            are retained before that substitution. ``eligible`` keeps every
-            nonconfirmable hard requirement; ``feasible`` additionally requires
-            zero robot/world and self proposal cost. Both are sampling-only evidence.
-            Ordinary/dense metrics and native-solid confirmation remain final.
+            Functional multipliers and centering/command preferences are
+            objectives. Original task and observed-scene residuals determine
+            sampled eligibility; final metrics use the acceptance spacing.
             """
             constraints = trajectories.costs_and_constraints
             collection = constraints.constraints
@@ -2828,12 +2551,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                         finite = torch.isfinite(detached).all(-1)
                         valid = finite & (detached <= 0).all(-1)
                         feasible = feasible & valid
-                        # BEGIN both hard and hybrid self proxies may await CAD confirmation.
-                        # Raw scene terms already retained analytic hand and
-                        # every other nonconfirmable hard requirement above.
-                        eligible = eligible & (finite if name in {
-                            'self_collision', 'anchor_self_collision'} else valid)
-                        # END NaN/Inf and non-self hard terms remain ineligible.
+                        # BEGIN all native hard channels keep their verdict.
+                        eligible = eligible & valid
+                        # END no channel receives a separate confirmation path.
                     if name != "functional_augmented_lagrangian":
                         fixed_objective = fixed_objective+detached.sum(-1)
             feasible = feasible & torch.isfinite(fixed_objective)
@@ -2878,15 +2598,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                                 if context is None else context["times"])
             # END normalized progress remains separate from physical sample time.
             # END optimizer calls retain their original differentiable time grid.
-            # BEGIN native constraints and online fields share one acceptance model.
-            if self._process_mode and active_scene.gripper is not None and active_scene.gripper.controller in {"timed_reference", "binary"}:
-                batch, horizon = state.joint_state.position.shape[:2]
-                if self._process_mode.startswith("seed_"):
-                    query_time = (seed_parameter*active_clock["duration"]).expand(batch, horizon)
-                else:
-                    query_time = sample_times
-                state = _timed_native_state(state, problem, active_scene, self._joint_names, query_time,
-                                            sphere_padding=_native_collision_padding(self))
             collection = super().compute_costs(state, cost_collection, goal, **kwargs)
             # END reference IK receives the same physical time as its optimizer.
             # BEGIN native IK remains an initializer even if its reference collides.
@@ -2899,11 +2610,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # END full trajectory constraints still run in both optimizer/metrics.
             q, dq = state.joint_state.position, state.joint_state.velocity
             batch, horizon, _ = q.shape
-            # BEGIN complete-candidate metrics revise raw regular self proxies only.
-            if context is not None:
-                _confirm_native_self_collection(collection, context['native_confirmation'],
-                    q, self._joint_names, context['times'])
-            # END optimization rollouts retain native gradients and original costs.
             tool = state.tool_poses
             quaternion = orientation_vjp.apply(q, tool.quaternion.detach(),
                                                state.cuda_robot_model_state.tool_jacobians[..., 3:, :].detach())
@@ -2941,28 +2647,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # BEGIN retain the actual anchor state for native self collision.
             anchor_joints = JointState.from_position(anchor_q.contiguous(), joint_names=list(self._joint_names))
             anchor_state = self._anchor_fk.compute_kinematics(anchor_joints)
-            native_self = self.get_cost("self_collision")
-            if native_self is not None and native_self.enabled:
-                anchor_native = _timed_native_state(
-                    RobotState(joint_state=anchor_joints, cuda_robot_model_state=anchor_state),
-                    problem, active_scene, self._joint_names, anchor_times,
-                    sphere_padding=_native_collision_padding(self))
-                self._anchor_self_collision.setup_batch_tensors(batch, anchor_u.shape[1])
-                anchor_collision = self._anchor_self_collision.forward(
-                    native_layout.apply(anchor_native.robot_spheres).contiguous())
-                # BEGIN exact anchors are checked at their own q/time before folding.
-                if context is not None:
-                    anchor_collision = context['native_confirmation'].confirm_self(
-                        anchor_collision[..., 0], anchor_q, self._joint_names,
-                        anchor_times, source='anchor_self_collision')[..., None]
-                # END a final-column sum never supplies a made-up physical instant.
-                # These values already contain the native optimizer weight
-                # and policy in optimizer and metrics. Do not square or multiply them
-                # by the separate task/scene constraint weight below.
-                folded_collision = torch.cat((q.new_zeros((batch, horizon-1, 1)),
-                    (anchor_collision*anchor_valid[..., None]).sum(1, keepdim=True)), dim=1)
-                collection.add(folded_collision, "anchor_self_collision")
-            # END anchor sphere penalties retain native optimizer gradients.
             anchor_quaternion = orientation_vjp.apply(anchor_q, anchor_state.tool_poses.quaternion.detach(),
                                                       anchor_state.tool_jacobians[..., 3:, :].detach())
             anchor_position = native_layout.apply(anchor_state.tool_poses.position)[:, :, self._tool_index]
@@ -3011,22 +2695,17 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # BEGIN candidate retention reads scalar evidence from this same scene query.
             scene_evidence_out = {} if self._process_mode in ("trajectory_metrics", "trajectory_optimizer") else None
             # END no extra FK, source query, or geometry history is created.
-            # BEGIN only optimization substitutes a path objective for world time sums.
-            active = ordered(torch.cat((valid, anchor_valid.expand(batch, -1).bool()), 1))
-            optimizer_scene_out = {} if self._process_mode == "trajectory_optimizer" else None
-            # END metric calls retain the original scene computation.
             scene_value = _scene_boundary_evaluate(active_scene, problem, active_map,
                 spheres, position, quaternion, progress, q, self._joint_names,
                 trajectory_time=trajectory_time, normalized_time=ordered(all_u),
                 query_counts=self._query_counts,
                 component_diagnostics=None if context is None else context["scene_components"],
-                # BEGIN only the complete candidate boundary runs CPU confirmation.
-                native_confirmation=None if context is None else context.get("native_confirmation"),
+                # BEGIN the caller declares the required model separation for this query.
+                query_role="optimization" if self._process_mode == "trajectory_optimizer" and context is None else "acceptance",
                 scene_evidence_out=scene_evidence_out,
-                optimizer_candidate_evidence=self._process_mode == "trajectory_optimizer",
-                optimizer_scene_out=optimizer_scene_out, sample_valid=active)
+                optimizer_candidate_evidence=self._process_mode == "trajectory_optimizer")
             # END ordinary optimizer and proposal metric calls remain unchanged.
-            # END raw residual zero sets are shared; only optimizer weights differ.
+            # END metrics retain the separate acceptance spacing.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
             # BEGIN retain collision gradients for small positive clearance deficits.
             # The scene already returns nonnegative physical violations. A
@@ -3034,8 +2713,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # original skill penalty keeps its squared optimizer objective.
             if self._process_mode == "trajectory_optimizer":
                 values = [("skill_process", process_value.square()),
-                          ("process_scene", optimizer_scene_out["nonworld_values"])]
-                # END metrics and optimizer retain exactly the same scene zero set.
+                          ("process_scene", scene_value)]
+                # END the scene residual remains linear in its physical violation.
                 # BEGIN signed inequalities enter PHR directly, never squared twice.
                 signed, _ = problem.functional_inequalities(
                     position, quaternion, progress, trajectory_time=trajectory_time)
@@ -3092,13 +2771,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # gradient and makes any anchor violation fail feasibility.
                 folded = torch.cat((torch.zeros_like(regular[:, :-1]), (value[:, horizon:]*anchor_valid).sum(1, keepdim=True)), 1)
                 # BEGIN retain the unchanged aggregate tensor as the query identity.
-                # BEGIN world path cost is already a whole-trajectory scalar.
-                # Add it once after regular/anchor folding, retaining the same
-                # native collection shape and existing common scene weight.
-                if name == "process_scene" and self._process_mode == "trajectory_optimizer":
-                    folded = folded + torch.cat((torch.zeros_like(regular[:, :-1]),
-                        optimizer_scene_out["world_objective"][:, None]), 1)
-                # END no horizon multiplier or duplicate old world time sum remains.
                 weighted = (regular+folded).unsqueeze(-1) * budget.constraint_weight
                 collection.add(weighted, name)
                 if name == "process_scene" and self._process_mode == "trajectory_optimizer":
@@ -3326,18 +2998,15 @@ def _unknown_policy_failure(report, policy):
 
 # BEGIN collision recovery consumes typed evidence, never aggregate name matching.
 def _collision_metric_residuals(metrics, seed_index=None):
-    """Summarize scene collisions and the registered native self-collision terms.
+    """Summarize collision evidence from the same observed-scene query.
 
-    Anchor self collision is a folded constraint: it may require recovery but
-    does not identify a new physical sampling time. Scene diagnostic channels
-    separate collision from support gaps; missing same-query evidence is
-    an integration error, never permission to reinterpret process_scene.
+    The other diagnostic channels retain missing support and coverage as
+    distinct results. The aggregate process_scene value is not reclassified.
     """
     constraints = metrics.costs_and_constraints.constraints
     def maximum(value):
         return float((value if seed_index is None else value[seed_index]).max().item())
-    residuals = {name: maximum(value) for name, value in zip(constraints.names, constraints.values)
-        if name in {"self_collision", "anchor_self_collision"}}
+    residuals = {}
     if "process_scene" in constraints.names:
         residuals["scene_collision"] = maximum(_scene_metric_channel(metrics, 0))
     return residuals
@@ -3524,7 +3193,7 @@ class _CuroboPlanner:
         # END every private scene receives the same already frozen hand clock.
         self.anchor_capacity = _anchor_capacity(self.progress_map, anchors, budget)
         robot_dict, self.robot_metadata = _bounded_robot_configuration(robot, problem, scene, budget)
-        # BEGIN native and source FK must consume the same complete robot description.
+        # BEGIN independent and differentiable FK share the same pure kinematic tree.
         # Compare the parsed XML with the validator's consumed snapshot, not
         # with its mutable source file. Runtime native tree overrides have no
         # counterpart in the bound source model and cannot change this tree.
@@ -3537,7 +3206,7 @@ class _CuroboPlanner:
         if (kinematics["base_link"] != robot_validator.checker.base_frame
                 or kinematics.get("extra_links") or kinematics.get("add_object_link", False)
                 or ET.tostring(ET.parse(native_urdf).getroot(), encoding="unicode")
-                != checker.model_record()["urdf_xml"]):
+                != checker.urdf_xml):
             raise ValueError("Native planning requires the consumed source URDF/base without tree overrides")
         locks = kinematics.get("lock_joints") or {}
         independent_hand = hand is not None and hand.controller in {"timed_reference", "binary"}
@@ -3615,6 +3284,7 @@ class _CuroboPlanner:
             # All environment geometry is owned by PlanningScene in reference
             # coordinates. Spheres remain an optimizer gradient only.
             constraint.pop("scene_collision_cfg", None)
+            constraint.pop("self_collision_cfg", None)
             constraint["process_mode"] = mode
             return data
 
@@ -3628,7 +3298,7 @@ class _CuroboPlanner:
         ik_cfg = InverseKinematicsCfg.create(
             robot=deepcopy(robot_dict), optimizer_configs=[ik_optimizer],
             metrics_rollout=configuration("metrics_base.yml", "seed_metrics"),
-            device_cfg=self.device_cfg, num_seeds=budget.ik_seeds, seed_solver_num_seeds=budget.ik_seeds,
+            device_cfg=self.device_cfg, self_collision_check=False, num_seeds=budget.ik_seeds, seed_solver_num_seeds=budget.ik_seeds,
             max_batch_size=1, max_goalset=1, use_cuda_graph=False,
             position_tolerance=problem.numerical.position_m,
             orientation_tolerance=problem.numerical.rotation_rad,
@@ -3669,7 +3339,7 @@ class _CuroboPlanner:
                             "max_dt": budget.maximum_trajectory_dt, "base_ratio": 1.})
         # END the owned config uses M+2 intervals; no native horizon is lengthened.
         self._trajectory_configuration = {
-            "robot": deepcopy(robot_dict),
+            "robot": deepcopy(robot_dict), "self_collision_check": False,
             "optimizer_configs": [trajectory_optimizer],
             "metrics_rollout": configuration("metrics_base.yml", "trajectory_metrics"),
             "transition_model": transition, "device_cfg": self.device_cfg,
@@ -3782,66 +3452,14 @@ class _CuroboPlanner:
         self.trajopt = ProcessTrajectoryOptimizer(TrajectoryOptimizerCfg.create(**deepcopy(self._trajectory_configuration)))
         self._bind_formal_clock()
         self._initialize_verification_constraints()
-        self._bind_native_self_collision_pairs()
         self._bind_physical_domains()
         self._manager_type.bind_request(problem, scene, self.progress_map, self.anchors, budget, self.functional_constraints)
 
     # BEGIN resident native solvers rebind only request values and optimizer state.
     def _bind_online_robot(self):
-        params = self.ik.kinematics.config.kinematics_config
-        spheres = params.link_spheres.detach().cpu().numpy().reshape(-1, 4)
-        links = params.link_sphere_idx_map.detach().cpu().numpy().reshape(-1)
-        names = {int(index): name for name, index in params.link_name_to_idx_map.items()}
-        geometry = [{"link_name": names[int(link)], "sphere_indices": np.flatnonzero(links == link).tolist(),
-                     "centers_local": spheres[links == link, :3].tolist(), "radii": spheres[links == link, 3].tolist()}
-                    for link in np.unique(links)]
-        collision = self.ik.kinematics.get_self_collision_config()
-        validator = self.robot_validator
-        self.scene.bind_online_robot(robot_sphere_geometry=geometry,
-            robot_self_collision_pairs=collision.collision_pairs.detach().cpu().numpy().tolist(),
-            robot_self_collision_padding=collision.sphere_padding.detach().cpu().numpy().tolist(),
-            robot_geometry_source=self.scene.robot_geometry_source,
-            robot_model={"urdf_path": str(validator.checker.urdf_path), "base_frame": validator.checker.base_frame,
-                         "tool_frame": validator.tool_frame, "T_reference_base": validator.T_reference_base.tolist(),
-                         "T_frame_tcp": validator.T_frame_tcp.tolist()})
-
-    # BEGIN native sphere costs retain exactly the non-replaced registered pairs.
-    def _bind_native_self_collision_pairs(self):
-        """Apply prepared solid-pair replacement to every existing native cost.
-
-        Keep kinematics' complete original pair policy immutable: the online
-        model validates its replacement against that source on each rebind.
-        Only each cost's private configuration receives the remaining pairs.
-        The scene metric owns the precise replacement residual in every final
-        candidate query; IK remains an initializer, never an acceptance path.
-        """
-        managers = [self._verification_native]
-        for solver in (self.ik, self.trajopt):
-            rollouts = solver.core.get_all_rollout_instances()
-            if solver is self.trajopt:
-                rollouts = [*rollouts, *solver.additional_metrics_rollouts.values()]
-            for rollout in rollouts:
-                managers.extend(rollout._cost_manager_list)
-        visited = set()
-        for manager in managers:
-            costs = [manager.get_cost("self_collision"), getattr(manager, "_anchor_self_collision", None)]
-            for cost in costs:
-                if cost is None or id(cost) in visited:
-                    continue
-                visited.add(id(cost))
-                original = cost.config.self_collision_kin_config
-                pairs = self.torch.as_tensor(self.scene.native_self_collision_pairs,
-                    dtype=original.collision_pairs.dtype, device=original.collision_pairs.device).reshape(-1, 2)
-                if not hasattr(cost, "_enabled_before_pair_replacement"):
-                    cost._enabled_before_pair_replacement = cost.enabled
-                cost.config.self_collision_kin_config = replace(original, collision_pairs=pairs)
-                if len(pairs) and cost._enabled_before_pair_replacement:
-                    cost.enable_cost()
-                elif not len(pairs):
-                    cost.disable_cost()
-                cost._batch_size = None
-            manager._batch_size = None
-    # END fixed palm, arm/finger and every other registered pair remain active.
+        self.scene.bind_online_robot(configuration=self.robot_dict,
+            validator=self.robot_validator, device=self.device_cfg.device,
+            check_request=lambda: self.check_request())
 
     def rebind(self, problem, scene, budget, *, continuation=None, goal_identities=None):
         """Reuse IK/TrajOpt while clearing all prior candidate and request state."""
@@ -3886,7 +3504,6 @@ class _CuroboPlanner:
         from .functional_augmented_lagrangian import FunctionalAugmentedLagrangian
         self.functional_constraints = FunctionalAugmentedLagrangian(problem.functional_constraint_keys)
         self._manager_type.bind_request(problem, scene, mapping, anchors, budget, self.functional_constraints)
-        self._bind_native_self_collision_pairs()
         self._verification_scene = scene.clone_for_rollout()
         self.trajopt.config.minimum_trajectory_dt = budget.maximum_trajectory_dt
         self.trajopt.config.maximum_trajectory_dt = budget.maximum_trajectory_dt
@@ -3985,7 +3602,6 @@ class _CuroboPlanner:
     def initial_state_diagnostics(self):
         """Test measured q/dq and online collision geometry before proposing motion."""
         # BEGIN frozen-world confirmation belongs to planning, not device supervision.
-        from .online_native_confirmation import OnlineCollisionConfirmation
         # END robot_validation supplies only the registered robot model here.
         limits = self._verification_native.get_cost("cspace").config.joint_limits
         columns = [limits.joint_names.index(name) for name in self.joint_names]
@@ -3998,43 +3614,27 @@ class _CuroboPlanner:
             js = self.JointState(position=q.contiguous(), velocity=dq.contiguous(), joint_names=list(self.joint_names))
             state = self._verification_fk.compute_kinematics(js)
             native = self._RobotState(joint_state=js, cuda_robot_model_state=state)
-            native = _timed_native_state(native, self.problem, self.scene, self.joint_names,
-                q.new_zeros(q.shape[:2]), sphere_padding=_native_collision_padding(self._verification_native))
-            collision = self._verification_native.get_cost("self_collision")
-            if collision is not None and collision.enabled:
-                collision.setup_batch_tensors(1, 1)
-                components["self_collision"] = collision.forward(native.robot_spheres.contiguous())
             index = state.tool_poses.tool_frames.index(self.problem.tool_link)
             position, quaternion = self.problem.transform_tool_pose(
                 state.tool_poses.position[:, :, index], state.tool_poses.quaternion[:, :, index])
             progress = q.new_full(q.shape[:2], self.problem.start_progress)
             # BEGIN retain the same entrance query's scene and native evidence.
             # The hard scene residual remains authoritative. Capture named
-            # positive/nonfinite terms and the native confirmer's final report
             # without rerunning geometry or changing any acceptance threshold.
             scene_components = {}
-            native_confirmation = OnlineCollisionConfirmation(
-                self.robot_validator, self.scene, check_request=self.check_request)
-            # BEGIN measured entrance self spheres use the same model-only rule.
-            if 'self_collision' in components:
-                components['self_collision'] = native_confirmation.confirm_self(
-                    components['self_collision'][..., 0], q, self.joint_names,
-                    q.new_zeros(q.shape[:2]), source='self_collision')[..., None]
-            # END proxy overlap alone cannot prove an immutable entry infeasible.
             # END diagnostic collection owns no additional collision query.
             components["scene"] = _scene_boundary_evaluate(self.scene, self.problem, self.progress_map,
                 self.problem.transform_robot_spheres(native.robot_spheres), position, quaternion,
                 progress, q, self.joint_names, trajectory_time=q.new_zeros(q.shape[:2]),
                 normalized_time=q.new_zeros(q.shape[:2]),
                 # BEGIN measured entrance uses the same candidate confirmation rule.
-                native_confirmation=native_confirmation, component_diagnostics=scene_components)
-            # END proxy geometry alone cannot declare an immutable entrance impossible.
+                component_diagnostics=scene_components)
             residuals = {name: float(value.max().item()) for name, value in components.items()}
         failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
         return {"passed": not failed, "residuals": residuals, "failed_components": failed,
                 # BEGIN expose final same-query evidence beside the unchanged verdict.
                 "scene_components": scene_components,
-                "native_confirmation": deepcopy(native_confirmation.last_report),
+                "observed_geometry": deepcopy(self.scene.last_query_report),
                 # END callers can identify a failed owner/pair without another solve.
                 "scope": "measured joint limits and selected online collision model"}
     # END reject an immutable infeasible entrance before running native IK.
@@ -4285,7 +3885,6 @@ class _CuroboPlanner:
         """
         torch = self.torch
         # BEGIN discrete search uses the existing registered-solid acceptance.
-        from .online_native_confirmation import OnlineCollisionConfirmation
         # END differentiable projection equations retain their original costs.
         # BEGIN every required connection consumes the same request deadline.
         search_started = time.monotonic()
@@ -4396,7 +3995,7 @@ class _CuroboPlanner:
                 return result
             return evaluate
 
-        def valid(values, scene, confirmation):
+        def valid(values, scene):
             with torch.no_grad():
                 values_t = self.device_cfg.to_device(values[None, None])
                 js, state, p, r, progress = state_parts(values_t)
@@ -4407,21 +4006,14 @@ class _CuroboPlanner:
                     "scene": _scene_boundary_evaluate(scene, self.problem, self.progress_map,
                         self.problem.transform_robot_spheres(state.robot_spheres), p, r, progress,
                         js.position, self.joint_names, trajectory_time=clock_time,
-                        normalized_time=values_t[..., -1], native_confirmation=confirmation)}
+                        normalized_time=values_t[..., -1])}
                 # BEGIN self collision consumes the original timed hand model.
                 # Scene evaluation above transforms its own unpadded spheres;
                 # only the native manager receives this separate timed state.
-                native_state = _timed_native_state(
-                    self._RobotState(joint_state=js, cuda_robot_model_state=state),
-                    self.problem, scene, self.joint_names, clock_time,
-                    sphere_padding=_native_collision_padding(self._verification_native))
+                native_state = self._RobotState(joint_state=js, cuda_robot_model_state=state)
                 # END never apply native self padding to the scene spheres.
                 # BEGIN OMPL shares the native registered-sphere self-collision contract.
                 native = self._verification_native.compute_costs(native_state)
-                # BEGIN OMPL self validity shares the exact q/time CAD confirmation.
-                _confirm_native_self_collection(native, confirmation, js.position,
-                    self.joint_names, clock_time)
-                # END non-self native terms remain untouched before the validity gate.
                 terms.update({f"native:{name}": value for name, value in zip(native.names, native.values)})
                 # BEGIN expensive confirmation/setup cannot escape the deadline.
                 check_search()
@@ -4473,9 +4065,8 @@ class _CuroboPlanner:
         # An explicit empty inventory means the scene has no native-confirmable
         # components; it never grants permission to skip its ordinary checks.
         def search_frame(begin, branch_scene, parameter):
-            confirmation = (OnlineCollisionConfirmation(self.robot_validator, branch_scene,
-                check_request=check_search) if branch_scene.native_collision_components else None)
-            return {"start": begin, "scene": branch_scene, "confirmation": confirmation,
+            branch_scene.check_request = check_search
+            return {"start": begin, "scene": branch_scene,
                     "proposals": proposals(begin, parameter), "attempts": 0, "path": None}
 
         scene = self.scene.clone_for_rollout()
@@ -4529,7 +4120,7 @@ class _CuroboPlanner:
                 def stage_valid(value):
                     key = np.asarray(value, dtype=float).tobytes()
                     if key not in validity_cache:
-                        validity_cache[key] = valid(value, scene, frame["confirmation"])
+                        validity_cache[key] = valid(value, scene)
                     return validity_cache[key]
                 path, stage_report = _ompl_stage(begin, goal, np.r_[lower, lo], np.r_[upper, hi],
                     stage_valid, constraint, tolerance=tolerance,
@@ -4629,9 +4220,6 @@ class _CuroboPlanner:
         phase = float(np.interp(u, self.progress_map.u, self.progress_map.s))
         reports = []
         # BEGIN static IK qualification uses the same discrete collision model.
-        from .online_native_confirmation import OnlineCollisionConfirmation
-        confirmation = (OnlineCollisionConfirmation(self.robot_validator, self.scene,
-            check_request=self.check_request) if self.scene.native_collision_components else None)
         # END this local scope retains no evidence across a different query/scene.
         for index, row in enumerate(values):
             report = {"native_pose_ik_success": bool(flags[index]), "candidate_source": "native_ik",
@@ -4642,6 +4230,14 @@ class _CuroboPlanner:
                 report["invalid_joint_indices"] = np.flatnonzero(~np.isfinite(row)).tolist()
                 # END non-finite joints never enter FK or acquire scene evidence.
                 continue
+            # BEGIN failed reference IK rows never enter select_ik_chains.
+            # Functional goals have a different allowed set and still need
+            # their task/model query even when the nominal full pose failed.
+            if not goal_ids and not flags[index]:
+                report["static_model_query"] = "not_run_native_reference_ik_failed"
+                continue
+            report["static_model_query"] = "evaluated"
+            # END source reference failures remain in the diagnostic inventory.
             with self.torch.no_grad():
                 q = self.device_cfg.to_device(row[None, None]).contiguous()
                 zero = self.torch.zeros_like(q)
@@ -4661,14 +4257,9 @@ class _CuroboPlanner:
                 online = _scene_boundary_evaluate(self.scene, self.problem, self.progress_map,
                     self.problem.transform_robot_spheres(state.robot_spheres), p, r, progress, q,
                     self.joint_names, trajectory_time=times, normalized_time=q.new_full(q.shape[:2], u),
-                    component_diagnostics=scene_components, native_confirmation=confirmation)
-                native = _timed_native_state(self._RobotState(joint_state=js, cuda_robot_model_state=state),
-                    self.problem, self.scene, self.joint_names, times,
-                    sphere_padding=_native_collision_padding(self._verification_native))
+                    component_diagnostics=scene_components)
+                native = self._RobotState(joint_state=js, cuda_robot_model_state=state)
                 constraints = self._verification_native.compute_costs(native)
-                # BEGIN reference anchors cannot be invalidated by an unconfirmed self proxy.
-                _confirm_native_self_collection(constraints, confirmation, q, self.joint_names, times)
-                # END native pose success remains an initializer, never execution authorization.
                 model = {"scene": online, **dict(zip(constraints.names, constraints.values))}
                 report.update(task_satisfied=_ompl_terms_accepted(task), model_valid=_ompl_terms_accepted(model))
                 # BEGIN preserve positive/non-finite residuals in their original families.
@@ -4843,43 +4434,25 @@ class _CuroboPlanner:
             tuple(getattr(self, "satisfied_dependencies", ())))
         return trajectory, candidate_scene, mapping
 
-    def _candidate_metrics(self, trajectory, candidate_scene, *, native_query=False):
+    def _candidate_metrics(self, trajectory, candidate_scene):
         """Run existing native metrics on exact, possibly nonuniform queries.
 
         The installed rollout does not forward query kwargs to its managers.
         A short-lived manager context therefore carries actual times and exact
         source-curve anchors; finally clears it even when native evaluation
-        raises. Positive robot/world sphere candidates are confirmed against
-        the native robot solids and the same frozen observed geometry.
+        raises. All states query the same observed fields at the acceptance
+        spacing; task and observation evidence remain tied to that query.
         """
         from curobo._src.solver.solve_mode import SolveMode
         from curobo._src.solver.solve_state import SolveState
         # BEGIN candidate acceptance owns its model-only collision confirmation.
-        from .online_native_confirmation import OnlineCollisionConfirmation
         candidate_scene = self.scene if candidate_scene is None else candidate_scene
-        native_confirmation = OnlineCollisionConfirmation(
-            self.robot_validator, candidate_scene, check_request=self.check_request)
         # END no confirmation object is installed in an optimization rollout.
         mapping = _ProgressMap(trajectory.progress_u, trajectory.progress_s)
         pairs = mapping.anchor_parameters(self.anchors)
-        # BEGIN confirmation retains both original sampling grids and promoted witnesses.
-        # Dense-only rechecking could miss an ordinary-grid or recovery-anchor
-        # failure. These are existing query times, not new adaptive refinement.
-        if native_query:
-            source_pairs = self._manager_type.query_anchor_parameters()
-            extra_u = np.setdiff1d(source_pairs[:, 0], pairs[:, 0])
-            if len(extra_u):
-                pairs = np.concatenate((pairs, np.column_stack((extra_u,
-                    np.interp(extra_u, mapping.u, mapping.s)))))
-                pairs = pairs[np.argsort(pairs[:, 0], kind='stable')]
-            times = _candidate_confirmation_times(trajectory, self.budget,
-                regular_count=self.trajopt.horizon, regular_dt=self.formal_clock['native_dt'],
-                dense_count=self.formal_clock['valid_count'], dense_dt=self.formal_clock['interpolation_dt'])
-        else:
-            # A caller's curve has its own physical grid and task anchors;
-            # it has no earlier native rollout samples or promoted witnesses.
-            times = _candidate_sample_times(trajectory, self.budget)
-        # END the same admitted point/anchor capacities remain hard limits below.
+        # BEGIN a supplied curve uses its own physical grid and task anchors.
+        times = _candidate_sample_times(trajectory, self.budget)
+        # END ordinary/dense native candidates retain their completed metrics.
         if (len(pairs) > self.budget.max_task_anchors
                 or len(times)+len(pairs) > min(self.budget.max_validation_points, self.budget.interpolation_buffer_size)):
             raise MotionPlanningError("capacity_exceeded", "Candidate samples and exact anchors exceed the admitted query budget")
@@ -4895,7 +4468,7 @@ class _CuroboPlanner:
             # END normalized float32 keys never reconstruct physical time.
             "anchor_q": tensor(anchor_q[:, columns])[None].contiguous(),
             "anchor_dq": tensor(anchor_dq[:, columns])[None].contiguous(),
-            "scene_components": {}, "native_confirmation": native_confirmation}
+            "scene_components": {}}
         # The task manager owns all real pose requirements. These inert goal
         # slots only initialize the same resident native rollout buffers.
         self.trajopt.disable_tool_pose_tracking()
@@ -4940,8 +4513,6 @@ class _CuroboPlanner:
             coverage_residuals = _coverage_metric_residuals(metrics)
             conditional_unknown_residuals = _conditional_unknown_metric_residuals(metrics)
             # END all categories belong to these same completed candidate queries.
-            # END a confirmed-clear proxy cannot erase missing scene support.
-            # END a confirmed-clear proxy cannot trigger a collision recovery.
             # BEGIN a nonfinite sample remains visible beside finite neighbours.
             def maximum(value):
                 flat = value.detach().reshape(-1)
@@ -4954,7 +4525,6 @@ class _CuroboPlanner:
             feasible = bool(metrics.feasible) if isinstance(metrics.feasible, bool) else bool(metrics.feasible.all().item())
             # BEGIN native feasibility flags cannot hide an invalid raw constraint.
             feasible = feasible and all(np.isfinite(value) and value <= 0 for value in residuals.values())
-            # END confirmation changes only proved-clear robot/world candidates.
         finally:
             for manager in managers:
                 manager._candidate_query = None
@@ -4974,7 +4544,7 @@ class _CuroboPlanner:
             "native_metrics": {"success": feasible, "interpolated": {"constraints": residuals}},
             "scene_components": context["scene_components"],
             # BEGIN retain raw broad-phase positives and native confirmation evidence.
-            "native_confirmation": deepcopy(native_confirmation.last_report),
+            "observed_geometry": deepcopy(candidate_scene.last_query_report),
             # END corrected metrics do not erase the original suspected collision.
             "optimizer": {"unchanged_from_seed": True, "maximum_control_update": 0.}}
         return report, times/trajectory.duration, len(times)+len(pairs)
@@ -5035,7 +4605,6 @@ class _CuroboPlanner:
                 index = torch.where(torch.isfinite(flat), flat,
                                     torch.full_like(flat, float('inf'))).argmax()
                 return float(flat[index].item())
-                # END a clear neighbouring time cannot hide a nonfinite self proxy.
             constraints = metrics.costs_and_constraints.constraints
             report[label] = {"constraints": {name: maximum(value) for name, value in
                 zip(constraints.names, constraints.values)}, "convergence": {name: maximum(value)
@@ -5091,41 +4660,10 @@ class _CuroboPlanner:
         report = reports[selected]
         candidate = _trajectory_candidate(result, selected)
         trajectory = self._native_curve(candidate)
-        # BEGIN a registered world/self sphere proxy cannot conclusively reject.
-        # Task, joint and nonfinite failures still reject immediately. Precise
-        # hand geometry remains a scene hard term during complete confirmation.
-        # Reuse the complete candidate metric path, including both source grids.
-        confirmation_points = 0
-        if not report['accepted']:
-            ordered = sorted(range(len(reports)), key=lambda index: (
-                sum(max(0., value) for value in reports[index]['residuals'].values())
-                if all(np.isfinite(value) for value in reports[index]['residuals'].values()) else float('inf'), index))
-            for index in ordered:
-                original = reports[index]
-                positives = {name for name, value in original['residuals'].items() if value > 0}
-                if (not positives or not all(name.rsplit(':', 1)[-1] in {
-                        'process_scene', 'self_collision', 'anchor_self_collision'} for name in positives)
-                        or not all(np.isfinite(value) for value in original['residuals'].values())):
-                    continue
-                proposed = candidate if index == selected else _trajectory_candidate(result, index)
-                curve = trajectory if index == selected else self._native_curve(proposed)
-                confirmed, _, points = self._candidate_metrics(curve, self.scene, native_query=True)
-                confirmation_points += points
-                # BEGIN keep selection strict even if a metrics producer is inconsistent.
-                confirmed['accepted'] = bool(confirmed['accepted']) and all(
-                    np.isfinite(value) and value <= 0 for value in confirmed['residuals'].values())
-                # END a failed candidate cannot prevent checking another existing seed.
-                reports[index] = {**original, **confirmed,
-                    'sphere_proposal_metrics': original['native_metrics'],
-                    'optimizer': original['optimizer'], 'seed_provenance': original['seed_provenance'],
-                    'confirmation_validation_points': points}
-                if confirmed['accepted']:
-                    selected, candidate, trajectory = index, proposed, curve
-                    break
-            report = reports[selected]
-        # END acceptance still requires all task and scene constraints to pass.
-        return candidate, trajectory, {**report, "selected_seed_index": selected, "candidates": reports,
-                                       'confirmation_validation_points': confirmation_points}
+        # BEGIN select from completed metrics of the same observed model.
+        return candidate, trajectory, {**report, "selected_seed_index": selected,
+                                       "candidates": reports}
+        # END selection neither changes geometry nor repeats a rejected query.
 
 
     # END the attempt witness set is independent of the selected continuation.
@@ -5627,18 +5165,8 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         diagnostics["functional_ik_fit_hints"] = deepcopy(planner.goal_ik_fit_hints)
         diagnostics["joint_reference"] = deepcopy(planner.joint_reference_report)
         # BEGIN one reference verdict, one main solve and one mutually exclusive recovery.
-        # BEGIN charge every conditional native confirmation through the existing ledger.
-        def select_candidate_with_accounting(result):
-            native, curve, report = planner.select_candidate(result)
-            points = report.get('confirmation_validation_points', 0)
-            if points:
-                consumed['validation_passes'] += 1
-                consumed['validation_queries'] += points
-                check()
-            return native, curve, report
-        # END proxy-only rejections without confirmation spend no additional queries.
         reference_result = planner.evaluate_reference(seeds)
-        native_result, trajectory, attempt = select_candidate_with_accounting(reference_result)
+        native_result, trajectory, attempt = planner.select_candidate(reference_result)
         if joint_reference is not None and planner.joint_reference_report is not None:
             same = (trajectory.joint_names == joint_reference.joint_names
                     and np.array_equal(trajectory.times, joint_reference.times)
@@ -5654,7 +5182,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             check("trajectory_solves")
             consumed["trajectory_solves"] += 1
             stage = "main_solve"
-            native_result, trajectory, attempt = select_candidate_with_accounting(planner.optimize(seeds))
+            native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
             diagnostics["attempts"].append(deepcopy(attempt))
             check()
             observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == "needs_observation"
@@ -5695,7 +5223,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     # END no extra full solve is authorized by task residuals alone.
                     check("trajectory_solves")
                     consumed["trajectory_solves"] += 1
-                    native_result, trajectory, attempt = select_candidate_with_accounting(planner.optimize(seeds))
+                    native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
                     diagnostics["attempts"].append(deepcopy(attempt))
                     check()
         # END mixed failures retain ordinary optimization and recovery.

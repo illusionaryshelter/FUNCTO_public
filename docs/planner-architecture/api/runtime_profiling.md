@@ -1,8 +1,7 @@
 # `manipulation/runtime_profiling.py` 实现契约
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。
-
-本模块的阶段职责与数据语义见[组件说明](../04-solver-and-search.md)和[API 契约](../06-api-contracts.md)。[返回实现目录](../07-implementation-index.md)。
+代码基线：`__IMPLEMENTATION_COMMIT__`。
+职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_write_profile`
 
@@ -14,11 +13,57 @@
 def _write_profile(profiler, output, elapsed, succeeded):
 ```
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+实现说明：
 
-直接写入的状态或数组位置：`module['calls']`、`module['self_seconds']`。
+> Keep the full pstats archive and bounded, sortable JSON summaries.
+> 
+> Self time excludes nested calls and can be summed across functions or
+> files. Cumulative time includes callees and must not be added across rows.
+> Both include measurement overhead; neither is a separate unprofiled run.
 
-直接调用：
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+output.mkdir
+profiler.dump_stats
+pstats.Stats
+statistics.stats.items
+statistics.stats
+functions.append
+modules.setdefault
+statistics.total_calls
+modules.values
+(output / 'runtime.json').write_text
+json.dumps
+```
+
+写入目标：
+
+```python
+output
+statistics
+functions
+modules
+filename
+line
+name
+primitive
+calls
+own
+cumulative
+_
+row
+module
+module['calls']
+module['self_seconds']
+report
+```
+
+直接调用符号：
 
 ```python
 Path
@@ -46,14 +91,45 @@ json.dumps
 def run_with_optional_profile(operation, *args, enabled=False, output, **kwargs):
 ```
 
-输出分支的源码表达式：
+实现说明：
+
+> Call an operation unchanged, optionally recording its host call tree.
+> 
+> Profiling is explicitly opt-in. It is disabled before exporting statistics
+> so report generation is not misreported as application work. An operation's
+> return value or exception is preserved even if profile export fails.
+> The operation owns its output directory lifecycle; this helper creates its
+> profile subdirectory only after the operation has returned or raised.
+
+显式输出分支：
 
 ```python
 operation(*args, **kwargs)
 result
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+cProfile.Profile
+time.perf_counter
+profiler.enable
+profiler.disable
+type(error).__name__
+sys.stderr
+```
+
+写入目标：
+
+```python
+profiler
+succeeded
+started
+result
+elapsed
+```
+
+直接调用符号：
 
 ```python
 operation

@@ -1,43 +1,82 @@
 # `manipulation/initial_support.py` 实现契约
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。
-
-本模块的阶段职责与数据语义见[组件说明](../03-attachment-contact-and-hand.md)和[API 契约](../06-api-contracts.md)。[返回实现目录](../07-implementation-index.md)。
+代码基线：`__IMPLEMENTATION_COMMIT__`。
+职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `InitialSupportRelation`
 
-[定义位置](../../../manipulation/initial_support.py#L24)。
+[定义位置](../../../manipulation/initial_support.py#L20)。
 
 ```python
-class InitialSupportRelation:
-    relation_id: str
-    actor: str
-    target_owner: str
-    interval: tuple
-    plane_origin: object
-    plane_normal: object
-    source: dict
+class InitialSupportRelation():
 ```
 
-该类型的直接方法：`__post_init__`、`record`。
+类字段：
+
+```python
+relation_id: str
+actor: str
+target_owner: str
+interval: tuple
+plane_origin: object
+plane_normal: object
+source: dict
+```
+
+实现说明：
+
+> Declared current actor and observed support-plane layer.
+> 
+> The target owner must be the separately observed support-plane layer, not
+> an arbitrary compound obstacle relabelled as support. Its finite allowed
+> material is established by entrance observed-field intersection, not a rectangle
+> copied from a future placement feature.
 
 ## `InitialSupportRelation.__post_init__`
 
-[定义位置](../../../manipulation/initial_support.py#L41)。
+[定义位置](../../../manipulation/initial_support.py#L37)。
 
 输入签名：
 
 ```python
-def InitialSupportRelation.__post_init__(self):
+def __post_init__(self):
 ```
 
-直接读取的对象属性：`self.actor`、`self.target_owner`、`self.interval`、`self.plane_origin`、`self.plane_normal`、`self.source`。
+显式输出分支：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+无显式条目。
 
-直接写入的状态或数组位置：`self.interval`、`self.plane_origin`、`self.plane_normal`、`self.source`。
+读取的对象属性：
 
-直接调用：
+```python
+self.actor
+self.target_owner
+self.interval
+self.plane_origin
+self.plane_normal
+np.isclose
+np.linalg.norm
+np.linalg
+self.source
+evidence.get
+value.strip
+evidence[key].strip
+```
+
+写入目标：
+
+```python
+name
+self.interval
+self.plane_origin
+self.plane_normal
+evidence
+value
+key
+self.source
+```
+
+直接调用符号：
 
 ```python
 _text
@@ -57,23 +96,36 @@ deepcopy
 
 ## `InitialSupportRelation.record`
 
-[定义位置](../../../manipulation/initial_support.py#L64)。
+[定义位置](../../../manipulation/initial_support.py#L60)。
 
 输入签名：
 
 ```python
-def InitialSupportRelation.record(self):
+def record(self):
 ```
 
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 row
 ```
 
-直接写入的状态或数组位置：`row[key]`、`row['interval']`。
+读取的对象属性：
 
-直接调用：
+```python
+row[key].tolist
+```
+
+写入目标：
+
+```python
+row
+key
+row[key]
+row['interval']
+```
+
+直接调用符号：
 
 ```python
 asdict
@@ -83,7 +135,7 @@ list
 
 ## `_initial_pose`
 
-[定义位置](../../../manipulation/initial_support.py#L72)。
+[定义位置](../../../manipulation/initial_support.py#L68)。
 
 输入签名：
 
@@ -91,15 +143,41 @@ list
 def _initial_pose(owner):
 ```
 
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 pose
 ```
 
-直接写入的状态或数组位置：`pose[:3, 3]`、`pose[:3, :3]`。
+读取的对象属性：
 
-直接调用：
+```python
+owner.pose_path.sample
+owner.pose_path
+torch.tensor
+torch.float64
+np.eye
+position.detach().cpu().numpy
+position.detach().cpu
+position.detach
+Rotation.from_quat(quaternion.detach().cpu().numpy()[[1, 2, 3, 0]]).as_matrix
+Rotation.from_quat
+quaternion.detach().cpu().numpy
+quaternion.detach().cpu
+quaternion.detach
+```
+
+写入目标：
+
+```python
+position
+quaternion
+pose
+pose[:3, 3]
+pose[:3, :3]
+```
+
+直接调用符号：
 
 ```python
 owner.pose_path.sample
@@ -117,195 +195,306 @@ quaternion.detach
 
 ## `PreparedInitialSupport`
 
-[定义位置](../../../manipulation/initial_support.py#L80)。
+[定义位置](../../../manipulation/initial_support.py#L76)。
 
 ```python
-class PreparedInitialSupport:
-    ...
-    ...
+class PreparedInitialSupport():
 ```
 
-该类型的直接方法：`__init__`、`_select_components`、`components`、`collision_values`、`record`。
+类字段：
+
+无显式条目。
+
+实现说明：
+
+> Freeze entrance-touched cells and bound the whole observed actor height.
+> 
+> A component is the nonpositive trilinear set within one fully supported
+> source cell. Only actual entrance intersection selects it. Adjacent cells
+> retain their ordinary separation requirement, including at permission
+> boundaries. The relation never adds a distance halo to selected material.
 
 ## `PreparedInitialSupport.__init__`
 
-[定义位置](../../../manipulation/initial_support.py#L90)。
+[定义位置](../../../manipulation/initial_support.py#L85)。
 
 输入签名：
 
 ```python
-def PreparedInitialSupport.__init__(self, relation, actor, target, numerical_tolerance, *, record=None):
+def __init__(self, relation, actor, target, numerical_tolerance):
 ```
 
-直接读取的对象属性：`self.actor_vertices`、`self.initial_height`、`self._select_components`、`record.get`、`self.baseline_height`、`self.numerical_tolerance`、`self.kind`、`self.selected_component_ids`。
+显式输出分支：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+无显式条目。
 
-直接写入的状态或数组位置：`self.relation`、`self.target_query`、`self.numerical_tolerance`、`self.actor_vertices`、`self.actor_vertices.flags.writeable`、`self.initial_height`、`self.baseline_height`、`self._device`、`self.kind`、`self.selected_component_ids`、`self.selected_component_ids.flags.writeable`、`self.query`。
+读取的对象属性：
 
-直接调用：
+```python
+actor.owner_id
+relation.actor
+target.owner_id
+relation.target_owner
+actor.moving
+target.moving
+actor.query
+target.query
+np.isfinite
+item.interval
+relation.interval
+actor.attachments
+np.linalg.inv
+np.linalg
+relation.plane_origin
+relation.plane_normal
+self.numerical_tolerance
+actor.query.bounds
+target.query.root
+target.query.nodes
+pending.pop
+node.lower
+node.upper
+node.children
+pending.extend
+target.query._cell_values[node.cell].reshape
+target.query._cell_values
+node.cell
+np.ones
+target.query.cell_origins
+target.query.voxel_size
+np.eye
+self.selected_cells.append
+self.selected_cells
+self.unresolved_cells.append
+self.unresolved_cells
+```
+
+写入目标：
+
+```python
+item
+self.relation
+self.actor_field
+self.target_field
+self.numerical_tolerance
+mapping
+self.initial_height
+self.selected_cells
+self.unresolved_cells
+actor_bounds
+pending
+node
+i
+values
+cell
+result
+```
+
+直接调用符号：
 
 ```python
 isinstance
 ValueError
 np.isfinite
 any
-bind_native_owner_geometry
 float
-np.concatenate
-geometry.values
 np.linalg.inv
 _initial_pose
-((entrance - relation.plane_origin) @ relation.plane_normal).min
-min
-self._select_components
-len
-target.query.source_geometry.distance_field
-record.get
-relation.record
-decode_array
-np.any
-np.diff
-np.array_equal
-np.array
-FrozenESDF
+query_minimum_height
+world_bounds
+pending.pop
+box_distance
+pending.extend
+target.query._cell_values[node.cell].reshape
+ObservedField
+np.ones
+query_distance
+np.eye
+self.selected_cells.append
+self.unresolved_cells.append
+tuple
+sorted
 ```
 
-## `PreparedInitialSupport._select_components`
+## `PreparedInitialSupport.permission`
 
-[定义位置](../../../manipulation/initial_support.py#L151)。
+[定义位置](../../../manipulation/initial_support.py#L122)。
 
 输入签名：
 
 ```python
-def PreparedInitialSupport._select_components(self, geometry, mapping, *, candidates=None):
+def permission(self, target_matrix, *, additional=None):
 ```
 
-直接读取的对象属性：`self.target_query`、`result.min_distance`。
+实现说明：
 
-输出分支的源码表达式：
+> Remove selected original cell IDs from this pair's second domain.
+
+显式输出分支：
 
 ```python
-np.asarray(selected, dtype=np.int64)
+PairPermission(regions, excluded_second_cells=excluded)
 ```
 
-直接写入的状态或数组位置：`request.enable_signed_distance`。
-
-直接调用：
+读取的对象属性：
 
 ```python
-geometry.values
-np.asarray
-boxes.append
-coal.Box
-coal.Transform3s
-points.min
-points.max
-coal.DistanceRequest
-max
-float
-np.unique
-np.concatenate
-source.component_indices
-source._vertices
-int
-vertices.min
-vertices.max
-np.any
-source.collision_component
-np.eye
-coal.DistanceResult
-coal.distance
-np.isfinite
-ValueError
-selected.append
+additional.regions
+self.selected_cells
+excluded.update
+additional.excluded_second_cells
+```
+
+写入目标：
+
+```python
+regions
+excluded
+```
+
+直接调用符号：
+
+```python
+list
+set
+excluded.update
+PairPermission
 ```
 
 ## `PreparedInitialSupport.components`
 
-[定义位置](../../../manipulation/initial_support.py#L188)。
+[定义位置](../../../manipulation/initial_support.py#L129)。
 
 输入签名：
 
 ```python
-def PreparedInitialSupport.components(self, actor_pose, target_pose, progress):
+def components(self, actor_pose, target_pose, progress, *, check_request=None):
 ```
 
-直接读取的对象属性：`self._device`、`self.actor_vertices`、`self.relation`、`self.baseline_height`、`self.numerical_tolerance`。
+实现说明：
 
-输出分支的源码表达式：
+> Compare height intervals; expose unresolved evidence independently.
+
+显式输出分支：
 
 ```python
-(active, residual)
+{f'initial_support/{self.relation.relation_id}': torch.stack(residuals).reshape(progress.shape), f'unresolved/initial_support/{self.relation.relation_id}': torch.stack(unresolved).reshape(progress.shape)}
 ```
 
-直接写入的状态或数组位置：`self._device[key]`。
-
-直接调用：
+读取的对象属性：
 
 ```python
+self.initial_height
+np.ndindex
+progress.shape
+actor_pose[0][index].sum
+target_pose[0][index].sum
+self.relation.interval
+self.relation
+progress[index].detach
+np.linalg.inv
+np.linalg
+self.actor_field
+self.relation.plane_origin
+self.relation.plane_normal
+self.numerical_tolerance
+progress.new_tensor
+((relative - progress.new_tensor(self.relation.plane_origin)) * progress.new_tensor(self.relation.plane_normal)).sum
+direction.detach
+residuals.append
+unresolved.append
+self.relation.relation_id
+torch.stack(residuals).reshape
+torch.stack
+torch.stack(unresolved).reshape
+```
+
+写入目标：
+
+```python
+actor_matrices
+target_matrices
+residuals
+unresolved
+initial
+index
+zero
+active
+value
+uncertain
+mapping
+height
+baseline_lower
+baseline_upper
+certain
+violation
+magnitude
+local
+world
+relative
+direction
+```
+
+直接调用符号：
+
+```python
+_matrices
+np.ndindex
 tuple
-torch.tensor
+actor_pose[0][index].sum
+target_pose[0][index].sum
+float
+progress[index].detach
+np.linalg.inv
+query_minimum_height
+min
+progress.new_tensor
 quaternion_rotate
-quaternion.unsqueeze
-position.unsqueeze
-quaternion_conjugate(target_pose[1]).unsqueeze
 quaternion_conjugate
-target_pose[0].unsqueeze
-((local - origin) * normal).sum(-1).amin
-((local - origin) * normal).sum
-torch.where
-torch.relu
-```
-
-## `PreparedInitialSupport.collision_values`
-
-[定义位置](../../../manipulation/initial_support.py#L205)。
-
-输入签名：
-
-```python
-def PreparedInitialSupport.collision_values(self, spheres, ordinary, active):
-```
-
-直接读取的对象属性：`self.kind`、`self.query`。
-
-输出分支的源码表达式：
-
-```python
-torch.where(active.unsqueeze(-1), values, ordinary)
-```
-
-直接调用：
-
-```python
-torch.zeros_like
-self.query
-torch.where
-active.unsqueeze
+((relative - progress.new_tensor(self.relation.plane_origin)) * progress.new_tensor(self.relation.plane_normal)).sum
+direction.detach
+residuals.append
+unresolved.append
+torch.stack(residuals).reshape
+torch.stack
+torch.stack(unresolved).reshape
 ```
 
 ## `PreparedInitialSupport.record`
 
-[定义位置](../../../manipulation/initial_support.py#L210)。
+[定义位置](../../../manipulation/initial_support.py#L163)。
 
 输入签名：
 
 ```python
-def PreparedInitialSupport.record(self):
+def record(self):
 ```
 
-直接读取的对象属性：`self.relation`、`self.initial_height`、`self.baseline_height`、`self.numerical_tolerance`、`self.selected_component_ids`、`self.kind`、`self.query`。
-
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
-{'model': 'initial_observed_support_v1', 'relation': self.relation.record(), 'initial_height_m': self.initial_height, 'baseline_height_m': self.baseline_height, 'numerical_position_tolerance_m': self.numerical_tolerance, 'selected_component_ids': encode_array(self.selected_component_ids), 'kind': self.kind, **({'distance': encode_array(self.query.distance)} if self.query is not None else {})}
+dict(model='initial_observed_support_v2', relation=self.relation.record(), initial_height=self.initial_height, numerical_position_tolerance_m=self.numerical_tolerance, selected_cells=list(self.selected_cells), unresolved_cells=list(self.unresolved_cells), component_semantics='nonpositive set in each fully supported source trilinear cell')
 ```
 
-直接调用：
+读取的对象属性：
 
 ```python
 self.relation.record
-encode_array
+self.relation
+self.initial_height
+self.numerical_tolerance
+self.selected_cells
+self.unresolved_cells
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+dict
+self.relation.record
+list
 ```

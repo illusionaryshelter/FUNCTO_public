@@ -1,0 +1,419 @@
+# `manipulation/observed_collision.py` 实现契约
+
+代码基线：`__IMPLEMENTATION_COMMIT__`。
+职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+
+## `_world`
+
+[定义位置](../../../manipulation/observed_collision.py#L11)。
+
+输入签名：
+
+```python
+def _world(point, pose):
+```
+
+显式输出分支：
+
+```python
+position + quaternion_rotate(quaternion, local)
+```
+
+读取的对象属性：
+
+```python
+torch.as_tensor
+position.dtype
+position.device
+```
+
+写入目标：
+
+```python
+position
+quaternion
+local
+```
+
+直接调用符号：
+
+```python
+torch.as_tensor
+quaternion_rotate
+```
+
+## `pair_residual`
+
+[定义位置](../../../manipulation/observed_collision.py#L17)。
+
+输入签名：
+
+```python
+def pair_residual(first, first_pose, first_matrix, second, second_pose, second_matrix, *, separation_m, permission=None, check_request=None, precision_m=0.0001):
+```
+
+实现说明：
+
+> Query one rigid pair and attach a local rigid-motion derivative.
+> 
+> The reported status and nonnegative residual come from the interval
+> query. A separated witness pair supplies a point-distance derivative.
+> Strict overlap instead uses a local zero-section normal from one of the
+> same fields. That normal is an optimization direction, not a penetration
+> estimate or evidence for candidate acceptance.
+
+显式输出分支：
+
+```python
+(zero, result)
+(zero, result)
+(residual, result)
+(zero + float(separation_m), result)
+(zero + float(separation_m) - (signed - signed.detach()), result)
+```
+
+读取的对象属性：
+
+```python
+first_pose[0].sum
+second_pose[0].sum
+torch.linalg.vector_norm
+torch.linalg
+gap.detach
+second.local_zero
+torch.as_tensor
+second_pose[0].dtype
+second_pose[0].device
+((_world(first_local, first_pose) - _world(target, second_pose)) * normal).sum
+first.local_zero
+first_pose[0].dtype
+first_pose[0].device
+((_world(second_local, second_pose) - _world(target, first_pose)) * normal).sum
+signed.detach
+```
+
+写入目标：
+
+```python
+result
+zero
+status
+first_local
+second_local
+gap
+value
+residual
+result['direction']
+boundary
+_
+target
+normal
+signed
+```
+
+直接调用符号：
+
+```python
+query_distance
+first_pose[0].sum
+second_pose[0].sum
+inverse_points
+torch.linalg.vector_norm
+_world
+max
+float
+gap.detach
+second.local_zero
+quaternion_rotate
+torch.as_tensor
+((_world(first_local, first_pose) - _world(target, second_pose)) * normal).sum
+first.local_zero
+((_world(second_local, second_pose) - _world(target, first_pose)) * normal).sum
+signed.detach
+```
+
+## `query_region_intersection`
+
+[定义位置](../../../manipulation/observed_collision.py#L69)。
+
+输入签名：
+
+```python
+def query_region_intersection(field, pose, normals, bounds, *, precision_m=1e-06, check_request=None):
+```
+
+实现说明：
+
+> Find a supported zero surface in the finite convex contact region.
+> 
+> An original zero sample or a sign-changing segment inside one supported
+> cell proves surface contact by continuity. Negative interior material is
+> insufficient. Interval bounds prune cells without a zero; finite unresolved
+> boxes remain distinct from missing contact.
+
+显式输出分支：
+
+```python
+{'status': 'contact', 'witness': world.tolist(), 'evidence': 'original_zero_sample'}
+{'status': 'contact', 'segment': world[[a, b]].tolist(), 'evidence': 'opposite_sign_supported_segment'}
+{'status': 'unresolved' if unresolved else 'missing_contact'}
+```
+
+读取的对象属性：
+
+```python
+np.asarray
+field.root
+field.nodes
+pending.pop
+node.cell
+expanded.add
+field.cell_origins
+field.voxel_size
+PairPermission._classify
+node.lower
+node.upper
+node.children
+pending.extend
+field.cell_value
+np.min
+np.max
+field._cell_values
+world.tolist
+candidates.extend
+np.array
+np.flatnonzero
+world[[a, b]].tolist
+np.argmax
+np.linalg.norm
+np.linalg
+node.upper.copy
+node.lower.copy
+```
+
+写入目标：
+
+```python
+region
+pending
+unresolved
+expanded
+node
+lower
+i
+corners
+values
+_
+errors
+original
+zeros
+local
+world
+error
+candidates
+a
+b
+start
+end
+slope
+offset
+lo
+hi
+v
+w
+t
+inside
+point
+e
+negative
+positive
+axis
+mid
+hi[axis]
+lo[axis]
+```
+
+直接调用符号：
+
+```python
+np.asarray
+set
+check_request
+pending.pop
+expanded.add
+_Node
+PairPermission._classify
+world_bounds
+pending.extend
+box_corners
+field.cell_value
+np.min
+np.max
+transform_points
+transform_point_error
+world.tolist
+zip
+min
+max
+candidates.extend
+np.array
+np.flatnonzero
+len
+world[[a, b]].tolist
+int
+np.argmax
+np.linalg.norm
+node.upper.copy
+node.lower.copy
+```
+
+## `query_minimum_height`
+
+[定义位置](../../../manipulation/observed_collision.py#L144)。
+
+输入签名：
+
+```python
+def query_minimum_height(field, pose, origin, normal, *, precision_m, check_request=None):
+```
+
+实现说明：
+
+> Bound the minimum plane height over the represented occupied set.
+> 
+> Spatial boxes provide lower bounds; actual supported occupied points
+> provide upper bounds and a rigid-motion derivative witness. The stopping
+> precision bounds numerical uncertainty and never changes a task tolerance.
+
+显式输出分支：
+
+```python
+dict(status='missing_observation', lower_m=None, upper_m=None, witness_local=None)
+dict(status='unresolved', lower_m=final_lower, upper_m=upper, witness_local=None if witness is None else witness.tolist(), visited_boxes=visits)
+dict(status='bounded', lower_m=final_lower, upper_m=upper, witness_local=None if witness is None else witness.tolist(), visited_boxes=visits)
+```
+
+读取的对象属性：
+
+```python
+np.isfinite
+field.root
+np.asarray
+np.inf
+field.nodes
+heapq.heappop
+field.occupied_points
+terms.sum
+(errors * np.abs(normal)).sum
+np.abs
+np.abs(terms).sum
+np.abs(origin * normal).sum
+np.argmin
+points[index].copy
+field.split
+witness.tolist
+```
+
+写入目标：
+
+```python
+origin
+normal
+pending
+serial
+upper
+witness
+final_lower
+visits
+lower
+_
+node
+points
+world
+errors
+terms
+values
+index
+children
+child
+```
+
+直接调用符号：
+
+```python
+np.isfinite
+ValueError
+dict
+np.asarray
+count
+push
+heapq.heappop
+check_request
+field.occupied_points
+len
+transform_points
+transform_point_error
+terms.sum
+(errors * np.abs(normal)).sum
+np.abs
+np.abs(terms).sum
+np.abs(origin * normal).sum
+int
+np.argmin
+float
+points[index].copy
+min
+field.split
+witness.tolist
+```
+
+## `query_minimum_height.push`
+
+[定义位置](../../../manipulation/observed_collision.py#L161)。
+
+输入签名：
+
+```python
+def push(node):
+```
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+node.lower
+node.upper
+np.where
+terms.sum
+np.abs(terms).sum
+np.abs
+np.abs(origin * normal).sum
+heapq.heappush
+```
+
+写入目标：
+
+```python
+lower_box
+upper_box
+corner
+terms
+lower
+```
+
+直接调用符号：
+
+```python
+world_bounds
+np.where
+float
+terms.sum
+np.abs(terms).sum
+np.abs
+np.abs(origin * normal).sum
+heapq.heappush
+next
+```

@@ -211,10 +211,10 @@ class PhysicalGradientCore(GradientOptCore):
     def _retain_sampled_candidate(self, action, hard_eligible, sampled_feasible, objective):
         """Keep one action per seed, preferring stronger sampled evidence.
 
-        Rank 0 has no candidate. Rank 1 satisfies every sampled requirement
-        except robot/world proxy collisions that native solids may clear;
-        rank 2 also satisfies those proxies. Neither rank authorizes execution:
-        ordinary/dense final metrics still decide acceptance. Within one rank,
+        Rank 0 has no candidate; positive ranks record the caller's hard
+        eligibility and sampled-feasibility flags. The observed-scene caller
+        requires every hard component in both flags. Ordinary/dense final
+        metrics still decide acceptance. Within one rank,
         the unchanged parameter-free objective orders all line-search trials,
         including points which Wolfe did not select. One slot bounds storage.
         """
@@ -235,7 +235,7 @@ class PhysicalGradientCore(GradientOptCore):
         self._candidate_action.copy_(torch.where(improved[:, None, None], selected, self._candidate_action))
         self._candidate_objective.copy_(torch.where(improved, value, self._candidate_objective))
         self._candidate_rank.copy_(torch.where(improved, rank, self._candidate_rank))
-        # END a cheaper pending confirmation cannot displace sampled feasibility.
+        # END retained candidates preserve the supplied hard evidence.
 
     def _finish_functional_block(self, state):
         """Change parameters only between existing blocks, never add a solve.
@@ -255,9 +255,22 @@ class PhysicalGradientCore(GradientOptCore):
         count, particles = self.config.num_problems, self.config.num_particles
         base = state.exploration_action.detach().clone()
         repeated = base[:, None].expand(-1, particles, -1, -1).contiguous().view(count, particles, self.opt_dim)
-        self._compute_cost_constraint_and_gradient(repeated)
-        signed = {name: value.view(count, particles)[:, 0]
-                  for name, value in self._last_functional_signed.items()}
+        # BEGIN the old objective supplies residuals and candidate evidence only.
+        # Its gradient is never consumed after the multipliers change. Keep the
+        # exact exploration base and candidate-retention side effect, but do
+        # not construct an autograd graph for this observation.
+        self._check_request()
+        with torch.no_grad():
+            action = repeated.view(count * particles, self.action_horizon, self.action_dim)
+            trajectories = self.rollout_fn.evaluate_action(action, use_cuda_graph=False)
+            eligible, feasible, raw_signed, objective = (
+                self.rollout_fn.constraint_manager.optimizer_evidence(trajectories))
+            self._last_functional_signed = raw_signed
+            self._retain_sampled_candidate(action, eligible, feasible, objective)
+            signed = {name: value.view(count, particles)[:, 0]
+                      for name, value in raw_signed.items()}
+        self._check_request(wait_for_device=True)
+        # END changed-objective costs/gradients below still restart its history.
         changed = owner.update(signed)
         self._check_request(wait_for_device=True)
         if not bool(changed.any()):
@@ -598,21 +611,19 @@ class PhysicalGradientCore(GradientOptCore):
         # END the seed has its actual goal and physical clock before observation.
 
     def optimize(self, seed_action):
-        # BEGIN every solve starts with fresh curvature and current objective values.
-        self._iteration_state = None
-        if self._on_reinitialize is not None:
-            self._on_reinitialize(None)
-        # END an AL recovery never retains the old scalar-cost ordering.
-        self._prepare_solve(seed_action)
-        self._reset_progress()
-        # BEGIN a new solve must not pair its seed with the previous PHR cost.
-        # Native callers commonly invoke reinitialize first, but optimize is
-        # also a complete owned entry point. Clear the tracker in place here:
-        # block-boundary changes deliberately preserve these cumulative clocks.
-        self._best.clear()
-        # END this full-solve reset is never called by _finish_functional_block.
+        # BEGIN native reinitialize owns preparation of its cached initial state.
+        # Consuming that state must preserve the AL parameters, candidate
+        # evidence and gradient computed together. A direct optimize call has
+        # no prepared state and starts the same lifecycle here.
+        if self._iteration_state is None:
+            if self._on_reinitialize is not None:
+                self._on_reinitialize(None)
+            self._prepare_solve(seed_action)
+            self._reset_progress()
+            self._best.clear()
+            self._begin_functional_solve(seed_action)
+        # END the native loop consumes and clears the single-use initial state.
         # BEGIN run AL inside the original loop and retain one candidate per seed.
-        self._begin_functional_solve(seed_action)
         self._al_blocks_remaining = self.outer_iters
         try:
             result = super().optimize(seed_action)

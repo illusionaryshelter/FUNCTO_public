@@ -10,7 +10,7 @@ from .planning_scene import _text, _valid_interval
 
 @dataclass(frozen=True)
 class HoldingContact:
-    """One registered robot material solid touching its attached owner.
+    """One registered robot body assigned an internal attachment contact.
 
     The caller declares this internal contact in its attachment model. The
     same nominal attachment places the owner for external collision checks.
@@ -23,28 +23,21 @@ class HoldingContact:
     condition_id: str
     target_owner: str
     material_id: str
-    native_geometry: str
-    sphere_indices: tuple
+    robot_body: str
     interval: tuple
     source: str
 
     def __post_init__(self):
-        for name in ('rule_id', 'condition_id', 'target_owner', 'material_id', 'native_geometry', 'source'):
+        for name in ('rule_id', 'condition_id', 'target_owner', 'material_id', 'robot_body', 'source'):
             _text(getattr(self, name), name)
-        indices = tuple(self.sphere_indices)
-        if (not indices or len(set(indices)) != len(indices)
-                or any(type(index) is not int or index < 0 for index in indices)):
-            raise ValueError('Holding contact requires explicit unique native material sphere indices')
-        object.__setattr__(self, 'sphere_indices', indices)
         object.__setattr__(self, 'interval', _valid_interval(self.interval))
 
 
 def bind_holding_contacts(problem, material_binding, declarations, *, source):
     """Bind declared attachment/material associations atomically.
 
-    The caller names the robot's contact materials. Their complete native
-    solids and sphere ordering come from robot calibration, not task names or
-    a previous grasp pose. The condition identifies that same nominal model;
+    The caller names the robot's contact materials. Their registered body identities come from the observation partition
+    and the model declaration. The condition identifies that same nominal model;
     no measured Holding flag is required or inferred.
     """
     _text(source, 'Holding material source')
@@ -71,45 +64,11 @@ def bind_holding_contacts(problem, material_binding, declarations, *, source):
             material = materials[name]
             rule_id = f'{identity}:material:{name}'
             contacts.append(HoldingContact(rule_id, identity, owner, name,
-                material['native_geometry'], tuple(material['sphere_indices']), interval, source))
+                material['robot_body'], interval, source))
             rule_ids.append(rule_id)
         replacements[identity] = {**deepcopy(condition), 'contact_rule_ids': rule_ids}
     problem.conditions = tuple(replacements.get(row.get('condition_id'), row) for row in problem.conditions)
     return tuple(contacts)
-
-
-def validate_holding_materials(contacts, owners, sphere_materials, native_materials, collision_bodies):
-    """Reject partial, relabelled or unrelated robot geometry before solving."""
-    identities, pairs = set(), set()
-    owner_ids = {owner.owner_id for owner in owners}
-    geometry_indices, sphere_geometry = {}, {}
-    for body in collision_bodies:
-        # BEGIN robot body groups use the mapper's geometry_names contract.
-        # native_geometry_names belongs to owner aliases, not robot bodies.
-        names = tuple(body['geometry_names'])
-        # END use the same robot grouping consumed by native confirmation.
-        for index in body['sphere_indices']:
-            sphere_geometry[index] = names
-        for name in names:
-            geometry_indices.setdefault(name, set()).update(body['sphere_indices'])
-    for contact in contacts:
-        if not isinstance(contact, HoldingContact):
-            raise ValueError('Holding scene input requires typed current material contacts')
-        pair = (contact.native_geometry, contact.target_owner, contact.interval)
-        if (contact.rule_id in identities or pair in pairs or contact.target_owner not in owner_ids
-                or native_materials.get(contact.native_geometry) != contact.material_id
-                or set(contact.sphere_indices) != geometry_indices.get(contact.native_geometry)
-                or any(index >= len(sphere_materials) or sphere_materials[index] != contact.material_id
-                       or sphere_geometry.get(index) != (contact.native_geometry,) for index in contact.sphere_indices)):
-            raise ValueError('Holding contact must bind exactly one complete registered robot material and owner')
-        # BEGIN a declaration cannot create an attachment through material identity.
-        relations = [relation for owner in owners if owner.owner_id == contact.target_owner
-                     for relation in owner.attachments if relation.condition_id == contact.condition_id]
-        if len(relations) != 1 or relations[0].interval != contact.interval:
-            raise ValueError('Holding contact must retain its current attachment interval')
-        # END release lifetime belongs to the same declared attachment contract.
-        identities.add(contact.rule_id)
-        pairs.add(pair)
 
 
 def validate_holding_conditions(contacts, owners, conditions):

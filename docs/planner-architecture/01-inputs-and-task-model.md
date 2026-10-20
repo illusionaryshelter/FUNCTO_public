@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。本组件将已有示教、当前任务关系及机器人入口状态编译为 `PlanningProblem`，供场景绑定与数值规划调用。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
+代码基线：`__IMPLEMENTATION_COMMIT__`。本组件将已有示教、当前任务关系及机器人入口状态编译为 `PlanningProblem`，供场景绑定与数值规划调用。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
 
 ## 1. 输入的来源与相互依赖
 
@@ -29,7 +29,7 @@
 | `execution_events` | 调用者明确指定的动作、停止或独立证据依赖 | `PlanningEvent` 编译相应事件 |
 | `coordinate_directions` | 机构坐标在给定区间的方向、净变化或局部速度要求 | `CoordinateDirectionRequirement` |
 
-当前记录入口 `prepare_recorded_task.prepare_candidate` 和 `run_recorded_skill.run_prepared` 将这些数据与机器人 fixture 连接。fixture 提供已知机器人运动学、碰撞模型和标定。`recorded_owner_geometry` 适配器读取完整物体长方体模型，并将其组织为物体碰撞实体。实验适配器与当前持物计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-planner-architecture-audit/plan-comparison.md)。
+`tests/planning` 中的实验运行器 `run_recorded_skill.run_prepared` 将编译后的问题与机器人记录连接。`observed_robot_fixture.build_robot_validator` 读取纯运动学、连杆观测场、标定及实体对策略；`load_observed_owner` 读取已有实体场与固定关系。实验适配器与当前持物计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 2. 固定坐标下的示教表示
 
@@ -84,11 +84,11 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 记 `errors` 返回的位置误差和转角误差为 `e_p`、`e_r`，各自容差为 `ε_p`、`ε_r`，则 `PoseEventRequirement.evaluate` 返回 `max(0,e_p−ε_p)+max(0,e_r−ε_r)`。`SupportRequirement.evaluate` 对四项原始有符号条件分别取正部后求和；`normalized_inequalities` 则按长度或法向弦长尺度缩放原始条件，供增广拉格朗日计算使用。
 
-`NumericalTolerance` 控制浮点计算比较，目标容差规定任务允许误差，支撑容差规定允许间隙，球覆盖误差描述几何近似精度。这些量由各自接口保存，并参与对应计算。
+`NumericalTolerance` 控制浮点计算比较，目标容差规定任务允许误差，支撑容差规定允许间隙；实体距离的模型余量由观测碰撞查询单独应用。各量由对应接口保存。
 
 ## 5. PlanningProblem 的运行接口
 
-`sample_reference(s)` 返回当前进度的名义工具参考；`source_time_to_progress` 和 `progress_to_source_time` 在保存的源时钟中转换。`transform_tool_pose`、`reference_to_link_pose`、`transform_robot_spheres` 和 `transform_tool_velocity` 将原生机器人计算转换到任务参考坐标，或将任务目标转换回原生连杆坐标。变换依赖构造时固定的 `base_pose/tool_transform`。
+`sample_reference(s)` 返回当前进度的名义工具参考；`source_time_to_progress` 和 `progress_to_source_time` 在保存的源时钟中转换。`transform_tool_pose`、`reference_to_link_pose` 和 `transform_tool_velocity` 将原生机器人计算转换到任务参考坐标，或将任务目标转换回原生连杆坐标。变换依赖构造时固定的 `base_pose/tool_transform`。
 
 `residuals(position, quaternion, progress, ...)` 接收相互对齐的批量候选状态，返回名字到非负残差张量的字典。姿态数组分别为 `[...,3]` 和 `[...,4]`；进度数组是相同的批量/时间维度。具名关节、速度、物理时间和工具速度在对应要求需要时使用。事件约束在其精确进度的首次物理到达样本上计算，`point_goal_ids` 将当前查询样本绑定到相应原目标身份。
 
@@ -113,7 +113,7 @@ normal    = ‖R n_b+n‖₂ − 2 sin(ε_θ/2)
 
 四项均以小于等于零为满足。前三项以米计；第四项是两个单位法线之间的弦长条件，表达物体外法线与支撑面法线反向对齐。`normalized_inequalities` 使用 `max(ε_g,ε_num)` 缩放前三项，使用声明角容差和数值角容差对应弦长的较大者缩放法向项。硬验收直接消费原始条件的正部和，功能约束优化消费缩放后的有符号条件。
 
-参考 API 接收显式物体坐标约定。若 TSDF 使用相机坐标 `C`、任务点使用物体坐标 `B`，则 `T_C_B` 将任务点转换至 TSDF 坐标，法线使用该变换的旋转部分。随后各计算通过同一物体表示坐标和共同参考坐标连接。技能表示中的任务点与功能区域保留其任务含义；当前物体的碰撞占据由场景模型表达。二者共享坐标，并不要求以碰撞模型替换技能表示。当前输入契约与持物改造计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-planner-architecture-audit/plan-comparison.md)。
+参考 API 接收显式物体坐标约定。若 TSDF 使用相机坐标 `C`、任务点使用物体坐标 `B`，则 `T_C_B` 将任务点转换至 TSDF 坐标，法线使用该变换的旋转部分。随后各计算通过同一物体表示坐标和共同参考坐标连接。技能表示中的任务点与功能区域保留其任务含义；当前物体的碰撞占据由场景模型表达。二者共享坐标，并不要求以碰撞模型替换技能表示。当前输入契约与持物改造计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 7. 输入辅助模块的调用范围
 
@@ -122,3 +122,5 @@ normal    = ‖R n_b+n‖₂ − 2 sin(ε_θ/2)
 `observations.py` 定义相机记录 `Camera(K,width,height,depth_scale)`。`load_calibration` 读取针孔内参和深度单位，`load_rgbd` 返回对应图像、米制深度与标定；`backproject` 以 `K⁻¹[u,v,1]` 和深度恢复相机点。`rigid_registration` 从明确的三维对应估计刚体变换和误差；`poses_from_tracks/poses_from_models` 将已有点轨迹或模型姿态组织为具名时间上的物体位姿。`track_rgbd` 通过独立跟踪 worker 取得固定点身份的观测序列，供示教输入准备。`planning_observation` 与机器人自过滤直接复用 `_intrinsics`；观测、区域及支撑输入准备复用 `backproject`。
 
 `grounding.py` 中 `infer_task` 从指令与源/当前图像产生结构化语义任务，`select_roles` 从检测候选选择对象角色，`propose_query_regions` 提出可在图像中核对的区域查询，`match_points` 在指定 masks 内计算对应像素。`selection.select_grounding_candidates` 将已有源语义、当前指令和明确视图候选交给选择器，返回所选候选或未决状态。它们为所选技能与几何绑定提供输入；数值规划从已经确定的任务与场景开始。各接口完整输入和直接返回记录见[实现索引](07-implementation-index.md)。
+
+已有实体模型通过 `observed_owners` 直接进入场景；新实体可以由 mask 和深度建立。事件前表示坐标 C 与事件工具位姿 E_g 确定固定关系 A=E_g⁻¹C_pre，之后工具 FK 给出 C(t)=E(t)A。源任务坐标至 C 的变换 M_D 同时用于任务点重表达，参考生成消费 J=M_D⁻¹。

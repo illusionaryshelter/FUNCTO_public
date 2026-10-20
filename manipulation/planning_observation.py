@@ -1,48 +1,24 @@
-"""Current calibrated RGB-D to owner-separated cuRobo planning geometry.
+"""Calibrated RGB-D partitions to fixed observed entity fields and free cells."""
 
-The input is a registered snapshot of the current scene: camera-z depth in
-metres, native pinhole calibration, camera-to-planning transforms, and explicit
-visible owner masks and explicit three-state robot self-filter evidence.
-No demonstration mesh, simulator state, inferred
-back surface, or bounding-box erasure enters this adapter. cuRobo's existing
-Mapper builds the collision field; independently admitted environment rays
-bound online coverage. Explicitly named audit APIs retain historical raw rays.
-Optional, separately verified physical solid interiors can supply current
-occupied evidence. A closed collision proxy is not such physical evidence.
-"""
-
-# BEGIN current RGB-D observation bridge using the installed native mapper.
+# BEGIN one measured geometry representation for every scene entity.
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import replace
 import math
 from numbers import Real
-
 import numpy as np
-# BEGIN image filtering is only for independent depth-footprint queries.
 from scipy.ndimage import minimum_filter
-# END semantic ownership does not use image morphology.
-from scipy.spatial.transform import Rotation
 import torch
-
 from .motion import _inverse, _pose_array
 from .observations import _intrinsics
 from .planning_problem import PosePath
-# BEGIN mapping and planning share explicit request-wide resource ceilings.
-from .resource_admission import (
-    DEFAULT_MAX_DEVICE_USED_BYTES, DEFAULT_MAX_HOST_RSS_BYTES,
-    MAX_DEVICE_USED_BYTES, MAX_HOST_RSS_BYTES,
-    ResourceLimitError, require_device_memory, require_host_memory,
-)
-# END native Mapper allocations never borrow PyTorch's cached free blocks.
-from .planning_scene import (
-    CollisionOwner, CuroboSphereQuery, ObservedSpace, PlanningScene, _text,
-    _validate_contact_and_gripper_inputs,
-)
-# BEGIN body-wide replacement by a separately observed fine field.
-from .voxel_layers import MAX_FINE_CELLS, LayeredVoxelQuery, validate_body_groups
-# END both native and independent consumers retain the same layer inventory.
+from .resource_admission import (DEFAULT_MAX_DEVICE_USED_BYTES, DEFAULT_MAX_HOST_RSS_BYTES,
+    require_device_memory, require_host_memory)
+from .planning_scene import CollisionOwner, ObservedSpace, _text
 
+TASK_VOXEL_SIZE_M = .002
+DEFAULT_ENVIRONMENT_VOXEL_SIZE_M = .01
+MAX_FINE_CELLS = 4_000_000
 
 def _views(views, reference_frame, depth_range_m):
     """Normalize an explicitly calibrated snapshot without filling bad depth."""
@@ -75,7 +51,6 @@ def _views(views, reference_frame, depth_range_m):
     return result
 
 
-# BEGIN adapt calibrated integer pixel centres only at the native depth boundary.
 def _mapper_intrinsics(matrix):
     """Preserve input rays under the Mapper's half-integer pixel convention.
 
@@ -90,10 +65,8 @@ def _mapper_intrinsics(matrix):
     native = _intrinsics(matrix).copy()
     native[:2, 2] += .5
     return native
-# END this is coordinate conversion, not a depth shift or geometric allowance.
 
 
-# BEGIN exact rectangle queries preserve the complete projected voxel footprint.
 def _rectangle_min_depth(depth, lower_xy, upper_xy):
     """Query inclusive, in-image integer rectangles with bounded image storage.
 
@@ -121,10 +94,8 @@ def _rectangle_min_depth(depth, lower_xy, upper_xy):
             np.minimum(filtered[bottom, left], filtered[bottom, right]))
         del filtered
     return result
-# END downward block sizes accelerate an exact query; they never expand rays.
 
 
-# BEGIN callers explicitly select independent free-ray evidence.
 def _known_free_voxels(views, *, ray_depths, origin, shape, voxel_size, depth_error_m):
     """Prove each complete voxel free under the supplied pixel-ray model.
 
@@ -211,333 +182,8 @@ def _known_free_voxels(views, *, ray_depths, origin, shape, voxel_size, depth_er
             known[indices[inside][furthest[inside] < low]] = True
     # END no enlarged pixel footprint, clipping, ray restoration or old fallback.
     return known.reshape(shape)
-# END masked endpoints never implicitly become free-ray evidence.
 
 
-# BEGIN current physical-solid evidence, separate from collision outer proxies.
-def _pose_evidence(record, views, reference_frame, label):
-    """Require a current snapshot identity and a whole-body pose-error bound."""
-    if (not isinstance(record, Mapping) or record.get("state") != "current_observed"
-            or record.get("reference_frame") != reference_frame):
-        raise ValueError(f"{label} needs current observed pose evidence in the planning frame")
-    source = _text(record.get("source"), f"{label} current pose source")
-    identities = record.get("observation_ids")
-    if (not isinstance(identities, (list, tuple)) or not identities
-            or len(set(identities)) != len(identities) or not set(identities) <= set(views)):
-        raise ValueError(f"{label} must identify synchronized views in this current snapshot")
-    error = record.get("max_point_error_m")
-    if not isinstance(error, Real) or not np.isfinite(error) or error < 0:
-        raise ValueError(f"{label} requires an explicit nonnegative whole-body pose error in metres")
-    return {"source": source, "observation_ids": list(identities), "max_point_error_m": float(error)}
-
-
-def _robot_solid_poses(current_robot, links, views, reference_frame):
-    """Evaluate only the supplied measured state with a private native FK buffer.
-
-    The already loaded cuRobo model must expose each requested link. No robot
-    is loaded, no future trajectory is sampled, and no collision mesh is
-    promoted to physical solid evidence. The point-error bound must include
-    feedback, calibration and FK error over every supplied solid, including
-    angular uncertainty at its furthest point.
-    """
-    evidence = _pose_evidence(current_robot, views, reference_frame, "Robot solid")
-    from curobo.kinematics import Kinematics
-    from curobo.types import JointState
-
-    model = current_robot.get("kinematics")
-    if not isinstance(model, Kinematics):
-        raise TypeError("Robot solid poses require the already loaded native Kinematics model")
-    supplied_names = current_robot.get("joint_names", ())
-    raw_position = np.asarray(current_robot.get("joint_position"))
-    if (not isinstance(supplied_names, (list, tuple)) or not 0 < len(supplied_names) <= 16
-            or raw_position.shape != (len(supplied_names),)):
-        raise ValueError("Robot solid feedback must fit the bounded sixteen-joint input before conversion")
-    names, position = tuple(supplied_names), np.asarray(raw_position, float)
-    if (names != tuple(model.joint_names) or not np.isfinite(position).all()
-            or model.total_spheres > 512 or len(model.config.kinematics_config.link_name_to_idx_map) > 64
-            or len(model.tool_frames) > 64 or not set(links) <= set(model.tool_frames)):
-        raise ValueError("Robot solid FK needs the bounded actual joint layout and every requested link frame")
-    limits = model.config.kinematics_config.joint_limits.position.detach().cpu().numpy()
-    if np.any(position < limits[0]) or np.any(position > limits[1]):
-        raise ValueError("Measured robot solid state must respect its native joint limits")
-    base = _pose_array(current_robot.get("T_output_robot_base"), "T_output_robot_base")
-    geometry_source = _text(current_robot.get("robot_geometry_source"), "actual robot collision-model source")
-    locked = model.config.kinematics_config.lock_jointstate
-    locked_positions = {}
-    if locked is not None:
-        if len(names)+len(locked.joint_names) > 16:
-            raise ValueError("Current solid evidence must also bound the native locked-joint state")
-        values = locked.position.detach().cpu().numpy().reshape(-1)
-        if values.shape != (len(locked.joint_names),) or not np.isfinite(values).all():
-            raise ValueError("Locked robot joints need one finite native value per named joint")
-        locked_positions = {name: float(value) for name, value in zip(locked.joint_names, values)}
-    # One pose per requested link, with at most 16 DOF / 64 links / 512
-    # spheres, is small. Private buffers avoid modifying a caller's live FK
-    # values or gradients. Retain the actual complete current sphere model so
-    # the planner can reject a different model with the same names/counts.
-    fk = Kinematics(model.config, compute_spheres=True, compute_com=False)
-    with torch.no_grad():
-        query = model.device_cfg.to_device(position)[None, None]
-        state = fk.compute_kinematics(JointState.from_position(query, joint_names=list(names)))
-        xyz = state.tool_poses.position[0, 0].detach().cpu().numpy().copy()
-        wxyz = state.tool_poses.quaternion[0, 0].detach().cpu().numpy().copy()
-        spheres = state.robot_spheres[0, 0].detach().cpu().numpy().astype(float)
-    poses = {}
-    for link in links:
-        index = model.tool_frames.index(link)
-        pose = np.eye(4)
-        pose[:3, 3] = xyz[index]
-        pose[:3, :3] = Rotation.from_quat(wxyz[index, [1, 2, 3, 0]]).as_matrix()
-        poses[link] = base@pose
-    spheres[:, :3] = spheres[:, :3]@base[:3, :3].T+base[:3, 3]
-    evidence.update(joint_names=list(names), joint_position=position.tolist(),
-                    locked_joint_positions=locked_positions,
-                    T_output_robot_base=base.tolist(), robot_geometry_source=geometry_source,
-                    robot_spheres=int(model.total_spheres), current_spheres_output=spheres.tolist(),
-                    link_poses_output={name: pose.tolist() for name, pose in poses.items()})
-    return poses, evidence
-
-
-def _known_solid_evidence(known_solids, owner_frames, current_robot, views, reference_frame):
-    """Normalize trustworthy inner occupancy without inventing physical solids.
-
-    ``occupancy_kind`` is a caller-provided evidence claim, independently of
-    mesh topology: verified_physical_solid includes actual holes/cavities;
-    verified_inner_solid is wholly contained in physical occupied material.
-    A watertight convex hull, collision sphere cover, AABB, or partial RGB-D
-    reconstruction is not sufficient. Topological checks alone cannot prove
-    this claim, so its source remains explicit in the returned evidence.
-    """
-    if known_solids is None:
-        return (), {"solids": [], "owners": {}, "robot": None}
-    if not isinstance(known_solids, Mapping) or len(known_solids) > 64:
-        raise ValueError("Known physical solids must be a bounded mapping of at most 64 bodies")
-    import trimesh
-
-    records, face_count, vertex_count = [], 0, 0
-    for identity, supplied in known_solids.items():
-        _text(identity, "known solid identity")
-        if (not isinstance(supplied, Mapping)
-                or supplied.get("occupancy_kind") not in {"verified_physical_solid", "verified_inner_solid"}):
-            raise ValueError("Known occupancy requires independently verified physical/inner solid evidence, not an outer collision proxy")
-        source = _text(supplied.get("geometry_source"), "verified solid occupancy source")
-        mesh = supplied.get("mesh")
-        if not isinstance(mesh, trimesh.Trimesh):
-            raise TypeError("Known solid evidence needs an explicit metric trimesh.Trimesh")
-        face_count += len(mesh.faces)
-        vertex_count += len(mesh.vertices)
-        # Check counts before copies, topology caches, triangle trees or
-        # proximity workspaces. Input meshes are already caller-owned memory.
-        if (not 0 < len(mesh.faces) <= 50_000 or face_count > 100_000 or vertex_count > 100_000):
-            raise ValueError("Known solid meshes exceed the bounded 100,000-face/vertex CPU geometry budget")
-        if (not np.isfinite(mesh.vertices).all() or not mesh.is_volume):
-            raise ValueError("A verified solid also needs a finite, closed, consistently oriented volume mesh")
-        error = supplied.get("max_geometry_error_m")
-        if not isinstance(error, Real) or not np.isfinite(error) or error < 0:
-            raise ValueError("Known solids require an explicit nonnegative geometry-error bound in metres")
-        kind, body = supplied.get("body_kind"), supplied.get("body_id")
-        if kind not in {"owner", "robot_link"}:
-            raise ValueError("Known occupancy must bind to a current owner or an actual robot link")
-        _text(body, "known solid body identity")
-        offset = _pose_array(supplied.get("T_body_solid"), "T_body_solid")
-        # Only bounded metric geometry is required. Trimesh.copy() would also
-        # duplicate caller-owned texture images that have no occupancy role.
-        geometry = trimesh.Trimesh(vertices=np.asarray(mesh.vertices).copy(),
-                                   faces=np.asarray(mesh.faces).copy(), process=False, validate=False)
-        records.append({"solid_id": identity, "body_kind": kind, "body_id": body,
-                        "occupancy_kind": supplied["occupancy_kind"], "geometry_source": source,
-                        "max_geometry_error_m": float(error), "mesh": geometry, "T_body_solid": offset})
-    owner_frames = {} if owner_frames is None else owner_frames
-    if not isinstance(owner_frames, Mapping) or len(owner_frames) > 32:
-        raise ValueError("Known owner solids require bounded current owner-frame evidence")
-    owners, poses, errors = {}, {}, {}
-    for body in {row["body_id"] for row in records if row["body_kind"] == "owner"}:
-        if body not in owner_frames:
-            raise ValueError("A known owner solid must belong to the current observed owner frames")
-        frame = owner_frames[body]
-        evidence = _pose_evidence(frame, views, reference_frame, f"Owner {body}")
-        pose = _pose_array(frame.get("T_output_owner"), "T_output_owner")
-        # Pose evidence must be tied to visible current owner pixels, not only
-        # an arbitrary source string or an unseen proposed owner transform.
-        visible = False
-        for identity in evidence["observation_ids"]:
-            view = views[identity]
-            masks = view.get("owner_masks", {})
-            if body not in masks:
-                continue
-            mask = np.asarray(masks[body])
-            if mask.dtype != np.bool_ or mask.shape != view["depth"].shape:
-                raise ValueError("Known owner pose evidence requires aligned boolean owner masks")
-            visible |= bool(np.any(mask & (view["depth"] > 0)))
-        if not visible:
-            raise ValueError("Known owner solids require visible current depth for their pose evidence")
-        evidence["T_output_owner"] = pose.tolist()
-        owners[body], poses[("owner", body)], errors[("owner", body)] = evidence, pose, evidence["max_point_error_m"]
-    robot = None
-    links = {row["body_id"] for row in records if row["body_kind"] == "robot_link"}
-    if links:
-        link_poses, robot = _robot_solid_poses(current_robot, sorted(links), views, reference_frame)
-        for link, pose in link_poses.items():
-            poses[("robot_link", link)], errors[("robot_link", link)] = pose, robot["max_point_error_m"]
-    summaries = []
-    for row in records:
-        body = (row["body_kind"], row["body_id"])
-        row["T_output_solid"] = poses[body]@row["T_body_solid"]
-        row["max_pose_error_m"] = errors[body]
-        # Account for the longest body-to-solid lever arm when comparing
-        # native link rotations. This numerical inward guard is independent
-        # of the caller's physical geometry and pose uncertainty contracts.
-        offset = row["T_body_solid"]
-        body_extent = (np.abs(offset[:3, 3])
-                       + np.abs(offset[:3, :3])@np.abs(row["mesh"].vertices).max(0))
-        row["numerical_inward_margin_m"] = max(
-            1e-6*(1.+float(np.linalg.norm(body_extent))),
-            64*np.finfo(float).eps*max(1., float(np.abs(row["T_output_solid"]).max())))
-        summaries.append({key: value for key, value in row.items() if key not in {"mesh", "T_body_solid", "T_output_solid"}})
-        summaries[-1].update(T_body_solid=row["T_body_solid"].tolist(), T_output_solid=row["T_output_solid"].tolist())
-    return records, {"solids": summaries, "owners": owners, "robot": robot}
-
-
-def _add_known_solid_voxels(known, records, *, origin, voxel_size):
-    """Union only complete cells proved inside a current physical solid.
-
-    Positive signed distance must exceed the cell's circumsphere plus both
-    evidence error bounds. Concavities and cavities stay outside. Transformed
-    mesh bounds only prune proximity queries; no bounding-box cell is ever
-    accepted without a native trimesh volume/distance query. Each call caps
-    the worst-case point/triangle candidate product before allocating it.
-    """
-    if not records:
-        return 0
-    import trimesh
-
-    added = 0
-    free = known.copy()
-    origin, shape_xyz = np.asarray(origin, float), np.asarray(known.shape[::-1])
-    radius = math.sqrt(3)*voxel_size/2
-    corners = np.array([[x, y, z] for x in (0, 1) for y in (0, 1) for z in (0, 1)])
-    for row in records:
-        mesh, pose = row["mesh"], row["T_output_solid"]
-        local_box = mesh.bounds[0]+corners*(mesh.bounds[1]-mesh.bounds[0])
-        world_box = local_box@pose[:3, :3].T+pose[:3, 3]
-        if not np.isfinite(world_box).all():
-            raise ValueError("Known solid bounds must remain finite in the planning frame")
-        # Clamp floating indices before integer conversion, including distant
-        # current bodies that have no overlap with this observation grid.
-        low_float = np.ceil((world_box.min(0)+radius-origin)/voxel_size)
-        high_float = np.floor((world_box.max(0)-radius-origin)/voxel_size)
-        if np.any(low_float > shape_xyz-1) or np.any(high_float < 0):
-            continue
-        low = np.maximum(low_float, 0).astype(np.int64)
-        high = np.minimum(high_float, shape_xyz-1).astype(np.int64)
-        if np.any(low > high):
-            continue
-        crop_shape = tuple((high-low+1)[::-1])
-        # trimesh may consider every triangle for a pathological concave mesh.
-        # Bound that worst case to 262,144 point/triangle pairs per call;
-        # typical rtree pruning is cheaper. No unbounded point batch is used.
-        chunk = max(1, min(1024, 262_144//len(mesh.faces)))
-        # A separate one-micrometre numerical shrink (scaled by local extent)
-        # exceeds the 1e-7 native model/FK comparison threshold. It only
-        # removes coverage, and is not a physical/contact error allowance.
-        required = (radius+row["max_geometry_error_m"]+row["max_pose_error_m"]
-                    + row["numerical_inward_margin_m"])
-        for start in range(0, math.prod(crop_shape), chunk):
-            flat = np.arange(start, min(start+chunk, math.prod(crop_shape)))
-            z, y, x = np.unravel_index(flat, crop_shape)
-            x, y, z = x+low[0], y+low[1], z+low[2]
-            points = origin+voxel_size*np.column_stack((x, y, z))
-            local = (points-pose[:3, 3])@pose[:3, :3]
-            signed = trimesh.proximity.signed_distance(mesh, local)
-            contained = np.isfinite(signed) & (signed > required)
-            # Both tests already include whole-cell and physical error bounds.
-            # Their overlap is contradictory current evidence, not a region
-            # that may quietly become known after a Boolean union. Previously
-            # proved occupied cells may overlap another same-body inner solid.
-            if np.any(contained & free[z, y, x]):
-                raise ValueError("Current solid occupancy contradicts proved-free RGB-D cells")
-            added += int(np.count_nonzero(contained & ~known[z, y, x]))
-            known[z[contained], y[contained], x[contained]] = True
-    return added
-# END current physical-solid evidence, separate from collision outer proxies.
-
-
-# BEGIN explicitly isolated raw-depth coverage for historical source audits.
-def observed_audit_space_from_rgbd(views, *, origin, shape, voxel_size, depth_error_m,
-                             reference_frame, depth_range_m, known_solids=None,
-                             owner_frames=None, current_robot=None):
-    """Historical source-audit coverage from original, unfiltered depth.
-
-    This function is not online collision coverage. The online scene builder
-    requires three-state self-filter evidence and excludes entire uncertain
-    rays; this audit intentionally replays the original raw-depth contract.
-
-    ``views`` maps observation IDs to depth, K, T_output_camera and
-    reference_frame. ``origin`` is the centre of cell [0,0,0], ``shape`` is
-    (z,y,x). Raw depth proves free ray prefixes. Optional ``known_solids`` maps
-    IDs to metric trimesh meshes, occupancy_kind (verified_physical_solid or
-    verified_inner_solid), geometry_source, max_geometry_error_m, body_kind
-    (owner or robot_link), body_id, and T_body_solid. Closed outer collision
-    proxies and partial RGB-D surfaces are not physical occupancy evidence.
-
-    Owner frames used by solids additionally require state=current_observed,
-    reference_frame, observation_ids, and max_point_error_m. Robot solids use
-    current_robot with those same evidence fields plus source, kinematics (an
-    already loaded native model), joint_names, joint_position,
-    T_output_robot_base and robot_geometry_source. Pose error bounds cover all
-    points of the supplied solids, including angular/calibration uncertainty.
-    Only current poses contribute; candidate future poses cannot fill unknown.
-    Owner occupancy requires complete collision geometry downstream. Unknown
-    surface bands and air outside an evidenced solid remain unknown.
-    """
-    normalized = _views(views, reference_frame, depth_range_m)
-    known = _known_free_voxels(normalized, ray_depths={name: row["depth"] for name, row in normalized.items()}, origin=origin, shape=shape, voxel_size=voxel_size,
-                               depth_error_m=depth_error_m)
-    # BEGIN retain original ray evidence before adding current solid interiors.
-    # K may grow by O below; the robot volume oracle must still consume F.
-    known_free = known.copy()
-    records, evidence = _known_solid_evidence(known_solids, owner_frames, current_robot, normalized, reference_frame)
-    _add_known_solid_voxels(known, records, origin=origin, voxel_size=voxel_size)
-    return ObservedSpace(known, origin=origin, voxel_size=voxel_size,
-                         observation_ids=tuple(normalized), reference_frame=reference_frame,
-                         occupancy_evidence=evidence, known_free=known_free)
-    # END occupied cells never become observed-free cells.
-# END online coverage instead consumes three-state free-ray evidence.
-
-
-# BEGIN explicitly historical binary-mask audit; production uses three states.
-def _audit_partition_masks(views, owner_ids):
-    """Preserve every visible pixel outside explicit disjoint owner masks."""
-    masks, observed = {}, {identity: 0 for identity in owner_ids}
-    for name, view in views.items():
-        image, depth = np.asarray(view["image"]), view["depth"]
-        if image.dtype != np.uint8 or image.shape != (*depth.shape, 3):
-            raise ValueError("Current RGB must be an aligned uint8 H,W,3 image")
-        supplied = view["owner_masks"]
-        if not isinstance(supplied, Mapping) or set(supplied) != set(owner_ids):
-            raise ValueError("Each view must explicitly include every selected owner mask, including empty masks")
-        robot = np.asarray(view["robot_mask"])
-        if robot.dtype != np.bool_ or robot.shape != depth.shape:
-            raise ValueError("The robot mask must be an explicit aligned boolean image")
-        occupied = robot.copy()
-        masks[name] = {}
-        for identity in owner_ids:
-            mask = np.asarray(supplied[identity])
-            if mask.dtype != np.bool_ or mask.shape != depth.shape:
-                raise ValueError("Visible owner masks must be aligned boolean images")
-            if np.any(mask & occupied):
-                raise ValueError("Visible owner/robot pixel identities must be disjoint")
-            masks[name][identity] = mask.copy()
-            observed[identity] += int(np.count_nonzero(mask & (depth > 0)))
-            occupied |= mask
-        masks[name][None] = ~occupied
-    if any(count == 0 for count in observed.values()):
-        raise ValueError("Every explicit collision owner needs current valid depth evidence")
-    return masks
-# END this audit API cannot be selected by a missing production field.
-
-
-# BEGIN production three-state evidence contract and semantic ownership.
 def _self_filtered_views(views, reference_frame, depth_range_m):
     """Validate measured classification before applying mapper depth limits.
 
@@ -562,7 +208,7 @@ def _self_filtered_views(views, reference_frame, depth_range_m):
     return normalized
 
 
-def _partition_masks(views, owner_ids):
+def _partition_masks(views, owner_ids, *, build_background=True):
     # BEGIN conserve every admitted endpoint under the supplied identities.
     """Partition current environment endpoints into owners and background.
 
@@ -570,9 +216,11 @@ def _partition_masks(views, owner_ids):
     uncertainty is not permission to silently choose a semantic winner.
     All admitted endpoints outside explicit owners remain observed obstacles;
     proximity to an owner neither grants its identity nor erases occupancy.
-    Background stays fixed for this planning request, so the caller must
-    completely partition visible surfaces of owners that will move. Measured
-    free-ray prefixes and robot self-filter evidence remain independent.
+    Only entities being integrated appear in owner_ids. A supplied background
+    mask selects the static endpoints of the original observation independently
+    of retained moving entities. Without that mask, the new-owner complement
+    defines the background. Retained background bypasses this integration.
+    Free rays remain the original independently filtered measurements.
     """
     from .robot_self_filter import ENVIRONMENT, validate_self_filter
     masks, observed = {}, {identity: 0 for identity in owner_ids}
@@ -600,12 +248,23 @@ def _partition_masks(views, owner_ids):
             observed[identity] += int(np.count_nonzero(masks[name][identity] & (depth > 0)))
         # The disjoint owner intersections and this complement exhaust the
         # accepted environment. SELF/shadow pixels never enter any partition.
-        masks[name][None] = environment & ~occupied
-        masks[name][None].setflags(write=False)
+        # BEGIN background admission is independent of retained entity visibility.
+        if build_background:
+            background = view.get("background_mask")
+            if background is None:
+                background = ~occupied
+            else:
+                background = np.asarray(background)
+                if background.dtype != np.bool_ or background.shape != depth.shape:
+                    raise ValueError("A supplied background partition must be an aligned boolean image")
+                if np.any(background & occupied):
+                    raise ValueError("Background and newly mapped entity partitions must be disjoint")
+            masks[name][None] = environment & background
+            masks[name][None].setflags(write=False)
+        # END retained entities do not acquire a new segmentation requirement.
     if any(count == 0 for count in observed.values()):
         raise ValueError("Every explicit collision owner needs current valid depth evidence after self filtering")
     return masks
-    # END input masks alone assign identity; no measured environment is erased.
 
 
 def _self_filter_report(views):
@@ -630,7 +289,6 @@ def _self_filter_report(views):
             },
         }
     return reports
-# END occupied endpoint selection and free-ray evidence remain independent.
 
 
 def _mapper_memory_bound(config):
@@ -651,82 +309,6 @@ def _mapper_memory_bound(config):
     camera = pixels*(16+samples*16)+blocks*(32+config.max_support_pixels_per_block_camera*8)
     esdf = cells*128
     return int(2*(tsdf+hashes+camera+esdf)+16*1024**2)
-
-
-# BEGIN enforce request totals for each new native mapping allocation.
-def _require_audit_mapping_memory(estimated_bytes, device, *,
-                            max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
-                            max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES):
-    """Check live host/device space before one new Mapper allocation.
-
-    The per-partition estimate already includes mapper scratch and retained
-    fields. Another fixed 64 MiB covers the small native collision-query
-    objects and transient depth/calibration tensors built around those fields.
-    Earlier partitions are already represented by live RSS/device usage and
-    must not be charged again. This admission reserves the native-buffer bound
-    on the host as conservative working room for the CPU TSDF export; it is
-    not a measurement of that export's Python-object peak. The external process
-    supervisor must continue enforcing the same total limits during export.
-    CUDA context, other applications and retained fields count toward total
-    device use. Native Mapper/Warp allocations cannot use PyTorch's cache.
-    """
-    device = torch.device(device)
-    if device.type != "cuda":
-        raise ValueError("Native RGB-D mapping requires an explicit CUDA device")
-    if type(estimated_bytes) is not int or estimated_bytes < 0:
-        raise ValueError("Mapping estimate must be a nonnegative byte count")
-    required_bytes = estimated_bytes+64*1024**2
-    # BEGIN preserve unmaterialized Coal reservations during map refinement.
-    # Lazy independent geometry may already promise host arrays that have not
-    # entered RSS. Resident geometry is excluded by this shared inventory.
-    from .tsdf_geometry import ObservedTsdfGeometry
-    require_host_memory(required_bytes,
-                        pending_existing_bytes=ObservedTsdfGeometry.pending_storage_total_nbytes(),
-                        max_rss_bytes=max_host_rss_bytes)
-    # END retained fields in RSS are still counted only once.
-    require_device_memory(torch, device, native_bytes=required_bytes,
-                          max_device_used_bytes=max_device_used_bytes)
-    return required_bytes
-# END each native allocation checks the same request-wide host/device totals.
-
-
-# BEGIN reject native index layouts that disagree with the complete mapped field.
-def _require_native_voxel_layout(voxel, native):
-    """Admit the same XYZ field for native queries and independent geometry.
-
-    VoxelData stores float32 ``dims / voxel_size`` parameters. The two native
-    SDF entry points now recover these integral sizes with wp.round, fixing
-    cuRobo #699. Compare that actual kernel layout with the completed mapper
-    tensor before publishing either consumer. This is an admission check;
-    it never rewrites metadata or repairs an inconsistent field.
-    """
-    storage = native.data.voxels
-    layer = storage.get_idx(voxel.name)
-    values = storage.params[0, layer, :3].detach().cpu()
-    field_shape = tuple(int(value) for value in voxel.feature_tensor.shape)
-    # BEGIN match the corrected Warp kernel's positive roundf conversion.
-    if (len(field_shape) != 3 or not bool(torch.isfinite(values).all())
-            or bool((values <= 0).any())):
-        raise ValueError("Completed native ESDF needs a dense XYZ field and finite positive grid params")
-    # Warp uses C roundf (half away from zero); Python/torch round instead use
-    # ties to even. These are positive float32 grid counts, so floor(x + 0.5)
-    # on each promoted scalar reproduces the native conversion, including ties.
-    native_shape = tuple(math.floor(float(value)+.5) for value in values.tolist())
-    # END no legacy truncation or metadata-writing fallback remains.
-    declared_shape = tuple(int(round(float(value)/float(voxel.voxel_size))) for value in voxel.dims)
-    if native_shape != field_shape or declared_shape != field_shape:
-        raise ValueError(
-            f"Unsupported native ESDF grid layout for {voxel.name}: "
-            f"field_shape_xyz={field_shape}, native_rounded_shape_xyz={native_shape}, "
-            f"native_params_xyz={values.tolist()}, declared_shape_xyz={declared_shape}, "
-            f"dims_m={list(voxel.dims)}, voxel_size_m={float(voxel.voxel_size)}")
-# END no rounding repair, reshape or alternate field enters either consumer.
-
-
-# BEGIN independently bounded owner resolution on the same current RGB-D input.
-# BEGIN task ownership, rather than experiment flags, selects map precision.
-TASK_VOXEL_SIZE_M = 0.002
-DEFAULT_ENVIRONMENT_VOXEL_SIZE_M = 0.01
 
 
 def scene_task_owner_ids(scene):
@@ -752,10 +334,9 @@ def scene_task_owner_ids(scene):
 def observation_resolutions(owner_ids, *, task_owner_ids, environment_voxel_size):
     """Resolve the common 2 mm task / coarser environment mapping contract.
 
-    All task identities must be present, even for invisible or completely
-    modelled bodies. A complete body avoids allocating a redundant RGB-D map;
-    it still uses this spacing for its registered contact query. Resource
-    admission may reject a request but cannot silently coarsen a task owner.
+    Task identities select the shared task resolution. Reused entity fields
+    preserve their original samples. Resource admission checks each new map
+    at the requested spacing.
     """
     if isinstance(owner_ids, (str, bytes)) or isinstance(task_owner_ids, (str, bytes)):
         raise ValueError('Owner identities must be explicit collections')
@@ -772,10 +353,9 @@ def observation_resolutions(owner_ids, *, task_owner_ids, environment_voxel_size
         raise ValueError('Environment grid spacing must be finite and coarser than 2 mm')
     return {identity: TASK_VOXEL_SIZE_M if identity in task else float(environment_voxel_size)
             for identity in owners}
-# END one library policy applies before any mapping or native allocation.
 
 
-def _owner_mapper_config(config, views, masks, owner_id, pose, voxel_size, depth_error_m, query_radius_m=0.):
+def _owner_mapper_config(config, views, masks, owner_id, pose, voxel_size, depth_error_m):
     """Enclose every labelled depth sample in a finite owner-local grid.
 
     The background and raw free-space grid keep their own resolution. This
@@ -800,20 +380,15 @@ def _owner_mapper_config(config, views, masks, owner_id, pose, voxel_size, depth
     if not len(points):
         raise ValueError("A refined owner field needs current labelled valid depth samples")
     lower, upper = points.min(axis=0), points.max(axis=0)
-    # BEGIN the frozen online map includes every registered query centre that
-    # can reach the observed owner. This is pre-admission model support, not
-    # a region enlarged after a failed optimizer candidate.
-    padding = 4*voxel_size+depth_error_m+float(query_radius_m)
-    # END audit callers retain their explicitly zero extra sphere support.
+    # Padding retains complete interpolation cells around measured endpoints.
+    padding = 4*voxel_size+depth_error_m
     extent = tuple(upper-lower+2*padding)
     return replace(config, grid_center=torch.as_tensor((lower+upper)/2, dtype=torch.float32),
         extent_meters_xyz=extent, extent_esdf_meters_xyz=extent,
         voxel_size=voxel_size, esdf_voxel_size=voxel_size,
         truncation_distance=2*voxel_size, max_visible_blocks_per_integration=None)
-# END refined owner fields remain partial collision geometry.
 
 
-# BEGIN explicit small-region allocation before any native mapping work.
 def _fine_mapper_config(config, request):
     """Freeze a caller-evidenced small region in this partition's local frame.
 
@@ -841,468 +416,8 @@ def _fine_mapper_config(config, request):
         extent_meters_xyz=tuple(extent), extent_esdf_meters_xyz=tuple(extent),
         voxel_size=size, esdf_voxel_size=size, truncation_distance=2*size,
         max_visible_blocks_per_integration=None)
-# END no allocation is reduced after seeing collision values.
 
 
-# BEGIN one immutable mapped partition, shared by initial build and refinement.
-def _map_partition(normalized, masks, identity, config, inverse, depth_error_m, request=None):
-    """Reconstruct one field from original partitioned observations, sequentially."""
-    from curobo.perception import Mapper
-    from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
-    from curobo._src.geom.types import SceneCfg
-    from curobo.types import CameraObservation, DeviceCfg, Pose
-    config_device = DeviceCfg(device=config.device)
-    region = None
-    # A fresh mapper per partition preserves ownership at every observed
-    # surface. Queries retain their native field tensors; summing every
-    # partition's budget also covers delayed native scratch cleanup. No
-    # clear_region or AABB subtraction is used.
-    mapper = Mapper(config)
-    for name, view in normalized.items():
-        depth = np.where(masks[name][identity], view["depth"], 0.).astype(np.float32)
-        observation = CameraObservation(
-            name=name, depth_image=config_device.to_device(depth)[None],
-            rgb_image=torch.as_tensor(np.asarray(view["image"]).copy(), dtype=torch.uint8,
-                                      device=config_device.device)[None],
-            # BEGIN this audit Mapper uses the same native depth convention.
-            intrinsics=config_device.to_device(_mapper_intrinsics(view["K"]))[None],
-            # END original calibration remains available to independent rays.
-            pose=Pose.from_matrix(config_device.to_device(inverse@view["T_output_camera"])[None]),
-            resolution=list(depth.shape), depth_to_meter=1.)
-        mapper.integrate(camera_observation=observation)
-    stats = mapper.get_stats(scan_pool=True)
-    # Native stats omit the optional holes key when no blocks exist.
-    # Use the invariant itself, which also covers an empty background.
-    if (stats["allocation_failures"] != 0
-            or stats["num_allocated"] != stats["active_blocks"]+stats["free_count"]):
-        raise RuntimeError("Native observation mapping lost geometry through block-pool allocation failure")
-    voxel = mapper.compute_esdf()
-    partition_id = "observed_background" if identity is None else identity
-    voxel.name = partition_id
-    native = SceneCollision.from_config(SceneCollisionCfg(
-        device_cfg=config_device, scene_model=SceneCfg(voxel=[voxel]), cache={"voxel": 1}))
-    # BEGIN validate native indexing before a query or solid can be published.
-    _require_native_voxel_layout(voxel, native)
-    # END a mismatched complete field remains unsupported, not executable.
-    query = CuroboSphereQuery(native, owner_ids=(partition_id,),
-                                         source=f"current_rgbd:{','.join(normalized)}")
-    # BEGIN preserve observed TSDF geometry independently of ESDF optimizer costs.
-    # The Mapper is still alive here: export its weighted distance samples,
-    # not the ESDF seeds expanded into occupied cubes. The adapter uses one
-    # affine tetrahedral field for both its zero set and observed negative
-    # region, with physical sample-centre coordinates and no unknown fill.
-    from .tsdf_geometry import build_tsdf_geometry
-    query.independent_geometry = build_tsdf_geometry(
-        mapper, name=partition_id, source=query.source)
-    # END native sphere costs retain their original differentiable ESDF.
-    # BEGIN export the actual fine sign source before releasing its Mapper.
-    if request is not None:
-        from .native_voxel_sources import export_source_bits
-        shape = tuple(voxel.feature_tensor.shape)
-        bits = export_source_bits(mapper, config, voxel)
-        # Raw depth retains robot/other-owner occlusion. Only its observed
-        # free prefix can support a background sign; no masked hole is free.
-        local_views = {name: {**view, "T_output_camera": inverse@view["T_output_camera"]}
-                       for name, view in normalized.items()}
-        fine_origin = np.asarray(voxel.pose[:3])-(np.asarray(shape)-1)*voxel.voxel_size/2
-        free = _known_free_voxels(local_views, ray_depths={name: row["depth"] for name, row in local_views.items()}, origin=fine_origin, shape=shape[::-1],
-            voxel_size=voxel.voxel_size, depth_error_m=depth_error_m).transpose(2, 1, 0)
-        # Truncation, a full grid diagonal and one interpolation step
-        # are numerical map support, never the sensor-error margin.
-        support = math.ceil((config.truncation_distance+math.sqrt(3)*config.voxel_size
-                              +config.esdf_voxel_size)/config.esdf_voxel_size)*config.esdf_voxel_size
-        region = {"pose": list(voxel.pose), "shape_xyz": list(shape),
-            "voxel_size_m": float(voxel.voxel_size), "numerical_support_m": support,
-            "measurement_allowance_m": float(request["measurement_allowance_m"]),
-            "measurement_evidence": request["measurement_evidence"], "source": request["source"],
-            "observation_ids": list(normalized), "source_bits_hex": bits.tobytes().hex(),
-            "raw_free_packbits_hex": np.packbits(free).tobytes().hex(),
-            "distance_scope": "local source-supported distance; no global nearest-surface certificate"}
-    # END positive ESDF values never become observation evidence.
-    statistics = {"allocated_blocks": stats["num_allocated"],
-                                "max_blocks": config.max_blocks,
-                                "tsdf_voxel_size_m": float(config.voxel_size),
-                                "esdf_voxel_size_m": float(config.esdf_voxel_size),
-                                "truncation_distance_m": float(config.truncation_distance),
-                                # BEGIN record the finite field actually queried.
-                                "grid_center_local_m": config.grid_center.cpu().tolist(),
-                                "extent_esdf_meters_xyz": list(config.extent_esdf_meters_xyz),
-                                # BEGIN disclose counts even when a finite inventory refuses admission.
-                                "independent_field": query.independent_geometry["field_summary"],
-                                # END a resource refusal cannot masquerade as an empty observed target.
-                                # END voxel resolution is not a sensor-error certificate.
-                                "estimated_buffers_bytes": _mapper_memory_bound(config)}
-    del mapper, observation
-    return query, statistics, region
-# END no different mapping formula exists for a refined field.
-
-
-# BEGIN request-owned original observations for finite background remapping.
-class _FrozenBackgroundRefinement:
-    """Retain read-only sensor inputs, never a previous solver or fine field."""
-
-    # BEGIN refinements inherit the original request's explicit capacity limits.
-    def __init__(self, normalized, masks, config, request, depth_error_m, *,
-                 max_mapping_bytes, max_host_rss_bytes, max_device_used_bytes):
-        self.views, self.masks = {}, {}
-        for name, view in normalized.items():
-            self.views[name] = {}
-            for key in ("image", "depth", "K", "T_output_camera"):
-                value = np.asarray(view[key]).copy()
-                value.setflags(write=False)
-                self.views[name][key] = value
-            mask = masks[name][None].copy()
-            mask.setflags(write=False)
-            self.masks[name] = {None: mask}
-        self.config = deepcopy(config)
-        self.request = deepcopy(request)
-        self.depth_error_m = float(depth_error_m)
-        self.max_mapping_bytes = max_mapping_bytes
-        self.max_host_rss_bytes = max_host_rss_bytes
-        self.max_device_used_bytes = max_device_used_bytes
-    # END old retained fields are charged only through measured live totals.
-
-    @property
-    def storage_bytes(self):
-        """Count the one shared immutable CPU observation snapshot."""
-        return sum(value.nbytes for view in self.views.values() for value in view.values())+sum(
-            value[None].nbytes for value in self.masks.values())
-
-    def refine(self, current, witnesses):
-        """Build one enlarged local map without changing frozen evidence.
-
-        The old ROI is retained to prevent repeated movement/shrinkage. All
-        positive complete-body witnesses enter the requested union; capacity
-        refusal is explicit rather than dropping an inconvenient body.
-        """
-        report = {"status": "unavailable", "active_witnesses": len(witnesses),
-                  "max_fine_cells": MAX_FINE_CELLS,
-                  "max_mapping_bytes": self.max_mapping_bytes,
-                  "max_host_rss_bytes": self.max_host_rss_bytes,
-                  "max_device_used_bytes": self.max_device_used_bytes}
-        if not witnesses:
-            report["status"] = "no_active_witnesses"
-            return None, report
-        if len(witnesses) > 32768:
-            raise ValueError("Background refinement witnesses exceed the finite sample inventory")
-        envelopes = np.asarray([row["envelope_world_m"] for row in witnesses], dtype=float)
-        if (envelopes.shape != (len(witnesses), 2, 3) or not np.isfinite(envelopes).all()
-                or np.any(envelopes[:, 0] > envelopes[:, 1])):
-            raise ValueError("Refinement requires finite ordered complete-body envelopes")
-        report.update(active_positive_spheres=sum(int(row["positive_spheres"]) for row in witnesses),
-                      active_bodies=sorted({row["body_id"] for row in witnesses}),
-                      coarse_cost=sum(float(row["coarse_cost"]) for row in witnesses))
-        # BEGIN distinguish native geometry from the Mapper's Python size input.
-        # Mapper rounds its spacing and center to float32, but computes shape
-        # as ceil(Python extent/Python spacing). Re-ceiling N*native_spacing
-        # with the original Python spacing can spuriously turn N into N+1.
-        size = float(self.request["voxel_size_m"])
-        native_size = current.region.size
-        padding = current.region.support+6*native_size
-        previous_shape = tuple(current.region.shape)
-        previous_half = np.asarray(previous_shape)*native_size/2
-        previous_lower = current.region.pose[:3]-previous_half
-        previous_upper = current.region.pose[:3]+previous_half
-        lower = np.minimum(envelopes[:, 0].min(0)-padding, previous_lower)
-        upper = np.maximum(envelopes[:, 1].max(0)+padding, previous_upper)
-        expanded = (lower < previous_lower) | (upper > previous_upper)
-        same_bounds = not expanded.any()
-        center = current.region.pose[:3].copy()
-        shape = list(previous_shape)
-        if not same_bounds:
-            # Decide coverage using the actual center the native Mapper will
-            # store. Unchanged axes keep their exact old center and integer
-            # shape; changed axes cover both sides after center quantization.
-            center[expanded] = ((lower[expanded]+upper[expanded])/2).astype(np.float32)
-            for axis in np.flatnonzero(expanded):
-                span = 2*max(center[axis]-lower[axis], upper[axis]-center[axis])
-                count = max(previous_shape[axis], math.ceil(span/native_size))
-                # Division can round down at an integer. Check the published
-                # physical bounds directly and add one cell only if needed.
-                half = count*native_size/2
-                if center[axis]-half > lower[axis] or center[axis]+half < upper[axis]:
-                    count += 1
-                shape[axis] = count
-        # The integer shape owns admission. Encoding the Mapper's extent one
-        # binary64 step inward avoids a second ceil caused by multiplication
-        # roundoff; published geometry is still exactly N*native_spacing.
-        cells = math.prod(shape)
-        report["requested_cells"] = cells
-        if cells > MAX_FINE_CELLS:
-            report["status"] = "local_cell_budget_refused"
-            return None, report
-        extent = np.nextafter(np.asarray(shape, dtype=float)*size, 0.)
-        actual_extent = np.asarray(shape)*native_size
-        if (tuple(math.ceil(float(value)/size) for value in extent) != tuple(shape)
-                or np.any(center-actual_extent/2 > lower)
-                or np.any(center+actual_extent/2 < upper)):
-            raise RuntimeError("Refined native grid must retain its exact shape and contain every requested bound")
-        # END neither approximate equality nor nominal spacing can hide growth.
-        request = {**self.request, "center_m": center.tolist(), "extent_m": extent.tolist(),
-                   "source": "planner active complete-body background collision witnesses; same frozen RGB-D"}
-        report.update(center_m=center.tolist(), extent_m=extent.tolist(), voxel_size_m=size,
-                      shape_xyz=shape, actual_voxel_size_m=native_size,
-                      actual_extent_m=actual_extent.tolist())
-        if same_bounds:
-            # Existing observation fields remain immutable. A new witness can
-            # require another supported overlap box without needing any new
-            # Mapper allocation or changing a previously captured selector.
-            fine, region = current.fine.clone_for_rollout(), current.region.record
-            mapping = deepcopy(current.mapping_report)
-            report.update(mapping_reused=True, estimated_mapping_bytes=0)
-        else:
-            # BEGIN only a real physical expansion needs a Mapper admission.
-            config = _fine_mapper_config(self.config, request)
-            estimate = _mapper_memory_bound(config)
-            report["estimated_mapping_bytes"] = estimate
-            if estimate > self.max_mapping_bytes:
-                report["status"] = "mapping_byte_budget_refused"
-                return None, report
-            # END unchanged fields never allocate or reserve remapping buffers.
-            try:
-                _require_audit_mapping_memory(estimate, config.device,
-                    max_host_rss_bytes=self.max_host_rss_bytes,
-                    max_device_used_bytes=self.max_device_used_bytes)
-            except ResourceLimitError as error:
-                # This admission check allocates nothing. Its explicit live
-                # resource refusal retains the still-valid original scene;
-                # Mapper/runtime exceptions below remain actual failures.
-                report.update(status="live_mapping_memory_refused", reason=str(error))
-                return None, report
-            fine, mapping, region = _map_partition(self.views, self.masks, None, config,
-                                                   np.eye(4), self.depth_error_m, request)
-            report["mapping_reused"] = False
-        replacement = LayeredVoxelQuery(current.coarse.clone_for_rollout(), fine, region)
-        # Re-prove old boxes in the new field before adding new witnesses. A
-        # body already at weight one is absent from the unresolved witness
-        # list; omitting these boxes would withdraw its existing fine guide.
-        previous_boxes = current.region.guidance_boxes+current.region.pose[:3]
-        # High-cost new witnesses retain deterministic tie order. The source
-        # predicate is checked again for every old and new envelope.
-        ordered = np.argsort([-float(row["coarse_cost"]) for row in witnesses], kind="stable")
-        support_report = replacement.region.prepare_guidance_boxes(
-            np.concatenate((previous_boxes, envelopes[ordered])))
-        support_report["previous_cuboid_envelopes"] = len(previous_boxes)
-        report.update(mapping=mapping, support=support_report)
-        if not support_report["cuboids"]:
-            report["status"] = "observation_support_unavailable"
-            return None, report
-        if same_bounds and np.array_equal(replacement.region.guidance_boxes, current.region.guidance_boxes):
-            report["status"] = ("cuboid_budget_refused" if support_report["cuboid_capacity_reached"]
-                and support_report["supported_uncovered_envelopes"] else "unchanged_source_supported_cuboids")
-            return None, report
-        replacement.refinement_source = self
-        replacement.mapping_report = deepcopy(mapping)
-        report["status"] = "refined"
-        return replacement, report
-# END only the newly mapped fine layer is allocated between solver lifetimes.
-
-
-def build_audit_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m,
-                          # BEGIN every owner explicitly selects its own metric grid.
-                          owner_voxel_sizes_m,
-                          reference_frame, robot_sphere_materials, robot_geometry_source,
-                          gripper=None, has_gripper=True, contacts=(),
-                          known_solids=None, current_robot=None,
-                          max_mapping_bytes=256*1024**2,
-                          max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
-                          max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES,
-                          native_geometry_materials=None,
-                          # END no name heuristic or shared owner-spacing fallback.
-                          # BEGIN explicit pose-arrival robot/owner pair permissions.
-                          robot_owner_permissions=(),
-                          fine_regions=None, robot_collision_bodies=()):
-                          # END mapping preserves the caller's bound policy.
-                          # END no owner sample is omitted by the refinement.
-    """Fuse a current snapshot into a partial, explicitly partitioned scene.
-
-    Each view additionally requires image, owner_masks and robot_mask. Empty
-    boolean masks explicitly declare no visible pixels; missing masks are an
-    error. ``owner_frames[id]`` supplies observed T_output_owner and its source,
-    in the same fixed gauge used by grounding. ``mapper_cfg`` is the installed
-    cuRobo MapperCfg with explicit TSDF and ESDF extents and one camera buffer;
-    views are integrated sequentially. ``owner_voxel_sizes_m`` must map exactly
-    every owner ID to positive finite metres; an empty owner set requires {}.
-    Each rotated owner-local grid encloses every valid labelled depth sample.
-    A larger spacing changes the discretized TSDF/ESDF surfaces and truncation
-    band; it can lose thin surface detail, so it is not a storage-only change
-    or a contact-accuracy certificate. Raw pixels, owner poses, unknown space
-    and the background/free-space grid are unchanged by these choices.
-
-    RGB-D supplies partial observed surfaces, so all produced owners remain
-    geometry_complete=False and initially static. A caller binding a payload
-    must still supply its evidenced conservative sphere cover and attachment;
-    this adapter never invents unseen geometry. Coverage near actual contact
-    and inside a currently occluding robot may remain insufficient. Optional
-    known_solids/current_robot follow observed_audit_space_from_rgbd's independently
-    verified occupied-interior contract. Their inner meshes never become an
-    outer collision model or change geometry_complete. An owner supplying
-    occupied evidence is unknown until its collision geometry is complete.
-    """
-    from curobo.perception import MapperCfg
-
-    if not isinstance(mapper_cfg, MapperCfg):
-        raise TypeError("Provide the installed cuRobo MapperCfg directly")
-    if (mapper_cfg.extent_esdf_meters_xyz is None or mapper_cfg.num_cameras != 1
-            or mapper_cfg.feature_dim != 0 or mapper_cfg.lidar_num_sensors != 0
-            or mapper_cfg.enable_static or mapper_cfg.decay_factor != 1 or mapper_cfg.frustum_decay_factor != 1
-            or mapper_cfg.edt_solver != "pba" or mapper_cfg.color_grid_size != 1):
-        raise ValueError("Snapshot mapping needs explicit bounds, one camera, exact PBA, and no static/feature/decay channels")
-    # BEGIN reject invalid total/module budgets before any native device access.
-    if type(max_host_rss_bytes) is not int or not 0 < max_host_rss_bytes <= MAX_HOST_RSS_BYTES:
-        raise ValueError("RGB-D mapping requires a positive host limit no larger than twelve GiB")
-    if type(max_device_used_bytes) is not int or not 0 < max_device_used_bytes <= MAX_DEVICE_USED_BYTES:
-        raise ValueError("RGB-D mapping requires a positive device limit no larger than eight GiB")
-    if (type(max_mapping_bytes) is not int or max_mapping_bytes <= 0
-            or max_mapping_bytes > min(max_host_rss_bytes, max_device_used_bytes)):
-        raise ValueError("RGB-D mapping needs a positive allocation budget within both declared total limits")
-    # END no independent one-GiB ceiling constrains an explicitly admitted map.
-    normalized = _views(views, reference_frame,
-                        (mapper_cfg.depth_minimum_distance, mapper_cfg.depth_maximum_distance))
-    if any(view["depth"].shape != (mapper_cfg.image_height, mapper_cfg.image_width) for view in normalized.values()):
-        raise ValueError("Current image sizes must match the explicitly allocated native camera buffer")
-    if not isinstance(owner_frames, Mapping) or len(owner_frames) > 32:
-        raise ValueError("Selected owner frames must be an explicit bounded mapping")
-    frames = {}
-    for identity, frame in owner_frames.items():
-        _text(identity, "owner identity")
-        if identity == "observed_background":
-            raise ValueError("observed_background is reserved for unowned visible scene geometry")
-        frames[identity] = (_pose_array(frame["T_output_owner"], "T_output_owner"),
-                            _text(frame["source"], "current owner-frame source"))
-    # BEGIN exact owner keys prevent silent precision defaults or unused entries.
-    if not isinstance(owner_voxel_sizes_m, Mapping) or set(owner_voxel_sizes_m) != set(frames):
-        raise ValueError("Owner voxel sizes must map exactly every selected owner ID")
-    sizes = {}
-    for identity, value in owner_voxel_sizes_m.items():
-        if (isinstance(value, (bool, np.bool_)) or not isinstance(value, Real)
-                or not np.isfinite(value) or value <= 0):
-            raise ValueError("Each owner voxel size must be explicit finite positive metres")
-        sizes[identity] = float(value)
-    # END each owner uses its caller-declared resolution in its own local frame.
-    # BEGIN reject CPU-checkable scene contracts before native device access.
-    robot_sphere_materials = tuple(robot_sphere_materials)
-    if not robot_sphere_materials:
-        raise ValueError("The actual robot sphere model and material identities are required")
-    _text(robot_geometry_source, "robot sphere model source")
-    # BEGIN multi-resolution selection needs every physical body's full cover.
-    fine_regions = {} if fine_regions is None else dict(fine_regions)
-    if not set(fine_regions) <= {None, *frames}:
-        raise ValueError("Fine regions must name existing owner partitions, or None for background")
-    if fine_regions:
-        robot_collision_bodies = validate_body_groups(robot_collision_bodies, len(robot_sphere_materials))
-    # END material identities cannot substitute for body ownership.
-    contacts = _validate_contact_and_gripper_inputs(
-        dict.fromkeys(frames), robot_sphere_materials, contacts, gripper, has_gripper)
-    torch_device = torch.device(mapper_cfg.device)
-    if torch_device.type != "cuda":
-        raise ValueError("Native RGB-D mapping requires an explicit CUDA device")
-    # END reject CPU-checkable scene contracts before mapping/FK allocations.
-    masks = _audit_partition_masks(normalized, frames)
-    center = mapper_cfg.grid_center.detach().cpu().numpy()
-    configs = {None: mapper_cfg}
-    # BEGIN all selected owner fields use every labelled point at their own spacing.
-    for identity, (pose, _) in frames.items():
-        configs[identity] = _owner_mapper_config(mapper_cfg, normalized, masks, identity,
-            pose, sizes[identity], depth_error_m)
-    # END raw depth, masks, background bounds and owner transforms are preserved.
-    # BEGIN each layer gets its own Mapper, with all allocations admitted together.
-    jobs = {(identity, "coarse"): config for identity, config in configs.items()}
-    jobs.update({(identity, "fine"): _fine_mapper_config(configs[identity], request)
-                 for identity, request in fine_regions.items()})
-    estimates = {key: _mapper_memory_bound(config) for key, config in jobs.items()}
-    # END a fine field is reconstructed from the same pixels, never upsampled.
-    if sum(estimates.values()) > max_mapping_bytes:
-        raise ValueError(f"Native RGB-D mapper buffers exceed the declared budget: {sum(estimates.values())} bytes")
-    # BEGIN preflight the CPU TSDF record contract before allocating a Mapper.
-    # Independent collision evidence exports a dense float32 TSDF snapshot.
-    # Its existing record-array bound is separate from map workspace capacity;
-    # finding this unsupported shape after GPU mapping would waste the work.
-    from .tsdf_geometry import _require_sample_array_budget
-    for config in jobs.values():
-        _require_sample_array_budget(tuple(config.grid_shape[::-1]))
-    # END a larger module quota cannot silently widen the geometry format.
-    shape_xyz = tuple(math.ceil(x/mapper_cfg.esdf_voxel_size) for x in mapper_cfg.extent_esdf_meters_xyz)
-    origin = center-(np.asarray(shape_xyz)-1)*mapper_cfg.esdf_voxel_size/2
-    known = _known_free_voxels(normalized, ray_depths={name: row["depth"] for name, row in normalized.items()}, origin=origin, shape=shape_xyz[::-1],
-                               voxel_size=mapper_cfg.esdf_voxel_size, depth_error_m=depth_error_m)
-    # BEGIN preserve the same raw F used by the CPU-only RGB-D builder.
-    known_free = known.copy()
-    free_count = int(known.sum())
-    records, evidence = _known_solid_evidence(known_solids, owner_frames, current_robot, normalized, reference_frame)
-    if evidence["robot"] is not None and (
-            evidence["robot"]["robot_geometry_source"] != robot_geometry_source
-            or evidence["robot"]["robot_spheres"] != len(robot_sphere_materials)):
-        raise ValueError("Occupied robot evidence must use this scene's complete native collision model")
-    occupied_count = _add_known_solid_voxels(known, records, origin=origin, voxel_size=mapper_cfg.esdf_voxel_size)
-    coverage = ObservedSpace(known, origin=origin, voxel_size=mapper_cfg.esdf_voxel_size,
-                             observation_ids=tuple(normalized), reference_frame=reference_frame,
-                             occupancy_evidence=evidence, known_free=known_free)
-    # END native mapping and occupied-solid evidence cannot widen F.
-    queries, statistics, regions = {}, {}, {}
-    for (identity, layer), config in jobs.items():
-        # BEGIN admit only this new partition against the measured live total.
-        # Previous partitions' retained fields and allocator caches are already
-        # in live memory. Adding the whole batch again would charge them twice.
-        _require_audit_mapping_memory(estimates[identity, layer], config.device,
-            max_host_rss_bytes=max_host_rss_bytes,
-            max_device_used_bytes=max_device_used_bytes)
-        # END the module's aggregate CPU estimate remains an independent bound.
-        inverse = np.eye(4) if identity is None else _inverse(frames[identity][0])
-        query, report, region = _map_partition(normalized, masks, identity, config, inverse,
-            depth_error_m, fine_regions[identity] if layer == "fine" else None)
-        queries[identity, layer] = query
-        statistics.setdefault("observed_background" if identity is None else identity, {})[layer] = report
-        if region is not None:
-            regions[identity] = region
-    # BEGIN publish one selector-backed query per physical owner partition.
-    queries = {identity: (LayeredVoxelQuery(queries[identity, "coarse"], queries[identity, "fine"], regions[identity])
-                         if identity in regions else queries[identity, "coarse"])
-               for identity in configs}
-    # END coarse and fine costs are never fused as separate obstacles.
-    # BEGIN snapshot remapping follows the background through scene copies.
-    if None in fine_regions:
-        queries[None].refinement_source = _FrozenBackgroundRefinement(
-            normalized, masks, configs[None], fine_regions[None], depth_error_m,
-            max_mapping_bytes=max_mapping_bytes, max_host_rss_bytes=max_host_rss_bytes,
-            max_device_used_bytes=max_device_used_bytes)
-        queries[None].mapping_report = deepcopy(statistics["observed_background"]["fine"])
-    # END owner substitutions and installation additions preserve this query.
-    owners = [CollisionOwner(identity, queries[identity],
-                              PosePath(np.array([0., 1.]), np.repeat(pose[None], 2, axis=0), source),
-                              source, geometry_complete=False)
-              for identity, (pose, source) in frames.items()]
-    result = PlanningScene(background=queries[None], owners=owners, coverage=coverage,
-                           reference_frame=reference_frame, robot_sphere_materials=robot_sphere_materials,
-                           robot_geometry_source=robot_geometry_source, contacts=contacts,
-                           # BEGIN preserve the independently calibrated native material identities.
-                           gripper=gripper, has_gripper=has_gripper,
-                           native_geometry_materials=native_geometry_materials,
-                           # BEGIN retain identical pair permissions through observation binding.
-                           robot_owner_permissions=robot_owner_permissions,
-                           robot_collision_bodies=robot_collision_bodies)
-                           # END RGB-D mapping does not activate actual contact permission.
-                           # END the mapping does not itself create a contact permission.
-    result.observation_report = {"source": "current calibrated RGB-D and explicit current physical-solid evidence", "partitions": statistics,
-                                 # BEGIN distinguish requested capacity from observed process peaks.
-                                 "owner_voxel_sizes_m": sizes,
-                                 "estimated_mapping_buffers_bytes": sum(estimates.values()),
-                                 "max_mapping_bytes": max_mapping_bytes,
-                                 "max_host_rss_bytes": max_host_rss_bytes,
-                                 "max_device_used_bytes": max_device_used_bytes,
-                                 # END each scene and its refinements share these limits.
-                                 "known_free_voxels": free_count, "additional_known_occupied_voxels": occupied_count,
-                                 "known_voxels": int(known.sum()), "coverage_voxels": int(known.size),
-                                 "occupancy_evidence": deepcopy(evidence),
-                                 "depth_error_m": float(depth_error_m),
-                                 "depth_range_m": [float(mapper_cfg.depth_minimum_distance),
-                                                   float(mapper_cfg.depth_maximum_distance)],
-                                 "geometry_precision": "native discretized TSDF/ESDF proxy; resolution is not a contact-accuracy certificate",
-                                 "coverage": "whole-cell free ray prefixes or verified current solid interiors; all other volume remains unknown"}
-    return result
-# END current RGB-D observation bridge using the installed native mapper.
-
-# BEGIN production mapping derives bounded proposals from one observed source.
 def _require_mapping_memory(estimated_bytes, device, *,
                             max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
                             max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES):
@@ -1320,394 +435,125 @@ def _require_mapping_memory(estimated_bytes, device, *,
     return required
 
 
-
-# BEGIN prepare the background's numerical query domain independently of evidence.
-def _background_query_config(config, query_radius_m):
-    """Cover every declared-radius query that can reach this TSDF source.
-
-    Source components lie between observed TSDF sample centres. Padding adds
-    the declared sphere radius and one query cell, keeping an empty border
-    for the conservative distance transform. It depends only on source and
-    query layouts, never on a goal or a failed trajectory. Integer padding
-    preserves the original proposal lattice without moving TSDF evidence.
-    """
-    if (isinstance(query_radius_m, (bool, np.bool_)) or not isinstance(query_radius_m, Real)
-            or not np.isfinite(query_radius_m) or query_radius_m < 0):
-        raise ValueError('Background query support requires a finite nonnegative sphere radius')
-    radius = float(query_radius_m)
-    h_source, h_query = float(config.voxel_size), float(config.esdf_voxel_size)
-    center = config.grid_center.detach().cpu().numpy().astype(float)
-    source_shape = tuple(math.ceil(float(size)/h_source) for size in config.extent_meters_xyz)
-    original_shape = tuple(math.ceil(float(size)/h_query) for size in config.extent_esdf_meters_xyz)
-    source_half = np.asarray(source_shape, dtype=float)*h_source/2
-    source_lower, source_upper = center-source_half, center+source_half
-    original_half = (np.asarray(original_shape, dtype=float)-1)*h_query/2
-    required_lower = source_lower-h_query-radius
-    required_upper = source_upper+h_query+radius
-    lower_padding = tuple(max(0, math.ceil(float(value)/h_query))
-        for value in center-original_half-required_lower)
-    upper_padding = tuple(max(0, math.ceil(float(value)/h_query))
-        for value in required_upper-(center+original_half))
-    shape = tuple(size+lower+upper for size, lower, upper
-        in zip(original_shape, lower_padding, upper_padding))
-    if min(shape) < 2:
-        raise ValueError('UNSUPPORTED_MODEL: background query grid requires at least two cells per axis')
-    query_center = center+(np.asarray(upper_padding)-np.asarray(lower_padding))*h_query/2
-    # A rounded multiplication can make ceil(extent/h) allocate one extra
-    # cell. Select the interior side of the exact requested cell count, then
-    # verify that the installed Mapper's sizing expression retains it.
-    extent = tuple(float(np.nextafter(size*h_query, 0.)) for size in shape)
-    if tuple(math.ceil(size/h_query) for size in extent) != shape:
-        raise ValueError('UNSUPPORTED_MODEL: background query extent cannot preserve its declared grid shape')
-    derived = replace(config, extent_esdf_meters_xyz=extent)
-    query_half = (np.asarray(shape, dtype=float)-1)*h_query/2
-    report = {
-        'query_radius_m': radius,
-        'radius_scope': 'Declared robot spheres and complete mechanical gripper envelope; later installed payloads are not covered by this preparation',
-        'source_shape_xyz': list(source_shape),
-        'source_lower_m': source_lower.tolist(), 'source_upper_m': source_upper.tolist(),
-        'source_center_m': center.tolist(), 'source_voxel_size_m': h_source,
-        'original_query_shape_xyz': list(original_shape),
-        'padding_lower_voxels': list(lower_padding), 'padding_upper_voxels': list(upper_padding),
-        'query_shape_xyz': list(shape), 'query_center_m': query_center.tolist(),
-        'query_lower_m': (query_center-query_half).tolist(),
-        'query_upper_m': (query_center+query_half).tolist(), 'query_voxel_size_m': h_query,
-        'source': 'Native Mapper TSDF evidence retained; independent source-derived proposal extent and centre',
-    }
-    return derived, query_center, report
-
-
-def _validate_background_query_support(query, query_radius_m):
-    """Reject incomplete proposal support instead of masking a query failure.
-
-    The actual source components' radius-expanded box must fit the numerical
-    sample centres. No tolerance, reduced radius or second map construction
-    repairs a failed preparation contract.
-    """
-    if query.geometry_lower is not None and (
-            np.any(query.geometry_lower-query_radius_m < query.origin)
-            or np.any(query.geometry_upper+query_radius_m > query.upper)):
-        raise ValueError('UNSUPPORTED_MODEL: native background query field does not cover its declared sphere radius')
-# END source observation coverage is never inferred from numerical query extent.
-
-
-def _map_online_partition(normalized, masks, identity, config, inverse, *, query_center=None,
-                          max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES):
-    """Integrate one source, then prepare a conservative field from its material.
-
-    The Mapper supplies observed TSDF samples through its existing public
-    block export. Its approximate ESDF seeds are not built or interpreted as
-    material. A single affine source defines both contact and confirmation.
-    """
-    from time import perf_counter
-    from curobo.perception import Mapper
-    from curobo.types import CameraObservation, DeviceCfg, Pose
-    from .online_geometry import FrozenESDF
-    from .online_observed_geometry import FrozenObservedGeometry
-    from .tsdf_geometry import build_tsdf_geometry
-    device = DeviceCfg(device=config.device)
-    mapper = Mapper(config)
-    for name, view in normalized.items():
-        depth = np.where(masks[name][identity], view['depth'], 0.).astype(np.float32)
-        observation = CameraObservation(name=name, depth_image=device.to_device(depth)[None],
-            rgb_image=torch.as_tensor(np.asarray(view['image']).copy(), dtype=torch.uint8,device=device.device)[None],
-            # BEGIN adapt integer-centre input calibration for native depth only.
-            intrinsics=device.to_device(_mapper_intrinsics(view['K']))[None],
-            # END owner and background mapping preserve the same physical rays.
-            pose=Pose.from_matrix(device.to_device(inverse@view['T_output_camera'])[None]),
-            resolution=list(depth.shape),depth_to_meter=1.)
-        mapper.integrate(camera_observation=observation)
-    stats=mapper.get_stats(scan_pool=True)
-    if stats['allocation_failures'] or stats['num_allocated'] != stats['active_blocks']+stats['free_count']:
-        raise ValueError('UNSUPPORTED_MODEL: native mapping allocation lost observed geometry')
-    # BEGIN freeze source geometry once; source and proposal have independent grids.
-    name='observed_background' if identity is None else identity
-    source=f"current_rgbd:{','.join(normalized)}"
-    started = perf_counter()
-    exported = build_tsdf_geometry(mapper, name=name, source=source,
-                                   max_host_rss_bytes=max_host_rss_bytes)
-    geometry = FrozenObservedGeometry(exported['solids'][0], max_host_rss_bytes=max_host_rss_bytes)
-    source_seconds = perf_counter()-started
-    shape=np.asarray([math.ceil(float(value)/config.esdf_voxel_size)
-                      for value in config.extent_esdf_meters_xyz], dtype=int)
-    center = config.grid_center.detach().cpu().numpy() if query_center is None else np.asarray(query_center)
-    origin=center-(shape-1)*float(config.esdf_voxel_size)/2
-    started = perf_counter()
-    query=FrozenESDF.from_source(geometry,origin=origin,shape=tuple(shape),
-        voxel_size=config.esdf_voxel_size,owner_ids=(name,),source=source)
-    proposal_seconds = perf_counter()-started
-    # END no approximate seed becomes an occupied source cell.
-    return query,{'allocated_blocks':stats['num_allocated'],'shape_xyz':shape.tolist(),
-        'voxel_size_m':float(config.esdf_voxel_size),'origin':origin.tolist(),
-        'observed_geometry':exported['field_summary'], 'source_preparation_seconds':source_seconds,
-        'proposal_preparation_seconds':proposal_seconds,
-        'proposal_model':'Conservative component-AABB distance bound; values are not source occupancy or penetration'}
-
-
-def build_scene_from_rgbd(views,owner_frames,*,mapper_cfg,depth_error_m,task_owner_ids,
-                         reference_frame,robot_sphere_materials,robot_geometry_source,
-                         unknown_policy,gripper=None,has_gripper=True,contacts=(),
-                         max_mapping_bytes=256*1024**2,max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
+def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, task_owner_ids,
+                         reference_frame, robot_bodies, robot_geometry_source,
+                         contacts=(), gripper=None, has_gripper=True, unknown_policy,
+                         max_mapping_bytes, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
                          max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES,
-                         native_geometry_materials=None,robot_owner_permissions=(),
-                         fine_regions=None,robot_collision_bodies=(),complete_owners=(),
+                         fine_regions=None, observed_owners=(), background=None, coverage=None,
                          initial_support_relations=(), holding_contacts=()):
-    """Build observed fields and admit current complete owners exactly once.
+    """Combine newly observed entities with existing fixed entity fields.
 
-    Every view requires ``self_filter`` with uint8 ``labels``, independent
-    ``free_ray_depth_m`` and a nonempty ``source``. Only ENVIRONMENT pixels
-    contribute measured surface endpoints and free rays. SELF and
-    AMBIGUOUS_SHADOW contribute neither; raw depth remains unchanged.
-    # BEGIN explicit input identity must conserve observed occupancy.
-    Every admitted endpoint enters its supplied owner or the background.
-    Background is a world-fixed snapshot for this request, so visible surfaces
-    of owners that will move must be completely assigned by the input masks.
-    Unnamed endpoints retain occupancy and cannot borrow an owner's contact
-    permission. Diagnostics expose the actual immutable background input and
-    endpoint counts; older serialized geometry requires rebuilding.
-    # END no segmentation heuristic changes endpoint or free-ray admission.
+    owner_frames names only entities to integrate from the supplied masks and
+    depth. observed_owners supplies existing fields and their declared motion;
+    these entities require no image, mask or visible depth. Their samples and
+    local support are passed unchanged to the planning scene.
 
-    ``fine_regions`` now selects a partition's sole field before mapping. It
-    never creates a coarse layer, blends resolutions or expands after solving.
-    The explicit unknown policy is separate from both field values and raw
-    free-ray evidence. The audit builder remains explicitly named above.
-
-    ``complete_owners`` supplies existing CollisionOwner geometry in the same
-    current owner frames. Their semantic masks still exclude those pixels
-    from background mapping, and their measured rays still bound coverage.
-    Only the remaining partitions allocate a Mapper. Task owners (the carrier
-    and functional reference) use 2 mm grids; other owners use the coarser
-    environment spacing from mapper_cfg. Task identities are required inputs,
-    not names inferred from masks. The resolved resolution must match each
-    complete query's registered contact/field spacing; its
-    geometry and native material registration are validated by the final scene.
-    # BEGIN initial support remains a separate current-state relation.
-    ``initial_support_relations`` describes finite support already present at
-    this request's entrance. It is passed to the same frozen scene together
-    with the complete actor geometry, without copying a future placement's
-    material identities, pose tolerances or required-contact conditions.
-    # END no observation, free-space evidence or complete owner is replaced.
+    An existing background and coverage are reused in world coordinates. A new
+    background uses each view's explicit background_mask when supplied, or the
+    complement of newly mapped owners. The caller supplies a static partition
+    when the observation also contains separately retained moving entities.
     """
-    from curobo.perception import MapperCfg
+    from .observed_mapping import integrate_entity, FrozenObservedField
     from .online_geometry import OnlinePlanningScene
-    if not isinstance(mapper_cfg,MapperCfg):
-        raise TypeError('Provide the installed native MapperCfg')
-    if (mapper_cfg.extent_esdf_meters_xyz is None or mapper_cfg.num_cameras!=1
-            or mapper_cfg.enable_static or mapper_cfg.decay_factor!=1 or mapper_cfg.frustum_decay_factor!=1
-            or mapper_cfg.edt_solver!='pba' or mapper_cfg.feature_dim!=0 or mapper_cfg.lidar_num_sensors!=0):
-        raise ValueError('Current snapshot requires one explicit bounded nondecaying native map')
-    if robot_owner_permissions:
-        raise ValueError('Whole robot/owner pair permissions are not supported online')
-    if (type(max_mapping_bytes) is not int or not 0<max_mapping_bytes<=min(max_host_rss_bytes,max_device_used_bytes)
-            or not 0<max_host_rss_bytes<=MAX_HOST_RSS_BYTES or not 0<max_device_used_bytes<=MAX_DEVICE_USED_BYTES):
-        raise ValueError('Mapping budgets must fit explicit host/device limits')
-    # BEGIN online views require audited three-state evidence, never old robot_mask.
-    normalized=_self_filtered_views(views,reference_frame,(mapper_cfg.depth_minimum_distance,mapper_cfg.depth_maximum_distance))
-    # END depth limits cannot restore excluded endpoints or free rays.
-    if any(view['depth'].shape!=(mapper_cfg.image_height,mapper_cfg.image_width) for view in normalized.values()):
-        raise ValueError('Snapshot image dimensions must match the allocated camera buffer')
-    # BEGIN the production path owns precision for every current request.
-    if len(owner_frames)>32:
-        raise ValueError('At most 32 observed owners are supported')
-    task_owner_ids = tuple(task_owner_ids) if not isinstance(task_owner_ids, (str, bytes)) else task_owner_ids
-    owner_voxel_sizes_m = observation_resolutions(owner_frames,
-        task_owner_ids=task_owner_ids, environment_voxel_size=mapper_cfg.voxel_size)
-    # END callers cannot downgrade a functional reference to save memory.
-    frames={identity:(_pose_array(row['T_output_owner'],'current owner pose'),_text(row['source'],'owner source')) for identity,row in owner_frames.items()}
-    # BEGIN consume only the complete owner/background endpoint partition.
-    masks=_partition_masks(normalized,frames)
-    # END all map inputs and later diagnostics share one partition decision.
-    # BEGIN admit complete geometry before choosing observed map partitions.
-    # The semantic owner inventory remains intact: skipping its Mapper must
-    # neither turn its pixels into background nor assert its occluded space free.
-    direct={}
-    for owner in complete_owners:
-        if not isinstance(owner,CollisionOwner) or not owner.geometry_complete:
-            raise ValueError('Direct owners require complete CollisionOwner geometry')
-        identity=owner.owner_id
-        if identity not in frames or identity in direct:
-            raise ValueError('Direct owners require unique identities in the current owner frames and masks')
-        spacing=owner_voxel_sizes_m[identity]
-        query_spacing=getattr(owner.query,'voxel_size',None)
-        if (isinstance(spacing,(bool,np.bool_)) or not isinstance(spacing,Real)
-                or not np.isfinite(spacing) or spacing<=0
-                or not isinstance(query_spacing,Real) or not np.isfinite(query_spacing)
-                or not np.isclose(spacing,query_spacing,atol=1e-12,rtol=0)):
-            raise ValueError('Direct owner resolution must match its complete query spacing')
-        position,quaternion=owner.pose_path.sample(torch.tensor(0.,dtype=torch.float64))
-        position=position.detach().cpu().numpy()
-        quaternion=quaternion.detach().cpu().numpy()
-        pose=frames[identity][0]
-        if (position.shape!=(3,) or quaternion.shape!=(4,)
-                or not np.isfinite(position).all() or not np.isfinite(quaternion).all()
-                or not np.isclose(np.linalg.norm(quaternion),1.,atol=1e-7,rtol=0)
-                or not np.allclose(position,pose[:3,3],atol=1e-7,rtol=0)
-                or not np.allclose(Rotation.from_quat(quaternion[[1,2,3,0]]).as_matrix(),pose[:3,:3],atol=1e-7,rtol=0)):
-            raise ValueError('Direct owner initial pose must match its current observation frame')
-        direct[identity]=owner
-    owner_materials={identity:direct[identity].sphere_materials if identity in direct else None for identity in frames}
-    contacts=_validate_contact_and_gripper_inputs(owner_materials,tuple(robot_sphere_materials),contacts,gripper,has_gripper)
-    # END complete-owner material contacts enter the same final scene once.
-    configs={None:mapper_cfg}
-    # BEGIN derive fixed owner interpolation support from the declared robot
-    # sphere model before allocating any map or trying any candidate.
-    radius=0.
-    for body in robot_collision_bodies:
-        values=np.asarray(body['local_spheres'],dtype=float)
-        if values.ndim!=2 or values.shape[1]!=4 or not np.isfinite(values).all():
-            raise ValueError('Owner map support needs the declared complete body sphere geometry')
-        radius=max(radius,float(values[:,3].max(initial=0.)))
-    # END no task identity or success/failure result chooses a map bound.
-    for identity,(pose,_) in frames.items():
-        # BEGIN complete geometry needs no throwaway observed field.
-        if identity in direct:
-            continue
-        # END its semantic partition remains in masks for every Mapper call.
-        configs[identity]=_owner_mapper_config(mapper_cfg,normalized,masks,identity,pose,
-            owner_voxel_sizes_m[identity],depth_error_m,query_radius_m=radius)
-    requests={} if fine_regions is None else dict(fine_regions)
-    if not set(requests)<=set(configs):
-        raise ValueError('Fixed regions must identify an observed mapped owner or background')
-    for identity,request in requests.items():
-        configs[identity]=_fine_mapper_config(configs[identity],request)
-        # BEGIN a bounded ROI cannot bypass the task/environment precision rule.
-        spacing = configs[identity].voxel_size
-        if identity in task_owner_ids:
-            if not .001 <= spacing <= TASK_VOXEL_SIZE_M:
-                raise ValueError('A task-owner ROI must retain 1–2 mm grid spacing')
-        elif spacing <= TASK_VOXEL_SIZE_M:
-            raise ValueError('An environment ROI must remain coarser than 2 mm')
-        # END ROI bounds and measurement evidence retain their existing checks.
-    # BEGIN observation coverage retains the pre-expansion background layout.
-    coverage_cfg = configs[None]
-    background_radius = radius
-    if gripper is not None:
-        # Match PrismaticGripper.spheres' continuous joint-box envelope. The
-        # mechanical limits cover every current or future permitted interval;
-        # a nominal command does not reduce the required numerical support.
-        half = (gripper.joint_limits[:, 1]-gripper.joint_limits[:, 0])/2
-        displacement = np.einsum('ncj,j->nc', np.abs(gripper.sphere_joint_translation), half)
-        hand_radii = gripper.local_spheres[:, 3]+np.linalg.norm(displacement, axis=-1)
-        background_radius = max(background_radius, float(hand_radii.max(initial=0.)))
-    configs[None], background_query_center, background_support = _background_query_config(
-        coverage_cfg, background_radius)
-    # END the existing owner fields keep their original preparation contract.
-    estimates={identity:_mapper_memory_bound(config) for identity,config in configs.items()}
-    from .collision_records import MAX_ARRAY_BYTES
-    for config in configs.values():
-        shape=tuple(math.ceil(float(x)/config.esdf_voxel_size) for x in config.extent_esdf_meters_xyz)
-        if min(shape)<2 or math.prod(shape)*4>MAX_ARRAY_BYTES:
-            # BEGIN report the common codec limit rather than a stale local cap.
-            raise ValueError(f'UNSUPPORTED_MODEL: frozen distance field exceeds the {MAX_ARRAY_BYTES // 1024**2} MiB binary record limit')
-            # END allocation still also requires the unchanged total budgets.
-    if sum(estimates.values())>max_mapping_bytes:
-        # BEGIN expose the actual allocation inventory before touching CUDA.
-        partitions={('observed_background' if identity is None else identity):value for identity,value in estimates.items()}
-        raise ValueError(f'UNSUPPORTED_MODEL: fixed scene exceeds declared mapping allocation: '
-            f'estimated_bytes={sum(estimates.values())}, limit_bytes={max_mapping_bytes}, '
-            f'mapped_partition_bytes={partitions}, direct_complete_owners={list(direct)}')
-        # END direct geometry is not charged as a discarded observation map.
-    # BEGIN distance-query support cannot enlarge observed-free evidence.
-    background_cfg=coverage_cfg
-    # END all ray inputs and the original background coverage grid stay fixed.
-    shape=tuple(math.ceil(float(x)/background_cfg.esdf_voxel_size) for x in background_cfg.extent_esdf_meters_xyz)
-    center=background_cfg.grid_center.detach().cpu().numpy()
-    origin=center-(np.asarray(shape)-1)*background_cfg.esdf_voxel_size/2
-    # BEGIN only ENVIRONMENT rays can prove free volume in the online scene.
-    ray_depths={name: row['self_filter']['free_ray_depth_m'] for name,row in normalized.items()}
-    known=_known_free_voxels(normalized,ray_depths=ray_depths,origin=origin,shape=shape[::-1],
-        voxel_size=background_cfg.esdf_voxel_size,depth_error_m=depth_error_m)
-    coverage=ObservedSpace(known,origin=origin,voxel_size=background_cfg.esdf_voxel_size,
-        observation_ids=tuple(normalized),reference_frame=reference_frame)
-    # END SELF and AMBIGUOUS_SHADOW stay unknown to coverage.
-    queries,reports={},{}
-    for identity,config in configs.items():
-        _require_mapping_memory(estimates[identity],config.device,max_host_rss_bytes=max_host_rss_bytes,
-            max_device_used_bytes=max_device_used_bytes)
-        inverse=np.eye(4) if identity is None else _inverse(frames[identity][0])
-        # BEGIN only the background uses the independently prepared query centre.
-        queries[identity],reports['observed_background' if identity is None else identity]=_map_online_partition(
-            normalized,masks,identity,config,inverse,
-            query_center=background_query_center if identity is None else None,
-            max_host_rss_bytes=max_host_rss_bytes)
-        if identity is None:
-            _validate_background_query_support(queries[None], background_radius)
-            background_support.update(
-                actual_query_lower_m=queries[None].origin.tolist(),
-                actual_query_upper_m=queries[None].upper.tolist(),
-                actual_geometry_lower_m=None if queries[None].geometry_lower is None else queries[None].geometry_lower.tolist(),
-                actual_geometry_upper_m=None if queries[None].geometry_upper is None else queries[None].geometry_upper.tolist())
-            reports['observed_background']['query_support'] = background_support
-        # END an incomplete exported field is rejected, never retried or relaxed.
-    # BEGIN assemble the original complete objects and newly observed fields.
-    owners=[direct[identity] if identity in direct else
-        CollisionOwner(identity,queries[identity],PosePath(np.array([0.,1.]),np.stack((pose,pose)),source),
-        source,geometry_complete=False) for identity,(pose,source) in frames.items()]
-    # END no partial scene or post-mapping owner replacement is constructed.
-    scene=OnlinePlanningScene(background=queries[None],owners=owners,coverage=coverage,
-        reference_frame=reference_frame,robot_sphere_materials=robot_sphere_materials,
-        robot_geometry_source=robot_geometry_source,unknown_policy=unknown_policy,
-        contacts=contacts,gripper=gripper,has_gripper=has_gripper,
-        # BEGIN bind explicit current support alongside ordinary material rules.
-        initial_support_relations=tuple(initial_support_relations),
-        # BEGIN current held materials are passed without former grasp constraints.
-        holding_contacts=tuple(holding_contacts),
-        # END the final scene validates the native robot identities and attachment.
-        # END the online scene owns support geometry and acceptance semantics.
-        robot_collision_bodies=robot_collision_bodies,native_geometry_materials=native_geometry_materials)
-    # BEGIN report the exact background input and endpoint conservation.
-    # Counts describe the current input partition, not permanent object
-    # identity or proof of the Mapper's reconstructed surface completeness.
     from .robot_self_filter import ENVIRONMENT
-    scene.observation_partition_masks={name:{'background':masks[name][None]}
-        for name in normalized}
-    endpoint_partition_report={}
-    for name,view in normalized.items():
-        environment_pixels=int(np.count_nonzero(view['self_filter']['labels']==ENVIRONMENT))
-        owner_pixels={identity:int(np.count_nonzero(masks[name][identity])) for identity in frames}
-        background_pixels=int(np.count_nonzero(masks[name][None]))
-        endpoint_partition_report[name]={
-            'policy':'Every admitted ENVIRONMENT endpoint belongs to its supplied owner or background; '
-                     'owner masks and independent free-ray evidence are unchanged',
-            'map_lifecycle':'Fresh Mapper per partition from current snapshot views; background is fixed '
-                            'in world coordinates for this request, so moving owners require complete '
-                            'visible input masks; old scene bindings retain their original geometry',
-            'environment_pixels':environment_pixels,
-            'owner_pixels':owner_pixels,
-            'background_pixels':background_pixels,
-            'all_environment_endpoints_assigned':background_pixels+sum(owner_pixels.values())==environment_pixels,
-        }
-    # END reported background masks are the ones submitted to mapping.
-    # BEGIN retain the exact self-filter and per-owner exclusion evidence.
-    scene.observation_report={'source':'current calibrated owner-partitioned RGB-D','partitions':reports,
-        # BEGIN record the library decision together with actual allocated grids.
-        'resolution_policy': {'task_owner_ids': list(task_owner_ids),
-            'task_voxel_size_m': TASK_VOXEL_SIZE_M,
-            'environment_voxel_size_m': float(mapper_cfg.voxel_size),
-            'owner_voxel_sizes_m': {identity: (float(configs[identity].voxel_size)
-                if identity in configs else owner_voxel_sizes_m[identity]) for identity in frames},
-            'source': 'Library task-owner mapping policy; explicit grounded carrier/functional reference identities'},
-        # END complete geometry and observed maps share the same role inventory.
-        'estimated_mapping_buffers_bytes':sum(estimates.values()),'depth_error_m':float(depth_error_m),
-        # BEGIN distinguish native/complete geometry from allocated RGB-D fields.
-        'mapped_partition_estimates_bytes':{('observed_background' if identity is None else identity):value for identity,value in estimates.items()},
-        'direct_complete_owners':{identity:{'source':owner.source,'query_type':type(owner.query).__name__,
-            'voxel_size_m':float(owner.query.voxel_size),'mapping_allocated':False} for identity,owner in direct.items()},
-        # END mapping estimates do not claim to measure total scene residency.
-        'known_free_voxels':int(known.sum()),'coverage_voxels':int(known.size),
-        # BEGIN retain the independent free-ray grid beside numerical support.
-        'coverage_grid': {'origin_m': origin.tolist(), 'shape_xyz': list(shape),
-            'voxel_size_m': float(background_cfg.esdf_voxel_size),
-            'source': 'Unchanged pre-query-expansion background grid and ENVIRONMENT free rays'},
-        # END an enlarged ESDF is never recorded as newly observed free space.
-        # BEGIN describe the registered online contact model used by this scene.
-        'geometry_model':'observed affine TSDF sources and explicitly complete owner geometry; conservative proposal/contact fields and local native-solid confirmation',
-        # END source-cell interpretation is confined to preparation, not online queries.
-        'unknown_policy':deepcopy(unknown_policy),
-        'self_filter':_self_filter_report(normalized),
-        # BEGIN explicit identities conserve occupied endpoints independently of rays.
-        'endpoint_partition':endpoint_partition_report}
-        # END the original self-filter labels and free-ray evidence remain unchanged.
-    # END excluded surfaces remain independently auditable.
+
+    # BEGIN select geometry sources by the public input, independently of tasks.
+    direct = {}
+    for owner in observed_owners:
+        if (not isinstance(owner, CollisionOwner) or not isinstance(owner.query, FrozenObservedField)
+                or owner.owner_id in direct):
+            raise ValueError("Existing entity models require unique registered identities")
+        direct[owner.owner_id] = owner
+    frames = {identity: (_pose_array(row["T_output_owner"], "observed owner frame"),
+                        _text(row["source"], "owner source")) for identity, row in owner_frames.items()}
+    if set(frames).intersection(direct):
+        raise ValueError("Choose one geometry source for each entity: RGB-D or an existing model")
+    all_ids = tuple((*frames, *direct))
+    if not set(task_owner_ids) <= set(all_ids):
+        raise ValueError("Every task entity needs an observed or existing model")
+    if background is not None and not isinstance(background, FrozenObservedField):
+        raise TypeError("An existing background must retain its raw observed field")
+    if coverage is not None and (not isinstance(coverage, ObservedSpace)
+                                 or coverage.reference_frame != reference_frame):
+        raise ValueError("Existing free-ray coverage must use the planning frame")
+    needs_mapping = bool(frames) or background is None
+    normalized, masks, configs, resolutions = {}, {}, {}, {}
+    if needs_mapping or coverage is None:
+        from curobo.perception import MapperCfg
+        if not isinstance(mapper_cfg, MapperCfg):
+            raise TypeError("New RGB-D integration requires the installed MapperCfg")
+        if (mapper_cfg.num_cameras != 1 or mapper_cfg.enable_static
+                or mapper_cfg.decay_factor != 1 or mapper_cfg.frustum_decay_factor != 1):
+            raise ValueError("Frozen snapshots use one nondecaying measured TSDF channel")
+        if not 0 < max_mapping_bytes <= min(max_host_rss_bytes, max_device_used_bytes):
+            raise ValueError("Mapping allocation must fit the request's host and device ceilings")
+        normalized = _self_filtered_views(views, reference_frame,
+            (mapper_cfg.depth_minimum_distance, mapper_cfg.depth_maximum_distance))
+        if direct and background is None and any("background_mask" not in row for row in normalized.values()):
+            raise ValueError("With retained entities, provide the static background or its original pixel partition")
+        masks = _partition_masks(normalized, frames, build_background=background is None)
+        resolutions = observation_resolutions(all_ids, task_owner_ids=task_owner_ids,
+                                               environment_voxel_size=mapper_cfg.voxel_size)
+        if background is None:
+            configs[None] = mapper_cfg
+        configs.update({identity: _owner_mapper_config(mapper_cfg, normalized, masks,
+            identity, pose, resolutions[identity], depth_error_m)
+            for identity, (pose, _) in frames.items()})
+        for identity, request in ({} if fine_regions is None else fine_regions).items():
+            configs[identity] = _fine_mapper_config(configs[identity], request)
+    estimates = {identity: _mapper_memory_bound(config) for identity, config in configs.items()}
+    if estimates and max(estimates.values()) > max_mapping_bytes:
+        raise ValueError("One serial Mapper exceeds the declared mapping allocation")
+    if coverage is None:
+        shape_xyz = np.asarray(mapper_cfg.grid_shape[::-1], int)
+        origin = mapper_cfg.grid_center.detach().cpu().numpy()-(shape_xyz-1)*mapper_cfg.voxel_size/2
+        ray_depths = {name: row["self_filter"]["free_ray_depth_m"] for name, row in normalized.items()}
+        known = _known_free_voxels(normalized, ray_depths=ray_depths, origin=origin,
+            shape=tuple(map(int, shape_xyz[::-1])), voxel_size=mapper_cfg.voxel_size, depth_error_m=depth_error_m)
+        coverage = ObservedSpace(known, origin=origin, voxel_size=mapper_cfg.voxel_size,
+                                observation_ids=tuple(normalized), reference_frame=reference_frame)
+    queries, reports = {}, {}
+    for identity, config in configs.items():
+        inverse = np.eye(4) if identity is None else _inverse(frames[identity][0])
+        name = "observed_background" if identity is None else identity
+        observations = ({"image": view["image"], "depth": view["depth"], "mask": masks[key][identity],
+                         "K": view["K"], "T_entity_camera": inverse @ view["T_output_camera"]}
+                        for key, view in normalized.items())
+        query, report = integrate_entity(observations, config=config, name=name,
+            source=f"provided_rgbd:{','.join(normalized)}", max_host_rss_bytes=max_host_rss_bytes,
+            max_device_used_bytes=max_device_used_bytes)
+        queries[identity], reports[name] = query, report
+    owners = [CollisionOwner(identity, queries[identity],
+        PosePath(np.array([0., 1.]), np.stack((pose, pose)), source), source)
+        for identity, (pose, source) in frames.items()]
+    owners.extend(direct.values())
+    scene = OnlinePlanningScene(background=queries[None] if background is None else background,
+        owners=owners, coverage=coverage, reference_frame=reference_frame, robot_bodies=robot_bodies,
+        robot_geometry_source=robot_geometry_source, contacts=contacts, gripper=gripper,
+        has_gripper=has_gripper, unknown_policy=unknown_policy,
+        initial_support_relations=initial_support_relations, holding_contacts=holding_contacts)
+    scene.observation_partition_masks = {name: {"background": row[None]}
+                                        for name, row in masks.items() if None in row}
+    endpoint_report = {}
+    for name, view in normalized.items():
+        environment_count = int(np.count_nonzero(view["self_filter"]["labels"] == ENVIRONMENT))
+        owners_count = {identity: int(np.count_nonzero(masks[name][identity])) for identity in frames}
+        background_count = int(np.count_nonzero(masks[name][None])) if None in masks[name] else 0
+        endpoint_report[name] = {"environment_pixels": environment_count,
+            "new_owner_pixels": owners_count, "new_background_pixels": background_count,
+            "unmapped_pixels": environment_count-background_count-sum(owners_count.values())}
+    known = coverage._known
+    scene.observation_report = {"source": "explicit RGB-D partitions and existing entity fields", "partitions": reports,
+        "geometry_model": "observed_trilinear_occupied_sets", "depth_error_m": depth_error_m,
+        "reused_observed_owners": {identity: owner.query.summary() for identity, owner in direct.items()},
+        "reused_background": background is not None,
+        "owner_voxel_sizes_m": {**{identity: value for identity, value in resolutions.items() if identity in frames},
+                                  **{identity: owner.query.voxel_size for identity, owner in direct.items()}},
+        "maximum_serial_mapping_bytes": max(estimates.values(), default=0),
+        "known_free_voxels": int(known.sum()), "coverage_voxels": int(known.size),
+        "self_filter": _self_filter_report(normalized), "endpoint_partition": endpoint_report}
     return scene
-# END no old source-world audit, Boolean solver or adaptive refinement is installed.
+    # END an existing entity has no observation or visibility prerequisite.
+
+# END independent ray evidence supplies coverage.

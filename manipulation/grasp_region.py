@@ -7,7 +7,7 @@ compatibility only: it does not establish an observed surface, actual contact,
 force closure, a future finger trajectory, or Holding.
 """
 
-# BEGIN candidate-domain geometry reuses the existing native permission law.
+# BEGIN candidate-domain geometry uses the declared task permission law.
 from collections.abc import Mapping
 from itertools import product
 import math
@@ -16,7 +16,6 @@ import numpy as np
 from scipy.optimize import linprog
 
 from .motion import _pose_array
-from .robot_geometry_check import _feature_region_halfspaces
 
 
 def _array(value, shape, label):
@@ -28,13 +27,11 @@ def _array(value, shape, label):
 
 
 def _rule_geometry(record, joint_count):
-    """Validate only calibrated material/permission fields used by this query.
+    """Read task feature coordinates, finite patches and their tolerances.
 
-    Generation has no runtime sphere cover. Therefore complete ContactRule
-    dictionaries and their explicitly calibrated geometric subset are both
-    usable without inventing sphere IDs. Every physical parameter and both
-    existing numerical tolerances are required; this layer supplies no new
-    physical defaults. The full planner still validates its full ContactRule.
+    Features remain source task data. The complete ContactRule also binds
+    body identity and activity; this existential query uses its geometric
+    fields and the caller's continuous finger-coordinate limits.
     """
     if not isinstance(record, Mapping):
         raise ValueError("Each material permission must be an explicit record")
@@ -42,7 +39,7 @@ def _rule_geometry(record, joint_count):
     required = (*names, "feature_kind", "feature_points", "feature_normal",
                 "feature_joint_translation", "patch_origin", "patch_axes",
                 "patch_half_size", "gap_bounds", "normal_tolerance_rad",
-                "modeling_allowance_m", "geometry_error_m", "minimum_thickness_m",
+                "modeling_allowance_m", "geometry_error_m",
                 "numerical_position_tolerance_m", "numerical_angle_tolerance_rad")
     if not set(required) <= set(record):
         raise ValueError("Permission geometry must retain every declared material, patch and tolerance field")
@@ -59,9 +56,8 @@ def _rule_geometry(record, joint_count):
         raise ValueError("Permission material needs its complete planar polygon or two-endpoint edge")
     result["feature_points"] = points = _array(points, points.shape, "feature_points")
     result["feature_normal"] = normal = _array(result["feature_normal"], (3,), "feature_normal")
-    if (not np.isclose(np.linalg.norm(normal), 1., atol=1e-6)
-            or np.max(np.abs((points-points[0]) @ normal)) > 1e-8):
-        raise ValueError("Material vertices must lie in their explicit unit-normal plane")
+    if not np.isclose(np.linalg.norm(normal), 1., atol=1e-6):
+        raise ValueError("The source task feature needs its explicit unit normal")
     mapping = result["feature_joint_translation"]
     if mapping is not None:
         mapping = _array(mapping, (len(points), 3, joint_count), "feature_joint_translation")
@@ -78,7 +74,7 @@ def _rule_geometry(record, joint_count):
     if np.any(half <= 0) or gap[0] > gap[1]:
         raise ValueError("Permission patch extents and gap bounds must be valid")
     scalars = ("normal_tolerance_rad", "modeling_allowance_m", "geometry_error_m",
-               "minimum_thickness_m", "numerical_position_tolerance_m", "numerical_angle_tolerance_rad")
+               "numerical_position_tolerance_m", "numerical_angle_tolerance_rad")
     for key in scalars:
         value = result[key]
         if (isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.number))
@@ -87,12 +83,100 @@ def _rule_geometry(record, joint_count):
         result[key] = float(value)
     if (not 0 <= result["normal_tolerance_rad"] < math.pi/2
             or not 0 <= result["modeling_allowance_m"] <= result["geometry_error_m"]
-            or result["minimum_thickness_m"] <= 0
-            or result["modeling_allowance_m"] >= result["minimum_thickness_m"]/2
             or min(result["numerical_position_tolerance_m"], result["numerical_angle_tolerance_rad"]) < 0):
         raise ValueError("Permission allowances must retain their declared bounded physical meaning")
     return result
 
+
+# BEGIN task halfspaces remain available independently of robot collision models.
+def _feature_region_halfspaces(rule, actor_pose, target_pose, finger_positions):
+    """Return world task inequalities and their affine finger derivative.
+
+    A @ x <= b describes the finite source feature and target patch. Rigid
+    prismatic feature motion changes b by db_dq @ dq. Source point heights
+    are retained; the region does not assert observed target occupancy.
+    """
+    from scipy.spatial import ConvexHull
+    points = np.asarray(rule["feature_points"], float)
+    local_points = points
+    mapping = rule["feature_joint_translation"]
+    if mapping is not None:
+        if finger_positions is None:
+            return None, None, "missing_named_finger_geometry"
+        points = points + np.einsum("vcj,j->vc", np.asarray(mapping, float), finger_positions)
+        translation = actor_pose[:3, :3] @ np.asarray(mapping, float)[0]
+    else:
+        translation = np.zeros((3, 0))
+    world = points @ actor_pose[:3, :3].T + actor_pose[:3, 3]
+    normal = actor_pose[:3, :3] @ np.asarray(rule["feature_normal"], float)
+    axes = target_pose[:3, :3] @ np.asarray(rule["patch_axes"], float)
+    origin = target_pose[:3, :3] @ np.asarray(rule["patch_origin"], float) + target_pose[:3, 3]
+    tolerance = float(rule["numerical_position_tolerance_m"])
+    angle = np.arctan2(np.linalg.norm(np.cross(normal, axes[:, 2])), -normal @ axes[:, 2])
+    if angle > rule["normal_tolerance_rad"] + rule["numerical_angle_tolerance_rad"]:
+        return None, None, "material_normal_outside_permission"
+    rows, bounds, derivatives = [], [], []
+    kind = rule["feature_kind"]
+    if kind == "edge":
+        if world.shape != (2, 3):
+            raise ValueError("An independent material edge requires exactly its two endpoints")
+        delta = local_points[1]-local_points[0]
+        length = np.linalg.norm(delta)
+        if length == 0:
+            raise ValueError("An independent material edge must have nonzero length")
+        local_tangent = delta/length
+        lateral = np.cross(np.asarray(rule["feature_normal"]), local_tangent)
+        lateral /= np.linalg.norm(lateral)
+        tangent = actor_pose[:3, :3] @ local_tangent
+        lateral = actor_pose[:3, :3] @ lateral
+        for axis, extent in ((tangent, length), (-tangent, 0.), (lateral, 0.), (-lateral, 0.)):
+            rows.append(axis)
+            bounds.append(float(axis @ world[0]+extent+tolerance))
+            derivatives.append(axis @ translation)
+    elif kind == "polygon":
+        basis = np.linalg.svd(local_points-local_points[0], full_matrices=True)[2][:2].T
+        local = (local_points-local_points[0]) @ basis
+        edges = ConvexHull(local).equations
+        for edge in edges:
+            axis = actor_pose[:3, :3] @ (basis @ edge[:2])
+            rows.append(axis)
+            bounds.append(float(axis @ world[0] - edge[2] + tolerance))
+            derivatives.append(axis @ translation)
+    else:
+        raise ValueError("Independent contact features support only explicit edges or polygons")
+    allowance = float(rule["modeling_allowance_m"])
+    for axis in (normal, -normal):
+        rows.append(axis)
+        bounds.append(float(np.max(world @ axis) + allowance + tolerance))
+        derivatives.append(axis @ translation)
+    for column, half in enumerate(rule["patch_half_size"]):
+        for sign in (-1., 1.):
+            axis = sign * axes[:, column]
+            rows.append(axis)
+            bounds.append(float(axis @ origin + half + tolerance))
+            derivatives.append(np.zeros(translation.shape[1]))
+    for sign in (-1., 1.):
+        axis = sign * axes[:, 2]
+        rows.append(axis)
+        bounds.append(float(axis @ origin + allowance + tolerance))
+        derivatives.append(np.zeros(translation.shape[1]))
+    if kind == "edge":
+        gap_axis = float(axes[:, 2] @ tangent)*tangent
+        gap_offset = float((axes[:, 2]-gap_axis) @ world[0]-axes[:, 2] @ origin)
+        gap_derivative = (axes[:, 2]-gap_axis) @ translation
+    else:
+        height = float(normal @ world[0])
+        cosine = float(axes[:, 2] @ normal)
+        gap_axis = axes[:, 2]-cosine*normal
+        gap_offset = cosine*height-float(axes[:, 2] @ origin)
+        gap_derivative = cosine*normal @ translation
+    for sign, limit in ((1., rule["gap_bounds"][1]), (-1., -rule["gap_bounds"][0])):
+        rows.append(sign*gap_axis)
+        bounds.append(float(limit-sign*gap_offset+tolerance))
+        derivatives.append(-sign*gap_derivative)
+    region = np.asarray(rows), np.asarray(bounds)
+    return region, np.asarray(derivatives), None
+# END affine task inequalities preserve original source coordinates.
 
 def check_grasp_region_compatibility(contact_rules, *, T_reference_tool,
                                      T_reference_owner, finger_position_limits):

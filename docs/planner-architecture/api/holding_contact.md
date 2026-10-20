@@ -1,59 +1,78 @@
 # `manipulation/holding_contact.py` 实现契约
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。
-
-本模块的阶段职责与数据语义见[组件说明](../03-attachment-contact-and-hand.md)和[API 契约](../06-api-contracts.md)。[返回实现目录](../07-implementation-index.md)。
+代码基线：`__IMPLEMENTATION_COMMIT__`。
+职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `HoldingContact`
 
 [定义位置](../../../manipulation/holding_contact.py#L12)。
 
 ```python
-class HoldingContact:
-    rule_id: str
-    condition_id: str
-    target_owner: str
-    material_id: str
-    native_geometry: str
-    sphere_indices: tuple
-    interval: tuple
-    source: str
+class HoldingContact():
 ```
 
-该类型的直接方法：`__post_init__`。
+类字段：
+
+```python
+rule_id: str
+condition_id: str
+target_owner: str
+material_id: str
+robot_body: str
+interval: tuple
+source: str
+```
+
+实现说明：
+
+> One registered robot body assigned an internal attachment contact.
+> 
+> The caller declares this internal contact in its attachment model. The
+> same nominal attachment places the owner for external collision checks.
+> This does not establish physical Holding. Only this exact material
+> solid/owner pair is internal; other robot solids and other owners remain
+> obstacles. Release ends the relationship. No historical contact normal,
+> gap, target patch, arrival pose, or close command appears in this record.
 
 ## `HoldingContact.__post_init__`
 
-[定义位置](../../../manipulation/holding_contact.py#L31)。
+[定义位置](../../../manipulation/holding_contact.py#L30)。
 
 输入签名：
 
 ```python
-def HoldingContact.__post_init__(self):
+def __post_init__(self):
 ```
 
-直接读取的对象属性：`self.sphere_indices`、`self.interval`。
+显式输出分支：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+无显式条目。
 
-直接调用：
+读取的对象属性：
+
+```python
+object.__setattr__
+self.interval
+```
+
+写入目标：
+
+```python
+name
+```
+
+直接调用符号：
 
 ```python
 _text
 getattr
-tuple
-len
-set
-any
-type
-ValueError
 object.__setattr__
 _valid_interval
 ```
 
 ## `bind_holding_contacts`
 
-[定义位置](../../../manipulation/holding_contact.py#L42)。
+[定义位置](../../../manipulation/holding_contact.py#L36)。
 
 输入签名：
 
@@ -61,17 +80,58 @@ _valid_interval
 def bind_holding_contacts(problem, material_binding, declarations, *, source):
 ```
 
-直接读取的对象属性：`problem.conditions`、`problem.phases`。
+实现说明：
 
-输出分支的源码表达式：
+> Bind declared attachment/material associations atomically.
+> 
+> The caller names the robot's contact materials. Their registered body identities come from the observation partition
+> and the model declaration. The condition identifies that same nominal model;
+> no measured Holding flag is required or inferred.
+
+显式输出分支：
 
 ```python
 tuple(contacts)
 ```
 
-直接写入的状态或数组位置：`replacements[identity]`、`problem.conditions`。
+读取的对象属性：
 
-直接调用：
+```python
+problem.conditions
+row.get
+phase.metadata
+problem.phases
+phase.metadata.get
+contacts.append
+rule_ids.append
+replacements.get
+```
+
+写入目标：
+
+```python
+conditions
+row
+ids
+materials
+replacements
+contacts
+condition
+identity
+owner
+selected
+name
+spans
+phase
+interval
+rule_ids
+material
+rule_id
+replacements[identity]
+problem.conditions
+```
+
+直接调用符号：
 
 ```python
 _text
@@ -90,41 +150,9 @@ deepcopy
 replacements.get
 ```
 
-## `validate_holding_materials`
-
-[定义位置](../../../manipulation/holding_contact.py#L81)。
-
-输入签名：
-
-```python
-def validate_holding_materials(contacts, owners, sphere_materials, native_materials, collision_bodies):
-```
-
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
-
-直接写入的状态或数组位置：`sphere_geometry[index]`。
-
-直接调用：
-
-```python
-set
-tuple
-geometry_indices.setdefault(name, set()).update
-geometry_indices.setdefault
-isinstance
-ValueError
-native_materials.get
-geometry_indices.get
-any
-len
-sphere_geometry.get
-identities.add
-pairs.add
-```
-
 ## `validate_holding_conditions`
 
-[定义位置](../../../manipulation/holding_contact.py#L115)。
+[定义位置](../../../manipulation/holding_contact.py#L74)。
 
 输入签名：
 
@@ -132,11 +160,63 @@ pairs.add
 def validate_holding_conditions(contacts, owners, conditions):
 ```
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+实现说明：
 
-直接写入的状态或数组位置：`actual[:3, 3]`、`actual[:3, :3]`。
+> Check model identity, without comparing a goal or a physical object pose.
 
-直接调用：
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+contact.rule_id
+condition.get
+row.owner_id
+row.attachments
+relation.condition_id
+consumed.intersection
+by_rule.get
+contact.condition_id
+contact.target_owner
+contact.interval
+relation.interval
+np.eye
+relation.position_tool_owner
+Rotation.from_quat(np.asarray(relation.quaternion_tool_owner)[[1, 2, 3, 0]]).as_matrix
+Rotation.from_quat
+np.asarray
+relation.quaternion_tool_owner
+declared.shape
+np.isfinite(declared).all
+np.isfinite
+np.allclose
+np.linalg.inv
+np.linalg
+consumed.update
+```
+
+写入目标：
+
+```python
+by_rule
+contact
+consumed
+condition
+ids
+owner
+relations
+row
+relation
+identity
+actual
+actual[:3, 3]
+actual[:3, :3]
+declared
+```
+
+直接调用符号：
 
 ```python
 set

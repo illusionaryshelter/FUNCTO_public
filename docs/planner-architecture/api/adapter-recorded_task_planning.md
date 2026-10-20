@@ -1,8 +1,7 @@
 # `tests/planning/recorded_task_planning.py` 实现契约
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。
-
-本模块的阶段职责与数据语义见[组件说明](../05-acceptance-and-execution.md)和[API 契约](../06-api-contracts.md)。[返回实现目录](../07-implementation-index.md)。
+代码基线：`__IMPLEMENTATION_COMMIT__`。
+职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_json_value`
 
@@ -14,14 +13,28 @@
 def _json_value(value):
 ```
 
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 value.tolist()
 value.item()
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.ndarray
+value.tolist
+np.generic
+value.item
+type(value).__name__
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 isinstance
@@ -41,7 +54,11 @@ type
 def _diagnostic_value(value):
 ```
 
-输出分支的源码表达式：
+实现说明：
+
+> Convert owned CPU evidence without silently dropping NaN/Inf failures.
+
+显式输出分支：
 
 ```python
 _diagnostic_value(value.tolist())
@@ -52,7 +69,26 @@ _diagnostic_value(value.item())
 value
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.ndarray
+value.tolist
+np.generic
+value.item
+value.items
+np.isfinite
+np.isnan
+```
+
+写入目标：
+
+```python
+key
+item
+```
+
+直接调用符号：
 
 ```python
 isinstance
@@ -74,9 +110,34 @@ np.isnan
 def _write_diagnostic_json(path, document):
 ```
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+实现说明：
 
-直接调用：
+> Replace a complete JSON document; a failed write keeps the last one.
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+json.dumps
+path.with_name
+path.name
+temporary.write_text
+temporary.replace
+temporary.unlink
+```
+
+写入目标：
+
+```python
+path
+rendered
+temporary
+```
+
+直接调用符号：
 
 ```python
 Path
@@ -98,11 +159,67 @@ temporary.unlink
 def save_curve(path, curve, *, classification, execution_limits, fk=None, validation_status='completed', joint_limits=None, planning_result=None):
 ```
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+实现说明：
 
-直接写入的状态或数组位置：`binding['execution_limits']`、`planning_result.execution_binding`。
+> Preserve the exact exported cubic, event identities and optional FK.
+> 
+> ``fk`` contains independently evaluated native FK of this same exported
+> curve, in the problem reference frame. Native planner callers also supply
+> their effective bounds; the shared production calculus then reports both
+> the full curve and its original executable prefix. This recorder never
+> changes classification based on an additional report.
 
-直接调用：
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+planning_result.trajectory
+ExecutionLimits.from_mapping
+limits.describe
+np.asarray
+curve.joint_names
+curve.times
+curve.position
+curve.velocity
+curve.progress_u
+curve.progress_s
+curve.finger_trajectory
+arrays.update
+fingers.joint_names
+fingers.times
+fingers.position
+fingers.velocity
+curve.executable_until
+json.dumps
+fingers.describe
+curve.satisfied_dependencies
+curve.events
+curve.conditions
+curve.residuals
+curve.duration
+curve.next_verification
+np.savez_compressed
+path.with_suffix('.json').write_text
+path.with_suffix
+```
+
+写入目标：
+
+```python
+binding
+limits
+binding['execution_limits']
+planning_result.execution_binding
+arrays
+fingers
+derivative_metadata
+rendered
+```
+
+直接调用符号：
 
 ```python
 ValueError
@@ -133,17 +250,69 @@ path.with_suffix
 def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, provenance, execution_limits, backend, joint_reference=None, continuation=None, rebind=None, request_ledger=None):
 ```
 
-直接读取的对象属性：`problem.phase_count`、`result.diagnostics`、`result.success`、`result.request_ledger`、`result.trajectory`。
+实现说明：
 
-输出分支的源码表达式：
+> Call the bound backend once; persistence cannot initiate another solve.
+> 
+> The caller owns the backend lifetime so successive requests can reuse its
+> native models. Diagnostic curves have no formal binding and cannot enter
+> the simulation executor. No monkeypatch, observer-side export, source
+> geometry query, or candidate-sized tensor history is installed here.
+
+显式输出分支：
 
 ```python
 result
 ```
 
-直接写入的状态或数组位置：`report['request_ledger_path']`、`entry['curve_saved']`、`entry['diagnostic_error']`、`report['elapsed_seconds']`、`report['peak_rss_bytes']`。
+读取的对象属性：
 
-直接调用：
+```python
+output.mkdir
+time.monotonic
+problem.phase_count
+planning.plan_trajectory
+result.diagnostics.pop
+result.diagnostics
+report.update
+result.success
+result.request_ledger
+ledger_path.resolve
+result.diagnostics.get
+result.trajectory
+diagnostic.residuals
+report['candidates'].append
+type(error).__name__
+(output / 'exception.txt').write_text
+traceback.format_exc
+resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+resource.getrusage
+resource.RUSAGE_SELF
+torch.cuda.is_initialized
+torch.cuda
+torch.cuda.max_memory_allocated
+torch.cuda.max_memory_reserved
+```
+
+写入目标：
+
+```python
+output
+started
+report
+result
+diagnostic
+ledger_path
+report['request_ledger_path']
+bounds
+entry
+entry['curve_saved']
+entry['diagnostic_error']
+report['elapsed_seconds']
+report['peak_rss_bytes']
+```
+
+直接调用符号：
 
 ```python
 Path

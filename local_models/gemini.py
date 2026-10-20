@@ -17,7 +17,9 @@ class Gemini:
     """A small application adapter; s3e owns the HTTP protocol and validation."""
 
     def __init__(self, model: str | None = None, base_url: str | None = None):
-        self.model = model or os.environ.get("GEMINI_MODEL", "gemini-3.7-flash-tiered")
+        # BEGIN user-selected shared default for all Gemini consumers.
+        self.model = model or os.environ.get("GEMINI_MODEL", "gemini-3.8-flash-low")
+        # END explicit per-request/environment model selection retains precedence.
         self.base_url = base_url or os.environ.get(
             "SUB2API_BASE_URL", "http://127.0.0.1:18080/antigravity")
 

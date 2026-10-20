@@ -1,46 +1,23 @@
-"""Model-relative robot identity and shadow classification for calibrated RGB-D.
+"""Robot identity and occlusion from registered observed link fields.
 
-Each supplied component is a filled native collision solid. Coal performs point
-and finite-segment distance queries, including true Euclidean sphere padding.
-The result does not assert physical material identity: collision geometry may
-approximate the robot, and calibration/synchronization remain caller inputs.
+The maintained TSDF raycaster predicts image depths from the same saved
+weighted observations. Its candidate hits are checked against the raw field's
+interpolation support before they influence measurement admission.
 """
 
-# BEGIN three-state collision-model self filtering, independent of experiment assets.
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-
-import coal
+# BEGIN observed-field self filtering shares the registered robot model.
+from collections.abc import Mapping
 import numpy as np
+import torch
 
-from .observations import _intrinsics
-from .robot_geometry_check import _convex_solid, _name, _rigid_pose
-
+from .robot_geometry_check import _name
+from .implicit_distance import inverse_points
+from .resource_admission import require_device_memory, require_host_memory
 
 SELF = np.uint8(1)
 ENVIRONMENT = np.uint8(2)
 AMBIGUOUS_SHADOW = np.uint8(3)
 _MAX_PIXELS = 2_000_000
-_CHUNK = 16_384
-
-
-@dataclass(frozen=True)
-class RobotCollisionShape:
-    """One native component in geometry-local coordinates, with a rigid pose.
-
-    ``box`` dimensions are full x/y/z lengths; ``cylinder`` dimensions are
-    radius/full z-axis length. ``convex`` vertices describe one filled native
-    convex component. Scaling is about this explicitly supplied geometry's
-    local origin, never its link or world origin; the adapter must preserve
-    the native geometry centre when constructing this record.
-    """
-
-    name: str
-    kind: str
-    T_world_geometry: np.ndarray
-    source: str
-    dimensions: tuple = ()
-    vertices: np.ndarray | None = None
 
 
 def validate_self_filter(value, depth_m):
@@ -69,162 +46,76 @@ def validate_self_filter(value, depth_m):
     return {"labels": labels, "free_ray_depth_m": free, "source": source}
 
 
-def _shape(record, scale):
-    """Build a maintained-library solid; no triangle-surface containment test."""
-    if record.kind == "convex":
-        if record.dimensions:
-            raise ValueError("A convex component has vertices, not primitive dimensions")
-        vertices = np.asarray(record.vertices, dtype=float)
-        if vertices.ndim != 2 or vertices.shape[1:] != (3,) or not 4 <= len(vertices) <= 100_000:
-            raise ValueError("A self-filter convex component exceeds the native vertex budget")
-        return _convex_solid(vertices * scale)
-    if record.vertices is not None:
-        raise ValueError("An analytic primitive cannot also supply mesh vertices")
-    dimensions = np.asarray(record.dimensions, dtype=float)
-    count = {"box": 3, "cylinder": 2}.get(record.kind)
-    if (count is None or dimensions.shape != (count,) or not np.isfinite(dimensions).all()
-            or np.any(dimensions <= 0)):
-        raise ValueError("Self-filter primitives require native positive box or cylinder dimensions")
-    dimensions = dimensions * scale
-    if not np.isfinite(dimensions).all():
-        raise ValueError("Scaled primitive dimensions must remain finite")
-    return coal.Box(*dimensions) if record.kind == "box" else coal.Cylinder(*dimensions)
 
+def classify_depth(*, observed_depth, K, T_world_camera, bodies, body_poses,
+                   block_checkpoints, depth_error_m, source,
+                   max_host_rss_bytes, max_device_used_bytes, device="cuda:0"):
+    """Classify measured endpoints using complete named robot FK at capture.
 
-def _world_bounds(shape, pose, numerical_band):
-    """Enclose the library's local AABB, including its swept-sphere padding."""
-    shape.computeLocalAABB()
-    lower, upper = np.asarray(shape.aabb_local.min_), np.asarray(shape.aabb_local.max_)
-    centre = pose[:3, :3] @ ((lower + upper) / 2) + pose[:3, 3]
-    extent = np.abs(pose[:3, :3]) @ ((upper - lower) / 2) + numerical_band
-    if not np.isfinite(np.r_[centre, extent]).all():
-        raise ValueError("Robot self-filter geometry bounds must remain finite")
-    return np.nextafter(centre - extent, -np.inf), np.nextafter(centre + extent, np.inf)
-
-
-def _segment_rotations(directions):
-    """Place each Coal capsule's z axis along its finite observation segment."""
-    helper = np.zeros_like(directions)
-    helper[:, 0] = 1.
-    close = np.abs(directions[:, 0]) > .9
-    helper[close] = [0., 1., 0.]
-    first = np.cross(helper, directions)
-    first /= np.linalg.norm(first, axis=1)[:, None]
-    return np.stack((first, np.cross(directions, first), directions), axis=2)
-
-
-def classify_depth(*, observed_depth, K, T_world_camera, geometries,
-                   padding_scale, padding_offset_m, source):
-    """Return three-state labels and conservative per-pixel free-ray depths.
-
-    SELF wins when an endpoint is strictly inside any nominal component, even
-    if another component shadows it: this is explicitly model-relative point
-    ownership. Otherwise a padded finite-segment hit is AMBIGUOUS_SHADOW. Only
-    ENVIRONMENT retains evidence. The numerical band uses unchanged Coal
-    GJK/EPA defaults as a conservative diagnostic convention, not a proved error
-    bound or a sensor accuracy claim. Query exceptions abort; nonfinite results
-    remain ambiguous. No GPU, renderer, scene object state or policy is used.
+    A strictly negative supported endpoint is SELF. A supported predicted hit
+    before the endpoint, including its declared depth error, is ambiguous.
+    Remaining valid pixels keep their original environment depth. Missing
+    robot observations are reported without filling their hidden geometry.
     """
+    from curobo.perception import Mapper, MapperCfg
+    from curobo.types import DeviceCfg, Pose
+    from .planning_observation import _mapper_memory_bound, _mapper_intrinsics
     depth = np.asarray(observed_depth, dtype=float)
-    if depth.ndim != 2 or not depth.size or depth.size > _MAX_PIXELS:
-        raise ValueError("Self filtering requires a nonempty bounded H,W depth image")
-    matrix = _intrinsics(K)
-    camera = _rigid_pose(T_world_camera, "T_world_camera")
-    source = _name(source, "self-filter source")
-    if (isinstance(padding_scale, (bool, np.bool_)) or not np.isscalar(padding_scale)
-            or not np.isfinite(padding_scale) or padding_scale < 1
-            or isinstance(padding_offset_m, (bool, np.bool_)) or not np.isscalar(padding_offset_m)
-            or not np.isfinite(padding_offset_m) or padding_offset_m < 0):
-        raise ValueError("Self filtering requires explicit finite padding_scale >= 1 and padding_offset_m >= 0")
-    if not isinstance(geometries, Sequence) or not 0 < len(geometries) <= 256:
-        raise ValueError("Self filtering requires one to 256 explicit native collision components")
-    request = coal.DistanceRequest()
-    request.enable_signed_distance = True
-    band = max(float(request.gjk_tolerance), float(request.epa_tolerance))
-    bodies, names = [], set()
-    for record in geometries:
-        if not isinstance(record, RobotCollisionShape) or record.name in names:
-            raise ValueError("Self-filter components must have unique explicit shape records")
-        names.add(_name(record.name, "collision component name"))
-        _name(record.source, "collision component source")
-        pose = _rigid_pose(record.T_world_geometry, "T_world_geometry")
-        nominal = _shape(record, 1.)
-        # With unit scale the library clone preserves the same native convex
-        # hull exactly and avoids an unnecessary second hull construction.
-        padded = nominal.clone() if padding_scale == 1 else _shape(record, float(padding_scale))
-        padded.setSweptSphereRadius(float(padding_offset_m))
-        bodies.append((record, nominal, padded, coal.Transform3s(pose[:3, :3], pose[:3, 3]),
-                       _world_bounds(nominal, pose, band), _world_bounds(padded, pose, band)))
-    labels = np.full(depth.size, AMBIGUOUS_SHADOW, dtype=np.uint8)
-    valid = np.flatnonzero(np.isfinite(depth.ravel()) & (depth.ravel() > 0))
-    counts = {"point_queries": 0, "segment_queries": 0, "nonfinite_queries": 0}
-    point, segment, query_pose, result = coal.Sphere(0.), coal.Capsule(0., 1.), coal.Transform3s(), coal.DistanceResult()
-    origin = camera[:3, 3]
-    inverse_K = np.linalg.inv(matrix)
-    # A finite chunk bounds all N-by-3 and N-by-3-by-3 intermediates. Neither
-    # geometry count nor image size multiplies retained query storage.
-    for start in range(0, len(valid), _CHUNK):
-        pixels = valid[start:start + _CHUNK]
-        rows, cols = np.divmod(pixels, depth.shape[1])
-        rays = np.column_stack((cols, rows, np.ones(len(rows)))) @ inverse_K.T
-        with np.errstate(over="ignore", invalid="ignore"):
-            endpoints = (rays * depth.ravel()[pixels, None]) @ camera[:3, :3].T + origin
-            delta = endpoints - origin
-            lengths = np.hypot(np.hypot(delta[:, 0], delta[:, 1]), delta[:, 2])
-        finite = np.isfinite(endpoints).all(axis=1) & np.isfinite(lengths) & (lengths > 0)
-        state = np.where(finite, ENVIRONMENT, AMBIGUOUS_SHADOW).astype(np.uint8)
-        for _, nominal, _, pose, (lower, upper), _ in bodies:
-            candidates = np.flatnonzero(finite & (state != SELF)
-                                       & np.all((endpoints >= lower) & (endpoints <= upper), axis=1))
-            query_pose.setIdentity()
-            for index in candidates:
-                query_pose.setTranslation(endpoints[index])
-                result.clear()
-                distance = float(coal.distance(nominal, pose, point, query_pose, request, result))
-                counts["point_queries"] += 1
-                if not np.isfinite(distance):
-                    state[index] = AMBIGUOUS_SHADOW
-                    counts["nonfinite_queries"] += 1
-                elif distance < -band:
-                    state[index] = SELF
-                elif distance <= band:
-                    state[index] = AMBIGUOUS_SHADOW
-        # A segment's bounding box only rejects impossible candidates. Coal,
-        # not this broad phase, decides intersection with each filled solid.
-        segment_lower, segment_upper = np.minimum(endpoints, origin), np.maximum(endpoints, origin)
-        for _, _, padded, pose, _, (lower, upper) in bodies:
-            candidates = np.flatnonzero(finite & (state == ENVIRONMENT)
-                                       & np.all((segment_upper >= lower) & (segment_lower <= upper), axis=1))
-            rotations = _segment_rotations(delta[candidates] / lengths[candidates, None])
-            for row, index in enumerate(candidates):
-                segment.halfLength = float(lengths[index] / 2)
-                query_pose.setRotation(rotations[row])
-                query_pose.setTranslation(origin + delta[index] / 2)
-                result.clear()
-                distance = float(coal.distance(padded, pose, segment, query_pose, request, result))
-                counts["segment_queries"] += 1
-                if not np.isfinite(distance):
-                    state[index] = AMBIGUOUS_SHADOW
-                    counts["nonfinite_queries"] += 1
-                elif distance <= band:
-                    state[index] = AMBIGUOUS_SHADOW
-        labels[pixels] = state
-    labels = labels.reshape(depth.shape)
+    if depth.ndim != 2 or depth.size > _MAX_PIXELS or not np.isfinite(depth_error_m) or depth_error_m < 0:
+        raise ValueError("Self filtering needs bounded measured depth and its nonnegative error")
+    height, width = depth.shape
+    y, x = np.indices(depth.shape)
+    rays = np.stack((x, y, np.ones_like(x)), -1) @ np.linalg.inv(np.asarray(K, float)).T
+    valid = np.isfinite(depth) & (depth > 0)
+    endpoints_camera = rays*np.where(valid, depth, 0.)[..., None]
+    world_camera = np.asarray(T_world_camera, float)
+    endpoints = endpoints_camera @ world_camera[:3, :3].T+world_camera[:3, 3]
+    labels = np.where(valid, ENVIRONMENT, AMBIGUOUS_SHADOW).astype(np.uint8)
+    nearest = np.full(depth.shape, np.inf)
+    tensor = DeviceCfg(device)
+    counts = {}
+    for body in bodies:
+        if body.field is None:
+            counts[body.name] = {"status": "missing_observation"}
+            continue
+        field = body.field
+        matrix = np.asarray(body_poses[body.name], float)
+        values, supported, _, error = field.sample(inverse_points(endpoints, matrix))
+        own = valid & supported & (values+error < 0)
+        labels[own] = SELF
+        extent = field.shape*field.voxel_size
+        # Subtract one representable ULP before ceil to recover the integer
+        # grid shape despite a floating product/division round-trip.
+        extent = np.nextafter(extent, np.zeros(3))
+        center = field.origin+(field.shape-1)*field.voxel_size/2
+        config = MapperCfg(extent_meters_xyz=tuple(extent), voxel_size=field.voxel_size,
+            extent_esdf_meters_xyz=tuple(extent), esdf_voxel_size=field.voxel_size,
+            grid_center=torch.tensor(center, dtype=torch.float32), truncation_distance=2*field.voxel_size,
+            image_height=height, image_width=width, depth_minimum_distance=.05,
+            depth_maximum_distance=5., device=device)
+        bound = _mapper_memory_bound(config)
+        require_host_memory(bound, pending_existing_bytes=0, max_rss_bytes=max_host_rss_bytes)
+        require_device_memory(torch, device, native_bytes=bound, max_device_used_bytes=max_device_used_bytes)
+        mapper = Mapper.load_blocks(block_checkpoints[body.name], config)
+        camera_local = np.linalg.inv(matrix) @ world_camera
+        rendered, _, render_valid = mapper.render(tensor.to_device(_mapper_intrinsics(K)),
+            Pose.from_matrix(tensor.to_device(camera_local)[None]), (height, width))
+        rendered = rendered.detach().cpu().numpy().reshape(depth.shape)
+        render_valid = render_valid.detach().cpu().numpy().reshape(depth.shape)
+        candidates = render_valid & np.isfinite(rendered) & (rendered > 0)
+        hits = rays*np.where(candidates, rendered, 0.)[..., None]
+        hits = hits @ camera_local[:3, :3].T+camera_local[:3, 3]
+        _, supported_hits, _, _ = field.sample(hits)
+        accepted = candidates & supported_hits
+        nearest = np.minimum(nearest, np.where(accepted, rendered, np.inf))
+        counts[body.name] = {"status": "observed_partial", "self_pixels": int(own.sum()),
+                             "supported_render_hits": int(accepted.sum())}
+        del mapper
+    shadow = valid & (nearest <= depth+depth_error_m) & (labels != SELF)
+    labels[shadow] = AMBIGUOUS_SHADOW
     filtered = validate_self_filter({"labels": labels,
         "free_ray_depth_m": np.where(labels == ENVIRONMENT, depth, 0.), "source": source}, depth)
-    return {"self_filter": filtered, "provenance": {
-        "source": source, "padding_scale": float(padding_scale), "padding_offset_m": float(padding_offset_m),
-        "scale_centre": "each component's explicit geometry-local origin; pose translation unchanged",
-        "padding_definition": "uniform local scaling followed by Coal Euclidean swept-sphere dilation",
-        "numerical_boundary_m": band, "numerical_boundary_is_proved_error_bound": False,
-        "counts": {**counts, "self_pixels": int(np.count_nonzero(labels == SELF)),
-                   "environment_pixels": int(np.count_nonzero(labels == ENVIRONMENT)),
-                   "ambiguous_shadow_pixels": int(np.count_nonzero(labels == AMBIGUOUS_SHADOW))},
-        "geometries": [{"name": row[0].name, "kind": row[0].kind, "source": row[0].source,
-                        "T_world_geometry": np.asarray(row[0].T_world_geometry).tolist()} for row in bodies],
-        "input_depth_modified": False, "renderer_used": False,
-        "free_ray_policy": "only ENVIRONMENT retains original depth; SELF and AMBIGUOUS_SHADOW are zero",
-        "self_scope": "strict interior of declared nominal collision model; not certified physical robot identity",
-        "shadow_scope": "closed finite camera-to-observation segment; not an infinite ray",
-    }}
-# END only explicit environment observations contribute surface or free-space evidence.
+    return {"self_filter": filtered, "predicted_depth_m": np.where(np.isfinite(nearest), nearest, 0.),
+            "provenance": {"model": "same_observed_robot_fields", "bodies": counts,
+                           "depth_error_m": float(depth_error_m)}}
+# END unknown raycast fill is never admitted as field support or collision geometry.

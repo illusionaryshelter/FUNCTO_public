@@ -4,7 +4,9 @@
 DEFAULT_MAX_HOST_RSS_BYTES = 8 * 1024**3
 MAX_HOST_RSS_BYTES = 12 * 1024**3
 DEFAULT_MAX_DEVICE_USED_BYTES = 6 * 1024**3
-MAX_DEVICE_USED_BYTES = 8 * 1024**3
+# BEGIN explicit requests may use the user-authorized ten-GiB device envelope.
+MAX_DEVICE_USED_BYTES = 10 * 1024**3
+# END the default remains six GiB; this is only the maximum request capacity.
 MIN_HOST_AVAILABLE_BYTES = 2 * 1024**3
 MIN_DEVICE_FREE_BYTES = 2 * 1024**3
 # BEGIN an explicit request may include the retained simulator's process tree.
@@ -119,7 +121,7 @@ def require_device_memory(torch, device, *, native_bytes, torch_bytes=0, max_dev
         if type(value) is not int or value < 0:
             raise ValueError(f"{name} must be a nonnegative byte count")
     if type(max_device_used_bytes) is not int or not 0 < max_device_used_bytes <= MAX_DEVICE_USED_BYTES:
-        raise ValueError("Device admission requires an explicit limit no larger than eight GiB")
+        raise ValueError("Device admission requires an explicit limit no larger than ten GiB")
     free_bytes, total_bytes = map(int, torch.cuda.mem_get_info(device))
     reusable_torch_bytes = (max(0, int(torch.cuda.memory_reserved(device))
                                  -int(torch.cuda.memory_allocated(device))) if torch_bytes else 0)

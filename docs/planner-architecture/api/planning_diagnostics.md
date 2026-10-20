@@ -1,20 +1,32 @@
 # `manipulation/planning_diagnostics.py` 实现契约
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。
-
-本模块的阶段职责与数据语义见[组件说明](../05-acceptance-and-execution.md)和[API 契约](../06-api-contracts.md)。[返回实现目录](../07-implementation-index.md)。
+代码基线：`__IMPLEMENTATION_COMMIT__`。
+职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `AttemptWitnesses`
 
 [定义位置](../../../manipulation/planning_diagnostics.py#L13)。
 
 ```python
-class AttemptWitnesses:
-    ...
-    ...
+class AttemptWitnesses():
 ```
 
-该类型的直接方法：`__init__`、`_validated_parameters`、`parameters`、`current_parameters`、`last_selection`、`_native_parameters`、`_validation_parameters`、`add_native`、`add_validation`、`set_current`、`select_parameters`。
+类字段：
+
+无显式条目。
+
+实现说明：
+
+> Keep historical failures separate from the next optimizer's queries.
+> 
+> The ledger records normalized physical time, not source progress: a pause
+> can map several distinct trajectory times to one progress value. Exact
+> repeated times share one query. Nearby but distinct times remain distinct
+> because neither a numerical tolerance nor a previous passing query proves
+> the intervening source geometry safe. Only the explicitly selected current
+> candidate supplies the bounded optimizer query set. Historical parameters
+> remain mandatory inputs to independent export validation after exchange;
+> this scheduler neither discards evidence nor certifies motion.
 
 ## `AttemptWitnesses.__init__`
 
@@ -23,14 +35,27 @@ class AttemptWitnesses:
 输入签名：
 
 ```python
-def AttemptWitnesses.__init__(self):
+def __init__(self):
 ```
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+显式输出分支：
 
-直接写入的状态或数组位置：`self._parameters`、`self._current`、`self._selection_counts`、`self._last_selection`。
+无显式条目。
 
-直接调用：
+读取的对象属性：
+
+无显式条目。
+
+写入目标：
+
+```python
+self._parameters
+self._current
+self._selection_counts
+self._last_selection
+```
+
+直接调用符号：
 
 ```python
 set
@@ -43,17 +68,32 @@ set
 输入签名：
 
 ```python
-@staticmethod
-def AttemptWitnesses._validated_parameters(values, *, source):
+def _validated_parameters(values, *, source):
 ```
 
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 parameters
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.asarray
+parameters.ndim
+np.isfinite(parameters).all
+np.isfinite
+np.any
+```
+
+写入目标：
+
+```python
+parameters
+```
+
+直接调用符号：
 
 ```python
 np.asarray
@@ -70,19 +110,31 @@ ValueError
 输入签名：
 
 ```python
-@property
-def AttemptWitnesses.parameters(self):
+def parameters(self):
 ```
 
-直接读取的对象属性：`self._parameters`。
+实现说明：
 
-输出分支的源码表达式：
+> Return an owned sorted snapshot; callers cannot erase the ledger.
+
+显式输出分支：
 
 ```python
 np.asarray(sorted(self._parameters), dtype=float)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.asarray
+self._parameters
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 np.asarray
@@ -96,19 +148,31 @@ sorted
 输入签名：
 
 ```python
-@property
-def AttemptWitnesses.current_parameters(self):
+def current_parameters(self):
 ```
 
-直接读取的对象属性：`self._current`。
+实现说明：
 
-输出分支的源码表达式：
+> Return failures belonging to the explicitly selected candidate.
+
+显式输出分支：
 
 ```python
 np.asarray(sorted(self._current), dtype=float)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.asarray
+self._current
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 np.asarray
@@ -122,19 +186,30 @@ sorted
 输入签名：
 
 ```python
-@property
-def AttemptWitnesses.last_selection(self):
+def last_selection(self):
 ```
 
-直接读取的对象属性：`self._last_selection`。
+实现说明：
 
-输出分支的源码表达式：
+> Return owned scheduling evidence, not a constraint-slack verdict.
+
+显式输出分支：
 
 ```python
 deepcopy(self._last_selection)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+self._last_selection
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 deepcopy
@@ -147,17 +222,49 @@ deepcopy
 输入签名：
 
 ```python
-@classmethod
-def AttemptWitnesses._native_parameters(cls, native_metrics, *, duration):
+def _native_parameters(cls, native_metrics, *, duration):
 ```
 
-输出分支的源码表达式：
+实现说明：
+
+> Read exact times from bound native source-constraint traces.
+> 
+> Traces can carry the original normalized query parameter or their
+> physical ``time_s`` and frozen duration; the latter ratio is used
+> exactly, without clipping or epsilon merging. Unavailable/unmatched
+> observer traces contain no attributed witness and are left to their
+> existing diagnostic report.
+
+显式输出分支：
 
 ```python
 cls._validated_parameters(parameters, source='Native failure witnesses')
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.isfinite
+native_metrics.get
+parameters.extend
+metrics.get
+trace.get
+parameters.append
+cls._validated_parameters
+```
+
+写入目标：
+
+```python
+duration
+parameters
+label
+metrics
+row
+trace
+```
+
+直接调用符号：
 
 ```python
 float
@@ -178,17 +285,38 @@ cls._validated_parameters
 输入签名：
 
 ```python
-@classmethod
-def AttemptWitnesses._validation_parameters(cls, validation):
+def _validation_parameters(cls, validation):
 ```
 
-输出分支的源码表达式：
+实现说明：
+
+> Read failed times from a completed independent curve check.
+
+显式输出分支：
 
 ```python
 parameters[failed]
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+cls._validated_parameters
+np.asarray
+violations.shape
+parameters.shape
+np.isfinite
+```
+
+写入目标：
+
+```python
+parameters
+violations
+failed
+```
+
+直接调用符号：
 
 ```python
 cls._validated_parameters
@@ -204,14 +332,33 @@ np.isfinite
 输入签名：
 
 ```python
-def AttemptWitnesses.add_native(self, native_metrics, *, duration):
+def add_native(self, native_metrics, *, duration):
 ```
 
-直接读取的对象属性：`self._native_parameters`、`self._parameters`。
+实现说明：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+> Accumulate evidence from any visited seed without changing priority.
 
-直接调用：
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+self._native_parameters
+self._parameters.update
+self._parameters
+parameters.tolist
+```
+
+写入目标：
+
+```python
+parameters
+```
+
+直接调用符号：
 
 ```python
 self._native_parameters
@@ -226,14 +373,31 @@ parameters.tolist
 输入签名：
 
 ```python
-def AttemptWitnesses.add_validation(self, validation):
+def add_validation(self, validation):
 ```
 
-直接读取的对象属性：`self._parameters`、`self._validation_parameters`。
+实现说明：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+> Accumulate completed validation failures without changing priority.
 
-直接调用：
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+self._parameters.update
+self._parameters
+self._validation_parameters(validation).tolist
+self._validation_parameters
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 self._parameters.update
@@ -248,16 +412,45 @@ self._validation_parameters
 输入签名：
 
 ```python
-def AttemptWitnesses.set_current(self, native_metrics, *, validation=None, duration):
+def set_current(self, native_metrics, *, validation=None, duration):
 ```
 
-直接读取的对象属性：`self._native_parameters`、`self._validation_parameters`、`self._parameters`。
+实现说明：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+> Select one continuation candidate's native and independent failures.
+> 
+> The caller must invoke this only after candidate selection. Observers
+> and unselected seeds use add_native/add_validation instead. Validate
+> both inputs before mutation, so a malformed completed validation cannot
+> partly replace current priority or add unbound native evidence.
 
-直接写入的状态或数组位置：`self._current`、`self._last_selection`。
+显式输出分支：
 
-直接调用：
+无显式条目。
+
+读取的对象属性：
+
+```python
+self._native_parameters
+np.empty
+self._validation_parameters
+np.r_[native, independent].tolist
+np.r_
+self._parameters.update
+self._parameters
+```
+
+写入目标：
+
+```python
+native
+independent
+current
+self._current
+self._last_selection
+```
+
+直接调用符号：
 
 ```python
 self._native_parameters
@@ -275,20 +468,58 @@ self._parameters.update
 输入签名：
 
 ```python
-def AttemptWitnesses.select_parameters(self, *, fixed_parameters, regular_parameters, max_points):
+def select_parameters(self, *, fixed_parameters, regular_parameters, max_points):
 ```
 
-直接读取的对象属性：`self._validated_parameters`、`self._current`、`self._selection_counts`、`self._parameters`。
+实现说明：
 
-输出分支的源码表达式：
+> Schedule bounded current failures fairly; retain all history.
+> 
+> Fixed anchors and regular optimizer samples cover only their supplied
+> exact representations. The caller supplies native float32 aliases for
+> fixed anchors when those aliases represent actual existing queries.
+> Among remaining current failures, choose the least frequently selected
+> times first and break ties by time. Boolean collision failures and
+> process errors in different units therefore never compete by magnitude.
+> Pending failures remain explicit even at zero capacity. A changed query
+> set is a gradient-work decision, not evidence of positive signed slack
+> or a claim that an omitted historical failure cannot recur.
+
+显式输出分支：
 
 ```python
 np.asarray(sorted(selected), dtype=float)
 ```
 
-直接写入的状态或数组位置：`self._selection_counts[parameter]`、`self._last_selection`。
+读取的对象属性：
 
-直接调用：
+```python
+self._validated_parameters
+fixed.tolist
+regular.tolist
+self._current
+self._selection_counts.get
+self._selection_counts
+self._parameters
+np.asarray
+```
+
+写入目标：
+
+```python
+fixed
+regular
+covered
+eligible
+ordered
+selected
+parameter
+self._selection_counts[parameter]
+self._last_selection
+value
+```
+
+直接调用符号：
 
 ```python
 type
@@ -313,17 +544,75 @@ np.asarray
 def capture_component_failures(components, times, progress, joints, position, quaternion, *, normalized_time=None, mode='exact'):
 ```
 
-输出分支的源码表达式：
+实现说明：
+
+> Capture process/self residual times before anchor columns are folded.
+> 
+> Inputs use the already ordered native query layout ``[batch, time, ...]``.
+> Each component's trailing dimensions are reduced only within that same
+> state. The resulting rows share the existing scene-trace schema, so the
+> caller can attach them to the exact named joint-state trace without
+> repeating FK, process evaluation or a source-geometry query.
+
+显式输出分支：
 
 ```python
 rows
 ```
 
-直接写入的状态或数组位置：`row['normalized_time']`。
-
-直接调用：
+读取的对象属性：
 
 ```python
+value.detach().cpu().numpy().copy
+value.detach().cpu().numpy
+value.detach().cpu
+value.detach
+times.shape
+components.items
+values.ndim
+values.shape
+values.reshape(*shape, -1).max
+values.reshape
+np.argwhere
+np.isfinite
+value.shape
+parameters.shape
+q.tolist
+p.tolist
+rotation.tolist
+rows.append
+```
+
+写入目标：
+
+```python
+cpu
+shape
+rows
+state
+parameters
+name
+tensor
+values
+batch
+column
+value
+time_s
+phase
+q
+p
+rotation
+row
+row['normalized_time']
+```
+
+直接调用符号：
+
+```python
+value.detach().cpu().numpy().copy
+value.detach().cpu().numpy
+value.detach().cpu
+value.detach
 tuple
 len
 ValueError
@@ -352,17 +641,67 @@ rows.append
 def scene_component_failures(components, times, progress, permission, joints, position, quaternion, *, modes):
 ```
 
-直接读取的对象属性：`result.append`。
+实现说明：
 
-输出分支的源码表达式：
+> Retain every positive/nonfinite hard component in its original mode.
+> 
+> Unknown observation coverage remains informational under the existing
+> scene law. Missing release anchors are hard requirements under that same
+> law. A mode index refers to the pre-fold query, never to its maximum.
+
+显式输出分支：
 
 ```python
 result
 ```
 
-直接调用：
+读取的对象属性：
 
 ```python
+value.detach().cpu().numpy().copy
+value.detach().cpu().numpy
+value.detach().cpu
+value.detach
+components.items
+name.startswith
+times.shape
+np.argwhere
+np.isfinite
+result.append
+q.tolist
+p.tolist
+rotation.tolist
+```
+
+写入目标：
+
+```python
+cpu
+hard
+name
+value
+result
+state
+width
+tensor
+values
+batch
+column
+time_s
+phase
+permitted
+q
+p
+rotation
+```
+
+直接调用符号：
+
+```python
+value.detach().cpu().numpy().copy
+value.detach().cpu().numpy
+value.detach().cpu
+value.detach
 components.items
 name.startswith
 len
@@ -387,7 +726,15 @@ rotation.tolist
 def bind_trace_to_native_seed(trace, state, seed_index, joint_names):
 ```
 
-输出分支的源码表达式：
+实现说明：
+
+> Bind by complete typed q/dq bytes, independently of native seed ranking.
+> 
+> Native result sorting can permute seeds after metrics evaluation. Comparing
+> the original named states avoids attributing another seed's scene witness.
+> Identical q/dq rows share the same fixed-clock scene evaluation.
+
+显式输出分支：
 
 ```python
 {'status': 'unavailable', 'reason': 'No source metrics trace was retained'}
@@ -396,9 +743,42 @@ def bind_trace_to_native_seed(trace, state, seed_index, joint_names):
 {'status': 'recorded', 'source_batch_index': index, 'component_failures': failures, 'world_geometry': deepcopy(trace['world_geometry']), 'world_geometry_scope': 'Worst witness across this metrics call; joint/time identity is explicit', 'scope': 'Original source components before mode maximum, constraint weighting and anchor folding'}
 ```
 
-直接写入的状态或数组位置：`row['geometry_witnesses']`。
+读取的对象属性：
 
-直接调用：
+```python
+state.joint_names.index
+state.joint_names
+getattr(state, name)[0, seed_index].detach().cpu().numpy
+getattr(state, name)[0, seed_index].detach().cpu
+getattr(state, name)[0, seed_index].detach
+actual.dtype
+stored[index].dtype
+actual.shape
+stored[index].shape
+actual.tobytes
+stored[index].tobytes
+trace['world_geometry'].get
+```
+
+写入目标：
+
+```python
+columns
+name
+arrays
+matches
+index
+actual
+stored
+failures
+row
+witnesses
+references
+reference
+row['geometry_witnesses']
+```
+
+直接调用符号：
 
 ```python
 state.joint_names.index

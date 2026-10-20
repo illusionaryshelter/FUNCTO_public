@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[数据文件审计](../../../sim-version-plans/2026-10-19-planner-data-provenance-audit/index.md)。
+代码基线：`__IMPLEMENTATION_COMMIT__`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 
@@ -47,9 +47,10 @@
 | `input-manifest.json` | 工作根目录、技能段、候选及图像/场景路径 | 记录入口选择明确任务与文件；清单本身不是几何 |
 | `scene.json` | 当前对象身份、功能绑定、入口、目标、名义附着、任务点与支撑要求 | `prepare_candidate/build_planning_problem` 或实验 `build_problem`；形成参考和硬要求 |
 | `feedback.json`、`robot_feedback.json` | 具名机器人 `q/dq`、手指状态、设备时间和标定 FK | 固定规划入口、机器人/手指几何与执行续接 |
-| `robot-fixture.json`、机器人 YAML、URDF、robot-only MJCF 和所引用模型文件 | 已知机器人运动学、实体、标定、关节限制、固定安装件和碰撞对 | 机器人配置、IK、`RobotStateValidator` 及设备绑定 |
+| `robot-fixture.json`、纯运动学 YAML/URDF | 关节树、坐标、标定、关节限制及明确实体对策略 | cuRobo FK/IK、Pinocchio FK 和设备绑定 |
+| `observed-robot.json` 与各连杆原始场 | 具名连杆、固定刚体分组、观测场或缺失状态；同源 TSDF 块用于深度过滤 | `ObservedBody`、机器人状态验证和场景查询 |
 | `contact-bindings.json` | 机器人材料、任务接触区域、对象对应、活动区间、接触条件 | `ContactRule/HoldingContact`；同一文件中机器人模型、源任务定义及当前区域各保留其职责 |
-| `owner-geometry.json`（可选） | 当前接口支持的显式物体基本体、覆盖球、位姿、附着与材料 | `bind_box_owner_materials/create_box_owner` 建立独立完整物体模型；现场 TSDF 持物方案对此路径的替换见当前计划 |
+| `observed-owner.json` 与所引用原始场 | 已保存实体模型、局部坐标、位姿路径与固定附着 | `load_observed_owner` 直接读取，后续技能复用相同场 |
 | `unknown-policy.json`、`fine-regions` JSON（可选） | 未知空间的明确处理策略；指定局部细化请求 | 场景构造和覆盖查询；策略允许尝试不表示该区域已观测为空 |
 | `finger-targets.json`、`execution-limits.json` | 原事件对应手指目标；设备、跟踪、停止及事件约束 | 手指曲线、候选检查和执行绑定 |
 | 关节参考 NPZ（可选） | 具名时间/进度上的关节参考 | `load_joint_reference` 提供候选参考 |
@@ -66,3 +67,5 @@
 仿真器通过 `scene.xml`、`initial-state.npz` 或 `episode.h5` 中的积分状态恢复运行环境；控制适配器向执行器提供机器人反馈。构造环境所用的内部状态不等于规划器可读的输入。相同的 HDF5 可以同时保存机器人编码器和环境对象状态，判断以实际读取的数据列与传递对象为准。
 
 `NativeSkillPhysicsEvaluator` 消费仿真实际运行环境中产生的真值，以及用于解释对象身份、源技能和评价条件的记录，产生物理效果报告。`step_callback` 的返回值不控制机器人指令，记录错误单独保存；外层运行器的 `physics_success` 用于事后输出。源 `evidence.json` 在技能提取中的事件职责与评价器在当前运行中的读取职责分别成立。
+
+实验运行器的 `snapshot.feedback_path` 明确指向图像采集时的机器人反馈，规划入口的反馈单独绑定。`owner-mask` 仅用于本次建立的实体；`background-mask` 可选定原观测的静态端点分区。已有实体复用时无需再次提供其 mask；背景世界坐标与原自由射线不随运动实体改变。

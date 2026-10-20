@@ -1,26 +1,11 @@
 # `manipulation/robot_self_filter.py` 实现契约
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。
-
-本模块的阶段职责与数据语义见[组件说明](../02-observation-and-collision.md)和[API 契约](../06-api-contracts.md)。[返回实现目录](../07-implementation-index.md)。
-
-## `RobotCollisionShape`
-
-[定义位置](../../../manipulation/robot_self_filter.py#L28)。
-
-```python
-class RobotCollisionShape:
-    name: str
-    kind: str
-    T_world_geometry: np.ndarray
-    source: str
-    dimensions: tuple = ()
-    vertices: np.ndarray | None = None
-```
+代码基线：`__IMPLEMENTATION_COMMIT__`。
+职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `validate_self_filter`
 
-[定义位置](../../../manipulation/robot_self_filter.py#L46)。
+[定义位置](../../../manipulation/robot_self_filter.py#L23)。
 
 输入签名：
 
@@ -28,13 +13,50 @@ class RobotCollisionShape:
 def validate_self_filter(value, depth_m):
 ```
 
-输出分支的源码表达式：
+实现说明：
+
+> Validate the only production observation contract, without mutation.
+> 
+> Unknown/SELF pixels contribute neither measured surfaces nor free rays.
+> ENVIRONMENT rays retain exactly their original finite positive depth; an
+> endpoint cannot be extended, guessed, or silently restored by a consumer.
+
+显式输出分支：
 
 ```python
 {'labels': labels, 'free_ray_depth_m': free, 'source': source}
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.asarray
+depth.ndim
+depth.size
+labels.dtype
+np.uint8
+labels.shape
+depth.shape
+np.isin(labels, (SELF, ENVIRONMENT, AMBIGUOUS_SHADOW)).all
+np.isin
+free.shape
+np.isfinite(free).all
+np.isfinite
+np.any
+np.array_equal
+```
+
+写入目标：
+
+```python
+depth
+labels
+free
+source
+environment
+```
+
+直接调用符号：
 
 ```python
 np.asarray
@@ -50,168 +72,164 @@ _name
 np.array_equal
 ```
 
-## `_shape`
-
-[定义位置](../../../manipulation/robot_self_filter.py#L72)。
-
-输入签名：
-
-```python
-def _shape(record, scale):
-```
-
-直接读取的对象属性：`record.kind`、`record.dimensions`、`record.vertices`。
-
-输出分支的源码表达式：
-
-```python
-_convex_solid(vertices * scale)
-coal.Box(*dimensions) if record.kind == 'box' else coal.Cylinder(*dimensions)
-```
-
-直接调用：
-
-```python
-ValueError
-np.asarray
-len
-_convex_solid
-{'box': 3, 'cylinder': 2}.get
-np.isfinite(dimensions).all
-np.isfinite
-np.any
-coal.Box
-coal.Cylinder
-```
-
-## `_world_bounds`
-
-[定义位置](../../../manipulation/robot_self_filter.py#L94)。
-
-输入签名：
-
-```python
-def _world_bounds(shape, pose, numerical_band):
-```
-
-输出分支的源码表达式：
-
-```python
-(np.nextafter(centre - extent, -np.inf), np.nextafter(centre + extent, np.inf))
-```
-
-直接调用：
-
-```python
-shape.computeLocalAABB
-np.asarray
-np.abs
-np.isfinite(np.r_[centre, extent]).all
-np.isfinite
-ValueError
-np.nextafter
-```
-
-## `_segment_rotations`
-
-[定义位置](../../../manipulation/robot_self_filter.py#L105)。
-
-输入签名：
-
-```python
-def _segment_rotations(directions):
-```
-
-输出分支的源码表达式：
-
-```python
-np.stack((first, np.cross(directions, first), directions), axis=2)
-```
-
-直接写入的状态或数组位置：`helper[:, 0]`、`helper[close]`。
-
-直接调用：
-
-```python
-np.zeros_like
-np.abs
-np.cross
-np.linalg.norm
-np.stack
-```
-
 ## `classify_depth`
 
-[定义位置](../../../manipulation/robot_self_filter.py#L116)。
+[定义位置](../../../manipulation/robot_self_filter.py#L50)。
 
 输入签名：
 
 ```python
-def classify_depth(*, observed_depth, K, T_world_camera, geometries, padding_scale, padding_offset_m, source):
+def classify_depth(*, observed_depth, K, T_world_camera, bodies, body_poses, block_checkpoints, depth_error_m, source, max_host_rss_bytes, max_device_used_bytes, device='cuda:0'):
 ```
 
-直接读取的对象属性：`record.name`、`record.source`、`record.T_world_geometry`、`result.clear`。
+实现说明：
 
-输出分支的源码表达式：
+> Classify measured endpoints using complete named robot FK at capture.
+> 
+> A strictly negative supported endpoint is SELF. A supported predicted hit
+> before the endpoint, including its declared depth error, is ambiguous.
+> Remaining valid pixels keep their original environment depth. Missing
+> robot observations are reported without filling their hidden geometry.
+
+显式输出分支：
 
 ```python
-{'self_filter': filtered, 'provenance': {'source': source, 'padding_scale': float(padding_scale), 'padding_offset_m': float(padding_offset_m), 'scale_centre': "each component's explicit geometry-local origin; pose translation unchanged", 'padding_definition': 'uniform local scaling followed by Coal Euclidean swept-sphere dilation', 'numerical_boundary_m': band, 'numerical_boundary_is_proved_error_bound': False, 'counts': {**counts, 'self_pixels': int(np.count_nonzero(labels == SELF)), 'environment_pixels': int(np.count_nonzero(labels == ENVIRONMENT)), 'ambiguous_shadow_pixels': int(np.count_nonzero(labels == AMBIGUOUS_SHADOW))}, 'geometries': [{'name': row[0].name, 'kind': row[0].kind, 'source': row[0].source, 'T_world_geometry': np.asarray(row[0].T_world_geometry).tolist()} for row in bodies], 'input_depth_modified': False, 'renderer_used': False, 'free_ray_policy': 'only ENVIRONMENT retains original depth; SELF and AMBIGUOUS_SHADOW are zero', 'self_scope': 'strict interior of declared nominal collision model; not certified physical robot identity', 'shadow_scope': 'closed finite camera-to-observation segment; not an infinite ray'}}
+{'self_filter': filtered, 'predicted_depth_m': np.where(np.isfinite(nearest), nearest, 0.0), 'provenance': {'model': 'same_observed_robot_fields', 'bodies': counts, 'depth_error_m': float(depth_error_m)}}
 ```
 
-直接写入的状态或数组位置：`request.enable_signed_distance`、`counts['point_queries']`、`state[index]`、`counts['nonfinite_queries']`、`segment.halfLength`、`counts['segment_queries']`、`labels[pixels]`。
-
-直接调用：
+读取的对象属性：
 
 ```python
 np.asarray
-ValueError
-_intrinsics
-_rigid_pose
-_name
-isinstance
-np.isscalar
+depth.ndim
+depth.size
 np.isfinite
-len
-coal.DistanceRequest
-max
-float
-set
-names.add
-_shape
-nominal.clone
-padded.setSweptSphereRadius
-bodies.append
-coal.Transform3s
-_world_bounds
-np.full
-np.flatnonzero
-depth.ravel
-coal.Sphere
-coal.Capsule
-coal.DistanceResult
+depth.shape
+np.indices
+np.stack
+np.ones_like
+np.linalg.inv(np.asarray(K, float)).T
 np.linalg.inv
-range
-np.divmod
-np.column_stack
-np.ones
-np.errstate
-np.hypot
-np.isfinite(endpoints).all
-np.where(finite, ENVIRONMENT, AMBIGUOUS_SHADOW).astype
+np.linalg
 np.where
-np.all
-query_pose.setIdentity
-query_pose.setTranslation
-result.clear
-coal.distance
+world_camera[:3, :3].T
+np.where(valid, ENVIRONMENT, AMBIGUOUS_SHADOW).astype
+np.uint8
+np.full
+np.inf
+body.field
+body.name
+field.sample
+field.shape
+field.voxel_size
+np.nextafter
+np.zeros
+field.origin
+torch.tensor
+torch.float32
+Mapper.load_blocks
+mapper.render
+tensor.to_device
+Pose.from_matrix
+rendered.detach().cpu().numpy().reshape
+rendered.detach().cpu().numpy
+rendered.detach().cpu
+rendered.detach
+render_valid.detach().cpu().numpy().reshape
+render_valid.detach().cpu().numpy
+render_valid.detach().cpu
+render_valid.detach
+camera_local[:3, :3].T
 np.minimum
-np.maximum
-_segment_rotations
-enumerate
-query_pose.setRotation
-labels.reshape
-validate_self_filter
+own.sum
+accepted.sum
+```
+
+写入目标：
+
+```python
+depth
+height
+width
+y
+x
+rays
+valid
+endpoints_camera
+world_camera
+endpoints
+labels
+nearest
+tensor
+counts
+body
+counts[body.name]
+field
+matrix
+values
+supported
+_
+error
+own
+labels[own]
+extent
+center
+config
+bound
+mapper
+camera_local
+rendered
+render_valid
+candidates
+hits
+supported_hits
+accepted
+shadow
+labels[shadow]
+filtered
+```
+
+直接调用符号：
+
+```python
+np.asarray
+np.isfinite
+ValueError
+np.indices
+np.stack
+np.ones_like
+np.linalg.inv
+np.where
+np.where(valid, ENVIRONMENT, AMBIGUOUS_SHADOW).astype
+np.full
+DeviceCfg
+field.sample
+inverse_points
+np.nextafter
+np.zeros
+MapperCfg
+tuple
+torch.tensor
+_mapper_memory_bound
+require_host_memory
+require_device_memory
+Mapper.load_blocks
+mapper.render
+tensor.to_device
+_mapper_intrinsics
+Pose.from_matrix
+rendered.detach().cpu().numpy().reshape
+rendered.detach().cpu().numpy
+rendered.detach().cpu
+rendered.detach
+render_valid.detach().cpu().numpy().reshape
+render_valid.detach().cpu().numpy
+render_valid.detach().cpu
+render_valid.detach
+np.minimum
 int
-np.count_nonzero
-np.asarray(row[0].T_world_geometry).tolist
+own.sum
+accepted.sum
+validate_self_filter
+float
 ```

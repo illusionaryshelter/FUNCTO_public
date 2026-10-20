@@ -10,7 +10,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.transform import Rotation
 
 from manipulation.grasp_region import check_grasp_region_compatibility
-from manipulation.robot_geometry_check import _feature_region, _feature_region_halfspaces
+from manipulation.grasp_region import _feature_region_halfspaces
 
 
 def permission(side, *, half_gap=.02, material=None, rule_id=None, joints=1, joint=0):
@@ -26,7 +26,7 @@ def permission(side, *, half_gap=.02, material=None, rule_id=None, joints=1, joi
                 patch_axes=np.column_stack(([0., 1., 0.], [0., 0., side], [side, 0., 0.])),
                 patch_half_size=[.01, .01], gap_bounds=[-.00001, .00001],
                 normal_tolerance_rad=.01, modeling_allowance_m=0., geometry_error_m=0.,
-                minimum_thickness_m=.01, numerical_position_tolerance_m=.000001,
+                numerical_position_tolerance_m=.000001,
                 numerical_angle_tolerance_rad=.000001)
 
 
@@ -70,6 +70,13 @@ def test_each_material_needs_a_common_q_not_separate_incompatible_witnesses():
     assert accepted["status"] == "compatible"
     np.testing.assert_allclose(accepted["hypothetical_finger_positions_m"], [.01, .03], atol=2e-6)
 
+def test_source_feature_heights_are_preserved_without_plane_projection():
+    rule = permission(-1)
+    rule["feature_points"][1, 0] = 4e-7
+    original = rule["feature_points"].copy()
+    assert query([rule])["status"] == "compatible"
+    np.testing.assert_array_equal(rule["feature_points"], original)
+
 
 def test_alternative_rules_for_one_material_are_or_not_and():
     unreachable = permission(-1, rule_id="left_elsewhere")
@@ -108,7 +115,7 @@ def test_rigid_gauge_change_and_witnesses_agree_with_existing_fixed_q_checker():
     assert result["status"] == "compatible"
     q = np.asarray(result["hypothetical_finger_positions_m"])
     for rule, point in zip(rules, result["hypothetical_reference_contact_points"]):
-        region, reason = _feature_region(rule, transform, transform, q)
+        region, _, reason = _feature_region_halfspaces(rule, transform, transform, q)
         assert reason is None
         assert np.max(region[0] @ point-region[1]) <= 2e-9
 

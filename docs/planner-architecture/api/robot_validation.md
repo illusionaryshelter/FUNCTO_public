@@ -1,8 +1,7 @@
 # `manipulation/robot_validation.py` 实现契约
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。
-
-本模块的阶段职责与数据语义见[组件说明](../05-acceptance-and-execution.md)和[API 契约](../06-api-contracts.md)。[返回实现目录](../07-implementation-index.md)。
+代码基线：`__IMPLEMENTATION_COMMIT__`。
+职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_positive_scalar`
 
@@ -14,13 +13,24 @@
 def _positive_scalar(value, label):
 ```
 
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 float(value)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.isscalar
+np.isfinite
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 isinstance
@@ -35,30 +45,82 @@ float
 [定义位置](../../../manipulation/robot_validation.py#L26)。
 
 ```python
-class RobotStateValidator:
-    ...
-    ...
+class RobotStateValidator():
 ```
 
-该类型的直接方法：`__init__`、`_planning_positions`、`validate_planning_binding`、`check_planning_self`、`check_planning_world`、`planning_binding_record`、`describe`、`_pose_difference`、`check_state`、`preflight`。
+类字段：
+
+```python
+name = 'pinocchio_observed_robot_state'
+```
+
+实现说明：
+
+> Named limits, calibrated model identity and observed robot pair checks.
+> 
+> Pair declarations are independent of task identity and distance evidence.
+> Missing robot observations remain coverage records. Numerical distance
+> uncertainty of two represented fields remains an explicit failed query.
 
 ## `RobotStateValidator.__init__`
 
-[定义位置](../../../manipulation/robot_validation.py#L43)。
+[定义位置](../../../manipulation/robot_validation.py#L36)。
 
 输入签名：
 
 ```python
-def RobotStateValidator.__init__(self, checker, *, joint_names, arm_joint_names, finger_joint_names, pairs, named_velocity_limits, reference_frame, T_reference_base, tool_frame, T_frame_tcp, fk_translation_tolerance_m, fk_rotation_tolerance_rad, source):
+def __init__(self, checker, *, joint_names, arm_joint_names, finger_joint_names, pairs, named_velocity_limits, reference_frame, T_reference_base, tool_frame, T_frame_tcp, fk_translation_tolerance_m, fk_rotation_tolerance_rad, source):
 ```
 
-直接读取的对象属性：`self.joint_names`、`self.arm_joint_names`、`self.finger_joint_names`、`self.tool_frame`、`self.fk_rotation_tolerance_rad`、`self.velocity_limits`、`self.pairs`。
+显式输出分支：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+无显式条目。
 
-直接写入的状态或数组位置：`self.checker`、`self.joint_names`、`self.arm_joint_names`、`self.finger_joint_names`、`self.reference_frame`、`self.tool_frame`、`self.T_reference_base`、`self.T_frame_tcp`、`self.fk_translation_tolerance_m`、`self.fk_rotation_tolerance_rad`、`self.source`、`self.velocity_limits`、`self.pairs`、`self.required_pairs`。
+读取的对象属性：
 
-直接调用：
+```python
+self.joint_names
+self.arm_joint_names
+self.finger_joint_names
+checker.joint_names
+checker._frame_id
+self.tool_frame
+self.fk_rotation_tolerance_rad
+np.pi
+self.velocity_limits
+checker.joint_velocity_limits
+self.pairs
+pair.policy
+checker.geometry_names
+pair.first
+pair.second
+pair.source
+```
+
+写入目标：
+
+```python
+self.checker
+self.joint_names
+self.arm_joint_names
+self.finger_joint_names
+self.reference_frame
+self.tool_frame
+self.T_reference_base
+self.T_frame_tcp
+self.fk_translation_tolerance_m
+self.fk_rotation_tolerance_rad
+self.source
+self.velocity_limits
+name
+self.pairs
+self.required_pairs
+pair
+expected
+supplied
+```
+
+直接调用符号：
 
 ```python
 isinstance
@@ -78,23 +140,80 @@ any
 
 ## `RobotStateValidator._planning_positions`
 
-[定义位置](../../../manipulation/robot_validation.py#L90)。
+[定义位置](../../../manipulation/robot_validation.py#L83)。
 
 输入签名：
 
 ```python
-def RobotStateValidator._planning_positions(self, joint_positions, joint_names, *, time_s, gripper):
+def _planning_positions(self, joint_positions, joint_names, *, time_s, gripper):
 ```
 
-直接读取的对象属性：`self.joint_names`、`self.finger_joint_names`、`self.arm_joint_names`、`self.checker`。
+实现说明：
 
-输出分支的源码表达式：
+> Complete only declared coordinates; identify unknown descendants.
+> 
+> Pinocchio requires the complete tree coordinates even when an actuator
+> has no future geometry model. Interior placeholders affect only that
+> actuator's descendants, which are explicitly excluded from acceptance.
+
+显式输出分支：
 
 ```python
 (np.asarray([named[name] for name in self.joint_names]), unmodelled)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.asarray
+self.joint_names
+values.shape
+values.dtype.kind
+values.dtype
+np.isfinite(values).all
+np.isfinite
+np.isscalar
+values.astype
+gripper.joint_names
+self.finger_joint_names
+gripper.controller
+self.arm_joint_names
+gripper.current_positions
+gripper.nominal_finger_trajectory
+gripper.nominal_finger_trajectory.valid_mask
+model.joint_names
+np.asarray(time_s).dtype
+time_dtype.kind
+model.duration
+model.valid_until_s
+model.sample
+self.checker.joint_limits
+self.checker
+self.checker.geometry_depending_on
+fingers.shape
+fingers.dtype.kind
+fingers.dtype
+np.isfinite(fingers).all
+named.update
+fingers.astype
+```
+
+写入目标：
+
+```python
+names
+values
+named
+unmodelled
+fingers
+model
+time_dtype
+sample_time
+_
+name
+```
+
+直接调用符号：
 
 ```python
 tuple
@@ -120,19 +239,57 @@ fingers.astype
 
 ## `RobotStateValidator.validate_planning_binding`
 
-[定义位置](../../../manipulation/robot_validation.py#L150)。
+[定义位置](../../../manipulation/robot_validation.py#L143)。
 
 输入签名：
 
 ```python
-def RobotStateValidator.validate_planning_binding(self, problem, gripper):
+def validate_planning_binding(self, problem, gripper):
 ```
 
-直接读取的对象属性：`problem.reference_frame`、`self.reference_frame`、`problem.tool_link`、`self.tool_frame`、`problem.base_pose`、`self.T_reference_base`、`problem.tool_transform`、`self.T_frame_tcp`、`self._planning_positions`、`problem.start_q`、`problem.joint_names`、`self.checker`、`self.finger_joint_names`。
+实现说明：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+> Bind model identity and measured entrance before allocating solvers.
+> 
+> Collision feasibility remains the entrance gate's responsibility. This
+> checks the source model, calibration and coordinate partition without
+> reconstructing geometry or replacing the supplied measured entrance.
 
-直接调用：
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+problem.reference_frame
+self.reference_frame
+problem.tool_link
+self.tool_frame
+np.array_equal
+problem.base_pose
+self.T_reference_base
+problem.tool_transform
+self.T_frame_tcp
+self._planning_positions
+problem.start_q
+problem.joint_names
+gripper.joint_limits
+self.checker.joint_limits
+self.checker
+self.finger_joint_names
+gripper.controller
+gripper.current_positions
+```
+
+写入目标：
+
+```python
+name
+named
+```
+
+直接调用符号：
 
 ```python
 np.array_equal
@@ -144,29 +301,80 @@ zip
 
 ## `RobotStateValidator.check_planning_self`
 
-[定义位置](../../../manipulation/robot_validation.py#L171)。
+[定义位置](../../../manipulation/robot_validation.py#L164)。
 
 输入签名：
 
 ```python
-def RobotStateValidator.check_planning_self(self, joint_positions, joint_names, *, time_s, gripper):
+def check_planning_self(self, joint_positions, joint_names, *, time_s, gripper):
 ```
 
-直接读取的对象属性：`self._planning_positions`、`self.pairs`、`self.checker`、`self.joint_names`、`self.T_reference_base`。
+实现说明：
 
-输出分支的源码表达式：
+> Check all known required native pairs at this one physical instant.
+> 
+> Each required pair uses the registered observed fields at the supplied
+> full joint state. ``passed`` covers only represented
+> geometry; an unmodelled future hand is reported explicitly. Scalar
+> joint limits still apply even when mechanical contact is permitted.
+
+显式输出分支：
 
 ```python
-{'passed': passed, 'residual': float(not passed), 'queried_pairs': len(pairs), 'minimum_required_clearance_m': None if minimum is None else minimum['signed_distance_m'], 'unmodelled_geometry_names': list(unmodelled), 'violations': violations, 'minimum_pair': minimum, 'joint_limit_violations': limits, 'rounded_limit_representations': rounded_limits, 'joint_names': result['joint_names'], 'joint_positions': result['joint_positions']}
+{'passed': passed, 'residual': float(not passed), 'queried_pairs': len(pairs), 'minimum_required_clearance_lower_m': None if minimum is None else minimum['lower_m'], 'missing_observation_pairs': missing, 'unmodelled_geometry_names': list(unmodelled), 'violations': violations, 'minimum_pair': minimum, 'joint_limit_violations': limits, 'rounded_limit_representations': rounded_limits, 'joint_names': result['joint_names'], 'joint_positions': result['joint_positions']}
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+self._planning_positions
+self.pairs
+pair.policy
+pair.first
+pair.second
+self.checker.query
+self.checker
+self.joint_names
+self.T_reference_base
+row.get
+np.asarray
+active.dtype.kind
+active.dtype
+limits.items
+rounded_limits.append
+```
+
+写入目标：
+
+```python
+positions
+unmodelled
+unknown
+pairs
+pair
+result
+violations
+row
+distances
+minimum
+missing
+limits
+rounded_limits
+active
+active_values
+name
+boundary
+passed
+```
+
+直接调用符号：
 
 ```python
 self._planning_positions
 set
 tuple
 self.checker.query
+row.get
 min
 dict
 np.asarray
@@ -179,65 +387,45 @@ len
 list
 ```
 
-## `RobotStateValidator.check_planning_world`
-
-[定义位置](../../../manipulation/robot_validation.py#L217)。
-
-输入签名：
-
-```python
-def RobotStateValidator.check_planning_world(self, joint_positions, joint_names, *, time_s, gripper, scene_checker, progress, nominal_owner_poses, layer_selection, robot_owner_permission_progress):
-```
-
-直接读取的对象属性：`self._planning_positions`、`self.pairs`、`self.joint_names`、`self.T_reference_base`、`self.tool_frame`、`self.T_frame_tcp`、`self.finger_joint_names`。
-
-输出分支的源码表达式：
-
-```python
-{'residual': float(not scene['passed']), 'scene': scene, 'unmodelled_geometry_names': list(unmodelled), 'joint_names': list(self.joint_names), 'joint_positions': positions.tolist()}
-```
-
-直接写入的状态或数组位置：`robot['unmodelled_geometry_names']`。
-
-直接调用：
-
-```python
-isinstance
-TypeError
-self._planning_positions
-set
-scene_checker._scene_native_aliases.values
-tuple
-scene_checker.query
-np.asarray
-self.joint_names.index
-scene_checker.query_scene
-float
-list
-positions.tolist
-```
-
 ## `RobotStateValidator.planning_binding_record`
 
-[定义位置](../../../manipulation/robot_validation.py#L257)。
+[定义位置](../../../manipulation/robot_validation.py#L215)。
 
 输入签名：
 
 ```python
-def RobotStateValidator.planning_binding_record(self):
+def planning_binding_record(self):
 ```
 
-直接读取的对象属性：`self.describe`、`record.pop`、`self.checker`。
+实现说明：
 
-输出分支的源码表达式：
+> Freeze the same source geometry, complete pair policy and numerics.
+
+显式输出分支：
 
 ```python
 record
 ```
 
-直接写入的状态或数组位置：`record['pair_order']`、`record['model']`、`record['scope']`。
+读取的对象属性：
 
-直接调用：
+```python
+self.describe
+record.pop
+self.checker.model_record
+self.checker
+```
+
+写入目标：
+
+```python
+record
+record['pair_order']
+record['model']
+record['scope']
+```
+
+直接调用符号：
 
 ```python
 self.describe
@@ -247,23 +435,59 @@ self.checker.model_record
 
 ## `RobotStateValidator.describe`
 
-[定义位置](../../../manipulation/robot_validation.py#L268)。
+[定义位置](../../../manipulation/robot_validation.py#L226)。
 
 输入签名：
 
 ```python
-def RobotStateValidator.describe(self):
+def describe(self):
 ```
 
-直接读取的对象属性：`self.name`、`self.source`、`self.joint_names`、`self.arm_joint_names`、`self.finger_joint_names`、`self.checker`、`self.reference_frame`、`self.T_reference_base`、`self.tool_frame`、`self.T_frame_tcp`、`self.velocity_limits`、`self.required_pairs`、`self.pairs`、`self.fk_translation_tolerance_m`、`self.fk_rotation_tolerance_rad`。
+实现说明：
 
-输出分支的源码表达式：
+> Static report defines the order of every per-state distance vector.
+
+显式输出分支：
 
 ```python
 {'name': self.name, 'source': self.source, 'joint_names': list(self.joint_names), 'arm_joint_names': list(self.arm_joint_names), 'finger_joint_names': list(self.finger_joint_names), 'urdf_path': self.checker.urdf_path, 'base_frame': self.checker.base_frame, 'reference_frame': self.reference_frame, 'T_reference_base': self.T_reference_base.tolist(), 'tool_frame': self.tool_frame, 'T_frame_tcp': self.T_frame_tcp.tolist(), 'joint_position_limits': {name: list(self.checker.joint_limits[name]) for name in self.joint_names}, 'joint_velocity_limits': dict(self.velocity_limits), 'geometry_sources': self.checker.geometry_sources, 'pair_order': [asdict(pair) for pair in self.required_pairs], 'pair_policy': [asdict(pair) for pair in self.pairs], 'numerics': dict(self.checker.numerics), 'fk_model_translation_tolerance_m': self.fk_translation_tolerance_m, 'fk_model_rotation_tolerance_rad': self.fk_rotation_tolerance_rad, 'fk_tolerance_scope': 'Consistency of known robot models/calibration at the same measured joints; even a 1e-8 tolerance is not physical Cartesian sensing accuracy', 'robot_pose_scope': 'Fixed calibrated base and TCP FK estimates from measured joint positions; no independent Cartesian observation', 'scope': 'known robot/installation native pair policy, model FK and joint limits', 'observed_scene_checked': False, 'unknown_space_checked': False, 'continuous_collision_certified': False, 'world_collision_checked': False}
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+self.name
+self.source
+self.joint_names
+self.arm_joint_names
+self.finger_joint_names
+self.checker.urdf_path
+self.checker
+self.checker.base_frame
+self.reference_frame
+self.T_reference_base.tolist
+self.T_reference_base
+self.tool_frame
+self.T_frame_tcp.tolist
+self.T_frame_tcp
+self.checker.joint_limits
+self.velocity_limits
+self.checker.geometry_sources
+self.required_pairs
+self.pairs
+self.checker.numerics
+self.fk_translation_tolerance_m
+self.fk_rotation_tolerance_rad
+```
+
+写入目标：
+
+```python
+name
+pair
+```
+
+直接调用符号：
 
 ```python
 list
@@ -275,21 +499,35 @@ asdict
 
 ## `RobotStateValidator._pose_difference`
 
-[定义位置](../../../manipulation/robot_validation.py#L292)。
+[定义位置](../../../manipulation/robot_validation.py#L250)。
 
 输入签名：
 
 ```python
-def RobotStateValidator._pose_difference(self, actual, expected):
+def _pose_difference(self, actual, expected):
 ```
 
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 {'translation_m': float(np.linalg.norm(actual[:3, 3] - expected[:3, 3])), 'rotation_rad': float(Rotation.from_matrix(expected[:3, :3].T @ actual[:3, :3]).magnitude())}
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.linalg.norm
+np.linalg
+Rotation.from_matrix(expected[:3, :3].T @ actual[:3, :3]).magnitude
+Rotation.from_matrix
+expected[:3, :3].T
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 float
@@ -300,23 +538,89 @@ Rotation.from_matrix
 
 ## `RobotStateValidator.check_state`
 
-[定义位置](../../../manipulation/robot_validation.py#L296)。
+[定义位置](../../../manipulation/robot_validation.py#L254)。
 
 输入签名：
 
 ```python
-def RobotStateValidator.check_state(self, feedback, *, stage, trajectory_time):
+def check_state(self, feedback, *, stage, trajectory_time):
 ```
 
-直接读取的对象属性：`self.joint_names`、`self.arm_joint_names`、`self.finger_joint_names`、`self.reference_frame`、`self.tool_frame`、`self.T_frame_tcp`、`self.checker`、`self.T_reference_base`、`self.required_pairs`、`self._pose_difference`、`self.fk_translation_tolerance_m`、`self.fk_rotation_tolerance_rad`、`self.velocity_limits`。
+实现说明：
 
-输出分支的源码表达式：
+> Gate full actual q, after the executor validates identity and time.
+> 
+> Clock freshness and physical tracking use the execution layer's own
+> # BEGIN independent models do not manufacture independent measurements.
+> guard. This independently checks model-frame identity, joint limits,
+> observed robot separation and backend FK versus Pinocchio FK at the same
+> measured q. Fixed-base/TCP consistency tolerances, including 1e-8 values,
+> are numerical/model requirements, not sensor-accuracy certificates.
+> # END original physical tracking limits remain owned by ExecutionLimits.
+> No actuator command is read by this function.
+
+显式输出分支：
 
 ```python
 report
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.isscalar
+np.isfinite
+self.joint_names
+self.arm_joint_names
+self.finger_joint_names
+self.reference_frame
+self.tool_frame
+np.array_equal
+self.T_frame_tcp
+np.asarray
+velocities.shape
+velocities.dtype.kind
+velocities.dtype
+np.isfinite(velocities).all
+self.checker.query
+self.checker
+self.T_reference_base
+self.required_pairs
+self._pose_difference
+self.fk_translation_tolerance_m
+self.fk_rotation_tolerance_rad
+violations.append
+result['joint_limit_violations'].items
+self.velocity_limits
+row.get
+```
+
+写入目标：
+
+```python
+key
+expected
+tool_transform
+base
+estimated_tool
+velocities
+result
+expected_tool
+base_error
+tool_error
+violations
+name
+error
+metric
+maximum
+row
+velocity
+index
+required
+report
+```
+
+直接调用符号：
 
 ```python
 _name
@@ -338,30 +642,117 @@ abs
 float
 enumerate
 deepcopy
+row.get
 min
 ```
 
 ## `RobotStateValidator.preflight`
 
-[定义位置](../../../manipulation/robot_validation.py#L368)。
+[定义位置](../../../manipulation/robot_validation.py#L330)。
 
 输入签名：
 
 ```python
-def RobotStateValidator.preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0.0, until=None, current_time=None):
+def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0.0, until=None, current_time=None):
 ```
 
-直接读取的对象属性：`trajectory.joint_names`、`self.arm_joint_names`、`self.joint_names`、`self.finger_joint_names`、`trajectory.duration`、`self.check_state`、`trajectory.times`、`trajectory.position`、`trajectory.velocity`、`trajectory.executable_until`、`trajectory._curve`、`self.checker`、`self.velocity_limits`。
+实现说明：
 
-输出分支的源码表达式：
+> Check actual entrance and reference cubic q/dq over its whole prefix.
+> 
+> Each scalar cubic's exact polynomial derivative supplies its critical
+> times through SciPy's maintained root solver. Values are evaluated in
+> binary64; this is a polynomial range check, not formal exact arithmetic.
+> It certifies neither future finger positions nor continuous collision.
+> The original evidence barrier defines the end of the checked prefix.
+
+显式输出分支：
 
 ```python
 {'passed': not violations and initial['passed'], 'violations': violations, 'scope': 'Known robot geometry at measured entrance, model FK and scalar reference q/dq', 'checked_interval_s': [float(start_time), stop], 'reference_cubic_extrema': extrema, 'actual_state': initial, 'future_finger_states_assumed': False, 'reference_collision_checked': False, 'continuous_collision_certified': False, 'observed_scene_checked': False, 'world_collision_checked': False, 'unknown_space_checked': False}
 ```
 
-直接写入的状态或数组位置：`row[label]`、`extrema[name]`。
+读取的对象属性：
 
-直接调用：
+```python
+trajectory.joint_names
+self.arm_joint_names
+execution_limits.joint_names
+self.joint_names
+execution_limits.arm_joint_names
+execution_limits.finger_joint_names
+self.finger_joint_names
+np.isscalar
+np.isfinite
+trajectory.duration
+self.check_state
+np.asarray
+trajectory.times
+trajectory.position
+trajectory.velocity
+times.ndim
+np.isfinite(times).all
+np.any
+np.diff
+positions.shape
+velocities.shape
+np.isfinite(positions).all
+np.isfinite(velocities).all
+trajectory.executable_until
+np.array_equal
+curve.x
+trajectory._curve.x
+trajectory._curve
+curve.c
+trajectory._curve.c
+np.unique
+np.r_
+scalar.derivative(order + 1).roots
+scalar.derivative
+np.isfinite(values).all
+np.argmin
+np.argmax
+self.checker.joint_limits
+self.checker
+violations.append
+self.velocity_limits
+```
+
+写入目标：
+
+```python
+current_time
+initial
+times
+positions
+velocities
+expected_shape
+stop
+curve
+violations
+extrema
+endpoints
+index
+name
+scalar
+row
+order
+label
+roots
+candidates
+values
+lower_index
+upper_index
+row[label]
+lower
+upper
+bound
+expected
+value
+extrema[name]
+```
+
+直接调用符号：
 
 ```python
 tuple

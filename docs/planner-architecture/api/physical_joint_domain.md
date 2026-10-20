@@ -1,8 +1,7 @@
 # `manipulation/physical_joint_domain.py` 实现契约
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。
-
-本模块的阶段职责与数据语义见[组件说明](../04-solver-and-search.md)和[API 契约](../06-api-contracts.md)。[返回实现目录](../07-implementation-index.md)。
+代码基线：`__IMPLEMENTATION_COMMIT__`。
+职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `JointDomainInitializationError`
 
@@ -10,9 +9,15 @@
 
 ```python
 class JointDomainInitializationError(ValueError):
-    ...
-    ...
 ```
+
+类字段：
+
+无显式条目。
+
+实现说明：
+
+> A bounded initializer construction failed for the unchanged actual.
 
 ## `cubic_position_report`
 
@@ -24,13 +29,47 @@ class JointDomainInitializationError(ValueError):
 def cubic_position_report(curve: CubicHermiteSpline, lower: np.ndarray, upper: np.ndarray) -> dict:
 ```
 
-输出分支的源码表达式：
+实现说明：
+
+> Check an exported polynomial independently of native free controls.
+
+显式输出分支：
 
 ```python
 {'maximum_bound_excess': maximum, 'maximum_violation': witness}
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+np.ndarray
+curve.c
+curve.x
+polynomial.derivative().roots
+polynomial.derivative
+np.unique
+np.r_
+np.isfinite
+np.isfinite(values).all
+np.maximum
+excess.argmax
+```
+
+写入目标：
+
+```python
+maximum
+witness
+joint
+polynomial
+roots
+times
+values
+excess
+index
+```
+
+直接调用符号：
 
 ```python
 range
@@ -54,12 +93,16 @@ float
 [定义位置](../../../manipulation/physical_joint_domain.py#L49)。
 
 ```python
-class JointPositionDomain:
-    ...
-    ...
+class JointPositionDomain():
 ```
 
-该类型的直接方法：`__init__`、`feasible`、`recovery_step`、`validate`、`validate_scales`、`limit_step`、`limit_step_tensor`。
+类字段：
+
+无显式条目。
+
+实现说明：
+
+> Named finite scalar joint intervals for native single-state IK.
 
 ## `JointPositionDomain.__init__`
 
@@ -68,16 +111,40 @@ class JointPositionDomain:
 输入签名：
 
 ```python
-def JointPositionDomain.__init__(self, lower: torch.Tensor, upper: torch.Tensor):
+def __init__(self, lower: torch.Tensor, upper: torch.Tensor):
 ```
 
-直接读取的对象属性：`self.lower`、`self.upper`。
+显式输出分支：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+无显式条目。
 
-直接写入的状态或数组位置：`self.lower`、`self.upper`。
+读取的对象属性：
 
-直接调用：
+```python
+torch.Tensor
+lower.detach().reshape(-1).to
+lower.detach().reshape
+lower.detach
+torch.float64
+upper.detach().reshape(-1).to
+upper.detach().reshape
+upper.detach
+torch.isfinite(self.lower).all
+torch.isfinite
+self.lower
+torch.isfinite(self.upper).all
+self.upper
+(self.lower < self.upper).all
+```
+
+写入目标：
+
+```python
+self.lower
+self.upper
+```
+
+直接调用符号：
 
 ```python
 lower.detach().reshape(-1).to
@@ -101,18 +168,34 @@ ValueError
 输入签名：
 
 ```python
-def JointPositionDomain.feasible(self, action: torch.Tensor) -> torch.Tensor:
+def feasible(self, action: torch.Tensor) -> torch.Tensor:
 ```
 
-直接读取的对象属性：`self.lower`、`self.upper`。
-
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 (torch.isfinite(values) & (values >= self.lower) & (values <= self.upper)).all(dim=(-1, -2))
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+torch.Tensor
+action.to
+torch.float64
+(torch.isfinite(values) & (values >= self.lower) & (values <= self.upper)).all
+torch.isfinite
+self.lower
+self.upper
+```
+
+写入目标：
+
+```python
+values
+```
+
+直接调用符号：
 
 ```python
 action.to
@@ -127,16 +210,28 @@ torch.isfinite
 输入签名：
 
 ```python
-def JointPositionDomain.recovery_step(self, base, gradient, step_limits, scales):
+def recovery_step(self, base, gradient, step_limits, scales):
 ```
 
-输出分支的源码表达式：
+实现说明：
+
+> Return a legal descent direction; the caller must verify cost decrease.
+
+显式输出分支：
 
 ```python
 recover_position_step(self, base, gradient, step_limits, scales)
 ```
 
-直接调用：
+读取的对象属性：
+
+无显式条目。
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 recover_position_step
@@ -149,18 +244,36 @@ recover_position_step
 输入签名：
 
 ```python
-def JointPositionDomain.validate(self, action: torch.Tensor) -> torch.Tensor | None:
+def validate(self, action: torch.Tensor) -> torch.Tensor | None:
 ```
 
-直接读取的对象属性：`self.feasible`。
+实现说明：
 
-输出分支的源码表达式：
+> Raise outside a graph; return a recorded predicate inside its scope.
+> 
+> Graph callers must use the predicate to isolate invalid actions before
+> a rollout. Recording an error alone would still let a captured kernel
+> consume that action before the enclosing block reports the failure.
+
+显式输出分支：
 
 ```python
 require_tensor(self.feasible(action).all(), 'An optimizer action left the physical joint domain', error_type=JointDomainInitializationError)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+torch.Tensor
+self.feasible(action).all
+self.feasible
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 require_tensor
@@ -175,13 +288,31 @@ self.feasible
 输入签名：
 
 ```python
-@staticmethod
-def JointPositionDomain.validate_scales(scales: torch.Tensor) -> None:
+def validate_scales(scales: torch.Tensor) -> None:
 ```
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+实现说明：
 
-直接调用：
+> Validate the fixed native line-search multipliers outside capture.
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+torch.Tensor
+torch.isfinite(scales).all
+torch.isfinite
+(scales >= 0).all
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 require_tensor
@@ -197,18 +328,40 @@ torch.isfinite
 输入签名：
 
 ```python
-def JointPositionDomain.limit_step(self, base: torch.Tensor, step: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+def limit_step(self, base: torch.Tensor, step: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 ```
 
-直接读取的对象属性：`self.validate`、`self.validate_scales`、`self.limit_step_tensor`。
+实现说明：
 
-输出分支的源码表达式：
+> Shorten one direction before constructing any native trial action.
+> 
+> Every nonnegative line-search scale retains its ratio on the same
+> direction. Convexity of the physical position domain justifies the
+> scalar bisection. Rechecking the actual native-dtype trial arithmetic
+> handles rounding at a physical boundary without widening that domain.
+
+显式输出分支：
 
 ```python
 limited
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+torch.Tensor
+self.validate
+self.validate_scales
+self.limit_step_tensor
+```
+
+写入目标：
+
+```python
+limited
+```
+
+直接调用符号：
 
 ```python
 self.validate
@@ -223,19 +376,63 @@ self.limit_step_tensor
 输入签名：
 
 ```python
-def JointPositionDomain.limit_step_tensor(self, base: torch.Tensor, step: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+def limit_step_tensor(self, base: torch.Tensor, step: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 ```
 
-直接读取的对象属性：`self.feasible`。
+实现说明：
 
-输出分支的源码表达式：
+> Apply the exact step map to an already validated base/scales.
+> 
+> Eager calls can return an unchanged full step after checking every
+> actual trial. Graph/warmup scopes retain device-only control flow.
+> The optimizer separately validates the resulting trial predicates
+> before calling either native rollout.
+
+显式输出分支：
 
 ```python
 step
 limited
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+torch.Tensor
+torch.isfinite(step).all
+torch.isfinite
+torch.where
+torch.zeros_like
+scales.max
+torch.ones_like
+self.feasible
+step.device.type
+step.device
+torch.cuda.is_current_stream_capturing
+torch.cuda
+full.all
+self.feasible(trials).all
+```
+
+写入目标：
+
+```python
+finite
+step
+maximum
+low
+high
+full
+eager
+trials
+_
+middle
+trial_step
+passed
+limited
+```
+
+直接调用符号：
 
 ```python
 torch.isfinite(step).all
@@ -259,11 +456,20 @@ range
 
 ```python
 class CubicJointDomain(JointPositionDomain):
-    ...
-    ...
 ```
 
-该类型的直接方法：`__init__`、`evaluate`、`fit_reference`、`recovery_step`、`coefficients`、`_relative_coefficients`、`extrema`、`feasible`、`_construct_anchor`、`initialize`。
+类字段：
+
+无显式条目。
+
+实现说明：
+
+> Exact position domain of the shared instantaneous-boundary cubic.
+> 
+> Only measured q0/dq0 are fixed. Acceleration and jerk remain optimizable
+> immediately; the original three terminal copies retain a stopped end.
+> Free controls themselves have no invented box: only the represented
+> physical q(t) determines this domain.
 
 ## `CubicJointDomain.__init__`
 
@@ -272,16 +478,59 @@ class CubicJointDomain(JointPositionDomain):
 输入签名：
 
 ```python
-def CubicJointDomain.__init__(self, lower: torch.Tensor, upper: torch.Tensor, start_q: torch.Tensor, start_dq: torch.Tensor, knot_dt: float, knots: int):
+def __init__(self, lower: torch.Tensor, upper: torch.Tensor, start_q: torch.Tensor, start_dq: torch.Tensor, knot_dt: float, knots: int):
 ```
 
-直接读取的对象属性：`self._curve_map`、`self.lower`、`self.upper`。
+显式输出分支：
 
-输出方式：函数体没有显式 `return`；正常结束返回 `None`。
+无显式条目。
 
-直接写入的状态或数组位置：`self.knots`、`self._anchor`、`self._start_q`、`self._start_dq`、`self._curve_map`、`self.intervals`、`self._coefficient_matrix`、`self._velocity_coefficients`、`self._entrance_valid`。
+读取的对象属性：
 
-直接调用：
+```python
+torch.Tensor
+super().__init__
+start_q.detach().reshape(-1).to
+start_q.detach().reshape
+start_q.detach
+torch.float64
+start_dq.detach().reshape(-1).to
+start_dq.detach().reshape
+start_dq.detach
+self._curve_map.intervals
+self._curve_map
+torch.as_tensor
+self._curve_map.matrix
+q.device
+self._curve_map.velocity_coefficients
+torch.isfinite(q).all
+torch.isfinite
+torch.isfinite(dq).all
+(q >= self.lower).all
+self.lower
+(q <= self.upper).all
+self.upper
+((q > self.lower) | (dq >= 0)).all
+((q < self.upper) | (dq <= 0)).all
+```
+
+写入目标：
+
+```python
+self.knots
+q
+dq
+self._anchor
+self._start_q
+self._start_dq
+self._curve_map
+self.intervals
+self._coefficient_matrix
+self._velocity_coefficients
+self._entrance_valid
+```
+
+直接调用符号：
 
 ```python
 super().__init__
@@ -310,18 +559,34 @@ torch.isfinite(dq).all
 输入签名：
 
 ```python
-def CubicJointDomain.evaluate(self, actions, progress, derivative=0):
+def evaluate(self, actions, progress, derivative=0):
 ```
 
-直接读取的对象属性：`self._curve_map`。
+实现说明：
 
-输出分支的源码表达式：
+> Sample normalized progress, returning NumPy values in physical units.
+> 
+> Actions end in [free controls, joints]; output ends in [queries,
+> joints]. Derivatives 1..3 use seconds from the immutable knot clock.
+
+显式输出分支：
 
 ```python
 self._curve_map.evaluate(actions, progress, derivative)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+self._curve_map.evaluate
+self._curve_map
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 self._curve_map.evaluate
@@ -334,18 +599,34 @@ self._curve_map.evaluate
 输入签名：
 
 ```python
-def CubicJointDomain.fit_reference(self, progress, joint_targets, prior_controls=None, velocity_bounds=None):
+def fit_reference(self, progress, joint_targets, prior_controls=None, velocity_bounds=None):
 ```
 
-直接读取的对象属性：`self._curve_map`。
+实现说明：
 
-输出分支的源码表达式：
+> Fit soft samples on this clock, optionally enforcing model velocity.
+> 
+> Returns [controls,joints] or None with a construction report. Velocity
+> bounds apply only to this initializer, not to the optimizer domain or
+> its recovery directions for trajectories with existing violations.
+
+显式输出分支：
 
 ```python
 fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls, velocity_bounds)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+self._curve_map
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 fit_cubic_reference
@@ -358,18 +639,30 @@ fit_cubic_reference
 输入签名：
 
 ```python
-def CubicJointDomain.recovery_step(self, base, gradient, step_limits, scales):
+def recovery_step(self, base, gradient, step_limits, scales):
 ```
 
-直接读取的对象属性：`self._curve_map`。
+实现说明：
 
-输出分支的源码表达式：
+> Find a curve-feasible direction without boxing its free coefficients.
+
+显式输出分支：
 
 ```python
 recover_position_step(self, base, gradient, step_limits, scales, self._curve_map)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+self._curve_map
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 recover_position_step
@@ -382,18 +675,31 @@ recover_position_step
 输入签名：
 
 ```python
-def CubicJointDomain.coefficients(self, action: torch.Tensor) -> torch.Tensor:
+def coefficients(self, action: torch.Tensor) -> torch.Tensor:
 ```
 
-直接读取的对象属性：`self.knots`、`self.lower`、`self._relative_coefficients`、`self._start_q`。
-
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 self._relative_coefficients(action) + self._start_q
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+torch.Tensor
+action.shape
+self.knots
+self.lower
+self._relative_coefficients
+self._start_q
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 len
@@ -408,18 +714,32 @@ self._relative_coefficients
 输入签名：
 
 ```python
-def CubicJointDomain._relative_coefficients(self, action):
+def _relative_coefficients(self, action):
 ```
 
-直接读取的对象属性：`self._coefficient_matrix`、`self._start_q`、`self._velocity_coefficients`、`self._start_dq`。
-
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 torch.matmul(self._coefficient_matrix, action.to(torch.float64) - self._start_q) + self._velocity_coefficients[:, None] * self._start_dq
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+torch.matmul
+self._coefficient_matrix
+action.to
+torch.float64
+self._start_q
+self._velocity_coefficients
+self._start_dq
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
 
 ```python
 torch.matmul
@@ -433,18 +753,77 @@ action.to
 输入签名：
 
 ```python
-def CubicJointDomain.extrema(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def extrema(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 ```
 
-直接读取的对象属性：`self.knots`、`self.lower`、`self._relative_coefficients`、`self.intervals`、`self._start_dq`、`self._curve_map`、`self._start_q`。
+实现说明：
 
-输出分支的源码表达式：
+> Evaluate endpoints and every real derivative root of each cubic.
+
+显式输出分支：
 
 ```python
 (values.amin(dim=(-2, -3)), values.amax(dim=(-2, -3)))
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+torch.Tensor
+action.shape
+self.knots
+self.lower
+self._relative_coefficients
+self.intervals
+torch.cat
+torch.zeros_like
+(self._start_dq * self._curve_map.knot_dt).expand_as
+self._start_dq
+self._curve_map.knot_dt
+self._curve_map
+linear.square
+torch.sqrt
+torch.clamp_min
+torch.where
+torch.ones_like
+torch.stack
+self._start_q
+values.amin
+values.amax
+```
+
+写入目标：
+
+```python
+c
+p0
+p1
+p2
+p3
+offset
+first_diff
+second_diff
+third_diff
+a
+b
+d
+e
+initial_d
+quadratic
+linear
+discriminant
+root
+safe_quad
+first
+second
+safe_linear
+linear_root
+first_valid
+second_valid
+values
+```
+
+直接调用符号：
 
 ```python
 len
@@ -471,18 +850,39 @@ values.amax
 输入签名：
 
 ```python
-def CubicJointDomain.feasible(self, action: torch.Tensor) -> torch.Tensor:
+def feasible(self, action: torch.Tensor) -> torch.Tensor:
 ```
 
-直接读取的对象属性：`self.extrema`、`self._entrance_valid`、`self.lower`、`self.upper`。
-
-输出分支的源码表达式：
+显式输出分支：
 
 ```python
 self._entrance_valid & torch.isfinite(action).all(dim=(-1, -2)) & torch.isfinite(low).all(-1) & torch.isfinite(high).all(-1) & (low >= self.lower).all(-1) & (high <= self.upper).all(-1)
 ```
 
-直接调用：
+读取的对象属性：
+
+```python
+torch.Tensor
+self.extrema
+self._entrance_valid
+torch.isfinite(action).all
+torch.isfinite
+torch.isfinite(low).all
+torch.isfinite(high).all
+(low >= self.lower).all
+self.lower
+(high <= self.upper).all
+self.upper
+```
+
+写入目标：
+
+```python
+low
+high
+```
+
+直接调用符号：
 
 ```python
 self.extrema
@@ -501,21 +901,96 @@ torch.isfinite(high).all
 输入签名：
 
 ```python
-def CubicJointDomain._construct_anchor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _construct_anchor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
 ```
 
-直接读取的对象属性：`self._start_q`、`self.knots`、`self._entrance_valid`、`self.feasible`、`self.lower`、`self.upper`、`self.intervals`、`self._curve_map`、`result.success`、`result.x`、`self.validate`。
+实现说明：
 
-输出分支的源码表达式：
+> Use the existing SciPy LP and analytic extrema in a finite cutting loop.
+> 
+> Failure means this bounded initializer was not constructed. It does
+> not rewrite dq0 or prove that every representation is infeasible.
+> Only this initializer uses a small inward numerical margin, to obtain
+> representable free controls. The optimizer's domain remains the full
+> physical interval above.
+
+显式输出分支：
 
 ```python
 constant
 anchor
 ```
 
-直接写入的状态或数组位置：`controls[:, joint]`。
+读取的对象属性：
 
-直接调用：
+```python
+torch.dtype
+torch.device
+self._start_q.to(dtype=dtype, device=device).expand(1, self.knots, -1).clone
+self._start_q.to(dtype=dtype, device=device).expand
+self._start_q.to
+self._start_q
+self.knots
+self._entrance_valid
+self.feasible(constant).all
+self.feasible
+self.lower.cpu().numpy
+self.lower.cpu
+self.lower
+self.upper.cpu().numpy
+self.upper.cpu
+self.upper
+np.empty
+np.linspace
+self.intervals
+self._curve_map.query
+self._curve_map
+np.minimum
+np.abs(weights).sum
+np.abs
+np.finfo(np.float32).eps
+np.finfo
+np.float32
+np.zeros
+np.r_
+result.success
+result.x.astype(np.float32).astype
+result.x.astype
+result.x
+self._curve_map.extrema_times
+np.any
+np.unique
+torch.as_tensor
+self.validate
+torch.Tensor
+```
+
+写入目标：
+
+```python
+constant
+lower
+upper
+controls
+joint
+samples
+solved
+_
+weights
+fixed
+offset
+influence
+margin
+result
+candidate
+query
+positions
+bad
+controls[:, joint]
+anchor
+```
+
+直接调用符号：
 
 ```python
 self._start_q.to(dtype=dtype, device=device).expand(1, self.knots, -1).clone
@@ -557,21 +1032,57 @@ self.validate
 输入签名：
 
 ```python
-def CubicJointDomain.initialize(self, proposals: torch.Tensor) -> torch.Tensor:
+def initialize(self, proposals: torch.Tensor) -> torch.Tensor:
 ```
 
-直接读取的对象属性：`self.knots`、`self.lower`、`self.feasible`、`self._anchor`、`self._construct_anchor`、`self.limit_step`、`self.validate`。
+实现说明：
 
-输出分支的源码表达式：
+> Keep legal reference seeds and contract only illegal initializers.
+
+显式输出分支：
 
 ```python
 proposals
 initialized.reshape(shape)
 ```
 
-直接写入的状态或数组位置：`self._anchor`。
+读取的对象属性：
 
-直接调用：
+```python
+torch.Tensor
+proposals.shape
+proposals.reshape
+self.knots
+self.lower
+self.feasible(values).all
+self.feasible
+self._anchor
+valid.any
+values[valid][:1].clone
+self._construct_anchor
+proposals.dtype
+proposals.device
+self._anchor.expand_as
+values.new_ones
+self.limit_step
+self.validate
+initialized.reshape
+```
+
+写入目标：
+
+```python
+shape
+values
+valid
+self._anchor
+base
+scales
+step
+initialized
+```
+
+直接调用符号：
 
 ```python
 proposals.reshape

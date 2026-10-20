@@ -1,14 +1,14 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`bc79a78071e464c35ed9839d62595f735ad85465`。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
+代码基线：`__IMPLEMENTATION_COMMIT__`。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
 
 ## 1. 候选的完整验收
 
-`_CuroboPlanner._candidate_metrics` 消费 `JointTrajectory` 和本候选场景，沿原多项式计算机器人 FK、任务残差、场景分项及必要实体复核。`_candidate_sample_times` 保留原多项式各区间端点，并按 `interpolation_dt` 分割区间；检查原生候选时，`_candidate_confirmation_times` 还合并此前普通与密集计算的实际物理时刻。确切任务锚点和已加入的碰撞见证单独采样，并计入同一查询容量。调用方提供的原曲线使用自己的区间、时间采样与任务锚点，没有先前原生网格。
+`_CuroboPlanner._candidate_metrics` 消费 `JointTrajectory` 和本候选场景，沿原多项式计算机器人 FK、任务残差、同一观测场的场景分项。`_candidate_sample_times` 保留原多项式各区间端点，并按 `interpolation_dt` 分割区间；原生候选直接保留此前普通与密集计算的实际硬残差。确切任务锚点和已加入的碰撞见证单独采样，并计入同一查询容量。调用方提供的原曲线使用自己的区间、时间采样与任务锚点，没有先前原生网格。
 
 当前 `validation_joint_step` 用于 OMPL 连接检查；`validation_spatial_step_m` 虽属于 `PlanningBudget` 并校验为正数，但没有生产消费者。`geometry_motion_bound.py` 提供独立运动界计算及其单元回归，当前候选验收没有调用该模块。本次验收的几何计算范围由上述有限时间网格和确切锚点定义。
 
-`OnlineCollisionConfirmation` 消费本次代价与同次查询证据。`confirm_self` 将机器人自碰撞代理冲突交给独立机器人模型；`__call__` 收集世界几何候选。`NativeCollisionConfirmation.confirm` 使用原生机器人实体、具名物体位姿、实际激活的有限接触规则和 TSDF 源组件进行复核。`_PrimitiveContactCells.nearby` 与 TSDF 空间索引分别提供两种源几何的邻域。复核结果修订对应碰撞分项，观测覆盖及查询域状态保留其各自来源。
+候选使用同一观测实体集合及 `query_role='acceptance'` 的 2 mm 距离冗余。所有非 conditional 正分项都表示当前硬条件未满足；未决状态单独报告。普通与密集样本共享同一场，不存在另一套碰撞实体替换阶段。
 
 `_candidate_domain_validation` 独立检查保存曲线的入口 `q0,dq0` 及连续关节范围。`cubic_position_report` 对每个标量三次段求位置极值；速度范围来自导数极值；`cubic_derivative_report` 检查每段两端的加速度，并分别包含内部结点左右极限。`JointTrajectory.sample` 通过保存的 `CubicHermiteSpline` 返回 `q,dq,ddq,s`，在内部结点采用右段导数，在最终端点采用左极限。
 
@@ -30,7 +30,7 @@
 
 初始及后续反馈具有完整具名 `q/dq`、反馈身份、试验身份、时间、参考坐标、工具标定和工具位姿。机械臂与手指共同构成完整机器人关节顺序；设备原生 `qpos/qvel` 经适配器转换为这份具名反馈。`ExecutionLimits` 提供机械臂位置/速度跟踪带、工具中心点（TCP）相对指令轨迹的跟踪带、机械臂和手指停止速度、实际手指位置区间、事件限制与观察节拍。`FixedFingerTargets.bind` 把开闭目标与原轨迹事件匹配；实际手指允许区间和指令目标分别用于反馈检查与控制。
 
-`RobotStateValidator.validate_planning_binding` 核对规划机器人与独立检查器的模型、关节和工具关系。`preflight` 检查执行入口、原曲线前缀和共享设备范围。`check_state` 处理实际完整关节状态、关节速度、机器人实体碰撞以及 FK/工具反馈一致性。`check_planning_self` 与 `check_planning_world` 则为规划阶段提供同一机器人模型的名义状态复核。
+`RobotStateValidator.validate_planning_binding` 核对规划机器人与独立检查器的模型、关节和工具关系。`preflight` 检查执行入口、原曲线前缀和共享设备范围。`check_state` 处理实际完整关节状态、关节速度、机器人观测场碰撞以及 FK/工具反馈一致性。`check_planning_self` 为规划阶段提供同一机器人观测模型的具名状态检查。
 
 ## 4. 控制时钟与每步操作
 
@@ -72,3 +72,5 @@
 | `planning_stage_failed` | 阶段输入、资源或数值调用产生其他异常 | `failed_stage`、`reason`、`error_type`、原异常栈 |
 
 状态说明所完成计算的结论。结果消费者通过具体残差、输入来源及失败阶段决定下一项研究或操作。场景支持范围、未知区域、接触表示范围和实体相交各有独立分项，详见[观测与碰撞](02-observation-and-collision.md)。
+
+场景快照类型为 `observed_scene_v1`，保存原始样本、位姿路径、附着、机器人观测和运动学、接触、支撑及自由射线格。单体恢复由 `FrozenObservedField.from_record` 和 `ObservedBody.from_record` 提供；场景快照当前用于输入保存与身份检查。
