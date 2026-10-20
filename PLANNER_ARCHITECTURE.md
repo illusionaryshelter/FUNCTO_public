@@ -17,6 +17,7 @@
 | [验收、保存与执行](docs/planner-architecture/05-acceptance-and-execution.md) | 候选如何成为可执行结果，绑定保存哪些数据，执行检查与事后评价分别消费什么 |
 | [接口契约目录](docs/planner-architecture/06-api-contracts.md) | 按模块逐项解释可调用接口的作用、输入、返回值、前置数据和调用者 |
 | [实现符号索引](docs/planner-architecture/07-implementation-index.md) | 对照代码自动提取的精确签名、类型字段、返回表达式及直接调用；含内部函数和工厂内生成的类 |
+| [外部文件与数据职责](docs/planner-architecture/08-external-files-and-data-roles.md) | 技能包、感知文件、规划输入、执行绑定与评价文件分别代表什么，谁读取它们，以及技能表示与实际运行环境状态的边界 |
 
 前六份文档解释数学与计算语义；实现符号索引提供逐函数的查证入口。索引记录 Python 语法树中出现的直接调用；运行分支、动态派发、对象方法的具体实现及原生库内部过程在相应组件章节解释。
 
@@ -28,7 +29,9 @@
 
 规划器同时使用三个参数。源时间是示教记录中的时间；技能进度 `s` 在第 `i` 个参考阶段内取 `[i,i+1]`；归一化执行时间 `u=t/T` 位于 `[0,1]`，其中 `t` 是本次轨迹开始后的物理时间，`T` 是本次轨迹总时长。`_ProgressMap` 保存 `u→s` 的分段关系。事件按原始身份和进度绑定到物理时间，夹爪指令再映射到设备控制步。停留阶段可以让多个物理时刻对应同一技能进度，因此碰撞记录同时保存进度与物理时刻。本文称产生碰撞分项的具体时刻、候选状态和分项身份为“碰撞见证”；恢复步骤据此补充采样时刻。
 
-本文把数据分为观测、声明模型、任务要求和计算结果。RGB-D 与编码器反馈是观测；附着矩阵、机器人模型和未知空间尝试策略是显式声明；目标允许范围、接触区域和时间条件是任务要求；参考路径、逆运动学（IK）解、碰撞候选和规划结果是计算结果。每项输入保留其原始生产者与数据类别，序列化和坐标变换沿用该来源。仿真物体位姿、真实分割、接触和效果评分由独立事后评价接口消费。
+本文把数据分为技能表示、当前观测、声明模型、任务要求、计算结果和评价数据。所有属于 skill representation 的内容完整保留：源演示区域、轨迹、物体与工具相对关系、功能坐标、任务几何、交互和释放事件均为 grounding、参考生成和后续规划的合法输入，包括由仿真示教提取的内容。RGB-D 与编码器反馈是当前观测；附着矩阵、机器人模型和未知空间尝试策略是显式声明；目标允许范围、接触区域和时间条件是任务要求；参考路径、逆运动学（IK）解、碰撞候选和规划结果是计算结果。
+
+系统禁止求解额外引入“仿真实际运行环境中产生的真值”，即本次待执行或正在执行环境中的真实物体/目标位姿、真实分割、接触和成功效果等特权状态。这类数据由独立事后评价接口消费，不得进入 grounding、参考生成、规划判断或执行授权。源示教中的同类字段仍承担技能表示的职责；字段名、仿真来源和序列化形式不能代替用途判断。当前外部实验文件与代码的逐项核对见[数据文件审计](../sim-version-plans/2026-10-19-planner-data-provenance-audit/index.md)。
 
 碰撞实体 `owner` 由身份、局部几何和位姿构成；对象 `mask` 是 RGB-D 图像中属于该实体的像素分区。机器人 `fixture` 是已知机器人运动学、碰撞模型及标定的集合。请求中的 `ledger` 保存累计规划工作，`continuation` 保存前次执行留下的续接状态。各对象的字段与构造接口见相应组件章节。
 
@@ -36,7 +39,9 @@
 
 ```mermaid
 flowchart TD
-    A["已选技能 program、当前 scene、机器人反馈和标定"] --> B["build_planning_problem：参考与显式要求"]
+    S["完整 skill representation：源区域、轨迹、关系及事件"] --> R["grounding：结合当前观测绑定功能区域与参考"]
+    R --> A["已选技能 program、当前 scene、机器人反馈和标定"]
+    A --> B["build_planning_problem：参考与显式要求"]
     C["现场 RGB-D、相机标定、对象 masks、自过滤结果"] --> D["build_scene_from_rgbd：固定观测几何与未知策略"]
     E["机器人 URDF、碰撞实体、球覆盖、成对规则"] --> F["RobotStateValidator 与机器人配置"]
     B --> G["MotionBackend.plan / plan_trajectory"]
@@ -51,7 +56,7 @@ flowchart TD
     L --> M["PlanningResult：成功绑定或明确失败"]
     M --> N["保存原曲线与输入记录"]
     N --> O["TrajectoryExecutor：机器人反馈、指令与独立效果"]
-    O --> P["独立仿真评价：真实目标误差、接触与任务效果"]
+    O --> P["独立事后评价：仿真实际运行环境中产生的真值"]
 ```
 
 图中的箭头表示数据消费关系。已经通过检查的原关节曲线或初始参考曲线直接交付；其余请求在剩余预算内进入优化及必要恢复。独立仿真评价产生结果记录。
@@ -92,7 +97,7 @@ flowchart TD
 
 ## 5. 文档与计划的关系
 
-当前功能计划位于[抓取前模型复用计划](../sim-version-plans/2026-10-19-grasp-model-support-plan/plan.md)，实际 API 的逐项对照结果见[架构与计划差异审查](../sim-version-plans/2026-10-19-planner-architecture-audit/plan-comparison.md)。组件文档说明指定提交中的计算与接口，阶段计划说明所需变更及实施顺序，差异审查连接二者。已有代码验证记录见[真值边界验证记录](../sim-version-plans/2026-10-19-planner-truth-boundary-audit/validation.md)。
+当前功能计划位于[抓取前模型复用计划](../sim-version-plans/2026-10-19-grasp-model-support-plan/plan.md)，实际 API 的逐项对照结果见[架构与计划差异审查](../sim-version-plans/2026-10-19-planner-architecture-audit/plan-comparison.md)。组件文档说明指定提交中的计算与接口，阶段计划说明所需变更及实施顺序，差异审查连接二者。已有代码验证记录见[实际运行环境数据边界验证记录](../sim-version-plans/2026-10-19-planner-truth-boundary-audit/validation.md)，文件依赖和现存实验状态见[数据文件审计](../sim-version-plans/2026-10-19-planner-data-provenance-audit/index.md)。
 
 ## 6. 持续维护方法
 
