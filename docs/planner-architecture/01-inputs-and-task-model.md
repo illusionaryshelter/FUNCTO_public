@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：待本次实现提交标注。本组件将已有示教、当前任务关系及机器人入口状态编译为 `PlanningProblem`，供场景绑定与数值规划调用。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
+代码基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本组件将已有示教、当前任务关系及机器人入口状态编译为 `PlanningProblem`，供场景绑定与数值规划调用。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
 
 ## 1. 输入的来源与相互依赖
 

@@ -1,6 +1,6 @@
 # `manipulation/implicit_distance.py` 实现契约
 
-代码基线：`pending-implementation-commit`。
+代码基线：`22e6bda65682c1584d89623320024795fc1efa4e`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `transform_points`
