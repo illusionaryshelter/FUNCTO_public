@@ -218,10 +218,10 @@ grasp point. The existing `main.py` tool-use reproduction remains available.
 `manipulation.program.ground_program(program, scene)` consumes independent
 `skill_kind="grasp"` and `"manipulation"` skills. It returns EEF geometry,
 explicit gripper intentions and original frame IDs/timestamps. A grasp is a
-candidate until current observations verify stable holding; lifting belongs to
-the subsequent manipulation. Held-object motion uses the caller's measured
-`scene.holding.T_carrier_eef`, not the preceding grasp candidate. At release,
-the EEF continues independently and the released object requires observation.
+geometric proposal. Held-object motion consumes the caller's declared
+`scene.holding.T_carrier_eef` and its source, with the same relationship in the
+task and collision models. The release boundary ends this nominal attachment;
+physical holding and release effects are recorded by independent evaluation.
 
 `regions.function_frame` constructs directions from evidenced functional
 geometry. For tasks that require a complete functional orientation,
@@ -284,11 +284,11 @@ static pose cannot establish past full revolutions.
 
 This numerical consumer does not identify a new object's hidden joint or
 its travel limits. A learned same-instance mechanism can be localized using
-robot FK and a separately established fixed Holding. Transferring that prior
+robot FK and an explicitly declared fixed attachment. Transferring that prior
 to a different instance needs evidence. `coordinate_limits`, when supplied,
 are checked at controlled trajectory nodes; otherwise the result explicitly
 reports `limit_status="not_supplied"`. Neither case certifies collisions or
-execution. The existing Holding, gripper events, release boundary, independent
+execution. The declared attachment, gripper events, release boundary, independent
 retreat and optional entry-corridor checks remain in force. Source action
 intervals are retained as demonstration evidence, not returned as transferable
 robot commands.
@@ -465,9 +465,9 @@ as described below.
 
 `perception.ground_current_program(..., output="eef")` calls this binder and
 the existing complete skill consumer. Choose `output="object"` explicitly
-for manipulation body geometry. Missing actual Holding never silently switches
-an EEF request to object-only output. Both return candidates with correspondence
-and coordinate evidence, not certificates of physical execution. The existing
+for manipulation body geometry. EEF output consumes the declared attachment;
+object output returns the carrier path. Both preserve correspondence and
+coordinate records for the subsequent task and robot planning stages. The existing
 raw-video `--demo` path keeps its separate extraction/tracking responsibility.
 
 <!-- BEGIN unordered support binding and explicit held-carrier contract. -->
@@ -482,7 +482,7 @@ geometry. All events in one `on` skill name the same source support region and
 use one consistent carrier mapping. The chosen finite patch stays within
 observed support pixels.
 
-The caller supplies the already bound carrier and actual holding:
+The caller supplies the bound carrier and declared attachment:
 
 - `scene.carrier_id`, `initial_pose`, `body_points` and `body_points_source`
   identify the current body, its pose in the common output coordinates, and
@@ -502,9 +502,9 @@ The caller supplies the already bound carrier and actual holding:
   that evidence. The visual binder rejects a pre-supplied `support`; an
   independently established signed support observation instead goes directly
   to `ground_program` or `ground_object_program`, the numerical consumers.
-- EEF output retains the synchronized `eef_pose`, actual
-  `holding.T_carrier_eef`, and the existing tool identity requirements. The
-  support binder neither estimates nor verifies that holding relationship.
+- EEF output retains synchronized robot `eef_pose`, declared
+  `holding.T_carrier_eef`, and tool identity. The support binder consumes this
+  model relationship when transforming carrier geometry into tool coordinates.
 
 This does not require current simulator object GT. When the carrier's contact
 surface is visible, the upstream helper
@@ -512,7 +512,7 @@ surface is visible, the upstream helper
 normal_tolerance_rad, client=None, extractor=None)` reuses the source-region
 visual matcher. It returns `carrier_mapping`, `on_geometry`, `initial_pose`,
 `body_points` and their coordinate/evidence records, which the caller combines
-with actual holding feedback. Its source plane template declares
+with robot feedback and the declared attachment. Its source plane template declares
 `normal_role="outward"`; only matched source interaction queries become
 contact samples. Sparse observations do not establish an occluded complete
 face or full body coverage. A previously known carrier model may supply richer
@@ -528,12 +528,10 @@ independent post-release retreat remain distinct and retain the original
 timeline. Satisfying a function event does not certify subsequent contact,
 force stability, collision-free robot motion or execution.
 
-An isolated placement experiment may explicitly assume a fixed known carrier
-and exact Holding. This tests support grounding and conditional motion transfer;
-it does not establish online holding estimation or successful execution of a
-preceding grasp. Offline demonstration GT may label source geometry and events;
-current hidden reference-object pose, masks, contact or surface geometry must
-not enter a visual grounding experiment.
+Placement binds the carrier representation, robot entrance, declared
+attachment and observed support region. Simulator object poses, segmentation,
+contacts and outcome scores enter the independent result evaluator. The current
+input and execution contracts are specified in [the planner architecture](PLANNER_ARCHITECTURE.md).
 <!-- END unordered support binding and explicit held-carrier contract. -->
 
 Plane-only evidence is rejected where a full functional orientation is required.
@@ -545,7 +543,7 @@ silently projected off that mechanism. Supplied entry corridors remain checked.
 directly, keeps the original function-origin/Euler objective and internal hard
 events, and independently verifies all saved-node increments. Its fixed strict
 constraint mode does not retry by weakening angular limits. The compiled tool
-object path uses the same core; missing actual holding never produces a fake EEF.
+object path uses the same core; EEF paths use the explicit attachment transform.
 
 Existing `--prepared` accepts a JSON object containing `skill_kind`, `demo`,
 `task` when needed, and the current `scene`. Source numeric arrays may live in
@@ -753,7 +751,7 @@ camera-local frame `Fn`, pass `region_transform = Fn @ inverse(Fd)` and
 This camera pose is a coordinate gauge, not a recovered object pose. Keep both
 complete candidates when line sign is unresolved. The original timeline,
 closure events and protected suffix remain governed by the grasp consumer;
-actual holding, IK, collision and execution still require current verification.
+the selected candidate then enters task binding, robot IK, collision checking and execution.
 <!-- END observed local protrusion geometry for independent grasp grounding. -->
 
 <!-- BEGIN observed orthogonal surfaces for functional-frame grounding. -->
@@ -1001,192 +999,33 @@ congruence on functional transfer between different shapes.
 
 Selected/unresolved references carry `registration_validation` with the tested
 transform, owner IDs, evidence source and per-view summaries. Frame IDs,
-timestamps, grasp closure, functional events, actual-Holding requirements and
+timestamps, grasp closure, functional events, declared attachment requirements and
 release/retreat semantics are preserved. `robot_execution_verified` remains
 false: this module does not add cuRobo/OMPL, whole-robot collision, trajectory
 optimization or proof of complete `inside`/physical execution.
 <!-- END production projective registration screening and selected trajectory. -->
 
-<!-- BEGIN shared constrained motion backend and fixed online scene. -->
+<!-- BEGIN current planner architecture entry. -->
 ## Robot motion planning and execution
 
-`MotionBackend` in [`manipulation/planning.py`](manipulation/planning.py)
-combines cuRobo IK and forward kinematics with SciPy SLSQP trajectory
-optimization. Skills supply nominal goals, process requirements, current object
-bindings, finite interaction permissions and original event identities.
-Ordinary `PosePath` samples guide initialization and the motion objective;
-they do not create mandatory approach poses, stops or separate requests.
-The broader task interface is described in
-[motion_planner_prd.md](motion_planner_prd.md); the implementation described
-here uses the shared constrained curve below.
+当前代码架构以 [PLANNER_ARCHITECTURE.md](PLANNER_ARCHITECTURE.md) 为入口，引用实现提交 `bc79a78071e464c35ed9839d62595f735ad85465`。组件章节依次说明输入与任务编译、RGB-D/TSDF 几何、附着与有限接触、固定时钟求解、候选验收和设备执行，并提供逐 API 契约及实现符号索引。
 
-The backend retains its native IK and robot models across requests. Each request
-binds its current state, scene, event clock and constrained trajectory problem;
-previous request state is cleared before reuse. Concurrent use of the same
-backend is rejected while a request owns its mutable buffers. Cancellation or
-deadline expiry revokes a late result's execution authorization.
+`MotionBackend` 复用 cuRobo V2 的 IK、机器人正运动学和 L-BFGS 求解器。`PlanningProblem` 提供原功能目标、过程要求、事件和声明附着；`OnlinePlanningScene` 提供观测几何、未知空间策略、机器人球覆盖及接触规则。机械臂轨迹使用共享三次基固定入口位置、入口速度和物理时间；SciPy 与 `quadprog` 处理基函数、连续关节极值和受约束参考拟合，OMPL 在有限预算内生成恢复种子。
+
+生产观测模型由现场 RGB-D 的机器人自过滤结果和对象分区构建。Mapper 融合的已观测 TSDF 单元定义源几何组件，`FrozenESDF` 保存从同一源组件构造的保守候选距离场。候选冲突在适用的状态检查和验收处交给登记实体与 TSDF 源组件复核；未知空间和查询支持范围分别保留其状态。
+
+`plan_trajectory` 返回成功的 `PlanningResult` 或具名失败原因。成功结果绑定原关节多项式、任务、场景、事件时钟、已完成验收和累计工作。`TrajectoryExecutor` 按该时钟下发关节位置、速度、加速度及手指指令，并检查具名机器人反馈、跟踪、机器人实体碰撞和独立任务效果。末端相对名义功能目标的几何误差由仿真事后评价接口记录。
 
 ```python
 from manipulation.planning import MotionBackend, PlanningBudget
 
-backend = MotionBackend(robot_configuration, robot_validator=robot_validator,
-                        budget=PlanningBudget())
+backend = MotionBackend(robot_config, robot_validator=robot_validator,
+                        budget=PlanningBudget(), device="cuda:0")
 try:
     result = backend.plan(problem, online_scene)
-    # Reuse backend.plan(...) for later, freshly observed motion requests.
 finally:
     backend.close()
 ```
 
-[`cubic_seed.py`](manipulation/cubic_seed.py) fits finite reference IK samples or
-a supplied joint reference into free cubic coefficients, preserving the measured
-entrance position and velocity. The fit is an initial guess, not a feasibility
-certificate. [`physical_curve.py`](manipulation/physical_curve.py) defines the
-actual delivered curve: float64 position and velocity nodes reconstructed as a
-`CubicHermiteSpline` on one fixed physical clock. Optimization, qualification
-and export use these same nodes and polynomial pieces.
-
-[`constrained_trajectory.py`](manipulation/constrained_trajectory.py) supplies
-SLSQP with the nominal objective and explicit physical inequalities together:
-
-- Continuous joint position, velocity, acceleration and jerk bounds use the
-  extrema of the delivered polynomial, including both sides of segment joins.
-- Declared `JointCoupling` relations and explicit stop events use their existing
-  numerical joint and velocity bands on that same curve.
-- Signed scene clearances and existing controller/model requirements use
-  `OnlinePlanningScene.signed_constraints` at the fixed scene samples and exact
-  interaction anchors. These finite scene queries do not establish continuous
-  collision clearance between samples.
-
-The physical numerical contract is fixed for the request. Structurally fixed
-zero boundary factors are removed analytically; the resulting canonical rows
-retain their physical units with a one-SI-unit scale. The sum of negative slack
-magnitudes in that same canonical vector must be at most `1e-6`, also supplied
-as SLSQP's `ftol`. This is an aggregate numerical tolerance, not a separate
-`1e-6` allowance for every row. Raw bound excesses, signed clearances and validity
-remain in the report; an accepted result with a nonzero numerical violation
-retains a warning. Changes to row normalization or the fixed curve grid change
-this contract and cannot be introduced only during final qualification.
-
-Nominal pose, placement, support and other task residuals, reference preferences
-and smoothness contribute to the objective. They describe the requested motion
-and its quality; their error does not independently veto a physically qualified
-candidate. A lower objective cannot compensate for a physical inequality.
-SLSQP may explore infeasible coefficients, and an infeasible initial guess does
-not reject the request. Immutable entrance/model conditions are checked
-separately because changing the free coefficients cannot repair them.
-
-All returned seeds are qualified using the same physical vector and ranked
-among qualified candidates by the same objective used in optimization.
-`SLSQP.success` is diagnostic and does not replace qualification. If the main
-solve returns no qualified candidate with a collision failure, the existing
-request budget may admit one bounded OMPL search and another solve from its
-fitted seed. OMPL uses the same registered geometry and phase permissions;
-its discrete path does not certify the final timed cubic curve. The request's
-clock, iteration limits, search allowance and cumulative deadline remain shared.
-Failure within that budget does not prove that the motion has no solution.
-
-Delivery reuses the selected candidate's completed evaluation and exports its
-original float64 nodes once. It does not run a second geometric verdict, repair
-the curve, increase collision sampling or start a quality-refinement stage.
-Diagnostic candidates carry no execution authorization.
-
-The production scene is implemented in
-[`online_geometry.py`](manipulation/online_geometry.py) and
-[`native_collision.py`](manipulation/native_collision.py):
-
-- Registered robot solids and complete scene primitives use Pinocchio forward
-  kinematics and Coal signed distances for the declared self/world pairs.
-  The same solids, transforms, pair policies and derivatives participate in
-  optimization and qualification. Sphere overlap does not add a second veto
-  for a pair already represented by registered solids.
-- `FrozenESDF` retains the frozen Mapper distance grid for observed geometry.
-  Robot and moving-owner spheres query this approximate field. Signed distance
-  and query validity are separate: a point outside field support supplies no
-  collision measurement, and an invalid zero slot is not measured clearance.
-  Observation coverage remains diagnostic; neither missing observations nor
-  successful planning establish that unobserved space is free.
-- `ContactRule` and `HoldingContact` bind named actors, targets, finite registered
-  components and activation intervals. Native permissions must cover complete
-  registered components; a partial component selection cannot silently exempt
-  its whole solid. ESDF permissions retain their declared sphere subset and
-  target. These are model permissions, not evidence that contact or Holding
-  has physically occurred.
-- The bound gripper controller and finger clock retain their own requirements.
-  Unresolved future finger positions do not become measured collisions; the
-  independent robot checks use actual feedback during execution.
-
-`initial_support.InitialSupportRelation` describes a declared current support
-between an attached owner and a separately observed static plane layer. One
-entrance query freezes the contacting sphere subset for that actor/target pair
-and interval. It does not reuse future placement material, infer exact
-penetration depth or certify support success. This observed-field permission
-cannot stand in for a complete native-component permission.
-
-`planning_observation.build_scene_from_rgbd` prepares the frozen scene.
-Explicit complete `CollisionOwner` geometry can enter through `complete_owners`
-without allocating an observation field that would be discarded. Its RGB-D
-rays still contribute only their original observed-free evidence. Background
-fusion excludes the one-pixel, eight-neighbor outer ring around observed owner
-pixels because their ownership is uncertain; excluded endpoints are assigned
-to neither partition. Fresh snapshots rebuild the partitions rather than
-retaining old fusion pollution.
-
-Mapping precision follows task roles. `scene_task_owner_ids` selects the grounded
-`carrier_id` and optional `reference_id`; `observation_resolutions` assigns their
-query grids **2 mm** spacing. Other observed owners and background use the
-environment grid, whose shared recorded-runner default is **10 mm**. Complete
-geometry retains its original solids. Experiments do not override resolution
-per owner or loosen physical limits to fit a skill. The report records actual
-spacings, model provenance and resource admission; voxel spacing alone is not
-a surface-accuracy claim. Full source-geometry reconstruction and component
-checkers remain separate audit tools.
-
-`PlanningProblem.bound_motion_block` uses actual evidence dependencies to bound
-one request while preserving original progress and event identities. Coupled
-motion requirements cannot be split by inserting a new stop. New actual evidence
-may authorize a freshly bound request; it does not authorize an unplanned suffix
-of an old curve. Validated progress retains cumulative work and physical-step
-history.
-
-<!-- BEGIN permanent execution boundary: target error remains posthoc. -->
-`PlanningResult.execution_binding` retains the exact selected curve and frozen
-planning scene for authorization and provenance. `TrajectoryExecutor` does not
-rebuild or query that frozen world during preflight or physical execution.
-`RobotStateValidator` checks measured joint limits, model/FK identity and the
-registered required native robot/fixed-installation collision pairs. Joint
-velocity and reference tracking, command timing, fresh observations, current
-Holding dependencies and independent effect requirements retain their own
-execution checks.
-
-Target-relative TCP position/orientation error is **never an online rejection
-criterion**, including before close. Encoder FK minus a frozen predicted goal
-does not measure the current real tool-to-target relation. Pose error, missing
-target pose, or an arrival-dependent time window cannot reject closing or
-continuation, stop execution, or require replanning. Nominal planning targets remain in the
-motion objective; the independent simulation evaluator records actual pose
-errors and task outcomes without feeding them back as these control gates.
-
-The task layer supplies predicate estimates through `observation_callback`;
-the motion planner does not run a VLM. An attachment-dependent owner uses
-current Holding evidence or a current owner pose. A caller may explicitly
-supply `attachment_assumptions`, keyed by condition ID with a declared source.
-The executor records such a bound model assumption separately from observations;
-contrary or unknown evidence cannot be replaced by it. It supplies no actual
-goal-arrival witness, release effect or task success. Commanded fingers remain
-separate from measured finger positions, and frozen geometry cannot establish
-actual contact.
-<!-- END independent feedback and task evidence retain their own checks. -->
-
-Array records admit at most 64 MiB per array. Contact fields retain their
-independent 256 MiB aggregate limit; overall planning, archive and process
-resource limits remain independent checks.
-
-CPU contracts include `tests/test_physical_curve.py`,
-`tests/test_signed_scene_constraints.py`, `tests/test_motion_backend_contract.py`
-and the affected geometry/execution tests. The recorded-task CLI in
-`tests/planning/run_recorded_skill.py` owns the backend lifetime and records
-returned artifacts without initiating another solve or validation. Dataset
-selections and user-run experiments belong in the workspace's
-`sim-version-plans` directories.
-<!-- END shared constrained motion backend and fixed online scene. -->
+调用前须完成机器人配置/验证器、`PlanningProblem` 和 `OnlinePlanningScene` 的构造。它们的完整参数、来源和形状见[接口契约](docs/planner-architecture/06-api-contracts.md)。运行契约见 [motion_planner_prd.md](motion_planner_prd.md)，故障定位见 [motion_planner_debug.md](motion_planner_debug.md)，记录输入、仿真执行及独立评价的命令见 [tests/planning/README.md](tests/planning/README.md)。
+<!-- END current planner architecture entry. -->
