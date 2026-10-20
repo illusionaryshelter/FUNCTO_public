@@ -1,11 +1,11 @@
 # `manipulation/planning_observation.py` 实现契约
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。
+代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_views`
 
-[定义位置](../../../manipulation/planning_observation.py#L23)。
+[定义位置](../../../manipulation/planning_observation.py#L25)。
 
 输入签名：
 
@@ -78,7 +78,7 @@ _pose_array
 
 ## `_mapper_intrinsics`
 
-[定义位置](../../../manipulation/planning_observation.py#L54)。
+[定义位置](../../../manipulation/planning_observation.py#L56)。
 
 输入签名：
 
@@ -126,7 +126,7 @@ _intrinsics
 
 ## `_rectangle_min_depth`
 
-[定义位置](../../../manipulation/planning_observation.py#L70)。
+[定义位置](../../../manipulation/planning_observation.py#L72)。
 
 输入签名：
 
@@ -202,7 +202,7 @@ np.minimum
 
 ## `_known_free_voxels`
 
-[定义位置](../../../manipulation/planning_observation.py#L99)。
+[定义位置](../../../manipulation/planning_observation.py#L101)。
 
 输入签名：
 
@@ -379,7 +379,7 @@ known.reshape
 
 ## `_self_filtered_views`
 
-[定义位置](../../../manipulation/planning_observation.py#L187)。
+[定义位置](../../../manipulation/planning_observation.py#L189)。
 
 输入签名：
 
@@ -435,7 +435,7 @@ np.where
 
 ## `_partition_masks`
 
-[定义位置](../../../manipulation/planning_observation.py#L211)。
+[定义位置](../../../manipulation/planning_observation.py#L213)。
 
 输入签名：
 
@@ -445,17 +445,19 @@ def _partition_masks(views, owner_ids, *, build_background=True):
 
 实现说明：
 
-> Partition current environment endpoints into owners and background.
+> Partition measured endpoints with one eight-neighbour boundary ring.
 > 
 > Check owner/owner overlap on the supplied masks before self filtering;
 > uncertainty is not permission to silently choose a semantic winner.
-> All admitted endpoints outside explicit owners remain observed obstacles;
-> proximity to an owner neither grants its identity nor erases occupancy.
 > Only entities being integrated appear in owner_ids. A supplied background
 > mask selects the static endpoints of the original observation independently
 > of retained moving entities. Without that mask, the new-owner complement
-> defines the background. Retained background bypasses this integration.
-> Free rays remain the original independently filtered measurements.
+> defines the background candidates. Environment pixels on the nonbackground
+> side seed one 3-by-3 dilation; adjacent background candidates are withheld
+> from integration. They acquire neither an entity identity nor free-space
+> evidence. SELF, shadow and invalid-depth pixels do not seed this ring.
+> Entity masks and independently filtered free rays remain unchanged.
+> Retained background bypasses this integration.
 
 显式输出分支：
 
@@ -504,6 +506,7 @@ mask
 masks[name][identity]
 observed[identity]
 background
+boundary
 masks[name][None]
 count
 ```
@@ -522,6 +525,8 @@ np.any
 int
 np.count_nonzero
 view.get
+binary_dilation
+np.ones
 masks[name][None].setflags
 any
 observed.values
@@ -529,7 +534,7 @@ observed.values
 
 ## `_self_filter_report`
 
-[定义位置](../../../manipulation/planning_observation.py#L270)。
+[定义位置](../../../manipulation/planning_observation.py#L278)。
 
 输入签名：
 
@@ -579,7 +584,7 @@ view['owner_masks'].items
 
 ## `_mapper_memory_bound`
 
-[定义位置](../../../manipulation/planning_observation.py#L294)。
+[定义位置](../../../manipulation/planning_observation.py#L302)。
 
 输入签名：
 
@@ -645,7 +650,7 @@ int
 
 ## `scene_task_owner_ids`
 
-[定义位置](../../../manipulation/planning_observation.py#L314)。
+[定义位置](../../../manipulation/planning_observation.py#L322)。
 
 输入签名：
 
@@ -693,7 +698,7 @@ scene.get
 
 ## `observation_resolutions`
 
-[定义位置](../../../manipulation/planning_observation.py#L334)。
+[定义位置](../../../manipulation/planning_observation.py#L342)。
 
 输入签名：
 
@@ -745,7 +750,7 @@ float
 
 ## `_owner_mapper_config`
 
-[定义位置](../../../manipulation/planning_observation.py#L358)。
+[定义位置](../../../manipulation/planning_observation.py#L366)。
 
 输入签名：
 
@@ -835,7 +840,7 @@ torch.as_tensor
 
 ## `_fine_mapper_config`
 
-[定义位置](../../../manipulation/planning_observation.py#L392)。
+[定义位置](../../../manipulation/planning_observation.py#L400)。
 
 输入签名：
 
@@ -908,7 +913,7 @@ torch.as_tensor
 
 ## `_require_mapping_memory`
 
-[定义位置](../../../manipulation/planning_observation.py#L421)。
+[定义位置](../../../manipulation/planning_observation.py#L429)。
 
 输入签名：
 
@@ -952,7 +957,7 @@ require_device_memory
 
 ## `build_scene_from_rgbd`
 
-[定义位置](../../../manipulation/planning_observation.py#L438)。
+[定义位置](../../../manipulation/planning_observation.py#L446)。
 
 输入签名：
 
@@ -971,8 +976,11 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
 > 
 > An existing background and coverage are reused in world coordinates. A new
 > background uses each view's explicit background_mask when supplied, or the
-> complement of newly mapped owners. The caller supplies a static partition
+> complement of newly mapped owners, after withholding the one-pixel
+> eight-neighbour semantic boundary. The caller supplies a static partition
 > when the observation also contains separately retained moving entities.
+> The existing unmapped_pixels count includes the withheld boundary;
+> independently measured free-ray coverage is unchanged.
 
 显式输出分支：
 

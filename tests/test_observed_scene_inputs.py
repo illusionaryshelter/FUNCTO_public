@@ -74,16 +74,17 @@ class MapperConfig:
 
 
 def test_new_entity_maps_its_pixels_while_existing_entity_is_passed_unchanged():
+    # BEGIN the public mapper consumes the protected original static partition.
     owner = retained_owner()
-    target = np.zeros((3, 3), bool)
+    target = np.zeros((7, 7), bool)
     target[0, 0] = True
-    original_entity = np.zeros((3, 3), bool)
-    original_entity[1, 1] = True
+    original_entity = np.zeros((7, 7), bool)
+    original_entity[3, 3] = True
     background = ~(target | original_entity)
-    depth = np.ones((3, 3))
-    view = {"image": np.zeros((3, 3, 3), np.uint8), "depth": depth, "K": np.eye(3),
+    depth = np.ones((7, 7))
+    view = {"image": np.zeros((7, 7, 3), np.uint8), "depth": depth, "K": np.eye(3),
         "T_output_camera": np.eye(4), "reference_frame": "world",
-        "self_filter": {"labels": np.full((3, 3), ENVIRONMENT, np.uint8),
+        "self_filter": {"labels": np.full((7, 7), ENVIRONMENT, np.uint8),
                         "free_ray_depth_m": depth, "source": "capture"},
         "owner_masks": {"target": target}, "background_mask": background}
     built = {}
@@ -105,8 +106,15 @@ def test_new_entity_maps_its_pixels_while_existing_entity_is_passed_unchanged():
             coverage=coverage(), **args)
     assert set(built) == {"target", "observed_background"}
     np.testing.assert_array_equal(built["target"], target)
-    np.testing.assert_array_equal(built["observed_background"], background)
-    assert not built["observed_background"][1, 1]
+    expected_background = background.copy()
+    expected_background[:2, :2] = False
+    expected_background[2:5, 2:5] = False
+    np.testing.assert_array_equal(built["observed_background"], expected_background)
+    np.testing.assert_array_equal(view["background_mask"], background)
+    np.testing.assert_array_equal(view["self_filter"]["free_ray_depth_m"], depth)
+    assert built["observed_background"][6, 6]
+    assert not built["observed_background"][3, 3]
     assert next(row for row in scene.owners if row.owner_id == "entity") is owner
-    assert scene.observation_report["endpoint_partition"]["old_capture"]["unmapped_pixels"] == 1
+    assert scene.observation_report["endpoint_partition"]["old_capture"]["unmapped_pixels"] == 12
+    # END one retained pixel and eleven boundary pixels stay out of the new maps.
 # END masks reconstruct only the entities named by the new observation input.

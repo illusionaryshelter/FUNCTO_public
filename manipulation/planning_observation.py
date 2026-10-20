@@ -7,7 +7,9 @@ from dataclasses import replace
 import math
 from numbers import Real
 import numpy as np
-from scipy.ndimage import minimum_filter
+# BEGIN restore the existing one-pixel semantic boundary operation.
+from scipy.ndimage import binary_dilation, minimum_filter
+# END use the installed SciPy implementation without a new dependency.
 import torch
 from .motion import _inverse, _pose_array
 from .observations import _intrinsics
@@ -209,18 +211,20 @@ def _self_filtered_views(views, reference_frame, depth_range_m):
 
 
 def _partition_masks(views, owner_ids, *, build_background=True):
-    # BEGIN conserve every admitted endpoint under the supplied identities.
-    """Partition current environment endpoints into owners and background.
+    # BEGIN preserve entity masks and protect their uncertain image boundaries.
+    """Partition measured endpoints with one eight-neighbour boundary ring.
 
     Check owner/owner overlap on the supplied masks before self filtering;
     uncertainty is not permission to silently choose a semantic winner.
-    All admitted endpoints outside explicit owners remain observed obstacles;
-    proximity to an owner neither grants its identity nor erases occupancy.
     Only entities being integrated appear in owner_ids. A supplied background
     mask selects the static endpoints of the original observation independently
     of retained moving entities. Without that mask, the new-owner complement
-    defines the background. Retained background bypasses this integration.
-    Free rays remain the original independently filtered measurements.
+    defines the background candidates. Environment pixels on the nonbackground
+    side seed one 3-by-3 dilation; adjacent background candidates are withheld
+    from integration. They acquire neither an entity identity nor free-space
+    evidence. SELF, shadow and invalid-depth pixels do not seed this ring.
+    Entity masks and independently filtered free rays remain unchanged.
+    Retained background bypasses this integration.
     """
     from .robot_self_filter import ENVIRONMENT, validate_self_filter
     masks, observed = {}, {identity: 0 for identity in owner_ids}
@@ -246,8 +250,6 @@ def _partition_masks(views, owner_ids, *, build_background=True):
             occupied |= mask
             masks[name][identity] = mask & environment
             observed[identity] += int(np.count_nonzero(masks[name][identity] & (depth > 0)))
-        # The disjoint owner intersections and this complement exhaust the
-        # accepted environment. SELF/shadow pixels never enter any partition.
         # BEGIN background admission is independent of retained entity visibility.
         if build_background:
             background = view.get("background_mask")
@@ -259,12 +261,18 @@ def _partition_masks(views, owner_ids, *, build_background=True):
                     raise ValueError("A supplied background partition must be an aligned boolean image")
                 if np.any(background & occupied):
                     raise ValueError("Background and newly mapped entity partitions must be disjoint")
-            masks[name][None] = environment & background
+            # The explicit static partition also excludes retained entities.
+            # Its complement supplies their original image boundary without
+            # requiring those entities to be segmented or integrated again.
+            boundary = environment & background & binary_dilation(
+                environment & ~background, structure=np.ones((3, 3), bool), iterations=1)
+            masks[name][None] = environment & background & ~boundary
             masks[name][None].setflags(write=False)
         # END retained entities do not acquire a new segmentation requirement.
     if any(count == 0 for count in observed.values()):
         raise ValueError("Every explicit collision owner needs current valid depth evidence after self filtering")
     return masks
+    # END the boundary changes background admission only.
 
 
 def _self_filter_report(views):
@@ -451,8 +459,11 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
 
     An existing background and coverage are reused in world coordinates. A new
     background uses each view's explicit background_mask when supplied, or the
-    complement of newly mapped owners. The caller supplies a static partition
+    complement of newly mapped owners, after withholding the one-pixel
+    eight-neighbour semantic boundary. The caller supplies a static partition
     when the observation also contains separately retained moving entities.
+    The existing unmapped_pixels count includes the withheld boundary;
+    independently measured free-ray coverage is unchanged.
     """
     from .observed_mapping import integrate_entity, FrozenObservedField
     from .online_geometry import OnlinePlanningScene

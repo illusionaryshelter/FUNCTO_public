@@ -771,16 +771,16 @@ class OnlineObservationContractTest(unittest.TestCase):
         owner[[30, 31, 32], [30, 31, 32]] = True
         record["owner_masks"] = {"part": owner}
         normalized = _self_filtered_views({"camera": record}, "world", (.1, 3.))
-        # BEGIN all accepted endpoints keep their supplied owner or background.
+        # BEGIN one-pixel uncertainty is withheld only beside valid owner pixels.
         masks = _partition_masks(normalized, ("part",))["camera"]
         self.assertEqual(int(masks["part"].sum()), 1)
         self.assertFalse(masks[None][30, 30])
         self.assertFalse(masks[None][31, 31])
-        self.assertTrue(masks[None][33, 33])
+        self.assertFalse(masks[None][33, 33])
         self.assertTrue(masks[None][29, 29])
         self.assertTrue(masks[None][30, 31])
         self.assertTrue(masks[None][34, 34])
-        # END SELF/shadow and owner masks never suppress adjacent environment.
+        # END SELF/shadow never seed the owner's uncertainty ring.
         report = _self_filter_report(normalized)["camera"]["owners"]["part"]
         self.assertEqual(report["excluded_self_pixels"], 1)
         self.assertEqual(report["excluded_ambiguous_shadow_pixels"], 1)
@@ -796,8 +796,8 @@ class OnlineObservationContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "after self filtering"):
             _partition_masks(normalized, ("part",))
 
-    # BEGIN endpoint-conservation counterexamples preserve identity and visibility.
-    def test_unlabelled_adjacent_obstacle_stays_occupied_without_inventing_an_owner(self):
+    # BEGIN boundary uncertainty preserves identity and independent ray evidence.
+    def test_unlabelled_boundary_is_withheld_without_inventing_an_owner(self):
         record = view()
         mask = np.zeros(record['depth'].shape, bool)
         mask[40:43, 40:43] = True
@@ -807,10 +807,9 @@ class OnlineObservationContractTest(unittest.TestCase):
         original_labels = record['self_filter']['labels'].copy()
         normalized = _self_filtered_views({'camera': record}, 'world', (.1, 3.))
         mapped = _partition_masks(normalized, ('part',))['camera']
-        # An unlabelled adjacent endpoint may be leaked object material or a
-        # thin independent obstacle. The planner cannot decide that identity
-        # from adjacency and must retain the measured obstacle in either case.
-        self.assertTrue(mapped[None][43, 43])
+        # The one-pixel ring records uncertain identity; neither the owner map
+        # nor the background map integrates that measured endpoint.
+        self.assertFalse(mapped[None][43, 43])
         self.assertFalse(mapped['part'][43, 43])
         self.assertTrue(mapped[None][44, 44])
         np.testing.assert_array_equal(mapped['part'], mask)
@@ -819,10 +818,12 @@ class OnlineObservationContractTest(unittest.TestCase):
         np.testing.assert_array_equal(record['self_filter']['labels'], original_labels)
         np.testing.assert_array_equal(normalized['camera']['self_filter']['free_ray_depth_m'], original_rays)
         self.assertFalse(mapped[None].flags.writeable)
-        np.testing.assert_array_equal(mapped[None] | mapped['part'], np.ones_like(mask))
+        expected = np.ones_like(mask)
+        expected[39:44, 39:44] = False
+        np.testing.assert_array_equal(mapped[None], expected)
         self.assertFalse(np.any(mapped[None] & mapped['part']))
 
-    def test_adjacent_owners_keep_identity_and_do_not_erase_other_endpoints(self):
+    def test_adjacent_owners_keep_identity_with_a_shared_boundary_ring(self):
         record = view()
         first, second = np.zeros(record['depth'].shape, bool), np.zeros(record['depth'].shape, bool)
         first[40, 40] = True
@@ -834,11 +835,11 @@ class OnlineObservationContractTest(unittest.TestCase):
         np.testing.assert_array_equal(mapped['second'], second)
         self.assertFalse(mapped[None][40, 40])
         self.assertFalse(mapped[None][40, 41])
-        self.assertTrue(mapped[None][39, 40])
-        self.assertTrue(mapped[None][39, 41])
-        # Integer counts prove both endpoint conservation and non-overlap.
-        np.testing.assert_array_equal(sum(mask.astype(int) for mask in mapped.values()),
-                                      np.ones_like(first, dtype=int))
+        self.assertFalse(mapped[None][39, 40])
+        self.assertFalse(mapped[None][39, 41])
+        expected = np.ones_like(first)
+        expected[39:42, 39:43] = False
+        np.testing.assert_array_equal(mapped[None], expected)
         # Conflicting raw semantic evidence still fails before any uncertainty
         # treatment can hide the overlap.
         record['owner_masks']['second'][40, 40] = True
@@ -862,10 +863,11 @@ class OnlineObservationContractTest(unittest.TestCase):
             self.assertFalse(mapped[None][row, row])
             self.assertFalse(mapped['part'][row, row])
             self.assertTrue(mapped[None][row+1, row+1])
-        self.assertTrue(mapped[None][41, 41])
-        np.testing.assert_array_equal(sum(mask.astype(int) for mask in mapped.values()),
-            (normalized['camera']['self_filter']['labels'] == ENVIRONMENT).astype(int))
-    # END self filtering alone determines which measured endpoints are admitted.
+        self.assertFalse(mapped[None][41, 41])
+        expected = normalized['camera']['self_filter']['labels'] == ENVIRONMENT
+        expected[39:42, 39:42] = False
+        np.testing.assert_array_equal(mapped[None], expected)
+    # END only valid environment-owner pixels seed the boundary ring.
 
     def test_online_evidence_is_required_and_cannot_grant_excluded_rays(self):
         from manipulation.robot_self_filter import AMBIGUOUS_SHADOW
@@ -994,8 +996,8 @@ class OnlineObservationContractTest(unittest.TestCase):
         record['owner_masks'] = {'part': mask}
         rebuilt = _self_filtered_views({'A': record}, 'world', (.1, 3.))
         rebuilt_masks = _partition_masks(rebuilt, ('part',))
-        # An independently corrected visible mask, rather than a planner
-        # dilation, is what removes the other measured owner endpoint.
+        # A corrected owner mask changes its identity and the adjacent boundary;
+        # withheld pixels never become owner pixels solely through dilation.
         complete_record = {**record, 'owner_masks': {'part': mask.copy()}}
         complete_record['owner_masks']['part'][41, 41] = True
         complete = _self_filtered_views({'A': complete_record}, 'world', (.1, 3.))
@@ -1026,12 +1028,12 @@ class OnlineObservationContractTest(unittest.TestCase):
         old_depth, new_depth, complete_depth, owner_depth = [instance.integrate.call_args.kwargs['camera_observation'].depth_image.numpy()[0]
                                 for instance in instances]
         self.assertGreater(old_depth[41, 41], 0.)
-        self.assertGreater(new_depth[41, 41], 0.)
+        self.assertEqual(new_depth[41, 41], 0.)
         self.assertEqual(new_depth[40, 40], 0.)
         self.assertGreater(new_depth[42, 42], 0.)
         self.assertEqual(complete_depth[40, 40], 0.)
         self.assertEqual(complete_depth[41, 41], 0.)
-        self.assertGreater(complete_depth[42, 42], 0.)
+        self.assertEqual(complete_depth[42, 42], 0.)
         np.testing.assert_array_equal(new_depth, np.where(rebuilt_masks['A'][None], record['depth'], 0.))
         np.testing.assert_array_equal(complete_depth,
             np.where(complete_masks['A'][None], complete_record['depth'], 0.))
