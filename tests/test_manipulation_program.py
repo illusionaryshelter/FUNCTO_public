@@ -121,15 +121,19 @@ class ProgramTest(unittest.TestCase):
         np.testing.assert_allclose(first["object_poses"], second["object_poses"])
         np.testing.assert_allclose(second["eef_poses"][:, 2, 3] - first["eef_poses"][:, 2, 3], .03)
 
-    def test_candidate_or_unsynchronized_holding_is_rejected(self):
+    # BEGIN declared holding never requires truth; model consistency still does.
+    def test_declared_attachment_needs_no_verified_physical_holding(self):
         program, scene = fixture()
-        scene["holding"]["verified"] = False
-        with self.assertRaisesRegex(ValueError, "actual holding"):
-            ground_program(program, scene)
-        scene["holding"]["verified"] = True
+        baseline = ground_program(program, scene)
+        for value in (False, None):
+            scene["holding"]["verified"] = value
+            result = ground_program(program, scene)
+            np.testing.assert_allclose(result["eef_poses"], baseline["eef_poses"])
+        scene["holding"].pop("verified")
         scene["eef_pose"] = pose(x=1)
-        with self.assertRaisesRegex(ValueError, "synchronized"):
+        with self.assertRaisesRegex(ValueError, "declared attachment model"):
             ground_program(program, scene)
+    # END changing a physical score cannot change the reference.
 
     def test_function_event_cannot_be_replaced_by_end_or_release(self):
         program, scene = fixture()

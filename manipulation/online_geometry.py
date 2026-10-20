@@ -623,20 +623,20 @@ class OnlinePlanningScene:
         if len(conditions)!=sum('condition_id' in row for row in problem.conditions):
             raise ValueError('Online condition identities must be unique')
         condition_ids=set(conditions)
-        # BEGIN Holding binds its current internal materials, not a prior task goal.
+        # BEGIN the declared attachment binds its nominal internal materials.
         validate_holding_conditions(self.holding_contacts, self.owners, problem.conditions)
-        # END the attachment's transform below is current geometry consistency only.
         for owner in self.owners:
             for relation in owner.attachments:
                 if relation.condition_id not in condition_ids or (relation.release_condition_id is not None and relation.release_condition_id not in condition_ids):
                     raise ValueError('Every online attachment must identify this problem condition')
                 declaration=conditions[relation.condition_id]
-                if declaration.get('kind') not in {'candidate_attachment','observed_attachment'} or declaration.get('carrier_id')!=owner.owner_id or declaration.get('progress')!=relation.interval[0]:
+                if declaration.get('kind') not in {'candidate_attachment','declared_attachment'} or declaration.get('carrier_id')!=owner.owner_id or declaration.get('progress')!=relation.interval[0]:
                     raise ValueError('Online attachment must preserve the owner and exact condition boundary')
                 if relation.release_condition_id is not None:
                     release=conditions[relation.release_condition_id]
                     if release.get('kind')!='predicted_release' or release.get('carrier_id')!=owner.owner_id or release.get('progress')!=relation.interval[1]:
                         raise ValueError('Online release must preserve its exact owner, event and boundary')
+        # END these checks bind model identity; none establishes physical Holding.
         if self.gripper is not None:
             commands = {(row['skill_id'], row['event_id'], row.get('occurrence',0), row['command'], row['progress']) for row in self.gripper.commands}
             events = {(event.skill_id, event.event_id, event.occurrence, event.kind, event.progress) for event in problem.events if event.kind in {'open','close','hold'}}
@@ -754,7 +754,7 @@ class OnlinePlanningScene:
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time=None,
                    active_contact_rule_ids=None, contact_permission_progress=None,
-                   owner_poses=None, condition_evidence=None, native_confirmation=None,
+                   owner_poses=None, native_confirmation=None,
                    collision_paths_out=None):
         """Return the unchanged hard components and optional sphere trajectories.
 
@@ -927,12 +927,11 @@ class OnlinePlanningScene:
                     pose, found = self._release_pose(relation,position,quaternion,progress)
                     releases.append(pose)
                     costs[f'unsupported/release_anchor/{owner.owner_id}/{index}'] = ((progress>=relation.interval[1]) & ~found[:,None]).to(progress.dtype)
-                if active_contact_rule_ids is not None:
-                    evidence = condition_evidence or {}
-                    active = (progress>=relation.interval[0]) & (progress<relation.interval[1])
-                    if not evidence.get(relation.condition_id,False):
-                        costs[f'unsupported/holding/{owner.owner_id}/{index}'] = active.to(progress.dtype)
+            # BEGIN use the bound attachment model without another effect proof.
+            # Its matrix and lifetime already match the problem; no Holding
+            # score may reject this query or alter the nominal placement.
             poses[owner.owner_id] = owner.pose(position,quaternion,progress,releases)
+            # END the owner placement and material permissions share one model.
         actors = {'robot':(spheres,(position,quaternion))}
         # BEGIN use the already resolved owner poses, including attachment modes.
         if confirmation is not None:
@@ -1016,10 +1015,10 @@ class OnlinePlanningScene:
                     if rule.required:
                         costs[f'contact/required/{rule.rule_id}'] = owner.query.required_contact(rule,policy)*policy['active']
                 values, gap = owner.query.contact_query(local,policies) if policies else (owner.query(local),torch.zeros_like(local[...,3]))
-                # BEGIN a held assembly's established material contacts are internal.
-                # This mask depends on Holding and release, never on an old grasp
-                # target pose or a newly fitted permissive patch. Other materials
-                # on the same hand still query this complete owner normally.
+                # BEGIN declared attachment materials are internal to that model.
+                # Only the same bound attachment interval activates this exact
+                # material/owner pair. It does not assert physical Holding;
+                # other hand materials still query the complete owner normally.
                 if actor == 'robot':
                     for contact in self.holding_contacts:
                         if contact.target_owner != owner.owner_id:
@@ -1030,8 +1029,6 @@ class OnlinePlanningScene:
                                   (permission_progress <= contact.interval[1]))
                         if relation.release_condition_id is not None:
                             active = active & (permission_progress < contact.interval[1])
-                        if active_contact_rule_ids is not None:
-                            active = active & ((condition_evidence or {}).get(contact.condition_id) is True)
                         selected = torch.zeros(values.shape[-1], dtype=torch.bool, device=values.device)
                         selected[list(contact.sphere_indices)] = True
                         internal = active[...,None] & selected
@@ -1243,10 +1240,15 @@ class OnlinePlanningScene:
                     gpu_shared=int(gpu_shared),gpu_live=gpu_live,gpu_retained=0,gpu_graph_live=gpu_live)
         # END no duplicate group bank or bool-as-one-byte floating cache assumption.
 
+    # BEGIN feedback queries reuse the scene declaration without condition scores.
     def query_state(self,spheres,tool_pose,progress,*,joint_position=None,joint_names=None,
-                    trajectory_time=0.,active_contact_rule_ids=frozenset(),owner_poses=None,condition_evidence=None,
+                    trajectory_time=0.,active_contact_rule_ids=frozenset(),owner_poses=None,
                     native_confirmation=None):
-        """Cheap actual-state query; fresh finite latches and evidence are explicit."""
+        """Query robot feedback against the declared scene and finite latches.
+
+        Attachment geometry remains the caller's nominal model; this query
+        neither requires nor certifies physical Holding.
+        """
         tool = np.asarray(tool_pose,dtype=float)
         p = torch.as_tensor(tool[:3,3],dtype=torch.float64)[None,None]
         q = torch.as_tensor(Rotation.from_matrix(tool[:3,:3]).as_quat()[[3,0,1,2]],dtype=torch.float64)[None,None]
@@ -1254,7 +1256,7 @@ class OnlinePlanningScene:
         joints = None if joint_position is None else torch.as_tensor(joint_position,dtype=torch.float64)[None,None]
         terms = self.components(torch.as_tensor(spheres,dtype=torch.float64)[None,None],p,q,step,
             joint_position=joints,joint_names=joint_names,trajectory_time=torch.tensor([[float(trajectory_time)]],dtype=torch.float64),
-            active_contact_rule_ids=active_contact_rule_ids,owner_poses=owner_poses,condition_evidence=condition_evidence,
+            active_contact_rule_ids=active_contact_rule_ids,owner_poses=owner_poses,
             native_confirmation=native_confirmation)
         values = {name:float(value.item()) for name,value in terms.items()}
         # BEGIN a missing numerical result cannot be cleared by native confirmation.
@@ -1282,6 +1284,7 @@ class OnlinePlanningScene:
             report['native_confirmation'] = deepcopy(native_confirmation.last_report)
         # END a clear native pair is distinct from an unqueried broad-phase zero.
         return report
+    # END the report preserves geometry checks and does not certify real Holding.
 
     def describe(self):
         return {'model':'frozen_online_esdf_planar_contact_v2','reference_frame':self.reference_frame,

@@ -106,8 +106,9 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
             self.assertEqual(result["goal_identities"]["pose_events"], [])
             self.assertEqual(result["completed_goal_ids"], [])
         actual["completed_goal_ids"] = [["pose_events", 7]]
-        with self.assertRaisesRegex(ContinuationBindingError, "original request"):
-            _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, actual)
+        # Posthoc labels are not inputs, including an unrelated identity.
+        _, result = _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, actual)
+        self.assertEqual(result["completed_goal_ids"], [])
 
     def test_missing_owner_does_not_restore_past_pose_gate_or_remove_future_anchor(self):
         relation = {"target_owner_id": "target", "T_owner_target": np.eye(4),
@@ -473,39 +474,25 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
         self.assertEqual(plain(request), before)
         self.assertEqual(result.request_ledger["consumed_planning"]["initializations"], 2)
 
-    # BEGIN failed continuation work cannot publish unverified completion authority.
-    def test_rejected_nonpose_completion_cannot_poison_a_failed_work_ledger(self):
-        # A measured mechanism coordinate remains a separate online evidence
-        # contract; removing target-pose gates must not authorize false labels.
+    # BEGIN coordinate goals have the same nominal-only continuation semantics.
+    def test_coordinate_scores_cannot_change_the_remaining_nominal_goals(self):
         model = MotionModel("prismatic", np.zeros((1, 1)), np.eye(4), np.eye(3), None,
-                            1e-6, 1e-6, {"source": "physical slider"})
+                            1e-6, 1e-6, {"source": "declared slider model"})
         mechanism = MechanismRequirement(0., 1., model, np.eye(4), [[0., 2.]], [0.], "slider frame")
-        request = problem()
-        request.mechanisms = (mechanism,)
-        request.coordinate_events = (CoordinateEventRequirement(.2, mechanism, .5, .001, "measured slider goal"),)
-        actual = continuation(request)
-        actual["completed_goal_ids"] = [["coordinate_events", 0]]
-        actual["goal_evidence"] = [{"identity": ["coordinate_events", 0], "value": "T", "completion_verified": False}]
-        # The executor output already carries appended facts. They still
-        # need validation before a planning failure can return a trusted ledger.
-        actual["request_ledger"] = deepcopy(actual["original_binding"]["request_ledger"])
-        for key in ("completed_goal_ids", "goal_evidence"):
-            actual["request_ledger"][key] = deepcopy(actual[key])
-        scene = SimpleNamespace(gripper=None, required_progress_anchors=(), bind_robot_validator=Mock())
-        scene.clone_for_rollout = lambda: deepcopy(scene)
-        with patch("manipulation.planning._CuroboPlanner") as native:
-            failed = plan_trajectory(request, scene, {}, robot_validator=self.robot_validator, continuation=actual)
-            self.assertFalse(failed.success)
-            self.assertIn("actual allowed-set T evidence", failed.diagnostics["reason"])
-            self.assertEqual(failed.request_ledger["completed_goal_ids"], [])
-            self.assertEqual(failed.request_ledger["goal_evidence"], [])
-            self.assertTrue(failed.request_ledger["requires_continuation"])
-            self.assertEqual(failed.request_ledger["consumed_planning"]["binding_attempts"], 2)
-            self.assertIn("continuation_facts_pending_validation", failed.diagnostics)
-            retried = plan_trajectory(request, scene, {}, robot_validator=self.robot_validator, request_ledger=failed.request_ledger)
-            self.assertFalse(retried.success)
-            self.assertIn("actual continuation facts", retried.diagnostics["reason"])
-            native.assert_not_called()
+        original = problem()
+        original.mechanisms = (mechanism,)
+        original.coordinate_events = tuple(CoordinateEventRequirement(t, mechanism, .5, .001,
+            "nominal slider goal") for t in (.2, .8))
+        for value in ("T", "F", "U", None):
+            request = deepcopy(original)
+            actual = continuation(request)
+            actual["completed_goal_ids"] = [["coordinate_events", 0], ["coordinate_events", 1]]
+            actual["goal_evidence"] = [{"identity": ["coordinate_events", 0], "value": value}]
+            _, prior = _prepare_continuation(request, SimpleNamespace(gripper=None), None, actual)
+            self.assertEqual(prior["goal_identities"]["coordinate_events"], [1])
+            self.assertEqual(prior["completed_goal_ids"], [])
+            self.assertEqual(plain(request.coordinate_events[0]), plain(original.coordinate_events[1]))
+    # END neither successful nor failed scores remove future geometric anchors.
 
     def test_continuation_cannot_replace_an_original_actual_time_origin(self):
         event = PlanningEvent("origin", "s", 0., 0, "close", "original command")

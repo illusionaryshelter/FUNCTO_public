@@ -56,7 +56,7 @@ def held_problem():
     metadata = dict(carrier_id="payload", owner_initial_pose=initial, mode="held",
         attachment=attachment, attachment_interval=[0., .8],
         attachment_condition_id="actual-holding", release_condition_id="actual-release")
-    condition = dict(kind="observed_attachment", condition_id="actual-holding",
+    condition = dict(kind="declared_attachment", condition_id="actual-holding",
         carrier_id="payload", T_carrier_eef=attachment.tolist(), progress=0.)
     return SimpleNamespace(phases=[SimpleNamespace(metadata=metadata)], conditions=[condition])
 

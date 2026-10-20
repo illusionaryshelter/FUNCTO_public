@@ -1,8 +1,7 @@
-"""Bind a confirmed grasp to measured hand geometry and arm-only planning.
+"""Bind measured finger coordinates to hand geometry and arm-only planning.
 
 Position targets belong to the executor. This boundary consumes synchronized
-robot feedback and caller-verified holding evidence; it neither executes a
-closure nor infers contact from a commanded width or a quiet robot.
+robot q/dq; it neither observes an object nor proves physical holding.
 """
 
 # BEGIN measured post-grasp hand configuration, independent of optimizer DOF.
@@ -31,19 +30,15 @@ def _source(value, label):
     return deepcopy(value)
 
 
-def build_post_grasp_robot_config(robot, feedback, scene):
+def build_post_grasp_robot_config(robot, feedback):
     """Return a new measured-hand robot config and an arm-only start state.
 
     ``feedback`` is one complete named robot snapshot: q/dq, arm_joint_names,
     finger_joint_names, feedback_id, timestamp_s, source, reference_frame,
     base_pose, tool_pose, tool_link and tool_transform. Commanded finger targets
     and actuator ctrl may be retained in that snapshot but are never geometry
-    inputs. ``scene`` is the same-time current observation, with observation_ids,
-    initial_pose (reference-from-carrier), eef_pose, and ``holding``. Holding
-    must already be verified, name this robot_feedback_id, carrier_id, the same
-    observation_ids and its own source, and supply the actual T_carrier_eef.
-    This function validates that binding;
-    it does not certify the caller's contact/holding measurements.
+    inputs. Finger coordinates need only their robot feedback: object poses,
+    contact evidence and attachment assumptions belong to separate models.
 
     The original cspace layout, arm rest posture, collision geometry and pair
     policy are preserved. Only finger locks and their matching default entries
@@ -53,8 +48,8 @@ def build_post_grasp_robot_config(robot, feedback, scene):
     motion or a complete environment/payload collision scene. New measurements
     or a release require a new binding, not reuse of a stale model.
     """
-    if not all(isinstance(value, Mapping) for value in (robot, feedback, scene)):
-        raise TypeError("Robot, complete feedback and current scene must be mappings")
+    if not all(isinstance(value, Mapping) for value in (robot, feedback)):
+        raise TypeError("Robot and complete feedback must be mappings")
     names = _names(feedback["joint_names"], "Complete robot feedback")
     arm = _names(feedback["arm_joint_names"], "Active arm joints")
     fingers = _names(feedback["finger_joint_names"], "Measured finger joints")
@@ -68,35 +63,17 @@ def build_post_grasp_robot_config(robot, feedback, scene):
     if any(not isinstance(value, str) or not value.strip() for value in (identifier, frame)):
         raise ValueError("Current feedback needs an explicit identity and reference frame")
     source = _source(feedback["source"], "Robot feedback")
-    times = np.asarray([feedback["timestamp_s"], scene["timestamp_s"]], float)
-    if not np.isfinite(times).all() or abs(times[0]-times[1]) > 1e-9:
-        raise ValueError("Holding observations and complete robot feedback must be synchronized")
-    if scene.get("state") != "current_observed" or scene.get("reference_frame") != frame:
-        raise ValueError("Post-grasp geometry needs current observations in the robot reference frame")
-    observations = _names(scene["observation_ids"], "Current observation identities")
-    carrier_id = scene["carrier_id"]
-    if not isinstance(carrier_id, str) or not carrier_id.strip():
-        raise ValueError("The current observed grasp carrier must have an explicit identity")
-    holding = scene.get("holding")
-    if (not isinstance(holding, Mapping) or holding.get("verified") is not True
-            or holding.get("robot_feedback_id") != identifier
-            or holding.get("carrier_id") != carrier_id):
-        raise ValueError("Confirmed holding must identify this robot feedback and observed carrier")
-    if set(_names(holding["observation_ids"], "Holding observation identities")) != set(observations):
-        raise ValueError("Confirmed holding must use the same current observation identities")
-    holding_source = _source(holding.get("source"), "Confirmed holding")
+    # BEGIN a robot-only hand model does not require an object proof chain.
+    timestamp = float(feedback["timestamp_s"])
+    if not np.isfinite(timestamp):
+        raise ValueError("Robot feedback needs a finite acquisition timestamp")
+    # END missing object observations cannot reject measured finger geometry.
     base = _pose_array(feedback["base_pose"], "measured robot base")
     tool = _pose_array(feedback["tool_pose"], "measured tool pose")
     tool_transform = _pose_array(feedback["tool_transform"], "native tool calibration")
     tool_link = feedback["tool_link"]
     if not isinstance(tool_link, str) or not tool_link.strip():
         raise ValueError("Measured feedback must identify its calibrated native tool link")
-    observed_tool = _pose_array(scene["eef_pose"], "observed current EEF")
-    carrier = _pose_array(scene["initial_pose"], "observed current carrier")
-    attachment = _pose_array(holding["T_carrier_eef"], "actual holding transform")
-    if (not np.allclose(tool, observed_tool, atol=1e-8, rtol=0)
-            or not np.allclose(carrier @ attachment, tool, atol=1e-6, rtol=0)):
-        raise ValueError("Actual holding, current object observation and measured EEF disagree")
 
     result = deepcopy(robot)
     kinematics = result["robot_cfg"]["kinematics"]
@@ -123,17 +100,15 @@ def build_post_grasp_robot_config(robot, feedback, scene):
         "start_dq": dq[indices].tolist(), "reference_frame": frame,
         "base_pose": base.tolist(), "eef_pose": tool.tolist(),
         "tool_link": tool_link, "tool_transform": tool_transform.tolist(),
-        "source": source, "feedback_id": identifier, "timestamp_s": float(times[0]),
+        "source": source, "feedback_id": identifier, "timestamp_s": timestamp,
     }
     binding = {
         "state": "measured_post_grasp", "robot_feedback_id": identifier,
-        "timestamp_s": float(times[0]), "reference_frame": frame,
-        "observation_ids": list(observations), "carrier_id": carrier_id,
-        "holding_source": holding_source,
+        "timestamp_s": timestamp, "reference_frame": frame,
         "finger_joint_names": list(fingers), "finger_positions": list(locked.values()),
         "finger_velocities": [float(dq[names.index(name)]) for name in fingers],
-        "T_carrier_eef": attachment.tolist(), "active_joint_names": list(arm),
-        "scope": "Measured hand robot collision configuration; environment and payload still require current evidence",
+        "active_joint_names": list(arm),
+        "scope": "Measured finger coordinates in the robot collision model; no object pose or holding claim",
     }
     return {"robot_config": result, "planning_feedback": active_feedback,
             "full_feedback": deepcopy(feedback), "hand_binding": binding}

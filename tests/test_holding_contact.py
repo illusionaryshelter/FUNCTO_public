@@ -1,4 +1,4 @@
-"""Holding carries an assembly into the next skill without a grasp-pose goal."""
+"""Declared attachments share nominal geometry without physical Holding proof."""
 # BEGIN CPU counterexamples keep internal materials, other obstacles and release distinct.
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -47,23 +47,25 @@ def setup(*, release=True, other_owner=False, self_collision=False, angle=0.):
         'centers_local':[[0.,0.,0.]],'radii':[.005]}, {'link_name':'arm','sphere_indices':[1],
         'centers_local':[[0.,0.,0.]],'radii':[.005]}],
         robot_self_collision_pairs=[[0,1]] if self_collision else [])
-    condition = {'kind':'observed_attachment','condition_id':'held','carrier_id':'part','progress':0.,
+    condition = {'kind':'declared_attachment','condition_id':'held','carrier_id':'part','progress':0.,
                  'T_carrier_eef':pose.tolist(),'contact_rule_ids':['held-pad']}
     validate_holding_conditions(current.holding_contacts,current.owners,[condition])
     return current,pose,condition
 
 
-def query(current,pose,*,progress=.5,evidence=True,arm_center=.06):
-    return current.query_state(np.array([[0.,0.,0.,.005],[arm_center,0.,0.,.005]]),pose,progress,
-        condition_evidence={'held':evidence},owner_poses={'part':np.eye(4)})
+# BEGIN queries use only robot feedback and the declared attachment matrix.
+def query(current,pose,*,progress=.5,arm_center=.06):
+    return current.query_state(np.array([[0.,0.,0.,.005],[arm_center,0.,0.,.005]]),pose,progress)
+# END no object pose or physical Holding score supplies the fixture's geometry.
 
 
 @pytest.mark.parametrize('angle',[0.,27.81,85.])
-def test_current_holding_accepts_arbitrary_observed_attachment_without_previous_grasp_target(angle):
+def test_declared_attachment_accepts_identity_and_general_matrix_without_holding_proof(angle):
     current,pose,_ = setup(angle=angle)
     result = query(current,pose)
     assert result['passed'],result
     assert result['components']['collision/robot/part']==0
+    assert not any(name.startswith('unsupported/holding/') for name in result['components'])
     assert not any(name.startswith('contact/') for name in result['components'])
     assert not {'patch_origin','patch_axes','gap_bounds','normal_tolerance_rad'} & set(asdict(current.holding_contacts[0]))
 
@@ -77,13 +79,6 @@ def test_holding_does_not_clear_other_robot_material_or_other_owner_or_self():
     assert report['components']['collision/part/obstacle']>0
     current,pose,_ = setup(self_collision=True)
     assert query(current,pose,arm_center=0.)['components']['collision/robot/self']>0
-
-
-@pytest.mark.parametrize('evidence',[False,None])
-def test_false_or_unknown_holding_cannot_authorize_current_internal_contact(evidence):
-    current,pose,_ = setup()
-    result = query(current,pose,evidence=evidence)
-    assert not result['passed'] and result['components']['collision/robot/part']>0
 
 
 @pytest.mark.parametrize('release',[False,True])
@@ -117,7 +112,7 @@ def test_partial_or_relabelled_material_and_wrong_current_attachment_are_rejecte
 
 
 def test_binder_selects_current_materials_without_reading_a_previous_skill():
-    condition = {'kind':'observed_attachment','condition_id':'held','carrier_id':'part'}
+    condition = {'kind':'declared_attachment','condition_id':'held','carrier_id':'part'}
     problem = SimpleNamespace(conditions=(condition,),phases=[SimpleNamespace(metadata={
         'carrier_id':'part','attachment_condition_id':'held','attachment_interval':[0.,1.]})])
     material = {'materials':{'pad':{'native_geometry':'native-pad','sphere_indices':[0]}}}
@@ -129,4 +124,4 @@ def test_binder_selects_current_materials_without_reading_a_previous_skill():
     assert result[0].condition_id=='held'
     assert problem.conditions[0]['contact_rule_ids']==[result[0].rule_id]
     assert condition==original
-# END tests provide explicit semantic facts; synthetic geometry proves no physical grasp.
+# END declarations are nominal models; synthetic geometry proves no physical grasp.

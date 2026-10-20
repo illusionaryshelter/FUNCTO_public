@@ -10,7 +10,6 @@ this production execution boundary.
 # BEGIN production trajectory execution and required physical contracts.
 from __future__ import annotations
 
-from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 import json
@@ -56,7 +55,7 @@ def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condit
     """
     checks = []
     for index, value in enumerate(event.get("timing", ())):
-        if _posthoc_pose_timing(value):
+        if _posthoc_geometry_timing(value):
             continue
         constraint = value if isinstance(value, EventTimeConstraint) else EventTimeConstraint(**value)
         if (constraint.check_target != check_target
@@ -76,7 +75,7 @@ def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condit
     return checks
 
 
-# BEGIN target-pose errors are exclusively simulation posthoc evidence.
+# BEGIN geometry-goal errors are exclusively simulation posthoc evidence.
 # Do not reintroduce an FK-versus-predicted-target arrival gate here. Encoder
 # FK does not observe the real tool-to-target relation; target truth is absent
 # at runtime. Such an error must NEVER veto close, stop playback, or request
@@ -84,13 +83,17 @@ def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condit
 # Nominal planning pose constraints remain unchanged. Robot joint feedback,
 # robot-model collision checks and independent effect observations keep their
 # own execution duties. The simulation evaluator alone computes pose errors.
-def _posthoc_pose_timing(value):
-    """Identify timing whose witness or origin requires a target-pose result."""
+def _posthoc_geometry_timing(value):
+    """Identify timing whose witness/origin requires a geometry-goal result.
+
+    Pose, support and mechanism-coordinate goals constrain the nominal plan.
+    Their physical accuracy belongs to the independent result evaluator.
+    """
     row = asdict(value) if isinstance(value, EventTimeConstraint) else value
     goal = row.get("goal_id") or ()
     origin_goal = (row.get("origin_event") or {}).get("goal_id") or ()
-    return bool((row.get("check_target") == "arrival" and goal and goal[0] == "pose_events")
-                or (origin_goal and origin_goal[0] == "pose_events"))
+    return bool((row.get("check_target") == "arrival" and goal and goal[0] in {"pose_events", "coordinate_events", "supports"})
+                or (origin_goal and origin_goal[0] in {"pose_events", "coordinate_events", "supports"}))
 # END neither a reference clock nor missing target truth is an arrival sensor.
 
 
@@ -296,7 +299,7 @@ class ExecutionLimits:
                     or policy["period_s"] <= 0 or policy["maximum_age_s"] < 0
                     or not isinstance(policy["required_fields"], (tuple, list))
                     or not set(policy["required_fields"]) <= {
-                        "binding_valid", "scene_condition_evidence", "scene_owner_poses"}
+                        "binding_valid"}
                     or len(set(policy["required_fields"])) != len(policy["required_fields"])):
                 raise ValueError("Observation policy needs explicit cadence, age bound, required fields and source")
             object.__setattr__(self, "observation_policy", deepcopy(policy))
@@ -414,42 +417,11 @@ def continuation_execution_inputs(continuation, finger_targets, execution_limits
 # END same-request continuation does not replay or relabel a completed command.
 
 
-# BEGIN current Holding dependencies are task evidence, not world geometry.
-def _holding_dependency_violations(scene, progress, observation, *, attachment_assumptions=None):
-    """Validate the declared basis for using an owner's attachment pose.
-
-    A currently observed owner pose replaces attachment-based pose inference.
-    Otherwise the active attachment needs its declared condition to be true.
-    # BEGIN explicitly authorized models remain separate from observations.
-    A validated assumption permits missing evidence within that attachment's
-    interval only. An explicit False or unknown result still takes precedence.
-    This argument never supplies an effect or an actual pose-goal witness.
-    # END the independent predicate layer owns measured semantic truth.
-    The caller supplies only freshness-validated observations (or the exact
-    entrance feedback). Frozen owner poses and command intent are never proof.
-    """
-    evidence = observation or {}
-    poses = evidence.get("scene_owner_poses", {})
-    conditions = evidence.get("scene_condition_evidence", {})
-    failures = []
-    for owner in scene.get("owners", ()):
-        owner_id = owner["owner_id"]
-        if owner_id in poses:
-            _pose_array(poses[owner_id], "current observed owner pose")
-            continue
-        for relation in owner.get("attachments", ()):
-            lower, upper = relation["interval"]
-            active = lower <= progress < upper or (progress == upper and relation["release_condition_id"] is None)
-            # BEGIN absence can use a declared model; contrary evidence cannot.
-            identity = relation["condition_id"]
-            assumed = identity in (attachment_assumptions or {}) and identity not in conditions
-            if active and conditions.get(identity) is not True and not assumed:
-                failures.append({"kind": "actual_holding_unverified", "name": relation["condition_id"],
-                    "owner": owner_id, "progress": float(progress),
-                    "reason": "Active owner attachment needs current Holding evidence or a current owner pose"})
-            # END an assumption has exactly the accepted attachment lifetime.
-    return failures
-# END a frozen attachment transform cannot supply its own current validity.
+# BEGIN nominal attachment validity is not an online physical predicate.
+# The accepted attachment model predicts owner geometry. Missing Holding or a
+# difference from observed object motion cannot veto its execution. Independent
+# task-effect dependencies retain their own explicit observation contract.
+# END no owner pose or extra assumption interface authorizes model use here.
 
 
 class TrajectoryExecutor:
@@ -608,7 +580,6 @@ class TrajectoryExecutor:
 
     def execute(self, result, *, finger_targets, initial_feedback, execution_limits,
                 output, step_callback=None, observation_callback=None,
-                attachment_assumptions=None,
                 max_physics_steps=30_000, start_position_tolerance=2e-6,
                 start_velocity_tolerance=2e-6, max_hold_steps=250):
         """Follow the exact bound curve within its authorized execution scope.
@@ -624,17 +595,12 @@ class TrajectoryExecutor:
         ``observation_callback(feedback, curve_time)`` supplies current allowed
         scene/effect evidence. A declared dependency ends this finite motion
         block; its actual T/F/U result is retained for a fresh scene binding.
-        # BEGIN predicate estimation is separate from attachment model use.
-        ``attachment_assumptions`` explicitly maps accepted attachment condition
-        IDs to nonempty authorization sources. It allows that bound model to be
-        used when Holding evidence is absent, without manufacturing observations
-        or satisfying actual pose/effect goals. Future visual predicate estimates
-        (for example from S3E) enter through ``observation_callback`` with their
-        own acquisition timestamps and provenance; explicit False/unknown wins.
-        Initial admission precedes that callback: without an assumption, the
-        caller must supply the entrance predicate in ``initial_feedback`` and
-        its matching attachment provenance in the accepted problem binding.
-        # END neither a model assumption nor a close command proves Holding.
+        # BEGIN nominal attachment use and predicate estimation are separate.
+        Declared attachments belong to the accepted planning model. No measured
+        Holding predicate, object pose or additional authorization is required
+        to execute that model. Independent task effects still enter through
+        ``observation_callback`` with their acquisition time and provenance.
+        # END a nominal attachment is never promoted to physical Holding.
         The last native step can finish less than one timestep after the
         barrier's clock time, but its commanded q/dq/progress is clamped to the
         barrier itself. Finger events use the archived reference's original
@@ -680,18 +646,6 @@ class TrajectoryExecutor:
             raise ValueError("Current scene/effect observations require an explicit callable")
         if observation_callback is not None and execution_limits.observation_policy is None:
             raise ValueError("An observation callback needs its declared device cadence and freshness policy")
-        # BEGIN a caller must declare each assumption and its authorization source.
-        if attachment_assumptions is None:
-            attachment_assumptions = {}
-        if (not isinstance(attachment_assumptions, Mapping)
-                or any(not isinstance(identity, str) or not identity.strip()
-                    or not ((isinstance(source, str) and source.strip())
-                            or (isinstance(source, Mapping) and source))
-                    for identity, source in attachment_assumptions.items())):
-            raise ValueError("Attachment assumptions require condition IDs mapped to nonempty sources")
-        attachment_assumptions = deepcopy(dict(attachment_assumptions))
-        assumption_records = []
-        # END no default assumption is inferred from an absent semantic observer.
         backend = self.backend
         # END formal candidate handoff.
         if tuple(trajectory.joint_names) != backend.arm_joint_names:
@@ -723,7 +677,7 @@ class TrajectoryExecutor:
         if (declared_controller != actual_controller
                 or declared_controller["native_timestep_s"] != float(backend.timestep)):
             raise ValueError("The bound controller policy differs from the actual backend mode, gains or clock")
-        validate_result_only_goal_ids(binding, trajectory, policy["result_only_goal_ids"])
+        validate_result_only_goal_ids(binding, policy["result_only_goal_ids"])
         # END there is no implicit q-only migration or global optional-check switch.
         original_targets = FixedFingerTargets.from_mapping(policy["finger_targets"])
         original_limits = ExecutionLimits.from_mapping(policy["execution_limits"])
@@ -902,11 +856,8 @@ class TrajectoryExecutor:
             feedback_failure=None, event_gate_checks=[], abort_hold=None,
             dependency_hold=None, verified_events=[], dependency_outcomes=[], extended_preflights=[],
             evaluated_events=[], stopped_events=[], reached_events=[],
-            # BEGIN archived pose labels cannot acquire online completion authority.
-            completed_goal_ids=[deepcopy(row) for row in binding.get("completed_goal_ids", [])
-                                if row[0] != "pose_events"],
-            goal_evidence=[deepcopy(row) for row in binding.get("goal_evidence", [])
-                           if row["identity"][0] != "pose_events"])
+            # BEGIN archived geometry labels have no online completion authority.
+            completed_goal_ids=[], goal_evidence=[])
             # END the independent evaluator retains pose results outside this ledger.
         # BEGIN one local allowance covers normal commands and both hold paths.
         normal_accounting = {"charged_steps": 0, "physical_steps": 0,
@@ -1010,7 +961,7 @@ class TrajectoryExecutor:
                 raise ValueError("Actual pose goals require unique original nonnegative indexes")
             requirement = PoseEventRequirement(**deepcopy(row))
             pose_requirements[identity] = requirement
-        # BEGIN retain declared close-arrival identity and observed attachment provenance.
+        # BEGIN retain declared close-arrival identity and nominal attachment provenance.
         # These records are part of the already validated formal scene/problem;
         # neither a task name nor a close command invents a target or a pair.
         contact_bindings = {}
@@ -1025,9 +976,9 @@ class TrajectoryExecutor:
         contact_rows = binding["scene"].get("contacts", ())
         finite_permission_ids = set()
         # END missing scene metadata cannot silently turn a gated rule into an ordinary rule.
-        # BEGIN attachment evidence is verified against this execution entrance.
-        # The caller supplies verified evidence; execution checks its identity,
-        # clock and frozen attachment geometry without reading native object truth.
+        # BEGIN attachment records retain only their accepted model identity.
+        # These checks match fields in one model; no object measurement,
+        # simulator truth, Holding predicate or observation clock is needed.
         holding_bindings = {}
         start_progress = float(trajectory.sample(0.)[3])
         # BEGIN retain the accepted attachment and finite-rule identity contract.
@@ -1041,7 +992,7 @@ class TrajectoryExecutor:
             raise ValueError('Holding contacts require unique current material identities')
         # END no former grasp patch, gap or normal is re-evaluated at this boundary.
         for condition in binding["problem"].get("conditions", ()):
-            if condition.get("kind") != "observed_attachment" or "contact_rule_ids" not in condition:
+            if condition.get("kind") != "declared_attachment" or "contact_rule_ids" not in condition:
                 continue
             condition_id = condition["condition_id"]
             rule_ids = condition["contact_rule_ids"]
@@ -1054,41 +1005,18 @@ class TrajectoryExecutor:
             relations = [row for owner in owners for row in owner.get("attachments", ())
                          if row.get("condition_id") == condition_id]
             if len(owners) != 1 or len(relations) != 1:
-                raise ValueError("Current Holding needs one observed owner and matching attachment")
+                raise ValueError("Declared attachment needs one owner and matching model relation")
             relation = relations[0]
             lower, upper = map(float, relation["interval"])
             if (condition.get("progress") != lower or not lower <= start_progress <= upper
                     or (start_progress == upper and relation["release_condition_id"] is not None)):
-                raise ValueError("Holding permission must bind the currently active observed attachment")
-            evidence = condition.get("source")
-            provenance = evidence.get("source") if isinstance(evidence, Mapping) else None
-            if (not isinstance(evidence, dict) or evidence.get("verified") is not True
-                    or evidence.get("robot_feedback_id") != initial_feedback["feedback_id"]
-                    or evidence.get("carrier_id") != condition["carrier_id"]
-                    or not ((isinstance(provenance, str) and provenance.strip())
-                            or (isinstance(provenance, Mapping) and provenance))):
-                raise ValueError("Holding permission evidence must identify current robot feedback and owner")
-            timestamp = evidence.get("timestamp_s")
-            if (not isinstance(timestamp, (int, float)) or not np.isfinite(timestamp)
-                    or abs(float(timestamp)-float(initial_feedback["timestamp_s"])) > 1e-9):
-                raise ValueError("Holding permission evidence must use the current feedback timestamp")
-            expected = np.linalg.inv(_pose_array(condition.get("T_carrier_eef"), "observed Holding transform"))
+                raise ValueError("Holding permission must bind the active declared attachment interval")
+            expected = np.linalg.inv(_pose_array(condition.get("T_carrier_eef"), "declared attachment transform"))
             actual = np.eye(4)
             actual[:3, 3] = relation["position_tool_owner"]
             actual[:3, :3] = Rotation.from_quat(np.asarray(relation["quaternion_tool_owner"])[[1, 2, 3, 0]]).as_matrix()
             if not np.allclose(actual, expected, atol=1e-7, rtol=0):
                 raise ValueError("Holding permission and bound attachment transform disagree")
-            # BEGIN a model assumption can replace absence, never explicit evidence.
-            current_conditions = initial_feedback.get("scene_condition_evidence", {})
-            assumed = condition_id in attachment_assumptions and condition_id not in current_conditions
-            if current_conditions.get(condition_id) is not True and not assumed:
-                raise ValueError("Current feedback must positively verify the Holding condition")
-            if condition_id in attachment_assumptions:
-                assumption_records.append({"kind": "model_assumption", "condition_id": condition_id,
-                    "owner_id": condition["carrier_id"], "interval": [lower, upper],
-                    "release_condition_id": relation["release_condition_id"],
-                    "source": deepcopy(attachment_assumptions[condition_id])})
-            # END original entrance provenance and geometry checks remain mandatory.
             for identity in rule_ids:
                 rule = rules_by_id.get(identity)
                 if (rule is None or rule['condition_id'] != condition_id or rule["target_owner"] != condition["carrier_id"]
@@ -1099,18 +1027,12 @@ class TrajectoryExecutor:
                 holding_bindings[identity] = {"rule_id": identity, "condition_id": condition_id,
                     "target_owner": condition["carrier_id"], "interval": [lower, upper],
                     "release_condition_id": relation["release_condition_id"],
-                    "feedback_id": initial_feedback["feedback_id"], "timestamp_s": float(timestamp),
-                    "source": deepcopy(evidence)}
+                    "source": deepcopy(condition["source"])}
         # BEGIN unused or relabelled current materials cannot silently acquire Holding.
         if set(holding_bindings) != set(rules_by_id):
             raise ValueError('Each Holding material must belong to the accepted current attachment')
         # END no previous execution latch, proximity or command proves Holding.
-        # END false or stale evidence cannot be repaired by a software pair rule.
-        # BEGIN reject declarations that do not name a validated active attachment.
-        if set(attachment_assumptions) != {row["condition_id"] for row in assumption_records}:
-            raise ValueError("Attachment assumptions must identify accepted currently active observed attachments")
-        report["attachment_assumptions"] = assumption_records
-        # END these records are not added to feedback, effects or completed goals.
+        # END these model records are not feedback, effects or completed goals.
         for condition in binding["problem"].get("conditions", ()):
             if condition.get("kind") != "grasp_contact_activation":
                 continue
@@ -1139,8 +1061,8 @@ class TrajectoryExecutor:
                 "rule_ids": rule_ids, "requirement": requirement}
         # BEGIN close-command checks carry no target-pose gate or world permission.
         report["grasp_command_checks"] = []
-        report["observed_attachment_bindings"] = list(holding_bindings.values())
-        # END attachment provenance is evidence, not inferred contact success.
+        report["declared_attachment_bindings"] = list(holding_bindings.values())
+        # END model provenance does not imply physical contact success.
         # BEGIN no target-relative metric is evaluated by the executor.
         report["pose_goal_evaluation"] = "simulation_posthoc_only"
         # Original requirements stay in the binding for the independent sink;
@@ -1445,7 +1367,7 @@ class TrajectoryExecutor:
                     continue
                 event = events[event_occurrence_key(pending)]
                 constraint = event["timing"][pending["constraint_index"]]
-                if _posthoc_pose_timing(constraint):
+                if _posthoc_geometry_timing(constraint):
                     continue
                 facts = [row for row in report["history"]
                     if event_occurrence_key(row) == event_occurrence_key(event) and row["value"] == "T"
@@ -1471,7 +1393,7 @@ class TrajectoryExecutor:
             now = request_origin+float(elapsed)
             for event in active_timing_events.values():
                 for index, item in enumerate(event.get("timing", ())):
-                    if _posthoc_pose_timing(item):
+                    if _posthoc_geometry_timing(item):
                         continue
                     constraint = EventTimeConstraint(**item)
                     try:
@@ -1571,7 +1493,7 @@ class TrajectoryExecutor:
                     if (observation_cache is not None
                             and observation["timestamp_s"] < observation_cache["timestamp_s"]-1e-8):
                         raise ValueError("Observation acquisition time cannot move backward")
-                    for field in ("binding_valid", "scene_condition_evidence", "scene_owner_poses", "effects"):
+                    for field in ("binding_valid", "effects"):
                         if field in observation and (type(observation[field]) is not bool if field == "binding_valid"
                                                     else not isinstance(observation[field], dict)):
                             raise ValueError(f"Observation field {field} has no explicit valid value")
@@ -1616,7 +1538,6 @@ class TrajectoryExecutor:
                     current["effects"] = {key: {"value": "U",
                         "source": "Historical acquisition predates this actual occurrence binding"}
                         for key in current.get("effects", {})}
-                    current["completed_goal_ids"] = []
                 return current
             # Losing optional future-effect evidence does not invalidate the
             # static model. It also cannot leave an old T eligible for a gate.
@@ -1713,50 +1634,10 @@ class TrajectoryExecutor:
                         "last_applied_finger_goal": target_positions.tolist(),
                         "rejected_event": None if event is None else deepcopy(event)}
                     raise ExecutionGuardError("Current observation invalidated the bound scene; rebind from actual")
-                # Completion IDs refer to the original request collections,
-                # never a suffix list renumbered by an interrupted binding.
-                for identity in observation.get("completed_goal_ids", []):
-                    if (not isinstance(identity, (tuple, list)) or len(identity) != 2
-                            or identity[0] not in ("pose_events", "coordinate_events", "supports")
-                            or type(identity[1]) is not int or identity[1] < 0):
-                        raise ValueError("Completed goal evidence needs an original collection/index identity")
-                    key = tuple(identity)
-                    previous = {tuple(item) for item in binding.get("completed_goal_ids", [])}
-                    indexes = binding.get("goal_identities", {}).get(identity[0], [])
-                    if key not in previous:
-                        if identity[1] not in indexes:
-                            raise ValueError("Completed goal identity does not belong to this original request")
-                    # BEGIN pose labels cannot become online target-arrival evidence.
-                    # Pose accuracy belongs to the independent simulation sink.
-                    if identity[0] == "pose_events":
-                        continue
-                    # END other typed goal observers retain their explicit provenance.
-                    identity = list(identity)
-                    if identity not in report["completed_goal_ids"]:
-                        # BEGIN an arrival obligation consumes actual completion time.
-                        arrival_time = request_origin+float(observation["timestamp_s"])-sim_start
-                        for arrival_event in active_timing_events.values():
-                            if any(item["check_target"] == "arrival" and list(item["goal_id"]) == identity
-                                   for item in arrival_event.get("timing", ())):
-                                checks = timed_witness(arrival_event, "arrival", arrival_time, "T",
-                                    observation["source"], goal_id=identity, feedback_id=feedback["feedback_id"],
-                                    timestamp_s=observation["timestamp_s"])
-                                reject_timing(feedback, physical_elapsed, checks, event=arrival_event)
-                        # END a reference anchor cannot replace an observed goal arrival.
-                        report["completed_goal_ids"].append(identity)
-                        acquired_elapsed = float(observation["timestamp_s"])-sim_start
-                        report["goal_evidence"].append({"identity": identity, "value": "T",
-                            "source": observation["source"], "timestamp_s": observation["timestamp_s"],
-                            "feedback_id": feedback["feedback_id"], "candidate_id": binding["candidate_id"],
-                            "completion_verified": True, "evaluated_curve_time_s": min(acquired_elapsed, stop),
-                            "physical_elapsed_s": acquired_elapsed,
-                            "consumer_elapsed_s": float(physical_elapsed), "consumer_curve_time_s": float(curve_time),
-                            "requirement": deepcopy(binding["problem"][identity[0]][indexes.index(identity[1])]),
-                            "measurement_sources": [{"kind": "explicit_upstream_typed_goal_observation",
-                                "source": observation["source"], "timestamp_s": observation["timestamp_s"]}]})
-                for key in ("scene_condition_evidence", "scene_owner_poses"):
-                    if key in observation:
-                        feedback[key] = deepcopy(observation[key])
+                # BEGIN geometry-goal accuracy is exclusively posthoc evidence.
+                # Observer completion labels and owner poses cannot discharge
+                # online obligations or create an actual-arrival timing gate.
+                # END independent effect observations retain their own duties.
                 observe_timed_effects(observation, feedback, physical_elapsed)
             check_directions(observation, feedback, curve_time, physical_elapsed)
             resolve_pending_timing(feedback, physical_elapsed)
@@ -1770,20 +1651,11 @@ class TrajectoryExecutor:
             failures = self._execution_violations(feedback, reference_q, reference_dq, reference_tcp,
                 limits=execution_limits, binding=limit_binding, finger_state=finger_state,
                 expected_sim_time=sim_start+physical_elapsed, require_stop=requires_stop)
-            # BEGIN task dependency validity is independent of frozen world geometry.
-            current_evidence = observation
-            if float(feedback["timestamp_s"]) == float(initial_feedback["timestamp_s"]):
-                # Entrance attachment provenance was checked against this exact
-                # sample. A simultaneous explicit observation may override it;
-                # no later tick can inherit these entrance-only facts.
-                current_evidence = {**initial_feedback, **(observation or {})}
-            failures.extend(_holding_dependency_violations(binding["scene"],
-                float(trajectory.sample(curve_time)[3]), current_evidence,
-                attachment_assumptions=attachment_assumptions))
+            # BEGIN declared attachment models need no repeated physical proof.
             contact_check = check_close_binding(feedback,
                 curve_time=curve_time, physical_elapsed=physical_elapsed, point=point,
                 contact_event=contact_event, failures=failures)
-            # END command timing never certifies physical target arrival.
+            # END command timing never certifies physical target arrival or Holding.
             geometry = None
             if not failures:
                 geometry = self._geometry_result("check_state", deepcopy(feedback),
@@ -1864,8 +1736,8 @@ class TrajectoryExecutor:
                             "T" if values and all(value == "T" for value in values) else "U"),
                         "source": "Bound effect predicates evaluated from explicit observed T/F/U evidence"})
                 if event["kind"] == "function":
-                    # A reached node records the clock occurrence only. Past
-                    # goals still require their separate actual completion IDs.
+                    # A reached node records the nominal clock occurrence only.
+                    # Physical geometry-goal completion belongs to posthoc evaluation.
                     report["reached_events"].append({**deepcopy(event),
                         "reached_time_s": float(elapsed), "feedback_id": feedback["feedback_id"]})
                 if event["kind"] not in ("open", "close", "hold"):
@@ -1892,7 +1764,8 @@ class TrajectoryExecutor:
                     # an actual, occurrence-matched in-window witness.
                     for timed_event in active_timing_events.values():
                         for constraint_index, constraint in enumerate(timed_event.get("timing", ())):
-                            if (constraint["check_target"] != "effect"
+                            if (_posthoc_geometry_timing(constraint)
+                                    or constraint["check_target"] != "effect"
                                     or constraint["condition_id"] != str(event["requires_evidence"])):
                                 continue
                             witnessed = any(event_occurrence_key(row) == event_occurrence_key(timed_event)
@@ -2216,7 +2089,7 @@ class TrajectoryExecutor:
             timing_values = []
             for event in active_timing_events.values():
                 for index, constraint in enumerate(event.get("timing", ())):
-                    if _posthoc_pose_timing(constraint):
+                    if _posthoc_geometry_timing(constraint):
                         continue
                     checks = [row for row in report["timing_checks"]
                               if event_occurrence_key(row) == event_occurrence_key(event)
@@ -2373,9 +2246,9 @@ class TrajectoryExecutor:
             if final_feedback is not None and report["status"] in (
                     "stopped_for_evidence", "curve_finished", "feedback_rejected", "execution_error", "effect_rejected"):
             # END an unavailable sample remains absent, while both ledgers persist.
-                # This is a robot-only observation. A later bridge still needs
-                # a current scene observation and independently verified
-                # holding evidence before constructing an attached-object model.
+                # This is robot-only feedback. A later planning request owns
+                # its perception inputs and declared nominal attachment model;
+                # this archive supplies no physical Holding certification.
                 feedback = deepcopy(report["continuation"]["actual_feedback"])
                 completed = report["status"] in ("stopped_for_evidence", "curve_finished")
                 name = ("failure-feedback.json" if not completed else

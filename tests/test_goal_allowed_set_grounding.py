@@ -45,7 +45,7 @@ class AllowedSetGroundingTest(unittest.TestCase):
         self.assertEqual(actual["function_owner_id"], held["scene"]["carrier_id"])
         self.assertEqual(actual["target_owner_id"], held["scene"]["reference_id"])
         condition = next(row for row in request.conditions if row.get("condition_id") == actual["attachment_condition_id"])
-        self.assertEqual(condition["kind"], "observed_attachment")
+        self.assertEqual(condition["kind"], "declared_attachment")
         np.testing.assert_allclose(np.asarray(condition["T_carrier_eef"]) @ goal.tool_from_function,
                                    actual["T_owner_function"])
         np.testing.assert_allclose(held["scene"]["reference_pose"] @ actual["T_owner_target"], goal.target)

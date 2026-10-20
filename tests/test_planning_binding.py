@@ -376,7 +376,6 @@ class PlanningBindingTest(unittest.TestCase):
             self.assertEqual(prior["completed_goal_ids"], [])
 
     def test_current_owner_observation_is_not_promoted_to_online_pose_success(self):
-        from manipulation.planning import _verified_completed_goals
         from test_recorded_simulation import ActualPoseGoalTests
         fixture = ActualPoseGoalTests.fixture(progress=0., actual_relation={
             "target_owner_id": "current_part", "T_owner_target": np.eye(4).tolist()})
@@ -388,9 +387,8 @@ class PlanningBindingTest(unittest.TestCase):
         report = ActualPoseGoalTests.run_trial(fixture, observe=observe)
         self.assertEqual(report["goal_evidence"], [])
         continuation = report["continuation"]
-        self.assertEqual(_verified_completed_goals(continuation, continuation["original_binding"],
-            {("pose_events", 7)}, elapsed=continuation["elapsed_physical_s"],
-            curve_elapsed=continuation["last_curve_time_s"]), set())
+        self.assertEqual(continuation["completed_goal_ids"], [])
+        self.assertEqual(continuation["goal_evidence"], [])
     # END independent non-pose effects retain their separate evidence requirements.
 
     def test_continuation_cannot_reset_budget_actual_or_event_identity(self):

@@ -223,7 +223,7 @@ class CurrentProgramTest(unittest.TestCase):
             np.testing.assert_array_equal(evidence["T_camera_owner"], np.eye(4))
         # Keeping an attachment measured in the old owner gauge is a real
         # synchronization error, even though all individual matrices are SE(3).
-        with self.assertRaisesRegex(ValueError, "not synchronized"):
+        with self.assertRaisesRegex(ValueError, "declared attachment model"):
             ground_current_program(program, scene, templates, gauge_owners, client=client(), extractor=descriptors)
 
     def test_output_calibration_is_equivariant_and_must_be_explicit(self):
@@ -250,7 +250,7 @@ class CurrentProgramTest(unittest.TestCase):
                                       client=client(), extractor=descriptors)
         self.assertEqual(body["output_type"], "object_trajectory")
         self.assertNotIn("eef_poses", body)
-        with self.assertRaisesRegex(ValueError, "actual holding"):
+        with self.assertRaisesRegex(ValueError, "attachment model source"):
             ground_current_program(program, scene, templates, owners, output="eef",
                                    client=client(), extractor=descriptors)
         grasp, grasp_scene, grasp_templates, grasp_owners = fixture("grasp")

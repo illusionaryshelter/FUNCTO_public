@@ -1647,18 +1647,18 @@ class PlanningScene:
             matched.add(index)
         # END finite declarations never require a second whole-hand permission.
         for rule in self.robot_owner_permissions:
-            # BEGIN current Holding binds one owner and its complete attachment span.
+            # BEGIN a declared model binds one owner and its attachment span.
             if rule.holding_condition_id is not None:
                 condition = conditions.get(rule.holding_condition_id)
                 relations = [relation for relation in by_id[rule.target_owner].attachments
                     if relation.condition_id == rule.holding_condition_id
                     and relation.interval == rule.interval]
-                if (condition is None or condition.get("kind") != "observed_attachment"
+                if (condition is None or condition.get("kind") != "declared_attachment"
                         or condition.get("carrier_id") != rule.target_owner
                         or condition.get("progress") != rule.interval[0] or len(relations) != 1):
-                    raise ValueError("A Holding permission requires the same observed owner, condition and attachment interval")
+                    raise ValueError("A Holding permission requires the same declared owner, condition and attachment interval")
                 relation = relations[0]
-                expected = _inverse(_pose_array(condition.get("T_carrier_eef"), "observed Holding transform"))
+                expected = _inverse(_pose_array(condition.get("T_carrier_eef"), "declared attachment transform"))
                 actual = np.eye(4)
                 actual[:3, 3] = relation.position_tool_owner
                 actual[:3, :3] = Rotation.from_quat(np.asarray(relation.quaternion_tool_owner)[[1, 2, 3, 0]]).as_matrix()
@@ -1782,8 +1782,10 @@ class PlanningScene:
                     raise ValueError("Attachment/release conditions must identify the same owner and exact boundary")
                 if release and declared.get("kind") != "predicted_release":
                     raise ValueError("A release condition must refer to the problem's explicit release event")
-                if not release and declared.get("kind") not in {"candidate_attachment", "observed_attachment"}:
-                    raise ValueError("An attachment must refer to actual or explicitly conditional Holding evidence")
+                # BEGIN attachment kinds name models, never measured Holding.
+                if not release and declared.get("kind") not in {"candidate_attachment", "declared_attachment"}:
+                    raise ValueError("An attachment must refer to its candidate or declared nominal model")
+                # END no condition-evidence proof participates in this binding.
             # During a held span CollisionOwner.pose uses this exact rollout's
             # FK and the checked rigid attachment. The problem constrains that
             # same FK with its mechanism eta; a second independently sampled
@@ -3206,7 +3208,7 @@ class PlanningScene:
                             spheres, dtype=torch.long), True)
                         # END selected sphere order and policy values are unchanged.
                         # END permission predicates and geometry are unchanged.
-                        # BEGIN observed Holding expires at its real release boundary.
+                        # BEGIN declared internal contact ends at its release boundary.
                         active = _interval(permission_progress, rule.interval)
                         if rule.holding_condition_id is not None and any(
                                 relation.condition_id == rule.holding_condition_id

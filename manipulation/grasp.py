@@ -226,7 +226,7 @@ def ground_grasp(demo, scene):
 
 
 def attached_eef_reference(carrier_poses, actual_T_carrier_eef):
-    """Apply a caller-verified measured attachment during rigid holding only.
+    """Apply the caller's declared attachment during modeled rigid holding.
 
     The caller obtains ``actual_T_carrier_eef = inverse(T_world_carrier) @
     T_world_eef`` from synchronized current evidence after checking stability.

@@ -451,16 +451,17 @@ class RobotGeometryChecker:
         # END planning clones share this immutable scene allocation.
 
     def query_scene(self, robot_state, *, tool_pose, progress, finger_positions, state_kind,
-                    owner_poses=None, nominal_owner_poses=None, condition_evidence=None,
+                    owner_poses=None, nominal_owner_poses=None,
                     active_robot_owner_permissions=frozenset(), robot_owner_permission_progress=None,
                     active_contact_rule_ids=frozenset(),
                     layer_selection=None, layer_selection_index=(0, 0), select_layers=False):
         """Query every robot/scene and moving-owner/other-owner solid pair.
 
-        Nominal attached motion is an explicit conditional hypothesis. Actual
-        moving-owner geometry needs current observation or affirmed attachment
-        evidence. Neither an open/close command nor hidden simulator state is
-        read. Static owner poses remain the explicitly bound scene assumption.
+        Nominal attached motion follows the explicitly declared model. An
+        actual-state report keeps unobserved object geometry conditional; that
+        report does not request Holding proof or invalidate the nominal model.
+        Hidden simulator state and attachment/effect scores are not inputs.
+        Static owner poses remain the explicitly bound scene assumption.
         Layered targets consume the original planner's archived body decision
         at the supplied (batch, horizon) index. This checker never reselects a
         layer using its independently computed double-precision FK. Only an
@@ -473,7 +474,7 @@ class RobotGeometryChecker:
             raise ValueError("Independent scene query requires actual/nominal scope and bound progress")
         if not hasattr(self, "_scene_binding"):
             raise ValueError("Independent scene query has no bound scene model")
-        # BEGIN actual finite grasp contact needs this execution's arrival latch.
+        # BEGIN actual-state finite contact uses the caller's explicit active set.
         finite_active = active_contact_rule_ids
         if finite_active is None:
             if state_kind != "nominal":
@@ -487,7 +488,7 @@ class RobotGeometryChecker:
             if (rule["rule_id"] not in self._gated_contact_rule_ids
                 or state_kind == "nominal" or rule["rule_id"] in finite_active)]
         # END all three material consumers use the same filtered finite rules.
-        # BEGIN actual permission is an executor-owned arrival latch, never a clock inference.
+        # BEGIN pair permission uses the supplied active set within its bound interval.
         active = active_robot_owner_permissions
         known = {rule.rule_id for rule in self._robot_owner_permissions}
         if active is None:
@@ -528,7 +529,9 @@ class RobotGeometryChecker:
                      "measured_count": 0, "omitted_ambiguous_surface_count": 0,
                      "omitted_finite_patch_subset_count": 0}
         # END this diagnostic never changes collision acceptance or enumeration.
-        owner_poses, condition_evidence = owner_poses or {}, condition_evidence or {}
+        # BEGIN geometry inputs do not carry attachment or release truth scores.
+        owner_poses = owner_poses or {}
+        # END supplied object poses retain their separate observation scope.
         # BEGIN consume this candidate's owner poses without claiming observations.
         nominal_owner_poses = nominal_owner_poses or {}
         if nominal_owner_poses and (state_kind != "nominal" or owner_poses):
@@ -546,33 +549,28 @@ class RobotGeometryChecker:
             active = [relation for relation in owner["attachments"]
                       if progress >= relation["interval"][0] and
                       (progress < relation["interval"][1] or relation["release_condition_id"] is None)]
-            if active and condition_evidence.get(active[-1]["condition_id"]) is False:
-                violations.append({"kind": "current_scene_binding_invalid", "owner": identity,
-                                   "condition_id": active[-1]["condition_id"], "reason": "attachment_hypothesis_refuted"})
-            # BEGIN current observations do not erase a refuted declared release.
+            # BEGIN declared attachment/release motion is independent of effects.
             released = [(index, relation) for index, relation in enumerate(owner["attachments"])
                         if progress >= relation["interval"][1] and relation["release_condition_id"] is not None]
-            if not active and released and condition_evidence.get(released[-1][1]["release_condition_id"]) is False:
-                violations.append({"kind": "current_scene_binding_invalid", "owner": identity,
-                    "condition_id": released[-1][1]["release_condition_id"], "reason": "release_hypothesis_refuted"})
-            # END the measured pose supplies geometry, not success of an effect.
+            # END no truth score can refute a model or veto its geometry query.
             if identity in owner_poses:
                 poses[identity] = _rigid_pose(owner_poses[identity], "current observed owner pose")
                 continue
             if active:
                 relation = active[-1]
-                condition = condition_evidence.get(relation["condition_id"])
-                # BEGIN missing Holding is a permitted hypothesis. Only an
-                # explicit dependency can put a barrier in the executable curve.
-                if condition is not True and state_kind == "actual":
+                # BEGIN an unmeasured physical relation is only a report scope.
+                # Nominal CAD still checks this exact model. Actual-state
+                # diagnostics cannot promote its placement to observed truth;
+                # unresolved rows never enter the returned pass/fail predicate.
+                if state_kind == "actual":
                     uncertain_owners.add(identity)
                 offset = np.eye(4)
                 offset[:3, :3] = Rotation.from_quat(np.asarray(relation["quaternion_tool_owner"])[[1, 2, 3, 0]]).as_matrix()
                 offset[:3, 3] = relation["position_tool_owner"]
                 poses[identity] = tool_pose @ offset
-                if condition is not True:
-                    unresolved.append({"owner": identity, "condition_id": relation["condition_id"], "kind": "conditional_attachment"})
-                # END nominal geometry remains checked under its declared hypothesis.
+                unresolved.append({"owner": identity, "condition_id": relation["condition_id"],
+                    "kind": "conditional_attachment", "scope": "physical relation unobserved; declared nominal model remains valid"})
+                # END physical uncertainty does not require another attachment proof.
             else:
                 if released:
                     index, relation = released[-1]
@@ -787,14 +785,13 @@ class RobotGeometryChecker:
                     if permissions:
                         row["permission"] = permissions[0].rule_id
                         row["permission_scope"] = "explicit_robot_owner_pair"
-                        # BEGIN report the actual activation contract, including current Holding.
+                        # BEGIN report nominal declaration without claiming measured Holding.
                         if permissions[0].holding_condition_id is not None:
-                            row["permission_authorization"] = ("conditional_nominal_holding_attachment"
-                                if state_kind == "nominal" else "current_execution_holding_binding")
+                            row["permission_authorization"] = "declared_attachment_model"
                         else:
-                            row["permission_authorization"] = ("conditional_nominal_arrival" if state_kind == "nominal"
-                                                                else "current_execution_arrival_latch")
-                        # END a Holding permission is never described as a measured arrival.
+                            row["permission_authorization"] = ("nominal_contact_scope" if state_kind == "nominal"
+                                                                else "caller_active_contact_scope")
+                        # END attachment authorization remains a model in both query scopes.
                         continue
                     # END signed distance, witnesses and physical contacts remain raw evidence.
                     # BEGIN resolve a Coal numerical boundary using complete solid intersections.

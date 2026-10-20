@@ -79,7 +79,7 @@ def _history(*, mapped=True, material_frame=True, goal_progress=1., duration=.4,
     evaluator._model, evaluator._planning_result, evaluator._goals = model, result, goals
     # BEGIN match constructor role validation in this explicit non-physics double.
     evaluator._diagnostic_goal_ids = validate_diagnostic_goal_ids(
-        result.execution_binding, result.trajectory, diagnostic_goal_ids)
+        result.execution_binding, diagnostic_goal_ids)
     # END tests cannot bypass the same bound eligibility checks.
     evaluator._target, evaluator._reference, evaluator._target_joints = 0, None, []
     evaluator._skill_kind = "grasp"
@@ -219,52 +219,66 @@ def test_diagnostic_pose_cannot_waive_missing_evidence_or_incomplete_curve(compl
     assert grade["physics_success"] is None and grade["physics_outcome"] == outcome
 
 
-def test_unselected_result_only_goal_remains_a_required_functional_goal():
+# BEGIN every unselected geometric goal retains its original required verdict.
+@pytest.mark.parametrize("collection", ["pose_events", "coordinate_events", "supports"])
+@pytest.mark.parametrize("value,outcome,success", [("F", "failed", False), ("U", "unverified", None)])
+def test_unselected_result_only_goal_remains_a_required_functional_goal(collection, value, outcome, success):
     report, result = _saved_components()
     binding = result.execution_binding
-    binding["goal_identities"]["pose_events"].append(9)
-    binding["problem"]["pose_events"].append(deepcopy(binding["problem"]["pose_events"][0]))
-    binding["device_policy"]["result_only_goal_ids"].append(["pose_events", 9])
-    report["functional_goal_evidence"].append({"identity": ["pose_events", 9], "value": "F"})
+    binding["goal_identities"].setdefault(collection, []).append(9)
+    # Regrading reads saved values; only the bound identity count is used here.
+    requirement = (deepcopy(binding["problem"]["pose_events"][0]) if collection == "pose_events"
+                   else {"progress": 1., "source": "Explicit identity-only regrading fixture"})
+    binding["problem"].setdefault(collection, []).append(requirement)
+    binding["device_policy"]["result_only_goal_ids"].append([collection, 9])
+    report["functional_goal_evidence"].append({"identity": [collection, 9], "value": value})
     grade = summarize_skill_evidence(report, binding=binding, trajectory=result.trajectory,
                                     diagnostic_goal_ids=[["pose_events", 7]])
-    assert grade["physics_success"] is False
-    assert grade["evaluation_policy"]["required_goal_ids"] == [["pose_events", 9]]
+    assert grade["physics_success"] is success and grade["physics_outcome"] == outcome
+    assert grade["evaluation_policy"]["required_goal_ids"] == [[collection, 9]]
     assert grade["functional_goal_evidence"][1]["evaluation_role"] == "required"
+# END result scope alone never selects a diagnostic grading role.
 
 
+# BEGIN all geometric collections share identity-only diagnostic eligibility.
+@pytest.mark.parametrize("collection", ["pose_events", "coordinate_events", "supports"])
 @pytest.mark.parametrize("violation", ["undeclared", "midcurve", "arrival", "contact_gate",
                                      "successor_origin", "process", "unknown", "duplicate", "completed_arrival"])
-def test_diagnostic_role_accepts_all_pose_scopes_but_rejects_invalid_identities(violation):
+def test_diagnostic_role_accepts_all_geometry_scopes_but_rejects_invalid_identities(collection, violation):
     _, result, *_ = _fixture()
-    binding, selected = result.execution_binding, [["pose_events", 7]]
+    binding, selected = result.execution_binding, [[collection, 7]]
+    pose_requirement = binding["problem"].pop("pose_events")[0]
+    requirement = pose_requirement if collection == "pose_events" else {
+        "progress": 1., "source": "Explicit identity-only validation fixture"}
+    binding["problem"][collection] = [requirement]
+    binding["goal_identities"] = {collection: [7]}
+    binding["device_policy"]["result_only_goal_ids"] = deepcopy(selected)
     if violation == "undeclared":
         binding["device_policy"]["result_only_goal_ids"] = []
     elif violation == "midcurve":
-        binding["problem"]["pose_events"][0]["progress"] = .5
+        requirement["progress"] = .5
     elif violation in ("arrival", "completed_arrival"):
-        binding["timing_events"] = [{"timing": [{"check_target": "arrival", "goal_id": ["pose_events", 7]}]}]
+        binding["timing_events"] = [{"timing": [{"check_target": "arrival", "goal_id": [collection, 7]}]}]
         if violation == "completed_arrival":
-            binding["completed_goal_ids"] = [["pose_events", 7]]
+            binding["completed_goal_ids"] = deepcopy(selected)
     elif violation == "contact_gate":
         binding["problem"]["conditions"].append({"kind": "grasp_contact_activation",
-                                                "arrival_goal_id": ["pose_events", 7]})
+                                                "arrival_goal_id": [collection, 7]})
     elif violation == "successor_origin":
         binding["timing_events"] = [{"timing": [{"check_target": "effect",
-            "origin_event": {"goal_id": ["pose_events", 7]}}]}]
+            "origin_event": {"goal_id": [collection, 7]}}]}]
     elif violation == "process":
         selected = [["pose_relations", 0]]
     elif violation == "unknown":
-        selected = [["pose_events", 99]]
+        selected = [[collection, 99]]
     elif violation == "duplicate":
         selected *= 2
-    # BEGIN no terminal/contact/arrival switch can restore an online pose gate.
     if violation in ("process", "unknown", "duplicate"):
         with pytest.raises(ValueError):
-            validate_diagnostic_goal_ids(binding, result.trajectory, selected)
+            validate_diagnostic_goal_ids(binding, selected)
     else:
-        assert validate_diagnostic_goal_ids(binding, result.trajectory, selected) == selected
-    # END evaluator roles remain explicit; original metrics are not erased.
+        assert validate_diagnostic_goal_ids(binding, selected) == selected
+# END evaluator roles remain explicit; original metrics are not erased.
 
 
 @pytest.mark.parametrize("corruption", ["candidate", "missing_goal", "duplicate_goal"])
@@ -506,7 +520,7 @@ def _support_history(*, delta=None, until=None, mapped=True, material_frame=True
         "owner_initial_pose": entry.tolist(), "attachment": attachment.tolist(),
         "attachment_condition_id": "declared_holding", "attachment_interval": [0., 1.],
         "release_condition_id": "declared_release"}}
-    holding = {"kind": "observed_attachment", "condition_id": "declared_holding",
+    holding = {"kind": "declared_attachment", "condition_id": "declared_holding",
         "carrier_id": "declared_material", "progress": 0., "T_carrier_eef": attachment.tolist()}
     release = {"kind": "predicted_release", "condition_id": "declared_release",
         "skill_id": "declared_skill", "event_id": "release_event", "carrier_id": "declared_material",
@@ -568,6 +582,9 @@ def test_support_native_material_pose_preserves_original_goal_and_does_not_follo
     report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=execution)
     goal = report["functional_goal_evidence"][0]
     assert goal["identity"] == ["supports", 11] and goal["value"] == "T"
+    # BEGIN support measurements remain posthoc without a device-policy listing.
+    assert goal["execution_scope"] == "result"
+    # END the original support verdict still contributes to required grading.
     assert goal["sample_elapsed_s"] == .1 and goal["query_count"] == 1
     assert goal["gap_tolerance_m"] == goal["normal_tolerance_rad"] == .0001
     assert "position_tolerance_m" not in goal

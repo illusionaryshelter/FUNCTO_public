@@ -962,14 +962,14 @@ def _validate_bound_event_times(problem, progress_map, duration, origin_s=0., hi
     # is outside the remaining plan, its actual arrival and any dependent time
     # origin belong only to simulation grading; they cannot reject a rebind.
     history = [row for row in history if not (row.get("check_target") == "arrival"
-        and (row.get("goal_id") or [None])[0] == "pose_events")]
+        and (row.get("goal_id") or [None])[0] in ("pose_events", "supports", "coordinate_events"))]
 
     def past_pose_timing(constraint):
         identities = [constraint.goal_id if constraint.check_target == "arrival" else None,
                       (constraint.origin_event or {}).get("goal_id")]
-        return any(identity and identity[0] == "pose_events"
-                   and identity[1] not in goal_identities["pose_events"] for identity in identities)
-    # END retained pose-arrival labels never become actual planning witnesses.
+        return any(identity and identity[0] in ("pose_events", "supports", "coordinate_events")
+                   and identity[1] not in goal_identities[identity[0]] for identity in identities)
+    # END retained geometric-arrival labels never become actual planning witnesses.
     current = {event_occurrence_key(event): event for event in problem.events}
     all_events = {event_occurrence_key(row): PlanningEvent(**row) for row in timing_events}
     all_events.update(current)
@@ -1211,26 +1211,21 @@ def _request_work_ledger(problem, budget, previous=None, continuation=None):
         if (ledger["original_events"] != old["original_events"]
                 or ledger["obligation_contract"] != old["obligation_contract"]):
             raise ContinuationBindingError("A request ledger cannot rewrite original source or goal/process identities")
-        if not {tuple(value) for value in old["completed_goal_ids"]} <= {tuple(value) for value in ledger["completed_goal_ids"]}:
-            raise ContinuationBindingError("A request ledger cannot erase historical completed goals")
         if not {tuple(value) for value in old["completed_direction_ids"]} <= {tuple(value) for value in ledger["completed_direction_ids"]}:
             raise ContinuationBindingError("A request ledger cannot erase historical completed directions")
         if any(consumed[name] < old["consumed_planning"][name] for name in consumed):
             raise ContinuationBindingError("Cumulative planning work must retain all prior attempts")
-        for name in ("history", "event_records", "timing_events", "timing_checks", "goal_evidence", "direction_evidence", "effect_history", "binding_records"):
+        for name in ("history", "event_records", "timing_events", "timing_checks", "direction_evidence", "effect_history", "binding_records"):
             if ledger[name][:len(old[name])] != old[name]:
                 raise ContinuationBindingError(f"The request ledger rewrote prior {name}")
         # Append actual execution facts once; a historical T is retained here,
         # not promoted to currently applicable scene evidence in a new binding.
-        for name in ("history", "timing_checks", "goal_evidence", "completed_goal_ids", "completed_direction_ids", "direction_evidence", "effect_history"):
+        # BEGIN geometric outcome labels are posthoc only, not request facts.
+        for name in ("history", "timing_checks", "completed_direction_ids", "direction_evidence", "effect_history"):
             for row in continuation.get(name, ()):
-                # BEGIN simulation pose labels never become trusted online facts.
-                if ((name == "completed_goal_ids" and row[0] == "pose_events")
-                        or (name == "goal_evidence" and row["identity"][0] == "pose_events")):
-                    continue
-                # END non-pose completion keeps its validated actual evidence.
                 if row not in ledger[name]:
                     ledger[name].append(deepcopy(row))
+        # END original geometric requirements remain in obligation_contract.
         for name in ("applied_events", "superseded_events", "evaluated_events", "stopped_events", "reached_events", "verified_events"):
             for row in continuation.get(name, ()):
                 record = {"record_kind": name, **deepcopy(row)}
@@ -1259,87 +1254,14 @@ def _check_work_budget(budget, consumed, *, started, initial_seconds, stage=None
 # END derived capacities include every declared native candidate, without new services.
 
 
-# BEGIN completion evidence is checked before removing any original goal.
-def _verified_completed_goals(continuation, original, all_goals, *, elapsed,
-                              curve_elapsed):
-    """Verify non-pose goal evidence without importing simulation pose metrics.
-
-    Target-pose accuracy is exclusively posthoc. Neither a previous pose label
-    nor its error may gate continuation or certify physical task completion.
-    Past nominal pose anchors leave the remaining plan by progress, retaining
-    their original requirements in the request ledger for simulation grading.
-    """
-    def identities(rows):
-        if (not isinstance(rows, (tuple, list)) or any(
-                not isinstance(row, (tuple, list)) or len(row) != 2
-                or not isinstance(row[0], str) or type(row[1]) is not int
-                for row in rows)):
-            raise ContinuationBindingError("Completed goals need original collection/index identities")
-        values = {tuple(row) for row in rows}
-        if not values <= all_goals:
-            raise ContinuationBindingError("Completed goal identity does not belong to the original request")
-        return {identity for identity in values if identity[0] != "pose_events"}
-
-    previous = identities(original.get("completed_goal_ids", []))
-    claimed = identities(continuation.get("completed_goal_ids", []))
-    ledger = original["request_ledger"]
-    if not previous <= identities(ledger["completed_goal_ids"]):
-        raise ContinuationBindingError("Prior completed goals lack their preserved request ledger")
-    for identity in previous:
-        if not any(tuple(row.get("identity", ())) == identity
-                   and row.get("value") == "T" and row.get("completion_verified") is True
-                   and isinstance(row.get("candidate_id"), str) and row["candidate_id"]
-                   for row in ledger["goal_evidence"]):
-            raise ContinuationBindingError("Prior completed goals lack their preserved actual T evidence")
-    new = claimed-previous
-    if not new:
-        return previous | claimed
-    feedback = continuation["actual_feedback"]
-    timestamp = feedback.get("timestamp_s")
-    if (isinstance(timestamp, bool) or not isinstance(timestamp, (float, int))
-            or not np.isfinite(timestamp)):
-        raise ContinuationBindingError("Goal completion needs synchronized actual continuation time")
-    origin = float(timestamp)-elapsed
-    for identity in new:
-        proofs = [row for row in continuation.get("goal_evidence", ())
-                  if isinstance(row, dict) and tuple(row.get("identity", ())) == identity]
-        verified = False
-        for row in proofs:
-            if (row.get("candidate_id") != original["candidate_id"] or row.get("value") != "T"
-                    or row.get("completion_verified") is not True
-                    or any(not isinstance(row.get(key), str) or not row[key].strip()
-                           for key in ("source", "feedback_id"))):
-                continue
-            times = [row.get(key) for key in ("timestamp_s", "physical_elapsed_s", "evaluated_curve_time_s")]
-            if (any(isinstance(value, bool) or not isinstance(value, (float, int))
-                    or not np.isfinite(value) for value in times)):
-                continue
-            acquired, physical, curve_time = times
-            if (not 0 <= physical <= elapsed+1e-8 or not 0 <= curve_time <= curve_elapsed+1e-8
-                    or abs(acquired-origin-physical) > 1e-8):
-                continue
-            goals = original["problem"][identity[0]]
-            indices = original.get("goal_identities", {}).get(identity[0], list(range(len(goals))))
-            if identity[1] not in indices:
-                continue
-            requirement = goals[indices.index(identity[1])]
-            if row.get("requirement") != requirement or not row.get("measurement_sources"):
-                continue
-            verified = True
-            break
-        if not verified:
-            raise ContinuationBindingError("Goal completion needs actual allowed-set T evidence from this executed candidate")
-    return previous | claimed
-# END non-pose observations retain their original evidence checks.
-
-
 def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
     """Validate a fresh actual/scene binding without replaying consumed events.
 
     A continuation is the executor's existing result record. It is not a
     request to restore the old actual state or guess past task success. The
     original absolute progress, event identities and cumulative solve budget
-    survive; angular history and past goal effects require supplied facts.
+    survive. Nominal pose/support/coordinate anchors leave the suffix by
+    progress; physical task effects remain separate independent observations.
     """
     from .execution_binding import plain
     from .planning_problem import event_occurrence_key
@@ -1502,12 +1424,12 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
         due = row.get("activation_time_s") if row.get("activation_time_s") is not None else row["time"]
         if due < elapsed and rebind is None:
             raise ContinuationBindingError(f"Unconsumed event {identity} is overdue on the frozen schedule; an explicit rebind is required")
-    # BEGIN non-pose goals require evidence; pose accuracy cannot gate continuation.
+    # BEGIN every geometric goal is nominal, independent of physical scoring.
+    # Pose, support and mechanism-coordinate targets are all model constraints.
+    # Missing/false/true result labels cannot change the remaining trajectory.
     all_goals = {(name, index) for name in ("pose_events", "coordinate_events", "supports")
                  for index in range(len(getattr(problem, name)))}
-    completed_goals = _verified_completed_goals(continuation, original, all_goals,
-        elapsed=elapsed, curve_elapsed=curve_elapsed)
-    # END no posthoc pose error or completion claim becomes a control dependency.
+    # END explicit independent task effects keep their own event dependencies.
     # Actual direction completion is not implied by traversing source progress.
     all_directions = {(index, column) for index, mechanism in enumerate(problem.mechanisms)
                       for column in range(len(mechanism.directions))}
@@ -1576,8 +1498,7 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
         selected_events[identity] = replace(current_events[identity], occurrence=max(occurrences, default=0)+1)
     remaining_goal_ids = {(name, index) for name in ("pose_events", "coordinate_events", "supports")
         for index, goal in enumerate(getattr(problem, name))
-        if ((name, index) not in completed_goals and (name != "pose_events" or goal.progress >= start_progress))
-        or (name, index) in retry_goals}
+        if goal.progress >= start_progress or (name, index) in retry_goals}
     if rebind is not None:
         required_progress = [event.progress for event in selected_events.values()]
         required_progress += [getattr(problem, name)[index].progress for name, index in remaining_goal_ids]
@@ -1590,13 +1511,9 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
         if start_progress >= problem.end_progress:
             start_progress = float(problem.source_progress[-2])
     # END original frame/progress associations remain unchanged across occurrences.
-    for collection in ("pose_events", "coordinate_events", "supports"):
-        for index, requirement in enumerate(getattr(problem, collection)):
-            # BEGIN a passed nominal pose anchor is not an unverified online goal.
-            if (collection != "pose_events" and rebind is None
-                    and requirement.progress < start_progress and (collection, index) not in completed_goals):
-                raise ContinuationBindingError(f"Past goal {collection}:{index} needs actual completion evidence")
-            # END the ledger retains the pose requirement for independent grading.
+    # BEGIN past nominal anchors are retained in the ledger, not re-proved.
+    # Leaving a completed schedule prefix does not assert physical success.
+    # END retries explicitly restore original goals through retry_goal_ids.
     for index, requirement in enumerate(problem.mechanisms):
         for column, direction in enumerate(requirement.directions):
             if (direction.end < start_progress and (index, column) not in completed_directions
@@ -1685,7 +1602,7 @@ def _prepare_continuation(problem, scene, budget, continuation, *, rebind=None):
         "timing_events": deepcopy(continuation.get("request_ledger", original["request_ledger"])["timing_events"]),
         "device_policy": deepcopy(continuation.get("device_policy")),
         "active_finger_interval": deepcopy(continuation.get("active_finger_interval")),
-        "completed_goal_ids": sorted(completed_goals), "effects": deepcopy(continuation.get("effects", {})),
+        "completed_goal_ids": [], "effects": deepcopy(continuation.get("effects", {})),
         "previous_request_time_origin_s": float(original.get("request_time_origin_s", 0.)),
         "request_time_origin_s": float(original.get("request_time_origin_s", 0.))+float(elapsed),
         "request_time_origin_step": int(original.get("request_time_origin_step", 0))+local_steps}
@@ -5611,10 +5528,9 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 request_events=deepcopy(ledger["original_events"]),
                 consumed_events=[] if prior is None else prior["consumed_events"],
                 goal_identities=deepcopy(block_record["goal_identities"]),
-                completed_goal_ids=[deepcopy(value) for value in
-                                    (ledger["completed_goal_ids"] if prior is None else prior["completed_goal_ids"])
-                                    if tuple(value) not in retry_goal_ids],
-                goal_evidence=deepcopy(ledger["goal_evidence"]),
+                # BEGIN no physical geometry score enters an execution binding.
+                completed_goal_ids=[], goal_evidence=[],
+                # END independent effect and direction histories stay separate.
                 direction_identities=([[(index, column) for column in range(len(mechanism.directions))]
                     for index, mechanism in enumerate(getattr(problem, "mechanisms", ()))]
                     if prior is None else deepcopy(prior["direction_identities"])),

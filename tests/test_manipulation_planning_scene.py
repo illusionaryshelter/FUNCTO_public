@@ -965,8 +965,10 @@ class PlanningSceneTest(unittest.TestCase):
             "attachment": attachment, "attachment_interval": [0., 1.],
             "attachment_condition_id": "observed_holding", "release_condition_id": None})
         problem = PlanningProblem(("arm",), np.zeros(1), np.zeros(1), "tool", "world", np.eye(4), np.eye(4),
-                                  (phase,), conditions=({"kind": "observed_attachment", "carrier_id": "payload",
+                                  # BEGIN bind the declared nominal attachment, without observed Holding.
+                                  (phase,), conditions=({"kind": "declared_attachment", "carrier_id": "payload",
                                                         "condition_id": "observed_holding", "progress": 0.},))
+        # END scene consistency concerns the nominal model, not a physical proof.
         return scene((owner,)), problem
 
     def test_bound_payload_cannot_be_omitted_or_changed_to_evade_collision(self):

@@ -501,7 +501,7 @@ def run_prepared(args, *, problem, provenance):
         from manipulation.contact_binding import build_material_contact_rules
         from recorded_owner_geometry import bind_box_owner_materials
         activations = [row for row in problem.conditions
-                       if row.get("kind") in {"grasp_contact_activation", "observed_attachment"}]
+                       if row.get("kind") in {"grasp_contact_activation", "declared_attachment"}]
         contacts, pair_permissions, initial_support_relations, holding_contacts = (), (), (), ()
         material_binding = {"robot_sphere_materials": [None]*sphere_count,
                             "native_geometry_materials": {}, "materials": {}, "owner_materials": {}}
@@ -537,7 +537,7 @@ def run_prepared(args, *, problem, provenance):
                 bind_grasp_contact_rules(problem, contacts, contact_inputs.get("grasp_activations"))
             elif contact_inputs.get("grasp_activations"):
                 raise ValueError("Finite grasp activations require compiled grasp conditions")
-            if any(row["kind"] == "observed_attachment" for row in activations):
+            if any(row["kind"] == "declared_attachment" for row in activations):
                 # BEGIN current Holding selects registered materials without old grasp laws.
                 from manipulation.holding_contact import bind_holding_contacts
                 holding_contacts = bind_holding_contacts(problem, material_binding,

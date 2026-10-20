@@ -112,32 +112,17 @@ def _actual_pose_goal(requirement, feedback, observation):
 # END these metrics remain simulation evidence, never online prerequisites.
 
 # BEGIN explicitly diagnostic goals retain measurements without vetoing skill effects.
-def validate_diagnostic_goal_ids(binding, trajectory, values):
-    """Validate an explicit grading role without changing execution obligations.
+def validate_diagnostic_goal_ids(binding, values):
+    """Validate explicit grading roles for the current geometric goal identities.
 
-    Result-only means that the executor does not wait for a goal; it does not
-    mean that the goal is optional for success. A diagnostic goal must be named
-    separately; non-pose goals must already belong to that result-only policy. Reuse the same
-    identity checks. Pose goals always belong to posthoc evaluation; other
-    goal kinds retain terminal/dependency restrictions. Process and effect
-    predicates cannot be selected here.
+    Pose, support and mechanism-coordinate goals are evaluated after execution.
+    Each remains required for success unless separately selected as diagnostic.
+    Execution-policy lists and event references do not choose that grading role;
+    process and effect predicates cannot be selected here.
     """
-    # Validate against the complete current identities instead of borrowing a
-    # previous completion label. The binding itself remains untouched.
-    selected = validate_result_only_goal_ids({**binding, "completed_goal_ids": []}, trajectory, values)
-    declared = binding.get("device_policy", {}).get("result_only_goal_ids", [])
-    for identity in selected:
-        # BEGIN every pose goal is posthoc; its grading role is still explicit.
-        if identity[0] == "pose_events":
-            continue
-        # END online non-pose evidence retains its declared dependency contract.
-        if identity not in declared:
-            raise ValueError("A diagnostic goal must already be an explicit result-only goal")
-        for event in (*trajectory.events, *binding.get("timing_events", ())):
-            if any(tuple((item.get("origin_event") or {}).get("goal_id") or ()) == tuple(identity)
-                   for item in event.get("timing", ())):
-                raise ValueError("A goal used by a subsequent event cannot be diagnostic")
-    return selected
+    # BEGIN grading validates current identities without an online geometry policy.
+    return validate_result_only_goal_ids(binding, values)
+    # END explicit diagnostic selection leaves all other obligations required.
 
 
 def summarize_skill_evidence(report, *, binding, trajectory, diagnostic_goal_ids=()):
@@ -149,7 +134,9 @@ def summarize_skill_evidence(report, *, binding, trajectory, diagnostic_goal_ids
     remain required. Complete acquisition and full-curve execution are also
     required; this result never becomes an online observation or dependency fact.
     """
-    selected = validate_diagnostic_goal_ids(binding, trajectory, diagnostic_goal_ids)
+    # BEGIN diagnostic eligibility consumes goal identities alone.
+    selected = validate_diagnostic_goal_ids(binding, diagnostic_goal_ids)
+    # END trajectory measurements and obligation grading remain unchanged.
     if report["candidate_id"] != binding["candidate_id"]:
         raise ValueError("Evidence and grading roles must refer to the same formal candidate")
     goals = deepcopy(report["functional_goal_evidence"])
@@ -337,7 +324,7 @@ class _FunctionalGoalEvaluator:
                 conditions = [row for row in problem.get("conditions", ())
                               if row.get("condition_id") == condition_id]
                 if (len(conditions) != 1 or conditions[0].get("carrier_id") != carrier
-                        or conditions[0].get("kind") not in ("observed_attachment", "candidate_attachment")
+                        or conditions[0].get("kind") not in ("declared_attachment", "candidate_attachment")
                         or conditions[0].get("progress") != span[0]):
                     raise ValueError("Support carrier needs the same uniquely declared attachment condition")
                 declared = _pose_array(conditions[0]["T_carrier_eef"], "Declared support attachment")
@@ -445,16 +432,17 @@ class _FunctionalGoalEvaluator:
         request_times = origin + times-times[0]
         history = [] if execution_report is None else execution_report.get("history", [])
         timing_events = self._binding.get("timing_events", [])
-        result_only = self._binding.get("device_policy", {}).get("result_only_goal_ids", [])
+        # BEGIN every geometric measurement belongs to independent result grading.
         for identity, requirement in self._requirements.items():
             scheduled, due = pose_goal_schedule(self._trajectory, requirement.progress, self._model.opt.timestep)
             row = {"identity": list(identity), "value": "U", "query_count": 0,
-                "execution_scope": "result" if list(identity) in result_only else "execution",
+                "execution_scope": "result",
                 "progress": requirement.progress,
                 "scheduled_curve_time_s": float(scheduled) if np.isfinite(scheduled) else None,
                 "device_due_time_s": float(due) if np.isfinite(due) else None,
                 "requirement_source": deepcopy(requirement.source),
                 "scope": "Independent result evidence only; does not update runtime completion or release a dependency"}
+            # END execution-policy metadata cannot label geometry as online evidence.
             # BEGIN preserve the original units and shape of each goal's allowed set.
             if identity[0] == "supports":
                 row.update(gap_tolerance_m=requirement.gap_tolerance,
@@ -702,7 +690,7 @@ class NativeSkillPhysicsEvaluator:
         self._goals = _FunctionalGoalEvaluator(model, catalog, planning_result, evaluation_owner_bindings)
         # BEGIN the caller must explicitly declare any diagnostic-only goals.
         self._diagnostic_goal_ids = validate_diagnostic_goal_ids(
-            planning_result.execution_binding, planning_result.trajectory, diagnostic_goal_ids)
+            planning_result.execution_binding, diagnostic_goal_ids)
         # END default grading still requires every original functional goal.
         # END formal curve/scene data is read without adding a runtime observation.
         self._samples, self._contacts, self._offsets = [], [], [0]

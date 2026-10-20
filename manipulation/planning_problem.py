@@ -977,7 +977,8 @@ class PoseEventRequirement:
     currently observed target owner and its material target transform. A held
     function additionally names its owner/material frame and the already bound
     attachment condition. The execution consumer must obtain fresh owner poses
-    or a currently verified attachment; planning-time poses are not observations.
+    or an independently measured attachment; planning declarations are not observations.
+    This metadata is for posthoc evaluation only and never gates online motion.
     """
     progress: float
     tool_from_function: np.ndarray
@@ -1286,11 +1287,11 @@ class PlanningProblem:
                          if hasattr(requirement, "progress") else
                          (requirement.start, requirement.end) if hasattr(requirement, "start")
                          else (self.start_progress, float(self.phase_count)))
-                # BEGIN pose accuracy is a simulation result, never an online gate.
+                # BEGIN geometric accuracy is posthoc, never an online gate.
                 consumers = (("PlanningProblem.residuals", "simulation_posthoc_pose_evaluation")
-                             if name == "pose_events" else ("PlanningProblem.residuals",))
+                             if name in {"pose_events", "supports", "coordinate_events"} else ("PlanningProblem.residuals",))
                 categories = ((category, "simulation_posthoc_obligation")
-                              if name == "pose_events" else (category,))
+                              if name in {"pose_events", "supports", "coordinate_events"} else (category,))
                 # END nominal optimization retains its original allowed set.
                 add((name, index), categories, consumers,
                     scope, requirement.source)
@@ -1304,13 +1305,15 @@ class PlanningProblem:
                             (direction.start, direction.end), direction.source)
         for index, condition in enumerate(self.conditions):
             kind = condition.get("kind")
-            if kind not in {"candidate_attachment", "observed_attachment",
+            if kind not in {"candidate_attachment", "declared_attachment",
                             "predicted_release", "grasp_contact_activation"}:
                 raise ValueError(f"Unsupported compiled condition consumer: {kind!r}")
-            categories = ("scene_rule", "actual_evidence_obligation")
-            # Evidence is acquired at a point; an observed attachment governs
-            # the explicit held span in phase metadata. Do not mistake that
-            # observation point for the lifetime of its scene assumption.
+            # BEGIN only effect conditions request independent physical evidence.
+            categories = (("scene_rule", "actual_evidence_obligation")
+                          if condition.get("effect_requirement") else ("scene_rule",))
+            # A declared attachment governs the modeled span in phase metadata;
+            # its start is a model boundary, not a physical evidence timestamp.
+            # END declarations do not introduce an observation obligation.
             point = condition.get("progress")
             spans = tuple(tuple(phase.metadata["attachment_interval"]) for phase in self.phases
                           if phase.metadata.get("attachment_condition_id") == condition.get("condition_id")
@@ -2106,14 +2109,16 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
         # END source close identity/progress and the complete skill clock stay intact.
     elif program["skill_kind"] == "manipulation":
         objects = grounded["object_poses"]
-        attachment = _pose_array(scene["holding"]["T_carrier_eef"], "actual attachment")
-        attachment_id = f"{skill_id}:actual_holding"
+        # BEGIN the held phase uses a declared model, without physical truth.
+        attachment = _pose_array(scene["holding"]["T_carrier_eef"], "declared attachment")
+        attachment_id = f"{skill_id}:declared_attachment"
         last_held = len(objects)-1
         release = demo.get("release_frame")
         held_end = 1. if last_held else 0.
-        conditions.append({"kind": "observed_attachment", "skill_id": skill_id,
+        conditions.append({"kind": "declared_attachment", "skill_id": skill_id,
             "condition_id": attachment_id, "carrier_id": carrier,
             "T_carrier_eef": attachment.tolist(), "source": deepcopy(scene["holding"]), "progress": 0.})
+        # END no verified-Holding predicate is compiled from this model.
         model, limits = (None, None) if scene.get("motion_model") is None else _current_model(scene["motion_model"])
         mechanism = None
         if model is not None:

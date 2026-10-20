@@ -1,6 +1,6 @@
 """CPU Holding-permission contracts; mocked clocks never certify physical Holding."""
 
-# BEGIN observed Holding and arrival/close permissions have independent lifetimes.
+# BEGIN declared attachment and arrival/close permissions have independent lifetimes.
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
@@ -33,12 +33,10 @@ def holding_fixture(*, release=True):
     simulation, curve, targets = _fixture()
     curve.events[2].update(kind="function", requires_evidence=None, stop=False)
     _bind_fingers(simulation, curve, targets)
-    feedback = _initial_feedback(simulation)
     upper = .75 if release else 1.
-    condition = {"kind": "observed_attachment", "carrier_id": "target",
+    condition = {"kind": "declared_attachment", "carrier_id": "target",
         "condition_id": "observed_holding", "contact_rule_ids": ["current_holding"], "progress": 0., "T_carrier_eef": np.eye(4).tolist(),
-        "source": {"verified": True, "carrier_id": "target", "robot_feedback_id": feedback["feedback_id"],
-            "timestamp_s": feedback["timestamp_s"], "source": "Explicit synthetic entrance Holding observation"}}
+        "source": {"source": "Explicit synthetic nominal attachment model"}}
     curve.conditions = (deepcopy(condition),)
     result = _result(curve)
     relation = asdict(Attachment((0., upper), [0., 0., 0.], [1., 0., 0., 0.],
@@ -67,15 +65,9 @@ def execute_fixture(fixture, *, checker=None, feedback=None, result_only_goal_id
     executor = TrajectoryExecutor(simulation, geometry_checker=gate)
     if feedback is None:
         feedback = _initial_feedback(simulation)
-        feedback["scene_condition_evidence"] = {"observed_holding": True}
-    # BEGIN successful sequencing fixtures explicitly supply fresh task facts.
-    # The entrance fact must not act as a perpetual geometry permission latch.
-    if observation_callback is None:
-        def observation_callback(current, curve_time):
-            return {"source": "Explicit CPU Holding observation fixture",
-                    "timestamp_s": current["timestamp_s"],
-                    "scene_condition_evidence": {"observed_holding": True}}
-    # END these declared synthetic facts are never simulator contact feedback.
+    # BEGIN no physical Holding observation is required to use a nominal model.
+    # Robot feedback still supplies the ordinary joint/model safety checks.
+    # END neither fixture creation nor tick callbacks manufacture Holding=True.
     with TemporaryDirectory() as temporary, patch("manipulation.robosuite_execution.mujoco.mj_forward"):
         report = _execute_bound(executor, result,
             finger_targets=FixedFingerTargets.from_mapping(targets), execution_limits=limits,
@@ -84,9 +76,9 @@ def execute_fixture(fixture, *, checker=None, feedback=None, result_only_goal_id
     return report, gate
 
 
-# BEGIN current evidence and declared release replace runtime geometry latches.
+# BEGIN a declared release bounds the model without any runtime Holding latch.
 @pytest.mark.parametrize("release", [False, True])
-def test_current_holding_dependency_is_independent_of_open_and_ends_at_release(release):
+def test_declared_attachment_runs_without_physical_proof_and_keeps_release_interval(release):
     fixture = holding_fixture(release=release)
 
     class EntranceChecker(_GeometryChecker):
@@ -94,40 +86,21 @@ def test_current_holding_dependency_is_independent_of_open_and_ends_at_release(r
             self.entrance_arguments = dict(kwargs)
             return super().preflight(*args, **kwargs)
 
-    # After a declared release the attachment estimate is no longer needed.
-    # Open alone still does not release a Holding dependency.
-    def observation(current, curve_time):
-        return {"source": "Fresh declared Holding/release fixture", "timestamp_s": current["timestamp_s"],
-                "scene_condition_evidence": {"observed_holding": not release or curve_time < .009}}
-    report, gate = execute_fixture(fixture, checker=EntranceChecker(fixture[0].joint_names),
-                                   observation_callback=observation)
+    report, gate = execute_fixture(fixture, checker=EntranceChecker(fixture[0].joint_names))
     assert report["status"] == "curve_finished"
     assert "active_contact_rule_ids" not in gate.entrance_arguments
-    # Both the original open and the later close preserve the independently
-    # observed attachment; neither command silently means physical release.
+    # Open/close playback does not assert the physical success of the model.
     assert [row["kind"] for row in report["events"]][:2] == ["open", "close"]
     assert all("active_contact_rule_ids" not in row for row in gate.states)
-    assert report["observed_attachment_bindings"][0]["source"]["verified"] is True
+    attachment = report["declared_attachment_bindings"][0]
+    assert attachment["source"] == {"source": "Explicit synthetic nominal attachment model"}
+    assert attachment["interval"] == [0., .75 if release else 1.]
     assert "active_contact_rule_ids" not in report
     assert "holding_contact_permission_changes" not in report
-# END entrance provenance is retained separately from current task truth.
+# END the report identifies a declaration without promoting it to an observation.
 
 
-@pytest.mark.parametrize("field,value", [
-    ("verified", False), ("verified", "U"), ("robot_feedback_id", "old_trial"),
-    ("timestamp_s", 1.2), ("timestamp_s", float("nan")), ("carrier_id", "another_owner"), ("source", ""),
-])
-def test_holding_activation_rejects_stale_false_unknown_or_unsourced_evidence_before_control(field, value):
-    fixture = holding_fixture()
-    simulation, _, _, result, _ = fixture
-    result.execution_binding["problem"]["conditions"][0]["source"][field] = value
-    refresh_validation(result)
-    with pytest.raises(ValueError):
-        execute_fixture(fixture)
-    assert simulation.arm_goals == [] and simulation.sim_time == 1.3
-
-
-@pytest.mark.parametrize("change", ["owner", "interval", "transform", "duplicate", "condition"])
+@pytest.mark.parametrize("change", ["kind", "owner", "interval", "transform", "duplicate", "condition"])
 def test_holding_activation_cannot_relabel_a_different_condition_or_attachment(change):
     fixture = holding_fixture()
     binding = fixture[3].execution_binding
@@ -150,13 +123,14 @@ def test_holding_activation_cannot_relabel_a_different_condition_or_attachment(c
     assert fixture[0].arm_goals == []
 
 
-def test_explicit_current_false_holding_cannot_be_hidden_by_verified_entrance_record():
+@pytest.mark.parametrize("physical_score", [False, True])
+def test_physical_holding_score_cannot_veto_or_certify_a_declared_model(physical_score):
     fixture = holding_fixture()
     feedback = _initial_feedback(fixture[0])
-    feedback["scene_condition_evidence"] = {"observed_holding": False}
-    with pytest.raises(ValueError, match="positively verify"):
-        execute_fixture(fixture, feedback=feedback)
-    assert fixture[0].arm_goals == []
+    feedback["scene_condition_evidence"] = {"observed_holding": physical_score}
+    report, _ = execute_fixture(fixture, feedback=feedback)
+    assert report["status"] == "curve_finished"
+    assert "verified" not in report["declared_attachment_bindings"][0]["source"]
 
 
 def test_current_holding_does_not_bypass_robot_state_rejections():
@@ -168,23 +142,22 @@ def test_current_holding_does_not_bypass_robot_state_rejections():
     assert "active_contact_rule_ids" not in gate.states[-1]
 
 
-def test_structured_holding_provenance_is_retained_without_rewriting_the_input():
+def test_structured_model_source_is_retained_without_rewriting_the_input():
     fixture = holding_fixture()
     result = fixture[3]
-    provenance = {"kind": "explicit_test_result", "geometry_source": "current RGB-D and robot FK",
-                  "effect_source": "separately declared Holding evidence"}
+    provenance = {"kind": "explicit_nominal_model", "geometry_source": "known CAD and robot FK",
+                  "attachment_model": "caller supplied identity transform"}
     result.execution_binding["problem"]["conditions"][0]["source"]["source"] = provenance
     refresh_validation(result)
     report, _ = execute_fixture(fixture)
-    assert report["observed_attachment_bindings"][0]["source"]["source"] == provenance
+    assert report["declared_attachment_bindings"][0]["source"]["source"] == provenance
 
 
-def test_arrival_close_and_later_open_keep_independent_holding_evidence():
+def test_arrival_close_and_later_open_keep_the_same_declared_attachment():
     fixture = recorded_tests.GraspContactActivationTests.fixture(reopen=True)
     simulation, _, _, result, _ = fixture
     _, _, _, holding_result, _ = holding_fixture(release=False)
     condition = deepcopy(holding_result.execution_binding["problem"]["conditions"][0])
-    condition["source"]["robot_feedback_id"] = _initial_feedback(simulation)["feedback_id"]
     result.execution_binding["problem"]["conditions"].append(condition)
     result.execution_binding["scene"]["owners"] = holding_result.execution_binding["scene"]["owners"]
     result.execution_binding["scene"]["holding_contacts"] = deepcopy(
@@ -193,13 +166,13 @@ def test_arrival_close_and_later_open_keep_independent_holding_evidence():
     report, _ = execute_fixture(fixture, result_only_goal_ids=[["pose_events", 0]])
     assert report["status"] == "curve_finished"
     assert report["grasp_command_checks"][-1]["control_applied"]
-    assert report["observed_attachment_bindings"][0]["condition_id"] == "observed_holding"
+    assert report["declared_attachment_bindings"][0]["condition_id"] == "observed_holding"
     assert "grasp_contact_permission_changes" not in report
     assert "active_contact_rule_ids" not in report
 
 
 @pytest.mark.parametrize("change", [None, "kind", "owner", "interval", "transform"])
-def test_planning_scene_requires_exact_observed_attachment_for_holding_permission(change):
+def test_planning_scene_requires_exact_declared_attachment_for_holding_permission(change):
     original, problem = scene_tests.PlanningSceneTest().bound_payload()
     condition = problem.conditions[0]
     condition["T_carrier_eef"] = np.eye(4).tolist()
@@ -242,19 +215,19 @@ def test_nominal_holding_permission_ends_at_real_release_and_keeps_other_spheres
         torch.tensor([[.2, .4 if release else .2]], dtype=torch.float64))
 
 
-def test_native_holding_permission_keeps_false_conditions_unknown_geometry_and_release_boundary(checker):
+def test_native_declared_permission_keeps_unknown_geometry_and_release_boundary(checker):
     model = model_binding(holding_condition_id="observed_holding", arrival_goal_id=(), activation_event={}, interval=(0., 1.))
     model["owners"][0]["attachments"] = [asdict(Attachment((0., 1.), [0., 0., 0.], [1., 0., 0., 0.],
         "observed_holding", "declared_release"))]
     checker.bind_scene(model)
     robot = checker.query(joint_names=checker.joint_names, joint_positions=[0., 0.], T_reference_base=np.eye(4), pairs=())
     result = checker.query_scene(robot, tool_pose=np.eye(4), progress=.5, finger_positions=[0., 0.],
-        state_kind="actual", condition_evidence={"observed_holding": False},
+        state_kind="actual",
         active_robot_owner_permissions={"arrived_close"})
-    assert not result["passed"]
-    assert any(row["kind"] == "current_scene_binding_invalid" for row in result["violations"])
+    assert result["passed"] and not result["violations"]
+    assert not result["observed_scene_checked"]
     assert result["pairs"][0]["permission"] == "arrived_close"
-    assert result["pairs"][0]["permission_authorization"] == "current_execution_holding_binding"
+    assert result["pairs"][0]["permission_authorization"] == "declared_attachment_model"
     # Nominal and actual geometry reject a stale active set at the real release;
     # a current owner pose supplies geometry without satisfying a release effect.
     for kind in ("actual", "nominal"):

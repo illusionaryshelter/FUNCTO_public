@@ -603,7 +603,7 @@ class NominalFingerGeometry:
 
 
 def bind_nominal_finger_geometry(reference, conditions, event_clock, *, progress_interval):
-    """Declare geometry from existing contact identities and verified Holding.
+    """Declare geometry from contact identities and the nominal held model.
 
     ``reference`` remains the original C1 command, including measured dq.
     ``event_clock`` is the already-bound original occurrence clock; no inverse
@@ -613,14 +613,11 @@ def bind_nominal_finger_geometry(reference, conditions, event_clock, *, progress
     begin, end = np.asarray(progress_interval, dtype=float)
     if not np.isfinite([begin, end]).all() or begin < 0. or end < begin:
         raise ValueError("Nominal geometry needs the current bound progress interval")
-    holding = [row for row in conditions if row.get("kind") == "observed_attachment"]
+    # BEGIN attachment conditions declare a model, not a measured predicate.
+    holding = [row for row in conditions if row.get("kind") == "declared_attachment"]
+    # END the accepted condition already owns its model provenance.
     boundaries = []
     if holding:
-        for row in holding:
-            evidence = row["source"]
-            if (evidence.get("verified") is not True
-                    or evidence.get("robot_feedback_id") != reference.feedback_id):
-                raise ValueError("Held nominal geometry requires Holding verified against this measured feedback")
         # The first original open command or identified release effect ends
         # this held-shape assumption, regardless of source list ordering.
         boundaries.extend((row["applied_time_s"], event_occurrence_key(row))
@@ -642,7 +639,7 @@ def bind_nominal_finger_geometry(reference, conditions, event_clock, *, progress
         times = np.array([0., reference.duration])
         positions = np.tile(reference.position[0], (2, 1))
         velocities = np.zeros_like(positions)
-        origin = ("Verified Holding; frozen measured entrance q, geometric dq=0 (not measured dq); "
+        origin = ("Declared attachment model; frozen measured entrance q, geometric dq=0 (not measured dq); "
                   f"feedback={reference.feedback_id}; conditions="
                   + repr([row["condition_id"] for row in holding]))
     else:

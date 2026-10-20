@@ -266,14 +266,13 @@ def validate_controller_policy(value, *, joint_names):
     return result
 
 
-def validate_result_only_goal_ids(binding, trajectory, values):
+def validate_result_only_goal_ids(binding, values):
     """Validate explicit result roles without weakening online consumers.
 
     Every selected goal keeps its original identity and mathematical allowed
-    set. Pose goals are exclusively posthoc, at every progress including close.
-    Non-pose selections require terminal progress and no actual-arrival window.
-    Process, current-feedback and effect-dependency checks are separate and
-    are never disabled by this list.
+    set. Pose, support and mechanism-coordinate accuracy are exclusively
+    posthoc at every progress. Robot-feedback and independent task-effect
+    dependencies are separate and are never disabled by this list.
     """
     if not isinstance(values, (list, tuple)):
         raise ValueError("Result-only goals require an explicit list of original goal identities")
@@ -298,21 +297,11 @@ def validate_result_only_goal_ids(binding, trajectory, values):
         requirements = binding["problem"].get(value[0], [])
         if len(requirements) != len(indexes):
             raise ValueError("Result-only goal identities must retain their complete bound requirements")
-        # BEGIN pose errors are always posthoc, including pre-close arrivals.
+        # BEGIN geometry-goal errors are always posthoc at every progress.
         # A declaration here selects a result role; it cannot enable/disable an
         # online pose gate because production execution has no such gate.
-        if value[0] == "pose_events":
-            selected.append(identity)
-            continue
-        # END other typed goal scopes retain their existing restrictions.
-        requirement = requirements[indexes.index(value[1])]
-        if requirement.get("progress") != float(trajectory.progress_s[-1]):
-            raise ValueError("Only a terminal goal without a remaining progress suffix can be result-only")
-        for event in (*trajectory.events, *binding.get("timing_events", ())):
-            if any(item.get("check_target") == "arrival" and tuple(item.get("goal_id") or ()) == tuple(identity)
-                   for item in event.get("timing", ())):
-                raise ValueError("An actual-arrival obligation cannot be changed into a result-only goal")
         selected.append(identity)
+        # END arrival timing cannot restore a physical-accuracy control gate.
     return selected
 
 
@@ -343,7 +332,7 @@ def rebind_execution_result(result, *, controller_policy, result_only_goal_ids,
     if ledger.get("requires_continuation") is True or binding.get("consumed_physics_steps", 0):
         raise ValueError("An executed request must continue from its actual world instead of device-only rebinding")
     policy = validate_controller_policy(controller_policy, joint_names=result.trajectory.joint_names)
-    result_ids = validate_result_only_goal_ids(binding, result.trajectory, result_only_goal_ids)
+    result_ids = validate_result_only_goal_ids(binding, result_only_goal_ids)
     limits = execution_limits.describe()
     previous_limits = binding.get("execution_limits")
     if previous_limits is not None:

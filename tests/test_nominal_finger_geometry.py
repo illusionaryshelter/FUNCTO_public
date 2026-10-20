@@ -37,8 +37,10 @@ def activation(identity=("s", "close", 0), begin=.6):
 
 
 def holding(reference):
-    return {"kind": "observed_attachment", "condition_id": "measured-holding",
-        "source": {"verified": True, "robot_feedback_id": reference.feedback_id}}
+    # BEGIN the geometry assumption requires no physical Holding certificate.
+    return {"kind": "declared_attachment", "condition_id": "declared-holding",
+        "source": {"source": "Explicit synthetic nominal attachment model"}}
+    # END encoder q still supplies the actual entrance finger coordinates.
 
 
 def bind(reference, conditions, clock, interval=(0., 1.)):

@@ -815,15 +815,13 @@ def test_simulation_ready_hook_rejects_invalid_ownership_or_callable_before_rest
 # END callback delivery never authorizes geometry or advances the native clock.
 
 
-# BEGIN assumption and observer plumbing cannot synthesize robot or effect evidence.
+# BEGIN observer plumbing cannot synthesize robot or effect evidence.
 @pytest.mark.parametrize("supplied", [False, True])
-def test_runner_forwards_attachment_assumptions_separately_from_observer(tmp_path, supplied):
-    """Check both optional channels at executor admission without native stepping."""
+def test_runner_forwards_observer_without_a_second_attachment_authorization(tmp_path, supplied):
+    """The accepted model needs only the existing independent observer channel."""
     simulation, curve, targets = _fixture()
     args, result, initial = _live_runner_inputs(tmp_path, simulation, curve, targets, skill_id="live_skill")
     original_feedback = _feedback_json(initial)
-    assumptions = {"bound_condition": {"authorization": "explicit test caller"}} if supplied else None
-    original_assumptions = deepcopy(assumptions)
     observer = (lambda feedback, curve_time: None) if supplied else None
     admission = RuntimeError("test stops at executor admission")
 
@@ -832,51 +830,52 @@ def test_runner_forwards_attachment_assumptions_separately_from_observer(tmp_pat
         execute = stack.enter_context(patch.object(construct.return_value, "execute", side_effect=admission))
         with pytest.raises(RuntimeError) as raised:
             runner.run(args, simulation=simulation, initial_feedback=initial,
-                attachment_assumptions=assumptions, observation_callback=observer)
+                observation_callback=observer)
     assert raised.value is admission
-    assert execute.call_args.kwargs["attachment_assumptions"] is assumptions
+    assert "attachment_assumptions" not in execute.call_args.kwargs
     assert execute.call_args.kwargs["observation_callback"] is observer
     assert _feedback_json(execute.call_args.kwargs["initial_feedback"]) == original_feedback
-    assert _feedback_json(initial) == original_feedback and assumptions == original_assumptions
+    assert _feedback_json(initial) == original_feedback
     assert simulation.sim_time == initial["sim_time"] and simulation.arm_goals == []
     report = json.loads((args.output/"simulation-report.json").read_text())
-    assert report["attachment_assumptions_provided"] is supplied
+    assert "attachment_assumptions_provided" not in report
     assert report["online_observation_provided"] is supplied
 
 
+# BEGIN a physics grade has no authority over continuous stage admission.
 @pytest.mark.parametrize("supplied", [False, True])
-def test_continuous_session_forwards_separate_inputs_on_restore_and_live_handoff(tmp_path, supplied):
-    """Both session branches expose predicate inputs while preserving the same trial."""
+@pytest.mark.parametrize("physics_score", [True, False, None])
+def test_continuous_session_runs_after_any_posthoc_score(tmp_path, supplied, physics_score):
+    """Success, failure and missing grading preserve the same commands/backend."""
     import continuous_simulation as continuous
 
     simulation, curve, targets = _fixture()
     args, _, initial = _recorded_ready_inputs(tmp_path/"inputs", simulation, curve, targets)
     session = continuous.ContinuousSimulationSession(manifest_path=args.manifest,
         fixture_path=args.robot_fixture, controller_part=args.controller_part, output=tmp_path/"session")
-    assumptions = {"bound_condition": "explicit test caller"} if supplied else None
     observer = (lambda feedback, curve_time: None) if supplied else None
     calls = []
 
     def run_stage(spec, **kwargs):
         calls.append(kwargs)
-        assert kwargs["attachment_assumptions"] is assumptions
         assert kwargs["observation_callback"] is observer
+        assert "attachment_assumptions" not in kwargs
         if len(calls) == 1:
             assert "simulation" not in kwargs and "initial_feedback" not in kwargs
             kwargs["on_simulation_ready"](simulation, {})
         else:
             assert kwargs["simulation"] is simulation and "on_simulation_ready" not in kwargs
             assert _feedback_json(kwargs["initial_feedback"]) == _feedback_json(initial)
-        return {"status": "completed", "physics_success": True,
+        return {"status": "completed", "physics_success": physics_score,
                 "native_start_time_s": initial["sim_time"]}
 
-    with patch.object(continuous, "run", side_effect=run_stage), patch.object(
-            session, "_integration_state", return_value=np.array([initial["sim_time"]])):
+    with patch.object(continuous, "run", side_effect=run_stage):
         for _ in range(2):
-            report = session.execute(vars(args), attachment_assumptions=assumptions,
-                observation_callback=observer)
+            report = session.execute(vars(args), observation_callback=observer)
             assert report["status"] == "completed"
     assert len(calls) == 2 and len(session.stages) == 2
+    assert [row["physics_success_posthoc"] for row in session.stages] == [physics_score]*2
     assert session.trial_id == simulation.trial_id and simulation.sim_time == initial["sim_time"]
     assert simulation.arm_goals == []
+# END no physical score is reinterpreted as an online task observation.
 # END passing an input is never treated as an observation or physical outcome.

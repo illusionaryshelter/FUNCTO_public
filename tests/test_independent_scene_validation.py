@@ -52,12 +52,14 @@ def checker(tmp_path):
         NativePrimitive("pad", "base", "box", (.1, .1, .1), rigid(.049), "complete pad native solid")])
 
 
-def query(checker, model, *, progress=.5, kind="actual", condition=None, owner_poses=None):
+# BEGIN native scene queries accept geometry, not Holding/release truth scores.
+def query(checker, model, *, progress=.5, kind="actual", owner_poses=None):
     checker.bind_scene(model)
     robot = checker.query(joint_names=checker.joint_names, joint_positions=[0., 0.],
                           T_reference_base=np.eye(4), pairs=())
     return checker.query_scene(robot, tool_pose=np.eye(4), progress=progress, finger_positions=[0., 0.],
-                               state_kind=kind, condition_evidence=condition, owner_poses=owner_poses)
+                               state_kind=kind, owner_poses=owner_poses)
+# END unobserved physical state remains a report scope, not a missing-proof gate.
 
 
 def test_local_permission_checks_whole_overlap_and_keeps_raw_contacts(checker):
@@ -141,8 +143,11 @@ def test_unknown_conditional_attachment_is_not_an_automatic_holding_gate(checker
     assert result["passed"] and not result["query_gaps"]
     assert not result["observed_scene_checked"]
     assert any(row["kind"] == "conditional_scene_collision" for row in result["unresolved_assumptions"])
-    rejected = query(checker, model, condition={"candidate_grasp": False})
-    assert any(row["kind"] == "current_scene_binding_invalid" for row in rejected["violations"])
+    # The same exact model still enforces nominal solid collision. Neither
+    # diagnostic uncertainty nor missing physical proof clears that conflict.
+    nominal = query(checker, model, kind="nominal")
+    assert not nominal["passed"]
+    assert nominal["violations"][0]["kind"] == "independent_scene_collision"
     # A current observed target pose makes this an actual known pad conflict.
     actual = query(checker, model, owner_poses={"target": np.eye(4)})
     assert not actual["passed"] and actual["violations"][0]["kind"] == "independent_scene_collision"
@@ -225,14 +230,14 @@ def test_same_candidate_release_pose_is_used_after_release(checker):
     assert any(row["kind"] == "predicted_release_pose" for row in result["unresolved_assumptions"])
 
 
-def test_current_owner_observation_cannot_override_a_refuted_release(checker):
+def test_current_owner_geometry_after_release_needs_no_effect_score(checker):
     model = binding()
     model["owners"][0]["attachments"] = [{"interval": [0., 1.], "position_tool_owner": [0., 0., 0.],
         "quaternion_tool_owner": [1., 0., 0., 0.], "condition_id": "held", "release_condition_id": "released"}]
-    result = query(checker, model, progress=1.5, condition={"released": False}, owner_poses={"target": rigid(-1.)})
-    assert not result["passed"]
-    assert any(row.get("reason") == "release_hypothesis_refuted" for row in result["violations"])
-# END no reference pose or unconfirmed effect creates an actual Holding/release fact.
+    result = query(checker, model, progress=1.5, owner_poses={"target": rigid(-1.)})
+    assert result["passed"] and not result["violations"]
+    assert result["pairs"][0]["relation"] == "separated"
+# END geometry queries neither require nor establish a physical release fact.
 
 # BEGIN native installation aliases reuse exact solids without exempting payloads.
 def test_explicit_native_alias_avoids_duplicate_self_collision_but_checks_payload(checker):

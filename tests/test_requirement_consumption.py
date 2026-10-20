@@ -27,7 +27,8 @@ class RequirementConsumptionTest(unittest.TestCase):
         self.assertIn(("coordinate_events", 0), rows)
         self.assertIn(("mechanisms", 0, "coordinate_limits"), rows)
         self.assertIn(("mechanisms", 0, "directions", 0), rows)
-        self.assertEqual(rows[("coordinate_events", 0)]["consumers"], ("PlanningProblem.residuals",))
+        self.assertEqual(rows[("coordinate_events", 0)]["consumers"],
+                         ("PlanningProblem.residuals", "simulation_posthoc_pose_evaluation"))
         progress = torch.tensor([[0., request.coordinate_events[0].progress]], dtype=torch.float64)
         mechanism = request.mechanisms[0]
         body = mechanism.model.poses(np.array([[.1], [.11]]))
@@ -99,10 +100,13 @@ class RequirementConsumptionTest(unittest.TestCase):
             for index, condition in enumerate(request.conditions):
                 row = rows[("conditions", index)]
                 self.assertTrue(row["source"])
-                if condition["kind"] == "observed_attachment":
+                # BEGIN declaration is a model condition without a truth obligation.
+                if condition["kind"] == "declared_attachment":
+                    self.assertNotIn("actual_evidence_obligation", row["categories"])
                     self.assertEqual(row["evidence_progress"], 0.)
                     self.assertEqual(row["scene_rule_spans"], ((0., 1.),))
                     self.assertEqual(row["progress_scope"], (0., 1.))
+                # END physical outcome evidence belongs to separate effect conditions.
                 elif condition["kind"] == "predicted_release":
                     self.assertEqual(row["evidence_progress"], 1.)
                     self.assertEqual(row["scene_rule_boundary"], 1.)

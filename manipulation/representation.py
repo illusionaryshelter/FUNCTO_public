@@ -220,8 +220,11 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
     """Adapt source motion to the actual entry AND nominal interaction pose.
 
     J maps current body coordinates B_N into demonstrated coordinates B_D;
-    A maps B_N into the actual tool E. Either measured E or B plus A determines
-    both current poses. If both are supplied, their agreement is mandatory.
+    # BEGIN A is the declared rigid attachment model, not physical truth.
+    A maps the modeled body B_N into tool E. Robot feedback E plus A determines
+    the modeled body pose. If both poses are supplied, they must use this same
+    model; the equality does not verify physical holding or target arrival.
+    # END no simulator body measurement is required to bind held motion.
     Free object motion is adapted in a fixed material frame, independently of
     the body's coordinate chart and the grasp. The original motion first binds
     the nominal goal at interaction_time; that goal is not inferred from the
@@ -243,7 +246,7 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
     if kind not in {"grasp", "manipulation"}:
         raise ValueError("Unknown representation kind")
     if A is not None and contact_motion:
-        raise ValueError("Choose actual rigid holding or time-varying contact, not both")
+        raise ValueError("Choose a rigid attachment model or time-varying contact, not both")
     extra = [representation.get(key) for key in ("approach_time", "interaction_time", "release_time")]
     extra += [held_until_time]
     extra = [float(value) for value in extra if value is not None]
@@ -379,7 +382,7 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
                 inverse_A = _inverse(result["A"])
                 raw_eef = _right_path(raw_body, inverse_A, "bound held tool diagnostic")
                 diagnostic("eef", raw_eef, path_times)
-                publish("eef", _right_path(adapted_body, inverse_A, "tool from adapted body and actual A"),
+                publish("eef", _right_path(adapted_body, inverse_A, "tool from adapted body and declared A"),
                         current_eef, raw_eef.sample_numpy(event_progress))
             elif contact_motion and "C_D" in result and J is not None and current_eef is not None:
                 # Contact is an explicitly supplied time-varying source
@@ -395,7 +398,7 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
                 publish("eef", adapted_eef, current_eef, raw_eef.sample_numpy(event_progress))
             else:
                 result["missing"]["eef_poses"] = ("Nonattached contact needs C_D, J and actual EEF"
-                    if contact_motion else "EEF reference needs a confirmed current grasp relation A")
+                    if contact_motion else "EEF reference needs a declared attachment model A")
     if "eef_poses" in result or "object_poses" in result:
         result["status"] = "partial" if result["missing"] else "reference"
     return result

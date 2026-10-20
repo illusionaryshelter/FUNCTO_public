@@ -276,7 +276,7 @@ def _bind_support_scene(program, scene, source_templates, current_owners, *, cli
     """Bind an on goal from reference RGB-D, without reference point identities.
 
     Carrier pose, geometry, source-to-current mapping and (for EEF output)
-    actual Holding are upstream responsibilities. This function never assumes
+    the declared attachment model are caller responsibilities. This function never assumes
     the carrier is identical to the demonstration, nor guesses identity for its
     mapping. Only the support role needs a current image here. Every event in
     this skill must refer to the same evidenced source support region, because
@@ -379,7 +379,7 @@ def bind_current_scene(program, scene, source_templates, current_owners, *, clie
     ``current_owners`` uses role keys and calibrated owner RGB-D observations
     described by ``_current_owner``. Its owner poses and visible geometry are
     expressed in the named ``scene.reference_frame``. Caller EEF feedback,
-    actual Holding, known geometry and mechanism evidence are retained; none
+    declared attachment, known geometry and mechanism evidence are retained; none
     are inferred from a source demonstration or from successful matching.
 
     All inputs are copied. Source recipes, owner IDs and coordinate mappings
@@ -515,7 +515,7 @@ def ground_current_program(program, scene, source_templates, current_owners, *, 
     """Bind current observations then call exactly one existing numerical core.
 
     ``output='eef'`` requests a complete grasp/manipulation EEF reference and
-    retains all actual-Holding requirements. ``output='object'`` deliberately
+    retains the explicitly declared attachment model. ``output='object'`` deliberately
     requests manipulation body geometry only. Missing feedback never triggers
     an automatic output downgrade. Both return geometric candidates, not robot
     execution certificates, with visual binding evidence for inspection.

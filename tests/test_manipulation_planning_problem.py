@@ -819,13 +819,15 @@ class PlanningBuilderTest(unittest.TestCase):
         np.testing.assert_array_equal(request.source_timestamps, demo["timestamps"])
     # END no renamed operation, invented frame or truncated skill map is created.
 
-    def test_only_one_current_skill_and_actual_holding_are_accepted(self):
+    def test_only_one_current_skill_and_a_declared_attachment_are_required(self):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             compile_inputs(grasp_input(), manipulation_input())
         skill = manipulation_input()
         skill["scene"]["holding"]["verified"] = False
-        with self.assertRaisesRegex(ValueError, "actual holding"):
-            compile_inputs(skill)
+        # BEGIN a physical holding label has no planning authority.
+        request = compile_inputs(skill)
+        self.assertEqual(request.conditions[0]["kind"], "declared_attachment")
+        # END the explicit transform still defines the nominal model.
         a = MotionPhase("a", path([pose(), pose()]), metadata={"skill_id": "a"})
         b = MotionPhase("b", path([pose(), pose()]), metadata={"skill_id": "b"})
         with self.assertRaisesRegex(ValueError, "one current"):

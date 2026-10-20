@@ -835,7 +835,7 @@ def ground_object_program(program, scene):
     Human tool demonstrations may establish object motion before robot grasp
     binding exists. This geometry-only entry preserves their function events
     without fabricating an EEF trajectory. The complete skill consumer requires
-    actual holding separately. It uses exactly the same object numerical core.
+    a declared attachment model separately. It uses the same object numerical core.
     """
     if program.get("skill_kind") != "manipulation":
         raise ValueError("An object-only function program must be manipulation")
@@ -906,14 +906,18 @@ def ground_program(program, scene):
     its tangential position and yaw remain preferences, not observations.
     Every event for one carrier must use the same explicit carrier mapping.
 
-    Manipulation additionally requires caller-verified ``scene.holding`` with
-    measured ``T_carrier_eef`` and its evidence source, plus synchronized
-    ``initial_pose`` and ``eef_pose``. ``release_frame`` is an observed source
+    # BEGIN nominal attachment is a model, never simulator success evidence.
+    Manipulation additionally requires ``scene.holding`` with the declared
+    ``T_carrier_eef`` and its model source. ``initial_pose`` and robot
+    ``eef_pose`` must use that same model; this equality checks coordinates,
+    not whether the physical object is actually held. No verified flag or
+    simulator object pose is required. ``release_frame`` is an observed source
     phase boundary, independent of the opening command and function event. The
     object and EEF references stop at this boundary. Complete source times and
     commands remain separate evidence; released-hand motion is not generated.
     Only the current tool identity and calibrated frame are required for held
-    manipulation, because the actual attachment supplies its tool relation.
+    manipulation, because the declared attachment supplies its tool relation.
+    # END physical holding success belongs to independent result assessment.
 
     Grasp source frames only initialize the current single-skill plan. Its
     bound terminal grasp relation is a goal; no approach frame is a waypoint.
@@ -953,20 +957,22 @@ def ground_program(program, scene):
            and any(event.get(field) for field in ("timing", "requires_evidence", "stop"))
            for event in commands):
         raise ValueError("A gripper requirement lies after release, outside current controlled motion")
+    # BEGIN a single declared attachment supplies the held-motion model.
     holding = scene.get("holding", {})
-    if holding.get("verified") is not True or not holding.get("source"):
-        raise ValueError("Manipulation requires caller-verified actual holding, not a grasp candidate")
-    actual = _pose_array(holding["T_carrier_eef"], "Actual T_carrier_eef")
+    if not holding.get("source"):
+        raise ValueError("Manipulation requires the declared attachment model source")
+    attachment = _pose_array(holding["T_carrier_eef"], "Declared T_carrier_eef")
     initial = _pose_array(scene["initial_pose"], "Current carrier pose")
     eef_initial = _pose_array(scene["eef_pose"], "Current EEF pose")
-    if not np.allclose(initial @ actual, eef_initial, atol=1e-6, rtol=0):
-        raise ValueError("Actual holding transform and current object/EEF observations are not synchronized")
+    if not np.allclose(initial @ attachment, eef_initial, atol=1e-6, rtol=0):
+        raise ValueError("Carrier and EEF initial coordinates disagree with the declared attachment model")
+    # END this is model consistency, not a measured object-to-target gate.
     task = program["task"]
     if task.get("relation") not in {"transfer", "on", "inside", "articulation", "tool_use"}:
         raise ValueError("Unsupported functional relation")
     objects, checks, motion_checks = _object_reference(
         demo, scene, frames, last_held, task, initial)
-    eef = attached_eef_reference(objects, actual)
+    eef = attached_eef_reference(objects, attachment)
     # Preserve the original command metadata even when its recording extends
     # beyond this skill's holding interval. A later source command is not an
     # executable event of the current controlled motion.
