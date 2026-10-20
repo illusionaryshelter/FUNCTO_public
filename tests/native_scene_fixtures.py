@@ -37,6 +37,7 @@ def bind_fixed_robot(scene, *, centers=None, radii=None, self_pairs=()):
                             'geometries': geometry}, native_joint_names=(),
         native_self_pairs=[{'first': names[first], 'second': names[second], 'margin': 0.}
                            for first, second in self_pairs],
-        robot_model={'T_reference_base': np.eye(4).tolist()})
+        robot_model={'T_reference_base': np.eye(4).tolist(), 'tool_frame': 'base',
+                     'T_frame_tcp': np.eye(4).tolist()})
     return scene
 # END fixture geometry is explicit and carries the same current scene contract.

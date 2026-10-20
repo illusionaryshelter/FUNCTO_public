@@ -148,13 +148,14 @@ class CoordinateDirectionTest(unittest.TestCase):
 
     def test_reverse_nominal_direction_is_cost_without_an_export_gate(self):
         from manipulation.planning import _ProgressMap, _nominal_task_cost
-        from tests.test_manipulation_planning import cartesian_problem, constant_path, export_fixture
+        from tests.test_manipulation_planning import cartesian_problem, constant_path
         request = cartesian_problem((MotionPhase("free reference", constant_path()),))
         request.mechanisms = (mechanism([direction("local_rate", start=.25, end=.75)]),)
-        planner, native = export_fixture(request, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-            [[0., 0., 0.], [.2, 0., 0.], [.4, 0., 0.]],
-            [[0., 0., 0.], [-.1, 0., 0.], [0., 0., 0.]], 1.)
-        curve, _ = planner.export(native, {"accepted": True, "residuals": {}})
+        from manipulation.planning import JointTrajectory
+        curve = JointTrajectory(request.joint_names, np.array([0., 1., 2.]),
+            np.array([[0., 0., 0.], [.2, 0., 0.], [.4, 0., 0.]]),
+            np.array([[0., 0., 0.], [-.1, 0., 0.], [0., 0., 0.]]),
+            np.array([0., 1.]), np.array([0., 1.]), (), (), {})
         self.assertNotIn("mechanism:0:direction:0:local_rate", curve.residuals)
         positions = torch.tensor(curve.position[None], dtype=torch.float64, requires_grad=True)
         rotation = torch.zeros((1, 3, 4), dtype=torch.float64); rotation[..., 0] = 1.

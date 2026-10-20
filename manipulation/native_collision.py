@@ -56,7 +56,7 @@ class NativeCollisionModel:
     identities, never geometry evidence cached from a previous candidate.
     """
     def __init__(self, *, robot_model, joint_names, T_reference_base,
-                 self_pairs, owners, moving_owners, owner_aliases=None):
+                 self_pairs, owners, moving_owners, owner_aliases=None, owner_frames=None):
         self.joint_names = tuple(joint_names)
         self.owner_ids = tuple(owners)
         owner_aliases = {} if owner_aliases is None else owner_aliases
@@ -186,6 +186,47 @@ class NativeCollisionModel:
         self._margin = np.asarray(margins, dtype=float)
         self._request = coal.DistanceRequest()
         self._request.enable_signed_distance = True
+        # BEGIN structural motion identities use the same registered FK tree.
+        self.robot_geometry_frames = {row['name']: row['frame'] for row in robot_model['geometries']}
+        self._frame_joint_dependencies = {}
+        # BEGIN a bound owner names a registered frame, independently of any task.
+        # Query source indices select which q sample owns that frame. External
+        # world transforms remain a separate physical source, named by -1.
+        owner_frames = {} if owner_frames is None else dict(owner_frames)
+        if not set(owner_frames) <= set(self.owner_ids):
+            raise ValueError('Native frame bindings must name registered owners')
+        for frame in owner_frames.values():
+            self.frame_joint_dependencies(frame)
+        self.owner_frames = owner_frames
+        self._bound_frames = tuple(dict.fromkeys(int(self._model.getFrameId(name))
+                                                for name in owner_frames.values()))
+        self._owner_frame_indices = tuple(-1 if owner not in owner_frames else
+            self._bound_frames.index(int(self._model.getFrameId(owner_frames[owner])))
+            for owner in self.owner_ids)
+        self._frames = tuple(dict.fromkeys([solid.frame for solid in self._solids if solid.frame is not None]
+                                          + list(self._bound_frames)))
+        self._frame_slots = {frame: index for index, frame in enumerate(self._frames)}
+        # END these are immutable frame identities, not cross-evaluation FK caches.
+
+    def frame_joint_dependencies(self, frame_name):
+        """Return a fixed named-coordinate mask for one registered URDF frame.
+
+        This is ancestry, not a numerical Jacobian test. Shared ancestors can
+        cancel only when two frames consume the same query-time coordinates.
+        """
+        if frame_name not in self._frame_joint_dependencies:
+            frame = int(self._model.getFrameId(frame_name))
+            if frame >= self._model.nframes:
+                raise ValueError(f'Collision dependency has unknown native frame: {frame_name}')
+            names = set()
+            joint = int(self._model.frames[frame].parentJoint)
+            while joint:
+                names.add(str(self._model.names[joint]))
+                joint = int(self._model.parents[joint])
+            self._frame_joint_dependencies[frame_name] = np.asarray(
+                [name in names for name in self.joint_names], dtype=bool)
+        return self._frame_joint_dependencies[frame_name]
+        # END only the frozen URDF establishes these dependencies.
 
     # BEGIN unknown actuator dependencies follow this exact native FK tree.
     def geometry_depending_on(self, joint_names):
@@ -212,26 +253,64 @@ class NativeCollisionModel:
         return tuple(result)
     # END masks select native geometry, without adding an estimated joint value.
 
-    def __call__(self, q_full, owner_matrices, enabled):
+    def __call__(self, q_full, owner_transforms, enabled, owner_sources):
+        self._validate_query(q_full, owner_transforms, enabled, owner_sources)
+        derivatives = torch.is_grad_enabled() and (q_full.requires_grad or owner_transforms.requires_grad)
+        return _NativeDistance.apply(q_full, owner_transforms, enabled, None, owner_sources, self, derivatives)
+
+    # BEGIN signed clearances retain fixed/variable slots at every query time.
+    def signed(self, q_full, owner_transforms, enabled, variable, *, owner_sources):
+        """Return true minimum clearance and validity for each group/two slots.
+
+        Slot 0 contains structurally fixed pairs; slot 1 contains pairs whose
+        relative transform depends on the candidate. The caller supplies that
+        structural classification independently of current distance/gradient.
+        Empty slots are zero placeholders with ``valid=False``, not contact.
+
+        ``owner_sources[b,t,n] >= 0`` binds owner n to its registered frame at
+        that sample in batch b; its transform is fixed frame-from-owner.
+        Source -1 instead uses the supplied world-from-owner transform. Both
+        robot and bound-owner FK consume the identical q_full values.
+        """
+        self._validate_query(q_full, owner_transforms, enabled, owner_sources)
+        if variable.shape != enabled.shape or variable.dtype != torch.bool:
+            raise ValueError('Signed collision requires one structural variable mask per pair/state')
+        derivatives = torch.is_grad_enabled() and (q_full.requires_grad or owner_transforms.requires_grad)
+        values = _NativeDistance.apply(q_full, owner_transforms, enabled, variable, owner_sources, self, derivatives)
+        constant_group = torch.as_tensor(self._group, device=enabled.device, dtype=torch.long)
+        valid = torch.stack([torch.stack([
+            (enabled & (variable == slot) & (constant_group == index)).any(-1)
+            for slot in (False, True)], -1) for index in range(len(self.groups))], -2) if len(self.pairs) else torch.zeros_like(values, dtype=torch.bool)
+        return values, valid
+
+    def _validate_query(self, q_full, owner_transforms, enabled, owner_sources):
         expected = (*q_full.shape[:2], len(self.owner_ids), 4, 4)
         if (q_full.ndim != 3 or q_full.shape[-1] != len(self.joint_names)
-                or owner_matrices.shape != expected
+                or owner_transforms.shape != expected
+                or owner_sources.shape != expected[:-2] or owner_sources.dtype != torch.long
                 or enabled.shape != (*q_full.shape[:2], len(self.pairs))
                 or enabled.dtype != torch.bool
-                or q_full.device != owner_matrices.device or q_full.dtype != owner_matrices.dtype):
+                or q_full.device != owner_transforms.device or q_full.dtype != owner_transforms.dtype
+                or q_full.device != owner_sources.device):
             raise ValueError('Native collision requires aligned q, owner transforms and enabled pair masks')
-        derivatives = torch.is_grad_enabled() and (q_full.requires_grad or owner_matrices.requires_grad)
-        return _NativeDistance.apply(q_full, owner_matrices, enabled, self, derivatives)
+    # END execution residuals and planning clearances share the exact query below.
 
-    def _evaluate(self, coordinates, owner_matrices, enabled, derivatives):
-        """One FK per state, library distances only for enabled AABB candidates."""
+    def _evaluate(self, coordinates, owner_transforms, enabled, derivatives, owner_sources, variable=None):
+        """One FK/query path for residual sums or exact signed group minima."""
         states, dof = coordinates.shape
-        values = np.zeros((states, len(self.groups)))
+        signed = variable is not None
+        channels = len(self.groups)*(2 if signed else 1)
+        values = np.zeros((states, channels))
         q_gradient = np.zeros((*values.shape, dof)) if derivatives else None
         owner_gradient = np.zeros((*values.shape, len(self.owner_ids), 4, 4)) if derivatives else None
-        if not np.isfinite(coordinates).all() or not np.isfinite(owner_matrices).all():
+        if not np.isfinite(coordinates).all() or not np.isfinite(owner_transforms).all():
             raise ValueError('Native collision requires finite current joint coordinates and owner transforms')
         base_rotation = self._base[:3, :3]
+        # BEGIN one q64 FK batch supplies every robot solid and bound owner.
+        # This evaluation-local table supports release references without a
+        # second FK path or a dense output-time/input-time Jacobian.
+        frame_poses = np.empty((states, len(self._frames), 4, 4))
+        frame_jacobians = np.zeros((states, len(self._frames), 6, dof)) if derivatives else None
         for state in range(states):
             q = np.empty(self._model.nq)
             q[self._q_columns] = coordinates[state]
@@ -241,9 +320,31 @@ class NativeCollisionModel:
             else:
                 pin.forwardKinematics(self._model, self._data, q)
             pin.updateFramePlacements(self._model, self._data)
+            for slot, frame in enumerate(self._frames):
+                frame_poses[state, slot] = self._base @ self._data.oMf[frame].homogeneous
+                if derivatives and dof:
+                    # Pinocchio squeezes the single-column NumPy result;
+                    # retain its mathematical 6-by-nv layout for all robots.
+                    jacobian = np.asarray(pin.getFrameJacobian(self._model, self._data, frame,
+                        pin.LOCAL_WORLD_ALIGNED)).reshape(6, self._model.nv)[:, self._v_columns]
+                    frame_jacobians[state, slot, :3] = base_rotation @ jacobian[:3]
+                    frame_jacobians[state, slot, 3:] = base_rotation @ jacobian[3:]
+        bound_slots = [self._frame_slots[frame] for frame in self._bound_frames]
+        bound_poses = frame_poses[:, bound_slots]
+        bound_jacobians = frame_jacobians[:, bound_slots] if derivatives else None
+        owner_matrices = owner_transforms.copy()
+        for owner, frame in enumerate(self._owner_frame_indices):
+            selected = owner_sources[:, owner] >= 0
+            if selected.any():
+                if frame < 0:
+                    raise ValueError('A sourced owner must declare its registered robot frame')
+                owner_matrices[selected, owner] = (bound_poses[owner_sources[selected, owner], frame]
+                                                    @ owner_transforms[selected, owner])
+        # END external world poses are retained only for explicit source -1.
+        for state in range(states):
             poses, lower, upper = [], [], []
             for solid in self._solids:
-                parent = (self._base @ self._data.oMf[solid.frame].homogeneous
+                parent = (frame_poses[state, self._frame_slots[solid.frame]]
                           if solid.frame is not None else owner_matrices[state, solid.owner_index])
                 pose = parent @ solid.local_pose
                 centre = pose[:3, :3] @ solid.centre + pose[:3, 3]
@@ -252,35 +353,25 @@ class NativeCollisionModel:
                 lower.append(centre-half)
                 upper.append(centre+half)
             lower, upper = np.asarray(lower), np.asarray(upper)
-            axis_gap = np.maximum(lower[self._first]-upper[self._second],
-                                  lower[self._second]-upper[self._first]).max(-1)
-            candidates = np.flatnonzero(enabled[state] & (axis_gap <= self._margin))
-            frame_jacobians = {}
-
+            gap = np.maximum(lower[self._first]-upper[self._second],
+                             lower[self._second]-upper[self._first])
             def accumulate(solid, witness, direction, group):
                 if solid.frame is not None:
                     # A fixed robot has a 3-by-0 point Jacobian. There is no
                     # joint derivative to request from Pinocchio in that case.
                     if dof == 0:
                         return
-                    if solid.frame not in frame_jacobians:
-                        # BEGIN Pinocchio's NumPy binding squeezes a one-column matrix.
-                        # Its mathematical Jacobian remains 6-by-nv for every
-                        # scalar-joint count, including a one-coordinate robot.
-                        frame_jacobians[solid.frame] = np.asarray(pin.getFrameJacobian(
-                            self._model, self._data, solid.frame, pin.LOCAL_WORLD_ALIGNED)).reshape(6, self._model.nv).copy()
-                        # END joint-count changes cannot change derivative rank.
-                    jacobian = frame_jacobians[solid.frame]
-                    point_base = base_rotation.T @ (witness-self._base[:3, 3])
-                    offset = point_base-self._data.oMf[solid.frame].translation
-                    point_jacobian = base_rotation @ (jacobian[:3]+np.cross(jacobian[3:].T, offset).T)
-                    q_gradient[state, group] += direction @ point_jacobian[:, self._v_columns]
+                    slot = self._frame_slots[solid.frame]
+                    jacobian = frame_jacobians[state, slot]
+                    offset = witness-frame_poses[state, slot, :3, 3]
+                    point_jacobian = jacobian[:3]+np.cross(jacobian[3:].T, offset).T
+                    q_gradient[state, group] += direction @ point_jacobian
                 else:
                     matrix = owner_matrices[state, solid.owner_index]
                     point_local = matrix[:3, :3].T @ (witness-matrix[:3, 3])
                     owner_gradient[state, group, solid.owner_index, :3] += np.outer(direction, np.r_[point_local, 1.])
 
-            for index in candidates:
+            def measure(index):
                 first, second = self._first[index], self._second[index]
                 a, b = self._solids[first], self._solids[second]
                 transform_a, transform_b = poses[first], poses[second]
@@ -291,40 +382,111 @@ class NativeCollisionModel:
                 distance = float(result.min_distance)
                 if not np.isfinite(distance):
                     raise RuntimeError('Coal returned a nonfinite registered-solid distance')
-                residual = self._margin[index]-distance
-                if residual <= 0:
-                    continue
-                group = self._group[index]
-                values[state, group] += residual
+                return distance, result
+
+            def derivative(index, result, group, sign):
                 if derivatives:
+                    a, b = self._solids[self._first[index]], self._solids[self._second[index]]
                     normal = np.asarray(result.normal)
                     witness_a, witness_b = np.asarray(result.getNearestPoint1()), np.asarray(result.getNearestPoint2())
                     if not np.isfinite(np.r_[normal, witness_a, witness_b]).all():
                         raise RuntimeError('Coal returned nonfinite same-query derivative witnesses')
-                    # rho=margin-d and delta d=n.(delta pB-delta pA).
-                    accumulate(a, witness_a, normal, group)
-                    accumulate(b, witness_b, -normal, group)
-        return values, q_gradient, owner_gradient
+                    # delta d=n.(delta pB-delta pA). sign=+1 for
+                    # clearance d-margin, -1 for the execution residual.
+                    accumulate(a, witness_a, -sign*normal, group)
+                    accumulate(b, witness_b, sign*normal, group)
+
+            if signed:
+                # A disjoint-box distance is a lower bound for enclosed
+                # solids. Overlap has no signed penetration lower bound and
+                # therefore must reach Coal. Bounds only skip impossible
+                # minima; every returned finite clearance is a Coal query.
+                bounds = np.linalg.norm(np.maximum(gap, 0.), axis=-1)-self._margin
+                bounds[np.all(gap <= 0., axis=-1)] = -np.inf
+                channel = self._group*2+variable[state].astype(np.int64)
+                for group in range(channels):
+                    indices = np.flatnonzero(enabled[state] & (channel == group))
+                    indices = indices[np.argsort(bounds[indices], kind='stable')]
+                    best, witness = np.inf, None
+                    for index in indices:
+                        if bounds[index] > best:
+                            break
+                        distance, result = measure(index)
+                        clearance = distance-self._margin[index]
+                        if clearance < best:
+                            best, witness = clearance, (index, result)
+                    if witness is not None:
+                        values[state, group] = best
+                        derivative(*witness, group, 1.)
+            else:
+                # Preserve the existing execution/entrance zero set and
+                # positive residual sum, including declared self margins.
+                indices = np.flatnonzero(enabled[state] & (gap.max(-1) <= self._margin))
+                for index in indices:
+                    distance, result = measure(index)
+                    residual = self._margin[index]-distance
+                    if residual > 0:
+                        group = self._group[index]
+                        values[state, group] += residual
+                        derivative(index, result, group, -1.)
+        return values, q_gradient, owner_gradient, bound_poses, bound_jacobians
 
 
 class _NativeDistance(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q_full, owner_matrices, enabled, model, derivatives):
+    def forward(ctx, q_full, owner_transforms, enabled, variable, owner_sources, model, derivatives):
         batch, horizon, dof = q_full.shape
-        values, q_gradient, owner_gradient = model._evaluate(
+        slots = (len(model.groups),) if variable is None else (len(model.groups), 2)
+        sources = owner_sources.detach().cpu().numpy()
+        if np.any(sources < -1) or np.any(sources >= horizon):
+            raise ValueError('Owner frame sources must be -1 or a query index in their own batch')
+        flat_sources = np.where(sources >= 0, sources+np.arange(batch)[:, None, None]*horizon, -1)
+        values, q_gradient, owner_gradient, frame_poses, frame_jacobians = model._evaluate(
             q_full.detach().cpu().double().numpy().reshape(batch*horizon, dof),
-            owner_matrices.detach().cpu().double().numpy().reshape(batch*horizon, len(model.owner_ids), 4, 4),
-            enabled.detach().cpu().numpy().reshape(batch*horizon, len(model.pairs)), derivatives)
+            owner_transforms.detach().cpu().double().numpy().reshape(batch*horizon, len(model.owner_ids), 4, 4),
+            enabled.detach().cpu().numpy().reshape(batch*horizon, len(model.pairs)), derivatives,
+            flat_sources.reshape(batch*horizon, len(model.owner_ids)),
+            None if variable is None else variable.detach().cpu().numpy().reshape(batch*horizon, len(model.pairs)))
+        ctx.channels = values.shape[-1]
+        ctx.owner_frame_indices = model._owner_frame_indices
         if derivatives:
             ctx.save_for_backward(
-                q_full.new_tensor(q_gradient.reshape(batch, horizon, len(model.groups), dof)),
-                owner_matrices.new_tensor(owner_gradient.reshape(batch, horizon, len(model.groups), len(model.owner_ids), 4, 4)))
-        return q_full.new_tensor(values.reshape(batch, horizon, len(model.groups)))
+                q_full.new_tensor(q_gradient.reshape(batch, horizon, ctx.channels, dof)),
+                owner_transforms.new_tensor(owner_gradient.reshape(batch, horizon, ctx.channels, len(model.owner_ids), 4, 4)),
+                owner_transforms, owner_sources,
+                q_full.new_tensor(frame_poses.reshape(batch, horizon, len(model._bound_frames), 4, 4)),
+                q_full.new_tensor(frame_jacobians.reshape(batch, horizon, len(model._bound_frames), 6, dof)))
+        return q_full.new_tensor(values.reshape(batch, horizon, *slots))
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, gradient):
-        q_gradient, owner_gradient = ctx.saved_tensors
-        return (torch.einsum('btg,btgd->btd', gradient, q_gradient),
-                torch.einsum('btg,btgnij->btnij', gradient, owner_gradient), None, None, None)
+        q_gradient, owner_gradient, owner_transforms, owner_sources, frame_poses, frame_jacobians = ctx.saved_tensors
+        gradient = gradient.reshape(*q_gradient.shape[:2], ctx.channels)
+        q_gradient = torch.einsum('btg,btgd->btd', gradient, q_gradient)
+        owner_gradient = torch.einsum('btg,btgnij->btnij', gradient, owner_gradient)
+        # BEGIN one owner wrench scatters only to its declared source sample.
+        # The existing per-group matrix derivative is enough; no T-by-T
+        # Jacobian or second cuRobo pose derivative is retained.
+        batch, horizon, dof = q_gradient.shape
+        for owner, frame in enumerate(ctx.owner_frame_indices):
+            if frame < 0:
+                continue
+            source = owner_sources[..., owner]
+            bound, index = source >= 0, source.clamp_min(0)
+            pose = frame_poses[:, :, frame].gather(1, index[..., None, None].expand(batch, horizon, 4, 4))
+            jacobian = frame_jacobians[:, :, frame].gather(1, index[..., None, None].expand(batch, horizon, 6, dof))
+            world = pose @ owner_transforms[..., owner, :, :]
+            matrix_gradient = owner_gradient[..., owner, :, :]
+            force = matrix_gradient[..., :3, 3]
+            torque = torch.cross(world[..., :3, :3].transpose(-1, -2),
+                matrix_gradient[..., :3, :3].transpose(-1, -2), dim=-1).sum(-2)
+            torque = torque+torch.cross(world[..., :3, 3]-pose[..., :3, 3], force, dim=-1)
+            contribution = torch.einsum('btk,btkd->btd', torch.cat((force, torque), -1), jacobian)
+            q_gradient.scatter_add_(1, index[..., None].expand(batch, horizon, dof),
+                                    torch.where(bound[..., None], contribution, 0.))
+            owner_gradient[..., owner, :, :] = torch.where(bound[..., None, None],
+                pose.transpose(-1, -2) @ matrix_gradient, matrix_gradient)
+        # END source -1 keeps the original external world-matrix gradient.
+        return q_gradient, owner_gradient, None, None, None, None, None
 # END task permissions and observed fields remain owned by the ordinary scene.

@@ -171,7 +171,8 @@ def native_box_scene(*, target_x=.04, contact=None, attached=False, sphere_count
     current.bind_online_robot(robot_sphere_geometry=[{'link_name': 'slider',
         'sphere_indices': list(range(sphere_count)), 'centers_local': [[0., 0., 0.]]*sphere_count,
         'radii': [.09]*sphere_count}], native_robot_model=native, native_joint_names=('slide',),
-        native_self_pairs=(), robot_model={'T_reference_base': np.eye(4).tolist()})
+        native_self_pairs=(), robot_model={'T_reference_base': np.eye(4).tolist(), 'tool_frame': 'slider',
+                                          'T_frame_tcp': np.eye(4).tolist()})
     return current
 
 

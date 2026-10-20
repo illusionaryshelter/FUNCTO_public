@@ -16,99 +16,10 @@ import torch
 from manipulation.cubic_seed import CubicSeed, cubic_position_report
 from manipulation.planning import (
     MotionPlanningError, PlanningBudget, _CuroboPlanner, _ProgressMap,
-    _minimum_cost_candidate, _process_manager_type,
+    _minimum_cost_candidate,
 )
 
 
-def test_native_rollout_keeps_nonzero_support_task_cost_without_rejection():
-    from curobo.types import DeviceCfg, JointState
-    from curobo._src.rollout.rollout_robot import RobotRollout
-    from curobo._src.state.state_robot import RobotState
-
-    device = DeviceCfg("cpu")
-    q = torch.full((2, 3, 3), .1, requires_grad=True)
-    joints = JointState.from_position(q, joint_names=["x", "y", "z"])
-    joints.velocity, joints.dt = torch.zeros_like(q), torch.full((2,), .5)
-
-    def kinematics(joints):
-        position = joints.position
-        rotation = position.new_zeros((*position.shape[:2], 1, 4))
-        rotation[..., 0] = 1.
-        return SimpleNamespace(
-            tool_poses=SimpleNamespace(tool_frames=["tool"], position=position[..., None, :], quaternion=rotation),
-            tool_jacobians=position.new_zeros((*position.shape[:2], 1, 6, 3)),
-            robot_spheres=torch.cat((position, torch.full_like(position[..., :1], .01)), -1)[..., None, :])
-
-    problem = SimpleNamespace(tool_link="tool", mechanisms=(), stop_progress=(),
-        transform_tool_pose=lambda p, r: (p, r), transform_robot_spheres=lambda value: value,
-        residuals=lambda p, *args, **kwargs: {"support:0": torch.relu(p[..., 2]-.001)},
-        optimizer_preferences=lambda p, *args, **kwargs: (p-1.).square().sum(-1))
-    scene = SimpleNamespace(gripper=None, collision=0.,
-        optimizer_preferences=lambda progress, *args: torch.zeros_like(progress))
-    scene.clone_for_rollout = lambda: scene
-    # BEGIN one mixed scene query retains geometric and non-geometric names.
-    scene.query_count = 0
-    def scene_components(spheres, p, r, progress, joints, *args, **kwargs):
-        scene.query_count += 1
-        return {"collision/robot/background": torch.full_like(progress, scene.collision),
-                "collision/robot/object": torch.zeros_like(progress),
-                "gripper/controller": torch.relu(joints[..., 0]-.2),
-                "unsupported/release_anchor/object/0": torch.zeros_like(progress)}
-    scene.components = scene_components
-    # END all components use the same ordered regular and anchor samples.
-    model = SimpleNamespace(tool_frames=["tool"], config=object(), total_spheres=1,
-                            get_self_collision_config=lambda: None)
-    transition = SimpleNamespace(joint_names=["x", "y", "z"], robot_model=model, interpolation_steps=1)
-    state = RobotState(joint_state=joints, cuda_robot_model_state=kinematics(joints))
-    with patch("curobo.kinematics.Kinematics", return_value=SimpleNamespace(compute_kinematics=kinematics)), \
-         patch("curobo._src.rollout.cost_manager.cost_manager_robot.synchronize_cuda_streams"), \
-         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test must not initialize CUDA")):
-        factory = _process_manager_type(problem, scene,
-            _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), np.array([0., 1.]),
-            PlanningBudget(constraint_weight=1.), clock={"duration": 1.}, seed_parameter=torch.zeros((1, 1)))
-        config = lambda mode: factory.create({"process_mode": mode}, device_cfg=device)
-        rollout = RobotRollout.__new__(RobotRollout)
-        rollout.config = SimpleNamespace(cost_cfg=config("trajectory_cost"),
-            constraint_cfg=config("trajectory_constraint"), hybrid_cost_constraint_cfg=None)
-        rollout._num_particles_goal = None
-        for target, cfg in (("cost_manager", rollout.config.cost_cfg),
-                            ("constraint_manager", rollout.config.constraint_cfg)):
-            manager = cfg.class_type(device)
-            manager.initialize_from_config(cfg, transition)
-            setattr(rollout, target, manager)
-        result = rollout._compute_costs_and_constraints_impl(state)
-        assert result.costs.names == ["nominal_task"]
-        assert result.constraints.names == ["collision/robot/background", "collision/robot/object",
-            "gripper/controller", "unsupported/release_anchor/object/0"]
-        assert scene.query_count == 1
-        assert bool(result.get_feasible(sum_horizon=True).all())
-        objective = result.get_sum_cost_and_constraint(sum_horizon=True)
-        assert bool((objective > 0).all())
-        objective.sum().backward()
-        assert bool(torch.isfinite(q.grad).all()) and bool((q.grad.abs() > 0).any())
-        # The same ordinary scene collision remains a physical rejection.
-        scene.collision = .02
-        collision = rollout._compute_costs_and_constraints_impl(state)
-        assert not bool(collision.get_feasible(sum_horizon=True).any())
-
-        # BEGIN component splitting preserves aggregate values and derivatives.
-        # Two geometry terms and two fixed/controller terms share one query;
-        # compare the native collection against their former summed formula.
-        captured = {}
-        def mixed_components(spheres, p, r, progress, joints, *args, **kwargs):
-            terms = {"collision/robot/background": joints[..., 0].square(),
-                     "collision/robot/object": 2*joints[..., 1].square(),
-                     "gripper/controller": 3*joints[..., 2].square(),
-                     "unsupported/release_anchor/object/0": torch.ones_like(progress)}
-            captured["old_sum"] = sum(terms.values()).sum()
-            return terms
-        scene.components = mixed_components
-        mixed = rollout._compute_costs_and_constraints_impl(state)
-        separated_sum = sum(value.sum() for value in mixed.constraints.values)
-        torch.testing.assert_close(separated_sum, captured["old_sum"])
-        separated_gradient, = torch.autograd.grad(separated_sum, q, retain_graph=True)
-        summed_gradient, = torch.autograd.grad(captured["old_sum"], q)
-        torch.testing.assert_close(separated_gradient, summed_gradient)
         # END no extra query or new physical threshold is needed to classify.
 
 
@@ -121,38 +32,8 @@ def test_candidate_selection_uses_total_nominal_cost_and_rejects_nonfinite_value
         _minimum_cost_candidate([np.nan, np.inf], [True, True])
 
 
-def test_native_result_accepts_task_cost_but_keeps_joint_and_finite_checks():
-    # BEGIN selection consumes real finite curves before comparing task scores.
-    from test_manipulation_planning import selection_fixture
-    states = np.zeros((2, 9, 3))
-    planner, native = selection_fixture(states, states, [10., 1.])
-    # END nominal task error remains a preference, not an execution veto.
-    _, report = planner.select_candidate(native)
-    assert report["accepted"] and report["selected_seed_index"] == 1
-    assert report["native_metrics"]["rollout"]["costs"]["nominal_task"] == pytest.approx(1.)
-    native.metrics.costs_and_constraints.constraints.values[0][1] = 1.
-    _, report = planner.select_candidate(native)
-    assert report["accepted"] and report["selected_seed_index"] == 0
-    native.metrics.costs_and_constraints.costs.values[0][0] = float("nan")
-    _, report = planner.select_candidate(native)
-    assert not report["accepted"]
 
 
-def test_goal_free_native_result_keeps_missing_goalset_when_selecting_a_seed():
-    from manipulation.planning import _trajectory_candidate
-    from test_manipulation_planning import PlannerCandidateSelectionTests
-    result = PlannerCandidateSelectionTests.native_candidates(native_violations=(0., 0.))
-    # Run the installed native metric processor. An empty convergence
-    # collection must produce no pose goalset, exactly as in the GPU solve.
-    result._process_metrics()
-    assert result.goalset_index is None
-    selected = _trajectory_candidate(result, 1)
-    assert selected.goalset_index is None
-    assert selected.num_seeds == 1 and bool(selected.success.all())
-    torch.testing.assert_close(selected.solution, result.solution[:, 1:2])
-    torch.testing.assert_close(selected.total_cost_reshaped, result.total_cost_reshaped[:, 1:2])
-    assert selected.get_interpolated_plan().position.shape == (1, 1, 5, 3)
-    torch.testing.assert_close(selected.get_interpolated_plan().dt, torch.tensor([[.11]]))
 
 
 def test_ompl_connection_preserves_release_history_for_later_single_state_queries():
@@ -193,7 +74,8 @@ def test_ompl_connection_preserves_release_history_for_later_single_state_querie
         native_robot_model={"urdf_xml": urdf, "geometries": [{"name": "body", "frame": "base",
             "kind": "sphere", "dimensions": [.02], "T_frame_geometry": body_pose.tolist(),
             "source": "explicit fixed robot body"}]}, native_joint_names=("x", "y", "z"),
-        native_self_pairs=[], robot_model={"T_reference_base": np.eye(4).tolist()})
+        native_self_pairs=[], robot_model={"T_reference_base": np.eye(4).tolist(),
+            "tool_frame": "tool", "T_frame_tcp": np.eye(4).tolist()})
     # END release-history checks still use the original independent owner.
     assert not scene.query_state(body, np.eye(4), .75,
         joint_position=np.zeros(3), joint_names=("x", "y", "z"))["passed"]
@@ -219,8 +101,7 @@ def test_ompl_connection_preserves_release_history_for_later_single_state_querie
         robot_spheres=kwargs["cuda_robot_model_state"].robot_spheres)
     limits = SimpleNamespace(joint_names=list(planner.joint_names),
                               position=torch.tensor([[-2.]*3, [2.]*3]))
-    planner._verification_native = SimpleNamespace(get_cost={
-        "cspace": SimpleNamespace(config=SimpleNamespace(joint_limits=limits))}.get)
+    planner.joint_limits = limits
     planner.seed_curve = CubicSeed(torch.zeros((1, 3)), torch.zeros((1, 3)), .1, 8)
     trajectory = JointTrajectory(planner.joint_names, np.array([0., 1.]),
         np.array([[0., 0., 0.], [.4, 0., 0.]]), np.array([[.4, 0., 0.], [.4, 0., 0.]]),

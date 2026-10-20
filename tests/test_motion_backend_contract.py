@@ -49,7 +49,6 @@ class Native:
         self.budget = PlanningBudget()
         core = lambda: SimpleNamespace(optimizers=[])
         self.ik = SimpleNamespace(config=SimpleNamespace(exit_early=False), core=core())
-        self.trajopt = SimpleNamespace(core=core())
         self.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         self.scene_workspace_bytes = self.scene_cpu_workspace_bytes = self.scene_gpu_workspace_bytes = 0
         self.anchor_fk_workspace_bytes = 0
@@ -63,9 +62,11 @@ class Native:
         self.last_validation = {"u": np.array([0., 1.]), "violations": np.zeros(2)}
         limits = SimpleNamespace(joint_names=["q"], position=torch.tensor([[-1.], [1.]]),
             velocity=torch.tensor([[-1.], [1.]]), acceleration=torch.tensor([[-1.], [1.]]))
-        self._verification_native = SimpleNamespace(get_cost=lambda _: SimpleNamespace(config=SimpleNamespace(joint_limits=limits)))
+        self.joint_limits = limits
         self.curve = JointTrajectory(("q",), np.array([0., 1.]), np.zeros((2, 1)), np.zeros((2, 1)),
                                     np.array([0., 1.]), np.array([0., 1.]), (), (), {})
+    def query_diagnostics(self):
+        return {"calls": 0, "states": 0}
     def initial_state_diagnostics(self):
         return {"passed": True}
     def reference_seeds(self, joint_reference=None):
@@ -121,7 +122,7 @@ def test_timeout_retains_actual_query_counts_without_delivering_a_partial_candid
     from manipulation.planning import MotionPlanningError
     native = Native([False])
     counts = {"mode": "trajectory_cost", "calls": 3, "states": 48}
-    native._manager_type = SimpleNamespace(query_diagnostics=lambda: [dict(counts)])
+    native.query_diagnostics = lambda: [dict(counts)]
     def stop(seed):
         native.calls.append("solve")
         raise MotionPlanningError("deadline_exceeded", "actual solve consumed request deadline")

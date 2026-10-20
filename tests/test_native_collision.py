@@ -29,19 +29,22 @@ def primitive(dimensions=(.02, .08, .04), kind='cuboid', pose=None):
                 pose=[0., 0., 0., 1., 0., 0., 0.] if pose is None else pose)
 
 
-def model(*, shapes=None, owners=None, self_pairs=(), moving_owners=(), fixed=False, names=('turn', 'slide'), base=None):
+def model(*, shapes=None, owners=None, self_pairs=(), moving_owners=(), fixed=False,
+          names=('turn', 'slide'), base=None, owner_frames=None):
     return NativeCollisionModel(robot_model=dict(
         urdf_xml='<robot name="fixed"><link name="base"/></robot>' if fixed else URDF,
         geometries=[body(frame='base' if fixed else 'slider')] if shapes is None else shapes),
         joint_names=() if fixed else names, T_reference_base=np.eye(4) if base is None else base,
         self_pairs=self_pairs, owners={'obstacle': [primitive()]} if owners is None else owners,
-        moving_owners=moving_owners)
+        moving_owners=moving_owners, owner_frames=owner_frames)
 
 
-def query(current, q, matrices, enabled=None):
+def query(current, q, matrices, enabled=None, *, owner_sources=None):
     if enabled is None:
         enabled = torch.ones((*q.shape[:2], len(current.pairs)), dtype=torch.bool)
-    return current(q, matrices, enabled)
+    if owner_sources is None:
+        owner_sources = torch.full(matrices.shape[:3], -1, dtype=torch.long, device=q.device)
+    return current(q, matrices, enabled, owner_sources)
 
 
 def owner_pose(x, *, rotation=None, count=1):

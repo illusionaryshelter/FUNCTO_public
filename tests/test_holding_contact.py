@@ -57,7 +57,8 @@ def setup(*, release=True, other_owner=False, self_collision=False, angle=0.):
         'centers_local':[[0.,0.,0.]],'radii':[.005]}],
         native_robot_model=native, native_joint_names=('arm_x',),
         native_self_pairs=[{'first': 'native-pad', 'second': 'native-arm', 'margin': 0.}]
-            if self_collision else [], robot_model={'T_reference_base': np.eye(4).tolist()})
+            if self_collision else [], robot_model={'T_reference_base': np.eye(4).tolist(),
+                'tool_frame': 'pad', 'T_frame_tcp': pose.tolist()})
     # END supplied q controls both exact robot shape and its matching proxy centre.
     condition = {'kind':'observed_attachment','condition_id':'held','carrier_id':'part','progress':0.,
                  'T_carrier_eef':pose.tolist(),'contact_rule_ids':['held-pad']}

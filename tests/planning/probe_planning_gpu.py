@@ -1,9 +1,9 @@
-"""Bounded native motion probe: nominal goals remain independent of references.
+"""Bounded constrained motion probe: nominal goals remain independent of references.
 
 Run in the existing recovery environment with this checkout's cuRobo on
 PYTHONPATH. CUDA execution is serial; Torch's allocator is capped at 2 GiB.
 This allocator cap does not bound other native allocations. This declared empty
-synthetic world checks native planning only; it supplies no observed-scene,
+synthetic world checks constrained planning only; it supplies no observed-scene,
 independent Coal, actuator, or physical contact certification.
 """
 
@@ -65,8 +65,8 @@ def main():
     # END actual source names and TCP transforms replace built-in robot assumptions.
     del state, actual, kinematics
     gc.collect()
-    # BEGIN retain the existing bounded native integration work budget.
-    # The three synthetic variants exercise native cost integration and curve
+    # BEGIN retain the existing bounded integration work budget.
+    # The three synthetic variants exercise the shared nominal objective and curve
     # export. Nonzero task errors remain diagnostics, not acceptance thresholds.
     budget = PlanningBudget(max_validation_points=512, max_task_anchors=32, max_robot_spheres=sphere_count,
                             search_seconds=3., maximum_trajectory_solves=2)

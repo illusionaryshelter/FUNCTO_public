@@ -98,7 +98,7 @@ class PlanningPrecisionTests(unittest.TestCase):
             from manipulation.planning import PlanningBudget
             planner.budget = PlanningBudget()
             planner.ik = SimpleNamespace(core=SimpleNamespace(optimizers=[]), destroy=Mock())
-            planner.trajopt = SimpleNamespace(core=SimpleNamespace(optimizers=[]), destroy=Mock())
+            planner.trajectory_solver = SimpleNamespace(calls=0, states=0)
             planner.scene_workspace_bytes = 0
             planner.scene_cpu_workspace_bytes = planner.scene_gpu_workspace_bytes = 0
             planner.anchor_fk_workspace_bytes = 0

@@ -52,7 +52,8 @@ def make_scene(*, independent_hand=False, background_distance=1.):
         native_robot_model={'urdf_xml': URDF, 'geometries': geometry}, native_joint_names=('arm', 'finger'),
         native_self_pairs=[{'first': 'finger_solid', 'second': 'palm_solid', 'margin': 0.},
                            {'first': 'palm_solid', 'second': 'arm_solid', 'margin': 0.}],
-        robot_model={'T_reference_base': np.eye(4).tolist()})
+        robot_model={'T_reference_base': np.eye(4).tolist(), 'tool_frame': 'tool',
+                     'T_frame_tcp': np.eye(4).tolist()})
     return current
 
 

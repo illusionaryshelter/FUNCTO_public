@@ -124,17 +124,25 @@ def run(output, knots=8, *, fixture_path):
         def measured(planner, seed):
             saved = seed.detach().clone()
             result = original(planner, seed)
-            # Evaluate a cloned initializer on the live particle layout to
-            # expose the actual collision objective entering generation.
-            particles = planner.trajopt.optimizer.optimizers[0].config.num_particles
-            x = saved.reshape(-1, saved.shape[-2], saved.shape[-1]).repeat_interleave(particles, 0).requires_grad_(True)
-            rollout = planner.trajopt.optimizer_rollouts[0]
-            evaluated = rollout.evaluate_action(x, use_cuda_graph=False)
-            terms = evaluated.costs_and_constraints.constraints
-            value = terms.values[terms.names.index("process_scene")]
-            gradient, = torch.autograd.grad(value.sum(), x)
-            report["generation_attempts"].append({"scene_objective_at_initializer": float(value.sum().detach().cpu()),
-                                                   "scene_gradient_max": float(gradient.abs().max().detach().cpu())})
+            # BEGIN collision is a signed constraint in the shared evaluation.
+            # Keep fixed relations and per-state validity visible; an absent
+            # slot's zero placeholder is not measured contact or clearance.
+            attempts = []
+            for index, controls in enumerate(saved[0].cpu().numpy()):
+                evaluated = planner.trajectory_solver.evaluate(controls)
+                attempts.append({"seed_index": index, "objective": evaluated.objective,
+                    "physical_violation": evaluated.violation, "accepted": evaluated.accepted,
+                    "collision_variable_rows": [{"name": name, "slack": float(value),
+                        "gradient_max": float(np.abs(gradient).max())}
+                        for name, value, gradient in zip(evaluated.names, evaluated.slack, evaluated.jacobian)
+                        if name.startswith("scene/collision/")],
+                    "collision_fixed_rows": {name: float(value)
+                        for name, value in zip(evaluated.fixed_names, evaluated.fixed_slack)
+                        if name.startswith("scene/collision/")},
+                    "collision_groups": {name: value for name, value in evaluated.scene_report["groups"].items()
+                        if name.startswith("collision/")}})
+            report["generation_attempts"].append(attempts)
+            # END no squared collision cost replaces the physical inequalities.
             return result
 
         # BEGIN restore collision diagnostics after every planner invocation.

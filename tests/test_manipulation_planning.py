@@ -25,17 +25,14 @@ from manipulation.planning import (
     cubic_derivative_report,
     _CuroboPlanner,
     _ProgressMap,
-    _formal_native_clock,
     _fixed_spline_grid,
     _anchor_capacity,
     _planning_workspace_bytes,
     _PlanningWorkspace,
     _require_planning_memory,
     _bounded_robot_configuration,
-    _hermite_at_parameters,
     _native_gradient_layout_type,
     _orientation_vjp_type,
-    _process_manager_type,
     _progress_for_cubic_boundaries,
     _verification_stop_preference,
     plan_trajectory,
@@ -90,90 +87,21 @@ def cartesian_problem(phases, events=()):
         source_timestamps=np.array([0., float(len(phases))]), source_progress=np.array([0., float(len(phases))]))
 
 
-def export_fixture(problem, progress_map, position, velocity, dt):
-    """Exercise real polynomial export with explicit analytic joint bounds.
-
-    Native integration and collision checks have separate tests. Broad bounds
-    keep these fixtures focused on process/timing; derivative regressions
-    replace those bounds with their stated physical values.
-    """
-    position = torch.as_tensor(position, dtype=torch.float64)[None]
-    velocity = torch.as_tensor(velocity, dtype=torch.float64)[None]
-
-    native = SimpleNamespace(position=position, velocity=velocity,
-                             dt=torch.tensor([dt], dtype=torch.float64))
-    planner = _CuroboPlanner.__new__(_CuroboPlanner)
-    planner.check_request = Mock()
-    planner.problem = problem
-    planner.budget = PlanningBudget()
-    clock = {(event.skill_id, event.event_id, event.occurrence): {"event": asdict(event), "time": float(progress_map.anchor_parameters([event.progress])[0, 0]*(position.shape[1]-1)*dt),
-        "hold_until": float(progress_map.anchor_parameters([event.progress])[-1, 0]*(position.shape[1]-1)*dt)} for event in problem.events}
-    planner.progress_map = _ProgressMap(progress_map.u, progress_map.s, clock)
-    planner.anchors = problem.anchors
-    planner.joint_names = problem.joint_names
-    planner.torch = torch
-    planner.trajopt = SimpleNamespace(get_active_js=lambda state: state)
-    planner.formal_clock = {"valid_count": position.shape[1], "interpolation_dt": dt,
-                            "duration": (position.shape[1]-1)*dt}
-    planner.finger_trajectory = None
-    planner.start = SimpleNamespace(position=position[:, 0], velocity=velocity[:, 0])
-    limits = SimpleNamespace(joint_names=list(problem.joint_names),
-        position=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64),
-        velocity=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64),
-        acceleration=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64))
-    cspace = SimpleNamespace(enabled=True, config=SimpleNamespace(joint_limits=limits))
-    planner._verification_native = SimpleNamespace(
-        get_cost={"cspace": cspace}.get,
-        compute_costs=lambda state: SimpleNamespace(names=(), values=()))
-    return planner, SimpleNamespace(batch_size=1, num_seeds=1, get_interpolated_plan=lambda: native)
 
 
 # BEGIN returned-candidate fixtures retain actual CPU native result slicing.
-def selection_fixture(position, velocity, scores, dt=.125):
-    """Supply returned curves and scores without simulating GPU optimization."""
-    from curobo.types import DeviceCfg, JointState
-    from curobo._src.rollout.metrics import CostCollection
-
-    position, velocity = np.asarray(position, float), np.asarray(velocity, float)
-    problem = cartesian_problem((MotionPhase("free", constant_path()),))
-    planner, _ = export_fixture(problem,
-        _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), position[0], velocity[0], dt)
-    planner.seed_strategies, planner.last_optimizer_diagnostics = ["first", "second"], []
-    native = PlannerCandidateSelectionTests.native_candidates(
-        flags=(True, True), native_violations=(0., 0.))
-    state = JointState(position=torch.tensor(position)[None], velocity=torch.tensor(velocity)[None],
-        acceleration=torch.zeros((1, *position.shape), dtype=torch.float64),
-        jerk=torch.zeros((1, *position.shape), dtype=torch.float64),
-        dt=torch.full((1, 2), dt, dtype=torch.float64),
-        joint_names=list(problem.joint_names), device_cfg=DeviceCfg("cpu", dtype=torch.float64))
-    native.js_solution, native.interpolated_trajectory = state.clone(), state
-    count = position.shape[1]
-    native.interpolated_last_tstep = torch.full((1, 2), count, dtype=torch.int64)
-    native.metrics.costs_and_constraints.costs = CostCollection(names=["nominal_task"],
-        values=[torch.tensor(scores, dtype=torch.float64)[:, None, None].expand(2, count, 1).clone()/count])
-    native.metrics.costs_and_constraints.constraints = CostCollection(names=["cspace"],
-        values=[torch.zeros((2, count, 1), dtype=torch.float64)])
-    return planner, native
 # END fixtures declare complete saved curves and no independent acceptance oracle.
 
 
 class PlannerCalculusTests(unittest.TestCase):
     def test_formal_spline_clock_preserves_raw_duration_and_exact_dense_grid(self):
-        from curobo._src.types.control_space import ControlSpace
         for native_dt, subdivisions, count in ((.2, 32, 641), (.05, 8, 161)):
             with self.subTest(native_dt=native_dt):
-                native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=native_dt,
-                    maximum_trajectory_dt=native_dt, interpolation_dt=.025), interpolation_steps=4,
-                    transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3), action_horizon=18)
-                clock = _formal_native_clock(native)
+                clock = _fixed_spline_grid(intervals=20, native_dt=native_dt,
+                    interpolation_steps=4, interpolation_dt=.025)
                 self.assertEqual(clock["valid_count"], count)
                 self.assertEqual(clock["subdivisions"], subdivisions)
                 self.assertEqual(clock["duration"], 80*float(np.float32(native_dt)))
-                self.assertEqual(clock["duration"], (count-1)*float(np.float32(.025)))
-                self.assertEqual(np.float32(clock["interpolation_dt"]*subdivisions), np.float32(clock["knot_dt"]))
-        native.config.minimum_trajectory_dt = .04
-        with self.assertRaisesRegex(ValueError, "fixed request-wide"):
-            _formal_native_clock(native)
 
     def test_exact_grid_supports_general_representable_clock_and_rejects_retiming(self):
         grid = _fixed_spline_grid(intervals=10, native_dt=.125,
@@ -301,58 +229,7 @@ class PlannerCalculusTests(unittest.TestCase):
                 np.testing.assert_array_equal(joints.grad.numpy()[..., 3], 0.)
                 self.assertGreater(np.max(np.abs(joints.grad.numpy()[..., :3])), .1)
 
-    def test_hermite_values_and_derivatives_match_scipy_with_distinct_counts_and_dt(self):
-        rng = np.random.default_rng(481)
-        position, velocity = rng.normal(size=(2, 3, 9, 4))
-        counts = np.array([9, 6, 2])
-        dt = np.array([.07, .13, .4])
-        parameters = np.broadcast_to([0., .023, .17, 1/3, .501, .873, 1.], (3, 7)).copy()
-        expected_q, expected_dq = [], []
-        for row, count in enumerate(counts):
-            curve = CubicHermiteSpline(np.arange(count)*dt[row], position[row, :count],
-                                       velocity[row, :count], axis=0)
-            times = parameters[row]*(count-1)*dt[row]
-            expected_q.append(curve(times))
-            expected_dq.append(curve(times, 1))
-            # Invalid native padding must never stretch the skill schedule or
-            # become a real knot, even when its values are conspicuously bad.
-            position[row, count:] = 1e5
-            velocity[row, count:] = -2e5
-        actual_q, actual_dq = _hermite_at_parameters(
-            torch.tensor(position), torch.tensor(velocity), torch.tensor(dt),
-            torch.tensor(counts), torch.tensor(parameters))
-        np.testing.assert_allclose(actual_q.numpy(), expected_q, rtol=3e-13, atol=3e-13)
-        np.testing.assert_allclose(actual_dq.numpy(), expected_dq, rtol=3e-13, atol=3e-13)
 
-    def test_exact_curve_anchor_gradients_exclude_padding_and_match_scipy(self):
-        rng = np.random.default_rng(382)
-        data = rng.normal(size=(2, 5, 2))
-        count, dt = 3, .19
-        parameters = np.array([[0., .17, .49, .79, 1.]])
-        weights = rng.normal(size=(2, 5, 2))
-
-        def independent_loss(value):
-            curve = CubicHermiteSpline(np.arange(count)*dt, value[0, :count],
-                                       value[1, :count], axis=0)
-            times = parameters[0]*(count-1)*dt
-            return np.sum(curve(times)*weights[0] + curve(times, 1)*weights[1])
-
-        q = torch.tensor(data[0][None], requires_grad=True)
-        dq = torch.tensor(data[1][None], requires_grad=True)
-        result_q, result_dq = _hermite_at_parameters(
-            q, dq, torch.tensor([dt]), torch.tensor([count]), torch.tensor(parameters))
-        loss = (result_q*torch.tensor(weights[0]) + result_dq*torch.tensor(weights[1])).sum()
-        loss.backward()
-        actual = np.stack((q.grad.numpy()[0], dq.grad.numpy()[0]))
-        epsilon = 1e-6
-        expected = np.zeros_like(data)
-        for index in np.ndindex(data.shape):
-            plus, minus = data.copy(), data.copy()
-            plus[index] += epsilon
-            minus[index] -= epsilon
-            expected[index] = (independent_loss(plus)-independent_loss(minus))/(2*epsilon)
-        np.testing.assert_allclose(actual, expected, rtol=3e-7, atol=2e-8)
-        np.testing.assert_array_equal(actual[:, count:], 0.)
 
 
 class NativeCubicClockTests(unittest.TestCase):
@@ -414,48 +291,6 @@ class NativeCubicClockTests(unittest.TestCase):
         rejected = problem.residuals(position, quaternion, progress, joint_velocity=bad_first)
         np.testing.assert_allclose(rejected["stop:analytic:stop"].numpy(), [[.25e-4, 0., 0.]], atol=1e-20)
 
-    def test_equal_native_dt_bounds_prevent_implicit_post_solve_retiming(self):
-        import ast
-        from pathlib import Path
-        import curobo
-
-        # Execute the installed arithmetic methods verbatim on CPU. Importing
-        # the full trajectory solver would also import CUDA interpolation/JIT;
-        # parsing these two functions avoids creating that unrelated runtime.
-        root = Path(curobo.__file__).resolve().parent / "_src"
-        functions = []
-        for relative, name in (("util/trajectory.py", "calculate_dt_no_clamp"),
-                               ("solver/solver_trajopt.py", "compute_trajectory_dt")):
-            tree = ast.parse((root/relative).read_text())
-            function = next(node for node in ast.walk(tree)
-                            if isinstance(node, ast.FunctionDef) and node.name == name)
-            function.decorator_list = []
-            functions.append(function)
-        future = ast.parse("from __future__ import annotations").body
-        module = ast.fix_missing_locations(ast.Module(body=future+functions, type_ignores=[]))
-        scope = {"torch": torch, "log_and_raise": lambda message: (_ for _ in ()).throw(ValueError(message))}
-        exec(compile(module, "installed_native_dt_arithmetic", "exec"), scope)
-        calculate = scope["compute_trajectory_dt"]
-        limits = SimpleNamespace(max_velocity=torch.ones(2), max_acceleration=torch.ones(2),
-                                 max_jerk=torch.ones(2))
-        solver = SimpleNamespace(transition_model=limits,
-                                 config=SimpleNamespace(minimum_trajectory_dt=.002, maximum_trajectory_dt=.2))
-        velocity = torch.zeros((1, 2, 4, 2))
-        velocity[:, 1] = 10.
-        state = SimpleNamespace(position=torch.zeros_like(velocity), velocity=velocity,
-                                acceleration=torch.zeros_like(velocity), jerk=torch.zeros_like(velocity),
-                                dt=torch.full((1, 2), .2))
-        before_cuda = torch.cuda.is_initialized()
-        with patch("torch.cuda.init", side_effect=AssertionError("retiming arithmetic must remain on CPU")):
-            # The former interval does shrink a slow/constant trajectory, so
-            # this fixture would expose a post-solve clock change.
-            old = calculate(solver, state)
-            self.assertLess(float(old[0, 0]), .01)
-            solver.config.minimum_trajectory_dt = .2
-            for scaled in (False, True):
-                fixed = calculate(solver, state, scale_dt=scaled)
-                torch.testing.assert_close(fixed, torch.full((1, 2), .2), rtol=0, atol=0)
-        self.assertEqual(torch.cuda.is_initialized(), before_cuda)
 
     def test_source_progress_keeps_source_and_terminal_plateaus_without_entrance_pause(self):
         source = _ProgressMap(np.array([0., .3, .55, .8, 1.]), np.array([0., .6, .6, 1.7, 2.]))
@@ -671,148 +506,6 @@ class NativeIkCoverageTests(unittest.TestCase):
         self.assertEqual(torch.cuda.is_initialized(), before_cuda)
 
 
-class NativeCostManagerOwnershipTests(unittest.TestCase):
-    """Run installed native constructors while excluding GPU-only resources.
-
-    Only CUDA stream creation and Warp runtime initialization are replaced.
-    Native configuration binding, cost construction, weight normalization and
-    enable/disable behavior execute unchanged on CPU tensors. These checks
-    establish lifecycle ownership, not collision or trajectory numerics.
-    """
-
-    def setUp(self):
-        before_cuda = torch.cuda.is_initialized()
-        guard = patch("torch.cuda._lazy_init", side_effect=AssertionError(
-            "Native configuration ownership tests must not initialize CUDA"))
-        guard.start()
-        self.addCleanup(guard.stop)
-        for name, options in (
-            ("curobo._src.rollout.cost_manager.cost_manager_robot.create_cuda_stream_pair",
-             {"return_value": (None, None)}),
-            ("curobo._src.cost.cost_cspace_base.init_warp", {}),
-        ):
-            replacement = patch(name, **options)
-            replacement.start()
-            self.addCleanup(replacement.stop)
-        self.addCleanup(lambda: self.assertEqual(torch.cuda.is_initialized(), before_cuda))
-
-        from curobo._src.robot.types.joint_limits import JointLimits
-        from curobo._src.types.device_cfg import DeviceCfg
-        self.JointLimits = JointLimits
-        self.device_cfg = DeviceCfg("cpu")
-        self.config_type = _process_manager_type(None, None, None, None, None)
-        self.raw = {
-            "self_collision_cfg": {"weight": 5000., "convert_to_binary": True},
-            "cspace_cfg": {
-                "weight": [10., 20., 30., 40., 50.],
-                "activation_distance": [0.] * 5,
-                "squared_l2_regularization_weight": [1000., 10000., 5., 0., 10000.],
-                "cost_type": "STATE",
-            },
-        }
-
-    def configuration(self):
-        return self.config_type.create(deepcopy(self.raw), device_cfg=self.device_cfg)
-
-    def transition(self, interpolation_steps=4, *, teleport=False, bound_scale=1.):
-        bounds = torch.tensor([[-1., -2.], [1., 2.]]) * bound_scale
-        limits = self.JointLimits(
-            ["first_joint", "second_joint"], bounds, bounds * 2, bounds * 3,
-            bounds * 4, bounds * 5, self.device_cfg)
-        # Native constructors only bind the self-collision metadata here;
-        # no collision forward/kernel is invoked by this lifecycle test.
-        robot = SimpleNamespace(
-            get_self_collision_config=lambda: SimpleNamespace(num_spheres=2),
-            total_spheres=2)
-        return SimpleNamespace(
-            robot_model=robot, interpolation_steps=interpolation_steps,
-            action_dim=2, teleport_mode=teleport, get_state_bounds=lambda: limits)
-
-    def manager(self, config, transition):
-        result = config.class_type(self.device_cfg)
-        result.initialize_from_config(config, transition)
-        return result
-
-
-    def test_repeated_managers_and_verifier_each_normalize_self_weight_once(self):
-        template = self.configuration()
-        managers = []
-        # Six users reproduce metrics/auxiliary/interpolated rollout sharing;
-        # distinct interpolation counts must use their own native divisor.
-        for steps in (4, 4, 4, 4, 4, 4, 1, 8):
-            manager = self.manager(template, self.transition(steps))
-            managers.append(manager)
-            self.assertIsNot(manager.config, template)
-            self.assertEqual(manager.get_cost("self_collision")._weight.item(), 5000. / steps)
-            self.assertTrue(manager.get_cost("self_collision").enabled)
-            torch.testing.assert_close(manager.get_cost("cspace")._weight,
-                                       torch.tensor(self.raw["cspace_cfg"]["weight"]), rtol=0, atol=0)
-            torch.testing.assert_close(
-                manager.get_cost("cspace").config.squared_l2_regularization_weight,
-                torch.tensor(self.raw["cspace_cfg"]["squared_l2_regularization_weight"]), rtol=0, atol=0)
-
-        # The verifier inherits the metrics configuration with only native
-        # cspace limits; source solids replace its former sphere hard gate.
-        metrics_template = deepcopy(template)
-        metrics_template.self_collision_cfg = None
-        planner = _CuroboPlanner.__new__(_CuroboPlanner)
-        planner.check_request = Mock()
-        planner.device_cfg = self.device_cfg
-        planner.trajopt = SimpleNamespace(
-            config=SimpleNamespace(metrics_rollout_config=SimpleNamespace(constraint_cfg=metrics_template)),
-            transition_model=self.transition())
-        for _ in range(2):
-            planner._initialize_verification_constraints()
-            self.assertIsNone(planner._verification_native.get_cost("self_collision"))
-            torch.testing.assert_close(planner._verification_native.get_cost("cspace")._weight,
-                                       torch.tensor(self.raw["cspace_cfg"]["weight"]), rtol=0, atol=0)
-        self.assertEqual(template.self_collision_cfg.weight.item(), 5000.)
-        self.assertIsNone(template.self_collision_cfg.self_collision_kin_config)
-        self.assertIsNone(template.cspace_cfg.joint_limits)
-        self.assertEqual(len({id(manager.config) for manager in managers}), len(managers))
-
-        # Native runtime toggles must restore this instance's normalized
-        # weight and leave sibling managers enabled with their own weights.
-        managers[0].disable_cost_component("self_collision")
-        self.assertFalse(managers[0].get_cost("self_collision").enabled)
-        self.assertEqual(managers[1].get_cost("self_collision")._weight.item(), 1250.)
-        managers[0].enable_cost_component("self_collision")
-        self.assertEqual(managers[0].get_cost("self_collision")._weight.item(), 1250.)
-
-    def test_transition_binding_keeps_cspace_types_limits_and_smoothness_private(self):
-        template = self.configuration()
-        teleport_transition = self.transition(1, teleport=True)
-        state_transition = self.transition(4, bound_scale=3.)
-        teleport = self.manager(template, teleport_transition).get_cost("cspace")
-        state = self.manager(template, state_transition).get_cost("cspace")
-        # The native teleport conversion selects POSITION fields. A later
-        # STATE manager must still receive every original derivative weight.
-        self.assertEqual(teleport.config.cost_type.name, "POSITION")
-        self.assertEqual(state.config.cost_type.name, "STATE")
-        self.assertEqual(template.cspace_cfg.cost_type.name, "STATE")
-        torch.testing.assert_close(teleport._weight, torch.tensor([10., 50.]), rtol=0, atol=0)
-        torch.testing.assert_close(state._weight, torch.tensor([10., 20., 30., 40., 50.]), rtol=0, atol=0)
-        torch.testing.assert_close(state.config.squared_l2_regularization_weight,
-                                   torch.tensor([1000., 10000., 5., 0., 10000.]), rtol=0, atol=0)
-        for cost, transition in ((teleport, teleport_transition), (state, state_transition)):
-            for name in ("position", "velocity", "acceleration", "jerk", "effort"):
-                torch.testing.assert_close(getattr(cost.config.joint_limits, name),
-                                           getattr(transition.get_state_bounds(), name), rtol=0, atol=0)
-        self.assertIsNone(template.cspace_cfg.joint_limits)
-
-    def test_failed_native_binding_does_not_contaminate_a_later_manager(self):
-        template = self.configuration()
-        broken = self.transition()
-        # Native initialization binds self-collision before requesting the
-        # cspace limits. Fail at that later boundary to expose partial writes.
-        broken.get_state_bounds = Mock(side_effect=ValueError("unavailable test bounds"))
-        with self.assertRaisesRegex(ValueError, "unavailable test bounds"):
-            self.manager(template, broken)
-        healthy = self.manager(template, self.transition())
-        self.assertEqual(healthy.get_cost("self_collision")._weight.item(), 1250.)
-        self.assertEqual(template.self_collision_cfg.weight.item(), 5000.)
-        self.assertIsNone(template.self_collision_cfg.self_collision_kin_config)
-        self.assertIsNone(template.cspace_cfg.joint_limits)
 
 
 class RobotAllocationPreflightTests(unittest.TestCase):
@@ -872,190 +565,6 @@ class RobotAllocationPreflightTests(unittest.TestCase):
             _bounded_robot_configuration(self.robot, self.problem, self.scene, PlanningBudget(max_robot_links=12))
 
 
-class PlannerCandidateSelectionTests(unittest.TestCase):
-    """Use real CPU native results so seed/time reshaping cannot be mocked away."""
-
-    @staticmethod
-    def native_candidates(flags=(False, True), native_violations=(.02, 0.)):
-        from curobo.types import DeviceCfg, JointState
-        from curobo._src.rollout.metrics import CostCollection, CostsAndConstraints, RolloutMetrics
-        from curobo._src.solver.solver_trajopt_result import TrajOptSolverResult
-
-        # The native failed-seed cost loses small differences beside 1e16 in
-        # float32. Actual process violations must determine continuation.
-        shape = (1, 2, 9, 3)
-        position = torch.stack((torch.ones((9, 3)), 2*torch.ones((9, 3))))[None]
-        position[:, :, 0] = 0.
-        position[:, 1, 5:] = 1000.
-        state = JointState(position=position, velocity=torch.zeros(shape),
-                           acceleration=torch.zeros(shape), jerk=torch.zeros(shape),
-                           dt=torch.tensor([[.07, .11]]), joint_names=["x", "y", "z"],
-                           device_cfg=DeviceCfg("cpu"))
-        solution = torch.stack((torch.ones((4, 3)), 2*torch.ones((4, 3))))[None]
-        constraints = CostCollection(
-            values=[torch.tensor(native_violations)[:, None, None].expand(2, 9, 1).clone()],
-            names=["cspace"])
-        metrics = RolloutMetrics(costs_and_constraints=CostsAndConstraints(constraints=constraints))
-        return TrajOptSolverResult(
-            success=torch.tensor([flags]), solution=solution, optimized_seeds=solution.clone(),
-            js_solution=state.clone(), interpolated_trajectory=state,
-            interpolated_last_tstep=torch.tensor([[9, 5]]),
-            metrics=metrics, interpolated_metrics=None,
-            position_error=torch.zeros((1, 2)), rotation_error=torch.zeros((1, 2)),
-            goalset_index=torch.zeros((1, 2, 1), dtype=torch.long),
-            seed_cost=torch.tensor([[1e16, 1e16]], dtype=torch.float32),
-            total_cost_reshaped=torch.tensor([[1e16, 1e16]], dtype=torch.float32),
-            seed_rank=torch.tensor([[0, 1]]), batch_size=1, num_seeds=2)
-
-
-    # BEGIN continuous domain qualification precedes every candidate choice.
-    def test_select_checks_each_actual_curve_and_delivery_reuses_selected_validation(self):
-        from manipulation.cubic_trajectory import CubicBasis
-        basis = CubicBasis(6, 1.)
-        times = np.arange(basis.intervals*4+1)/4
-        controls = np.array([0., .2, 1.2, .7, 0., 0.])
-        position = np.zeros((2, len(times), 3))
-        velocity = np.zeros_like(position)
-        position[0, :, 0] = (basis.weights_at_knot_times(times)[0] @ controls).astype(np.float32)
-        velocity[0, :, 0] = (basis.weights_at_knot_times(times, 1)[0] @ controls).astype(np.float32)
-        position[1], velocity[1] = .5*position[0], .5*velocity[0]
-        planner, native = selection_fixture(position, velocity, [1., 2.], dt=.25)
-
-        # Preserve the existing nominal preference when both curves qualify.
-        _, unconstrained = planner.select_candidate(native)
-        self.assertEqual(unconstrained["selected_seed_index"], 0)
-        curve = CubicHermiteSpline(times, position[0, :, 0], velocity[0, :, 0])
-        roots = curve.derivative().roots(extrapolate=False)
-        roots = roots[np.isfinite(roots) & (roots >= times[0]) & (roots <= times[-1])]
-        sampled_max = position[0, :, 0].max()
-        continuous_max = curve(np.r_[times, roots]).max()
-        upper = (sampled_max+continuous_max)/2
-        limits = planner._verification_native.get_cost("cspace").config.joint_limits
-        limits.position[1, 0] = upper
-        self.assertLess(sampled_max, upper)
-        self.assertGreater(continuous_max, upper)
-
-        with patch.object(planner, "_candidate_domain_validation", wraps=planner._candidate_domain_validation) as check:
-            trajectory, report = planner.select_candidate(native)
-        self.assertEqual(check.call_count, 2)
-        self.assertTrue(report["accepted"])
-        self.assertEqual(report["selected_seed_index"], 1)
-        self.assertFalse(report["candidates"][0]["accepted"])
-        self.assertGreater(report["candidates"][0]["residuals"]["continuous_position"], 0.)
-        self.assertEqual(report["candidates"][1]["residuals"]["continuous_position"], 0.)
-        completed_validation = planner.last_validation
-        with patch.object(planner, "_native_curve", side_effect=AssertionError("delivery must reuse the curve")), \
-             patch.object(planner, "_candidate_domain_validation", side_effect=AssertionError("delivery must reuse validation")):
-            delivered, queries = planner.export(trajectory, report)
-        self.assertIs(delivered, trajectory)
-        self.assertIs(planner.last_validation, completed_validation)
-        self.assertEqual(queries, 0)
-
-        # If every returned curve fails, the finite minimum stays diagnostic.
-        limits.position[1, 0] = .1
-        rejected, rejected_report = planner.select_candidate(native)
-        self.assertFalse(rejected_report["accepted"])
-        self.assertEqual(rejected_report["selected_seed_index"], 0)
-        self.assertIs(planner.delivery_candidate, rejected)
-        self.assertIsNone(planner.last_validation)
-
-    def test_nonfinite_returned_curve_cannot_displace_a_finite_candidate(self):
-        for value in (float("nan"), float("inf")):
-            with self.subTest(value=value):
-                position = np.zeros((2, 9, 3)); position[0, 4, 0] = value
-                planner, native = selection_fixture(position, np.zeros_like(position), [1., 2.])
-                with patch.object(planner, "_candidate_domain_validation", wraps=planner._candidate_domain_validation) as check:
-                    trajectory, report = planner.select_candidate(native)
-                self.assertEqual(check.call_count, 1)
-                self.assertTrue(report["accepted"])
-                self.assertEqual(report["selected_seed_index"], 1)
-                self.assertFalse(report["candidates"][0]["accepted"])
-                self.assertEqual(report["candidates"][0]["residuals"]["finite_joint_curve"], float("inf"))
-                self.assertTrue(np.isfinite(trajectory.position).all())
-
-    def test_only_geometry_components_enter_collision_recovery_diagnostics(self):
-        components = ("collision/robot/background", "gripper/controller",
-                      "unsupported/release_anchor/held/0")
-        for component in components:
-            with self.subTest(component=component):
-                states = np.zeros((2, 9, 3))
-                planner, native = selection_fixture(states, states, [1., 2.])
-                constraints = native.metrics.costs_and_constraints.constraints
-                constraints.names.append(component)
-                constraints.values.append(torch.full((2, 9, 1), .2, dtype=torch.float64))
-                _, report = planner.select_candidate(native)
-                self.assertFalse(report["accepted"])
-                self.assertEqual(report["residuals"][f"rollout:{component}"], .2)
-                expected = {f"rollout:{component}": .2} if component.startswith("collision/") else {}
-                self.assertEqual(report["collision_residuals"], expected)
-    # END no joint threshold, solver preference or native success flag is changed.
-
-
-    def test_native_single_seed_gather_preserves_clock_valid_length_and_original_rank(self):
-        from manipulation.planning import _trajectory_candidate
-
-        result = self.native_candidates()
-        original_rank = result.seed_rank.clone()
-        for index in (1, 0):
-            selected = _trajectory_candidate(result, index)
-            self.assertEqual((selected.batch_size, selected.num_seeds), (1, 1))
-            self.assertEqual(tuple(selected.solution.shape), (1, 1, 4, 3))
-            torch.testing.assert_close(selected.solution, result.solution[:, index:index+1])
-            curve = selected.get_interpolated_plan()
-            self.assertEqual(tuple(curve.position.shape), (1, 1, (9, 5)[index], 3))
-            self.assertLess(float(curve.position.max()), 3.)
-            np.testing.assert_allclose(curve.dt.numpy(), [[(.07, .11)[index]]], rtol=1e-7)
-            torch.testing.assert_close(result.seed_rank, original_rank, rtol=0, atol=0)
-        with self.assertRaises(ValueError):
-            _trajectory_candidate(result, 2)
-
-
-    def test_locked_finger_state_keeps_seven_control_dofs_and_nine_state_dofs_separate(self):
-        from curobo.types import DeviceCfg, JointState
-        from manipulation.planning import _trajectory_candidate
-
-        for interpolated_has_knots in (False, True):
-            with self.subTest(interpolated_has_knots=interpolated_has_knots):
-                result = self.native_candidates()
-                controls = torch.stack((torch.ones((12, 7)), 2*torch.ones((12, 7))))[None]
-                result.solution, result.optimized_seeds = controls, controls.clone()
-                # The installed V2 solver restores locked fingers in sampled
-                # states, then stores its seven active action controls in the
-                # same JointState.knot field. Its generic gather incorrectly
-                # assumes these two last dimensions are always identical.
-                position = torch.stack((torch.ones((9, 9)), 2*torch.ones((9, 9))))[None]
-                position[:, 1, 5:, :7] = 1000.
-                position[..., 7:] = .04
-                state = JointState(
-                    position=position, velocity=torch.zeros_like(position),
-                    acceleration=torch.zeros_like(position), jerk=torch.zeros_like(position),
-                    dt=torch.tensor([[.07, .11]]), knot=controls, knot_dt=torch.tensor([[.28, .44]]),
-                    joint_names=[*(f"arm_{index}" for index in range(7)), "finger_left", "finger_right"],
-                    device_cfg=DeviceCfg("cpu"))
-                result.js_solution = state.clone()
-                result.interpolated_trajectory = state.clone()
-                if not interpolated_has_knots:
-                    result.interpolated_trajectory.knot = None
-                    result.interpolated_trajectory.knot_dt = None
-                selected = _trajectory_candidate(result, 1)
-                self.assertEqual(tuple(selected.solution.shape), (1, 1, 12, 7))
-                self.assertEqual(tuple(selected.optimized_seeds.shape), (1, 1, 12, 7))
-                self.assertEqual(tuple(selected.js_solution.position.shape), (1, 1, 9, 9))
-                self.assertEqual(tuple(selected.js_solution.knot.shape), (1, 1, 12, 7))
-                torch.testing.assert_close(selected.js_solution.knot, controls[:, 1:2], rtol=0, atol=0)
-                torch.testing.assert_close(selected.js_solution.knot_dt, torch.tensor([[.44]]), rtol=0, atol=0)
-                curve = selected.get_interpolated_plan()
-                self.assertEqual(tuple(curve.position.shape), (1, 1, 5, 9))
-                torch.testing.assert_close(curve.position[..., 7:], torch.full((1, 1, 5, 2), .04), rtol=0, atol=0)
-                self.assertLess(float(curve.position.max()), 3.)
-                if interpolated_has_knots:
-                    torch.testing.assert_close(selected.interpolated_trajectory.knot, controls[:, 1:2], rtol=0, atol=0)
-                else:
-                    self.assertIsNone(selected.interpolated_trajectory.knot)
-                # Extraction must leave the original all-seed state intact.
-                self.assertEqual(tuple(result.js_solution.knot.shape), (1, 2, 12, 7))
-                self.assertEqual(tuple(result.js_solution.position.shape), (1, 2, 9, 9))
-                torch.testing.assert_close(result.js_solution.knot, controls, rtol=0, atol=0)
 
 
 class ContinuousCubicDerivativeTests(unittest.TestCase):
@@ -1129,89 +638,6 @@ class ContinuousCubicDerivativeTests(unittest.TestCase):
                 cubic_derivative_report(self.curve(), bounds, joint_names=names)
 
 
-class ExportedCurveContractTests(unittest.TestCase):
-
-
-    def test_analytic_acceleration_violation_enters_existing_candidate_residuals(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-            [[0., 0., 0.], [1., 0., 0.], [4., 0., 0.]],
-            [[0., 0., 0.], [3., 0., 0.], [3., 0., 0.]], 1.)
-        limits = planner._verification_native.get_cost("cspace").config.joint_limits
-        limits.acceleration[:, 0] = torch.tensor([-2., 5.], dtype=torch.float64)
-        from manipulation.planning import MotionPlanningError
-        trajectory, report, _ = planner.evaluate_candidate(planner._native_curve(result),
-            native_report={"accepted": True, "residuals": {}})
-        self.assertFalse(report["accepted"])
-        self.assertGreater(report["residuals"]["continuous_acceleration"], 0.)
-        with self.assertRaises(MotionPlanningError) as caught:
-            planner.export(trajectory, report)
-        self.assertEqual(caught.exception.reason, "output_inconsistent")
-
-    def test_multiple_native_seeds_cannot_be_flattened_into_one_export(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-                                         np.zeros((3, 3)), np.zeros((3, 3)), .25)
-        result.num_seeds = 2
-        result.get_interpolated_plan = Mock(side_effect=AssertionError("must reject before reading mixed curves"))
-        with self.assertRaisesRegex(ValueError, "one.*seed|selected seed"):
-            planner._native_curve(result)
-        result.get_interpolated_plan.assert_not_called()
-
-    def test_reference_short_loop_does_not_require_motion_or_a_hard_anchor(self):
-        knots = np.array([0., .501, .502, .503, 1.])
-        reference = np.broadcast_to(np.eye(4), (len(knots), 4, 4)).copy()
-        reference[:, 0, 3] = [0., 0., .02, 0., 0.]
-        problem = cartesian_problem((MotionPhase("reference loop", PosePath(knots, reference, "reference")),))
-        planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-                                         np.zeros((9, 3)), np.zeros((9, 3)), .125)
-        trajectory, report, _ = planner.evaluate_candidate(planner._native_curve(result),
-            native_report={"accepted": True, "residuals": {}})
-        self.assertTrue(report["accepted"])
-        self.assertNotIn(.502, planner.last_validation["u"])
-        self.assertTrue(all(value == 0. for value in trajectory.residuals.values()))
-        self.assertFalse(any(key.startswith("phase:") for key in trajectory.residuals))
-
-    def test_plateau_has_two_validation_anchors_but_one_original_event_trigger(self):
-        phases = tuple(MotionPhase(f"free {index}", constant_path()) for index in range(3))
-        events = (
-            PlanningEvent("close", "first", 1., 73, "close", "original first close"),
-            PlanningEvent("verify", "first", 1., 79, "verification", "first grasp boundary",
-                          "actual stable Holding feedback", True),
-            PlanningEvent("close-again", "first", 2., 115, "close", "original second close"),
-            PlanningEvent("verify-again", "first", 2., 121, "verification", "second grasp boundary",
-                          "another actual Holding observation", True),
-        )
-        problem = cartesian_problem(phases, events)
-        mapping = _ProgressMap(np.array([0., .2, .45, .75, 1.]), np.array([0., 1., 1., 2., 3.]))
-        np.testing.assert_allclose(mapping.anchor_parameters([1.]), [[.2, 1.], [.45, 1.]])
-        planner, result = export_fixture(problem, mapping, np.zeros((7, 3)), np.zeros((7, 3)), .2)
-        trajectory, report, _ = planner.evaluate_candidate(planner._native_curve(result),
-            native_report={"accepted": True, "residuals": {}})
-        self.assertTrue(report["accepted"])
-        self.assertEqual(len(trajectory.events), len(events))
-        self.assertEqual([(event["skill_id"], event["event_id"]) for event in trajectory.events],
-                         [(event.skill_id, event.event_id) for event in events])
-        first = trajectory.events[0]
-        self.assertAlmostEqual(first["time"], .2*trajectory.duration)
-        self.assertAlmostEqual(first["hold_until"], .45*trajectory.duration)
-        self.assertAlmostEqual(trajectory.executable_until, first["time"])
-        self.assertEqual(trajectory.next_verification["source_frame"], 79)
-        # Returned barrier details cannot mutate the trajectory's authorization
-        # boundary or turn a future verification into supplied evidence.
-        returned = trajectory.next_verification
-        returned["time"] = trajectory.duration
-        self.assertAlmostEqual(trajectory.executable_until, first["time"])
-
-    def test_no_evidence_barrier_allows_the_complete_exported_duration(self):
-        problem = cartesian_problem((MotionPhase("free", constant_path()),))
-        planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-                                         np.zeros((3, 3)), np.zeros((3, 3)), .25)
-        trajectory, report, _ = planner.evaluate_candidate(planner._native_curve(result),
-            native_report={"accepted": True, "residuals": {}})
-        self.assertTrue(report["accepted"])
-        self.assertIsNone(trajectory.next_verification)
-        self.assertEqual(trajectory.executable_until, trajectory.duration)
 
 
 if __name__ == "__main__":

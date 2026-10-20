@@ -1007,21 +1007,24 @@ false: this module does not add cuRobo/OMPL, whole-robot collision, trajectory
 optimization or proof of complete `inside`/physical execution.
 <!-- END production projective registration screening and selected trajectory. -->
 
-<!-- BEGIN shared resident motion backend and fixed online scene. -->
+<!-- BEGIN shared constrained motion backend and fixed online scene. -->
 ## Robot motion planning and execution
 
-The motion contract is defined in [motion_planner_prd.md](motion_planner_prd.md).
-Skills supply typed goals, process requirements, current object bindings,
-finite material permissions and original event identities. Ordinary `PosePath`
-samples provide initialization guidance; they do not create mandatory approach
-poses, stops, motion requests or additional validation capacity.
+`MotionBackend` in [`manipulation/planning.py`](manipulation/planning.py)
+combines cuRobo IK and forward kinematics with SciPy SLSQP trajectory
+optimization. Skills supply nominal goals, process requirements, current object
+bindings, finite interaction permissions and original event identities.
+Ordinary `PosePath` samples guide initialization and the motion objective;
+they do not create mandatory approach poses, stops or separate requests.
+The broader task interface is described in
+[motion_planner_prd.md](motion_planner_prd.md); the implementation described
+here uses the shared constrained curve below.
 
-`MotionBackend` owns a robot's native cuRobo IK and trajectory optimizer. Its
-first binding initializes the fixed-capacity native models; later requests
-replace values and clear optimizer/request state without rebuilding those
-models. Concurrent use of the same backend is rejected while its buffers are
-owned by a request. Cancellation or deadline expiry revokes a late result's
-execution authorization.
+The backend retains its native IK and robot models across requests. Each request
+binds its current state, scene, event clock and constrained trajectory problem;
+previous request state is cleared before reuse. Concurrent use of the same
+backend is rejected while a request owns its mutable buffers. Cancellation or
+deadline expiry revokes a late result's execution authorization.
 
 ```python
 from manipulation.planning import MotionBackend, PlanningBudget
@@ -1035,217 +1038,155 @@ finally:
     backend.close()
 ```
 
-<!-- BEGIN bounded recovery and shared signed functional-event constraints. -->
-Each request evaluates its initialization candidate first. A feasible candidate
-proceeds directly to delivery. Otherwise it receives one primary solve and at
-most one recovery: add collision check times for dense positive intervals without
-an existing positive sample in the same collision channel, or use bounded OMPL
-initialization when no such interval needs refinement. An already detected
-collision does not claim that additional sampling will remove it. Mixed intervals
-retain refinement for independently missed collisions.
-Functional-multiplier updates use the existing inner iteration blocks; they do
-not create another trajectory solve. Pose, coordinate and finite-support events
-share this signed-inequality mechanism. Support keeps separate gap, body-height,
-footprint and normal requirements, normalized by its declared metric scales;
-normalization never changes their hard allowed set. Support events have no
-duplicate ordinary square penalty and retain free tangent/yaw motion. There is no
-post-feasibility quality stage, per-candidate export validation, witness-driven
-map refinement, or solver reconstruction loop. A recorded joint reference is
-explicit guidance; when native fitting changes its representation, diagnostics
-say so rather than claiming the original curve was preserved.
-<!-- END final acceptance still checks the original physical requirements. -->
+[`cubic_seed.py`](manipulation/cubic_seed.py) fits finite reference IK samples or
+a supplied joint reference into free cubic coefficients, preserving the measured
+entrance position and velocity. The fit is an initial guess, not a feasibility
+certificate. [`physical_curve.py`](manipulation/physical_curve.py) defines the
+actual delivered curve: float64 position and velocity nodes reconstructed as a
+`CubicHermiteSpline` on one fixed physical clock. Optimization, qualification
+and export use these same nodes and polynomial pieces.
 
-The native optimizer, native success metrics and OMPL checks
-use the same `OnlinePlanningScene` in `manipulation/online_geometry.py`:
+[`constrained_trajectory.py`](manipulation/constrained_trajectory.py) supplies
+SLSQP with the nominal objective and explicit physical inequalities together:
 
-<!-- BEGIN non-gradient search preserves the existing source-geometry authority. -->
-OMPL state validity, entrance checks and final candidate checks can confirm
-registered world-collision sphere proposals against the same frozen source
-solids. Each search branch owns its confirmation context and release history;
-contact and task requirements remain independent hard checks.
-<!-- BEGIN observation coverage and observed collision have separate authority. -->
-Unknown coverage follows the scene's explicit `unknown_policy.outside_regions`:
-`forbid` retains a hard boundary and permits bounded path search;
-`require_observation` returns `needs_observation` when completed candidate evidence
-isolates coverage as its only hard failure; `allow_attempt` removes finite
-coverage deficits from the hard aggregate while preserving conditional evidence.
-Nonfinite queries, known collisions, missing model support and other physical
-requirements remain hard. Conditional native metric summaries are weighted
-diagnostics; `scene_components.maximum` retains the raw physical coverage deficit.
-A policy-permitted plan does not establish that unobserved space is free.
-The execution layer does not rebuild this frozen scene or add another coverage veto.
-<!-- END the existing policy is shared by optimization, search and acceptance. -->
-Native self-collision states use the bound finger clock. Differentiable optimizer
-queries retain their existing sphere costs and do not run CPU confirmation.
-<!-- END source confirmation does not supply observations or contact permissions. -->
+- Continuous joint position, velocity, acceleration and jerk bounds use the
+  extrema of the delivered polynomial, including both sides of segment joins.
+- Declared `JointCoupling` relations and explicit stop events use their existing
+  numerical joint and velocity bands on that same curve.
+- Signed scene clearances and existing controller/model requirements use
+  `OnlinePlanningScene.signed_constraints` at the fixed scene samples and exact
+  interaction anchors. These finite scene queries do not establish continuous
+  collision clearance between samples.
 
-- `FrozenESDF` retains the current Mapper field and source-validity bits.
-  <!-- BEGIN direct complete-owner admission without discarded observation maps. -->
-  Each observed background/owner partition has one fixed field. Explicit
-  complete `CollisionOwner` geometry may enter `build_scene_from_rgbd` through
-  `complete_owners`; it retains its current frame, native materials and semantic
-  mask partition without allocating an observation field that would be discarded.
-  Its RGB-D rays still contribute only their original observed-free evidence.
-  The library resolves task/environment precision, including the complete
-  owner's contact grid spacing, from current task identities. Owner support is
-  prepared from the observed extent and registered robot sphere radius before
-  solving; requests cannot enlarge it after a failed query.
-  <!-- END direct complete-owner admission. -->
-  <!-- BEGIN semantic ownership uncertainty is handled before fusion. -->
-  Online background fusion excludes a one-pixel, eight-neighbor outer ring
-  around admitted observed owner pixels. These endpoints have uncertain
-  ownership: they are added to neither an owner mask nor the background.
-  Existing valid measured free-ray prefixes remain independent and unchanged.
-  This bounded image-grid assumption does not repair arbitrary segmentation
-  errors or certify excluded geometry as free; the existing unknown-space
-  policy still applies. Every request builds fresh per-partition Mappers from
-  its RGB-D snapshot. Rebuilding with corrected partitions removes old fusion
-  pollution; restoring an old frozen scene binding does not repair its map.
-  Observation diagnostics retain the actual background and boundary masks.
-  <!-- END no collision-result erasure or object-specific mask growth. -->
-- `FrozenPrimitives` retains calibrated complete boxes/cylinders and their
-  declared transforms. Robot sphere layout and self-collision exclusions are
-  bound to the same registered robot model.
-<!-- BEGIN unknown decisions are explicit and independent of camera coverage. -->
-- Unknown-space policy declares an action outside any finite conditional regions:
-  `forbid`, `require_observation`, or `allow_attempt`. Known occupied geometry
-  remains active under every action. Missing numerical support for an existing
-  geometry query still requires a scene update. Policy permission never creates
-  observed-free evidence or a successful task fact.
-<!-- END finite region permissions are optional policy data, not mandatory coverage. -->
-- `ContactRule` names a finite material feature, target owner, target region,
-  interval, normal and gap allowance. Contact subtraction preserves every
-  represented cell outside that finite permission, including cells covered by
-  the same robot sphere. A whole hand/owner pair exemption is not accepted.
-  <!-- BEGIN exact target-field storage sharing. -->
-  Rules with exactly equal target regions may share their immutable distance
-  arrays. Material identity, activation intervals and per-sphere rule subsets
-  remain independent; restored repeated fields must agree exactly. CPU and GPU
-  storage count each shared field once under the existing contact-bank limit.
-  <!-- END no permission or geometric tolerance is merged by storage sharing. -->
+The physical numerical contract is fixed for the request. Structurally fixed
+zero boundary factors are removed analytically; the resulting canonical rows
+retain their physical units with a one-SI-unit scale. The sum of negative slack
+magnitudes in that same canonical vector must be at most `1e-6`, also supplied
+as SLSQP's `ftol`. This is an aggregate numerical tolerance, not a separate
+`1e-6` allowance for every row. Raw bound excesses, signed clearances and validity
+remain in the report; an accepted result with a nonzero numerical violation
+retains a warning. Changes to row normalization or the fixed curve grid change
+this contract and cannot be introduced only during final qualification.
 
-<!-- BEGIN native confirmation of registered actor/world sphere candidates. -->
-Positive registered actor/world sphere costs are collision candidates. Final candidate
-acceptance uses `online_native_confirmation.OnlineCollisionConfirmation`:
-only those candidates are
-checked with registered native robot solids or complete known-owner box unions,
-against the same frozen observed TSDF source components (or analytic frozen
-primitives). Owner registration proves every box cell is covered by its assigned
-sphere and binds finite material geometry to that complete solid at scene
-admission, even when no positive candidate exists. Confirmation uses the same
-query's attachment/release pose. One spatial index is prepared per request.
-Effective finite contact rules remove only wholly contained source components
-for the exact registered material; unknown-space, field support,
-contact conditions and self-collision constraints retain their own verdicts.
-Numerical boundary or unsupported native results keep the sphere rejection.
-Optimization still uses the differentiable sphere costs. This is a discrete
-observed-model check, not a continuous or unobserved-space safety certificate.
-Native finite materials support full planar extrusions and true box edges.
-An edge retains its two endpoints, supporting normal cone and complete box;
-a conservative depth bound preserves its original numerical lateral tolerance.
-Optional contacts constrain their normal only where the complete body can
-intersect removed target material. Required contacts and task support intervals
-retain their original normal requirements. A grasp handoff rigidly re-expresses
-its finite patches and binds the new request's Holding condition; it does not
-copy the previous close-event latch.
-<!-- END native confirmation of registered actor/world sphere candidates. -->
+Nominal pose, placement, support and other task residuals, reference preferences
+and smoothness contribute to the objective. They describe the requested motion
+and its quality; their error does not independently veto a physically qualified
+candidate. A lower objective cannot compensate for a physical inequality.
+SLSQP may explore infeasible coefficients, and an infeasible initial guess does
+not reject the request. Immutable entrance/model conditions are checked
+separately because changing the free coefficients cannot repair them.
 
-<!-- BEGIN current support is distinct from future placement material. -->
-`initial_support.InitialSupportRelation` describes an existing finite support
-between a complete attached owner and an independently observed static plane.
-It does not reuse a future placement's material edges, gap or normal targets.
-The target's entire observed source must belong to this independently selected
-support layer; supplying that partition is the caller's responsibility.
-Preparation freezes only source components intersecting the owner's entrance
-native geometry. This inventory is finite without a future material footprint
-or an ideal-plane clipping condition on the reconstructed source vertices.
-The differentiable field and native confirmation remove the same component
-IDs for that actor/target pair. A separate whole-owner minimum-height constraint
-prevents nominal penetration from increasing beyond the approximate entrance
-model; it does not certify physical penetration depth. Separation, rotation and
-return require no new phase or latch. Other owners, background, source components
-not intersecting at entrance, and final placement conditions retain their checks.
-The declaration cannot identify obstacles incorrectly mixed into a plane layer.
-Frozen bindings store the relation and prepared
-field, and workspace admission includes both field and vertex-query memory.
-<!-- END current support does not redefine grasp or placement success. -->
+All returned seeds are qualified using the same physical vector and ranked
+among qualified candidates by the same objective used in optimization.
+`SLSQP.success` is diagnostic and does not replace qualification. If the main
+solve returns no qualified candidate with a collision failure, the existing
+request budget may admit one bounded OMPL search and another solve from its
+fitted seed. OMPL uses the same registered geometry and phase permissions;
+its discrete path does not certify the final timed cubic curve. The request's
+clock, iteration limits, search allowance and cumulative deadline remain shared.
+Failure within that budget does not prove that the motion has no solution.
 
-`planning_observation.build_scene_from_rgbd` creates this production model.
-<!-- BEGIN common task/environment mapping precision. -->
-`planning_observation.scene_task_owner_ids` reads the grounded `carrier_id`
-(manipulated body) and optional `reference_id` (functional target). These
-identities are passed as `task_owner_ids` to `build_scene_from_rgbd`.
-The library's `observation_resolutions` assigns **2 mm** grids to both task
-owners. Other observed owners and the background use the environment grid;
-the shared recorded runner defaults to **10 mm**. An initial support surface
-belongs to the environment unless it is also the current functional target.
-This rule depends on task roles, never dataset names, object names or sizes.
+Delivery reuses the selected candidate's completed evaluation and exports its
+original float64 nodes once. It does not run a second geometric verdict, repair
+the curve, increase collision sampling or start a quality-refinement stage.
+Diagnostic candidates carry no execution authorization.
 
-Production experiments cannot supply per-owner resolution overrides. Complete
-geometry retains its exact solids and uses the same resolved contact-query
-spacing without allocating a redundant RGB-D field. Explicit task-owner ROIs
-must retain 1–2 mm spacing. The scene report records the task identities and
-actual field spacings. Memory admission remains independent: insufficient
-capacity rejects the request instead of silently coarsening a task object,
-dropping observed surfaces or relaxing contact/placement tolerances.
-<!-- END task precision is a library contract shared by experiments. -->
+The production scene is implemented in
+[`online_geometry.py`](manipulation/online_geometry.py) and
+[`native_collision.py`](manipulation/native_collision.py):
 
-`build_audit_scene_from_rgbd`, source TSDF geometry, complete-volume coverage
-and detailed source-scene component checkers are separate audit tools. The
-bounded native confirmation above queries only local source components for
-positive candidates; it does not reconstruct or scan the whole source scene.
+- Registered robot solids and complete scene primitives use Pinocchio forward
+  kinematics and Coal signed distances for the declared self/world pairs.
+  The same solids, transforms, pair policies and derivatives participate in
+  optimization and qualification. Sphere overlap does not add a second veto
+  for a pair already represented by registered solids.
+- `FrozenESDF` retains the frozen Mapper distance grid for observed geometry.
+  Robot and moving-owner spheres query this approximate field. Signed distance
+  and query validity are separate: a point outside field support supplies no
+  collision measurement, and an invalid zero slot is not measured clearance.
+  Observation coverage remains diagnostic; neither missing observations nor
+  successful planning establish that unobserved space is free.
+- `ContactRule` and `HoldingContact` bind named actors, targets, finite registered
+  components and activation intervals. Native permissions must cover complete
+  registered components; a partial component selection cannot silently exempt
+  its whole solid. ESDF permissions retain their declared sphere subset and
+  target. These are model permissions, not evidence that contact or Holding
+  has physically occurred.
+- The bound gripper controller and finger clock retain their own requirements.
+  Unresolved future finger positions do not become measured collisions; the
+  independent robot checks use actual feedback during execution.
+
+`initial_support.InitialSupportRelation` describes a declared current support
+between an attached owner and a separately observed static plane layer. One
+entrance query freezes the contacting sphere subset for that actor/target pair
+and interval. It does not reuse future placement material, infer exact
+penetration depth or certify support success. This observed-field permission
+cannot stand in for a complete native-component permission.
+
+`planning_observation.build_scene_from_rgbd` prepares the frozen scene.
+Explicit complete `CollisionOwner` geometry can enter through `complete_owners`
+without allocating an observation field that would be discarded. Its RGB-D
+rays still contribute only their original observed-free evidence. Background
+fusion excludes the one-pixel, eight-neighbor outer ring around observed owner
+pixels because their ownership is uncertain; excluded endpoints are assigned
+to neither partition. Fresh snapshots rebuild the partitions rather than
+retaining old fusion pollution.
+
+Mapping precision follows task roles. `scene_task_owner_ids` selects the grounded
+`carrier_id` and optional `reference_id`; `observation_resolutions` assigns their
+query grids **2 mm** spacing. Other observed owners and background use the
+environment grid, whose shared recorded-runner default is **10 mm**. Complete
+geometry retains its original solids. Experiments do not override resolution
+per owner or loosen physical limits to fit a skill. The report records actual
+spacings, model provenance and resource admission; voxel spacing alone is not
+a surface-accuracy claim. Full source-geometry reconstruction and component
+checkers remain separate audit tools.
 
 `PlanningProblem.bound_motion_block` uses actual evidence dependencies to bound
 one request while preserving original progress and event identities. Coupled
-process/velocity requirements cannot be split by inserting a new stop. Actual
-T evidence at a boundary permits a newly bound request; it does not authorize
-an unplanned suffix of an old curve. Validated forward progress starts another
-request allowance while retaining cumulative work and physical-step history.
+motion requirements cannot be split by inserting a new stop. New actual evidence
+may authorize a freshly bound request; it does not authorize an unplanned suffix
+of an old curve. Validated progress retains cumulative work and physical-step
+history.
 
-Delivery checks the exact native-to-Hermite representation, measured entry,
-continuous named joint position/velocity/acceleration and bound clock once.
-<!-- BEGIN planning geometry and physical execution have distinct duties. -->
-`PlanningResult.execution_binding` retains the exact curve and frozen planning
-scene for authorization and provenance. `TrajectoryExecutor` does not rebuild
-or query that frozen world during preflight or physical execution.
+<!-- BEGIN permanent execution boundary: target error remains posthoc. -->
+`PlanningResult.execution_binding` retains the exact selected curve and frozen
+planning scene for authorization and provenance. `TrajectoryExecutor` does not
+rebuild or query that frozen world during preflight or physical execution.
 `RobotStateValidator` checks measured joint limits, model/FK identity and the
-registered required native robot/fixed-installation collision pairs only.
-<!-- BEGIN target-relative accuracy is exclusively simulation posthoc evidence. -->
-Robot joint/reference tracking, command timing, fresh observations, current
-Holding dependencies and effect requirements remain execution duties.
+registered required native robot/fixed-installation collision pairs. Joint
+velocity and reference tracking, command timing, fresh observations, current
+Holding dependencies and independent effect requirements retain their own
+execution checks.
+
 Target-relative TCP position/orientation error is **never an online rejection
-criterion**, including before close. Encoder FK versus a frozen predicted goal
-does not observe the real tool-to-target relation. Pose errors, unavailable
-target truth, and timing that depends on pose arrival cannot stop execution or
-force replanning. Nominal planning constraints keep their original tolerances;
-the independent simulation evaluator retains actual pose errors and T/F/U.
-<!-- END posthoc diagnostics cannot become control or continuation gates. -->
-<!-- BEGIN predicate estimation and declared model assumptions are separate inputs. -->
+criterion**, including before close. Encoder FK minus a frozen predicted goal
+does not measure the current real tool-to-target relation. Pose error, missing
+target pose, or an arrival-dependent time window cannot reject closing or
+continuation, stop execution, or require replanning. Nominal planning targets remain in the
+motion objective; the independent simulation evaluator records actual pose
+errors and task outcomes without feeding them back as these control gates.
+
 The task layer supplies predicate estimates through `observation_callback`;
-the planner does not run a VLM. An attachment-dependent owner uses current
-Holding evidence or a current owner pose. The caller may instead explicitly
-authorize a bound attachment model with `attachment_assumptions`, keyed by
-condition ID with a declared source. The executor derives its scope from the
-accepted binding and records it as a model assumption, never an observation.
-Explicit contrary or unknown predicate evidence cannot be replaced by that
-assumption. It supplies no actual pose-goal witness, release effect or physical
-success. Without this authorization the original evidence requirements apply;
-entrance facts cannot silently persist into later samples.
-<!-- END S3E or another predicate estimator belongs outside the motion planner. -->
-Commanded
-fingers remain separate from measured finger positions. Frozen occupied cells
-and their conservative envelopes cannot establish actual physical contact.
+the motion planner does not run a VLM. An attachment-dependent owner uses
+current Holding evidence or a current owner pose. A caller may explicitly
+supply `attachment_assumptions`, keyed by condition ID with a declared source.
+The executor records such a bound model assumption separately from observations;
+contrary or unknown evidence cannot be replaced by it. It supplies no actual
+goal-arrival witness, release effect or task success. Commanded fingers remain
+separate from measured finger positions, and frozen geometry cannot establish
+actual contact.
+<!-- END independent feedback and task evidence retain their own checks. -->
 
 Array records admit at most 64 MiB per array. Contact fields retain their
 independent 256 MiB aggregate limit; overall planning, archive and process
 resource limits remain independent checks.
-<!-- END physical outcomes require current evidence, not frozen geometry. -->
 
-CPU contracts live under `tests/test_motion_backend_contract.py`,
-`tests/test_online_geometry.py`, and the affected planning/execution tests.
-The recorded-task CLI in `tests/planning/run_recorded_skill.py` owns the backend
-lifetime and requires explicit finite-contact and unknown-policy inputs.
-Its result recorder saves only returned artifacts and never initiates another
-solve or validation. Dataset-specific selections and user-run experiments
-belong in the workspace's `sim-version-plans` directories.
-<!-- END shared resident motion backend and fixed online scene. -->
+CPU contracts include `tests/test_physical_curve.py`,
+`tests/test_signed_scene_constraints.py`, `tests/test_motion_backend_contract.py`
+and the affected geometry/execution tests. The recorded-task CLI in
+`tests/planning/run_recorded_skill.py` owns the backend lifetime and records
+returned artifacts without initiating another solve or validation. Dataset
+selections and user-run experiments belong in the workspace's
+`sim-version-plans` directories.
+<!-- END shared constrained motion backend and fixed online scene. -->

@@ -1,8 +1,8 @@
 """Small reference fits and final checks for the shared cubic trajectory.
 
 A seed is a numerical initial guess, not a proof of physical or task success.
-NumPy fits the existing affine basis; cuRobo owns subsequent optimization.
-The inexpensive polynomial check applies only to the actual delivered curve.
+NumPy fits the existing affine basis; the shared physical curve constrains
+subsequent optimization. The standalone report is a raw polynomial diagnostic.
 """
 
 # BEGIN reference-only cubic algebra, without optimizer-domain machinery.
@@ -60,4 +60,4 @@ class CubicSeed:
         return result, {"method": "least_squares", "rank": int(rank),
                         "rms_joint_error": float(np.sqrt(np.mean((fitted-targets)**2)))}
 
-# END only final exported curves receive physical acceptance checks.
+# END reference fits do not replace the shared physical constraint rows.

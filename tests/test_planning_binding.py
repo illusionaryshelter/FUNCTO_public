@@ -13,7 +13,7 @@ import torch
 from manipulation.planning import (PlanningBudget, _CuroboPlanner, _ProgressMap,
     ContinuationBindingError, _bind_event_clock, _initial_timing,
     _prepare_continuation, _continuation_timing, _fixed_spline_grid,
-    _ompl_stage, _known_scene_cost,
+    _ompl_stage,
     _progress_for_cubic_boundaries)
 from manipulation.planning_problem import (MotionPhase, PlanningEvent, PlanningProblem,
                                           PosePath, PoseEventRequirement)
@@ -69,18 +69,14 @@ class PlanningBindingTest(unittest.TestCase):
                 self.assertEqual(capped.maximum_trajectory_dt, .125)
 
     def test_selected_source_clock_binds_native_events_and_timed_fingers_together(self):
-        from curobo._src.types.control_space import ControlSpace
-        from manipulation.planning import JointTrajectory, _formal_native_clock
+        from manipulation.planning import JointTrajectory
         from manipulation.planning_scene import PrismaticGripper
 
         event = PlanningEvent("close", "current", .8, 183, "close", "transferred reference command")
         problem = self.problem((event,), source_times=(0., 9.15, 9.85), source_progress=(0., .8, 1.))
         budget, mapping = _initial_timing(problem, PlanningBudget(knots=16, interpolation_buffer_size=768))
-        native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=budget.maximum_trajectory_dt,
-            maximum_trajectory_dt=budget.maximum_trajectory_dt, interpolation_dt=budget.interpolation_dt),
-            interpolation_steps=budget.interpolation_steps, action_horizon=budget.knots+2,
-            transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3))
-        grid = _formal_native_clock(native)
+        grid = _fixed_spline_grid(intervals=budget.knots+4, native_dt=budget.maximum_trajectory_dt,
+            interpolation_steps=budget.interpolation_steps, interpolation_dt=budget.interpolation_dt)
         mapping, _ = _progress_for_cubic_boundaries(mapping, budget.knots,
             stop_progress=problem.stop_progress, anchors=problem.anchors)
         mapping = _bind_event_clock(problem, mapping, grid["duration"], .002)
@@ -146,14 +142,6 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertFalse(np.any(warped.s < .4))
 
 
-    def test_nominal_goals_do_not_enable_native_convergence_gates(self):
-        planner = _CuroboPlanner.__new__(_CuroboPlanner)
-        planner.trajopt = SimpleNamespace(disable_tool_pose_tracking=Mock(), disable_joint_position_tracking=Mock())
-        state, goal = planner._native_request(torch.zeros((1, 2, 4, 1)))
-        self.assertIsNone(goal)
-        self.assertEqual(state.num_seeds, 2)
-        self.assertEqual(state.tool_frames, [])
-        planner.trajopt.disable_tool_pose_tracking.assert_called_once()
 
 
     def test_dependency_boundary_inside_reference_interval_uses_device_tick(self):
@@ -388,17 +376,6 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertGreater(len(checked), 0)
 
 
-    def test_ordinary_scene_query_preserves_samples_without_precision_supplements(self):
-        progress = torch.tensor([[0., .5, 1.]])
-        q = torch.zeros((1, 3, 1))
-        components = Mock(return_value={"collision/robot/background": torch.zeros_like(progress)})
-        scene = SimpleNamespace(components=components)
-        value = _known_scene_cost(scene,
-            torch.zeros((1, 3, 1, 4)), torch.zeros((1, 3, 3)), torch.ones((1, 3, 4)),
-            progress, q, ("q",), trajectory_time=progress)
-        components.assert_called_once()
-        torch.testing.assert_close(components.call_args.args[3], progress)
-        torch.testing.assert_close(value, torch.zeros_like(progress))
 
 
 
