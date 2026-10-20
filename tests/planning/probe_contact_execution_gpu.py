@@ -64,9 +64,10 @@ def build_native(output):
     targets = FixedFingerTargets(NAMES[1:], "explicit unchanged free-finger actuator goals", (
         {"skill_id": "press_fixture", "event_id": "hold", "kind": "hold", "positions": [.01, -.01]},))
     interval = {"position_bounds": [[0., .04], [-.04, 0.]], "maximum_speed": [1., 1.]}
-    limits = ExecutionLimits(source="explicit fixture stop and native hardware limits",
+    limits = ExecutionLimits(source="explicit fixture 3 mm contact tracking band and native hardware limits",
         joint_names=NAMES, arm_joint_names=NAMES[:1], finger_joint_names=NAMES[1:],
-        stop_arm_velocity=[.01], stop_finger_velocity=[.01, .01],
+        arm_position_error=[.003], arm_velocity_error=[.2], tcp_position_error_m=.003,
+        tcp_rotation_error_rad=.001, stop_arm_velocity=[.01], stop_finger_velocity=[.01, .01],
         initial_fingers=interval, events=({"skill_id": "press_fixture", "event_id": "hold", **interval},),
         observation_policy=None)
     covers = {"arm": [{"center": [0., 0., 0.], "radius": float(np.linalg.norm([PAD_WIDTH/2, PAD_WIDTH/2, .05]))}],
@@ -137,27 +138,30 @@ def build_scene(device, robot, backend, targets, problem):
         current_positions=actual["q"][1:], joint_limits=[[0., .04], [-.04, 0.]], joint_bounds=None,
         coupling_matrix=np.empty((0, 2)), coupling_offset=[], sphere_indices=finger_ids,
         local_spheres=[[0., .15, .15, np.sqrt(3)*.01], [0., -.15, .15, np.sqrt(3)*.01]],
-        sphere_joint_translation=affine,
+        sphere_joint_translation=affine, self_collision_pairs=tuple(combinations(range(3), 2)),
         commands=({"skill_id": "press_fixture", "event_id": "hold", "occurrence": 0, "command": "hold", "progress": 0.},),
         source="explicit independent free finger actuators", control_timestep_s=DT,
         finger_trajectory_factory=factory, nominal_finger_trajectory_factory=free_finger_model)
-    # BEGIN exact primitive geometry supplies ordinary collision distances.
+    # BEGIN this synthetic fixture declares its finite contact grid explicitly.
     def query(name, position, dimensions):
         return FrozenPrimitives(primitives=[{"kind": "cuboid", "pose": [*position, 1., 0., 0., 0.],
-            "dimensions": dimensions}], owner_ids=(name,),
-            source="explicit complete native fixture solid")
+            "dimensions": dimensions}], owner_ids=(name,), contact_voxel_size_m=.01,
+            source="explicit complete native fixture solid; 10 mm finite contact cells")
     # END no native physics value contributes to this planning field.
     background = query("far_background", [0., 0., -1.], [.1, .1, .1])
     owner = CollisionOwner("target", query("target", [0., 0., -.05], [.6, .6, .1]),
         PosePath(np.array([0., 1.]), np.stack((np.eye(4), np.eye(4))), "explicit static target pose"),
         "explicit complete fixture slab", True)
-    rule = ContactRule("press", "robot", "target", (0., 1.), sphere_ids["arm"],
-        "declared press-face sphere group against the target during this interaction")
+    half = PAD_WIDTH/2
+    rule = ContactRule("press", "robot", "target", (0., 1.), sphere_ids["arm"], "press_face",
+        [[-half,-half,0.],[half,-half,0.],[half,half,0.],[-half,half,0.]], [0.,0.,-1.],
+        [0.,0.,0.], np.eye(3), [.1,.1], (-.0025,.0025), .01, .003, .003, .1,
+        "declared finite pressing face and target patch")
     materials = [None]*3
     materials[sphere_ids["arm"][0]] = "press_face"
     coverage = ObservedSpace(np.ones((41,41,41), bool), origin=[-.5,-.5,-.5], voxel_size=.025,
         observation_ids=("explicit complete known fixture volume",), reference_frame="world")
-    return OnlinePlanningScene(background=background, owners=(owner,), coverage=coverage, reference_frame="world",
+    return OnlinePlanningScene(unknown_policy={"outside_regions": "forbid", "conditional_regions": []}, background=background, owners=(owner,), coverage=coverage, reference_frame="world",
         robot_sphere_materials=materials, robot_geometry_source="three exact outward native box covers",
         contacts=(rule,), gripper=hand, native_geometry_materials={"pad": "press_face"})
 

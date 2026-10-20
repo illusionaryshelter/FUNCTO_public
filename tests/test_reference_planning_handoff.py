@@ -59,7 +59,7 @@ class ReferencePlanningHandoffTest(unittest.TestCase):
         # END planner handoff preserves the adapted path and independent task goals.
         phase = reference_phase(reference, skill_id="analytic_grasp", source="observed transformed reference")
         empty = problem(phase)
-        self.assertEqual(empty.pose_events, ())
+        self.assertIsNone(empty.terminal_pose_target)
         self.assertEqual((empty.events, empty.pose_events, empty.pose_relations, empty.mechanisms), ((), (), (), ()))
         np.testing.assert_array_equal(phase.metadata["source_frame_indices"], frames)
         np.testing.assert_array_equal(phase.metadata["source_timestamps"], times)
@@ -72,7 +72,7 @@ class ReferencePlanningHandoffTest(unittest.TestCase):
         goal = PoseEventRequirement(1., np.eye(4), target, .004, .03,
                                    source="independent analytic task specification")
         compiled = problem(phase, pose_events=(goal,))
-        self.assertEqual(compiled.pose_events, (goal,))
+        self.assertIs(compiled.terminal_pose_target, goal)
         np.testing.assert_array_equal(goal.target, target)
         self.assertEqual((goal.position_tolerance_m, goal.rotation_tolerance_rad), (.004, .03))
         np.testing.assert_allclose(sample(compiled, phase.reference.progress), reference["eef_poses"], atol=1e-12)
@@ -107,7 +107,7 @@ class ReferencePlanningHandoffTest(unittest.TestCase):
         self.assertEqual(phase.metadata["source_timestamps"][-1], 7.)
         self.assertEqual(len(compiled.phases), 1)
         self.assertEqual(compiled.conditions, ())
-        self.assertEqual(compiled.pose_events, ())
+        self.assertIsNone(compiled.terminal_pose_target)
 
     def test_mechanism_interpolates_scalar_before_fk_and_attachment(self):
         model = MotionModel("revolute", np.array([[0.], [np.pi]]), pose(.4),

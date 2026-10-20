@@ -14,24 +14,8 @@ from manipulation.robot_geometry_check import _scene_component_pairs
 from manipulation.scene_surface_batch import SurfaceDistanceBatch, surface_batch_workspace_bytes
 from manipulation.tsdf_geometry import ObservedTsdfGeometry, tsdf_geometry_from_samples
 from test_independent_scene_validation import binding, checker
+from test_source_world_deduplication import assert_report_bytes_equal
 from test_tsdf_query_optimization import component_record
-
-
-def assert_report_bytes_equal(actual, expected):
-    """Compare independent audit reports, including signed-zero float bytes."""
-    assert type(actual) is type(expected)
-    if isinstance(actual, dict):
-        assert actual.keys() == expected.keys()
-        for name in actual:
-            assert_report_bytes_equal(actual[name], expected[name])
-    elif isinstance(actual, (tuple, list)):
-        assert len(actual) == len(expected)
-        for first, second in zip(actual, expected):
-            assert_report_bytes_equal(first, second)
-    elif isinstance(actual, float):
-        assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
-    else:
-        assert actual == expected
 
 
 class SerialSurfaceQueries:
@@ -197,7 +181,11 @@ def test_later_surface_error_cannot_replace_earlier_component_error(monkeypatch,
     assert len(cache) == 1
 
 
-def test_surface_reservation_is_added_to_independent_scene_workspace(checker, monkeypatch):
+def test_surface_reservation_is_added_to_scene_and_admitted_before_work(checker, monkeypatch):
+    from manipulation.planning import _PlanningWorkspace, _require_planning_host_memory
+    from manipulation.resource_admission import ResourceLimitError
+    from test_resource_admission import host_snapshot
+
     values = np.ones((2, 2, 2))
     values[:, :, 0] = -1.
     model = binding()
@@ -211,4 +199,13 @@ def test_surface_reservation_is_added_to_independent_scene_workspace(checker, mo
         patch.setattr(surface_module, "surface_batch_workspace_bytes", lambda *args: 0)
         checker.bind_scene(model)
     assert admitted-checker.scene_query_workspace_nbytes == reserve
+    monkeypatch.setattr(ObservedTsdfGeometry, "pending_storage_total_nbytes", classmethod(lambda cls: 0))
+    native = Mock(side_effect=AssertionError("admission must precede native work"))
+    monkeypatch.setattr(surface_module, "ordered_distances", native)
+    host_snapshot(monkeypatch, rss=1024**3, child_rss=0, available=8*1024**3)
+    workspace = _PlanningWorkspace(0, admitted, 0, 0, 0, False)
+    with pytest.raises(ResourceLimitError):
+        _require_planning_host_memory(workspace, max_host_rss_bytes=1024**3+admitted-1)
+    _require_planning_host_memory(workspace, max_host_rss_bytes=1024**3+admitted)
+    native.assert_not_called()
 # END no new numerical tolerance or alternate acceptance backend is involved.

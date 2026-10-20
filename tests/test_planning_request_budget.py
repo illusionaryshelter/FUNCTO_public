@@ -145,10 +145,19 @@ class PlanningRequestBudgetTest(unittest.TestCase):
     # END an explicit physical quota never replenishes samples, solves or time.
 
     # BEGIN reused delivery metrics cannot spend a second native-query pass.
-    def test_last_native_solve_delivers_without_recharging_completed_geometry(self):
+    def test_confirmed_last_solve_can_deliver_without_recharging_reused_geometry(self):
         for solves in (1, 2):
             with self.subTest(solves=solves):
-                native = Native([False] * (solves-1) + [True], collision=True)
+                native = Native([False] * solves + [True], collision=True)
+                select = native.select_candidate
+                query_counts = iter([0] + [11] * solves)
+
+                def confirmed(accepted):
+                    candidate, curve, report = select(accepted)
+                    report['confirmation_validation_points'] = next(query_counts)
+                    return candidate, curve, report
+
+                native.select_candidate = confirmed
                 result, backend = run_native(native,
                     budget=replace(self.budget, maximum_trajectory_solves=solves, trajectory_seeds=1))
                 try:
@@ -157,10 +166,30 @@ class PlanningRequestBudgetTest(unittest.TestCase):
                     self.assertEqual(native.calls.count('solve'), solves)
                     self.assertEqual(native.calls.count('export'), 1)
                     work = result.request_ledger['consumed_planning']
-                    self.assertEqual(work['validation_passes'], 0)
-                    self.assertEqual(work['validation_queries'], 1)
+                    self.assertEqual(work['validation_passes'], solves)
+                    self.assertEqual(work['validation_queries'], 1 + 11 * solves)
                 finally:
                     backend.close()
+
+    def test_real_excess_native_confirmation_still_exhausts_the_original_budget(self):
+        native = Native([False, False, True], collision=True)
+        select = native.select_candidate
+
+        def confirmed(accepted):
+            candidate, curve, report = select(accepted)
+            report['confirmation_validation_points'] = 11
+            return candidate, curve, report
+
+        native.select_candidate = confirmed
+        result, backend = run_native(native, budget=replace(self.budget, trajectory_seeds=1))
+        try:
+            self.assertFalse(result.success)
+            self.assertEqual(result.diagnostics['failure'], 'cumulative_planning_budget_exhausted')
+            self.assertEqual(result.request_ledger['consumed_planning']['validation_passes'], 3)
+            self.assertNotIn('export', native.calls)
+            self.assertIsNone(result.execution_binding)
+        finally:
+            backend.close()
 
     def test_delivery_that_reports_new_queries_still_consumes_a_pass(self):
         native = Native([True])

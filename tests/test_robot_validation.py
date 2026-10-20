@@ -105,7 +105,7 @@ def test_explicit_mechanical_contact_retains_policy_without_querying_permitted_p
     assert result["distances_m"] == []
     assert gate.describe()["pair_order"] == []
     assert result["min_required_clearance_m"] is None
-    assert gate.describe()["pair_policy"][0]["source"] == permitted.source
+    assert gate.planning_binding_record()["pair_order"][0]["source"] == permitted.source
     # An identical unpermitted pair still fails; closeness never grants permission.
     assert validator(model).check_state(feedback(finger=finger), stage="after_step", trajectory_time=.1)["passed"] is False
 
@@ -271,6 +271,140 @@ def planning_problem(names=NAMES[:1], positions=(.03,)):
         reference_frame="world", base_pose=np.eye(4), tool_link="tool", tool_transform=np.eye(4))
 
 
+@pytest.mark.parametrize("finger,passed,relation", [
+    (-.08, True, "separated"), (0., False, "penetrating"),
+    (-.01000025, False, "numerical_boundary"),
+])
+def test_planning_self_queries_native_solids_without_any_sphere_cost(model, finger, passed, relation):
+    gate = validator(model)
+    result = gate.check_planning_self([finger, .03], NAMES[::-1], time_s=.2,
+                                     gripper=planning_hand(controller="position_tracking"))
+    assert result["passed"] is passed
+    assert result["residual"] == float(not passed)
+    assert result["queried_pairs"] == 1
+    assert result["minimum_pair"]["relation"] == relation
+    assert result["joint_names"] == list(NAMES)
+    assert result["joint_positions"] == [.03, finger]
+    assert len(result["violations"]) == int(not passed)
+    assert result["unmodelled_geometry_names"] == []
+
+
+@pytest.mark.parametrize("policy", ["excluded", "mechanical_contact"])
+def test_planning_native_pair_permissions_keep_joint_limits(model, policy):
+    gate = validator(model, [PairQuery("first", "second", policy, "explicit source policy")])
+    accepted = gate.check_planning_self([.03, 0.], NAMES, time_s=.2, gripper=None)
+    assert accepted["passed"] and accepted["queried_pairs"] == 0
+    assert accepted["minimum_pair"] is None and accepted["minimum_required_clearance_m"] is None
+    rejected = gate.check_planning_self([.11, 0.], NAMES, time_s=.2, gripper=None)
+    assert not rejected["passed"] and rejected["residual"] == 1.
+    assert rejected["violations"] == []
+    assert set(rejected["joint_limit_violations"]) == {"left_slide"}
+
+
+@pytest.mark.parametrize("index,boundary", [(0, "upper"), (1, "lower")])
+def test_planning_source_limits_admit_only_exact_active_dtype_endpoints(model, index, boundary):
+    # Mechanical contact removes collision as a confounder; the independent
+    # scalar joint domain must still reject each adjacent unrepresentable q.
+    gate = validator(model, [PairQuery("first", "second", "mechanical_contact", "explicit source permission")])
+    q = np.array([.03, -.08], dtype=np.float32)
+    q[index] = np.float32(.1 if boundary == "upper" else -.1)
+    accepted = gate.check_planning_self(q, NAMES, time_s=.2, gripper=None)
+    assert accepted["passed"] and accepted["joint_limit_violations"] == {}
+    assert accepted["joint_positions"] == q.astype(float).tolist()
+    evidence = accepted["rounded_limit_representations"]
+    assert len(evidence) == 1 and evidence[0]["joint_name"] == NAMES[index]
+    assert evidence[0]["represented_boundary"] == boundary
+    assert evidence[0]["position"] == float(q[index])
+    assert evidence[0]["position"] != evidence[0][boundary]
+    adjacent = q.copy()
+    adjacent[index] = np.nextafter(q[index], np.float32(np.inf if boundary == "upper" else -np.inf))
+    for values in (adjacent, q.astype(np.float64)):
+        rejected = gate.check_planning_self(values, NAMES, time_s=.2, gripper=None)
+        assert not rejected["passed"] and rejected["rounded_limit_representations"] == []
+        assert set(rejected["joint_limit_violations"]) == {NAMES[index]}
+    actual = feedback(arm=float(q[0]), finger=float(q[1]))
+    assert any(row["kind"] == "independent_joint_position"
+               for row in gate.check_state(actual, stage="actual", trajectory_time=.2)["violations"])
+
+
+def test_planning_active_dtype_cannot_relax_independent_nominal_finger_limits(model):
+    gate = validator(model, [PairQuery("first", "second", "mechanical_contact", "explicit source permission")])
+    # BEGIN the fixture explicitly declares nominal geometry, including its scope.
+    from manipulation.gripper_trajectory import NominalFingerGeometry
+    nominal = NominalFingerGeometry(NAMES[1:], [0., 1.], [[float(np.float32(-.1))]]*2,
+                                   [[0.]]*2, 1., 1., "synthetic constant out-of-range hand")
+    # END active-arm dtype cannot alter a separately declared nominal finger.
+    result = gate.check_planning_self(np.array([.03], dtype=np.float32), NAMES[:1], time_s=.2,
+        gripper=planning_hand(controller="timed_reference", nominal=nominal))
+    assert not result["passed"] and result["rounded_limit_representations"] == []
+    assert set(result["joint_limit_violations"]) == {"right_slide"}
+
+
+@pytest.mark.parametrize("controller", ["binary", "timed_reference"])
+def test_planning_unknown_future_fingers_never_use_the_control_command(model, controller):
+    gate = validator(model)
+    hand = planning_hand(controller=controller)
+    actual = gate.check_planning_self([.03], NAMES[:1], time_s=0., gripper=hand)
+    assert actual["passed"] and actual["queried_pairs"] == 1
+    assert actual["joint_positions"] == [.03, -.08]
+    future = gate.check_planning_self([.03], NAMES[:1], time_s=.2, gripper=hand)
+    assert future["passed"] and future["queried_pairs"] == 0
+    assert future["unmodelled_geometry_names"] == ["second"]
+    # BEGIN this synthetic linear model explicitly covers its entire clock.
+    from manipulation.gripper_trajectory import NominalFingerGeometry
+    nominal = NominalFingerGeometry(NAMES[1:], [0., 1.], [[-.08], [0.]], [[.08]]*2,
+                                   1., 1., "synthetic linear hand")
+    # END the unbound command still cannot provide these coordinates.
+    hand.nominal_finger_trajectory = nominal
+    middle = gate.check_planning_self([.03], NAMES[:1], time_s=.5, gripper=hand)
+    assert middle["passed"] and middle["joint_positions"] == [.03, -.04]
+    finish = gate.check_planning_self([.03], NAMES[:1], time_s=1., gripper=hand)
+    assert not finish["passed"] and finish["queried_pairs"] == 1
+    assert finish["unmodelled_geometry_names"] == []
+
+
+def test_planning_nominal_finger_endpoint_preserves_exact_native_time_representation(model):
+    # BEGIN native endpoint representation belongs to a scoped geometry record.
+    from manipulation.gripper_trajectory import NominalFingerGeometry
+
+    duration = 9*float(np.float32(.2))
+    nominal = NominalFingerGeometry(NAMES[1:], [0., duration], [[-.08], [-.04]], [[0.], [0.]],
+                                   duration, duration, "synthetic complete native clock")
+    # END actuator event generation is independent of this representation check.
+    hand = planning_hand(controller="timed_reference", nominal=nominal)
+    gate = validator(model)
+    endpoint = np.float32(duration)
+    assert float(endpoint) > duration
+    result = gate.check_planning_self([.03], NAMES[:1], time_s=endpoint, gripper=hand)
+    final_position = float(nominal.sample(duration)[0][0])
+    assert result["passed"] and result["joint_positions"] == [.03, final_position]
+    interior = gate.check_planning_self([.03], NAMES[:1], time_s=1, gripper=hand)
+    assert interior["joint_positions"][1] == float(nominal.sample(1.)[0][0])
+    assert interior["joint_positions"][1] != final_position
+    for beyond in (np.nextafter(endpoint, np.float32(np.inf)), float(endpoint),
+                   np.nextafter(duration, np.inf)):
+        with pytest.raises(ValueError, match="original trajectory duration"):
+            gate.check_planning_self([.03], NAMES[:1], time_s=beyond, gripper=hand)
+
+
+def test_planning_unknown_finger_keeps_arm_against_fixed_installation(model):
+    from itertools import combinations
+    fixed_pose = np.eye(4)
+    fixed_pose[:3, 3] = [.03, .2, 0.]
+    second_pose = np.eye(4)
+    second_pose[1, 3] = .4
+    checker = RobotGeometryChecker(model.urdf_path, base_frame="base", geometries=[
+        NativePrimitive("first", "left", "box", (.04, .04, .04), np.eye(4), "moving arm solid"),
+        NativePrimitive("second", "right", "box", (.04, .04, .04), second_pose, "moving finger solid"),
+        NativePrimitive("mount", "base", "box", (.01, .01, .01), fixed_pose, "fixed installation")])
+    pairs = [PairQuery(a, b, "required", "native enabled pair")
+             for a, b in combinations(checker.geometry_names, 2)]
+    result = validator(checker, pairs).check_planning_self([.03], NAMES[:1], time_s=1., gripper=planning_hand())
+    assert not result["passed"] and result["queried_pairs"] == 1
+    assert result["unmodelled_geometry_names"] == ["second"]
+    assert [(row["first"], row["second"]) for row in result["violations"]] == [("first", "mount")]
+
+
 def test_planning_robot_without_hand_requires_complete_native_coordinates(model):
     gate = RobotStateValidator(model, joint_names=NAMES, arm_joint_names=NAMES, finger_joint_names=(),
         pairs=[PairQuery("first", "second", "required", "native enabled pair")],
@@ -278,8 +412,9 @@ def test_planning_robot_without_hand_requires_complete_native_coordinates(model)
         T_reference_base=np.eye(4), tool_frame="tool", T_frame_tcp=np.eye(4),
         fk_translation_tolerance_m=1e-8, fk_rotation_tolerance_rad=1e-8, source="robot without hand")
     gate.validate_planning_binding(planning_problem(NAMES, [.03, -.08]), None)
+    assert gate.check_planning_self([.03, -.08], NAMES, time_s=.2, gripper=None)["passed"]
     with pytest.raises(ValueError, match="every native joint"):
-        gate.validate_planning_binding(planning_problem(NAMES[:1], [.03]), None)
+        gate.check_planning_self([.03], NAMES[:1], time_s=.2, gripper=None)
 
 
 def test_planning_binding_preserves_calibration_joint_partition_and_measured_fingers(model):
@@ -304,7 +439,18 @@ def test_planning_binding_preserves_calibration_joint_partition_and_measured_fin
         gate.validate_planning_binding(active, hand)
 
 
-# END entrance identity stays independent of nominal task quality.
+def test_planning_binding_records_owned_source_geometry_and_complete_policy(model):
+    import json
+    gate = validator(model)
+    record = gate.planning_binding_record()
+    assert json.loads(json.dumps(record, allow_nan=False)) == record
+    assert record["pair_order"][0]["policy"] == "required"
+    assert "left_slide" in record["model"]["urdf_xml"]
+    assert record["model"]["geometries"][0]["dimensions"] == [.04, .04, .04]
+    assert record["numerics"] == model.numerics
+    record["model"]["geometries"][0]["dimensions"][0] = 10.
+    assert gate.planning_binding_record()["model"]["geometries"][0]["dimensions"][0] == .04
+# END every planning decision uses the same native solid and mechanical policy.
 
 
 # BEGIN production runtime shares online fields, sphere layout and actual joints.
@@ -324,7 +470,7 @@ def online_binding(gate, *, distance=1., supported=True):
     from observed_geometry_fixtures import field_from_samples
     field = field_from_samples(values,
         origin=[-1., -1., -1.] if supported else [.04, -1., -1.],
-        voxel_size=.25, observed=np.ones(shape, bool), owner_ids=("background",), source="online sensor source")
+        voxel_size=.25, observed=np.ones(shape, bool), owner_ids=(), source="online sensor source")
     # END source geometry and numerical support have independent meanings.
     # END unqueried numerical support remains independent of collision evidence.
     coverage = ObservedSpace(np.ones(shape, bool), origin=[-1., -1., -1.], voxel_size=.25,
@@ -341,16 +487,11 @@ def online_binding(gate, *, distance=1., supported=True):
     scene = OnlinePlanningScene(background=field, owners=(), coverage=coverage,
         reference_frame="world", robot_sphere_materials=("left", "right"),
         robot_geometry_source="native sphere fixture", has_gripper=False,
-        robot_collision_bodies=bodies)
+        robot_collision_bodies=bodies,
+        unknown_policy={"conditional_regions": [], "outside_regions": "forbid"})
     scene.bind_online_robot(robot_sphere_geometry=[
         {"link_name": link, "sphere_indices": [index], "centers_local": [centers[index]], "radii": [radius]}
-        for index, link in enumerate(("left", "right"))],
-        # BEGIN bind the same native solids and mechanical pair policy.
-        native_robot_model=gate.checker.model_record(), native_joint_names=gate.joint_names,
-        native_self_pairs=[{"first": pair.first, "second": pair.second,
-            "margin": max(gate.checker.numerics["gjk_tolerance"], gate.checker.numerics["epa_tolerance"])}
-            for pair in gate.required_pairs],
-        # END observed field queries remain separate scene components.
+        for index, link in enumerate(("left", "right"))], robot_self_collision_pairs=[],
         robot_model={"urdf_path": str(gate.checker.urdf_path), "base_frame": gate.checker.base_frame,
             "tool_frame": gate.tool_frame, "T_reference_base": gate.T_reference_base.tolist(),
             "T_frame_tcp": gate.T_frame_tcp.tolist()})
@@ -361,6 +502,7 @@ def online_binding(gate, *, distance=1., supported=True):
 # BEGIN execution never rebuilds or queries a frozen world, even at preflight.
 def test_preflight_and_actual_tick_query_required_robot_pairs_only(model, monkeypatch):
     from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
+    from manipulation.online_native_confirmation import NativeCollisionConfirmation
     gate = validator(model)
     curve = trajectory([.03, .03], [0., 0.])
     def forbidden(*args, **kwargs):
@@ -370,6 +512,7 @@ def test_preflight_and_actual_tick_query_required_robot_pairs_only(model, monkey
     monkeypatch.setattr(OnlinePlanningScene, "from_binding", forbidden)
     monkeypatch.setattr(OnlinePlanningScene, "query_state", forbidden)
     monkeypatch.setattr(FrozenESDF, "signed_distance", forbidden)
+    monkeypatch.setattr(NativeCollisionConfirmation, "confirm", forbidden)
     native_query = model.query
     calls = []
     def query(**kwargs):
@@ -393,6 +536,7 @@ def test_preflight_and_actual_tick_query_required_robot_pairs_only(model, monkey
 def test_frozen_world_failures_remain_planning_verdicts_only(model, failure):
     from manipulation.execution import TrajectoryExecutor
     from manipulation.online_geometry import OnlinePlanningScene
+    from manipulation.online_native_confirmation import OnlineCollisionConfirmation
     gate = validator(model)
     binding = online_binding(gate, distance=-.1 if failure == "collision" else 1.,
                              supported=failure != "unsupported_field")
@@ -407,12 +551,12 @@ def test_frozen_world_failures_remain_planning_verdicts_only(model, failure):
         spheres[ids, :3] = np.asarray(row["centers_local"]) @ pose[:3, :3].T + pose[:3, 3]
         spheres[ids, 3] = row["radii"]
     planning = scene.query_state(spheres, state["tool_pose"], 0., joint_position=state["q"],
-        joint_names=NAMES)
+        joint_names=NAMES, native_confirmation=OnlineCollisionConfirmation(gate, scene))
+    assert not planning["passed"]
     if failure == "collision":
-        assert not planning["passed"] and planning["components"]["collision/robot/background"] > 0
+        assert planning["native_confirmation"]["states"][0]["collision_targets"] == ["background"]
     else:
-        assert planning["passed"]
-        assert not any(name.startswith("scene_update/") for name in planning["components"])
+        assert planning["status"] == "SCENE_UPDATE_REQUIRED"
     adapter = SimpleNamespace(geometry_checker=gate, _geometry_pair_count=len(gate.required_pairs))
     actual = TrajectoryExecutor._geometry_result(adapter, "check_state", state,
         stage="actual", trajectory_time=0.)

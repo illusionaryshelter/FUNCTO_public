@@ -379,7 +379,18 @@ class RobotGeometryChecker:
             # END the selected inventory remains the target owner's own geometry.
         if len(self._scene_shapes) * (len(self._geometries)+len(self._scene_shapes)) > 100000:
             raise ValueError("Independent scene pair inventory exceeds the bounded CPU query budget")
-        from .planning_scene import grasp_contact_rule_ids
+        # BEGIN native authorization is bound to explicit names, never inferred materials.
+        from .planning_scene import RobotOwnerContactPermission, grasp_contact_rule_ids
+        self._robot_owner_permissions = tuple(RobotOwnerContactPermission(**row)
+            for row in scene_binding.get("robot_owner_permissions", ()))
+        identities = [rule.rule_id for rule in self._robot_owner_permissions]
+        if (len(set(identities)) != len(identities)
+                or set(identities) & {row["rule_id"] for row in scene_binding["contacts"]}):
+            raise ValueError("Robot-owner and material permission IDs must be unique")
+        for rule in self._robot_owner_permissions:
+            if (rule.target_owner not in self._scene_owners
+                    or not set(rule.native_geometry_names) <= self._geometries.keys()):
+                raise ValueError("Robot-owner permission requires bound owner and native robot geometry names")
         # BEGIN finite grasp gates retain their own actor/material scope.
         self._gated_contact_rule_ids = set()
         condition_ids = set()
@@ -441,6 +452,7 @@ class RobotGeometryChecker:
 
     def query_scene(self, robot_state, *, tool_pose, progress, finger_positions, state_kind,
                     owner_poses=None, nominal_owner_poses=None, condition_evidence=None,
+                    active_robot_owner_permissions=frozenset(), robot_owner_permission_progress=None,
                     active_contact_rule_ids=frozenset(),
                     layer_selection=None, layer_selection_index=(0, 0), select_layers=False):
         """Query every robot/scene and moving-owner/other-owner solid pair.
@@ -461,7 +473,7 @@ class RobotGeometryChecker:
             raise ValueError("Independent scene query requires actual/nominal scope and bound progress")
         if not hasattr(self, "_scene_binding"):
             raise ValueError("Independent scene query has no bound scene model")
-        # BEGIN the independent audit consumes explicit finite material permissions.
+        # BEGIN actual finite grasp contact needs this execution's arrival latch.
         finite_active = active_contact_rule_ids
         if finite_active is None:
             if state_kind != "nominal":
@@ -475,7 +487,41 @@ class RobotGeometryChecker:
             if (rule["rule_id"] not in self._gated_contact_rule_ids
                 or state_kind == "nominal" or rule["rule_id"] in finite_active)]
         # END all three material consumers use the same filtered finite rules.
-        # BEGIN retain independent distances without legacy whole-pair exemptions.
+        # BEGIN actual permission is an executor-owned arrival latch, never a clock inference.
+        active = active_robot_owner_permissions
+        known = {rule.rule_id for rule in self._robot_owner_permissions}
+        if active is None:
+            if state_kind != "nominal":
+                raise ValueError("Actual robot-owner permission requires an explicit active set")
+            active = known
+        elif (not isinstance(active, (set, frozenset))
+                or any(not isinstance(identity, str) for identity in active) or not active <= known):
+            raise ValueError("Active robot-owner permissions must name only rules in the bound scene")
+        # Nominal checks share the planner's conditional law. Actual checks
+        # require both the declared interval and this execution's fresh latch.
+        permission_progress = progress if robot_owner_permission_progress is None else robot_owner_permission_progress
+        if not np.isfinite(permission_progress) or permission_progress < 0:
+            raise ValueError("Robot-owner permission requires finite nonnegative progress")
+        if state_kind == "actual" and permission_progress != progress:
+            raise ValueError("Actual permission must use the actual bound progress")
+        permitted_rules = [rule for rule in self._robot_owner_permissions
+            if rule.interval[0] <= permission_progress <= rule.interval[1]
+            and (state_kind == "nominal" or rule.rule_id in active)]
+        # BEGIN Holding permission shares the attachment's exclusive real release end.
+        # Even an erroneous supplied active set cannot extend that frozen contract.
+        permitted_rules = [rule for rule in permitted_rules
+            if rule.holding_condition_id is None or permission_progress < rule.interval[1]
+            or not any(relation["condition_id"] == rule.holding_condition_id
+                and relation["release_condition_id"] is not None
+                for relation in self._scene_owners[rule.target_owner][0]["attachments"])]
+        # END original arrival/close permission intervals keep their existing semantics.
+        # END ordinary collision evidence below is still queried and archived.
+        # BEGIN retain unpermitted distances before component evidence is reduced.
+        # Whole-pair permissions also apply to separated pieces, whose normal
+        # fast path has no reason to attach a contact-permission field. Native
+        # installation pairs retain their independent required/excluded law.
+        permitted_robot_pairs = {(name, rule.target_owner) for rule in permitted_rules
+                                 for name in rule.native_geometry_names}
         clearance = {"minimum_recorded_distance_m": None,
                      "minimum_recorded_adjusted_distance_m": None,
                      "minimum_pair": None, "minimum_adjusted_pair": None,
@@ -697,7 +743,8 @@ class RobotGeometryChecker:
                             and value >= rows[summary["index"]]["signed_distance_m"]):
                         rows[summary["index"]]["component_summary"]["tested"] += measured_count
                         # BEGIN a permitted nearest piece cannot hide an unpermitted next piece.
-                        if first["owner"] == "robot":
+                        if (first["owner"] == "robot"
+                                and (first["name"], second["owner"]) not in permitted_robot_pairs):
                             _record_unpermitted_clearance(clearance, value, margin,
                                 first["name"], second["owner"], second["name"], "queried_source_component",
                                 measured_count=measured_count)
@@ -733,6 +780,23 @@ class RobotGeometryChecker:
                     row["contacts"] = [{"position": np.asarray(contact.pos).tolist(), "normal": np.asarray(contact.normal).tolist(),
                                         "penetration_depth": float(contact.penetration_depth)} for contact in result.getContacts()]
                     row["contact_report_truncated"] = result.numContacts() >= request.num_max_contacts
+                    # BEGIN authorized whole-pair contact does not consume a local patch allowance.
+                    permissions = [rule for rule in permitted_rules
+                        if first["owner"] == "robot" and first["name"] in rule.native_geometry_names
+                        and second["owner"] == rule.target_owner]
+                    if permissions:
+                        row["permission"] = permissions[0].rule_id
+                        row["permission_scope"] = "explicit_robot_owner_pair"
+                        # BEGIN report the actual activation contract, including current Holding.
+                        if permissions[0].holding_condition_id is not None:
+                            row["permission_authorization"] = ("conditional_nominal_holding_attachment"
+                                if state_kind == "nominal" else "current_execution_holding_binding")
+                        else:
+                            row["permission_authorization"] = ("conditional_nominal_arrival" if state_kind == "nominal"
+                                                                else "current_execution_arrival_latch")
+                        # END a Holding permission is never described as a measured arrival.
+                        continue
+                    # END signed distance, witnesses and physical contacts remain raw evidence.
                     # BEGIN resolve a Coal numerical boundary using complete solid intersections.
                     # A sub-tolerance positive gap can be reported by GJK as zero
                     # distance/contact. Infeasibility of the complete convex
@@ -817,10 +881,13 @@ class RobotGeometryChecker:
                         # distance to the rest of this complete solid outside
                         # that finite patch. This remains true for an analytic
                         # cuboid with no TSDF components or query gaps.
-                        if current.get("actor") == "robot" and current.get("permission"):
+                        if (current.get("actor") == "robot" and current.get("permission")
+                                and current.get("permission_scope") != "explicit_robot_owner_pair"):
                             clearance["omitted_finite_patch_subset_count"] += 1
                         if (current.get("actor") == "robot" and "signed_distance_m" in current
-                                and not current.get("permission")):
+                                and not current.get("permission")
+                                and (current["actor_geometry"], current["target_owner"])
+                                    not in permitted_robot_pairs):
                             _record_unpermitted_clearance(clearance, current["signed_distance_m"],
                                 current.get("measurement_allowance_m", 0.),
                                 current["actor_geometry"], current["target_owner"], current["target_geometry"],
@@ -906,7 +973,8 @@ class RobotGeometryChecker:
         # point, so do not call its distance unpermitted in that case.
         for row in rows:
             if (row.get("actor") != "robot" or not row.get("diagnostic_only")
-                    or row.get("distance_scope") != "observed_zero_surface_only"):
+                    or row.get("distance_scope") != "observed_zero_surface_only"
+                    or (row["actor_geometry"], row["target_owner"]) in permitted_robot_pairs):
                 continue
             # BEGIN an unrelated material cannot borrow another pad's permission.
             # Match the same directed actor/material identities used by the
@@ -963,9 +1031,11 @@ class RobotGeometryChecker:
                 "layer_selection_checks": selection_checks,
                 "layer_selection": selection_snapshot,
                 # BEGIN expose authorization separately from geometry relation and task effects.
+                "active_robot_owner_permissions": sorted(rule.rule_id for rule in permitted_rules),
                 "active_contact_rule_ids": sorted(rule["rule_id"] for rule in contact_rules
                     if rule["rule_id"] in self._gated_contact_rule_ids
                     and rule["interval"][0] <= progress <= rule["interval"][1]),
+                "robot_owner_permission_progress": float(permission_progress),
                 # END a permission does not establish actual contact or Holding.
                 "progress": float(progress), "observed_scene_checked": not gaps and not uncertain_owners and not unmodelled_geometries,
                 "supplied_scene_models_checked": not gaps,
@@ -1219,47 +1289,6 @@ class RobotGeometryChecker:
                 "geometry_poses": {name: pose.tolist() for name, pose in geometry_poses.items()},
                 "geometry_sources": {name: value[2] for name, value in self._geometries.items()},
                 "numerics": dict(self.numerics), "pairs": rows}
-
-    # BEGIN native collision witnesses use the same named robot and reference frame.
-    def geometry_point_jacobians(self, robot_state, points, T_reference_base):
-        """Return world point Jacobians in the query's named joint order.
-
-        ``points`` contains (geometry name, world point) pairs from a completed
-        native query. Pinocchio's LOCAL_WORLD_ALIGNED Jacobian is the velocity
-        of the *frame origin*, expressed in base axes. Shift its linear rows
-        to the witness, then rotate into the external reference axes. All
-        witnesses share one computeJointJacobians call and named q mapping.
-        This operation grants no collision permission or joint-limit waiver.
-        """
-        names = tuple(robot_state['joint_names'])
-        values = np.asarray(robot_state['joint_positions'], dtype=float)
-        if (len(names) != len(set(names)) or set(names) != set(self.joint_names)
-                or values.shape != (len(names),) or not np.isfinite(values).all()):
-            raise ValueError('Point Jacobians require the complete finite native joint query')
-        transform = _rigid_pose(T_reference_base)
-        q = pin.neutral(self.model)
-        for name, value in zip(names, values):
-            q[self._q_columns[name]] = value
-        pin.computeJointJacobians(self.model, self._data, q)
-        pin.updateFramePlacements(self.model, self._data)
-        columns = [self.model.joints[self.model.getJointId(name)].idx_v for name in names]
-        frame_jacobians, result = {}, []
-        for geometry, point in points:
-            frame = self._geometries[geometry][0]
-            frame_id = self._frame_id(frame)
-            if frame not in frame_jacobians:
-                frame_jacobians[frame] = pin.getFrameJacobian(
-                    self.model, self._data, frame_id, pin.LOCAL_WORLD_ALIGNED).reshape(6, self.model.nv).copy()
-            jacobian = frame_jacobians[frame]
-            point = np.asarray(point, dtype=float)
-            if point.shape != (3,) or not np.isfinite(point).all():
-                raise ValueError('A native witness must be a finite world point')
-            base_point = transform[:3, :3].T @ (point-transform[:3, 3])
-            offset = base_point-self._data.oMf[frame_id].translation
-            shifted = jacobian[:3]+np.cross(jacobian[3:].T, offset).T
-            result.append(transform[:3, :3] @ shifted[:, columns])
-        return result
-    # END no finite differences, FK approximation or scene-specific transform.
 
     # BEGIN bounded native many-pair queries with explicitly pristine history.
     def _native_pair_distances(self, pairs, poses):

@@ -264,6 +264,8 @@ def _limit_values(simulation, curve):
     return {"source": "Synthetic CPU contract-test limits; not measured hardware performance",
             "joint_names": list(simulation.joint_names), "arm_joint_names": list(simulation.arm_joint_names),
             "finger_joint_names": list(simulation.finger_joint_names),
+            "arm_position_error": [.001]*7, "arm_velocity_error": [.001]*7,
+            "tcp_position_error_m": .001, "tcp_rotation_error_rad": .001,
             "stop_arm_velocity": [.1]*7, "stop_finger_velocity": [.05, .05], "initial_fingers": deepcopy(finger_state),
             "observation_policy": {"source": "Explicit synthetic synchronous observer policy",
                 "period_s": simulation.timestep, "maximum_age_s": 0., "required_fields": []},
@@ -1153,7 +1155,7 @@ class ExecutionGuardTests(unittest.TestCase):
                     feedback[field] = feedback[field][::-1]
                 else:
                     feedback[field][2] = np.nan
-                failures = executor._execution_violations(feedback,
+                failures = executor._execution_violations(feedback, q, dq, np.eye(4),
                     limits=limits, binding=binding, finger_state=limits.initial_fingers,
                     expected_sim_time=backend.sim_time)
                 expected = "feedback_identity" if field == "actuator_names" else "nonfinite_feedback"
@@ -1187,7 +1189,7 @@ class ExecutionGuardTests(unittest.TestCase):
         simulation, curve, value = _fixture()
         policy = _limit_values(simulation, curve)
         missing = deepcopy(policy)
-        missing.pop("stop_arm_velocity")
+        missing.pop("arm_position_error")
         with self.assertRaisesRegex(ValueError, "every physical limit"):
             ExecutionLimits.from_mapping(missing)
         timed = deepcopy(policy)
@@ -1210,6 +1212,7 @@ class ExecutionGuardTests(unittest.TestCase):
         curve.events[0]["time"] = 0.
         _bind_fingers(simulation, curve, value)
         limits = _limit_values(simulation, curve)
+        limits["arm_position_error"] = [1e-5]*7
         initial = _initial_feedback(simulation)
 
         def step():
@@ -1234,10 +1237,12 @@ class ExecutionGuardTests(unittest.TestCase):
 
     def test_post_step_failures_retain_actual_sample_and_cannot_advance_to_close(self):
         changes = (
+            ("arm_position_tracking", lambda data: data.qpos.__setitem__(0, .11)),
             ("actual_finger_position", lambda data: data.qpos.__setitem__(7, .025)),
             ("actual_finger_velocity", lambda data: data.qvel.__setitem__(7, .08)),
             ("native_joint_position", lambda data: data.qpos.__setitem__(0, 2.1)),
             ("hardware_joint_velocity", lambda data: data.qvel.__setitem__(0, 1.1)),
+            ("tcp_tracking", lambda data: simulation.scripted_tcp_estimate_offset.__setitem__(0, .01)),
             ("feedback_clock", lambda data: setattr(data, "time", data.time+.002)),
             ("nonfinite_feedback", lambda data: data.qvel.__setitem__(0, np.nan)),
         )
@@ -1955,6 +1960,8 @@ class ActualPoseGoalTests(unittest.TestCase):
         result.execution_binding["goal_identities"] = {"pose_events": [7]}
         result.execution_binding["validation"]["inputs"]["problem"] = deepcopy(result.execution_binding["problem"])
         values = _limit_values(simulation, curve)
+        values["tcp_position_error_m"] = .005
+        values["tcp_rotation_error_rad"] = .02
         return simulation, curve, targets, result, ExecutionLimits.from_mapping(values)
 
     @staticmethod
@@ -1998,33 +2005,12 @@ class ActualPoseGoalTests(unittest.TestCase):
             self.assertFalse(report["continuation"]["requires_rebind"])
             self.assertIn("close", [row["kind"] for row in report["events"]])
 
-    # BEGIN ordinary command-tracking error is diagnostic, not task permission.
-    def test_robot_reference_tracking_error_is_reported_without_stopping(self):
+    def test_robot_reference_tracking_violation_still_stops_execution(self):
         fixture = self.fixture()
         fixture[0].scripted_tcp_estimate_offset[0] = .006
-        report = self.run_trial(fixture)
-        self.assertEqual(report["status"], "curve_finished")
-        self.assertIsNone(report["feedback_failure"])
-        self.assertAlmostEqual(report["tracking_quality"]["maximum_error"]["tcp_position_m"], .006)
-        self.assertIn("close", [row["kind"] for row in report["events"]])
-
-    def test_arm_command_tracking_error_keeps_physical_limits_and_effects(self):
-        fixture = self.fixture()
-        simulation = fixture[0]
-        original_step = simulation._sim.step
-
-        def step():
-            original_step()
-            simulation.native_data.qpos[0] = .11
-            simulation.native_data.qvel[0] = .01
-
-        simulation._sim.step = step
-        report = self.run_trial(fixture)
-        self.assertEqual(report["status"], "curve_finished")
-        self.assertGreater(report["tracking_quality"]["maximum_error"]["arm_position_rad"], .005)
-        self.assertEqual(report["completed_goal_ids"], [])
-        self.assertFalse(report["evidence_passed"])
-    # END tracking quality cannot manufacture independent task effects.
+        report = self.run_trial(fixture, rejects=True)
+        self.assertEqual(report["feedback_failure"]["violations"][0]["kind"], "tcp_tracking")
+        self.assertTrue(report["abort_hold"]["native_ctrl_written"])
 
     def test_posthoc_schedule_preserves_first_plateau_and_strict_native_tick(self):
         from manipulation.execution import pose_goal_schedule
@@ -2136,6 +2122,7 @@ class GraspContactActivationTests(unittest.TestCase):
         result.execution_binding["validation"]["inputs"] = deepcopy({
             key: result.execution_binding[key] for key in ("problem", "scene")})
         values = _limit_values(simulation, curve)
+        values.update(tcp_position_error_m=.005, tcp_rotation_error_rad=.02)
         return simulation, curve, targets, result, ExecutionLimits.from_mapping(values)
 
     @staticmethod
@@ -2639,7 +2626,7 @@ class TrajectoryDeviceBindingTests(unittest.TestCase):
             source.execution_binding["execution_limits"] = deepcopy(old)
             changed = deepcopy(old)
             if change == "physical":
-                changed["stop_arm_velocity"][0] += .001
+                changed["arm_position_error"][0] += .001
             elif change == "required_observation":
                 changed["observation_policy"] = None
             else:
@@ -2756,6 +2743,129 @@ class TrajectoryDeviceBindingTests(unittest.TestCase):
         self.assertNotIn("hold-later", [row["event_id"] for row in report["events"]])
         self.assertEqual(report["completed_goal_ids"], [])
 # END result grading cannot change online control prerequisites or original mathematical goals.
+
+
+# BEGIN task-set enlargement preserves stricter proof and independent tolerances.
+class TaskToleranceRebindingTests(unittest.TestCase):
+    @staticmethod
+    def source_result():
+        simulation, curve, targets = _fixture()
+        result = _result(curve)
+        binding = result.execution_binding
+        goals = [{"progress": progress, "tool_from_function": np.eye(4).tolist(),
+            "target": np.eye(4).tolist(), "position_tolerance_m": .001,
+            "rotation_tolerance_rad": float(np.pi/180),
+            "source": {"skill_id": skill, "kind": kind}, "actual_relation": None}
+            for progress, skill, kind in ((.4, "grasp_instance", "arrival"),
+                (.7, "grasp_instance", "relation"), (1., "manipulation_instance", "functional_goal"))]
+        binding["problem"].update(pose_events=goals, numerical={"position_m": 1e-5})
+        binding["goal_identities"] = {"pose_events": [0, 1, 2]}
+        binding["validation"]["inputs"] = deepcopy({key: binding[key] for key in ("problem", "scene")})
+        binding["execution_limits"] = _limits(simulation, curve).describe()
+        binding["request_ledger"] = {"request_id": "original_request", "requires_continuation": False,
+            "consumed_planning": {"trajectory_solves": 2, "validation_queries": 17},
+            "planning_budget": {"maximum_trajectory_solves": 4},
+            "obligation_contract": {"pose_events": deepcopy(goals)}, "history": []}
+        return simulation, result, targets
+
+    @staticmethod
+    def changes():
+        return [{"goal_id": ["pose_events", index], "position_tolerance_m": .002,
+                 "rotation_tolerance_rad": float(np.pi/180)} for index in (0, 1)]
+
+    def test_selected_task_goals_change_while_old_proof_curve_and_limits_remain(self):
+        from manipulation.execution_binding import check_result, relax_pose_goal_tolerances
+        from recorded_skill_evaluation import _actual_pose_goal
+        from manipulation.planning_problem import PoseEventRequirement
+
+        _, source, _ = self.source_result()
+        original = deepcopy(source.execution_binding)
+        revised = relax_pose_goal_tolerances(source, changes=self.changes(), source="Explicit user task revision")
+        binding = check_result(revised)
+        self.assertEqual(source.execution_binding, original)
+        self.assertIs(revised.trajectory, source.trajectory)
+        for name in ("curve", "scene", "execution_limits"):
+            self.assertEqual(binding[name], original[name])
+        for name in ("inputs", "native", "export"):
+            self.assertEqual(binding["validation"][name], original["validation"][name])
+        self.assertEqual(binding["problem"]["pose_events"][2], original["problem"]["pose_events"][2])
+        self.assertEqual(binding["problem"]["numerical"], original["problem"]["numerical"])
+        self.assertNotEqual(binding["request_ledger"]["request_id"], original["request_ledger"]["request_id"])
+        self.assertEqual(binding["request_ledger"]["consumed_planning"], original["request_ledger"]["consumed_planning"])
+        self.assertEqual(binding["request_ledger"]["planning_budget"], original["request_ledger"]["planning_budget"])
+        pose = np.eye(4); pose[0, 3] = .0015
+        feedback = {"tool_pose": pose, "tool_pose_source": "measured-joint FK", "source": "synthetic FK test",
+            "tool_pose_is_independent_observation": False, "timestamp_s": 1., "feedback_id": "same sample"}
+        old_goal = PoseEventRequirement(**original["problem"]["pose_events"][0])
+        new_goal = PoseEventRequirement(**binding["problem"]["pose_events"][0])
+        self.assertEqual(_actual_pose_goal(old_goal, feedback, None)["value"], "F")
+        self.assertEqual(_actual_pose_goal(new_goal, feedback, None)["value"], "T")
+
+    def test_reject_shrinking_nonfinite_duplicate_unknown_and_unchanged_requests(self):
+        from manipulation.execution_binding import relax_pose_goal_tolerances
+
+        for kind in ("smaller_position", "smaller_angle", "nan", "pi", "boolean", "duplicate", "unknown", "extra", "same"):
+            _, source, _ = self.source_result()
+            changes = self.changes()
+            if kind == "smaller_position": changes[0]["position_tolerance_m"] = .0005
+            elif kind == "smaller_angle": changes[0]["rotation_tolerance_rad"] = .001
+            elif kind == "nan": changes[0]["position_tolerance_m"] = float("nan")
+            elif kind == "pi": changes[0]["rotation_tolerance_rad"] = float(np.pi)
+            elif kind == "boolean": changes[0]["position_tolerance_m"] = True
+            elif kind == "duplicate": changes[1]["goal_id"] = changes[0]["goal_id"]
+            elif kind == "unknown": changes[0]["goal_id"] = ["pose_events", 99]
+            elif kind == "extra": changes[0]["target"] = np.eye(4).tolist()
+            else:
+                for change in changes: change["position_tolerance_m"] = .001
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                relax_pose_goal_tolerances(source, changes=changes, source="Explicit test")
+
+    def test_tampered_geometry_goal_or_ledger_cannot_claim_set_inclusion(self):
+        from manipulation.execution_binding import check_result, relax_pose_goal_tolerances
+
+        for kind in ("target", "numerical", "scene", "other_goal", "spent_budget"):
+            _, source, _ = self.source_result()
+            revised = relax_pose_goal_tolerances(source, changes=self.changes(), source="Explicit test")
+            binding = revised.execution_binding
+            if kind == "target": binding["problem"]["pose_events"][0]["target"][0][3] = .001
+            elif kind == "numerical": binding["problem"]["numerical"]["position_m"] = .002
+            elif kind == "scene": binding["scene"]["source"] = "different geometry"
+            elif kind == "other_goal": binding["problem"]["pose_events"][2]["position_tolerance_m"] = .002
+            else: binding["request_ledger"]["consumed_planning"]["trajectory_solves"] = 0
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                check_result(revised)
+
+    def test_executed_or_already_derived_request_requires_its_own_new_validation(self):
+        from manipulation.execution_binding import relax_pose_goal_tolerances
+
+        for kind in ("physics", "continuation", "completed_goal", "derived"):
+            _, source, _ = self.source_result()
+            if kind == "physics": source.execution_binding["consumed_physics_steps"] = 1
+            elif kind == "continuation": source.execution_binding["request_ledger"]["requires_continuation"] = True
+            elif kind == "completed_goal": source.execution_binding["completed_goal_ids"] = [["pose_events", 0]]
+            else: source = relax_pose_goal_tolerances(source, changes=self.changes(), source="First revision")
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                relax_pose_goal_tolerances(source, changes=self.changes(), source="Explicit test")
+
+    def test_archive_round_trip_and_device_rebinding_retain_original_task_evidence(self):
+        from manipulation.execution_binding import check_result, relax_pose_goal_tolerances
+        from recorded_task_planning import save_curve
+
+        simulation, source, targets = self.source_result()
+        revised = relax_pose_goal_tolerances(source, changes=self.changes(), source="Explicit test")
+        limits = _limits(simulation, source.trajectory)
+        revised = TrajectoryDeviceBindingTests.bind(simulation, revised, targets, limits)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary)/"trajectory.npz"
+            save_curve(path, revised.trajectory, classification="planner_accepted",
+                       execution_limits=limits.describe(), planning_result=revised)
+            restored = load_saved_trajectory(path)
+            check_result(restored)
+            self.assertEqual(restored.execution_binding, revised.execution_binding)
+            np.testing.assert_array_equal(restored.trajectory._curve.c, source.trajectory._curve.c)
+            self.assertEqual(restored.execution_binding["validation"]["inputs"]["problem"]["pose_events"][0]["position_tolerance_m"], .001)
+            self.assertEqual(restored.execution_binding["problem"]["pose_events"][0]["position_tolerance_m"], .002)
+# END a task edit never masquerades as a new solve or controller calibration.
 
 
 if __name__ == "__main__":

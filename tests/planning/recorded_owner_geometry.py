@@ -315,7 +315,7 @@ def bind_box_owner_materials(prepared):
 # END a face identity grants no permission by itself.
 
 
-def create_box_owner(prepared):
+def create_box_owner(prepared, *, contact_voxel_size_m):
     """Bind declared complete cuboids to the shared finite online model."""
     # BEGIN preserve explicit completeness at the serialized input boundary.
     # Loading an external JSON cannot upgrade a partial or undeclared body.
@@ -337,7 +337,8 @@ def create_box_owner(prepared):
             "sphere_indices": list(range(*covers[row["name"]]["sphere_range"])),
             "subdivisions": list(covers[row["name"]]["subdivisions"]),
             "source": prepared["source"]}} for row in prepared["cuboids"]],
-        owner_ids=(prepared["owner_id"],), source=prepared["source"])
+        owner_ids=(prepared["owner_id"],), source=prepared["source"],
+        contact_voxel_size_m=contact_voxel_size_m)
     # END this metadata changes no primitive dimension, pose or analytic query.
     # END no source solid or separate device collision store is reconstructed.
     initial = np.asarray(prepared["initial_pose"], float)

@@ -1,4 +1,4 @@
-"""Bounded constrained-curve integration on a synthetic obstacle-free robot.
+"""Bounded V2 process-manager integration on a synthetic obstacle-free robot.
 
 This is a numerical API test, not a current-scene planning or execution claim.
 It imports the production planner and limits all seed/horizon allocations.
@@ -37,14 +37,15 @@ def no_obstacle_scene(sphere_count, *, hand, installation_owners, geometry_sourc
         reference_frame="robot_base", observation_ids=("declared synthetic empty box",))
     return OnlinePlanningScene(background=empty_background(coverage), owners=installation_owners,
         coverage=coverage, reference_frame="robot_base", robot_sphere_materials=(None,)*sphere_count,
-        robot_geometry_source=geometry_source, gripper=hand)
+        robot_geometry_source=geometry_source, gripper=hand,
+        unknown_policy={"outside_regions": "forbid", "conditional_regions": []})
 # END there is no partial mock of the changing planner/scene interface.
 
 
 def run(output, debug_gradient, initial_joint_velocity=0., *, fixture_path):
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    report = {"scope": "synthetic no-obstacle constrained-curve API integration",
+    report = {"scope": "synthetic no-obstacle process-manager API integration",
               "production_environment_validation": False, "status": "running"}
     try:
         import torch
@@ -117,24 +118,30 @@ def run(output, debug_gradient, initial_joint_velocity=0., *, fixture_path):
             def measured_optimize(planner, seed):
                 result = original_optimize(planner, seed)
                 traces = []
-                # BEGIN inspect the same objective and signed rows solved by SLSQP.
-                # Each seed is one free-control array. No native line-search
-                # particles or independent trajectory metrics exist here.
-                for index, controls in enumerate(seed[0].detach().cpu().numpy()):
-                    evaluated = planner.trajectory_solver.evaluate(controls)
-                    traces.append({"seed_index": index, "objective": evaluated.objective,
-                        "objective_gradient_max": float(np.abs(evaluated.objective_gradient).max()),
-                        "physical_violation": evaluated.violation, "accepted": evaluated.accepted,
-                        "variable_constraints": [{"name": name, "slack": float(value),
-                            "gradient_max": float(np.abs(gradient).max())}
-                            for name, value, gradient in zip(evaluated.names, evaluated.slack, evaluated.jacobian)],
-                        "fixed_constraints": dict(zip(evaluated.fixed_names, evaluated.fixed_slack.tolist())),
-                        "scene": evaluated.scene_report})
-                # END infeasible diagnostic trials retain their actual signed rows.
+                for rollout in planner.trajopt.optimizer_rollouts:
+                    # The live optimizer retains one goal index per line-search
+                    # particle, so diagnostic actions must preserve that axis.
+                    particles = planner.trajopt.optimizer.optimizers[0].config.num_particles
+                    x = seed.detach().reshape(-1, seed.shape[-2], seed.shape[-1]).repeat_interleave(
+                        particles, dim=0).clone().requires_grad_(True)
+                    evaluated = rollout.evaluate_action(x, use_cuda_graph=False)
+                    collection = evaluated.costs_and_constraints
+                    row = {"rollout": rollout.rollout_instance_name,
+                           "manager": type(rollout.constraint_manager).__name__,
+                           "process_mode": rollout.constraint_manager._process_mode,
+                           "terms": {}}
+                    for label, terms in (("cost", collection.costs), ("constraint", collection.constraints)):
+                        for name, value in zip(terms.names, terms.values):
+                            grad = torch.autograd.grad(value.sum(), x, retain_graph=True, allow_unused=True)[0] if value.requires_grad else None
+                            row["terms"][f"{label}:{name}"] = {
+                                "sum": float(value.detach().sum().cpu()),
+                                "requires_grad": value.requires_grad,
+                                "gradient_present": grad is not None,
+                                "gradient_nonfinite": None if grad is None else int((~torch.isfinite(grad)).sum().cpu()),
+                                "finite_gradient_max": None if grad is None else float(torch.nan_to_num(grad).abs().max().cpu())}
+                    traces.append(row)
                 report["gradient_trace"] = traces
-                report["max_control_change"] = max(float(np.abs(
-                    evaluated.actions-controls.detach().cpu().numpy()).max())
-                    for evaluated, controls in zip(result, seed[0]))
+                report["max_control_change"] = float((result.solution.reshape_as(seed)-seed).abs().max().detach().cpu())
                 return result
 
         # A native solve or diagnostic callback may raise. ExitStack restores

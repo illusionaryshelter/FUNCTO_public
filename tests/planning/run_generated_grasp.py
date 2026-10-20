@@ -10,6 +10,7 @@ Only a formal planner-accepted archive can be selected for later execution.
 # BEGIN serial generated-grasp integration with unchanged native validation.
 import argparse
 from copy import deepcopy
+from dataclasses import fields
 import json
 import os
 from pathlib import Path
@@ -81,16 +82,18 @@ def load_inputs(command_path):
             "contacts": json.loads(Path(option(command, "--contact-bindings")).read_text())}
 
 
-# BEGIN generation consumes calibrated robot geometry, not contact-success proofs.
-def tool_inputs(inputs):
-    """Bind the selected native finger materials to the generator tool model.
+def region_inputs(inputs):
+    """Calibrate material geometry only; no invented runtime sphere indices.
 
-    Local interaction declarations identify the participating pads and owner.
-    Their finite feature geometry calibrates the robot profile only; no target
-    patch, gap, normal or existential contact fit is tested here.
+    The existing planner independently binds these same native faces to its
+    actual sphere inventory. The candidate check only needs the finite face,
+    its affine finger motion, the fixed owner patch and mechanical q limits.
+    Numerical tolerances come from ContactRule's existing public defaults;
+    every physical allowance remains the explicit declaration's value.
     """
     import mujoco
     from manipulation.contact_binding import calibrate_box_material_features
+    from manipulation.planning_scene import ContactRule
     from prepare_recorded_task import prepare_candidate
 
     fixture, feedback = inputs["fixture"], inputs["feedback"]
@@ -105,27 +108,78 @@ def tool_inputs(inputs):
                    if row.get("kind") == "grasp_contact_activation"]
     supplied = inputs["contacts"]["grasp_activations"]
     if set(supplied) != {row["condition_id"] for row in activations}:
-        raise ValueError("Every original close requires its explicit interaction bindings")
+        raise ValueError("Every original close requires its explicit finite material bindings")
     selected_ids = {name for names in supplied.values() for name in names}
-    declarations = [row for row in inputs["contacts"]["contacts"] if row["rule_id"] in selected_ids]
-    keys = {"actor", "material_id", "target_owner", "rule_id", "interval", "source"}
+    declarations = [row for row in inputs["contacts"]["contacts"]
+                    if row["rule_id"] in selected_ids]
     if (not selected_ids or {row["rule_id"] for row in declarations} != selected_ids
-            or any(set(row) != keys or row["actor"] != "robot"
+            or any(row.get("actor", "robot") != "robot"
                    or row["target_owner"] != inputs["scene"]["carrier_id"] for row in declarations)):
-        raise ValueError("Interaction declarations must name this robot and selected carrier")
+        raise ValueError("Candidate contact regions must bind this robot and selected carrier")
     model = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
-    calibrated = calibrate_box_material_features(model, tcp_site=fixture["tcp_site"],
+    materials = calibrate_box_material_features(model, tcp_site=fixture["tcp_site"],
         joint_positions=measured, finger_joint_names=feedback["finger_joint_names"],
         material_faces=inputs["contacts"]["material_faces"])
-    selected_materials = sorted({row["material_id"] for row in declarations})
-    return {"materials": [{"material_id": identity, **deepcopy(calibrated[identity])}
-                           for identity in selected_materials],
+    numerical = {field.name: field.default for field in fields(ContactRule)
+                 if field.name in {"numerical_position_tolerance_m", "numerical_angle_tolerance_rad"}}
+    rules = []
+    for declaration in declarations:
+        material = materials[declaration["material_id"]]
+        rule = {**numerical, **deepcopy(declaration), "actor": "robot"}
+        for name in ("feature_kind", "feature_points", "feature_normal", "feature_joint_translation"):
+            if name in declaration:
+                raise ValueError("Material geometry must come from the isolated native robot")
+            rule[name] = material[name]
+        rules.append(rule)
+    # Keep each original close's permission set separate. Two different
+    # activations cannot lend each other material/patch permissions.
+    requirements = []
+    for activation in activations:
+        goal = problem.pose_events[activation["arrival_goal_id"][1]]
+        progress = [float(goal.progress)]
+        if activation["interval"][1] == 1.:
+            progress.append(1.)
+        requirements.append({"condition_id": activation["condition_id"],
+            "activation_event": activation["activation_event"],
+            "rule_ids": list(supplied[activation["condition_id"]]),
+            "goal_progress": sorted(set(progress))})
+    return {"contact_rules": rules, "requirements": requirements,
+            "T_reference_owner": inputs["scene"]["carrier_pose"],
             "finger_position_limits": [model.jnt_range[model.joint(name).id].tolist()
                                        for name in feedback["finger_joint_names"]],
             "finger_joint_names": feedback["finger_joint_names"],
             "source": inputs["contacts"]["source"],
-            "scope": "Known robot geometry calibration only; no target contact or Holding proof"}
-# END target interaction outcomes belong to independent execution observations.
+            "scope": "Fixed declared permission geometry; neither measured target surface nor actual contact"}
+
+
+def check_region(candidate, regions, requirement=None):
+    from manipulation.grasp_region import check_grasp_region_compatibility
+    selected = regions["requirements"] if requirement is None else [requirement]
+    reports = []
+    for item in selected:
+        report = check_grasp_region_compatibility(
+            [rule for rule in regions["contact_rules"] if rule["rule_id"] in item["rule_ids"]],
+            T_reference_tool=np.asarray(candidate["T_reference_tool"]),
+            T_reference_owner=np.asarray(regions["T_reference_owner"]),
+            finger_position_limits=np.asarray(regions["finger_position_limits"]))
+        reports.append({"condition_id": item["condition_id"], **report})
+    states = {row["status"] for row in reports}
+    return {"status": ("contradicted" if "contradicted" in states else
+                       "unresolved" if "unresolved" in states else "compatible"),
+            "requirements": reports, "actual_contact_verified": False}
+
+
+def check_approach(tool_pose, geometry, approach, limit):
+    """Apply only an explicit hard direction to this exact planned tool pose."""
+    if limit is None:
+        return {"status": "not_required"}
+    direction = np.asarray(approach, float)
+    direction /= np.linalg.norm(direction)
+    axis = (np.asarray(tool_pose) @ np.asarray(geometry["T_tool_grasp"]))[:3, 2]
+    axis /= np.linalg.norm(axis)
+    angle = float(np.arctan2(np.linalg.norm(np.cross(axis, direction)), axis @ direction))
+    return {"status": "compatible" if angle <= limit else "contradicted",
+            "angle_rad": angle, "maximum_angle_rad": limit}
 
 
 def generate(args):
@@ -147,11 +201,11 @@ def generate(args):
     # generation consumes only its measured geometry and calibrated transform.
     tool = load_robosuite_panda_tool(tool_id=scene["tool_id"], tool_frame=scene["tool_frame"])
     geometry = tool.grasp_generation_geometry()
-    binding = tool_inputs(inputs)
+    regions = region_inputs(inputs)
     from generated_grasp_tool_binding import validate_tool_binding
     geometry["fixture_binding_check"] = validate_tool_binding(
-        tool, binding["materials"], binding["finger_position_limits"])
-    write_json(args.output / "tool-binding-inputs.json", binding)
+        tool, regions["contact_rules"], regions["finger_position_limits"])
+    write_json(args.output / "region-inputs.json", regions)
     write_json(args.output / "gripper-geometry.json", geometry)
     backend = GraspGenXBackend(checkpoints_dir=args.checkpoints, gripper_geometry=geometry)
     request = GraspGenerationRequest(model_points_reference=points_reference,
@@ -160,10 +214,13 @@ def generate(args):
         approach_reference=None if args.approach is None else np.asarray(args.approach),
         hard_max_approach_angle_rad=args.hard_approach_angle)
     result = generate_grasp_candidates(request, backend, seed=args.seed)
+    for candidate in result["candidates"]:
+        candidate["region_compatibility"] = check_region(candidate, regions)
     result["input_provenance"] = {
         "scene": inputs["candidate"]["scene_path"],
         "visible_owner_point_count": len(points), "body_points_source": scene["body_points_source"],
-        "model_geometry_is_complete": False, "interaction_binding_source": binding["source"], "simulator_object_state_used": False,
+        "model_geometry_is_complete": False, "permitted_region_source": regions["source"],
+        "region_is_observed_segmentation": False, "simulator_object_state_used": False,
         "planning_tested": False, "actual_holding_verified": False}
     write_json(args.output / "generation.json", result)
 
@@ -207,6 +264,57 @@ def candidate_manifest(inputs, candidate, output):
     return path, identity
 
 
+def planned_region_checks(trajectory_path, inputs, regions, *, geometry=None,
+                          approach=None, hard_angle=None):
+    """Check exact planned goal FK without granting execution authorization.
+
+    A planner may choose any member of the original metric/angle allowed set.
+    Checking only the generator's nominal transform therefore is insufficient.
+    The saved cubic and progress map are sampled without fitting or smoothing;
+    only the isolated robot model supplies FK. Finger q remains existential
+    here and is never written into the executed finger trajectory.
+    """
+    import mujoco
+    from manipulation.planning import JointTrajectory, _ProgressMap
+
+    with np.load(trajectory_path, allow_pickle=False) as saved:
+        if str(saved["classification"].item()) != "planner_accepted":
+            raise ValueError("Only a formal planner-accepted curve can reach candidate selection")
+        curve = JointTrajectory(tuple(map(str, saved["joint_names"])), saved["times"].copy(),
+            saved["position"].copy(), saved["velocity"].copy(), saved["progress_u"].copy(),
+            saved["progress_s"].copy(), (), (), {})
+    model = mujoco.MjModel.from_xml_path(inputs["fixture"]["robot_mjcf_path"])
+    data = mujoco.MjData(model)
+    for name, position in zip(inputs["feedback"]["joint_names"], inputs["feedback"]["start_q"]):
+        data.qpos[model.joint(name).qposadr[0]] = position
+    site = model.site(inputs["fixture"]["tcp_site"]).id
+    mujoco.mj_kinematics(model, data)
+    actual = np.eye(4)
+    actual[:3, :3] = data.site_xmat[site].reshape(3, 3)
+    actual[:3, 3] = data.site_xpos[site]
+    if not np.allclose(actual, inputs["feedback"]["eef_pose"], atol=1e-8, rtol=0):
+        raise ValueError("Independent FK must match the original synchronized entrance")
+    mapping = _ProgressMap(curve.progress_u, curve.progress_s)
+    samples = [(u, progress, requirement) for requirement in regions["requirements"]
+               for u, progress in mapping.anchor_parameters(requirement["goal_progress"])]
+    checks = []
+    for u, progress, requirement in samples:
+        query_time = float(u * curve.duration)
+        q = curve.sample(np.array([query_time]))[0][0]
+        for name, position in zip(curve.joint_names, q):
+            data.qpos[model.joint(name).qposadr[0]] = position
+        mujoco.mj_kinematics(model, data)
+        pose = np.eye(4)
+        pose[:3, :3], pose[:3, 3] = data.site_xmat[site].reshape(3, 3), data.site_xpos[site]
+        region = check_region({"T_reference_tool": pose}, regions, requirement)
+        direction = check_approach(pose, geometry, approach, hard_angle)
+        status = "contradicted" if direction["status"] == "contradicted" else region["status"]
+        checks.append({"time_s": query_time, "progress": float(progress),
+                       "T_reference_tool": pose, "region": region,
+                       "approach": direction, "status": status})
+    return checks
+
+
 def planning_outcome(report, diagnostics=None):
     """Separate bounded search rejection from input, runtime and resource errors."""
     if report.get("status") != "completed":
@@ -220,7 +328,7 @@ def planning_outcome(report, diagnostics=None):
     # an unknown error category is an error, never an assumed geometric failure.
     diagnostics = {} if diagnostics is None else diagnostics
     normal_failures = {"no_feasible_solution_found", "cumulative_planning_budget_exhausted",
-                       "deadline_exceeded"}
+                       "deadline_exceeded", "needs_observation", "unknown_space_forbidden"}
     failure = diagnostics.get("failure", report.get("failure"))
     if (failure not in normal_failures or diagnostics.get("error_type") not in
             {None, "PlanningWorkExhausted", "MotionPlanningError"}):
@@ -230,7 +338,7 @@ def planning_outcome(report, diagnostics=None):
 
 def run(args):
     # BEGIN the generator owns one common order; this runner adds no source priority.
-    """Try scored candidates in order until a basic motion candidate is accepted."""
+    """Try scored candidates in order until full planning and region checks accept."""
     # END the exact prior has the same eligibility as every other candidate.
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
@@ -238,7 +346,7 @@ def run(args):
     summary = {"status": "running", "selected": None, "attempts": [],
                "max_candidate_attempts": args.max_candidate_attempts,
                "search_wall_seconds": args.search_wall_seconds,
-               "actual_execution_tested": False, "scope": "Generation and bounded motion attempts; actual grasp success unverified"}
+               "actual_execution_tested": False, "scope": "Generation and full independent grasp planning"}
     try:
         child = [sys.executable, "-u", str(Path(__file__).resolve()), "--generate-only",
                  "--planning-command", str(args.planning_command), "--output", str(args.output),
@@ -253,12 +361,14 @@ def run(args):
         if code != 0:
             raise RuntimeError(f"Candidate generation failed with exit code {code}; see generation.log")
         generation = json.loads((args.output / "generation.json").read_text())
+        regions = json.loads((args.output / "region-inputs.json").read_text())
+        geometry = json.loads((args.output / "gripper-geometry.json").read_text())
         inputs = load_inputs(args.planning_command)
         attempts = 0
         for candidate in generation["candidates"]:
-            # BEGIN generator quality proposes a nominal action, not its effects.
-            # Each attempted target reaches the same bounded motion backend.
-            # END no additional contact-success proof screens accepted motion.
+            # A rejected nominal centre cannot reject the complete original
+            # goal tolerance set. Keep it eligible for the full motion planner,
+            # then check the actual planned arrival member below.
             remaining = deadline - time.monotonic()
             if attempts >= args.max_candidate_attempts or remaining <= 0:
                 summary["status"] = "search_budget_exhausted"
@@ -301,15 +411,23 @@ def run(args):
                 row["failure"] = diagnostics.get("failure")
                 continue
             trajectory = output / "planning" / "planning" / "trajectory.npz"
+            checks = planned_region_checks(trajectory, inputs, regions, geometry=geometry,
+                approach=args.approach, hard_angle=args.hard_approach_angle)
+            write_json(output / "planned-region-checks.json", checks)
             if time.monotonic() >= deadline:
                 summary["status"] = "search_budget_exhausted"
                 break
+            if any(check["status"] == "contradicted" for check in checks):
+                row["status"] = "planned_region_contradiction"
+                continue
+            row["planned_region_status"] = ("compatible" if all(c["status"] == "compatible" for c in checks)
+                                             else "unresolved")
             summary.update(status="planning_accepted", selected={
                 "candidate_id": candidate["candidate_id"], "source": candidate["source"],
                 "quality": candidate["quality"], "trajectory": str(trajectory),
                 "manifest": str(manifest), "scene": str(output / "scene.json"),
                 "T_reference_tool": candidate["T_reference_tool"],
-                "actual_holding_verified": False})
+                "region_status": row["planned_region_status"], "actual_holding_verified": False})
             break
         else:
             summary["status"] = "no_accepted_candidate_in_generated_pool"
@@ -334,10 +452,10 @@ def parser():
     result.add_argument("--seed", type=int, default=0)
     result.add_argument("--max-candidate-attempts", type=int, default=8)
     result.add_argument("--search-wall-seconds", type=float, default=600.)
-    result.add_argument("--max-host-rss-mib", type=int, default=8_000_000_000//1024**2)
-    result.add_argument("--max-device-used-mib", type=int, default=6_000_000_000//1024**2)
+    result.add_argument("--max-host-rss-mib", type=int, default=8192)
+    result.add_argument("--max-device-used-mib", type=int, default=6144)
     result.add_argument("--approach", type=float, nargs=3)
-    result.add_argument("--hard-approach-angle", type=float, help="Explicit generated-candidate angular bound; final motion has no direction-success guarantee")
+    result.add_argument("--hard-approach-angle", type=float, help="Explicit hard angular bound in radians")
     result.add_argument("--generate-only", action="store_true")
     return result
 

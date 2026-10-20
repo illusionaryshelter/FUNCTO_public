@@ -13,6 +13,7 @@ import resource
 import mujoco
 import numpy as np
 
+from manipulation.planning_scene import ContactRule
 from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChecker
 from manipulation.robosuite_execution import RobosuiteExecutionBackend
 
@@ -30,7 +31,7 @@ def _scene(rule):
     identity = np.eye(4).tolist()
     return {
         "reference_frame": "world", "native_geometry_materials": {"pad": "press_face"},
-        "contacts": [rule], "background": {"geometry": {"solids": [], "query_gaps": []}},
+        "contacts": [asdict(rule)], "background": {"geometry": {"solids": [], "query_gaps": []}},
         "owners": [{"owner_id": "target", "source": "explicit static fixture target",
             "geometry_complete": True, "moving": False, "attachments": [], "native_geometry_names": [],
             "pose_interval": [0., 1.], "pose_path": {"progress": [0., 1.], "poses": [identity, identity],
@@ -65,8 +66,7 @@ def test_native_contact_is_permitted_locally_and_actual_state_remains_distinct(t
         NativePrimitive("pad", "arm", "box", (.1, .1, .1), np.eye(4), "native pad dimensions"),
         NativePrimitive("left_pad", "left", "box", (.02, .02, .02), np.eye(4), "native left finger"),
         NativePrimitive("right_pad", "right", "box", (.02, .02, .02), np.eye(4), "native right finger")])
-    contact = dict(required=False, feature_joint_translation=None, feature_kind="polygon",
-        numerical_position_tolerance_m=1e-6, numerical_angle_tolerance_rad=1e-6, rule_id="press", actor="robot", target_owner="target", interval=(0., 1.),
+    contact = ContactRule(rule_id="press", actor="robot", target_owner="target", interval=(0., 1.),
         sphere_indices=(0,), material_id="press_face",
         feature_points=[[-.05, -.05, 0.], [.05, -.05, 0.], [.05, .05, 0.], [-.05, .05, 0.]],
         feature_normal=[0., 0., -1.], patch_origin=[0., 0., 0.], patch_axes=np.eye(3), patch_half_size=[.1, .1],
@@ -234,8 +234,7 @@ def test_complete_solid_empty_intersection_resolves_coal_numerical_boundary(tmp_
         NativePrimitive("pad", "arm", "box", (.01, .01, .1), np.eye(4), "explicit thin audit pad"),
         NativePrimitive("left_pad", "left", "box", (.02, .02, .02), np.eye(4), "explicit audit left finger"),
         NativePrimitive("right_pad", "right", "box", (.02, .02, .02), np.eye(4), "explicit audit right finger")])
-    rule = dict(required=False, feature_joint_translation=None, feature_kind="polygon",
-        numerical_position_tolerance_m=1e-6, numerical_angle_tolerance_rad=1e-6, rule_id="press", actor="robot", target_owner="target", interval=(0., 1.),
+    rule = ContactRule(rule_id="press", actor="robot", target_owner="target", interval=(0., 1.),
         sphere_indices=(0,), material_id="press_face",
         feature_points=[[-.005,-.005,0.],[.005,-.005,0.],[.005,.005,0.],[-.005,.005,0.]],
         feature_normal=[0.,0.,-1.], patch_origin=[0.,0.,0.], patch_axes=np.eye(3), patch_half_size=[.1,.1],

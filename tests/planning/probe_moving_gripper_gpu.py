@@ -136,14 +136,14 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
             {"joint_names": names, "start_q": initial.cpu().numpy(),
              "finger_joint_names": finger_names, "finger_link_names": fixture["finger_link_names"]},
             frame_problem, device=device, position_limits=fixture["position_limits"], fixture=fixture)
-        sphere_indices = geometry["sphere_indices"]
+        sphere_indices, self_pairs = geometry["sphere_indices"], geometry["self_collision_pairs"]
         local_spheres, affine = geometry["local_spheres"], geometry["sphere_joint_translation"]
         installations, installation_report = create_fixed_installation_owners(fixture,
             device_cfg=device, T_output_base=np.eye(4),
             sphere_indices_by_link=geometry["sphere_indices_by_link"])
         report["native_hand"] = {
             "active_joint_names": list(names), "finger_joint_names": list(finger_names),
-            "finger_sphere_indices": list(sphere_indices),
+            "finger_sphere_indices": list(sphere_indices), "enabled_self_collision_pairs": len(self_pairs),
             "joint_limits_m": limits.tolist(), "affine_native_fk_max_error_m": geometry["affine_fk_max_error_m"],
             "drive_coupling_matrix": coupling.tolist(), "drive_coupling_offset": coupling_offset.tolist(),
             "drive_contract": "explicit synthetic equal fraction of the signed mechanical opening ranges",
@@ -178,10 +178,11 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
             current_positions=initial[finger_columns].cpu().numpy(), joint_limits=limits,
             joint_bounds=bounds, coupling_matrix=coupling, coupling_offset=coupling_offset,
             sphere_indices=sphere_indices, local_spheres=local_spheres,
-            sphere_joint_translation=affine,
+            sphere_joint_translation=affine, self_collision_pairs=self_pairs,
             commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id, "occurrence": event.occurrence,
                             "command": event.kind, "progress": event.progress} for event in events),
-            source="explicit synthetic position-tracking drive; geometry calibrated against native source FK")
+            source="explicit synthetic position-tracking drive; geometry calibrated against native source FK",
+            self_collision_geometry=geometry['self_collision_geometry'])
         # BEGIN fixed analytic distance field for the declared distant cuboid.
         background = FrozenPrimitives(primitives=[{"kind": "cuboid", "pose": [0., 0., -1., 1., 0., 0., 0.],
             "dimensions": [.1, .1, .1]}], owner_ids=("synthetic_far_obstacle",),
@@ -189,7 +190,7 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
         # END planning and execution serialize this same field.
         coverage = ObservedSpace(np.ones((81, 81, 81), bool), origin=[-2., -2., -2.], voxel_size=.05,
                                  observation_ids=("explicit synthetic known-space grid",), reference_frame="robot_base")
-        scene = OnlinePlanningScene(background=background, owners=installations, coverage=coverage, reference_frame="robot_base",
+        scene = OnlinePlanningScene(unknown_policy={"outside_regions": "forbid", "conditional_regions": []}, background=background, owners=installations, coverage=coverage, reference_frame="robot_base",
                               robot_sphere_materials=(None,)*kinematics.total_spheres,
                               robot_geometry_source=fixture["robot_geometry_source"],
                               gripper=hand)
@@ -227,9 +228,9 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
         original_export = planner_module._CuroboPlanner.export
         report["candidate_scene_components"] = []
 
-        def measured_export(planner, native_result, native_report):
+        def measured_export(planner, native_result):
             """Inspect the one accepted export without changing its result."""
-            curve, count = original_export(planner, native_result, native_report)
+            curve, count = original_export(planner, native_result)
             times = np.linspace(0., curve.duration, 401)
             # BEGIN the joint sample exposes acceleration before progress.
             coordinates, _, _, progress = curve.sample(times)
@@ -240,7 +241,7 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
                 state = kinematics.compute_kinematics(JointState.from_position(native_q, joint_names=list(names)))
                 tool_p, tool_r = problem.transform_tool_pose(state.tool_poses.position[:, :, tool_index],
                                                             state.tool_poses.quaternion[:, :, tool_index])
-                terms = planner.scene.components(problem.transform_robot_spheres(state.robot_spheres),
+                terms = planner._verification_scene.components(problem.transform_robot_spheres(state.robot_spheres),
                     tool_p, tool_r, native_s, native_q, names, trajectory_time=device.to_device(times)[None])
                 expected = bounds(native_s)[0]
                 report["candidate_scene_components"].append({

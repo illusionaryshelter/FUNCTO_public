@@ -110,8 +110,8 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
             "nominal_scene": {"states": "must not be duplicated into the small summary"}},
         "feedback_failure": {"point": "after_step", "curve_time_s": .002,
             "physical_elapsed_s": .002, "actual_feedback": initial,
-            "violations": [{"kind": "hardware_joint_velocity", "name": "arm_0",
-                "measured": np.float64(1.1), "maximum_absolute": 1.}]},
+            "violations": [{"kind": "arm_position_tracking", "name": "arm_0",
+                "measured": np.float64(.11), "expected": .10002, "maximum_error": .001}]},
         "continuation": {"actual_feedback": initial},
         "large_geometry_diagnostic": "x"*(16*1024**2+1)}
 
@@ -203,8 +203,8 @@ def test_large_generated_report_is_reused_and_primary_error_survives_cleanup(
         "reference_collision_checked": True, "continuous_collision_certified": False,
         "observed_scene_checked": True, "unknown_space_checked": False}
     assert report["feedback_failure_summary"]["first_violation"] == {
-        "kind": "hardware_joint_velocity", "name": "arm_0", "measured": 1.1,
-        "maximum_absolute": 1.}
+        "kind": "arm_position_tracking", "name": "arm_0", "measured": .11,
+        "expected": .10002, "maximum_error": .001}
     assert report["feedback_failure_summary"]["actual_feedback"] == _feedback_json(initial)
     assert report["final_robot_feedback"] == _feedback_json(initial)
     assert bool(report["execution_persistence_errors"]) is archive_write_failure
@@ -376,21 +376,14 @@ def test_partial_video_tick_does_not_invent_peer_frames_or_timestamps():
 # BEGIN generic upstream NumPy booleans survive the executor and every sink.
 @pytest.mark.parametrize("failed_sink", [None, "continuation.json", "physical-trajectory.npz",
                                        "failure-feedback.json", "execution-report.json", "all"])
-def test_numpy_observation_survives_speed_rejection_and_independent_writes(tmp_path, failed_sink):
+def test_numpy_observation_survives_tracking_rejection_and_independent_writes(tmp_path, failed_sink):
     simulation, curve, targets = _fixture()
     initial = _initial_feedback(simulation)
     original_step = simulation._sim.step
-    step_count = 0
 
     def step():
-        nonlocal step_count
         original_step()
-        step_count += 1
-        # BEGIN inject one physical failure, followed by the fixture's stop.
-        # This test covers evidence persistence, not an endlessly overspeeding
-        # plant; a completed hold must retain its original one-step accounting.
-        simulation.native_data.qvel[0] = 1.1 if step_count == 1 else 0.
-        # END the first measured sample still triggers the real hardware guard.
+        simulation.native_data.qpos[0] = .11
 
     def observe(feedback, curve_time):
         # Explicit generic upstream evidence exercises serialization only.
@@ -403,7 +396,7 @@ def test_numpy_observation_survives_speed_rejection_and_independent_writes(tmp_p
 
     simulation._sim.step = step
     executor = _executor(simulation)
-    primary = ExecutionGuardError("original measured hardware speed rejection")
+    primary = ExecutionGuardError("original measured tracking rejection")
     write_error = OSError("injected evidence sink failure")
     attempted = []
     write_text, save_npz = Path.write_text, np.savez_compressed
@@ -426,7 +419,7 @@ def test_numpy_observation_survives_speed_rejection_and_independent_writes(tmp_p
     assert attempted == ["continuation.json", "physical-trajectory.npz", "failure-feedback.json", "execution-report.json"]
     report = executor.last_execution_report
     assert report["feedback_failure"]["point"] == "after_step"
-    assert report["feedback_failure"]["violations"][0]["kind"] == "hardware_joint_velocity"
+    assert report["feedback_failure"]["violations"][0]["kind"] == "arm_position_tracking"
     assert report["executed_steps"] == report["abort_hold"]["physical_steps"] == 1
     assert report["continuation"]["consumed_physics_steps"] == 2
     raw_metrics = report["latest_observation"]["effects"]["test:observed_state"]["metrics"]
@@ -443,7 +436,7 @@ def test_numpy_observation_survives_speed_rejection_and_independent_writes(tmp_p
     if "physical-trajectory.npz" not in failed:
         with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
             assert saved["actual_q"].shape == (2, 9)
-            assert saved["actual_dq"][-1, 0] == 1.1
+            assert saved["actual_q"][-1, 0] == .11
     if "failure-feedback.json" not in failed:
         feedback = json.loads((output/"failure-feedback.json").read_text())
         assert feedback["q"] == report["continuation"]["actual_feedback"]["q"].tolist()

@@ -168,6 +168,103 @@ class RobotStateValidator:
                 if not np.array_equal([named[name] for name in self.finger_joint_names], gripper.current_positions):
                     raise ValueError("Planning fingers must preserve the same measured entrance")
 
+    def check_planning_self(self, joint_positions, joint_names, *, time_s, gripper):
+        """Check all known required native pairs at this one physical instant.
+
+        A positive sphere proxy cost is not consumed here, and a zero sphere
+        cost cannot bypass these solid queries. ``passed`` covers only known
+        geometry; an unmodelled future hand is reported explicitly. Scalar
+        joint limits still apply even when mechanical contact is permitted.
+        """
+        positions, unmodelled = self._planning_positions(
+            joint_positions, joint_names, time_s=time_s, gripper=gripper)
+        unknown = set(unmodelled)
+        pairs = tuple(pair for pair in self.pairs if pair.policy == "required"
+                      and pair.first not in unknown and pair.second not in unknown)
+        result = self.checker.query(joint_names=self.joint_names, joint_positions=positions,
+            T_reference_base=self.T_reference_base, pairs=pairs)
+        violations = [row for row in result["pairs"] if row["relation"] != "separated"]
+        minimum = min(result["pairs"], key=lambda row: row["signed_distance_m"], default=None)
+        # BEGIN admit only the active tensor's exact representation of a limit.
+        # For example float32(.1) lies above the source binary64 upper limit
+        # .1, while naming that same endpoint in the native planner. Keep the
+        # original q for Coal FK and preserve the source-limit discrepancy as
+        # evidence; neither an epsilon nor clipping admits a neighbouring q.
+        # Independently sampled nominal fingers are absent from active_values
+        # and therefore retain the source model's original hard limit check.
+        limits = dict(result["joint_limit_violations"])
+        rounded_limits = []
+        active = np.asarray(joint_positions)
+        if active.dtype.kind == "f":
+            active_values = dict(zip(joint_names, active))
+            for name, row in tuple(limits.items()):
+                boundary = "lower" if row["position"] < row["lower"] else "upper"
+                if (name in active_values
+                        and active_values[name] == np.asarray(row[boundary], dtype=active.dtype)):
+                    rounded_limits.append({"joint_name": name, "input_dtype": str(active.dtype),
+                                           "represented_boundary": boundary, **row})
+                    del limits[name]
+        # END the execution gate and nonendpoint planning states remain strict.
+        passed = not violations and not limits
+        return {"passed": passed, "residual": float(not passed), "queried_pairs": len(pairs),
+                "minimum_required_clearance_m": None if minimum is None else minimum["signed_distance_m"],
+                "unmodelled_geometry_names": list(unmodelled), "violations": violations,
+                "minimum_pair": minimum, "joint_limit_violations": limits,
+                "rounded_limit_representations": rounded_limits,
+                "joint_names": result["joint_names"], "joint_positions": result["joint_positions"]}
+
+    # BEGIN planning world queries own their source geometry and nominal hand contract.
+    def check_planning_world(self, joint_positions, joint_names, *, time_s, gripper,
+                             scene_checker, progress, nominal_owner_poses,
+                             layer_selection, robot_owner_permission_progress):
+        """Check one nominal state against this request's owned source scene.
+
+        The caller has already selected each map layer using the actual native
+        sphere inputs. Its one-state record and candidate owner poses travel
+        unchanged to the planning scene query. The separate checker owns
+        this planning binding; measured execution never binds or queries it.
+        """
+        if not isinstance(scene_checker, RobotGeometryChecker):
+            raise TypeError("Planning world acceptance needs a bound source scene checker")
+        positions, unmodelled = self._planning_positions(
+            joint_positions, joint_names, time_s=time_s, gripper=gripper)
+        unknown = set(unmodelled)
+        # Self acceptance already checks every required robot pair. Scene
+        # aliases additionally retain their exact native pair evidence,
+        # including excluded and mechanical pairs, without querying unrelated
+        # robot pairs twice for every world state.
+        aliases = set(scene_checker._scene_native_aliases.values())
+        pairs = tuple(pair for pair in self.pairs
+                      if (pair.first in aliases or pair.second in aliases)
+                      and pair.first not in unknown and pair.second not in unknown)
+        robot = scene_checker.query(joint_names=self.joint_names, joint_positions=positions,
+            T_reference_base=self.T_reference_base, pairs=pairs, frames=[self.tool_frame])
+        robot["unmodelled_geometry_names"] = unmodelled
+        tool_pose = np.asarray(robot["frame_poses"][self.tool_frame]) @ self.T_frame_tcp
+        fingers = (None if unmodelled else
+                   positions[[self.joint_names.index(name) for name in self.finger_joint_names]])
+        scene = scene_checker.query_scene(robot, tool_pose=tool_pose,
+            progress=float(progress), finger_positions=fingers, state_kind="nominal",
+            nominal_owner_poses=nominal_owner_poses,
+            active_robot_owner_permissions=None,
+            robot_owner_permission_progress=float(robot_owner_permission_progress),
+            layer_selection=layer_selection, layer_selection_index=(0, 0))
+        return {"residual": float(not scene["passed"]), "scene": scene,
+                "unmodelled_geometry_names": list(unmodelled),
+                "joint_names": list(self.joint_names), "joint_positions": positions.tolist()}
+    # END a zero proxy cost never bypasses source world collision or query gaps.
+
+    def planning_binding_record(self):
+        """Freeze the same source geometry, complete pair policy and numerics."""
+        record = self.describe()
+        # BEGIN planning identity retains the complete model pair policy.
+        record["pair_order"] = record.pop("pair_policy")
+        # END the smaller runtime distance layout cannot change model identity.
+        record["model"] = self.checker.model_record()
+        record["scope"] = "complete source robot/installation solids and required/excluded/mechanical pair policy"
+        return record
+    # END planning and execution preserve the same required/excluded/mechanical policy.
+
     def describe(self):
         """Static report defines the order of every per-state distance vector."""
         return {"name": self.name, "source": self.source,
@@ -187,7 +284,7 @@ class RobotStateValidator:
                 # BEGIN FK tolerances compare known models, not Cartesian sensors.
                 "fk_tolerance_scope": "Consistency of known robot models/calibration at the same measured joints; even a 1e-8 tolerance is not physical Cartesian sensing accuracy",
                 "robot_pose_scope": "Fixed calibrated base and TCP FK estimates from measured joint positions; no independent Cartesian observation",
-                # END model consistency is separate from diagnostic command tracking.
+                # END physical tracking and task tolerances keep their own meaning.
                 "scope": "known robot/installation native pair policy, model FK and joint limits",
                 "observed_scene_checked": False, "unknown_space_checked": False,
                 "continuous_collision_certified": False, "world_collision_checked": False}
@@ -199,13 +296,13 @@ class RobotStateValidator:
     def check_state(self, feedback, *, stage, trajectory_time):
         """Gate full actual q, after the executor validates identity and time.
 
-        Clock freshness and measured hardware speed use the execution layer's own
+        Clock freshness and physical tracking use the execution layer's own
         # BEGIN independent models do not manufacture independent measurements.
         guard. This independently checks model-frame identity, joint limits,
         robot solid separation and backend FK versus Pinocchio FK at the same
         measured q. Fixed-base/TCP consistency tolerances, including 1e-8 values,
         are numerical/model requirements, not sensor-accuracy certificates.
-        # END command tracking is diagnostic and cannot veto task attempts.
+        # END original physical tracking limits remain owned by ExecutionLimits.
         No actuator command is read by this function.
         """
         _name(stage, "validation stage")
@@ -292,7 +389,7 @@ class RobotStateValidator:
         # END device tick alignment must not silently shift a contact-rule interval.
         # BEGIN preflight validates actual robot feedback, never frozen world geometry.
         initial = self.check_state(initial_feedback, stage="preflight_actual_state", trajectory_time=float(current_time))
-        # END actual task evidence and command identity belong to the executor.
+        # END task observation and close-arrival gates remain executor responsibilities.
         times = np.asarray(trajectory.times, dtype=float)
         positions, velocities = np.asarray(trajectory.position, dtype=float), np.asarray(trajectory.velocity, dtype=float)
         expected_shape = (len(times), len(self.arm_joint_names))

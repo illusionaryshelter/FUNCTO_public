@@ -87,12 +87,12 @@ def test_shared_calibration_keeps_named_signed_coordinates_and_sphere_order():
     with patch("curobo.kinematics.Kinematics", return_value=native), \
             patch("curobo.kinematics.KinematicsCfg.from_robot_yaml_file", side_effect=lambda value, **kwargs: value), \
             patch("robot_fixture.bind_fixture_gripper_geometry", return_value={'sphere_indices': [1, 0]}), \
-            patch("robot_fixture.bind_fixture_prismatic_proxies", side_effect=lambda fixture, robot, geometry, feedback:
+            patch("robot_fixture.bind_fixture_prismatic_self_geometry", side_effect=lambda fixture, robot, geometry, feedback:
                 {'geometry': [], 'local_spheres': geometry['local_spheres'],
                  'sphere_joint_translation': geometry['sphere_joint_translation'], 'audit': {}}):
         result = calibrate_native_hand(robot, feedback, problem, device=device,
             position_limits={"left": [0., .04], "right": [-.04, 0.]}, fixture={})
-    assert result["sphere_indices"] == (1, 0)
+    assert result["sphere_indices"] == (1, 0) and result["self_collision_pairs"] == ((0, 1),)
     np.testing.assert_allclose(result["current_positions"], [.031, -.022], atol=0., rtol=0.)
     np.testing.assert_allclose(result["local_spheres"][:, 1], [.1, -.1], atol=1e-15)
     np.testing.assert_allclose(result["sphere_joint_translation"][:, 1, :], np.eye(2), atol=1e-15)
@@ -107,7 +107,8 @@ def test_fixed_nominal_hand_preserves_actual_posture_and_original_installation_i
     problem = SimpleNamespace(events=(event,) if with_command else (), base_pose=np.eye(4))
     geometry = {"joint_limits": np.array([[0., .04], [-.04, 0.]]), "sphere_indices": (0, 1),
         "local_spheres": np.array([[0., .1, 0., .01], [0., -.1, 0., .01]]),
-        "sphere_joint_translation": np.zeros((2, 3, 2)),
+        "sphere_joint_translation": np.zeros((2, 3, 2)), "self_collision_pairs": ((0, 1),),
+        "self_collision_geometry": [],
         "native_geometry_binding": {},
         "affine_fk_max_error_m": 0.,
         "sphere_indices_by_link": {"left_link": [0], "right_link": [1], "extra_tool": [2, 3]}}

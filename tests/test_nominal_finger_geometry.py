@@ -13,7 +13,7 @@ from manipulation.gripper_trajectory import (
     FingerTrajectory, NominalFingerGeometry, bind_nominal_finger_geometry,
 )
 from manipulation.planning_problem import event_occurrence_key
-from manipulation.planning_scene import PrismaticGripper
+from manipulation.planning_scene import PlanningScene, PrismaticGripper
 from manipulation.robot_validation import RobotStateValidator
 from test_gripper_trajectory import _arguments
 
@@ -52,7 +52,7 @@ def hand(model, *, command_factory=None, nominal_factory=None):
         coupling_matrix=np.empty((0, 2)), coupling_offset=[], sphere_indices=(0, 1),
         local_spheres=[[0., 0., 0., .001]]*2,
         sphere_joint_translation=[[[1., 0.], [0., 0.], [0., 0.]], [[0., 1.], [0., 0.], [0., 0.]]],
-        commands=(), source="explicit CPU hand", control_timestep_s=.002,
+        self_collision_pairs=(), commands=(), source="explicit CPU hand", control_timestep_s=.002,
         finger_trajectory_factory=command_factory, nominal_finger_trajectory_factory=nominal_factory)
     if nominal_factory is None:
         result.nominal_finger_trajectory = model
@@ -183,6 +183,33 @@ def test_invalid_physical_times_are_not_silently_changed_to_unknown_geometry(inv
         model.valid_mask(invalid)
 
 
+def test_scalar_native_geometry_and_coverage_drop_only_the_expired_samples():
+    reference, _ = command_and_clock()
+    model = NominalFingerGeometry.from_reference(reference, valid_until_s=.1, source="finite fixture")
+    actual_hand = hand(model)
+    gate = object.__new__(RobotStateValidator)
+    gate.joint_names = ("arm", *model.joint_names)
+    gate.arm_joint_names, gate.finger_joint_names = ("arm",), model.joint_names
+    gate.checker = SimpleNamespace(joint_limits={"arm": [-1., 1.], "finger_a": [0., .04],
+        "finger_b": [-.04, 0.]}, geometry_depending_on=lambda names: ("moving_finger_solid",))
+    endpoint = np.float32(.1)
+    queries = np.array([0., endpoint, np.nextafter(endpoint, np.float32(np.inf))], dtype=np.float32)
+    for index, time in enumerate(queries):
+        _, unknown = gate._planning_positions([0.], ("arm",), time_s=time, gripper=actual_hand)
+        assert bool(unknown) == (index == 2)
+    calls = []
+    def check_state(**value):
+        calls.append(value)
+        return {"passed": True}
+    world = object.__new__(PlanningScene)
+    world.gripper = actual_hand
+    world.robot_coverage = SimpleNamespace(_checker=gate.checker, check_state=check_state)
+    time = torch.from_numpy(queries[None])
+    reports = world.check_robot_coverage(torch.zeros((1, 3, 1), dtype=time.dtype), ("arm",), time)
+    assert [row["passed"] for row in reports] == [True, True, False]
+    assert reports[-1]["failure"] == "future_finger_geometry_unbound"
+    assert reports[-1]["attempt_allowed"] is True
+    assert len(calls) == 2
 
 
 def test_cloned_hand_binds_geometry_to_its_own_new_command_reference():

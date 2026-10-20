@@ -111,7 +111,9 @@ def _case_inputs(mode="static"):
     curve = SimpleNamespace(duration=1., sample=lambda time: (np.zeros(1), np.zeros(1), np.zeros(1), 0.))
     case = {"name": "mock_case", "mode": mode, "source_time_s": 0., "order": ["open", "close"]}
     fingers = SimpleNamespace(duration=.012, sample=lambda time: (np.array([.03, -.03]), np.zeros(2)))
-    limits = SimpleNamespace(stop_arm_velocity=[.01], stop_finger_velocity=[.001, .001])
+    limits = SimpleNamespace(stop_arm_velocity=[.01], stop_finger_velocity=[.001, .001],
+        arm_position_error=[.01], arm_velocity_error=[.1], tcp_position_error_m=.005,
+        tcp_rotation_error_rad=.02)
     state = {"position_bounds": [[0., .04], [-.04, 0.]], "maximum_speed": [.2, .2]}
     return curve, case, fingers, limits, {"open": state, "close": state}
 

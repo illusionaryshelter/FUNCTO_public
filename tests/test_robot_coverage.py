@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from manipulation.robot_coverage import CoverageBudgetExceeded, RobotCoverage, _free_rectangles
 from manipulation.robot_geometry_check import NativeSolid, RobotGeometryChecker
-from manipulation.planning_scene import ObservedSpace
+from manipulation.planning_scene import ObservedSpace, PlanningScene
 
 
 URDF = """<robot name="coverage_slides">
@@ -104,6 +104,41 @@ def test_new_volume_in_actual_free_cells_passes_without_baseline_mutation(urdf):
 
 
 # BEGIN scene/oracle evidence identity and cumulative request-budget regressions.
+def test_scene_and_oracle_require_identical_original_free_grid(urdf):
+    from types import SimpleNamespace
+    free = np.ones((7, 7, 7), bool)
+    oracle = build(urdf, free=free, max_queries=1)
+
+    class EmptyQuery:
+        owner_ids = frozenset()
+
+        def clone_for_rollout(self):
+            return EmptyQuery()
+
+    def make_scene(mask, *, origin=(-.3, -.3, -.3), voxel_size=.1, frame="world"):
+        observed = ObservedSpace(mask, origin=origin, voxel_size=voxel_size,
+                                 reference_frame=frame, observation_ids=("current_grid",))
+        return PlanningScene(background=EmptyQuery(), owners=(), coverage=observed,
+            reference_frame="world", robot_sphere_materials=(None,),
+            robot_geometry_source="synthetic native body", has_gripper=False,
+            robot_coverage=oracle)
+
+    world = make_scene(free.copy())
+    changed = free.copy()
+    changed[3, 3, 3] = False
+    for mask, options in ((changed, {}),
+                          (free, {"origin": (np.nextafter(-.3, 0.), -.3, -.3)}),
+                          (free, {"voxel_size": np.nextafter(.1, 1.)})):
+        with pytest.raises(ValueError, match="exact same original free grid"):
+            make_scene(mask, **options)
+    with pytest.raises(ValueError, match="same calibrated frame"):
+        make_scene(free, frame="different_frame")
+
+    first, second = world.clone_for_rollout(), world.clone_for_rollout()
+    assert first.robot_coverage is oracle and second.robot_coverage is oracle
+    assert query(first.robot_coverage, 0., entrance=True)["passed"]
+    exhausted = query(second.robot_coverage, 0., entrance=True)
+    assert not exhausted["passed"] and exhausted["failure"] == "state_query_budget"
 # END cloning a candidate neither widens F nor restarts proof work.
 
 

@@ -63,7 +63,7 @@ def calibrate_native_hand(robot, feedback, problem, *, device, position_limits, 
     import torch
     from curobo.kinematics import Kinematics, KinematicsCfg
     from curobo.types import JointState
-    from robot_fixture import bind_fixture_gripper_geometry, bind_fixture_prismatic_proxies
+    from robot_fixture import bind_fixture_gripper_geometry, bind_fixture_prismatic_self_geometry
 
     unlocked = deepcopy(robot)
     unlocked["robot_cfg"]["kinematics"]["lock_joints"] = None
@@ -119,14 +119,17 @@ def calibrate_native_hand(robot, feedback, problem, *, device, position_limits, 
     error = float(np.max(np.abs(current_local-predicted)))
     if error > 2e-6:
         raise ValueError(f"Native finger geometry is not affine in the declared TCP: {error} m")
+    pairs = native.get_self_collision_config().collision_pairs.cpu().numpy()
+    self_pairs = tuple(tuple(int(i) for i in pair) for pair in pairs if set(pair)&set(indices))
     result = {"joint_names": names, "finger_joint_names": finger_names,
         "current_positions": initial[columns], "joint_limits": limits,
         "sphere_indices": indices, "local_spheres": local_spheres,
-        "sphere_joint_translation": affine,
+        "sphere_joint_translation": affine, "self_collision_pairs": self_pairs,
         "affine_fk_max_error_m": error, "robot_spheres": current,
         "tool_position": p, "tool_quaternion": q,
         "sphere_indices_by_link": indices_by_link}
-    binding = bind_fixture_prismatic_proxies(fixture, robot, result, feedback)
+    binding = bind_fixture_prismatic_self_geometry(fixture, robot, result, feedback)
+    result['self_collision_geometry'] = binding['geometry']
     result['local_spheres'] = binding['local_spheres']
     result['sphere_joint_translation'] = binding['sphere_joint_translation']
     result['native_geometry_binding'] = binding['audit']
@@ -198,8 +201,9 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
         coupling_matrix=np.empty((0, len(fingers))), coupling_offset=np.empty(0),
         sphere_indices=geometry["sphere_indices"], local_spheres=geometry["local_spheres"],
         sphere_joint_translation=geometry["sphere_joint_translation"],
-        commands=commands,
-        source=source, control_timestep_s=control_timestep_s, nominal_finger_trajectory_factory=nominal)
+        self_collision_pairs=geometry["self_collision_pairs"], commands=commands,
+        source=source, control_timestep_s=control_timestep_s, nominal_finger_trajectory_factory=nominal,
+        self_collision_geometry=geometry['self_collision_geometry'])
     original_links = {row["link"] for row in fixture["collision_geometries"]}
     owners, owner_report = create_fixed_installation_owners(fixture, device_cfg=device,
         T_output_base=problem.base_pose, sphere_indices_by_link={name: indices for name, indices in
@@ -217,12 +221,13 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
 def empty_background(coverage):
     """No observed occupied sites inside this explicitly declared free fixture."""
     from manipulation.online_geometry import FrozenESDF
-    # BEGIN this synthetic fixture explicitly declares an empty finite model.
-    # The finite distance cap exceeds the fixture's full grid diagonal. It is
-    # a constructed test input, not a claim inferred from missing observations.
-    distance = 2*np.linalg.norm(np.asarray(coverage.known_free.shape)*coverage.voxel_size)
-    return FrozenESDF(np.full(coverage.known_free.shape, distance, dtype=np.float32),
-        origin=coverage.origin, voxel_size=coverage.voxel_size, owner_ids=('synthetic_background',),
+    # BEGIN the synthetic free fixture explicitly supplies no observed material.
+    from manipulation.online_observed_geometry import FrozenObservedGeometry
+    from manipulation.tsdf_geometry import tsdf_geometry_from_samples
+    empty = tsdf_geometry_from_samples(np.ones((1, 1, 1), np.float32), np.zeros((1, 1, 1), bool),
+        origin=coverage.origin, voxel_size=coverage.voxel_size, name='empty', source='synthetic empty source')
+    return FrozenESDF.from_source(FrozenObservedGeometry(empty['solids'][0]),
+        origin=coverage.origin, shape=coverage.known_free.shape, voxel_size=coverage.voxel_size, owner_ids=(),
         source="declared synthetic empty background; no recorded observation claim")
-    # END no parallel source-solid world is needed to test native planning.
+    # END neither an arbitrary field value nor coverage mask creates a solid.
 # END physical unknown-space policy remains the separate finite coverage grid.

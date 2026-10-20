@@ -212,10 +212,7 @@ class ExecutionLimits:
     bounds describe permitted *actual* positions after each original event;
     targets may lie outside them when contact prevents complete closure. These
     intervals are runtime protection limits, never a planning geometry sweep.
-    # BEGIN TaskFlux attempts keep physical limits separate from tracking quality.
-    Arm/TCP command tracking is recorded as diagnostic error, not an execution
-    permission. Actual hardware limits and explicitly required stops remain.
-    # END ordinary tracking cannot certify or reject a task effect.
+    One arm/TCP tracking band applies to the path and to command-event gates.
     Event times are owned exclusively by ``JointTrajectory``.
     """
 
@@ -223,6 +220,10 @@ class ExecutionLimits:
     joint_names: tuple[str, ...]
     arm_joint_names: tuple[str, ...]
     finger_joint_names: tuple[str, ...]
+    arm_position_error: object
+    arm_velocity_error: object
+    tcp_position_error_m: float
+    tcp_rotation_error_rad: float
     stop_arm_velocity: object
     # BEGIN whole-device stop confirmation uses a declared hand criterion.
     stop_finger_velocity: object
@@ -245,7 +246,7 @@ class ExecutionLimits:
             object.__setattr__(self, field, tuple(value))
         if self.joint_names != self.arm_joint_names + self.finger_joint_names:
             raise ValueError("Execution arm and fingers must partition the complete named robot order")
-        for field in ("stop_arm_velocity",):
+        for field in ("arm_position_error", "arm_velocity_error", "stop_arm_velocity"):
             value = _finite_array(getattr(self, field), (len(self.arm_joint_names),), field, nonnegative=True)
             object.__setattr__(self, field, value.tolist())
         # BEGIN explicit measured finger stop threshold in named joint order.
@@ -253,6 +254,12 @@ class ExecutionLimits:
                                     "stop_finger_velocity", nonnegative=True)
         object.__setattr__(self, "stop_finger_velocity", finger_stop.tolist())
         # END no stopping tolerance is inferred from allowed path velocity.
+        tcp = _finite_array([self.tcp_position_error_m, self.tcp_rotation_error_rad], (2,),
+                            "Physical TCP tracking tolerances", nonnegative=True)
+        if tcp[1] > np.pi:
+            raise ValueError("A TCP angular tracking tolerance cannot exceed pi radians")
+        object.__setattr__(self, "tcp_position_error_m", float(tcp[0]))
+        object.__setattr__(self, "tcp_rotation_error_rad", float(tcp[1]))
 
         def finger_bounds(row, *, event):
             keys = {"position_bounds", "maximum_speed"}
@@ -501,7 +508,8 @@ class TrajectoryExecutor:
                 "violations": [{"kind": "geometry_checker_error",
                 "name": self.geometry_checker.name, "measured": f"{type(error).__name__}: {error}"}]}
 
-    def _execution_violations(self, feedback, *, limits, binding, finger_state, expected_sim_time,
+    def _execution_violations(self, feedback, reference_q, reference_dq, reference_tcp,
+                              *, limits, binding, finger_state, expected_sim_time,
                               require_stop=False):
         """Return explicit named violations; neither clip nor repair feedback."""
         backend = self.backend
@@ -546,7 +554,7 @@ class TrajectoryExecutor:
             actual[field] = value
             for index in np.flatnonzero(~np.isfinite(value)):
                 add("nonfinite_feedback", f"{field}:{names[index]}", float(value[index]))
-        # END only physical position/speed and explicit stop limits can reject.
+        # END physical position, speed and tracking limits remain unchanged.
         pose = np.asarray(feedback.get("tool_pose"), dtype=float)
         if (pose.shape != (4, 4) or not np.isfinite(pose).all()
                 or not np.allclose(pose[3], [0., 0., 0., 1.], atol=1e-9, rtol=0)
@@ -565,6 +573,12 @@ class TrajectoryExecutor:
             add("hardware_joint_velocity", backend.joint_names[index], float(dq[index]),
                 maximum_absolute=float(speed[index]))
         narm = len(backend.arm_joint_names)
+        for field, measured, expected, threshold in (
+                ("arm_position_tracking", q[:narm], reference_q, np.asarray(limits.arm_position_error)),
+                ("arm_velocity_tracking", dq[:narm], reference_dq, np.asarray(limits.arm_velocity_error))):
+            for index in np.flatnonzero(np.abs(measured-expected) > threshold):
+                add(field, backend.arm_joint_names[index], float(measured[index]),
+                    expected=float(expected[index]), maximum_error=float(threshold[index]))
         if require_stop:
             threshold = np.asarray(limits.stop_arm_velocity)
             for index in np.flatnonzero(np.abs(dq[:narm]) > threshold):
@@ -578,10 +592,17 @@ class TrajectoryExecutor:
         for index in np.flatnonzero(np.abs(dq[narm:]) > finger_speed):
             add("actual_finger_velocity", backend.finger_joint_names[index], float(dq[narm+index]),
                 maximum_absolute=float(finger_speed[index]))
-        # BEGIN nominal tracking has no veto in the physical guard.
-        # Valid feedback can differ from the commanded arm/TCP. The caller
-        # records that quality separately; task effects need their own evidence.
-        # END no reference target or commanded pose is needed by this guard.
+        # BEGIN robot-model tracking uses measured q versus commanded q only.
+        # Both TCP transforms use the same calibrated robot FK. This detects
+        # deviation from the robot command, not physical target accuracy. Never
+        # replace reference_tcp with a perceived/GT target or a pose-event goal.
+        position_error = float(np.linalg.norm(pose[:3, 3]-reference_tcp[:3, 3]))
+        rotation_error = float(Rotation.from_matrix(reference_tcp[:3, :3].T @ pose[:3, :3]).magnitude())
+        for field, error, bound in (("tcp_position_m", position_error, limits.tcp_position_error_m),
+                                    ("tcp_rotation_rad", rotation_error, limits.tcp_rotation_error_rad)):
+            if error > bound:
+                add("tcp_tracking", field, error, maximum_error=bound)
+        # END target-relative position/orientation remains simulation posthoc only.
         return failures
 
 
@@ -993,7 +1014,9 @@ class TrajectoryExecutor:
         # These records are part of the already validated formal scene/problem;
         # neither a task name nor a close command invents a target or a pair.
         contact_bindings = {}
-        # BEGIN local interaction identities share the frozen problem/scene binding.
+        if binding["scene"].get("robot_owner_permissions"):
+            raise ValueError("Online execution requires finite material rules, not robot-owner pair exemptions")
+        # BEGIN finite material gates share the frozen problem/scene binding.
         from .planning_scene import grasp_contact_rule_ids, validate_grasp_contact_arrival
         finite_conditions = [row for row in binding["problem"].get("conditions", ())
             if row.get("kind") == "grasp_contact_activation" and "contact_rule_ids" in row]
@@ -1744,29 +1767,9 @@ class TrajectoryExecutor:
             requires_stop = (bool(event.get("stop", False)) if event is not None else
                              bool(barrier is not None and barrier.get("stop", False)
                                   and abs(curve_time-stop) <= 1e-12))
-            failures = self._execution_violations(feedback,
+            failures = self._execution_violations(feedback, reference_q, reference_dq, reference_tcp,
                 limits=execution_limits, binding=limit_binding, finger_state=finger_state,
                 expected_sim_time=sim_start+physical_elapsed, require_stop=requires_stop)
-            # BEGIN report ordinary command tracking without another stop gate.
-            # These errors compare encoder-derived robot state with the issued
-            # command. They never compare against a perceived or simulated goal.
-            # A malformed/physically rejected sample remains in feedback_failure;
-            # it is not coerced into a finite quality measurement here.
-            if not failures:
-                pose = np.asarray(feedback["tool_pose"], dtype=float)
-                values = {
-                    "arm_position_rad": float(np.max(np.abs(np.asarray(feedback["q"])[:narm]-reference_q))),
-                    "arm_velocity_rad_s": float(np.max(np.abs(np.asarray(feedback["dq"])[:narm]-reference_dq))),
-                    "tcp_position_m": float(np.linalg.norm(pose[:3, 3]-reference_tcp[:3, 3])),
-                    "tcp_rotation_rad": float(Rotation.from_matrix(reference_tcp[:3, :3].T @ pose[:3, :3]).magnitude()),
-                }
-                quality = report.setdefault("tracking_quality", {
-                    "scope": "valid physical-feedback checks against the robot command; not task success",
-                    "checks": 0, "maximum_error": dict.fromkeys(values, 0.)})
-                quality["checks"] += 1
-                for name, value in values.items():
-                    quality["maximum_error"][name] = max(quality["maximum_error"][name], value)
-            # END tracking quality has no threshold or execution permission.
             # BEGIN task dependency validity is independent of frozen world geometry.
             current_evidence = observation
             if float(feedback["timestamp_s"]) == float(initial_feedback["timestamp_s"]):
@@ -1962,7 +1965,8 @@ class TrajectoryExecutor:
                 and event_occurrence_key(entry_commands[-1]) in contact_bindings else None)
             if entry_close is not None:
                 preflight_feedback = samples[-1]["feedback"]
-                failures = self._execution_violations(preflight_feedback,
+                reference_tcp = backend.reference_tool_pose(q)
+                failures = self._execution_violations(preflight_feedback, q, dq, reference_tcp,
                     limits=execution_limits, binding=limit_binding, finger_state=finger_state,
                     expected_sim_time=sim_start, require_stop=bool(entry_close.get("stop", False)))
                 check_close_binding(preflight_feedback,

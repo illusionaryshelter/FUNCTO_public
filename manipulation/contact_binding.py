@@ -157,28 +157,49 @@ def calibrate_box_material_features(model, *, tcp_site, joint_positions,
         for index, row in enumerate(declarations)}
 
 
-# BEGIN bind only a material's existing sphere identity to an interaction pair.
 def build_material_contact_rules(material_binding, declarations):
-    """Resolve named calibrated materials into small ordinary-contact rules.
+    """Combine calibrated material with explicit owner-local permissions.
 
-    Declarations name a current actor, target and stage. Material selection
-    supplies sphere indices; no patch, gap, normal or success proof is input.
-    Old precise-contact records fail explicitly rather than silently widening.
+    The target patch and every physical allowance come from the caller's
+    declared observation/model evidence. They are never inferred from the
+    robot material, a collision failure, or a desired grasp outcome.
     """
     result = []
-    fields = {'rule_id', 'actor', 'target_owner', 'interval', 'material_id', 'source'}
+    feature_fields = ("sphere_indices", "feature_kind", "feature_points", "feature_normal", "feature_joint_translation")
     for declaration in declarations:
-        if not isinstance(declaration, dict) or set(declaration) != fields:
-            raise ValueError('Interaction declarations require rule_id, actor, target_owner, interval, material_id and source')
-        actor = declaration['actor']
-        materials = (material_binding['materials'] if actor == 'robot' else
-                     material_binding.get('owner_materials', {}).get(actor, {}))
-        material = materials.get(declaration['material_id'])
-        if material is None:
-            raise ValueError('Interaction material must belong to its named actor')
-        result.append(ContactRule(rule_id=declaration['rule_id'], actor=actor,
-            target_owner=declaration['target_owner'], interval=declaration['interval'],
-            sphere_indices=tuple(material['sphere_indices']),
-            source=f"{declaration['source']}; calibrated material: {material['source']}"))
+        row = dict(declaration)
+        # BEGIN select the actor's exact native material without sharing identities.
+        # Rigid-owner features are expressed in that owner's coordinates. Their
+        # sphere indices refer to its own complete cover, never robot indices.
+        actor = row.setdefault("actor", "robot")
+        materials = (material_binding["materials"] if actor == "robot" else
+                     material_binding.get("owner_materials", {}).get(actor, {}))
+        if row["material_id"] not in materials:
+            raise ValueError("Contact material must belong to its explicitly bound actor")
+        material = materials[row["material_id"]]
+        if any(name in row for name in (*feature_fields, "online_material")):
+            raise ValueError("Material geometry must come from its native binding")
+        # END caller declarations only set the finite target patch and allowance.
+        for name in feature_fields:
+            row[name] = material[name]
+        row["sphere_indices"] = tuple(row["sphere_indices"])
+        # BEGIN bind online native capability only through its actor's source proof.
+        if "online_material" in material:
+            model = deepcopy(material["online_material"])
+            # Robot covers retain their calibrated certificate. Complete rigid
+            # owners carry their independently declared Cartesian box-cell
+            # proof; neither actor borrows the other's native geometry names.
+            sphere_source = (material.get("cover_certificate_path") if actor == "robot"
+                             else material.get("sphere_binding_source"))
+            if not isinstance(sphere_source, str) or not sphere_source.strip():
+                raise ValueError("Online native material requires its verified collision-sphere cover binding")
+            model.update(sphere_indices=list(row["sphere_indices"]),
+                         sphere_binding_source=sphere_source)
+            row["online_material"] = model
+        # END source-audit features without capability remain audit-only.
+        if row["minimum_thickness_m"] > material["native_thickness_m"]:
+            raise ValueError("Contact thin-part scale must also respect the native material thickness")
+        row["source"] = f"{row['source']}; native material: {material['source']}"
+        result.append(ContactRule(**row))
     return tuple(result)
-# END bind only a material's existing sphere identity to an interaction pair.
+# END material identity does not grant whole-link or whole-owner exemptions.

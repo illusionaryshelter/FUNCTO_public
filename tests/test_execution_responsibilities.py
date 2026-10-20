@@ -9,6 +9,7 @@ import pytest
 from manipulation.execution import (_holding_dependency_violations, ExecutionGuardError,
     ExecutionLimits, FixedFingerTargets, TrajectoryExecutor)
 from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
+from manipulation.online_native_confirmation import NativeCollisionConfirmation
 from test_recorded_simulation import (_GeometryChecker, _bind_fingers, _execute_bound, _fixture,
     _initial_feedback, _limit_values, _result)
 
@@ -37,6 +38,7 @@ def test_actual_execution_never_queries_frozen_fields_or_reuses_entrance_holding
     monkeypatch.setattr(FrozenESDF, "signed_distance", forbidden)
     monkeypatch.setattr(OnlinePlanningScene, "from_binding", forbidden)
     monkeypatch.setattr(OnlinePlanningScene, "query_state", forbidden)
+    monkeypatch.setattr(NativeCollisionConfirmation, "confirm", forbidden)
     simulation, curve, targets = _fixture()
     if mode != "false_dependency":
         curve.events[2].update(kind="effect", requires_evidence=None, stop=False)

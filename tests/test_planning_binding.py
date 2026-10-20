@@ -1,6 +1,6 @@
-# BEGIN tests migrated to native motion attempts and retained numerical contracts.
 """CPU checks of source timing, activation and functional IK goal proposals."""
 
+# BEGIN frozen binding and target generation contracts independent of CUDA.
 from types import SimpleNamespace
 from dataclasses import asdict, replace
 from copy import deepcopy
@@ -13,8 +13,9 @@ import torch
 from manipulation.planning import (PlanningBudget, _CuroboPlanner, _ProgressMap,
     ContinuationBindingError, _bind_event_clock, _initial_timing,
     _prepare_continuation, _continuation_timing, _fixed_spline_grid,
-    _ompl_stage,
+    _ompl_stage, _scene_boundary_evaluate, _timed_native_state,
     _progress_for_cubic_boundaries)
+from manipulation.planning_ik import rank_ik_candidates
 from manipulation.planning_problem import (MotionPhase, PlanningEvent, PlanningProblem,
                                           PosePath, PoseEventRequirement)
 
@@ -35,6 +36,7 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertLessEqual(budget.maximum_trajectory_dt, PlanningBudget().maximum_trajectory_dt)
         self.assertNotEqual(budget.maximum_trajectory_dt, PlanningBudget().maximum_trajectory_dt)
 
+    # BEGIN source duration owns timing; output spacing cannot stretch it to 16 seconds.
     def test_source_duration_selects_exact_dense_grid_within_existing_capacity(self):
         original = PlanningBudget(knots=16, interpolation_buffer_size=768)
         problem = self.problem(source_times=(0., 4., 9.850000000000293))
@@ -69,14 +71,18 @@ class PlanningBindingTest(unittest.TestCase):
                 self.assertEqual(capped.maximum_trajectory_dt, .125)
 
     def test_selected_source_clock_binds_native_events_and_timed_fingers_together(self):
-        from manipulation.planning import JointTrajectory
+        from curobo._src.types.control_space import ControlSpace
+        from manipulation.planning import JointTrajectory, _formal_native_clock
         from manipulation.planning_scene import PrismaticGripper
 
         event = PlanningEvent("close", "current", .8, 183, "close", "transferred reference command")
         problem = self.problem((event,), source_times=(0., 9.15, 9.85), source_progress=(0., .8, 1.))
         budget, mapping = _initial_timing(problem, PlanningBudget(knots=16, interpolation_buffer_size=768))
-        grid = _fixed_spline_grid(intervals=budget.knots+4, native_dt=budget.maximum_trajectory_dt,
-            interpolation_steps=budget.interpolation_steps, interpolation_dt=budget.interpolation_dt)
+        native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=budget.maximum_trajectory_dt,
+            maximum_trajectory_dt=budget.maximum_trajectory_dt, interpolation_dt=budget.interpolation_dt),
+            interpolation_steps=budget.interpolation_steps, action_horizon=budget.knots+2,
+            transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3))
+        grid = _formal_native_clock(native)
         mapping, _ = _progress_for_cubic_boundaries(mapping, budget.knots,
             stop_progress=problem.stop_progress, anchors=problem.anchors)
         mapping = _bind_event_clock(problem, mapping, grid["duration"], .002)
@@ -87,17 +93,19 @@ class PlanningBindingTest(unittest.TestCase):
             return JointTrajectory(("finger",), np.array([0., duration]), np.full((2, 1), .04),
                 np.zeros((2, 1)), progress_map.u, progress_map.s, (), (), {})
 
+        # BEGIN geometry explicitly declares this constant fixture's clock scope.
         def geometry(duration, progress_map, command_reference):
             from manipulation.gripper_trajectory import NominalFingerGeometry
             return NominalFingerGeometry.from_reference(command_reference,
                 valid_until_s=duration, source="explicit whole-clock constant fixture")
+        # END matching command times alone do not authorize nominal geometry.
 
         hand = PrismaticGripper(controller="timed_reference", control_timestep_s=.002,
             joint_names=("finger",), current_positions=[.04], joint_limits=[[0., .04]], joint_bounds=None,
             finger_trajectory_factory=fingers, nominal_finger_trajectory_factory=geometry,
             coupling_matrix=np.empty((0, 1)), coupling_offset=[], sphere_indices=(0,),
             local_spheres=[[0., 0., 0., .001]], sphere_joint_translation=[[[1.], [0.], [0.]]],
-            commands=[{"skill_id": "current", "event_id": "close", "occurrence": 0,
+            self_collision_pairs=(), commands=[{"skill_id": "current", "event_id": "close", "occurrence": 0,
                 "command": "close", "progress": .8}], source="explicit CPU clock contract")
         hand.bind_clock(grid["duration"], mapping)
         self.assertTrue(all(duration == grid["duration"] and actual_map is mapping for duration, actual_map in seen))
@@ -108,6 +116,7 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertEqual(record["activation_time_s"], record["bound_activation_step"]*.002)
         self.assertEqual(grid["duration"], (grid["valid_count"]-1)*grid["interpolation_dt"])
         self.assertEqual(grid["duration"], (budget.knots+4)*budget.interpolation_steps*grid["native_dt"])
+    # END no extra retiming optimizer or relaxed interpolation equality is introduced.
 
     def test_command_goal_query_uses_activation_and_keeps_intent_separate(self):
         event = PlanningEvent("close", "current", .5, 10, "close", "source close")
@@ -141,8 +150,57 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertEqual(warped.s[-1], 1.)
         self.assertFalse(np.any(warped.s < .4))
 
+    # BEGIN true goals guide IK while every trajectory goal keeps its original owner.
+    def test_functional_ik_goal_uses_actual_target_in_native_link_coordinates(self):
+        problem = self.problem()
+        target = np.eye(4); target[0, 3] = .8
+        function = np.eye(4); function[0, 3] = .1
+        goal = PoseEventRequirement(.5, function, target, .01, .02, "true goal")
+        problem.pose_events = (goal,)
+        planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.problem, planner.torch = problem, torch
+        planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+        planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float32))
+        planner.GoalToolPose = SimpleNamespace
+        native = planner._functional_goal(goal)
+        np.testing.assert_allclose(native.position.numpy().reshape(3), [.7, 0., 0.], atol=1e-7)
+        # Changing the reference path cannot move the actual native goal.
+        problem.phases[0].reference.poses[:, 0, 3] = -.8
+        torch.testing.assert_close(planner._functional_goal(goal).position, native.position)
+        goal.target[0, 3] = .5
+        self.assertAlmostEqual(float(planner._functional_goal(goal).position.flatten()[0]), .4, places=6)
+        planner.progress_map = _ProgressMap(np.array([0., .8, 1.]), np.array([0., 1., 1.]))
+        torch.testing.assert_close(planner._functional_goal(goal).position,
+                                   torch.tensor([[[[[.4, 0., 0.]]]]]))
 
+    def test_nonfinite_single_ik_seed_does_not_hide_a_valid_success(self):
+        candidates = np.array([[np.nan, 0.], [1., 2.], [3., 4.]])
+        selected = rank_ik_candidates(candidates,
+            [{"task_satisfied": flag, "model_valid": flag, "native_pose_ik_success": flag}
+             for flag in [True, True, False]],
+            np.array([[0., 0.]]), count=1, joint_tolerance=1e-6, query_kind="reference")
+        np.testing.assert_array_equal(selected, [1])
 
+    def test_structural_routes_bind_real_terminal_pose_or_no_pose_goal(self):
+        planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner.problem = self.problem()
+        target = PoseEventRequirement(1., np.eye(4), np.eye(4), .001, .02, "goal")
+        planner.problem.pose_events = (target,)
+        planner.scene = SimpleNamespace(contacts=())
+        planner.trajopt = SimpleNamespace(disable_tool_pose_tracking=Mock(),
+            enable_tool_pose_tracking=Mock(), disable_joint_position_tracking=Mock())
+        goal = SimpleNamespace(tool_frames=["tool"])
+        planner._functional_goal = Mock(return_value=goal)
+        _, bound = planner._native_request(torch.zeros((1, 1, 4, 1)))
+        self.assertIs(bound, goal)
+        planner._functional_goal.assert_called_once_with(target)
+        self.assertEqual(planner.route, "native_pose")
+        planner.problem.pose_events = ()
+        _, bound = planner._native_request(torch.zeros((1, 1, 4, 1)))
+        self.assertIsNone(bound)
+        self.assertEqual(planner.route, "constrained")
+        planner.trajopt.disable_tool_pose_tracking.assert_called_once()
+    # END full functional tolerances are checked by typed process residuals only.
 
     def test_dependency_boundary_inside_reference_interval_uses_device_tick(self):
         event = PlanningEvent("effect", "current", .37, 1, "verify", "dependency",
@@ -177,7 +235,9 @@ class PlanningBindingTest(unittest.TestCase):
                         "ik_queries": 24, "search_queries": 0, "validation_passes": 2, "validation_queries": 20,
                         "trajectory_solves": 2, "search_seconds": .7, "planning_seconds": 1.},
                     "physics_budget": 1000, "consumed_physics_steps": 100,
+                    # BEGIN a real continuation retains all original task geometry.
                     "problem": plain(problem),
+                    # END pose completion is checked against this frozen binding.
                     "curve": {"duration": 1., "progress_u": [0., .5, 1.],
                               "progress_s": [0., .8, 1.], "events": rows, "executable_until": 1.}}
         from manipulation.planning import _request_work_ledger
@@ -187,7 +247,9 @@ class PlanningBindingTest(unittest.TestCase):
         return {"candidate_id": "candidate", "original_binding": original,
                 "physics_budget": 1000, "cumulative_physics_steps": 100+local_steps,
                 "remaining_physics_steps": 900-local_steps, "consumed_physics_steps": local_steps,
+                # BEGIN successful synthetic native steps have an explicit exact clock.
                 "confirmed_physics_steps": local_steps, "step_accounting_exact": True,
+                # END charges alone cannot advance a continuation's original time.
                 "device_timestep_s": timestep,
                 "actual_feedback": {"joint_names": ["q"], "q": [0.], "dq": [0.]},
                 "elapsed_physical_s": elapsed,
@@ -214,6 +276,7 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertEqual(mapping.event_clock[("current", "close", 0)]["activation_time_s"], .65)
         self.assertEqual(mapping.event_clock[("current", "close", 0)]["request_intent_time_s"], .9)
 
+    # BEGIN resource changes coexist with an older frozen execution binding.
     def test_continuation_resource_change_retains_original_work_and_physics(self):
         from manipulation.planning import plan_trajectory
 
@@ -248,7 +311,9 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertEqual(second.request_ledger["original_events"], original["original_binding"]["request_ledger"]["original_events"])
         self.assertEqual(second.request_ledger["binding_records"][:len(first.request_ledger["binding_records"])],
             first.request_ledger["binding_records"])
+    # END resource changes cannot manufacture new physical time or solver work.
 
+    # BEGIN a paid but stationary attempt never advances the physical clock.
     def test_continuation_separates_charges_from_exact_confirmed_steps(self):
         request = self.problem((PlanningEvent("close", "current", .9, 1, "close", "task"),))
         retained = self.continuation(request, elapsed=0.)
@@ -263,6 +328,7 @@ class PlanningBindingTest(unittest.TestCase):
             changed = deepcopy(retained); changed[key] = value
             with self.subTest(key=key, value=value), self.assertRaises(ContinuationBindingError):
                 _prepare_continuation(deepcopy(request), SimpleNamespace(gripper=None), None, changed)
+    # END an unknown count cannot masquerade as an exact zero-step continuation.
 
     def test_continuation_never_replays_applied_events_or_guesses_past_effects(self):
         events = (PlanningEvent("earlier", "current", .1, 1, "close", "task"),
@@ -293,6 +359,7 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertEqual(prior["effects"]["Holding"]["value"], "U")
         self.assertEqual(prior["consumed_events"], [("current", "observe", 0)])
 
+    # BEGIN past nominal pose anchors never require online target truth.
     def test_continuation_keeps_future_pose_anchors_without_claiming_past_success(self):
         for claimed in (False, True):
             problem = self.problem()
@@ -324,6 +391,7 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertEqual(_verified_completed_goals(continuation, continuation["original_binding"],
             {("pose_events", 7)}, elapsed=continuation["elapsed_physical_s"],
             curve_elapsed=continuation["last_curve_time_s"]), set())
+    # END independent non-pose effects retain their separate evidence requirements.
 
     def test_continuation_cannot_reset_budget_actual_or_event_identity(self):
         for mutation, message in (("budget", "cannot reset"), ("actual", "Fresh planning actual"),
@@ -360,25 +428,86 @@ class PlanningBindingTest(unittest.TestCase):
         with self.assertRaisesRegex(ContinuationBindingError, "physics-step budget is exhausted"):
             _prepare_continuation(problem, SimpleNamespace(gripper=None), None, continuation)
 
-    def test_native_ompl_returns_a_bounded_ordinary_joint_connection(self):
+    def test_native_ompl_connector_checks_crossed_event_time_and_progress_plateau(self):
         checked = []
+        mapping = _ProgressMap(np.array([0., .3, .7, 1.]), np.array([0., .5, .5, 1.]))
         def valid(state):
             checked.append(state.copy())
             return True
         path, report = _ompl_stage(np.array([0., 0.]), np.array([1., 1.]),
-            np.array([-2., -2.]), np.array([2., 2.]), valid,
-            step=.2, seconds=1., sample_limit=256)
+            np.array([-2., 0.]), np.array([2., 1.]), valid,
+            lambda state, derivative: np.empty((0, len(state))) if derivative else np.empty(0),
+            tolerance=1e-5, step=.2, seconds=1., sample_limit=256,
+            query_parameters=[.3, .37, .7])
         self.assertIsNotNone(path)
-        np.testing.assert_allclose(path[0], [0., 0.])
-        np.testing.assert_allclose(path[-1], [1., 1.])
-        self.assertLessEqual(len(path), 256)
-        self.assertEqual(report["strategy"], "native_rrt_connect")
-        self.assertGreater(len(checked), 0)
+        self.assertEqual(report["strategy"], "native_direct_connection")
+        self.assertTrue(np.all(np.diff(path[:, -1]) > 0))
+        self.assertTrue(np.any(np.isclose(path[:, -1], .37, atol=1e-15, rtol=0.)))
+        pause = (path[:, -1] >= .3) & (path[:, -1] <= .7)
+        self.assertGreater(np.ptp(path[pause, 0]), .3)
+        np.testing.assert_array_equal(np.interp(path[pause, -1], mapping.u, mapping.s),
+                                      np.full(pause.sum(), .5))
 
+    def test_scene_switch_checks_float32_sides_at_same_q_and_time_without_relocking_plateau(self):
+        mapping = _ProgressMap(np.array([0., .25, .75, 1.]), np.array([0., .5, .5, 1.]))
+        progress = torch.full((1, 3), .5, dtype=torch.float32)
+        clock = torch.tensor([[.25, .5, .75]], dtype=torch.float32)
+        q = torch.tensor([[[0.], [.1], [.1]]], dtype=torch.float32)
+        observations = []
+        # BEGIN the unchanged material-mode fixture declares no arrival pair permission.
+        def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
+                     contact_permission_progress):
+            observations.append((s.clone(), joints.clone(), trajectory_time.clone()))
+            return ((s < .5) & (joints[..., 0] > 0)).to(s.dtype)
+        scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate)
+        # END the existing test still proves both original material-mode sides.
+        def check(joints):
+            return _scene_boundary_evaluate(scene, self.problem(), mapping,
+                torch.zeros((1, 3, 1, 4)), torch.zeros((1, 3, 3)),
+                torch.tensor([[[1., 0., 0., 0.]]]).expand(1, 3, 4),
+                progress, joints, ("q",), trajectory_time=clock, normalized_time=clock)
+        self.assertTrue(bool((check(q) == 0).all()))
+        sides, positions, times = observations[-1]
+        # BEGIN only the plateau entrance/exit have distinct side queries.
+        self.assertEqual(sides.shape[1], 5)
+        self.assertLess(float(sides[0, 3]), .5)
+        self.assertGreater(float(sides[0, 4]), .5)
+        selected = torch.tensor([0, 1, 2, 0, 2])
+        torch.testing.assert_close(positions, q.index_select(1, selected), rtol=0., atol=0.)
+        torch.testing.assert_close(times, clock.index_select(1, selected), rtol=0., atol=0.)
+        # END all original exact states remain present at unchanged q/time.
+        q[:, 0] = .1
+        self.assertGreater(float(check(q)[0, 0]), 0.)
 
-
+    def test_unknown_finger_model_keeps_actual_entrance_palm_and_arm_native_pairs(self):
+        problem = self.problem()
+        spheres = torch.zeros((1, 2, 3, 4)); spheres[..., 3] = .02
+        quaternion = torch.zeros((1, 2, 1, 4)); quaternion[..., 0] = 1.
+        native = SimpleNamespace(robot_spheres=spheres,
+            tool_jacobians=torch.zeros((1, 2, 1, 6, 1)))
+        state = SimpleNamespace(joint_state=SimpleNamespace(position=torch.zeros((1, 2, 1))),
+            cuda_robot_model_state=native, robot_spheres=spheres,
+            tool_poses=SimpleNamespace(tool_frames=["tool"], position=torch.zeros((1, 2, 1, 3)),
+                                       quaternion=quaternion))
+        hand = SimpleNamespace(controller="timed_reference", nominal_finger_trajectory=None,
+            sphere_indices=(0, 1), sphere_joint_translation=np.array([[[0., 0., 0.]], [[1., 0., 0.]]]),
+            # BEGIN match the explicit hand-state interface used by native geometry.
+            state=lambda *args, **kwargs: SimpleNamespace(coordinates=None, half=None,
+                uncertain=kwargs["trajectory_time"] > 0), spheres=lambda values, *args: values)
+            # END uncertainty is per physical query, not a tuple convention.
+        with patch("manipulation.planning._native_gradient_layout_type",
+                   return_value=SimpleNamespace(apply=lambda value: value)), \
+             patch("manipulation.planning._orientation_vjp_type",
+                   return_value=SimpleNamespace(apply=lambda q, r, jac: r)):
+            result = _timed_native_state(state, problem, SimpleNamespace(gripper=hand), ("q",),
+                                        torch.tensor([[0., .1]]), sphere_padding=.05)
+        radii = result.cuda_robot_model_state.robot_spheres[..., 3]
+        torch.testing.assert_close(radii[:, 0], spheres[:, 0, :, 3], rtol=0., atol=0.)
+        self.assertLess(float(radii[0, 1, 1]+.05), 0.)
+        torch.testing.assert_close(radii[:, 1, [0, 2]], spheres[:, 1, [0, 2], 3], rtol=0., atol=0.)
+        torch.testing.assert_close(state.cuda_robot_model_state.robot_spheres, spheres, rtol=0., atol=0.)
 
 
 if __name__ == '__main__':
     unittest.main()
-# END native attempt-planner test migration.
+# END these tests claim clock/goal contracts, not physical execution success.

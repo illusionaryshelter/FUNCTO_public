@@ -85,8 +85,11 @@ def complete_owner(*, T_owner_source=None, box_quaternion=None):
 
 
 def contact_declaration():
-    return dict(actor="payload", rule_id="support-interaction", material_id="support_face",
-        target_owner="reference", interval=(.6, .8), source="Current bound reference interaction")
+    return dict(actor="payload", rule_id="finite-support", material_id="support_face",
+        target_owner="reference", interval=(.6, .8), patch_origin=[0., 0., 0.],
+        patch_axes=np.eye(3), patch_half_size=[.04, .06], gap_bounds=(-.0001, .0001),
+        normal_tolerance_rad=.001, modeling_allowance_m=.0001, geometry_error_m=.0001,
+        minimum_thickness_m=.008, source="Current finite reference-local observed support patch")
 
 
 # BEGIN the actual recorded parser keeps initial support outside material binding.
@@ -228,11 +231,13 @@ def test_owner_material_is_the_real_planar_face_with_its_full_solid_cover():
     rule, = build_material_contact_rules(combined, [contact_declaration()])
     assert rule.actor == "payload" and rule.target_owner == "reference"
     assert rule.interval == (.6, .8)
-    assert rule.sphere_indices == tuple(material["sphere_indices"])
-    assert not hasattr(rule, "gap_bounds")
-    with pytest.raises(ValueError, match="named actor"):
+    np.testing.assert_allclose(rule.feature_points, points)
+    # Bounds remain caller evidence. The binding never expands a patch to the
+    # reference owner's extent or turns another payload solid into material.
+    np.testing.assert_array_equal(rule.patch_half_size, [.04, .06])
+    with pytest.raises(ValueError, match="bound actor"):
         build_material_contact_rules(combined, [dict(contact_declaration(), actor="different")])
-    with pytest.raises(ValueError, match="Interaction declarations"):
+    with pytest.raises(ValueError, match="native binding"):
         build_material_contact_rules(combined, [dict(contact_declaration(), feature_points=points)])
 
 
@@ -245,13 +250,14 @@ def test_complete_payload_enters_initial_scene_with_native_contacts_and_current_
     from manipulation.planning_observation import build_scene_from_rgbd
     from recorded_owner_geometry import create_box_owner
     from test_manipulation_planning_observation import view
+    from observed_geometry_fixtures import point_source
 
     prepared = complete_owner()
     binding = bind_box_owner_materials(prepared)
     contacts = build_material_contact_rules(
         dict(materials={}, owner_materials={"payload": binding["materials"]}), [contact_declaration()])
     prepared["sphere_materials"] = binding["sphere_materials"]
-    owner = create_box_owner(prepared)
+    owner = create_box_owner(prepared, contact_voxel_size_m=.002)
     record = view()
     identities = ("payload", "reference", "initial_support")
     masks = {identity: np.zeros(record["depth"].shape, bool) for identity in identities}
@@ -265,20 +271,22 @@ def test_complete_payload_enters_initial_scene_with_native_contacts_and_current_
         extent_esdf_meters_xyz=(.2, .2, .2), esdf_voxel_size=.01,
         grid_center=torch.tensor([0., 0., 1.]), image_height=96, image_width=96, device="cuda:0")
     mapped = {}
-    def make(normalized, partition_masks, identity, config, inverse):
+    def make(normalized, partition_masks, identity, config, inverse, *, query_center=None,
+             max_host_rss_bytes=None):
         # Replace only device mapping. Production input checks, final scene
         # construction and native material/sphere registration remain active.
         assert not partition_masks["current"][None][45, 45]
         shape = np.ceil(np.asarray(config.extent_esdf_meters_xyz)/config.esdf_voxel_size).astype(int)
-        center = config.grid_center.numpy()
-        query = FrozenESDF(np.full(tuple(shape), 1e4, np.float32),
-            origin=center-(shape-1)*config.esdf_voxel_size/2,
+        center = config.grid_center.numpy() if query_center is None else np.asarray(query_center)
+        query = FrozenESDF.from_source(point_source(),
+            origin=center-(shape-1)*config.esdf_voxel_size/2, shape=tuple(shape),
             voxel_size=config.esdf_voxel_size,
             owner_ids=("observed_background" if identity is None else identity,),
             source="Explicit synthetic CPU field")
         mapped[identity] = query
         return query, {"shape_xyz": shape.tolist()}
 
+    policy = {"conditional_regions": [], "outside_regions": "forbid"}
     with patch("manipulation.planning_observation._map_online_partition", side_effect=make), \
          patch("manipulation.planning_observation._require_mapping_memory"), \
          patch("torch.cuda.mem_get_info", side_effect=AssertionError("CPU contract touched CUDA")):
@@ -286,10 +294,10 @@ def test_complete_payload_enters_initial_scene_with_native_contacts_and_current_
             depth_error_m=.003, task_owner_ids=("payload", "reference"),
             reference_frame="world", robot_sphere_materials=(None,), robot_geometry_source="Native test robot",
             complete_owners=(owner,), contacts=contacts, native_geometry_materials=binding["native_geometry_materials"],
-            has_gripper=False, max_mapping_bytes=1024**3)
+            has_gripper=False, unknown_policy=policy, max_mapping_bytes=1024**3)
     assert set(mapped) == {None, "reference", "initial_support"}
     # BEGIN complete payload and observed functional reference share task precision.
-    assert result.owners[0] is owner and not hasattr(owner.query, "contact_voxel_size_m")
+    assert result.owners[0] is owner and owner.query.contact_voxel_size_m == .002
     assert result.observation_report['resolution_policy']['owner_voxel_sizes_m'] == {
         'payload': .002, 'reference': .002, 'initial_support': .01}
     # END the environment plane keeps its separate coarse field.
@@ -297,7 +305,7 @@ def test_complete_payload_enters_initial_scene_with_native_contacts_and_current_
     assert result.owners[2].query is mapped["initial_support"]
     assert result.background is mapped[None] and result.coverage.observation_ids == ("current",)
     assert result.contacts == contacts and result.native_geometry_materials == binding["native_geometry_materials"]
-    assert result.describe()["unknown_space"] == "diagnostic_only"
+    assert result.robot_owner_permissions == () and result.unknown_policy == policy
     np.testing.assert_array_equal(owner.pose_path.poses[0], prepared["initial_pose"])
     assert owner.attachments[0].interval == tuple(prepared["attachments"][0]["interval"])
     assert owner.attachments[0].condition_id == "actual-holding"
@@ -369,17 +377,33 @@ def test_true_native_edge_retains_two_endpoints_and_projects_hint_in_owner_frame
     assert binding["native_geometry_materials"] == {"payload/base": "support_edge"}
 
 
-def test_edge_material_selects_spheres_without_requiring_contact_tolerances():
+def test_edge_permission_copies_native_dimension_without_expanding_contact_tolerances():
     prepared, _, _, _ = native_edge_owner()
     native = bind_box_owner_materials(prepared)
     combined = dict(materials={}, owner_materials={"payload": native["materials"]})
-    declaration = dict(contact_declaration(), material_id="support_edge")
+    declaration = dict(contact_declaration(), material_id="support_edge", normal_tolerance_rad=1e-4)
     rule, = build_material_contact_rules(combined, [declaration])
-    assert rule.sphere_indices == tuple(native["materials"]["support_edge"]["sphere_indices"])
-    assert not hasattr(rule, "normal_tolerance_rad")
-    for extra in ({"feature_kind": "polygon"}, {"normal_tolerance_rad": 1e-4}, {"gap_bounds": [-.001, .001]}):
-        with pytest.raises(ValueError, match="Interaction declarations"):
-            build_material_contact_rules(combined, [{**declaration, **extra}])
+    assert rule.feature_kind == "edge" and rule.feature_points.shape == (2, 3)
+    assert rule.normal_tolerance_rad == 1e-4
+    assert rule.gap_bounds == (-1e-4, 1e-4)
+    assert rule.numerical_position_tolerance_m == 1e-6
+    # BEGIN registered online geometry retains the same nonidentity owner map.
+    model = rule.online_material
+    assert model["kind"] == "native_box_edge_v1" and model["native_geometry"] == "base"
+    assert model["sphere_indices"] == list(rule.sphere_indices)
+    assert rule._native_edge_geometry["lateral_depth_ratio"] == pytest.approx(4/3)
+    from itertools import product
+    pose = np.asarray(model["T_actor_box"])
+    vertices = np.asarray(list(product((-1., 1.), repeat=3)))*model["half_size_m"]
+    np.testing.assert_allclose(rule._native_edge_geometry["vertices_actor"],
+        vertices @ pose[:3, :3].T+pose[:3, 3], rtol=0, atol=1e-15)
+    assert np.linalg.norm(pose[:3, 3]) > .1
+    assert not np.allclose(pose[:3, :3], np.eye(3))
+    # END source/owner translations and rotations are not silently identities.
+    for changed in ({"feature_kind": "polygon"}, {"feature_points": [[0., 0., 0.]]*4},
+                    {"feature_normal": [0., 0., -1.]}):
+        with pytest.raises(ValueError, match="native binding"):
+            build_material_contact_rules(combined, [{**declaration, **changed}])
 
 
 # BEGIN actor confirmation can validate all boxes, including nonmaterial ones.
@@ -388,7 +412,7 @@ def test_complete_owner_serializes_exact_primitive_sphere_registration():
     prepared = complete_owner()
     native = bind_box_owner_materials(prepared)
     prepared["sphere_materials"] = native["sphere_materials"]
-    owner = create_box_owner(prepared)
+    owner = create_box_owner(prepared, contact_voxel_size_m=.001)
     primitives = owner.query.primitives
     assert len(primitives) == len(prepared["cuboids"])
     groups = {row["box_name"]: row for row in prepared["provenance"]["coverage_cells"]}

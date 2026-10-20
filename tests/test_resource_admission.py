@@ -57,35 +57,46 @@ def test_host_admission_retains_two_gib_system_headroom(monkeypatch):
         "host_available", 4*GIB, 4*GIB-1)
 
 
-def test_planner_host_check_adds_only_new_live_scratch(monkeypatch):
+def test_planner_host_check_adds_only_live_work_and_global_pending(monkeypatch):
+    from manipulation.tsdf_geometry import ObservedTsdfGeometry
+
+    monkeypatch.setattr(ObservedTsdfGeometry, "pending_storage_total_nbytes", classmethod(lambda cls: 73))
     admit = Mock()
     monkeypatch.setattr("manipulation.planning.require_host_memory", admit)
-    workspace = _PlanningWorkspace(4*GIB, 127, GIB, 61)
-    _require_planning_host_memory(workspace.cpu_live_bytes, max_host_rss_bytes=10*GIB)
-    # Shared fields are already in RSS; planning has no lazy source geometry.
-    admit.assert_called_once_with(127, pending_existing_bytes=0, max_rss_bytes=10*GIB)
+    workspace = _PlanningWorkspace(4*GIB, 127, GIB, 0, 61, False)
+    _require_planning_host_memory(workspace.cpu_live_bytes,
+        encoded_record_bytes_upper=11, max_host_rss_bytes=10*GIB)
+    # The four GiB shared capacity is already represented by actual RSS and
+    # the geometry's pending count. Adding it again would reject valid work.
+    admit.assert_called_once_with(127+3*11, pending_existing_bytes=73, max_rss_bytes=10*GIB)
 
 
-def test_new_live_scratch_includes_existing_rss_at_one_byte_boundary(monkeypatch):
+def test_new_validation_records_include_previous_candidate_rss_at_one_byte_boundary(monkeypatch):
+    from manipulation.tsdf_geometry import ObservedTsdfGeometry
+
+    monkeypatch.setattr(ObservedTsdfGeometry, "pending_storage_total_nbytes", classmethod(lambda cls: 0))
     process = host_snapshot(monkeypatch, rss=10*GIB, child_rss=GIB, available=4*GIB)
-    _require_planning_host_memory(GIB, max_host_rss_bytes=12*GIB)
-    # One additional resident byte cannot be spent by new model-query scratch.
+    encoded_bytes = (GIB-1)//3
+    _require_planning_host_memory(1, encoded_record_bytes_upper=encoded_bytes, max_host_rss_bytes=12*GIB)
+    # One additional resident byte, for example from an earlier candidate,
+    # cannot be spent again by the new candidate's records/serialization.
     process.memory_info.return_value.rss += 1
     with pytest.raises(ResourceLimitError) as captured:
-        _require_planning_host_memory(GIB, max_host_rss_bytes=12*GIB)
+        _require_planning_host_memory(1, encoded_record_bytes_upper=encoded_bytes, max_host_rss_bytes=12*GIB)
     assert (captured.value.resource, captured.value.required_bytes) == ("host_process_rss", 12*GIB+1)
 
 
-def test_cpu_residency_does_not_change_actual_gpu_query_budget():
+def test_cpu_residency_does_not_change_gpu_budget_or_graph_choice():
     allocation = {"gpu_retained": 5, "gpu_live": 150, "gpu_shared": 23,
-                  "cpu_shared": 17, "cpu_live": 31}
+                  "gpu_graph_live": 60, "cpu_shared": 17, "cpu_live": 31}
     scene = SimpleNamespace(required_progress_anchors=(), contacts=(),
         estimated_workspace_allocation=lambda *args, **kwargs: dict(allocation))
     metadata = {"active_joint_names": ["joint"], "links": 1, "spheres": 1}
-    budget = PlanningBudget(max_scene_gpu_workspace_bytes=10*5+150+23)
+    budget = PlanningBudget(max_scene_gpu_workspace_bytes=13*5+150+23+120)
     small = _planning_workspace_bytes(scene, metadata, budget, 1)
     allocation["cpu_shared"] = 9*GIB
     large = _planning_workspace_bytes(scene, metadata, budget, 1)
+    assert small.trajectory_graph is large.trajectory_graph is True
     assert small.gpu_bytes == large.gpu_bytes == budget.max_scene_gpu_workspace_bytes
     assert large.cpu_bytes-small.cpu_bytes == 9*GIB-17
 
@@ -95,21 +106,21 @@ def device_snapshot(*, free=12*GIB, total=12*GIB, reserved=0, allocated=0):
         memory_reserved=Mock(return_value=reserved), memory_allocated=Mock(return_value=allocated)))
 
 
-def test_device_admission_counts_scene_and_anchor_fk_without_host_storage():
+def test_device_limit_disables_only_extra_graph_pools_when_eager_fits():
     runtime = device_snapshot()
-    workspace = _PlanningWorkspace(9*GIB, 0, GIB, GIB)
+    workspace = _PlanningWorkspace(9*GIB, 0, GIB, 4*GIB, 0, True)
     admitted = _require_planning_memory(runtime, "cuda:0", workspace, max_device_used_bytes=6*GIB)
-    assert admitted is workspace
-    # Two GiB native + one GiB scene + one GiB anchor FK fit; no graph pools
-    # or host inventory are charged against CUDA.
-    with pytest.raises(ResourceLimitError):
-        _require_planning_memory(runtime, "cuda:0", replace(workspace, anchor_fk_bytes=4*GIB),
-                                 max_device_used_bytes=6*GIB)
+    assert admitted == replace(workspace, trajectory_graph=False)
+    assert workspace.trajectory_graph is True
+    # An explicit eight-GiB limit admits these graph pools without charging
+    # the same nine-GiB host inventory to CUDA.
+    assert _require_planning_memory(runtime, "cuda:0", workspace,
+                                     max_device_used_bytes=8*GIB) is workspace
 
 
 def test_eager_device_overflow_is_a_typed_refusal():
     runtime = device_snapshot(free=10*GIB)
-    workspace = _PlanningWorkspace(0, 0, 2*GIB+1, 0)
+    workspace = _PlanningWorkspace(0, 0, 2*GIB+1, GIB, 0, True)
     with pytest.raises(ResourceLimitError) as captured:
         _require_planning_memory(runtime, "cuda:0", workspace, max_device_used_bytes=6*GIB)
     assert (captured.value.resource, captured.value.required_bytes, captured.value.limit_bytes) == (
@@ -119,7 +130,7 @@ def test_eager_device_overflow_is_a_typed_refusal():
 def test_standalone_device_check_cannot_bypass_the_physical_maximum():
     runtime = device_snapshot()
     with pytest.raises(ValueError, match="eight GiB"):
-        _require_planning_memory(runtime, "cuda:0", _PlanningWorkspace(0, 0, 0, 0),
+        _require_planning_memory(runtime, "cuda:0", _PlanningWorkspace(0, 0, 0, 0, 0, False),
                                  max_device_used_bytes=8*GIB+1)
     runtime.cuda.mem_get_info.assert_not_called()
 

@@ -1336,9 +1336,9 @@ def bind_fixture_gripper_geometry(fixture, robot_cfg, sphere_indices_by_link, fi
 # END permission changes software checks only, never native contact physics.
 
 
-# BEGIN source affine coordinates for observed-field sphere proxies.
-def bind_fixture_prismatic_proxies(fixture, robot_cfg, geometry, feedback):
-    """Bind observed-field sphere coefficients to the source joint axes.
+# BEGIN source-verified affine convex geometry for complete native hand pairs.
+def bind_fixture_prismatic_self_geometry(fixture, robot_cfg, geometry, feedback):
+    """Freeze native hand convex solids in the same zero-coordinate TCP frame.
 
     MuJoCo is used only during this fixture binding. The complete hand subtree
     was already checked by ``bind_fixture_gripper_geometry``; each source joint
@@ -1409,7 +1409,7 @@ def bind_fixture_prismatic_proxies(fixture, robot_cfg, geometry, feedback):
             pose_rows.append(((world_vertices-tcp[:3, 3]) @ tcp[:3, :3],
                               (world_centres-tcp[:3, 3]) @ tcp[:3, :3]))
         snapshots.append(pose_rows)
-    errors = []
+    result, errors = [], []
     canonical_spheres = np.array(geometry['local_spheres'], dtype=float, copy=True)
     canonical_mapping = np.array(geometry['sphere_joint_translation'], dtype=float, copy=True)
     hand_rows = {index: row for row, index in enumerate(geometry['sphere_indices'])}
@@ -1436,6 +1436,7 @@ def bind_fixture_prismatic_proxies(fixture, robot_cfg, geometry, feedback):
             mapping[:, column] = dependency*(tcp[:3, :3].T @ data.xaxis[joints[column]])
             if not np.allclose(shifts, mapping[:, column], atol=2e-12, rtol=0):
                 raise ValueError('Native hand joint dependency and measured affine endpoints disagree')
+        zero_vertices = vertices-(mapping @ coordinates[0])
         zero_centres = centres-(mapping @ coordinates[0])
         selected_rows = [hand_rows[i] for i in record['ids']]
         # BEGIN compare physical positions over the complete mechanical box.
@@ -1462,12 +1463,15 @@ def bind_fixture_prismatic_proxies(fixture, robot_cfg, geometry, feedback):
         canonical_spheres[selected_rows, :3] = zero_centres
         canonical_mapping[selected_rows] = mapping
         # END no physical clearance or collision allowance was increased.
-    return {'local_spheres': canonical_spheres,
+        result.append({'geometry_id': record['row']['geom'], 'sphere_indices': list(record['ids']),
+            'vertices': zero_vertices.tolist(), 'joint_translation': mapping.tolist(),
+            'source': f"{fixture['robot_mjcf_path']}::geom[{record['row']['geom']}]; {record['row']['certificate_path']}"})
+    return {'geometry': result, 'local_spheres': canonical_spheres,
             'sphere_joint_translation': canonical_mapping,
             'audit': {'position_tolerance_m': 2e-6,
                 'comparison': 'maximum absolute coordinate error over complete mechanical joint limits',
                 'geometry_errors': errors}}
-# END entity collision geometry is registered separately with the full robot.
+# END online convex projections retain the complete original pair policy.
 
 
 # BEGIN bind exact native material geometry to the runtime sphere ordering.

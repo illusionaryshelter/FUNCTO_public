@@ -98,7 +98,7 @@ class PlanningPrecisionTests(unittest.TestCase):
             from manipulation.planning import PlanningBudget
             planner.budget = PlanningBudget()
             planner.ik = SimpleNamespace(core=SimpleNamespace(optimizers=[]), destroy=Mock())
-            planner.trajectory_solver = SimpleNamespace(calls=0, states=0)
+            planner.trajopt = SimpleNamespace(core=SimpleNamespace(optimizers=[]), destroy=Mock())
             planner.scene_workspace_bytes = 0
             planner.scene_cpu_workspace_bytes = planner.scene_gpu_workspace_bytes = 0
             planner.anchor_fk_workspace_bytes = 0
@@ -121,19 +121,19 @@ class PlanningPrecisionTests(unittest.TestCase):
         self.assertEqual(self.flags(), (True, False))
 
 
-# BEGIN nominal preference uses physical units without inverse-tolerance amplification.
-class NominalGoalCostTests(unittest.TestCase):
-    def test_equal_pose_errors_have_equal_costs_despite_different_diagnostic_tolerances(self):
-        from manipulation.planning_problem import MotionPhase, PoseEventRequirement
-        from test_manipulation_planning import cartesian_problem, constant_path
+# BEGIN optimizer conditioning respects each goal's real functional accuracy.
+class FunctionalGoalScalingTests(unittest.TestCase):
+    def test_equal_relative_errors_have_equal_objectives_without_relaxing_raw_goals(self):
+        from manipulation.planning_problem import PlanningProblem, PoseEventRequirement
         objective = []
         for tolerance in (1e-2, 1e-4):
             goal = PoseEventRequirement(1., np.eye(4), np.eye(4), tolerance, .01, "declared precision")
-            problem = cartesian_problem((MotionPhase("reference", constant_path()),))
-            problem.pose_events = (goal,)
-            p = torch.tensor([[[.02, 0., 0.]]], requires_grad=True)
+            # BEGIN this pose-only fixture explicitly has no mechanism directions.
+            problem = SimpleNamespace(pose_relations=(), pose_events=(goal,), coordinate_events=(), mechanisms=())
+            # END the full problem contract remains strict in production.
+            p = torch.tensor([[[2*tolerance, 0., 0.]]], requires_grad=True)
             q = torch.tensor([[[1., 0., 0., 0.]]])
-            value = problem.optimizer_preferences(p, q, torch.ones(1, 1))
+            value = PlanningProblem.optimizer_preferences(problem, p, q, torch.ones(1, 1))
             objective.append(float(value.detach()))
             self.assertGreater(float(goal.evaluate(p, q).detach()), 0.)
             derivative = torch.autograd.grad(value.sum(), p)[0]
@@ -142,7 +142,7 @@ class NominalGoalCostTests(unittest.TestCase):
             inside = torch.tensor([[[.5*tolerance, 0., 0.]]])
             self.assertEqual(float(goal.evaluate(inside, q)), 0.)
         self.assertAlmostEqual(*objective, places=5)
-# END diagnostic scales never create a task acceptance gate.
+# END optimizer scaling never alters raw acceptance or invents target freedom.
 
 
 if __name__ == "__main__":

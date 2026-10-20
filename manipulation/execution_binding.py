@@ -59,11 +59,10 @@ def curve_snapshot(trajectory):
 def bind_candidate(trajectory, *, problem, scene, validation, native_report):
     """Bind the accepted joint curve and the exact online geometry snapshot.
 
-    # BEGIN the handoff certifies only the selected motion-model checks.
-    Native metrics and the unchanged Hermite curve name one optimized attempt.
-    Nominal task costs may remain nonzero. Execution checks current robot state
-    and independent effects; it never reruns the frozen observed-world query.
-    # END an offline geometry audit cannot authorize or veto this handoff.
+    Native-backend metrics and the unchanged Hermite curve name one candidate,
+    whether it was supplied directly or produced by trajectory optimization.
+    Execution checks current measured state against this same scene binding;
+    an independent source-mesh audit cannot authorize or veto the handoff.
     """
     violations = np.asarray(validation["violations"], dtype=float)
     queries = np.asarray(validation["u"], dtype=float)
@@ -71,9 +70,9 @@ def bind_candidate(trajectory, *, problem, scene, validation, native_report):
             or queries.shape != violations.shape or not np.isfinite(queries).all()
             or not np.isfinite(violations).all() or np.any(violations > 0)
             or np.any(queries < 0) or np.any(queries > 1)):
-        # BEGIN only basic motion violations belong in the export check.
+        # BEGIN supplied and optimized curves share one online acceptance gate.
         raise ValueError("Execution binding requires completed accepted online validation")
-        # END nominal task cost is not an execution permission.
+        # END source provenance cannot bypass any acceptance requirement.
     candidate_id = str(uuid4())
     inputs = {"problem": plain(problem), "scene": plain(scene.to_execution_binding())}
     return {"candidate_id": candidate_id, "curve": curve_snapshot(trajectory),
@@ -85,6 +84,106 @@ def bind_candidate(trajectory, *, problem, scene, validation, native_report):
             # END native metrics can evaluate either accepted curve representation.
             "export": plain(validation), "native": plain(native_report)},
         "execution_limits": None}
+
+
+# BEGIN an explicitly enlarged task set can inherit stricter completed evidence.
+def _relaxed_pose_contract(problem, identities, changes, ledger, request_id):
+    """Derive only larger pose-goal sets; every other mathematical input stays.
+
+    Goal identities belong to the existing typed pose-event collection. Skill
+    selection is the caller's task policy, never a dataset/skill branch here.
+    This implication needs no new IK solve: a fixed pose inside the old metric
+    balls also lies inside larger concentric balls with the same angle metric.
+    """
+    if not isinstance(changes, list) or not changes:
+        raise ValueError("Task tolerance relaxation needs explicit original pose goals")
+    expected = deepcopy(problem)
+    goals = expected.get("pose_events", [])
+    indexes = identities.get("pose_events", [])
+    if len(indexes) != len(goals) or len(set(indexes)) != len(indexes):
+        raise ValueError("Task tolerance relaxation requires complete original goal identities")
+    revised_ledger = None if ledger is None else deepcopy(ledger)
+    if revised_ledger is not None:
+        if (ledger.get("requires_continuation") is True
+                or not isinstance(request_id, str) or not request_id.strip()
+                or request_id == ledger.get("request_id")):
+            raise ValueError("A revised task needs a new unexecuted request identity")
+        revised_ledger["request_id"] = request_id
+    seen, enlarged = set(), False
+    for change in changes:
+        if not isinstance(change, dict) or set(change) != {
+                "goal_id", "position_tolerance_m", "rotation_tolerance_rad"}:
+            raise ValueError("Declare only a pose goal identity and its two task tolerances")
+        identity = change["goal_id"]
+        if (not isinstance(identity, list) or len(identity) != 2
+                or identity[0] != "pose_events" or type(identity[1]) is not int
+                or identity[1] not in indexes or identity[1] in seen):
+            raise ValueError("Task tolerance relaxation needs unique existing pose goal identities")
+        seen.add(identity[1])
+        goal = goals[indexes.index(identity[1])]
+        contract = None
+        if revised_ledger is not None:
+            rows = revised_ledger.get("obligation_contract", {}).get("pose_events", [])
+            if identity[1] < 0 or identity[1] >= len(rows):
+                raise ValueError("The source ledger must retain the same pose obligation")
+            contract = rows[identity[1]]
+        for name in ("position_tolerance_m", "rotation_tolerance_rad"):
+            value, old = change[name], goal[name]
+            if (isinstance(old, bool) or not isinstance(old, (int, float))
+                    or not np.isfinite(old) or old <= 0
+                    or (name == "rotation_tolerance_rad" and old >= np.pi)
+                    or isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not np.isfinite(value) or value <= 0 or value < old
+                    or (name == "rotation_tolerance_rad" and value >= np.pi)):
+                raise ValueError("A task tolerance must be finite and can only enlarge the original allowed set")
+            if contract is not None:
+                if contract.get(name) != old:
+                    raise ValueError("Source task thresholds and cumulative obligation contract disagree")
+                contract[name] = value
+            enlarged |= value > old
+            goal[name] = value
+    if not enlarged:
+        raise ValueError("A task tolerance revision must enlarge at least one allowed set")
+    return expected, revised_ledger
+
+
+def relax_pose_goal_tolerances(result, *, changes, source):
+    """Create a new task binding while retaining the original stricter proof.
+
+    The archived native/export inputs stay original. Only explicit monotone
+    goal changes are derived; geometry, curve, timing, physical limits and
+    already spent planning work remain unchanged. This cannot revise an
+    executed world or silently continue a request with different obligations.
+    """
+    from .planning import PlanningResult
+
+    binding = check_result(result)
+    if (not ((isinstance(source, str) and source.strip()) or (isinstance(source, dict) and source))
+            or "pose_tolerance_relaxation" in binding["validation"]):
+        raise ValueError("Declare one explicit task revision from original completed evidence")
+    ledger = binding.get("request_ledger")
+    if (binding.get("consumed_physics_steps", 0) or binding.get("completed_goal_ids", [])
+            or (ledger is not None and ledger.get("requires_continuation") is True)):
+        raise ValueError("Task tolerance revision requires an unexecuted source candidate")
+    if result.request_ledger is not None and result.request_ledger != ledger:
+        raise ValueError("Task tolerance revision cannot choose inconsistent cumulative ledgers")
+    changes = plain(changes)
+    problem, revised_ledger = _relaxed_pose_contract(binding["problem"],
+        binding.get("goal_identities", {}), changes, ledger, str(uuid4()))
+    source_id = binding["candidate_id"]
+    identity = str(uuid4())
+    binding.update(candidate_id=identity, problem=problem)
+    binding["validation"].update(candidate_id=identity,
+        pose_tolerance_relaxation={"source": plain(source), "source_candidate_id": source_id,
+            "source_request_ledger": deepcopy(ledger), "changes": changes},
+        scope="Original accepted native/export inputs retained; explicit larger pose-goal allowed sets inherit that proof; independent execution preflight pending")
+    if revised_ledger is not None:
+        binding["request_ledger"] = revised_ledger
+    revised = PlanningResult(result.success, result.trajectory, deepcopy(result.diagnostics),
+                             binding, deepcopy(revised_ledger))
+    check_result(revised)
+    return revised
+# END task requirements remain separate from solver and controller tolerances.
 
 
 def check_result(result, *, execution_limits=None):
@@ -112,12 +211,25 @@ def check_result(result, *, execution_limits=None):
         raise ValueError("Candidate export validation is missing or rejected")
     if binding.get("curve") != curve_snapshot(result.trajectory):
         raise ValueError("Candidate polynomial, command clock or executable scope changed after validation")
-    # BEGIN a candidate retains its exact nominal inputs and motion evidence.
-    # Task costs are preferences; no stricter task-success proof can be
-    # inherited by changing tolerances on an already accepted trajectory.
-    if evidence.get("inputs") != {"problem": binding["problem"], "scene": binding["scene"]}:
+    # BEGIN preserve the actual validation inputs for an explicit set inclusion.
+    revision = evidence.get("pose_tolerance_relaxation")
+    if revision is not None:
+        if (not isinstance(revision, dict) or set(revision) != {
+                "source", "source_candidate_id", "source_request_ledger", "changes"}
+                or not revision["source"] or not isinstance(revision["source_candidate_id"], str)
+                or not revision["source_candidate_id"].strip()
+                or not isinstance(evidence.get("inputs"), dict)
+                or evidence["inputs"].get("scene") != binding["scene"]):
+            raise ValueError("Task tolerance inheritance needs its original complete input evidence")
+        ledger = binding.get("request_ledger")
+        expected_problem, expected_ledger = _relaxed_pose_contract(evidence["inputs"]["problem"],
+            binding.get("goal_identities", {}), revision["changes"], revision["source_request_ledger"],
+            None if ledger is None else ledger.get("request_id"))
+        if binding["problem"] != expected_problem or ledger != expected_ledger:
+            raise ValueError("Task tolerance revision changed more than the declared allowed sets and request identity")
+    elif evidence.get("inputs") != {"problem": binding["problem"], "scene": binding["scene"]}:
         raise ValueError("Candidate scene or problem differs from the validated input binding")
-    # END changed inputs require an explicitly new planning request.
+    # END unchanged direct validation still requires exact original inputs.
     if execution_limits is not None:
         declared = plain(execution_limits.describe())
         if binding.get("execution_limits") is not None and binding["execution_limits"] != declared:

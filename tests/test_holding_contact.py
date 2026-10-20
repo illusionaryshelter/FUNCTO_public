@@ -17,7 +17,7 @@ from test_online_geometry import scene as empty_scene
 
 
 def setup(*, release=True, other_owner=False, self_collision=False, angle=0.):
-    original = empty_scene()
+    original = empty_scene(outside_regions='allow_attempt')
     pose = np.eye(4)
     pose[:3,:3] = Rotation.from_euler('z',angle,degrees=True).as_matrix()
     attachment = Attachment((0.,.75),[0.,0.,0.],
@@ -41,25 +41,12 @@ def setup(*, release=True, other_owner=False, self_collision=False, angle=0.):
     # END owner aliases are a separate schema and cannot stand in for bodies.
     current = OnlinePlanningScene(background=original.background,owners=owners,coverage=original.coverage,
         reference_frame='world',robot_sphere_materials=('pad',None),robot_geometry_source='calibrated test robot',
-        holding_contacts=(contact,),robot_collision_bodies=bodies,
+        unknown_policy=original.unknown_policy,holding_contacts=(contact,),robot_collision_bodies=bodies,
         native_geometry_materials={'native-pad':'pad'},has_gripper=False)
-    # BEGIN the test's moving arm has an explicit native coordinate and solid.
-    urdf = ('<robot name="holding"><link name="pad"/><link name="arm"/>'
-            '<joint name="arm_x" type="prismatic"><parent link="pad"/><child link="arm"/>'
-            '<axis xyz="1 0 0"/><limit lower="-1" upper="1" effort="1" velocity="1"/>'
-            '</joint></robot>')
-    native = {'urdf_xml': urdf, 'geometries': [
-        {'name': name, 'frame': frame, 'kind': 'sphere', 'dimensions': [.005],
-         'T_frame_geometry': np.eye(4).tolist(), 'source': 'explicit native test material'}
-        for name, frame in (('native-pad', 'pad'), ('native-arm', 'arm'))]}
     current.bind_online_robot(robot_sphere_geometry=[{'link_name':'pad','sphere_indices':[0],
         'centers_local':[[0.,0.,0.]],'radii':[.005]}, {'link_name':'arm','sphere_indices':[1],
         'centers_local':[[0.,0.,0.]],'radii':[.005]}],
-        native_robot_model=native, native_joint_names=('arm_x',),
-        native_self_pairs=[{'first': 'native-pad', 'second': 'native-arm', 'margin': 0.}]
-            if self_collision else [], robot_model={'T_reference_base': np.eye(4).tolist(),
-                'tool_frame': 'pad', 'T_frame_tcp': pose.tolist()})
-    # END supplied q controls both exact robot shape and its matching proxy centre.
+        robot_self_collision_pairs=[[0,1]] if self_collision else [])
     condition = {'kind':'observed_attachment','condition_id':'held','carrier_id':'part','progress':0.,
                  'T_carrier_eef':pose.tolist(),'contact_rule_ids':['held-pad']}
     validate_holding_conditions(current.holding_contacts,current.owners,[condition])
@@ -68,7 +55,6 @@ def setup(*, release=True, other_owner=False, self_collision=False, angle=0.):
 
 def query(current,pose,*,progress=.5,evidence=True,arm_center=.06):
     return current.query_state(np.array([[0.,0.,0.,.005],[arm_center,0.,0.,.005]]),pose,progress,
-        joint_position=[arm_center], joint_names=('arm_x',),
         condition_evidence={'held':evidence},owner_poses={'part':np.eye(4)})
 
 

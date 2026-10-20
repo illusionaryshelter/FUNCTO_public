@@ -1,13 +1,13 @@
-"""Bounded constrained motion probe: nominal goals remain independent of references.
+"""Bounded native PRD probe: real goals remain independent of references.
 
 Run in the existing recovery environment with this checkout's cuRobo on
 PYTHONPATH. CUDA execution is serial; Torch's allocator is capped at 2 GiB.
 This allocator cap does not bound other native allocations. This declared empty
-synthetic world checks constrained planning only; it supplies no observed-scene,
+synthetic world checks native planning only; it supplies no observed-scene,
 independent Coal, actuator, or physical contact certification.
 """
 
-# BEGIN bounded native goal/reference integration and candidate diagnostics.
+# BEGIN bounded native goal/reference integration with formal result evidence.
 import argparse
 from copy import deepcopy
 from dataclasses import asdict
@@ -65,9 +65,10 @@ def main():
     # END actual source names and TCP transforms replace built-in robot assumptions.
     del state, actual, kinematics
     gc.collect()
-    # BEGIN retain the existing bounded integration work budget.
-    # The three synthetic variants exercise the shared nominal objective and curve
-    # export. Nonzero task errors remain diagnostics, not acceptance thresholds.
+    # BEGIN explicit integration budget; task precision and device policy stay fixed.
+    # The archived 1 s / 256-query run exhausted its finite OMPL connection
+    # budget for the changed goal. This probe grants bounded additional search
+    # work; it does not change production defaults or relax an acceptance gate.
     budget = PlanningBudget(max_validation_points=512, max_task_anchors=32, max_robot_spheres=sphere_count,
                             search_seconds=3., maximum_trajectory_solves=2)
     # END keep the complete budget in every probe report.
@@ -96,10 +97,11 @@ def main():
             reference_frame="synthetic_base", observation_ids=("declared-synthetic-empty-box",))
         scene = OnlinePlanningScene(reference_frame="synthetic_base", background=empty_background(coverage),
             owners=owners, coverage=coverage, robot_sphere_materials=(None,)*sphere_count, gripper=hand,
-            robot_geometry_source=fixture["robot_geometry_source"])
+            robot_geometry_source=fixture["robot_geometry_source"],
+            unknown_policy={"outside_regions": "forbid", "conditional_regions": []})
         started = time.monotonic()
         result = plan_trajectory(problem, scene, robot, robot_validator=validator, budget=budget)
-        # END this probe evaluates planning only; no physical world is executed.
+        # END planning and execution retain the same frozen online geometry.
         row = {"case": name, "success": result.success, "elapsed_s": time.monotonic()-started,
                "goal": goal.tolist(), "reference": path.poses.tolist(), "diagnostics": result.diagnostics,
                "execution_binding": result.execution_binding, "fixed_hand_hypothesis": hand_report}
