@@ -1,6 +1,6 @@
 # `manipulation/motion.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_poses_array`
@@ -232,7 +232,7 @@ def _basis(axis: np.ndarray, reference_rotation: np.ndarray) -> np.ndarray:
 实现说明：
 
 > Choose a reproducible right-handed basis using the body-frame gauge.
-> 
+>
 > Axis sign and in-plane basis are coordinate conventions, not estimates of
 > opening direction or a semantic zero.  Using the reference orientation
 > makes the convention equivariant under a common world-frame transform.
@@ -348,7 +348,7 @@ def _angles(relative_rotations: np.ndarray, axis: np.ndarray) -> np.ndarray:
 实现说明：
 
 > Closest rotation about axis, then a continuous observed angle lift.
-> 
+>
 > atan2 uses the trace-maximizing projection onto the axis subgroup.  Its
 > residual is checked separately; projection does not establish compatibility.
 > A half-turn between samples has two equally plausible motion directions.
@@ -426,7 +426,7 @@ diagnostics: dict[str, Any]
 实现说明：
 
 > One identifiable motion family fitted to a fixed-body pose sequence.
-> 
+>
 > ``coordinates`` contains the fitted reference sequence, or the returned
 > sequence after ``transfer_motion``.  For free motion its columns are world
 > position and principal rotation vector, not an angular interpolation rule.
@@ -511,7 +511,7 @@ def poses(self, coordinates: Any) -> np.ndarray:
 实现说明：
 
 > Evaluate FK at coordinates; interpolation, when used, belongs here.
-> 
+>
 > No world-position chord is substituted for a revolute arc.  A single
 > coordinate vector is accepted and still returns shape (1, 4, 4).
 
@@ -639,7 +639,7 @@ def coordinates_of(self, poses: Any) -> np.ndarray:
 实现说明：
 
 > Return coordinates only when full poses match this family.
-> 
+>
 > Compatibility uses the declared fitting tolerances.  Returned angles
 > are unwrapped in sequence order; a single pose has a principal branch.
 > ``transfer_motion`` separately checks exact endpoint reachability and
@@ -912,7 +912,7 @@ def analyze_motion(poses: Any, position_tolerance: float=0.005, rotation_toleran
 实现说明：
 
 > Describe observed motion without selecting an applied task constraint.
-> 
+>
 > Every candidate is checked against the complete SE(3) sequence, including
 > orientation. A line may be compatible with a prismatic description while
 > remaining an unconstrained carry task. Similarly, a planar observation
@@ -920,7 +920,7 @@ def analyze_motion(poses: Any, position_tolerance: float=0.005, rotation_toleran
 > retain all fitted coordinates and per-frame residuals; no terminal-only
 > compression replaces the observed motion. Near-static observations remain
 > valid poses but report that their motion structure is not identifiable.
-> 
+>
 > Invalid poses raise before candidate fitting. In particular, ``free`` does
 > not repair invalid rotations, missing observations or a lost track.
 
@@ -972,7 +972,7 @@ def fit_motion(poses: Any, kind: str='auto', position_tolerance: float=0.005, ro
 实现说明：
 
 > Fit one of five rigid motion descriptions using complete poses.
-> 
+>
 > ``auto`` selects the lowest-dimensional identifiable compatible family and
 > reports all tested alternatives.  Free SE(3) containment is not evidence
 > against a constrained description, nor is a constrained fit proof of a
@@ -1032,7 +1032,7 @@ def free_transfer_parameters(reference_start, initial_pose, reference_goal=None,
 实现说明：
 
 > Bind one free-motion interval without sampling or inventing a clock.
-> 
+>
 > The reference is evaluated at the caller's fixed material frame. ``right``
 > attaches its observed entrance to the actual entrance. The two terminal
 > corrections are subsequently weighted by the caller's explicit interval
@@ -1092,12 +1092,12 @@ def transfer_motion(demo_poses: Any, initial_pose: Any, reference_transform: Any
 实现说明：
 
 > Transfer object motion, preserving the initial pose and reachable goal.
-> 
+>
 > A maps demonstration-reference coordinates to test-reference coordinates:
 > ``T[k] = A @ Td[k] @ inv(Td[0]) @ inv(A) @ initial_pose``.
 > The supplied mapping is an input assumption; it is not evidence that an
 > unseen mechanism shares the demonstration axis or shape.
-> 
+>
 > A terminal correction follows explicitly supplied normalized progress in
 > model coordinates.  For free motion, translation uses an additive world
 > correction and orientation uses a left-multiplied Slerp correction.  For

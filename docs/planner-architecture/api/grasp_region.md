@@ -1,6 +1,6 @@
 # `manipulation/grasp_region.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_array`
@@ -60,7 +60,7 @@ def _rule_geometry(record, joint_count):
 实现说明：
 
 > Read task feature coordinates, finite patches and their tolerances.
-> 
+>
 > Features remain source task data. The complete ContactRule also binds
 > body identity and activity; this existential query uses its geometric
 > fields and the caller's continuous finger-coordinate limits.
@@ -153,7 +153,7 @@ def _feature_region_halfspaces(rule, actor_pose, target_pose, finger_positions):
 实现说明：
 
 > Return world task inequalities and their affine finger derivative.
-> 
+>
 > A @ x <= b describes the finite source feature and target patch. Rigid
 > prismatic feature motion changes b by db_dq @ dq. Source point heights
 > are retained; the region does not assert observed target occupancy.
@@ -262,21 +262,21 @@ def check_grasp_region_compatibility(contact_rules, *, T_reference_tool, T_refer
 实现说明：
 
 > Check existential compatibility with fixed, material-specific patches.
-> 
+>
 > ``contact_rules`` contains only the robot rules bound to this grasp arrival
 > and one owner. Their feature coordinates use the named tool frame, patch
 > coordinates use the owner frame, and affine finger columns use the same
 > coordinate order as ``finger_position_limits`` (J by 2, metres). The caller
 > binds those identities and supplies existing calibrated geometry. Rule
 > ``required`` flags, clocks and collision permissions are never changed.
-> 
+>
 > Rules for one material are alternatives (OR); all materials must fit at
 > one common hypothetical q (AND). A separate intersection point per material
 > and shared continuous q variables give a linear feasibility problem for
 > each rule combination. No finite set of sampled openings substitutes for
 > the full declared coordinate box. The query does not assume synchronous
 > fractional closure or assert that physical contact will stop at its q.
-> 
+>
 > ``compatible`` has a hypothetical witness; ``contradicted`` means every
 > finite permission combination is geometrically incompatible; solver
 > incompleteness gives ``unresolved``. Missing observed target sides cannot

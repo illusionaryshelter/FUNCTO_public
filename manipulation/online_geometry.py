@@ -434,6 +434,14 @@ class OnlinePlanningScene:
         fields["background"] = self.background
         matrices = {name: _matrices(pose) for name, pose in poses.items()}
         robot_matrices = {name: _matrices(pose) for name, pose in robot_poses.items()}
+        # BEGIN one batch zero retains every position and named-joint gradient.
+        # Clear or skipped pairs still return a differentiable scalar. Form
+        # that zero once over the batch, retaining each entity's connection
+        # before individual pair queries attach any penetration direction.
+        zero = complete_q.sum(-1) * 0
+        for pose in (*poses.values(), *robot_poses.values()):
+            zero = zero + pose[0].sum(-1) * 0
+        # END a shared zero changes neither geometry queries nor their verdicts.
         policies = {}
         for rule in self.contacts:
             actor_pose = (position, quaternion) if rule.actor == "robot" else poses[rule.actor]
@@ -504,12 +512,12 @@ class OnlinePlanningScene:
         for index in np.ndindex(tuple(progress.shape)):
             evidence = self.robot_model.query(joint_names=complete_names,
                 joint_positions=q_cpu[index], T_reference_base=self.robot_validator.T_reference_base,
-                pairs=self.robot_pairs, check_request=self.check_request)
-            value = complete_q[index].sum() * 0
+                # BEGIN acceptance queries use the validator's existing required tuple.
+                pairs=self.robot_validator.required_pairs, check_request=self.check_request)
+            # END robot_pairs retains the complete policy for serialization.
+            value = zero[index]
             undecided = value
             for row in evidence["pairs"]:
-                if row["policy"] != "required":
-                    continue
                 first_id, second_id = row["first"], row["second"]
                 if uncertain_cpu[index] and ({first_id, second_id} & unmodelled):
                     continue
@@ -576,17 +584,19 @@ class OnlinePlanningScene:
             for index in np.ndindex(tuple(progress.shape)):
                 if self.check_request is not None:
                     self.check_request()
-                zero = first_pose[0][index].sum()*0+second_pose[0][index].sum()*0
+                # BEGIN each pair reuses this state's batch zero, including skips.
+                state_zero = zero[index]
                 if uncertain_cpu[index] and (first_id in unmodelled or second_id in unmodelled):
-                    residuals.append(zero)
+                    residuals.append(state_zero)
                     continue
                 held_internal = (target in attached and attached[target][index]
                     and ((actor == "robot" and first_id in self.tool_geometry_names)
                          or (actor in attached and attached[actor][index])))
                 if held_internal:
-                    residuals.append(zero)
+                    residuals.append(state_zero)
                     report["internal_assembly_pair_count"] += 1
                     continue
+                # END skipped pairs retain zero derivatives to all entity positions.
                 regions = []
                 for rule in rules:
                     normals, bounds, active = policies[rule.rule_id]
@@ -602,7 +612,7 @@ class OnlinePlanningScene:
                         permission = model.permission(sm[index], additional=permission)
                 value, evidence = pair_residual(first, (first_pose[0][index], first_pose[1][index]), fm[index],
                     second, (second_pose[0][index], second_pose[1][index]), sm[index],
-                    permission=permission, check_request=self.check_request)
+                    permission=permission, check_request=self.check_request, zero=state_zero)
                 residuals.append(value)
                 report["pair_queries"] += 1
                 status = evidence["status"]

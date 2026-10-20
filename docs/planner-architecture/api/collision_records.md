@@ -1,6 +1,6 @@
 # `manipulation/collision_records.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_array_layout`
@@ -61,7 +61,7 @@ def encode_array(value):
 实现说明：
 
 > Encode a NumPy array or an already detached CPU Torch tensor.
-> 
+>
 > Payload length is exactly ``4 * ceil(raw_bytes / 3)`` ASCII bytes, where
 > ``raw_bytes = prod(shape) * dtype.itemsize``. Shape and dtype metadata add
 > only a small per-array cost. GPU transfer and graph detachment must occur
@@ -131,7 +131,7 @@ def decode_array(record):
 实现说明：
 
 > Decode a strictly bounded record as a read-only NumPy array.
-> 
+>
 > The array shares its immutable decoded bytes, avoiding an additional full
 > payload copy. A caller intentionally editing values must request copy().
 > Exact encoded length is checked before base64 decoding, then exact raw
@@ -187,7 +187,7 @@ def slice_layer_selection(records, index=(0, 0)):
 实现说明：
 
 > Retain one [batch, time] state for each actor/target layer record.
-> 
+>
 > Input and output map actor/target names to LayerSelection.record() values.
 > Singleton batch/time axes are preserved, so independent geometry checking
 > uses the same schema for a full bounded chunk and an archived single state.

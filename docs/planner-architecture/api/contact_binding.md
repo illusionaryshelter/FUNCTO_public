@@ -1,6 +1,6 @@
 # `manipulation/contact_binding.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `bind_grasp_contact_rules`
@@ -16,7 +16,7 @@ def bind_grasp_contact_rules(problem, contacts, activations):
 实现说明：
 
 > Attach declared rule IDs atomically, preserving every goal and event.
-> 
+>
 > ``activations`` maps each compiled grasp condition ID to its finite rule
 > IDs. Neither owner coincidence nor matching nominal time establishes this
 > association implicitly. Scene validation subsequently checks the actual
@@ -83,7 +83,7 @@ def build_material_contact_rules(material_binding, declarations):
 实现说明：
 
 > Combine source task features with explicit finite target permissions.
-> 
+>
 > Robot features name their observed body. Other features use their actor's
 > local coordinates. The material record supplies feature geometry; each
 > declaration supplies the target, active interval and task allowances.

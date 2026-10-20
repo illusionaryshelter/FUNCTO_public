@@ -1,6 +1,6 @@
 # `manipulation/representation.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_timeline`
@@ -121,7 +121,7 @@ def sample_poses(poses, timestamps, query_times):
 实现说明：
 
 > Interpolate one actual pose track at original seconds, without clamping.
-> 
+>
 > Reuse PosePath's translation/Slerp interpolation.  A one-pose observation
 > remains one observation: it cannot be extrapolated to a longer recording.
 
@@ -182,7 +182,7 @@ def trajectory_summary(poses, timestamps, *, approach_time=None, interaction_tim
 实现说明：
 
 > Read interaction pose and displacement direction from this same track.
-> 
+>
 > The returned direction describes the origin of the supplied pose, not the
 > surface normal or another attached origin.  Missing events or zero net
 > displacement do not discard the complete motion.
@@ -321,7 +321,7 @@ def build_representation(*, timestamps, frame_indices, kind, T_world_carrier=Non
 实现说明：
 
 > Compile available synchronized observations into the PRD representation.
-> 
+>
 > ``carrier`` means the grasped body for grasp and the manipulated body for
 > manipulation. ``reference`` is the physical body carrying F_R. L_G and L_R
 > map functional coordinates into their respective fixed body coordinates.
@@ -393,7 +393,7 @@ def _component_path(value, times, path_times, *, source, parent=None, attachment
 实现说明：
 
 > Interpolate one relation before composing its parent/right attachment.
-> 
+>
 > All components share the same physical-time interval. At release, each
 > component is independently restricted to that interval; interpolating the
 > already multiplied object/EEF samples would cut rotating lever-arm arcs.
@@ -614,7 +614,7 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
 实现说明：
 
 > Adapt source motion to the actual entry AND nominal interaction pose.
-> 
+>
 > J maps current body coordinates B_N into demonstrated coordinates B_D;
 > # BEGIN A is the declared rigid attachment model, not physical truth.
 > A maps the modeled body B_N into tool E. Robot feedback E plus A determines
@@ -625,7 +625,7 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
 > the body's coordinate chart and the grasp. The original motion first binds
 > the nominal goal at interaction_time; that goal is not inferred from the
 > adapted output. All intermediate samples use the shared transfer kernel.
-> 
+>
 > Grasp motion requires actual E. A scalar mechanism instead uses its current
 > model and current coordinate, preserving its physical manifold and winding.
 > Production object/tool paths stop at release or an earlier held_until_time.

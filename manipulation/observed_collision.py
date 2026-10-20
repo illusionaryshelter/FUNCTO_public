@@ -16,7 +16,7 @@ def _world(point, pose):
 
 
 def pair_residual(first, first_pose, first_matrix, second, second_pose, second_matrix, *,
-                  permission=None, check_request=None, precision_m=1e-4):
+                  permission=None, check_request=None, precision_m=1e-4, zero=None):
     """Query one rigid pair and attach a local rigid-motion derivative.
 
     Confirmed penetration has classification value one; clear and unresolved
@@ -25,6 +25,9 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
     observed field. Native witnesses retain their interval bounds; their
     midpoint supplies only a local rigid-motion direction. The direction
     neither estimates penetration nor supplies candidate acceptance evidence.
+
+    ``zero`` may be one scalar from a batch's differentiable zero baseline.
+    A standalone call constructs that baseline from its two position tensors.
     """
     # BEGIN native models retain their geometry; observations retain their cells.
     from .implicit_distance import ObservedField
@@ -33,7 +36,10 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
     result = query(
         first, first_matrix, second, second_matrix,
         precision_m=precision_m, permission=permission, check_request=check_request)
-    zero = first_pose[0].sum() * 0 + second_pose[0].sum() * 0
+    # BEGIN scene batches may share their already differentiable zero baseline.
+    if zero is None:
+        zero = first_pose[0].sum() * 0 + second_pose[0].sum() * 0
+    # END the supplied baseline changes no geometric evidence or local direction.
     status = result["status"]
     if status == "clear":
         return zero, result

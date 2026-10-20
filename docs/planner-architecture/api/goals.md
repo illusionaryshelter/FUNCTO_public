@@ -1,6 +1,6 @@
 # `manipulation/goals.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_points`
@@ -119,7 +119,7 @@ source: str = 'observed_support_patch'
 实现说明：
 
 > A finite convex support patch: origin, tangent basis, outward normal.
-> 
+>
 > ``boundary`` is a convex set of XY coordinates in ``basis``. It describes
 > observed/known support area, rather than extending a fitted plane forever.
 
@@ -245,7 +245,7 @@ source: str
 实现说明：
 
 > Known convex free space, expressed by unit-normal halfspaces A x + b<=0.
-> 
+>
 > Vertices/halfspaces must refer to the interior free region supplied by
 > observed cavity geometry or upstream scene geometry. An outer object mask
 > cannot establish this region. ``source`` remains in the output evidence.
@@ -457,7 +457,7 @@ def place_on(preferred_pose, body_points, surface, *, margin=0.0):
 实现说明：
 
 > Preserve desired orientation; find the closest supported translation.
-> 
+>
 > The projected footprint of all supplied object points must lie inside the
 > support patch. This sufficient geometric condition does not prove static
 > stability or infer unobserved parts of the object.

@@ -1,6 +1,6 @@
 # `manipulation/tensor_cpu_snapshot.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `masked_cpu_snapshot`
@@ -16,12 +16,12 @@ def masked_cpu_snapshot(tensors, valid):
 实现说明：
 
 > Copy ``tensor.detach()[valid]`` fields together without numeric casts.
-> 
+>
 > All fields share a device and the mask's leading dimensions; their tail
 > shapes and dtypes may differ. Byte concatenation performs no arithmetic,
 > including for signed zeros and NaN payloads. Each returned NumPy array
 > owns only its field's selected bytes, not a view retaining the whole pack.
-> 
+>
 > Let P be the unmasked payload size and K the selected payload size, K<=P.
 > Contiguous source copies plus the pack use at most 2P temporary bytes.
 > The masked gather uses P+K plus its row indices; discard P before the CPU

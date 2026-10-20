@@ -1,6 +1,6 @@
 # `manipulation/planning_problem.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_tensor`
@@ -262,7 +262,7 @@ def _slerp(a, b, fraction):
 实现说明：
 
 > Shortest-arc interpolation with finite identity first derivatives.
-> 
+>
 > A normalized linear blend is only an approximation to Slerp and changes
 > angular progress when another sample splits a short segment. The chord
 > half-angle identity avoids acos near one, and sinc weights evaluate the
@@ -396,7 +396,7 @@ parent: PosePath | None = None
 实现说明：
 
 > A current-scene reference, optionally parameterized by mechanism FK.
-> 
+>
 > A mechanism path interpolates its signed/unwrapped coordinates and then
 > evaluates FK. It never interpolates a hinge as Cartesian chord segments.
 > ``attachment`` maps the path body to the requested tool, if applicable.
@@ -663,7 +663,7 @@ class TransferredPosePath(PosePath):
 实现说明：
 
 > Adapt one material-frame path without interpolating composed outputs.
-> 
+>
 > ``reference`` already owns its physical interpolation frame and normalized
 > time/phase map. ``goals`` contains explicit ``progress``/``pose`` records;
 > their nominal poses are geometry boundaries, not new robot task equalities.
@@ -864,7 +864,7 @@ velocity: float = 0.0001
 实现说明：
 
 > Solver acceptance errors; these are never inferred skill freedom.
-> 
+>
 > Pose intervals use target-local XYZ and rotation-vector components, so
 > ``position_m`` and ``rotation_rad`` apply to each component of those
 > intervals. Reports expose both component maxima and vector norms; a norm
@@ -971,12 +971,12 @@ def reference_phase(reference, *, skill_id, source):
 实现说明：
 
 > Adapt a generated geometric reference to the existing tool PosePath.
-> 
+>
 > ``reference`` is the result of representation.generate_reference. Reuse
 > its explicit eef_path, including the separately sampled parent, body
 > correspondence and attachment. Rebuilding a path from composed EEF or
 > object knots would cut rotating offsets and change intermediate poses.
-> 
+>
 > The returned MotionPhase is reference data only. It declares neither a
 > task goal nor a physical attachment/collision permission. The caller must
 > independently supply real robot state, typed requirements and scene
@@ -1066,7 +1066,7 @@ source: object
 实现说明：
 
 > An explicitly required pose relation on an independent progress scope.
-> 
+>
 > Bounds use target-local XYZ/rotation-vector components. ``source`` must
 > identify the task/model evidence requiring this relation, rather than the
 > mere existence of a demonstration path. Ordinary reference phases never
@@ -1252,7 +1252,7 @@ condition_id: str | None = None
 实现说明：
 
 > An evidenced window in the original request's physical seconds.
-> 
+>
 > Offsets are relative to exactly one explicit origin. A goal arrival and
 > an observed effect name their separate evidence targets. Planning wall
 > time and demonstration timestamps are never substituted for physics time.
@@ -1324,7 +1324,7 @@ def resolve_event_window(constraint, history, *, predicted_origins=()):
 实现说明：
 
 > Resolve an absolute window; only actual T witnesses can be past origins.
-> 
+>
 > Predictions are accepted only when the caller explicitly supplies them for
 > a future origin in this candidate. They are never appended to real history.
 > Repeated observations of the same occurrence use its first actual T
@@ -1405,7 +1405,7 @@ timing: tuple[EventTimeConstraint, ...] = ()
 实现说明：
 
 > Original source identity plus a unique skill-instance location.
-> 
+>
 > A verification barrier grants no future evidence. If it needs a stop,
 > zero joint velocity is part of the generated trajectory at this anchor.
 
@@ -1565,7 +1565,7 @@ def _first_event_query(progress, anchor, trajectory_time=None):
 实现说明：
 
 > Select exactly one earliest event query, never an entire progress plateau.
-> 
+>
 > Complete rollout callers append exact anchors after the regular samples,
 > so they provide actual query times. Ordered CPU/export queries may omit
 > times. Duplicate representations of the same physical instant count once.
@@ -1626,7 +1626,7 @@ def anchor_pose(position, quaternion, progress, anchor):
 实现说明：
 
 > Read an exact anchor from the full horizon, allowing duplicate queries.
-> 
+>
 > The backend appends actual FK at each event before calling constraints.
 > Missing anchors deliberately produce nonfinite values, never a nearest
 > sample surrogate. Outer validation must reject nonfinite solver results.
@@ -1727,7 +1727,7 @@ def _mechanism_errors(model, tool_from_carrier, position, quaternion):
 实现说明：
 
 > Differentiable counterpart of MotionModel.coordinates_of's pose check.
-> 
+>
 > Project the actual path body onto the same physical model, then measure
 > position norm and SO(3) angle. The tool offset is removed before projecting:
 > a small tool error does not establish compatibility of an attached body.
@@ -1846,7 +1846,7 @@ origin_source: object = None
 实现说明：
 
 > An evidenced signed change, monotonicity, or physical coordinate rate.
-> 
+>
 > ``minimum`` is a displacement for ``net`` and a rate for ``local_rate``;
 > ``monotone`` uses zero and permits only the stated displacement tolerance.
 > No direction is inferred from the demonstration's coordinate sequence.
@@ -1918,7 +1918,7 @@ directions: tuple[CoordinateDirectionRequirement, ...] = ()
 实现说明：
 
 > Current physical manifold/limits, independent of the seed reference.
-> 
+>
 > Angular coordinates are lifted from the ordered candidate trajectory, with
 > the actual initial coordinate fixing its branch. A single state can check
 > manifold membership and principal-angle feasibility only; it cannot certify
@@ -2401,7 +2401,7 @@ def direction_residuals(self, position, quaternion, progress, *, trajectory_time
 实现说明：
 
 > Check finite ordered queries; only final curves use instantaneous rates.
-> 
+>
 > A geometric OMPL path uses physical-time secants solely to screen a
 > seed. Its downstream cubic must still pass true J(q) dq rate checks.
 > Single-state seed membership deliberately proves no path direction.
@@ -2534,6 +2534,7 @@ class SupportRequirement():
 类字段：
 
 ```python
+acceptance_components = ('body', 'footprint')
 progress: float
 tool_from_carrier: np.ndarray
 body_points: np.ndarray
@@ -2552,7 +2553,7 @@ source: object
 
 ## `SupportRequirement.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L904)。
+[定义位置](../../../manipulation/planning_problem.py#L911)。
 
 输入签名：
 
@@ -2600,7 +2601,7 @@ ValueError
 
 ## `SupportRequirement.raw_inequalities`
 
-[定义位置](../../../manipulation/planning_problem.py#L916)。
+[定义位置](../../../manipulation/planning_problem.py#L923)。
 
 输入签名：
 
@@ -2611,7 +2612,7 @@ def raw_inequalities(self, position, quaternion, numerical):
 实现说明：
 
 > Return four signed per-pose requirements, each satisfied at <= 0.
-> 
+>
 > Lengths remain in metres and the normal error remains a chord length.
 > Keeping feasible-side values lets AL multipliers decrease without
 > inventing a tangent location or yaw target inside this finite support.
@@ -2694,7 +2695,7 @@ height.amin
 
 ## `SupportRequirement.normalized_inequalities`
 
-[定义位置](../../../manipulation/planning_problem.py#L943)。
+[定义位置](../../../manipulation/planning_problem.py#L950)。
 
 输入签名：
 
@@ -2705,7 +2706,7 @@ def normalized_inequalities(self, position, quaternion, numerical):
 实现说明：
 
 > Scale units for AL without changing any acceptance right-hand side.
-> 
+>
 > The three length requirements share the declared gap scale, bounded
 > below by numerical precision. In particular, a tight boundary rounding
 > allowance does not become its own large optimization weight. The same
@@ -2751,50 +2752,55 @@ self.raw_inequalities
 
 ## `SupportRequirement.evaluate`
 
-[定义位置](../../../manipulation/planning_problem.py#L959)。
+[定义位置](../../../manipulation/planning_problem.py#L966)。
 
 输入签名：
 
 ```python
-def evaluate(self, position, quaternion, numerical):
+def evaluate(self, position, quaternion, numerical, *, for_acceptance=False):
 ```
 
 实现说明：
 
-> Preserve the original nonnegative hard residual in its original units.
+> Sum nominal requirements, or the two retained delivery components.
+>
+> The default preserves the complete optimization value and gradient.
+> Acceptance omits gap and normal alignment without changing either
+> declared tolerance or any body/footprint calculation.
 
 显式输出分支：
 
 ```python
-sum((torch.relu(value) for value in self.raw_inequalities(position, quaternion, numerical).values()))
+sum((torch.relu(components[name]) for name in selected))
 ```
 
 读取的对象属性：
 
 ```python
-torch.relu
-self.raw_inequalities(position, quaternion, numerical).values
 self.raw_inequalities
+self.acceptance_components
+torch.relu
 ```
 
 写入目标：
 
 ```python
-value
+components
+selected
+name
 ```
 
 直接调用符号：
 
 ```python
+self.raw_inequalities
 sum
 torch.relu
-self.raw_inequalities(position, quaternion, numerical).values
-self.raw_inequalities
 ```
 
 ## `PoseEventRequirement`
 
-[定义位置](../../../manipulation/planning_problem.py#L968)。
+[定义位置](../../../manipulation/planning_problem.py#L981)。
 
 ```python
 class PoseEventRequirement():
@@ -2815,11 +2821,11 @@ actual_relation: dict | None = None
 实现说明：
 
 > The original full material-frame event, with its own metric thresholds.
-> 
+>
 > These acceptance thresholds are not inferred freedom for the neighbouring
 > motion. In particular, a larger generic solver tolerance never replaces a
 > tighter threshold already specified by the source functional event.
-> 
+>
 > ``actual_relation=None`` explicitly describes a fixed tool calibration
 > against a fixed world target. Owner-relative goals instead name the
 > currently observed target owner and its material target transform. A held
@@ -2830,7 +2836,7 @@ actual_relation: dict | None = None
 
 ## `PoseEventRequirement.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L993)。
+[定义位置](../../../manipulation/planning_problem.py#L1006)。
 
 输入签名：
 
@@ -2890,7 +2896,7 @@ condition.strip
 
 ## `PoseEventRequirement.errors`
 
-[定义位置](../../../manipulation/planning_problem.py#L1023)。
+[定义位置](../../../manipulation/planning_problem.py#L1036)。
 
 输入签名：
 
@@ -2933,7 +2939,7 @@ torch.linalg.vector_norm
 
 ## `PoseEventRequirement.evaluate`
 
-[定义位置](../../../manipulation/planning_problem.py#L1029)。
+[定义位置](../../../manipulation/planning_problem.py#L1042)。
 
 输入签名：
 
@@ -2972,7 +2978,7 @@ torch.relu
 
 ## `CoordinateEventRequirement`
 
-[定义位置](../../../manipulation/planning_problem.py#L1037)。
+[定义位置](../../../manipulation/planning_problem.py#L1050)。
 
 ```python
 class CoordinateEventRequirement():
@@ -2996,7 +3002,7 @@ coordinate_origin: float | None = None
 
 ## `CoordinateEventRequirement.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L1047)。
+[定义位置](../../../manipulation/planning_problem.py#L1060)。
 
 输入签名：
 
@@ -3039,7 +3045,7 @@ ValueError
 
 ## `CoordinateEventRequirement.absolute_target`
 
-[定义位置](../../../manipulation/planning_problem.py#L1059)。
+[定义位置](../../../manipulation/planning_problem.py#L1072)。
 
 输入签名：
 
@@ -3071,7 +3077,7 @@ self.coordinate_origin
 
 ## `CoordinateEventRequirement.kind`
 
-[定义位置](../../../manipulation/planning_problem.py#L1063)。
+[定义位置](../../../manipulation/planning_problem.py#L1076)。
 
 输入签名：
 
@@ -3103,7 +3109,7 @@ self.mechanism
 
 ## `CoordinateEventRequirement.error`
 
-[定义位置](../../../manipulation/planning_problem.py#L1066)。
+[定义位置](../../../manipulation/planning_problem.py#L1079)。
 
 输入签名：
 
@@ -3154,7 +3160,7 @@ difference.abs
 
 ## `CoordinateEventRequirement.evaluate`
 
-[定义位置](../../../manipulation/planning_problem.py#L1075)。
+[定义位置](../../../manipulation/planning_problem.py#L1088)。
 
 输入签名：
 
@@ -3189,7 +3195,7 @@ self.error
 
 ## `InteriorRequirement`
 
-[定义位置](../../../manipulation/planning_problem.py#L1082)。
+[定义位置](../../../manipulation/planning_problem.py#L1095)。
 
 ```python
 class InteriorRequirement():
@@ -3213,7 +3219,7 @@ source: object
 
 ## `InteriorRequirement.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L1092)。
+[定义位置](../../../manipulation/planning_problem.py#L1105)。
 
 输入签名：
 
@@ -3260,7 +3266,7 @@ ValueError
 
 ## `InteriorRequirement.evaluate`
 
-[定义位置](../../../manipulation/planning_problem.py#L1100)。
+[定义位置](../../../manipulation/planning_problem.py#L1113)。
 
 输入签名：
 
@@ -3313,7 +3319,7 @@ torch.relu
 
 ## `PlanningProblem`
 
-[定义位置](../../../manipulation/planning_problem.py#L1111)。
+[定义位置](../../../manipulation/planning_problem.py#L1124)。
 
 ```python
 class PlanningProblem():
@@ -3349,7 +3355,7 @@ end_progress: float | None = None
 实现说明：
 
 > One current skill; source timing and real requirements have separate owners.
-> 
+>
 > Pose paths initialize the search and support deviation reports. Only the
 > explicit goal/process collections below constrain generated robot motion.
 > ``source_timestamps`` and ``source_progress`` retain the bound source map;
@@ -3357,7 +3363,7 @@ end_progress: float | None = None
 
 ## `PlanningProblem.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L1144)。
+[定义位置](../../../manipulation/planning_problem.py#L1157)。
 
 输入签名：
 
@@ -3479,7 +3485,7 @@ np.diff
 
 ## `PlanningProblem.phase_count`
 
-[定义位置](../../../manipulation/planning_problem.py#L1199)。
+[定义位置](../../../manipulation/planning_problem.py#L1212)。
 
 输入签名：
 
@@ -3511,7 +3517,7 @@ len
 
 ## `PlanningProblem.bound_motion_block`
 
-[定义位置](../../../manipulation/planning_problem.py#L1203)。
+[定义位置](../../../manipulation/planning_problem.py#L1216)。
 
 输入签名：
 
@@ -3522,7 +3528,7 @@ def bound_motion_block(self, goal_identities=None, satisfied_dependencies=()):
 实现说明：
 
 > Copy the authorized interval without inventing stops or new clocks.
-> 
+>
 > Only an explicit unmet evidence dependency ends a block. Ordinary
 > events and reference phase boundaries do not split moving process
 > relations. Original phase coordinates and process origins survive;
@@ -3613,7 +3619,7 @@ asdict
 
 ## `PlanningProblem.requirement_consumption`
 
-[定义位置](../../../manipulation/planning_problem.py#L1262)。
+[定义位置](../../../manipulation/planning_problem.py#L1275)。
 
 输入签名：
 
@@ -3624,7 +3630,7 @@ def requirement_consumption(self):
 实现说明：
 
 > Describe existing consumers without introducing another request format.
-> 
+>
 > Collection/index identities address the requirements used by residuals,
 > scene binding and execution. The returned records are independent copies;
 > changing them cannot change a goal or grant execution evidence. Ordinary
@@ -3708,7 +3714,7 @@ event_occurrence_key
 
 ## `PlanningProblem.requirement_consumption.add`
 
-[定义位置](../../../manipulation/planning_problem.py#L1273)。
+[定义位置](../../../manipulation/planning_problem.py#L1286)。
 
 输入签名：
 
@@ -3739,7 +3745,7 @@ deepcopy
 
 ## `PlanningProblem.source_time_map`
 
-[定义位置](../../../manipulation/planning_problem.py#L1353)。
+[定义位置](../../../manipulation/planning_problem.py#L1366)。
 
 输入签名：
 
@@ -3780,7 +3786,7 @@ self.source_progress.copy
 
 ## `PlanningProblem.source_time_to_progress`
 
-[定义位置](../../../manipulation/planning_problem.py#L1359)。
+[定义位置](../../../manipulation/planning_problem.py#L1372)。
 
 输入签名：
 
@@ -3815,7 +3821,7 @@ np.interp
 
 ## `PlanningProblem.progress_to_source_time`
 
-[定义位置](../../../manipulation/planning_problem.py#L1363)。
+[定义位置](../../../manipulation/planning_problem.py#L1376)。
 
 输入签名：
 
@@ -3850,7 +3856,7 @@ np.interp
 
 ## `PlanningProblem.terminal_pose_target`
 
-[定义位置](../../../manipulation/planning_problem.py#L1368)。
+[定义位置](../../../manipulation/planning_problem.py#L1381)。
 
 输入签名：
 
@@ -3890,7 +3896,7 @@ next
 
 ## `PlanningProblem.anchors`
 
-[定义位置](../../../manipulation/planning_problem.py#L1373)。
+[定义位置](../../../manipulation/planning_problem.py#L1386)。
 
 输入签名：
 
@@ -3951,7 +3957,7 @@ float
 
 ## `PlanningProblem.stop_progress`
 
-[定义位置](../../../manipulation/planning_problem.py#L1387)。
+[定义位置](../../../manipulation/planning_problem.py#L1400)。
 
 输入签名：
 
@@ -3989,7 +3995,7 @@ np.array
 
 ## `PlanningProblem.sample_reference`
 
-[定义位置](../../../manipulation/planning_problem.py#L1390)。
+[定义位置](../../../manipulation/planning_problem.py#L1403)。
 
 输入签名：
 
@@ -4041,7 +4047,7 @@ torch.where
 
 ## `PlanningProblem.transform_tool_pose`
 
-[定义位置](../../../manipulation/planning_problem.py#L1399)。
+[定义位置](../../../manipulation/planning_problem.py#L1412)。
 
 输入签名：
 
@@ -4084,7 +4090,7 @@ _tensor(self.tool_transform[:3, 3], position).expand_as
 
 ## `PlanningProblem.reference_to_link_pose`
 
-[定义位置](../../../manipulation/planning_problem.py#L1406)。
+[定义位置](../../../manipulation/planning_problem.py#L1419)。
 
 输入签名：
 
@@ -4129,7 +4135,7 @@ _quaternion
 
 ## `PlanningProblem.transform_robot_spheres`
 
-[定义位置](../../../manipulation/planning_problem.py#L1414)。
+[定义位置](../../../manipulation/planning_problem.py#L1427)。
 
 输入签名：
 
@@ -4167,7 +4173,7 @@ torch.cat
 
 ## `PlanningProblem.transform_tool_velocity`
 
-[定义位置](../../../manipulation/planning_problem.py#L1420)。
+[定义位置](../../../manipulation/planning_problem.py#L1433)。
 
 输入签名：
 
@@ -4218,17 +4224,21 @@ torch.linalg.cross
 
 ## `PlanningProblem.residuals`
 
-[定义位置](../../../manipulation/planning_problem.py#L1430)。
+[定义位置](../../../manipulation/planning_problem.py#L1443)。
 
 输入签名：
 
 ```python
-def residuals(self, position, quaternion, progress, joint_position=None, joint_names=None, joint_velocity=None, *, trajectory_time=None, point_goal_ids=None, tool_linear_velocity=None, tool_angular_velocity=None, direction_mode='trajectory'):
+def residuals(self, position, quaternion, progress, joint_position=None, joint_names=None, joint_velocity=None, *, trajectory_time=None, point_goal_ids=None, tool_linear_velocity=None, tool_angular_velocity=None, direction_mode='trajectory', for_acceptance=False):
 ```
 
 实现说明：
 
-> Nonnegative violations of real requirements only, without cancellation.
+> Nonnegative nominal or acceptance violations, without cancellation.
+>
+> Only SupportRequirement distinguishes the two calculations: its gap
+> and normal target remain in optimization and are omitted at delivery.
+> Every other requirement uses its original value, mask and tolerance.
 
 显式输出分支：
 
@@ -4396,7 +4406,7 @@ joint_velocity.abs
 
 ## `PlanningProblem.residuals.event_mask`
 
-[定义位置](../../../manipulation/planning_problem.py#L1439)。
+[定义位置](../../../manipulation/planning_problem.py#L1458)。
 
 输入签名：
 
@@ -4431,7 +4441,7 @@ torch.zeros_like
 
 ## `PlanningProblem.evaluate`
 
-[定义位置](../../../manipulation/planning_problem.py#L1523)。
+[定义位置](../../../manipulation/planning_problem.py#L1545)。
 
 输入签名：
 
@@ -4466,7 +4476,7 @@ self.residuals
 
 ## `PlanningProblem.functional_constraint_keys`
 
-[定义位置](../../../manipulation/planning_problem.py#L1533)。
+[定义位置](../../../manipulation/planning_problem.py#L1555)。
 
 输入签名：
 
@@ -4509,9 +4519,58 @@ tuple
 enumerate
 ```
 
+## `PlanningProblem.functional_acceptance_keys`
+
+[定义位置](../../../manipulation/planning_problem.py#L1572)。
+
+输入签名：
+
+```python
+def functional_acceptance_keys(self):
+```
+
+实现说明：
+
+> Original functional identities that can reject a delivered curve.
+>
+> The optimizer still receives functional_constraint_keys in full.
+> Building the support subset from typed requirements avoids parsing a
+> skill name or changing pose/coordinate-event acceptance elsewhere.
+
+显式输出分支：
+
+```python
+tuple((key for key in self.functional_constraint_keys if key not in support_keys))
+```
+
+读取的对象属性：
+
+```python
+self.supports
+requirement.acceptance_components
+self.functional_constraint_keys
+```
+
+写入目标：
+
+```python
+support_keys
+index
+requirement
+component
+key
+```
+
+直接调用符号：
+
+```python
+enumerate
+tuple
+```
+
 ## `PlanningProblem.functional_inequalities`
 
-[定义位置](../../../manipulation/planning_problem.py#L1548)。
+[定义位置](../../../manipulation/planning_problem.py#L1586)。
 
 输入签名：
 
@@ -4522,7 +4581,7 @@ def functional_inequalities(self, position, quaternion, progress, *, trajectory_
 实现说明：
 
 > Return signed event residuals and their single physical query masks.
-> 
+>
 > For input progress ``[batch, horizon]``, residual values have shape
 > ``[batch]`` and Boolean masks have shape ``[batch, horizon]``. A pose
 > event supplies separate position-norm and rotation-norm inequalities;
@@ -4531,7 +4590,7 @@ def functional_inequalities(self, position, quaternion, progress, *, trajectory_
 > ``error/original_tolerance-1``. A support event instead supplies four
 > signed physical inequalities divided by its shared positive scales;
 > their zero sets remain the original finite-support requirements.
-> 
+>
 > The first actual event instant is used even when progress pauses or an
 > exact anchor duplicates a regular sample. A missing required event is
 > NaN, not a falsely feasible zero. Events before a continued request's
@@ -4620,7 +4679,7 @@ float
 
 ## `PlanningProblem.functional_inequalities.add`
 
-[定义位置](../../../manipulation/planning_problem.py#L1570)。
+[定义位置](../../../manipulation/planning_problem.py#L1608)。
 
 输入签名：
 
@@ -4659,7 +4718,7 @@ float
 
 ## `PlanningProblem.optimizer_preferences`
 
-[定义位置](../../../manipulation/planning_problem.py#L1606)。
+[定义位置](../../../manipulation/planning_problem.py#L1644)。
 
 输入签名：
 
@@ -4670,7 +4729,7 @@ def optimizer_preferences(self, position, quaternion, progress, *, trajectory_ti
 实现说明：
 
 > Guide process relations and optional quality-stage goal centering.
-> 
+>
 > Functional feasibility is supplied only by the signed inequality AL
 > terms. ``quality`` additionally prefers the original goal center inside
 > the same enforced tolerance. Process equations and directional commands
@@ -4782,7 +4841,7 @@ torch.finfo
 
 ## `PlanningProblem.measurements`
 
-[定义位置](../../../manipulation/planning_problem.py#L1671)。
+[定义位置](../../../manipulation/planning_problem.py#L1709)。
 
 输入签名：
 
@@ -4870,7 +4929,7 @@ requirement.error
 
 ## `PlanningProblem.verification_issues`
 
-[定义位置](../../../manipulation/planning_problem.py#L1700)。
+[定义位置](../../../manipulation/planning_problem.py#L1738)。
 
 输入签名：
 
@@ -4881,7 +4940,7 @@ def verification_issues(self, progress):
 实现说明：
 
 > Require actual goal/scope queries and the beginning of angular history.
-> 
+>
 > Sampling resolution/continuous interval coverage remains the curve
 > verifier's responsibility. A point query alone proves no winding.
 
@@ -4931,7 +4990,7 @@ requirement.history_complete
 
 ## `PlanningProblem.remaining_obligations`
 
-[定义位置](../../../manipulation/planning_problem.py#L1718)。
+[定义位置](../../../manipulation/planning_problem.py#L1756)。
 
 输入签名：
 
@@ -4942,7 +5001,7 @@ def remaining_obligations(self, progress, applied_ids=()):
 实现说明：
 
 > Read a suffix of this binding; this does not construct a resumed plan.
-> 
+>
 > ``applied_ids`` contains (skill_id, event_id, occurrence) triples. An unapplied command
 > before ``progress`` remains visible as overdue; elapsed time is not
 > evidence that it was applied. Scope intersections retain their original
@@ -5023,7 +5082,7 @@ phase.metadata.get
 
 ## `PlanningProblem.projection_requirements`
 
-[定义位置](../../../manipulation/planning_problem.py#L1772)。
+[定义位置](../../../manipulation/planning_problem.py#L1810)。
 
 输入签名：
 
@@ -5081,7 +5140,7 @@ len
 
 ## `PlanningProblem.goal_requirements_at`
 
-[定义位置](../../../manipulation/planning_problem.py#L1789)。
+[定义位置](../../../manipulation/planning_problem.py#L1827)。
 
 输入签名：
 
@@ -5124,7 +5183,7 @@ abs
 
 ## `PlanningProblem.goal_residual`
 
-[定义位置](../../../manipulation/planning_problem.py#L1794)。
+[定义位置](../../../manipulation/planning_problem.py#L1832)。
 
 输入签名：
 
@@ -5135,7 +5194,7 @@ def goal_residual(self, position, quaternion, progress, *, goal_ids):
 实现说明：
 
 > Differentiable violations of allowed goal sets for initialization only.
-> 
+>
 > Winding acceptance still requires the complete ordered candidate path;
 > a local coordinate query is only a modulo-angle seed screening query.
 
@@ -5190,7 +5249,7 @@ torch.cat
 
 ## `PlanningProblem.project_residual`
 
-[定义位置](../../../manipulation/planning_problem.py#L1822)。
+[定义位置](../../../manipulation/planning_problem.py#L1860)。
 
 输入签名：
 
@@ -5275,7 +5334,7 @@ torch.cat
 
 ## `_path_from_rows`
 
-[定义位置](../../../manipulation/planning_problem.py#L1866)。
+[定义位置](../../../manipulation/planning_problem.py#L1904)。
 
 输入签名：
 
@@ -5326,7 +5385,7 @@ np.eye
 
 ## `_model_from_diagnostics`
 
-[定义位置](../../../manipulation/planning_problem.py#L1876)。
+[定义位置](../../../manipulation/planning_problem.py#L1914)。
 
 输入签名：
 
@@ -5360,7 +5419,7 @@ np.asarray
 
 ## `_validate_skill_requirements`
 
-[定义位置](../../../manipulation/planning_problem.py#L1888)。
+[定义位置](../../../manipulation/planning_problem.py#L1926)。
 
 输入签名：
 
@@ -5371,7 +5430,7 @@ def _validate_skill_requirements(spec):
 实现说明：
 
 > Check requirement-bearing records while retaining scene evidence metadata.
-> 
+>
 > A spelling error in a declared requirement must not become an inert dict
 > entry. Observed scene records and provenance are intentionally not closed
 > schemas: geometry consumers validate their own necessary input fields.
@@ -5437,7 +5496,7 @@ event['kind'].strip
 
 ## `_validate_skill_requirements.fields`
 
-[定义位置](../../../manipulation/planning_problem.py#L1895)。
+[定义位置](../../../manipulation/planning_problem.py#L1933)。
 
 输入签名：
 
@@ -5470,7 +5529,7 @@ sorted
 
 ## `build_planning_problem`
 
-[定义位置](../../../manipulation/planning_problem.py#L1979)。
+[定义位置](../../../manipulation/planning_problem.py#L2017)。
 
 输入签名：
 
@@ -5481,7 +5540,7 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
 实现说明：
 
 > Bind one current skill's actual entry, independent goals and source map.
-> 
+>
 > Every ordinary source row remains available for initialization/deviation
 > reporting. Only explicit functional events, physical models, scoped
 > geometry and requested execution events become planning requirements.
@@ -5663,7 +5722,7 @@ getattr
 
 ## `build_planning_problem.append_interval`
 
-[定义位置](../../../manipulation/planning_problem.py#L2037)。
+[定义位置](../../../manipulation/planning_problem.py#L2075)。
 
 输入签名：
 

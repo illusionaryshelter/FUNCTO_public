@@ -1,6 +1,6 @@
 # `manipulation/resource_admission.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `configure_host_process_root`
@@ -16,7 +16,7 @@ def configure_host_process_root(root_pid):
 实现说明：
 
 > Bind this worker's host budget to itself or an explicit live ancestor.
-> 
+>
 > The standalone default remains this process plus its children. A worker
 > launched by a retained simulation instead supplies that simulation's PID,
 > so later geometry checks include its parent and sibling workers too. The
@@ -130,7 +130,7 @@ def require_host_memory(new_bytes, *, pending_existing_bytes, max_rss_bytes):
 实现说明：
 
 > Admit new host storage while honoring every live lazy reservation.
-> 
+>
 > RSS already contains allocated arrays, native shapes and tree nodes. Add
 > only the proposed allocation and still-unmaterialized storage promised to
 > existing geometry. In particular, do not subtract a capacity estimate from
@@ -209,13 +209,13 @@ def require_device_memory(torch, device, *, native_bytes, torch_bytes=0, max_dev
 实现说明：
 
 > Admit new buffers against current whole-device usage and free capacity.
-> 
+>
 > ``native_bytes`` belongs to Mapper or other native allocators, which cannot
 > reuse pages held by Torch's caching allocator. Only ``torch_bytes`` may use
 > this process's reserved but currently unallocated Torch pages. All existing
 > fields, CUDA contexts, cached pages and other applications already appear
 > in driver-reported device usage; none is added again as a new allocation.
-> 
+>
 > This is a conservative capacity estimate at the allocation boundary, not
 > an allocator lock: concurrent allocations and fragmentation can still make
 > a later native allocation fail. No cache is cleared or limit increased.

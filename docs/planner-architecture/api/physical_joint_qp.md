@@ -1,6 +1,6 @@
 # `manipulation/physical_joint_qp.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_numpy`
@@ -307,7 +307,7 @@ def extrema_times(self, controls, joint, derivative=0):
 实现说明：
 
 > Return boundaries and extrema of q or dq, in fixed-clock units.
-> 
+>
 > Query times use knot units. Values use the model's joint coordinates
 > and seconds; velocity extrema are roots of the actual acceleration.
 
@@ -438,7 +438,7 @@ def solve_joint(self, hessian, linear, lower, upper, joint, *, origin, initial, 
 实现说明：
 
 > Exchange violated analytic extrema for linear QP rows, at most 24 times.
-> 
+>
 > The optimization variable is a coefficient increment from ``origin``.
 > For fitting, the origin is zero. For recovery it is the current legal
 > action. Checking the rounded candidate, rather than the double QP
@@ -559,7 +559,7 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
 实现说明：
 
 > Project a scaled negative gradient, retaining independent joint motion.
-> 
+>
 > Position constraints are separable by joint, so the small diagonal QPs
 > are solved serially. The original native step limits bound *increments*,
 > not cubic coefficients. The optimizer must separately demand actual cost
@@ -795,7 +795,7 @@ def _fit_anchor(domain, curve, dtype, device, velocity_bounds):
 实现说明：
 
 > Construct an anchor satisfying position and velocity on this clock.
-> 
+>
 > A position initializer can be reused only after the velocity check.
 > Otherwise a small strictly convex QP constructs a numerical interior
 > anchor for the same two domains; there is no position-only downgrade.
@@ -878,7 +878,7 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, v
 实现说明：
 
 > Fit soft references, with optional model velocity bounds only for seeds.
-> 
+>
 > Every production caller passes the model's [lower,upper] velocity bounds.
 > Position-only numerical users may omit them; a requested position-and-
 > velocity initialization is never silently weakened on construction failure.

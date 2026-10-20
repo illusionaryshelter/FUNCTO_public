@@ -1,6 +1,6 @@
 # `manipulation/optimizer_device_checks.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `has_active_device_checks`
@@ -351,7 +351,7 @@ def require_tensor(condition, message, *, error_type=ValueError):
 实现说明：
 
 > Validate eagerly, or return the recorded predicate for safe selection.
-> 
+>
 > A returned tensor is never a Python branch condition. The guarded caller
 > must use it in ``torch.where`` with an explicitly safe value. Outside an
 > optimizer scope this function raises immediately or returns ``None``.
@@ -445,7 +445,7 @@ def constant_tensor(value, like, *, dtype=None):
 实现说明：
 
 > Keep model constants alive for capture using their original conversion.
-> 
+>
 > The cache belongs to a single optimizer's graph lifetime. Keys describe
 > host values only; tensor inputs always keep the original ``as_tensor``
 > path, including their gradients. No device values are read to form keys.

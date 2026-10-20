@@ -1,6 +1,6 @@
 # `manipulation/planning_ik.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_validate_reports`
@@ -176,13 +176,13 @@ def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance,
 实现说明：
 
 > Return bounded distinct proposals, without assembling a trajectory.
-> 
+>
 > ``query_kind='reference'`` prefers successful nominal-pose IK within the
 > same task/source screening tier. ``query_kind='functional'`` does not use
 > that flag: the declared allowed set can pass despite failure to reach its
 > nominal centre. Both kinds retain finite recovery proposals, explicitly
 > leaving their failed checks in the reports; they never reject a skill.
-> 
+>
 > Within one tier, distance to the nearest supplied previous state precedes
 > extra environment clearance, self clearance and joint-limit margin. These
 > optional quality measurements cannot buy a large posture jump. Missing or
@@ -298,14 +298,14 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 实现说明：
 
 > Connect qualified reference anchors and interpolate missing seed samples.
-> 
+>
 > Inputs retain the caller's candidate indices. ``previous`` is the measured
 > start of shape ``[1,D]`` at t=0; strictly increasing ``query_times_s`` are
 > physical seconds, and ``velocity_limits`` contains named-order native
 > lower/upper bounds of shape ``[2,D]``. No wraparound, retiming or extra IK
 > query is introduced. Each report requires an explicit ``candidate_source``;
 > only ``native_ik`` may report native pose success.
-> 
+>
 > Finite native IK successes can be anchors even when static task or source
 > checks fail. Native success includes the native solver's constraints and
 > convergence; it does not establish observation coverage or task success.
@@ -317,7 +317,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 > With no qualified anchor, return no reference chain: the caller owns its
 > independent measured-state initializer. Every emitted chain still needs
 > whole-curve optimization and validation.
-> 
+>
 > Dynamic programming retains at most ``count`` paths at each last candidate.
 > Failed static task/model check counts rank proposals first, without
 > removing the only available transferred-reference chain. Edges then

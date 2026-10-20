@@ -1,6 +1,6 @@
 # `manipulation/cubic_trajectory.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `CubicBasis`
@@ -18,7 +18,7 @@ class CubicBasis():
 实现说明：
 
 > Uniform cubic coefficients with free entrance acceleration and jerk.
-> 
+>
 > M position-valued actions represent c2..c(M+1). With h the knot interval,
 > c0=x0-2*h*dq0 and c1=1.5*q0+.5*h*dq0-.5*x0 eliminate q0/dq0 exactly.
 > Three final copies retain the original stopped final interval. Therefore
@@ -134,7 +134,7 @@ def weights(self, progress, derivative=0):
 实现说明：
 
 > Return action and entrance-velocity weights in physical seconds.
-> 
+>
 > q=q0+W@(x-q0)+V*dq0. For derivative>0 the independent q0 term is
 > absent. Exact endpoint rows simplify mathematical identities, rather
 > than admitting a neighbouring measured state or widening a tolerance.
@@ -252,7 +252,7 @@ class CubicTrajectoryStep():
 实现说明：
 
 > Small differentiable action-to-JointState component for cuRobo.
-> 
+>
 > Both regular rollout and dense export use ``sample``. Basis tensors are
 > float64 so measured sub-float32 increments are combined relative to q0
 > before the final native float32 state cast. Torch owns the complete VJP;

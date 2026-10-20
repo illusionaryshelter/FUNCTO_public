@@ -1,6 +1,6 @@
 # `manipulation/curobo_solver_components.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `PhysicalLineSearch`
@@ -242,7 +242,7 @@ def _check_request(self, *, wait_for_device=False):
 实现说明：
 
 > Check cancellation/budget without inventing another deadline.
-> 
+>
 > Checks surround bounded calls; an already submitted CUDA kernel or
 > backward pass remains non-preemptible. Captured steps are checked by
 > their host replay boundary, never by a timer frozen into the graph.
@@ -366,7 +366,7 @@ def _cost_and_gradient_with_guard(self, x, rollout):
 实现说明：
 
 > Keep native cost/backward arithmetic, checking their host boundary.
-> 
+>
 > cuRobo's two cost callbacks have no before-backward hook. This owned
 > implementation retains their detach, reshape, reduction, backward
 > vector and return tensors. The only added operation is the same
@@ -520,7 +520,7 @@ def _begin_functional_solve(self, action):
 实现说明：
 
 > Declare seed layout before the first evaluation and reset in place.
-> 
+>
 > A collision/search recovery can replace or replicate seeds. Each such
 > native optimize call therefore starts its own dual sequence; only its
 > existing inner blocks share parameters. Graph-owned addresses survive
@@ -590,11 +590,13 @@ def _retain_sampled_candidate(self, action, hard_eligible, sampled_feasible, obj
 实现说明：
 
 > Keep one action per seed, preferring stronger sampled evidence.
-> 
+>
 > Rank 0 has no candidate; positive ranks record the caller's hard
-> eligibility and sampled-feasibility flags. The observed-scene caller
-> requires every hard component in both flags. Ordinary/dense final
-> metrics still decide acceptance. Within one rank,
+> eligibility and sampled-feasibility flags. The caller's eligibility
+> checks delivery requirements; sampled feasibility additionally tracks
+> the unchanged nominal optimization targets. In particular, support
+> gap and normal errors cannot discard an otherwise eligible curve.
+> Ordinary/dense final metrics still decide acceptance. Within one rank,
 > the unchanged parameter-free objective orders all line-search trials,
 > including points which Wolfe did not select. One slot bounds storage.
 
@@ -681,7 +683,7 @@ torch.no_grad
 
 ## `PhysicalGradientCore._finish_functional_block`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L240)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L242)。
 
 输入签名：
 
@@ -692,7 +694,7 @@ def _finish_functional_block(self, state):
 实现说明：
 
 > Change parameters only between existing blocks, never add a solve.
-> 
+>
 > Native exploration_action is the next line search's actual base. Its
 > residual cannot be inferred from the last callback, which evaluated
 > several different trials. Re-evaluate that base in the ordinary layout,
@@ -808,7 +810,7 @@ self._restart_changed_objective
 
 ## `PhysicalGradientCore._restart_changed_objective`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L287)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L289)。
 
 输入签名：
 
@@ -885,7 +887,7 @@ torch.no_grad
 
 ## `PhysicalGradientCore._restart_changed_objective.copy_rows`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L289)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L291)。
 
 输入签名：
 
@@ -924,7 +926,7 @@ value.reshape_as
 
 ## `PhysicalGradientCore._reset_progress`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L328)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L330)。
 
 输入签名：
 
@@ -964,7 +966,7 @@ range
 
 ## `PhysicalGradientCore._guarded_step_direction`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L335)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L337)。
 
 输入签名：
 
@@ -975,7 +977,7 @@ def _guarded_step_direction(self, state):
 实现说明：
 
 > Admit only actual, finite, positive-curvature exploration samples.
-> 
+>
 > The native CUDA operation fuses history insertion and two-loop
 > recursion. Run it on the existing full batch, then restore skipped
 > rows in place; neither graph addresses nor active-row arithmetic
@@ -1125,7 +1127,7 @@ torch.no_grad
 
 ## `PhysicalGradientCore._guarded_opt_step`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L380)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L382)。
 
 输入签名：
 
@@ -1228,7 +1230,7 @@ torch.zeros_like
 
 ## `PhysicalGradientCore.solve_diagnostics`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L404)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L406)。
 
 输入签名：
 
@@ -1308,7 +1310,7 @@ report.update
 
 ## `PhysicalGradientCore._recover_stalled`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L433)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L435)。
 
 输入签名：
 
@@ -1319,7 +1321,7 @@ def _recover_stalled(self, state):
 实现说明：
 
 > Try one physically legal Armijo recovery per stalled block/seed.
-> 
+>
 > QP construction is host work. Its trials use the normal main rollout
 > layout, including a fresh zero-scale cost/gradient, and never enter
 > approximate-Wolfe's non-descending exploration fallback.
@@ -1555,7 +1557,7 @@ self._exhausted.all
 
 ## `PhysicalGradientCore._create_initial_iteration_state`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L550)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L552)。
 
 输入签名：
 
@@ -1601,7 +1603,7 @@ action.clone
 
 ## `PhysicalGradientCore.update_num_problems`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L560)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L562)。
 
 输入签名：
 
@@ -1678,7 +1680,7 @@ float
 
 ## `PhysicalGradientCore._prepare_solve`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L595)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L597)。
 
 输入签名：
 
@@ -1732,7 +1734,7 @@ action.detach
 
 ## `PhysicalGradientCore.reinitialize`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L603)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L605)。
 
 输入签名：
 
@@ -1773,7 +1775,7 @@ super
 
 ## `PhysicalGradientCore.optimize`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L613)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L615)。
 
 输入签名：
 
@@ -1827,7 +1829,7 @@ torch.where
 
 ## `PhysicalGradientCore._capture_state`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L639)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L641)。
 
 输入签名：
 
@@ -1838,7 +1840,7 @@ def _capture_state(self):
 实现说明：
 
 > Snapshot the native closure state omitted by GraphExecutor.clone().
-> 
+>
 > Native fused L-BFGS mutates these exact allocations. Its graph executor
 > clones iteration-state inputs, but its three warmups also update shared
 > quasi-Newton history. Restoring values in place preserves both their
@@ -1896,7 +1898,7 @@ saved.element_size
 
 ## `PhysicalGradientCore._restore_capture_state`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L673)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L675)。
 
 输入签名：
 
@@ -1933,7 +1935,7 @@ tensor.copy_
 
 ## `PhysicalGradientCore._dispatch`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L679)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L681)。
 
 输入签名：
 
@@ -1994,7 +1996,7 @@ getattr
 
 ## `PhysicalGradientCore._replay_graph`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L715)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L717)。
 
 输入签名：
 
@@ -2062,7 +2064,7 @@ executor
 
 ## `PhysicalGradientCore.reset_cuda_graph`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L747)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L749)。
 
 输入签名：
 
@@ -2099,7 +2101,7 @@ self._device_checks.clear_constants
 
 ## `PhysicalGradientCore.reset_shape`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L753)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L755)。
 
 输入签名：
 
@@ -2134,7 +2136,7 @@ super
 
 ## `PhysicalGradientCore.extra_workspace_bytes`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L760)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L762)。
 
 输入签名：
 
@@ -2200,7 +2202,7 @@ value.element_size
 
 ## `PhysicalGradientCore.bind_domain`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L775)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L777)。
 
 输入签名：
 
@@ -2243,7 +2245,7 @@ self._reset_progress
 
 ## `LayoutGoalManager`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L787)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L789)。
 
 ```python
 class LayoutGoalManager(GoalManager):
@@ -2259,7 +2261,7 @@ class LayoutGoalManager(GoalManager):
 
 ## `LayoutGoalManager._get_padded_goalset_for_links`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L790)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L792)。
 
 输入签名：
 
@@ -2295,7 +2297,7 @@ super
 
 ## `bind_solver_components`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L802)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L804)。
 
 输入签名：
 
@@ -2306,7 +2308,7 @@ def bind_solver_components(solver, domain: JointPositionDomain, *, use_optimizer
 实现说明：
 
 > Compose only a FUNCTO-owned solver, before its first solve.
-> 
+>
 > Reuse the existing native rollouts and L-BFGS history owner. Assign the new
 > core before resizing so native L-BFGS callbacks access that core's dimensions.
 > Repeated binding updates the physical domain without discarding goal state.

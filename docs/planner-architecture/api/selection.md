@@ -1,6 +1,6 @@
 # `manipulation/selection.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_selected_owner`
@@ -421,25 +421,25 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
 实现说明：
 
 > Select semantic candidates using a fixed, automatically assembled prompt.
-> 
+>
 > ``entity`` selects a semantic object instance, which may contain multiple
 > physical bodies. It requires source owner_mask as visible entity context;
 > a source contact mask is optional. This scope does not bind a region to a
 > body and does not replace the existing physical owner selection scopes.
-> 
+>
 > ``source`` consumes existing ``image``, interaction ``mask``, ``description``
 > and optional ``query_descriptions``. ``selection_scope='owner'`` additionally
 > requires ``source.owner_mask``. These are compiled demonstration evidence;
 > only ``instruction`` describes the current request. No source file path,
 > skill-name branch, source pose or current oracle geometry is used.
-> 
+>
 > ``selection_scope='interaction_reference'`` selects the functional component
 > named in the offline ``source.interaction_reference`` (scope ``part``), with
 > its ``object_description`` and ``interaction_part_description``. The source
 > red contact mask locates the demonstrated interaction; it does not require
 > the selected component to have exactly the same contact-patch extent. This
 > scope needs no complete current owner mask and never manufactures one.
-> 
+>
 > ``selection_scope='owner_evidence'`` interprets ``source.mask`` as visible
 > evidence of the rigid entity described by the source, not as a contact mask.
 > Its optional ``owner_mask`` provides wider source context only. Neither
@@ -448,7 +448,7 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
 > are complementary/overlapping evidence of one target, never alternatives
 > between instances. Empty/unresolved decisions require ``same_owner=None``.
 > This semantic membership claim does not establish measured motion rigidity.
-> 
+>
 > Each ``views[view_id]`` contains an image and detector candidates. Explicit
 > positive integer candidate IDs are preserved; otherwise the input index
 > starting at one is used. A normal single-view call supplies one mapping
@@ -458,21 +458,21 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
 > component, not merely components of one owner. This explicit semantic
 > assertion does not establish rigidity or geometric registration. Other
 > scopes share context only; their local IDs establish no association.
-> 
+>
 > For ``interaction_region`` or ``interaction_reference``, a view may supply ``selected_owner`` with
 > exactly owner_id, mask, description and source. That actual current mask is
 > shown independently in green, and the same request must verify that each
 > selected part belongs to that instance. Spatial overlap alone is not used
 > to associate, select, clip or merge masks. Unclear membership remains null.
 > Omitting this record preserves the original request and behavior.
-> 
+>
 > Each result has a status: selected, alternatives (all semantically allowed),
 > unresolved, no_match, or no_candidates. ``regions`` retains the separate
 > selected masks. Owner and local interaction scopes are explicit in the
 > returned record; this function never silently constructs an owner_mask.
 > Geometry, correspondence, accessibility and grasp feasibility remain the
 > responsibilities of the existing downstream consumers.
-> 
+>
 > Owner-evidence selections use ``selected`` for one or several masks, carry
 > the semantic ``same_owner`` assertion, and never merge their pixels or
 > upgrade them to a complete ``owner_mask``. Entity/component-reference

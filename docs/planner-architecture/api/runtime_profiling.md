@@ -1,6 +1,6 @@
 # `manipulation/runtime_profiling.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_write_profile`
@@ -16,7 +16,7 @@ def _write_profile(profiler, output, elapsed, succeeded):
 实现说明：
 
 > Keep the full pstats archive and bounded, sortable JSON summaries.
-> 
+>
 > Self time excludes nested calls and can be summed across functions or
 > files. Cumulative time includes callees and must not be added across rows.
 > Both include measurement overhead; neither is a separate unprofiled run.
@@ -94,7 +94,7 @@ def run_with_optional_profile(operation, *args, enabled=False, output, **kwargs)
 实现说明：
 
 > Call an operation unchanged, optionally recording its host call tree.
-> 
+>
 > Profiling is explicitly opt-in. It is disabled before exporting statistics
 > so report generation is not misreported as application work. An operation's
 > return value or exception is preserved even if profile export fails.

@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。本组件将已有示教、当前任务关系及机器人入口状态编译为 `PlanningProblem`，供场景绑定与数值规划调用。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
+代码基线：待本次实现提交标注。本组件将已有示教、当前任务关系及机器人入口状态编译为 `PlanningProblem`，供场景绑定与数值规划调用。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
 
 ## 1. 输入的来源与相互依赖
 
@@ -72,7 +72,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 | 要求类型 | 输入及计算对象 | 输出与使用位置 |
 |---|---|---|
 | `PoseEventRequirement` | 一个进度、功能坐标在工具坐标中的变换、目标位姿、位置和角度容差 | `errors` 返回位置误差与转角误差；`evaluate` 返回两项超容差非负残差之和 |
-| `SupportRequirement` | 进度、物体坐标在工具坐标中的变换、物体点、接触点、外法线、有限支撑面和容差 | `raw_inequalities` 返回间隙、整体位置、投影范围、法向四类有符号条件，均以 `≤0` 为满足；归一化与硬验收分别消费 |
+| `SupportRequirement` | 进度、物体坐标在工具坐标中的变换、物体点、接触点、外法线、有限支撑面和容差 | `raw_inequalities` 返回 gap/body/footprint/normal 四类有符号条件；优化消费四项，轨迹验收消费 body/footprint |
 | `InteriorRequirement` | 区间、物体点、凸区域半空间和内缩距离 | 所有指定点相对半空间的最大越界量，减数值容差后截为非负 |
 | `PoseProcessRequirement` | 区间、相对位姿及六维允许范围 | 过程中的平移和转动误差，只有明确受约束方向进入残差 |
 | `MechanismRequirement` | 当前机构模型、附着、坐标限位、入口坐标及方向要求 | 流形偏离、坐标限位与方向残差；完整路径保留角度展开历史 |
@@ -82,7 +82,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 | `PlanningEvent` | 原技能/事件/发生次数身份、进度、源帧、种类、可选停止与效果依赖 | 决定指令时刻，并按显式字段编译停止要求或下一段动作的独立依赖 |
 | `EventTimeConstraint` | 检查对象、绝对或相对时间窗、可选起源事件 | 规划时检查名义时钟；执行只消费允许的指令/独立效果时间，几何目标到达时间仅事后评价 |
 
-记 `errors` 返回的位置误差和转角误差为 `e_p`、`e_r`，各自容差为 `ε_p`、`ε_r`，则 `PoseEventRequirement.evaluate` 返回 `max(0,e_p−ε_p)+max(0,e_r−ε_r)`。`SupportRequirement.evaluate` 对四项原始有符号条件分别取正部后求和；`normalized_inequalities` 则按长度或法向弦长尺度缩放原始条件，供增广拉格朗日计算使用。
+记 `errors` 返回的位置误差和转角误差为 `e_p`、`e_r`，各自容差为 `ε_p`、`ε_r`，则 `PoseEventRequirement.evaluate` 返回 `max(0,e_p−ε_p)+max(0,e_r−ε_r)`。`SupportRequirement.evaluate(..., for_acceptance=False)` 对四项原始有符号条件分别取正部后求和，保留完整优化值及梯度；`for_acceptance=True` 仅汇总 `acceptance_components=("body","footprint")`。`normalized_inequalities` 按长度或法向弦长尺度缩放全部四项，供增广拉格朗日计算使用。
 
 `NumericalTolerance` 控制浮点计算比较，目标容差规定任务允许误差，支撑容差规定允许间隙；实体距离的模型余量由观测碰撞查询单独应用。各量由对应接口保存。
 
@@ -90,9 +90,11 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `sample_reference(s)` 返回当前进度的名义工具参考；`source_time_to_progress` 和 `progress_to_source_time` 在保存的源时钟中转换。`transform_tool_pose`、`reference_to_link_pose` 和 `transform_tool_velocity` 将原生机器人计算转换到任务参考坐标，或将任务目标转换回原生连杆坐标。变换依赖构造时固定的 `base_pose/tool_transform`。
 
-`residuals(position, quaternion, progress, ...)` 接收相互对齐的批量候选状态，返回名字到非负残差张量的字典。姿态数组分别为 `[...,3]` 和 `[...,4]`；进度数组是相同的批量/时间维度。具名关节、速度、物理时间和工具速度在对应要求需要时使用。事件约束在其精确进度的首次物理到达样本上计算，`point_goal_ids` 将当前查询样本绑定到相应原目标身份。
+`residuals(position, quaternion, progress, ..., for_acceptance=False)` 接收相互对齐的批量候选状态，返回名字到非负残差张量的字典。姿态数组分别为 `[...,3]` 和 `[...,4]`；进度数组是相同的批量/时间维度。具名关节、速度、物理时间和工具速度在对应要求需要时使用。事件约束在其精确进度的首次物理到达样本上计算，`point_goal_ids` 将当前查询样本绑定到相应原目标身份。默认计算完整名义条件；轨迹指标传入 `for_acceptance=True`，使每个支持事件的残差只汇总 body/footprint。其他要求使用原值、原掩码与原容差。
 
-`evaluate` 汇总 `residuals`。`functional_inequalities` 返回按功能事件身份排列的有符号归一化条件与事件掩码，供功能约束增广拉格朗日计算。位置与角度条件使用 `error/tolerance−1`；支撑使用四类原始条件对应的正尺度。缺少要求的精确事件样本时输出 NaN，表达该条件在当前样本集上的未求值状态。
+`PlanningProblem.evaluate` 汇总默认的完整 `residuals`。`functional_constraint_keys` 枚举当前请求区间中的全部功能条件身份；`functional_inequalities` 按这些身份返回有符号归一化条件与事件掩码，供功能约束增广拉格朗日计算。位置与角度条件使用 `error/tolerance−1`；支撑保留四类原始条件及其正尺度。缺少要求的精确事件样本时输出 NaN，表达该条件在当前样本集上的未求值状态。
+
+`functional_acceptance_keys` 从同一功能身份集合选择轨迹验收所需的条件：支持事件保留 body/footprint，位姿与机构坐标事件保留全部原条件。`ProcessCostManager` 在优化前向中读取非支持过程残差及这组键对应的既有有符号数值，构造候选保留的资格；完整四项继续参与增广拉格朗日和严格优化可行性判断。两类计算复用同一事件位姿及条件身份。
 
 `optimizer_preferences` 表示过程等式、方向与可选目标中心偏好；当前生产求解调用 `phase="feasibility"`。`measurements` 提供解释性原量；`projection_requirements`、`project_residual`、`goal_requirements_at` 和 `goal_residual` 供 IK 排序、边界投影和 OMPL 状态检查。投影以机器人候选状态为变量，保持目标与允许范围为固定输入。
 
@@ -111,7 +113,7 @@ footprint = max_i,j [a_jᵀ Uᵀ(x′_i−o)+b_j] + m − ε_num
 normal    = ‖R n_b+n‖₂ − 2 sin(ε_θ/2)
 ```
 
-四项均以小于等于零为满足。前三项以米计；第四项是两个单位法线之间的弦长条件，表达物体外法线与支撑面法线反向对齐。`normalized_inequalities` 使用 `max(ε_g,ε_num)` 缩放前三项，使用声明角容差和数值角容差对应弦长的较大者缩放法向项。硬验收直接消费原始条件的正部和，功能约束优化消费缩放后的有符号条件。
+四项均以小于等于零为满足。前三项以米计；第四项是两个单位法线之间的弦长条件，表达物体外法线与支撑面法线反向对齐。`normalized_inequalities` 使用 `max(ε_g,ε_num)` 缩放前三项，使用声明角容差和数值角容差对应弦长的较大者缩放法向项。功能约束优化消费全部四项的有符号归一化值；轨迹验收直接消费 body/footprint 两项原始条件的正部和。gap/normal 及其原容差继续属于名义支持模型，由原始与归一化接口提供结果分析数值。
 
 参考 API 接收显式物体坐标约定。若 TSDF 使用相机坐标 `C`、任务点使用物体坐标 `B`，则 `T_C_B` 将任务点转换至 TSDF 坐标，法线使用该变换的旋转部分。随后各计算通过同一物体表示坐标和共同参考坐标连接。技能表示中的任务点与功能区域保留其任务含义；当前物体的碰撞占据由场景模型表达。二者共享坐标，并不要求以碰撞模型替换技能表示。当前输入契约与持物改造计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-put-planner-audit/2026-10-20-model-restoration-plan.md)。
 

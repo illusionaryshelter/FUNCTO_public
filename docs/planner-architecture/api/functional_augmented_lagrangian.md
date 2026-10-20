@@ -1,6 +1,6 @@
 # `manipulation/functional_augmented_lagrangian.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `FunctionalAugmentedLagrangian`
@@ -23,7 +23,7 @@ required_reduction = 0.5
 实现说明：
 
 > One multiplier vector and penalty per independently optimized seed.
-> 
+>
 > ``bind`` declares the seed layout before evaluation/capture. Rollout rows
 > are seed-major, then line-search-particle-major, exactly as GradientOptCore
 > reshapes actions. ``update`` requires one actual continuation point per
@@ -83,7 +83,7 @@ def bind(self, like, num_seeds=None):
 实现说明：
 
 > Keep addresses for an unchanged layout; a changed layout starts fresh.
-> 
+>
 > Manager rebinding only supplies dtype/device and therefore retains the
 > existing seed count. The core explicitly declares its count at each
 > solve entry, before either initial or ordinary rollout evaluation.
@@ -258,7 +258,7 @@ def terms(self, signed):
 实现说明：
 
 > Nonnegative PHR terms, broadcasting only within each seed's particles.
-> 
+>
 > Omitting the x-independent ``-lambda**2/(2*rho)`` preserves gradients
 > and minimizers while retaining the native tracker's nonnegative cost
 > convention. Such costs cannot be compared across parameter updates.
@@ -322,7 +322,7 @@ def update(self, signed):
 实现说明：
 
 > Return changed seed rows after one block's inexact PHR update.
-> 
+>
 > ``max(abs(max(g, -lambda/rho)))`` measures feasibility/complementarity
 > progress, not stationarity or full KKT convergence. The first update
 > establishes the comparison value. Finite steps may approach a boundary

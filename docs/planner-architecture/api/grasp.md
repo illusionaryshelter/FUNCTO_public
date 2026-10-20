@@ -1,6 +1,6 @@
 # `manipulation/grasp.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `validate_timeline`
@@ -16,7 +16,7 @@ def validate_timeline(frame_indices, timestamps):
 实现说明：
 
 > Return independent arrays with original observation IDs and seconds.
-> 
+>
 > Frame IDs need not be consecutive or begin at zero. They are identifiers,
 > not array offsets. Times must be finite and strictly increasing; this
 > validation never replaces them with the geometry kernel's sample phase.
@@ -121,7 +121,7 @@ def _gripper_events(value, frames):
 实现说明：
 
 > Check explicit intentions without deriving commands from measured qpos.
-> 
+>
 > # BEGIN source end ownership is independent of device execution coverage.
 > An explicitly owned command may use either source boundary. Requiring an
 > observed frame avoids silently snapping an event after decimation. The
@@ -272,12 +272,12 @@ def bind_grasp_candidate(scene, T_reference_tool, *, source):
 实现说明：
 
 > Return a scene whose new grasp goal also aligns its complete reference.
-> 
+>
 > ``T_reference_tool`` uses the scene's ``reference_frame`` and the existing
 > ``tool_frame`` control point, not a generator's gripper base. Its producer
 > must first perform that calibrated frame conversion. This binding only
 > creates an action candidate; it establishes neither clearance nor Holding.
-> 
+>
 > Keep the original independent goal as ``grasp_reference_prior``. Grounding
 > then moves every ordinary reference sample by the rigid displacement from
 > that prior to the selected goal. An existing prior remains the anchor when
@@ -345,7 +345,7 @@ def ground_grasp(demo, scene):
 实现说明：
 
 > Bind the original same-tool reference and its independent grasp goal.
-> 
+>
 > Region correspondence maps the complete source motion into the current
 > scene. The actual robot state belongs to the planner; no selected source
 > frame creates an approach waypoint, Cartesian suffix lock, or stop. The
@@ -355,7 +355,7 @@ def ground_grasp(demo, scene):
 > ordinary reference samples and never observed Holding. Numerical solver
 > tolerances do not supply missing task precision. ``protected_start_frame``
 > retains contact evidence identity only.
-> 
+>
 > # BEGIN candidate alignment is explicit rather than inferred from a goal change.
 > ``grasp_reference_prior`` opts into a generated candidate's full-reference
 > alignment. For bound source samples D, original goal P and selected goal E
@@ -433,7 +433,7 @@ def attached_eef_reference(carrier_poses, actual_T_carrier_eef):
 实现说明：
 
 > Apply the caller's declared attachment during modeled rigid holding.
-> 
+>
 > The caller obtains ``actual_T_carrier_eef = inverse(T_world_carrier) @
 > T_world_eef`` from synchronized current evidence after checking stability.
 > This function only composes geometry; passing a matrix is not evidence that

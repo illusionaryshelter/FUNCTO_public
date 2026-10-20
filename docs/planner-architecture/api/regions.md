@@ -1,6 +1,6 @@
 # `manipulation/regions.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `SupportReferenceNotFound`
@@ -18,7 +18,7 @@ class SupportReferenceNotFound(ValueError):
 实现说明：
 
 > The existing support initializer could not provide a nominal member.
-> 
+>
 > This may be a missing preferred alignment branch, a failed exact-normal
 > height member or an exhausted bounded yaw search. It carries no claim that
 > the continuous allowed set is empty. Invalid numerical/structural geometry
@@ -119,12 +119,12 @@ def function_frame(origin, axis, plane_normal):
 实现说明：
 
 > Construct an owner-local SE(3) frame from two observed signed directions.
-> 
+>
 > x follows the operational axis, z the function-plane normal, and y=z cross x.
 > Axis and normal must be perpendicular; only floating-point residuals below
 > 1e-6 are removed. A missing/parallel/unsigned direction is not completed from
 > a world axis. Region centroids or PCA axes are not introduced by this API.
-> 
+>
 > This follows MimicFunc A.2.2's center-to-function direction. The released
 > ``compute_function_plane_frame`` uses the opposite x and y, an equivalent
 > fixed local z-pi gauge only when all associated poses use it consistently.
@@ -181,7 +181,7 @@ def source_region_frame(*, T_world_body, T_world_camera, points_world=None, T_wo
 实现说明：
 
 > Bind one supplied source frame, or construct it from the source region.
-> 
+>
 > All inputs belong to the region-image timestamp.  A supplied interaction
 > point from another time must first be transported with its owning body.
 > The fitted normal faces the source camera; the longer projected camera x/y
@@ -261,7 +261,7 @@ def align_axis(preferred_rotation, local_axis, target_axis, *, antiparallel_axis
 实现说明：
 
 > Choose the rotation nearest a preference that maps one signed axis.
-> 
+>
 > The remaining twist is selected from ``preferred_rotation``, not measured
 > from the single axis. Return one numerical rotation candidate; callers must
 > retain that distinction when stating task requirements. For opposite axes,
@@ -342,13 +342,13 @@ def ground_relation(demo_pose, demo_carrier_frame, scene_carrier_frame, demo_ref
 实现说明：
 
 > Preserve an explicit functional relation across different owner shapes.
-> 
+>
 > ``demo_pose`` is T_Rd_Cd. Each functional frame F is T_owner_function in
 > that owner's *fixed* local coordinates, not an observation-camera pose.
 > Let S=inv(F_Rd) D_d F_Cd. The event goal is D_n=F_Rn S inv(F_Cn).
 > This is equivalent to A_R D_d inv(A_C), with A_X=F_Xn inv(F_Xd).
 > No congruence of the complete objects or their region point sets is needed.
-> 
+>
 > The returned pose is a functional-event target, not a freely normalized
 > trajectory reference: normalizing it by its initial pose would cancel A_C.
 > A complete frame target must not silently replace a partially observed
@@ -396,7 +396,7 @@ def relation_error(pose, carrier_frame, reference_frame, functional_relation):
 实现说明：
 
 > Independently check function-frame position and SO(3) angle residuals.
-> 
+>
 > Errors are metric diagnostics, with no built-in task acceptance threshold.
 > They do not establish physical contact, grasp stability or task success.
 
@@ -489,13 +489,13 @@ def check_region_on(pose, carrier_region_points, carrier_outward_normal, support
 实现说明：
 
 > Check the specifically declared contact face against a finite support.
-> 
+>
 > Every supplied owner-local contact-face sample must be within the support
 > boundary and plane gap tolerance. Its signed outward normal must oppose the
 > support normal. Unlike ``check_on``, a different, lower part of the carrier
 > cannot satisfy this contact-face check. No convex hull is fabricated for the
 > carrier region and no missing support geometry is completed.
-> 
+>
 > This validates supplied part geometry, not the semantic part name: if a
 > caller labels the rim as the bottom, geometry cannot recover that label.
 > Return diagnostics plus ``valid``; invalid numerical inputs raise, whereas
@@ -576,7 +576,7 @@ def ground_on(preferred_pose, body_points, carrier_region_points, carrier_outwar
 实现说明：
 
 > Instantiate a partial face-on-support relation using existing geometry.
-> 
+>
 > First rotate the specified carrier outward normal opposite the support
 > normal, selecting the closest twist from the explicit pose preference.
 > Then ``place_on`` moves the *whole supplied body geometry* into the finite
@@ -585,7 +585,7 @@ def ground_on(preferred_pose, body_points, carrier_region_points, carrier_outwar
 > absolute angle. Both signs at the same angle are compared by translation
 > change. Finally verify the declared functional contact face independently;
 > the body's lowest point alone cannot make this API report success.
-> 
+>
 > The chosen twist and tangential location are numerical preferences, not
 > measured task requirements. Their feasible range is bounded by the supplied
 > support and body geometry. The output certifies this sampled geometric
@@ -684,7 +684,7 @@ def bind_region(source_points, target_points, *, max_error=0.01):
 实现说明：
 
 > Fit corresponding owner-local surface samples, preserving fit evidence.
-> 
+>
 > Source/target rows must already represent paired semantic-region locations.
 > This optional estimator is useful for locally congruent geometry; it is not
 > a requirement that functionally equivalent objects have congruent shapes.
@@ -727,7 +727,7 @@ def bind_observations(mask, depth, K, T_camera_owner):
 实现说明：
 
 > Lift visible region pixels into their fixed owner frame, without mutation.
-> 
+>
 > Depth is registered metric camera-z depth. ``T_camera_owner`` is that
 > observation's calibrated camera-from-owner pose; it need not be identity.
 > Nonpositive/nonfinite depth contributes no surface point. An empty valid
@@ -795,7 +795,7 @@ def sample_region_pixels(mask, depth, count=24):
 实现说明：
 
 > Choose bounded, dispersed source queries strictly inside a visible ROI.
-> 
+>
 > Erode a valid-depth ROI by one pixel when enough points remain, reducing
 > boundary-depth contamination. Farthest-point sampling considers at most
 > 6,000 candidate pixels and stores no dense distance matrix. This controls
@@ -1023,7 +1023,7 @@ def _source_observation(demo):
 实现说明：
 
 > Require source function evidence, including its geometric query roles.
-> 
+>
 > Function-direction witnesses may lie outside the true interaction patch,
 > but must remain on the same selected source owner. The interaction mask is
 > never expanded to make it encompass those witnesses. Small segmentation
@@ -1107,12 +1107,12 @@ def _recipe_frame(points, recipe):
 实现说明：
 
 > Rebuild a function frame, independent of cross-instance point distances.
-> 
+>
 > For Q (N,3), o=Q.T@w, a=Q.T@axis_weights and b=Q.T@plane_weights.
 > sum(w)=1 and both direction sums=0 make the construction SE(3)-equivariant.
 > x=unit(a), z=unit(b cross x), y=z cross x. Different point distances and
 > shapes are allowed. Zero or parallel directions cannot produce a frame.
-> 
+>
 > In ``plane`` mode the same arithmetic supplies a reproducible plane basis,
 > but its x direction is merely a chosen tangent, never an observed functional
 > angle. Its ordered normal is not automatically a physical outward normal;
@@ -1203,7 +1203,7 @@ def source_function_geometry(demo):
 实现说明：
 
 > Validate and lift compiled source functional queries without inference.
-> 
+>
 > Source includes the true interaction mask, owner context, explicit queries,
 > per-query descriptions and a geometry recipe. It need not contain fixed
 > function/center/grasp landmarks. This computes the recipe's source frame;
@@ -1275,7 +1275,7 @@ def match_functional_region(demo, current, *, client=None, extractor=None):
 实现说明：
 
 > Infer current functional geometry from source evidence and owner RGB-D.
-> 
+>
 > Current input requires image, owner_mask, depth, K, T_camera_owner and
 > owner_id. Optional interaction_evidence contains a selected visible part,
 > semantic description and provenance, never a functional frame or queries.
@@ -1286,7 +1286,7 @@ def match_functional_region(demo, current, *, client=None, extractor=None):
 > current owner and valid depth. Those query correspondences reconstruct the
 > current functional frame under the same source recipe. Unlike rigid fitting,
 > no cross-instance pairwise-distance equality is assumed.
-> 
+>
 > Owner-context crops are fixed for all queries. One descriptor pair is
 > extracted and reused; each matcher invocation retains its bounded sampling.
 > Repeated target pixels are not arbitrarily reassigned: recipe degeneracy,

@@ -1,6 +1,6 @@
 # `tests/planning/recorded_task_planning.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_json_value`
@@ -162,7 +162,7 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
 实现说明：
 
 > Preserve the exact exported cubic, event identities and optional FK.
-> 
+>
 > ``fk`` contains independently evaluated native FK of this same exported
 > curve, in the problem reference frame. Native planner callers also supply
 > their effective bounds; the shared production calculus then reports both
@@ -253,7 +253,7 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
 实现说明：
 
 > Call the bound backend once; persistence cannot initiate another solve.
-> 
+>
 > The caller owns the backend lifetime so successive requests can reuse its
 > native models. Diagnostic curves have no formal binding and cannot enter
 > the simulation executor. No monkeypatch, observer-side export, source

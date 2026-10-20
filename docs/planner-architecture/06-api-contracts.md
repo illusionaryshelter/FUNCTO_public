@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`85f67b53ffaa13b474c98061a0acfc51dea91c32`。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
+代码基线：待本次实现提交标注。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -26,8 +26,9 @@
 | `resolve_event_window` | 解析绝对或相对物理时间窗 | `EventTimeConstraint`、实际历史、可用预测原点 → 上下时间界；时钟绑定与执行 |
 | `PoseProcessRequirement.error` | 计算过程关系偏差 | 候选位置/姿态/进度 → 指定过程残差；问题残差 |
 | `PoseEventRequirement.errors/evaluate` | 计算确切功能目标误差与超容差量 | 候选工具位姿、已绑定材料/目标 → 位置/角度误差或正部和；硬验收 |
-| `SupportRequirement.raw_inequalities` | 计算有限支撑四条件 | 候选工具位姿、物体点/材料、目标平面/边界 → gap/body/footprint/normal；硬条件与归一化 |
-| `SupportRequirement.normalized_inequalities/evaluate` | 分别给出优化尺度和硬残差 | 四类原始条件与数值尺度 → 有符号归一化条件或正部和；AL 与验收 |
+| `SupportRequirement.raw_inequalities` | 计算有限支撑四条件 | 候选工具位姿、物体点/材料、目标平面/边界 → gap/body/footprint/normal 原始有符号值；优化、验收选择与分析 |
+| `SupportRequirement.normalized_inequalities` | 缩放完整支持条件，保留各项零集合 | 四类原始条件与数值尺度 → 四项有符号归一化条件；功能 AL |
+| `SupportRequirement.acceptance_components/evaluate` | 声明支持验收子集并计算相应残差 | 同一工具位姿、支持几何、数值容差及 `for_acceptance` → 默认四项正部和，True 时为 body/footprint 正部和；`PlanningProblem.residuals` |
 | `InteriorRequirement.evaluate` | 计算物体点在指定凸区域中的包含条件 | 候选位姿、点集、半空间、数值容差 → 非负越界；过程要求 |
 | `MechanismRequirement.coordinates/errors` | 将候选位姿解释为机构坐标和流形偏差 | 已绑定机构、附着、候选位姿 → 坐标或模型误差；机构约束 |
 | `MechanismRequirement.project_residual/history_complete` | 提供过程投影及转角历史完整性 | 位姿/进度 → 投影残差或历史完整状态；OMPL、任务验证 |
@@ -38,8 +39,10 @@
 | `transform_tool_pose/reference_to_link_pose` | 连接原生 FK 连杆与任务工具坐标 | 固定基座/工具标定、位姿 → 对应坐标中的位姿；FK 与 IK |
 | `transform_tool_velocity` | 转换工具速度 | 线/角速度及连杆姿态 → 任务坐标中的工具速度；方向要求 |
 | `transform_robot_spheres` | 转换原生状态的空球数组 | 当前纯运动学配置的空数组 → 同布局空数组；原生状态接口 |
-| `residuals/evaluate` | 对同一候选状态计算全部已编译硬条件 | 位姿、进度、具名关节/速度、物理时间、确切目标身份 → 分项或聚合残差；原生 metrics |
-| `functional_constraint_keys/functional_inequalities` | 给功能条件确定键与有符号尺度 | 确切事件样本、位姿/时间 → 条件键和归一化不等式；AL |
+| `PlanningProblem.residuals` | 按调用目的计算已编译条件 | 位姿、进度、具名关节/速度、物理时间、确切目标身份及 `for_acceptance=False` → 非负分项；优化使用默认完整条件，轨迹 metrics 传 True 选择支持验收子集 |
+| `PlanningProblem.evaluate` | 汇总完整名义条件 | 与默认 residuals 相同的候选状态及任务输入 → 全部分项之和；直接任务评价 |
+| `functional_constraint_keys/functional_inequalities` | 给完整功能条件确定键与有符号尺度 | 确切事件样本、位姿/时间 → 条件键、归一化不等式及事件掩码；AL、严格优化可行性与同次候选证据 |
+| `functional_acceptance_keys` | 从完整功能身份中选取验收条件 | 已编译功能要求 → 支持仅 body/footprint，其他功能身份完整保留；优化中候选资格读取同次 signed 数值 |
 | `optimizer_preferences` | 计算过程/方向等优化偏好 | 候选状态、时间及优化阶段 → 偏好张量；代价管理器 |
 | `measurements` | 保存可解释的任务原量 | 候选位姿与时间 → 测量字典；诊断 |
 | `anchors/stop_progress` | 枚举确切任务时刻和停止要求 | 编译后任务 → 进度集合；固定时钟与查询布局 |
@@ -58,7 +61,7 @@
 | `FrozenObservedField.record/from_record/save/load` | 固定场或结构化样本记录 | 同一样本及坐标的场/记录；保存与复用 |
 | `ObservedField.sample/cell_value` | 原场支持内的局部点或具体单元 | 值、有效性、梯度、数值误差；距离、过滤与接触 |
 | `query_distance` | 两个原场、刚体变换、数值精度和有限许可 | 已表示域的 clear/intersection/unresolved、诊断距离界及见证；优化与验收使用同一非穿透规则 |
-| `pair_residual` | 原生实体—场或场—场、可微位姿、同值矩阵、数值精度与有限许可 | 已确认体积交叠的分类值 1 及局部法向导数；clear/未决返回零，分类证据单独保留 |
+| `pair_residual` | 原生实体—场或场—场、可微位姿、同值矩阵、数值精度、有限许可及可选共享零值 | 已确认体积交叠的分类值 1 及局部法向导数；clear/未决复用零值，分类证据单独保留；场景逐对调用 |
 | `query_region_intersection` | 原场、位姿、有限半空间 | 受支持零表面 contact/missing_contact/unresolved；required接触 |
 | `query_minimum_height` | 原场、位姿与声明平面 | 整体最低高度区间及见证；初始支撑 |
 | `robot_self_filter.classify_depth` | 原深度、采集时FK放置的原生组件、明确shadow padding | SELF/AMBIGUOUS_SHADOW/ENVIRONMENT、原自由射线及来源；建图 |
@@ -69,7 +72,7 @@
 | `DifferentiableRobotKinematics.poses` | 纯运动学配置和完整具名关节 | 可微世界连杆位姿；场景再合成原实体局部变换 |
 | `RobotGeometryChecker.query` | 具名关节、基座标定、成对策略和所需帧 | 限位、独立FK、原生有符号距离/见证/法向及分离/穿透/数值边界；`RobotStateValidator` |
 | `OnlinePlanningScene.bind_online_robot` | 同一原生检查器、纯运动学配置、验证器、请求检查 | 完整FK和对策略绑定；后端初始化 |
-| `OnlinePlanningScene.components/evaluate` | 同时刻具名关节、工具位姿、实际进度、物理时间及仅作阶段记录的 query_role | 依实际附着排除组合体内部配对，返回分项/硬和与见证报告及 `internal_assembly_pair_count`；IK、优化、验收共用非穿透规则 |
+| `OnlinePlanningScene.components/evaluate` | 同时刻具名关节、工具位姿、实际进度、物理时间及仅作阶段记录的 query_role | 原 required 自身配对、组合体外配对与独立场景条件的分项/硬和及见证；复用批次可导零值，保存 `internal_assembly_pair_count`；IK、优化、验收共用非穿透规则 |
 | `describe/to_execution_binding` | 场景已有输入、工具成员及实体附着 | `collision_rule='nonpenetration'`、`tool_geometry_names` 描述与 `native_robot_observed_scene_v1` 快照；结果绑定 |
 | `clone_for_rollout/with_release_history` | 同一原始场及已选搜索前缀 | 私有关系状态、共享不可变场；搜索与优化 |
 | `estimated_workspace_allocation` | batch/horizon和实体数 | 共享场与逐状态临时存储估计；资源准入 |
@@ -112,13 +115,16 @@
 | `fit_cubic_reference/recover_position_step` | 求受位置/速度域约束的拟合或更新 | 物理域、仿射基、目标或梯度/步长 → 合法系数或步方向；域方法 |
 | `bind_solver_components` | 将物理域扩展装入一个原生实例 | cuRobo solver、domain、graph 设置 → 已绑定实例；后端初始化 |
 | `PhysicalGradientCore.optimize/reinitialize/bind_domain` | 管理原生迭代、候选保留与请求域 | 合法种子、重置掩码或新域 → 优化动作/更新状态；IK 与轨迹 solver |
+| `PhysicalGradientCore._retain_sampled_candidate` | 在每个种子的固定槽中保留可交付候选 | 当前动作、同次 eligible/feasible 与原排序目标 → 等级1或2的保留动作；普通与密集 metrics 随后验收 |
 | `PhysicalGradientCore.solve_diagnostics/extra_workspace_bytes` | 导出本次数值恢复与存储量 | 当前优化核心 → 报告/字节；请求诊断/准入 |
+| `ProcessCostManager.compute_costs` | 计算同次任务、场景及功能 AL，并形成候选依据 | 机器人状态、已绑定问题/时钟/场景、有效网格与锚点 → 代价和约束；场景只查询整批有效列并集，回填后按行归约 |
+| `ProcessCostManager.optimizer_evidence` | 以 AL 与场景张量身份核对本次前向，再合并原生其余硬约束 | 对应前向的 trajectories → `(eligible, feasible, signed, fixed_objective)`，分别为验收资格、完整优化可行性、有符号功能条件及原排序目标；优化核心保留候选 |
 | `FunctionalAugmentedLagrangian.bind/reset/terms/update` | 分种子保存并更新功能乘子 | 条件键、种子布局、有符号残差 → 优化项或更新掩码；代价与块间更新 |
 | `FunctionalAugmentedLagrangian.snapshot/report` | 导出功能约束数值状态 | 已完成求解状态 → 乘子/罚参数/更新记录；诊断 |
 | `rank_ik_candidates/select_ik_chains` | 排序并连接有限 IK 状态 | 原生结果、任务/场景残差、入口与阶段 → 排序记录/关节链；参考种子 |
 | `_CuroboPlanner.reference_seeds/ompl_seed` | 生成固定基参考或搜索种子 | 原参考/可选外部曲线、场景、当前候选 → 系数及来源/搜索报告；请求主流程 |
 | `_CuroboPlanner.evaluate_reference/optimize` | 运行完整参考 metrics 或原生优化 | 动作种子 → 原生结果；候选选择 |
-| `_CuroboPlanner.select_candidate/native_diagnostics` | 按原始约束选择并解释已有候选 | `select_candidate` 返回 `(candidate, trajectory, report)`；`native_diagnostics` 返回指定种子的指标报告；主流程 |
+| `_CuroboPlanner.select_candidate/native_diagnostics` | 按普通与密集轨迹验收条件选择并解释已有候选 | `select_candidate` 返回 `(candidate, trajectory, report)`；`native_diagnostics` 返回指定种子的指标报告；主流程 |
 | `_CuroboPlanner.evaluate_candidate/export` | 验收原多项式并输出完整曲线 | `evaluate_candidate` 返回 `(trajectory, attempt, points)`；`export` 复用同身份报告后返回 `(trajectory, points)`；请求入口随后生成执行绑定 |
 | `AttemptWitnesses.add_native/add_validation/set_current` | 收集本次实际失败时刻并记录当前候选 | 完成的 native/export metrics → 有限参数集合；诊断采样 |
 | `AttemptWitnesses.select_parameters` | 在固定容量内合并必须点与可选见证 | 固定/普通参数和最大点数 → 诊断查询参数；报告生成 |

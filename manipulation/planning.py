@@ -2682,7 +2682,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # BEGIN every supported functional event has exactly one optimizer owner.
             process_terms = problem.residuals(position, quaternion, progress, q, self._joint_names,
                 joint_velocity=dq, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear,
-                tool_angular_velocity=tool_angular)
+                tool_angular_velocity=tool_angular,
+                # BEGIN delivery metrics omit only support gap and normal.
+                for_acceptance=self._process_mode == "trajectory_metrics")
+                # END nominal optimization retains every original requirement.
             process_value = sum((value for name, value in process_terms.items()
                 if self._process_mode != "trajectory_optimizer"
                 or not name.startswith(("function_pose:", "function_coordinate:", "support:"))),
@@ -2690,7 +2693,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # A support-only request still supplies a tensor after its old
             # square penalty is removed. Its four signed requirements now
             # belong to the same AL owner as pose/coordinate events below.
-            # END metrics retain the complete original hard residual dictionary.
+            # END optimization owns all targets; metrics use delivery requirements.
             # BEGIN optimizer and success metrics consume the identical online scene.
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
             # BEGIN align validity with the time-sorted grid and exact anchors.
@@ -2702,15 +2705,32 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # BEGIN candidate retention reads scalar evidence from this same scene query.
             scene_evidence_out = {} if self._process_mode in ("trajectory_metrics", "trajectory_optimizer") else None
             # END no extra FK, source query, or geometry history is created.
+            # BEGIN omit columns with no real state in any batch row.
+            # Keep the union over rows so every trajectory retains its ordered
+            # exact release witnesses in the same rectangular scene query.
+            # For unequal sample counts, a column needed by another row stays
+            # present; the existing row-wise validity mask still owns reduction.
+            scene_columns = active.any(0).nonzero().flatten()
+
+            def scene_input(value):
+                return value.index_select(1, scene_columns)
+
             scene_value = _scene_boundary_evaluate(active_scene, problem, active_map,
-                spheres, position, quaternion, progress, q, self._joint_names,
-                trajectory_time=trajectory_time, normalized_time=ordered(all_u),
+                scene_input(spheres), scene_input(position), scene_input(quaternion),
+                scene_input(progress), scene_input(q), self._joint_names,
+                trajectory_time=scene_input(trajectory_time), normalized_time=scene_input(ordered(all_u)),
                 query_counts=self._query_counts,
                 component_diagnostics=None if context is None else context["scene_components"],
                 # BEGIN the caller selects the query path under one nonpenetration rule.
                 query_role="optimization" if self._process_mode == "trajectory_optimizer" and context is None else "acceptance",
                 scene_evidence_out=scene_evidence_out,
                 optimizer_candidate_evidence=self._process_mode == "trajectory_optimizer")
+            scene_indices = scene_columns[None].expand(batch, -1)
+            scene_value = scene_value.new_zeros(progress.shape).scatter(1, scene_indices, scene_value)
+            if scene_evidence_out is not None:
+                for name, evidence in scene_evidence_out.items():
+                    scene_evidence_out[name] = evidence.new_zeros(progress.shape).scatter(1, scene_indices, evidence)
+            # END restore scalar layouts before the unchanged task/scene reduction.
             # END ordinary optimizer and proposal metric calls remain unchanged.
             # END metrics and optimization retain the same collision zero set.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
@@ -2736,12 +2756,29 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 feasible = torch.isfinite(original_process).all(-1) & (original_process <= 0).all(-1)
                 for residual in signed.values():
                     feasible = feasible & torch.isfinite(residual.detach()) & (residual.detach() <= 0)
-                # BEGIN preserve all hard scene terms except finite, explicitly confirmable proposals.
+                # BEGIN retention uses delivery requirements without another task query.
+                # Complete support residuals remain in strict optimization
+                # feasibility above. Their retained body/footprint conditions
+                # are already available in the same signed event evaluation.
+                # All non-support process requirements retain their original
+                # unweighted values, including drive coupling and stops.
+                acceptance_process = sum((value for name, value in process_terms.items()
+                    if not name.startswith("support:")), torch.zeros_like(progress))
+                acceptance_process = torch.where(active, acceptance_process, 0.).detach()
+                eligible = (torch.isfinite(acceptance_process).all(-1)
+                            & (acceptance_process <= 0).all(-1))
+                acceptance_keys = set(problem.functional_acceptance_keys)
+                for name, residual in signed.items():
+                    if name in acceptance_keys:
+                        detached = residual.detach()
+                        eligible = eligible & torch.isfinite(detached) & (detached <= 0)
+                # END only support gap/normal differ from the optimizer's target set.
+                # BEGIN preserve every original hard scene term.
                 # Use where for inactive samples; multiplication by zero would
                 # not suppress a nonfinite inactive value. Mode-side reduction
                 # has already retained every active hard violation.
                 hard_invalid = torch.where(active, scene_evidence_out["optimizer_hard_invalid"], 0.)
-                eligible = feasible & (hard_invalid <= 0).all(-1)
+                eligible = eligible & (hard_invalid <= 0).all(-1)
                 # BEGIN strict scene feasibility uses original unweighted hard residuals.
                 raw_scene = torch.where(active, scene_value.detach(), 0.)
                 feasible = feasible & torch.isfinite(raw_scene).all(-1) & (raw_scene <= 0).all(-1)

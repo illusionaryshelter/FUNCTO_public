@@ -212,9 +212,11 @@ class PhysicalGradientCore(GradientOptCore):
         """Keep one action per seed, preferring stronger sampled evidence.
 
         Rank 0 has no candidate; positive ranks record the caller's hard
-        eligibility and sampled-feasibility flags. The observed-scene caller
-        requires every hard component in both flags. Ordinary/dense final
-        metrics still decide acceptance. Within one rank,
+        eligibility and sampled-feasibility flags. The caller's eligibility
+        checks delivery requirements; sampled feasibility additionally tracks
+        the unchanged nominal optimization targets. In particular, support
+        gap and normal errors cannot discard an otherwise eligible curve.
+        Ordinary/dense final metrics still decide acceptance. Within one rank,
         the unchanged parameter-free objective orders all line-search trials,
         including points which Wolfe did not select. One slot bounds storage.
         """

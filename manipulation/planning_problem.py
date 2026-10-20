@@ -890,6 +890,13 @@ class MechanismRequirement:
 @dataclass
 class SupportRequirement:
     """A finite observed support and a specific material face at one event."""
+    # BEGIN support geometry retains its optimization and delivery meanings.
+    # Every source-declared component remains a nominal optimization target.
+    # Delivery checks the body half-space and finite footprint; contact gap
+    # and normal alignment remain available for post-plan analysis. This is
+    # one component contract for all skills, never a task-specific tolerance.
+    acceptance_components = ("body", "footprint")
+    # END source points, transforms, events and numerical declarations remain.
     progress: float
     tool_from_carrier: np.ndarray
     body_points: np.ndarray
@@ -912,7 +919,7 @@ class SupportRequirement:
         if not isinstance(self.surface, SupportSurface) or not self.source:
             raise ValueError("Support constraints need observed finite geometry and a source")
 
-    # BEGIN support acceptance and optimization share the original allowed set.
+    # BEGIN retain all source-declared support inequalities for optimization.
     def raw_inequalities(self, position, quaternion, numerical):
         """Return four signed per-pose requirements, each satisfied at <= 0.
 
@@ -956,11 +963,17 @@ class SupportRequirement:
         return {name: value/(normal_scale if name == "normal" else length_scale)
                 for name, value in self.raw_inequalities(position, quaternion, numerical).items()}
 
-    def evaluate(self, position, quaternion, numerical):
-        """Preserve the original nonnegative hard residual in its original units."""
+    def evaluate(self, position, quaternion, numerical, *, for_acceptance=False):
+        """Sum nominal requirements, or the two retained delivery components.
+
+        The default preserves the complete optimization value and gradient.
+        Acceptance omits gap and normal alignment without changing either
+        declared tolerance or any body/footprint calculation.
+        """
         import torch
-        return sum(torch.relu(value) for value in
-                   self.raw_inequalities(position, quaternion, numerical).values())
+        components = self.raw_inequalities(position, quaternion, numerical)
+        selected = self.acceptance_components if for_acceptance else components
+        return sum(torch.relu(components[name]) for name in selected)
     # END no centering target, contact permission or physical tolerance is added.
 
 
@@ -1429,8 +1442,14 @@ class PlanningProblem:
 
     def residuals(self, position, quaternion, progress, joint_position=None,
                   joint_names=None, joint_velocity=None, *, trajectory_time=None, point_goal_ids=None,
-                  tool_linear_velocity=None, tool_angular_velocity=None, direction_mode="trajectory"):
-        """Nonnegative violations of real requirements only, without cancellation."""
+                  tool_linear_velocity=None, tool_angular_velocity=None, direction_mode="trajectory",
+                  for_acceptance=False):
+        """Nonnegative nominal or acceptance violations, without cancellation.
+
+        Only SupportRequirement distinguishes the two calculations: its gap
+        and normal target remain in optimization and are omitted at delivery.
+        Every other requirement uses its original value, mask and tolerance.
+        """
         import torch
         if position.shape != (*progress.shape, 3) or quaternion.shape != (*progress.shape, 4):
             raise ValueError("Pose arrays must align with the complete progress horizon")
@@ -1485,7 +1504,10 @@ class PlanningProblem:
             selected = mask.to(torch.int64).argmax(-1, keepdim=True)
             event_position = position.gather(-2, selected[..., None].expand(*selected.shape, 3))
             event_quaternion = quaternion.gather(-2, selected[..., None].expand(*selected.shape, 4))
-            value = requirement.evaluate(event_position, event_quaternion, self.numerical)
+            # BEGIN one event pose uses the declared evaluation purpose.
+            value = requirement.evaluate(event_position, event_quaternion, self.numerical,
+                                         for_acceptance=for_acceptance)
+            # END no event, task geometry or physical allowance is rewritten.
             value = torch.where(mask.any(-1, keepdim=True), value, 0.)
             # A caller may use a different progress dtype; retain the original
             # support evaluator's pose dtype rather than the clock's dtype.
@@ -1544,6 +1566,22 @@ class PlanningProblem:
                for index, requirement in enumerate(self.supports)
                if requirement.progress >= self.start_progress
                for component in ("gap", "body", "footprint", "normal")])
+
+    # BEGIN candidate retention reads the same delivery subset as metrics.
+    @property
+    def functional_acceptance_keys(self):
+        """Original functional identities that can reject a delivered curve.
+
+        The optimizer still receives functional_constraint_keys in full.
+        Building the support subset from typed requirements avoids parsing a
+        skill name or changing pose/coordinate-event acceptance elsewhere.
+        """
+        support_keys = {f"support:{index}:{component}"
+                        for index, requirement in enumerate(self.supports)
+                        for component in ("gap", "body", "footprint", "normal")
+                        if component not in requirement.acceptance_components}
+        return tuple(key for key in self.functional_constraint_keys if key not in support_keys)
+    # END support contact diagnostics cannot indirectly reject retained curves.
 
     def functional_inequalities(self, position, quaternion, progress, *, trajectory_time=None):
         """Return signed event residuals and their single physical query masks.

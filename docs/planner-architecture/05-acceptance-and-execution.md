@@ -1,10 +1,12 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`85f67b53ffaa13b474c98061a0acfc51dea91c32`。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
+代码基线：待本次实现提交标注。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
 
 ## 1. 候选的完整验收
 
 `_CuroboPlanner._candidate_metrics` 消费 `JointTrajectory` 和本候选场景，沿原多项式计算机器人 FK、任务残差、同一观测场的场景分项。`_candidate_sample_times` 保留原多项式各区间端点，并按 `interpolation_dt` 分割区间；原生候选直接保留此前普通与密集计算的实际硬残差。确切任务锚点和已加入的碰撞见证单独采样，并计入同一查询容量。调用方提供的原曲线使用自己的区间、时间采样与任务锚点，没有先前原生网格。
+
+这些轨迹指标由 `ProcessCostManager` 的 `trajectory_metrics` 模式计算，并调用 `PlanningProblem.residuals(..., for_acceptance=True)`。`SupportRequirement` 在其精确事件位姿上验收整体高度 body 和有限投影范围 footprint；间距 gap 和法向 normal 保留在原名义优化模型及分析接口中。其他任务目标、过程关系、关节耦合、显式停止和场景条件保持原验收定义。优化期间候选资格由同次前向结果中的非支持过程残差和 `functional_acceptance_keys` 计算，与这里的任务子集对应。
 
 当前 `validation_joint_step` 用于 OMPL 连接检查；`validation_spatial_step_m` 虽属于 `PlanningBudget` 并校验为正数，但没有生产消费者。`geometry_motion_bound.py` 提供独立运动界计算及其单元回归，当前候选验收没有调用该模块。本次验收的几何计算范围由上述有限时间网格和确切锚点定义。
 
@@ -14,7 +16,7 @@
 
 `_candidate_domain_validation` 独立检查保存曲线的入口 `q0,dq0` 及连续关节范围。`cubic_position_report` 对每个标量三次段求位置极值；速度范围来自导数极值；`cubic_derivative_report` 检查每段两端的加速度，并分别包含内部结点左右极限。`JointTrajectory.sample` 通过保存的 `CubicHermiteSpline` 返回 `q,dq,ddq,s`，在内部结点采用右段导数，在最终端点采用左极限。
 
-`evaluate_candidate` 汇总模型条件、原始任务条件和连续关节域。已有完整 `native_report` 时使用其同一曲线的已完成几何证据，并继续检查保存多项式及入口；返回报告记录本次是否发生新查询及其数量。所有验收分项要求有限数且残差不大于零。有限采样几何验收的含义由采样规则、源几何和未知策略共同确定；连续关节极值检查具有独立的解析范围。
+`evaluate_candidate` 汇总模型条件、上述任务验收条件和连续关节域。已有完整 `native_report` 时使用其同一曲线的已完成验收证据，并继续检查保存多项式及入口；返回报告记录本次是否发生新查询及其数量。所有验收分项要求有限数且残差不大于零。有限采样几何验收的含义由采样规则、源几何和未知策略共同确定；连续关节极值检查具有独立的解析范围。
 
 ## 2. 结果结构与输入身份
 
@@ -22,7 +24,7 @@
 
 `execution_binding.bind_candidate` 接受候选、任务、场景、导出验收和原生报告，生成 `candidate_id`，并保存任务输入、`scene.to_execution_binding()`、`curve_snapshot` 和同身份验收记录。`curve_snapshot` 还保存实际多项式系数、可执行终点和首个显式效果依赖对应的边界。`plain` 将 NumPy 与公开 dataclass 字段转换为明确的普通数据；无界区间使用具名 JSON 表达。
 
-`check_result` 要求正式成功结果及完成的验收，然后核对候选身份、曲线、原始输入、时间和执行范围的一致性。可选 `execution_limits` 对照已绑定设备限制。返回独立字典副本，供执行入口消费。
+`check_result` 要求正式成功结果及完成的验收，读取 `validation.native.accepted` 和导出报告中的有限非正残差，然后核对候选身份、曲线、原始输入、时间和执行范围的一致性。这里消费轨迹验收已完成的结论；完整名义条件继续作为任务输入保存。可选 `execution_limits` 对照已绑定设备限制。返回独立字典副本，供执行入口消费。
 
 `rebind_execution_result` 在明确控制策略、手指目标和设备限制下建立新的执行绑定，保留被验收曲线及数学输入。`validate_controller_policy` 核对按具名关节下发 `q,dq,ddq` 的控制解释、采样相位和加速度结点侧。`relax_pose_goal_tolerances` 是调用者显式扩大既有位姿目标允许集合的接口：输入具体目标身份、新容差及来源，验证集合包含关系后产生新任务绑定，保存原较严格条件下的已完成证据。此操作作用于尚未执行的结果。
 

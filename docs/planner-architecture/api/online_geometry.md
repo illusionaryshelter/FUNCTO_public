@@ -1,31 +1,1582 @@
-# 已知机器人与观测任务场景
+# `manipulation/online_geometry.py` 实现契约
 
-代码基线：`85f67b53ffaa13b474c98061a0acfc51dea91c32`。
+代码基线：`pending-implementation-commit`。
+职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
-`OnlinePlanningScene` 的构造输入为 `background`、`owners`、`coverage`、`reference_frame`、共享 `robot_model`、明确 `fixed_geometry_names` 和必填 `tool_geometry_names`，以及有限接触、带附着的实体、手指、初始支撑和未知空间策略。background/owner 保留原观测场；robot_model 是与验证器相同的 `RobotGeometryChecker`。固定角色和完整工具成员由机器人适配器提供已注册的几何 ID。
+## `_plain`
 
-| API | 计算、前置数据及输出 |
-|---|---|
-| `bind_online_robot(*, configuration, validator, device, check_request=None)` | 绑定同一检查器、完整可微关节树、原配对和请求回调，保存 robot_configuration |
-| `components(..., joint_position, joint_names, *, trajectory_time, ..., query_role)` | 同一状态的完整 q、任务位姿、实际进度和手指时钟 → 硬/conditional分项及 last_query_report；其中保存内部配对样本数，query_role 只记录优化/验收阶段 |
-| `evaluate(*args, **kwargs)` | 聚合非 conditional 分项；可把原分项写入 components_out |
-| `clone_for_rollout()` | 共享原场和原模型，复制关系/手指的候选状态 |
-| `with_release_history(position, quaternion, progress)` | 固定已选搜索前缀中的确切释放 FK；返回候选场景 |
-| `validate_problem(problem, *, goal_identities=None)` | 核对原任务、附着/释放条件、附着固定变换、接触激活及命令身份 |
-| `optimizer_preferences(progress, joint_position, joint_names)` | 位置跟踪指令的优化偏好 |
-| `project_residual(progress, joint_position, joint_names)` | 手指驱动中独立于已给耦合方程的等式，供 OMPL 投影 |
-| `estimated_workspace_allocation(batch, horizon)` | 原场和原生查询共享字节、逐状态临时字节 → 资源准入 |
-| `describe()` | 原模型身份、固定实体、`tool_geometry_names`、`collision_rule='nonpenetration'` 和未知策略 |
-| `to_execution_binding()` / `binding_record()` | `native_robot_observed_scene_v1`：原机器人几何、基座/标定、完整配对、工具成员、纯运动学配置、原任务场、有限接触/附着关系、手指和自由格 |
+[定义位置](../../../manipulation/online_geometry.py#L30)。
 
-`components` 使用完整 FK 乘实体固定局部变换。必检机器人自身对直接消费 checker 的原生 relation：分离通过，穿透产生原距离残差，数值边界进入独立的 `unresolved/robot/self` 硬分项。机械许可及排除对保留原策略。
+输入签名：
 
-机器人—观测场、运动实体—背景及运动实体参与的场—场配对共用非穿透查询，优化与验收不改变几何规则。已确认体积交叠产生前向分类值 1，并附同一观测场局部法向构成的刚体导数；该值不是米制穿透深度。局部方向不可用不抹去已确认的分类值。场配对 `unresolved` 的碰撞残差为零，状态仍保留在 `status_counts` 及有限 `nonclear_pairs` 记录中，不转换为 `clear`。`evaluate` 仍对实际非 conditional 分项求和；任务接触、初始支撑及覆盖保留自己的硬或条件分项。
+```python
+def _plain(value):
+```
 
-固定安装体与运动 owner 进行同一非穿透查询；活动机器人与固定安装体由原生配对覆盖。机器人基座连杆即使 FK 恒定仍保留原机器人身份。机器人图像覆盖不形成拒绝分项；运动 owner 继续按显式策略查询已测自由空间。
+显式输出分支：
 
-`Attachment.active(progress)` 同时供实体运动与组合体配对使用。有释放声明时活动区间左闭右开；没有释放声明时，自起点持续附着并包含规划窗口终点。场景在几何调用前排除工具成员与当前附着 owner，以及同一 TCP 上共同附着的 owner 之间的内部对，按状态样本记录 `internal_assembly_pair_count`。成员保留原形状和原场，继续检查背景、其他 owner 及其余机器人部件。上述判定读取实际 `progress`，不读取有限接触的 `contact_permission_progress`。
+```python
+value.tolist()
+[_plain(row) for row in value]
+{key: _plain(row) for (key, row) in value.items()}
+value.item()
+value
+```
 
-有限任务特征中的机器人材料使用确切 geom ID。`_permission` 把原特征和目标 patch、任务间隙、法向、区间转为点对许可；它与组合体成员定义分别计算。零距离不单独构成体积交叠证据；任务要求的有限区域表面接触由独立查询判断。
+读取的对象属性：
 
-`_release_pose` 获取原释放锚点，`_owner_poses` 取得同一候选的 owner 位姿并记录缺失释放；`_matrices` 保存可微位姿的同值矩阵给数值查询，`_plain` 序列化已完成记录。释放后的原场保持该候选释放位姿。几何分类、优化导数和执行反馈检查各自保留职责。
+```python
+np.ndarray
+value.tolist
+value.items
+np.generic
+value.item
+```
+
+写入目标：
+
+```python
+row
+key
+```
+
+直接调用符号：
+
+```python
+isinstance
+value.tolist
+_plain
+value.items
+value.item
+```
+
+## `_matrices`
+
+[定义位置](../../../manipulation/online_geometry.py#L42)。
+
+输入签名：
+
+```python
+def _matrices(pose):
+```
+
+实现说明：
+
+> Snapshot the same differentiable rigid poses for interval queries.
+
+显式输出分支：
+
+```python
+result
+```
+
+读取的对象属性：
+
+```python
+value.detach().cpu().numpy
+value.detach().cpu
+value.detach
+np.broadcast_to(np.eye(4), (*position.shape[:-1], 4, 4)).copy
+np.broadcast_to
+np.eye
+position.shape
+Rotation.from_quat(quaternion.reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix().reshape
+Rotation.from_quat(quaternion.reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix
+Rotation.from_quat
+quaternion.reshape
+```
+
+写入目标：
+
+```python
+position
+quaternion
+value
+result
+result[..., :3, 3]
+result[..., :3, :3]
+```
+
+直接调用符号：
+
+```python
+value.detach().cpu().numpy
+value.detach().cpu
+value.detach
+np.broadcast_to(np.eye(4), (*position.shape[:-1], 4, 4)).copy
+np.broadcast_to
+np.eye
+Rotation.from_quat(quaternion.reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix().reshape
+Rotation.from_quat(quaternion.reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix
+Rotation.from_quat
+quaternion.reshape
+```
+
+## `OnlinePlanningScene`
+
+[定义位置](../../../manipulation/online_geometry.py#L52)。
+
+```python
+class OnlinePlanningScene():
+```
+
+类字段：
+
+```python
+binding_record = to_execution_binding
+```
+
+实现说明：
+
+> Known robot collision entities and original observed task fields.
+>
+> Robot geometry is shared with the state validator and placed by complete
+> joint FK. Unknown-space decisions for moving scene owners retain the
+> supplied policy and the original measured free-ray coverage.
+
+## `OnlinePlanningScene.__init__`
+
+[定义位置](../../../manipulation/online_geometry.py#L61)。
+
+输入签名：
+
+```python
+def __init__(self, *, background, owners, coverage, reference_frame, robot_model, fixed_geometry_names, tool_geometry_names, contacts=(), gripper=None, has_gripper=True, unknown_policy, initial_support_relations=(), numerical_position_tolerance_m=1e-06, numerical_rotation_tolerance_rad=1e-06):
+```
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+owner.query
+robot_model.geometry_names
+self.fixed_geometry_names
+self.tool_geometry_names
+owner.owner_id
+self.owners
+dict.fromkeys
+robot_model._geometries.values
+robot_model._geometries
+np.asarray
+lower.shape
+upper.shape
+np.any
+rule.rule_id
+self.contacts
+rule.target_owner
+rule.actor
+rule.robot_body
+rule.interval
+owner.attachments
+relation.interval
+self.initial_support_relations
+row.relation_id
+row.actor
+row.target_owner
+self.numerical_position_tolerance_m
+```
+
+写入目标：
+
+```python
+owner
+self.background
+self.owners
+self.coverage
+self.reference_frame
+self.robot_model
+self.fixed_geometry_names
+self.tool_geometry_names
+robot_ids
+self.required_robot_links
+frame
+_
+self.contacts
+self.gripper
+self.has_gripper
+self.unknown_policy
+region
+lower
+upper
+owner_ids
+rule
+self.numerical_position_tolerance_m
+self.numerical_rotation_tolerance_rad
+self.required_progress_anchors
+x
+relation
+self.initial_support_relations
+self._initial_support_models
+by_owner
+row
+self._fixed_release_poses
+self.observation_report
+self.observation_partition_masks
+self.grasp_contact_activations
+self.robot_configuration
+self.robot_pairs
+self.robot_validator
+self.kinematics
+self.check_request
+self.last_query_report
+```
+
+直接调用符号：
+
+```python
+isinstance
+any
+TypeError
+tuple
+set
+len
+ValueError
+dict.fromkeys
+robot_model._geometries.values
+deepcopy
+np.asarray
+np.any
+float
+sorted
+PreparedInitialSupport
+```
+
+## `OnlinePlanningScene.bind_online_robot`
+
+[定义位置](../../../manipulation/online_geometry.py#L129)。
+
+输入签名：
+
+```python
+def bind_online_robot(self, *, configuration, validator, device, check_request=None):
+```
+
+实现说明：
+
+> Bind the complete joint tree; each query supplies its own finger state.
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+validator.checker
+self.robot_model
+validator.pairs
+self.required_robot_links
+validator.T_reference_base
+```
+
+写入目标：
+
+```python
+self.robot_validator
+self.robot_pairs
+self.robot_configuration
+self.kinematics
+self.check_request
+```
+
+直接调用符号：
+
+```python
+ValueError
+deepcopy
+DifferentiableRobotKinematics
+```
+
+## `OnlinePlanningScene.clone_for_rollout`
+
+[定义位置](../../../manipulation/online_geometry.py#L140)。
+
+输入签名：
+
+```python
+def clone_for_rollout(self):
+```
+
+显式输出分支：
+
+```python
+result
+```
+
+读取的对象属性：
+
+```python
+self.owners
+self._fixed_release_poses
+self.gripper
+```
+
+写入目标：
+
+```python
+result
+result.owners
+owner
+result._fixed_release_poses
+result.gripper
+result.last_query_report
+```
+
+直接调用符号：
+
+```python
+copy
+tuple
+dict
+```
+
+## `OnlinePlanningScene._release_pose`
+
+[定义位置](../../../manipulation/online_geometry.py#L149)。
+
+输入签名：
+
+```python
+def _release_pose(relation, position, quaternion, progress):
+```
+
+实现说明：
+
+> Gather exact release FK; a missing anchor is an explicit violation.
+>
+> The first occurrence is the physical release. Later samples on the
+> same progress plateau may move the hand while the owner stays fixed.
+> When absent, the gathered numeric value is not accepted as
+> a release prediction: ``found`` is false and subsequent samples fail.
+> Keeping arithmetic finite avoids poisoning an earlier, still-attached
+> query's derivatives when it does not need a release state yet.
+
+显式输出分支：
+
+```python
+((p + quaternion_rotate(q, _tensor(relation.position_tool_owner, p)), quaternion_multiply(q, _tensor(relation.quaternion_tool_owner, q))), matches.any(-1))
+```
+
+读取的对象属性：
+
+```python
+relation.release_condition_id
+(progress - relation.interval[1]).abs
+relation.interval
+matches.to(torch.int64).argmax
+matches.to
+torch.int64
+torch.gather
+index[:, None, None].expand
+relation.position_tool_owner
+relation.quaternion_tool_owner
+matches.any
+```
+
+写入目标：
+
+```python
+matches
+index
+p
+q
+```
+
+直接调用符号：
+
+```python
+ValueError
+(progress - relation.interval[1]).abs
+matches.to(torch.int64).argmax
+matches.to
+torch.gather
+index[:, None, None].expand
+quaternion_rotate
+_tensor
+quaternion_multiply
+matches.any
+```
+
+## `OnlinePlanningScene.with_release_history`
+
+[定义位置](../../../manipulation/online_geometry.py#L170)。
+
+输入签名：
+
+```python
+def with_release_history(self, position, quaternion, progress):
+```
+
+实现说明：
+
+> Copy release FK from an already selected prefix into a child branch.
+>
+> Future releases remain variables. The first reached occurrence of a
+> release owns its pose, including on a progress plateau; extending a
+> branch cannot replace it with the later hand pose. Full optimization
+> still uses the original scene, where releases remain shared decisions.
+
+显式输出分支：
+
+```python
+result
+```
+
+读取的对象属性：
+
+```python
+self.clone_for_rollout
+self.owners
+owner.attachments
+owner.owner_id
+relation.release_condition_id
+result._fixed_release_poses
+(progress >= relation.interval[1] - 1e-07).any
+relation.interval
+self._release_pose
+found.all
+```
+
+写入目标：
+
+```python
+result
+owner
+index
+relation
+key
+pose
+found
+result._fixed_release_poses[key]
+```
+
+直接调用符号：
+
+```python
+self.clone_for_rollout
+enumerate
+bool
+(progress >= relation.interval[1] - 1e-07).any
+self._release_pose
+found.all
+ValueError
+```
+
+## `OnlinePlanningScene._permission`
+
+[定义位置](../../../manipulation/online_geometry.py#L192)。
+
+输入签名：
+
+```python
+def _permission(self, rule, actor_pose, target_pose, progress, coordinates, *, uncertain_hand=None):
+```
+
+显式输出分支：
+
+```python
+(policy, residual * active.to(progress.dtype), (active & ~certain).to(progress.dtype))
+```
+
+读取的对象属性：
+
+```python
+rule.feature_points
+rule.feature_joint_translation
+torch.einsum
+torch.ones_like
+torch.bool
+quaternion_conjugate(target_pose[1]).unsqueeze
+target_pose[0].unsqueeze
+rule.feature_normal
+rule.patch_axes
+torch.atan2
+torch.linalg.vector_norm
+torch.linalg
+torch.linalg.cross
+(actor_normal * target_normal).sum
+torch.relu
+rule.normal_tolerance_rad
+rule.numerical_angle_tolerance_rad
+rule.interval
+actor_pose[1].unsqueeze
+rule._feature_edge_normals
+inverse_target.unsqueeze
+rule.numerical_position_tolerance_m
+(edge_normals * origin.unsqueeze(-2)).sum
+origin.unsqueeze
+rule._feature_edge_offsets
+(material_normal.unsqueeze(-2) * target_local).sum
+material_normal.unsqueeze
+rows.append
+bounds.append
+(sign * material_heights).max(-1).values.unsqueeze
+(sign * material_heights).max(-1).values
+(sign * material_heights).max
+rule.modeling_allowance_m
+rule.patch_origin
+rule.patch_half_size
+axis.expand
+progress.shape
+(axis @ patch_origin + width + tolerance).expand
+rule.feature_kind
+rule._feature_tangent
+(tangent * patch_normal).sum(-1).unsqueeze
+(tangent * patch_normal).sum
+(origin * (patch_normal - gap_axis)).sum
+(material_normal * patch_normal).sum
+cosine.unsqueeze
+rule.gap_bounds
+(sign * gap_axis).unsqueeze
+(limit - sign * gap_offset + tolerance).unsqueeze
+torch.cat
+rule.robot_body
+active.to
+progress.dtype
+(active & ~certain).to
+```
+
+写入目标：
+
+```python
+points
+mapping
+certain
+world
+target_local
+actor_normal
+target_normal
+angle
+normal
+active
+inverse_target
+material_normal
+edges_world
+edge_normals
+origin
+tolerance
+rows
+bounds
+material_heights
+sign
+patch_axes
+patch_origin
+column
+width
+axis
+patch_normal
+tangent_world
+tangent
+gap_axis
+gap_offset
+cosine
+limit
+region_normals
+region_bounds
+residual
+policy
+```
+
+直接调用符号：
+
+```python
+_tensor
+torch.einsum
+ValueError
+torch.ones_like
+_world_points
+quaternion_rotate
+quaternion_conjugate(target_pose[1]).unsqueeze
+quaternion_conjugate
+target_pose[0].unsqueeze
+torch.atan2
+torch.linalg.vector_norm
+torch.linalg.cross
+(actor_normal * target_normal).sum
+torch.relu
+_interval
+actor_pose[1].unsqueeze
+inverse_target.unsqueeze
+(edge_normals * origin.unsqueeze(-2)).sum
+origin.unsqueeze
+(material_normal.unsqueeze(-2) * target_local).sum
+material_normal.unsqueeze
+rows.append
+bounds.append
+(sign * material_heights).max(-1).values.unsqueeze
+(sign * material_heights).max
+enumerate
+axis.expand
+(axis @ patch_origin + width + tolerance).expand
+(tangent * patch_normal).sum(-1).unsqueeze
+(tangent * patch_normal).sum
+(origin * (patch_normal - gap_axis)).sum
+(material_normal * patch_normal).sum
+cosine.unsqueeze
+(sign * gap_axis).unsqueeze
+(limit - sign * gap_offset + tolerance).unsqueeze
+torch.cat
+active.to
+(active & ~certain).to
+```
+
+## `OnlinePlanningScene.optimizer_preferences`
+
+[定义位置](../../../manipulation/online_geometry.py#L261)。
+
+输入签名：
+
+```python
+def optimizer_preferences(self, progress, joint_position, joint_names):
+```
+
+实现说明：
+
+> Squared tracking error for optimizer use only; no acceptance change.
+>
+> A tracking drive already specifies one executable command at every
+> progress. Its hard numerical band remains in components(). This small
+> objective keeps optimization attracted to that command after entering
+> the feasible band, instead of stopping at a float32-sensitive boundary.
+> Binary drives supply no command width and therefore no such objective.
+> Material contact and functional pose freedoms are never centered here.
+
+显式输出分支：
+
+```python
+torch.zeros_like(progress)
+((joint_position[..., indices] - command) ** 2).sum(-1)
+```
+
+读取的对象属性：
+
+```python
+self.gripper
+hand.controller
+torch.zeros_like
+hand.joint_bounds
+lower.shape
+progress.shape
+hand.joint_names
+upper.shape
+tuple(joint_names).index
+torch.long
+((joint_position[..., indices] - command) ** 2).sum
+```
+
+写入目标：
+
+```python
+hand
+lower
+upper
+indices
+name
+command
+```
+
+直接调用符号：
+
+```python
+torch.zeros_like
+ValueError
+hand.joint_bounds
+len
+tuple(joint_names).index
+tuple
+constant_tensor
+((joint_position[..., indices] - command) ** 2).sum
+```
+
+## `OnlinePlanningScene.project_residual`
+
+[定义位置](../../../manipulation/online_geometry.py#L285)。
+
+输入签名：
+
+```python
+def project_residual(self, progress, joint_position, joint_names):
+```
+
+实现说明：
+
+> Independent executable finger-drive equalities for OMPL projection.
+>
+> Output has J-rank(A) rows for tracking and zero rows otherwise. The
+> caller must include the same native A q=b coupling in its problem;
+> duplicate coupling rows are intentionally not introduced here. These
+> are exact equalities, with projection convergence handled separately
+> from the native controller command or task's permissible motion.
+
+显式输出分支：
+
+```python
+joint_position[..., :0]
+(joint_position[..., indices] - command) @ _tensor(hand._drive_basis.T, joint_position)
+```
+
+读取的对象属性：
+
+```python
+self.gripper
+self.gripper.controller
+tuple(joint_names).index
+hand.joint_names
+hand.joint_bounds
+torch.long
+hand._drive_basis.T
+hand._drive_basis
+```
+
+写入目标：
+
+```python
+hand
+indices
+name
+lower
+upper
+command
+```
+
+直接调用符号：
+
+```python
+tuple(joint_names).index
+tuple
+hand.joint_bounds
+constant_tensor
+_tensor
+```
+
+## `OnlinePlanningScene.validate_problem`
+
+[定义位置](../../../manipulation/online_geometry.py#L307)。
+
+输入签名：
+
+```python
+def validate_problem(self, problem, *, goal_identities=None):
+```
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+problem.reference_frame
+self.reference_frame
+problem.conditions
+row.get
+problem.pose_events
+self.contacts
+used.intersection
+problem.events
+event.kind
+pose_ids.index
+requirement.actual_relation
+requirement.progress
+commands[0].progress
+used.update
+self.owners
+owner.attachments
+relation.condition_id
+declaration.get
+owner.owner_id
+relation.interval
+np.linalg.inv
+np.linalg
+np.asarray
+np.eye
+relation.position_tool_owner
+Rotation.from_quat(relation.quaternion_tool_owner[[1, 2, 3, 0]]).as_matrix
+Rotation.from_quat
+relation.quaternion_tool_owner
+np.allclose
+relation.release_condition_id
+release.get
+self.gripper
+self.gripper.commands
+row.skill_id
+row.event_id
+row.occurrence
+row.kind
+row.progress
+```
+
+写入目标：
+
+```python
+conditions
+row
+activations
+pose_ids
+used
+ids
+rule
+original
+commands
+event
+requirement
+self.grasp_contact_activations
+owner
+relation
+declaration
+expected
+actual
+actual[:3, 3]
+actual[:3, :3]
+release
+```
+
+直接调用符号：
+
+```python
+ValueError
+row.get
+list
+range
+len
+set
+grasp_contact_rule_ids
+asdict
+used.intersection
+event_occurrence_key
+pose_ids.index
+validate_grasp_contact_arrival
+used.update
+tuple
+deepcopy
+declaration.get
+np.linalg.inv
+np.asarray
+np.eye
+Rotation.from_quat(relation.quaternion_tool_owner[[1, 2, 3, 0]]).as_matrix
+Rotation.from_quat
+np.allclose
+release.get
+```
+
+## `OnlinePlanningScene._owner_poses`
+
+[定义位置](../../../manipulation/online_geometry.py#L364)。
+
+输入签名：
+
+```python
+def _owner_poses(self, position, quaternion, progress, owner_poses, costs):
+```
+
+显式输出分支：
+
+```python
+poses
+```
+
+读取的对象属性：
+
+```python
+self.owners
+owner.owner_id
+np.asarray
+position.new_tensor(matrix[:3, 3]).expand
+position.new_tensor
+progress.shape
+quaternion.new_tensor
+Rotation.from_matrix(matrix[:3, :3]).as_quat
+Rotation.from_matrix
+q.expand
+owner.attachments
+relation.release_condition_id
+releases.append
+self._fixed_release_poses
+self._release_pose
+((progress >= relation.interval[1]) & ~found[:, None]).to
+relation.interval
+progress.dtype
+owner.pose
+```
+
+写入目标：
+
+```python
+poses
+owner
+matrix
+p
+q
+poses[owner.owner_id]
+releases
+index
+relation
+pose
+found
+costs[f'relationship/missing_release/{owner.owner_id}/{index}']
+```
+
+直接调用符号：
+
+```python
+np.asarray
+position.new_tensor(matrix[:3, 3]).expand
+position.new_tensor
+quaternion.new_tensor
+Rotation.from_matrix(matrix[:3, :3]).as_quat
+Rotation.from_matrix
+q.expand
+enumerate
+releases.append
+self._release_pose
+((progress >= relation.interval[1]) & ~found[:, None]).to
+owner.pose
+```
+
+## `OnlinePlanningScene.components`
+
+[定义位置](../../../manipulation/online_geometry.py#L387)。
+
+输入签名：
+
+```python
+def components(self, robot_spheres, position, quaternion, progress, joint_position=None, joint_names=None, *, trajectory_time, active_contact_rule_ids=None, contact_permission_progress=None, owner_poses=None, query_role='acceptance'):
+```
+
+实现说明：
+
+> Return same-state residuals and retain distance/coverage diagnostics.
+>
+> ``robot_spheres`` is an empty native-kinematics output. Registered
+> native entities carry all robot geometry. Query roles identify the
+> caller in diagnostics; both roles use the same nonpenetration rule.
+
+显式输出分支：
+
+```python
+costs or {'observed_geometry': torch.zeros_like(progress)}
+```
+
+读取的对象属性：
+
+```python
+self.kinematics
+self.gripper
+self.gripper.state
+hand_state.coordinates
+hand_state.half
+hand_state.controller_residual
+hand_state.uncertain.to
+hand_state.uncertain
+progress.dtype
+self.gripper.joint_names
+torch.cat
+self.gripper.joint_names.index
+self.kinematics.poses
+self.robot_model._geometries.items
+self.robot_model._geometries
+self.robot_model
+Rotation.from_matrix(local[:3, :3]).as_quat
+Rotation.from_matrix
+self._owner_poses
+torch.zeros_like
+owner.owner_id
+owner.query
+self.owners
+self.background
+poses.items
+robot_poses.items
+complete_q.sum
+poses.values
+robot_poses.values
+pose[0].sum
+self.contacts
+rule.actor
+self._permission
+rule.target_owner
+rule.rule_id
+policy['normals'].detach().cpu().numpy
+policy['normals'].detach().cpu
+policy['normals'].detach
+policy['bounds'].detach().cpu().numpy
+policy['bounds'].detach().cpu
+policy['bounds'].detach
+active.detach().cpu().numpy
+active.detach().cpu
+active.detach
+rule.required
+policy['active'].detach().cpu().numpy
+policy['active'].detach().cpu
+policy['active'].detach
+np.ndindex
+progress.shape
+target_matrix[:3, :3].T
+self.check_request
+np.mean
+rule.feature_points
+target_field.local_zero
+progress.new_tensor
+torch.relu
+(policy['normals'][index] * point).sum
+torch.linalg.vector_norm
+torch.linalg
+direction.detach
+gaps.append
+undecided.append
+policy['active'].to
+normal.dtype
+torch.stack(gaps).reshape
+torch.stack
+progress.new_tensor(undecided).reshape
+permission_progress.detach().cpu().numpy
+permission_progress.detach().cpu
+permission_progress.detach
+np.zeros
+hand_state.uncertain.detach().cpu().numpy
+hand_state.uncertain.detach().cpu
+hand_state.uncertain.detach
+self.robot_validator.checker.geometry_depending_on
+self.robot_validator.checker
+self.robot_validator
+self.tool_geometry_names
+complete_q.detach().cpu().numpy
+complete_q.detach().cpu
+complete_q.detach
+self.robot_model.query
+self.robot_validator.T_reference_base
+self.robot_validator.required_pairs
+report['status_counts'].get
+((_world(b, pb) - _world(a, pa)) * normal).sum
+signed.detach
+report['nonclear_pairs'].append
+self_costs.append
+self_unresolved.append
+torch.stack(self_costs).reshape
+torch.stack(self_unresolved).reshape
+owner.moving
+fields.items
+self.fixed_geometry_names
+pairs.append
+first.moving
+second.moving
+first.owner_id
+second.owner_id
+first.query
+second.query
+progress.detach().cpu().numpy
+progress.detach().cpu
+progress.detach
+owner.attachments
+np.logical_or.reduce
+np.logical_or
+relation.active
+attachment_progress.shape
+rule.robot_body
+self._initial_support_models.values
+self._initial_support_models
+model.relation.actor
+model.relation
+model.relation.target_owner
+residuals.append
+regions.append
+model.relation.interval
+model.permission
+torch.stack(residuals).reshape
+costs.get
+costs.update
+model.components
+self.coverage
+self.unknown_policy
+unknown.append
+unresolved.append
+rows.append
+progress.new_tensor(unknown).reshape
+progress.new_tensor(unresolved).reshape
+```
+
+写入目标：
+
+```python
+costs
+permission_progress
+hand_state
+coordinates
+half
+complete_q
+complete_names
+costs['gripper/controller']
+costs['conditional/hand_geometry']
+missing_names
+name
+link_poses
+robot_poses
+frame
+_
+local
+link_position
+link_quaternion
+local_position
+local_quaternion
+robot_poses[name]
+poses
+identity
+identity[1][..., 0]
+poses['background']
+fields
+owner
+fields['background']
+matrices
+pose
+robot_matrices
+zero
+policies
+rule
+actor_pose
+policy
+normal
+uncertain
+policy['active']
+active
+policies[rule.rule_id]
+gaps
+undecided
+normals_cpu
+bounds_cpu
+interval_active
+target_field
+target_matrices
+index
+evidence
+target_matrix
+world_normals
+world_bounds
+gap
+actor_matrix
+local_center
+world_center
+target_center
+boundary
+point
+excess
+direction
+costs[f'contact/{rule.rule_id}']
+costs[f'unresolved/contact/{rule.rule_id}']
+costs[f'conditional/contact/{rule.rule_id}']
+progress_cpu
+uncertain_cpu
+unmodelled
+report
+q_cpu
+self_costs
+self_unresolved
+value
+row
+first_id
+second_id
+status
+report['pair_queries']
+report['status_counts'][status]
+a
+b
+pa
+item
+pb
+signed
+costs['collision/robot/self']
+costs['unresolved/robot/self']
+pairs
+moving_owners
+geometry
+target
+field
+first
+second
+attachment_progress
+attached
+relation
+component
+first_pose
+second_pose
+fm
+sm
+actor
+residuals
+rules
+support
+model
+state_zero
+held_internal
+report['internal_assembly_pair_count']
+regions
+normals
+bounds
+region
+permission
+costs[component]
+report['owner_coverage']
+unknown
+unresolved
+rows
+conditional
+prefix
+costs[f'{prefix}unknown/forbidden/{owner.owner_id}']
+costs[f'{prefix}unresolved/coverage/{owner.owner_id}']
+report['owner_coverage'][owner.owner_id]
+self.last_query_report
+```
+
+直接调用符号：
+
+```python
+ValueError
+tuple
+self.gripper.state
+hand_state.uncertain.to
+torch.cat
+self.gripper.joint_names.index
+self.kinematics.poses
+self.robot_model._geometries.items
+_tensor
+Rotation.from_matrix(local[:3, :3]).as_quat
+Rotation.from_matrix
+quaternion_rotate
+quaternion_multiply
+self._owner_poses
+torch.zeros_like
+_matrices
+poses.items
+robot_poses.items
+complete_q.sum
+poses.values
+robot_poses.values
+pose[0].sum
+self._permission
+policy['normals'].detach().cpu().numpy
+policy['normals'].detach().cpu
+policy['normals'].detach
+policy['bounds'].detach().cpu().numpy
+policy['bounds'].detach().cpu
+policy['bounds'].detach
+active.detach().cpu().numpy
+active.detach().cpu
+active.detach
+policy['active'].detach().cpu().numpy
+policy['active'].detach().cpu
+policy['active'].detach
+np.ndindex
+query_region_intersection
+float
+np.mean
+transform_points
+target_field.local_zero
+progress.new_tensor
+torch.relu
+(policy['normals'][index] * point).sum
+torch.linalg.vector_norm
+direction.detach
+gaps.append
+undecided.append
+policy['active'].to
+torch.stack(gaps).reshape
+torch.stack
+progress.new_tensor(undecided).reshape
+permission_progress.detach().cpu().numpy
+permission_progress.detach().cpu
+permission_progress.detach
+np.zeros
+hand_state.uncertain.detach().cpu().numpy
+hand_state.uncertain.detach().cpu
+hand_state.uncertain.detach
+set
+self.robot_validator.checker.geometry_depending_on
+list
+complete_q.detach().cpu().numpy
+complete_q.detach().cpu
+complete_q.detach
+self.robot_model.query
+report['status_counts'].get
+inverse_points
+((_world(b, pb) - _world(a, pa)) * normal).sum
+_world
+signed.detach
+len
+report['nonclear_pairs'].append
+self_costs.append
+self_unresolved.append
+torch.stack(self_costs).reshape
+torch.stack(self_unresolved).reshape
+fields.items
+pairs.append
+combinations
+progress.detach().cpu().numpy
+progress.detach().cpu
+progress.detach
+np.logical_or.reduce
+relation.active
+self._initial_support_models.values
+self.check_request
+residuals.append
+regions.append
+PairPermission
+model.permission
+pair_residual
+torch.stack(residuals).reshape
+costs.get
+costs.update
+model.components
+query_coverage
+unknown.append
+unresolved.append
+rows.append
+progress.new_tensor(unknown).reshape
+progress.new_tensor(unresolved).reshape
+```
+
+## `OnlinePlanningScene.evaluate`
+
+[定义位置](../../../manipulation/online_geometry.py#L659)。
+
+输入签名：
+
+```python
+def evaluate(self, *args, **kwargs):
+```
+
+显式输出分支：
+
+```python
+torch.stack([value for (name, value) in components.items() if not name.startswith('conditional/')]).sum(0)
+```
+
+读取的对象属性：
+
+```python
+kwargs.pop
+self.components
+output.update
+torch.stack([value for (name, value) in components.items() if not name.startswith('conditional/')]).sum
+torch.stack
+components.items
+name.startswith
+```
+
+写入目标：
+
+```python
+output
+components
+name
+value
+```
+
+直接调用符号：
+
+```python
+kwargs.pop
+self.components
+output.update
+torch.stack([value for (name, value) in components.items() if not name.startswith('conditional/')]).sum
+torch.stack
+components.items
+name.startswith
+```
+
+## `OnlinePlanningScene.estimated_workspace_allocation`
+
+[定义位置](../../../manipulation/online_geometry.py#L667)。
+
+输入签名：
+
+```python
+def estimated_workspace_allocation(self, batch, horizon):
+```
+
+显式输出分支：
+
+```python
+dict(cpu_shared=shared, cpu_live=live, gpu_shared=0, gpu_live=live, gpu_retained=0, gpu_graph_live=0)
+```
+
+读取的对象属性：
+
+```python
+self.background
+owner.query
+self.owners
+field.storage_nbytes
+{id(value): value for value in fields}.values
+self.robot_model.native_query_storage_nbytes
+self.robot_model
+self.robot_model.geometry_names
+```
+
+写入目标：
+
+```python
+fields
+owner
+shared
+field
+value
+entities
+states
+live
+```
+
+直接调用符号：
+
+```python
+sum
+{id(value): value for value in fields}.values
+id
+len
+int
+dict
+```
+
+## `OnlinePlanningScene.describe`
+
+[定义位置](../../../manipulation/online_geometry.py#L679)。
+
+输入签名：
+
+```python
+def describe(self):
+```
+
+显式输出分支：
+
+```python
+{'model': 'native_robot_observed_scene_v1', 'reference_frame': self.reference_frame, 'robot_geometry_source': 'registered_native_model', 'owners': [owner.owner_id for owner in self.owners], 'robot_entities': list(self.robot_model.geometry_names), 'fixed_geometry_names': list(self.fixed_geometry_names), 'tool_geometry_names': list(self.tool_geometry_names), 'unknown_policy': deepcopy(self.unknown_policy), 'robot_view_coverage_status': 'not_queried', 'collision_rule': 'nonpenetration', 'required_progress_anchors': self.required_progress_anchors, 'observation_report': deepcopy(self.observation_report)}
+```
+
+读取的对象属性：
+
+```python
+self.reference_frame
+owner.owner_id
+self.owners
+self.robot_model.geometry_names
+self.robot_model
+self.fixed_geometry_names
+self.tool_geometry_names
+self.unknown_policy
+self.required_progress_anchors
+self.observation_report
+```
+
+写入目标：
+
+```python
+owner
+```
+
+直接调用符号：
+
+```python
+list
+deepcopy
+```
+
+## `OnlinePlanningScene.to_execution_binding`
+
+[定义位置](../../../manipulation/online_geometry.py#L691)。
+
+输入签名：
+
+```python
+def to_execution_binding(self):
+```
+
+显式输出分支：
+
+```python
+{'schema': 'native_robot_observed_scene_v1', **self.describe(), 'owners': owners, 'robot_model': native, 'robot_configuration': deepcopy(self.robot_configuration), 'background': self.background.record(), 'contacts': _plain([asdict(row) for row in self.contacts]), 'tool_geometry_names': list(self.tool_geometry_names), 'grasp_contact_activations': _plain(self.grasp_contact_activations), 'initial_support_relations': [row.record() for row in self.initial_support_relations], 'gripper': hand_record, 'has_gripper': self.has_gripper, 'numerical_position_tolerance_m': self.numerical_position_tolerance_m, 'numerical_rotation_tolerance_rad': self.numerical_rotation_tolerance_rad, 'coverage': {'known_free': encode_array(self.coverage.known_free), 'origin': self.coverage.origin.tolist(), 'voxel_size': self.coverage.voxel_size, 'observation_ids': list(self.coverage.observation_ids)}}
+```
+
+读取的对象属性：
+
+```python
+self.owners
+owner.pose_path
+owners.append
+owner.owner_id
+owner.source
+owner.moving
+owner.pose_interval
+path.progress
+path.poses
+path.source
+path.motion_model
+path.coordinates
+path.attachment
+owner.attachments
+owner.query.record
+owner.query
+self.gripper
+hand.nominal_finger_trajectory
+hand.nominal_finger_trajectory.describe
+self.robot_model.model_record
+self.robot_model
+self.robot_model.base_frame
+self.robot_validator
+self.robot_validator.T_reference_base.tolist
+self.robot_validator.T_reference_base
+self.robot_pairs
+self.describe
+self.robot_configuration
+self.background.record
+self.background
+self.contacts
+self.tool_geometry_names
+self.grasp_contact_activations
+row.record
+self.initial_support_relations
+self.has_gripper
+self.numerical_position_tolerance_m
+self.numerical_rotation_tolerance_rad
+self.coverage.known_free
+self.coverage
+self.coverage.origin.tolist
+self.coverage.origin
+self.coverage.voxel_size
+self.coverage.observation_ids
+```
+
+写入目标：
+
+```python
+owners
+owner
+path
+row
+hand
+hand_record
+name
+hand_record['nominal_model']
+native
+pair
+```
+
+直接调用符号：
+
+```python
+owners.append
+list
+_plain
+asdict
+owner.query.record
+getattr
+hand.nominal_finger_trajectory.describe
+self.robot_model.model_record
+self.robot_validator.T_reference_base.tolist
+self.describe
+deepcopy
+self.background.record
+row.record
+encode_array
+self.coverage.origin.tolist
+```

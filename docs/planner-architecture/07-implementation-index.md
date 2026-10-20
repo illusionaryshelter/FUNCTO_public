@@ -1,8 +1,10 @@
-# 当前实现接口索引
+# 实现符号索引
 
-代码基线：`85f67b53ffaa13b474c98061a0acfc51dea91c32`。组件职责、输入输出、坐标和调用关系见[API契约](06-api-contracts.md)。各链接包含当前组件契约或从源码读取的符号签名；定义数按Python语法树统计。
+代码基线：`pending-implementation-commit`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
 
-覆盖 53 个Python文件、923 个定义。C++混合几何计算见[原生区间接口](api/coal-native-interval.md)。
+`build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
+
+覆盖 **53 个文件、925 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -13,7 +15,7 @@
 | [manipulation/goals.py](api/goals.md) | 14 | [01](01-inputs-and-task-model.md) |
 | [manipulation/grasp.py](api/grasp.md) | 8 | [01](01-inputs-and-task-model.md) |
 | [manipulation/skill.py](api/skill.md) | 13 | [01](01-inputs-and-task-model.md) |
-| [manipulation/planning_problem.py](api/planning_problem.md) | 103 | [01](01-inputs-and-task-model.md) |
+| [manipulation/planning_problem.py](api/planning_problem.md) | 104 | [01](01-inputs-and-task-model.md) |
 | [manipulation/regions.py](api/regions.md) | 21 | [01](01-inputs-and-task-model.md) |
 | [manipulation/support_grounding.py](api/support_grounding.md) | 4 | [01](01-inputs-and-task-model.md) |
 | [manipulation/pipeline.py](api/pipeline.md) | 10 | [01](01-inputs-and-task-model.md) |
@@ -29,7 +31,7 @@
 | [manipulation/initial_support.py](api/initial_support.md) | 9 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_state.py](api/gripper_state.md) | 3 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_trajectory.py](api/gripper_trajectory.md) | 29 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/planning.py](api/planning.md) | 164 | [04](04-solver-and-search.md) |
+| [manipulation/planning.py](api/planning.md) | 165 | [04](04-solver-and-search.md) |
 | [manipulation/planning_ik.py](api/planning_ik.md) | 7 | [04](04-solver-and-search.md) |
 | [manipulation/cubic_trajectory.py](api/cubic_trajectory.md) | 19 | [04](04-solver-and-search.md) |
 | [manipulation/physical_joint_domain.py](api/physical_joint_domain.md) | 21 | [04](04-solver-and-search.md) |

@@ -1,6 +1,6 @@
 # `manipulation/execution_binding.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `plain`
@@ -16,7 +16,7 @@ def plain(value):
 实现说明：
 
 > Copy declared input fields without retaining solver/cache objects.
-> 
+>
 > Unbounded intervals are explicit JSON data; NaN never represents a
 > missing measurement. Private dataclass caches are deliberately excluded.
 
@@ -139,7 +139,7 @@ def bind_candidate(trajectory, *, problem, scene, validation, native_report):
 实现说明：
 
 > Bind the accepted joint curve and the exact online geometry snapshot.
-> 
+>
 > Native-backend metrics and the unchanged Hermite curve name one candidate,
 > whether it was supplied directly or produced by trajectory optimization.
 > Execution checks current measured state against this same scene binding;
@@ -206,7 +206,7 @@ def _relaxed_pose_contract(problem, identities, changes, ledger, request_id):
 实现说明：
 
 > Derive only larger pose-goal sets; every other mathematical input stays.
-> 
+>
 > Goal identities belong to the existing typed pose-event collection. Skill
 > selection is the caller's task policy, never a dataset/skill branch here.
 > This implication needs no new IK solve: a fixed pose inside the old metric
@@ -290,7 +290,7 @@ def relax_pose_goal_tolerances(result, *, changes, source):
 实现说明：
 
 > Create a new task binding while retaining the original stricter proof.
-> 
+>
 > The archived native/export inputs stay original. Only explicit monotone
 > goal changes are derived; geometry, curve, timing, physical limits and
 > already spent planning work remain unchanged. This cannot revise an
@@ -503,7 +503,7 @@ def validate_result_only_goal_ids(binding, values):
 实现说明：
 
 > Validate explicit result roles without weakening online consumers.
-> 
+>
 > Every selected goal keeps its original identity and mathematical allowed
 > set. Pose, support and mechanism-coordinate accuracy are exclusively
 > posthoc at every progress. Robot-feedback and independent task-effect
@@ -562,7 +562,7 @@ def rebind_execution_result(result, *, controller_policy, result_only_goal_ids, 
 实现说明：
 
 > Make a new explicit execution binding from unchanged formal evidence.
-> 
+>
 > This is a device-contract change at a separately declared entrance, not
 > continuation of an executed world. The original curve, planning inputs,
 > checks and cumulative request ledger remain unchanged. A completed native

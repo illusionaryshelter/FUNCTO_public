@@ -1,6 +1,6 @@
 # `manipulation/observations.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `Camera`
@@ -83,7 +83,7 @@ def load_calibration(path) -> Camera:
 实现说明：
 
 > Read Open3D calibration, including its column-major flattened matrix.
-> 
+>
 > ``path`` may be intrinsic.json or its directory. ``depth_unit_m`` explicitly
 > gives metres per raw value. The existing Open3D ``depth_scale`` metadata is
 > a *divisor*, e.g. 1000 means millimetres. Either field may occur in intrinsic
@@ -211,7 +211,7 @@ def load_rgbd(directory, index=0):
 实现说明：
 
 > Read one aligned RGB-D pair; invalid depths remain invalid for selection.
-> 
+>
 > Depth must already be registered to RGB. Intrinsic image dimensions are
 > checked, rather than rescaling calibration or guessing a depth alignment.
 
@@ -314,7 +314,7 @@ def backproject(depth_m, K, pixels_uv=None, mask=None):
 实现说明：
 
 > Backproject metric depth, preserving explicit correspondence identities.
-> 
+>
 > Without ``pixels_uv``, select every finite positive depth (within mask, if
 > given); no maximum range is imposed. With explicit N-by-2 (u, v) positions,
 > sample nearest-pixel depth and retain subpixel rays. Any invalid selected
@@ -451,7 +451,7 @@ class _RigidCorrespondences():
 实现说明：
 
 > Use Open3D's rigid estimator inside correspondence-scored RANSAC.
-> 
+>
 > Scoring must use the supplied feature pairs, not nearest-neighbour cloud
 > distance: a wrong feature permutation can still align two cloud surfaces.
 > skimage supplies the maintained RANSAC sampling/termination implementation.
@@ -571,7 +571,7 @@ def rigid_registration(source, target, max_error=0.01):
 实现说明：
 
 > Fit a rigid source-to-target transform from known corresponding N-by-3 rows.
-> 
+>
 > Returns ``(T, diagnostics)``. The accepted consensus must contain at least
 > half of the supplied correspondences and three noncollinear points; there
 > is no rank-three requirement. ``max_error`` is a metric per-pair threshold,
@@ -669,7 +669,7 @@ def _model_poses(value, name):
 实现说明：
 
 > Check the transform convention without repairing invalid predictions.
-> 
+>
 > These checks establish only numerical SE(3) validity. They do not measure
 > pose accuracy, object identity, symmetry ambiguity, or tracking success.
 
@@ -728,7 +728,7 @@ def poses_from_models(camera_from_model, initial_points, *, reference_camera_fro
 实现说明：
 
 > Convert validated model poses to a fixed observed body frame.
-> 
+>
 > ``camera_from_model[t]`` must be FoundationPose's returned transform of the
 > *original* mesh, not its internally centered ``pose_last``. ``initial_points``
 > are finite metric observations in the first camera frame. With their
@@ -737,7 +737,7 @@ def poses_from_models(camera_from_model, initial_points, *, reference_camera_fro
 > returned poses are R0@inv(Rt)@Bt@X; without a reference they are Bt@X and
 > require a stationary camera. This removes reference motion, including any
 > actual reference-object motion, rather than asserting a fixed world frame.
-> 
+>
 > Local points inv(P0)@p0 remain material-point hypotheses throughout the
 > sequence. No further depth lookup changes their identity. This function is
 > pure coordinate conversion, accepts a single frame, and makes no tracking
@@ -819,7 +819,7 @@ def poses_from_tracks(tracked, initial_points, *, frame_indices=None, max_error=
 实现说明：
 
 > Fit independent bodies and preserve their common first-camera gauge.
-> 
+>
 > ``body_poses[owner]`` maps that owner's fixed initial geometry-centroid
 > body into camera-zero coordinates with actual object motion retained.
 > ``poses`` removes the reference body's motion, if present, using
@@ -983,7 +983,7 @@ def track_rgbd(directory, mask, *, reference_mask=None, max_frames=None, station
 实现说明：
 
 > Recover body motion from local RGB-D without an instance mesh.
-> 
+>
 > Camera stationarity must be declared explicitly, or by the existing
 > config.json ``stationary_camera`` boolean. Supplied ``extrinsics`` are
 > camera-from-world matrices for this selected frame sequence. The reference

@@ -1,6 +1,6 @@
 # `manipulation/function_motion.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `FunctionReferenceError`
@@ -127,7 +127,7 @@ def optimize_trajectory(reference_trajectory, static_pose, function_keyframes):
 实现说明：
 
 > Preserve the original sampled objective and equality constraints.
-> 
+>
 > ``function_keyframes=[{'index': i, 'pose': (position, xyz_angles)}, ...]``
 > supplies every hard function event. Physical contact is not required
 > (pouring is an example). The trajectory length is taken from the supplied
@@ -236,13 +236,13 @@ def transfer_function_motion(reference_poses, initial_pose, function_goals):
 实现说明：
 
 > Optimize explicit function frames with one or more hard function events.
-> 
+>
 > ``reference_poses`` is (N,4,4) and ``initial_pose`` is (4,4), all in one
 > grounded reference frame. ``function_goals`` contains ``{'index': i,
 > 'pose': T_reference_function}``; indices are array rows, after the initial
 > node and before N. The caller maps original event frame IDs to these rows
 > without replacing source timestamps or dropping intermediate events.
-> 
+>
 > All events are hard equalities in one solve with the strict original limits. The
 > returned independent SE(3) checks compare against the supplied goals, not
 > against redefined goals derived from the optimizer's output. Passing these

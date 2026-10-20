@@ -37,7 +37,10 @@ def make_scene(tmp_path, *, gap=.001, fixed=(), occupied_background=False, polic
         has_gripper=False, unknown_policy={"conditional_regions": [], "outside_regions": "forbid"})
     pair = PairQuery("first", "second", policy, "source native pair")
     scene.robot_pairs = (pair,)
-    scene.robot_validator = SimpleNamespace(checker=checker, T_reference_base=np.eye(4))
+    # BEGIN the fixture exposes the same preselected tuple as RobotStateValidator.
+    scene.robot_validator = SimpleNamespace(checker=checker, T_reference_base=np.eye(4),
+        required_pairs=tuple(item for item in scene.robot_pairs if item.policy == "required"))
+    # END the full scene policy remains separately available for serialization.
 
     class BaseKinematics:
         def poses(self, q, names):
@@ -151,3 +154,62 @@ def test_fixed_installation_still_constrains_a_moving_observed_owner(tmp_path):
     rows = scene.last_query_report["nonclear_pairs"]
     assert any(row["first"] == "first" and row["second"] == "moving" for row in rows)
 # END no rendered robot pixels participate in the native model's validity.
+
+
+# BEGIN performance changes retain policy identity and every zero derivative.
+@pytest.mark.parametrize("policy", ["required", "excluded", "mechanical_contact"])
+def test_scene_queries_only_required_pairs_and_serializes_complete_policy(tmp_path, monkeypatch, policy):
+    scene = make_scene(tmp_path, policy=policy)
+    query = scene.robot_model.query
+    submitted = []
+
+    def inspect(**kwargs):
+        submitted.append(kwargs["pairs"])
+        return query(**kwargs)
+
+    monkeypatch.setattr(scene.robot_model, "query", inspect)
+    evaluate(scene)
+    assert submitted == [scene.robot_validator.required_pairs]
+    assert len(submitted[0]) == int(policy == "required")
+    assert scene.to_execution_binding()["robot_model"]["pairs"][0]["policy"] == policy
+
+
+def test_scene_shares_batch_zero_across_pairs_and_retains_all_position_gradients(tmp_path, monkeypatch):
+    from manipulation.planning_scene import Attachment
+    import manipulation.online_geometry as geometry
+
+    scene = make_scene(tmp_path)
+    field = FrozenObservedField(np.zeros((2, 2, 2)), np.zeros((2, 2, 2), bool),
+        weights=np.zeros((2, 2, 2)), origin=[0.] * 3, voxel_size=.01,
+        name="entity", source="empty observed support")
+    scene.owners = (CollisionOwner("entity", field,
+        PosePath(np.array([0., 1.]), np.stack((np.eye(4), np.eye(4))), "declared path"),
+        "observed entity", attachments=(Attachment((0., 1.), [.1, 0., 0.],
+            [1., 0., 0., 0.], "declared_attachment", None),)),)
+    scene.tool_geometry_names = ("first",)
+    q = torch.tensor([[[.04, -.02], [.05, -.03]]], dtype=torch.float64, requires_grad=True)
+    tool_position = torch.zeros((1, 2, 3), dtype=torch.float64, requires_grad=True)
+    robot_position = torch.zeros((1, 2, 3), dtype=torch.float64, requires_grad=True)
+    rotation = torch.tensor([[[1., 0., 0., 0.], [1., 0., 0., 0.]]],
+                            dtype=torch.float64, requires_grad=True)
+    scene.kinematics = SimpleNamespace(poses=lambda *args: {"base": (robot_position, rotation)})
+    pair_query = geometry.pair_residual
+    shared_zeros = []
+
+    def inspect(*args, zero, **kwargs):
+        shared_zeros.append(zero)
+        return pair_query(*args, zero=zero, **kwargs)
+
+    monkeypatch.setattr(geometry, "pair_residual", inspect)
+    progress = torch.tensor([[.25, .75]], dtype=torch.float64)
+    terms = scene.components(None, tool_position, rotation, progress, q,
+        ("left_slide", "right_slide"), trajectory_time=progress)
+    total = sum(value.sum() for value in terms.values())
+    assert total.item() == 0
+    gradients = torch.autograd.grad(total, (q, tool_position, robot_position, rotation))
+    assert all(torch.count_nonzero(value) == 0 for value in gradients)
+    assert len(shared_zeros) > progress.numel()
+    assert len({value.untyped_storage().data_ptr() for value in shared_zeros}) == 1
+    assert all(value.requires_grad for value in shared_zeros)
+    assert scene.last_query_report["internal_assembly_pair_count"] == progress.numel()
+# END shared storage leaves explicit internal membership and model policy intact.

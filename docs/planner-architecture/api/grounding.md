@@ -1,6 +1,6 @@
 # `manipulation/grounding.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_image`
@@ -150,7 +150,7 @@ def infer_task(instruction, demo_image, scene_image, *, demo_final_image=None, c
 实现说明：
 
 > Infer semantic candidates for one active-carrier stage, never metric geometry.
-> 
+>
 > The optional demonstration final image provides outcome context. This is not
 > a multistage planner: stage splitting and subsequent state updates belong to
 > the caller. Motion remains a proposal until validated against observations.
@@ -332,7 +332,7 @@ def _candidate_sheet(image, detections):
 实现说明：
 
 > Number each mask in its own panel so nested parts cannot hide each other.
-> 
+>
 > Pillow avoids importing the legacy annotation stack (torchvision and its
 > visualization dependencies) merely to prepare a semantic selection image.
 
@@ -406,7 +406,7 @@ def select_roles(image, task, domain='demo', *, detector=None, client=None):
 实现说明：
 
 > Bind carrier/reference to actual SAM instances, selecting only if ambiguous.
-> 
+>
 > Both roles are required for this stage interface. Masks may overlap for a
 > moving part and its body, but identical masks or one selected ID are rejected.
 > This image-level check is not proof of physical identity in an occluded scene.
@@ -495,7 +495,7 @@ def _selected_interaction_evidence(record, image, owner_mask, *, owner_id=None):
 实现说明：
 
 > Validate an observed part without promoting it to a physical answer.
-> 
+>
 > The semantic selection's provenance belongs to the record. A mask is
 > permitted to spill outside its independently selected owner; it is retained
 > unchanged, provided the two have some overlap. Queries need not lie in it.
@@ -556,7 +556,7 @@ def propose_query_regions(source_image, current_image, source_owner_mask, curren
 实现说明：
 
 > Ask once for coarse current-owner cells corresponding to source queries.
-> 
+>
 > Images are owner-context crops; xy queries and returned integer xyxy boxes
 > use their respective crop coordinates. Right/bottom box edges are exclusive.
 > Source queries may lie outside the interaction region, because functional
@@ -564,14 +564,14 @@ def propose_query_regions(source_image, current_image, source_owner_mask, curren
 > explain that evidence; they are actually passed to the semantic selector.
 > Noisy source region pixels outside the owner remain visible and are counted;
 > nonempty overlap is required, while every query must belong to the owner.
-> 
+>
 > The current owner is partitioned by a 5x5 image grid, discarding empty cells.
 > A selected cell gets a quarter-cell margin for the downstream dense search.
 > These boxes are program-defined search windows, NOT predicted part masks or
 > metric geometry. The caller must intersect each window with the current
 > owner and valid depth, then assess the resulting correspondences. Null or
 > invalid semantic selections fail explicitly rather than guessing a region.
-> 
+>
 > Optional selected current interaction evidence supplies an observed mask,
 > owner identity, semantic description and provenance. Its blue overlay and
 > cell coverage guide the same VLM request; they neither change the owner nor
@@ -878,7 +878,7 @@ def match_points(image1, image2, mask1, mask2, pixels1, *, extractor=None):
 实现说明：
 
 > Transfer xy queries with MARCO features and its native masked decoder.
-> 
+>
 > The extractor receives original RGB images; MARCO owns resize and bottom/
 > right padding. Returned subpixel coordinates refer to the original target
 > image. Source support and output mask membership use the same nearest-pixel

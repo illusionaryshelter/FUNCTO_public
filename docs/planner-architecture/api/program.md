@@ -1,6 +1,6 @@
 # `manipulation/program.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `ReferenceGenerationError`
@@ -32,7 +32,7 @@ def _mechanism_entry_contract(model_spec, initial, *, require_lift=False):
 实现说明：
 
 > Validate immutable actual entry without selecting a goal-set member.
-> 
+>
 > A full-frame target's centre need not lie on the mechanism or within its
 > limits: another pose in the declared task allowed set may be feasible.
 > The typed goal and physical mechanism remain separate solver obligations.
@@ -265,7 +265,7 @@ def _current_model(value):
 实现说明：
 
 > Bind the existing FK model to evidenced current mechanism parameters.
-> 
+>
 > The caller supplies its reference pose, signed coordinate basis, and (for
 > a hinge) axis point, all in the result reference frame. A source fit or an
 > action name alone does not establish a new instance's mechanism. Optional
@@ -382,7 +382,7 @@ def _current_initial_coordinates(model_spec, model, pose, *, require_lift=False)
 实现说明：
 
 > Preserve an evidenced lifted actual coordinate after checking its FK.
-> 
+>
 > Without an explicit observation, pose alone fixes only a principal angle.
 > An original entry-delta target has its own separate immutable origin and
 > must not be inferred from this fresh actual measurement during a rebind.
@@ -463,7 +463,7 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
 实现说明：
 
 > Transfer in a physical function frame, preserving every internal event.
-> 
+>
 > Free intervals reuse the existing SE(3) transfer kernel on a material
 > functional frame, not on an arbitrary body origin. Constrained intervals
 > stay in one caller-bound current FK model; we never fit a new axis after
@@ -471,16 +471,16 @@ def _event_transfer(reference, start, goals, function_frame, model_spec=None, *,
 > This fitting attempt uses nominal event centres on the model. Failure to
 > fit one such centre is a reference-generation failure; the separately
 > retained typed goal allowed sets do not acquire exact pose equalities.
-> 
+>
 > Native joint events additionally supply their complete coordinate reference
 > and indexed coordinate goals. These are not recovered from their FK poses:
 > doing so would discard explicitly recorded revolute winding numbers.
-> 
+>
 > Native prismatic intervals between hard events retain the source's scalar
 > progress profile while adapting its displacement to the new endpoints.
 > The unanchored suffix after the final event retains source metric increments;
 > this does not rescale the final controlled object motion before release.
-> 
+>
 > Endpoint corrections use the recorded timestamp fraction within each
 > interval. Source sample density cannot redefine that fraction. Native
 > prismatic progress scaling remains a source-coordinate operation, not a
@@ -746,7 +746,7 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
 实现说明：
 
 > Bind measured source coordinates and explicit current coordinate goals.
-> 
+>
 > Source ``motion_coordinates`` cover every original observation; only their
 > controlled prefix through release generates a reference. Their evidence is in
 > ``motion_coordinates_source``. Every event declares ``joint_coordinate``,
@@ -761,7 +761,7 @@ def _joint_reference(demo, scene, frames, last_held, task, initial):
 > unwrapped radians. The caller must bind the same signed coordinate sense
 > on source and current mechanisms; fitting the source does not establish a
 > current joint axis or a new instance's limits.
-> 
+>
 > The observed initial pose and any evidenced lifted coordinate define q0. The
 > soft reference is q_ref=q_demo-q_demo[0]+q0. Native prismatic intervals
 > between hard events then scale their source progress to the explicit
@@ -1223,7 +1223,7 @@ def ground_object_program(program, scene):
 实现说明：
 
 > Return only function-constrained body motion when no attachment is known.
-> 
+>
 > Human tool demonstrations may establish object motion before robot grasp
 > binding exists. This geometry-only entry preserves their function events
 > without fabricating an EEF trajectory. The complete skill consumer requires
@@ -1287,7 +1287,7 @@ def ground_program(program, scene):
 实现说明：
 
 > Generate one grasp/manipulation geometry reference from a compiled demo.
-> 
+>
 > ``program`` contains ``skill_kind``, ``demo`` and (for manipulation) task
 > ``relation``/``motion``. Every functional event names its source frame ID,
 > carrier-local material function frame and evidence source. Full-frame
@@ -1295,7 +1295,7 @@ def ground_program(program, scene):
 > a current carrier frame and metric event tolerances. Their explicit
 > ``scene.reference_pose`` embeds the current reference owner's local frame
 > in ``scene.reference_frame`` (the common output frame).
-> 
+>
 > # BEGIN explicit current grasp goal, separate from source-reference motion.
 > Grasp scenes require ``grasp_goal`` with current carrier-local
 > ``T_carrier_eef``, positive task ``position_tolerance_m`` and
@@ -1303,7 +1303,7 @@ def ground_program(program, scene):
 > Region correspondence still transforms the ordinary demonstration;
 > changing that reference cannot silently rewrite the independent grasp goal.
 > # END no device/numerical tolerance or last reference sample supplies this input.
-> 
+>
 > Articulation events may instead declare ``constraint_kind=joint_coordinate``.
 > Source ``motion_coordinates`` / ``motion_coordinates_source`` preserve the
 > full observed signed scalar sequence; event ``coordinate_value`` and
@@ -1314,7 +1314,7 @@ def ground_program(program, scene):
 > and ``entry_source`` from the original request entrance.
 > No reference pose, source body-pose sequence, surrogate region frame or
 > source/current body correspondence is needed for this scalar route.
-> 
+>
 > An ``on`` relation instead supplies finite ``scene.support`` in the output
 > frame and, per event, ``carrier_mapping`` (current-carrier-from-source-
 > carrier), owner IDs, evidence source and ``on_geometry`` contact samples,
@@ -1323,7 +1323,7 @@ def ground_program(program, scene):
 > current initial carrier pose before the support constrains the event goal;
 > its tangential position and yaw remain preferences, not observations.
 > Every event for one carrier must use the same explicit carrier mapping.
-> 
+>
 > # BEGIN nominal attachment is a model, never simulator success evidence.
 > Manipulation additionally requires ``scene.holding`` with the declared
 > ``T_carrier_eef`` and its model source. ``initial_pose`` and robot
@@ -1336,7 +1336,7 @@ def ground_program(program, scene):
 > Only the current tool identity and calibrated frame are required for held
 > manipulation, because the declared attachment supplies its tool relation.
 > # END physical holding success belongs to independent result assessment.
-> 
+>
 > Grasp source frames only initialize the current single-skill plan. Its
 > bound terminal grasp relation is a goal; no approach frame is a waypoint.
 

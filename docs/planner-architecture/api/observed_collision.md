@@ -1,6 +1,6 @@
 # `manipulation/observed_collision.py` 实现契约
 
-代码基线：`f04a478e7dff67b61f9b6c2d98d408fa9d64a0c2`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_world`
@@ -49,7 +49,7 @@ quaternion_rotate
 输入签名：
 
 ```python
-def pair_residual(first, first_pose, first_matrix, second, second_pose, second_matrix, *, permission=None, check_request=None, precision_m=0.0001):
+def pair_residual(first, first_pose, first_matrix, second, second_pose, second_matrix, *, permission=None, check_request=None, precision_m=0.0001, zero=None):
 ```
 
 实现说明：
@@ -62,6 +62,9 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
 > observed field. Native witnesses retain their interval bounds; their
 > midpoint supplies only a local rigid-motion direction. The direction
 > neither estimates penetration nor supplies candidate acceptance evidence.
+>
+> ``zero`` may be one scalar from a batch's differentiable zero baseline.
+> A standalone call constructs that baseline from its two position tensors.
 
 显式输出分支：
 
@@ -127,7 +130,7 @@ signed.detach
 
 ## `query_region_intersection`
 
-[定义位置](../../../manipulation/observed_collision.py#L69)。
+[定义位置](../../../manipulation/observed_collision.py#L75)。
 
 输入签名：
 
@@ -262,7 +265,7 @@ node.lower.copy
 
 ## `query_minimum_height`
 
-[定义位置](../../../manipulation/observed_collision.py#L144)。
+[定义位置](../../../manipulation/observed_collision.py#L150)。
 
 输入签名：
 
@@ -362,7 +365,7 @@ witness.tolist
 
 ## `query_minimum_height.push`
 
-[定义位置](../../../manipulation/observed_collision.py#L161)。
+[定义位置](../../../manipulation/observed_collision.py#L167)。
 
 输入签名：
 

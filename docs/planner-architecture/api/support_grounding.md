@@ -1,6 +1,6 @@
 # `manipulation/support_grounding.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plane_candidates`
@@ -16,7 +16,7 @@ def _plane_candidates(depth, K, valid):
 实现说明：
 
 > Consensus on at most 6000 points, followed by bounded full-mask checks.
-> 
+>
 > Candidate masks contain actual valid-depth pixels within the fitted plane
 > tolerance. The masks are never replaced by a hull, box, or filled contour.
 > Closely intersecting planes may share observed boundary pixels; this does
@@ -137,7 +137,7 @@ def _covered_polygon(polygon, mask):
 实现说明：
 
 > Check the polygon's whole rasterized area and densely sampled boundary.
-> 
+>
 > Boundary checks alone miss holes. Conversely, filled-polygon checks alone
 > hide their subpixel rounding convention. We check both, at quarter-pixel
 > boundary spacing, against an already one-pixel-eroded observed mask. This
@@ -226,7 +226,7 @@ def _observed_patch(mask):
 实现说明：
 
 > Retain a full convex observation, or a conservative large local patch.
-> 
+>
 > For ordinary convex panels the full safe hull is retained, so a long shelf
 > is not always shrunk to a small disk. If that hull crosses a hole, concavity,
 > or gap, OpenCV's exact Euclidean distance transform supplies the largest
@@ -334,7 +334,7 @@ def infer_support(image, depth_m, K, reference_mask, *, support_direction, instr
 实现说明：
 
 > Select a task support from visible reference-instance plane candidates.
-> 
+>
 > RGB and depth must be aligned, depth must be metric, and ``K`` must describe
 > that image. All returned geometry uses camera coordinates. Even a single
 > candidate requires semantic confirmation: its largest plane may be a side
@@ -345,7 +345,7 @@ def infer_support(image, depth_m, K, reference_mask, *, support_direction, instr
 > point, the current carrier position, a matched query, or an inferred object
 > axis. Only its direction matters. Near-tangent directions are rejected;
 > accepting its sign does not establish a stable or sufficiently level face.
-> 
+>
 > Unordered observed points establish the plane. Its sample mean and PCA
 > tangent axis define computational coordinates only: neither is a physical
 > object centre, placement target, or task-required yaw. The returned finite

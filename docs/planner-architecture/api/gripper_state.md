@@ -1,6 +1,6 @@
 # `manipulation/gripper_state.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_names`
@@ -92,14 +92,14 @@ def build_post_grasp_robot_config(robot, feedback):
 实现说明：
 
 > Return a new measured-hand robot config and an arm-only start state.
-> 
+>
 > ``feedback`` is one complete named robot snapshot: q/dq, arm_joint_names,
 > finger_joint_names, feedback_id, timestamp_s, source, reference_frame,
 > base_pose, tool_pose, tool_link and tool_transform. Commanded finger targets
 > and actuator ctrl may be retained in that snapshot but are never geometry
 > inputs. Finger coordinates need only their robot feedback: object poses,
 > contact evidence and attachment assumptions belong to separate models.
-> 
+>
 > The original cspace layout, arm rest posture, collision geometry and pair
 > policy are preserved. Only finger locks and their matching default entries
 > are updated from actual q. Planning q/dq contains only the named arm joints;

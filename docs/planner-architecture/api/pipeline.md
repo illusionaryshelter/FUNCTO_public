@@ -1,6 +1,6 @@
 # `manipulation/pipeline.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `motion_kind`
@@ -16,7 +16,7 @@ def motion_kind(task):
 实现说明：
 
 > Select the applied family from semantic evidence, not trajectory rank.
-> 
+>
 > The existing semantic ``motion`` proposal can specify planar motion for a
 > whole-stage support/contact requirement; complete poses must still fit it.
 > ``auto`` for a general object task does not authorize a new mechanical
@@ -264,7 +264,7 @@ def run_stage(observation):
 实现说明：
 
 > Create and validate an object trajectory from a grounded demonstration.
-> 
+>
 > Required fields: ``task`` (relation/interaction/motion), ``demo_poses``,
 > ``scene`` (initial_pose/body_points/reference_transform), ``carrier_id``,
 > ``reference_id`` and ``reference_frame``. All scene geometry shares that
@@ -456,7 +456,7 @@ def run_sequence(observations):
 实现说明：
 
 > Run an already ordered stage list, updating carrier/reference states.
-> 
+>
 > Each stage's ``reference_pose`` describes the reference at capture time.
 > These transforms and every initial carrier pose must share one world or
 > otherwise explicitly registered reference frame. This is state handoff,

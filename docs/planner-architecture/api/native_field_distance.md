@@ -1,25 +1,492 @@
-# 已知凸实体与原始观测场的非穿透查询
+# `manipulation/native_field_distance.py` 实现契约
 
-代码基线：`f04a478e7dff67b61f9b6c2d98d408fa9d64a0c2`。
+代码基线：`pending-implementation-commit`。
+职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
-`query_native_field(geometry, native_pose, field, field_pose, *, precision_m=1e-4, permission=None, check_request=None)` 输入一个已编译 Coal 原生实体、原 `ObservedField`、各自世界位姿、数值精度和有限点对许可。位姿把各自局部坐标映到同一参考坐标，长度以米计。机器人保持原有体积的凸实体或解析形状，任务对象保持原支持单元内的三线性非正集合。接口检查未许可域中的体积交叠，不要求额外正间距。
+## `_transform`
 
-空间框和原实体支持投影提供距离下界。Coal 的 native/box 查询仅建议投影方向；`native_projection_bounds` 对实际原实体计算外向投影区间。`_projection_gap` 结合任务子框的投影得到可靠分离下界，GJK 数值容差不充当误差上界。
+[定义位置](../../../manipulation/native_field_distance.py#L22)。
 
-`native_feasible_point_bounds` 构造原实体内的点，并保留其局部和世界区间。凸实体的候选来自原面顶点及原顶点均值的非负组合，Eigen 仅提出权重；区间重算证明该点的实际归属。解析形状使用对应的原形状构造。它与任务场中已确认的占据点给出距离上界。
+输入签名：
 
-若同一原生可行点的完整区间严格位于一个原支持单元的开内部，且该范围上三线性值可靠地严格为负，或原单元八角点全部非正，则原场在该点附近具有占据开邻域。该邻域与原生实体的未许可体积交叠产生 `intersection`。八角非正条件也覆盖插值恒零的满格，因为占据定义为 `φ≤0`。支持单元边界上的公共点不能单独建立此证据。这里的区间包含坐标变换和求值误差；完整 `witness_*_bounds` 保留实际点的数值范围，中点仅供显示和局部导数。结论不输出真实物理穿透深度。
+```python
+def _transform(matrix):
+```
 
-`PairPermission` 同时约束两个端点。完全许可的域排除；跨许可边界时局部细分原生实体与搜索盒的交集，以检查许可外部分。通常只细分任务场。正的分离下界可排除当前域，空间框交叠不能确定原生实体或原场归属。
+显式输出分支：
 
-本域实际占据点对的距离上界不超过 `precision_m`，且双方空间框交集至少一个轴向厚度不超过该精度时，可把本域记为未决并停止细分。另一停止条件是任务子域达到指定空间尺度；许可边界混合时还要求原生搜索域达到该尺度。上界必须来自当前域，不能复用其他域的近距离点对。局部停止后仍检查其余域，因此一处近零距离不能掩盖同一实体对另一处的体积交叠。
+```python
+coal.Transform3s(matrix[:3, :3], matrix[:3, 3])
+```
 
-| 返回状态 | 已完成的结论及场景消费 |
-|---|---|
-| `intersection` | 已确认原生模型与已表示原场的未许可体积交叠；`pair_residual` 产生前向分类值 1 |
-| `unresolved` | 没有找到交叠证据，但仍有数值未决域；场配对仅报告，不产生碰撞硬成本 |
-| `clear` | 已表示查询域完成排除，未留未决域；不表示未观测空间或连续运动已获验证 |
+读取的对象属性：
 
-`lower_m/upper_m` 保留诊断距离界；它们不是当前接口要求达到的净空。空占据集合另带 `empty_set`。任务所需的表面接触、原生机器人自身数值边界及覆盖条件由各自接口处理。
+```python
+coal.Transform3s
+```
 
-`_transform` 构造 Coal 位姿，`_native_bounds` 使用三轴投影包围原实体，`_local_interval` 将世界点区间带误差地映回任务场局部坐标。请求回调沿遍历执行，查询采用串行 CPU 工作区。
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+coal.Transform3s
+```
+
+## `_native_bounds`
+
+[定义位置](../../../manipulation/native_field_distance.py#L26)。
+
+输入签名：
+
+```python
+def _native_bounds(geometry, transform):
+```
+
+显式输出分支：
+
+```python
+np.asarray(intervals, dtype=float).T
+```
+
+读取的对象属性：
+
+```python
+np.eye
+np.asarray(intervals, dtype=float).T
+np.asarray
+```
+
+写入目标：
+
+```python
+intervals
+axis
+```
+
+直接调用符号：
+
+```python
+native_projection_bounds
+np.eye
+np.asarray
+```
+
+## `_projection_gap`
+
+[定义位置](../../../manipulation/native_field_distance.py#L32)。
+
+输入签名：
+
+```python
+def _projection_gap(geometry, transform, box):
+```
+
+实现说明：
+
+> Certify a lower bound using a direction proposed by Coal.
+>
+> GJK's tolerance is not a distance error bound. Only the native support
+> interval and the box's outward projection determine this lower bound.
+> A poor direction merely gives zero and leaves the domain to refinement.
+
+显式输出分支：
+
+```python
+0.0
+max(0.0, float(np.nextafter((gap - error) / (length * (1 + _GAMMA)), -np.inf)))
+```
+
+读取的对象属性：
+
+```python
+coal.DistanceRequest
+coal.DistanceResult
+coal.distance
+coal.Box
+coal.Transform3s
+np.eye
+np.asarray
+result.normal
+np.isfinite(direction).all
+np.isfinite
+np.linalg.norm
+np.linalg
+np.where
+np.nextafter
+minimum.sum
+np.abs(minimum).sum
+np.abs
+np.inf
+maximum.sum
+np.abs(maximum).sum
+```
+
+写入目标：
+
+```python
+center
+request
+result
+direction
+length
+native_low
+native_high
+minimum
+maximum
+box_low
+box_high
+gap
+error
+```
+
+直接调用符号：
+
+```python
+coal.DistanceRequest
+coal.DistanceResult
+coal.distance
+coal.Box
+coal.Transform3s
+np.eye
+np.asarray
+np.isfinite(direction).all
+np.isfinite
+RuntimeError
+float
+np.linalg.norm
+native_projection_bounds
+np.where
+np.nextafter
+minimum.sum
+np.abs(minimum).sum
+np.abs
+maximum.sum
+np.abs(maximum).sum
+max
+abs
+```
+
+## `_local_interval`
+
+[定义位置](../../../manipulation/native_field_distance.py#L59)。
+
+输入签名：
+
+```python
+def _local_interval(world, pose):
+```
+
+显式输出分支：
+
+```python
+(np.nextafter((local - error).min(0), -np.inf), np.nextafter((local + error).max(0), np.inf))
+```
+
+读取的对象属性：
+
+```python
+np.nextafter
+(local - error).min
+np.inf
+(local + error).max
+```
+
+写入目标：
+
+```python
+corners
+local
+error
+```
+
+直接调用符号：
+
+```python
+box_corners
+inverse_points
+inverse_point_error
+np.nextafter
+(local - error).min
+(local + error).max
+```
+
+## `query_native_field`
+
+[定义位置](../../../manipulation/native_field_distance.py#L66)。
+
+输入签名：
+
+```python
+def query_native_field(geometry, native_pose, field, field_pose, *, precision_m=0.0001, permission=None, check_request=None):
+```
+
+实现说明：
+
+> Check penetration over unpermitted native and observed point pairs.
+>
+> A finite contact permission constrains both endpoints. When its boundary
+> cuts the native shape, a local search box B denotes K intersect B, where K
+> is the unchanged native shape. B is never accepted as robot material.
+> Feasible native witnesses retain interval enclosures of the constructed
+> point. Their midpoint is used only for display and a local derivative.
+
+显式输出分支：
+
+```python
+report('clear', None, intersection=False, empty=True)
+report('intersection', 0.0, intersection=True)
+report('unresolved', unresolved_lower)
+report('clear', 0.0, intersection=False)
+```
+
+读取的对象属性：
+
+```python
+np.isfinite
+np.asarray
+np.eye
+np.inf
+field.root
+field.nodes
+heapq.heappop
+node.cell
+field.occupied_points
+np.maximum
+np.minimum
+np.any
+field.cell_origins
+np.all
+field.voxel_size
+np.nextafter
+field.cell_value
+permission.boxes
+field._cell_values
+np.abs
+np.linalg.norm
+np.linalg
+np.abs(world).sum
+np.abs(target).sum
+node.upper
+node.lower
+np.min
+node.children
+np.argmax
+native_box[1].copy
+native_box[0].copy
+field.split
+```
+
+写入目标：
+
+```python
+precision
+native_pose
+field_pose
+transform
+native_local
+native_world
+pending
+serial
+upper
+witness
+visits
+unresolved_lower
+lower
+_
+native_box
+node
+wa
+wb
+policy
+partitioned
+domain_upper
+local_points
+points
+errors
+proposals
+index
+wanted
+feasible
+local
+world
+key
+field_local
+support
+center
+radius
+value
+error
+forbidden
+inside
+target
+delta
+distance
+candidate_upper
+diameter
+native_diameter
+overlap
+split_native
+axis
+middle
+hi
+lo
+hi[axis]
+lo[axis]
+children
+child
+```
+
+直接调用符号：
+
+```python
+float
+np.isfinite
+ValueError
+np.asarray
+_transform
+_native_bounds
+np.eye
+count
+report
+push
+heapq.heappop
+check_request
+field.occupied_points
+transform_points
+transform_point_error
+np.maximum
+np.minimum
+enumerate
+native_feasible_point_bounds
+np.any
+_local_interval
+np.all
+np.nextafter
+field.cell_value
+permission.boxes
+len
+np.abs
+np.linalg.norm
+np.abs(world).sum
+np.abs(target).sum
+min
+np.min
+int
+np.argmax
+native_box[1].copy
+native_box[0].copy
+field.split
+```
+
+## `query_native_field.report`
+
+[定义位置](../../../manipulation/native_field_distance.py#L88)。
+
+输入签名：
+
+```python
+def report(status, lower, *, intersection=None, empty=False):
+```
+
+显式输出分支：
+
+```python
+output
+```
+
+读取的对象属性：
+
+```python
+np.isfinite
+output.update
+((a[0] + a[1]) / 2).tolist
+((b[0] + b[1]) / 2).tolist
+np.asarray(a).tolist
+np.asarray
+np.asarray(b).tolist
+```
+
+写入目标：
+
+```python
+output
+a
+b
+output['empty_set']
+```
+
+直接调用符号：
+
+```python
+dict
+np.isfinite
+float
+output.update
+((a[0] + a[1]) / 2).tolist
+((b[0] + b[1]) / 2).tolist
+np.asarray(a).tolist
+np.asarray
+np.asarray(b).tolist
+```
+
+## `query_native_field.push`
+
+[定义位置](../../../manipulation/native_field_distance.py#L105)。
+
+输入签名：
+
+```python
+def push(native_box, node, partitioned=False):
+```
+
+显式输出分支：
+
+```python
+None
+None
+None
+None
+None
+```
+
+读取的对象属性：
+
+```python
+permission.excludes_cells
+node.cell
+node.lower
+node.upper
+permission.boxes
+np.linalg.norm
+np.linalg
+heapq.heappush
+```
+
+写入目标：
+
+```python
+wa
+wb
+policy
+lower
+diameter
+```
+
+直接调用符号：
+
+```python
+permission.excludes_cells
+world_bounds
+permission.boxes
+box_distance
+max
+_projection_gap
+float
+np.linalg.norm
+heapq.heappush
+int
+next
+```

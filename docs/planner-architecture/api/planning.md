@@ -1,6 +1,6 @@
 # `manipulation/planning.py` 实现契约
 
-代码基线：`85f67b53ffaa13b474c98061a0acfc51dea91c32`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_fixed_spline_grid`
@@ -5133,7 +5133,17 @@ name.startswith
 torch.zeros_like
 anchor_valid.bool().expand
 anchor_valid.bool
+active.any(0).nonzero().flatten
+active.any(0).nonzero
+active.any
 self._query_counts
+scene_columns[None].expand
+scene_value.new_zeros(progress.shape).scatter
+scene_value.new_zeros
+progress.shape
+scene_evidence_out.items
+evidence.new_zeros(progress.shape).scatter
+evidence.new_zeros
 process_value.square
 problem.functional_inequalities
 functional_constraints.terms(signed).values
@@ -5149,12 +5159,16 @@ torch.isfinite
 (original_process <= 0).all
 signed.values
 residual.detach
+torch.where(active, acceptance_process, 0.0).detach
+torch.isfinite(acceptance_process).all
+(acceptance_process <= 0).all
+problem.functional_acceptance_keys
+signed.items
 (hard_invalid <= 0).all
 scene_value.detach
 torch.isfinite(raw_scene).all
 (raw_scene <= 0).all
 value.detach
-signed.items
 values.append
 problem.optimizer_preferences
 active_scene.optimizer_preferences
@@ -5220,7 +5234,11 @@ value
 valid
 active
 scene_evidence_out
+scene_columns
 scene_value
+scene_indices
+evidence
+scene_evidence_out[name]
 values
 signed
 augmented
@@ -5229,8 +5247,11 @@ augmented_cost
 original_process
 feasible
 residual
-hard_invalid
+acceptance_process
 eligible
+acceptance_keys
+detached
+hard_invalid
 raw_scene
 self._optimizer_evidence
 regular
@@ -5238,7 +5259,6 @@ folded
 weighted
 channels
 category
-evidence
 regular_evidence
 folded_evidence
 self._scene_evidence
@@ -5287,7 +5307,17 @@ name.startswith
 torch.zeros_like
 anchor_valid.bool().expand
 anchor_valid.bool
+active.any(0).nonzero().flatten
+active.any(0).nonzero
+active.any
 _scene_boundary_evaluate
+scene_input
+scene_columns[None].expand
+scene_value.new_zeros(progress.shape).scatter
+scene_value.new_zeros
+scene_evidence_out.items
+evidence.new_zeros(progress.shape).scatter
+evidence.new_zeros
 process_value.square
 problem.functional_inequalities
 functional_constraints.terms(signed).values
@@ -5302,12 +5332,16 @@ torch.isfinite
 (original_process <= 0).all
 signed.values
 residual.detach
+torch.where(active, acceptance_process, 0.0).detach
+torch.isfinite(acceptance_process).all
+(acceptance_process <= 0).all
+set
+signed.items
 (hard_invalid <= 0).all
 scene_value.detach
 torch.isfinite(raw_scene).all
 (raw_scene <= 0).all
 value.detach
-signed.items
 values.append
 problem.optimizer_preferences
 active_scene.optimizer_preferences
@@ -5361,9 +5395,41 @@ order.reshape
 value.gather
 ```
 
+## `_process_manager_type.ProcessCostManager.compute_costs.scene_input`
+
+[定义位置](../../../manipulation/planning.py#L2715)。
+
+输入签名：
+
+```python
+def scene_input(value):
+```
+
+显式输出分支：
+
+```python
+value.index_select(1, scene_columns)
+```
+
+读取的对象属性：
+
+```python
+value.index_select
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+value.index_select
+```
+
 ## `_process_manager_type.ProcessCostManagerCfg`
 
-[定义位置](../../../manipulation/planning.py#L2802)。
+[定义位置](../../../manipulation/planning.py#L2839)。
 
 ```python
 class ProcessCostManagerCfg(RobotCostManagerCfg):
@@ -5377,7 +5443,7 @@ process_mode: str = ''
 
 ## `_process_manager_type.ProcessCostManagerCfg.__post_init__`
 
-[定义位置](../../../manipulation/planning.py#L2805)。
+[定义位置](../../../manipulation/planning.py#L2842)。
 
 输入签名：
 
@@ -5405,7 +5471,7 @@ self.class_type
 
 ## `_process_manager_type.ProcessCostManagerCfg.create`
 
-[定义位置](../../../manipulation/planning.py#L2809)。
+[定义位置](../../../manipulation/planning.py#L2846)。
 
 输入签名：
 
@@ -5447,7 +5513,7 @@ data_dict.get
 
 ## `_process_manager_type.bind_request`
 
-[定义位置](../../../manipulation/planning.py#L2814)。
+[定义位置](../../../manipulation/planning.py#L2851)。
 
 输入签名：
 
@@ -5488,7 +5554,7 @@ manager.bind_request_data
 
 ## `_process_manager_type.add_collision_witnesses`
 
-[定义位置](../../../manipulation/planning.py#L2825)。
+[定义位置](../../../manipulation/planning.py#L2862)。
 
 输入签名：
 
@@ -5553,7 +5619,7 @@ manager.bind_request_data
 
 ## `_trajectory_candidate`
 
-[定义位置](../../../manipulation/planning.py#L2853)。
+[定义位置](../../../manipulation/planning.py#L2890)。
 
 输入签名：
 
@@ -5645,7 +5711,7 @@ metrics.debug[index:index + 1].detach
 
 ## `_scene_metric_channel`
 
-[定义位置](../../../manipulation/planning.py#L2911)。
+[定义位置](../../../manipulation/planning.py#L2948)。
 
 输入签名：
 
@@ -5692,7 +5758,7 @@ RuntimeError
 
 ## `_scene_update_metric_residuals`
 
-[定义位置](../../../manipulation/planning.py#L2920)。
+[定义位置](../../../manipulation/planning.py#L2957)。
 
 输入签名：
 
@@ -5746,7 +5812,7 @@ flat[index].item
 
 ## `_coverage_metric_residuals`
 
-[定义位置](../../../manipulation/planning.py#L2936)。
+[定义位置](../../../manipulation/planning.py#L2973)。
 
 输入签名：
 
@@ -5803,7 +5869,7 @@ flat[index].item
 
 ## `_conditional_unknown_metric_residuals`
 
-[定义位置](../../../manipulation/planning.py#L2954)。
+[定义位置](../../../manipulation/planning.py#L2991)。
 
 输入签名：
 
@@ -5857,7 +5923,7 @@ flat[index].item
 
 ## `_unknown_policy_failure`
 
-[定义位置](../../../manipulation/planning.py#L2968)。
+[定义位置](../../../manipulation/planning.py#L3005)。
 
 输入签名：
 
@@ -5923,7 +5989,7 @@ name.endswith
 
 ## `_collision_metric_residuals`
 
-[定义位置](../../../manipulation/planning.py#L3007)。
+[定义位置](../../../manipulation/planning.py#L3044)。
 
 输入签名：
 
@@ -5969,7 +6035,7 @@ _scene_metric_channel
 
 ## `_collision_metric_residuals.maximum`
 
-[定义位置](../../../manipulation/planning.py#L3014)。
+[定义位置](../../../manipulation/planning.py#L3051)。
 
 输入签名：
 
@@ -6004,7 +6070,7 @@ float
 
 ## `_dense_collision_witnesses`
 
-[定义位置](../../../manipulation/planning.py#L3024)。
+[定义位置](../../../manipulation/planning.py#L3061)。
 
 输入签名：
 
@@ -6176,7 +6242,7 @@ report.update
 
 ## `_CuroboPlanner`
 
-[定义位置](../../../manipulation/planning.py#L3125)。
+[定义位置](../../../manipulation/planning.py#L3162)。
 
 ```python
 class _CuroboPlanner():
@@ -6192,7 +6258,7 @@ class _CuroboPlanner():
 
 ## `_CuroboPlanner.__init__`
 
-[定义位置](../../../manipulation/planning.py#L3129)。
+[定义位置](../../../manipulation/planning.py#L3166)。
 
 输入签名：
 
@@ -6237,7 +6303,7 @@ self.close
 
 ## `_CuroboPlanner._initialize`
 
-[定义位置](../../../manipulation/planning.py#L3152)。
+[定义位置](../../../manipulation/planning.py#L3189)。
 
 输入签名：
 
@@ -6507,7 +6573,7 @@ self._manager_type.bind_request
 
 ## `_CuroboPlanner._initialize.configuration`
 
-[定义位置](../../../manipulation/planning.py#L3288)。
+[定义位置](../../../manipulation/planning.py#L3325)。
 
 输入签名：
 
@@ -6549,7 +6615,7 @@ constraint.pop
 
 ## `_CuroboPlanner._initialize.ProcessTrajectoryOptimizer`
 
-[定义位置](../../../manipulation/planning.py#L3374)。
+[定义位置](../../../manipulation/planning.py#L3411)。
 
 ```python
 class ProcessTrajectoryOptimizer(TrajectoryOptimizer):
@@ -6561,7 +6627,7 @@ class ProcessTrajectoryOptimizer(TrajectoryOptimizer):
 
 ## `_CuroboPlanner._initialize.ProcessTrajectoryOptimizer._prepare_goal_buffer`
 
-[定义位置](../../../manipulation/planning.py#L3376)。
+[定义位置](../../../manipulation/planning.py#L3413)。
 
 输入签名：
 
@@ -6609,7 +6675,7 @@ super
 
 ## `_CuroboPlanner._initialize.ProcessTrajectoryOptimizer._get_result`
 
-[定义位置](../../../manipulation/planning.py#L3394)。
+[定义位置](../../../manipulation/planning.py#L3431)。
 
 输入签名：
 
@@ -6650,7 +6716,7 @@ super
 
 ## `_CuroboPlanner._initialize.ProcessTrajectoryOptimizer.get_interpolated_trajectory`
 
-[定义位置](../../../manipulation/planning.py#L3403)。
+[定义位置](../../../manipulation/planning.py#L3440)。
 
 输入签名：
 
@@ -6751,7 +6817,7 @@ rollout.metrics_constraint_manager.set_dense_counts
 
 ## `_CuroboPlanner._bind_online_robot`
 
-[定义位置](../../../manipulation/planning.py#L3466)。
+[定义位置](../../../manipulation/planning.py#L3503)。
 
 输入签名：
 
@@ -6788,7 +6854,7 @@ self.check_request
 
 ## `_CuroboPlanner.rebind`
 
-[定义位置](../../../manipulation/planning.py#L3471)。
+[定义位置](../../../manipulation/planning.py#L3508)。
 
 输入签名：
 
@@ -6965,7 +7031,7 @@ self._bind_physical_domains
 
 ## `_CuroboPlanner._bind_formal_clock`
 
-[定义位置](../../../manipulation/planning.py#L3557)。
+[定义位置](../../../manipulation/planning.py#L3594)。
 
 输入签名：
 
@@ -7008,7 +7074,7 @@ self.formal_clock.update
 
 ## `_CuroboPlanner._seed_u`
 
-[定义位置](../../../manipulation/planning.py#L3565)。
+[定义位置](../../../manipulation/planning.py#L3602)。
 
 输入签名：
 
@@ -7053,7 +7119,7 @@ np.interp
 
 ## `_CuroboPlanner._initialize_verification_constraints`
 
-[定义位置](../../../manipulation/planning.py#L3575)。
+[定义位置](../../../manipulation/planning.py#L3612)。
 
 输入签名：
 
@@ -7095,7 +7161,7 @@ deepcopy
 
 ## `_CuroboPlanner._bind_physical_domains`
 
-[定义位置](../../../manipulation/planning.py#L3588)。
+[定义位置](../../../manipulation/planning.py#L3625)。
 
 输入签名：
 
@@ -7154,7 +7220,7 @@ bind_solver_components
 
 ## `_CuroboPlanner.initial_state_diagnostics`
 
-[定义位置](../../../manipulation/planning.py#L3609)。
+[定义位置](../../../manipulation/planning.py#L3646)。
 
 输入签名：
 
@@ -7274,7 +7340,7 @@ deepcopy
 
 ## `_CuroboPlanner.close`
 
-[定义位置](../../../manipulation/planning.py#L3649)。
+[定义位置](../../../manipulation/planning.py#L3686)。
 
 输入签名：
 
@@ -7320,7 +7386,7 @@ gc.collect
 
 ## `_CuroboPlanner._goal`
 
-[定义位置](../../../manipulation/planning.py#L3672)。
+[定义位置](../../../manipulation/planning.py#L3709)。
 
 输入签名：
 
@@ -7370,7 +7436,7 @@ quaternion[:, :, None, None].contiguous
 
 ## `_CuroboPlanner._seed_velocity_bounds`
 
-[定义位置](../../../manipulation/planning.py#L3680)。
+[定义位置](../../../manipulation/planning.py#L3717)。
 
 输入签名：
 
@@ -7424,7 +7490,7 @@ limits.velocity.detach
 
 ## `_CuroboPlanner.reference_seeds`
 
-[定义位置](../../../manipulation/planning.py#L3686)。
+[定义位置](../../../manipulation/planning.py#L3723)。
 
 输入签名：
 
@@ -7725,7 +7791,7 @@ seeds.contiguous
 
 ## `_CuroboPlanner.ompl_seed`
 
-[定义位置](../../../manipulation/planning.py#L3884)。
+[定义位置](../../../manipulation/planning.py#L3921)。
 
 输入签名：
 
@@ -8014,7 +8080,7 @@ controls[None, None].contiguous
 
 ## `_CuroboPlanner.ompl_seed.goals_at_time`
 
-[定义位置](../../../manipulation/planning.py#L3942)。
+[定义位置](../../../manipulation/planning.py#L3979)。
 
 输入签名：
 
@@ -8048,7 +8114,7 @@ float
 
 ## `_CuroboPlanner.ompl_seed.check_search`
 
-[定义位置](../../../manipulation/planning.py#L3946)。
+[定义位置](../../../manipulation/planning.py#L3983)。
 
 输入签名：
 
@@ -8081,7 +8147,7 @@ TimeoutError
 
 ## `_CuroboPlanner.ompl_seed.state_parts`
 
-[定义位置](../../../manipulation/planning.py#L3952)。
+[定义位置](../../../manipulation/planning.py#L3989)。
 
 输入签名：
 
@@ -8170,7 +8236,7 @@ _torch_interpolate
 
 ## `_CuroboPlanner.ompl_seed.equations`
 
-[定义位置](../../../manipulation/planning.py#L3971)。
+[定义位置](../../../manipulation/planning.py#L4008)。
 
 输入签名：
 
@@ -8200,7 +8266,7 @@ cache
 
 ## `_CuroboPlanner.ompl_seed.equations.residual_function`
 
-[定义位置](../../../manipulation/planning.py#L3973)。
+[定义位置](../../../manipulation/planning.py#L4010)。
 
 输入签名：
 
@@ -8255,7 +8321,7 @@ torch.cat
 
 ## `_CuroboPlanner.ompl_seed.equations.evaluate`
 
-[定义位置](../../../manipulation/planning.py#L3981)。
+[定义位置](../../../manipulation/planning.py#L4018)。
 
 输入签名：
 
@@ -8325,7 +8391,7 @@ min
 
 ## `_CuroboPlanner.ompl_seed.valid`
 
-[定义位置](../../../manipulation/planning.py#L4005)。
+[定义位置](../../../manipulation/planning.py#L4042)。
 
 输入签名：
 
@@ -8413,7 +8479,7 @@ terms.items
 
 ## `_CuroboPlanner.ompl_seed.proposals`
 
-[定义位置](../../../manipulation/planning.py#L4037)。
+[定义位置](../../../manipulation/planning.py#L4074)。
 
 输入签名：
 
@@ -8477,7 +8543,7 @@ np.asarray
 
 ## `_CuroboPlanner.ompl_seed.search_frame`
 
-[定义位置](../../../manipulation/planning.py#L4074)。
+[定义位置](../../../manipulation/planning.py#L4111)。
 
 输入签名：
 
@@ -8509,7 +8575,7 @@ proposals
 
 ## `_CuroboPlanner._functional_goal`
 
-[定义位置](../../../manipulation/planning.py#L4206)。
+[定义位置](../../../manipulation/planning.py#L4243)。
 
 输入签名：
 
@@ -8573,7 +8639,7 @@ quaternion[:, :, None, None].contiguous
 
 ## `_CuroboPlanner._rank_ik_candidates`
 
-[定义位置](../../../manipulation/planning.py#L4223)。
+[定义位置](../../../manipulation/planning.py#L4260)。
 
 输入签名：
 
@@ -8715,7 +8781,7 @@ rank_ik_candidates
 
 ## `_CuroboPlanner._build_goal_ik_candidates`
 
-[定义位置](../../../manipulation/planning.py#L4289)。
+[定义位置](../../../manipulation/planning.py#L4326)。
 
 输入签名：
 
@@ -8841,7 +8907,7 @@ candidates[index].tolist
 
 ## `_CuroboPlanner._observed_native_result`
 
-[定义位置](../../../manipulation/planning.py#L4335)。
+[定义位置](../../../manipulation/planning.py#L4372)。
 
 输入签名：
 
@@ -8906,7 +8972,7 @@ self.trajopt._get_best_result
 
 ## `_CuroboPlanner._optimizer_reports`
 
-[定义位置](../../../manipulation/planning.py#L4350)。
+[定义位置](../../../manipulation/planning.py#L4387)。
 
 输入签名：
 
@@ -8964,7 +9030,7 @@ displacement.max
 
 ## `_CuroboPlanner.promote_collision_witnesses`
 
-[定义位置](../../../manipulation/planning.py#L4363)。
+[定义位置](../../../manipulation/planning.py#L4400)。
 
 输入签名：
 
@@ -9019,7 +9085,7 @@ bool
 
 ## `_CuroboPlanner._native_request`
 
-[定义位置](../../../manipulation/planning.py#L4378)。
+[定义位置](../../../manipulation/planning.py#L4415)。
 
 输入签名：
 
@@ -9092,7 +9158,7 @@ SolveState
 
 ## `_CuroboPlanner.evaluate_reference`
 
-[定义位置](../../../manipulation/planning.py#L4402)。
+[定义位置](../../../manipulation/planning.py#L4439)。
 
 输入签名：
 
@@ -9165,7 +9231,7 @@ seed.reshape
 
 ## `_CuroboPlanner.bind_reference_candidate`
 
-[定义位置](../../../manipulation/planning.py#L4416)。
+[定义位置](../../../manipulation/planning.py#L4453)。
 
 输入签名：
 
@@ -9262,7 +9328,7 @@ getattr
 
 ## `_CuroboPlanner._candidate_metrics`
 
-[定义位置](../../../manipulation/planning.py#L4444)。
+[定义位置](../../../manipulation/planning.py#L4481)。
 
 输入签名：
 
@@ -9448,7 +9514,7 @@ deepcopy
 
 ## `_CuroboPlanner.evaluate_candidate`
 
-[定义位置](../../../manipulation/planning.py#L4559)。
+[定义位置](../../../manipulation/planning.py#L4596)。
 
 输入签名：
 
@@ -9513,7 +9579,7 @@ max
 
 ## `_CuroboPlanner.optimize`
 
-[定义位置](../../../manipulation/planning.py#L4576)。
+[定义位置](../../../manipulation/planning.py#L4613)。
 
 输入签名：
 
@@ -9580,7 +9646,7 @@ self._optimizer_reports
 
 ## `_CuroboPlanner.native_diagnostics`
 
-[定义位置](../../../manipulation/planning.py#L4593)。
+[定义位置](../../../manipulation/planning.py#L4630)。
 
 输入签名：
 
@@ -9644,7 +9710,7 @@ _conditional_unknown_metric_residuals
 
 ## `_CuroboPlanner.select_candidate`
 
-[定义位置](../../../manipulation/planning.py#L4634)。
+[定义位置](../../../manipulation/planning.py#L4671)。
 
 输入签名：
 
@@ -9729,7 +9795,7 @@ self._native_curve
 
 ## `_CuroboPlanner._native_curve`
 
-[定义位置](../../../manipulation/planning.py#L4679)。
+[定义位置](../../../manipulation/planning.py#L4716)。
 
 输入签名：
 
@@ -9845,7 +9911,7 @@ getattr
 
 ## `_CuroboPlanner._candidate_domain_validation`
 
-[定义位置](../../../manipulation/planning.py#L4711)。
+[定义位置](../../../manipulation/planning.py#L4748)。
 
 输入签名：
 
@@ -9959,7 +10025,7 @@ asdict
 
 ## `_CuroboPlanner.export`
 
-[定义位置](../../../manipulation/planning.py#L4734)。
+[定义位置](../../../manipulation/planning.py#L4771)。
 
 输入签名：
 
@@ -10002,7 +10068,7 @@ MotionPlanningError
 
 ## `_verified_dependency_outcomes`
 
-[定义位置](../../../manipulation/planning.py#L4743)。
+[定义位置](../../../manipulation/planning.py#L4780)。
 
 输入签名：
 
@@ -10063,7 +10129,7 @@ satisfied.add
 
 ## `_bind_motion_work_ledger`
 
-[定义位置](../../../manipulation/planning.py#L4765)。
+[定义位置](../../../manipulation/planning.py#L4802)。
 
 输入签名：
 
@@ -10117,7 +10183,7 @@ deepcopy
 
 ## `MotionPlanningError`
 
-[定义位置](../../../manipulation/planning.py#L4784)。
+[定义位置](../../../manipulation/planning.py#L4821)。
 
 ```python
 class MotionPlanningError(ValueError):
@@ -10133,7 +10199,7 @@ class MotionPlanningError(ValueError):
 
 ## `MotionPlanningError.__init__`
 
-[定义位置](../../../manipulation/planning.py#L4786)。
+[定义位置](../../../manipulation/planning.py#L4823)。
 
 输入签名：
 
@@ -10166,7 +10232,7 @@ super
 
 ## `MotionBackend`
 
-[定义位置](../../../manipulation/planning.py#L4791)。
+[定义位置](../../../manipulation/planning.py#L4828)。
 
 ```python
 class MotionBackend():
@@ -10186,7 +10252,7 @@ class MotionBackend():
 
 ## `MotionBackend.__init__`
 
-[定义位置](../../../manipulation/planning.py#L4798)。
+[定义位置](../../../manipulation/planning.py#L4835)。
 
 输入签名：
 
@@ -10225,7 +10291,7 @@ Lock
 
 ## `MotionBackend._claim`
 
-[定义位置](../../../manipulation/planning.py#L4806)。
+[定义位置](../../../manipulation/planning.py#L4843)。
 
 输入签名：
 
@@ -10260,7 +10326,7 @@ get_ident
 
 ## `MotionBackend._release`
 
-[定义位置](../../../manipulation/planning.py#L4811)。
+[定义位置](../../../manipulation/planning.py#L4848)。
 
 输入签名：
 
@@ -10296,7 +10362,7 @@ self._busy.release
 
 ## `MotionBackend.bind_request`
 
-[定义位置](../../../manipulation/planning.py#L4817)。
+[定义位置](../../../manipulation/planning.py#L4854)。
 
 输入签名：
 
@@ -10342,7 +10408,7 @@ self._planner.rebind
 
 ## `MotionBackend.plan`
 
-[定义位置](../../../manipulation/planning.py#L4833)。
+[定义位置](../../../manipulation/planning.py#L4870)。
 
 输入签名：
 
@@ -10377,7 +10443,7 @@ plan_trajectory
 
 ## `MotionBackend.close`
 
-[定义位置](../../../manipulation/planning.py#L4840)。
+[定义位置](../../../manipulation/planning.py#L4877)。
 
 输入签名：
 
@@ -10415,7 +10481,7 @@ self._release
 
 ## `plan_trajectory`
 
-[定义位置](../../../manipulation/planning.py#L4853)。
+[定义位置](../../../manipulation/planning.py#L4890)。
 
 输入签名：
 
@@ -10770,7 +10836,7 @@ diagnostics.get
 
 ## `plan_trajectory.mark_wallclock`
 
-[定义位置](../../../manipulation/planning.py#L4876)。
+[定义位置](../../../manipulation/planning.py#L4913)。
 
 输入签名：
 

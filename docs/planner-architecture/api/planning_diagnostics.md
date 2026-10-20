@@ -1,6 +1,6 @@
 # `manipulation/planning_diagnostics.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `AttemptWitnesses`
@@ -18,7 +18,7 @@ class AttemptWitnesses():
 实现说明：
 
 > Keep historical failures separate from the next optimizer's queries.
-> 
+>
 > The ledger records normalized physical time, not source progress: a pause
 > can map several distinct trajectory times to one progress value. Exact
 > repeated times share one query. Nearby but distinct times remain distinct
@@ -228,7 +228,7 @@ def _native_parameters(cls, native_metrics, *, duration):
 实现说明：
 
 > Read exact times from bound native source-constraint traces.
-> 
+>
 > Traces can carry the original normalized query parameter or their
 > physical ``time_s`` and frozen duration; the latter ratio is used
 > exactly, without clipping or epsilon merging. Unavailable/unmatched
@@ -418,7 +418,7 @@ def set_current(self, native_metrics, *, validation=None, duration):
 实现说明：
 
 > Select one continuation candidate's native and independent failures.
-> 
+>
 > The caller must invoke this only after candidate selection. Observers
 > and unselected seeds use add_native/add_validation instead. Validate
 > both inputs before mutation, so a malformed completed validation cannot
@@ -474,7 +474,7 @@ def select_parameters(self, *, fixed_parameters, regular_parameters, max_points)
 实现说明：
 
 > Schedule bounded current failures fairly; retain all history.
-> 
+>
 > Fixed anchors and regular optimizer samples cover only their supplied
 > exact representations. The caller supplies native float32 aliases for
 > fixed anchors when those aliases represent actual existing queries.
@@ -547,7 +547,7 @@ def capture_component_failures(components, times, progress, joints, position, qu
 实现说明：
 
 > Capture process/self residual times before anchor columns are folded.
-> 
+>
 > Inputs use the already ordered native query layout ``[batch, time, ...]``.
 > Each component's trailing dimensions are reduced only within that same
 > state. The resulting rows share the existing scene-trace schema, so the
@@ -644,7 +644,7 @@ def scene_component_failures(components, times, progress, permission, joints, po
 实现说明：
 
 > Retain every positive/nonfinite hard component in its original mode.
-> 
+>
 > Unknown observation coverage remains informational under the existing
 > scene law. Missing release anchors are hard requirements under that same
 > law. A mode index refers to the pre-fold query, never to its maximum.
@@ -729,7 +729,7 @@ def bind_trace_to_native_seed(trace, state, seed_index, joint_names):
 实现说明：
 
 > Bind by complete typed q/dq bytes, independently of native seed ranking.
-> 
+>
 > Native result sorting can permute seeds after metrics evaluation. Comparing
 > the original named states avoids attributing another seed's scene witness.
 > Identical q/dq rows share the same fixed-clock scene evaluation.

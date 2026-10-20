@@ -1,6 +1,6 @@
 # `manipulation/physical_joint_domain.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `JointDomainInitializationError`
@@ -250,7 +250,7 @@ def validate(self, action: torch.Tensor) -> torch.Tensor | None:
 实现说明：
 
 > Raise outside a graph; return a recorded predicate inside its scope.
-> 
+>
 > Graph callers must use the predicate to isolate invalid actions before
 > a rollout. Recording an error alone would still let a captured kernel
 > consume that action before the enclosing block reports the failure.
@@ -334,7 +334,7 @@ def limit_step(self, base: torch.Tensor, step: torch.Tensor, scales: torch.Tenso
 实现说明：
 
 > Shorten one direction before constructing any native trial action.
-> 
+>
 > Every nonnegative line-search scale retains its ratio on the same
 > direction. Convexity of the physical position domain justifies the
 > scalar bisection. Rechecking the actual native-dtype trial arithmetic
@@ -382,7 +382,7 @@ def limit_step_tensor(self, base: torch.Tensor, step: torch.Tensor, scales: torc
 实现说明：
 
 > Apply the exact step map to an already validated base/scales.
-> 
+>
 > Eager calls can return an unchanged full step after checking every
 > actual trial. Graph/warmup scopes retain device-only control flow.
 > The optimizer separately validates the resulting trial predicates
@@ -465,7 +465,7 @@ class CubicJointDomain(JointPositionDomain):
 实现说明：
 
 > Exact position domain of the shared instantaneous-boundary cubic.
-> 
+>
 > Only measured q0/dq0 are fixed. Acceleration and jerk remain optimizable
 > immediately; the original three terminal copies retain a stopped end.
 > Free controls themselves have no invented box: only the represented
@@ -565,7 +565,7 @@ def evaluate(self, actions, progress, derivative=0):
 实现说明：
 
 > Sample normalized progress, returning NumPy values in physical units.
-> 
+>
 > Actions end in [free controls, joints]; output ends in [queries,
 > joints]. Derivatives 1..3 use seconds from the immutable knot clock.
 
@@ -605,7 +605,7 @@ def fit_reference(self, progress, joint_targets, prior_controls=None, velocity_b
 实现说明：
 
 > Fit soft samples on this clock, optionally enforcing model velocity.
-> 
+>
 > Returns [controls,joints] or None with a construction report. Velocity
 > bounds apply only to this initializer, not to the optimizer domain or
 > its recovery directions for trajectories with existing violations.
@@ -907,7 +907,7 @@ def _construct_anchor(self, dtype: torch.dtype, device: torch.device) -> torch.T
 实现说明：
 
 > Use the existing SciPy LP and analytic extrema in a finite cutting loop.
-> 
+>
 > Failure means this bounded initializer was not constructed. It does
 > not rewrite dq0 or prove that every representation is infeasible.
 > Only this initializer uses a small inward numerical margin, to obtain

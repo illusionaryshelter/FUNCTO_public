@@ -1,6 +1,6 @@
 # `manipulation/skill.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_semantics`
@@ -494,7 +494,7 @@ def save_grounding_skill(directory, *, metadata, source, representation):
 实现说明：
 
 > Write one new ``functo.grounding_skill.2`` bundle, manifest last.
-> 
+>
 > ``metadata`` includes skill_id, owner_role, semantic and roles, and may carry
 > independent task conditions, provenance and missing inputs. ``source`` is
 > one actual image plus its native observation point bank, calibrated depth,
@@ -606,7 +606,7 @@ def load_grounding_skill(directory):
 实现说明：
 
 > Read only this version-2 package's files; provenance paths stay opaque.
-> 
+>
 > Return ``manifest, metadata, source, representation``. The source's nested
 > ``observation`` is directly usable by the dual-view adapter. Loading never
 > invokes models, re-extracts regions or fabricates absent motion components.
@@ -707,7 +707,7 @@ def observe_interaction_reference(skill, instruction, views, *, detector=None, c
 实现说明：
 
 > Detect and semantically select the reference chosen during extraction.
-> 
+>
 > Each view supplies an ``image`` and may supply separately observed
 > ``selected_owner`` context for a part. The detector receives precisely the
 > stored noun phrase. Object references select semantic entities, potentially

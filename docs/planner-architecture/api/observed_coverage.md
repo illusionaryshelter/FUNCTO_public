@@ -1,6 +1,6 @@
 # `manipulation/observed_coverage.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `query_coverage`
@@ -16,7 +16,7 @@ def query_coverage(field, pose, coverage, regions, *, precision_m=0.0001, check_
 实现说明：
 
 > Bound only represented occupancy; boxes can prove coverage, not occupancy.
-> 
+>
 > Unknown-space witnesses must be actual occupied points. An overlapping
 > bounding box only schedules subdivision. Robot callers do not invoke
 > this owner-policy query: robot field-of-view absence allows an attempt.

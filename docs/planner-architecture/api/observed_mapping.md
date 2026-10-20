@@ -1,6 +1,6 @@
 # `manipulation/observed_mapping.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `FrozenObservedField`
@@ -318,7 +318,7 @@ def freeze_mapper(mapper, *, name, source, max_host_rss_bytes=DEFAULT_MAX_HOST_R
 实现说明：
 
 > Decode the native weighted TSDF block export into XYZ sample arrays.
-> 
+>
 > Native block coordinates are centered, and local samples are indexed as
 > z*B*B+y*B+x. The origin denotes the first sample center, not a voxel face.
 
@@ -444,7 +444,7 @@ def integrate_entity(observations, *, config, name, source, max_host_rss_bytes=D
 实现说明：
 
 > Integrate an iterable of calibrated, identity-partitioned RGB-D views.
-> 
+>
 > Each row provides depth (camera-z meters), an entity mask, RGB, K with
 > integer pixel centers and T_entity_camera in the OpenCV camera convention.
 > Rows may describe different times: their poses already express the camera

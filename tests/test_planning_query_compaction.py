@@ -23,8 +23,11 @@ def test_boundary_compaction_keeps_batched_plateaus_release_witness_and_tie_grad
     upper = torch.where(right, torch.nextafter(progress, torch.full_like(progress, float('inf'))), progress)
     seen = []
 
+    # BEGIN both direct oracle and production callback declare their query role.
     def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
-                 contact_permission_progress):
+                 contact_permission_progress, query_role="acceptance"):
+        assert query_role == "acceptance"
+        # END this numerical oracle leaves geometry-role selection to its caller.
         seen.append((s.detach().clone(), joints.detach().clone(), trajectory_time.detach().clone(),
                      contact_permission_progress.detach().clone()))
         # A released owner needs an exact release pose in the same evaluation;

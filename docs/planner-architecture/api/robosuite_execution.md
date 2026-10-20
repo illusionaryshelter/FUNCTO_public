@@ -1,6 +1,6 @@
 # `manipulation/robosuite_execution.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `RobosuiteExecutionBackend`
@@ -778,7 +778,7 @@ def apply_control(self, arm_q, arm_dq, arm_ddq, finger_positions):
 实现说明：
 
 > Apply one named q/dq/ddq reference and native finger positions.
-> 
+>
 > Every arm vector follows ``arm_joint_names`` from this binding. The
 > executor samples all three at its declared clamped step endpoint;
 > none is substituted by measured velocity or finite differences here.
@@ -786,7 +786,7 @@ def apply_control(self, arm_q, arm_dq, arm_ddq, finger_positions):
 > and bias at the same current state. Adding M*(Kd*dq_ref + ddq_ref)
 > yields M*(ddq_ref + Kp*(q_ref-q) + Kd*(dq_ref-dq)) + bias, without
 > changing gains or canceling unknown contact/passive forces.
-> 
+>
 > This method writes only actuator ctrl and does not integrate physics.
 > Its raw torque components and references belong to the same call;
 > saturation is applied only to their total, never to each component.
@@ -945,7 +945,7 @@ def step(self):
 实现说明：
 
 > Integrate one native step and retain its count even if refresh fails.
-> 
+>
 > One entered attempt is conservatively charged. A normal native return
 > confirms its one completed step; an exceptional return can still be
 > resolved by the native clock. A stationary exceptional clock confirms
@@ -1025,7 +1025,7 @@ def _prepare_reference_fk(self):
 实现说明：
 
 > Require a fixed, controlled TCP chain before creating scratch data.
-> 
+>
 > This arm-curve executor has no commanded finger *path*. A TCP that
 > depends on fingers cannot use measured fingers to hide its tracking
 > error, so it requires a separately defined reference and is rejected
@@ -1170,7 +1170,7 @@ def abort_hold(self, feedback, finger_positions, *, expected_sim_time, stop_velo
 实现说明：
 
 > Apply hold through existing controllers, then measure bounded settling.
-> 
+>
 > The arm goal is the failed sample's actual q. The last applied finger
 > goal is retained, so an event rejected by supervision is never issued
 > by fault handling. Hold telemetry is separate from the failed curve.
@@ -1319,7 +1319,7 @@ def proprioception(self):
 实现说明：
 
 > Read encoders/commands/time and estimate TCP with calibrated FK.
-> 
+>
 > The tool pose is a model estimate from this sample's measured arm q,
 > not an independent TCP observation. Acceleration and actuator force
 > are not available sensors in this binding and are not exported.

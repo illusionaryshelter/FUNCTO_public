@@ -1,6 +1,6 @@
 # `manipulation/gripper_trajectory.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`pending-implementation-commit`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_text`
@@ -92,7 +92,7 @@ def _activation(time_s, timestep):
 实现说明：
 
 > Select the first native control tick at or after the original event.
-> 
+>
 > The product is checked as well as the quotient: binary64 division must
 > not round a slightly future event down to an earlier physical command.
 > No physical or numerical early-application allowance is introduced.
@@ -135,7 +135,7 @@ def _extrema(curve, names, limits):
 实现说明：
 
 > Inspect all scalar polynomial extrema and both acceleration knot sides.
-> 
+>
 > SciPy supplies polynomial roots. Values at stored q/dq endpoints use the
 > spline's endpoint constraints; ddq is affine on each cubic and needs both
 > one-sided endpoints. Reported excess is never clipped by an allowance.
@@ -229,7 +229,7 @@ def _segment(q0, dq0, goal, start, end, timestep, names, limits):
 实现说明：
 
 > Find the first bounded Hermite ramp ending on the native control grid.
-> 
+>
 > This is a finite search over realizable control ticks, not a new dynamic
 > model or a time-optimality claim. Every candidate uses SciPy's same cubic
 > and exact scalar limits. The original deadline is also considered when
@@ -553,7 +553,7 @@ def build(cls, *, joint_names, initial_position, initial_velocity, commands, dur
 实现说明：
 
 > Compile explicit event goals without changing their original clock.
-> 
+>
 > Before a later first event, a bounded C1 takeover returns to the
 > measured initial coordinate and zero reference velocity. This is an
 > explicit position-hold reference, not fictitious stationary feedback.
@@ -688,7 +688,7 @@ def _validate_segments(self):
 实现说明：
 
 > Validate saved phase boundaries without regenerating or retiming.
-> 
+>
 > Reconstruct only the explicitly saved knots from event targets and
 > ramp endpoints. A changed archive cannot hide motion before an event,
 > replace the initial slope, or omit conditional commands in the suffix.
@@ -1142,7 +1142,7 @@ _torch_cache: dict = field(default_factory=dict, init=False, repr=False, compare
 实现说明：
 
 > An owned finger polynomial with an explicit physical validity prefix.
-> 
+>
 > A free-motion model reuses the original command polynomial. A held model
 > freezes measured entrance q; its zero derivative describes that geometric
 > assumption, not the measured entrance dq or the executable command curve.
@@ -1232,7 +1232,7 @@ def valid_mask(self, times):
 实现说明：
 
 > Use the same exact typed boundary as the planner's Torch query.
-> 
+>
 > A float32 endpoint is its declared representation of the binary64
 > source time, even when rounding lies above it. Its next representable
 > value is outside. No epsilon or progress-based entrance is admitted.
@@ -1559,7 +1559,7 @@ def bind_nominal_finger_geometry(reference, conditions, event_clock, *, progress
 实现说明：
 
 > Declare geometry from contact identities and the nominal held model.
-> 
+>
 > ``reference`` remains the original C1 command, including measured dq.
 > ``event_clock`` is the already-bound original occurrence clock; no inverse
 > progress map, replacement event, stop or execution barrier is introduced.
