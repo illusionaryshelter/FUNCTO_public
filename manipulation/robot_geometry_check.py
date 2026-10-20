@@ -5,6 +5,17 @@ its measured trilinear field in its named link frame. A missing observation
 remains a missing field; it does not become an invented occupied volume.
 """
 
+# BEGIN 机器人模型来源边界与设计依据。
+# 禁止的是通过三维重建为任务相关物体制作 mesh：这需要人工建模，
+# 且每遇到一个新物体都要重复，不能作为任务运行的前提。
+# 机械臂官方随附的本体 mesh 允许使用；它是同一机械臂跨任务持续复用
+# 的已知模型，不需要为每个任务物体重新制作。
+# 已知机器人与指垫的形状、相对连杆的固定变换由本体模型给出，
+# 模型位姿由基座标定和关节反馈的正运动学（FK）计算，不以相机可见为前提。
+# 当前检查器仍只接收 ObservedBody、查询观测场，尚未恢复官方本体几何；
+# 这一实现现状不能被解释为禁止官方机器人 mesh 或要求重新观测机器人。
+# END 保留模型来源及上述原因，避免再次把任务物体重建禁令扩大到机器人。
+
 # BEGIN one observed-entity geometry contract for robot model checks.
 from dataclasses import dataclass
 from pathlib import Path

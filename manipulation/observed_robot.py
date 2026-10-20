@@ -36,6 +36,12 @@ class ObservedBody:
 
 def pure_kinematics(path):
     """Read the declared kinematic tree and reject geometry-bearing inputs."""
+    # BEGIN 区分本函数的输入限制与机器人模型来源。
+    # 下方检查只表达当前接口接受纯运动学 URDF，不定义碰撞几何的来源规则。
+    # 官方随附、跨任务复用的机器人 mesh 允许使用；禁止的是为任务物体
+    # 逐个通过人工三维重建制作 mesh。完整原因见 robot_geometry_check.py 模块开头。
+    # 不得据此检查推导出机器人或指垫必须通过 RGB-D 重新建模。
+    # END 运动学文件限制不构成禁止官方机器人碰撞模型的依据。
     root = ET.parse(path).getroot()
     if root.findall(".//visual") or root.findall(".//collision") or root.findall(".//mesh"):
         raise ValueError("The robot model must contain only kinematic link and joint declarations")
