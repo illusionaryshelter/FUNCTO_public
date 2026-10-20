@@ -1,6 +1,6 @@
 # 当前规划器验证与故障分析
 
-本文件引用代码基线 `ATTACHED_TOOL_CODE_COMMIT`，说明如何解释当前实现的诊断和组织必要验证。组件职责由 [PLANNER_ARCHITECTURE.md](PLANNER_ARCHITECTURE.md)定义，运行契约见[当前运动规划器运行契约](motion_planner_prd.md)。实验耗时和阶段方案保存在工作区的阶段文档中。
+本文件引用代码基线 `85f67b53ffaa13b474c98061a0acfc51dea91c32`，说明如何解释当前实现的诊断和组织必要验证。组件职责由 [PLANNER_ARCHITECTURE.md](PLANNER_ARCHITECTURE.md)定义，运行契约见[当前运动规划器运行契约](motion_planner_prd.md)。实验耗时和阶段方案保存在工作区的阶段文档中。
 
 ## 从输入到结果核对同一请求
 

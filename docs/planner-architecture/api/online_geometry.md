@@ -1,6 +1,6 @@
 # 已知机器人与观测任务场景
 
-代码基线：`ATTACHED_TOOL_CODE_COMMIT`。
+代码基线：`85f67b53ffaa13b474c98061a0acfc51dea91c32`。
 
 `OnlinePlanningScene` 的构造输入为 `background`、`owners`、`coverage`、`reference_frame`、共享 `robot_model`、明确 `fixed_geometry_names` 和必填 `tool_geometry_names`，以及有限接触、带附着的实体、手指、初始支撑和未知空间策略。background/owner 保留原观测场；robot_model 是与验证器相同的 `RobotGeometryChecker`。固定角色和完整工具成员由机器人适配器提供已注册的几何 ID。
 

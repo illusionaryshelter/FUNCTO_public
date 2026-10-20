@@ -1,6 +1,6 @@
 # 当前运动规划器运行契约
 
-代码基线为 `ATTACHED_TOOL_CODE_COMMIT`。本文件规定当前运动组件的输入、输出及判断权限；详细架构由 [PLANNER_ARCHITECTURE.md](PLANNER_ARCHITECTURE.md) 和其组件文档维护。阶段实施计划保存在工作区 `sim-version-plans`。
+代码基线为 `85f67b53ffaa13b474c98061a0acfc51dea91c32`。本文件规定当前运动组件的输入、输出及判断权限；详细架构由 [PLANNER_ARCHITECTURE.md](PLANNER_ARCHITECTURE.md) 和其组件文档维护。阶段实施计划保存在工作区 `sim-version-plans`。
 
 ## 输入与任务表达
 

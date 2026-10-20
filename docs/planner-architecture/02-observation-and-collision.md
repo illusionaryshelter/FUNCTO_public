@@ -1,6 +1,6 @@
 # 观测与碰撞模型
 
-代码基线：`ATTACHED_TOOL_CODE_COMMIT`。
+代码基线：`85f67b53ffaa13b474c98061a0acfc51dea91c32`。
 
 ## 1. 两种实体来源
 

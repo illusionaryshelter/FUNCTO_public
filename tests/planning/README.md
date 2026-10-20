@@ -1,6 +1,6 @@
 # 记录式规划、执行与诊断入口
 
-本文对应 FUNCTO_public 代码基线 `ATTACHED_TOOL_CODE_COMMIT`。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
+本文对应 FUNCTO_public 代码基线 `85f67b53ffaa13b474c98061a0acfc51dea91c32`。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
 
 ## 运行环境与输入
 

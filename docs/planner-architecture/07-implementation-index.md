@@ -1,6 +1,6 @@
 # 当前实现接口索引
 
-代码基线：`ATTACHED_TOOL_CODE_COMMIT`。组件职责、输入输出、坐标和调用关系见[API契约](06-api-contracts.md)。各链接包含当前组件契约或从源码读取的符号签名；定义数按Python语法树统计。
+代码基线：`85f67b53ffaa13b474c98061a0acfc51dea91c32`。组件职责、输入输出、坐标和调用关系见[API契约](06-api-contracts.md)。各链接包含当前组件契约或从源码读取的符号签名；定义数按Python语法树统计。
 
 覆盖 53 个Python文件、923 个定义。C++混合几何计算见[原生区间接口](api/coal-native-interval.md)。
 
