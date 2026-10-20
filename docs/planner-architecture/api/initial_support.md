@@ -1,6 +1,6 @@
 # `manipulation/initial_support.py` 实现契约
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。
+代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `InitialSupportRelation`
@@ -26,7 +26,7 @@ source: dict
 实现说明：
 
 > Declared current actor and observed support-plane layer.
-> 
+>
 > The target owner must be the separately observed support-plane layer, not
 > an arbitrary compound obstacle relabelled as support. Its finite allowed
 > material is established by entrance observed-field intersection, not a rectangle
@@ -208,11 +208,11 @@ class PreparedInitialSupport():
 实现说明：
 
 > Freeze entrance-touched cells and bound the whole observed actor height.
-> 
+>
 > A component is the nonpositive trilinear set within one fully supported
 > source cell. Only actual entrance intersection selects it. Adjacent cells
-> retain their ordinary separation requirement, including at permission
-> boundaries. The relation never adds a distance halo to selected material.
+> retain the ordinary nonpenetration query, including at permission
+> boundaries. Selected material is identified by its original cell.
 
 ## `PreparedInitialSupport.__init__`
 
@@ -318,7 +318,7 @@ sorted
 
 ## `PreparedInitialSupport.permission`
 
-[定义位置](../../../manipulation/initial_support.py#L122)。
+[定义位置](../../../manipulation/initial_support.py#L124)。
 
 输入签名：
 
@@ -363,7 +363,7 @@ PairPermission
 
 ## `PreparedInitialSupport.components`
 
-[定义位置](../../../manipulation/initial_support.py#L129)。
+[定义位置](../../../manipulation/initial_support.py#L131)。
 
 输入签名：
 
@@ -462,7 +462,7 @@ torch.stack(unresolved).reshape
 
 ## `PreparedInitialSupport.record`
 
-[定义位置](../../../manipulation/initial_support.py#L163)。
+[定义位置](../../../manipulation/initial_support.py#L165)。
 
 输入签名：
 

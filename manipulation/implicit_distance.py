@@ -1,10 +1,10 @@
-"""Distances between observed, trilinear implicit occupied sets.
+"""Nonpenetration queries between observed trilinear occupied sets.
 
 The TSDF values define a set; they are not Euclidean distances.  A query
 searches pairs of spatial boxes containing that set.  Box distances are lower
-bounds, while pairs of points in the sets give upper bounds.  Only the cells
-needed to decide the requested metric separation are subdivided.  No surface
-mesh, convex hull, or geometric model imported from a simulator is involved.
+bounds, while pairs of points in the sets give upper bounds. Supported cells
+are subdivided to distinguish volume overlap from unresolved boundary domains.
+The original samples and support define every geometric decision.
 """
 
 # BEGIN direct observed-set queries replace surface/solid conversion.
@@ -450,18 +450,20 @@ class ObservedField:
         return best
 
 
-def query_distance(first, first_pose, second, second_pose, *, separation_m,
+def query_distance(first, first_pose, second, second_pose, *,
                    precision_m=1e-4, permission=None, check_request=None):
-    """Return an interval and evidence for this pair of observed occupied sets.
+    """Check penetration between the two supported occupied sets.
 
     ``permission`` classifies world-space box pairs as ``permitted``,
     ``forbidden`` or ``mixed``. Only wholly permitted domains are skipped.
     A witness uses its arithmetic uncertainty box, so a mixed permission
-    boundary cannot establish a forbidden contact.
+    boundary cannot establish a forbidden contact. Distance intervals remain
+    diagnostic; positive clearance is not a constraint.
     """
-    margin, precision = float(separation_m), float(precision_m)
-    if not np.isfinite([margin, precision]).all() or margin < 0 or precision <= 0:
-        raise ValueError("Distance queries need a nonnegative separation and positive precision")
+    # BEGIN one nonpenetration rule applies to optimization and acceptance.
+    precision = float(precision_m)
+    if not np.isfinite(precision) or precision <= 0:
+        raise ValueError("Penetration queries need positive finite numerical precision")
     if first.root is None or second.root is None:
         return {"status": "clear", "lower_m": None, "upper_m": None, "empty_set": True,
                 "intersection": False, "queries": 0, "witness_first": None,
@@ -481,7 +483,7 @@ def query_distance(first, first_pose, second, second_pose, *, separation_m,
         if policy == "permitted":
             return
         lower = box_distance(wa, wb)
-        if lower <= margin:
+        if lower == 0:
             # BEGIN expose unpermitted domains before refining permission seams.
             # A mixed box contains both permitted and unpermitted points. FIFO
             # expansion exposes its interior children; choosing the smallest
@@ -497,9 +499,10 @@ def query_distance(first, first_pose, second, second_pose, *, separation_m,
         visits += 1
         if check_request is not None and visits % 64 == 1:
             check_request()
-        if lower > margin:
+        if lower > 0:
             continue
         if a.cell >= 0 and b.cell >= 0:
+            domain_upper = math.inf
             local_a, local_b = first.occupied_points(a), second.occupied_points(b)
             pa, pb = transform_points(local_a, poses[0]), transform_points(local_b, poses[1])
             errors_a = transform_point_error(local_a, poses[0])
@@ -516,6 +519,7 @@ def query_distance(first, first_pose, second, second_pose, *, separation_m,
                     value += float(np.linalg.norm(errors_a[i]) + np.linalg.norm(errors_b[j]))
                     value = float(np.nextafter(value + _GAMMA * (
                         value + np.abs(pa[i]).sum() + np.abs(pb[j]).sum()), np.inf))
+                    domain_upper = min(domain_upper, value)
                     if value < upper:
                         upper, witness = value, (pa[i].copy(), pb[j].copy())
                     break
@@ -529,14 +533,19 @@ def query_distance(first, first_pose, second, second_pose, *, separation_m,
                 xa_error, xb_error = (inverse_point_error(point, poses[0]),
                                       inverse_point_error(point, poses[1]))
                 support_a, support_b = first.cell_origins[a.cell], second.cell_origins[b.cell]
-                if (np.any(xa - xa_error < support_a)
-                        or np.any(xa + xa_error > support_a + first.voxel_size)
-                        or np.any(xb - xb_error < support_b)
-                        or np.any(xb + xb_error > support_b + second.voxel_size)):
+                if (np.any(xa - xa_error <= support_a)
+                        or np.any(xa + xa_error >= support_a + first.voxel_size)
+                        or np.any(xb - xb_error <= support_b)
+                        or np.any(xb + xb_error >= support_b + second.voxel_size)):
                     continue
                 va, _, ea = first.cell_value(a.cell, xa, xa_error)
                 vb, _, eb = second.cell_value(b.cell, xb, xb_error)
-                if va < -ea and vb < -eb:
+                # Strict support interiors distinguish a shared cell face
+                # from volume overlap. Nonpositive corner data imply a full
+                # occupied cell, including an identically zero interpolant.
+                inside_a = va < -ea or np.all(first._cell_values[a.cell] <= 0)
+                inside_b = vb < -eb or np.all(second._cell_values[b.cell] <= 0)
+                if inside_a and inside_b:
                     if permission is not None and permission.boxes(
                             (point, point), (point, point)) != "forbidden":
                         continue
@@ -544,23 +553,16 @@ def query_distance(first, first_pose, second, second_pose, *, separation_m,
                             "intersection": True, "queries": visits,
                             "witness_first": point.tolist(), "witness_second": point.tolist(),
                             "scope": "represented_observed_occupancy"}
-            if upper < margin:
-                return {"status": "margin_insufficient", "lower_m": 0., "upper_m": upper,
-                        "intersection": None, "queries": visits,
-                        "witness_first": witness[0].tolist(), "witness_second": witness[1].tolist(),
-                        "scope": "represented_observed_occupancy"}
-            if max(np.linalg.norm(a.upper - a.lower), np.linalg.norm(b.upper - b.lower)) <= precision:
-                # One unresolved minimum-distance domain is sufficient to
-                # prevent a clear verdict at this declared precision. Return
-                # its uncertainty instead of enumerating an entire tangent
-                # surface in search of an optional stronger classification.
-                return {"status": "unresolved", "lower_m": min(lower, unresolved_lower,
-                            pending[0][0] if pending else math.inf),
-                        "upper_m": upper if np.isfinite(upper) else None,
-                        "intersection": None, "queries": visits,
-                        "witness_first": None if witness is None else witness[0].tolist(),
-                        "witness_second": None if witness is None else witness[1].tolist(),
-                        "scope": "represented_observed_occupancy"}
+            if ((domain_upper <= precision
+                 and np.min(overlap_high - overlap_low) <= precision)
+                    or max(np.linalg.norm(a.upper - a.lower),
+                           np.linalg.norm(b.upper - b.lower)) <= precision):
+                # A thin possible overlap is unresolved at this numerical
+                # precision, with actual points also that close. An incidental
+                # thin overlap of loose boxes still needs refinement. Continue other
+                # domains: a contact here must not hide penetration elsewhere.
+                unresolved_lower = min(unresolved_lower, lower)
+                continue
         axis = int(np.linalg.norm(b.upper - b.lower) > np.linalg.norm(a.upper - a.lower))
         selected = (a, b)[axis]
         children = fields[axis].split(selected)
@@ -571,11 +573,12 @@ def query_distance(first, first_pose, second, second_pose, *, separation_m,
             push(child, b) if axis == 0 else push(a, child)
     unresolved = np.isfinite(unresolved_lower)
     return {"status": "unresolved" if unresolved else "clear",
-            "lower_m": unresolved_lower if unresolved else float(np.nextafter(margin, np.inf)),
+            "lower_m": unresolved_lower if unresolved else 0.,
             "upper_m": upper if np.isfinite(upper) else None,
             "intersection": None if unresolved else False,
             "queries": visits,
             "witness_first": None if witness is None else witness[0].tolist(),
             "witness_second": None if witness is None else witness[1].tolist(),
             "scope": "represented_observed_occupancy"}
+    # END unresolved domains never become positive collision evidence.
 # END every definitive result refers to the same supported implicit sets.

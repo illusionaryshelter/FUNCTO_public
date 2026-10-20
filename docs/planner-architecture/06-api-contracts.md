@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
+代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -57,20 +57,20 @@
 | `integrate_entity/freeze_mapper` | 明确实体像素、原深度、K、T_entity_camera 和资源范围 | 原始样本、权重、支持构成的 `FrozenObservedField`；建图 |
 | `FrozenObservedField.record/from_record/save/load` | 固定场或结构化样本记录 | 同一样本及坐标的场/记录；保存与复用 |
 | `ObservedField.sample/cell_value` | 原场支持内的局部点或具体单元 | 值、有效性、梯度、数值误差；距离、过滤与接触 |
-| `query_distance` | 两个原场、刚体变换、间距和有限许可 | 距离上下界、clear/margin_insufficient/intersection/unresolved及见证；优化与验收 |
-| `pair_residual` | 原生实体—场或场—场、可微位姿和同值矩阵 | 几何分类及局部可微残差；场景分项 |
+| `query_distance` | 两个原场、刚体变换、数值精度和有限许可 | 已表示域的 clear/intersection/unresolved、诊断距离界及见证；优化与验收使用同一非穿透规则 |
+| `pair_residual` | 原生实体—场或场—场、可微位姿、同值矩阵、数值精度与有限许可 | 已确认体积交叠的分类值 1 及局部法向导数；clear/未决返回零，分类证据单独保留 |
 | `query_region_intersection` | 原场、位姿、有限半空间 | 受支持零表面 contact/missing_contact/unresolved；required接触 |
 | `query_minimum_height` | 原场、位姿与声明平面 | 整体最低高度区间及见证；初始支撑 |
 | `robot_self_filter.classify_depth` | 原深度、采集时FK放置的原生组件、明确shadow padding | SELF/AMBIGUOUS_SHADOW/ENVIRONMENT、原自由射线及来源；建图 |
 | `ObservedSpace/query_coverage` | 原自由射线格、运动实体场及条件区域 | covered/unknown_witness/unresolved；场景按明确策略解释条件区域及未知 |
 | `NativeSolid/NativePrimitive` | 原凸组件顶点或解析尺寸、所属连杆、固定变换和来源 | 原生机器人实体；共享检查器 |
-| `native_field_distance.query_native_field` | Coal原实体、原任务场、两个位姿、间距、精度、点对许可 | 原集合距离区间及clear/margin_insufficient/intersection/unresolved；场景 |
+| `native_field_distance.query_native_field` | Coal原实体、原任务场、两个位姿、数值精度、点对许可 | 已表示域的 clear/intersection/unresolved、诊断距离区间与原生可行点区间；场景 |
 | `RobotGeometryChecker.model_record` | 已消费的原模型 | URDF和原顶点/解析尺寸/局部变换的独立副本；输入绑定 |
 | `DifferentiableRobotKinematics.poses` | 纯运动学配置和完整具名关节 | 可微世界连杆位姿；场景再合成原实体局部变换 |
 | `RobotGeometryChecker.query` | 具名关节、基座标定、成对策略和所需帧 | 限位、独立FK、原生有符号距离/见证/法向及分离/穿透/数值边界；`RobotStateValidator` |
 | `OnlinePlanningScene.bind_online_robot` | 同一原生检查器、纯运动学配置、验证器、请求检查 | 完整FK和对策略绑定；后端初始化 |
-| `OnlinePlanningScene.components/evaluate` | 同时刻具名关节、工具位姿、进度、物理时间及 query_role | 分项/硬和与见证报告；IK、优化、验收 |
-| `describe/to_execution_binding` | 场景已有输入及关系 | 描述与 `native_robot_observed_scene_v1` 快照；结果绑定 |
+| `OnlinePlanningScene.components/evaluate` | 同时刻具名关节、工具位姿、进度、物理时间及仅作阶段记录的 query_role | 分项/硬和与见证报告；任务场配对未决仅报告，IK、优化、验收共用非穿透规则 |
+| `describe/to_execution_binding` | 场景已有输入及关系 | `collision_rule='nonpenetration'` 描述与 `native_robot_observed_scene_v1` 快照；结果绑定 |
 | `clone_for_rollout/with_release_history` | 同一原始场及已选搜索前缀 | 私有关系状态、共享不可变场；搜索与优化 |
 | `estimated_workspace_allocation` | batch/horizon和实体数 | 共享场与逐状态临时存储估计；资源准入 |
 
@@ -150,7 +150,7 @@
 
 `collision_records.encode_array/decode_array` 保存 dtype、形状和压缩数组；消费者据其真实尺寸检查资源，再恢复同一数组。`slice_layer_selection` 从分层证据中选取指定样本。`tensor_cpu_snapshot` 将完成的张量复制到 CPU 报告，`runtime_profiling` 记录请求阶段的时间及资源。这些数据接口服务可复现记录。
 
-`implicit_distance` 对同一原场完成距离上下界与分类，`observed_collision` 为这些结果提供局部可微方向与任务接触查询，`observed_coverage` 解释实体是否处于原自由射线或明确条件区域。`observed_robot` 将完整具名关节映射为机器人连杆位姿。`native_field_distance` 连接已知本体几何与原任务场，双方保留各自的表示及共同的世界坐标。
+`implicit_distance` 对同一原场完成非穿透分类并保留诊断距离界，`observed_collision` 将已确认体积交叠转为分类值及局部优化方向，同时提供独立任务接触查询。`observed_coverage` 解释实体是否处于原自由射线或明确条件区域。`observed_robot` 将完整具名关节映射为机器人连杆位姿。`native_field_distance` 连接已知本体几何与原任务场，双方保留各自的表示及共同的世界坐标。场配对未决不产生碰撞硬成本；原生自身数值边界、任务接触、初始支撑和覆盖的条件各有独立消费者。
 
 `resource_admission.require_host_memory/require_device_memory` 输入新增存储需求、当前物理占用与明确上限，返回准入记录或类型化 `ResourceLimitError`。`optimizer_device_checks.DeviceChecks` 在设备计算期间保留有限性和域错误，`require_tensor` 在当前检查作用域内消费布尔张量。预算、诊断和数值错误共享同一请求生命周期。
 

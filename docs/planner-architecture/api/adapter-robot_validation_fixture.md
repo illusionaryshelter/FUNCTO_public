@@ -1,6 +1,6 @@
 # 记录入口的原生机器人适配
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。
+代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。
 
 `build_robot_validator(fixture, *, reference_frame, T_reference_base, tool_frame, T_frame_tcp)` 从 fixture 明确给出的 robot-only 模型和关节 URDF 构造检查器。碰撞清单分别声明机器人实体与固定安装体；每项保留 geom/frame 身份。原模型的关节范围、速度限制、工具标定和机械接触声明进入 `RobotStateValidator`。
 

@@ -16,18 +16,15 @@ class ImplicitDistanceTests(unittest.TestCase):
         self.field = ObservedField(self.values, np.ones(self.values.shape, bool),
                                    origin=[-.05] * 3, voxel_size=axis[1] - axis[0])
 
-    def query(self, shift, separation=.002):
+    # BEGIN task collision uses nonpenetration without a positive gap.
+    def query(self, shift):
         pose = np.eye(4)
         pose[0, 3] = shift
-        return query_distance(self.field, np.eye(4), self.field, pose,
-                              separation_m=separation)
+        return query_distance(self.field, np.eye(4), self.field, pose)
 
-    def test_pair_margin_is_applied_once(self):
-        self.assertEqual(self.query(.0815, .001)["status"], "clear")
-        result = self.query(.0815, .002)
-        self.assertEqual(result["status"], "margin_insufficient")
-        self.assertLess(result["upper_m"], .002)
-        self.assertIsNone(result["intersection"])
+    def test_positive_gaps_below_previous_clearance_are_clear(self):
+        for gap in (.0015, .0001, 1e-7):
+            self.assertEqual(self.query(.08 + gap)["status"], "clear")
 
     def test_batched_initial_bounds_match_scalar_refinement(self):
         """Mixed slopes and translated coordinates retain outward bounds."""
@@ -48,7 +45,7 @@ class ImplicitDistanceTests(unittest.TestCase):
     def test_intersection_requires_a_common_supported_point(self):
         field = ObservedField(-np.ones((2, 2, 2)), np.ones((2, 2, 2), bool),
                               origin=[0.] * 3, voxel_size=.01)
-        result = query_distance(field, np.eye(4), field, np.eye(4), separation_m=.002)
+        result = query_distance(field, np.eye(4), field, np.eye(4))
         self.assertEqual(result["status"], "intersection")
         for field, shift in ((field, 0.), (field, 0.)):
             point = np.asarray(result["witness_first"]) - [shift, 0., 0.]
@@ -62,7 +59,7 @@ class ImplicitDistanceTests(unittest.TestCase):
         pose[:3, 3] = [1.5, -.8, .9]
         other = np.eye(4)
         other[0, 3] = .09
-        result = query_distance(self.field, pose, self.field, pose @ other, separation_m=.002)
+        result = query_distance(self.field, pose, self.field, pose @ other)
         self.assertEqual(result["status"], "clear")
 
     def test_zero_samples_remain_closed_occupancy(self):
@@ -70,9 +67,10 @@ class ImplicitDistanceTests(unittest.TestCase):
                               origin=[0.] * 3, voxel_size=.01)
         pose = np.eye(4)
         pose[0, 3] = .011
-        result = query_distance(field, np.eye(4), field, pose, separation_m=.002)
-        self.assertEqual(result["status"], "margin_insufficient")
-        self.assertIsNone(result["intersection"])
+        result = query_distance(field, np.eye(4), field, pose)
+        self.assertEqual(result["status"], "clear")
+        self.assertEqual(query_distance(field, np.eye(4), field, np.eye(4))["status"],
+                         "intersection")
 
     def test_closed_supported_cell_border(self):
         observed = np.ones((3, 2, 2), bool)
@@ -87,7 +85,7 @@ class ImplicitDistanceTests(unittest.TestCase):
         value, valid, _, _ = field.sample(np.array([.5] * 3))
         self.assertFalse(valid)
         self.assertTrue(np.isnan(value))
-        result = query_distance(field, np.eye(4), self.field, np.eye(4), separation_m=.002)
+        result = query_distance(field, np.eye(4), self.field, np.eye(4))
         self.assertEqual(result["scope"], "represented_observed_occupancy")
 
     def test_serialization_retains_raw_samples_weights_and_support(self):
@@ -106,38 +104,69 @@ class ImplicitDistanceTests(unittest.TestCase):
         half = (normals, np.array([0., 1., 1., 1., 1., 1.]))
         region = PairPermission([(half, half)])
         result = query_distance(self.field, np.eye(4), self.field, np.eye(4),
-                                separation_m=.002, permission=region)
-        self.assertIn(result["status"], {"intersection", "margin_insufficient"})
+                                permission=region)
+        self.assertEqual(result["status"], "intersection")
         self.assertGreater(result["witness_first"][0], 0.)
 
     def test_fully_permitted_pair_is_removed_from_the_query_domain(self):
         normals = np.r_[np.eye(3), -np.eye(3)]
         box = (normals, np.ones(6))
         result = query_distance(self.field, np.eye(4), self.field, np.eye(4),
-                                separation_m=.002, permission=PairPermission([(box, box)]))
+                                permission=PairPermission([(box, box)]))
         self.assertEqual(result["status"], "clear")
         self.assertEqual(result["queries"], 0)
 
-    def test_separated_local_direction_matches_translation_difference(self):
+    def test_penetration_value_and_local_direction_have_separate_meanings(self):
         import torch
         from manipulation.observed_collision import pair_residual
         first = torch.zeros(3, dtype=torch.float64, requires_grad=True)
-        second = torch.tensor([.0815, 0., 0.], dtype=torch.float64)
+        second = torch.tensor([.07, 0., 0.], dtype=torch.float64)
         quaternion = torch.tensor([1., 0., 0., 0.], dtype=torch.float64)
         target = np.eye(4)
-        target[0, 3] = .0815
+        target[0, 3] = .07
         residual, record = pair_residual(
             self.field, (first, quaternion), np.eye(4),
-            self.field, (second, quaternion), target, separation_m=.002)
-        self.assertEqual(record["status"], "margin_insufficient")
+            self.field, (second, quaternion), target)
+        self.assertEqual(record["status"], "intersection")
+        self.assertEqual(residual.item(), 1.)
+        self.assertEqual(record["direction"], "local_zero_section_normal")
         residual.backward()
-        step = 1e-6
-        ahead, behind = np.eye(4), np.eye(4)
-        ahead[0, 3], behind[0, 3] = step, -step
-        qa = query_distance(self.field, ahead, self.field, target, separation_m=.002)
-        qb = query_distance(self.field, behind, self.field, target, separation_m=.002)
-        finite_difference = (qb["upper_m"] - qa["upper_m"]) / (2 * step)
-        self.assertAlmostEqual(first.grad[0].item(), finite_difference, places=6)
+        # Descent moves the left box away from the box translated to its right.
+        self.assertGreater(first.grad[0].item(), 0.)
+        self.assertTrue(torch.isfinite(first.grad).all())
+
+    def test_touching_supported_faces_do_not_establish_volume_overlap(self):
+        for value in (-1., 0.):
+            field = ObservedField(np.full((2, 2, 2), value), np.ones((2, 2, 2), bool),
+                                  origin=[0.] * 3, voxel_size=.01)
+            pose = np.eye(4)
+            pose[0, 3] = .01
+            result = query_distance(field, np.eye(4), field, pose)
+            self.assertEqual(result["status"], "unresolved")
+            self.assertIsNone(result["intersection"])
+
+    def test_shared_negative_corner_does_not_end_a_thick_overlap_search(self):
+        values = np.ones((2, 2, 2))
+        values[0, 0, 0] = -1.
+        field = ObservedField(values, np.ones_like(values, bool), origin=[0.] * 3, voxel_size=1.)
+        result = query_distance(field, np.eye(4), field, np.eye(4))
+        self.assertEqual(result["status"], "intersection")
+        point = np.asarray(result["witness_first"])
+        self.assertTrue(np.all(point > 0) and np.all(point < 1))
+        self.assertLess(field.sample(point)[0], 0.)
+
+    def test_touching_cell_does_not_hide_another_cell_penetration(self):
+        values = -np.ones((5, 4, 2))
+        observed = np.zeros_like(values, bool)
+        observed[:2, 2:4] = True
+        observed[3:5, :2] = True
+        first = ObservedField(values, observed, origin=[-.02, -.01, -.005], voxel_size=.01)
+        second = ObservedField(-np.ones((2, 2, 2)), np.ones((2, 2, 2), bool),
+                               origin=[-.04, -.07, -.04], voxel_size=.08)
+        result = query_distance(first, np.eye(4), second, np.eye(4))
+        self.assertEqual(result["status"], "intersection")
+        self.assertGreater(result["witness_first"][0], .01)
+    # END positive collision values require represented volume overlap.
 
 
 if __name__ == "__main__":

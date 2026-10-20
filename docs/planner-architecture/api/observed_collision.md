@@ -1,6 +1,6 @@
 # `manipulation/observed_collision.py` 实现契约
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。
+代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_world`
@@ -49,16 +49,16 @@ quaternion_rotate
 输入签名：
 
 ```python
-def pair_residual(first, first_pose, first_matrix, second, second_pose, second_matrix, *, separation_m, permission=None, check_request=None, precision_m=0.0001):
+def pair_residual(first, first_pose, first_matrix, second, second_pose, second_matrix, *, permission=None, check_request=None, precision_m=0.0001):
 ```
 
 实现说明：
 
 > Query one rigid pair and attach a local rigid-motion derivative.
 >
-> The reported status and nonnegative residual come from the interval
-> query. A separated witness pair supplies a point-distance derivative.
-> A common-point intersection uses a local zero-section normal from the
+> Confirmed penetration has classification value one; clear and unresolved
+> queries have value zero. The value is not a metric penetration depth.
+> A common-point penetration uses a local zero-section normal from the
 > observed field. Native witnesses retain their interval bounds; their
 > midpoint supplies only a local rigid-motion direction. The direction
 > neither estimates penetration nor supplies candidate acceptance evidence.
@@ -68,9 +68,8 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
 ```python
 (zero, result)
 (zero, result)
-(residual, result)
-(zero + float(separation_m), result)
-(zero + float(separation_m) - (signed - signed.detach()), result)
+(zero + 1.0, result)
+(zero + 1.0 - (signed - signed.detach()), result)
 ```
 
 读取的对象属性：
@@ -78,9 +77,6 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
 ```python
 first_pose[0].sum
 second_pose[0].sum
-torch.linalg.vector_norm
-torch.linalg
-gap.detach
 second.local_zero
 torch.as_tensor
 second_pose[0].dtype
@@ -103,15 +99,12 @@ zero
 status
 first_local
 second_local
-gap
-value
-residual
-result['direction']
 boundary
 _
 target
 normal
 signed
+result['direction']
 ```
 
 直接调用符号：
@@ -122,15 +115,11 @@ query
 first_pose[0].sum
 second_pose[0].sum
 inverse_points
-torch.linalg.vector_norm
-_world
-max
-float
-gap.detach
 second.local_zero
 quaternion_rotate
 torch.as_tensor
 ((_world(first_local, first_pose) - _world(target, second_pose)) * normal).sum
+_world
 first.local_zero
 ((_world(second_local, second_pose) - _world(target, first_pose)) * normal).sum
 signed.detach
@@ -138,7 +127,7 @@ signed.detach
 
 ## `query_region_intersection`
 
-[定义位置](../../../manipulation/observed_collision.py#L76)。
+[定义位置](../../../manipulation/observed_collision.py#L69)。
 
 输入签名：
 
@@ -273,7 +262,7 @@ node.lower.copy
 
 ## `query_minimum_height`
 
-[定义位置](../../../manipulation/observed_collision.py#L151)。
+[定义位置](../../../manipulation/observed_collision.py#L144)。
 
 输入签名：
 
@@ -373,7 +362,7 @@ witness.tolist
 
 ## `query_minimum_height.push`
 
-[定义位置](../../../manipulation/observed_collision.py#L168)。
+[定义位置](../../../manipulation/observed_collision.py#L161)。
 
 输入签名：
 

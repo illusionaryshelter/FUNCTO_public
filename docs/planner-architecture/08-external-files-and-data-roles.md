@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 

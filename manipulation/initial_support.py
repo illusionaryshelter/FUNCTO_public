@@ -78,8 +78,8 @@ class PreparedInitialSupport:
 
     A component is the nonpositive trilinear set within one fully supported
     source cell. Only actual entrance intersection selects it. Adjacent cells
-    retain their ordinary separation requirement, including at permission
-    boundaries. The relation never adds a distance halo to selected material.
+    retain the ordinary nonpenetration query, including at permission
+    boundaries. Selected material is identified by its original cell.
     """
 
     def __init__(self, relation, actor, target, numerical_tolerance):
@@ -112,8 +112,10 @@ class PreparedInitialSupport:
                 values=target.query._cell_values[node.cell].reshape(2,2,2)
                 cell=ObservedField(values,np.ones((2,2,2),bool),
                     origin=target.query.cell_origins[node.cell],voxel_size=target.query.voxel_size)
-                result=query_distance(actor.query,mapping,cell,np.eye(4),separation_m=0.,
+                # BEGIN support selection uses the same nonpenetration query.
+                result=query_distance(actor.query,mapping,cell,np.eye(4),
                                       precision_m=self.numerical_tolerance/4)
+                # END precision controls numerical uncertainty.
                 if result['status']=='intersection':self.selected_cells.append(node.cell)
                 elif result['status']=='unresolved':self.unresolved_cells.append(node.cell)
         self.selected_cells=tuple(sorted(self.selected_cells))

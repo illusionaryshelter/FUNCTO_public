@@ -1,6 +1,6 @@
 # 已知机器人实体与原生距离
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。
+代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
 
 `RobotGeometryChecker` 使用 Pinocchio 解释具名关节树，使用 Coal 查询显式注册的凸实体、盒体和圆柱。输入模型是同一机器人跨任务复用的本体模型。实体形状不依赖当前相机可见范围。坐标变换 `T_A_B` 将 B 中的点映到 A，长度以米计。
 
@@ -16,6 +16,6 @@
 | `geometry_depending_on(joint_names)` | 指定关节的原树依赖 | 受这些关节影响的实体身份；名义手指不确定状态 |
 | `query(*, joint_names, joint_positions, T_reference_base, pairs, frames=(), check_request=None)` | 完整具名关节、基座标定、配对和额外帧；FK 后合成各实体位姿 | 限位、帧与实体位姿、原生有符号距离、见证点、法向和 relation；验证器与场景 |
 
-`query` 的 relation 为 `separated`、`penetrating` 或 `numerical_boundary`，采用原 Coal GJK/EPA 数值尺度，且明确记录该尺度并非严格距离误差界。结构判断不消费任务环境的 1/2 mm 间距。非有限查询结果作为计算错误保留。
+`query` 的 relation 为 `separated`、`penetrating` 或 `numerical_boundary`，采用原 Coal GJK/EPA 数值尺度，且明确记录该尺度并非严格距离误差界。机器人自身的必检配对继续要求 `separated`；数值边界按该独立结构契约处理，没有并入任务场配对只报告未决的规则。非有限查询结果作为计算错误保留。
 
 `_native_pair_distances` 按原配对顺序分块，每块最多128对；每次恢复冷求解状态。`_frame_id` 解析具名帧，`_convex_solid` 将一个原凸碰撞组件编译为 Coal 形状；`_name`、`_rigid_pose` 校验输入坐标与身份。`native_query_storage_nbytes` 为原生查询工作区提供资源估计。

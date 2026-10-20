@@ -1,6 +1,6 @@
 # 已有任务实体与运动关系恢复
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。
+代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。
 
 `load_observed_owner(path)` 从 JSON 所指的 `FrozenObservedField` 文件恢复原样本、权重、支持和实体坐标，结合 `initial_pose`、attachments、owner_id 与来源生成 `CollisionOwner`。已有实体的恢复与当前可见深度无关。
 

@@ -1,6 +1,6 @@
 # 附着、接触与手指
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。
+代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
 
 ## 1. 实体观测与固定关系
 
@@ -16,7 +16,7 @@
 
 `ContactRule` 保存原始任务特征点、法线、边或多边形类型、目标区域坐标、活动区间、间隙和法向要求。机器人特征明确指向 `robot_body`，点在零手指位移时的 TCP 坐标中表达；`feature_joint_translation` 将具名棱柱关节坐标映入该坐标。普通实体特征在其自身坐标中表达。
 
-`OnlinePlanningScene._permission` 将当前特征和目标区域转成目标坐标中的有限半空间，并计算法向残差。调用方将许可转到世界坐标，以 `PairPermission` 交给同一原始场查询。许可要求两侧点分别落在各自明确区域中；区域外的实体部分继续检查通常距离。特征点描述任务接触位置，不定义实体占据。
+`OnlinePlanningScene._permission` 将当前特征和目标区域转成目标坐标中的有限半空间，并计算法向残差。调用方将许可转到世界坐标，以 `PairPermission` 交给同一原始场查询。许可要求两侧点分别落在各自明确区域中；区域外的实体部分继续进行非穿透查询。特征点描述任务接触位置，不定义实体占据。仅有零距离或公共边界不足以建立体积交叠证据，也不足以证明任务所要求的有限区域接触成立。
 
 required 接触调用 `query_region_intersection`，寻找有限区域内受支持的零表面。原始零样本或同一完整支持单元中的可靠异号线段证明零表面存在；严格负值内部不足以证明表面接触。法向、活动区间和手指名义状态另行计算。缺少零表面与数值未决分别记录。
 
@@ -30,7 +30,7 @@ required 接触调用 `query_region_intersection`，寻找有限区域内受支�
 
 ## 4. 初始支撑
 
-`PreparedInitialSupport` 消费两个原始场、入口关系和已声明平面。入口明确返回 intersection 的原支撑单元进入 `selected_cells`，未决单元单列。`PairPermission.excluded_second_cells` 仅排除该实体对中这些原始单元；邻接单元继续检查通常距离。
+`PreparedInitialSupport` 消费两个原始场、入口关系和已声明平面。它用同一非穿透查询逐个检查原支撑单元；只有入口已确认体积交叠、返回 `intersection` 的原单元进入 `selected_cells`，未决单元另存于 `unresolved_cells`。单纯触面不构成选格依据，也不需要为非穿透规则新增豁免。`PairPermission.excluded_second_cells` 仅排除该实体对中已选的原始单元；邻接单元继续接受普通非穿透查询，许可没有额外距离范围。
 
 `query_minimum_height` 为整个已表示实体相对支撑平面求高度区间。后续高度下界高于入口基线上界减数值容差时确认满足；后续上界低于入口下界减容差时报告下降违反量和局部梯度，其余为未决。基线两端截断到不大于零。活动区间采用左闭右开，记录类型为 `initial_observed_support_v2`。
 

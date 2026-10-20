@@ -1,6 +1,6 @@
 # 当前实现接口索引
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。组件职责、输入输出、坐标和调用关系见[API契约](06-api-contracts.md)。各链接包含当前组件契约或从源码读取的符号签名；定义数按Python语法树统计。
+代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。组件职责、输入输出、坐标和调用关系见[API契约](06-api-contracts.md)。各链接包含当前组件契约或从源码读取的符号签名；定义数按Python语法树统计。
 
 覆盖 54 个Python文件、924 个定义。C++混合几何计算见[原生区间接口](api/coal-native-interval.md)。
 

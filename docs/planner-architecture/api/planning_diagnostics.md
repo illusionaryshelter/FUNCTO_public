@@ -1,6 +1,6 @@
 # `manipulation/planning_diagnostics.py` 实现契约
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。
+代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `AttemptWitnesses`

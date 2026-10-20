@@ -1,6 +1,6 @@
 # 固定时钟轨迹求解与有限搜索
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。技能进度 `s` 与归一化时间 `u` 通过请求内固定的 `_ProgressMap` 联系。
+代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。技能进度 `s` 与归一化时间 `u` 通过请求内固定的 `_ProgressMap` 联系。
 
 ## 1. 请求生命周期与资源分配
 
@@ -40,15 +40,15 @@
 
 参考参数处有可用解时，缺失位置由入口和已有成功锚点连接，再通过 `CubicJointDomain.fit_reference` 得到固定基种子；全部 IK 行均不可用时，入口测量状态提供种子构造的基准。功能目标允许区域对应的 IK 候选可作为软拟合提示。调用者传入的 `JointTrajectory` 首先按原多项式验收，随后才在确有求解需要时拟合为优化种子。
 
-`initial_state_diagnostics` 使用已绑定机器人状态、同一任务和场景计算请求入口的具体残差。输出区分任务不满足、机器人模型碰撞、实体距离冗余不足、相交、数值未决及移动实体观测覆盖不足。这些分项决定请求是否具备继续计算的输入条件及何种后续操作适用。
+`initial_state_diagnostics` 使用已绑定机器人状态、同一任务和场景计算请求入口的具体残差。输出区分任务不满足、机器人模型碰撞、任务场已确认体积交叠及移动实体覆盖条件，并保留数值未决报告。任务场配对的未决不产生碰撞正残差；原生自身数值边界、任务接触、初始支撑及覆盖仍按各自条件计算。入口是否继续由实际硬分项决定，报告中的每个非 clear 状态并不自动成为拒绝理由。
 
 ## 5. 同一前向计算中的任务与碰撞约束
 
 `_process_manager_type` 为请求创建 `ProcessCostManager` 及对应配置类型。`bind_request_data` 绑定任务、场景、进度映射和功能约束；`set_dense_counts` 区分普通与密集样本的有效数量；`bind_scene_evidence` 连接同一次前向的场景证据；`compute_costs` 计算原生机器人项、任务项与场景项；`optimizer_evidence` 读取这一前向产生的候选分级依据。
 
-轨迹状态先通过 cuRobo 纯运动学 FK 得到工具位姿。场景的 `DifferentiableRobotKinematics` 使用本时刻完整具名关节与名义手指坐标求各连杆位姿，`CollisionOwner.pose` 求场景实体位姿。普通时刻与确切功能锚点按物理时间排列，`PlanningProblem.residuals` 与 `OnlinePlanningScene.components` 分别产生任务和观测几何分项。`_scene_boundary_evaluate` 显式传递 query_role：机器人—任务场与任务场—场在优化使用 1 mm，验收和静态 IK 使用 2 mm；原生机器人自身配对沿用原模型数值边界。
+轨迹状态先通过 cuRobo 纯运动学 FK 得到工具位姿。场景的 `DifferentiableRobotKinematics` 使用本时刻完整具名关节与名义手指坐标求各连杆位姿，`CollisionOwner.pose` 求场景实体位姿。普通时刻与确切功能锚点按物理时间排列，`PlanningProblem.residuals` 与 `OnlinePlanningScene.components` 分别产生任务和观测几何分项。`_scene_boundary_evaluate` 显式传递 `query_role`，用于记录优化或验收阶段；机器人—任务场与任务场—场在优化、验收和静态 IK 中均使用同一非穿透规则。原生机器人自身配对沿用原模型数值边界。
 
-`PlanningProblem.optimizer_preferences` 为过程位姿关系中的等式坐标和机构方向计算优化偏好；当调用阶段为 `quality` 时，还包括功能位姿与机构坐标目标中心。当前主求解使用 `feasibility` 阶段，没有额外的质量求解。普通示教参考的偏离由 `measurements` 报告，不构成该接口中的普遍路径贴合项。当前观测场分项由 `scene_value` 在同次计算中进入优化和指标；优化按物理违反量线性聚合。功能位姿、机构坐标与支撑条件通过下节的增广拉格朗日项进入优化。原生指标记录 `metrics.costs_and_constraints.constraints` 保留硬条件张量。`select_candidate` 首次按普通与密集原生结果判断时，要求该种子的 `result.success` 成立且两套 constraints 的各项最大值均为有限数、不大于零。`convergence` 中的离散标识单独作为原生诊断保存。
+`PlanningProblem.optimizer_preferences` 为过程位姿关系中的等式坐标和机构方向计算优化偏好；当调用阶段为 `quality` 时，还包括功能位姿与机构坐标目标中心。当前主求解使用 `feasibility` 阶段，没有额外的质量求解。普通示教参考的偏离由 `measurements` 报告，不构成该接口中的普遍路径贴合项。当前场景分项由 `scene_value` 在同次计算中进入优化和指标；其中任务场碰撞使用已确认体积交叠的分类值 1，并附同一场局部法向的刚体导数。该分类值没有米制深度含义，未决场配对仅保留诊断。功能位姿、机构坐标与支撑条件通过下节的增广拉格朗日项进入优化。原生指标记录 `metrics.costs_and_constraints.constraints` 保留硬条件张量。`select_candidate` 首次按普通与密集原生结果判断时，要求该种子的 `result.success` 成立且两套 constraints 的各项最大值均为有限数、不大于零。`convergence` 中的离散标识单独作为原生诊断保存。
 
 `optimization_constraints` 返回功能条件管理器，`query_anchor_parameters` 返回当前确切查询参数，`add_collision_witnesses` 将密集查询发现的有限冲突时刻加入同一锚点容量。`query_diagnostics` 保存本次实际输入布局和场景查询信息。同一次计算的张量身份将候选保存依据与其产生的代价连接。
 

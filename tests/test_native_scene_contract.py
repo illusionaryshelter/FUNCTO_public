@@ -67,6 +67,25 @@ def test_native_structure_gap_is_independent_of_task_acceptance_margin(tmp_path)
         assert not any("coverage" in key or "unknown" in key for key in costs)
 
 
+# BEGIN optimization and acceptance share task-field nonpenetration semantics.
+@pytest.mark.parametrize("gap,status", [(1e-3, "clear"), (1e-7, "clear"),
+                                      (0., "unresolved"), (-1e-3, "intersection")])
+def test_task_field_gap_and_boundary_have_the_same_meaning_in_both_roles(tmp_path, gap, status):
+    from manipulation.implicit_distance import ObservedField
+    scene = make_scene(tmp_path)
+    scene.background = ObservedField(-np.ones((2, 2, 2)), np.ones((2, 2, 2), bool),
+                                     origin=[-.005, .01 + gap, -.005], voxel_size=.01)
+    for role in ("optimization", "acceptance"):
+        costs = evaluate(scene, role)
+        assert (sum(costs.values()).item() > 0) == (status == "intersection")
+        assert scene.last_query_report["status_counts"].get(status, 0) > 0
+        assert scene.last_query_report["collision_rule"] == "nonpenetration"
+        if status == "unresolved":
+            assert any(row["status"] == "unresolved"
+                       for row in scene.last_query_report["nonclear_pairs"])
+# END numerical uncertainty is visible without creating a clearance gate.
+
+
 @pytest.mark.parametrize("gap,collision,unresolved", [(-.001, True, False), (0., False, True)])
 def test_self_penetration_and_numerical_boundary_remain_distinct(tmp_path, gap, collision, unresolved):
     costs = evaluate(make_scene(tmp_path, gap=gap))

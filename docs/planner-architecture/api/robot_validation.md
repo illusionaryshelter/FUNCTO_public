@@ -1,6 +1,6 @@
 # 机器人规划与实际反馈检查
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。
+代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。
 
 `RobotStateValidator` 绑定一个已知 `RobotGeometryChecker`、完整关节顺序及机械臂/手指分组、原配对、速度限制、参考基座及 TCP 标定。构造时给出的 FK 位置/角度数值容差用于比较同一机器人模型的运动学约定。
 

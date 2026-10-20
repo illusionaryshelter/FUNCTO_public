@@ -16,13 +16,14 @@ def solid_cell(lower, size=.02):
                          origin=lower, voxel_size=size)
 
 
-def query(shape, field, *, pose=None, margin=.002, permission=None):
+def query(shape, field, *, pose=None, permission=None):
     return query_native_field(shape, np.eye(4) if pose is None else pose,
-                              field, np.eye(4), separation_m=margin, permission=permission)
+                              field, np.eye(4), permission=permission)
 
 
-@pytest.mark.parametrize("gap,status", [(.003, "clear"), (.001, "margin_insufficient"),
-                                      (-.01, "intersection")])
+# BEGIN all positive gaps share the same nonpenetration rule.
+@pytest.mark.parametrize("gap,status", [(.003, "clear"), (.001, "clear"), (1e-7, "clear"),
+                                      (-1e-7, "intersection"), (-.01, "intersection")])
 def test_known_box_against_original_supported_cell(gap, status):
     result = query(coal.Box(.02, .02, .02), solid_cell([.01 + gap, -.005, -.005]))
     assert result["status"] == status
@@ -65,10 +66,39 @@ def test_empty_observation_does_not_invent_task_material():
     assert result["status"] == "clear" and result["empty_set"]
 
 
-def test_equal_margin_remains_unresolved_instead_of_becoming_collision():
-    result = query(coal.Box(.02, .02, .02), solid_cell([.012, -.005, -.005]))
+def test_touching_support_face_remains_unresolved_instead_of_becoming_collision():
+    result = query(coal.Box(.02, .02, .02), solid_cell([.01, -.005, -.005]))
     assert result["status"] == "unresolved"
     assert result["intersection"] is None
+
+
+def test_constant_zero_cell_has_occupied_volume():
+    field = ObservedField(np.zeros((2, 2, 2)), np.ones((2, 2, 2), bool),
+                          origin=[-.005] * 3, voxel_size=.01)
+    assert query(coal.Box(.02, .02, .02), field)["status"] == "intersection"
+
+
+def test_negative_corner_inside_native_shape_is_found_after_refinement():
+    values = np.ones((2, 2, 2))
+    values[0, 0, 0] = -1.
+    field = ObservedField(values, np.ones_like(values, bool), origin=[0.] * 3, voxel_size=1.)
+    assert query(coal.Box(4., 4., 4.), field)["status"] == "intersection"
+
+
+def test_a_touching_cell_does_not_hide_penetration_in_another_cell():
+    # Two disconnected supported cells: the first touches the box's upper
+    # face; the second lies inside it. Neither the unknown gap nor the first
+    # cell may terminate the query over this entity pair.
+    values = -np.ones((5, 4, 2))
+    observed = np.zeros_like(values, bool)
+    observed[:2, 2:4] = True
+    observed[3:5, :2] = True
+    field = ObservedField(values, observed, origin=[-.02, -.01, -.005], voxel_size=.01)
+    pose = np.eye(4)
+    result = query(coal.Box(.08, .02, .02), field, pose=pose)
+    assert result["status"] == "intersection"
+    assert result["witness_second"][0] > .01
+# END unresolved local contact never becomes a pair-wide clear verdict.
 
 
 @pytest.mark.parametrize("center", [[0., 0., 0.], [.25, .1, 0.], [-.35, .3, .2]])

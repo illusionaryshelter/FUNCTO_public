@@ -1,6 +1,6 @@
 # `manipulation/implicit_distance.py` 实现契约
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。
+代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `transform_points`
@@ -361,7 +361,7 @@ class PairPermission():
 实现说明：
 
 > A union of finite, world-frame permitted point-pair regions.
-> 
+>
 > Each entry contains ``((normals_a, bounds_a), (normals_b, bounds_b))``.
 > A point pair is permitted when both endpoints satisfy the corresponding
 > halfspaces of at least one entry. Interval, direction and relationship
@@ -562,7 +562,7 @@ class ObservedField():
 实现说明：
 
 > An immutable local TSDF and its actual interpolation support.
-> 
+>
 > Occupancy exists only in cells whose eight samples were observed. Unknown
 > samples never receive a positive value. The spatial tree indexes cells
 > that may contain nonpositive values, not a replacement solid.
@@ -760,7 +760,7 @@ def _initial_cell_bounds(self):
 实现说明：
 
 > Evaluate independent cells in batches, retaining x/y/z ordering.
-> 
+>
 > The formulas match ``cell_value`` and ``tighten`` including coordinate
 > error, endpoint slope bounds and outward rounding. Only independent
 > cells share a NumPy operation; each axis consumes the previous axis's
@@ -1122,7 +1122,7 @@ def tighten(self, node):
 实现说明：
 
 > Clip only provably positive face slabs from a mixed cell's box.
-> 
+>
 > At a fixed axis coordinate the minimum of a trilinear function is at
 > one of the four other-coordinate corners. Its first/last possible
 > zero therefore bounds the occupied projection on that axis. These
@@ -1442,32 +1442,30 @@ np.linalg.norm
 输入签名：
 
 ```python
-def query_distance(first, first_pose, second, second_pose, *, separation_m, precision_m=0.0001, permission=None, check_request=None):
+def query_distance(first, first_pose, second, second_pose, *, precision_m=0.0001, permission=None, check_request=None):
 ```
 
 实现说明：
 
-> Return an interval and evidence for this pair of observed occupied sets.
-> 
+> Check penetration between the two supported occupied sets.
+>
 > ``permission`` classifies world-space box pairs as ``permitted``,
 > ``forbidden`` or ``mixed``. Only wholly permitted domains are skipped.
 > A witness uses its arithmetic uncertainty box, so a mixed permission
-> boundary cannot establish a forbidden contact.
+> boundary cannot establish a forbidden contact. Distance intervals remain
+> diagnostic; positive clearance is not a constraint.
 
 显式输出分支：
 
 ```python
 {'status': 'clear', 'lower_m': None, 'upper_m': None, 'empty_set': True, 'intersection': False, 'queries': 0, 'witness_first': None, 'witness_second': None, 'scope': 'represented_observed_occupancy'}
 {'status': 'intersection', 'lower_m': 0.0, 'upper_m': 0.0, 'intersection': True, 'queries': visits, 'witness_first': point.tolist(), 'witness_second': point.tolist(), 'scope': 'represented_observed_occupancy'}
-{'status': 'margin_insufficient', 'lower_m': 0.0, 'upper_m': upper, 'intersection': None, 'queries': visits, 'witness_first': witness[0].tolist(), 'witness_second': witness[1].tolist(), 'scope': 'represented_observed_occupancy'}
-{'status': 'unresolved', 'lower_m': min(lower, unresolved_lower, pending[0][0] if pending else math.inf), 'upper_m': upper if np.isfinite(upper) else None, 'intersection': None, 'queries': visits, 'witness_first': None if witness is None else witness[0].tolist(), 'witness_second': None if witness is None else witness[1].tolist(), 'scope': 'represented_observed_occupancy'}
-{'status': 'unresolved' if unresolved else 'clear', 'lower_m': unresolved_lower if unresolved else float(np.nextafter(margin, np.inf)), 'upper_m': upper if np.isfinite(upper) else None, 'intersection': None if unresolved else False, 'queries': visits, 'witness_first': None if witness is None else witness[0].tolist(), 'witness_second': None if witness is None else witness[1].tolist(), 'scope': 'represented_observed_occupancy'}
+{'status': 'unresolved' if unresolved else 'clear', 'lower_m': unresolved_lower if unresolved else 0.0, 'upper_m': upper if np.isfinite(upper) else None, 'intersection': None if unresolved else False, 'queries': visits, 'witness_first': None if witness is None else witness[0].tolist(), 'witness_second': None if witness is None else witness[1].tolist(), 'scope': 'represented_observed_occupancy'}
 ```
 
 读取的对象属性：
 
 ```python
-np.isfinite([margin, precision]).all
 np.isfinite
 first.root
 second.root
@@ -1504,20 +1502,22 @@ first.voxel_size
 second.voxel_size
 first.cell_value
 second.cell_value
+first._cell_values
+second._cell_values
 point.tolist
-witness[0].tolist
-witness[1].tolist
+np.min
 a.upper
 a.lower
 b.upper
 b.lower
 fields[axis].split
+witness[0].tolist
+witness[1].tolist
 ```
 
 写入目标：
 
 ```python
-margin
 precision
 poses
 fields
@@ -1533,6 +1533,7 @@ a
 b
 wa
 wb
+domain_upper
 local_a
 local_b
 pa
@@ -1558,6 +1559,8 @@ va
 ea
 vb
 eb
+inside_a
+inside_b
 axis
 selected
 children
@@ -1569,7 +1572,6 @@ unresolved
 
 ```python
 float
-np.isfinite([margin, precision]).all
 np.isfinite
 ValueError
 np.asarray
@@ -1590,6 +1592,7 @@ np.nextafter
 np.abs(pa[i]).sum
 np.abs
 np.abs(pb[j]).sum
+min
 pa[i].copy
 pb[j].copy
 np.maximum
@@ -1602,17 +1605,17 @@ np.any
 first.cell_value
 second.cell_value
 point.tolist
-witness[0].tolist
-witness[1].tolist
+np.min
 max
-min
 int
 fields[axis].split
+witness[0].tolist
+witness[1].tolist
 ```
 
 ## `query_distance.push`
 
-[定义位置](../../../manipulation/implicit_distance.py#L476)。
+[定义位置](../../../manipulation/implicit_distance.py#L478)。
 
 输入签名：
 

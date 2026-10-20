@@ -1,6 +1,6 @@
 # 采集时机器人身份与遮挡过滤
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。
+代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。
 
 `RobotCollisionShape(name, kind, T_world_geometry, source, dimensions=(), vertices=None)` 保存单个原生凸组件或解析盒体/圆柱在图像采集时的位姿。凸顶点在实体局部坐标中；解析尺寸约定与机器人检查器一致。缩放围绕该实体局部原点。
 

@@ -40,18 +40,25 @@ def test_complete_selected_cell_permission_uses_identity_at_its_boundary():
     actor, target=owners()
     model=PreparedInitialSupport(relation(), actor, target, 1e-6)
     assert model.selected_cells == (0,)
-    result=query_distance(actor.query, np.eye(4), target.query, np.eye(4), separation_m=.002,
+    result=query_distance(actor.query, np.eye(4), target.query, np.eye(4),
                           permission=model.permission(np.eye(4)))
     assert result["status"] == "clear"
 
 
-def test_neighboring_cell_is_not_added_to_permission_by_separation_margin():
+def test_touching_neighbor_is_unresolved_and_remains_outside_permission():
     actor, target=owners((3, 2, 2))
     model=PreparedInitialSupport(relation(), actor, target, 1e-6)
     assert model.selected_cells == (0,)
-    result=query_distance(actor.query, np.eye(4), target.query, np.eye(4), separation_m=.002,
+    result=query_distance(actor.query, np.eye(4), target.query, np.eye(4),
                           permission=model.permission(np.eye(4)))
-    assert result["status"] == "margin_insufficient"
+    assert result["status"] == "unresolved"
+    # BEGIN exact contact does not expand permission to the adjacent cell.
+    moved = np.eye(4)
+    moved[0, 3] = .001
+    result = query_distance(actor.query, moved, target.query, np.eye(4),
+                            permission=model.permission(np.eye(4)))
+    assert result["status"] == "intersection"
+    # END subsequent penetration is still checked against the unpermitted cell.
 
 
 def test_whole_observed_height_detects_deepening_and_preserves_direction():

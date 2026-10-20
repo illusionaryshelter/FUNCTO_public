@@ -1,6 +1,6 @@
 # 记录式规划、执行与诊断入口
 
-本文对应 FUNCTO_public 代码基线 `__NATIVE_MODEL_COMMIT__`。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
+本文对应 FUNCTO_public 代码基线 `TASK_NONPENETRATION_CODE_COMMIT`。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
 
 ## 运行环境与输入
 
@@ -18,7 +18,7 @@
 
 `--contact-bindings` 保存原任务特征、有限目标区域、材料身份、活动区间和固定关系；`ContactRule` 与 `HoldingContact` 分别解释任务接触和附着内部许可。固定关系沿用关系建立前的同一场。源任务点、轨迹、区域与事件完整保留。
 
-`MotionBackend` 统一组织参考、IK、轨迹优化和有限搜索。碰撞计算组合已知机器人实体与原观测任务场。任务场景配对的优化间距为 1 mm、验收间距为 2 mm；原生自碰撞使用原配对和数值边界。具体数值过程和工作预算见[求解组件](../../docs/planner-architecture/04-solver-and-search.md)。
+`MotionBackend` 统一组织参考、IK、轨迹优化和有限搜索。碰撞计算组合已知机器人实体与原观测任务场。任务场景配对在优化、IK 和验收中采用同一非穿透规则；`query_role` 仅记录阶段。已确认体积交叠的分类残差为 1，不是米制穿透深度；场配对未决保留诊断，不作为碰撞正残差。原生自碰撞使用原配对和数值边界，任务接触、支撑及覆盖保持各自条件。任务 TSDF 的 2 mm 样本间距仍定义其网格分辨率。具体数值过程和工作预算见[求解组件](../../docs/planner-architecture/04-solver-and-search.md)。
 
 ## 输出与执行
 

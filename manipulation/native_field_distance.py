@@ -64,8 +64,8 @@ def _local_interval(world, pose):
 
 
 def query_native_field(geometry, native_pose, field, field_pose, *,
-                       separation_m, precision_m=1e-4, permission=None, check_request=None):
-    """Bound distance over unpermitted pairs of native and observed points.
+                       precision_m=1e-4, permission=None, check_request=None):
+    """Check penetration over unpermitted native and observed point pairs.
 
     A finite contact permission constrains both endpoints. When its boundary
     cuts the native shape, a local search box B denotes K intersect B, where K
@@ -73,9 +73,10 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
     Feasible native witnesses retain interval enclosures of the constructed
     point. Their midpoint is used only for display and a local derivative.
     """
-    margin, precision = float(separation_m), float(precision_m)
-    if not np.isfinite([margin, precision]).all() or margin < 0 or precision <= 0:
-        raise ValueError("Distance queries need nonnegative separation and positive precision")
+    # BEGIN positive clearance is not part of represented-entity collision.
+    precision = float(precision_m)
+    if not np.isfinite(precision) or precision <= 0:
+        raise ValueError("Penetration queries need positive finite numerical precision")
     native_pose, field_pose = np.asarray(native_pose, float), np.asarray(field_pose, float)
     transform = _transform(native_pose)
     native_local = _native_bounds(geometry, _transform(np.eye(4)))
@@ -110,10 +111,10 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
         if policy == "permitted":
             return
         lower = box_distance(wa, wb)
-        if lower > margin:
+        if lower > 0:
             return
         lower = max(lower, _projection_gap(geometry, transform, wb))
-        if lower > margin:
+        if lower > 0:
             return
         # K intersect B is empty if the full native set is separated from B.
         # The converse is deliberately not asserted.
@@ -133,6 +134,7 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
         if check_request is not None and visits % 64 == 1:
             check_request()
         if node.cell >= 0:
+            domain_upper = np.inf
             local_points = field.occupied_points(node)
             points = transform_points(local_points, field_pose)
             errors = transform_point_error(local_points, field_pose)
@@ -148,14 +150,18 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
                     continue
                 field_local = _local_interval(world, field_pose)
                 support = field.cell_origins[node.cell]
-                if (np.all(field_local[0] >= support)
-                        and np.all(field_local[1] <= support + field.voxel_size)):
+                if (np.all(field_local[0] > support)
+                        and np.all(field_local[1] < support + field.voxel_size)):
                     center = (field_local[0] + field_local[1]) / 2
                     radius = np.nextafter(
                         np.maximum(center - field_local[0], field_local[1] - center), np.inf)
                     value, _, error = field.cell_value(node.cell, center, radius)
                     forbidden = permission is None or permission.boxes(world, world) == "forbidden"
-                    if value < -error and forbidden:
+                    # An occupied open neighborhood of an actual native
+                    # point proves volume overlap for a solid native entity.
+                    # Nonpositive corners also cover a constant zero cell.
+                    inside = value < -error or np.all(field._cell_values[node.cell] <= 0)
+                    if inside and forbidden:
                         upper, witness = 0., (world, world)
                         return report("intersection", 0., intersection=True)
                 if index == len(points):
@@ -168,21 +174,18 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
                 distance = float(np.linalg.norm(delta))
                 error = _GAMMA * (distance + np.abs(world).sum() + np.abs(target).sum())
                 candidate_upper = float(np.nextafter(distance + error, np.inf))
+                domain_upper = min(domain_upper, candidate_upper)
                 if candidate_upper < upper:
                     upper, witness = candidate_upper, (world, target)
-            if upper < margin:
-                return report("margin_insufficient", 0.)
-            # A tight interval around the decision threshold is already an
-            # unresolved metric answer at the requested precision. Refining
-            # every box on a broad tangent face would not change that answer.
-            minimum = min(lower, unresolved_lower, pending[0][0] if pending else np.inf)
-            if upper - minimum <= precision:
-                return report("unresolved", minimum)
             diameter = float(np.linalg.norm(node.upper - node.lower))
             native_diameter = float(np.linalg.norm(native_box[1] - native_box[0]))
-            if diameter <= precision and (policy != "mixed" or native_diameter <= precision):
-                return report("unresolved", min(lower, unresolved_lower,
-                              pending[0][0] if pending else np.inf))
+            overlap = np.minimum(wa[1], wb[1]) - np.maximum(wa[0], wb[0])
+            if ((domain_upper <= precision and np.min(overlap) <= precision)
+                    or (diameter <= precision and (policy != "mixed" or native_diameter <= precision))):
+                # Only this domain is unresolved. Other supported cells can
+                # still provide penetration evidence for the same pair.
+                unresolved_lower = min(unresolved_lower, lower)
+                continue
         # Only finite permission seams need native-domain refinement.
         # Otherwise the full native shape is queried against smaller cells.
         split_native = (policy == "mixed" and not node.children
@@ -206,5 +209,6 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
                 push(native_box, child, partitioned)
     if np.isfinite(unresolved_lower):
         return report("unresolved", unresolved_lower)
-    return report("clear", float(np.nextafter(margin, np.inf)), intersection=False)
+    return report("clear", 0., intersection=False)
+    # END numerical uncertainty is reported separately from penetration.
 # END every definitive result concerns actual native/observed point pairs.

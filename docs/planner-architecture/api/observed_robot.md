@@ -1,6 +1,6 @@
 # 完整机器人可微运动学
 
-代码基线：`__NATIVE_MODEL_COMMIT__`。
+代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。
 
 `pure_kinematics(path)` 读取当前 cuRobo 接口所需的纯关节树 URDF。该输入格式要求与碰撞形状来源分开；机器人碰撞实体由共享的 `RobotGeometryChecker` 注册。
 

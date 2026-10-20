@@ -1,9 +1,9 @@
 """Planning on frozen observed implicit sets and declared rigid relationships.
 
 Robot entities retain their native models; task entities retain their
-observed trilinear fields. Robot/task separation is one millimetre in
-optimization and two in acceptance. Native self checks retain their original
-model pair policy and numerical boundary, without a task clearance margin.
+observed trilinear fields. Optimization and acceptance use the same
+nonpenetration rule. Native self checks retain their original model pair
+policy and numerical boundary.
 """
 
 # BEGIN direct entity pairs replace sphere proposals and solid confirmation.
@@ -382,14 +382,14 @@ class OnlinePlanningScene:
         """Return same-state residuals and retain distance/coverage diagnostics.
 
         ``robot_spheres`` is an empty native-kinematics output. Registered
-        native entities carry all robot geometry. Query roles are explicit and never
-        inferred from autograd state, because metric calls may retain a graph.
+        native entities carry all robot geometry. Query roles identify the
+        caller in diagnostics; both roles use the same nonpenetration rule.
         """
         if query_role not in {"optimization", "acceptance"}:
             raise ValueError("Observed geometry requires an explicit query role")
         if self.kinematics is None or joint_position is None:
             raise ValueError("Observed robot geometry must be bound to its named joint tree")
-        separation = .001 if query_role == "optimization" else .002
+        # BEGIN caller role does not introduce a geometric clearance.
         costs = {}
         permission_progress = progress if contact_permission_progress is None else contact_permission_progress
         hand_state, coordinates, half = None, None, None
@@ -482,7 +482,7 @@ class OnlinePlanningScene:
         unmodelled = (set() if hand_state is None else
                      set(self.robot_validator.checker.geometry_depending_on(self.gripper.joint_names)))
         # BEGIN native self checks use the same validator pair contract.
-        report = {"query_role": query_role, "separation_m": separation, "pair_queries": 0,
+        report = {"query_role": query_role, "collision_rule": "nonpenetration", "pair_queries": 0,
                   "status_counts": {}, "nonclear_pairs": [],
                   "robot_geometry_source": "registered_native_model",
                   "robot_view_coverage_status": "not_queried",
@@ -550,7 +550,7 @@ class OnlinePlanningScene:
                     first.query, second.query, poses[first.owner_id], poses[second.owner_id],
                     matrices[first.owner_id], matrices[second.owner_id], first.owner_id, second.owner_id))
         for component, first_id, second_id, first, second, first_pose, second_pose, fm, sm, actor, target in pairs:
-            residuals, unresolved = [], []
+            residuals = []
             rules = [rule for rule in self.contacts
                      if ((actor == "robot" and rule.actor == "robot" and rule.target_owner == target
                           and rule.robot_body == first_id)
@@ -563,14 +563,12 @@ class OnlinePlanningScene:
                 zero = first_pose[0][index].sum()*0+second_pose[0][index].sum()*0
                 if uncertain_cpu[index] and (first_id in unmodelled or second_id in unmodelled):
                     residuals.append(zero)
-                    unresolved.append(zero)
                     continue
                 held_internal = any(row.robot_body == first_id and row.target_owner == target
                     and row.interval[0] <= progress_cpu[index] < row.interval[1]
                     for row in self.holding_contacts) if actor == "robot" else False
                 if held_internal:
                     residuals.append(zero)
-                    unresolved.append(zero)
                     continue
                 regions = []
                 for rule in rules:
@@ -587,9 +585,8 @@ class OnlinePlanningScene:
                         permission = model.permission(sm[index], additional=permission)
                 value, evidence = pair_residual(first, (first_pose[0][index], first_pose[1][index]), fm[index],
                     second, (second_pose[0][index], second_pose[1][index]), sm[index],
-                    separation_m=separation, permission=permission, check_request=self.check_request)
+                    permission=permission, check_request=self.check_request)
                 residuals.append(value)
-                unresolved.append(zero+float(evidence["status"] == "unresolved"))
                 report["pair_queries"] += 1
                 status = evidence["status"]
                 report["status_counts"][status] = report["status_counts"].get(status, 0)+1
@@ -597,10 +594,10 @@ class OnlinePlanningScene:
                     report["nonclear_pairs"].append({"first": first_id, "second": second_id,
                         "component": component, "state_index": list(index), **evidence})
             value = torch.stack(residuals).reshape(progress.shape)
-            unresolved_value = torch.stack(unresolved).reshape(progress.shape)
             costs[component] = costs.get(component, torch.zeros_like(progress))+value
-            unresolved_key = "unresolved/"+component.removeprefix("collision/")
-            costs[unresolved_key] = costs.get(unresolved_key, torch.zeros_like(progress))+unresolved_value
+            # Field uncertainty remains in status_counts and nonclear_pairs.
+            # Only confirmed penetration contributes a collision residual.
+        # END a zero-distance unresolved domain is not a clearance violation.
         for model in self._initial_support_models.values():
             costs.update(model.components(poses[model.relation.actor], poses[model.relation.target_owner],
                                          progress, check_request=self.check_request))
@@ -658,7 +655,7 @@ class OnlinePlanningScene:
             "robot_entities": list(self.robot_model.geometry_names),
             "fixed_geometry_names": list(self.fixed_geometry_names),
             "unknown_policy": deepcopy(self.unknown_policy), "robot_view_coverage_status": "not_queried",
-            "optimization_separation_m": .001, "acceptance_separation_m": .002,
+            "collision_rule": "nonpenetration",
             "required_progress_anchors": self.required_progress_anchors,
             "observation_report": deepcopy(self.observation_report)}
 
