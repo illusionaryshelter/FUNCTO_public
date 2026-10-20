@@ -755,6 +755,130 @@ double certified_distance_upper_bound(const coal::CollisionGeometry& actor,
 }
 // END certificates affect search only; original Coal results remain untouched.
 
+// BEGIN expose existing native support and feasible-point enclosures to raw TSDF queries.
+bp::tuple native_projection_bounds(const coal::CollisionGeometry& geometry,
+    const coal::Transform3s& transform, const bp::object& direction_object) {
+  const coal::Vec3s direction = vector3(direction_object, "direction must be a finite float64 3-vector");
+  if (!finite_transform(transform) || direction.isZero(0.))
+    throw std::invalid_argument("Native projection requires a finite transform and nonzero direction");
+  const RoundingGuard rounding;
+  Interval projection;
+  if (!shape_projection(geometry, transform, direction, projection))
+    throw std::invalid_argument("The registered native shape has no supported projection enclosure");
+  return bp::make_tuple(projection.lower(), projection.upper());
+}
+
+bp::tuple point_bounds(const IntervalPoint& point) {
+  bp::list lower, upper;
+  for (int axis = 0; axis < 3; ++axis) {
+    lower.append(point[axis].lower());
+    upper.append(point[axis].upper());
+  }
+  return bp::make_tuple(lower, upper);
+}
+
+// BEGIN construct interior as well as surface points of the registered convex.
+bool volume_convex_point(const coal::CollisionGeometry& geometry,
+                         const coal::Vec3s& wanted, IntervalPoint& point) {
+  const auto* convex = dynamic_cast<const coal::Convex<coal::Triangle>*>(&geometry);
+  if (!convex || !convex->points || !convex->polygons || convex->num_points == 0
+      || convex->num_points > convex->points->size() || convex->num_polygons == 0
+      || convex->num_polygons > convex->polygons->size() || !wanted.allFinite()) return false;
+  // The exact mean of all original vertices belongs to the convex entity.
+  // Its rounded coordinate only proposes weights. Certification below uses
+  // the interval sum of the original vertices, not this rounded mean.
+  coal::Vec3s center = coal::Vec3s::Zero();
+  for (std::size_t i = 0; i < convex->num_points; ++i) {
+    if (!(*convex->points)[i].allFinite()) return false;
+    center += (*convex->points)[i];
+  }
+  center /= static_cast<double>(convex->num_points);
+  if (!center.allFinite()) return false;
+  std::array<std::size_t, 3> selected{};
+  std::array<double, 4> selected_weights{};
+  double best = kInfinity;
+  bool found = false;
+  for (std::size_t face = 0; face < convex->num_polygons; ++face) {
+    const coal::Triangle& triangle = (*convex->polygons)[face];
+    Eigen::Matrix3d edges;
+    for (int i = 0; i < 3; ++i) {
+      if (triangle[i] >= convex->num_points) return false;
+      edges.col(i) = (*convex->points)[triangle[i]] - center;
+    }
+    const coal::Vec3s proposal = edges.completeOrthogonalDecomposition().solve(wanted - center);
+    if (!proposal.allFinite()) continue;
+    std::array<double, 4> weights{std::max(0., 1. - proposal.sum()),
+        std::max(0., proposal[0]), std::max(0., proposal[1]), std::max(0., proposal[2])};
+    const double denominator = weights[0] + weights[1] + weights[2] + weights[3];
+    if (!std::isfinite(denominator) || denominator <= 0.) continue;
+    coal::Vec3s candidate = weights[0] * center;
+    for (int i = 0; i < 3; ++i) candidate += weights[i+1] * (*convex->points)[triangle[i]];
+    candidate /= denominator;
+    const double distance = (candidate - wanted).squaredNorm();
+    if (std::isfinite(distance) && distance < best) {
+      best = distance; found = true; selected_weights = weights;
+      for (int i = 0; i < 3; ++i) selected[i] = triangle[i];
+    }
+  }
+  if (!found) return false;
+  // Only this feasible point is constructed. The registered shape and its
+  // faces remain unchanged; no tetrahedral collision model is created.
+  const RoundingGuard rounding;
+  IntervalPoint mean{Interval(0.), Interval(0.), Interval(0.)};
+  for (std::size_t i = 0; i < convex->num_points; ++i)
+    for (int axis = 0; axis < 3; ++axis) mean[axis] += Interval((*convex->points)[i][axis]);
+  for (int axis = 0; axis < 3; ++axis) mean[axis] /= Interval(static_cast<double>(convex->num_points));
+  Interval denominator(selected_weights[0]);
+  for (int axis = 0; axis < 3; ++axis) point[axis] = Interval(selected_weights[0]) * mean[axis];
+  for (int i = 0; i < 3; ++i) {
+    denominator += Interval(selected_weights[i+1]);
+    for (int axis = 0; axis < 3; ++axis)
+      point[axis] += Interval(selected_weights[i+1]) * Interval((*convex->points)[selected[i]][axis]);
+  }
+  if (denominator.lower() <= 0. || !std::isfinite(denominator.upper())) return false;
+  for (int axis = 0; axis < 3; ++axis) point[axis] /= denominator;
+  return true;
+}
+// END the same original convex entity supplies feasible points throughout its volume.
+
+bp::dict native_feasible_point_bounds(const coal::CollisionGeometry& geometry,
+    const coal::Transform3s& transform, const bp::object& wanted_object) {
+  const coal::Vec3s wanted_world = vector3(wanted_object, "wanted_world must be a finite float64 3-vector");
+  if (!finite_transform(transform))
+    throw std::invalid_argument("Native point construction requires a finite transform");
+  // This inverse chooses a proposal only. Membership follows from the existing
+  // nonnegative vertex combination or analytic primitive construction.
+  const coal::Vec3s wanted_local = transform.getRotation().transpose()
+      * (wanted_world - transform.getTranslation());
+  IntervalPoint local;
+  const bool is_convex = dynamic_cast<const coal::ConvexBase*>(&geometry) != nullptr;
+  if (!(is_convex ? volume_convex_point(geometry, wanted_local, local)
+                  : feasible_local_point(geometry, wanted_local, -1, local)))
+    throw std::invalid_argument("The registered native shape has no supported feasible-point construction");
+  coal::Transform3s identity;
+  identity.setIdentity();
+  const IntervalPoint wanted = point_intervals(wanted_world);
+  double upper = feasible_pair_upper(local, transform, wanted, identity);
+  IntervalPoint triangle;
+  if (triangle_convex_point(geometry, wanted_local, triangle)) {
+    const double candidate_upper = feasible_pair_upper(triangle, transform, wanted, identity);
+    if (candidate_upper < upper) {
+      local = triangle;
+      upper = candidate_upper;
+    }
+  }
+  if (!std::isfinite(upper))
+    throw std::runtime_error("Native feasible-point enclosure is nonfinite");
+  // Keep the chosen local/world intervals together. A raw Coal nearest point
+  // need not equal this feasible point and is never substituted afterwards.
+  const RoundingGuard rounding;
+  bp::dict result;
+  result["local_bounds"] = point_bounds(local);
+  result["world_bounds"] = point_bounds(transformed_point(local, transform));
+  return result;
+}
+// END the bridge exports original-entity evidence, not task geometry or policy.
+
 // Read the original NumPy float64 value without recomputing a transform. memcpy
 // also supports a sliced or unaligned array without undefined C++ pointer loads.
 double pose_value(PyArrayObject* poses, Py_ssize_t index, int row, int column) {
@@ -1388,6 +1512,14 @@ BOOST_PYTHON_MODULE(_coal_scene_batch) {
       (bp::arg("actor_shape"), bp::arg("actor_transform"), bp::arg("target_shape"),
        bp::arg("target_transform"), bp::arg("distance_result")),
       "Return an outward upper distance from feasible native-geometry points; infinity if uncertified.");
+  // BEGIN raw TSDF traversal consumes the same maintained native constructions.
+  bp::def("native_projection_bounds", &native_projection_bounds,
+      (bp::arg("geometry"), bp::arg("transform"), bp::arg("direction")),
+      "Return an outward projection interval for the full registered native shape.");
+  bp::def("native_feasible_point_bounds", &native_feasible_point_bounds,
+      (bp::arg("geometry"), bp::arg("transform"), bp::arg("wanted_world")),
+      "Return local and world enclosures of the same actual native-shape point.");
+  // END no mesh is constructed from a task TSDF.
   // END no contact rule or prior-state result is stored in the native index.
 }
 // END near-contact decisions and result consumption stay in Python's original order.

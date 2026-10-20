@@ -453,66 +453,19 @@ def test_planning_binding_records_owned_source_geometry_and_complete_policy(mode
 # END every planning decision uses the same native solid and mechanical policy.
 
 
-# BEGIN production runtime shares online fields, sphere layout and actual joints.
-def online_binding(gate, *, distance=1., supported=True):
-    from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
-    from manipulation.planning_scene import ObservedSpace
-    shape = (9, 9, 9)
-    # BEGIN represent a genuinely unsupported boundary, not an empty remote map.
-    # The left solid's measured sphere centre is x=.03. A field starting at
-    # x=.04 has no sample there, but its first occupied cell and that sphere
-    # overlap. An unrelated all-positive field at x=10 correctly has no such
-    # scene-update obligation; the previous fixture did not test this failure.
-    values = np.full(shape, distance, np.float32)
-    if not supported:
-        values[0, :, :] = 0.
-    # BEGIN construct the explicit source whose boundary requires an update.
-    from observed_geometry_fixtures import field_from_samples
-    field = field_from_samples(values,
-        origin=[-1., -1., -1.] if supported else [.04, -1., -1.],
-        voxel_size=.25, observed=np.ones(shape, bool), owner_ids=(), source="online sensor source")
-    # END source geometry and numerical support have independent meanings.
-    # END unqueried numerical support remains independent of collision evidence.
-    coverage = ObservedSpace(np.ones(shape, bool), origin=[-1., -1., -1.], voxel_size=.25,
-        observation_ids=["observation"], reference_frame="world")
-    # BEGIN complete native box covers and explicit source identities.
-    # Both fixture boxes have 40 mm sides. The second box is translated 400 mm
-    # in its link frame; its cover must include that native local transform.
-    radius = float(np.sqrt(3.) * .02 + 1e-6)
-    centers = [[0., 0., 0.], [0., .4, 0.]]
-    bodies = [{'body_id': link, 'frame': link, 'sphere_indices': [index],
-        'geometry_names': [name], 'local_spheres': [[*centers[index], radius]],
-        'source': 'Complete circum-sphere of the explicit native test box'}
-        for index, (link, name) in enumerate((('left', 'first'), ('right', 'second')))]
-    scene = OnlinePlanningScene(background=field, owners=(), coverage=coverage,
-        reference_frame="world", robot_sphere_materials=("left", "right"),
-        robot_geometry_source="native sphere fixture", has_gripper=False,
-        robot_collision_bodies=bodies,
-        unknown_policy={"conditional_regions": [], "outside_regions": "forbid"})
-    scene.bind_online_robot(robot_sphere_geometry=[
-        {"link_name": link, "sphere_indices": [index], "centers_local": [centers[index]], "radii": [radius]}
-        for index, link in enumerate(("left", "right"))], robot_self_collision_pairs=[],
-        robot_model={"urdf_path": str(gate.checker.urdf_path), "base_frame": gate.checker.base_frame,
-            "tool_frame": gate.tool_frame, "T_reference_base": gate.T_reference_base.tolist(),
-            "T_frame_tcp": gate.T_frame_tcp.tolist()})
-    # END native confirmation receives the same complete robot sphere inventory.
-    return scene.to_execution_binding()
-
-
 # BEGIN execution never rebuilds or queries a frozen world, even at preflight.
 def test_preflight_and_actual_tick_query_required_robot_pairs_only(model, monkeypatch):
-    from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
-    from manipulation.online_native_confirmation import NativeCollisionConfirmation
+    from manipulation.online_geometry import OnlinePlanningScene
+    from manipulation.observed_mapping import FrozenObservedField
     gate = validator(model)
     curve = trajectory([.03, .03], [0., 0.])
     def forbidden(*args, **kwargs):
         raise AssertionError("Frozen-world queries are outside physical execution")
-    monkeypatch.setattr(model, "bind_scene", forbidden)
-    monkeypatch.setattr(model, "query_scene", forbidden)
-    monkeypatch.setattr(OnlinePlanningScene, "from_binding", forbidden)
-    monkeypatch.setattr(OnlinePlanningScene, "query_state", forbidden)
-    monkeypatch.setattr(FrozenESDF, "signed_distance", forbidden)
-    monkeypatch.setattr(NativeCollisionConfirmation, "confirm", forbidden)
+    # BEGIN guard the current planning field interfaces during actual control.
+    monkeypatch.setattr(OnlinePlanningScene, "components", forbidden)
+    monkeypatch.setattr(OnlinePlanningScene, "evaluate", forbidden)
+    monkeypatch.setattr(FrozenObservedField, "sample", forbidden)
+    # END execution obtains robot evidence from the native checker only.
     native_query = model.query
     calls = []
     def query(**kwargs):
@@ -531,34 +484,4 @@ def test_preflight_and_actual_tick_query_required_robot_pairs_only(model, monkey
     assert calls[-1]["pairs"] == gate.required_pairs
     assert gate.preflight(curve, feedback(), LIMITS, start_time=.2, current_time=.2, until=.8)["passed"]
 
-
-@pytest.mark.parametrize("failure", ["collision", "unsupported_field"])
-def test_frozen_world_failures_remain_planning_verdicts_only(model, failure):
-    from manipulation.execution import TrajectoryExecutor
-    from manipulation.online_geometry import OnlinePlanningScene
-    from manipulation.online_native_confirmation import OnlineCollisionConfirmation
-    gate = validator(model)
-    binding = online_binding(gate, distance=-.1 if failure == "collision" else 1.,
-                             supported=failure != "unsupported_field")
-    scene = OnlinePlanningScene.from_binding(binding)
-    state = feedback()
-    robot = model.query(joint_names=NAMES, joint_positions=state["q"],
-                        T_reference_base=np.eye(4), pairs=(), frames=["left", "right"])
-    spheres = np.empty((2, 4))
-    for row in binding["robot_sphere_geometry"]:
-        pose = np.asarray(robot["frame_poses"][row["link_name"]])
-        ids = row["sphere_indices"]
-        spheres[ids, :3] = np.asarray(row["centers_local"]) @ pose[:3, :3].T + pose[:3, 3]
-        spheres[ids, 3] = row["radii"]
-    planning = scene.query_state(spheres, state["tool_pose"], 0., joint_position=state["q"],
-        joint_names=NAMES, native_confirmation=OnlineCollisionConfirmation(gate, scene))
-    assert not planning["passed"]
-    if failure == "collision":
-        assert planning["native_confirmation"]["states"][0]["collision_targets"] == ["background"]
-    else:
-        assert planning["status"] == "SCENE_UPDATE_REQUIRED"
-    adapter = SimpleNamespace(geometry_checker=gate, _geometry_pair_count=len(gate.required_pairs))
-    actual = TrajectoryExecutor._geometry_result(adapter, "check_state", state,
-        stage="actual", trajectory_time=0.)
-    assert actual["passed"] and "scene" not in actual
-# END bad frozen observations cannot erase actual robot safety checks or certify the world.
+# END preflight and actual control keep the same native robot-only responsibilities.

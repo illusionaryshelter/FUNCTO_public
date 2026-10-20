@@ -1,8 +1,9 @@
 """Planning on frozen observed implicit sets and declared rigid relationships.
 
-Robot links and scene entities use the same trilinear geometry query. The
-optimizer asks for one millimetre separation; candidate acceptance asks for
-two. Task feature gaps and orientations are independent input constraints.
+Robot entities retain their native models; task entities retain their
+observed trilinear fields. Robot/task separation is one millimetre in
+optimization and two in acceptance. Native self checks retain their original
+model pair policy and numerical boundary, without a task clearance margin.
 """
 
 # BEGIN direct entity pairs replace sphere proposals and solid confirmation.
@@ -17,7 +18,8 @@ from scipy.spatial.transform import Rotation
 from .collision_records import encode_array, decode_array
 from .implicit_distance import PairPermission, transform_points
 from .observed_mapping import FrozenObservedField
-from .observed_robot import ObservedBody, DifferentiableRobotKinematics
+from .observed_robot import DifferentiableRobotKinematics
+from .robot_geometry_check import RobotGeometryChecker
 from .observed_collision import pair_residual
 from .planning_problem import PosePath, quaternion_rotate, quaternion_conjugate, quaternion_multiply
 from .planning_scene import (Attachment, CollisionOwner, ContactRule, ObservedSpace,
@@ -49,15 +51,16 @@ def _matrices(pose):
 
 
 class OnlinePlanningScene:
-    """One shared observed geometry for optimization and acceptance.
+    """Known robot collision entities and original observed task fields.
 
-    A robot's absent observation or position outside a camera view is reported
-    as coverage. It does not add a collision or an observation-request gate.
-    Unknown-space decisions for moving scene owners retain the supplied policy.
+    Robot geometry is shared with the state validator and placed by complete
+    joint FK. Unknown-space decisions for moving scene owners retain the
+    supplied policy and the original measured free-ray coverage.
     """
 
+    # BEGIN the scene shares the approved native robot model and explicit roles.
     def __init__(self, *, background, owners, coverage, reference_frame,
-                 robot_bodies, robot_geometry_source, contacts=(), gripper=None,
+                 robot_model, fixed_geometry_names, contacts=(), gripper=None,
                  has_gripper=True, unknown_policy, holding_contacts=(),
                  initial_support_relations=(), numerical_position_tolerance_m=1e-6,
                  numerical_rotation_tolerance_rad=1e-6):
@@ -66,13 +69,17 @@ class OnlinePlanningScene:
             raise TypeError("All entities must retain their raw observed field")
         self.background, self.owners, self.coverage = background, tuple(owners), coverage
         self.reference_frame = reference_frame
-        self.robot_bodies = tuple(robot_bodies)
-        if (not self.robot_bodies or any(not isinstance(row, ObservedBody) for row in self.robot_bodies)
-                or len({row.name for row in self.robot_bodies}) != len(self.robot_bodies)
+        if not isinstance(robot_model, RobotGeometryChecker):
+            raise TypeError("The scene requires the same known robot checker as its validator")
+        self.robot_model = robot_model
+        self.fixed_geometry_names = tuple(fixed_geometry_names)
+        robot_ids = set(robot_model.geometry_names)
+        if (not set(self.fixed_geometry_names) <= robot_ids
+                or len(set(self.fixed_geometry_names)) != len(self.fixed_geometry_names)
                 or len({owner.owner_id for owner in self.owners}) != len(self.owners)):
-            raise ValueError("Robot and scene entities need unique registered identities")
-        self.robot_geometry_source = robot_geometry_source
-        self.required_robot_links = tuple(dict.fromkeys(row.frame for row in self.robot_bodies))
+            raise ValueError("Fixed installations and scene owners need explicit unique identities")
+        self.required_robot_links = tuple(dict.fromkeys(
+            frame for frame, _, _, _ in robot_model._geometries.values()))
         self.contacts, self.holding_contacts = tuple(contacts), tuple(holding_contacts)
         self.gripper, self.has_gripper = gripper, has_gripper
         self.unknown_policy = deepcopy(unknown_policy)
@@ -84,7 +91,6 @@ class OnlinePlanningScene:
             if lower.shape != (3,) or upper.shape != (3,) or np.any(lower >= upper):
                 raise ValueError("Unknown-space regions need finite ordered three-dimensional bounds")
         owner_ids = {owner.owner_id for owner in self.owners}
-        robot_ids = {body.name for body in self.robot_bodies}
         if len({rule.rule_id for rule in (*self.contacts, *self.holding_contacts)}) != len(self.contacts)+len(self.holding_contacts):
             raise ValueError("Contact relation identities must be unique")
         for rule in self.contacts:
@@ -112,20 +118,23 @@ class OnlinePlanningScene:
         self._fixed_release_poses = {}
         self.observation_report, self.observation_partition_masks = {}, {}
         self.grasp_contact_activations = ()
-        self.robot_model, self.robot_pairs = {}, ()
+        self.robot_configuration, self.robot_pairs = {}, ()
         self.robot_validator, self.kinematics = None, None
         self.check_request = None
         self.last_query_report = {}
+    # END neither image visibility nor joint dependence defines model roles.
 
+    # BEGIN bind the same known model to the complete differentiable joint tree.
     def bind_online_robot(self, *, configuration, validator, device, check_request=None):
         """Bind the complete joint tree; each query supplies its own finger state."""
-        if tuple(validator.checker.geometry_names) != tuple(body.name for body in self.robot_bodies):
-            raise ValueError("Scene and independent model must share observed body identities")
+        if validator.checker is not self.robot_model:
+            raise ValueError("Scene and validator must share the same known robot model")
         self.robot_validator, self.robot_pairs = validator, validator.pairs
-        self.robot_model = deepcopy(configuration)
+        self.robot_configuration = deepcopy(configuration)
         self.kinematics = DifferentiableRobotKinematics(configuration,
             frames=self.required_robot_links, T_reference_base=validator.T_reference_base, device=device)
         self.check_request = check_request
+    # END per-entity local transforms are applied when geometric poses are formed.
 
     def clone_for_rollout(self):
         result = copy(self)
@@ -372,8 +381,8 @@ class OnlinePlanningScene:
                    owner_poses=None, query_role="acceptance"):
         """Return same-state residuals and retain distance/coverage diagnostics.
 
-        ``robot_spheres`` is an empty native-kinematics output. Registered link
-        fields carry all robot geometry. Query roles are explicit and never
+        ``robot_spheres`` is an empty native-kinematics output. Registered
+        native entities carry all robot geometry. Query roles are explicit and never
         inferred from autograd state, because metric calls may retain a graph.
         """
         if query_role not in {"optimization", "acceptance"}:
@@ -396,14 +405,24 @@ class OnlinePlanningScene:
                 complete_q = torch.cat((complete_q, coordinates[..., [
                     self.gripper.joint_names.index(name) for name in missing_names]]), dim=-1)
                 complete_names += tuple(missing_names)
-        robot_poses = self.kinematics.poses(complete_q, complete_names)
+        # BEGIN place each original collision entity using complete joint FK.
+        link_poses = self.kinematics.poses(complete_q, complete_names)
+        robot_poses = {}
+        for name, (frame, _, _, local) in self.robot_model._geometries.items():
+            link_position, link_quaternion = link_poses[frame]
+            local_position = _tensor(local[:3, 3], link_position)
+            local_quaternion = _tensor(
+                Rotation.from_matrix(local[:3, :3]).as_quat()[[3, 0, 1, 2]], link_quaternion)
+            robot_poses[name] = (
+                link_position + quaternion_rotate(link_quaternion, local_position),
+                quaternion_multiply(link_quaternion, local_quaternion))
+        # END geometry IDs remain distinct from their supporting link frames.
         poses = self._owner_poses(position, quaternion, progress, owner_poses, costs)
         identity = (torch.zeros_like(position), torch.zeros_like(quaternion))
         identity[1][..., 0] = 1
         poses["background"] = identity
         fields = {owner.owner_id: owner.query for owner in self.owners}
         fields["background"] = self.background
-        body_map = {body.name: body for body in self.robot_bodies}
         matrices = {name: _matrices(pose) for name, pose in poses.items()}
         robot_matrices = {name: _matrices(pose) for name, pose in robot_poses.items()}
         policies = {}
@@ -462,18 +481,61 @@ class OnlinePlanningScene:
                          else hand_state.uncertain.detach().cpu().numpy())
         unmodelled = (set() if hand_state is None else
                      set(self.robot_validator.checker.geometry_depending_on(self.gripper.joint_names)))
+        # BEGIN native self checks use the same validator pair contract.
+        report = {"query_role": query_role, "separation_m": separation, "pair_queries": 0,
+                  "status_counts": {}, "nonclear_pairs": [],
+                  "robot_geometry_source": "registered_native_model",
+                  "robot_view_coverage_status": "not_queried",
+                  "coverage_scope": "represented_observed_occupancy"}
+        from .implicit_distance import inverse_points
+        from .observed_collision import _world
+        q_cpu = complete_q.detach().cpu().numpy()
+        self_costs, self_unresolved = [], []
+        for index in np.ndindex(tuple(progress.shape)):
+            evidence = self.robot_model.query(joint_names=complete_names,
+                joint_positions=q_cpu[index], T_reference_base=self.robot_validator.T_reference_base,
+                pairs=self.robot_pairs, check_request=self.check_request)
+            value = complete_q[index].sum() * 0
+            undecided = value
+            for row in evidence["pairs"]:
+                if row["policy"] != "required":
+                    continue
+                first_id, second_id = row["first"], row["second"]
+                if uncertain_cpu[index] and ({first_id, second_id} & unmodelled):
+                    continue
+                status = row["relation"]
+                report["pair_queries"] += 1
+                report["status_counts"][status] = report["status_counts"].get(status, 0) + 1
+                if status == "numerical_boundary":
+                    undecided = undecided + 1.
+                elif status == "penetrating":
+                    # Native witnesses supply a local rigid-motion direction;
+                    # the original signed query alone owns the verdict.
+                    a = inverse_points(row["witness_first"], robot_matrices[first_id][index])
+                    b = inverse_points(row["witness_second"], robot_matrices[second_id][index])
+                    pa = tuple(item[index] for item in robot_poses[first_id])
+                    pb = tuple(item[index] for item in robot_poses[second_id])
+                    normal = _tensor(row["normal_first_to_second"], complete_q)
+                    signed = ((_world(b, pb) - _world(a, pa)) * normal).sum()
+                    value = value - row["signed_distance_m"] - (signed - signed.detach())
+                if status != "separated" and len(report["nonclear_pairs"]) < 32:
+                    report["nonclear_pairs"].append({"component": "collision/robot/self",
+                        "state_index": list(index), **row})
+            self_costs.append(value)
+            self_unresolved.append(undecided)
+        costs["collision/robot/self"] = torch.stack(self_costs).reshape(progress.shape)
+        costs["unresolved/robot/self"] = torch.stack(self_unresolved).reshape(progress.shape)
+        # END camera coverage and task margins cannot change self legality.
         pairs = []
-        for pair in self.robot_pairs:
-            first, second = body_map[pair.first], body_map[pair.second]
-            if pair.policy != "required" or first.rigid_component == second.rigid_component:
-                continue
-            pairs.append(("collision/robot/self", first.name, second.name, first.field, second.field,
-                          robot_poses[first.frame], robot_poses[second.frame],
-                          robot_matrices[first.frame], robot_matrices[second.frame], "robot", None))
-        for body in self.robot_bodies:
+        moving_owners = {owner.owner_id for owner in self.owners if owner.moving}
+        for name, (_, geometry, _, _) in self.robot_model._geometries.items():
             for target, field in fields.items():
-                pairs.append((f"collision/robot/{target}", body.name, target, body.field, field,
-                    robot_poses[body.frame], poses[target], robot_matrices[body.frame], matrices[target],
+                # Explicit fixed installations constrain moving owners.
+                # Their static support against background is not a motion pair.
+                if name in self.fixed_geometry_names and target not in moving_owners:
+                    continue
+                pairs.append((f"collision/robot/{target}", name, target, geometry, field,
+                    robot_poses[name], poses[target], robot_matrices[name], matrices[target],
                     "robot", target))
         for owner in self.owners:
             if owner.moving:
@@ -487,13 +549,7 @@ class OnlinePlanningScene:
                 pairs.append((f"collision/{first.owner_id}/{second.owner_id}", first.owner_id, second.owner_id,
                     first.query, second.query, poses[first.owner_id], poses[second.owner_id],
                     matrices[first.owner_id], matrices[second.owner_id], first.owner_id, second.owner_id))
-        report = {"query_role": query_role, "separation_m": separation, "pair_queries": 0,
-                  "status_counts": {}, "nonclear_pairs": [],
-                  "missing_robot_observations": [row.name for row in self.robot_bodies if row.field is None],
-                  "robot_unknown_policy": "allow_attempt", "robot_view_coverage_status": "not_queried", "coverage_scope": "represented_observed_occupancy"}
         for component, first_id, second_id, first, second, first_pose, second_pose, fm, sm, actor, target in pairs:
-            if first is None or second is None:
-                continue
             residuals, unresolved = [], []
             rules = [rule for rule in self.contacts
                      if ((actor == "robot" and rule.actor == "robot" and rule.target_owner == target
@@ -584,24 +640,24 @@ class OnlinePlanningScene:
                             if not name.startswith("conditional/")]).sum(0)
 
     def estimated_workspace_allocation(self, batch, horizon):
-        fields = [self.background, *(owner.query for owner in self.owners),
-                  *(body.field for body in self.robot_bodies if body.field is not None)]
+        fields = [self.background, *(owner.query for owner in self.owners)]
         shared = sum(field.storage_nbytes for field in {id(value): value for value in fields}.values())
+        shared += self.robot_model.native_query_storage_nbytes
         # Queries run serially on CPU; retained autograd data consists of
         # rigid poses and pair witnesses rather than dense sample-grid copies.
-        entities = len(self.robot_bodies)+len(self.owners)+1
+        entities = len(self.robot_model.geometry_names)+len(self.owners)+1
         states = int(batch)*int(horizon)
         live = states*(entities*256+entities*entities*256)
         return dict(cpu_shared=shared, cpu_live=live, gpu_shared=0,
                     gpu_live=live, gpu_retained=0, gpu_graph_live=0)
 
     def describe(self):
-        return {"model": "observed_trilinear_entities_v1", "reference_frame": self.reference_frame,
-            "robot_geometry_source": self.robot_geometry_source,
+        return {"model": "native_robot_observed_scene_v1", "reference_frame": self.reference_frame,
+            "robot_geometry_source": "registered_native_model",
             "owners": [owner.owner_id for owner in self.owners],
-            "robot_observations": {body.name: "missing" if body.field is None else "observed_partial"
-                                   for body in self.robot_bodies},
-            "unknown_policy": deepcopy(self.unknown_policy), "robot_unknown_policy": "allow_attempt", "robot_view_coverage_status": "not_queried",
+            "robot_entities": list(self.robot_model.geometry_names),
+            "fixed_geometry_names": list(self.fixed_geometry_names),
+            "unknown_policy": deepcopy(self.unknown_policy), "robot_view_coverage_status": "not_queried",
             "optimization_separation_m": .001, "acceptance_separation_m": .002,
             "required_progress_anchors": self.required_progress_anchors,
             "observation_report": deepcopy(self.observation_report)}
@@ -626,9 +682,14 @@ class OnlinePlanningScene:
                 "coupling_offset", "commands", "source", "control_timestep_s", "numerical_joint_tolerance")}
             hand_record["nominal_model"] = (None if hand.nominal_finger_trajectory is None
                                              else hand.nominal_finger_trajectory.describe())
-        return {"schema": "observed_scene_v1", **self.describe(), "owners": owners,
-            "robot_bodies": [body.record() for body in self.robot_bodies],
-            "robot_model": deepcopy(self.robot_model),
+        # BEGIN retain original geometry, calibration, policy and named FK inputs.
+        native = {**self.robot_model.model_record(),
+            "base_frame": self.robot_model.base_frame,
+            "T_reference_base": (None if self.robot_validator is None
+                                 else self.robot_validator.T_reference_base.tolist()),
+            "pairs": [asdict(pair) for pair in self.robot_pairs]}
+        return {"schema": "native_robot_observed_scene_v1", **self.describe(), "owners": owners,
+            "robot_model": native, "robot_configuration": deepcopy(self.robot_configuration),
             "background": self.background.record(), "contacts": _plain([asdict(row) for row in self.contacts]),
             "holding_contacts": _plain([asdict(row) for row in self.holding_contacts]),
             "grasp_contact_activations": _plain(self.grasp_contact_activations),
@@ -639,6 +700,7 @@ class OnlinePlanningScene:
             "coverage": {"known_free": encode_array(self.coverage.known_free),
                 "origin": self.coverage.origin.tolist(), "voxel_size": self.coverage.voxel_size,
                 "observation_ids": list(self.coverage.observation_ids)}}
+        # END scene serialization does not recreate a robot observation field.
 
     binding_record = to_execution_binding
 # END observations remain fixed while each candidate supplies its own rigid poses.

@@ -1,6 +1,6 @@
 # 附着、接触与手指
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。
+代码基线：`__NATIVE_MODEL_COMMIT__`。
 
 ## 1. 实体观测与固定关系
 
@@ -26,7 +26,7 @@ required 接触调用 `query_region_intersection`，寻找有限区域内受支�
 
 ## 3. 声明附着内部接触
 
-`HoldingContact` 将一个明确 `robot_body` 与实体及附着区间关联。`bind_holding_contacts` 消费材料身份表与原声明关系；`validate_holding_conditions` 比较实体身份、固定变换和区间。许可仅覆盖登记的实体对。观测缺失的指垫不会扩大为整个手指的豁免。
+`HoldingContact` 将一个明确 `robot_body` 与实体及附着区间关联。`bind_holding_contacts` 消费材料身份表与原声明关系；`validate_holding_conditions` 比较实体身份、固定变换和区间。许可仅覆盖登记的实体对；两个原生几何实体即使在空间中重叠，也各自保留登记身份和对应许可。
 
 ## 4. 初始支撑
 
@@ -36,6 +36,6 @@ required 接触调用 `query_region_intersection`，寻找有限区域内受支�
 
 ## 5. 指令、名义几何与反馈
 
-`PrismaticGripper` 负责具名关节、控制能力、耦合、事件和时钟。位置跟踪消费求解关节；定时或二值控制消费独立手指曲线。`bind_clock` 绑定与正式轨迹一致的物理时间；`state` 返回坐标、不确定状态和关节残差。完整机器人 FK 再将这些坐标转换为连杆场位姿。
+`PrismaticGripper` 负责具名关节、控制能力、耦合、事件和时钟。位置跟踪消费求解关节；定时或二值控制消费独立手指曲线。`bind_clock` 绑定与正式轨迹一致的物理时间；`state` 返回坐标、不确定状态和关节残差。完整机器人 FK 再将这些坐标转换为原生机器人实体位姿。
 
 `FingerTrajectory` 产生实际指令，`NominalFingerGeometry` 表达规划中声明的未来手指坐标。未来几何缺失的手指相关查询记录为 conditional；实际执行使用具名关节反馈检查模型。指令位置与名义接触状态分别保存。

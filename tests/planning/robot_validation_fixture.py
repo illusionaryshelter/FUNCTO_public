@@ -12,13 +12,59 @@ import sys
 
 import mujoco
 import numpy as np
-import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from manipulation.robot_geometry_check import PairQuery, RobotGeometryChecker
+from manipulation.robot_geometry_check import NativePrimitive, NativeSolid, PairQuery, RobotGeometryChecker
 from manipulation.robot_validation import RobotStateValidator
-from check_recorded_robot_geometry import _native_shapes
-from robot_fixture import _native_ignored_pairs, _pose, validate_fixture_collision_contract
+from manipulation.robot_self_filter import RobotCollisionShape
+from manipulation.tool_geometry import _collision_geometry
+from robot_fixture import _native_ignored_pairs, _native_geom_pose, _pose
+
+
+# BEGIN consume the reusable robot asset directly, without task-scene or sphere certificates.
+def _known_shapes(fixture, model):
+    """Read explicitly registered entities from the compiled robot-only asset.
+
+    Mesh vertices and their fixed local transforms are the model's original
+    collision representation. Boxes and cylinders stay analytic. The second
+    result retains geometry-local coordinates for shadow padding about each
+    entity's own origin.
+    """
+    shapes, local_records = [], []
+    for row in (*fixture["collision_geometries"], *fixture["fixed_collision_geometries"]):
+        name, frame = row["geom"], row["link"]
+        index = model.geom(name).id
+        if model.body(model.geom_bodyid[index]).name != frame:
+            raise ValueError(f"Registered robot geometry is attached to a different frame: {name}")
+        local = _native_geom_pose(model, index)
+        source = f"{fixture['robot_mjcf_path']}::geom[{name}]"
+        kind = model.geom_type[index]
+        if kind in (mujoco.mjtGeom.mjGEOM_BOX, mujoco.mjtGeom.mjGEOM_CYLINDER):
+            size = model.geom_size[index]
+            label = "box" if kind == mujoco.mjtGeom.mjGEOM_BOX else "cylinder"
+            dimensions = tuple(2 * size) if label == "box" else (size[0], 2 * size[1])
+            shapes.append(NativePrimitive(name, frame, label, dimensions, local, source))
+            fields = dict(kind=label, dimensions=dimensions)
+        elif kind == mujoco.mjtGeom.mjGEOM_MESH:
+            native = _collision_geometry(model, index, "registered_robot_component")
+            vertices = native["vertices"]
+            shapes.append(NativeSolid(name, frame,
+                vertices @ local[:3, :3].T + local[:3, 3], source))
+            fields = dict(kind="convex", vertices=vertices)
+        else:
+            raise ValueError(f"Unsupported registered native collision shape: {name}")
+        local_records.append((frame, local, dict(name=name, source=source, **fields)))
+    return shapes, local_records
+
+
+def robot_self_filter_shapes(fixture, frame_poses):
+    """Place the same asset's original components at image-capture joint FK."""
+    model = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
+    _, records = _known_shapes(fixture, model)
+    return tuple(RobotCollisionShape(
+        T_world_geometry=np.asarray(frame_poses[frame]) @ local, **fields)
+        for frame, local, fields in records)
+# END only the explicit robot model is loaded; task assets never enter this adapter.
 
 
 def _native_pair_policies(model, geometry_names):
@@ -67,8 +113,7 @@ def build_robot_validator(fixture, *, reference_frame, T_reference_base, tool_fr
     convention; a caller cannot relabel the frame or silently add an offset.
     # END matching models do not establish independent physical TCP accuracy.
     """
-    robot_config = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
-    validated = validate_fixture_collision_contract(fixture, robot_config)
+    # BEGIN the selected native model supplies geometry and pair semantics directly.
     model = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
     if model.nq > 64 or model.nbody > 128 or model.ngeom > 64:
         raise ValueError("Selected fixture exceeds the established bounded CPU robot-check budget")
@@ -77,18 +122,12 @@ def build_robot_validator(fixture, *, reference_frame, T_reference_base, tool_fr
     if (tool_frame != fixture["tool_link"] or tool_frame != fixture["tcp_site"]
             or not np.array_equal(T_frame_tcp, expected_tool_transform)):
         raise ValueError("Independent validator must retain the verified native TCP identity and transform")
-    shapes, geometry = _native_shapes(fixture, model)
-    geometry_names = tuple(geometry)
+    shapes, _ = _known_shapes(fixture, model)
+    geometry_names = tuple(shape.name for shape in shapes)
     policy = _native_pair_policies(model, geometry_names)
-    # Source and exported models must make exactly the same per-geom policy
-    # decision, including same-body pairs and individually masked geom pairs.
-    source_model = mujoco.MjModel.from_xml_path(fixture["source_scene_xml"])
-    if policy != _native_pair_policies(source_model, geometry_names):
-        raise ValueError("Independent pair policy differs between original source and exported robot")
     # BEGIN use the same explicit mechanical contract as native planning queries.
-    # Fixture validation above independently binds every declaration to both
-    # source and exported geometry; nothing is inferred from geom names or
-    # contact flags. Enabled physical contacts remain enabled in MuJoCo.
+    # Mechanical permissions are explicit declarations over registered IDs.
+    # Enabled physical contacts remain enabled in the native robot model.
     permitted = {frozenset((row["first"], row["second"])): row
                  for row in fixture["mechanical_contact_pairs"]}
     pairs = []
@@ -100,8 +139,7 @@ def build_robot_validator(fixture, *, reference_frame, T_reference_base, tool_fr
             identity = "mechanical_contact"
             reason += f"; explicit robot mechanical permission: {declaration['source']}"
         pairs.append(PairQuery(first, second, identity,
-            f"{fixture['source_scene_xml']} and {fixture['robot_mjcf_path']}: {reason}; "
-            "no sphere-certificate exclusion"))
+            f"{fixture['robot_mjcf_path']}: {reason}"))
     # END query all native solids while separating legality from contact physics.
     checker = RobotGeometryChecker(fixture["urdf_path"], base_frame=fixture["base_link"], geometries=shapes)
     for name in fixture["joint_names"]:
@@ -116,7 +154,8 @@ def build_robot_validator(fixture, *, reference_frame, T_reference_base, tool_fr
         reference_frame=reference_frame, T_reference_base=T_reference_base,
         tool_frame=tool_frame, T_frame_tcp=T_frame_tcp,
         fk_translation_tolerance_m=1e-8, fk_rotation_tolerance_rad=1e-8,
-        source=(f"Source-verified fixture {fixture['robot_mjcf_path']}; "
-                f"{validated['complete_native_geometry_count']} articulated and "
-                f"{validated['complete_fixed_installation_geometry_count']} fixed native solids"))
+        source=(f"Known robot model {fixture['robot_mjcf_path']}; "
+                f"{len(fixture['collision_geometries'])} robot entities and "
+                f"{len(fixture['fixed_collision_geometries'])} fixed installations"))
+    # END calibration tolerances retain their original kinematic-only meaning.
 # END source-verified robot geometry and policy adapter for execution.

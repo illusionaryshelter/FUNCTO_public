@@ -1,6 +1,6 @@
 # 固定时钟轨迹求解与有限搜索
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。技能进度 `s` 与归一化时间 `u` 通过请求内固定的 `_ProgressMap` 联系。
+代码基线：`__NATIVE_MODEL_COMMIT__`。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。技能进度 `s` 与归一化时间 `u` 通过请求内固定的 `_ProgressMap` 联系。
 
 ## 1. 请求生命周期与资源分配
 
@@ -46,7 +46,7 @@
 
 `_process_manager_type` 为请求创建 `ProcessCostManager` 及对应配置类型。`bind_request_data` 绑定任务、场景、进度映射和功能约束；`set_dense_counts` 区分普通与密集样本的有效数量；`bind_scene_evidence` 连接同一次前向的场景证据；`compute_costs` 计算原生机器人项、任务项与场景项；`optimizer_evidence` 读取这一前向产生的候选分级依据。
 
-轨迹状态先通过 cuRobo 纯运动学 FK 得到工具位姿。场景的 `DifferentiableRobotKinematics` 使用本时刻完整具名关节与名义手指坐标求各连杆位姿，`CollisionOwner.pose` 求场景实体位姿。普通时刻与确切功能锚点按物理时间排列，`PlanningProblem.residuals` 与 `OnlinePlanningScene.components` 分别产生任务和观测几何分项。`_scene_boundary_evaluate` 显式传递 query_role：优化使用 1 mm，验收和静态 IK 使用 2 mm。
+轨迹状态先通过 cuRobo 纯运动学 FK 得到工具位姿。场景的 `DifferentiableRobotKinematics` 使用本时刻完整具名关节与名义手指坐标求各连杆位姿，`CollisionOwner.pose` 求场景实体位姿。普通时刻与确切功能锚点按物理时间排列，`PlanningProblem.residuals` 与 `OnlinePlanningScene.components` 分别产生任务和观测几何分项。`_scene_boundary_evaluate` 显式传递 query_role：机器人—任务场与任务场—场在优化使用 1 mm，验收和静态 IK 使用 2 mm；原生机器人自身配对沿用原模型数值边界。
 
 `PlanningProblem.optimizer_preferences` 为过程位姿关系中的等式坐标和机构方向计算优化偏好；当调用阶段为 `quality` 时，还包括功能位姿与机构坐标目标中心。当前主求解使用 `feasibility` 阶段，没有额外的质量求解。普通示教参考的偏离由 `measurements` 报告，不构成该接口中的普遍路径贴合项。当前观测场分项由 `scene_value` 在同次计算中进入优化和指标；优化按物理违反量线性聚合。功能位姿、机构坐标与支撑条件通过下节的增广拉格朗日项进入优化。原生指标记录 `metrics.costs_and_constraints.constraints` 保留硬条件张量。`select_candidate` 首次按普通与密集原生结果判断时，要求该种子的 `result.success` 成立且两套 constraints 的各项最大值均为有限数、不大于零。`convergence` 中的离散标识单独作为原生诊断保存。
 

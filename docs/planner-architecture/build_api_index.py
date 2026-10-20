@@ -17,17 +17,16 @@ CHAPTERS = {
  '03': '03-attachment-contact-and-hand.md', '04': '04-solver-and-search.md',
  '05': '05-acceptance-and-execution.md',
 }
-# These modules describe the retired proxy/solid path, not the present
-# component call graph. Their old generated pages are removed explicitly.
+# These modules describe retired task-field conversion paths. Known robot
+# geometry adapters remain part of the current component call graph.
 RETIRED = {
  'tsdf_geometry', 'online_observed_geometry', 'tsdf_spatial_query',
  'scene_surface_batch', 'native_voxel_sources', 'voxel_layers', 'mapper_surface',
  'online_contact', 'contact_geometry', 'native_owner_geometry',
- 'prismatic_self_collision', 'tool_geometry', 'collision_path',
+ 'prismatic_self_collision', 'collision_path',
  'robot_coverage', 'geometry_motion_bound', 'online_native_confirmation',
  'adapter-prepare_recorded_task', 'adapter-recorded_owner_geometry',
- 'adapter-recorded_observation', 'adapter-robot_fixture',
- 'adapter-robot_validation_fixture', 'adapter-robot_coverage_fixture',
+ 'adapter-recorded_observation', 'adapter-robot_coverage_fixture',
  'adapter-contact_fixture', 'adapter-run_recorded_simulation',
  'adapter-recorded_simulation', 'adapter-recorded_skill_evaluation',
  'adapter-continuous_simulation',
@@ -77,7 +76,9 @@ def render(path, chapter):
             text.append('\n输入签名：\n'+code_block([signature+':']))
         doc = ast.get_docstring(node)
         if doc:
-            text.append('\n实现说明：\n\n'+'\n'.join('> '+line for line in doc.splitlines())+'\n')
+            # BEGIN blank blockquote lines contain no trailing whitespace.
+            text.append('\n实现说明：\n\n'+'\n'.join(('> '+line).rstrip() for line in doc.splitlines())+'\n')
+            # END retain the original docstring paragraph boundaries.
         if not isinstance(node, ast.ClassDef):
             nodes = list(local_nodes(node))
             returns = [ast.unparse(n.value) if n.value else 'None' for n in nodes
@@ -102,13 +103,20 @@ def main():
                if page not in RETIRED]
     for module, chapter in [('implicit_distance','02'), ('observed_mapping','02'),
                             ('observed_robot','02'), ('observed_collision','02'),
-                            ('observed_coverage','02'), ('grasp_region','03')]:
+                            ('observed_coverage','02'), ('grasp_region','03'),
+                            ('native_field_distance','02'), ('tool_geometry','02')]:
         row = (f'manipulation/{module}.py', module, chapter)
         if row not in modules:
             modules.append(row)
     row = ('tests/planning/observed_robot_fixture.py', 'adapter-observed_robot_fixture', '05')
     if row not in modules:
         modules.append(row)
+    # BEGIN index the direct consumers of the reusable native robot asset.
+    for module in ('robot_validation_fixture', 'robot_fixture'):
+        row = (f'tests/planning/{module}.py', f'adapter-{module}', '02')
+        if row not in modules:
+            modules.append(row)
+    # END observed task owners and known robot models retain separate adapters.
     total, table = 0, []
     for path, page, chapter in modules:
         content, count = render(path, chapter)

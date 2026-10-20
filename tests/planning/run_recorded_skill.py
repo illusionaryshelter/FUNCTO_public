@@ -413,7 +413,8 @@ def run_prepared(args, *, problem, provenance):
         if problem.reference_frame != "world":
             raise ValueError("Recorded world camera calibration requires a world-frame planning problem")
         # BEGIN load existing geometry before deciding which observations to build.
-        from observed_robot_fixture import build_robot_validator, load_observed_owner
+        from observed_robot_fixture import load_observed_owner
+        from robot_validation_fixture import build_robot_validator, robot_self_filter_shapes
         mark_wallclock("existing_owner_load_started")
         observed_owners = (() if args.observed_owner is None else
                            (load_observed_owner(args.observed_owner),))
@@ -431,12 +432,12 @@ def run_prepared(args, *, problem, provenance):
         # END retained entities keep their original samples and resolution.
         # END subsequent masks, map configurations and reports share these IDs.
         robot = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
-        mark_wallclock("observed_robot_load_started")
-        # BEGIN observed robot binding contains only kinematics, fields and explicit policies.
-        robot_validator, robot_bodies, block_checkpoints = build_robot_validator(fixture,
+        mark_wallclock("native_robot_load_started")
+        # BEGIN known native geometry is independent of the RGB-D task fields.
+        robot_validator = build_robot_validator(fixture,
             reference_frame=problem.reference_frame, T_reference_base=problem.base_pose,
             tool_frame=problem.tool_link, T_frame_tcp=problem.tool_transform)
-        mark_wallclock("observed_robot_load_completed")
+        mark_wallclock("native_robot_load_completed")
         report["independent_robot_model"] = robot_validator.describe()
         robot["robot_cfg"]["kinematics"]["lock_joints"] = {
             name: measured[name] for name in feedback["finger_joint_names"]}
@@ -507,19 +508,18 @@ def run_prepared(args, *, problem, provenance):
         capture = json.loads((root/capture_path).read_text())
         capture_fk = robot_validator.checker.query(joint_names=capture["joint_names"],
             joint_positions=capture["start_q"], T_reference_base=capture["base_pose"], pairs=(), frames=())
+        filter_geometries = robot_self_filter_shapes(fixture, capture_fk["frame_poses"])
         # END image filtering uses encoder feedback at image capture, not a later task entrance.
         observations = {}
         for view in segment["snapshot"]["views"]:
             calibration = json.loads((root/view["calibration_path"]).read_text())
             rgb = np.array(Image.open(root/view["rgb_path"]).convert("RGB"))
             depth = np.load(root/view["depth_path"], allow_pickle=False)
-            # BEGIN projection and endpoint membership consume the same observed fields.
+            # BEGIN nominal native membership and padded shadow have separate roles.
             filtered = classify_depth(observed_depth=depth, K=np.asarray(calibration["K"]),
-                T_world_camera=np.asarray(calibration["T_world_camera_cv"]), bodies=robot_bodies,
-                body_poses=capture_fk["geometry_poses"], block_checkpoints=block_checkpoints,
-                depth_error_m=args.depth_error, source=args.self_filter_source,
-                max_host_rss_bytes=args.max_host_rss_mib*1024**2,
-                max_device_used_bytes=args.max_device_used_mib*1024**2)
+                T_world_camera=np.asarray(calibration["T_world_camera_cv"]),
+                geometries=filter_geometries, padding_scale=args.self_padding_scale,
+                padding_offset_m=args.self_padding_offset_m, source=args.self_filter_source)
             # END raw measured depth is unchanged by robot observation filtering.
             labels = filtered["self_filter"]["labels"]
             view_output = args.output/"observations"/view["id"]
@@ -591,7 +591,9 @@ def run_prepared(args, *, problem, provenance):
         # END no simulator obstacle pose or task-specific crop enters the mapper.
         scene = build_scene_from_rgbd(observations, owner_frames, mapper_cfg=config,
             depth_error_m=args.depth_error, reference_frame=problem.reference_frame,
-            robot_bodies=robot_bodies, robot_geometry_source=fixture["source"], gripper=hand,
+            robot_model=robot_validator.checker,
+            fixed_geometry_names=tuple(row["geom"] for row in fixture["fixed_collision_geometries"]),
+            gripper=hand,
             observed_owners=observed_owners, contacts=contacts, holding_contacts=holding_contacts,
             initial_support_relations=initial_support_relations, task_owner_ids=task_owners,
             fine_regions=fine_regions, unknown_policy=json.loads(args.unknown_policy.read_text()),
@@ -603,7 +605,8 @@ def run_prepared(args, *, problem, provenance):
         report["observation_partitions"] = save_observation_partitions(scene, args.output)
         # END no reconstructed scene needs to retain these diagnostic arrays.
         report["fixed_robot_installation"] = {
-            "representation": "registered observed link fields in the same robot pair inventory"}
+            "representation": "explicit native installation entities",
+            "geometry_names": list(scene.fixed_geometry_names)}
         # BEGIN persist observed-free evidence without source-volume coverage.
         np.savez_compressed(args.output/"observed-free.npz", known_free=scene.coverage.known_free,
             origin=scene.coverage.origin, voxel_size=np.asarray(scene.coverage.voxel_size),
@@ -619,7 +622,7 @@ def run_prepared(args, *, problem, provenance):
             joint_names=np.asarray(feedback["joint_names"]),
             actual_q=np.asarray(feedback["start_q"]), actual_dq=np.asarray(feedback["start_dq"]))
         report["entrance_geometry_diagnostic"] = {
-            "path": "entrance-scene.npz", "body_count": len(robot_bodies),
+            "path": "entrance-scene.npz", "body_count": len(robot_validator.checker.geometry_names),
             "scope": "Measured native q0; the formally bound planner performs the only entrance verdict"}
         # END no uncertainty envelope is labelled as the current hand state.
         # BEGIN bind refined device geometry to an explicit unchanged-work budget.
@@ -754,6 +757,10 @@ def parse_args(argv=None):
     parser.add_argument("--depth-error", type=float, required=True)
     # BEGIN explicit geometric uncertainty, independent of measured depth error.
     parser.add_argument("--self-filter-source", required=True)
+    # BEGIN explicit model shadow padding never expands nominal collision geometry.
+    parser.add_argument("--self-padding-scale", type=float, required=True)
+    parser.add_argument("--self-padding-offset-m", type=float, required=True)
+    # END recorded runs state the same source padding used for their image filter.
     # END no rendered depth-equality threshold is accepted.
     # BEGIN the caller declares the unknown-space action explicitly.
     parser.add_argument("--unknown-policy", type=Path, required=True,

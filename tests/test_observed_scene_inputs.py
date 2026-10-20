@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from manipulation.observed_mapping import FrozenObservedField
-from manipulation.observed_robot import ObservedBody
+from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChecker
 from manipulation.planning_observation import build_scene_from_rgbd
 from manipulation.planning_problem import PosePath
 from manipulation.planning_scene import Attachment, CollisionOwner, ObservedSpace
@@ -32,12 +32,17 @@ def retained_owner():
             [1., 0., 0., 0.], "declared_attachment", None),))
 
 
-def arguments(owner):
+def arguments(owner, tmp_path):
+    # BEGIN known robot geometry is independent of these mapping inputs.
+    urdf = tmp_path / "robot.urdf"
+    urdf.write_text('<robot name="mapping_fixture"><link name="base"/></robot>')
+    robot = RobotGeometryChecker(urdf, base_frame="base", geometries=(
+        NativePrimitive("body", "base", "box", (.01, .01, .01), np.eye(4), "known robot"),))
     return dict(mapper_cfg=None, depth_error_m=.0001, task_owner_ids=("entity",),
-        reference_frame="world", robot_bodies=(ObservedBody("link", "link", None, "link", "source"),),
-        robot_geometry_source="observed robot", observed_owners=(owner,),
+        reference_frame="world", robot_model=robot, fixed_geometry_names=(), observed_owners=(owner,),
         unknown_policy={"conditional_regions": [], "outside_regions": "allow_attempt"},
         max_mapping_bytes=1000, has_gripper=False)
+    # END the same source checker is handed directly to the scene.
 
 
 def coverage():
@@ -45,11 +50,12 @@ def coverage():
         voxel_size=.01, observation_ids=("source",), reference_frame="world")
 
 
-def test_existing_entity_and_background_need_no_images_or_mapper():
+def test_existing_entity_and_background_need_no_images_or_mapper(tmp_path):
     owner, background, space = retained_owner(), field("background"), coverage()
     with patch("manipulation.observed_mapping.integrate_entity",
                side_effect=AssertionError("Existing geometry must not be integrated again")):
-        scene = build_scene_from_rgbd({}, {}, background=background, coverage=space, **arguments(owner))
+        scene = build_scene_from_rgbd({}, {}, background=background, coverage=space,
+                                     **arguments(owner, tmp_path))
     assert scene.owners[0] is owner
     assert scene.owners[0].query is owner.query
     assert scene.background is background
@@ -98,7 +104,7 @@ def test_new_entity_maps_its_pixels_while_existing_entity_is_passed_unchanged(tm
 
     native = ModuleType("curobo.perception")
     native.MapperCfg = MapperConfig
-    args = arguments(owner)
+    args = arguments(owner, tmp_path)
     args.update(mapper_cfg=MapperConfig(), task_owner_ids=("entity", "target"))
     with patch.dict("sys.modules", {"curobo.perception": native}), \
             patch("manipulation.planning_observation._mapper_memory_bound", return_value=1), \
@@ -167,7 +173,7 @@ def test_original_partitions_survive_self_filter_and_background_reuse(
         "background_mask": candidate if supply_background else None}
     native = ModuleType("curobo.perception")
     native.MapperCfg = MapperConfig
-    args = arguments(retained_owner())
+    args = arguments(retained_owner(), tmp_path)
     args.update(mapper_cfg=MapperConfig(), observed_owners=(), task_owner_ids=("target",))
     fused = {}
 

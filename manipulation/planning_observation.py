@@ -443,8 +443,9 @@ def _require_mapping_memory(estimated_bytes, device, *,
     return required
 
 
+# BEGIN known robot geometry is supplied independently of RGB-D partitions.
 def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, task_owner_ids,
-                         reference_frame, robot_bodies, robot_geometry_source,
+                         reference_frame, robot_model, fixed_geometry_names,
                          contacts=(), gripper=None, has_gripper=True, unknown_policy,
                          max_mapping_bytes, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
                          max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES,
@@ -545,8 +546,8 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
         for identity, (pose, source) in frames.items()]
     owners.extend(direct.values())
     scene = OnlinePlanningScene(background=queries[None] if background is None else background,
-        owners=owners, coverage=coverage, reference_frame=reference_frame, robot_bodies=robot_bodies,
-        robot_geometry_source=robot_geometry_source, contacts=contacts, gripper=gripper,
+        owners=owners, coverage=coverage, reference_frame=reference_frame, robot_model=robot_model,
+        fixed_geometry_names=fixed_geometry_names, contacts=contacts, gripper=gripper,
         has_gripper=has_gripper, unknown_policy=unknown_policy,
         initial_support_relations=initial_support_relations, holding_contacts=holding_contacts)
     # BEGIN persist semantic inputs separately from one-time fusion admission.
@@ -593,5 +594,6 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
         "self_filter": _self_filter_report(normalized), "endpoint_partition": endpoint_report}
     return scene
     # END an existing entity has no observation or visibility prerequisite.
+# END robot model inputs never imply another segmentation or mapping pass.
 
 # END independent ray evidence supplies coverage.

@@ -1,37 +1,13 @@
-"""Pure robot kinematics for the common observed-field geometry interface."""
+"""Complete differentiable robot kinematics for registered native entities."""
 
-# BEGIN registered observed link fields use native kinematic poses directly.
-from dataclasses import dataclass
+# BEGIN registered native entities use the complete kinematic tree directly.
 import xml.etree.ElementTree as ET
 
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
-from .observed_mapping import FrozenObservedField
 from .planning_problem import quaternion_multiply, quaternion_rotate
-
-
-@dataclass(frozen=True)
-class ObservedBody:
-    """An observed component rigidly fixed in the named link coordinate frame."""
-
-    name: str
-    frame: str
-    field: FrozenObservedField | None
-    rigid_component: str
-    source: str
-
-    def record(self):
-        return {"name": self.name, "frame": self.frame,
-                "field": None if self.field is None else self.field.record(),
-                "rigid_component": self.rigid_component, "source": self.source}
-
-    @classmethod
-    def from_record(cls, row):
-        return cls(row["name"], row["frame"],
-                   None if row["field"] is None else FrozenObservedField.from_record(row["field"]),
-                   row["rigid_component"], row["source"])
 
 
 def pure_kinematics(path):
@@ -49,7 +25,7 @@ def pure_kinematics(path):
 
 
 class DifferentiableRobotKinematics:
-    """Use all named joints, including nominal fingers, for observed link poses.
+    """Use all named joints, including nominal fingers, for native link poses.
 
     The planning solver may optimize only the arm. The scene appends the
     already selected measured/nominal finger coordinates before invoking this
@@ -78,7 +54,7 @@ class DifferentiableRobotKinematics:
         from curobo.types import JointState
         names = tuple(joint_names)
         if set(names) != set(self.joint_names):
-            raise ValueError("Observed robot poses require the complete named joint coordinates")
+            raise ValueError("Robot poses require the complete named joint coordinates")
         ordered = position[..., [names.index(name) for name in self.joint_names]].contiguous()
         state = self.model.compute_kinematics(
             JointState.from_position(ordered, joint_names=list(self.joint_names)))

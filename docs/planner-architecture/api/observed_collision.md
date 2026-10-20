@@ -1,11 +1,11 @@
 # `manipulation/observed_collision.py` 实现契约
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。
+代码基线：`__NATIVE_MODEL_COMMIT__`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_world`
 
-[定义位置](../../../manipulation/observed_collision.py#L11)。
+[定义位置](../../../manipulation/observed_collision.py#L12)。
 
 输入签名：
 
@@ -44,7 +44,7 @@ quaternion_rotate
 
 ## `pair_residual`
 
-[定义位置](../../../manipulation/observed_collision.py#L17)。
+[定义位置](../../../manipulation/observed_collision.py#L18)。
 
 输入签名：
 
@@ -55,12 +55,13 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
 实现说明：
 
 > Query one rigid pair and attach a local rigid-motion derivative.
-> 
+>
 > The reported status and nonnegative residual come from the interval
 > query. A separated witness pair supplies a point-distance derivative.
-> Strict overlap instead uses a local zero-section normal from one of the
-> same fields. That normal is an optimization direction, not a penetration
-> estimate or evidence for candidate acceptance.
+> A common-point intersection uses a local zero-section normal from the
+> observed field. Native witnesses retain their interval bounds; their
+> midpoint supplies only a local rigid-motion direction. The direction
+> neither estimates penetration nor supplies candidate acceptance evidence.
 
 显式输出分支：
 
@@ -95,6 +96,8 @@ signed.detach
 写入目标：
 
 ```python
+native_first
+query
 result
 zero
 status
@@ -114,7 +117,8 @@ signed
 直接调用符号：
 
 ```python
-query_distance
+isinstance
+query
 first_pose[0].sum
 second_pose[0].sum
 inverse_points
@@ -134,7 +138,7 @@ signed.detach
 
 ## `query_region_intersection`
 
-[定义位置](../../../manipulation/observed_collision.py#L69)。
+[定义位置](../../../manipulation/observed_collision.py#L76)。
 
 输入签名：
 
@@ -145,7 +149,7 @@ def query_region_intersection(field, pose, normals, bounds, *, precision_m=1e-06
 实现说明：
 
 > Find a supported zero surface in the finite convex contact region.
-> 
+>
 > An original zero sample or a sign-changing segment inside one supported
 > cell proves surface contact by continuity. Negative interior material is
 > insufficient. Interval bounds prune cells without a zero; finite unresolved
@@ -269,7 +273,7 @@ node.lower.copy
 
 ## `query_minimum_height`
 
-[定义位置](../../../manipulation/observed_collision.py#L144)。
+[定义位置](../../../manipulation/observed_collision.py#L151)。
 
 输入签名：
 
@@ -280,7 +284,7 @@ def query_minimum_height(field, pose, origin, normal, *, precision_m, check_requ
 实现说明：
 
 > Bound the minimum plane height over the represented occupied set.
-> 
+>
 > Spatial boxes provide lower bounds; actual supported occupied points
 > provide upper bounds and a rigid-motion derivative witness. The stopping
 > precision bounds numerical uncertainty and never changes a task tolerance.
@@ -369,7 +373,7 @@ witness.tolist
 
 ## `query_minimum_height.push`
 
-[定义位置](../../../manipulation/observed_collision.py#L161)。
+[定义位置](../../../manipulation/observed_collision.py#L168)。
 
 输入签名：
 

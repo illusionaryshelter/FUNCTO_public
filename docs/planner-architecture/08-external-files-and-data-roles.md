@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+代码基线：`__NATIVE_MODEL_COMMIT__`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 
@@ -52,7 +52,7 @@
 | `scene.json` | 当前对象身份、功能绑定、入口、目标、名义附着、任务点与支撑要求 | `prepare_candidate/build_planning_problem` 或实验 `build_problem`；形成参考和硬要求 |
 | `feedback.json`、`robot_feedback.json` | 具名机器人 `q/dq`、手指状态、设备时间和标定 FK | 固定规划入口、机器人/手指几何与执行续接 |
 | `robot-fixture.json`、纯运动学 YAML/URDF | 关节树、坐标、标定、关节限制及明确实体对策略 | cuRobo FK/IK、Pinocchio FK 和设备绑定 |
-| `observed-robot.json` 与各连杆原始场 | 具名连杆、固定刚体分组、观测场或缺失状态；同源 TSDF 块用于深度过滤 | `ObservedBody`、机器人状态验证和场景查询 |
+| robot-only 模型及其引用的官方机器人组件 | 已知机器人原形状、局部变换、原生逐实体配对及固定安装身份 | `robot_validation_fixture` → `RobotGeometryChecker` / `RobotCollisionShape`；规划、实际机器人检查与图像过滤 |
 | `contact-bindings.json` | 机器人材料、任务接触区域、对象对应、活动区间、接触条件 | `ContactRule/HoldingContact`；同一文件中机器人模型、源任务定义及当前区域各保留其职责 |
 | `observed-owner.json` 与所引用原始场 | 已保存实体模型、局部坐标、位姿路径与固定附着 | `load_observed_owner` 直接读取，后续技能复用相同场 |
 | `unknown-policy.json`、`fine-regions` JSON（可选） | 未知空间的明确处理策略；指定局部细化请求 | 场景构造和覆盖查询；策略允许尝试不表示该区域已观测为空 |

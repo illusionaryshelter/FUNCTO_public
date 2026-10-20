@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。本组件将已有示教、当前任务关系及机器人入口状态编译为 `PlanningProblem`，供场景绑定与数值规划调用。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
+代码基线：`__NATIVE_MODEL_COMMIT__`。本组件将已有示教、当前任务关系及机器人入口状态编译为 `PlanningProblem`，供场景绑定与数值规划调用。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
 
 ## 1. 输入的来源与相互依赖
 
@@ -29,7 +29,7 @@
 | `execution_events` | 调用者明确指定的动作、停止或独立证据依赖 | `PlanningEvent` 编译相应事件 |
 | `coordinate_directions` | 机构坐标在给定区间的方向、净变化或局部速度要求 | `CoordinateDirectionRequirement` |
 
-`tests/planning` 中的实验运行器 `run_recorded_skill.run_prepared` 将编译后的问题与机器人记录连接。`observed_robot_fixture.build_robot_validator` 读取纯运动学、连杆观测场、标定及实体对策略；`load_observed_owner` 读取已有实体场与固定关系。实验适配器与当前持物计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+`tests/planning` 中的实验运行器 `run_recorded_skill.run_prepared` 将编译后的问题与机器人记录连接。`robot_validation_fixture.build_robot_validator` 读取已知机器人组件、关节树、标定及原生实体对策略；`observed_robot_fixture.load_observed_owner` 读取已有任务实体场与固定关系。实验适配器与当前持物计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-put-planner-audit/2026-10-20-model-restoration-plan.md)。
 
 ## 2. 固定坐标下的示教表示
 
@@ -113,7 +113,7 @@ normal    = ‖R n_b+n‖₂ − 2 sin(ε_θ/2)
 
 四项均以小于等于零为满足。前三项以米计；第四项是两个单位法线之间的弦长条件，表达物体外法线与支撑面法线反向对齐。`normalized_inequalities` 使用 `max(ε_g,ε_num)` 缩放前三项，使用声明角容差和数值角容差对应弦长的较大者缩放法向项。硬验收直接消费原始条件的正部和，功能约束优化消费缩放后的有符号条件。
 
-参考 API 接收显式物体坐标约定。若 TSDF 使用相机坐标 `C`、任务点使用物体坐标 `B`，则 `T_C_B` 将任务点转换至 TSDF 坐标，法线使用该变换的旋转部分。随后各计算通过同一物体表示坐标和共同参考坐标连接。技能表示中的任务点与功能区域保留其任务含义；当前物体的碰撞占据由场景模型表达。二者共享坐标，并不要求以碰撞模型替换技能表示。当前输入契约与持物改造计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+参考 API 接收显式物体坐标约定。若 TSDF 使用相机坐标 `C`、任务点使用物体坐标 `B`，则 `T_C_B` 将任务点转换至 TSDF 坐标，法线使用该变换的旋转部分。随后各计算通过同一物体表示坐标和共同参考坐标连接。技能表示中的任务点与功能区域保留其任务含义；当前物体的碰撞占据由场景模型表达。二者共享坐标，并不要求以碰撞模型替换技能表示。当前输入契约与持物改造计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-put-planner-audit/2026-10-20-model-restoration-plan.md)。
 
 ## 7. 输入辅助模块的调用范围
 

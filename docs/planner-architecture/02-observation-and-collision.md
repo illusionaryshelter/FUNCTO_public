@@ -1,6 +1,6 @@
 # 观测与碰撞模型
 
-代码基线：`9fabc002e5e8761881ee369ca831ce1c5d6893fd`。
+代码基线：`__NATIVE_MODEL_COMMIT__`。
 
 ## 1. 两种实体来源
 
@@ -18,7 +18,7 @@
 
 ## 2. 深度过滤与场的形成
 
-`robot_self_filter.classify_depth` 消费采集时完整机器人关节反馈的 FK、相同连杆观测场及其 TSDF 块。受支持的严格负值端点标为 SELF；原生 `Mapper.render` 的预测命中先经原场支持复核，遮挡射线标为 AMBIGUOUS_SHADOW；其余有效测量标为 ENVIRONMENT。只有 ENVIRONMENT 保留原测量深度作为自由射线。缺失连杆观测单独记录。
+`robot_self_filter.classify_depth` 使用图像采集时具名关节 FK 放置同一已知机器人组件。端点严格位于名义实体内部时标为 SELF；其余端点对应的相机至测量点有限线段若与明确 padding 后的实体相交或处于数值边界，标为 AMBIGUOUS_SHADOW；其余有效测量标为 ENVIRONMENT。只有 ENVIRONMENT 保留原测量深度作为自由射线。padding 定义过滤阴影域，规划碰撞实体保留原形状。
 
 `integrate_entity` 接收 RGB、深度、实体 mask、K 和 `T_entity_camera`，逐实体串行融合。`_mapper_intrinsics` 将主点增加半像素，以适配 Mapper 的像素中心约定。`freeze_mapper` 读取加权 TSDF 与权重，保存 XYZ 排列的 float32 场值；`origin` 为首个样本中心。最小有效权重确定样本观测支持。
 
@@ -39,13 +39,21 @@
 
 `pair_residual` 将上述状态转换为可微残差。分离见证点对给出刚体运动方向；严格相交时使用同一场的局部零截面法向给出优化方向。方向不改变几何分类，也不作为穿透深度估计。未决状态单列分项。
 
-## 4. 机器人与场景查询
+## 4. 已知机器人与原任务场的组合
 
-`RobotGeometryChecker` 从纯运动学 URDF 建立 Pinocchio 模型，查询关节范围、独立 FK 和注册连杆场的成对距离。`DifferentiableRobotKinematics` 使用 cuRobo 完整关节树，包含本时刻的手指名义坐标。`ObservedBody` 保留连杆身份、固定刚体分组、原场或明确缺失状态。
+`RobotGeometryChecker` 用 URDF 建立 Pinocchio 关节树，以 `NativeSolid` 原凸组件顶点或 `NativePrimitive` 解析盒体/圆柱建立 Coal 碰撞实体。模型保留实体 ID、所属连杆、固定变换与来源。完整具名关节及基座标定确定各实体位姿。官方随附、跨任务复用的机器人模型是已知本体输入；任务物体继续使用 RGB-D 原场，不要求逐个物体人工制作 mesh。
 
-`OnlinePlanningScene.components` 取得机器人连杆位姿、各 `CollisionOwner.pose`、手指时钟状态和接触许可，再查询需要检查的机器人自身、机器人与场景、运动实体与背景以及实体之间的组合。`query_role='optimization'` 使用 1 mm；`acceptance` 使用 2 mm。`last_query_report` 保存分类计数和有限见证记录。`evaluate` 聚合硬分项，conditional 分项保留为报告。
+`query` 返回原生有符号距离、最近点、法向、FK 和关节域。`required`、`excluded`、`mechanical_contact` 是调用者明确提供的原模型配对语义。自碰撞使用 `separated`、`penetrating`、`numerical_boundary` 区分原生查询结果，保留 Coal 默认数值边界；该数值尺度不等于严格误差界，数值边界单列未决。
 
-机器人位置越出相机视野不产生拒绝项：`robot_unknown_policy='allow_attempt'`、`robot_view_coverage_status='not_queried'`。已有机器人观测场仍参与碰撞。缺失观测不被补成占据。
+`DifferentiableRobotKinematics` 用 cuRobo 完整关节树求连杆位姿，包括本时刻名义手指坐标。场景对解析实体乘固定局部变换；凸顶点已在连杆坐标中，局部变换为单位阵。机器人模型与状态验证器共享同一个检查器。
+
+`native_field_distance.query_native_field` 直接查询原生实体与原任务场。原实体的支持投影及任务空间框产生距离下界；原实体内可行点及原场占据点产生上界。凸体内点由原面顶点和原顶点均值的非负组合构造，区间计算保留该实际点的局部与世界范围。只有原生点完整区间位于原支持单元且三线性值严格为负，才确认两集合相交。见证中点仅用于显示和局部导数；`witness_*_bounds` 保存实际点的数值区间。相交结论不输出物理穿透深度。
+
+普通距离仅细分任务场。点对许可跨越边界时，局部搜索同时细分原生实体与搜索盒的交集。达到指定空间精度，或距离上下界已在计算精度内夹住阈值时，保留 `unresolved`。空间框交叠只触发继续计算。
+
+`OnlinePlanningScene.components` 计算原生机器人自身、机器人与观测场、运动实体与背景、实体之间的配对。任务场景查询在优化使用 1 mm，验收使用 2 mm；原生自身检查消费原结构配对和数值边界。`last_query_report` 保存每种分类及有限见证。`evaluate` 聚合硬分项，conditional 分项作为报告保留。
+
+`fixed_geometry_names` 明确声明安装体身份。安装体与运动 owner 查询任务间距；活动机器人与安装体由原生配对检查。安装体与静态背景/静态 owner 不增加运动配对。机器人首连杆即使 FK 恒定仍保留其机器人角色。机器人图像覆盖不形成拒绝分项，报告为 `not_queried`；运动 owner 继续使用显式未知空间策略。
 
 ## 5. 自由空间与移动实体覆盖
 
@@ -55,4 +63,6 @@
 
 ## 6. 保存与调用关系
 
-`build_scene_from_rgbd → integrate_entity → freeze_mapper` 建立新场；已有场直接进入 `OnlinePlanningScene`。规划器绑定完整机器人 FK，并在 IK、轨迹求解及验收中调用同一场景。`to_execution_binding` 输出 `observed_scene_v1`，保存场样本、机器人模型、实体运动、任务接触、原自由格及来源。当前场景快照用于保存输入身份；单体恢复由 `FrozenObservedField.from_record` 和 `ObservedBody.from_record` 实现。
+`build_scene_from_rgbd → integrate_entity → freeze_mapper` 建立本次新任务场；已有场直接进入 `OnlinePlanningScene`。已知机器人由 `RobotGeometryChecker` 注册，规划器绑定完整 FK 后，在 IK、轨迹求解及验收中调用同一场景。
+
+`to_execution_binding` 输出 `native_robot_observed_scene_v1`，保存机器人原形状、基座、标定、完整配对、固定角色和运动学配置，同时保存任务场样本、运动关系、接触与自由格。任务单场通过 `FrozenObservedField.from_record` 恢复；场景快照用于输入来源和身份交接，执行曲线恢复不等于重新构造可查询场景。

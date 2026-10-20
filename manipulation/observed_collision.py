@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from .implicit_distance import inverse_points, query_distance
+from .native_field_distance import query_native_field
 from .planning_problem import quaternion_rotate
 
 
@@ -20,11 +21,16 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
 
     The reported status and nonnegative residual come from the interval
     query. A separated witness pair supplies a point-distance derivative.
-    Strict overlap instead uses a local zero-section normal from one of the
-    same fields. That normal is an optimization direction, not a penetration
-    estimate or evidence for candidate acceptance.
+    A common-point intersection uses a local zero-section normal from the
+    observed field. Native witnesses retain their interval bounds; their
+    midpoint supplies only a local rigid-motion direction. The direction
+    neither estimates penetration nor supplies candidate acceptance evidence.
     """
-    result = query_distance(
+    # BEGIN native models retain their geometry; observations retain their cells.
+    from .implicit_distance import ObservedField
+    native_first = not isinstance(first, ObservedField)
+    query = query_native_field if native_first else query_distance
+    result = query(
         first, first_matrix, second, second_matrix, separation_m=separation_m,
         precision_m=precision_m, permission=permission, check_request=check_request)
     zero = first_pose[0].sum() * 0 + second_pose[0].sum() * 0
@@ -44,8 +50,8 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
         residual = zero + value - (gap - gap.detach())
         result["direction"] = "occupied_witness_pair"
         return residual, result
-    # The shared interior point lies in both actual implicit sets. Keep its
-    # local coordinate in one body and seek a local boundary of the other.
+    # The query established a common point in the represented sets. Keep its
+    # local coordinate for a rigid derivative and seek the observed boundary.
     boundary = second.local_zero(second_local)
     if boundary is not None:
         _, target, normal = boundary
@@ -53,7 +59,7 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
             normal, dtype=second_pose[0].dtype, device=second_pose[0].device))
         signed = ((_world(first_local, first_pose) - _world(target, second_pose)) * normal).sum()
     else:
-        boundary = first.local_zero(first_local)
+        boundary = None if native_first else first.local_zero(first_local)
         if boundary is None:
             result["direction"] = "unavailable"
             return zero + float(separation_m), result
@@ -63,6 +69,7 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
         signed = ((_world(second_local, second_pose) - _world(target, first_pose)) * normal).sum()
     result["direction"] = "local_zero_section_normal"
     return zero + float(separation_m) - (signed - signed.detach()), result
+    # END local directions never certify a native or observed point's membership.
 # END the derivative never changes the classification, threshold or occupied sets.
 
 

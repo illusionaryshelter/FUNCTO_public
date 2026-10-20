@@ -24,14 +24,14 @@ def _positive_scalar(value, label):
 
 
 class RobotStateValidator:
-    """Named limits, calibrated model identity and observed robot pair checks.
+    """Known robot entities, explicit mechanical policy and measured-state FK.
 
-    Pair declarations are independent of task identity and distance evidence.
-    Missing robot observations remain coverage records. Numerical distance
-    uncertainty of two represented fields remains an explicit failed query.
+    Required pairs need positive native separation. A numerical boundary is
+    reported separately from penetration. Excluded and mechanical-contact
+    declarations do not waive joint limits or model-identity checks.
     """
 
-    name = "pinocchio_observed_robot_state"
+    name = "pinocchio_coal_robot_state"
 
     def __init__(self, checker, *, joint_names, arm_joint_names, finger_joint_names,
                  pairs, named_velocity_limits, reference_frame, T_reference_base,
@@ -79,7 +79,7 @@ class RobotStateValidator:
         for pair in self.pairs:
             _name(pair.source, "native pair policy source")
 
-    # BEGIN one observed-body acceptance policy at planning and execution states.
+    # BEGIN one native-entity acceptance policy at planning and execution states.
     def _planning_positions(self, joint_positions, joint_names, *, time_s, gripper):
         """Complete only declared coordinates; identify unknown descendants.
 
@@ -161,11 +161,12 @@ class RobotStateValidator:
                 if not np.array_equal([named[name] for name in self.finger_joint_names], gripper.current_positions):
                     raise ValueError("Planning fingers must preserve the same measured entrance")
 
+    # BEGIN approved restoration of known robot geometry in check_planning_self.
     def check_planning_self(self, joint_positions, joint_names, *, time_s, gripper):
         """Check all known required native pairs at this one physical instant.
 
-        Each required pair uses the registered observed fields at the supplied
-        full joint state. ``passed`` covers only represented
+        Coal evaluates the declared native collision entities. ``passed``
+        covers only known
         geometry; an unmodelled future hand is reported explicitly. Scalar
         joint limits still apply even when mechanical contact is permitted.
         """
@@ -176,17 +177,12 @@ class RobotStateValidator:
                       and pair.first not in unknown and pair.second not in unknown)
         result = self.checker.query(joint_names=self.joint_names, joint_positions=positions,
             T_reference_base=self.T_reference_base, pairs=pairs)
-        # BEGIN direct observed-set acceptance consumes statuses, including uncertainty.
-        violations = [row for row in result["pairs"]
-                      if row["status"] in {"intersection", "margin_insufficient", "unresolved"}]
-        distances = [row for row in result["pairs"] if row.get("lower_m") is not None]
-        minimum = min(distances, key=lambda row: row["lower_m"], default=None)
-        missing = [row for row in result["pairs"] if row["status"] == "missing_observation"]
-        # END missing observations impose no camera-view rejection on the robot.
+        violations = [row for row in result["pairs"] if row["relation"] != "separated"]
+        minimum = min(result["pairs"], key=lambda row: row["signed_distance_m"], default=None)
         # BEGIN admit only the active tensor's exact representation of a limit.
         # For example float32(.1) lies above the source binary64 upper limit
         # .1, while naming that same endpoint in the native planner. Keep the
-        # original q for model FK and preserve the source-limit discrepancy as
+        # original q for Coal FK and preserve the source-limit discrepancy as
         # evidence; neither an epsilon nor clipping admits a neighbouring q.
         # Independently sampled nominal fingers are absent from active_values
         # and therefore retain the source model's original hard limit check.
@@ -205,13 +201,14 @@ class RobotStateValidator:
         # END the execution gate and nonendpoint planning states remain strict.
         passed = not violations and not limits
         return {"passed": passed, "residual": float(not passed), "queried_pairs": len(pairs),
-                "minimum_required_clearance_lower_m": None if minimum is None else minimum["lower_m"],
-                "missing_observation_pairs": missing,
+                "minimum_required_clearance_m": None if minimum is None else minimum["signed_distance_m"],
                 "unmodelled_geometry_names": list(unmodelled), "violations": violations,
                 "minimum_pair": minimum, "joint_limit_violations": limits,
                 "rounded_limit_representations": rounded_limits,
                 "joint_names": result["joint_names"], "joint_positions": result["joint_positions"]}
+    # END check_planning_self consumes the native model and original pair policy.
 
+    # BEGIN approved restoration of known robot geometry in planning_binding_record.
     def planning_binding_record(self):
         """Freeze the same source geometry, complete pair policy and numerics."""
         record = self.describe()
@@ -219,10 +216,12 @@ class RobotStateValidator:
         record["pair_order"] = record.pop("pair_policy")
         # END the smaller runtime distance layout cannot change model identity.
         record["model"] = self.checker.model_record()
-        record["scope"] = "observed robot/installations and declared required/excluded/mechanical pair policy"
+        record["scope"] = "complete source robot/installation solids and required/excluded/mechanical pair policy"
         return record
+    # END planning_binding_record consumes the native model and original pair policy.
     # END planning and execution preserve the same required/excluded/mechanical policy.
 
+    # BEGIN approved restoration of known robot geometry in describe.
     def describe(self):
         """Static report defines the order of every per-state distance vector."""
         return {"name": self.name, "source": self.source,
@@ -246,18 +245,20 @@ class RobotStateValidator:
                 "scope": "known robot/installation native pair policy, model FK and joint limits",
                 "observed_scene_checked": False, "unknown_space_checked": False,
                 "continuous_collision_certified": False, "world_collision_checked": False}
+    # END describe consumes the native model and original pair policy.
 
     def _pose_difference(self, actual, expected):
         return {"translation_m": float(np.linalg.norm(actual[:3, 3]-expected[:3, 3])),
                 "rotation_rad": float(Rotation.from_matrix(expected[:3, :3].T @ actual[:3, :3]).magnitude())}
 
+    # BEGIN approved restoration of known robot geometry in check_state.
     def check_state(self, feedback, *, stage, trajectory_time):
         """Gate full actual q, after the executor validates identity and time.
 
         Clock freshness and physical tracking use the execution layer's own
         # BEGIN independent models do not manufacture independent measurements.
         guard. This independently checks model-frame identity, joint limits,
-        observed robot separation and backend FK versus Pinocchio FK at the same
+        robot solid separation and backend FK versus Pinocchio FK at the same
         measured q. Fixed-base/TCP consistency tolerances, including 1e-8 values,
         are numerical/model requirements, not sensor-accuracy certificates.
         # END original physical tracking limits remain owned by ExecutionLimits.
@@ -285,7 +286,7 @@ class RobotStateValidator:
         # BEGIN execution checks known robot geometry without rebuilding a world scene.
         result = self.checker.query(joint_names=self.joint_names, joint_positions=feedback["q"],
             T_reference_base=self.T_reference_base, pairs=self.required_pairs, frames=[self.tool_frame])
-        # END frozen observed fields and sphere confirmation are planning-only.
+        # END task/environment geometry remains the planning scene responsibility.
         expected_tool = np.asarray(result["frame_poses"][self.tool_frame]) @ self.T_frame_tcp
         base_error = self._pose_difference(base, self.T_reference_base)
         tool_error = self._pose_difference(estimated_tool, expected_tool)
@@ -303,28 +304,27 @@ class RobotStateValidator:
             if abs(velocity) > self.velocity_limits[name]:
                 violations.append({"kind": "independent_joint_velocity", "name": name,
                                    "measured": float(velocity), "maximum_absolute": self.velocity_limits[name]})
-        # BEGIN model collision evidence uses the requested metric separation.
         for index, row in enumerate(result["pairs"]):
-            if row["policy"] == "required" and row["status"] in {
-                    "intersection", "margin_insufficient", "unresolved"}:
-                violations.append({"kind": "independent_robot_geometry",
-                    "name": f"{row['first']} / {row['second']}", "pair_index": index,
-                    "status": row["status"], "evidence": deepcopy(row)})
-        required = [row["lower_m"] for row in result["pairs"]
-                    if row["policy"] == "required" and row.get("lower_m") is not None]
-        # END a missing observation is a coverage record, never a collision.
+            # Numerical boundary is retained separately from penetration;
+            # either fails the declared positive-separation requirement.
+            if row["policy"] == "required" and row["relation"] != "separated":
+                violations.append({"kind": "independent_robot_collision", "name": f"{row['first']} / {row['second']}",
+                                   "measured": row["signed_distance_m"], "pair_index": index,
+                                   "relation": row["relation"], "evidence": deepcopy(row)})
+        required = [row["signed_distance_m"] for row in result["pairs"] if row["policy"] == "required"]
         report = {"passed": not violations, "violations": violations, "stage": stage,
                 "trajectory_time": float(trajectory_time),
-                "pair_evidence": result["pairs"],
-                "min_required_clearance_lower_m": min(required) if required else None,
+                "distances_m": [row["signed_distance_m"] for row in result["pairs"]],
+                "min_required_clearance_m": min(required) if required else None,
                 "base_model_error": base_error, "tcp_model_error": tool_error,
                 # BEGIN disclose what the small residual actually establishes.
                 "fk_error_scope": "Agreement of calibrated robot models at measured joints, not independent Cartesian sensing or physical accuracy",
                 # END a zero model residual cannot fill a missing object observation.
                 "actual_joint_positions": result["joint_positions"],
                 "world_collision_checked": False,
-                "scope": "supplied robot observed fields at this actual state; no between-state or scene certificate"}
+                "scope": "supplied robot solids at this actual state; no between-state or scene certificate"}
         return report
+    # END check_state consumes the native model and original pair policy.
         # END commands and nominal predictions never replace measured fingers.
 
     def preflight(self, trajectory, initial_feedback, execution_limits, *, start_time=0., until=None, current_time=None):

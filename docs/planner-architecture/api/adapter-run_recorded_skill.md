@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`__NATIVE_MODEL_COMMIT__`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
@@ -35,12 +35,12 @@ result
 scene.observation_partition_masks.items
 scene.observation_partition_masks
 folder.mkdir
-(folder / 'partition-report.json').write_text
+scene.observation_report
 masks['owner_masks'].items
 np.save
 path.resolve
+(folder / 'partition-report.json').write_text
 json.dumps
-scene.observation_report
 ```
 
 写入目标：
@@ -51,31 +51,31 @@ name
 masks
 folder
 row
-result[name]
 index
+identity
+mask
 path
 row['owner_masks'][identity]
 key
 filename
 report_key
-identity
-mask
 row[report_key]
+result[name]
 ```
 
 直接调用符号：
 
 ```python
 scene.observation_partition_masks.items
+Path
 folder.mkdir
-enumerate
-(folder / 'partition-report.json').write_text
 deepcopy
+enumerate
 masks['owner_masks'].items
 np.save
 str
-Path
 path.resolve
+(folder / 'partition-report.json').write_text
 json.dumps
 ```
 
@@ -272,7 +272,7 @@ float
 
 ## `finger_trajectory_factory.build`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L124)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L141)。
 
 输入签名：
 
@@ -419,7 +419,7 @@ execution_limits.describe
 
 ## `position_controlled_hand.nominal_geometry`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L186)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L203)。
 
 输入签名：
 
@@ -690,7 +690,8 @@ Image.open(root / view['rgb_path']).convert
 Image.open
 np.load
 np.asarray
-args.depth_error
+args.self_padding_scale
+args.self_padding_offset_m
 args.self_filter_source
 view_output.mkdir
 np.save
@@ -718,9 +719,11 @@ args.center
 args.fine_regions
 args.fine_regions.read_text
 row.items
+args.depth_error
 args.unknown_policy.read_text
 args.unknown_policy
 scene.observation_report
+scene.fixed_geometry_names
 np.savez_compressed
 scene.coverage.known_free
 scene.coverage
@@ -730,6 +733,7 @@ scene.coverage.observation_ids
 scene.unknown_policy
 scene.validate_problem
 entrance_fk['geometry_poses'].values
+robot_validator.checker.geometry_names
 args.knots
 args.interpolation_buffer_size
 args.ik_seeds
@@ -793,8 +797,6 @@ background_masks
 path
 robot
 robot_validator
-robot_bodies
-block_checkpoints
 report['independent_robot_model']
 robot['robot_cfg']['kinematics']['lock_joints']
 reference_factory
@@ -818,6 +820,7 @@ frame
 capture_path
 capture
 capture_fk
+filter_geometries
 observations
 calibration
 rgb
@@ -936,6 +939,7 @@ owner.query.summary
 args.observed_owner.resolve
 background_masks.items
 (root / capture_path).read_text
+robot_self_filter_shapes
 (root / view['calibration_path']).read_text
 np.array
 Image.open(root / view['rgb_path']).convert
@@ -987,7 +991,7 @@ _write_diagnostic_json
 
 ## `run_prepared.mark_wallclock`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L322)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L339)。
 
 输入签名：
 
@@ -1022,7 +1026,7 @@ print
 
 ## `run`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L687)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L690)。
 
 输入签名：
 
@@ -1100,7 +1104,7 @@ run_prepared
 
 ## `parse_args`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L716)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L719)。
 
 输入签名：
 

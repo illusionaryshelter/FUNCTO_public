@@ -1,4 +1,4 @@
-"""Bind a pure robot description, observed body records and explicit pair data."""
+"""Restore observed task owners and their declared rigid relationships."""
 
 # BEGIN recorded inputs use the same geometry contract as production scenes.
 import json
@@ -7,33 +7,6 @@ from pathlib import Path
 import numpy as np
 
 from manipulation.observed_mapping import FrozenObservedField
-from manipulation.observed_robot import ObservedBody
-from manipulation.robot_geometry_check import PairQuery, RobotGeometryChecker
-from manipulation.robot_validation import RobotStateValidator
-
-
-def build_robot_validator(fixture, *, reference_frame, T_reference_base, tool_frame, T_frame_tcp):
-    """Read only the prepared observed-model schema, including missing bodies."""
-    if fixture['schema'] != 'observed_robot_fixture_v1':
-        raise ValueError('A recorded request requires the current observed robot schema')
-    path = Path(fixture['observed_robot_path'])
-    record = json.loads(path.read_text())
-    bodies, checkpoints = [], {}
-    for row in record['fields']:
-        field = FrozenObservedField.load(row['field']) if row['status'] == 'observed' else None
-        source = (field.source if field is not None else f"Missing source observation: {path}")
-        bodies.append(ObservedBody(row['frame'], row['frame'], field, row['rigid_component'], source))
-        if field is not None:
-            checkpoints[row['frame']] = row['block_checkpoint']
-    checker = RobotGeometryChecker(record['urdf_path'], base_frame=record['base_frame'], geometries=bodies)
-    pairs = tuple(PairQuery(**row) for row in fixture['pair_policies'])
-    validator = RobotStateValidator(checker, joint_names=fixture['joint_names'],
-        arm_joint_names=fixture['arm_joint_names'], finger_joint_names=fixture['finger_joint_names'],
-        pairs=pairs, named_velocity_limits=fixture['velocity_limits'], reference_frame=reference_frame,
-        T_reference_base=T_reference_base, tool_frame=tool_frame, T_frame_tcp=T_frame_tcp,
-        fk_translation_tolerance_m=fixture['fk_translation_tolerance_m'],
-        fk_rotation_tolerance_rad=fixture['fk_rotation_tolerance_rad'], source=fixture['source'])
-    return validator, tuple(bodies), checkpoints
 
 
 def load_observed_owner(path):

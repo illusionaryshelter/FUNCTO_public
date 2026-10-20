@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 from manipulation.execution import ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
-from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
-from manipulation.online_native_confirmation import NativeCollisionConfirmation
+from manipulation.online_geometry import OnlinePlanningScene
+from manipulation.observed_mapping import FrozenObservedField
 from test_recorded_simulation import (_GeometryChecker, _bind_fingers, _execute_bound, _fixture,
     _initial_feedback, _limit_values, _result)
 
@@ -23,10 +23,11 @@ def attachment_scene():
 def test_actual_execution_never_queries_frozen_fields_or_requires_holding_proof(tmp_path, monkeypatch, mode):
     def forbidden(*args, **kwargs):
         raise AssertionError("Frozen world geometry was consumed during physical execution")
-    monkeypatch.setattr(FrozenESDF, "signed_distance", forbidden)
-    monkeypatch.setattr(OnlinePlanningScene, "from_binding", forbidden)
-    monkeypatch.setattr(OnlinePlanningScene, "query_state", forbidden)
-    monkeypatch.setattr(NativeCollisionConfirmation, "confirm", forbidden)
+    # BEGIN guard the currently implemented field and planning query APIs.
+    monkeypatch.setattr(FrozenObservedField, "sample", forbidden)
+    monkeypatch.setattr(OnlinePlanningScene, "components", forbidden)
+    monkeypatch.setattr(OnlinePlanningScene, "evaluate", forbidden)
+    # END physical control consumes robot feedback and independent task facts.
     simulation, curve, targets = _fixture()
     if mode != "false_dependency":
         curve.events[2].update(kind="effect", requires_evidence=None, stop=False)
