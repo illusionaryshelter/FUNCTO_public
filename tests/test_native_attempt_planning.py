@@ -46,7 +46,16 @@ def test_native_rollout_keeps_nonzero_support_task_cost_without_rejection():
     scene = SimpleNamespace(gripper=None, collision=0.,
         optimizer_preferences=lambda progress, *args: torch.zeros_like(progress))
     scene.clone_for_rollout = lambda: scene
-    scene.evaluate = lambda spheres, p, r, progress, *args, **kwargs: torch.full_like(progress, scene.collision)
+    # BEGIN one mixed scene query retains geometric and non-geometric names.
+    scene.query_count = 0
+    def scene_components(spheres, p, r, progress, joints, *args, **kwargs):
+        scene.query_count += 1
+        return {"collision/robot/background": torch.full_like(progress, scene.collision),
+                "collision/robot/object": torch.zeros_like(progress),
+                "gripper/controller": torch.relu(joints[..., 0]-.2),
+                "unsupported/release_anchor/object/0": torch.zeros_like(progress)}
+    scene.components = scene_components
+    # END all components use the same ordered regular and anchor samples.
     model = SimpleNamespace(tool_frames=["tool"], config=object(), total_spheres=1,
                             get_self_collision_config=lambda: None)
     transition = SimpleNamespace(joint_names=["x", "y", "z"], robot_model=model, interpolation_steps=1)
@@ -69,7 +78,9 @@ def test_native_rollout_keeps_nonzero_support_task_cost_without_rejection():
             setattr(rollout, target, manager)
         result = rollout._compute_costs_and_constraints_impl(state)
         assert result.costs.names == ["nominal_task"]
-        assert result.constraints.names == ["known_scene_collision"]
+        assert result.constraints.names == ["collision/robot/background", "collision/robot/object",
+            "gripper/controller", "unsupported/release_anchor/object/0"]
+        assert scene.query_count == 1
         assert bool(result.get_feasible(sum_horizon=True).all())
         objective = result.get_sum_cost_and_constraint(sum_horizon=True)
         assert bool((objective > 0).all())
@@ -79,6 +90,26 @@ def test_native_rollout_keeps_nonzero_support_task_cost_without_rejection():
         scene.collision = .02
         collision = rollout._compute_costs_and_constraints_impl(state)
         assert not bool(collision.get_feasible(sum_horizon=True).any())
+
+        # BEGIN component splitting preserves aggregate values and derivatives.
+        # Two geometry terms and two fixed/controller terms share one query;
+        # compare the native collection against their former summed formula.
+        captured = {}
+        def mixed_components(spheres, p, r, progress, joints, *args, **kwargs):
+            terms = {"collision/robot/background": joints[..., 0].square(),
+                     "collision/robot/object": 2*joints[..., 1].square(),
+                     "gripper/controller": 3*joints[..., 2].square(),
+                     "unsupported/release_anchor/object/0": torch.ones_like(progress)}
+            captured["old_sum"] = sum(terms.values()).sum()
+            return terms
+        scene.components = mixed_components
+        mixed = rollout._compute_costs_and_constraints_impl(state)
+        separated_sum = sum(value.sum() for value in mixed.constraints.values)
+        torch.testing.assert_close(separated_sum, captured["old_sum"])
+        separated_gradient, = torch.autograd.grad(separated_sum, q, retain_graph=True)
+        summed_gradient, = torch.autograd.grad(captured["old_sum"], q)
+        torch.testing.assert_close(separated_gradient, summed_gradient)
+        # END no extra query or new physical threshold is needed to classify.
 
 
 def test_candidate_selection_uses_total_nominal_cost_and_rejects_nonfinite_values():
@@ -91,22 +122,19 @@ def test_candidate_selection_uses_total_nominal_cost_and_rejects_nonfinite_value
 
 
 def test_native_result_accepts_task_cost_but_keeps_joint_and_finite_checks():
-    from curobo._src.rollout.metrics import CostCollection
-    from test_manipulation_planning import PlannerCandidateSelectionTests
-    native = PlannerCandidateSelectionTests.native_candidates(flags=(True, True), native_violations=(0., 0.))
-    native.metrics.costs_and_constraints.costs = CostCollection(
-        names=["nominal_task"], values=[torch.tensor([10., 1.])[:, None, None].expand(2, 9, 1).clone()/9])
-    planner = _CuroboPlanner.__new__(_CuroboPlanner)
-    planner.torch, planner.seed_strategies, planner.last_optimizer_diagnostics = torch, ["first", "second"], []
-    planner._native_curve = lambda result: result
-    _, _, report = planner.select_candidate(native)
+    # BEGIN selection consumes real finite curves before comparing task scores.
+    from test_manipulation_planning import selection_fixture
+    states = np.zeros((2, 9, 3))
+    planner, native = selection_fixture(states, states, [10., 1.])
+    # END nominal task error remains a preference, not an execution veto.
+    _, report = planner.select_candidate(native)
     assert report["accepted"] and report["selected_seed_index"] == 1
     assert report["native_metrics"]["rollout"]["costs"]["nominal_task"] == pytest.approx(1.)
     native.metrics.costs_and_constraints.constraints.values[0][1] = 1.
-    _, _, report = planner.select_candidate(native)
+    _, report = planner.select_candidate(native)
     assert report["accepted"] and report["selected_seed_index"] == 0
     native.metrics.costs_and_constraints.costs.values[0][0] = float("nan")
-    _, _, report = planner.select_candidate(native)
+    _, report = planner.select_candidate(native)
     assert not report["accepted"]
 
 
@@ -148,7 +176,27 @@ def test_ompl_connection_preserves_release_history_for_later_single_state_querie
         reference_frame="world", robot_sphere_materials=("body",),
         robot_geometry_source="analytic robot", has_gripper=False)
     body = np.array([[1., 1., 1., .02]])
-    assert not scene.query_state(body, np.eye(4), .75)["passed"]
+    # BEGIN register the same Cartesian kinematics used by the planner below.
+    # The robot body is fixed on base; x/y/z move only the tool and payload.
+    # A zero-DOF native fixture would contradict the declared planning joints.
+    urdf = '<robot name="cartesian"><link name="base"/>'
+    for name, parent, child, axis in (("x", "base", "lx", "1 0 0"),
+            ("y", "lx", "ly", "0 1 0"), ("z", "ly", "tool", "0 0 1")):
+        urdf += (f'<link name="{child}"/><joint name="{name}" type="prismatic">'
+            f'<parent link="{parent}"/><child link="{child}"/><axis xyz="{axis}"/>'
+            '<limit lower="-2" upper="2" effort="10" velocity="10"/></joint>')
+    urdf += '</robot>'
+    body_pose = np.eye(4); body_pose[:3, 3] = body[0, :3]
+    scene.bind_online_robot(
+        robot_sphere_geometry=[{"link_name": "base", "sphere_indices": [0],
+            "centers_local": body[:, :3].tolist(), "radii": body[:, 3].tolist()}],
+        native_robot_model={"urdf_xml": urdf, "geometries": [{"name": "body", "frame": "base",
+            "kind": "sphere", "dimensions": [.02], "T_frame_geometry": body_pose.tolist(),
+            "source": "explicit fixed robot body"}]}, native_joint_names=("x", "y", "z"),
+        native_self_pairs=[], robot_model={"T_reference_base": np.eye(4).tolist()})
+    # END release-history checks still use the original independent owner.
+    assert not scene.query_state(body, np.eye(4), .75,
+        joint_position=np.zeros(3), joint_names=("x", "y", "z"))["passed"]
 
     def kinematics(joints):
         q = joints.position

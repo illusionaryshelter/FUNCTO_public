@@ -1828,7 +1828,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, *, cloc
     """Compose native costs and constraints without replacing its optimizer.
 
     Modes ending in ``cost`` contribute nominal motion objectives only. Modes
-    ending in ``constraint`` contribute known model collisions only. Native
+    ending in ``constraint`` retain each named scene constraint. Native
     cspace terms retain joint limits; the scene owns all solid collisions. Exact event
     samples are finite semantic inputs, never adaptive feasibility witnesses.
     """
@@ -1942,18 +1942,24 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget, *, cloc
                     self._joint_names, dq, trajectory_time=times,
                     tool_linear_velocity=linear, tool_angular_velocity=angular)
                 value = value+self._scene.optimizer_preferences(progress, q, self._joint_names)
-                name = "nominal_task"
+                terms = {"nominal_task": value}
             else:
-                value = self._scene.evaluate(spheres, position, quaternion, progress, q,
+                # BEGIN preserve component identity in one scene evaluation.
+                # Only collision/* denotes geometry that a spatial seed search
+                # can address. Controller and missing-model terms retain their
+                # own names; splitting the sum changes neither weights nor
+                # the constraint gradient, and makes no second scene query.
+                terms = self._scene.components(spheres, position, quaternion, progress, q,
                     self._joint_names, trajectory_time=times)
-                name = "known_scene_collision"
-            value = value.gather(1, inverse)
-            # Invalid padded samples are excluded with where, which also
-            # prevents a padded NaN from being revived by multiplication by 0.
-            regular = torch.where(valid, value[:, :horizon], 0.)
-            extra = value[:, horizon:].sum(1, keepdim=True)
-            folded = torch.cat((torch.zeros_like(regular[:, :-1]), extra), 1)
-            collection.add((regular+folded)[..., None]*budget.constraint_weight, name)
+            for name, value in terms.items():
+                value = value.gather(1, inverse)
+                # Invalid padded samples are excluded with where, which also
+                # prevents a padded NaN from being revived by multiplication by 0.
+                regular = torch.where(valid, value[:, :horizon], 0.)
+                extra = value[:, horizon:].sum(1, keepdim=True)
+                folded = torch.cat((torch.zeros_like(regular[:, :-1]), extra), 1)
+                collection.add((regular+folded)[..., None]*budget.constraint_weight, name)
+            # END named terms preserve the original scalar objective.
             return collection
 
     @dataclass
@@ -2448,15 +2454,17 @@ class _CuroboPlanner:
                 state.tool_poses.position[:, :, index], state.tool_poses.quaternion[:, :, index])
             progress = q.new_full(q.shape[:2], self.problem.start_progress)
             detail = {}
-            components["known_scene_collision"] = _known_scene_cost(self.scene,
+            # BEGIN this aggregate also includes controller/model conditions.
+            components["scene_constraints"] = _known_scene_cost(self.scene,
                 self.problem.transform_robot_spheres(state.robot_spheres),
                 position, quaternion, progress, q, self.joint_names,
                 trajectory_time=q.new_zeros(q.shape[:2]), component_diagnostics=detail)
+            # END scene_components below retains each exact diagnostic name.
             # END no second proxy-self rejection follows the entity query.
             residuals = {name: float(value.max().item()) for name, value in components.items()}
         failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
         return {"passed": not failed, "residuals": residuals, "failed_components": failed,
-                "scene_components": detail, "scope": "measured joint bounds and known model collisions"}
+                "scene_components": detail, "scope": "measured joint bounds and named scene constraints"}
 
 
     def close(self):
@@ -2619,7 +2627,7 @@ class _CuroboPlanner:
 
 
     def evaluate_candidate(self, trajectory, *, native_report):
-        """Check only the actual polynomial after completed native model metrics."""
+        """Complete one seed's actual polynomial checks before seed selection."""
         attempt = deepcopy(native_report)
         validation = self._candidate_domain_validation(trajectory)
         residuals = {**attempt["residuals"], **trajectory.residuals}
@@ -2664,10 +2672,20 @@ class _CuroboPlanner:
 
 
     def select_candidate(self, result):
-        """Choose one physically admissible native seed by its full objective."""
+        """Compare the native reporting score after each actual curve is checked.
+
+        The score retains the existing nominal-task preference among feasible
+        results. It is a selection score, not the L-BFGS optimization objective,
+        which additionally contains native joint-state regularization costs.
+        """
         total = result.metrics.costs_and_constraints.get_sum_cost_and_constraint(sum_horizon=True)
         objectives = total.detach().reshape(-1).cpu().numpy()
-        reports = []
+        # BEGIN finish the same physical checks for every returned seed.
+        # A low reporting score cannot select a curve whose between-sample
+        # extrema fail while another returned curve already satisfies them.
+        reports, trajectories, validations = [], [], []
+        ranking_scores = objectives.copy()
+        self.delivery_candidate, self.last_validation = None, None
         for index in range(result.num_seeds):
             metrics = self.native_diagnostics(result, index)
             residuals = {f"{label}:{name}": value for label in ("rollout", "interpolated")
@@ -2675,15 +2693,38 @@ class _CuroboPlanner:
             finite = np.isfinite(objectives[index]) and bool(self.torch.isfinite(result.solution[:, index]).all())
             accepted = (finite and metrics["success"]
                         and all(np.isfinite(v) and v <= 0 for v in residuals.values()))
-            reports.append({"seed_index": index, "accepted": bool(accepted),
+            report = {"seed_index": index, "accepted": bool(accepted),
                 "objective": float(objectives[index]), "native_success": metrics["success"],
                 "native_metrics": metrics, "residuals": residuals,
-                "collision_residuals": {name: value for name, value in residuals.items() if "collision" in name},
+                "collision_residuals": {name: value for name, value in residuals.items()
+                    if name.split(":", 1)[1].startswith("collision/")},
                 "seed_provenance": self.seed_strategies[index],
-                "optimizer": self.last_optimizer_diagnostics[index] if self.last_optimizer_diagnostics else {}})
-        selected = _minimum_cost_candidate(objectives, [row["accepted"] for row in reports])
-        candidate = _trajectory_candidate(result, selected)
-        return candidate, self._native_curve(candidate), {**reports[selected],
+                "optimizer": self.last_optimizer_diagnostics[index] if self.last_optimizer_diagnostics else {}}
+            candidate = _trajectory_candidate(result, index)
+            native = self.trajopt.get_active_js(candidate.get_interpolated_plan())
+            finite_curve = bool(self.torch.isfinite(native.position).all()
+                                and self.torch.isfinite(native.velocity).all())
+            trajectory, validation = None, None
+            if finite_curve:
+                trajectory, report, _ = self.evaluate_candidate(
+                    self._native_curve(candidate), native_report=report)
+                validation = self.last_validation
+            else:
+                # A nonfinite state has no polynomial domain to evaluate. It
+                # excludes this seed without swallowing clock/layout errors
+                # or preventing another finite returned seed from selection.
+                report["accepted"] = False
+                report["residuals"]["finite_joint_curve"] = float("inf")
+            if not finite or not finite_curve:
+                ranking_scores[index] = np.nan
+            reports.append(report)
+            trajectories.append(trajectory)
+            validations.append(validation)
+        selected = _minimum_cost_candidate(ranking_scores, [row["accepted"] for row in reports])
+        self.delivery_candidate = trajectories[selected]
+        self.last_validation = validations[selected]
+        # END selected diagnostics and delivery reuse this exact checked curve.
+        return trajectories[selected], {**reports[selected],
             "selected_seed_index": selected, "candidates": reports}
 
 
@@ -2739,13 +2780,13 @@ class _CuroboPlanner:
             "continuous_position": position, "continuous_velocity": velocity, "cubic_derivatives": derivatives,
             "numerical_tolerances": asdict(self.problem.numerical)}
 
-    def export(self, result, native_report):
-        """Reuse completed native metrics at the common candidate boundary."""
-        trajectory, attempt, points = self.evaluate_candidate(self._native_curve(result), native_report=native_report)
-        if not attempt["accepted"]:
-            raise MotionPlanningError("output_inconsistent", "Accepted native curve failed exact output/domain consistency")
-        native_report.update(attempt)
-        return trajectory, points
+    def export(self, trajectory, native_report):
+        """Deliver the selected curve with its already completed domain checks."""
+        # BEGIN delivery does not reconstruct or re-evaluate a selected curve.
+        if not native_report["accepted"]:
+            raise MotionPlanningError("output_inconsistent", "An unqualified candidate cannot be delivered")
+        return trajectory, 0
+        # END last_validation remains the selected seed's completed report.
 
 
 def _verified_dependency_outcomes(continuation):
@@ -3119,7 +3160,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         consumed["trajectory_solves"] += 1
         stage = "main_solve"
         mark_wallclock("main_solve_started")
-        native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
+        trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
         mark_wallclock("main_solve_completed")
         diagnostics["attempts"].append(deepcopy(attempt))
         check()
@@ -3145,7 +3186,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 stage = "connection_solve"
                 planner.seed_strategies = ["native_ompl_connection"]*recovered.shape[1]
                 mark_wallclock("connection_solve_started")
-                native_result, trajectory, attempt = planner.select_candidate(planner.optimize(recovered))
+                trajectory, attempt = planner.select_candidate(planner.optimize(recovered))
                 mark_wallclock("connection_solve_completed")
                 diagnostics["attempts"].append(deepcopy(attempt))
                 check()
@@ -3158,12 +3199,11 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         stage = "delivery"
         check()
         mark_wallclock("validation_started")
-        trajectory, points = planner.export(native_result, attempt)
+        trajectory, points = planner.export(trajectory, attempt)
         mark_wallclock("validation_completed")
-        # export still checks the exact polynomial's limits and entrance, but
-        # evaluate_candidate(native_report=...) reuses the completed native
-        # geometry verdict and reports zero new queries. Only actual new
-        # queries consume a pass. Candidate binding below checks wall/work.
+        # Every returned seed completed its polynomial checks before selection.
+        # Delivery reuses the selected curve and native geometry verdict, with
+        # zero new queries. Candidate binding below still checks wall/work.
         if points:
             consumed["validation_passes"] += 1
             consumed["validation_queries"] += points

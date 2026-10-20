@@ -37,9 +37,10 @@ class Scene:
 
 class Native:
     """Deterministic solver outcomes; no geometry predicate is simulated."""
-    def __init__(self, outcomes, *, collision=False, ompl=True):
+    def __init__(self, outcomes, *, collision=False, ompl=True, failure_component=None):
         self.outcomes = iter(outcomes)
         self.collision, self.ompl_available = collision, ompl
+        self.failure_component = failure_component or ("collision/robot/background" if collision else "cspace")
         self.calls = []
         # These orchestration tests never query geometry; model access would
         # be a test error rather than an execution-validator factory fallback.
@@ -74,14 +75,18 @@ class Native:
         self.calls.append("solve")
         return next(self.outcomes)
     def select_candidate(self, accepted):
+        component, value = self.failure_component, 0. if accepted else 1.
         report = {"accepted": accepted, "native_success": accepted, "seed_provenance": "test",
-                  "residuals": {"process_scene" if self.collision else "cspace": 0. if accepted else 1.},
-                  "collision_residuals": {"rollout:scene_collision": float(self.collision and not accepted)}}
-        return SimpleNamespace(solution=torch.zeros((1, 1, 8, 1))), self.curve, report
+                  "residuals": {f"rollout:{component}": value},
+                  "collision_residuals": {f"rollout:{component}": value}
+                      if component.startswith("collision/") else {}}
+        return self.curve, report
     def ompl_seed(self, trajectory):
         self.calls.append("ompl")
         return (torch.zeros((1, 2, 8, 1)) if self.ompl_available else None), {"state_queries": 1}
-    def export(self, result, native_report):
+    def export(self, trajectory, native_report):
+        # Selection already qualified this exact object; delivery must reuse it.
+        assert trajectory is self.curve
         assert native_report["accepted"]
         self.last_validation = {"u": np.array([0., 1.]), "violations": np.zeros(2)}
         self.calls.append("export")
@@ -177,11 +182,15 @@ def test_failed_main_collision_gets_one_bounded_recovery():
     backend.close()
 
 
-def test_noncollision_motion_failure_does_not_add_a_full_solve():
-    native = Native([False, False])
+@pytest.mark.parametrize("component", ("cspace", "gripper/controller", "unsupported/release_anchor/held/0"))
+def test_noncollision_motion_failure_does_not_add_a_full_solve(component):
+    # Control/binding requirements are visible failures, not spatial obstacles.
+    native = Native([False, False], failure_component=component)
     result, backend = run(native)
     assert not result.success and result.execution_binding is None
     assert native.calls.count("solve") == 1 and "export" not in native.calls
+    assert "ompl" not in native.calls
+    assert result.diagnostics["residuals"] == {f"rollout:{component}": 1.}
     assert result.diagnostics["recovery"] is None
     assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
     backend.close()

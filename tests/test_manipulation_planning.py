@@ -128,6 +128,35 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     return planner, SimpleNamespace(batch_size=1, num_seeds=1, get_interpolated_plan=lambda: native)
 
 
+# BEGIN returned-candidate fixtures retain actual CPU native result slicing.
+def selection_fixture(position, velocity, scores, dt=.125):
+    """Supply returned curves and scores without simulating GPU optimization."""
+    from curobo.types import DeviceCfg, JointState
+    from curobo._src.rollout.metrics import CostCollection
+
+    position, velocity = np.asarray(position, float), np.asarray(velocity, float)
+    problem = cartesian_problem((MotionPhase("free", constant_path()),))
+    planner, _ = export_fixture(problem,
+        _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), position[0], velocity[0], dt)
+    planner.seed_strategies, planner.last_optimizer_diagnostics = ["first", "second"], []
+    native = PlannerCandidateSelectionTests.native_candidates(
+        flags=(True, True), native_violations=(0., 0.))
+    state = JointState(position=torch.tensor(position)[None], velocity=torch.tensor(velocity)[None],
+        acceleration=torch.zeros((1, *position.shape), dtype=torch.float64),
+        jerk=torch.zeros((1, *position.shape), dtype=torch.float64),
+        dt=torch.full((1, 2), dt, dtype=torch.float64),
+        joint_names=list(problem.joint_names), device_cfg=DeviceCfg("cpu", dtype=torch.float64))
+    native.js_solution, native.interpolated_trajectory = state.clone(), state
+    count = position.shape[1]
+    native.interpolated_last_tstep = torch.full((1, 2), count, dtype=torch.int64)
+    native.metrics.costs_and_constraints.costs = CostCollection(names=["nominal_task"],
+        values=[torch.tensor(scores, dtype=torch.float64)[:, None, None].expand(2, count, 1).clone()/count])
+    native.metrics.costs_and_constraints.constraints = CostCollection(names=["cspace"],
+        values=[torch.zeros((2, count, 1), dtype=torch.float64)])
+    return planner, native
+# END fixtures declare complete saved curves and no independent acceptance oracle.
+
+
 class PlannerCalculusTests(unittest.TestCase):
     def test_formal_spline_clock_preserves_raw_duration_and_exact_dense_grid(self):
         from curobo._src.types.control_space import ControlSpace
@@ -879,6 +908,89 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
             seed_rank=torch.tensor([[0, 1]]), batch_size=1, num_seeds=2)
 
 
+    # BEGIN continuous domain qualification precedes every candidate choice.
+    def test_select_checks_each_actual_curve_and_delivery_reuses_selected_validation(self):
+        from manipulation.cubic_trajectory import CubicBasis
+        basis = CubicBasis(6, 1.)
+        times = np.arange(basis.intervals*4+1)/4
+        controls = np.array([0., .2, 1.2, .7, 0., 0.])
+        position = np.zeros((2, len(times), 3))
+        velocity = np.zeros_like(position)
+        position[0, :, 0] = (basis.weights_at_knot_times(times)[0] @ controls).astype(np.float32)
+        velocity[0, :, 0] = (basis.weights_at_knot_times(times, 1)[0] @ controls).astype(np.float32)
+        position[1], velocity[1] = .5*position[0], .5*velocity[0]
+        planner, native = selection_fixture(position, velocity, [1., 2.], dt=.25)
+
+        # Preserve the existing nominal preference when both curves qualify.
+        _, unconstrained = planner.select_candidate(native)
+        self.assertEqual(unconstrained["selected_seed_index"], 0)
+        curve = CubicHermiteSpline(times, position[0, :, 0], velocity[0, :, 0])
+        roots = curve.derivative().roots(extrapolate=False)
+        roots = roots[np.isfinite(roots) & (roots >= times[0]) & (roots <= times[-1])]
+        sampled_max = position[0, :, 0].max()
+        continuous_max = curve(np.r_[times, roots]).max()
+        upper = (sampled_max+continuous_max)/2
+        limits = planner._verification_native.get_cost("cspace").config.joint_limits
+        limits.position[1, 0] = upper
+        self.assertLess(sampled_max, upper)
+        self.assertGreater(continuous_max, upper)
+
+        with patch.object(planner, "_candidate_domain_validation", wraps=planner._candidate_domain_validation) as check:
+            trajectory, report = planner.select_candidate(native)
+        self.assertEqual(check.call_count, 2)
+        self.assertTrue(report["accepted"])
+        self.assertEqual(report["selected_seed_index"], 1)
+        self.assertFalse(report["candidates"][0]["accepted"])
+        self.assertGreater(report["candidates"][0]["residuals"]["continuous_position"], 0.)
+        self.assertEqual(report["candidates"][1]["residuals"]["continuous_position"], 0.)
+        completed_validation = planner.last_validation
+        with patch.object(planner, "_native_curve", side_effect=AssertionError("delivery must reuse the curve")), \
+             patch.object(planner, "_candidate_domain_validation", side_effect=AssertionError("delivery must reuse validation")):
+            delivered, queries = planner.export(trajectory, report)
+        self.assertIs(delivered, trajectory)
+        self.assertIs(planner.last_validation, completed_validation)
+        self.assertEqual(queries, 0)
+
+        # If every returned curve fails, the finite minimum stays diagnostic.
+        limits.position[1, 0] = .1
+        rejected, rejected_report = planner.select_candidate(native)
+        self.assertFalse(rejected_report["accepted"])
+        self.assertEqual(rejected_report["selected_seed_index"], 0)
+        self.assertIs(planner.delivery_candidate, rejected)
+        self.assertIsNone(planner.last_validation)
+
+    def test_nonfinite_returned_curve_cannot_displace_a_finite_candidate(self):
+        for value in (float("nan"), float("inf")):
+            with self.subTest(value=value):
+                position = np.zeros((2, 9, 3)); position[0, 4, 0] = value
+                planner, native = selection_fixture(position, np.zeros_like(position), [1., 2.])
+                with patch.object(planner, "_candidate_domain_validation", wraps=planner._candidate_domain_validation) as check:
+                    trajectory, report = planner.select_candidate(native)
+                self.assertEqual(check.call_count, 1)
+                self.assertTrue(report["accepted"])
+                self.assertEqual(report["selected_seed_index"], 1)
+                self.assertFalse(report["candidates"][0]["accepted"])
+                self.assertEqual(report["candidates"][0]["residuals"]["finite_joint_curve"], float("inf"))
+                self.assertTrue(np.isfinite(trajectory.position).all())
+
+    def test_only_geometry_components_enter_collision_recovery_diagnostics(self):
+        components = ("collision/robot/background", "gripper/controller",
+                      "unsupported/release_anchor/held/0")
+        for component in components:
+            with self.subTest(component=component):
+                states = np.zeros((2, 9, 3))
+                planner, native = selection_fixture(states, states, [1., 2.])
+                constraints = native.metrics.costs_and_constraints.constraints
+                constraints.names.append(component)
+                constraints.values.append(torch.full((2, 9, 1), .2, dtype=torch.float64))
+                _, report = planner.select_candidate(native)
+                self.assertFalse(report["accepted"])
+                self.assertEqual(report["residuals"][f"rollout:{component}"], .2)
+                expected = {f"rollout:{component}": .2} if component.startswith("collision/") else {}
+                self.assertEqual(report["collision_residuals"], expected)
+    # END no joint threshold, solver preference or native success flag is changed.
+
+
     def test_native_single_seed_gather_preserves_clock_valid_length_and_original_rank(self):
         from manipulation.planning import _trajectory_candidate
 
@@ -1028,8 +1140,12 @@ class ExportedCurveContractTests(unittest.TestCase):
         limits = planner._verification_native.get_cost("cspace").config.joint_limits
         limits.acceleration[:, 0] = torch.tensor([-2., 5.], dtype=torch.float64)
         from manipulation.planning import MotionPlanningError
+        trajectory, report, _ = planner.evaluate_candidate(planner._native_curve(result),
+            native_report={"accepted": True, "residuals": {}})
+        self.assertFalse(report["accepted"])
+        self.assertGreater(report["residuals"]["continuous_acceleration"], 0.)
         with self.assertRaises(MotionPlanningError) as caught:
-            planner.export(result, {"accepted": True, "residuals": {}})
+            planner.export(trajectory, report)
         self.assertEqual(caught.exception.reason, "output_inconsistent")
 
     def test_multiple_native_seeds_cannot_be_flattened_into_one_export(self):
@@ -1039,7 +1155,7 @@ class ExportedCurveContractTests(unittest.TestCase):
         result.num_seeds = 2
         result.get_interpolated_plan = Mock(side_effect=AssertionError("must reject before reading mixed curves"))
         with self.assertRaisesRegex(ValueError, "one.*seed|selected seed"):
-            planner.export(result, {"accepted": True, "residuals": {}})
+            planner._native_curve(result)
         result.get_interpolated_plan.assert_not_called()
 
     def test_reference_short_loop_does_not_require_motion_or_a_hard_anchor(self):
@@ -1049,7 +1165,9 @@ class ExportedCurveContractTests(unittest.TestCase):
         problem = cartesian_problem((MotionPhase("reference loop", PosePath(knots, reference, "reference")),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                          np.zeros((9, 3)), np.zeros((9, 3)), .125)
-        trajectory, _ = planner.export(result, {"accepted": True, "residuals": {}})
+        trajectory, report, _ = planner.evaluate_candidate(planner._native_curve(result),
+            native_report={"accepted": True, "residuals": {}})
+        self.assertTrue(report["accepted"])
         self.assertNotIn(.502, planner.last_validation["u"])
         self.assertTrue(all(value == 0. for value in trajectory.residuals.values()))
         self.assertFalse(any(key.startswith("phase:") for key in trajectory.residuals))
@@ -1068,7 +1186,9 @@ class ExportedCurveContractTests(unittest.TestCase):
         mapping = _ProgressMap(np.array([0., .2, .45, .75, 1.]), np.array([0., 1., 1., 2., 3.]))
         np.testing.assert_allclose(mapping.anchor_parameters([1.]), [[.2, 1.], [.45, 1.]])
         planner, result = export_fixture(problem, mapping, np.zeros((7, 3)), np.zeros((7, 3)), .2)
-        trajectory, _ = planner.export(result, {"accepted": True, "residuals": {}})
+        trajectory, report, _ = planner.evaluate_candidate(planner._native_curve(result),
+            native_report={"accepted": True, "residuals": {}})
+        self.assertTrue(report["accepted"])
         self.assertEqual(len(trajectory.events), len(events))
         self.assertEqual([(event["skill_id"], event["event_id"]) for event in trajectory.events],
                          [(event.skill_id, event.event_id) for event in events])
@@ -1087,7 +1207,9 @@ class ExportedCurveContractTests(unittest.TestCase):
         problem = cartesian_problem((MotionPhase("free", constant_path()),))
         planner, result = export_fixture(problem, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
                                          np.zeros((3, 3)), np.zeros((3, 3)), .25)
-        trajectory, _ = planner.export(result, {"accepted": True, "residuals": {}})
+        trajectory, report, _ = planner.evaluate_candidate(planner._native_curve(result),
+            native_report={"accepted": True, "residuals": {}})
+        self.assertTrue(report["accepted"])
         self.assertIsNone(trajectory.next_verification)
         self.assertEqual(trajectory.executable_until, trajectory.duration)
 
