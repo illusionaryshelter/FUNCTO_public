@@ -1,6 +1,6 @@
 # `manipulation/execution.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `pose_goal_schedule`
@@ -16,7 +16,7 @@ def pose_goal_schedule(trajectory, progress, timestep):
 实现说明：
 
 > Return the first original progress time and its strict native due tick.
-> 
+>
 > A terminal progress plateau starts at its first matching knot. The
 > physical observation uses the first device tick covering that time;
 > one-ULP future times cannot borrow the preceding tick. This function
@@ -75,7 +75,7 @@ def _timing_checks(event, check_target, time_s, history, *, goal_id=None, condit
 实现说明：
 
 > Compare one actual witness with its own original physical-time windows.
-> 
+>
 > The caller supplies a measured activation/arrival/acquisition timestamp.
 > No reference event time or planning prediction can stand in for it here.
 > Unresolved origins remain U and retain their precise missing requirement.
@@ -141,7 +141,7 @@ def _posthoc_geometry_timing(value):
 实现说明：
 
 > Identify timing whose witness/origin requires a geometry-goal result.
-> 
+>
 > Pose, support and mechanism-coordinate goals constrain the nominal plan.
 > Their physical accuracy belongs to the independent result evaluator.
 
@@ -195,7 +195,7 @@ events: tuple[dict, ...]
 实现说明：
 
 > Explicit native position targets; neither robot feedback nor a curve.
-> 
+>
 > Each row identifies one original ``(skill_id, event_id, kind)``. Event
 > times belong exclusively to the exported, retimed arm trajectory. The
 > independent coordinates need not have equal magnitudes or opposite signs.
@@ -509,7 +509,7 @@ observation_policy: dict | None
 实现说明：
 
 > Measured-state limits supplied by the same physical planning contract.
-> 
+>
 > No physical tolerance is inferred from controller gains, numerical solver
 > tolerances, actuator targets or a previously failed execution. Finger
 > bounds describe permitted *actual* positions after each original event;
@@ -821,7 +821,7 @@ def continuation_execution_inputs(continuation, finger_targets, execution_limits
 实现说明：
 
 > Select remaining or explicitly retried original device policies.
-> 
+>
 > The request retains one immutable full device policy. A retry chooses a
 > new occurrence of an existing original event, never new actuator targets
 > or looser physical limits. The actual last applied interval is preserved
@@ -899,7 +899,7 @@ class TrajectoryExecutor():
 实现说明：
 
 > Follow the exported cubic using one concrete backend and geometry gate.
-> 
+>
 > No alternate event clock, interpolation or missing-checker fallback is
 > provided. The backend exposes actual named robot state independently from
 > actuator control. Geometry validation is mandatory for every execution
@@ -970,7 +970,7 @@ def _geometry_result(self, method, *args, **kwargs):
 实现说明：
 
 > Require an explicit verdict; checker errors reject physical control.
-> 
+>
 > A malformed result is a checker failure, never an omitted check. The
 > caller retains this failure alongside the same actual feedback used
 > for tracking checks, then stops before issuing another command.
@@ -1177,7 +1177,7 @@ def execute(self, result, *, finger_targets, initial_feedback, execution_limits,
 实现说明：
 
 > Follow the exact bound curve within its authorized execution scope.
-> 
+>
 > # BEGIN independent evidence collection has no control authority.
 > ``step_callback(model, data, record)`` is an independent evaluator/camera
 > sink for the initial state and each completed normal execution step.
@@ -1308,8 +1308,8 @@ report.update
 limit_binding['joint_ranges'].tolist
 binding['problem'].get
 binding.get('goal_identities', {}).get
-binding['scene'].get
 row.get
+binding['scene'].get
 condition.get
 owner.get
 np.linalg.inv
@@ -1317,8 +1317,6 @@ np.linalg
 np.eye
 Rotation.from_quat(np.asarray(relation['quaternion_tool_owner'])[[1, 2, 3, 0]]).as_matrix
 Rotation.from_quat
-rules_by_id.get
-finite_permission_ids.add
 pose_requirements.get
 finite_permission_ids.intersection
 finite_permission_ids.update
@@ -1477,11 +1475,8 @@ contact_rows
 finite_permission_ids
 holding_bindings
 start_progress
-holding_rows
-rules_by_id
 condition
 condition_id
-rule_ids
 owners
 relations
 owner
@@ -1490,11 +1485,11 @@ lower
 upper
 actual[:3, 3]
 actual[:3, :3]
-rule
-holding_bindings[identity]
+holding_bindings[condition_id]
 activation
 arrival
 commands
+rule_ids
 contact_bindings[identity]
 report['grasp_command_checks']
 report['declared_attachment_bindings']
@@ -1696,9 +1691,8 @@ binding['problem'].get
 binding.get('goal_identities', {}).get
 zip
 PoseEventRequirement
-binding['scene'].get
 row.get
-HoldingContact
+binding['scene'].get
 condition.get
 owner.get
 map
@@ -1707,8 +1701,6 @@ _pose_array
 np.eye
 Rotation.from_quat(np.asarray(relation['quaternion_tool_owner'])[[1, 2, 3, 0]]).as_matrix
 Rotation.from_quat
-rules_by_id.get
-finite_permission_ids.add
 event_occurrence_key
 pose_requirements.get
 grasp_contact_rule_ids
@@ -1888,7 +1880,7 @@ def run_hold(key, feedback, *, expected_sim_time):
 实现说明：
 
 > Allocate only the same invocation's unspent native attempts.
-> 
+>
 > Reserve the complete supplied hold allowance until its owned
 > result is available. If the hold itself unexpectedly raises or
 > loses its report, no unknown work becomes a free retry.
@@ -1940,7 +1932,7 @@ def normal_step(curve_time):
 实现说明：
 
 > Charge before integration and retain its result before capture.
-> 
+>
 > The backend publishes accounting at the native integration
 > boundary, before forward refresh. A later refresh/record error
 > cannot erase that completed step or replace the primary error.
@@ -1994,7 +1986,7 @@ float
 
 ## `TrajectoryExecutor.execute.dependency_already_observed`
 
-[定义位置](../../../manipulation/execution.py#L1149)。
+[定义位置](../../../manipulation/execution.py#L1124)。
 
 输入签名：
 
@@ -2026,7 +2018,7 @@ float
 
 ## `TrajectoryExecutor.execute.check_directions`
 
-[定义位置](../../../manipulation/execution.py#L1175)。
+[定义位置](../../../manipulation/execution.py#L1150)。
 
 输入签名：
 
@@ -2037,7 +2029,7 @@ def check_directions(observation, feedback, curve_time, elapsed):
 实现说明：
 
 > Require current scoped proof, while leaving future/net-prefix unknowns open.
-> 
+>
 > An observer owns coordinate/rate measurement and its T/F/U decision.
 > This boundary owns identity, acquisition freshness, interval coverage,
 > and physical stopping. In particular, an old completed attempt or a
@@ -2143,7 +2135,7 @@ ExecutionGuardError
 
 ## `TrajectoryExecutor.execute.effect_timestamp`
 
-[定义位置](../../../manipulation/execution.py#L1280)。
+[定义位置](../../../manipulation/execution.py#L1255)。
 
 输入签名：
 
@@ -2154,7 +2146,7 @@ def effect_timestamp(identity, fact, observation):
 实现说明：
 
 > Distinguish current predicate sampling from a witnessed past occurrence.
-> 
+>
 > A newly read assessment of an explicitly declared occurred-event
 > fact can remain T. Its actual witness time and occurrence identity
 > stay unchanged; the observation's fresh delivery time cannot be
@@ -2213,7 +2205,7 @@ max
 
 ## `TrajectoryExecutor.execute.witness`
 
-[定义位置](../../../manipulation/execution.py#L1315)。
+[定义位置](../../../manipulation/execution.py#L1290)。
 
 输入签名：
 
@@ -2260,7 +2252,7 @@ report['history'].append
 
 ## `TrajectoryExecutor.execute.timed_witness`
 
-[定义位置](../../../manipulation/execution.py#L1330)。
+[定义位置](../../../manipulation/execution.py#L1305)。
 
 输入签名：
 
@@ -2300,7 +2292,7 @@ witness
 
 ## `TrajectoryExecutor.execute.reject_timing`
 
-[定义位置](../../../manipulation/execution.py#L1342)。
+[定义位置](../../../manipulation/execution.py#L1317)。
 
 输入签名：
 
@@ -2347,7 +2339,7 @@ ExecutionGuardError
 
 ## `TrajectoryExecutor.execute.resolve_pending_timing`
 
-[定义位置](../../../manipulation/execution.py#L1362)。
+[定义位置](../../../manipulation/execution.py#L1337)。
 
 输入签名：
 
@@ -2405,7 +2397,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.check_deadlines`
 
-[定义位置](../../../manipulation/execution.py#L1391)。
+[定义位置](../../../manipulation/execution.py#L1366)。
 
 输入签名：
 
@@ -2465,7 +2457,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.observe_timed_effects`
 
-[定义位置](../../../manipulation/execution.py#L1418)。
+[定义位置](../../../manipulation/execution.py#L1393)。
 
 输入签名：
 
@@ -2528,7 +2520,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.observation_at`
 
-[定义位置](../../../manipulation/execution.py#L1453)。
+[定义位置](../../../manipulation/execution.py#L1428)。
 
 输入签名：
 
@@ -2646,7 +2638,7 @@ condition.get
 
 ## `TrajectoryExecutor.execute.record`
 
-[定义位置](../../../manipulation/execution.py#L1555)。
+[定义位置](../../../manipulation/execution.py#L1530)。
 
 输入签名：
 
@@ -2705,7 +2697,7 @@ deepcopy
 
 ## `TrajectoryExecutor.execute.check_close_binding`
 
-[定义位置](../../../manipulation/execution.py#L1583)。
+[定义位置](../../../manipulation/execution.py#L1558)。
 
 输入签名：
 
@@ -2716,7 +2708,7 @@ def check_close_binding(feedback, *, curve_time, physical_elapsed, point, contac
 实现说明：
 
 > Keep command timing without claiming actual target arrival.
-> 
+>
 > Never compare TCP and predicted target here: there is no current
 > target truth. A close command neither proves contact nor Holding.
 
@@ -2764,7 +2756,7 @@ failures.append
 
 ## `TrajectoryExecutor.execute.guard`
 
-[定义位置](../../../manipulation/execution.py#L1618)。
+[定义位置](../../../manipulation/execution.py#L1593)。
 
 输入签名：
 
@@ -2860,7 +2852,7 @@ check_deadlines
 
 ## `TrajectoryExecutor.execute.consume_ordinary_events`
 
-[定义位置](../../../manipulation/execution.py#L1692)。
+[定义位置](../../../manipulation/execution.py#L1667)。
 
 输入签名：
 
@@ -2946,7 +2938,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.release_dependencies`
 
-[定义位置](../../../manipulation/execution.py#L1751)。
+[定义位置](../../../manipulation/execution.py#L1726)。
 
 输入签名：
 
@@ -3021,7 +3013,7 @@ timed_witness
 
 ## `TrajectoryExecutor.execute.emit_independent_evidence`
 
-[定义位置](../../../manipulation/execution.py#L1806)。
+[定义位置](../../../manipulation/execution.py#L1781)。
 
 输入签名：
 

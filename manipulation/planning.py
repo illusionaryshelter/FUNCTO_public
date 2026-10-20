@@ -2525,7 +2525,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
 
             Functional multipliers and centering/command preferences are
             objectives. Original task and observed-scene residuals determine
-            sampled eligibility; final metrics use the acceptance spacing.
+            sampled eligibility under the same nonpenetration rule as final
+            metrics.
             """
             constraints = trajectories.costs_and_constraints
             collection = constraints.constraints
@@ -2692,6 +2693,12 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # END metrics retain the complete original hard residual dictionary.
             # BEGIN optimizer and success metrics consume the identical online scene.
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
+            # BEGIN align validity with the time-sorted grid and exact anchors.
+            # The trajectory tensors above contain both sample families in
+            # ``order``. Hard-evidence reduction must use that same ordering;
+            # padded grid entries do not become real trajectory states.
+            active = ordered(torch.cat((valid, anchor_valid.bool().expand(batch, -1)), dim=1))
+            # END this mask uses the existing sample counts and anchor validity.
             # BEGIN candidate retention reads scalar evidence from this same scene query.
             scene_evidence_out = {} if self._process_mode in ("trajectory_metrics", "trajectory_optimizer") else None
             # END no extra FK, source query, or geometry history is created.
@@ -2700,21 +2707,21 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 trajectory_time=trajectory_time, normalized_time=ordered(all_u),
                 query_counts=self._query_counts,
                 component_diagnostics=None if context is None else context["scene_components"],
-                # BEGIN the caller declares the required model separation for this query.
+                # BEGIN the caller selects the query path under one nonpenetration rule.
                 query_role="optimization" if self._process_mode == "trajectory_optimizer" and context is None else "acceptance",
                 scene_evidence_out=scene_evidence_out,
                 optimizer_candidate_evidence=self._process_mode == "trajectory_optimizer")
             # END ordinary optimizer and proposal metric calls remain unchanged.
-            # END metrics retain the separate acceptance spacing.
+            # END metrics and optimization retain the same collision zero set.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
-            # BEGIN retain collision gradients for small positive clearance deficits.
-            # The scene already returns nonnegative physical violations. A
+            # BEGIN retain collision gradients for small penetration residuals.
+            # The scene already returns nonnegative hard residuals. A
             # second square suppresses their gradient near zero; only the
             # original skill penalty keeps its squared optimizer objective.
             if self._process_mode == "trajectory_optimizer":
                 values = [("skill_process", process_value.square()),
                           ("process_scene", scene_value)]
-                # END the scene residual remains linear in its physical violation.
+                # END the scene residual is not squared a second time.
                 # BEGIN signed inequalities enter PHR directly, never squared twice.
                 signed, _ = problem.functional_inequalities(
                     position, quaternion, progress, trajectory_time=trajectory_time)

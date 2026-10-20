@@ -75,12 +75,12 @@ def load_contact_bindings(path):
     from manipulation.initial_support import InitialSupportRelation
 
     inputs = json.loads(Path(path).read_text())
-    required = {"materials", "contacts", "source"}
-    optional = {"grasp_activations", "holding_contacts", "initial_support_relations"}
+    required = {"contacts", "source"}
+    optional = {"grasp_activations", "initial_support_relations"}
     if (not isinstance(inputs, dict) or not required <= set(inputs)
             or set(inputs)-required-optional):
-        raise ValueError("Contact bindings need materials, contacts, source and optional "
-                         "grasp_activations/holding_contacts/initial_support_relations")
+        raise ValueError("Contact bindings need contacts, source and optional "
+                         "grasp_activations/initial_support_relations")
     if not isinstance(inputs["source"], str) or not inputs["source"].strip():
         raise ValueError("Contact bindings require a current evidence source")
     declarations = inputs.get("initial_support_relations", [])
@@ -474,24 +474,23 @@ def run_prepared(args, *, problem, provenance):
             execution_limits=execution_limits, position_limits=fixture["position_limits"],
             velocity_limits=fixture["velocity_limits"], trajectory_factory=reference_factory, fixture=fixture)
         report["gripper"] = hand_report
-        contacts, initial_support_relations, holding_contacts = (), (), ()
+        # BEGIN tool assembly membership comes from the same robot model.
+        from robot_validation_fixture import tool_geometry_names
+        tool_members = tool_geometry_names(fixture)
+        report["tool_geometry_names"] = list(tool_members)
+        contacts, initial_support_relations = (), ()
         report["contact_binding"] = {"policies": []}
         if args.contact_bindings is not None:
             from manipulation.planning_scene import ContactRule
-            from manipulation.holding_contact import bind_holding_contacts
             contact_inputs, initial_support_relations = load_contact_bindings(args.contact_bindings)
             contacts = tuple(ContactRule(**row) for row in contact_inputs["contacts"])
             if any(row.get("kind") == "grasp_contact_activation" for row in problem.conditions):
                 from manipulation.contact_binding import bind_grasp_contact_rules
                 bind_grasp_contact_rules(problem, contacts, contact_inputs["grasp_activations"])
-            if any(row.get("kind") == "declared_attachment" for row in problem.conditions):
-                holding_contacts = bind_holding_contacts(problem,
-                    {"materials": contact_inputs["materials"]}, contact_inputs["holding_contacts"],
-                    source=contact_inputs["source"])
             report["contact_binding"] = {"source": contact_inputs["source"],
                 "rule_ids": [row.rule_id for row in contacts],
-                "holding_contacts": [asdict(row) for row in holding_contacts],
                 "initial_support_relation_ids": [row.relation_id for row in initial_support_relations]}
+        # END Attachment supplies internal membership without material permissions.
         report["requirement_consumption"] = problem.requirement_consumption
         # END permissions affect software collision legality, never native physical contact.
         # BEGIN describe each model by its actual construction input.
@@ -593,8 +592,9 @@ def run_prepared(args, *, problem, provenance):
             depth_error_m=args.depth_error, reference_frame=problem.reference_frame,
             robot_model=robot_validator.checker,
             fixed_geometry_names=tuple(row["geom"] for row in fixture["fixed_collision_geometries"]),
+            tool_geometry_names=tool_members,
             gripper=hand,
-            observed_owners=observed_owners, contacts=contacts, holding_contacts=holding_contacts,
+            observed_owners=observed_owners, contacts=contacts,
             initial_support_relations=initial_support_relations, task_owner_ids=task_owners,
             fine_regions=fine_regions, unknown_policy=json.loads(args.unknown_policy.read_text()),
             max_mapping_bytes=args.mapping_memory_mib*1024**2,

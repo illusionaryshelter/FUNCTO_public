@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 
@@ -52,8 +52,8 @@
 | `scene.json` | 当前对象身份、功能绑定、入口、目标、名义附着、任务点与支撑要求 | `prepare_candidate/build_planning_problem` 或实验 `build_problem`；形成参考和硬要求 |
 | `feedback.json`、`robot_feedback.json` | 具名机器人 `q/dq`、手指状态、设备时间和标定 FK | 固定规划入口、机器人/手指几何与执行续接 |
 | `robot-fixture.json`、纯运动学 YAML/URDF | 关节树、坐标、标定、关节限制及明确实体对策略 | cuRobo FK/IK、Pinocchio FK 和设备绑定 |
-| robot-only 模型及其引用的官方机器人组件 | 已知机器人原形状、局部变换、原生逐实体配对及固定安装身份 | `robot_validation_fixture` → `RobotGeometryChecker` / `RobotCollisionShape`；规划、实际机器人检查与图像过滤 |
-| `contact-bindings.json` | 机器人材料、任务接触区域、对象对应、活动区间、接触条件 | `ContactRule/HoldingContact`；同一文件中机器人模型、源任务定义及当前区域各保留其职责 |
+| robot-only 模型及其引用的官方机器人组件 | 已知机器人原形状、局部变换、原生逐实体配对、固定安装身份及手指机构拓扑 | `robot_validation_fixture` → `RobotGeometryChecker` / `RobotCollisionShape` 与 `tool_geometry_names`；规划、实际机器人检查、图像过滤及完整工具成员声明 |
+| `contact-bindings.json` | 必填 `contacts/source`，可选 `grasp_activations/initial_support_relations`；完整源任务特征、有限目标区域、实体身份及活动区间 | `load_contact_bindings` → `ContactRule`、原抓取条件绑定及初始支撑关系；原任务特征和当前区域分别保留 |
 | `observed-owner.json` 与所引用原始场 | 已保存实体模型、局部坐标、位姿路径与固定附着 | `load_observed_owner` 直接读取，后续技能复用相同场 |
 | `unknown-policy.json`、`fine-regions` JSON（可选） | 未知空间的明确处理策略；指定局部细化请求 | 场景构造和覆盖查询；策略允许尝试不表示该区域已观测为空 |
 | `finger-targets.json`、`execution-limits.json` | 原事件对应手指目标；设备、跟踪、停止及事件约束 | 手指曲线、候选检查和执行绑定 |
@@ -67,6 +67,8 @@
 `recorded_task_planning.save_curve` 生成 `trajectory.npz` 与同名 JSON。NPZ 保存关节名称、时间、位置、速度和进度等数组；JSON 保存分类、执行绑定、问题和场景、事件、验收与设备限制。`load_saved_trajectory` 读取二者恢复正式执行输入。`diagnostic-trajectory.*` 保存拒绝候选的诊断数据，其执行资格与正式曲线不同。
 
 `planning-report.json`、场景快照 NPZ、自过滤与分区文件记录计算结果。场景绑定中的 owner query 保存用于复现的几何及坐标；某文件以后被显式加载时，它同时成为该后续阶段的输入。来源路径和实际文件读取须分别说明。
+
+场景快照中的 `tool_geometry_names` 保存机器人适配器给出的工具成员，各 owner 的 `attachments` 保存刚性关系及释放边界。运行报告记录同一工具清单；场景查询报告中的 `internal_assembly_pair_count` 是按实际状态排除的组合体内部配对数。执行报告的 `declared_attachment_bindings` 保存原条件与实体关系的模型对应，独立于实际接触与效果记录。
 
 仿真器通过 `scene.xml`、`initial-state.npz` 或 `episode.h5` 中的积分状态恢复运行环境；控制适配器向执行器提供机器人反馈。构造环境所用的内部状态不等于规划器可读的输入。相同的 HDF5 可以同时保存机器人编码器和环境对象状态，判断以实际读取的数据列与传递对象为准。
 

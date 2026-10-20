@@ -1,6 +1,6 @@
 # 固定时钟轨迹求解与有限搜索
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。技能进度 `s` 与归一化时间 `u` 通过请求内固定的 `_ProgressMap` 联系。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。技能进度 `s` 与归一化时间 `u` 通过请求内固定的 `_ProgressMap` 联系。
 
 ## 1. 请求生命周期与资源分配
 
@@ -48,6 +48,8 @@
 
 轨迹状态先通过 cuRobo 纯运动学 FK 得到工具位姿。场景的 `DifferentiableRobotKinematics` 使用本时刻完整具名关节与名义手指坐标求各连杆位姿，`CollisionOwner.pose` 求场景实体位姿。普通时刻与确切功能锚点按物理时间排列，`PlanningProblem.residuals` 与 `OnlinePlanningScene.components` 分别产生任务和观测几何分项。`_scene_boundary_evaluate` 显式传递 `query_role`，用于记录优化或验收阶段；机器人—任务场与任务场—场在优化、验收和静态 IK 中均使用同一非穿透规则。原生机器人自身配对沿用原模型数值边界。
 
+候选硬条件的有效位来自普通网格的实际样本数与确切锚点的有效标记。两组标记拼接后，按轨迹状态使用的同一时间排序重排为 `active`；硬条件归约只保留对应的有效样本。固定容量中的填充位置仍保留其无效身份。
+
 `PlanningProblem.optimizer_preferences` 为过程位姿关系中的等式坐标和机构方向计算优化偏好；当调用阶段为 `quality` 时，还包括功能位姿与机构坐标目标中心。当前主求解使用 `feasibility` 阶段，没有额外的质量求解。普通示教参考的偏离由 `measurements` 报告，不构成该接口中的普遍路径贴合项。当前场景分项由 `scene_value` 在同次计算中进入优化和指标；其中任务场碰撞使用已确认体积交叠的分类值 1，并附同一场局部法向的刚体导数。该分类值没有米制深度含义，未决场配对仅保留诊断。功能位姿、机构坐标与支撑条件通过下节的增广拉格朗日项进入优化。原生指标记录 `metrics.costs_and_constraints.constraints` 保留硬条件张量。`select_candidate` 首次按普通与密集原生结果判断时，要求该种子的 `result.success` 成立且两套 constraints 的各项最大值均为有限数、不大于零。`convergence` 中的离散标识单独作为原生诊断保存。
 
 `optimization_constraints` 返回功能条件管理器，`query_anchor_parameters` 返回当前确切查询参数，`add_collision_witnesses` 将密集查询发现的有限冲突时刻加入同一锚点容量。`query_diagnostics` 保存本次实际输入布局和场景查询信息。同一次计算的张量身份将候选保存依据与其产生的代价连接。
@@ -70,7 +72,7 @@
 
 ## 8. 从求解结果到候选曲线
 
-`_observed_native_result` 对给定动作执行普通与密集原生 metrics；`evaluate_reference` 验收初始动作；`optimize` 返回原生优化结果与计算诊断。`select_candidate` 优先选择已满足原始约束的种子，对剩余候选按明确残差和稳定索引排序；当代码重新计算已有候选时，仍使用同一原始观测模型和验收间距。
+`_observed_native_result` 对给定动作执行普通与密集原生 metrics；`evaluate_reference` 验收初始动作；`optimize` 返回原生优化结果与计算诊断。`select_candidate` 优先选择已满足原始约束的种子，对剩余候选按明确残差和稳定索引排序；当代码重新计算已有候选时，仍使用同一原始观测模型和非穿透规则。
 
 `_native_curve` 从原生位置、速度和原始时钟导出 `JointTrajectory`。`evaluate_candidate` 联合相同多项式的任务、场景与物理域证据；`export` 调用该验收入口并返回曲线与本次新增查询数量。已完成的原生验收报告可直接复用，以其曲线和时钟身份维持证据对应。随后，`plan_trajectory` 内的 `qualify_candidate` 调用 `execution_binding.bind_candidate`，把曲线、问题、场景和已完成验收连接为正式结果，并附加运动块与累计工作记录。完整验收与执行契约见[下一章](05-acceptance-and-execution.md)。
 

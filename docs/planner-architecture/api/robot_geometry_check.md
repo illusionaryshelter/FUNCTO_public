@@ -1,6 +1,6 @@
 # 已知机器人实体与原生距离
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
+代码基线：`f04a478e7dff67b61f9b6c2d98d408fa9d64a0c2`。
 
 `RobotGeometryChecker` 使用 Pinocchio 解释具名关节树，使用 Coal 查询显式注册的凸实体、盒体和圆柱。输入模型是同一机器人跨任务复用的本体模型。实体形状不依赖当前相机可见范围。坐标变换 `T_A_B` 将 B 中的点映到 A，长度以米计。
 

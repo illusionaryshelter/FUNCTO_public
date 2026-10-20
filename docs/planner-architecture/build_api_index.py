@@ -17,13 +17,13 @@ CHAPTERS = {
  '03': '03-attachment-contact-and-hand.md', '04': '04-solver-and-search.md',
  '05': '05-acceptance-and-execution.md',
 }
-# These modules describe retired task-field conversion paths. Known robot
-# geometry adapters remain part of the current component call graph.
+# These modules describe retired task-field conversion and contact bindings.
+# Known robot geometry adapters remain part of the current component call graph.
 RETIRED = {
  'tsdf_geometry', 'online_observed_geometry', 'tsdf_spatial_query',
  'scene_surface_batch', 'native_voxel_sources', 'voxel_layers', 'mapper_surface',
  'online_contact', 'contact_geometry', 'native_owner_geometry',
- 'prismatic_self_collision', 'collision_path',
+ 'prismatic_self_collision', 'collision_path', 'holding_contact',
  'robot_coverage', 'geometry_motion_bound', 'online_native_confirmation',
  'adapter-prepare_recorded_task', 'adapter-recorded_owner_geometry',
  'adapter-recorded_observation', 'adapter-robot_coverage_fixture',

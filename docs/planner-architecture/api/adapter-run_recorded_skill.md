@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
@@ -806,9 +806,10 @@ device
 hand
 hand_report
 report['gripper']
+tool_members
+report['tool_geometry_names']
 contacts
 initial_support_relations
-holding_contacts
 report['contact_binding']
 contact_inputs
 row
@@ -925,13 +926,12 @@ torch.cuda.reset_peak_memory_stats
 torch.get_num_threads
 DeviceCfg
 position_controlled_hand
+tool_geometry_names
 load_contact_bindings
 ContactRule
 any
 row.get
 bind_grasp_contact_rules
-bind_holding_contacts
-asdict
 frame['T_output_owner'].tolist
 supplied_masks[identity, view['id']].resolve
 owner_frames.items

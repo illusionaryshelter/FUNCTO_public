@@ -965,8 +965,6 @@ class TrajectoryExecutor:
         # These records are part of the already validated formal scene/problem;
         # neither a task name nor a close command invents a target or a pair.
         contact_bindings = {}
-        if binding["scene"].get("robot_owner_permissions"):
-            raise ValueError("Online execution requires finite material rules, not robot-owner pair exemptions")
         # BEGIN finite material gates share the frozen problem/scene binding.
         from .planning_scene import grasp_contact_rule_ids, validate_grasp_contact_arrival
         finite_conditions = [row for row in binding["problem"].get("conditions", ())
@@ -981,25 +979,11 @@ class TrajectoryExecutor:
         # simulator truth, Holding predicate or observation clock is needed.
         holding_bindings = {}
         start_progress = float(trajectory.sample(0.)[3])
-        # BEGIN retain the accepted attachment and finite-rule identity contract.
-        # BEGIN current Holding has its own material binding, separate from grasp goals.
-        holding_rows = binding['scene'].get('holding_contacts', ())
-        from .holding_contact import HoldingContact
-        for row in holding_rows:
-            HoldingContact(**row)
-        rules_by_id = {row['rule_id']: row for row in holding_rows}
-        if len(rules_by_id) != len(holding_rows):
-            raise ValueError('Holding contacts require unique current material identities')
-        # END no former grasp patch, gap or normal is re-evaluated at this boundary.
+        # BEGIN the accepted attachment owns the complete tool/payload assembly.
         for condition in binding["problem"].get("conditions", ()):
-            if condition.get("kind") != "declared_attachment" or "contact_rule_ids" not in condition:
+            if condition.get("kind") != "declared_attachment":
                 continue
             condition_id = condition["condition_id"]
-            rule_ids = condition["contact_rule_ids"]
-            if (not isinstance(rule_ids, (list, tuple)) or not rule_ids
-                    or any(not isinstance(identity, str) or not identity for identity in rule_ids)
-                    or len(set(rule_ids)) != len(rule_ids)):
-                raise ValueError("Current Holding needs unique explicit material contact IDs")
             owners = [row for row in binding["scene"].get("owners", ())
                       if row.get("owner_id") == condition["carrier_id"]]
             relations = [row for owner in owners for row in owner.get("attachments", ())
@@ -1010,28 +994,19 @@ class TrajectoryExecutor:
             lower, upper = map(float, relation["interval"])
             if (condition.get("progress") != lower or not lower <= start_progress <= upper
                     or (start_progress == upper and relation["release_condition_id"] is not None)):
-                raise ValueError("Holding permission must bind the active declared attachment interval")
+                raise ValueError("The declared attachment must cover the current trajectory start")
             expected = np.linalg.inv(_pose_array(condition.get("T_carrier_eef"), "declared attachment transform"))
             actual = np.eye(4)
             actual[:3, 3] = relation["position_tool_owner"]
             actual[:3, :3] = Rotation.from_quat(np.asarray(relation["quaternion_tool_owner"])[[1, 2, 3, 0]]).as_matrix()
             if not np.allclose(actual, expected, atol=1e-7, rtol=0):
-                raise ValueError("Holding permission and bound attachment transform disagree")
-            for identity in rule_ids:
-                rule = rules_by_id.get(identity)
-                if (rule is None or rule['condition_id'] != condition_id or rule["target_owner"] != condition["carrier_id"]
-                        or tuple(rule["interval"]) != tuple(relation["interval"])
-                        or identity in finite_permission_ids):
-                    raise ValueError("Holding must identify current robot materials on the same attached owner and interval")
-                finite_permission_ids.add(identity)
-                holding_bindings[identity] = {"rule_id": identity, "condition_id": condition_id,
-                    "target_owner": condition["carrier_id"], "interval": [lower, upper],
-                    "release_condition_id": relation["release_condition_id"],
-                    "source": deepcopy(condition["source"])}
-        # BEGIN unused or relabelled current materials cannot silently acquire Holding.
-        if set(holding_bindings) != set(rules_by_id):
-            raise ValueError('Each Holding material must belong to the accepted current attachment')
-        # END no previous execution latch, proximity or command proves Holding.
+                raise ValueError("Declared and bound attachment transforms disagree")
+            holding_bindings[condition_id] = {"condition_id": condition_id,
+                "target_owner": condition["carrier_id"], "interval": [lower, upper],
+                "release_condition_id": relation["release_condition_id"],
+                "tool_geometry_names": list(binding["scene"]["tool_geometry_names"]),
+                "source": deepcopy(condition["source"])}
+        # END contact materials and close commands do not define assembly membership.
         # END these model records are not feedback, effects or completed goals.
         for condition in binding["problem"].get("conditions", ()):
             if condition.get("kind") != "grasp_contact_activation":

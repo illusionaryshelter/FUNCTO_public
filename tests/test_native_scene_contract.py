@@ -33,7 +33,7 @@ def make_scene(tmp_path, *, gap=.001, fixed=(), occupied_background=False, polic
     space = ObservedSpace(np.zeros((2, 2, 2), bool), origin=[0, 0, 0], voxel_size=.01,
         observation_ids=("view",), reference_frame="world")
     scene = OnlinePlanningScene(background=background, owners=(), coverage=space,
-        reference_frame="world", robot_model=checker, fixed_geometry_names=fixed,
+        reference_frame="world", robot_model=checker, fixed_geometry_names=fixed, tool_geometry_names=(),
         has_gripper=False, unknown_policy={"conditional_regions": [], "outside_regions": "forbid"})
     pair = PairQuery("first", "second", policy, "source native pair")
     scene.robot_pairs = (pair,)

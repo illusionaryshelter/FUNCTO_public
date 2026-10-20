@@ -1,6 +1,6 @@
 # `manipulation/initial_support.py` 实现契约
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
+代码基线：`f04a478e7dff67b61f9b6c2d98d408fa9d64a0c2`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `InitialSupportRelation`

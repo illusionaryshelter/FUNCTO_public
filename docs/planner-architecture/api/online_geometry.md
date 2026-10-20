@@ -1,22 +1,22 @@
 # 已知机器人与观测任务场景
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。
 
-`OnlinePlanningScene` 的构造输入为 `background`、`owners`、`coverage`、`reference_frame`、共享 `robot_model` 和明确 `fixed_geometry_names`，以及接触、附着、手指、初始支撑和未知空间策略。background/owner 保留原观测场；robot_model 是与验证器相同的 `RobotGeometryChecker`。固定角色来自模型清单。
+`OnlinePlanningScene` 的构造输入为 `background`、`owners`、`coverage`、`reference_frame`、共享 `robot_model`、明确 `fixed_geometry_names` 和必填 `tool_geometry_names`，以及有限接触、带附着的实体、手指、初始支撑和未知空间策略。background/owner 保留原观测场；robot_model 是与验证器相同的 `RobotGeometryChecker`。固定角色和完整工具成员由机器人适配器提供已注册的几何 ID。
 
 | API | 计算、前置数据及输出 |
 |---|---|
 | `bind_online_robot(*, configuration, validator, device, check_request=None)` | 绑定同一检查器、完整可微关节树、原配对和请求回调，保存 robot_configuration |
-| `components(..., joint_position, joint_names, *, trajectory_time, ..., query_role)` | 同一状态的完整 q、任务位姿、进度和手指时钟 → 硬/conditional分项及 last_query_report；query_role 只记录优化/验收阶段 |
+| `components(..., joint_position, joint_names, *, trajectory_time, ..., query_role)` | 同一状态的完整 q、任务位姿、实际进度和手指时钟 → 硬/conditional分项及 last_query_report；其中保存内部配对样本数，query_role 只记录优化/验收阶段 |
 | `evaluate(*args, **kwargs)` | 聚合非 conditional 分项；可把原分项写入 components_out |
 | `clone_for_rollout()` | 共享原场和原模型，复制关系/手指的候选状态 |
 | `with_release_history(position, quaternion, progress)` | 固定已选搜索前缀中的确切释放 FK；返回候选场景 |
-| `validate_problem(problem, *, goal_identities=None)` | 核对原任务、附着/释放条件、接触激活及命令身份 |
+| `validate_problem(problem, *, goal_identities=None)` | 核对原任务、附着/释放条件、附着固定变换、接触激活及命令身份 |
 | `optimizer_preferences(progress, joint_position, joint_names)` | 位置跟踪指令的优化偏好 |
 | `project_residual(progress, joint_position, joint_names)` | 手指驱动中独立于已给耦合方程的等式，供 OMPL 投影 |
 | `estimated_workspace_allocation(batch, horizon)` | 原场和原生查询共享字节、逐状态临时字节 → 资源准入 |
-| `describe()` | 原模型身份、固定实体、`collision_rule='nonpenetration'` 和未知策略 |
-| `to_execution_binding()` / `binding_record()` | `native_robot_observed_scene_v1`：原机器人几何、基座/标定、完整配对、纯运动学配置、原任务场、接触/关系、手指和自由格 |
+| `describe()` | 原模型身份、固定实体、`tool_geometry_names`、`collision_rule='nonpenetration'` 和未知策略 |
+| `to_execution_binding()` / `binding_record()` | `native_robot_observed_scene_v1`：原机器人几何、基座/标定、完整配对、工具成员、纯运动学配置、原任务场、有限接触/附着关系、手指和自由格 |
 
 `components` 使用完整 FK 乘实体固定局部变换。必检机器人自身对直接消费 checker 的原生 relation：分离通过，穿透产生原距离残差，数值边界进入独立的 `unresolved/robot/self` 硬分项。机械许可及排除对保留原策略。
 
@@ -24,6 +24,8 @@
 
 固定安装体与运动 owner 进行同一非穿透查询；活动机器人与固定安装体由原生配对覆盖。机器人基座连杆即使 FK 恒定仍保留原机器人身份。机器人图像覆盖不形成拒绝分项；运动 owner 继续按显式策略查询已测自由空间。
 
-机器人材料使用确切 geom ID。`_permission` 把原有限特征和目标 patch、任务间隙、法向、区间转为点对许可；HoldingContact 在原附着区间把指定材料实体与 owner 作为内部对。其他原机器人实体继续接受非穿透查询。零距离不单独构成体积交叠证据；任务要求的有限区域表面接触由独立查询判断。
+`Attachment.active(progress)` 同时供实体运动与组合体配对使用。有释放声明时活动区间左闭右开；没有释放声明时，自起点持续附着并包含规划窗口终点。场景在几何调用前排除工具成员与当前附着 owner，以及同一 TCP 上共同附着的 owner 之间的内部对，按状态样本记录 `internal_assembly_pair_count`。成员保留原形状和原场，继续检查背景、其他 owner 及其余机器人部件。上述判定读取实际 `progress`，不读取有限接触的 `contact_permission_progress`。
+
+有限任务特征中的机器人材料使用确切 geom ID。`_permission` 把原特征和目标 patch、任务间隙、法向、区间转为点对许可；它与组合体成员定义分别计算。零距离不单独构成体积交叠证据；任务要求的有限区域表面接触由独立查询判断。
 
 `_release_pose` 获取原释放锚点，`_owner_poses` 取得同一候选的 owner 位姿并记录缺失释放；`_matrices` 保存可微位姿的同值矩阵给数值查询，`_plain` 序列化已完成记录。释放后的原场保持该候选释放位姿。几何分类、优化导数和执行反馈检查各自保留职责。

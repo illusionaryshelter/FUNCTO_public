@@ -7,6 +7,9 @@ frame. ContactRule retains task features in their declared coordinates.
 
 # BEGIN observed entity data replace sphere and completed-body interfaces.
 from __future__ import annotations
+# BEGIN task provenance uses the standard mapping interface.
+from collections.abc import Mapping
+# END retain the existing finite-contact provenance check.
 from copy import deepcopy
 from dataclasses import dataclass
 import math
@@ -111,6 +114,14 @@ class Attachment:
         if self.release_condition_id is not None:
             _text(self.release_condition_id, "release verification condition ID")
 
+    # BEGIN motion and collision membership share one attachment lifetime.
+    def active(self, progress):
+        """Return membership in the tool assembly at the supplied progress."""
+        if self.release_condition_id is None:
+            return progress >= self.interval[0]
+        return (progress >= self.interval[0]) & (progress < self.interval[1])
+    # END a window boundary alone does not release the attached entity.
+
 
 @dataclass
 class CollisionOwner:
@@ -153,12 +164,12 @@ class CollisionOwner:
             held_q = quaternion_multiply(quaternion, _tensor(relation.quaternion_tool_owner, quaternion))
             # BEGIN a window endpoint is not a physical release.
             if relation.release_condition_id is None:
-                held = progress >= relation.interval[0]
+                held = relation.active(progress)
                 predicted_p = torch.where(held[..., None], held_p, predicted_p)
                 predicted_q = torch.where(held[..., None], held_q, predicted_q)
                 continue
             # END continued Holding follows each current FK, including plateaus.
-            held = (progress >= relation.interval[0]) & (progress < relation.interval[1])
+            held = relation.active(progress)
             released = progress >= relation.interval[1]
             predicted_p = torch.where(released[..., None], release[0],
                                       torch.where(held[..., None], held_p, predicted_p))

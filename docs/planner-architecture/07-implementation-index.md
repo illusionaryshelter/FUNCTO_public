@@ -1,8 +1,8 @@
 # 当前实现接口索引
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。组件职责、输入输出、坐标和调用关系见[API契约](06-api-contracts.md)。各链接包含当前组件契约或从源码读取的符号签名；定义数按Python语法树统计。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。组件职责、输入输出、坐标和调用关系见[API契约](06-api-contracts.md)。各链接包含当前组件契约或从源码读取的符号签名；定义数按Python语法树统计。
 
-覆盖 54 个Python文件、924 个定义。C++混合几何计算见[原生区间接口](api/coal-native-interval.md)。
+覆盖 53 个Python文件、923 个定义。C++混合几何计算见[原生区间接口](api/coal-native-interval.md)。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -22,11 +22,10 @@
 | [manipulation/planning_observation.py](api/planning_observation.md) | 14 | [02](02-observation-and-collision.md) |
 | [manipulation/robot_self_filter.py](api/robot_self_filter.md) | 6 | [02](02-observation-and-collision.md) |
 | [manipulation/online_geometry.py](api/online_geometry.md) | 18 | [02](02-observation-and-collision.md) |
-| [manipulation/planning_scene.py](api/planning_scene.md) | 25 | [02](02-observation-and-collision.md) |
+| [manipulation/planning_scene.py](api/planning_scene.md) | 26 | [02](02-observation-and-collision.md) |
 | [manipulation/collision_records.py](api/collision_records.md) | 4 | [02](02-observation-and-collision.md) |
 | [manipulation/observations.py](api/observations.md) | 16 | [02](02-observation-and-collision.md) |
 | [manipulation/contact_binding.py](api/contact_binding.md) | 2 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/holding_contact.py](api/holding_contact.md) | 4 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/initial_support.py](api/initial_support.md) | 9 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_state.py](api/gripper_state.md) | 3 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_trajectory.py](api/gripper_trajectory.md) | 29 | [03](03-attachment-contact-and-hand.md) |
@@ -59,4 +58,4 @@
 | [manipulation/native_field_distance.py](api/native_field_distance.md) | 7 | [02](02-observation-and-collision.md) |
 | [manipulation/tool_geometry.py](api/tool_geometry.md) | 11 | [02](02-observation-and-collision.md) |
 | [tests/planning/robot_fixture.py](api/adapter-robot_fixture.md) | 31 | [02](02-observation-and-collision.md) |
-| [tests/planning/robot_validation_fixture.py](api/adapter-robot_validation_fixture.md) | 4 | [02](02-observation-and-collision.md) |
+| [tests/planning/robot_validation_fixture.py](api/adapter-robot_validation_fixture.md) | 6 | [02](02-observation-and-collision.md) |

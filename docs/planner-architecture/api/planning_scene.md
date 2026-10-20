@@ -1,11 +1,11 @@
 # `manipulation/planning_scene.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_array`
 
-[定义位置](../../../manipulation/planning_scene.py#L19)。
+[定义位置](../../../manipulation/planning_scene.py#L22)。
 
 输入签名：
 
@@ -47,7 +47,7 @@ result.copy
 
 ## `_text`
 
-[定义位置](../../../manipulation/planning_scene.py#L26)。
+[定义位置](../../../manipulation/planning_scene.py#L29)。
 
 输入签名：
 
@@ -81,7 +81,7 @@ ValueError
 
 ## `_tensor`
 
-[定义位置](../../../manipulation/planning_scene.py#L32)。
+[定义位置](../../../manipulation/planning_scene.py#L35)。
 
 输入签名：
 
@@ -111,7 +111,7 @@ constant_tensor
 
 ## `_interval`
 
-[定义位置](../../../manipulation/planning_scene.py#L37)。
+[定义位置](../../../manipulation/planning_scene.py#L40)。
 
 输入签名：
 
@@ -139,7 +139,7 @@ def _interval(progress, interval):
 
 ## `_valid_interval`
 
-[定义位置](../../../manipulation/planning_scene.py#L41)。
+[定义位置](../../../manipulation/planning_scene.py#L44)。
 
 输入签名：
 
@@ -173,7 +173,7 @@ tuple
 
 ## `_world_points`
 
-[定义位置](../../../manipulation/planning_scene.py#L48)。
+[定义位置](../../../manipulation/planning_scene.py#L51)。
 
 输入签名：
 
@@ -208,7 +208,7 @@ position.unsqueeze
 
 ## `ObservedSpace`
 
-[定义位置](../../../manipulation/planning_scene.py#L53)。
+[定义位置](../../../manipulation/planning_scene.py#L56)。
 
 ```python
 class ObservedSpace():
@@ -221,14 +221,14 @@ class ObservedSpace():
 实现说明：
 
 > Immutable union of cells certified free by calibrated depth rays.
-> 
+>
 > ``known[z,y,x]`` identifies the closed voxel centred at ``origin + h*[x,y,z]``.
 > This evidence is queried for moving scene entities. The robot view policy
 > is recorded separately by OnlinePlanningScene.
 
 ## `ObservedSpace.__init__`
 
-[定义位置](../../../manipulation/planning_scene.py#L60)。
+[定义位置](../../../manipulation/planning_scene.py#L63)。
 
 输入签名：
 
@@ -285,7 +285,7 @@ mask.copy
 
 ## `ObservedSpace.known_free`
 
-[定义位置](../../../manipulation/planning_scene.py#L76)。
+[定义位置](../../../manipulation/planning_scene.py#L79)。
 
 输入签名：
 
@@ -322,7 +322,7 @@ self._known.copy
 
 ## `ObservedSpace.clone_for_rollout`
 
-[定义位置](../../../manipulation/planning_scene.py#L81)。
+[定义位置](../../../manipulation/planning_scene.py#L84)。
 
 输入签名：
 
@@ -354,7 +354,7 @@ self
 
 ## `Attachment`
 
-[定义位置](../../../manipulation/planning_scene.py#L87)。
+[定义位置](../../../manipulation/planning_scene.py#L90)。
 
 ```python
 class Attachment():
@@ -373,7 +373,7 @@ release_condition_id: str | None
 实现说明：
 
 > Conditional rigid attachment over [start,end), never a Holding claim.
-> 
+>
 > The owner's external PosePath supplies its observed pose before attachment.
 > After release the owner remains at the same rollout's actual release FK,
 > preserving the optimization variables shared with subsequent constraints.
@@ -381,7 +381,7 @@ release_condition_id: str | None
 
 ## `Attachment.__post_init__`
 
-[定义位置](../../../manipulation/planning_scene.py#L102)。
+[定义位置](../../../manipulation/planning_scene.py#L105)。
 
 输入签名：
 
@@ -425,9 +425,45 @@ ValueError
 _text
 ```
 
+## `Attachment.active`
+
+[定义位置](../../../manipulation/planning_scene.py#L118)。
+
+输入签名：
+
+```python
+def active(self, progress):
+```
+
+实现说明：
+
+> Return membership in the tool assembly at the supplied progress.
+
+显式输出分支：
+
+```python
+progress >= self.interval[0]
+(progress >= self.interval[0]) & (progress < self.interval[1])
+```
+
+读取的对象属性：
+
+```python
+self.release_condition_id
+self.interval
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+无显式条目。
+
 ## `CollisionOwner`
 
-[定义位置](../../../manipulation/planning_scene.py#L116)。
+[定义位置](../../../manipulation/planning_scene.py#L127)。
 
 ```python
 class CollisionOwner():
@@ -451,7 +487,7 @@ pose_interval: tuple = (0.0, 1.0)
 
 ## `CollisionOwner.__post_init__`
 
-[定义位置](../../../manipulation/planning_scene.py#L126)。
+[定义位置](../../../manipulation/planning_scene.py#L137)。
 
 输入签名：
 
@@ -506,7 +542,7 @@ isinstance
 
 ## `CollisionOwner.pose`
 
-[定义位置](../../../manipulation/planning_scene.py#L147)。
+[定义位置](../../../manipulation/planning_scene.py#L158)。
 
 输入签名：
 
@@ -528,8 +564,9 @@ self.attachments
 relation.position_tool_owner
 relation.quaternion_tool_owner
 relation.release_condition_id
-relation.interval
+relation.active
 torch.where
+relation.interval
 ```
 
 写入目标：
@@ -555,12 +592,13 @@ zip
 quaternion_rotate
 _tensor
 quaternion_multiply
+relation.active
 torch.where
 ```
 
 ## `CollisionOwner.predicted_pose`
 
-[定义位置](../../../manipulation/planning_scene.py#L170)。
+[定义位置](../../../manipulation/planning_scene.py#L181)。
 
 输入签名：
 
@@ -599,7 +637,7 @@ self.pose_path.sample
 
 ## `ContactRule`
 
-[定义位置](../../../manipulation/planning_scene.py#L178)。
+[定义位置](../../../manipulation/planning_scene.py#L189)。
 
 ```python
 class ContactRule():
@@ -634,7 +672,7 @@ robot_body: str | None = None
 实现说明：
 
 > Declared source feature and finite target patch in their entity frames.
-> 
+>
 > Task points express allowed contact geometry, not an occupied body. A
 > robot feature identifies its registered body explicitly. Owner feature
 > points are entity-local. Robot feature points use TCP coordinates at zero
@@ -644,7 +682,7 @@ robot_body: str | None = None
 
 ## `ContactRule.__post_init__`
 
-[定义位置](../../../manipulation/planning_scene.py#L210)。
+[定义位置](../../../manipulation/planning_scene.py#L221)。
 
 输入签名：
 
@@ -762,7 +800,7 @@ min
 
 ## `grasp_contact_rule_ids`
 
-[定义位置](../../../manipulation/planning_scene.py#L267)。
+[定义位置](../../../manipulation/planning_scene.py#L278)。
 
 输入签名：
 
@@ -773,7 +811,7 @@ def grasp_contact_rule_ids(condition, contacts):
 实现说明：
 
 > Validate the finite rules selected by one explicit grasp activation.
-> 
+>
 > ``contacts`` contains serialized ContactRule records. The condition names
 > their existing identities; it cannot change material geometry or enlarge
 > owner/interval scope. Ordinary material rules without a grasp activation
@@ -831,7 +869,7 @@ tuple
 
 ## `validate_grasp_contact_arrival`
 
-[定义位置](../../../manipulation/planning_scene.py#L303)。
+[定义位置](../../../manipulation/planning_scene.py#L314)。
 
 输入签名：
 
@@ -842,7 +880,7 @@ def validate_grasp_contact_arrival(condition, requirement):
 实现说明：
 
 > Require the exact owner/event provenance of the frozen arrival target.
-> 
+>
 > Equal progress and a valid collection index are insufficient: another
 > owner's pose at that instant must never authorize these material rules.
 
@@ -873,7 +911,7 @@ ValueError
 
 ## `GripperState`
 
-[定义位置](../../../manipulation/planning_scene.py#L316)。
+[定义位置](../../../manipulation/planning_scene.py#L327)。
 
 ```python
 class GripperState(NamedTuple):
@@ -891,14 +929,14 @@ uncertain: torch.Tensor
 实现说明：
 
 > Coordinates/envelope and certainty shared by every collision consumer.
-> 
+>
 > ``uncertain`` identifies unmodelled future finger positions. A zero-width
 > command reference is not evidence that this flag is false. ``half`` is the
 > mechanical interval used only for conservative conditional diagnostics.
 
 ## `PrismaticGripper`
 
-[定义位置](../../../manipulation/planning_scene.py#L329)。
+[定义位置](../../../manipulation/planning_scene.py#L340)。
 
 ```python
 class PrismaticGripper():
@@ -911,13 +949,13 @@ class PrismaticGripper():
 实现说明：
 
 > Bind native finger coordinates to a supported controller and geometry.
-> 
+>
 > Position tracking uses explicitly modeled solver coordinates. Timed
 > actuator commands and optional nominal future geometry share the bound
 > elapsed clock but remain separate objects. Binary control without a future
 > model retains its mechanical envelope only as unresolved diagnostic
 > evidence. A sampled width or command is never measured future contact.
-> 
+>
 > ``joint_bounds(progress)`` is the solver tracking contract. Independent
 > ``finger_trajectory_factory`` supplies commands;
 > ``nominal_finger_trajectory_factory(duration, progress_map, command_reference)``
@@ -931,7 +969,7 @@ class PrismaticGripper():
 
 ## `PrismaticGripper.__init__`
 
-[定义位置](../../../manipulation/planning_scene.py#L350)。
+[定义位置](../../../manipulation/planning_scene.py#L361)。
 
 输入签名：
 
@@ -1025,7 +1063,7 @@ event_occurrence_key
 
 ## `PrismaticGripper.bind_clock`
 
-[定义位置](../../../manipulation/planning_scene.py#L427)。
+[定义位置](../../../manipulation/planning_scene.py#L438)。
 
 输入签名：
 
@@ -1083,7 +1121,7 @@ nominal.sample
 
 ## `PrismaticGripper.state`
 
-[定义位置](../../../manipulation/planning_scene.py#L448)。
+[定义位置](../../../manipulation/planning_scene.py#L459)。
 
 输入签名：
 

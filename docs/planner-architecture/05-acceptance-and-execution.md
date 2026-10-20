@@ -1,6 +1,6 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
 
 ## 1. 候选的完整验收
 
@@ -9,6 +9,8 @@
 当前 `validation_joint_step` 用于 OMPL 连接检查；`validation_spatial_step_m` 虽属于 `PlanningBudget` 并校验为正数，但没有生产消费者。`geometry_motion_bound.py` 提供独立运动界计算及其单元回归，当前候选验收没有调用该模块。本次验收的几何计算范围由上述有限时间网格和确切锚点定义。
 
 候选使用同一已知机器人与观测任务实体。任务场景配对在优化与验收中使用同一非穿透规则，`query_role='acceptance'` 只标识报告的调用阶段。已确认体积交叠产生值为 1 的分类残差；场配对的未决保留为报告，不产生碰撞硬成本，也不被视为已分离。原生自身配对仍使用原结构策略与数值边界；任务接触、初始支撑及覆盖条件各自计算。所有实际非 conditional 正分项都表示相应硬条件未满足。普通与密集样本共享同一模型，验收结论限于所查询的已表示集合、记录时刻和明确条件。
+
+每个验收样本以实际进度确定附着。工具与附着实体、同一 TCP 上共同附着实体的内部配对不进入碰撞查询；各成员原几何继续完成对外配对。`internal_assembly_pair_count` 保存内部配对样本数，工具成员由快照中的 `tool_geometry_names` 明确给出。
 
 `_candidate_domain_validation` 独立检查保存曲线的入口 `q0,dq0` 及连续关节范围。`cubic_position_report` 对每个标量三次段求位置极值；速度范围来自导数极值；`cubic_derivative_report` 检查每段两端的加速度，并分别包含内部结点左右极限。`JointTrajectory.sample` 通过保存的 `CubicHermiteSpline` 返回 `q,dq,ddq,s`，在内部结点采用右段导数，在最终端点采用左极限。
 
@@ -33,6 +35,8 @@
 `RobotStateValidator.validate_planning_binding` 核对规划机器人与独立检查器的模型、关节和工具关系。`preflight` 检查执行入口、原曲线前缀和共享设备范围。`check_state` 处理实际完整关节状态、关节速度、原生机器人实体碰撞以及 FK/工具反馈一致性。`check_planning_self` 为规划阶段提供同一已知机器人模型的具名状态检查。
 
 `check_state.distances_m` 按 `describe().pair_order` 输出原实体对距离，供执行器读取与记录；最小必检间隙单独汇总。数值边界与原模型穿透分别保留。未来手指状态未建模时的条件状态，与机器人模型缺失不是同一含义。
+
+执行入口将任务中的每个 `declared_attachment` 与场景中对应实体的 `Attachment` 对照，核对条件身份、当前轨迹入口所处区间及固定变换。`declared_attachment_bindings` 记录这些已接受的模型关系，并保存 `tool_geometry_names`、释放身份和原来源。有限任务接触继续按原 `grasp_contact_activation` 与 close 事件绑定；附着模型记录与任务接触特征分别保留。
 
 ## 4. 控制时钟与每步操作
 
@@ -75,4 +79,4 @@
 
 状态说明所完成计算的结论。结果消费者通过具体残差、输入来源及失败阶段决定下一项研究或操作。场景支持范围、未知区域、接触表示范围和实体相交各有独立分项，详见[观测与碰撞](02-observation-and-collision.md)。
 
-场景快照类型为 `native_robot_observed_scene_v1`，保存原始任务场、位姿路径、附着、原生机器人模型及其标定/配对/运动学、接触、支撑与自由格。单个任务场由 `FrozenObservedField.from_record` 恢复；场景快照用于输入保存与身份检查。
+场景快照类型为 `native_robot_observed_scene_v1`，保存原始任务场、位姿路径、附着、工具成员、原生机器人模型及其标定/配对/运动学、有限任务接触、支撑与自由格。单个任务场由 `FrozenObservedField.from_record` 恢复；场景快照用于输入保存与身份检查。

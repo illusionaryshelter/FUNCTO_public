@@ -1,6 +1,6 @@
 # 当前规划器验证与故障分析
 
-本文件引用代码基线 `bc79a78071e464c35ed9839d62595f735ad85465`，说明如何解释当前实现的诊断和组织必要验证。组件职责由 [PLANNER_ARCHITECTURE.md](PLANNER_ARCHITECTURE.md)定义，运行契约见[当前运动规划器运行契约](motion_planner_prd.md)。历史实验耗时、阶段方案和未实施事项应保留在工作区的阶段文档中，不作为本文件的当前实现结论。
+本文件引用代码基线 `ATTACHED_TOOL_CODE_COMMIT`，说明如何解释当前实现的诊断和组织必要验证。组件职责由 [PLANNER_ARCHITECTURE.md](PLANNER_ARCHITECTURE.md)定义，运行契约见[当前运动规划器运行契约](motion_planner_prd.md)。实验耗时和阶段方案保存在工作区的阶段文档中。
 
 ## 从输入到结果核对同一请求
 
@@ -12,21 +12,21 @@
 
 ## 区分几何冲突与表示缺口
 
-当前场景同时计算碰撞候选、接触条件、未知空间策略和数值支持范围。这些量在 `OnlinePlanningScene.components` 中分别命名，诊断时应保留原分项及其出现时刻，不把 `process_scene` 的聚合失败一概解释为碰撞。
+当前场景分别计算原生机器人自身配对、任务场非穿透、有限接触、初始支撑和未知空间覆盖。诊断保留 `OnlinePlanningScene.components` 的原分项及其出现时刻，`process_scene` 是这些条件的聚合结果。
 
 | 已有证据 | 可得结论及后续分析对象 |
 |---|---|
-| 正球代理项，尚无适用实体复核 | 该状态存在候选冲突；检查作用方、目标、球所属实体和源模型，不能宣布实体确定相交 |
-| 实体复核 `collision` | 同一状态下，登记实体与已查询源组件的距离低于数值边界；保留实体身份、源组件和见证 |
-| 实体复核 `unresolved` | 距离处于数值边界或结果非有限；不能将其改记为 clear 或确定穿透 |
-| 实体复核 `clear` | 只清除实际检查的对应碰撞项；不清除接触、未知空间、数值查询域或其他失败 |
+| 任务场配对 `intersection` | 原模型中存在共同占据的开邻域；保留原实体、支持单元及区间见证 |
+| 任务场配对 `unresolved` | 尚有域在当前精度或许可边界下未判定；仅记录，不产生碰撞正残差，也不记为 clear |
+| 任务场配对 `clear` | 已表示的未许可查询域完成排除；任务接触、支撑及未知空间条件独立计算 |
+| 原生自身 `penetrating/numerical_boundary` | 分别表示原生实体穿透与查询数值边界；由机器人自身的独立碰撞或未决分项处理 |
+| `internal_assembly_pair_count` | 工具与当前附着实体、共同附着实体之间排除的配对样本数；检查工具成员及实际附着进度 |
 | `contact/...` | 当前材料、有限区域、法向、间隙或必需接触条件不满足；检查同一规则输入和活动区间 |
 | `unknown/forbidden/...` | 几何进入当前策略禁止的未知覆盖；不是观察到碰撞 |
 | `conditional/...` | 保留允许尝试区域或条件手指几何的不确定性；通过不构成已观察自由空间 |
-| `scene_update/...` | 对已有源几何可能发生的查询超出当前数值支持；不能把零填充值当成测得间距 |
-| `unsupported/...` | 当前输入表示或消费者能力不足；检查具体缺失，不据此推断所有路径均不可行 |
+| `initial_support/...` 或 `unresolved/initial_support/...` | 分别表示已确认的相对入口支撑下降违反量，或当前高度关系尚未判定 |
 
-对于 RGB-D 模型，核对实际参与融合的图像分区、米制深度、相机标定、自过滤和对象坐标。生产准备已构造 TSDF 源组件，保守场由这些组件的包围盒覆盖生成。复核时应查询同一源组件，不能把候选场中的负数重新解释为实心占据或物理穿透深度。详细字段与判断权限见[观测与碰撞组件](docs/planner-architecture/02-observation-and-collision.md)。
+对于 RGB-D 模型，核对原实体 mask、背景候选与实际积分分区、米制深度、采集标定、自过滤和实体坐标。场查询直接消费原始 TSDF、观测支持及三线性单元，空间框只用于安排计算。见证中点是显示位置，体积交叠结论来自保留数值误差的原表示查询；分类残差不等于米制穿透深度。详细字段与判断权限见[观测与碰撞组件](docs/planner-architecture/02-observation-and-collision.md)。
 
 `unknown_policy` 的三种区域外策略具有不同结果。`require_observation` 隔离出的缺观察失败可直接请求新观察，`forbid` 仍可在原预算内寻找绕行，`allow_attempt` 保留条件未知记录。任何策略都不改写已存几何、接触许可或原观测自由证据。
 
@@ -56,11 +56,11 @@
 |---|---|
 | 任务表达、事件与原时间 | [test_manipulation_planning_problem.py](tests/test_manipulation_planning_problem.py)、[test_planning_time_requirements.py](tests/test_planning_time_requirements.py) |
 | 物理关节域、局部 QP 与原生优化适配 | [test_physical_joint_domain.py](tests/test_physical_joint_domain.py)、[test_physical_joint_qp.py](tests/test_physical_joint_qp.py)、[test_curobo_solver_components.py](tests/test_curobo_solver_components.py) |
-| TSDF 源表示、原生确认和未知策略 | [test_tsdf_geometry.py](tests/test_tsdf_geometry.py)、[test_online_native_confirmation.py](tests/test_online_native_confirmation.py)、[test_online_unknown_policy.py](tests/test_online_unknown_policy.py) |
-| 有限接触、持物与手指几何 | [test_online_contact.py](tests/test_online_contact.py)、[test_holding_contact.py](tests/test_holding_contact.py)、[test_gripper_trajectory.py](tests/test_gripper_trajectory.py) |
+| 原始观测场、原生实体与覆盖 | [test_implicit_distance.py](tests/test_implicit_distance.py)、[test_native_field_distance.py](tests/test_native_field_distance.py)、[test_observed_contact_coverage.py](tests/test_observed_contact_coverage.py) |
+| 附着组合体、任务特征与手指几何 | [test_attached_tool_collision.py](tests/test_attached_tool_collision.py)、[test_grasp_region.py](tests/test_grasp_region.py)、[test_gripper_trajectory.py](tests/test_gripper_trajectory.py) |
 | 候选、绑定与累计预算 | [test_planning_binding.py](tests/test_planning_binding.py)、[test_planning_request_budget.py](tests/test_planning_request_budget.py)、[test_recorded_task_planning.py](tests/test_recorded_task_planning.py) |
 | 声明附着和执行职责 | [test_declared_attachment_execution.py](tests/test_declared_attachment_execution.py)、[test_execution_responsibilities.py](tests/test_execution_responsibilities.py)、[test_execution_wallclock.py](tests/test_execution_wallclock.py) |
 
-`build_audit_scene_from_rgbd`、`RobotGeometryChecker.query_scene` 和 `tests/planning` 的专用审计脚本保留独立入口。人工调用它们可以检查模型差异、覆盖与具体失败；生产失败不自动启动一套独立全场审计。生产模型已存在的有限源组件确认仍属于正常候选判断，不能与独立审计混为一谈。
+`OnlinePlanningScene.last_query_report` 保存当前原模型的分类、实体身份与有限见证；`RobotGeometryChecker.query` 提供机器人原生配对证据。独立事后审计消费保存的输入及结果解释具体失败，其仿真真值不回流规划或控制。
 
 验证沿用现有 `recovery` 环境和 `PYTHONNOUSERSITE=1`。GPU 规划、感知与仿真应显式运行，遵守资源上限并串行安排；文档更新本身不需要重新启动这些实验。实验结果应交付可直接打开的本地 HTML，优先展示真实仿真图像中的源示教区域、迁移目标区域与采样点，并保留失败、警告和缺失状态。Markdown 与原始数组作为补充，指标图表不能代替迁移区域可视化。

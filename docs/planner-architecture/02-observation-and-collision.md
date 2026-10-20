@@ -1,10 +1,12 @@
 # 观测与碰撞模型
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。
 
 ## 1. 两种实体来源
 
 `build_scene_from_rgbd` 把新观测与已有模型组成一个 `OnlinePlanningScene`。`owner_frames` 仅包含本次按 RGB-D 建立的实体，给出局部坐标和来源；`observed_owners` 提供已有 `CollisionOwner`，保留其场对象、原样本、分辨率、观测支持及声明运动。同一身份选择一种来源。任务对象身份在两组实体的并集中解析。
+
+构造器必填的 `robot_model` 是与机器人验证器共享的已知模型检查器，`fixed_geometry_names` 声明固定安装体，`tool_geometry_names` 声明附着所使用的完整工具组件。后两者均为该检查器中已注册的几何实体 ID；其来源是机器人适配器提供的模型身份和机构拓扑。
 
 新观测视图包含 `image:uint8[H,W,3]`、相机 z 向米制 `depth`、零斜切内参 `K`、`T_output_camera`、参考坐标、各新实体的布尔 `owner_masks` 和机器人过滤结果。`_partition_masks` 只验证新建实体的像素分区。已保存实体不进入可见深度计数。
 
@@ -56,6 +58,8 @@
 
 `OnlinePlanningScene.components` 计算原生机器人自身、机器人与观测场、运动实体与背景、实体之间的配对。任务场景配对在优化与验收中使用同一非穿透规则，`query_role` 只记录调用者属于哪个阶段。`describe` 和查询报告以 `collision_rule='nonpenetration'` 说明规则。`last_query_report` 保留分类计数和有限见证；场配对的未决只进入该报告，不生成硬成本。`evaluate` 聚合实际硬分项，conditional 分项作为报告保留。原生自身的 `numerical_boundary` 仍属于独立硬分项；任务接触、初始支撑高度与未知空间覆盖的条件没有并入场配对的未决规则。
 
+在每个实际进度样本，场景先以 `Attachment.active(progress)` 确定当前附着实体，再从任务场配对中排除两类内部对：`tool_geometry_names` 中任一工具实体与当前附着实体，以及同一 TCP 上两个当前附着实体。内部对不调用几何查询，`internal_assembly_pair_count` 记录排除的配对样本数。所有成员保留自己的原形状、位姿和观测支持，继续参与对背景、组合体外实体和其余机器人部件的查询。机器人自身仍由原生配对策略处理。有限接触的 `contact_permission_progress` 仅决定任务许可，不改变附着生效时刻。
+
 `fixed_geometry_names` 明确声明安装体身份。安装体与运动 owner 进行同一非穿透查询；活动机器人与安装体由原生配对检查。安装体与静态背景/静态 owner 不增加运动配对。机器人首连杆即使 FK 恒定仍保留其机器人角色。机器人图像覆盖不形成拒绝分项，报告为 `not_queried`；运动 owner 继续使用显式未知空间策略。
 
 ## 5. 自由空间与移动实体覆盖
@@ -68,4 +72,4 @@
 
 `build_scene_from_rgbd → integrate_entity → freeze_mapper` 建立本次新任务场；已有场直接进入 `OnlinePlanningScene`。已知机器人由 `RobotGeometryChecker` 注册，规划器绑定完整 FK 后，在 IK、轨迹求解及验收中调用同一场景。
 
-`to_execution_binding` 输出 `native_robot_observed_scene_v1`，保存机器人原形状、基座、标定、完整配对、固定角色和运动学配置，同时保存任务场样本、运动关系、接触与自由格。任务单场通过 `FrozenObservedField.from_record` 恢复；场景快照用于输入来源和身份交接，执行曲线恢复不等于重新构造可查询场景。
+`to_execution_binding` 输出 `native_robot_observed_scene_v1`，保存机器人原形状、基座、标定、完整配对、固定角色、`tool_geometry_names` 和运动学配置，同时保存任务场样本、运动关系、有限任务接触与自由格。任务单场通过 `FrozenObservedField.from_record` 恢复；场景快照用于输入来源和身份交接，执行曲线恢复不等于重新构造可查询场景。

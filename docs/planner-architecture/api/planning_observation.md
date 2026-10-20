@@ -1,6 +1,6 @@
 # `manipulation/planning_observation.py` 实现契约
 
-代码基线：`b32dfbe5108be41ddb2d866c5813e6ff391e2918`。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_views`
@@ -963,7 +963,7 @@ require_device_memory
 输入签名：
 
 ```python
-def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, task_owner_ids, reference_frame, robot_model, fixed_geometry_names, contacts=(), gripper=None, has_gripper=True, unknown_policy, max_mapping_bytes, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES, max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES, fine_regions=None, observed_owners=(), background=None, coverage=None, initial_support_relations=(), holding_contacts=()):
+def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, task_owner_ids, reference_frame, robot_model, fixed_geometry_names, tool_geometry_names, contacts=(), gripper=None, has_gripper=True, unknown_policy, max_mapping_bytes, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES, max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES, fine_regions=None, observed_owners=(), background=None, coverage=None, initial_support_relations=()):
 ```
 
 实现说明：

@@ -25,7 +25,6 @@ from .planning_problem import PosePath, quaternion_rotate, quaternion_conjugate,
 from .planning_scene import (Attachment, CollisionOwner, ContactRule, ObservedSpace,
                              PrismaticGripper, _tensor, _interval, _world_points)
 from .optimizer_device_checks import constant_tensor
-from .holding_contact import HoldingContact, validate_holding_conditions
 
 
 def _plain(value):
@@ -60,8 +59,8 @@ class OnlinePlanningScene:
 
     # BEGIN the scene shares the approved native robot model and explicit roles.
     def __init__(self, *, background, owners, coverage, reference_frame,
-                 robot_model, fixed_geometry_names, contacts=(), gripper=None,
-                 has_gripper=True, unknown_policy, holding_contacts=(),
+                 robot_model, fixed_geometry_names, tool_geometry_names, contacts=(), gripper=None,
+                 has_gripper=True, unknown_policy,
                  initial_support_relations=(), numerical_position_tolerance_m=1e-6,
                  numerical_rotation_tolerance_rad=1e-6):
         if (not isinstance(background, FrozenObservedField)
@@ -73,14 +72,18 @@ class OnlinePlanningScene:
             raise TypeError("The scene requires the same known robot checker as its validator")
         self.robot_model = robot_model
         self.fixed_geometry_names = tuple(fixed_geometry_names)
+        # BEGIN a declared tool component and its attached owners form one assembly.
+        self.tool_geometry_names = tuple(tool_geometry_names)
         robot_ids = set(robot_model.geometry_names)
         if (not set(self.fixed_geometry_names) <= robot_ids
                 or len(set(self.fixed_geometry_names)) != len(self.fixed_geometry_names)
+                or not set(self.tool_geometry_names) <= robot_ids
+                or len(set(self.tool_geometry_names)) != len(self.tool_geometry_names)
                 or len({owner.owner_id for owner in self.owners}) != len(self.owners)):
-            raise ValueError("Fixed installations and scene owners need explicit unique identities")
+            raise ValueError("Tool members, fixed installations and scene owners need registered unique identities")
         self.required_robot_links = tuple(dict.fromkeys(
             frame for frame, _, _, _ in robot_model._geometries.values()))
-        self.contacts, self.holding_contacts = tuple(contacts), tuple(holding_contacts)
+        self.contacts = tuple(contacts)
         self.gripper, self.has_gripper = gripper, has_gripper
         self.unknown_policy = deepcopy(unknown_policy)
         if (set(unknown_policy) != {"conditional_regions", "outside_regions"}
@@ -91,16 +94,14 @@ class OnlinePlanningScene:
             if lower.shape != (3,) or upper.shape != (3,) or np.any(lower >= upper):
                 raise ValueError("Unknown-space regions need finite ordered three-dimensional bounds")
         owner_ids = {owner.owner_id for owner in self.owners}
-        if len({rule.rule_id for rule in (*self.contacts, *self.holding_contacts)}) != len(self.contacts)+len(self.holding_contacts):
+        if len({rule.rule_id for rule in self.contacts}) != len(self.contacts):
             raise ValueError("Contact relation identities must be unique")
         for rule in self.contacts:
             if (rule.target_owner not in owner_ids or rule.actor not in {"robot", *owner_ids}
                     or rule.actor == rule.target_owner
                     or (rule.actor == "robot" and rule.robot_body not in robot_ids)):
                 raise ValueError("Finite features must name registered distinct entities")
-        for relation in self.holding_contacts:
-            if relation.robot_body not in robot_ids or relation.target_owner not in owner_ids:
-                raise ValueError("An internal attachment contact needs its exact registered body")
+        # END internal membership comes from Attachment, independently of contact materials.
         self.numerical_position_tolerance_m = float(numerical_position_tolerance_m)
         self.numerical_rotation_tolerance_rad = float(numerical_rotation_tolerance_rad)
         self.required_progress_anchors = tuple(sorted(
@@ -306,7 +307,6 @@ class OnlinePlanningScene:
     def validate_problem(self, problem, *, goal_identities=None):
         if problem.reference_frame != self.reference_frame:
             raise ValueError("Scene and robot must use the same calibrated reference frame")
-        validate_holding_conditions(self.holding_contacts, self.owners, problem.conditions)
         conditions = {row["condition_id"]: row for row in problem.conditions if "condition_id" in row}
         # Bind finite contact declarations to the same nominal goal and close
         # occurrence. Execution activates by command occurrence, never by an
@@ -340,6 +340,15 @@ class OnlinePlanningScene:
                         or declaration.get("kind") not in {"declared_attachment", "candidate_attachment"}
                         or declaration["progress"] != relation.interval[0]):
                     raise ValueError("Rigid relationship must preserve its declared owner and event")
+                # BEGIN the declared motion and collision owner use the same transform.
+                expected = np.linalg.inv(np.asarray(declaration["T_carrier_eef"], float))
+                actual = np.eye(4)
+                actual[:3, 3] = relation.position_tool_owner
+                actual[:3, :3] = Rotation.from_quat(
+                    relation.quaternion_tool_owner[[1, 2, 3, 0]]).as_matrix()
+                if not np.allclose(actual, expected, atol=1e-7, rtol=0):
+                    raise ValueError("Collision owner and declared attachment transform disagree")
+                # END no contact-material association is needed for assembly membership.
                 if relation.release_condition_id is not None:
                     release = conditions[relation.release_condition_id]
                     if release.get("kind") != "predicted_release" or release["progress"] != relation.interval[1]:
@@ -484,6 +493,7 @@ class OnlinePlanningScene:
         # BEGIN native self checks use the same validator pair contract.
         report = {"query_role": query_role, "collision_rule": "nonpenetration", "pair_queries": 0,
                   "status_counts": {}, "nonclear_pairs": [],
+                  "internal_assembly_pair_count": 0, "tool_geometry_names": list(self.tool_geometry_names),
                   "robot_geometry_source": "registered_native_model",
                   "robot_view_coverage_status": "not_queried",
                   "coverage_scope": "represented_observed_occupancy"}
@@ -549,6 +559,12 @@ class OnlinePlanningScene:
                 pairs.append((f"collision/{first.owner_id}/{second.owner_id}", first.owner_id, second.owner_id,
                     first.query, second.query, poses[first.owner_id], poses[second.owner_id],
                     matrices[first.owner_id], matrices[second.owner_id], first.owner_id, second.owner_id))
+        # BEGIN original members retain their geometry for all external pairs.
+        attachment_progress = progress.detach().cpu().numpy()
+        attached = {owner.owner_id: np.logical_or.reduce(
+            [relation.active(attachment_progress) for relation in owner.attachments])
+            if owner.attachments else np.zeros(attachment_progress.shape, bool)
+            for owner in self.owners}
         for component, first_id, second_id, first, second, first_pose, second_pose, fm, sm, actor, target in pairs:
             residuals = []
             rules = [rule for rule in self.contacts
@@ -564,11 +580,12 @@ class OnlinePlanningScene:
                 if uncertain_cpu[index] and (first_id in unmodelled or second_id in unmodelled):
                     residuals.append(zero)
                     continue
-                held_internal = any(row.robot_body == first_id and row.target_owner == target
-                    and row.interval[0] <= progress_cpu[index] < row.interval[1]
-                    for row in self.holding_contacts) if actor == "robot" else False
+                held_internal = (target in attached and attached[target][index]
+                    and ((actor == "robot" and first_id in self.tool_geometry_names)
+                         or (actor in attached and attached[actor][index])))
                 if held_internal:
                     residuals.append(zero)
+                    report["internal_assembly_pair_count"] += 1
                     continue
                 regions = []
                 for rule in rules:
@@ -598,6 +615,7 @@ class OnlinePlanningScene:
             # Field uncertainty remains in status_counts and nonclear_pairs.
             # Only confirmed penetration contributes a collision residual.
         # END a zero-distance unresolved domain is not a clearance violation.
+        # END assembly membership only removes internal pairs while Attachment is active.
         for model in self._initial_support_models.values():
             costs.update(model.components(poses[model.relation.actor], poses[model.relation.target_owner],
                                          progress, check_request=self.check_request))
@@ -654,6 +672,7 @@ class OnlinePlanningScene:
             "owners": [owner.owner_id for owner in self.owners],
             "robot_entities": list(self.robot_model.geometry_names),
             "fixed_geometry_names": list(self.fixed_geometry_names),
+            "tool_geometry_names": list(self.tool_geometry_names),
             "unknown_policy": deepcopy(self.unknown_policy), "robot_view_coverage_status": "not_queried",
             "collision_rule": "nonpenetration",
             "required_progress_anchors": self.required_progress_anchors,
@@ -688,7 +707,7 @@ class OnlinePlanningScene:
         return {"schema": "native_robot_observed_scene_v1", **self.describe(), "owners": owners,
             "robot_model": native, "robot_configuration": deepcopy(self.robot_configuration),
             "background": self.background.record(), "contacts": _plain([asdict(row) for row in self.contacts]),
-            "holding_contacts": _plain([asdict(row) for row in self.holding_contacts]),
+            "tool_geometry_names": list(self.tool_geometry_names),
             "grasp_contact_activations": _plain(self.grasp_contact_activations),
             "initial_support_relations": [row.record() for row in self.initial_support_relations],
             "gripper": hand_record, "has_gripper": self.has_gripper,

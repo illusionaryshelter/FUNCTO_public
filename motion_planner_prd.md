@@ -1,6 +1,6 @@
 # 当前运动规划器运行契约
 
-代码基线为 `bc79a78071e464c35ed9839d62595f735ad85465`。本文件规定当前运动组件的输入、输出及判断权限；详细架构由 [PLANNER_ARCHITECTURE.md](PLANNER_ARCHITECTURE.md) 和其组件文档维护。本文描述已经存在的接口，不作为新的求解器方案或阶段实施计划。
+代码基线为 `ATTACHED_TOOL_CODE_COMMIT`。本文件规定当前运动组件的输入、输出及判断权限；详细架构由 [PLANNER_ARCHITECTURE.md](PLANNER_ARCHITECTURE.md) 和其组件文档维护。阶段实施计划保存在工作区 `sim-version-plans`。
 
 ## 输入与任务表达
 
@@ -12,13 +12,13 @@
 
 ## 固定几何与局部接触
 
-生产场景由 `planning_observation.build_scene_from_rgbd` 生成，类型为 `online_geometry.OnlinePlanningScene`。输入相机图像、米制深度、标定、互不重叠的物体 masks 和机器人自过滤结果共同确定各物体与背景的建图分区。每个被接纳的环境端点进入指定物体或背景。背景属于本次请求的固定世界表示，不能因为求解失败而删除或重新分配端点。
+生产场景由 `planning_observation.build_scene_from_rgbd` 生成，类型为 `online_geometry.OnlinePlanningScene`。新实体的相机图像、米制深度、标定、互不重叠的 masks 和机器人自过滤结果共同确定建图分区；已有实体直接复用原观测场。静态背景保留原世界坐标，自由空间保留独立测量射线。背景边缘保护只排除原候选分区的一圈像素，实体分区与原深度保持不变。
 
-Mapper 融合的观测 TSDF 经 `build_tsdf_geometry` 转为固定的仿射表面及负值体积组件。`FrozenObservedGeometry` 保留源组件与空间索引，`FrozenESDF` 保存由其包围盒覆盖产生的保守候选距离场。机器人及运动物体的球查询用于批量计算和优化引导。正代理残差只表示候选几何冲突；适用实体对在非梯度决策边界由 `OnlineCollisionConfirmation` 使用同一候选状态和同一源几何复核。复核只能改变实际检查过的碰撞分项，不能消除接触条件、未知区域、数值查询范围不足或模型缺失。详细表示与调用见[观测与碰撞模型](docs/planner-architecture/02-observation-and-collision.md)。
+`FrozenObservedField` 保留 Mapper 融合的 TSDF 原样本、权重、支持及坐标；八角点均受支持的单元以三线性插值的 `φ≤0` 定义占据。机器人使用跨任务复用的原生已知模型。原生实体与任务场、任务场与任务场直接采用同一非穿透查询：共同占据的开邻域产生 `intersection`，已表示查询域完成排除产生 `clear`，其余数值或许可边界保留 `unresolved`。已确认体积交叠产生分类残差 1，并由同一场的局部法向提供优化方向；场配对未决仅记录。机器人自身数值边界、任务接触、支撑和覆盖各有独立分项。详细表示与调用见[观测与碰撞模型](docs/planner-architecture/02-observation-and-collision.md)。
 
-自由空间证据与候选距离场分别保存。`unknown_policy.outside_regions` 明确取 `forbid`、`require_observation` 或 `allow_attempt`；有限 `conditional_regions` 另有范围和来源。允许尝试不构成已观测自由空间，禁止未知区域也不等于已观察到实体碰撞。数值场范围不足、未知策略拒绝和实体冲突应保留各自状态。
+自由空间证据与实体占据分别保存。`unknown_policy.outside_regions` 明确取 `forbid`、`require_observation` 或 `allow_attempt`；有限 `conditional_regions` 另有范围和来源。允许尝试不构成已观测自由空间，禁止未知区域也不等于已观察到实体碰撞。场查询未决、未知策略拒绝和实体冲突保留各自状态。
 
-`ContactRule` 只描述具名材料、目标区域和活动区间。`HoldingContact` 描述机器人材料与已声明附着对象之间的模型内部关系。它们不赋予整个机器人—物体对无限接触许可，也不证明真实接触或任务成功。当前运动对象和物体侧材料所支持的表示类型、初始支撑以及手指几何限制见[附着、接触与夹爪](docs/planner-architecture/03-attachment-contact-and-hand.md)。这些是现行消费者的能力边界，不能改写为所有观测 TSDF 必须具备完整物体先验的数学要求。
+`ContactRule` 描述原任务特征、具名材料、有限目标区域和活动区间。工具成员由机器人适配器提供的 `tool_geometry_names` 明确声明，实体的 `Attachment.active(progress)` 同时决定刚性跟随和组合体成员资格。工具与当前附着实体、同一 TCP 上共同附着实体之间不作内部碰撞查询；各成员原几何继续检查背景、其余机器人和外部实体。没有释放声明时附着跨越规划窗口终点继续，显式释放时退出组合体。有限任务接触及初始支撑的计算分别见[附着、接触与手指](docs/planner-architecture/03-attachment-contact-and-hand.md)。
 
 ## 数值求解与恢复
 

@@ -1,6 +1,6 @@
 # 已知凸实体与原始观测场的非穿透查询
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
+代码基线：`f04a478e7dff67b61f9b6c2d98d408fa9d64a0c2`。
 
 `query_native_field(geometry, native_pose, field, field_pose, *, precision_m=1e-4, permission=None, check_request=None)` 输入一个已编译 Coal 原生实体、原 `ObservedField`、各自世界位姿、数值精度和有限点对许可。位姿把各自局部坐标映到同一参考坐标，长度以米计。机器人保持原有体积的凸实体或解析形状，任务对象保持原支持单元内的三线性非正集合。接口检查未许可域中的体积交叠，不要求额外正间距。
 

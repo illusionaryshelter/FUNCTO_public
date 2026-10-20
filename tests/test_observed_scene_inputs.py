@@ -39,7 +39,8 @@ def arguments(owner, tmp_path):
     robot = RobotGeometryChecker(urdf, base_frame="base", geometries=(
         NativePrimitive("body", "base", "box", (.01, .01, .01), np.eye(4), "known robot"),))
     return dict(mapper_cfg=None, depth_error_m=.0001, task_owner_ids=("entity",),
-        reference_frame="world", robot_model=robot, fixed_geometry_names=(), observed_owners=(owner,),
+        reference_frame="world", robot_model=robot, fixed_geometry_names=(),
+        tool_geometry_names=("body",), observed_owners=(owner,),
         unknown_policy={"conditional_regions": [], "outside_regions": "allow_attempt"},
         max_mapping_bytes=1000, has_gripper=False)
     # END the same source checker is handed directly to the scene.

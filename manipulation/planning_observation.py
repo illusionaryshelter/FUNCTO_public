@@ -445,12 +445,12 @@ def _require_mapping_memory(estimated_bytes, device, *,
 
 # BEGIN known robot geometry is supplied independently of RGB-D partitions.
 def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, task_owner_ids,
-                         reference_frame, robot_model, fixed_geometry_names,
+                         reference_frame, robot_model, fixed_geometry_names, tool_geometry_names,
                          contacts=(), gripper=None, has_gripper=True, unknown_policy,
                          max_mapping_bytes, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
                          max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES,
                          fine_regions=None, observed_owners=(), background=None, coverage=None,
-                         initial_support_relations=(), holding_contacts=()):
+                         initial_support_relations=()):
     """Combine newly observed entities with existing fixed entity fields.
 
     owner_frames names only entities to integrate from the supplied masks and
@@ -547,9 +547,10 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
     owners.extend(direct.values())
     scene = OnlinePlanningScene(background=queries[None] if background is None else background,
         owners=owners, coverage=coverage, reference_frame=reference_frame, robot_model=robot_model,
-        fixed_geometry_names=fixed_geometry_names, contacts=contacts, gripper=gripper,
+        fixed_geometry_names=fixed_geometry_names, tool_geometry_names=tool_geometry_names,
+        contacts=contacts, gripper=gripper,
         has_gripper=has_gripper, unknown_policy=unknown_policy,
-        initial_support_relations=initial_support_relations, holding_contacts=holding_contacts)
+        initial_support_relations=initial_support_relations)
     # BEGIN persist semantic inputs separately from one-time fusion admission.
     scene.observation_partition_masks = {}
     for name, view in normalized.items():

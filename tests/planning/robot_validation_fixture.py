@@ -67,6 +67,31 @@ def robot_self_filter_shapes(fixture, frame_poses):
 # END only the explicit robot model is loaded; task assets never enter this adapter.
 
 
+# BEGIN the recorded robot topology supplies the complete current tool component.
+def tool_geometry_names(fixture):
+    """Return registered geometry under the named finger mechanism's root.
+
+    This source adapter uses the fixture's declared finger joints to identify
+    their common parent assembly. The production scene receives only explicit
+    registered geometry IDs; it has no finger-count or robot-name convention.
+    """
+    model = mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"])
+
+    def ancestors(body):
+        chain = []
+        while body:
+            chain.append(body)
+            body = int(model.body_parentid[body])
+        return chain
+
+    chains = [ancestors(int(model.body_parentid[model.jnt_bodyid[model.joint(name).id]]))
+              for name in fixture["finger_joint_names"]]
+    root = next(body for body in chains[0] if all(body in chain for chain in chains[1:]))
+    return tuple(row["geom"] for row in fixture["collision_geometries"]
+                 if root in ancestors(int(model.geom_bodyid[model.geom(row["geom"]).id])))
+# END membership depends on the reusable robot model, not on the current object.
+
+
 def _native_pair_policies(model, geometry_names):
     """Retain native body filtering and each geom's exact bitmask decision.
 

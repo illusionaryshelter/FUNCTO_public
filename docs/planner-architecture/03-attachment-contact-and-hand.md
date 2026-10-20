@@ -1,6 +1,6 @@
 # 附着、接触与手指
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。
 
 ## 1. 实体观测与固定关系
 
@@ -8,7 +8,7 @@
 
 设 C 为观测表示坐标，`C_pre=T_W_C` 为关系建立前的表示位姿，`E_g=T_W_E` 为声明生效事件处的规划工具/TCP位姿。以连杆 FK 表达时，`E_g=T_W_base·T_base_link(q_g)·T_link_tool`，其中 `q_g` 是该事件处的具名关节反馈，左右两项分别为基座和工具标定。固定关系为 `A=E_g⁻¹C_pre`。候选状态产生 `E(t)` 后，实体位姿为 `C(t)=E(t)A`。该运算沿用已有模型，当前实体可见性不参与。
 
-`Attachment` 保存区间、`position_tool_owner`、`quaternion_tool_owner`、条件身份与可选释放身份。`CollisionOwner.pose` 对关系生效区间应用同一固定变换。释放后使用该候选第一个释放锚点的预测位姿；没有释放声明时关系延续。`with_release_history` 为搜索分支保留已选前缀的释放位姿，未来释放仍为变量。
+`Attachment` 保存区间、`position_tool_owner`、`quaternion_tool_owner`、条件身份与可选释放身份。设区间为 `[a,b]`、当前实际技能进度为 `s`：具有释放声明时，`active(s)` 在 `a≤s<b` 为真；没有释放声明时，在 `s≥a` 为真，包含窗口终点并继续延续。`CollisionOwner.pose` 与碰撞配对共同使用这个判定。释放后使用该候选释放锚点的预测位姿；`with_release_history` 为搜索分支保留已选前缀的释放位姿，未来释放仍为变量。
 
 源任务坐标到 C 的关系记为 `M_D`。任务点通过 `M_D` 重表达，法线使用其旋转部分；`generate_reference` 使用 `J=M_D⁻¹`。源轨迹、功能区域、任务点和原事件仍承担技能表示职责。
 
@@ -24,9 +24,15 @@ required 接触调用 `query_region_intersection`，寻找有限区域内受支�
 
 `build_material_contact_rules` 将材料记录中的原任务特征和 `robot_body` 与声明的目标区域组合。`grasp_region.check_grasp_region_compatibility` 在明确手指关节区间中求共同的假设位置，使每个材料特征与至少一个目标许可区域相交。其线性规划使用世界坐标半空间及对手指坐标的仿射导数；原点集各自的法向高度范围完整保留。该输入描述任务许可，实体是否实际具有受支持零表面仍由场景接触查询计算。
 
-## 3. 声明附着内部接触
+## 3. 工具与附着实体组成的组合体
 
-`HoldingContact` 将一个明确 `robot_body` 与实体及附着区间关联。`bind_holding_contacts` 消费材料身份表与原声明关系；`validate_holding_conditions` 比较实体身份、固定变换和区间。许可仅覆盖登记的实体对；两个原生几何实体即使在空间中重叠，也各自保留登记身份和对应许可。
+`OnlinePlanningScene` 必填的 `tool_geometry_names` 给出完整工具组件的已注册几何实体 ID。记录入口调用 `robot_validation_fixture.tool_geometry_names(fixture)`：适配器读取已知 robot-only 模型与 fixture 声明的手指关节，求这些关节所属机构的公共父节点，再选取该节点子树中明确登记的碰撞实体。当前机器人得到掌体、两指体和两指腹五个成员。通用场景直接消费这些 ID，机器人其余部件保留各自身份。
+
+当前实体的 `Attachment.active(progress)` 为真时，该实体与工具组件属于同一组合体。场景排除工具成员与该实体的内部配对；两个实体同时附着于本场景同一 TCP 时，也排除它们之间的内部配对。排除发生在原几何查询之前，按状态样本累计到 `internal_assembly_pair_count`。组合体各成员仍分别保留原生形状或原始观测场、局部坐标和位姿，继续对背景、未附着实体及其余机器人部件进行原几何查询。机器人自身配对继续使用其独立模型策略。
+
+`validate_problem` 将每个 `Attachment` 对应到原 `declared_attachment` 或 `candidate_attachment` 条件，核对实体身份、生效事件与固定变换；显式释放对应同一 `predicted_release` 条件及区间终点。组合体成员由实际 `progress` 确定，有限任务接触所用的 `contact_permission_progress` 不提前建立附着。`ContactRule` 保留原特征、区域、间隙和法向计算，分别表达任务要求的有限接触。
+
+场景快照保存工具成员与各实体的 `Attachment`。执行入口从原 `declared_attachment` 条件及对应实体关系记录 `declared_attachment_bindings`，包含条件、实体、活动区间、释放身份、工具成员和来源。该记录表达候选采用的模型关系，物理接触与任务效果由各自的观察或事后评价记录。
 
 ## 4. 初始支撑
 

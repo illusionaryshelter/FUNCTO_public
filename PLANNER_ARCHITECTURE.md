@@ -1,6 +1,6 @@
 # FUNCTO 运动规划器架构
 
-代码基线：`TASK_NONPENETRATION_CODE_COMMIT`。组件正文描述该实现的输入、计算、输出和调用关系。阶段运行结果保存在项目外的 `sim-version-plans`。
+代码基线：`ATTACHED_TOOL_CODE_COMMIT`。组件正文描述该实现的输入、计算、输出和调用关系。阶段运行结果保存在项目外的 `sim-version-plans`。
 
 系统输入完整源技能表示、经标定的 RGB-D 与实体像素分区、已有实体观测模型、具名机器人关节反馈、已知机器人碰撞实体、纯运动学模型和任务声明。规划器产生具名关节曲线及模型验收报告；设备执行记录与仿真事后评价分别描述实际控制过程和任务效果。
 
@@ -10,7 +10,7 @@
 |---|---|
 | [输入与任务模型](docs/planner-architecture/01-inputs-and-task-model.md) | 源区域、轨迹、功能坐标、关系和事件经 grounding 与参考生成形成 `PlanningProblem` |
 | [观测与碰撞](docs/planner-architecture/02-observation-and-collision.md) | mask＋深度建立实体原始观测场，或直接接收已有场；已知机器人实体与任务原场直接查询距离 |
-| [附着、接触与手指](docs/planner-architecture/03-attachment-contact-and-hand.md) | 固定关系预测实体运动；源任务特征定义有限许可；手指指令与名义几何共享时钟 |
+| [附着、接触与手指](docs/planner-architecture/03-attachment-contact-and-hand.md) | 固定关系预测实体运动并确定工具组合体成员；源任务特征定义有限接触；手指指令与名义几何共享时钟 |
 | [数值求解与搜索](docs/planner-architecture/04-solver-and-search.md) | IK、连续关节域、三次曲线、L-BFGS 和有限 OMPL 搜索产生候选 |
 | [验收与执行](docs/planner-architecture/05-acceptance-and-execution.md) | 同一机器人与任务模型验收候选，保存原曲线及输入，执行消费机器人反馈和独立效果 |
 | [API 契约](docs/planner-architecture/06-api-contracts.md) | 公共接口的前置数据、返回值及实际消费者 |
@@ -42,6 +42,8 @@ flowchart TD
 源时间、技能进度 `s` 和执行物理时间 `t` 分别保存。`_ProgressMap` 将归一化执行时间映射到技能进度；事件保留 `(skill_id,event_id,occurrence)` 身份。机器人及手指在同一物理时刻求值，释放后的实体保持该候选释放时刻的预测位姿。
 
 `FrozenObservedField` 保存实体坐标中的原始 TSDF 样本、权重和观测支持。`CollisionOwner` 为该场绑定身份及运动；`NativeSolid/NativePrimitive` 将原机器人碰撞实体绑定到具名连杆。新实体可以由 RGB-D 建立，已有实体可以原样传入；模型复用不要求当前图像、mask 或可见深度。静态背景保留世界坐标，已测自由射线不会随实体移动。
+
+场景以显式 `tool_geometry_names` 声明完整工具组件。`Attachment.active(s)` 在实际技能进度 `s` 上同时确定实体的刚性跟随与组合体成员资格。工具组件与当前附着实体之间、同一 TCP 上共同附着的实体之间不产生内部碰撞查询；各成员仍以原机器人形状或原观测场检查背景、其余机器人及其他实体。显式释放时成员退出组合体，没有释放声明时附着跨越规划窗口终点继续。机器人自身配对沿用原模型策略。
 
 ## 几何计算与数值求解
 
