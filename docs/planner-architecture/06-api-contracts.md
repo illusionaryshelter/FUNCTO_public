@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
+代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -52,7 +52,8 @@
 
 | API | 输入与前置数据 | 输出及实际消费者 |
 |---|---|---|
-| `build_scene_from_rgbd` | 新建实体的 owner_frames、mask/深度/采集标定；或 observed_owners 中已有模型；可传已有 background/coverage | 同一 `OnlinePlanningScene`；运行器及通用场景构造 |
+| `build_scene_from_rgbd` | 新建实体的 owner_frames、mask/深度/采集标定；或 observed_owners 中已有模型；可传已有 background/coverage | 同一 `OnlinePlanningScene`，并独立记录本次原实体 mask、原背景候选和实际积分背景；运行器及通用场景构造 |
+| `save_observation_partitions` | 上述场景分区记录与输出目录 | 每视图的原实体文件、背景候选文件、实际积分文件及身份/路径/职责报告；后续建图复用前两者 |
 | `integrate_entity/freeze_mapper` | 明确实体像素、原深度、K、T_entity_camera 和资源范围 | 原始样本、权重、支持构成的 `FrozenObservedField`；建图 |
 | `FrozenObservedField.record/from_record/save/load` | 固定场或结构化样本记录 | 同一样本及坐标的场/记录；保存与复用 |
 | `ObservedField.sample/cell_value` | 原场支持内的局部点或具体单元 | 值、有效性、梯度、数值误差；距离、过滤与接触 |

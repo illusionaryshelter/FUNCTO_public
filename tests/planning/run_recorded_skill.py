@@ -25,26 +25,43 @@ PROJECT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT))
 
 
-# BEGIN persist the production builder's exact occupied endpoint partition.
+# BEGIN persist reusable semantic masks separately from fusion decisions.
 def save_observation_partitions(scene, output):
-    """Save exact fusion masks without reconstructing ownership in the runner.
+    """Save original entity/background masks and the admitted fusion mask.
 
-    The builder preserves each admitted environment endpoint in an explicit
-    owner or the current background snapshot. Original depth and independent
-    free rays stay in the observation records; this mask does not define them.
+    Future --owner-mask inputs use the saved semantic entity files and
+    --background-mask uses the saved background candidate. The fusion
+    background records this run's filtering and one-pixel boundary; feeding
+    it back as a candidate would incorrectly grow the excluded boundary.
+    A reused background field produces no new fusion-background mask.
     """
     result = {}
     for name, masks in scene.observation_partition_masks.items():
         folder = Path(output)/"observations"/name
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder/"background-mask.npy"
-        np.save(path, masks['background'])
-        row = {'background_mask_path':str(path.resolve()),
+        row = {'owner_masks': {}, 'background_candidate_mask_path': None,
+               'background_mask_path': None,
+               'mask_roles': {
+                   'owner_masks': 'Original semantic entity masks; reusable --owner-mask inputs',
+                   'background_candidate_mask_path': 'Original semantic background candidate; reusable --background-mask input',
+                   'background_mask_path': 'Actual fusion mask after robot filtering and one boundary exclusion; not a semantic input',
+               },
                'endpoint_partition':deepcopy(scene.observation_report['endpoint_partition'][name])}
+        for index, (identity, mask) in enumerate(masks['owner_masks'].items()):
+            path = folder/f"owner-{index:03d}-semantic-mask.npy"
+            np.save(path, mask)
+            row['owner_masks'][identity] = str(path.resolve())
+        for key, filename, report_key in (
+                ('background_candidate', 'background-candidate-mask.npy', 'background_candidate_mask_path'),
+                ('background', 'background-mask.npy', 'background_mask_path')):
+            if masks[key] is not None:
+                path = folder/filename
+                np.save(path, masks[key])
+                row[report_key] = str(path.resolve())
         (folder/"partition-report.json").write_text(json.dumps(row, indent=2)+"\n")
         result[name] = row
     return result
-# END diagnostics consume one decision, not a second segmentation algorithm.
+# END saved original masks preserve ownership without another segmentation call.
 
 
 # BEGIN typed initial support is a separate recorded declaration channel.

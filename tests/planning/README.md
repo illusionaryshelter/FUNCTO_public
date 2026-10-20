@@ -1,6 +1,6 @@
 # 记录式规划、执行与诊断入口
 
-本文对应 FUNCTO_public 代码基线 `cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
+本文对应 FUNCTO_public 代码基线 `9fabc002e5e8761881ee369ca831ce1c5d6893fd`。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
 
 ## 运行环境与输入
 
@@ -13,6 +13,8 @@
 核心接口 `planning_observation.build_scene_from_rgbd` 接受两类实体输入：新实体的 mask、深度和标定，经 `integrate_entity` 构成原始 TSDF；已有实体由 `observed_owners` 直接传入。已有 `background/coverage` 也可直接传入，完整既有场景可以不提供图像。混合输入使用明确背景分区，防止已有实体再次进入背景。自过滤使用图像采集时的机器人 FK 和同源连杆观测场。
 
 新背景还会排除原分区边界外的一圈八邻域像素，覆盖原图中已复用实体的边界。实体 mask 和自由射线保持原值；边缘端点记录在 `unmapped_pixels`。分区回归见 `test_observation_boundary_protection.py`，公开构造入口与模型复用回归见 `test_observed_scene_inputs.py`。
+
+`save_observation_partitions` 在 `observations/<view>/` 中独立保存本次新建实体的 `owner-*-semantic-mask.npy`、原始 `background-candidate-mask.npy` 和实际积分 `background-mask.npy`。`partition-report.json` 按实体 ID 指向文件并说明职责。后续 `--owner-mask` 读取原实体文件，`--background-mask` 读取原始候选文件；实际积分背景用于检查本次过滤结果。这样重复复用只排除同一圈边缘，也无需再次调用分割。复用背景模型时不会生成新的积分背景 mask。
 
 `--contact-bindings` 保存原任务特征、有限目标区域、材料身份、活动区间和固定关系；`ContactRule` 与 `HoldingContact` 分别解释任务接触和附着内部许可。固定关系沿用关系建立前的同一场。源任务点、轨迹、区域与事件完整保留。
 

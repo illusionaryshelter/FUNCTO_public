@@ -1,6 +1,6 @@
 # `manipulation/planning_observation.py` 实现契约
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`9fabc002e5e8761881ee369ca831ce1c5d6893fd`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_views`
@@ -89,7 +89,7 @@ def _mapper_intrinsics(matrix):
 实现说明：
 
 > Preserve input rays under the Mapper's half-integer pixel convention.
-> 
+>
 > Input calibration places pixel (u, v) at the integer centre used by
 > backprojection and free-ray evidence. The native depth integrator emits
 > allocation rays at (u+.5, v+.5) and casts positive projected coordinates
@@ -137,7 +137,7 @@ def _rectangle_min_depth(depth, lower_xy, upper_xy):
 实现说明：
 
 > Query inclusive, in-image integer rectangles with bounded image storage.
-> 
+>
 > For width w take a=2**floor(log2(w)), and similarly b for height h.
 > The four a-by-b blocks anchored inside the rectangle at its corners cover
 > it exactly: a<=w<2a and b<=h<2b. Their minimum is the rectangle minimum,
@@ -213,7 +213,7 @@ def _known_free_voxels(views, *, ray_depths, origin, shape, voxel_size, depth_er
 实现说明：
 
 > Prove each complete voxel free under the supplied pixel-ray model.
-> 
+>
 > With all camera-z coordinates positive, the perspective projection of a
 > convex combination of corners is a positive depth-weighted combination
 > of their projections. Thus the eight projected corners bound the entire
@@ -390,7 +390,7 @@ def _self_filtered_views(views, reference_frame, depth_range_m):
 实现说明：
 
 > Validate measured classification before applying mapper depth limits.
-> 
+>
 > A sensor-valid measurement can lie outside this mapper's configured range.
 > Such a pixel becomes ambiguous for this map and contributes neither an
 > endpoint nor a free ray. No caller arrays or original depths are changed.
@@ -446,7 +446,7 @@ def _partition_masks(views, owner_ids, *, build_background=True):
 实现说明：
 
 > Partition measured endpoints with one eight-neighbour boundary ring.
-> 
+>
 > Check owner/owner overlap on the supplied masks before self filtering;
 > uncertainty is not permission to silently choose a semantic winner.
 > Only entities being integrated appear in owner_ids. A supplied background
@@ -595,7 +595,7 @@ def _mapper_memory_bound(config):
 实现说明：
 
 > Conservative native buffer budget from the installed MapperCfg fields.
-> 
+>
 > Includes the real 10,000-block floor at block_size=8, TSDF/RGB storage,
 > hashes and per-block metadata, camera candidate/support buffers, dense
 > ESDF+PBA storage, retained collision-field copies, and a 2x scratch margin.
@@ -661,7 +661,7 @@ def scene_task_owner_ids(scene):
 实现说明：
 
 > Read the manipulated body and functional reference from a bound scene.
-> 
+>
 > These are semantic identities already established by task grounding. An
 > additional collision owner, including an initial support surface, is an
 > environment owner unless it is also the current functional reference.
@@ -709,7 +709,7 @@ def observation_resolutions(owner_ids, *, task_owner_ids, environment_voxel_size
 实现说明：
 
 > Resolve the common 2 mm task / coarser environment mapping contract.
-> 
+>
 > Task identities select the shared task resolution. Reused entity fields
 > preserve their original samples. Resource admission checks each new map
 > at the requested spacing.
@@ -761,7 +761,7 @@ def _owner_mapper_config(config, views, masks, owner_id, pose, voxel_size, depth
 实现说明：
 
 > Enclose every labelled depth sample in a finite owner-local grid.
-> 
+>
 > The background and raw free-space grid keep their own resolution. This
 > tighter grid spends precision on the observed owner's surfaces without
 > asserting unseen geometry or dropping a labelled surface to save memory.
@@ -851,7 +851,7 @@ def _fine_mapper_config(config, request):
 实现说明：
 
 > Freeze a caller-evidenced small region in this partition's local frame.
-> 
+>
 > The request is generic metric geometry, not an object/task heuristic.
 > Sensor allowance is supplied with its measurement evidence. Numerical
 > support is separately computed from this Mapper's truncation and samples.
@@ -968,12 +968,12 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
 实现说明：
 
 > Combine newly observed entities with existing fixed entity fields.
-> 
+>
 > owner_frames names only entities to integrate from the supplied masks and
 > depth. observed_owners supplies existing fields and their declared motion;
 > these entities require no image, mask or visible depth. Their samples and
 > local support are passed unchanged to the planning scene.
-> 
+>
 > An existing background and coverage are reused in world coordinates. A new
 > background uses each view's explicit background_mask when supplied, or the
 > complement of newly mapped owners, after withholding the one-pixel
@@ -981,6 +981,11 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
 > when the observation also contains separately retained moving entities.
 > The existing unmapped_pixels count includes the withheld boundary;
 > independently measured free-ray coverage is unchanged.
+>
+> observation_partition_masks keeps original owner masks and the original
+> background candidate separately from the admitted fusion background.
+> Reusing these original inputs applies the boundary operation once; a
+> previously filtered fusion mask is not a new semantic background input.
 
 显式输出分支：
 
@@ -991,47 +996,55 @@ scene
 读取的对象属性：
 
 ```python
-owner.query
-owner.owner_id
-owner_frames.items
+coverage._known
 set(frames).intersection
+configs.items
+owners.extend
+normalized.items
+owner.owner_id
+mapper_cfg.enable_static
+configs.update
+({} if fine_regions is None else fine_regions).items
+np.asarray
+direct.values
+view.get
+semantic.values
+scene.observation_partition_masks
+known.size
+owner_frames.items
 coverage.reference_frame
 mapper_cfg.num_cameras
-mapper_cfg.enable_static
 mapper_cfg.decay_factor
 mapper_cfg.frustum_decay_factor
 mapper_cfg.depth_minimum_distance
 mapper_cfg.depth_maximum_distance
-normalized.values
 mapper_cfg.voxel_size
-configs.update
-frames.items
-({} if fine_regions is None else fine_regions).items
-configs.items
-estimates.values
-np.asarray
 mapper_cfg.grid_shape
 mapper_cfg.grid_center.detach().cpu().numpy
+np.eye
+frames.items
+np.array
+candidate.setflags
+mask.setflags
+masks[name].get
+np.count_nonzero
+owner.query.summary
+owner.query.voxel_size
+estimates.values
+known.sum
+owner.query
+np.stack
+view['owner_masks'].items
+np.ones
+view['depth'].shape
+direct.items
 mapper_cfg.grid_center.detach().cpu
+owners_count.values
+resolutions.items
+normalized.values
+','.join
 mapper_cfg.grid_center.detach
 mapper_cfg.grid_center
-normalized.items
-np.eye
-','.join
-np.array
-np.stack
-owners.extend
-direct.values
-masks.items
-np.count_nonzero
-owners_count.values
-coverage._known
-owner.query.summary
-direct.items
-resolutions.items
-owner.query.voxel_size
-known.sum
-known.size
 ```
 
 写入目标：
@@ -1039,107 +1052,118 @@ known.size
 ```python
 direct
 owner
-direct[owner.owner_id]
 frames
-identity
-row
 all_ids
 needs_mapping
+estimates
+owners
+scene
+scene.observation_partition_masks
+endpoint_report
+known
+scene.observation_report
+direct[owner.owner_id]
 normalized
 masks
 configs
 resolutions
-configs[None]
-pose
-_
-request
-configs[identity]
-estimates
-config
 shape_xyz
 origin
 ray_depths
-name
-known
 coverage
 queries
 reports
+identity
+config
 inverse
+name
 observations
-key
 view
-query
-report
-queries[identity]
-reports[name]
-owners
-source
-scene
-scene.observation_partition_masks
-endpoint_report
+semantic
+candidate
+supplied_background
+mask
+scene.observation_partition_masks[name]
 environment_count
 owners_count
 background_count
 endpoint_report[name]
-scene.observation_report
+configs[None]
+request
+configs[identity]
+query
+report
+queries[identity]
+reports[name]
+row
+key
+pose
+source
 value
+_
 ```
 
 直接调用符号：
 
 ```python
-isinstance
-ValueError
-_pose_array
-_text
-owner_frames.items
 set(frames).intersection
-set
 tuple
+configs.items
+owners.extend
+OnlinePlanningScene
+normalized.items
+ValueError
 TypeError
 bool
-min
 _self_filtered_views
-any
-normalized.values
 _partition_masks
 observation_resolutions
 configs.update
-_owner_mapper_config
-frames.items
 ({} if fine_regions is None else fine_regions).items
-_fine_mapper_config
 _mapper_memory_bound
-configs.items
-max
-estimates.values
 np.asarray
-mapper_cfg.grid_center.detach().cpu().numpy
-mapper_cfg.grid_center.detach().cpu
-mapper_cfg.grid_center.detach
-normalized.items
 _known_free_voxels
-map
 ObservedSpace
+integrate_entity
+CollisionOwner
+direct.values
+view.get
+semantic.values
+int
+max
+_self_filter_report
+_pose_array
+_text
+owner_frames.items
+set
+isinstance
+any
+_fine_mapper_config
+mapper_cfg.grid_center.detach().cpu().numpy
 np.eye
 _inverse
-integrate_entity
-','.join
-CollisionOwner
 PosePath
+frames.items
 np.array
-np.stack
-owners.extend
-direct.values
-OnlinePlanningScene
-masks.items
-int
+candidate.setflags
+mask.setflags
+masks[name].get
 np.count_nonzero
-sum
-owners_count.values
 owner.query.summary
-direct.items
-resolutions.items
+estimates.values
 known.sum
-_self_filter_report
+min
+_owner_mapper_config
+np.stack
+view['owner_masks'].items
+np.ones
+sum
+direct.items
+mapper_cfg.grid_center.detach().cpu
+map
+owners_count.values
+resolutions.items
+normalized.values
+','.join
+mapper_cfg.grid_center.detach
 ```

@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。
+代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
@@ -15,11 +15,13 @@ def save_observation_partitions(scene, output):
 
 实现说明：
 
-> Save exact fusion masks without reconstructing ownership in the runner.
-> 
-> The builder preserves each admitted environment endpoint in an explicit
-> owner or the current background snapshot. Original depth and independent
-> free rays stay in the observation records; this mask does not define them.
+> Save original entity/background masks and the admitted fusion mask.
+>
+> Future --owner-mask inputs use the saved semantic entity files and
+> --background-mask uses the saved background candidate. The fusion
+> background records this run's filtering and one-pixel boundary; feeding
+> it back as a candidate would incorrectly grow the excluded boundary.
+> A reused background field produces no new fusion-background mask.
 
 显式输出分支：
 
@@ -33,11 +35,12 @@ result
 scene.observation_partition_masks.items
 scene.observation_partition_masks
 folder.mkdir
+(folder / 'partition-report.json').write_text
+masks['owner_masks'].items
 np.save
 path.resolve
-scene.observation_report
-(folder / 'partition-report.json').write_text
 json.dumps
+scene.observation_report
 ```
 
 写入目标：
@@ -47,28 +50,38 @@ result
 name
 masks
 folder
-path
 row
 result[name]
+index
+path
+row['owner_masks'][identity]
+key
+filename
+report_key
+identity
+mask
+row[report_key]
 ```
 
 直接调用符号：
 
 ```python
 scene.observation_partition_masks.items
-Path
 folder.mkdir
+enumerate
+(folder / 'partition-report.json').write_text
+deepcopy
+masks['owner_masks'].items
 np.save
 str
+Path
 path.resolve
-deepcopy
-(folder / 'partition-report.json').write_text
 json.dumps
 ```
 
 ## `load_contact_bindings`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L51)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L68)。
 
 输入签名：
 
@@ -79,7 +92,7 @@ def load_contact_bindings(path):
 实现说明：
 
 > Validate recorded contact input and construct independent support facts.
-> 
+>
 > Ordinary contact features bind through explicit source task declarations.
 > Initial support carries observed plane evidence and an existing interval;
 > its entrance geometry and height baseline belong to scene construction.
@@ -127,7 +140,7 @@ InitialSupportRelation
 
 ## `load_joint_reference`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L77)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L94)。
 
 输入签名：
 
@@ -138,7 +151,7 @@ def load_joint_reference(path, problem):
 实现说明：
 
 > Read a bounded named q/dq recording without changing current task goals.
-> 
+>
 > All coordinates and timestamps come from the supplied record. Shape,
 > ordering and finite-value checks prevent malformed guidance from entering
 > a native seed fit; goal/domain acceptance still belongs to the backend.
@@ -211,7 +224,7 @@ JointTrajectory
 
 ## `finger_trajectory_factory`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L108)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L125)。
 
 输入签名：
 
@@ -222,7 +235,7 @@ def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ct
 实现说明：
 
 > Bind original events once the native formal duration/map are known.
-> 
+>
 > Actual-position protection bounds are deliberately absent from this
 > constructor. They continue guarding measured feedback in the executor;
 > they cannot predict a hand shape or replace the original position goals.
@@ -325,7 +338,7 @@ np.stack
 
 ## `position_controlled_hand`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L159)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L176)。
 
 输入签名：
 
@@ -336,7 +349,7 @@ def position_controlled_hand(robot, feedback, problem, *, device, execution_limi
 实现说明：
 
 > Bind independent command reference after checking actual execution limits.
-> 
+>
 > The shared test adapter calibrates exactly the same native spheres and
 > prismatic translations. This recorded boundary still owns the measured
 > q/dq checks, execution policy, command identities and reference factory.
@@ -442,7 +455,7 @@ bind_nominal_finger_geometry
 
 ## `require_feedback_identity`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L213)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L230)。
 
 输入签名：
 
@@ -453,7 +466,7 @@ def require_feedback_identity(feedback):
 实现说明：
 
 > Keep the capture adapter's identity across planning and execution.
-> 
+>
 > A file path only names storage and can change when a capture is copied.
 > It cannot replace the ID already carried by current Holding evidence.
 
@@ -487,7 +500,7 @@ ValueError
 
 ## `recorded_owner_observation_inputs`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L225)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L242)。
 
 输入签名：
 
@@ -498,7 +511,7 @@ def recorded_owner_observation_inputs(problem, scene_input, views, mask_rows, *,
 实现说明：
 
 > Resolve masks only for entities selected for RGB-D reconstruction.
-> 
+>
 > Existing models retain their registered identity and motion. They do not
 > participate in the new observation-mask contract, including under complete
 > occlusion. New entity coordinates come from the explicit task binding.
@@ -564,7 +577,7 @@ Path
 
 ## `run_prepared`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L288)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L305)。
 
 输入签名：
 
@@ -575,7 +588,7 @@ def run_prepared(args, *, problem, provenance):
 实现说明：
 
 > Run the existing scene/solver pipeline on the supplied continuous path.
-> 
+>
 > Problem construction belongs to the caller. The actual feedback is checked
 > again here, so an offline reference cannot replace current robot state.
 > This function never reconstructs or resamples the supplied reference.
@@ -1009,7 +1022,7 @@ print
 
 ## `run`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L670)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L687)。
 
 输入签名：
 
@@ -1087,7 +1100,7 @@ run_prepared
 
 ## `parse_args`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L699)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L716)。
 
 输入签名：
 

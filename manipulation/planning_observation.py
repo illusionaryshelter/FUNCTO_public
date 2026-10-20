@@ -464,6 +464,11 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
     when the observation also contains separately retained moving entities.
     The existing unmapped_pixels count includes the withheld boundary;
     independently measured free-ray coverage is unchanged.
+
+    observation_partition_masks keeps original owner masks and the original
+    background candidate separately from the admitted fusion background.
+    Reusing these original inputs applies the boundary operation once; a
+    previously filtered fusion mask is not a new semantic background input.
     """
     from .observed_mapping import integrate_entity, FrozenObservedField
     from .online_geometry import OnlinePlanningScene
@@ -544,8 +549,30 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
         robot_geometry_source=robot_geometry_source, contacts=contacts, gripper=gripper,
         has_gripper=has_gripper, unknown_policy=unknown_policy,
         initial_support_relations=initial_support_relations, holding_contacts=holding_contacts)
-    scene.observation_partition_masks = {name: {"background": row[None]}
-                                        for name, row in masks.items() if None in row}
+    # BEGIN persist semantic inputs separately from one-time fusion admission.
+    scene.observation_partition_masks = {}
+    for name, view in normalized.items():
+        semantic = {identity: np.array(mask, dtype=bool, copy=True)
+                    for identity, mask in view["owner_masks"].items()}
+        candidate = None
+        supplied_background = view.get("background_mask")
+        if supplied_background is not None:
+            candidate = np.array(supplied_background, dtype=bool, copy=True)
+        elif None in masks[name]:
+            # This is the original semantic complement, before self
+            # filtering or boundary protection, not the fused result.
+            candidate = np.ones(view["depth"].shape, bool)
+            for mask in semantic.values():
+                candidate &= ~mask
+        if candidate is not None:
+            candidate.setflags(write=False)
+        for mask in semantic.values():
+            mask.setflags(write=False)
+        scene.observation_partition_masks[name] = {
+            "owner_masks": semantic, "background_candidate": candidate,
+            "background": masks[name].get(None),
+        }
+    # END retained geometry does not acquire a new image or segmentation input.
     endpoint_report = {}
     for name, view in normalized.items():
         environment_count = int(np.count_nonzero(view["self_filter"]["labels"] == ENVIRONMENT))

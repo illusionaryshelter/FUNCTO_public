@@ -2,10 +2,13 @@
 
 # BEGIN regression coverage for geometry reuse independent of current visibility.
 from dataclasses import dataclass
+from pathlib import Path
+import sys
 from types import ModuleType
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 
 from manipulation.observed_mapping import FrozenObservedField
@@ -13,7 +16,7 @@ from manipulation.observed_robot import ObservedBody
 from manipulation.planning_observation import build_scene_from_rgbd
 from manipulation.planning_problem import PosePath
 from manipulation.planning_scene import Attachment, CollisionOwner, ObservedSpace
-from manipulation.robot_self_filter import ENVIRONMENT
+from manipulation.robot_self_filter import ENVIRONMENT, SELF
 
 
 def field(name):
@@ -73,7 +76,7 @@ class MapperConfig:
     voxel_size: float = .01
 
 
-def test_new_entity_maps_its_pixels_while_existing_entity_is_passed_unchanged():
+def test_new_entity_maps_its_pixels_while_existing_entity_is_passed_unchanged(tmp_path):
     # BEGIN the public mapper consumes the protected original static partition.
     owner = retained_owner()
     target = np.zeros((7, 7), bool)
@@ -117,4 +120,84 @@ def test_new_entity_maps_its_pixels_while_existing_entity_is_passed_unchanged():
     assert next(row for row in scene.owners if row.owner_id == "entity") is owner
     assert scene.observation_report["endpoint_partition"]["old_capture"]["unmapped_pixels"] == 12
     # END one retained pixel and eleven boundary pixels stay out of the new maps.
+    # BEGIN the actual saved inputs reproduce the same one-time boundary.
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
+    from run_recorded_skill import save_observation_partitions
+    from manipulation.planning_observation import _partition_masks, _self_filtered_views
+    stored = save_observation_partitions(scene, tmp_path)["old_capture"]
+    original_target = np.load(stored["owner_masks"]["target"])
+    original_background = np.load(stored["background_candidate_mask_path"])
+    admitted_background = np.load(stored["background_mask_path"])
+    np.testing.assert_array_equal(original_target, target)
+    np.testing.assert_array_equal(original_background, background)
+    np.testing.assert_array_equal(admitted_background, expected_background)
+    reused = {**view, "owner_masks": {"target": original_target},
+              "background_mask": original_background}
+    for _ in range(3):
+        normalized = _self_filtered_views({"old_capture": reused}, "world", (.05, 5.))
+        partition = _partition_masks(normalized, ("target",))["old_capture"]
+        np.testing.assert_array_equal(partition[None], admitted_background)
+        np.testing.assert_array_equal(partition["target"], target)
+    # Snapshots are independent of the caller's later array edits.
+    target[0, 0] = False
+    background[6, 6] = False
+    assert scene.observation_partition_masks["old_capture"]["owner_masks"]["target"][0, 0]
+    assert scene.observation_partition_masks["old_capture"]["background_candidate"][6, 6]
+    # END reusing semantic inputs neither grows the ring nor invokes perception.
 # END masks reconstruct only the entities named by the new observation input.
+
+
+# BEGIN saved semantic inputs retain pixels excluded from this mapping pass.
+@pytest.mark.parametrize("reuse_background", [False, True])
+@pytest.mark.parametrize("supply_background", [False, True])
+def test_original_partitions_survive_self_filter_and_background_reuse(
+        tmp_path, reuse_background, supply_background):
+    target = np.zeros((5, 5), bool)
+    target[2, 2] = target[2, 3] = True
+    labels = np.full((5, 5), ENVIRONMENT, np.uint8)
+    labels[2, 3] = SELF
+    candidate = ~target
+    candidate[4, 4] = False
+    depth = np.ones((5, 5))
+    view = {"image": np.zeros((5, 5, 3), np.uint8), "depth": depth, "K": np.eye(3),
+        "T_output_camera": np.eye(4), "reference_frame": "world",
+        "self_filter": {"labels": labels, "free_ray_depth_m": np.where(labels == SELF, 0., depth),
+                        "source": "capture"},
+        "owner_masks": {"target": target},
+        "background_mask": candidate if supply_background else None}
+    native = ModuleType("curobo.perception")
+    native.MapperCfg = MapperConfig
+    args = arguments(retained_owner())
+    args.update(mapper_cfg=MapperConfig(), observed_owners=(), task_owner_ids=("target",))
+    fused = {}
+
+    def integrate(observations, *, name, **kwargs):
+        fused[name] = list(observations)[0]["mask"].copy()
+        return field(name), {"source": "new observed partition"}
+
+    saved_background = field("background") if reuse_background else None
+    with patch.dict("sys.modules", {"curobo.perception": native}), \
+            patch("manipulation.planning_observation._mapper_memory_bound", return_value=1), \
+            patch("manipulation.planning_observation._owner_mapper_config", return_value=args["mapper_cfg"]), \
+            patch("manipulation.observed_mapping.integrate_entity", side_effect=integrate):
+        scene = build_scene_from_rgbd({"capture": view},
+            {"target": {"T_output_owner": np.eye(4), "source": "target observation"}},
+            background=saved_background, coverage=coverage(), **args)
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
+    from run_recorded_skill import save_observation_partitions
+    stored = save_observation_partitions(scene, tmp_path)["capture"]
+    np.testing.assert_array_equal(np.load(stored["owner_masks"]["target"]), target)
+    assert not fused["target"][2, 3]
+    if supply_background or not reuse_background:
+        expected = candidate if supply_background else ~target
+        np.testing.assert_array_equal(np.load(stored["background_candidate_mask_path"]), expected)
+    else:
+        assert stored["background_candidate_mask_path"] is None
+    if reuse_background:
+        assert scene.background is saved_background
+        assert "observed_background" not in fused
+        assert stored["background_mask_path"] is None
+    else:
+        np.testing.assert_array_equal(
+            np.load(stored["background_mask_path"]), fused["observed_background"])
+# END original masks and geometry reuse have independent storage semantics.

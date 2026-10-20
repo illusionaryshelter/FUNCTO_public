@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`__IMPLEMENTATION_COMMIT__`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 
@@ -31,6 +31,10 @@
 |---|---|---|
 | `rgb.png`、`depth_m.npy`、`calibration.json` | 当前彩色图、米制深度、相机内参 `K` 与 `T_world_camera_cv` | 回投影、区域迁移、自过滤与 TSDF 建图 |
 | 检测目录、`selection.json`、`*-owner-mask.npy` | 当前图像检测结果、所选对象身份与像素归属 | `load_detections/prepare_selected_observation`；规划入口据此分配对象和背景 |
+| `observations/<view>/owner-*-semantic-mask.npy` | 本次传入的新建实体原始语义 mask；包括过滤未接纳的原语义像素 | `save_observation_partitions` 写出；可作为以后 `--owner-mask` 输入 |
+| `observations/<view>/background-candidate-mask.npy` | 原始背景候选，尚未应用机器人过滤与边缘保护 | `save_observation_partitions` 写出；可作为以后 `--background-mask` 输入 |
+| `observations/<view>/background-mask.npy` | 本次经过机器人过滤与一次边缘排除的实际积分分区 | 建图决策诊断；复用背景模型时无新分区输出 |
+| `observations/<view>/partition-report.json` | 实体 ID 对应的原 mask 路径、两种背景路径、文件职责及分区统计 | 指定后续复用文件；缺少本次输出的背景路径为 `null` |
 | `*-observation.npz`、`*-feature.npz` | 回投影点、原像素、有效性与实体归属；MARCO 图像特征 | 区域候选、图像对应和评分；是感知计算结果 |
 | `surface.npz` | 多视角表面元素、观测像素、视图身份、观测与元素对应 | 区域几何和各图的区域投影 |
 | `region.npz` | 选定功能区域的表面元素掩码等结果 | 当前功能区域、支撑面选择与可视化 |
@@ -68,4 +72,4 @@
 
 `NativeSkillPhysicsEvaluator` 消费仿真实际运行环境中产生的真值，以及用于解释对象身份、源技能和评价条件的记录，产生物理效果报告。`step_callback` 的返回值不控制机器人指令，记录错误单独保存；外层运行器的 `physics_success` 用于事后输出。源 `evidence.json` 在技能提取中的事件职责与评价器在当前运行中的读取职责分别成立。
 
-实验运行器的 `snapshot.feedback_path` 明确指向图像采集时的机器人反馈，规划入口的反馈单独绑定。`owner-mask` 仅用于本次建立的实体；`background-mask` 可选定原观测的静态端点分区。已有实体复用时无需再次提供其 mask；背景世界坐标与原自由射线不随运动实体改变。
+实验运行器的 `snapshot.feedback_path` 明确指向图像采集时的机器人反馈，规划入口的反馈单独绑定。`owner-mask` 仅用于本次建立的实体；`background-mask` 接收原观测的背景候选。保存的实际积分背景已经过边缘保护，再将它作为候选会多排除一圈，因此后续读取 `background-candidate-mask.npy`。已有实体复用时无需再次提供其 mask；背景世界坐标与原自由射线不随运动实体改变。

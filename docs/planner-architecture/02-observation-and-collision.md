@@ -1,6 +1,6 @@
 # 观测与碰撞模型
 
-代码基线：`cf7182cbf3888d9db2e7553df47dce9a0b1c339f`。
+代码基线：`9fabc002e5e8761881ee369ca831ce1c5d6893fd`。
 
 ## 1. 两种实体来源
 
@@ -11,6 +11,10 @@
 静态背景可直接通过 `background` 传入，已测自由空间通过 `coverage` 传入。两者和所有实体均已给定时，视图可为空，构造过程不调用 Mapper。需要建立背景时，`background_mask` 明确选择该幅观测中的静态端点；普通首次建图也可用新实体 mask 的补集。在含有独立复用实体的观测中，静态分区由调用者明确提供。原观测中未映射的端点记录为 `unmapped_pixels`，不被解释为新增自由空间。
 
 背景积分保留一圈像素身份不确定带。令 `E` 为有效 ENVIRONMENT 像素，`B` 为上述背景候选 mask；边缘带为 `E & B & binary_dilation(E & ~B, 3×3, 一次)`，最终背景为 `E & B` 排除该带。该规则同时覆盖新建实体与原静态分区所排除的已有实体，原实体 mask 不扩张。SELF、AMBIGUOUS_SHADOW 和无效深度不产生边缘种子。被排除端点计入现有 `unmapped_pixels`，自由空间仍由独立深度射线计算。这是一像素的分割边界保护，不是任意分割误差的几何上界。
+
+`scene.observation_partition_masks[view]` 独立保留三种数据：`owner_masks` 是本次传入的新建实体原始语义分区，`background_candidate` 是过滤前的背景候选 `B`，`background` 是实际积分背景。前两者复制为只读数组，保留被机器人过滤排除的原语义像素。显式背景候选直接保存；首次新建背景而未给候选时，保存原实体 mask 的补集。复用背景时，实际积分背景为 `None`；此时仅保存明确提供的候选。全部模型复用且无需视图时，记录为空。
+
+`save_observation_partitions` 按视图写出实体原始 mask、背景候选和实际积分背景，实体 ID 与路径对应关系存入 `partition-report.json`。再次建图时，`--owner-mask` 读取实体原始文件，`--background-mask` 读取 `background-candidate-mask.npy`，从而只执行一次边缘排除。已有实体继续复用自己的模型及原有记录。
 
 ## 2. 深度过滤与场的形成
 

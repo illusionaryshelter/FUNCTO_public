@@ -26,7 +26,10 @@ def test_recorded_partition_files_match_exact_builder_masks_and_current_report(t
     decision = {"background_pixels": 2, "environment_pixels": 4,
                 "owner_pixels": {"part": 2}, "all_environment_endpoints_assigned": True,
                 "source": "Current production builder decision"}
+    semantic = np.array([[False, True, False], [False, False, True]], dtype=bool)
+    candidate = ~semantic
     scene = SimpleNamespace(observation_partition_masks={"current": {
+        "owner_masks": {"part": semantic}, "background_candidate": candidate,
         "background": background}},
         observation_report={"endpoint_partition": {"current": decision}})
     folder = tmp_path/"observations"/"current"
@@ -40,7 +43,10 @@ def test_recorded_partition_files_match_exact_builder_masks_and_current_report(t
     assert not np.load(folder/"background-mask.npy", allow_pickle=False)[1, 0]
     stored = json.loads((folder/"partition-report.json").read_text())
     assert stored == rows["current"]
-    assert set(stored) == {"background_mask_path", "endpoint_partition"}
+    assert set(stored) == {"owner_masks", "background_candidate_mask_path",
+                           "background_mask_path", "mask_roles", "endpoint_partition"}
+    np.testing.assert_array_equal(np.load(stored["owner_masks"]["part"]), semantic)
+    np.testing.assert_array_equal(np.load(stored["background_candidate_mask_path"]), candidate)
     assert stored["endpoint_partition"] == decision
     # Diagnostic output must not retain a mutable alias into the scene report.
     decision["background_pixels"] = 99
