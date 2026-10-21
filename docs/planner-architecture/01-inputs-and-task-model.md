@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-库实现基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本组件将已有示教、当前任务关系及机器人入口状态组织为 `PlanningProblem`，供场景绑定与数值规划调用。本文的库接口对应该代码提交；第 4.1 节的实验输入适配器以所链接脚本和阶段计划记录其实现。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
+库实现基线：`本文件所在的 yaw 实现提交`。本组件将已有示教、当前任务关系及机器人入口状态组织为 `PlanningProblem`，供场景绑定与数值规划调用。本文的库接口对应该代码提交；第 4.1 节的实验输入适配器以所链接脚本和阶段计划记录其实现。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
 
 ## 1. 输入的来源与相互依赖
 
@@ -73,7 +73,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 | 要求类型 | 输入及计算对象 | 输出与使用位置 |
 |---|---|---|
-| `PoseEventRequirement` | 一个进度、功能坐标在工具坐标中的变换、目标位姿、位置和角度容差 | `errors` 返回位置误差与转角误差；`evaluate` 返回两项超容差非负残差之和 |
+| `PoseEventRequirement` | 一个进度、功能坐标到工具坐标的变换、目标位姿、位置/旋转容差，以及成对声明的 `yaw_axis/yaw_tolerance_rad` | `error_components` 返回位置、完整旋转或剩余倾斜及 yaw；`component_tolerances` 选择受约束分量；`evaluate` 汇总各分量超差 |
 | `SupportRequirement` | 进度、物体坐标在工具坐标中的变换、物体点、接触点、外法线、有限支撑面和容差 | `raw_inequalities` 返回 gap/body/footprint/normal 四类有符号条件；优化消费四项，轨迹验收消费 body/footprint |
 | `InteriorRequirement` | 区间、物体点、凸区域半空间和内缩距离 | 所有指定点相对半空间的最大越界量，减数值容差后截为非负 |
 | `PoseProcessRequirement` | 区间、相对位姿及六维允许范围 | 过程中的平移和转动误差，只有明确受约束方向进入残差 |
@@ -84,17 +84,21 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 | `PlanningEvent` | 原技能/事件/发生次数身份、进度、源帧、种类、可选停止与效果依赖 | 决定指令时刻，并按显式字段编译停止要求或下一段动作的独立依赖 |
 | `EventTimeConstraint` | 检查对象、绝对或相对时间窗、可选起源事件 | 规划时检查名义时钟；执行只消费允许的指令/独立效果时间，几何目标到达时间仅事后评价 |
 
-记 `errors` 返回的位置误差和转角误差为 `e_p`、`e_r`，各自容差为 `ε_p`、`ε_r`，则 `PoseEventRequirement.evaluate` 返回 `max(0,e_p−ε_p)+max(0,e_r−ε_r)`。`SupportRequirement.evaluate(..., for_acceptance=False)` 对四项原始有符号条件分别取正部后求和，保留完整优化值及梯度；`for_acceptance=True` 仅汇总 `acceptance_components=("body","footprint")`。`normalized_inequalities` 按长度或法向弦长尺度缩放全部四项，供增广拉格朗日计算使用。
+`PoseEventRequirement.error_components` 以候选工具位姿和固定变换求材料坐标 C 的位姿。位置分量为 C 原点到目标原点的欧氏距离。未声明 yaw 轴时，旋转分量为目标与候选之间的完整 SO(3) 最小转角。有轴时，旋转分量为去除绕轴转动后的剩余倾斜角；yaw 分量另行计算。`errors` 返回位置与该旋转分量；`errors_numpy` 为准备和诊断提供同一几何的 CPU 接口。`evaluate` 对 `component_tolerances` 中每个分量计算 `max(0,error−bound)` 后求和。`SupportRequirement.evaluate(..., for_acceptance=False)` 对四项原始有符号条件分别取正部后求和，保留完整优化值及梯度；`for_acceptance=True` 仅汇总 `acceptance_components=("body","footprint")`。`normalized_inequalities` 按长度或法向弦长尺度缩放全部四项，供增广拉格朗日计算使用。
 
 `NumericalTolerance` 控制浮点计算比较，目标容差规定任务允许误差，支撑容差规定允许间隙；实体距离的模型余量由观测碰撞查询单独应用。各量由对应接口保存。
 
-### 4.1 连续参考的显式位姿要求
+### 4.1 目标坐标中的可设置 yaw 容差
 
-当前实验输入适配器 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 的 `reference_inputs()` 读取技能表示、迁移功能坐标、声明关系 `J/A` 和冻结机器人反馈，调用 `generate_reference` 得到同一次计算的 `object_path/eef_path`。`build_problem()` 通过 `reference_phase` 传入连续工具参考，并在 `PlanningProblem.pose_events` 中登记两个 `PoseEventRequirement`，与原 `supports`、事件和附着条件共同构成任务输入。
+令 W 为规划世界系，E 为标定工具中心点 TCP，C 为受约束的材料坐标，C* 为该材料坐标的目标。固定关系 `A=T_E_C` 与机器人正运动学给出 `T_W_C(q)=T_W_E(q)A`。`target` 保存完整的 `T_W_C*`。`yaw_axis` 是 C* 系中的单位向量 a，`yaw_tolerance_rad=β` 是主值绕轴转角的绝对值上界，范围为 `[0,π]`。这两个字段共同声明；没有轴声明时，事件表达完整姿态精度。
 
-令 `W` 为规划世界坐标系，`E` 为标定的工具中心点 TCP 坐标系，`C` 为已有物体表示坐标系，`A=T_E_C` 为声明的刚性变换。具名关节状态 `q` 经机器人正运动学得到 `T_W_E(q)`，因此要求所计算的物体位姿为 `T_W_C(q)=T_W_E(q)A`。每个要求的 `tool_from_function=A`，`target=object_path.sample_numpy(s)`；位置误差为候选与目标的 `C` 原点欧氏距离，姿态误差为二者相对旋转的最小转角。位置容差为 `0.002 m`，姿态容差为 `π/180 rad`，来源是[本次任务声明](../../../sim-version-plans/2026-10-20-put-pose-goals-replay/plan.md)。目标来源和容差来源保存在各要求的 `source` 中。
+相对旋转 `R=R_W_C*ᵀ R_W_C` 的单位四元数写为 `(w,v)`，其中 v 为 C* 系中的三维向量。令 `b=v·a`，绕轴转角为 `ψ=atan2(2wb,w²−b²)`，剩余旋转为 `R_s=R Rot(a,−ψ)`。`rotation_tolerance_rad` 约束 `R_s` 的最小转角 θ，`yaw_tolerance_rad` 独立约束 `|ψ|`。这是有限旋转分解。因而带轴声明中的 1°表示 θ≤1°，不是某个 RPY 欧拉角，也不是 roll、pitch 各有 1°余量。绕垂直于 a 的轴转过半周时，绕轴分解的 ψ 不唯一；实现取 ψ=0 并保留 θ=π。
 
-两个查询进度分别为源 `interaction_time` 在受控参考时间区间中的归一化值，以及受控参考终点 `s=1`。当前终点对应源释放边界。规划器在候选首次到达相应进度的精确事件位姿上计算要求；机器人随后稳定尾段的最后样本具有自己的物理时刻。`SupportRequirement` 仍在交互进度计算原支撑几何。两个完整位姿要求经 `functional_inequalities` 进入增广拉格朗日求解，并经 `functional_acceptance_keys`、普通和密集轨迹指标参与候选保留与最终验收。参考路径提供目标数值，显式要求及其容差定义该数值在规划中的约束作用。
+β=π 覆盖整周，`component_tolerances` 只包含位置和 θ。功能约束、验收以及可选目标居中项均按此分量集合计算。β=0 要求绕轴偏差为零；β=π/6 给出 ±30°范围。`full_rotation` 与 `signed_yaw` 仅提供解释性数值。源完整姿态和参考路径仍保存原值。
+
+`_functional_events` 保留事件的轴与容差，`_material_pose_requirement` 用当前材料变换和功能目标构造上述要求。`_object_reference` 在入口以及参考功能点上使用同一分解；同刻事件的矛盾检查使用包含完整 yaw 范围的旋转球上界。`build_planning_problem` 从原事件复制轴与容差，保留 C* 的局部坐标语义。有限支撑声明由 `SupportRequirement` 独立表达；需要同时表达姿态集合时，调用者另行传入 `PoseEventRequirement`。
+
+当前连续参考适配器 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 的 `reference_inputs()` 读取完整技能表示、迁移功能坐标、声明关系 J/A 和冻结机器人反馈，调用 `generate_reference` 得到 `object_path/eef_path`。`build_problem()` 在交互进度和受控参考终点建立两个材料姿态要求。目标为 `object_path.sample_numpy(s)`，轴为 `R_W_C*ᵀ n_W`，其中 `n_W` 是观测支撑面的世界法向。三个容差直接读取 [scene.json](../../../sim-version-plans/2026-10-19-put-planner-audit/prepared-inputs/scene.json) 的 `pose_event_tolerances`：当前位置 0.002 m、剩余倾斜 π/180 rad、yaw π rad。该 1°衡量相对参考的倾斜；支撑面的法向与接触间距仍使用独立支撑声明。源时间、交互和释放事件继续决定查询进度。
 
 ## 5. PlanningProblem 的运行接口
 
@@ -102,7 +106,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `residuals(position, quaternion, progress, ..., for_acceptance=False)` 接收相互对齐的批量候选状态，返回名字到非负残差张量的字典。姿态数组分别为 `[...,3]` 和 `[...,4]`；进度数组是相同的批量/时间维度。具名关节、速度、物理时间和工具速度在对应要求需要时使用。事件约束在其精确进度的首次物理到达样本上计算，`point_goal_ids` 将当前查询样本绑定到相应原目标身份。默认计算完整名义条件；轨迹指标传入 `for_acceptance=True`，使每个支持事件的残差只汇总 body/footprint。其他要求使用原值、原掩码与原容差。
 
-`PlanningProblem.evaluate` 汇总默认的完整 `residuals`。`functional_constraint_keys` 枚举当前请求区间中的全部功能条件身份；`functional_inequalities` 按这些身份返回有符号归一化条件与事件掩码，供功能约束增广拉格朗日计算。位置与角度条件使用 `error/tolerance−1`；支撑保留四类原始条件及其正尺度。缺少要求的精确事件样本时输出 NaN，表达该条件在当前样本集上的未求值状态。
+`PlanningProblem.evaluate` 汇总默认的完整 `residuals`。`functional_constraint_keys` 枚举当前请求区间中的全部功能条件身份；`functional_inequalities` 按这些身份返回有符号归一化条件与事件掩码，供功能约束增广拉格朗日计算。正容差的分量使用 `error/tolerance−1`；零宽 yaw 使用 `error/numerical.rotation_rad`，数值缩放保持原零集合；支撑保留四类原始条件及其正尺度。缺少要求的精确事件样本时输出 NaN，表达该条件在当前样本集上的未求值状态。
 
 `functional_acceptance_keys` 从同一功能身份集合选择轨迹验收所需的条件：支持事件保留 body/footprint，位姿与机构坐标事件保留全部原条件。`ProcessCostManager` 在优化前向中读取非支持过程残差及这组键对应的既有有符号数值，构造候选保留的资格；完整四项继续参与增广拉格朗日和严格优化可行性判断。两类计算复用同一事件位姿及条件身份。
 

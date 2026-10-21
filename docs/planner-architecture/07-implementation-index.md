@@ -1,21 +1,21 @@
 # 实现符号索引
 
-代码基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
+代码基线：`本文件所在的 yaw 实现提交`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **53 个文件、925 个定义**。
+覆盖 **53 个文件、932 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
 | [manipulation/representation.py](api/representation.md) | 18 | [01](01-inputs-and-task-model.md) |
-| [manipulation/program.py](api/program.md) | 19 | [01](01-inputs-and-task-model.md) |
+| [manipulation/program.py](api/program.md) | 20 | [01](01-inputs-and-task-model.md) |
 | [manipulation/motion.py](api/motion.md) | 21 | [01](01-inputs-and-task-model.md) |
 | [manipulation/function_motion.py](api/function_motion.md) | 5 | [01](01-inputs-and-task-model.md) |
 | [manipulation/goals.py](api/goals.md) | 14 | [01](01-inputs-and-task-model.md) |
 | [manipulation/grasp.py](api/grasp.md) | 8 | [01](01-inputs-and-task-model.md) |
 | [manipulation/skill.py](api/skill.md) | 13 | [01](01-inputs-and-task-model.md) |
-| [manipulation/planning_problem.py](api/planning_problem.md) | 104 | [01](01-inputs-and-task-model.md) |
+| [manipulation/planning_problem.py](api/planning_problem.md) | 110 | [01](01-inputs-and-task-model.md) |
 | [manipulation/regions.py](api/regions.md) | 21 | [01](01-inputs-and-task-model.md) |
 | [manipulation/support_grounding.py](api/support_grounding.md) | 4 | [01](01-inputs-and-task-model.md) |
 | [manipulation/pipeline.py](api/pipeline.md) | 10 | [01](01-inputs-and-task-model.md) |

@@ -961,7 +961,10 @@ def _obligation_contract(problem):
     """
     from .execution_binding import plain
     columns = {
-        "pose_events": ("progress", "source", "position_tolerance_m", "rotation_tolerance_rad"),
+        # BEGIN retained obligations include their explicit orientation freedoms.
+        "pose_events": ("progress", "source", "position_tolerance_m", "rotation_tolerance_rad",
+                        "yaw_axis", "yaw_tolerance_rad"),
+        # END continuation cannot silently replace a yaw interval with a full pose.
         "coordinate_events": ("progress", "source", "target_coordinate", "tolerance", "kind", "coordinate_mode", "coordinate_origin"),
         "supports": ("progress", "source", "margin", "gap_tolerance", "normal_tolerance"),
         "pose_relations": ("start", "end", "source", "pose_bounds"),
@@ -3343,7 +3346,10 @@ class _CuroboPlanner:
             robot=deepcopy(robot_dict), optimizer_configs=[ik_optimizer],
             metrics_rollout=configuration("metrics_base.yml", "seed_metrics"),
             device_cfg=self.device_cfg, self_collision_check=False, num_seeds=budget.ik_seeds, seed_solver_num_seeds=budget.ik_seeds,
-            max_batch_size=1, max_goalset=1, use_cuda_graph=False,
+            # BEGIN material yaw families generate bounded complete-pose IK centres.
+            max_batch_size=1, max_goalset=budget.ik_seeds+1,
+            use_cuda_graph=False,
+            # END the native seed budget still counts joint branches, not target centres.
             position_tolerance=problem.numerical.position_m,
             orientation_tolerance=problem.numerical.rotation_rad,
             cost_manager_config_instance_type=self._manager_type,
@@ -4240,7 +4246,7 @@ class _CuroboPlanner:
     # END OMPL has no schedule replacement return value or side effect.
 
     # BEGIN bounded true-goal proposals retain static evidence before continuity.
-    def _functional_goal(self, target):
+    def _functional_goal(self, target, yaw_angles=None):
         """Convert one explicitly declared functional pose into native link coordinates.
 
         The centre is an IK proposal only. All other goals and the original
@@ -4248,14 +4254,20 @@ class _CuroboPlanner:
         a hard goal and no full pose is invented for a coordinate/support goal.
         """
         from scipy.spatial.transform import Rotation
-        pose = target.target @ np.linalg.inv(target.tool_from_function)
-        position = self.device_cfg.to_device(pose[:3, 3][None, None])
+        # BEGIN rotate the material frame before applying its offset TCP relation.
+        # Native layout is [batch,horizon,tool,goalset,component]. The trajectory
+        # request omits yaw_angles and still supplies a single nominal centre;
+        # its actual constraints are the continuous material-frame allowed set.
+        poses = target.target[None] if yaw_angles is None else target.target_poses(yaw_angles)
+        poses = poses @ np.linalg.inv(target.tool_from_function)
+        position = self.device_cfg.to_device(poses[:, :3, 3][None])
         quaternion = self.device_cfg.to_device(
-            Rotation.from_matrix(pose[:3, :3]).as_quat()[[3, 0, 1, 2]][None, None])
+            Rotation.from_matrix(poses[:, :3, :3]).as_quat()[:, [3, 0, 1, 2]][None])
         position, quaternion = self.problem.reference_to_link_pose(position, quaternion)
         return self.GoalToolPose(tool_frames=[self.problem.tool_link],
-            position=position[:, :, None, None].contiguous(),
-            quaternion=quaternion[:, :, None, None].contiguous())
+            position=position[:, None, None].contiguous(),
+            quaternion=quaternion[:, None, None].contiguous())
+        # END each sampled centre has a consistent object, TCP and link pose.
 
     def _rank_ik_candidates(self, candidates, success, previous, u, goal_ids=()):
         """Rank bounded IK proposals with the same online geometry as trajectory metrics."""
@@ -4293,7 +4305,10 @@ class _CuroboPlanner:
                                                        state.tool_poses.quaternion[:, :, index])
                 progress, times = q.new_full(q.shape[:2], phase), q.new_full(q.shape[:2], u*self.formal_clock["duration"])
                 task = self.problem.residuals(p, r, progress, q, self.joint_names,
-                    joint_velocity=zero, trajectory_time=times, point_goal_ids=goal_ids, direction_mode="point")
+                    # BEGIN seed qualification uses the same task set as curve delivery.
+                    joint_velocity=zero, trajectory_time=times, point_goal_ids=goal_ids,
+                    direction_mode="point", for_acceptance=True)
+                    # END nominal support preferences cannot become static rejection rules.
                 task = {name: value for name, value in task.items() if not name.startswith("stop:")}
                 # BEGIN reuse the existing static query for bounded rejection reasons.
                 scene_components = {}
@@ -4335,6 +4350,19 @@ class _CuroboPlanner:
         """
         self.goal_ik_candidates = {}
         controls = reference_seeds[0].detach().cpu().numpy()
+        # BEGIN measured start FK chooses a yaw proposal within each declared interval.
+        preferred_tool_pose = None
+        if any(goal.yaw_axis is not None and goal.yaw_tolerance_rad > 0 for goal in self.problem.pose_events):
+            from scipy.spatial.transform import Rotation
+            with self.torch.no_grad():
+                initial = self._verification_fk.compute_kinematics(self.start)
+                slot = initial.tool_poses.tool_frames.index(self.problem.tool_link)
+                p0, r0 = self.problem.transform_tool_pose(initial.tool_poses.position[0, 0, slot],
+                                                        initial.tool_poses.quaternion[0, 0, slot])
+                preferred_tool_pose = np.eye(4)
+                preferred_tool_pose[:3, 3] = p0.detach().cpu().numpy()
+                preferred_tool_pose[:3, :3] = Rotation.from_quat(r0.detach().cpu().numpy()[[1, 2, 3, 0]]).as_matrix()
+        # END current robot feedback supplies no current object truth.
         targets = sorted(enumerate(self.problem.pose_events), key=lambda item: (item[1].progress, item[0]))
         for _, target in targets:
             if target.progress < self.problem.start_progress:
@@ -4346,7 +4374,8 @@ class _CuroboPlanner:
             previous = self.physical_domain.evaluate(controls, np.asarray([u]))[:, 0]
             # END interpolation of free coefficients would omit the fixed boundaries.
             self.seed_parameter.fill_(u)
-            result = self.ik.solve_pose(self._functional_goal(target), current_state=self.start,
+            yaw_angles = target.proposal_yaw_angles(self.budget.ik_seeds, preferred_tool_pose)
+            result = self.ik.solve_pose(self._functional_goal(target, yaw_angles), current_state=self.start,
                 seed_config=self.device_cfg.to_device(previous[None]).contiguous(),
                 return_seeds=self.budget.ik_seeds)
             candidates = self.ik.get_active_js(result.js_solution).position[0].detach().cpu().numpy()
@@ -4360,6 +4389,10 @@ class _CuroboPlanner:
             selected, reports = self._rank_ik_candidates(candidates, success, previous, u, goal_ids)
             self.goal_ik_candidates[u] = {"progress": float(target.progress), "u": u,
                 "time_s": u*self.formal_clock["duration"], "goal_ids": [list(value) for value in goal_ids],
+                # BEGIN record finite centres independently from continuous task acceptance.
+                "target_yaw_proposals_rad": yaw_angles.tolist(),
+                "native_goalset_indices": result.goalset_index[0].detach().cpu().numpy()[selected].tolist(),
+                # END native success and actual task satisfaction remain separate evidence.
                 "candidates": [{"joint_position": candidates[index].tolist(), "report": reports[index]}
                                for index in selected],
                 "scope": "Finite full-pose IK proposals; every OMPL prefix and final trajectory must recheck them"}
@@ -4418,13 +4451,15 @@ class _CuroboPlanner:
         from curobo._src.solver.solve_state import SolveState
         target = next((goal for goal in self.problem.pose_events
                        if goal.progress == self.problem.end_progress), None)
-        self.route = ("native_pose" if target is not None and not any((self.problem.pose_relations,
+        self.route = ("native_pose" if target is not None and target.yaw_axis is None and not any((self.problem.pose_relations,
             self.problem.mechanisms, self.problem.interiors, self.problem.coordinate_events,
             self.problem.supports, self.scene.contacts)) and len(self.problem.pose_events) == 1 else "constrained")
         # Functional frames can be displaced from the TCP; their exact allowed
         # set remains in ProcessCostManager. Only an identity calibration can
         # share the native link-pose convergence tolerance without changing it.
+        # BEGIN native convergence to one nominal pose cannot represent a yaw interval.
         direct = self.route == "native_pose" and np.array_equal(target.tool_from_function, np.eye(4))
+        # END the task cost/metrics retain the complete continuous allowed set.
         if direct:
             self.trajopt.enable_tool_pose_tracking()
         else:

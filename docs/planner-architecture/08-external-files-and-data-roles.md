@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-库实现基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。本文的库接口对应该代码提交；第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+库实现基线：`本文件所在的 yaw 实现提交`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。本文的库接口对应该代码提交；第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 

@@ -13,7 +13,7 @@ import torch
 from manipulation.planning import (PlanningBudget, _CuroboPlanner, _ProgressMap,
     ContinuationBindingError, _bind_event_clock, _initial_timing,
     _prepare_continuation, _continuation_timing, _fixed_spline_grid,
-    _ompl_stage, _scene_boundary_evaluate, _timed_native_state,
+    _ompl_stage, _scene_boundary_evaluate,
     _progress_for_cubic_boundaries)
 from manipulation.planning_ik import rank_ik_candidates
 from manipulation.planning_problem import (MotionPhase, PlanningEvent, PlanningProblem,
@@ -103,10 +103,11 @@ class PlanningBindingTest(unittest.TestCase):
         hand = PrismaticGripper(controller="timed_reference", control_timestep_s=.002,
             joint_names=("finger",), current_positions=[.04], joint_limits=[[0., .04]], joint_bounds=None,
             finger_trajectory_factory=fingers, nominal_finger_trajectory_factory=geometry,
-            coupling_matrix=np.empty((0, 1)), coupling_offset=[], sphere_indices=(0,),
-            local_spheres=[[0., 0., 0., .001]], sphere_joint_translation=[[[1.], [0.], [0.]]],
-            self_collision_pairs=(), commands=[{"skill_id": "current", "event_id": "close", "occurrence": 0,
+            # BEGIN the current hand interface binds clocks and joint coordinates.
+            coupling_matrix=np.empty((0, 1)), coupling_offset=[],
+            commands=[{"skill_id": "current", "event_id": "close", "occurrence": 0,
                 "command": "close", "progress": .8}], source="explicit CPU clock contract")
+            # END robot collision entities are supplied by their geometry component.
         hand.bind_clock(grid["duration"], mapping)
         self.assertTrue(all(duration == grid["duration"] and actual_map is mapping for duration, actual_map in seen))
         self.assertEqual(hand.finger_trajectory.duration, hand.nominal_finger_trajectory.duration)
@@ -454,7 +455,7 @@ class PlanningBindingTest(unittest.TestCase):
         observations = []
         # BEGIN the unchanged material-mode fixture declares no arrival pair permission.
         def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
-                     contact_permission_progress):
+                     contact_permission_progress, query_role):
             observations.append((s.clone(), joints.clone(), trajectory_time.clone()))
             return ((s < .5) & (joints[..., 0] > 0)).to(s.dtype)
         scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate)
@@ -477,33 +478,10 @@ class PlanningBindingTest(unittest.TestCase):
         q[:, 0] = .1
         self.assertGreater(float(check(q)[0, 0]), 0.)
 
-    def test_unknown_finger_model_keeps_actual_entrance_palm_and_arm_native_pairs(self):
-        problem = self.problem()
-        spheres = torch.zeros((1, 2, 3, 4)); spheres[..., 3] = .02
-        quaternion = torch.zeros((1, 2, 1, 4)); quaternion[..., 0] = 1.
-        native = SimpleNamespace(robot_spheres=spheres,
-            tool_jacobians=torch.zeros((1, 2, 1, 6, 1)))
-        state = SimpleNamespace(joint_state=SimpleNamespace(position=torch.zeros((1, 2, 1))),
-            cuda_robot_model_state=native, robot_spheres=spheres,
-            tool_poses=SimpleNamespace(tool_frames=["tool"], position=torch.zeros((1, 2, 1, 3)),
-                                       quaternion=quaternion))
-        hand = SimpleNamespace(controller="timed_reference", nominal_finger_trajectory=None,
-            sphere_indices=(0, 1), sphere_joint_translation=np.array([[[0., 0., 0.]], [[1., 0., 0.]]]),
-            # BEGIN match the explicit hand-state interface used by native geometry.
-            state=lambda *args, **kwargs: SimpleNamespace(coordinates=None, half=None,
-                uncertain=kwargs["trajectory_time"] > 0), spheres=lambda values, *args: values)
-            # END uncertainty is per physical query, not a tuple convention.
-        with patch("manipulation.planning._native_gradient_layout_type",
-                   return_value=SimpleNamespace(apply=lambda value: value)), \
-             patch("manipulation.planning._orientation_vjp_type",
-                   return_value=SimpleNamespace(apply=lambda q, r, jac: r)):
-            result = _timed_native_state(state, problem, SimpleNamespace(gripper=hand), ("q",),
-                                        torch.tensor([[0., .1]]), sphere_padding=.05)
-        radii = result.cuda_robot_model_state.robot_spheres[..., 3]
-        torch.testing.assert_close(radii[:, 0], spheres[:, 0, :, 3], rtol=0., atol=0.)
-        self.assertLess(float(radii[0, 1, 1]+.05), 0.)
-        torch.testing.assert_close(radii[:, 1, [0, 2]], spheres[:, 1, [0, 2], 3], rtol=0., atol=0.)
-        torch.testing.assert_close(state.cuda_robot_model_state.robot_spheres, spheres, rtol=0., atol=0.)
+    # BEGIN remove the retired timed-sphere adapter regression.
+    # Native robot geometry now uses its declared joint-state/shape consumers;
+    # _timed_native_state and its radius-masking interface no longer exist.
+    # END current hand geometry contracts are covered by their component tests.
 
 
 if __name__ == '__main__':

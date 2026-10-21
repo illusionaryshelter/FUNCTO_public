@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
+代码基线：`本文件所在的 yaw 实现提交`。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -25,7 +25,11 @@
 | `event_occurrence_key` | 获取一次命令/事件的完整身份 | 事件记录 → `(skill_id,event_id,occurrence)`；规划、手指与执行 |
 | `resolve_event_window` | 解析绝对或相对物理时间窗 | `EventTimeConstraint`、实际历史、可用预测原点 → 上下时间界；时钟绑定与执行 |
 | `PoseProcessRequirement.error` | 计算过程关系偏差 | 候选位置/姿态/进度 → 指定过程残差；问题残差 |
-| `PoseEventRequirement.errors/evaluate` | 计算确切功能目标误差与超容差量 | 候选工具位姿、已绑定材料/目标 → 位置/角度误差或正部和；硬验收 |
+| `PoseEventRequirement.error_components/errors/errors_numpy` | 计算材料目标位置与完整旋转或倾斜/yaw | 工具位姿、固定材料关系、目标及显式目标局部轴 → 分量字典；`errors` 仅返回位置和旋转；准备、诊断、规划与事后评价 |
+| `PoseEventRequirement.component_tolerances/evaluate` | 选择并验收声明分量 | 位置/旋转容差及可选 yaw 容差 → 受约束分量与超差正部和；π 时省略 yaw |
+| `PoseEventRequirement.proposal_yaw_angles/target_poses` | 生成有限完整材料目标 | 原 IK 种子数、当前工具位姿和声明区间 → 角度集合及保持原点的材料目标；原生 IK 候选生成 |
+| `program._material_pose_requirement` | 在准备阶段绑定同一材料姿态集合 | 当前功能帧、目标、位置/旋转/可选 yaw 容差 → `PoseEventRequirement`；入口与功能点检查 |
+| `quaternion_axis_angle` | 有限旋转的主值绕轴分解 | 同一坐标系的相对四元数及单位轴 → `[-π,π]` 内绕轴角；姿态事件与机构误差 |
 | `SupportRequirement.raw_inequalities` | 计算有限支撑四条件 | 候选工具位姿、物体点/材料、目标平面/边界 → gap/body/footprint/normal 原始有符号值；优化、验收选择与分析 |
 | `SupportRequirement.normalized_inequalities` | 缩放完整支持条件，保留各项零集合 | 四类原始条件与数值尺度 → 四项有符号归一化条件；功能 AL |
 | `SupportRequirement.acceptance_components/evaluate` | 声明支持验收子集并计算相应残差 | 同一工具位姿、支持几何、数值容差及 `for_acceptance` → 默认四项正部和，True 时为 body/footprint 正部和；`PlanningProblem.residuals` |

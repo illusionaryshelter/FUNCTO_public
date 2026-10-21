@@ -661,10 +661,24 @@ def _functional_events(demo, scene, frames, poses, last_held, task, initial):
                        "position_tolerance_m": (_positive(event["position_tolerance_m"], "event position tolerance")
                                                 if relation["constraint_kind"] == "functional_frame" else None),
                        "rotation_tolerance_rad": (_positive(event["rotation_tolerance_rad"], "event rotation tolerance")
-                                                  if relation["constraint_kind"] == "functional_frame" else None)})
+                                                  if relation["constraint_kind"] == "functional_frame" else None),
+                       # BEGIN preserve explicit target-local yaw declarations through grounding.
+                       **{key: deepcopy(event[key]) for key in ("yaw_axis", "yaw_tolerance_rad") if key in event}})
+                       # END typed pose requirements own their validation and interpretation.
         previous = index
         names.add(name)
     return output
+
+
+# BEGIN preparation and planning share the material pose-event geometry.
+def _material_pose_requirement(event):
+    """Bind one grounded functional event without promoting its reference path."""
+    from .planning_problem import PoseEventRequirement
+    material = event["function_frame"]
+    return PoseEventRequirement(0., material, event["goal_pose"] @ material,
+        event["position_tolerance_m"], event["rotation_tolerance_rad"], event["source"],
+        yaw_axis=event.get("yaw_axis"), yaw_tolerance_rad=event.get("yaw_tolerance_rad"))
+# END source recipe-frame consistency checks retain their independent full-frame meaning.
 
 
 def _object_reference(demo, scene, frames, last_held, task, initial):
@@ -707,22 +721,30 @@ def _object_reference(demo, scene, frames, last_held, task, initial):
     for event_index, event in enumerate(events):
         index, goal = event["index"], event["goal_pose"]
         if event["constraint_kind"] == "functional_frame":
+            # BEGIN validate explicit orientation data before any allowed-set test.
+            requirement = _material_pose_requirement(event)
+            # END the same declaration reaches the later PlanningProblem.
             for previous_event in events[:event_index]:
                 if previous_event["index"] != index or previous_event["constraint_kind"] != "functional_frame":
                     continue
                 position_error, rotation_error = _errors(goal[None], previous_event["goal_pose"][None])
+                # BEGIN the whole yaw family lies inside this conservative SO(3) ball.
+                def radius(item):
+                    yaw = 0. if item.get("yaw_axis") is None else item["yaw_tolerance_rad"]
+                    return min(np.pi, item["rotation_tolerance_rad"]+yaw)
                 translation_bound = sum(item["position_tolerance_m"]
-                    + 2*np.linalg.norm(item["function_frame"][:3, 3])*np.sin(min(np.pi, item["rotation_tolerance_rad"])/2)
+                    + 2*np.linalg.norm(item["function_frame"][:3, 3])*np.sin(radius(item)/2)
                     for item in (event, previous_event))
-                rotation_bound = event["rotation_tolerance_rad"]+previous_event["rotation_tolerance_rad"]
+                rotation_bound = radius(event)+radius(previous_event)
+                # END this contradiction proof cannot shrink a permitted twist interval.
                 if position_error[0] > translation_bound or rotation_error[0] > rotation_bound:
                     raise ValueError("Same-frame functional allowed sets are provably inconsistent")
             if index == 0:
-                position_error, rotation_error = _errors((initial @ event["function_frame"])[None],
-                                                         (goal @ event["function_frame"])[None])
-                if (position_error[0] > event["position_tolerance_m"]
-                        or rotation_error[0] > event["rotation_tolerance_rad"]):
+                # BEGIN current entry is compared with the task's complete allowed set.
+                errors = requirement.errors_numpy(initial)
+                if any(errors[name] > bound for name, bound in requirement.component_tolerances.items()):
                     raise ValueError("The initial functional allowed set excludes the observed current pose")
+                # END a different nominal yaw alone cannot reject an allowed entry.
         unique_goals.setdefault(index, initial.copy() if index == 0 else goal)
     # END compatible noncentral members are left to the shared goal consumers.
     goal_pairs = list(unique_goals.items())
@@ -801,8 +823,13 @@ def _object_reference(demo, scene, frames, last_held, task, initial):
             error = relation_error(_inverse(_pose_array(scene["reference_pose"], "Reference pose")) @ pose,
                                    binding["carrier_frame"],
                                    binding["reference_frame"], event["functional_relation"])
-            if error["position_error_m"] > event["position_tolerance_m"] or error["rotation_error_rad"] > event["rotation_tolerance_rad"]:
+            # BEGIN the nominal relation diagnostic and allowed-set result are separate.
+            requirement = _material_pose_requirement(event)
+            components = requirement.errors_numpy(pose)
+            error["allowed_set_errors"] = {name: float(value) for name, value in components.items()}
+            if any(components[name] > bound for name, bound in requirement.component_tolerances.items()):
                 raise ValueError(f"Transferred trajectory misses functional event {event['event_id']!r}")
+            # END full-reference yaw error remains an analysis value when yaw is free.
         if task["relation"] == "inside":
             if "interior" in scene:
                 from .pipeline import _interior

@@ -249,10 +249,28 @@ def test_actual_task_and_online_checks_rank_reference_ik_without_hardening_its_p
     selected, reports = planner._rank_ik_candidates(
         [[.1, 0., 0.], [.7, 0., 0.]], [True, False], [[0., 0., 0.]], .4)
     assert selected.tolist() == [0, 1]
-    assert all(row["task_satisfied"] and row["model_valid"] for row in reports)
+    # BEGIN reference failures keep unqueried status; functional queries differ below.
+    assert reports[0]["task_satisfied"] and reports[0]["model_valid"]
+    assert reports[1]["static_model_query"] == "not_run_native_reference_ik_failed"
     assert not reports[1]["native_pose_ik_success"]
-    assert calls["online"] == [(.8, .4), (.8, .4)]
-    assert len(calls["native"]) == 2
+    assert calls["online"] == [(.8, .4)]
+    assert len(calls["native"]) == 1
+    # END no model evidence is invented for a skipped reference proposal.
+
+
+def test_static_functional_screening_requests_delivery_acceptance_subset(monkeypatch):
+    planner, _ = _static_planner(monkeypatch)
+    received = []
+    original = planner.problem.residuals
+
+    def residuals(*args, **kwargs):
+        received.append(kwargs["for_acceptance"])
+        return original(*args, **kwargs)
+
+    planner.problem.residuals = residuals
+    planner._rank_ik_candidates([[.1, 0., 0.]], [False], [[0., 0., 0.]], .4,
+                               (("pose_events", 0),))
+    assert received == [True]
 
 
 def test_functional_static_pool_keeps_allowed_pose_when_nominal_center_ik_failed(monkeypatch):
@@ -314,12 +332,15 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     from types import SimpleNamespace
     import torch
     from manipulation import planning
+    from manipulation.planning_problem import PoseEventRequirement
 
     planner = planning._CuroboPlanner.__new__(planning._CuroboPlanner)
     planner.budget = SimpleNamespace(ik_seeds=2)
     planner.joint_names = ("x", "y", "z")
+    # BEGIN the fixture supplies actual typed pose declarations to the proposal API.
     planner.problem = SimpleNamespace(start_progress=0., pose_events=[
-        SimpleNamespace(progress=.4), SimpleNamespace(progress=.4), SimpleNamespace(progress=.8)])
+        PoseEventRequirement(s, np.eye(4), np.eye(4), .01, .02, "declared event") for s in (.4, .4, .8)])
+    # END complete poses have exactly one nominal yaw proposal.
     planner.problem.goal_requirements_at = lambda phase: tuple(
         ("pose_events", index) for index, goal in enumerate(planner.problem.pose_events) if goal.progress == phase)
     planner.trajopt = SimpleNamespace(action_horizon=6)
@@ -331,13 +352,14 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     from manipulation.physical_joint_domain import CubicJointDomain
     planner.physical_domain = CubicJointDomain(torch.full((3,), -2.), torch.full((3,), 2.),
         planner.start.position, torch.zeros((1, 3)), 3./10., 6)
-    planner._functional_goal = lambda target: target
+    planner._functional_goal = lambda target, yaw_angles: target
     queries = []
 
     def solve(target, **kwargs):
         queries.append((target.progress, float(planner.seed_parameter.item()), kwargs))
         return SimpleNamespace(js_solution=SimpleNamespace(position=torch.tensor(
-            [[[.1, 0., 0.], [.7, 0., 0.]]], dtype=torch.float64)), success=torch.ones((1, 2), dtype=torch.bool))
+            [[[.1, 0., 0.], [.7, 0., 0.]]], dtype=torch.float64)), success=torch.ones((1, 2), dtype=torch.bool),
+            goalset_index=torch.zeros((1, 2, 1), dtype=torch.long))
 
     planner.ik = SimpleNamespace(solve_pose=solve, get_active_js=lambda value: value)
     planner._rank_ik_candidates = lambda values, success, previous, u, goals: (

@@ -61,6 +61,25 @@ def quaternion_rotvec(q):
     return q[..., 1:] * (2 * torch.atan2(length, q[..., :1]) / length)
 
 
+# BEGIN a declared axis has one pointwise principal twist, independent of RPY.
+def quaternion_axis_angle(relative, axis):
+    """Project a relative quaternion onto rotations about an explicit unit axis.
+
+    Both arguments use the same coordinate frame. The result lies in [-pi,pi]
+    and is unchanged by the quaternion sign. A perpendicular half-turn has no
+    unique twist; choosing zero there leaves its remaining rotation equal to
+    pi. Callers therefore retain the actual tilt instead of accepting a zero
+    quaternion or differentiating atan2 at (0,0).
+    """
+    import torch
+    w, along = relative[..., 0], (relative[..., 1:]*axis).sum(-1)
+    sine, cosine = 2*w*along, w.square()-along.square()
+    singular = w.square()+along.square() <= torch.finfo(relative.dtype).eps**2
+    return torch.atan2(torch.where(singular, torch.zeros_like(sine), sine),
+                       torch.where(singular, torch.ones_like(cosine), cosine))
+# END axis projection is shared by physical manifolds and pose-event tolerances.
+
+
 def _quaternion(pose):
     return Rotation.from_matrix(np.asarray(pose)[..., :3, :3]).as_quat()[..., [3, 0, 1, 2]]
 
@@ -612,16 +631,9 @@ def _mechanism_errors(model, tool_from_carrier, position, quaternion):
     projected_q = base_q.expand_as(q)
     if model.kind in {"revolute", "planar"}:
         relative = quaternion_multiply(q, quaternion_conjugate(base_q))
-        w, along = relative[..., 0], (relative[..., 1:]*axis).sum(-1)
-        sine, cosine = 2*w*along, w.square()-along.square()
-        # These are exactly MotionModel._angles's skew/trace projection.
-        # A half-turn about a perpendicular axis has no unique projected turn.
-        # Choose zero only at machine precision, before atan2, to avoid an
-        # undefined derivative; its actual SO(3) residual remains pi and fails
-        # the original model tolerance, rather than becoming a zero quaternion.
-        singular = w.square()+along.square() <= torch.finfo(q.dtype).eps**2
-        angle = torch.atan2(torch.where(singular, torch.zeros_like(sine), sine),
-                            torch.where(singular, torch.ones_like(cosine), cosine))
+        # BEGIN the same pointwise projection retains the manifold's SO(3) metric.
+        angle = quaternion_axis_angle(relative, axis)
+        # END ordered mechanism coordinates still own trajectory winding.
         half = angle[..., None]/2
         turn = torch.cat((torch.cos(half), torch.sin(half)*axis), -1)
         projected_q = quaternion_multiply(turn, base_q)
@@ -979,7 +991,7 @@ class SupportRequirement:
 
 @dataclass
 class PoseEventRequirement:
-    """The original full material-frame event, with its own metric thresholds.
+    """A material-frame event with explicit position and orientation tolerances.
 
     These acceptance thresholds are not inferred freedom for the neighbouring
     motion. In particular, a larger generic solver tolerance never replaces a
@@ -989,9 +1001,9 @@ class PoseEventRequirement:
     against a fixed world target. Owner-relative goals instead name the
     currently observed target owner and its material target transform. A held
     function additionally names its owner/material frame and the already bound
-    attachment condition. The execution consumer must obtain fresh owner poses
-    or an independently measured attachment; planning declarations are not observations.
-    This metadata is for posthoc evaluation only and never gates online motion.
+    attachment condition. These owner inputs describe the observations consumed
+    by the independent posthoc evaluator. Online control consumes its own robot
+    and task-effect feedback; this geometric metadata belongs to evaluation.
     """
     progress: float
     tool_from_function: np.ndarray
@@ -1002,6 +1014,13 @@ class PoseEventRequirement:
     # BEGIN explicit execution geometry; provenance remains opaque evidence.
     actual_relation: dict | None = None
     # END no runtime owner relation is inferred from an event name or source.
+    # BEGIN optional task-declared twist axis, expressed in target coordinates.
+    # With an axis, rotation_tolerance_rad bounds the remaining swing/tilt;
+    # yaw_tolerance_rad independently bounds principal twist about this axis.
+    # A pi yaw tolerance is a full free revolution, with no yaw objective.
+    yaw_axis: np.ndarray | None = None
+    yaw_tolerance_rad: float | None = None
+    # END absent axis declarations retain the complete SO(3) pose requirement.
 
     def __post_init__(self):
         self.tool_from_function = _pose_array(self.tool_from_function, "T_tool_function")
@@ -1010,6 +1029,18 @@ class PoseEventRequirement:
                 or not 0 < self.position_tolerance_m < np.inf
                 or not 0 < self.rotation_tolerance_rad < np.pi):
             raise ValueError("A material-frame event needs finite metric thresholds and its original source")
+        # BEGIN a yaw degree of freedom is explicit data, never a task-name rule.
+        if (self.yaw_axis is None) != (self.yaw_tolerance_rad is None):
+            raise ValueError("A yaw tolerance requires its axis in target coordinates")
+        if self.yaw_axis is not None:
+            from .regions import _unit
+            self.yaw_axis = _unit(self.yaw_axis, "target-frame yaw axis")
+            if (isinstance(self.yaw_tolerance_rad, (bool, np.bool_))
+                    or not np.isfinite(self.yaw_tolerance_rad)
+                    or not 0 <= self.yaw_tolerance_rad <= np.pi):
+                raise ValueError("Yaw tolerance must lie in [0, pi]; pi means free twist")
+            self.yaw_tolerance_rad = float(self.yaw_tolerance_rad)
+        # END the remaining orientation tolerance remains strictly below pi.
         # BEGIN validate each explicitly requested current material-frame input.
         if self.actual_relation is not None:
             relation = self.actual_relation
@@ -1033,16 +1064,97 @@ class PoseEventRequirement:
             self.actual_relation = relation
         # END absent current evidence remains an execution-level unknown.
 
-    def errors(self, position, quaternion):
+    # BEGIN every consumer uses the same declared position/swing/twist set.
+    @property
+    def component_tolerances(self):
+        """Metric bounds for actual constrained components; free yaw is absent."""
+        result = {"position": self.position_tolerance_m, "rotation": self.rotation_tolerance_rad}
+        if self.yaw_axis is not None and self.yaw_tolerance_rad < np.pi:
+            result["yaw"] = self.yaw_tolerance_rad
+        return result
+
+    def error_components(self, position, quaternion):
+        """Return physical errors plus signed yaw/full-rotation diagnostics.
+
+        C is the constrained material frame and C* its target. The relative
+        quaternion represents R_C*^T R_C, so yaw_axis is used in C* coordinates.
+        Removing its nearest axis rotation leaves the swing/tilt quaternion.
+        This is a finite-rotation decomposition, not Euler-angle subtraction.
+        """
         import torch
         p, q = _compose(position, quaternion, self.tool_from_function)
-        error = _pose_error(p, q, _tensor(self.target[:3, 3], p), _tensor(_quaternion(self.target), q))
-        return torch.linalg.vector_norm(error[..., :3], dim=-1), torch.linalg.vector_norm(error[..., 3:], dim=-1)
+        relative = quaternion_multiply(quaternion_conjugate(_tensor(_quaternion(self.target), q)), q)
+        rotation = torch.linalg.vector_norm(quaternion_rotvec(relative), dim=-1)
+        result = {"position": torch.linalg.vector_norm(p-_tensor(self.target[:3, 3], p), dim=-1),
+                  "rotation": rotation}
+        if self.yaw_axis is not None:
+            axis = _tensor(self.yaw_axis, q)
+            angle = quaternion_axis_angle(relative, axis)
+            half = angle[..., None]/2
+            turn = torch.cat((torch.cos(half), torch.sin(half)*axis), -1)
+            swing = quaternion_multiply(relative, quaternion_conjugate(turn))
+            result.update(rotation=torch.linalg.vector_norm(quaternion_rotvec(swing), dim=-1),
+                          yaw=angle.abs(), signed_yaw=angle, full_rotation=rotation)
+        return result
+
+    def errors(self, position, quaternion):
+        """Position and constrained orientation; use error_components for yaw."""
+        values = self.error_components(position, quaternion)
+        return values["position"], values["rotation"]
+
+    def errors_numpy(self, tool_poses):
+        """Evaluate the same tensor geometry for CPU preparation and diagnostics."""
+        import torch
+        poses = np.asarray(tool_poses, dtype=float)
+        return {name: value.detach().numpy() for name, value in self.error_components(
+            torch.as_tensor(poses[..., :3, 3].copy(), dtype=torch.float64),
+            torch.as_tensor(_quaternion(poses), dtype=torch.float64)).items()}
+
+    def target_poses(self, yaw_angles):
+        """Construct complete material targets at declared yaw proposal angles.
+
+        The target material origin stays fixed. Tool/link targets must be
+        obtained afterward using the complete attachment/calibration chain;
+        a rotated material frame generally translates an offset TCP.
+        """
+        angles = np.asarray(yaw_angles, dtype=float).reshape(-1)
+        if not np.isfinite(angles).all() or not len(angles):
+            raise ValueError("Yaw proposals must be a finite nonempty sequence")
+        if self.yaw_axis is None:
+            if np.any(angles != 0):
+                raise ValueError("A complete pose target has no declared yaw interval")
+            return np.repeat(self.target[None], len(angles), axis=0)
+        if np.any(np.abs(angles) > self.yaw_tolerance_rad):
+            raise ValueError("Yaw proposals must stay inside the declared interval")
+        result = np.repeat(self.target[None], len(angles), axis=0)
+        result[:, :3, :3] = self.target[:3, :3] @ Rotation.from_rotvec(angles[:, None]*self.yaw_axis).as_matrix()
+        return result
+
+    def proposal_yaw_angles(self, count, preferred_tool_pose):
+        """Sample finite IK centres; continuous component tolerances accept states.
+
+        The projected current posture supplies one centre. The existing IK
+        seed count also sizes a uniform yaw grid, avoiding another search
+        configuration. A full revolution excludes its duplicate endpoint.
+        This gives at most count+1 targets, not count+1 independent IK solves.
+        """
+        if type(count) is not int or count < 1:
+            raise ValueError("Yaw proposal count must be positive")
+        if self.yaw_axis is None or self.yaw_tolerance_rad == 0:
+            return np.zeros(1)
+        bound = self.yaw_tolerance_rad
+        preferred = float(self.errors_numpy(preferred_tool_pose)["signed_yaw"])
+        preferred = np.clip(preferred, -bound, bound)
+        angles = np.r_[preferred, np.linspace(-bound, bound, count, endpoint=bound < np.pi)]
+        if bound == np.pi:
+            angles = (angles+np.pi) % (2*np.pi)-np.pi
+        return np.unique(angles)
 
     def evaluate(self, position, quaternion):
         import torch
-        p, r = self.errors(position, quaternion)
-        return torch.relu(p-self.position_tolerance_m)+torch.relu(r-self.rotation_tolerance_rad)
+        values = self.error_components(position, quaternion)
+        return sum(torch.relu(values[name]-bound) for name, bound in self.component_tolerances.items())
+    # END preparation, optimizer, acceptance and reporting share this geometry.
 
 
 # BEGIN native goals compare lifted candidate coordinates, including winding.
@@ -1558,7 +1670,9 @@ class PlanningProblem:
             [f"function_pose:{index}:{component}"
              for index, requirement in enumerate(self.pose_events)
              if requirement.progress >= self.start_progress
-             for component in ("position", "rotation")]
+             # BEGIN only explicitly constrained orientation components get AL rows.
+             for component in requirement.component_tolerances]
+             # END a full-turn yaw interval has no hidden optimization target.
             + [f"function_coordinate:{index}"
                for index, requirement in enumerate(self.coordinate_events)
                if requirement.progress >= self.start_progress]
@@ -1588,10 +1702,14 @@ class PlanningProblem:
 
         For input progress ``[batch, horizon]``, residual values have shape
         ``[batch]`` and Boolean masks have shape ``[batch, horizon]``. A pose
-        event supplies separate position-norm and rotation-norm inequalities;
+        event supplies position and orientation inequalities, plus a yaw row
+        when a declared axis has yaw_tolerance_rad < pi. Orientation means
+        full SO(3) angle without an axis and remaining swing with an axis;
         a coordinate event uses its existing signed/unwrapped history before
         taking the absolute error. Those values are
-        ``error/original_tolerance-1``. A support event instead supplies four
+        ``error/original_tolerance-1`` for positive bounds. Exact zero yaw uses
+        ``error/numerical.rotation_rad``; this scale preserves the zero-width
+        allowed set. A support event instead supplies four
         signed physical inequalities divided by its shared positive scales;
         their zero sets remain the original finite-support requirements.
 
@@ -1606,7 +1724,10 @@ class PlanningProblem:
         signed, masks = {}, {}
 
         def add(key, error, tolerance, mask):
-            value = torch.where(mask, error/tolerance-1., 0.).sum(-1)
+            # BEGIN a zero yaw width is an exact declaration with numerical scaling.
+            scale = tolerance if tolerance > 0 else self.numerical.rotation_rad
+            value = torch.where(mask, (error-tolerance)/scale, 0.).sum(-1)
+            # END scaling never expands the declared interval.
             signed[key] = torch.where(mask.any(-1), value, float("nan"))
             masks[key] = mask
 
@@ -1614,9 +1735,11 @@ class PlanningProblem:
             if requirement.progress < self.start_progress:
                 continue
             mask = _first_event_query(progress, requirement.progress, trajectory_time)
-            position_error, rotation_error = requirement.errors(position, quaternion)
-            add(f"function_pose:{index}:position", position_error, requirement.position_tolerance_m, mask)
-            add(f"function_pose:{index}:rotation", rotation_error, requirement.rotation_tolerance_rad, mask)
+            # BEGIN task geometry defines the same components for optimization and delivery.
+            errors = requirement.error_components(position, quaternion)
+            for name, bound in requirement.component_tolerances.items():
+                add(f"function_pose:{index}:{name}", errors[name], bound, mask)
+            # END free yaw does not acquire a nominal-centre constraint.
         for index, requirement in enumerate(self.coordinate_events):
             if requirement.progress < self.start_progress:
                 continue
@@ -1667,13 +1790,16 @@ class PlanningProblem:
                 mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
                 result = result+torch.where(mask, preference, 0.)
         for requirement in self.pose_events if phase == "quality" else ():
-            p, r = requirement.errors(position, quaternion)
+            errors = requirement.error_components(position, quaternion)
             # BEGIN scale real goal objectives by their declared functional accuracy.
             # Raw metres/radians squared make a precise goal arbitrarily weak
             # beside native smoothness costs. This fixed rule changes numerical
             # conditioning only; residuals and final allowed sets stay in their
             # original units, and free support/region axes gain no target.
-            preference = (p/requirement.position_tolerance_m).square()+(r/requirement.rotation_tolerance_rad).square()
+            # BEGIN only bounded task coordinates have a nominal-centre preference.
+            preference = sum((errors[name]/(bound if bound > 0 else self.numerical.rotation_rad)).square()
+                             for name, bound in requirement.component_tolerances.items())
+            # END yaw_tolerance_rad=pi contributes neither a constraint nor a preference.
             result = result+torch.where(_first_event_query(progress, requirement.progress, trajectory_time), preference, 0.)
             # END goal precision is input semantics, never a per-skill weight.
         for requirement in self.coordinate_events if phase == "quality" else ():
@@ -1725,10 +1851,12 @@ class PlanningProblem:
             result[f"mechanism:{index}:position_error_m"] = torch.where(mask, p, 0.)
             result[f"mechanism:{index}:rotation_error_rad"] = torch.where(mask, r, 0.)
         for index, requirement in enumerate(self.pose_events):
-            p, r = requirement.errors(position, quaternion)
             mask = _first_event_query(progress, requirement.progress, trajectory_time)
-            result[f"function:{index}:position_error_m"] = torch.where(mask, p, 0.)
-            result[f"function:{index}:rotation_error_rad"] = torch.where(mask, r, 0.)
+            # BEGIN report constrained tilt separately from the full reference rotation.
+            for name, value in requirement.error_components(position, quaternion).items():
+                unit = "m" if name == "position" else "rad"
+                result[f"function:{index}:{name}_error_{unit}"] = torch.where(mask, value, 0.)
+            # END yaw diagnostics retain sign and never imply an online execution gate.
         for index, requirement in enumerate(self.coordinate_events):
             unit = "m" if requirement.kind == "prismatic" else "rad"
             result[f"coordinate:{index}:error_{unit}"] = torch.where(_first_event_query(progress, requirement.progress, trajectory_time),
@@ -1842,9 +1970,11 @@ class PlanningProblem:
                 raise ValueError("Unknown true goal collection")
             goal = getattr(self, collection)[index]
             if collection == "pose_events":
-                p, r = goal.errors(position, quaternion)
-                pieces.extend((torch.relu(p-goal.position_tolerance_m)[..., None],
-                               torch.relu(r-goal.rotation_tolerance_rad)[..., None]))
+                # BEGIN local projection uses the continuous declared yaw interval.
+                values = goal.error_components(position, quaternion)
+                pieces.extend(torch.relu(values[name]-bound)[..., None]
+                              for name, bound in goal.component_tolerances.items())
+                # END the finite IK proposal grid never becomes the allowed set.
             elif collection == "coordinate_events":
                 pieces.append(goal.evaluate(position, quaternion, progress)[..., None])
             else:
@@ -1960,7 +2090,8 @@ def _validate_skill_requirements(spec):
                common | {"command", "timestamp", "record_kind"}),
               ("functional event", demo.get("functional_events", ()), common |
                {"constraint_kind", "carrier_frame", "reference_frame", "position_tolerance_m",
-                "rotation_tolerance_rad", "coordinate_value", "coordinate_tolerance"}),
+                "rotation_tolerance_rad", "yaw_axis", "yaw_tolerance_rad",
+                "coordinate_value", "coordinate_tolerance"}),
               ("execution event", spec.get("execution_events", ()), common | {"kind"}))
     # END unknown requirement names still fail the same closed event schema.
     for label, events, allowed in groups:
@@ -1983,13 +2114,17 @@ def _validate_skill_requirements(spec):
                     raise ValueError("Unsupported functional event constraint_kind for its relation consumer")
                 # BEGIN task tolerances must belong to the selected consumer.
                 coordinate_fields = {"coordinate_value", "coordinate_tolerance"}
-                pose_fields = {"position_tolerance_m", "rotation_tolerance_rad",
+                pose_fields = {"position_tolerance_m", "rotation_tolerance_rad", "yaw_axis", "yaw_tolerance_rad",
                                "carrier_frame", "reference_frame"}
                 incompatible = ((pose_fields if actual_kind == "joint_coordinate" else coordinate_fields)
                                 & set(event))
                 if incompatible:
                     raise ValueError(f"Unsupported {actual_kind} requirement fields without consumers: "
                                      f"{sorted(incompatible)}")
+                # BEGIN a support-only record cannot silently swallow a pose declaration.
+                if actual_kind == "on_region" and {"yaw_axis", "yaw_tolerance_rad"} & set(event):
+                    raise ValueError("Explicit yaw bounds require a material pose event; support regions have no yaw target")
+                # END task data must reach a consumer with the declared semantics.
                 # END existing on-region source-frame metadata does not create a pose goal.
             if label == "execution event":
                 if event.get("kind") in {"open", "close", "hold", "function", "effect"}:
@@ -2198,6 +2333,9 @@ def build_planning_problem(skills, *, joint_names, start_q, start_dq, tool_link,
                 pose_events.append(PoseEventRequirement(progress, _inverse(attachment) @ material,
                     np.asarray(check["goal_pose"]) @ material,
                     event["position_tolerance_m"], event["rotation_tolerance_rad"], event["source"],
+                    # BEGIN the axis is declared in the event's target material coordinates.
+                    yaw_axis=event.get("yaw_axis"), yaw_tolerance_rad=event.get("yaw_tolerance_rad"),
+                    # END owner-frame grounding preserves the local axis coordinates.
                     # BEGIN current carrier/reference observations own actual satisfaction.
                     actual_relation={"function_owner_id": carrier, "T_owner_function": material,
                         "attachment_condition_id": attachment_id,

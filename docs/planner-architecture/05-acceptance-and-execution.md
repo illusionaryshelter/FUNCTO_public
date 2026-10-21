@@ -1,12 +1,12 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
+代码基线：`本文件所在的 yaw 实现提交`。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
 
 ## 1. 候选的完整验收
 
 `_CuroboPlanner._candidate_metrics` 消费 `JointTrajectory` 和本候选场景，沿原多项式计算机器人 FK、任务残差、同一观测场的场景分项。`_candidate_sample_times` 保留原多项式各区间端点，并按 `interpolation_dt` 分割区间；原生候选直接保留此前普通与密集计算的实际硬残差。确切任务锚点和已加入的碰撞见证单独采样，并计入同一查询容量。调用方提供的原曲线使用自己的区间、时间采样与任务锚点，没有先前原生网格。
 
-这些轨迹指标由 `ProcessCostManager` 的 `trajectory_metrics` 模式计算，并调用 `PlanningProblem.residuals(..., for_acceptance=True)`。`SupportRequirement` 在其精确事件位姿上验收整体高度 body 和有限投影范围 footprint；间距 gap 和法向 normal 保留在原名义优化模型及分析接口中。其他任务目标、过程关系、关节耦合、显式停止和场景条件保持原验收定义。优化期间候选资格由同次前向结果中的非支持过程残差和 `functional_acceptance_keys` 计算，与这里的任务子集对应。
+这些轨迹指标由 `ProcessCostManager` 的 `trajectory_metrics` 模式计算，并调用 `PlanningProblem.residuals(..., for_acceptance=True)`。`SupportRequirement` 在其精确事件位姿上验收整体高度 body 和有限投影范围 footprint；间距 gap 和法向 normal 保留在原名义优化模型及分析接口中。`PoseEventRequirement` 按 `component_tolerances` 验收位置、旋转以及有界 yaw；旋转在有轴时表示剩余倾斜，yaw 容差 π 时没有 yaw 验收分项。静态功能 IK 调用相同 `for_acceptance=True` 接口。过程关系、关节耦合、显式停止和场景条件分别计算。优化期间候选资格由同次前向结果中的非支持过程残差和 `functional_acceptance_keys` 计算，与这里的任务子集对应。
 
 当前 `validation_joint_step` 用于 OMPL 连接检查；`validation_spatial_step_m` 虽属于 `PlanningBudget` 并校验为正数，但没有生产消费者。`geometry_motion_bound.py` 提供独立运动界计算及其单元回归，当前候选验收没有调用该模块。本次验收的几何计算范围由上述有限时间网格和确切锚点定义。
 
@@ -56,7 +56,7 @@
 
 `observation_callback` 提供独立任务效果的观察记录，状态使用 `T/F/U` 分别表示成立、不成立和未知；来源、关联条件及时间随记录保存。显式 `requires_evidence` 规定当前运动块结束后继续执行所需的效果条件，执行在该边界产生后续绑定所需状态。原任务声明规定效果记录与执行依赖的对应关系。
 
-`step_callback` 为初始状态及每个已完成正常执行步提供事后记录数据，其返回值被忽略。首次回调异常写入报告并停用该记录接收方，不拒绝命令或触发停止。仿真评价器在这一通道读取仿真实际运行环境中产生的真值，包括当前物体位姿、接触与任务效果，计算目标误差和结果分数。`_posthoc_geometry_timing` 将依赖几何目标评价的时间项识别为事后记录范围；`pose_goal_schedule` 为评价器提供原目标时刻及对应设备步。源技能中的轨迹和事件仍属于完整保留的技能表示，按原接口参与参考与任务编译。
+`step_callback` 为初始状态及每个已完成正常执行步提供事后记录数据，其返回值被忽略。首次回调异常写入报告并停用该记录接收方，不拒绝命令或触发停止。仿真评价器在这一通道读取仿真实际运行环境中产生的真值，包括当前物体位姿、接触与任务效果，计算目标误差和结果分数。`_posthoc_geometry_timing` 将依赖几何目标评价的时间项识别为事后记录范围；`pose_goal_schedule` 为评价器提供原目标时刻及对应设备步。`recorded_skill_evaluation._actual_pose_goal` 将评价时的材料位姿和目标位姿送入同一 `PoseEventRequirement.errors_numpy`，按各受约束分量评分，并另存完整转角与带符号 yaw。其输出仅写入事后报告。源技能中的轨迹和事件仍属于完整保留的技能表示，按原接口参与参考与任务编译。
 
 ## 6. 续规划与累计工作
 

@@ -1,6 +1,6 @@
 # 固定时钟轨迹求解与有限搜索
 
-代码基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。技能进度 `s` 与归一化时间 `u` 通过请求内固定的 `_ProgressMap` 联系。
+代码基线：`本文件所在的 yaw 实现提交`。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。技能进度 `s` 与归一化时间 `u` 通过请求内固定的 `_ProgressMap` 联系。
 
 ## 1. 请求生命周期与资源分配
 
@@ -37,6 +37,12 @@
 `_CuroboPlanner._initialize` 先核对机器人模型身份、工具、活动关节及场景要求，然后建立时钟、绑定手指曲线、检查工作区并创建 IK 与轨迹求解器。原生配置来自 `ik/lbfgs_ik.yml` 和 `trajopt/lbfgs_bspline_trajopt.yml`。轨迹优化采用 L-BFGS，关节状态由本章三次基产生；主生产请求使用 eager 执行，即按当前程序调用计算张量运算。`bind_solver_components` 将本项目的物理域线搜索、优化核心与目标缓冲管理装配到对应求解器实例。
 
 `reference_seeds` 在三次基参考参数处查询任务参考，调用原生 IK，再经 `_rank_ik_candidates` 排序。`planning_ik.rank_ik_candidates` 分别记录原生有效性、当前任务残差、场景/自碰撞状态与相对前一候选的运动量；`select_ik_chains` 在有限候选集合中生成连续关节链。具有原生有效性的 IK 行可用于构造轨迹优化初值，任务与几何要求分别记录并继续参与验收。
+
+`_build_goal_ik_candidates` 在每个不同功能事件时刻生成完整姿态候选。对于带轴事件，`proposal_yaw_angles` 将入口机器人 FK 投影得到的绕轴角截入声明区间，并与均匀角度网格合并；网格数量采用已有 `ik_seeds`，整周区间省略重复端点。每个事件最多有 `ik_seeds+1` 个目标中心。`target_poses` 保持材料目标原点，旋转材料朝向；`_functional_goal` 再依次计算 `T_W_E=T_W_C A⁻¹` 和 `T_B_L=T_W_B⁻¹ T_W_E T_L_E⁻¹`。其中 B 是机器人基座，L 是原生工具连杆，`T_L_E` 是工具标定。材料与 TCP 存在偏置时，改变材料朝向也会改变 TCP 位置。
+
+完整中心作为 cuRobo `GoalToolPose` 的目标集合，形状为 `[batch,horizon,tool,goalset,3或4]`。一次求解仍返回原 `ik_seeds` 数量的关节状态；目标中心数不等于独立求解次数。常驻求解器固定预留 `ik_seeds+1` 容量，支持在不同目标声明间重新绑定。报告保存 `target_yaw_proposals_rad` 和按最终候选顺序排列的 `native_goalset_indices`。最终任务筛选使用连续允许集合，区间内部的角度不必等于某个采样中心。
+
+`_rank_ik_candidates` 使用 `PlanningProblem.residuals(..., for_acceptance=True)`，因此位姿候选与最终曲线消费同一任务验收集合；支撑的 body/footprint 参与筛选。功能候选是否满足任务与原生中心 IK 的成功标志分别记录。轨迹求解的 `_native_request` 对带轴目标选择任务约束路径，关闭单个名义完整姿态的原生收敛判定；连续姿态集合由功能约束及相同的验收接口表达。
 
 参考参数处有可用解时，缺失位置由入口和已有成功锚点连接，再通过 `CubicJointDomain.fit_reference` 得到固定基种子；全部 IK 行均不可用时，入口测量状态提供种子构造的基准。功能目标允许区域对应的 IK 候选可作为软拟合提示。调用者传入的 `JointTrajectory` 首先按原多项式验收，随后才在确有求解需要时拟合为优化种子。
 

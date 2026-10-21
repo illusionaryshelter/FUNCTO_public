@@ -12,6 +12,7 @@ Unmapped frames, unsupported predicates and unobserved intervals remain unknown.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -104,10 +105,17 @@ def _actual_pose_goal(requirement, feedback, observation):
     if missing:
         measured["reason"] = "; ".join(missing)
         return measured
-    position = float(np.linalg.norm(function[:3, 3]-target[:3, 3]))
-    rotation = float(Rotation.from_matrix(target[:3, :3].T @ function[:3, :3]).magnitude())
-    measured.update(position_error_m=position, rotation_error_rad=rotation,
-        value="T" if position <= requirement.position_tolerance_m and rotation <= requirement.rotation_tolerance_rad else "F")
+    # BEGIN independent actual poses are graded by the same declared yaw set.
+    # Here the input is already the material pose, so its local tool transform
+    # is identity. The observed target defines the same target-local axis.
+    actual_requirement = replace(requirement, tool_from_function=np.eye(4),
+                                 target=target, actual_relation=None)
+    errors = actual_requirement.errors_numpy(function)
+    measured.update({name+"_error_"+("m" if name == "position" else "rad"): float(value)
+                     for name, value in errors.items()})
+    measured["value"] = ("T" if all(errors[name] <= bound
+        for name, bound in requirement.component_tolerances.items()) else "F")
+    # END evaluation results remain local to this independent posthoc sink.
     return measured
 # END these metrics remain simulation evidence, never online prerequisites.
 
@@ -450,7 +458,11 @@ class _FunctionalGoalEvaluator:
                     numerical_position_tolerance_m=self._support_numerical.position_m)
             else:
                 row.update(position_tolerance_m=requirement.position_tolerance_m,
-                           rotation_tolerance_rad=requirement.rotation_tolerance_rad)
+                           rotation_tolerance_rad=requirement.rotation_tolerance_rad,
+                           # BEGIN preserve target-local orientation semantics in results.
+                           yaw_axis=None if requirement.yaw_axis is None else requirement.yaw_axis.tolist(),
+                           yaw_tolerance_rad=requirement.yaw_tolerance_rad)
+                           # END a full-turn interval is recorded as pi.
             # END support goals do not acquire a full-position/yaw target.
             arrivals = [item for event in timing_events for item in event.get("timing", ())
                         if item["check_target"] == "arrival" and tuple(item["goal_id"]) == identity]

@@ -1,6 +1,6 @@
 # `manipulation/program.py` 实现契约
 
-代码基线：`22e6bda65682c1584d89623320024795fc1efa4e`。
+代码基线：`本文件所在的 yaw 实现提交`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `ReferenceGenerationError`
@@ -1035,6 +1035,7 @@ relation['goal_pose']
 relation['reference_binding']
 relation['function_frame']
 relation['constraint_kind']
+key
 ```
 
 直接调用符号：
@@ -1061,12 +1062,52 @@ ground_relation
 output.append
 int
 _positive
+deepcopy
 names.add
+```
+
+## `_material_pose_requirement`
+
+[定义位置](../../../manipulation/program.py#L674)。
+
+输入签名：
+
+```python
+def _material_pose_requirement(event):
+```
+
+实现说明：
+
+> Bind one grounded functional event without promoting its reference path.
+
+显式输出分支：
+
+```python
+PoseEventRequirement(0.0, material, event['goal_pose'] @ material, event['position_tolerance_m'], event['rotation_tolerance_rad'], event['source'], yaw_axis=event.get('yaw_axis'), yaw_tolerance_rad=event.get('yaw_tolerance_rad'))
+```
+
+读取的对象属性：
+
+```python
+event.get
+```
+
+写入目标：
+
+```python
+material
+```
+
+直接调用符号：
+
+```python
+PoseEventRequirement
+event.get
 ```
 
 ## `_object_reference`
 
-[定义位置](../../../manipulation/program.py#L670)。
+[定义位置](../../../manipulation/program.py#L684)。
 
 输入签名：
 
@@ -1098,7 +1139,9 @@ event.get
 np.linalg.norm
 np.linalg
 np.sin
-np.pi
+requirement.errors_numpy
+requirement.component_tolerances.items
+requirement.component_tolerances
 unique_goals.setdefault
 initial.copy
 unique_goals.items
@@ -1109,6 +1152,7 @@ pose[:3, :3].T
 np.min
 surface.origin
 surface.normal
+components.items
 checks.append
 ```
 
@@ -1128,12 +1172,15 @@ unique_goals
 event_index
 index
 goal
+requirement
 previous_event
 position_error
 rotation_error
 translation_bound
 item
 rotation_bound
+errors
+bound
 goal_pairs
 motion
 model_spec
@@ -1157,6 +1204,9 @@ minimum_height
 error['body_checks']['minimum_signed_height_m']
 satisfies
 error['checked_member_satisfies_support']
+components
+error['allowed_set_errors']
+value
 inside
 error['containment']
 checks[-1]['reference_generation']
@@ -1180,11 +1230,14 @@ len
 _functional_events
 _inverse
 enumerate
+_material_pose_requirement
 _errors
 sum
 np.linalg.norm
 np.sin
-min
+radius
+requirement.errors_numpy
+requirement.component_tolerances.items
 unique_goals.setdefault
 initial.copy
 list
@@ -1205,6 +1258,7 @@ np.min
 bool
 relation_error
 _pose_array
+components.items
 check_inside
 _interior
 checks.append
@@ -1212,7 +1266,7 @@ checks.append
 
 ## `ground_object_program`
 
-[定义位置](../../../manipulation/program.py#L832)。
+[定义位置](../../../manipulation/program.py#L859)。
 
 输入签名：
 
@@ -1276,7 +1330,7 @@ _object_reference
 
 ## `ground_program`
 
-[定义位置](../../../manipulation/program.py#L870)。
+[定义位置](../../../manipulation/program.py#L897)。
 
 输入签名：
 
