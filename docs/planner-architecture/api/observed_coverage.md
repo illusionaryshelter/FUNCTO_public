@@ -1,6 +1,6 @@
 # `manipulation/observed_coverage.py` 实现契约
 
-代码基线：`本文件所在的 yaw 实现提交`。
+代码基线：`9e8b365`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `query_coverage`
