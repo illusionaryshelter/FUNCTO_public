@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`85f67b53ffaa13b474c98061a0acfc51dea91c32`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，当前实验的具体文件与状态见[当前实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+库实现基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。本文的库接口对应该代码提交；第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 
@@ -61,6 +61,23 @@
 | `continuation.json`、`rebind` JSON、`request-ledger.json`（可选） | 已发生事件、实际反馈、显式续接变化及累计工作 | 当前请求续接、绑定与预算计算 |
 
 技能表示中的功能点和接触定义提供“要做什么”的几何表达，现场碰撞模型提供“本次模型中的实体占据”。将它们变换到共同坐标后分别消费，不以改变碰撞表示为由删除技能内容。
+
+### 4.1 已生成参考到规划要求的实际文件路径
+
+当前 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 通过 `reference_inputs()` 调用 `generate_reference`，随后由 `build_problem()` 直接构造 `PlanningProblem`。该路线使用源技能包中的 `representation`，工具参考、物体参考及目标取样共用返回的连续路径对象。具体职责如下。
+
+| 文件或任务声明 | 内容与含义 | 直接消费与输出 |
+|---|---|---|
+| `2026-10-18-shared-scene-toward-base/skills/put_mug_on_shelf` | 源运动、功能坐标和交互/释放时刻 | `load_grounding_skill` → `generate_reference`；交互时刻另用于位姿要求和支撑要求的进度 |
+| `2026-10-18-shared-scene-toward-base/put-grounding-001/report.json` | 当前迁移得到的 `functional_frame.T_world_region` | `reference_inputs` → `generate_reference(T_world_function=...)` |
+| `2026-10-19-put-planner-audit/prepared-inputs/relations.json` | 当前到源物体坐标对应 `J`、声明的 TCP 到物体变换 `A` | `generate_reference` 生成刚性一致的参考；`PoseEventRequirement.tool_from_function` 使用同一 `A` |
+| 同一 `prepared-inputs/feedback.json` | 从已保存抓取末态接续的机器人 `q/dq`、标定 TCP 位姿及具名关节 | 参考入口、`PlanningProblem.start_q/start_dq` 与坐标标定 |
+| 同一 `prepared-inputs/scene.json` | 支撑平面、有限边界、源任务点、接触面及其原容差 | `SupportRequirement` 与附着条件 |
+| [位姿要求任务声明](../../../sim-version-plans/2026-10-20-put-pose-goals-replay/plan.md) | 用户指定的位置容差 2 mm、姿态容差 1° | 适配器将数值绑定到两个 `PoseEventRequirement`，并在 `source.tolerance_source` 记录来源 |
+
+表中目录均相对工作区 `sim-version-plans`。两个位姿目标来自 `object_path.sample_numpy(s)`：一个在源交互进度，另一个在受控参考终点进度 1，当前对应释放边界。被比较的候选是物体表示坐标系 `C` 在规划世界 `W` 中的位姿 `T_W_E(q)A`，其中 `E` 是 TCP，`A=T_E_C`；坐标与误差定义见[输入与任务模型](01-inputs-and-task-model.md#41-连续参考的显式位姿要求)。原 `SupportRequirement` 与这两个要求分别保存并共同参与规划消费。
+
+`prepared-inputs/reference.npz` 保存参考采样及来源记录；当前目标构造实际查询内存中的连续 `object_path`。`source.reference_scope` 分别记录 `interaction` 和 `controlled_reference_endpoint`，`source.target_source` 记录连续路径及事件进度这一计算来源。事件进度通过规划器的固定时钟映到精确查询时刻，受控参考终点与机器人稳定尾段最后样本分别记录。
 
 ## 5. 输出、执行与评价
 

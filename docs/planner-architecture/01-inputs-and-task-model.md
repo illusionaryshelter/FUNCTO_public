@@ -1,10 +1,12 @@
 # 输入、参考与任务模型
 
-代码基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本组件将已有示教、当前任务关系及机器人入口状态编译为 `PlanningProblem`，供场景绑定与数值规划调用。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
+库实现基线：`22e6bda65682c1584d89623320024795fc1efa4e`。本组件将已有示教、当前任务关系及机器人入口状态组织为 `PlanningProblem`，供场景绑定与数值规划调用。本文的库接口对应该代码提交；第 4.1 节的实验输入适配器以所链接脚本和阶段计划记录其实现。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
 
 ## 1. 输入的来源与相互依赖
 
 `build_planning_problem` 接收恰好一个技能实例。`skills[0]` 至少提供 `skill_id`、`program` 与 `scene`。`program` 保存技能种类、示教和任务关系；`scene` 保存当前绑定的对象身份、坐标、功能关系和声明附着。函数另外接收具名机器人 `joint_names/start_q/start_dq`、`tool_link`、`reference_frame`、`base_pose`、`tool_transform`、数值容差和可选关节耦合关系。
+
+具有连续参考及明确任务声明的输入适配器也可直接构造 `PlanningProblem`：`reference_phase` 将连续工具参考组织为 `MotionPhase`，适配器分别传入位姿目标、支撑条件和原事件。两条构造路径最终使用相同的要求类型与规划消费者；本文第 3 节和第 4 节前半部分描述 `build_planning_problem` 的编译路径，第 4.1 节描述直接构造路径。
 
 示教的 `frame_indices` 表示原记录帧身份，`timestamps` 表示对应源时间。二者保持严格递增且相互对应。功能事件与夹爪事件保留原帧身份，`source` 和 `provenance` 保存其生产依据，供输入来源追踪。
 
@@ -85,6 +87,14 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 记 `errors` 返回的位置误差和转角误差为 `e_p`、`e_r`，各自容差为 `ε_p`、`ε_r`，则 `PoseEventRequirement.evaluate` 返回 `max(0,e_p−ε_p)+max(0,e_r−ε_r)`。`SupportRequirement.evaluate(..., for_acceptance=False)` 对四项原始有符号条件分别取正部后求和，保留完整优化值及梯度；`for_acceptance=True` 仅汇总 `acceptance_components=("body","footprint")`。`normalized_inequalities` 按长度或法向弦长尺度缩放全部四项，供增广拉格朗日计算使用。
 
 `NumericalTolerance` 控制浮点计算比较，目标容差规定任务允许误差，支撑容差规定允许间隙；实体距离的模型余量由观测碰撞查询单独应用。各量由对应接口保存。
+
+### 4.1 连续参考的显式位姿要求
+
+当前实验输入适配器 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 的 `reference_inputs()` 读取技能表示、迁移功能坐标、声明关系 `J/A` 和冻结机器人反馈，调用 `generate_reference` 得到同一次计算的 `object_path/eef_path`。`build_problem()` 通过 `reference_phase` 传入连续工具参考，并在 `PlanningProblem.pose_events` 中登记两个 `PoseEventRequirement`，与原 `supports`、事件和附着条件共同构成任务输入。
+
+令 `W` 为规划世界坐标系，`E` 为标定的工具中心点 TCP 坐标系，`C` 为已有物体表示坐标系，`A=T_E_C` 为声明的刚性变换。具名关节状态 `q` 经机器人正运动学得到 `T_W_E(q)`，因此要求所计算的物体位姿为 `T_W_C(q)=T_W_E(q)A`。每个要求的 `tool_from_function=A`，`target=object_path.sample_numpy(s)`；位置误差为候选与目标的 `C` 原点欧氏距离，姿态误差为二者相对旋转的最小转角。位置容差为 `0.002 m`，姿态容差为 `π/180 rad`，来源是[本次任务声明](../../../sim-version-plans/2026-10-20-put-pose-goals-replay/plan.md)。目标来源和容差来源保存在各要求的 `source` 中。
+
+两个查询进度分别为源 `interaction_time` 在受控参考时间区间中的归一化值，以及受控参考终点 `s=1`。当前终点对应源释放边界。规划器在候选首次到达相应进度的精确事件位姿上计算要求；机器人随后稳定尾段的最后样本具有自己的物理时刻。`SupportRequirement` 仍在交互进度计算原支撑几何。两个完整位姿要求经 `functional_inequalities` 进入增广拉格朗日求解，并经 `functional_acceptance_keys`、普通和密集轨迹指标参与候选保留与最终验收。参考路径提供目标数值，显式要求及其容差定义该数值在规划中的约束作用。
 
 ## 5. PlanningProblem 的运行接口
 
